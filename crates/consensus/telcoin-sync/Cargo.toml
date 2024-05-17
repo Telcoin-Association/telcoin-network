@@ -9,8 +9,8 @@ publish = false
 [dependencies]
 # 
 tokio = { workspace = true, features = ["sync"] }
-futures = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "test-util"] }
+futures = { workspace = true }

@@ -37,15 +37,9 @@ reth-config = { workspace = true }
 reth-tasks = { workspace = true }
 #revm-inspectors = { workspace = true }
 reth-network = { workspace = true }
-reth-downloaders = { workspace = true }
 reth-blockchain-tree = { workspace = true }
 reth-db = { workspace = true }
-reth-auto-seal-consensus = { workspace = true }
-reth-basic-payload-builder = { workspace = true }
 reth-node-api = { workspace = true }
-reth-node-ethereum = { workspace = true }
-reth-ethereum-payload-builder = { workspace = true }
-reth = { workspace = true }
 eyre = { workspace = true }
 futures = { workspace = true }
 tempfile = { workspace = true }
@@ -66,4 +60,3 @@ narwhal-network = { workspace = true }
 narwhal-network-types = { workspace = true }
 narwhal-typed-store = { workspace = true }
 narwhal-primary = { workspace = true, features = ["test-utils"] }
-narwhal-executor = { workspace = true }

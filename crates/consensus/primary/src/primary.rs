@@ -675,12 +675,12 @@ impl PrimaryReceiverHandler {
 
         // Check that the time of the header is smaller than the current time. If not but the
         // difference is small, just wait. Otherwise reject with an error.
-        const TOLERANCE_MS: u64 = 1_000;
+        const TOLERANCE_SEC: u64 = 1;
         let current_time = now();
         if current_time < *header.created_at() {
-            if *header.created_at() - current_time < TOLERANCE_MS {
+            if *header.created_at() - current_time <= TOLERANCE_SEC {
                 // for a small difference we simply wait
-                tokio::time::sleep(Duration::from_millis(*header.created_at() - current_time))
+                tokio::time::sleep(Duration::from_secs(*header.created_at() - current_time))
                     .await;
             } else {
                 // For larger differences return an error, and log it

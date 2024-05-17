@@ -13,7 +13,6 @@ bincode.workspace = true
 reth-primitives = { workspace = true }
 fastcrypto.workspace = true
 futures.workspace = true
-narwhal-primary = { workspace = true }
 serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
