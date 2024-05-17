@@ -173,7 +173,7 @@ async fn test_leader_schedule_from_store() {
     let leader_2 = schedule.leader(2);
     assert_eq!(leader_2.id(), authority_ids[0]);
 
-    // AND we add some a commit with a final score where the validator 0 is expected to be the
+    // AND we add a commit with a final score where the validator 0 is expected to be the
     // lowest score one.
     let mut scores = ReputationScores::new(&committee);
     scores.final_of_schedule = true;
@@ -185,6 +185,9 @@ async fn test_leader_schedule_from_store() {
 
     store.write_consensus_state(&HashMap::new(), &sub_dag).unwrap();
 
+    // TODO:
+    // bad threshold currently set to 0 causing test to fail
+    //
     // WHEN
     let schedule = LeaderSchedule::from_store(committee, store);
 
