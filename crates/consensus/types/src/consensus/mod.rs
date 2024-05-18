@@ -9,6 +9,9 @@ mod reputation;
 pub use reputation::*;
 mod output;
 pub use output::*;
+mod execution;
+pub use execution::*;
+pub use reth_consensus::{Consensus, ConsensusError};
 
 /// A global sequence number assigned to every CommittedSubDag.
 pub type SequenceNumber = u64;

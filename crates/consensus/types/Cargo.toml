@@ -45,6 +45,7 @@ schemars = { version = "0.8.16" }
 serde_yaml = { workspace = true }
 reth-provider = { workspace = true }
 secp256k1 = { workspace = true }
+reth-consensus = { workspace = true }
 
 # optional dependencies for test-utils
 tempfile = { workspace = true, optional = true }
