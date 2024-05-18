@@ -678,4 +678,152 @@ mod tests {
         assert_eq!(canonical_tip.senders, senders_in_output);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_execute_consensus_output_with_duplicate_transactions() -> eyre::Result<()> {
+        init_test_tracing();
+
+        //=== Consensus
+        //
+        // create consensus output bc transactions in batches
+        // are randomly generated
+        //
+        // for each tx, seed address with funds in genesis
+        //
+        // TODO: this does not use a "real" `ConsensusOutput`
+        //
+        // refactor with valid data once test util helpers are in place
+        let leader = Certificate::default();
+        let sub_dag_index = 1;
+        let reputation_scores = ReputationScores::default();
+        let previous_sub_dag = None;
+        let mut batches = tn_types::test_utils::batches(4); // create 4 batches
+
+        // duplicate transactions for one batch
+        //
+        // TODO: test batches use default metadata. only transactions are unique.
+        //
+        // replace last batch with clone of the first - causes duplicate transaction
+        batches[3] = batches[0].clone();
+
+        let beneficiary = Address::from_str("0xdbdbdb2cbd23b783741e8d7fcf51e459b497e4a6")
+            .expect("beneficiary address from str");
+        let consensus_output = ConsensusOutput {
+            sub_dag: CommittedSubDag::new(
+                vec![Certificate::default()],
+                leader,
+                sub_dag_index,
+                reputation_scores,
+                previous_sub_dag,
+            )
+            .into(),
+            batches: vec![batches.clone()],
+            beneficiary,
+        };
+
+        // println!("\nbatches\n{:?}", batches);
+        // for batch in batches.iter() {
+        //     println!("\n{:?}\n", batch);
+        // }
+
+        //=== Execution
+
+        let genesis = adiri_genesis();
+
+        // collect txs and addresses for later assertions
+        let mut txs_in_output = vec![];
+        let mut senders_in_output = vec![];
+
+        let mut accounts_to_seed = Vec::new();
+        for batch in batches.into_iter() {
+            for tx in batch.transactions_owned() {
+                let tx_signed = TransactionSigned::decode_enveloped(&mut tx.as_ref())
+                    .expect("decode tx signed");
+                let address = tx_signed.recover_signer().expect("signer recoverable");
+                txs_in_output.push(tx_signed);
+                senders_in_output.push(address);
+                // fund account with 99mil TEL
+                let account = (
+                    address,
+                    GenesisAccount::default().with_balance(
+                        U256::from_str("0x51E410C0F93FE543000000")
+                            .expect("account balance is parsed"),
+                    ),
+                );
+                accounts_to_seed.push(account);
+            }
+        }
+        debug!("accounts to seed: {accounts_to_seed:?}");
+
+        // genesis
+        let genesis = genesis.extend_accounts(accounts_to_seed);
+        let chain: Arc<ChainSpec> = Arc::new(genesis.into());
+
+        let manager = TaskManager::current();
+        let executor = manager.executor();
+        let execution_node = default_test_execution_node(Some(chain), None, executor)?;
+        let (to_executor, from_consensus) = tn_types::test_channel!(1);
+        execution_node.start_engine(from_consensus).await?;
+        tokio::task::yield_now().await;
+
+        let provider = execution_node.get_provider().await;
+        let mut canon_state_notification_receiver = provider.subscribe_to_canonical_state();
+
+        //=== Testing begins
+
+        // send output to executor
+        let res = to_executor.send(consensus_output).await;
+        debug!("res: {:?}", res);
+        assert!(res.is_ok());
+
+        // wait for next canonical block
+        let too_long = Duration::from_secs(5);
+        let canon_update = timeout(too_long, canon_state_notification_receiver.recv())
+            .await
+            .expect("next canonical block created within time")
+            .expect("canon update is Some()");
+
+        assert_matches!(canon_update, CanonStateNotification::Commit { .. });
+        let canonical_tip = canon_update.tip();
+        debug!("canon update: {:?}", canonical_tip);
+
+        // ensure canonical tip is the next block
+        // assert_eq!(canonical_tip.header, storage_sealed_header);
+
+        // ensure database and provider are updated
+        let canonical_hash = canonical_tip.hash();
+
+        // wait for forkchoice to finish updating
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut current_finalized_header = provider
+                .finalized_header()
+                .expect("blockchain db has some finalized header 1")
+                .expect("some finalized header 2");
+            while canonical_hash != current_finalized_header.hash() {
+                // sleep - then look up finalized in db again
+                println!("\nwaiting for engine to complete forkchoice update...\n");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                current_finalized_header = provider
+                    .finalized_header()
+                    .expect("blockchain db has some finalized header 1")
+                    .expect("some finalized header 2");
+            }
+            tx.send(current_finalized_header)
+        });
+
+        let current_finalized_header = timeout(too_long, rx)
+            .await
+            .expect("next canonical block created within time")
+            .expect("finalized block retrieved from db");
+
+        debug!("update completed...");
+        assert_eq!(canonical_hash, current_finalized_header.hash());
+
+        // assert canonical tip contains all txs and senders in batches
+        assert_eq!(canonical_tip.block.body, txs_in_output);
+        assert_eq!(canonical_tip.block.beneficiary, beneficiary);
+        assert_eq!(canonical_tip.senders, senders_in_output);
+        Ok(())
+    }
 }
