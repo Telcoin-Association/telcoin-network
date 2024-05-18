@@ -3,18 +3,18 @@
 
 //! Specific test utils for execution layer
 use crate::{adiri_genesis, ExecutionKeypair};
-use fastcrypto::traits::{KeyPair as _, ToFromBytes};
 use rand::{
-    rngs::{OsRng, StdRng},
+    rngs::StdRng,
     SeedableRng,
 };
 use reth_primitives::{
     public_key_to_address, sign_message, Address, BaseFeeParams, ChainSpec,
     FromRecoveredPooledTransaction, Genesis, GenesisAccount, PooledTransactionsElement, Signature,
-    Transaction, TransactionKind, TransactionSigned, TxEip1559, TxHash, B256, U256,
+    Transaction, TransactionSigned, TxEip1559, TxHash, B256, U256, TxKind,
 };
 use reth_provider::BlockReaderIdExt;
 use reth_transaction_pool::{TransactionOrigin, TransactionPool};
+use secp256k1::Secp256k1;
 use std::sync::Arc;
 
 /// Adiri genesis with funded [TransactionFactory] default account.
@@ -47,26 +47,23 @@ impl TransactionFactory {
     /// Secret: 9bf49a6a0755f953811fce125f2683d50429c3bb49e074147e0089a52eae155f
     pub fn new() -> Self {
         let mut rng = StdRng::from_seed([0; 32]);
-        let keypair = ExecutionKeypair::generate(&mut rng);
+        let secp = Secp256k1::new();
+        let (secret_key, _public_key) = secp.generate_keypair(&mut rng);
+        let keypair = ExecutionKeypair::from_secret_key(&secp, &secret_key);
         Self { keypair, nonce: 0 }
     }
 
     /// Create a new instance of self from a random seed.
     pub fn new_random() -> Self {
-        let mut rng = StdRng::from_rng(OsRng).expect("OsRng available");
-        let keypair = ExecutionKeypair::generate(&mut rng);
-        Self { keypair, nonce: 0 }
-    }
-
-    /// Create a new instance of [Self] from a provided keypair.
-    pub fn new_from_keypair(private: &[u8]) -> Self {
-        let keypair = ExecutionKeypair::from_bytes(private).unwrap();
+        let secp = Secp256k1::new();
+        let (secret_key, _public_key) = secp.generate_keypair(&mut rand::thread_rng());
+        let keypair = ExecutionKeypair::from_secret_key(&secp, &secret_key);
         Self { keypair, nonce: 0 }
     }
 
     /// Return the address of the signer.
     pub fn address(&self) -> Address {
-        let public_key = self.keypair.public.pubkey;
+        let public_key = self.keypair.public_key();
         public_key_to_address(public_key)
     }
 
@@ -95,7 +92,7 @@ impl TransactionFactory {
             max_priority_fee_per_gas: 0,
             max_fee_per_gas: gas_price,
             gas_limit: 1_000_000,
-            to: TransactionKind::Call(to),
+            to: TxKind::Call(to),
             value,
             input: Default::default(),
             access_list: Default::default(),
@@ -115,7 +112,8 @@ impl TransactionFactory {
         // let env = std::env::var("WALLET_SECRET_KEY")
         //     .expect("Wallet address is set through environment variable");
         // let secret: B256 = env.parse().expect("WALLET_SECRET_KEY must start with 0x");
-        let secret = B256::from_slice(self.keypair.secret.as_ref());
+        // let secret = B256::from_slice(self.keypair.secret.as_ref());
+        let secret = B256::from_slice(&self.keypair.secret_bytes());
         let signature = sign_message(secret, hash);
         signature.expect("failed to sign transaction")
     }
@@ -184,13 +182,15 @@ mod tests {
         // let mut rng = StdRng::from_seed([0; 32]);
         // let keypair = ExecutionKeypair::generate(&mut rng);
 
-        let keypair = ExecutionKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
+        let secp = Secp256k1::new();
+        let (secret_key, _public_key) = secp.generate_keypair(&mut rand::thread_rng());
+        let keypair = ExecutionKeypair::from_secret_key(&secp, &secret_key);
 
         // let private = base64::encode(keypair.secret.as_bytes());
-        let bytes = keypair.secret.as_bytes();
-        println!("secret: {:?}", hex::encode(bytes));
-        let bytes = keypair.public().as_bytes();
-        println!("public: {:?}", hex::encode(bytes));
+        let secret = keypair.secret_bytes();
+        println!("secret: {:?}", hex::encode(secret));
+        let pubkey = keypair.public_key().serialize();
+        println!("public: {:?}", hex::encode(pubkey));
 
         // 9bf49a6a0755f953811fce125f2683d50429c3bb49e074147e0089a52eae155f
         // println!("{:?}", hex::encode(bytes));

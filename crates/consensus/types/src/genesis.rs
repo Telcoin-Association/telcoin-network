@@ -15,7 +15,6 @@ use fastcrypto::traits::{InsecureDefault, Signer};
 use reth_blockchain_tree::ShareableBlockchainTree;
 use reth_primitives::{keccak256, Address, ChainSpec, Genesis};
 use reth_provider::providers::BlockchainProvider;
-use reth_revm::EvmProcessorFactory;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -28,10 +27,6 @@ use std::{
 use tracing::{info, warn};
 /// The validators directory used to create genesis.
 pub const GENESIS_VALIDATORS_DIR: &str = "validators";
-
-/// The database provider interface for execution layer.
-pub type BlockchainProviderType<DB, Evm> =
-    BlockchainProvider<DB, ShareableBlockchainTree<DB, EvmProcessorFactory<Evm>>>;
 
 /// adiri parsed Genesis.
 pub fn adiri_genesis() -> Genesis {

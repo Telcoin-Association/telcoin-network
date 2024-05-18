@@ -32,7 +32,7 @@ jsonrpsee = { workspace = true, features = ["macros"] }
 gcloud-sdk = { version = "0.24.3", default-features = false, features = ["google-cloud-kms-v1", "tls-webpki-roots"] }
 k256 = "0.13.3"
 ecdsa = { version = "0.16.9", features = ["pem"] }
-secp256k1 = "0.27.0"
+secp256k1 = { workspace = true }
 tonic = { workspace = true }
 cfg-if = { workspace = true}
 

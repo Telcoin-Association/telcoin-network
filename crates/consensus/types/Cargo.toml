@@ -20,7 +20,6 @@ indexmap = { workspace = true }
 prometheus = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
-#prost = { workspace = true }
 rand = { workspace = true }
 roaring = { workspace = true }
 serde = { workspace = true }
@@ -45,6 +44,7 @@ alloy-rlp = { workspace = true }
 schemars = { version = "0.8.16" }
 serde_yaml = { workspace = true }
 reth-provider = { workspace = true }
+secp256k1 = { workspace = true }
 
 # optional dependencies for test-utils
 tempfile = { workspace = true, optional = true }
@@ -58,14 +58,6 @@ tempfile = { workspace = true }
 fdlimit = { workspace = true }
 tn-types = { path = ".", features = ["test-utils"] }
 consensus-metrics = { workspace = true }
-
-secp256k1 = "0.27.0"
-
-#serde_test = { workspace = true }
-#narwhal-test-utils = { workspace = true }
-
-#[target.'cfg(not(target_env = "msvc"))'.build-dependencies]
-#protobuf-src = { workspace = true }
 
 [features]
 default = []

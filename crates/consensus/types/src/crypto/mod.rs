@@ -17,7 +17,6 @@ use fastcrypto::{
     bls12381, ed25519,
     error::FastCryptoError,
     hash::{Blake2b256, HashFunction},
-    secp256k1,
     traits::{AggregateAuthenticator, KeyPair, Signer, ToFromBytes, VerifyingKey},
 };
 // This re-export allows using the trait-defined APIs
@@ -55,9 +54,9 @@ pub type NetworkKeypair = ed25519::Ed25519KeyPair;
 // EXECUTION
 //
 /// Public key used for signing transactions in the Execution Layer.
-pub type ExecutionPublicKey = secp256k1::Secp256k1PublicKey;
+pub type ExecutionPublicKey = secp256k1::PublicKey;
 /// Keypair used for signing transactions in the Execution Layer.
-pub type ExecutionKeypair = secp256k1::Secp256k1KeyPair;
+pub type ExecutionKeypair = secp256k1::Keypair;
 
 // TODO: implement randomness
 pub type RandomnessSignature = fastcrypto_tbls::types::Signature;
