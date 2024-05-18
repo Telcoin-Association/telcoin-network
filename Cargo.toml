@@ -72,6 +72,7 @@ reth-interfaces = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-b
 reth-network = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.7" }
 reth-network-api = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.7" }
 reth-prune = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.7" }
+reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.7" }
 reth-revm = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.7" }
 reth-exex = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.7" }
 reth-rpc = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.7" }
@@ -83,6 +84,7 @@ reth-stages = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.
 reth-static-file = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.7" }
 reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.7" }
 reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.7" }
+reth-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.7" }
 reth-auto-seal-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.7" }
 reth-beacon-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.7" }
 reth-blockchain-tree = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.7" }

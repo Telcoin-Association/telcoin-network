@@ -18,7 +18,6 @@
 
 use consensus_metrics::metered_channel::Sender;
 use reth_interfaces::{
-    consensus::{Consensus, ConsensusError},
     executor::{BlockExecutionError, BlockValidationError},
 };
 use reth_node_api::ConfigureEvm;
@@ -29,11 +28,11 @@ use reth_primitives::{
     EMPTY_OMMER_ROOT_HASH, U256,
 };
 use reth_provider::{
-    BlockExecutor, BlockReaderIdExt, BundleStateWithReceipts, StateProviderFactory,
+    BlockReaderIdExt, BundleStateWithReceipts, StateProviderFactory,
 };
 use reth_revm::{
     database::StateProviderDatabase, db::states::bundle_state::BundleRetention,
-    processor::EVMProcessor, State,
+    State,
 };
 use reth_transaction_pool::TransactionPool;
 use std::{
@@ -41,7 +40,7 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tn_types::{now, NewBatch};
+use tn_types::{now, AutoSealConsensus, NewBatch};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{debug, error, trace, warn};
 
@@ -52,47 +51,6 @@ mod task;
 // pub use crate::client::AutoSealClient;
 pub use mode::{FixedBlockTimeMiner, MiningMode, ReadyTransactionMiner};
 pub use task::MiningTask;
-
-/// A consensus implementation intended for local development and testing purposes.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct AutoSealConsensus {
-    /// Configuration
-    chain_spec: Arc<ChainSpec>,
-}
-
-impl AutoSealConsensus {
-    /// Create a new instance of [AutoSealConsensus]
-    pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { chain_spec }
-    }
-}
-
-impl Consensus for AutoSealConsensus {
-    fn validate_header(&self, _header: &SealedHeader) -> Result<(), ConsensusError> {
-        Ok(())
-    }
-
-    fn validate_header_against_parent(
-        &self,
-        _header: &SealedHeader,
-        _parent: &SealedHeader,
-    ) -> Result<(), ConsensusError> {
-        Ok(())
-    }
-
-    fn validate_header_with_total_difficulty(
-        &self,
-        _header: &Header,
-        _total_difficulty: U256,
-    ) -> Result<(), ConsensusError> {
-        Ok(())
-    }
-
-    fn validate_block(&self, _block: &SealedBlock) -> Result<(), ConsensusError> {
-        Ok(())
-    }
-}
 
 /// Builder type for configuring the setup
 #[derive(Debug)]
@@ -155,7 +113,7 @@ where
 
         // (consensus, auto_client, task)
         MiningTask::new(
-            Arc::clone(&consensus.chain_spec),
+            Arc::clone(consensus.chain_spec()),
             mode,
             to_worker,
             storage,
