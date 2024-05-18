@@ -679,6 +679,7 @@ mod tests {
         Ok(())
     }
 
+    /// TODO: test fails because all transactions must pass or everything fails during execution.
     #[tokio::test]
     async fn test_execute_consensus_output_with_duplicate_transactions() -> eyre::Result<()> {
         init_test_tracing();
@@ -720,11 +721,6 @@ mod tests {
             batches: vec![batches.clone()],
             beneficiary,
         };
-
-        // println!("\nbatches\n{:?}", batches);
-        // for batch in batches.iter() {
-        //     println!("\n{:?}\n", batch);
-        // }
 
         //=== Execution
 
@@ -786,9 +782,6 @@ mod tests {
         assert_matches!(canon_update, CanonStateNotification::Commit { .. });
         let canonical_tip = canon_update.tip();
         debug!("canon update: {:?}", canonical_tip);
-
-        // ensure canonical tip is the next block
-        // assert_eq!(canonical_tip.header, storage_sealed_header);
 
         // ensure database and provider are updated
         let canonical_hash = canonical_tip.hash();
