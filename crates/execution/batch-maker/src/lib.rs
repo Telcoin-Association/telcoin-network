@@ -486,7 +486,7 @@ mod tests {
         debug!("genesis hash: {genesis_hash:?}");
 
         let blockchain_db =
-            BlockchainProvider::new(provider_factory, NoopBlockchainTree::default())
+            BlockchainProvider::new(provider_factory, Arc::new(NoopBlockchainTree::default()))
                 .expect("test blockchain provider");
 
         // task manger
