@@ -17,12 +17,14 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 use consensus_metrics::metered_channel::Sender;
+use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider};
 use reth_interfaces::{
     executor::{BlockExecutionError, BlockValidationError},
 };
+use reth_evm::execute::Executor;
 use reth_node_api::ConfigureEvm;
 use reth_primitives::{
-    constants::{EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT}, proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, BlockWithSenders, Bloom, ChainSpec, Header, ReceiptWithBloom, SealedBlock, SealedHeader, TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256
+    constants::{EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT}, proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, BlockWithSenders, Bloom, ChainSpec, Header, ReceiptWithBloom, Receipts, SealedBlock, SealedHeader, TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256
 };
 use reth_provider::{
     BlockReaderIdExt, BundleStateWithReceipts, StateProviderFactory,
@@ -274,99 +276,9 @@ impl StorageInner {
     /// Builds and executes a new block with the given transactions, on the provided executor.
     ///
     /// This returns the header of the executed block, as well as the poststate from execution.
-    pub(crate) fn execute<EvmConfig>(
-        &mut self,
-        block: &BlockWithSenders,
-        executor: &mut EVMProcessor<'_, EvmConfig>,
-    ) -> Result<(BundleStateWithReceipts, u64), BlockExecutionError>
-    where
-        EvmConfig: ConfigureEvm,
-    {
-        trace!(target: "execution::batch_maker", transactions=?&block.body, "executing transactions");
-        // TODO: there isn't really a parent beacon block root here, so not sure whether or not to
-        // call the 4788 beacon contract
-
-        // set the first block to find the correct index in bundle state
-        executor.set_first_block(block.number);
-
-        let (receipts, gas_used) = executor.execute_transactions(block, U256::ZERO)?;
-
-        // Save receipts.
-        executor.save_receipts(receipts)?;
-
-        // add post execution state change
-        // Withdrawals, rewards etc.
-        executor.apply_post_execution_state_change(block, U256::ZERO)?;
-
-        // merge transitions
-        executor.db_mut().merge_transitions(BundleRetention::Reverts);
-
-        // apply post block changes
-        Ok((executor.take_output_state(), gas_used))
-    }
-
-    /// Fills in the post-execution header fields based on the given BundleState and gas used.
-    /// In doing this, the state root is calculated and the final header is returned.
-    pub(crate) fn complete_header<S: StateProviderFactory>(
-        &self,
-        mut header: Header,
-        bundle_state: &BundleStateWithReceipts,
-        client: &S,
-        gas_used: u64,
-    ) -> Result<Header, BlockExecutionError> {
-        let receipts = bundle_state.receipts_by_block(header.number);
-        header.receipts_root = if receipts.is_empty() {
-            EMPTY_RECEIPTS
-        } else {
-            let receipts_with_bloom = receipts
-                .iter()
-                .map(|r| (*r).clone().expect("receipts have not been pruned").into())
-                .collect::<Vec<ReceiptWithBloom>>();
-            header.logs_bloom =
-                receipts_with_bloom.iter().fold(Bloom::ZERO, |bloom, r| bloom | r.bloom);
-            proofs::calculate_receipt_root(&receipts_with_bloom)
-        };
-
-        header.gas_used = gas_used;
-
-        // calculate the state root
-        let state_root = client
-            .latest()
-            .map_err(|e| {
-                error!(target: "execution::batch_maker", "error retrieving client.latest() {e}");
-                BlockExecutionError::LatestBlock(e)
-            })?
-            .state_root(bundle_state.state())
-            .map_err(|e| {
-                error!(target: "execution::batch_maker", "error calculating state root: {e}");
-                BlockExecutionError::LatestBlock(e)
-            })?;
-        header.state_root = state_root;
-        Ok(header)
-    }
-
-    // /// Builds and executes a new block with the given transactions, on the provided [EVMProcessor].
-    // ///
-    // /// This returns the header of the executed block, as well as the poststate from execution.
-    // pub(crate) fn build_and_execute<EvmConfig>(
-    //     &mut self,
-    //     transactions: Vec<TransactionSigned>,
-    //     client: &(impl StateProviderFactory + BlockReaderIdExt),
-    //     chain_spec: Arc<ChainSpec>,
-    //     evm_config: EvmConfig,
-    // ) -> Result<(SealedHeader, BundleStateWithReceipts), BlockExecutionError>
-    // where
-    //     EvmConfig: ConfigureEvm,
-    // {
-
-
-    /// Builds and executes a new block with the given transactions, on the provided executor.
-    ///
-    /// This returns the header of the executed block, as well as the poststate from execution.
     pub(crate) fn build_and_execute<Provider, Executor>(
         &mut self,
         transactions: Vec<TransactionSigned>,
-        client: &(impl StateProviderFactory + BlockReaderIdExt),
         withdrawals: Option<Withdrawals>,
         provider: &Provider,
         chain_spec: Arc<ChainSpec>,
@@ -374,24 +286,10 @@ impl StorageInner {
     ) -> Result<(SealedHeader, BundleStateWithReceipts), BlockExecutionError>
     where
         Executor: BlockExecutorProvider,
-        Provider: StateProviderFactory,
+        Provider: StateProviderFactory + BlockReaderIdExt,
     {
         // use the last canonical block for next batch
-        debug!(target: "execution::batch_maker", latest=?client.latest_header().unwrap());
-
-        // TODO: ensure forkchoice updated is sent to engine as components start up
-        let parent = client.finalized_header()
-            .map_err(|e| {
-                error!(target: "execution::batch_maker", "error retrieving client.finalized_header() {e}");
-                BlockExecutionError::LatestBlock(e)
-            })?;
-        // .ok_or_else(|| {
-        //     error!("error retrieving client.finalized_header() returned `None`");
-        //     BlockExecutionError::ProviderError
-        // })?;
-
-        debug!(target: "execution::batch_maker", finalized=?parent);
-        let parent = client.latest_header()
+        let parent = provider.latest_header()
             .map_err(|e| {
                 error!(target: "execution::batch_maker", "error retrieving client.latest_header() {e}");
                 BlockExecutionError::LatestBlock(e)
@@ -400,6 +298,8 @@ impl StorageInner {
                 error!(target: "execution::batch_maker", "error retrieving client.latest_header() returned `None`");
                 BlockExecutionError::LatestBlock(reth_provider::ProviderError::FinalizedBlockNotFound)
             })?;
+
+        debug!(target: "execution::batch_maker", latest=?parent);
 
         let header = self.build_header_template(&transactions, chain_spec.clone(), &parent);
 
@@ -425,10 +325,9 @@ impl StorageInner {
 
         // TODO: should this use the latest or finalized for next batch?
         //
-        // for now, keep it consistent with finalized block retrieved for header template
+        // for now, keep it consistent with latest block retrieved for header template
         let mut db = StateProviderDatabase::new(
-            // client.latest().map_err(BlockExecutionError::LatestBlock)?,
-            parent,
+            provider.latest().map_err(BlockExecutionError::LatestBlock)?,
         );
 
         // execute the block
@@ -695,7 +594,7 @@ mod tests {
         // create header template
         // warning should appear with RUST_LOG=info
         let template =
-            storage.write().await.build_header_template(&Vec::new(), chain_spec, sealed_header);
+            storage.write().await.build_header_template(&Vec::new(), chain_spec, &sealed_header);
         let expected: u64 = system_time + 1;
         assert!(template.timestamp == expected);
     }
