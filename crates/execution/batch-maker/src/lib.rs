@@ -22,10 +22,7 @@ use reth_interfaces::{
 };
 use reth_node_api::ConfigureEvm;
 use reth_primitives::{
-    constants::{EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT},
-    proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, BlockWithSenders,
-    Bloom, ChainSpec, Header, ReceiptWithBloom, SealedBlock, SealedHeader, TransactionSigned, B256,
-    EMPTY_OMMER_ROOT_HASH, U256,
+    constants::{EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT}, proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, BlockWithSenders, Bloom, ChainSpec, Header, ReceiptWithBloom, SealedBlock, SealedHeader, TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256
 };
 use reth_provider::{
     BlockReaderIdExt, BundleStateWithReceipts, StateProviderFactory,
@@ -219,7 +216,7 @@ impl StorageInner {
         &self,
         transactions: &[TransactionSigned],
         chain_spec: Arc<ChainSpec>,
-        parent: SealedHeader,
+        parent: &SealedHeader,
     ) -> Header {
         // // check previous block for base fee
         // let base_fee_per_gas = self
@@ -228,6 +225,8 @@ impl StorageInner {
         //     .and_then(|parent| parent.next_block_base_fee(chain_spec.base_fee_params));
 
         // use finalized parent for this batch base fee
+        //
+        // TODO: use this worker's previous batch for base fee instead?
         let base_fee_per_gas =
             parent.next_block_base_fee(chain_spec.base_fee_params_at_timestamp(now()));
 
@@ -238,7 +237,7 @@ impl StorageInner {
             state_root: Default::default(),
             transactions_root: Default::default(),
             receipts_root: Default::default(),
-            withdrawals_root: Some(EMPTY_WITHDRAWALS),
+            withdrawals_root: Some(EMPTY_WITHDRAWALS), // TODO: support withdrawals
             logs_bloom: Default::default(),
             difficulty: U256::ZERO,
             number: parent.number + 1,
@@ -272,9 +271,9 @@ impl StorageInner {
         header
     }
 
-    /// Executes the block with the given block and senders, on the provided [EVMProcessor].
+    /// Builds and executes a new block with the given transactions, on the provided executor.
     ///
-    /// This returns the poststate from execution and post-block changes, as well as the gas used.
+    /// This returns the header of the executed block, as well as the poststate from execution.
     pub(crate) fn execute<EvmConfig>(
         &mut self,
         block: &BlockWithSenders,
@@ -346,18 +345,36 @@ impl StorageInner {
         Ok(header)
     }
 
-    /// Builds and executes a new block with the given transactions, on the provided [EVMProcessor].
+    // /// Builds and executes a new block with the given transactions, on the provided [EVMProcessor].
+    // ///
+    // /// This returns the header of the executed block, as well as the poststate from execution.
+    // pub(crate) fn build_and_execute<EvmConfig>(
+    //     &mut self,
+    //     transactions: Vec<TransactionSigned>,
+    //     client: &(impl StateProviderFactory + BlockReaderIdExt),
+    //     chain_spec: Arc<ChainSpec>,
+    //     evm_config: EvmConfig,
+    // ) -> Result<(SealedHeader, BundleStateWithReceipts), BlockExecutionError>
+    // where
+    //     EvmConfig: ConfigureEvm,
+    // {
+
+
+    /// Builds and executes a new block with the given transactions, on the provided executor.
     ///
     /// This returns the header of the executed block, as well as the poststate from execution.
-    pub(crate) fn build_and_execute<EvmConfig>(
+    pub(crate) fn build_and_execute<Provider, Executor>(
         &mut self,
         transactions: Vec<TransactionSigned>,
         client: &(impl StateProviderFactory + BlockReaderIdExt),
+        withdrawals: Option<Withdrawals>,
+        provider: &Provider,
         chain_spec: Arc<ChainSpec>,
-        evm_config: EvmConfig,
+        executor: &Executor,
     ) -> Result<(SealedHeader, BundleStateWithReceipts), BlockExecutionError>
     where
-        EvmConfig: ConfigureEvm,
+        Executor: BlockExecutorProvider,
+        Provider: StateProviderFactory,
     {
         // use the last canonical block for next batch
         debug!(target: "execution::batch_maker", latest=?client.latest_header().unwrap());
@@ -384,7 +401,7 @@ impl StorageInner {
                 BlockExecutionError::LatestBlock(reth_provider::ProviderError::FinalizedBlockNotFound)
             })?;
 
-        let header = self.build_header_template(&transactions, chain_spec.clone(), parent);
+        let header = self.build_header_template(&transactions, chain_spec.clone(), &parent);
 
         let block = Block { header, body: transactions, ommers: vec![], withdrawals: None }
             .with_recovered_senders()
@@ -395,30 +412,40 @@ impl StorageInner {
 
         trace!(target: "execution::batch_maker", transactions=?&block.body, "executing transactions");
 
-        // now execute the block
-        let db = State::builder()
-            .with_database_boxed(Box::new(StateProviderDatabase::new(client
-            .latest()
-            .map_err(|e| {
-                error!(target: "execution::batch_maker", "error retrieving client.latest() {e}");
-                BlockExecutionError::LatestBlock(e)
-            })?)))
-            .with_bundle_update()
-            .build();
+        // // now execute the block
+        // let db = State::builder()
+        //     .with_database_boxed(Box::new(StateProviderDatabase::new(client
+        //     .latest()
+        //     .map_err(|e| {
+        //         error!(target: "execution::batch_maker", "error retrieving client.latest() {e}");
+        //         BlockExecutionError::LatestBlock(e)
+        //     })?)))
+        //     .with_bundle_update()
+        //     .build();
 
-        let mut executor = EVMProcessor::new_with_state(chain_spec, db, evm_config);
+        // TODO: should this use the latest or finalized for next batch?
+        //
+        // for now, keep it consistent with finalized block retrieved for header template
+        let mut db = StateProviderDatabase::new(
+            // client.latest().map_err(BlockExecutionError::LatestBlock)?,
+            parent,
+        );
 
-        let (bundle_state, gas_used) = self.execute(&block, &mut executor)?;
+        // execute the block
+        let BlockExecutionOutput { state, receipts, .. } =
+            executor.executor(&mut db).execute((&block, U256::ZERO).into())?;
+        let bundle_state = BundleStateWithReceipts::new(
+            state,
+            Receipts::from_block_receipt(receipts),
+            block.number,
+        );
 
-        let Block { header, body, .. } = block.block;
-        let body = BlockBody { transactions: body, ommers: vec![], withdrawals: None };
+        let Block { mut header, body, .. } = block.block;
+        let body = BlockBody { transactions: body, ommers: vec![], withdrawals: Some(Withdrawals::default()) };
 
         trace!(target: "execution::batch_maker", ?bundle_state, ?header, ?body, "executed block, calculating state root and completing header");
 
-        // fill in the rest of the fields
-        let header = self.complete_header(header, &bundle_state, client, gas_used)?;
-
-        trace!(target: "execution::batch_maker", root=?header.state_root, ?body, "calculated root");
+        header.state_root = db.state_root(bundle_state.state())?;
 
         // finally insert into storage
         self.insert_new_block(header.clone(), body);
