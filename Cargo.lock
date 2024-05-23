@@ -10013,6 +10013,7 @@ dependencies = [
  "reth",
  "reth-blockchain-tree",
  "reth-db",
+ "reth-evm",
  "reth-interfaces",
  "reth-node-api",
  "reth-node-core",

@@ -2,7 +2,7 @@
 
 use super::{Consensus, ConsensusError};
 use std::sync::Arc;
-use reth_primitives::{ChainSpec, Header, SealedBlock, SealedHeader, U256};
+use reth_primitives::{BlockWithSenders, ChainSpec, Header, Receipt, SealedBlock, SealedHeader, U256};
 
 /// A consensus implementation that validates everything.
 /// 
@@ -47,7 +47,15 @@ impl Consensus for AutoSealConsensus {
         Ok(())
     }
 
-    fn validate_block(&self, _block: &SealedBlock) -> Result<(), ConsensusError> {
+    fn validate_block_pre_execution(&self, _block: &SealedBlock) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
+    fn validate_block_post_execution(
+        &self,
+        _block: &BlockWithSenders,
+        _receipts: &[Receipt],
+    ) -> Result<(), ConsensusError> {
         Ok(())
     }
 }
