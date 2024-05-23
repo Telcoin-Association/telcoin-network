@@ -11,8 +11,7 @@ use reth_interfaces::{
 use reth_node_api::ConfigureEvm;
 use reth_primitives::{GotExpected, Hardfork, Receipts, SealedBlockWithSenders, U256};
 use reth_provider::{
-    providers::{BlockchainProvider, BundleStateProvider}, BundleStateDataProvider, BundleStateWithReceipts,
-    ChainSpecProvider, HeaderProvider, StateProviderFactory, StateRootProvider,
+    providers::{BlockchainProvider, BundleStateProvider}, BundleStateDataProvider, BundleStateForkProvider as _, BundleStateWithReceipts, ChainSpecProvider, HeaderProvider, StateProviderFactory, StateRootProvider
 };
 use reth_revm::database::StateProviderDatabase;
 use std::{
@@ -67,6 +66,8 @@ where
     /// BlockchainTree has several useful methods, but they are private. The publicly exposed
     /// methods would result in canonicalizing batches, which is undesireable. It is possible to
     /// append then revert the batch, but this is also very inefficient.
+    ///
+    /// The validator flow follows: `reth::blockchain_tree::blockchain_tree::validate_block` method.
     async fn validate_batch(&self, batch: &Batch) -> Result<(), Self::Error> {
         // check sui + reth
         //
@@ -104,7 +105,7 @@ where
             return Err(e.into())
         }
 
-        if let Err(e) = self.consensus.validate_block(&sealed_block) {
+        if let Err(e) = self.consensus.validate_block_pre_execution(&sealed_block) {
             error!(?sealed_block, "Failed to validate block {}: {e}", sealed_block.header.hash());
             return Err(e.into())
         }
