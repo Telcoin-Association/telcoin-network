@@ -219,6 +219,7 @@ impl StorageInner {
         transactions: &[TransactionSigned],
         chain_spec: Arc<ChainSpec>,
         parent: &SealedHeader,
+        _withdrawals: Option<&Withdrawals>,
     ) -> Header {
         // // check previous block for base fee
         // let base_fee_per_gas = self
@@ -301,7 +302,7 @@ impl StorageInner {
 
         debug!(target: "execution::batch_maker", latest=?parent);
 
-        let header = self.build_header_template(&transactions, chain_spec.clone(), &parent);
+        let header = self.build_header_template(&transactions, chain_spec.clone(), &parent, withdrawals.as_ref());
 
         let block = Block { header, body: transactions, ommers: vec![], withdrawals: None }
             .with_recovered_senders()

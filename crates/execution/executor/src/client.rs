@@ -7,7 +7,7 @@ use reth_interfaces::p2p::{
     priority::Priority,
 };
 use reth_primitives::{
-    BlockBody, BlockHashOrNumber, Header, HeadersDirection, PeerId, WithPeerId, B256,
+    BlockBody, BlockHashOrNumber, Header, HeadersDirection, B256,
 };
 use std::fmt::Debug;
 use tracing::{trace, warn};

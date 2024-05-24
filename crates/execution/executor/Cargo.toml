@@ -19,6 +19,7 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 
 reth-primitives = { workspace = true }
+reth-consensus = { workspace = true }
 reth-interfaces = { workspace = true }
 reth-revm = { workspace = true }
 reth-stages = { workspace = true }
@@ -39,6 +40,7 @@ reth-tasks = { workspace = true }
 reth-network = { workspace = true }
 reth-blockchain-tree = { workspace = true }
 reth-db = { workspace = true }
+reth-evm = { workspace = true }
 reth-node-api = { workspace = true }
 eyre = { workspace = true }
 futures = { workspace = true }
