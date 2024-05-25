@@ -10100,6 +10100,7 @@ dependencies = [
  "reth-evm",
  "reth-interfaces",
  "reth-network",
+ "reth-network-types",
  "reth-node-api",
  "reth-payload-builder",
  "reth-primitives",

@@ -71,6 +71,7 @@ reth-downloaders = { git = "https://github.com/paradigmxyz/reth", commit = "39d2
 reth-interfaces = { git = "https://github.com/paradigmxyz/reth", commit = "39d24b495f7799eed6d4d184516deaa3e75165e8" }
 reth-network = { git = "https://github.com/paradigmxyz/reth", commit = "39d24b495f7799eed6d4d184516deaa3e75165e8" }
 reth-network-api = { git = "https://github.com/paradigmxyz/reth", commit = "39d24b495f7799eed6d4d184516deaa3e75165e8" }
+reth-network-types = { git = "https://github.com/paradigmxyz/reth", commit = "39d24b495f7799eed6d4d184516deaa3e75165e8" }
 reth-prune = { git = "https://github.com/paradigmxyz/reth", commit = "39d24b495f7799eed6d4d184516deaa3e75165e8" }
 reth-evm = { git = "https://github.com/paradigmxyz/reth", commit = "39d24b495f7799eed6d4d184516deaa3e75165e8" }
 reth-revm = { git = "https://github.com/paradigmxyz/reth", commit = "39d24b495f7799eed6d4d184516deaa3e75165e8" }
