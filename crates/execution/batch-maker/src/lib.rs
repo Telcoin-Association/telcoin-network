@@ -304,7 +304,7 @@ impl StorageInner {
 
         let header = self.build_header_template(&transactions, chain_spec.clone(), &parent, withdrawals.as_ref());
 
-        let block = Block { header, body: transactions, ommers: vec![], withdrawals: None }
+        let block = Block { header, body: transactions, ommers: vec![], withdrawals: withdrawals.clone() }
             .with_recovered_senders()
             .ok_or(BlockExecutionError::Validation(BlockValidationError::SenderRecoveryError))?;
 
@@ -341,7 +341,7 @@ impl StorageInner {
         );
 
         let Block { mut header, body, .. } = block.block;
-        let body = BlockBody { transactions: body, ommers: vec![], withdrawals: Some(Withdrawals::default()) };
+        let body = BlockBody { transactions: body, ommers: vec![], withdrawals };
 
         trace!(target: "execution::batch_maker", ?bundle_state, ?header, ?body, "executed block, calculating state root and completing header");
 

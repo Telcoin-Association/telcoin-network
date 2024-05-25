@@ -38,6 +38,7 @@ reth-config = { workspace = true }
 reth-tasks = { workspace = true }
 #revm-inspectors = { workspace = true }
 reth-network = { workspace = true }
+reth-network-types = { workspace = true }
 reth-blockchain-tree = { workspace = true }
 reth-db = { workspace = true }
 reth-evm = { workspace = true }

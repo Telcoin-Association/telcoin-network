@@ -13,6 +13,6 @@ pub(crate) enum ExecutorError {
     #[error("RLP error decoding transaction within consensus output: {0}")]
     DecodeTransaction(#[from] alloy_rlp::Error),
     /// Failed to decode transaction bytes
-    #[error("The number of transactions and signers recovered from batch don't match.")]
+    #[error("The number of transactions and signers recovered from batch don't match: {0} txs - {1} addresses")]
     RecoveredTransactionsLength(usize, usize),
 }

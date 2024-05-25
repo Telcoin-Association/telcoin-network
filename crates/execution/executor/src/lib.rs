@@ -279,7 +279,7 @@ impl StorageInner {
         let beneficiary = output.beneficiary();
 
         // try to recover transactions and signers
-        let (transactions, senders) = self.try_recover_transactions(output)?;
+        let transactions = self.try_recover_transactions(output)?;
 
         // TODO: save this in memory for faster execution
         //
@@ -309,10 +309,13 @@ impl StorageInner {
             header: header.clone(),
             body: transactions.clone(),
             ommers: vec![],
-            withdrawals: None,
+            withdrawals: withdrawals.clone(),
         }
         .with_recovered_senders()
         .ok_or(BlockExecutionError::Validation(BlockValidationError::SenderRecoveryError))?;
+
+        // take ownership of senders for final result
+        let senders = block.senders.clone();
 
         trace!(target: "execution::executor", transactions=?&block.body, "executing transactions");
 
@@ -335,12 +338,15 @@ impl StorageInner {
         );
 
         let Block { mut header, body, .. } = block.block;
-        let body = BlockBody { transactions: body, ommers: vec![], withdrawals };
+        let body = BlockBody { transactions: body, ommers: vec![], withdrawals: withdrawals.clone() };
 
         trace!(target: "execution::executor", ?bundle_state, ?header, ?body, "executed block, calculating state root and completing header");
 
         // calculate state root
-        header.state_root = db.state_root(bundle_state.state())?;
+        header.state_root = db.state_root(bundle_state.state()).map_err(|e| {
+            error!(target: "execution::executor", "Failed to calculate state root on current state: {e}");
+            BlockExecutionError::LatestBlock(e)
+        })?;
         trace!(target: "execution::executor", root=?header.state_root, ?body, "calculated state root");
 
         // finally insert into storage
@@ -353,6 +359,10 @@ impl StorageInner {
         //
         // set new header with hash that should have been updated by insert_new_block
         // let new_header = header.seal(self.best_hash);
+
+        // TODO: clean this up
+        let tx_length = transactions.len();
+        let senders_length = senders.len();
 
         // seal the block
         let block = Block {
@@ -367,7 +377,7 @@ impl StorageInner {
             SealedBlockWithSenders::new(sealed_block, senders)
                 .ok_or_else(|| {
                     error!(target: "execution::executor", "Unable to seal block with senders");
-                    ExecutorError::RecoveredTransactionsLength(sealed_block.body.len(), senders.len());
+                    ExecutorError::RecoveredTransactionsLength(tx_length, senders_length)
                 })?;
 
         Ok((sealed_block_with_senders, bundle_state))
@@ -382,10 +392,11 @@ impl StorageInner {
     fn try_recover_transactions(
         &self,
         output: ConsensusOutput,
-    ) -> Result<(Vec<TransactionSigned>, Vec<Address>), ExecutorError> {
-        // collect recovered txs and senders
+    ) -> Result<Vec<TransactionSigned>, ExecutorError> {
+        // collect recovered txs
+        //
+        // do not recover senders here to ensure consistency with upstream reth
         let mut transactions = vec![];
-        let mut senders = vec![];
 
         // TODO: there is a better way to do this, but wait until after execution refactor
         // 
@@ -407,26 +418,15 @@ impl StorageInner {
                             error!(target: "execution::executor", "Failed to decode enveloped tx: {tx:?}");
                             ExecutorError::DecodeTransaction(e)
                         })?;
-                    let sender = recovered.recover_signer().
-                        ok_or(BlockExecutionError::Validation(BlockValidationError::SenderRecoveryError))?;
 
                     // collect transaction + signer
                     transactions.push(recovered);
-                    senders.push(sender);
                 }
             }
         }
 
-        // ensure the lengths match
-        //
-        // this is also checked in SealedBlockWithSenders::new(), so maybe redundant
-        //
-        // better to fail here before storing sealed header
-        if transactions.len() != senders.len() {
-            return Err(ExecutorError::RecoveredTransactionsLength(transactions.len(), senders.len()));
-        }
 
-        Ok((transactions, senders))
+        Ok(transactions)
 
         // TODO: optimize by returning `impl Iterator<Item = Vec<Bytes>` and using `flat_map` to
         // return an iter of nested vecs since this is the only place where

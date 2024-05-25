@@ -6,6 +6,7 @@ use reth_interfaces::p2p::{
     headers::client::{HeadersClient, HeadersFut, HeadersRequest},
     priority::Priority,
 };
+use reth_network_types::{PeerId, WithPeerId};
 use reth_primitives::{
     BlockBody, BlockHashOrNumber, Header, HeadersDirection, B256,
 };
