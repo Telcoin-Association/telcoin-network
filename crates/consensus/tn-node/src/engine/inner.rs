@@ -122,7 +122,7 @@ where
         let provider_factory = ProviderFactory::new(
             database.clone(),
             Arc::clone(&node_config.chain),
-            data_dir.static_files_path(),
+            data_dir.static_files(),
         )?
         .with_static_files_metrics();
 
