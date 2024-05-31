@@ -11,7 +11,7 @@ use reth::{
 use reth_auto_seal_consensus::AutoSealConsensus;
 use reth_beacon_consensus::{
     hooks::{EngineHooks, StaticFileHook},
-    BeaconConsensus, BeaconConsensusEngine, MIN_BLOCKS_FOR_PIPELINE_RUN,
+    EthBeaconConsensus, EthBeaconConsensusEngine, MIN_BLOCKS_FOR_PIPELINE_RUN,
 };
 use reth_blockchain_tree::{
     BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
@@ -304,7 +304,7 @@ where
         let pipeline_events = pipeline.events();
         task.set_pipeline_events(pipeline_events);
 
-        let (beacon_consensus_engine, beacon_engine_handle) = BeaconConsensusEngine::with_channel(
+        let (beacon_consensus_engine, beacon_engine_handle) = EthBeaconConsensusEngine::with_channel(
             client.clone(),
             pipeline,
             self.blockchain_db.clone(),
@@ -471,7 +471,7 @@ where
         // validate batches using beaacon consensus
         // to ensure inner-chain compatibility
         let consensus: Arc<dyn Consensus> =
-            Arc::new(BeaconConsensus::new(self.node_config.chain.clone()));
+            Arc::new(EthBeaconConsensus::new(self.node_config.chain.clone()));
         // batch validator
         BatchValidator::<DB, Evm>::new(
             consensus,
