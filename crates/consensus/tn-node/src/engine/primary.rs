@@ -2,13 +2,13 @@
 //!
 //! Inspired by reth_node_ethereum crate.
 
-use reth_db::database::Database;
+use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
 use reth_node_builder::{
     components::ComponentsBuilder,
     node::{FullNodeTypes, NodeTypes},
 };
 use reth_node_ethereum::{
-    node::{EthereumNetworkBuilder, EthereumPayloadBuilder, EthereumPoolBuilder},
+    node::{EthereumExecutorBuilder, EthereumNetworkBuilder, EthereumPayloadBuilder, EthereumPoolBuilder},
     EthEngineTypes, EthEvmConfig,
 };
 use reth_provider::FullProvider;
@@ -25,7 +25,7 @@ pub struct PrimaryNode<DB, Provider> {
 impl<DB, Evm> PrimaryNode<DB, Evm> {
     /// Returns an execution layer's [ComponentsBuilder] configured for a Worker node.
     pub fn components<Node>(
-    ) -> ComponentsBuilder<Node, EthereumPoolBuilder, EthereumPayloadBuilder, EthereumNetworkBuilder>
+    ) -> ComponentsBuilder<Node, EthereumPoolBuilder, EthereumPayloadBuilder, EthereumNetworkBuilder, EthereumExecutorBuilder>
     where
         Node: FullNodeTypes<Engine = EthEngineTypes>,
     {
@@ -44,16 +44,11 @@ where
 {
     type Primitives = ();
     type Engine = EthEngineTypes;
-    type Evm = EthEvmConfig;
-
-    fn evm_config(&self) -> Self::Evm {
-        EthEvmConfig::default()
-    }
 }
 
 impl<DB, Provider> FullNodeTypes for PrimaryNode<DB, Provider>
 where
-    DB: Database + Clone + 'static,
+    DB: Database + DatabaseMetadata + DatabaseMetrics + Unpin + Clone + 'static,
     Provider: FullProvider<DB>,
 {
     type DB = DB;

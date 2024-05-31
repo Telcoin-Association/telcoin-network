@@ -8,7 +8,7 @@
 //! generic over it.
 
 use enr::{secp256k1::SecretKey, Enr};
-use reth_db::database::Database;
+use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
 use reth_discv4::DEFAULT_DISCOVERY_PORT;
 use reth_eth_wire::DisconnectReason;
 use reth_network::NetworkHandle;
@@ -22,10 +22,12 @@ use reth_node_builder::{
     BuilderContext, ConfigureEvm,
 };
 use reth_node_ethereum::{
-    node::{EthereumNetworkBuilder, EthereumPayloadBuilder, EthereumPoolBuilder},
+    node::{EthereumExecutorBuilder, EthereumNetworkBuilder, EthereumPayloadBuilder, EthereumPoolBuilder},
     EthEngineTypes, EthEvmConfig,
 };
-use reth_primitives::{NodeRecord, PeerId};
+use reth_primitives::NodeRecord;
+use reth_network_types::PeerId;
+use reth_provider::providers::BlockchainProvider;
 use reth_rpc_types::{admin::EthProtocolInfo, NetworkStatus};
 use reth_transaction_pool::TransactionPool;
 use std::{
@@ -42,20 +44,20 @@ pub struct WorkerNode<DB, Evm> {
     evm: PhantomData<Evm>,
 }
 
-impl<DB, Evm> WorkerNode<DB, Evm> {
-    /// Returns an execution layer's [ComponentsBuilder] configured for a Worker node.
-    pub fn components<Node>(
-    ) -> ComponentsBuilder<Node, EthereumPoolBuilder, EthereumPayloadBuilder, EthereumNetworkBuilder>
-    where
-        Node: FullNodeTypes<Engine = EthEngineTypes>,
-    {
-        ComponentsBuilder::default()
-            .node_types::<Node>()
-            .pool(EthereumPoolBuilder::default())
-            .payload(EthereumPayloadBuilder::default())
-            .network(EthereumNetworkBuilder::default())
-    }
-}
+// impl<DB, Evm> WorkerNode<DB, Evm> {
+//     /// Returns an execution layer's [ComponentsBuilder] configured for a Worker node.
+//     pub fn components<Node>(
+//     ) -> ComponentsBuilder<Node, EthereumPoolBuilder, EthereumPayloadBuilder, EthereumNetworkBuilder, EthereumExecutorBuilder>
+//     where
+//         Node: FullNodeTypes<Engine = EthEngineTypes>,
+//     {
+//         ComponentsBuilder::default()
+//             .node_types::<Node>()
+//             .pool(EthereumPoolBuilder::default())
+//             .payload(EthereumPayloadBuilder::default())
+//             .network(EthereumNetworkBuilder::default())
+//     }
+// }
 
 impl<DB, Evm> NodeTypes for WorkerNode<DB, Evm>
 where
@@ -64,16 +66,11 @@ where
 {
     type Primitives = ();
     type Engine = EthEngineTypes;
-    type Evm = EthEvmConfig;
-
-    fn evm_config(&self) -> Self::Evm {
-        EthEvmConfig::default()
-    }
 }
 
 impl<DB, Evm> FullNodeTypes for WorkerNode<DB, Evm>
 where
-    DB: Database + Unpin + Clone + 'static,
+    DB: Database + DatabaseMetadata + DatabaseMetrics + Unpin + Clone + 'static,
     Evm: ConfigureEvm + Clone + 'static,
 {
     type DB = DB;
