@@ -32,7 +32,7 @@ use std::{
     marker::PhantomData,
     net::{IpAddr, SocketAddr},
 };
-use tn_types::{adiri_chain_spec, BlockchainProviderType};
+use tn_types::adiri_chain_spec;
 
 /// Type configuration for a regular Telcoin node.
 #[derive(Debug, Default, Clone, Copy)]
@@ -78,7 +78,7 @@ where
 {
     type DB = DB;
 
-    type Provider = BlockchainProviderType<DB, Evm>;
+    type Provider = BlockchainProvider<DB>;
 }
 
 /// A builder for the worker's "network".

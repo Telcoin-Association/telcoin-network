@@ -40,7 +40,7 @@ use tn_batch_maker::{BatchMakerBuilder, MiningMode};
 use tn_batch_validator::BatchValidator;
 use tn_executor::Executor;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
-use tn_types::{BlockchainProviderType, ConsensusOutput, NewBatch, WorkerId};
+use tn_types::{ConsensusOutput, NewBatch, WorkerId};
 use tokio::sync::mpsc::unbounded_channel;
 use tracing::{debug, error, info};
 
@@ -70,7 +70,7 @@ where
     /// help TN stay in-sync with the Ethereum community.
     node_config: NodeConfig,
     /// Type that fetches data from the database.
-    blockchain_db: BlockchainProviderType<DB, Evm>,
+    blockchain_db: BlockchainProvider<DB>,
     /// Provider factory is held by the blockchain db, but there isn't a publicly
     /// available way to get a cloned copy.
     /// TODO: add a method to `BlockchainProvider` in upstream reth
@@ -102,7 +102,7 @@ where
     pub(super) fn new(
         // address: Address,
         // config: NodeConfig,
-        // blockchain_db: BlockchainProviderType<DB, Evm>,
+        // blockchain_db: BlockchainProvider<DB>,
         // provider_factory: ProviderFactory<DB>,
         // evm: Evm,
         // canon_state_notification_sender: CanonStateNotificationSender,
@@ -504,7 +504,7 @@ where
     }
 
     /// Return an database provider.
-    pub fn get_provider(&self) -> BlockchainProviderType<DB, Evm> {
+    pub fn get_provider(&self) -> BlockchainProvider<DB> {
         self.blockchain_db.clone()
     }
 

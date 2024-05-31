@@ -13,11 +13,12 @@ mod primary;
 mod worker;
 
 pub use primary::*;
+use reth_provider::providers::BlockchainProvider;
 use reth_tasks::TaskExecutor;
 use tn_batch_validator::BatchValidator;
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
-use tn_types::{BlockchainProviderType, ConsensusOutput, NewBatch, WorkerId};
+use tn_types::{ConsensusOutput, NewBatch, WorkerId};
 use tokio::sync::RwLock;
 pub use worker::*;
 
@@ -126,7 +127,7 @@ where
     }
 
     /// Return an database provider.
-    pub async fn get_provider(&self) -> BlockchainProviderType<DB, Evm> {
+    pub async fn get_provider(&self) -> BlockchainProvider<DB> {
         let guard = self.internal.read().await;
         guard.get_provider()
     }
