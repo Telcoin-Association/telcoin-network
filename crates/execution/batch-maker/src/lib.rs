@@ -439,6 +439,7 @@ mod tests {
 
         let evm_config = EthEvmConfig::default();
         let block_executor = EthExecutorProvider::new(chain.clone(), evm_config.clone());
+
         // build batch maker
         let task = BatchMakerBuilder::new(
             Arc::clone(&chain),

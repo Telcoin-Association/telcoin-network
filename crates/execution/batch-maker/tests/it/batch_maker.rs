@@ -15,7 +15,7 @@ use reth::tasks::TaskManager;
 use reth_blockchain_tree::noop::NoopBlockchainTree;
 use reth_db::test_utils::{create_test_rw_db, tempdir_path};
 use reth_node_core::init::init_genesis;
-use reth_node_ethereum::EthEvmConfig;
+use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
 use reth_primitives::{alloy_primitives::U160, Address, ChainSpec, TransactionSigned, U256};
 use reth_provider::{providers::BlockchainProvider, ProviderFactory};
 use reth_tracing::init_test_tracing;
@@ -90,7 +90,7 @@ async fn test_make_batch_el_to_cl() {
         .expect("provider factory");
 
     let genesis_hash = init_genesis(factory.clone()).expect("init genesis");
-    let blockchain_db = BlockchainProvider::new(factory, NoopBlockchainTree::default())
+    let blockchain_db = BlockchainProvider::new(factory, Arc::new(NoopBlockchainTree::default()))
         .expect("test blockchain provider");
 
     debug!("genesis hash: {genesis_hash:?}");
@@ -113,6 +113,7 @@ async fn test_make_batch_el_to_cl() {
     let address = Address::from(U160::from(333));
 
     let evm_config = EthEvmConfig::default();
+    let block_executor = EthExecutorProvider::new(chain.clone(), evm_config.clone());
 
     // build execution batch maker
     let task = BatchMakerBuilder::new(
@@ -122,7 +123,7 @@ async fn test_make_batch_el_to_cl() {
         to_worker,
         mining_mode,
         address,
-        evm_config,
+        block_executor,
     )
     .build();
 
