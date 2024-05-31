@@ -314,7 +314,7 @@ where
             None, // initial_target
             MIN_BLOCKS_FOR_PIPELINE_RUN,
             to_engine,
-            from_engine,
+            Box::pin(from_engine.into()), // unbounded stream
             hooks,
         )?;
 
