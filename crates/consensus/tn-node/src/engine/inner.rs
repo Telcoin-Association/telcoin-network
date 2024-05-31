@@ -30,7 +30,6 @@ use reth_node_ethereum::{
 };
 use reth_primitives::{Address, Head};
 use reth_provider::{providers::BlockchainProvider, CanonStateNotificationSender, ProviderFactory};
-use reth_revm::EvmProcessorFactory;
 use reth_rpc_types::engine::ForkchoiceState;
 use reth_static_file::StaticFileProducer;
 use reth_tasks::TaskExecutor;

@@ -10184,7 +10184,6 @@ dependencies = [
  "reth-payload-builder",
  "reth-primitives",
  "reth-provider",
- "reth-revm",
  "reth-rpc-types",
  "reth-stages",
  "reth-static-file",
