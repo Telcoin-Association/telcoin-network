@@ -17,6 +17,7 @@ use reth_blockchain_tree::{
     BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
 };
 use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
+use reth_evm::execute::BlockExecutorProvider;
 use reth_exex::ExExManagerHandle;
 use reth_node_builder::{
     components::{NetworkBuilder as _, PayloadServiceBuilder as _, PoolBuilder},
@@ -25,7 +26,7 @@ use reth_node_builder::{
 };
 use reth_node_ethereum::{
     node::{EthereumNetworkBuilder, EthereumPayloadBuilder, EthereumPoolBuilder},
-    EthEvmConfig,
+    EthEvmConfig, EthExecutorProvider,
 };
 use reth_primitives::{Address, Head, PruneModes};
 use reth_provider::{providers::BlockchainProvider, CanonStateNotificationSender, ProviderFactory, StaticFileProviderFactory as _};
@@ -144,21 +145,22 @@ where
 
         // get config from file
         // let reth_config = reth_config::Config::default(); // TODO: probably want to persist this?
-        let prune_config = node_config.prune_config()?; //.or(reth_config.prune.clone());
+        let prune_config = node_config.prune_config(); //.or(reth_config.prune.clone());
 
         // let evm_config = EthEvmConfig::default();
 
         // let evm_config = types.evm_config();
         let tree_config = BlockchainTreeConfig::default();
+        let block_executor = EthExecutorProvider::new(node_config.chain.clone(), evm.clone());
         let tree_externals = TreeExternals::new(
             provider_factory.clone(),
             auto_consensus.clone(),
-            EvmProcessorFactory::new(node_config.chain.clone(), evm.clone()),
+            block_executor,
         );
         let tree = BlockchainTree::new(
             tree_externals,
             tree_config,
-            prune_config.as_ref().map(|config| config.segments.clone()),
+            prune_config.map(|config| config.segments.clone()),
         )?
         .with_sync_metrics_tx(sync_metrics_tx.clone());
 
@@ -172,7 +174,7 @@ where
         // )?;
 
         let canon_state_notification_sender = tree.canon_state_notification_sender();
-        let blockchain_tree = ShareableBlockchainTree::new(tree);
+        let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
         debug!(target: "tn::execution", "configured blockchain tree");
 
         // setup the blockchain provider
@@ -461,16 +463,19 @@ where
     }
 
     /// Create a new batch validator.
-    pub(super) fn new_batch_validator(&self) -> BatchValidator<DB, Evm> {
+    pub(super) fn new_batch_validator<E: BlockExecutorProvider>(&self) -> BatchValidator<DB, E> {
         // validate batches using beaacon consensus
         // to ensure inner-chain compatibility
         let consensus: Arc<dyn Consensus> =
             Arc::new(EthBeaconConsensus::new(self.node_config.chain.clone()));
+        let block_executor = EthExecutorProvider::<Evm>::new(self.node_config.chain.clone(), self.evm.clone());
+
         // batch validator
-        BatchValidator::<DB, Evm>::new(
+        BatchValidator::<DB, E>::new(
             consensus,
             self.blockchain_db.clone(),
-            EvmProcessorFactory::new(self.node_config.chain.clone(), self.evm.clone()),
+            // EvmProcessorFactory::new(self.node_config.chain.clone(), self.evm.clone()),
+            block_executor,
         )
     }
 

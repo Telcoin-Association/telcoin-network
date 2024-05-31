@@ -10174,6 +10174,7 @@ dependencies = [
  "reth-discv4",
  "reth-eth-wire",
  "reth-ethereum-payload-builder",
+ "reth-evm",
  "reth-exex",
  "reth-interfaces",
  "reth-network",
