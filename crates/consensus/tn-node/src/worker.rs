@@ -310,7 +310,7 @@ impl WorkerNodes {
         execution_node: &ExecutionNode<DB, Evm>,
     ) -> eyre::Result<()>
     where
-        DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
+        DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
         Evm: ConfigureEvm + Clone + 'static,
     {
         let worker_ids_running = self.workers_running().await;
