@@ -366,7 +366,7 @@ mod tests {
     use reth_blockchain_tree::noop::NoopBlockchainTree;
     use reth_db::test_utils::{create_test_rw_db, tempdir_path};
     use reth_node_core::init::init_genesis;
-    use reth_node_ethereum::EthEvmConfig;
+    use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
     use reth_primitives::{alloy_primitives::U160, GenesisAccount};
     use reth_provider::{providers::BlockchainProvider, ProviderFactory};
     use reth_tracing::init_test_tracing;
@@ -438,6 +438,7 @@ mod tests {
         let address = Address::from(U160::from(33));
 
         let evm_config = EthEvmConfig::default();
+        let block_executor = EthExecutorProvider::new(chain.clone(), evm_config.clone());
         // build batch maker
         let task = BatchMakerBuilder::new(
             Arc::clone(&chain),
@@ -446,7 +447,7 @@ mod tests {
             to_worker,
             mining_mode,
             address,
-            evm_config,
+            block_executor,
         )
         .build();
 
@@ -592,10 +593,11 @@ mod tests {
         // create storage with the same sealed header so timestamps are the same
         let storage = Storage::new(sealed_header.clone(), address);
 
+        let withdrawals = Some(Withdrawals::default());
         // create header template
         // warning should appear with RUST_LOG=info
         let template =
-            storage.write().await.build_header_template(&Vec::new(), chain_spec, &sealed_header);
+            storage.write().await.build_header_template(&Vec::new(), chain_spec, &sealed_header, withdrawals.as_ref());
         let expected: u64 = system_time + 1;
         assert!(template.timestamp == expected);
     }
