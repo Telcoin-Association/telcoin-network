@@ -13,7 +13,7 @@ use reth_db::{
     test_utils::{create_test_rw_db, TempDatabase},
     DatabaseEnv,
 };
-use reth_node_ethereum::EthEvmConfig;
+use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
 use std::{str::FromStr, sync::Arc};
 use telcoin_network::node::NodeCommand;
 use tempfile::tempdir;
@@ -22,7 +22,7 @@ use tn_faucet::FaucetArgs;
 use tn_node::engine::{ExecutionNode, TnBuilder};
 
 /// Convnenience type for testing Execution Node.
-pub type TestExecutionNode = ExecutionNode<Arc<TempDatabase<DatabaseEnv>>, EthEvmConfig>;
+pub type TestExecutionNode = ExecutionNode<Arc<TempDatabase<DatabaseEnv>>, EthExecutorProvider>;
 
 /// A helper type to parse Args more easily.
 #[derive(Parser, Debug)]
@@ -47,9 +47,11 @@ pub fn default_test_execution_node(
         executor,
         None, // optional args
     )?;
+    
+    let block_executor = EthExecutorProvider::new(Arc::clone(&builder.node_config.chain), EthEvmConfig::default());
 
     // create engine node
-    let engine = ExecutionNode::new(builder, EthEvmConfig::default())?;
+    let engine = ExecutionNode::new(builder, block_executor)?;
 
     Ok(engine)
 }
@@ -179,9 +181,11 @@ pub fn faucet_test_execution_node(
         tn_config,
         opt_faucet_args: Some(faucet),
     };
+    
+    let block_executor = EthExecutorProvider::new(Arc::clone(&builder.node_config.chain), EthEvmConfig::default());
 
     // create engine node
-    let engine = ExecutionNode::new(builder, EthEvmConfig::default())?;
+    let engine = ExecutionNode::new(builder, block_executor)?;
 
     Ok(engine)
 }

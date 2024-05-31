@@ -8,7 +8,7 @@ use fastcrypto::traits::KeyPair as _;
 use jsonrpsee::http_client::HttpClient;
 use narwhal_network::client::NetworkClient;
 use reth_db::{test_utils::TempDatabase, DatabaseEnv};
-use reth_node_ethereum::EthEvmConfig;
+use reth_node_ethereum::EthExecutorProvider;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tn_config::Parameters;
 use tn_node::engine::ExecutionNode;
@@ -41,7 +41,7 @@ struct AuthorityDetailsInternal {
     primary: PrimaryNodeDetails,
     worker_keypairs: Vec<NetworkKeypair>,
     workers: HashMap<WorkerId, WorkerNodeDetails>,
-    execution: ExecutionNode<Arc<TempDatabase<DatabaseEnv>>, EthEvmConfig>,
+    execution: ExecutionNode<Arc<TempDatabase<DatabaseEnv>>, EthExecutorProvider>,
 }
 
 #[allow(clippy::arc_with_non_send_sync)]
@@ -55,7 +55,7 @@ impl AuthorityDetails {
         parameters: Parameters,
         committee: Committee,
         worker_cache: WorkerCache,
-        execution: ExecutionNode<Arc<TempDatabase<DatabaseEnv>>, EthEvmConfig>,
+        execution: ExecutionNode<Arc<TempDatabase<DatabaseEnv>>, EthExecutorProvider>,
     ) -> Self {
         // Create all the nodes we have in the committee
         let public_key = key_pair.public().clone();
@@ -270,7 +270,7 @@ impl AuthorityDetails {
     /// method should be called again to ensure the latest reference is used.
     pub async fn execution_components(
         &self,
-    ) -> eyre::Result<ExecutionNode<Arc<TempDatabase<DatabaseEnv>>, EthEvmConfig>> {
+    ) -> eyre::Result<ExecutionNode<Arc<TempDatabase<DatabaseEnv>>, EthExecutorProvider>> {
         let internal = self.internal.read().await;
         Ok(internal.execution.clone())
     }
