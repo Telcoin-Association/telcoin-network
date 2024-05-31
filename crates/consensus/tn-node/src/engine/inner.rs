@@ -463,19 +463,19 @@ where
     }
 
     /// Create a new batch validator.
-    pub(super) fn new_batch_validator<E: BlockExecutorProvider>(&self) -> BatchValidator<DB, E> {
+    pub(super) fn new_batch_validator/*<E: BlockExecutorProvider>*/(&self) -> BatchValidator<DB, Evm> {
         // validate batches using beaacon consensus
         // to ensure inner-chain compatibility
         let consensus: Arc<dyn Consensus> =
             Arc::new(EthBeaconConsensus::new(self.node_config.chain.clone()));
-        let block_executor = EthExecutorProvider::<Evm>::new(self.node_config.chain.clone(), self.evm.clone());
+        // let block_executor = EthExecutorProvider::<Evm>::new(self.node_config.chain.clone(), self.evm.clone());
 
         // batch validator
-        BatchValidator::<DB, E>::new(
+        BatchValidator::<DB, Evm>::new(
             consensus,
             self.blockchain_db.clone(),
-            // EvmProcessorFactory::new(self.node_config.chain.clone(), self.evm.clone()),
-            block_executor,
+            EvmProcessorFactory::new(self.node_config.chain.clone(), self.evm.clone()),
+            // block_executor,
         )
     }
 
