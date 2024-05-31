@@ -17,7 +17,7 @@ use narwhal_worker::{
     Worker, CHANNEL_CAPACITY, NUM_SHUTDOWN_RECEIVERS,
 };
 use prometheus::Registry;
-use reth_db::{database::Database, database_metrics::DatabaseMetrics};
+use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
 use reth_node_builder::ConfigureEvm;
 use std::{collections::HashMap, sync::Arc, time::Instant};
 use tn_config::Parameters;
@@ -70,7 +70,7 @@ impl WorkerNodeInner {
         execution_node: &ExecutionNode<DB, Evm>,
     ) -> eyre::Result<()>
     where
-        DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
+        DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
         Evm: ConfigureEvm + Clone + 'static,
     {
         if self.is_running().await {
@@ -237,7 +237,7 @@ impl WorkerNode {
         execution_node: &ExecutionNode<DB, Evm>,
     ) -> eyre::Result<()>
     where
-        DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
+        DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
         Evm: ConfigureEvm + Clone + 'static,
     {
         let mut guard = self.internal.write().await;

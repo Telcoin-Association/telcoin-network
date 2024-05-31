@@ -16,7 +16,7 @@ use reth_beacon_consensus::{
 use reth_blockchain_tree::{
     BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
 };
-use reth_db::{database::Database, database_metrics::DatabaseMetrics};
+use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
 use reth_exex::ExExManagerHandle;
 use reth_interfaces::consensus::Consensus;
 use reth_node_builder::{
@@ -95,7 +95,7 @@ where
 
 impl<DB, Evm> ExecutionNodeInner<DB, Evm>
 where
-    DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
+    DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
     Evm: ConfigureEvm + 'static,
 {
     /// Create a new instance of `Self`.

@@ -8,7 +8,7 @@ use narwhal_network::client::NetworkClient;
 pub use narwhal_storage::{CertificateStoreCacheMetrics, NodeStorage};
 use prometheus::Registry;
 use reth::dirs::ChainPath;
-use reth_db::{database::Database, database_metrics::DatabaseMetrics};
+use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
 use reth_node_builder::ConfigureEvm;
 use tn_config::{
     read_validator_keypair_from_file, traits::ConfigTrait as _, Config, BLS_KEYFILE,
@@ -35,7 +35,7 @@ pub async fn launch_node<DB, Evm>(
     tn_datadir: ChainPath<DataDirPath>,
 ) -> eyre::Result<()>
 where
-    DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
+    DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
     Evm: ConfigureEvm + Clone + 'static,
 {
     // config for validator keys

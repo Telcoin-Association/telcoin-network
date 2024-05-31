@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use consensus_metrics::metered_channel::{Receiver, Sender};
 use reth::dirs::{ChainPath, DataDirPath};
-use reth_db::{database::Database, database_metrics::DatabaseMetrics};
+use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
 use reth_node_builder::{ConfigureEvm, NodeConfig};
 mod inner;
 mod primary;
@@ -85,7 +85,7 @@ where
 
 impl<DB, Evm> ExecutionNode<DB, Evm>
 where
-    DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
+    DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
     Evm: ConfigureEvm + Clone + 'static,
 {
     /// Create a new instance of `Self`.

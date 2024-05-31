@@ -24,7 +24,7 @@ use narwhal_primary::{
 };
 use narwhal_storage::NodeStorage;
 use prometheus::{IntGauge, Registry};
-use reth_db::{database::Database, database_metrics::DatabaseMetrics};
+use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
 use reth_node_builder::ConfigureEvm;
 use std::{sync::Arc, time::Instant};
 use tn_config::Parameters;
@@ -87,7 +87,7 @@ impl PrimaryNodeInner {
         execution_components: &ExecutionNode<DB, Evm>,
     ) -> eyre::Result<()>
     where
-        DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
+        DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
         Evm: ConfigureEvm + Clone + 'static,
     {
         if self.is_running().await {
@@ -484,7 +484,7 @@ impl PrimaryNode {
         execution_components: &ExecutionNode<DB, Evm>,
     ) -> eyre::Result<()>
     where
-        DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
+        DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
         Evm: ConfigureEvm + Clone + 'static,
     {
         let mut guard = self.internal.write().await;
