@@ -10091,13 +10091,13 @@ dependencies = [
  "reth-rpc-types",
  "reth-stages",
  "reth-tasks",
+ "reth-tokio-util",
  "reth-tracing",
  "reth-transaction-pool",
  "tempfile",
  "thiserror",
  "tn-types",
  "tokio",
- "tokio-stream",
  "tracing",
 ]
 

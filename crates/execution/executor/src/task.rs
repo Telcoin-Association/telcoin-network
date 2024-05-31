@@ -10,6 +10,7 @@ use reth_provider::{
 };
 use reth_rpc_types::engine::ForkchoiceState;
 use reth_stages::PipelineEvent;
+use reth_tokio_util::EventStream;
 use std::{
     collections::VecDeque,
     future::Future,
@@ -19,7 +20,6 @@ use std::{
 };
 use tn_types::ConsensusOutput;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
 /// A Future that listens for new ready transactions and puts new blocks into storage
@@ -29,7 +29,7 @@ pub struct MiningTask<Client, Engine: EngineTypes, BlockExecutor> {
     /// The client used to interact with the state
     client: Client,
     /// Single active future that inserts a new block into `storage`
-    insert_task: Option<BoxFuture<'static, Option<UnboundedReceiverStream<PipelineEvent>>>>,
+    insert_task: Option<BoxFuture<'static, Option<EventStream<PipelineEvent>>>>,
     /// Shared storage to insert new blocks
     storage: Storage,
     /// The backlog of output from consensus that's ready to be executed.
@@ -39,7 +39,7 @@ pub struct MiningTask<Client, Engine: EngineTypes, BlockExecutor> {
     /// Used to notify consumers of new blocks
     canon_state_notification: CanonStateNotificationSender,
     /// The pipeline events to listen on
-    pipe_line_events: Option<UnboundedReceiverStream<PipelineEvent>>,
+    pipe_line_events: Option<EventStream<PipelineEvent>>,
     /// Receiving end from CL's `Executor`. The `ConsensusOutput` is sent
     /// to the mining task here.
     from_consensus: Receiver<ConsensusOutput>,
@@ -78,7 +78,7 @@ where
     }
 
     /// Sets the pipeline events to listen on.
-    pub fn set_pipeline_events(&mut self, events: UnboundedReceiverStream<PipelineEvent>) {
+    pub fn set_pipeline_events(&mut self, events: EventStream<PipelineEvent>) {
         self.pipe_line_events = Some(events);
     }
 }
