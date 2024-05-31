@@ -52,7 +52,7 @@ metrics = "0.21.1" # Needed for `metrics-macro` to resolve the crate using `::me
 serde_json = "1.0.94"
 humantime-serde = "1.1"
 fdlimit = "0.3.0"
-enr = { version = "=0.10.0", default-features = false, features = ["k256"] }
+enr = { version = "=0.12.0", default-features = false, features = ["k256", "rust-secp256k1"] }
 
 # crypto
 secp256k1 = { version = "0.28", default-features = false, features = [

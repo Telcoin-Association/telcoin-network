@@ -16,6 +16,7 @@ use reth_network_api::{
     NetworkError, NetworkInfo, PeerInfo, PeerKind, Peers, PeersInfo, Reputation,
     ReputationChangeKind,
 };
+use reth_network_types::PeerId;
 use reth_node_builder::{
     components::{ComponentsBuilder, NetworkBuilder},
     node::{FullNodeTypes, NodeTypes},
@@ -26,7 +27,6 @@ use reth_node_ethereum::{
     EthEngineTypes, EthEvmConfig,
 };
 use reth_primitives::NodeRecord;
-use reth_network_types::PeerId;
 use reth_provider::providers::BlockchainProvider;
 use reth_rpc_types::{admin::EthProtocolInfo, NetworkStatus};
 use reth_transaction_pool::TransactionPool;

@@ -11,7 +11,7 @@ use reth::{
 use reth_auto_seal_consensus::AutoSealConsensus;
 use reth_beacon_consensus::{
     hooks::{EngineHooks, StaticFileHook},
-    EthBeaconConsensus, EthBeaconConsensusEngine, MIN_BLOCKS_FOR_PIPELINE_RUN,
+    EthBeaconConsensus, BeaconConsensusEngine, MIN_BLOCKS_FOR_PIPELINE_RUN,
 };
 use reth_blockchain_tree::{
     BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
@@ -227,8 +227,6 @@ where
             self.data_dir.clone(),
             self.node_config.clone(),
             reth_config::Config::default(), // mostly peer / staging configs
-            // TODO: generic doesn't work here
-            EthEvmConfig::default(),
         );
 
         // let components_builder = PrimaryNode::<DB, _>::components();
@@ -304,7 +302,7 @@ where
         let pipeline_events = pipeline.events();
         task.set_pipeline_events(pipeline_events);
 
-        let (beacon_consensus_engine, beacon_engine_handle) = EthBeaconConsensusEngine::with_channel(
+        let (beacon_consensus_engine, beacon_engine_handle) = BeaconConsensusEngine::with_channel(
             client.clone(),
             pipeline,
             self.blockchain_db.clone(),
@@ -372,8 +370,6 @@ where
             self.data_dir.clone(),
             self.node_config.clone(),
             reth_config::Config::default(), // mostly peer / staging configs
-            // TODO: self.evm generic doesn't work
-            EthEvmConfig::default(),
         );
 
         // default tx pool

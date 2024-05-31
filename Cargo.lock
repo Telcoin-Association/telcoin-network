@@ -2645,7 +2645,7 @@ dependencies = [
  "alloy-rlp",
  "arrayvec",
  "delay_map",
- "enr 0.12.0",
+ "enr",
  "fnv",
  "futures",
  "hashlink",
@@ -2835,24 +2835,6 @@ name = "endian-type"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
-
-[[package]]
-name = "enr"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a3d8dc56e02f954cac8eb489772c552c473346fc34f67412bb6244fd647f7e4"
-dependencies = [
- "base64 0.21.7",
- "bytes",
- "hex",
- "k256",
- "log",
- "rand 0.8.5",
- "rlp",
- "secp256k1 0.27.0",
- "sha3 0.10.8",
- "zeroize",
-]
 
 [[package]]
 name = "enr"
@@ -7242,7 +7224,7 @@ source = "git+https://github.com/paradigmxyz/reth#39d24b495f7799eed6d4d184516dea
 dependencies = [
  "alloy-rlp",
  "discv5",
- "enr 0.12.0",
+ "enr",
  "generic-array",
  "parking_lot 0.12.2",
  "reth-net-common",
@@ -7265,7 +7247,7 @@ dependencies = [
  "alloy-rlp",
  "derive_more",
  "discv5",
- "enr 0.12.0",
+ "enr",
  "futures",
  "itertools 0.12.1",
  "libp2p-identity",
@@ -7287,7 +7269,7 @@ version = "0.2.0-beta.7"
 source = "git+https://github.com/paradigmxyz/reth#39d24b495f7799eed6d4d184516deaa3e75165e8"
 dependencies = [
  "data-encoding",
- "enr 0.12.0",
+ "enr",
  "linked_hash_set",
  "parking_lot 0.12.2",
  "reth-net-common",
@@ -7663,7 +7645,7 @@ dependencies = [
  "auto_impl",
  "derive_more",
  "discv5",
- "enr 0.12.0",
+ "enr",
  "fnv",
  "futures",
  "futures-test",
@@ -7708,7 +7690,7 @@ name = "reth-network-api"
 version = "0.2.0-beta.7"
 source = "git+https://github.com/paradigmxyz/reth#39d24b495f7799eed6d4d184516deaa3e75165e8"
 dependencies = [
- "enr 0.12.0",
+ "enr",
  "reth-discv4",
  "reth-eth-wire",
  "reth-network-types",
@@ -7726,7 +7708,7 @@ source = "git+https://github.com/paradigmxyz/reth#39d24b495f7799eed6d4d184516dea
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
- "enr 0.12.0",
+ "enr",
  "secp256k1 0.28.2",
  "serde_with 3.8.1",
  "thiserror",
@@ -10166,7 +10148,7 @@ dependencies = [
  "clap",
  "consensus-metrics",
  "dirs-next",
- "enr 0.10.0",
+ "enr",
  "eyre",
  "fastcrypto",
  "fdlimit",
@@ -10196,6 +10178,7 @@ dependencies = [
  "reth-interfaces",
  "reth-network",
  "reth-network-api",
+ "reth-network-types",
  "reth-node-builder",
  "reth-node-ethereum",
  "reth-payload-builder",

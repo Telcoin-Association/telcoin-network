@@ -68,6 +68,7 @@ fdlimit = { workspace = true }
 # added during upgrade to beta.3
 reth-basic-payload-builder = { workspace = true }
 reth-network = { workspace = true }
+reth-network-types = { workspace = true }
 reth-node-builder = { workspace = true }
 reth-payload-builder = { workspace = true }
 reth-network-api = { workspace = true }
