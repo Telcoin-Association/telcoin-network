@@ -18,7 +18,6 @@ use reth_blockchain_tree::{
 };
 use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
 use reth_exex::ExExManagerHandle;
-use reth_interfaces::consensus::Consensus;
 use reth_node_builder::{
     components::{NetworkBuilder as _, PayloadServiceBuilder as _, PoolBuilder},
     setup::build_networked_pipeline,
@@ -28,8 +27,8 @@ use reth_node_ethereum::{
     node::{EthereumNetworkBuilder, EthereumPayloadBuilder, EthereumPoolBuilder},
     EthEvmConfig,
 };
-use reth_primitives::{Address, Head};
-use reth_provider::{providers::BlockchainProvider, CanonStateNotificationSender, ProviderFactory};
+use reth_primitives::{Address, Head, PruneModes};
+use reth_provider::{providers::BlockchainProvider, CanonStateNotificationSender, ProviderFactory, StaticFileProviderFactory as _};
 use reth_rpc_types::engine::ForkchoiceState;
 use reth_static_file::StaticFileProducer;
 use reth_tasks::TaskExecutor;
@@ -39,7 +38,7 @@ use tn_batch_maker::{BatchMakerBuilder, MiningMode};
 use tn_batch_validator::BatchValidator;
 use tn_executor::Executor;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
-use tn_types::{ConsensusOutput, NewBatch, WorkerId};
+use tn_types::{Consensus, ConsensusOutput, NewBatch, WorkerId};
 use tokio::sync::mpsc::unbounded_channel;
 use tracing::{debug, error, info};
 
@@ -271,7 +270,7 @@ where
         let static_file_producer = StaticFileProducer::new(
             self.provider_factory.clone(),
             self.provider_factory.static_file_provider(),
-            self.node_config.prune_config()?.unwrap_or_default().segments,
+            PruneModes::default(),
         );
 
         // let static_file_producer_events = static_file_producer.lock().events();
