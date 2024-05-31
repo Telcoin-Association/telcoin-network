@@ -192,7 +192,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // because database init needs it to register metrics.
         let _ = node_config.install_prometheus_recorder()?;
 
-        let db_path = tn_data_dir.db_path();
+        let db_path = tn_data_dir.db();
         info!(target: "tn::engine", path = ?db_path, "opening database");
         let database =
             Arc::new(init_db(db_path.clone(), node_config.db.database_args())?.with_metrics());

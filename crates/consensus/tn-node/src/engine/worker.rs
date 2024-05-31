@@ -11,6 +11,7 @@ use enr::{secp256k1::SecretKey, Enr};
 use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
 use reth_discv4::DEFAULT_DISCOVERY_PORT;
 use reth_eth_wire::DisconnectReason;
+use reth_evm::execute::BlockExecutorProvider;
 use reth_network::NetworkHandle;
 use reth_network_api::{
     NetworkError, NetworkInfo, PeerInfo, PeerKind, Peers, PeersInfo, Reputation,
@@ -71,7 +72,7 @@ where
 impl<DB, Evm> FullNodeTypes for WorkerNode<DB, Evm>
 where
     DB: Database + DatabaseMetadata + DatabaseMetrics + Unpin + Clone + 'static,
-    Evm: ConfigureEvm + Clone + 'static,
+    Evm: BlockExecutorProvider + Clone + 'static,
 {
     type DB = DB;
 

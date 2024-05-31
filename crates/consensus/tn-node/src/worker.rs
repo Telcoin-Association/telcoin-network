@@ -18,6 +18,7 @@ use narwhal_worker::{
 };
 use prometheus::Registry;
 use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
+use reth_evm::execute::BlockExecutorProvider;
 use reth_node_builder::ConfigureEvm;
 use std::{collections::HashMap, sync::Arc, time::Instant};
 use tn_config::Parameters;
@@ -71,7 +72,7 @@ impl WorkerNodeInner {
     ) -> eyre::Result<()>
     where
         DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
-        Evm: ConfigureEvm + Clone + 'static,
+        Evm: BlockExecutorProvider + Clone + 'static,
     {
         if self.is_running().await {
             return Err(NodeError::NodeAlreadyRunning.into());
@@ -238,7 +239,7 @@ impl WorkerNode {
     ) -> eyre::Result<()>
     where
         DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
-        Evm: ConfigureEvm + Clone + 'static,
+        Evm: BlockExecutorProvider + Clone + 'static,
     {
         let mut guard = self.internal.write().await;
         guard
@@ -311,7 +312,7 @@ impl WorkerNodes {
     ) -> eyre::Result<()>
     where
         DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
-        Evm: ConfigureEvm + Clone + 'static,
+        Evm: BlockExecutorProvider + Clone + 'static,
     {
         let worker_ids_running = self.workers_running().await;
         if !worker_ids_running.is_empty() {

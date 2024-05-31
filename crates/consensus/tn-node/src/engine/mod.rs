@@ -7,6 +7,7 @@ use std::sync::Arc;
 use consensus_metrics::metered_channel::{Receiver, Sender};
 use reth::dirs::{ChainPath, DataDirPath};
 use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
+use reth_evm::execute::BlockExecutorProvider;
 use reth_node_builder::{ConfigureEvm, NodeConfig};
 mod inner;
 mod primary;
@@ -78,7 +79,7 @@ pub struct TnBuilder<DB> {
 pub struct ExecutionNode<DB, Evm>
 where
     DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
-    Evm: ConfigureEvm + Clone + 'static,
+    Evm: BlockExecutorProvider + Clone + 'static,
 {
     internal: Arc<RwLock<ExecutionNodeInner<DB, Evm>>>,
 }
@@ -86,7 +87,7 @@ where
 impl<DB, Evm> ExecutionNode<DB, Evm>
 where
     DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
-    Evm: ConfigureEvm + Clone + 'static,
+    Evm: BlockExecutorProvider + Clone + 'static,
 {
     /// Create a new instance of `Self`.
     pub fn new(tn_builder: TnBuilder<DB>, evm: Evm) -> eyre::Result<Self> {

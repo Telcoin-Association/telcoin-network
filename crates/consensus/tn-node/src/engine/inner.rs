@@ -34,6 +34,7 @@ use reth_rpc_types::engine::ForkchoiceState;
 use reth_static_file::StaticFileProducer;
 use reth_tasks::TaskExecutor;
 use reth_transaction_pool::{noop::NoopTransactionPool, TransactionPool};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use std::{collections::HashMap, sync::Arc};
 use tn_batch_maker::{BatchMakerBuilder, MiningMode};
 use tn_batch_validator::BatchValidator;
@@ -56,7 +57,7 @@ use super::{PrimaryNode, TnBuilder};
 pub(super) struct ExecutionNodeInner<DB, Evm>
 where
     DB: Database + Clone + Unpin + 'static,
-    Evm: ConfigureEvm + 'static,
+    Evm: BlockExecutorProvider + 'static,
 {
     /// The [Address] for the authority used as the suggested beneficiary.
     ///
@@ -95,7 +96,7 @@ where
 impl<DB, Evm> ExecutionNodeInner<DB, Evm>
 where
     DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
-    Evm: ConfigureEvm + 'static,
+    Evm: BlockExecutorProvider + 'static,
 {
     /// Create a new instance of `Self`.
     pub(super) fn new(
@@ -155,7 +156,8 @@ where
         let tree_externals = TreeExternals::new(
             provider_factory.clone(),
             auto_consensus.clone(),
-            block_executor,
+            // block_executor,
+            evm.clone(),
         );
         let tree = BlockchainTree::new(
             tree_externals,
@@ -250,6 +252,7 @@ where
 
         // engine channel
         let (to_engine, from_engine) = unbounded_channel();
+        let beacon_engine_stream = UnboundedReceiverStream::from(from_engine);
 
         // build executor
         let (_, client, mut task) = Executor::new(
@@ -314,7 +317,7 @@ where
             None, // initial_target
             MIN_BLOCKS_FOR_PIPELINE_RUN,
             to_engine,
-            Box::pin(from_engine.into()), // unbounded stream
+            Box::pin(beacon_engine_stream), // unbounded stream
             hooks,
         )?;
 
@@ -431,7 +434,7 @@ where
             .with_pool(transaction_pool.clone())
             .with_network(network)
             .with_executor(self.executor.clone())
-            .with_evm_config(self.evm.clone())
+            .with_evm_config(EthEvmConfig::default()) // TODO: this should come from self
             .with_events(self.blockchain_db.clone());
 
         //.node_configure namespaces
@@ -474,8 +477,8 @@ where
         BatchValidator::<DB, Evm>::new(
             consensus,
             self.blockchain_db.clone(),
-            EvmProcessorFactory::new(self.node_config.chain.clone(), self.evm.clone()),
-            // block_executor,
+            // EvmProcessorFactory::new(self.node_config.chain.clone(), self.evm.clone()),
+            self.evm.clone(),
         )
     }
 
