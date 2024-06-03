@@ -343,7 +343,7 @@ mod tests {
             let recoverable_signature = RecoverableSignature::from_compact(&compact, recid)
                 .expect("creating recoverable signature");
             if let Ok(recovered_key) = SECP256K1.recover_ecdsa(
-                &Message::from_slice(message_hash).expect("message from slice"),
+                &Message::from_digest_slice(message_hash).expect("message from slice"),
                 &recoverable_signature,
             ) {
                 let recovered_pubkey = recovered_key.serialize();
