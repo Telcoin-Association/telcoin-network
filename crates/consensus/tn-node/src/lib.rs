@@ -10,7 +10,6 @@ use prometheus::Registry;
 use reth::dirs::ChainPath;
 use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
 use reth_evm::execute::BlockExecutorProvider;
-use reth_node_builder::ConfigureEvm;
 use tn_config::{
     read_validator_keypair_from_file, traits::ConfigTrait as _, Config, BLS_KEYFILE,
     PRIMARY_NETWORK_KEYFILE, WORKER_NETWORK_KEYFILE,

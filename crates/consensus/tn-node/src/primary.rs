@@ -26,7 +26,6 @@ use narwhal_storage::NodeStorage;
 use prometheus::{IntGauge, Registry};
 use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
 use reth_evm::execute::BlockExecutorProvider;
-use reth_node_builder::ConfigureEvm;
 use std::{sync::Arc, time::Instant};
 use tn_config::Parameters;
 use tn_types::{
