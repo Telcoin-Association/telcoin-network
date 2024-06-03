@@ -21,7 +21,7 @@ use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, Executor as
 use reth_interfaces::executor::{BlockExecutionError, BlockValidationError};
 use reth_node_api::EngineTypes;
 use reth_primitives::{
-    constants::{EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT},
+    constants::{EMPTY_TRANSACTIONS, ETHEREUM_BLOCK_GAS_LIMIT},
     proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, ChainSpec,
     Header, Receipts, SealedBlockWithSenders, SealedHeader, TransactionSigned, Withdrawals, B256,
     EMPTY_OMMER_ROOT_HASH, U256,
@@ -230,7 +230,7 @@ impl StorageInner {
             state_root: Default::default(),
             transactions_root: Default::default(),
             receipts_root: Default::default(),
-            withdrawals_root: Some(EMPTY_WITHDRAWALS),
+            withdrawals_root: withdrawals.map(|w| proofs::calculate_withdrawals_root(w)),
             logs_bloom: Default::default(),
             difficulty: U256::ZERO,
             number: parent.number + 1,

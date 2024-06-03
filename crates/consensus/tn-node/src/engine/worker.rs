@@ -24,7 +24,7 @@ use reth_network_types::PeerId;
 use reth_node_builder::{
     components::NetworkBuilder,
     node::{FullNodeTypes, NodeTypes},
-    BuilderContext, ConfigureEvm,
+    BuilderContext,
 };
 use reth_node_ethereum::EthEngineTypes;
 use reth_primitives::NodeRecord;

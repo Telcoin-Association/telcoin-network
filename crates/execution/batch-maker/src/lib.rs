@@ -20,7 +20,7 @@ use consensus_metrics::metered_channel::Sender;
 use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, Executor};
 use reth_interfaces::executor::{BlockExecutionError, BlockValidationError};
 use reth_primitives::{
-    constants::{EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT},
+    constants::{EMPTY_TRANSACTIONS, ETHEREUM_BLOCK_GAS_LIMIT},
     proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, ChainSpec,
     Header, Receipts, SealedHeader, TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH,
     U256,
@@ -213,7 +213,7 @@ impl StorageInner {
         transactions: &[TransactionSigned],
         chain_spec: Arc<ChainSpec>,
         parent: &SealedHeader,
-        _withdrawals: Option<&Withdrawals>,
+        withdrawals: Option<&Withdrawals>,
     ) -> Header {
         // // check previous block for base fee
         // let base_fee_per_gas = self
@@ -234,7 +234,7 @@ impl StorageInner {
             state_root: Default::default(),
             transactions_root: Default::default(),
             receipts_root: Default::default(),
-            withdrawals_root: Some(EMPTY_WITHDRAWALS), // TODO: support withdrawals
+            withdrawals_root: withdrawals.map(|w| proofs::calculate_withdrawals_root(w)),
             logs_bloom: Default::default(),
             difficulty: U256::ZERO,
             number: parent.number + 1,

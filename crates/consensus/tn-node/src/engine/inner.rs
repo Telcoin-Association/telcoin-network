@@ -25,11 +25,11 @@ use reth_exex::ExExManagerHandle;
 use reth_node_builder::{
     components::{NetworkBuilder as _, PayloadServiceBuilder as _, PoolBuilder},
     setup::build_networked_pipeline,
-    BuilderContext, ConfigureEvm, NodeConfig, RethRpcConfig,
+    BuilderContext, NodeConfig, RethRpcConfig,
 };
 use reth_node_ethereum::{
     node::{EthereumNetworkBuilder, EthereumPayloadBuilder, EthereumPoolBuilder},
-    EthEvmConfig, EthExecutorProvider,
+    EthEvmConfig,
 };
 use reth_primitives::{Address, Head, PruneModes};
 use reth_provider::{
@@ -158,11 +158,9 @@ where
 
         // let evm_config = types.evm_config();
         let tree_config = BlockchainTreeConfig::default();
-        let block_executor = EthExecutorProvider::new(node_config.chain.clone(), evm.clone());
         let tree_externals = TreeExternals::new(
             provider_factory.clone(),
             auto_consensus.clone(),
-            // block_executor,
             evm.clone(),
         );
         let tree = BlockchainTree::new(

@@ -11,7 +11,7 @@ use reth_interfaces::{
 use reth_primitives::{GotExpected, Hardfork, Receipts, SealedBlockWithSenders, U256};
 use reth_provider::{
     providers::{BlockchainProvider, BundleStateProvider},
-    BundleStateDataProvider, BundleStateForkProvider as _, BundleStateWithReceipts,
+    BundleStateForkProvider as _, BundleStateWithReceipts,
     ChainSpecProvider, HeaderProvider, StateProviderFactory, StateRootProvider,
 };
 use reth_revm::database::StateProviderDatabase;
@@ -263,7 +263,6 @@ mod tests {
     };
     use reth_db::test_utils::{create_test_rw_db, tempdir_path};
     use reth_node_core::init::init_genesis;
-    use reth_node_ethereum::EthEvmConfig;
     use reth_primitives::{
         constants::EMPTY_WITHDRAWALS, hex, proofs::calculate_transaction_root, Address, Bloom,
         Bytes, ChainSpec, GenesisAccount, Header, SealedHeader, B256, EMPTY_OMMER_ROOT_HASH,
@@ -351,8 +350,6 @@ mod tests {
 
         // configure blockchain tree
         let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
-
-        let evm_config = EthEvmConfig::default();
 
         let tree_externals = TreeExternals::new(
             provider_factory.clone(),
@@ -468,8 +465,6 @@ mod tests {
         // configure blockchain tree
         let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
 
-        let evm_config = EthEvmConfig::default();
-
         let tree_externals = TreeExternals::new(
             provider_factory.clone(),
             Arc::clone(&consensus),
@@ -578,8 +573,6 @@ mod tests {
 
         // configure blockchain tree
         let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
-
-        let evm_config = EthEvmConfig::default();
 
         let tree_externals = TreeExternals::new(
             provider_factory.clone(),
@@ -690,8 +683,6 @@ mod tests {
 
         // configure blockchain tree
         let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
-
-        let evm_config = EthEvmConfig::default();
 
         let tree_externals = TreeExternals::new(
             provider_factory.clone(),
@@ -844,8 +835,6 @@ mod tests {
 
         // configure blockchain tree
         let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
-
-        let evm_config = EthEvmConfig::default();
 
         let tree_externals = TreeExternals::new(
             provider_factory.clone(),
