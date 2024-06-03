@@ -200,6 +200,7 @@ where
         let executor = self.executor_factory.executor(db);
         let state = executor.execute((&block_with_senders, U256::MAX).into())?;
         let BlockExecutionOutput { state, receipts, .. } = state;
+        self.consensus.validate_block_post_execution(&block_with_senders, &receipts)?;
 
         // create bundle state
         let bundle_state = BundleStateWithReceipts::new(
