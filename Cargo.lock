@@ -10006,6 +10006,7 @@ dependencies = [
  "reth-stages",
  "reth-tracing",
  "reth-transaction-pool",
+ "tn-batch-validator",
  "tn-types",
  "tokio",
  "tokio-stream",

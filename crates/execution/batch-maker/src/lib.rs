@@ -318,14 +318,16 @@ impl StorageInner {
         let mut db = StateProviderDatabase::new(
             provider.latest().map_err(BlockExecutionError::LatestBlock)?,
         );
+        
+        let block_number = block.number;
 
         // execute the block
-        let BlockExecutionOutput { state, receipts, .. } =
+        let BlockExecutionOutput { state, receipts, gas_used } =
             executor.executor(&mut db).execute((&block, U256::ZERO).into())?;
         let bundle_state = BundleStateWithReceipts::new(
             state,
             Receipts::from_block_receipt(receipts),
-            block.number,
+            block_number,
         );
 
         let Block { mut header, body, .. } = block.block;
@@ -333,7 +335,24 @@ impl StorageInner {
 
         trace!(target: "execution::batch_maker", ?bundle_state, ?header, ?body, "executed block, calculating state root and completing header");
 
+        
+        // set header's gas used
+        header.gas_used = gas_used;
+
+        // see reth::crates::payload::ethereum::default_ethereum_payload_builder()
+        //
+        // expensive calculations - update header
         header.state_root = db.state_root(bundle_state.state())?;
+        header.receipts_root = bundle_state.receipts_root_slow(block_number)
+            .ok_or_else(|| {
+                error!(target: "execution::batch_maker", "error calculating receipts root from bundle state");
+                BlockExecutionError::Other("Failed to create receipts root from bundle state".into())
+            })?;
+        header.logs_bloom = bundle_state.block_logs_bloom(block_number)
+            .ok_or_else(|| {
+                error!(target: "execution::batch_maker", "error calculating logs bloom from bundle state");
+                BlockExecutionError::Other("Failed to calculate logs bloom from bundle state".into())
+            })?;
 
         // finally insert into storage
         self.insert_new_block(header.clone(), body);

@@ -47,3 +47,4 @@ narwhal-worker = { workspace = true }
 narwhal-network = { workspace = true }
 narwhal-network-types = { workspace = true }
 narwhal-typed-store = { workspace = true }
+tn-batch-validator = { workspace = true }

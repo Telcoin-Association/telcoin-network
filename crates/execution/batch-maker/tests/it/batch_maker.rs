@@ -11,7 +11,7 @@ use narwhal_network_types::MockWorkerToPrimary;
 use narwhal_typed_store::Map;
 use narwhal_worker::{metrics::WorkerMetrics, BatchMaker, NUM_SHUTDOWN_RECEIVERS};
 use prometheus::Registry;
-use reth::tasks::TaskManager;
+use reth::{beacon_consensus::EthBeaconConsensus, tasks::TaskManager};
 use reth_blockchain_tree::noop::NoopBlockchainTree;
 use reth_db::test_utils::{create_test_rw_db, tempdir_path};
 use reth_node_core::init::init_genesis;
@@ -22,11 +22,11 @@ use reth_tracing::init_test_tracing;
 use reth_transaction_pool::{
     blobstore::InMemoryBlobStore, PoolConfig, TransactionPool, TransactionValidationTaskExecutor,
 };
+use tn_batch_validator::{BatchValidation, BatchValidator};
 use std::{sync::Arc, time::Duration};
 use tn_batch_maker::{BatchMakerBuilder, MiningMode};
 use tn_types::{
-    test_utils::{create_batch_store, get_gas_price, test_genesis, TransactionFactory},
-    Batch, BatchAPI, MetadataAPI, PreSubscribedBroadcastSender,
+    test_utils::{create_batch_store, get_gas_price, test_genesis, TransactionFactory}, Batch, BatchAPI, Consensus, MetadataAPI, PreSubscribedBroadcastSender
 };
 use tokio::time::timeout;
 use tracing::debug;
@@ -123,7 +123,7 @@ async fn test_make_batch_el_to_cl() {
         to_worker,
         mining_mode,
         address,
-        block_executor,
+        block_executor.clone(),
     )
     .build();
 
@@ -184,6 +184,17 @@ async fn test_make_batch_el_to_cl() {
         .await
         .expect("new batch created within time")
         .expect("new batch is Some()");
+
+    // ensure batch validator succeeds
+    let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
+    let batch_validator = BatchValidator::new(
+        consensus,
+        blockchain_db.clone(),
+        block_executor,
+    );
+
+    let valid_batch_result = batch_validator.validate_batch(&batch).await;
+    assert!(valid_batch_result.is_ok());
 
     // ensure expected transaction is in batch
     let expected_batch = Batch::new(vec![transaction1.envelope_encoded().into()]);

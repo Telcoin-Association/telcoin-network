@@ -958,5 +958,6 @@ mod tests {
     // invalid batch types for the rest of the sealed header:
     // - logs bloom
     // - sealed block number
+    // - BlockGasUsed
     // etc.
 }
