@@ -22,7 +22,6 @@ use reth_interfaces::{
     executor::{BlockExecutionError, BlockValidationError},
 };
 use reth_evm::execute::Executor;
-use reth_node_api::ConfigureEvm;
 use reth_primitives::{
     constants::{EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT}, proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, BlockWithSenders, Bloom, ChainSpec, Header, ReceiptWithBloom, Receipts, SealedBlock, SealedHeader, TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256
 };
