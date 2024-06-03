@@ -158,11 +158,8 @@ where
 
         // let evm_config = types.evm_config();
         let tree_config = BlockchainTreeConfig::default();
-        let tree_externals = TreeExternals::new(
-            provider_factory.clone(),
-            auto_consensus.clone(),
-            evm.clone(),
-        );
+        let tree_externals =
+            TreeExternals::new(provider_factory.clone(), auto_consensus.clone(), evm.clone());
         let tree = BlockchainTree::new(
             tree_externals,
             tree_config,
