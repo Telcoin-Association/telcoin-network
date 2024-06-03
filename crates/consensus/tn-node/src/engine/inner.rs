@@ -474,11 +474,7 @@ where
             Arc::new(EthBeaconConsensus::new(self.node_config.chain.clone()));
 
         // batch validator
-        BatchValidator::<DB, Evm>::new(
-            consensus,
-            self.blockchain_db.clone(),
-            self.evm.clone(),
-        )
+        BatchValidator::<DB, Evm>::new(consensus, self.blockchain_db.clone(), self.evm.clone())
     }
 
     /// Fetch the last executed stated from the database.

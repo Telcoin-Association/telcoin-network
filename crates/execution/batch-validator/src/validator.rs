@@ -195,12 +195,12 @@ where
         // capture current state
         let provider = BundleStateProvider::new(state_provider, bundle_state_data_provider);
         let db = StateProviderDatabase::new(&provider);
-        
+
         // executor for single block
         let executor = self.executor_factory.executor(db);
         let state = executor.execute((&block_with_senders, U256::MAX).into())?;
         let BlockExecutionOutput { state, receipts, .. } = state;
-        
+
         // create bundle state
         let bundle_state = BundleStateWithReceipts::new(
             state,
