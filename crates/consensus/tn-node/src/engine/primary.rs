@@ -4,12 +4,10 @@
 
 use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
 use reth_node_builder::{
-    components::ComponentsBuilder,
     node::{FullNodeTypes, NodeTypes},
 };
 use reth_node_ethereum::{
-    node::{EthereumExecutorBuilder, EthereumNetworkBuilder, EthereumPayloadBuilder, EthereumPoolBuilder},
-    EthEngineTypes, EthEvmConfig,
+    EthEngineTypes,
 };
 use reth_provider::FullProvider;
 use std::marker::PhantomData;

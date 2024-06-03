@@ -19,13 +19,12 @@ use reth_network_api::{
 };
 use reth_network_types::PeerId;
 use reth_node_builder::{
-    components::{ComponentsBuilder, NetworkBuilder},
+    components::{NetworkBuilder},
     node::{FullNodeTypes, NodeTypes},
     BuilderContext, ConfigureEvm,
 };
 use reth_node_ethereum::{
-    node::{EthereumExecutorBuilder, EthereumNetworkBuilder, EthereumPayloadBuilder, EthereumPoolBuilder},
-    EthEngineTypes, EthEvmConfig,
+    EthEngineTypes,
 };
 use reth_primitives::NodeRecord;
 use reth_provider::providers::BlockchainProvider;

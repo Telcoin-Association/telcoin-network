@@ -3,7 +3,7 @@ use consensus_metrics::metered_channel::Receiver;
 use futures_util::{future::BoxFuture, FutureExt};
 use reth_beacon_consensus::{BeaconEngineMessage, ForkchoiceStatus};
 use reth_evm::execute::BlockExecutorProvider;
-use reth_node_api::{ConfigureEvm, EngineTypes};
+use reth_node_api::{EngineTypes};
 use reth_primitives::{ChainSpec, Withdrawals};
 use reth_provider::{
     BlockReaderIdExt, CanonChainTracker, CanonStateNotificationSender, Chain, StateProviderFactory,

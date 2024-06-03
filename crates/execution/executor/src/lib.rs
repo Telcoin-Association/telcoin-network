@@ -21,17 +21,16 @@ use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, Executor as
 use reth_interfaces::{
     executor::{BlockExecutionError, BlockValidationError},
 };
-use reth_node_api::{ConfigureEvm, EngineTypes};
+use reth_node_api::{EngineTypes};
 use reth_primitives::{
-    constants::{EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT}, proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, BlockWithSenders, Bloom, ChainSpec, Header, ReceiptWithBloom, Receipts, SealedBlock, SealedBlockWithSenders, SealedHeader, TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256
+    constants::{EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT}, proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, ChainSpec, Header, Receipts, SealedBlockWithSenders, SealedHeader, TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256
 };
 use reth_provider::{
     BlockReaderIdExt, BundleStateWithReceipts, CanonStateNotificationSender,
     StateProviderFactory,
 };
 use reth_revm::{
-    database::StateProviderDatabase, db::states::bundle_state::BundleRetention,
-    State,
+    database::StateProviderDatabase,
 };
 use std::{collections::HashMap, sync::Arc};
 use tn_types::{now, AutoSealConsensus, BatchAPI, ConsensusOutput};

@@ -285,7 +285,7 @@ where
             Box::new(self.executor.clone()),
         ));
 
-        let mut pipeline = build_networked_pipeline(
+        let pipeline = build_networked_pipeline(
             &self.node_config.clone(),
             &reth_config.stages,
             client.clone(),
