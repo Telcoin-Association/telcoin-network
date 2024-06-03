@@ -17,7 +17,6 @@ reth-primitives = { workspace = true }
 reth-db = { workspace = true }
 reth-revm = { workspace = true }
 reth-blockchain-tree = { workspace = true }
-reth-node-api = { workspace = true }
 reth-evm = { workspace = true }
 alloy-rlp = { workspace = true }
 async-trait = { workspace = true }

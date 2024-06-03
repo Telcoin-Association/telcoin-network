@@ -10026,7 +10026,6 @@ dependencies = [
  "reth-db",
  "reth-evm",
  "reth-interfaces",
- "reth-node-api",
  "reth-node-core",
  "reth-node-ethereum",
  "reth-primitives",

@@ -8,7 +8,6 @@ use reth_interfaces::{
     blockchain_tree::{error::BlockchainTreeError, BlockchainTreeViewer},
     executor::BlockValidationError,
 };
-use reth_node_api::ConfigureEvm;
 use reth_primitives::{GotExpected, Hardfork, Receipts, SealedBlockWithSenders, U256};
 use reth_provider::{
     providers::{BlockchainProvider, BundleStateProvider}, BundleStateDataProvider, BundleStateForkProvider as _, BundleStateWithReceipts, ChainSpecProvider, HeaderProvider, StateProviderFactory, StateRootProvider
