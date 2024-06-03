@@ -10,7 +10,6 @@ publish = false
 base64 = { workspace = true }
 bcs = { workspace = true }
 reth-primitives = { workspace = true }
-reth-blockchain-tree = { workspace = true }
 reth-db = { workspace = true }
 reth-revm = { workspace = true }
 derive_builder = { workspace = true }
@@ -43,7 +42,6 @@ telcoin-sync = { workspace = true }
 alloy-rlp = { workspace = true }
 schemars = { version = "0.8.16" }
 serde_yaml = { workspace = true }
-reth-provider = { workspace = true }
 secp256k1 = { workspace = true }
 reth-consensus = { workspace = true }
 
@@ -52,6 +50,7 @@ tempfile = { workspace = true, optional = true }
 fdlimit = { workspace = true, optional = true }
 reth-tracing = { workspace = true, optional = true }
 reth-transaction-pool = { workspace = true, optional = true }
+reth-provider = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -62,7 +61,7 @@ consensus-metrics = { workspace = true }
 
 [features]
 default = []
-test-utils = ["tempfile", "fdlimit", "reth-tracing", "reth-transaction-pool", "reth-primitives/arbitrary"]
+test-utils = ["tempfile", "fdlimit", "reth-tracing", "reth-transaction-pool", "reth-primitives/arbitrary", "reth-provider"]
 arbitrary = ["reth-primitives/arbitrary"]
 
 [[bench]]

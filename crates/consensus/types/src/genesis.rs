@@ -12,9 +12,7 @@ use crate::{
 };
 use eyre::Context;
 use fastcrypto::traits::{InsecureDefault, Signer};
-use reth_blockchain_tree::ShareableBlockchainTree;
 use reth_primitives::{keccak256, Address, ChainSpec, Genesis};
-use reth_provider::providers::BlockchainProvider;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,

@@ -10234,7 +10234,6 @@ dependencies = [
  "proptest",
  "proptest-derive 0.3.0",
  "rand 0.8.5",
- "reth-blockchain-tree",
  "reth-consensus",
  "reth-db",
  "reth-primitives",
