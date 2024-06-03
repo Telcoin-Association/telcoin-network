@@ -192,15 +192,16 @@ where
         // TODO: validate base fee based on parent batch
         let state_provider = self.blockchain_db.history_by_block_number(canonical_fork.number)?;
 
+        // capture current state
         let provider = BundleStateProvider::new(state_provider, bundle_state_data_provider);
-
-        // let mut executor = self.executor_factory.with_state(&provider);
         let db = StateProviderDatabase::new(&provider);
+        
+        // executor for single block
         let executor = self.executor_factory.executor(db);
-        // executor.execute_and_verify_receipt(&block_with_senders, U256::MAX)?;
-        // let bundle_state = executor.take_output_state();
         let state = executor.execute((&block_with_senders, U256::MAX).into())?;
         let BlockExecutionOutput { state, receipts, .. } = state;
+        
+        // create bundle state
         let bundle_state = BundleStateWithReceipts::new(
             state,
             Receipts::from_block_receipt(receipts),
@@ -354,7 +355,6 @@ mod tests {
         let tree_externals = TreeExternals::new(
             provider_factory.clone(),
             Arc::clone(&consensus),
-            // reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
             reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
         );
         let tree_config = BlockchainTreeConfig::default();

@@ -19,21 +19,6 @@ pub struct PrimaryNode<DB, Provider> {
     evm: PhantomData<Provider>,
 }
 
-// impl<DB, Evm> PrimaryNode<DB, Evm> {
-//     /// Returns an execution layer's [ComponentsBuilder] configured for a Worker node.
-//     pub fn components<Node>(
-//     ) -> ComponentsBuilder<Node, EthereumPoolBuilder, EthereumPayloadBuilder,
-// EthereumNetworkBuilder, EthereumExecutorBuilder>     where
-//         Node: FullNodeTypes<Engine = EthEngineTypes>,
-//     {
-//         ComponentsBuilder::default()
-//             .node_types::<Node>()
-//             .pool(EthereumPoolBuilder::default())
-//             .payload(EthereumPayloadBuilder::default())
-//             .network(EthereumNetworkBuilder::default())
-//     }
-// }
-
 impl<DB, Provider> NodeTypes for PrimaryNode<DB, Provider>
 where
     DB: Send + Sync + 'static,

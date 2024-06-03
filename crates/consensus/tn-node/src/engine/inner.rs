@@ -472,14 +472,11 @@ where
         // to ensure inner-chain compatibility
         let consensus: Arc<dyn Consensus> =
             Arc::new(EthBeaconConsensus::new(self.node_config.chain.clone()));
-        // let block_executor = EthExecutorProvider::<Evm>::new(self.node_config.chain.clone(),
-        // self.evm.clone());
 
         // batch validator
         BatchValidator::<DB, Evm>::new(
             consensus,
             self.blockchain_db.clone(),
-            // EvmProcessorFactory::new(self.node_config.chain.clone(), self.evm.clone()),
             self.evm.clone(),
         )
     }

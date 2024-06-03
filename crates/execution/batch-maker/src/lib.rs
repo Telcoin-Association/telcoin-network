@@ -310,21 +310,7 @@ impl StorageInner {
                     BlockValidationError::SenderRecoveryError,
                 ))?;
 
-        // let senders = TransactionSigned::recover_signers(&block.body, block.body.len())
-        //     .ok_or(BlockExecutionError::Validation(BlockValidationError::SenderRecoveryError))?;
-
         trace!(target: "execution::batch_maker", transactions=?&block.body, "executing transactions");
-
-        // // now execute the block
-        // let db = State::builder()
-        //     .with_database_boxed(Box::new(StateProviderDatabase::new(client
-        //     .latest()
-        //     .map_err(|e| {
-        //         error!(target: "execution::batch_maker", "error retrieving client.latest() {e}");
-        //         BlockExecutionError::LatestBlock(e)
-        //     })?)))
-        //     .with_bundle_update()
-        //     .build();
 
         // TODO: should this use the latest or finalized for next batch?
         //
