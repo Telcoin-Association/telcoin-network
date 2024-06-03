@@ -21,7 +21,6 @@ use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, Executor as
 use reth_interfaces::{
     executor::{BlockExecutionError, BlockValidationError},
 };
-use reth_consensus::{Consensus, ConsensusError};
 use reth_node_api::{ConfigureEvm, EngineTypes};
 use reth_primitives::{
     constants::{EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT}, proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, BlockWithSenders, Bloom, ChainSpec, Header, ReceiptWithBloom, Receipts, SealedBlock, SealedBlockWithSenders, SealedHeader, TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256
