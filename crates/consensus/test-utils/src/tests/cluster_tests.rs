@@ -37,7 +37,7 @@ async fn basic_cluster_setup() {
         let db = el.get_provider().await;
         let blocks = db.block_range(0..=3).expect("at least 3 blocks");
 
-        println!("{:?}\n\n\n", authority.id);
+        println!("\n\n\nblocks for authority {:?}:", authority.id);
         for block in blocks.iter() {
             println!("\n{block:?}");
         }
