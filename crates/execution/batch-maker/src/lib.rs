@@ -440,7 +440,7 @@ mod tests {
         let address = Address::from(U160::from(33));
 
         let evm_config = EthEvmConfig::default();
-        let block_executor = EthExecutorProvider::new(chain.clone(), evm_config.clone());
+        let block_executor = EthExecutorProvider::new(chain.clone(), evm_config);
 
         // build batch maker
         let task = BatchMakerBuilder::new(

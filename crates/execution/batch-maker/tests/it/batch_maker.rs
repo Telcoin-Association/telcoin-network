@@ -113,7 +113,7 @@ async fn test_make_batch_el_to_cl() {
     let address = Address::from(U160::from(333));
 
     let evm_config = EthEvmConfig::default();
-    let block_executor = EthExecutorProvider::new(chain.clone(), evm_config.clone());
+    let block_executor = EthExecutorProvider::new(chain.clone(), evm_config);
 
     // build execution batch maker
     let task = BatchMakerBuilder::new(

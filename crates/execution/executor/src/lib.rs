@@ -104,7 +104,7 @@ where
         } = self;
         let auto_client = AutoSealClient::new(storage.clone());
         let task = MiningTask::new(
-            Arc::clone(&consensus.chain_spec()),
+            Arc::clone(consensus.chain_spec()),
             to_engine,
             canon_state_notification,
             storage,
