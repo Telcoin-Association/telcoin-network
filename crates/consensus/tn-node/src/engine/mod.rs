@@ -6,9 +6,12 @@ use std::sync::Arc;
 
 use consensus_metrics::metered_channel::{Receiver, Sender};
 use reth::dirs::{ChainPath, DataDirPath};
-use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
+use reth_db::{
+    database::Database,
+    database_metrics::{DatabaseMetadata, DatabaseMetrics},
+};
 use reth_evm::execute::BlockExecutorProvider;
-use reth_node_builder::{NodeConfig};
+use reth_node_builder::NodeConfig;
 mod inner;
 mod primary;
 mod worker;

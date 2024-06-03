@@ -2,13 +2,12 @@
 //!
 //! Inspired by reth_node_ethereum crate.
 
-use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
-use reth_node_builder::{
-    node::{FullNodeTypes, NodeTypes},
+use reth_db::{
+    database::Database,
+    database_metrics::{DatabaseMetadata, DatabaseMetrics},
 };
-use reth_node_ethereum::{
-    EthEngineTypes,
-};
+use reth_node_builder::node::{FullNodeTypes, NodeTypes};
+use reth_node_ethereum::EthEngineTypes;
 use reth_provider::FullProvider;
 use std::marker::PhantomData;
 
@@ -23,8 +22,8 @@ pub struct PrimaryNode<DB, Provider> {
 // impl<DB, Evm> PrimaryNode<DB, Evm> {
 //     /// Returns an execution layer's [ComponentsBuilder] configured for a Worker node.
 //     pub fn components<Node>(
-//     ) -> ComponentsBuilder<Node, EthereumPoolBuilder, EthereumPayloadBuilder, EthereumNetworkBuilder, EthereumExecutorBuilder>
-//     where
+//     ) -> ComponentsBuilder<Node, EthereumPoolBuilder, EthereumPayloadBuilder,
+// EthereumNetworkBuilder, EthereumExecutorBuilder>     where
 //         Node: FullNodeTypes<Engine = EthEngineTypes>,
 //     {
 //         ComponentsBuilder::default()

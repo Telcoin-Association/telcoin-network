@@ -11,12 +11,15 @@ use reth::{
 use reth_auto_seal_consensus::AutoSealConsensus;
 use reth_beacon_consensus::{
     hooks::{EngineHooks, StaticFileHook},
-    EthBeaconConsensus, BeaconConsensusEngine, MIN_BLOCKS_FOR_PIPELINE_RUN,
+    BeaconConsensusEngine, EthBeaconConsensus, MIN_BLOCKS_FOR_PIPELINE_RUN,
 };
 use reth_blockchain_tree::{
     BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
 };
-use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
+use reth_db::{
+    database::Database,
+    database_metrics::{DatabaseMetadata, DatabaseMetrics},
+};
 use reth_evm::execute::BlockExecutorProvider;
 use reth_exex::ExExManagerHandle;
 use reth_node_builder::{
@@ -29,12 +32,14 @@ use reth_node_ethereum::{
     EthEvmConfig, EthExecutorProvider,
 };
 use reth_primitives::{Address, Head, PruneModes};
-use reth_provider::{providers::BlockchainProvider, CanonStateNotificationSender, ProviderFactory, StaticFileProviderFactory as _};
+use reth_provider::{
+    providers::BlockchainProvider, CanonStateNotificationSender, ProviderFactory,
+    StaticFileProviderFactory as _,
+};
 use reth_rpc_types::engine::ForkchoiceState;
 use reth_static_file::StaticFileProducer;
 use reth_tasks::TaskExecutor;
 use reth_transaction_pool::{noop::NoopTransactionPool, TransactionPool};
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use std::{collections::HashMap, sync::Arc};
 use tn_batch_maker::{BatchMakerBuilder, MiningMode};
 use tn_batch_validator::BatchValidator;
@@ -42,6 +47,7 @@ use tn_executor::Executor;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
 use tn_types::{Consensus, ConsensusOutput, NewBatch, WorkerId};
 use tokio::sync::mpsc::unbounded_channel;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info};
 
 use crate::{
@@ -466,12 +472,13 @@ where
     }
 
     /// Create a new batch validator.
-    pub(super) fn new_batch_validator/*<E: BlockExecutorProvider>*/(&self) -> BatchValidator<DB, Evm> {
+    pub(super) fn new_batch_validator(&self) -> BatchValidator<DB, Evm> {
         // validate batches using beaacon consensus
         // to ensure inner-chain compatibility
         let consensus: Arc<dyn Consensus> =
             Arc::new(EthBeaconConsensus::new(self.node_config.chain.clone()));
-        // let block_executor = EthExecutorProvider::<Evm>::new(self.node_config.chain.clone(), self.evm.clone());
+        // let block_executor = EthExecutorProvider::<Evm>::new(self.node_config.chain.clone(),
+        // self.evm.clone());
 
         // batch validator
         BatchValidator::<DB, Evm>::new(

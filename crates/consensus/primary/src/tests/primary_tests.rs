@@ -536,18 +536,13 @@ async fn test_request_vote_accept_missing_parents() {
         header: test_header,
         parents: round_2_missing.clone(),
     });
-    assert!(request
-        .extensions_mut()
-        .insert(network.downgrade())
-        .is_none());
+    assert!(request.extensions_mut().insert(network.downgrade()).is_none());
     assert!(request
         .extensions_mut()
         .insert(anemo::PeerId(author.network_public_key().0.to_bytes()))
         .is_none());
 
-    let result = timeout(Duration::from_secs(5), handler.request_vote(request))
-        .await
-        .unwrap();
+    let result = timeout(Duration::from_secs(5), handler.request_vote(request)).await.unwrap();
     assert!(result.is_ok(), "{:?}", result);
 }
 

@@ -20,7 +20,7 @@ use humantime::format_duration;
 use lru_time_cache::LruCache;
 use reth_primitives::{
     Address, BaseFeeParams, FromRecoveredPooledTransaction, Signature as EthSignature, Transaction,
-    TxKind, TransactionSigned, TxEip1559, TxHash, B256, U256,
+    TransactionSigned, TxEip1559, TxHash, TxKind, B256, U256,
 };
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_rpc::eth::error::{EthApiError, EthResult, RpcInvalidTransactionError};

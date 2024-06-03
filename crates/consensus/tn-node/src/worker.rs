@@ -17,7 +17,10 @@ use narwhal_worker::{
     Worker, CHANNEL_CAPACITY, NUM_SHUTDOWN_RECEIVERS,
 };
 use prometheus::Registry;
-use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
+use reth_db::{
+    database::Database,
+    database_metrics::{DatabaseMetadata, DatabaseMetrics},
+};
 use reth_evm::execute::BlockExecutorProvider;
 use std::{collections::HashMap, sync::Arc, time::Instant};
 use tn_config::Parameters;

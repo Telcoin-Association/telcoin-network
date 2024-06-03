@@ -3,7 +3,7 @@ use consensus_metrics::metered_channel::Receiver;
 use futures_util::{future::BoxFuture, FutureExt};
 use reth_beacon_consensus::{BeaconEngineMessage, ForkchoiceStatus};
 use reth_evm::execute::BlockExecutorProvider;
-use reth_node_api::{EngineTypes};
+use reth_node_api::EngineTypes;
 use reth_primitives::{ChainSpec, Withdrawals};
 use reth_provider::{
     BlockReaderIdExt, CanonChainTracker, CanonStateNotificationSender, Chain, StateProviderFactory,
@@ -127,7 +127,13 @@ where
                     // TODO: support withdrawals
                     let withdrawals = Some(Withdrawals::default());
 
-                    match storage.build_and_execute(output, withdrawals, &client, chain_spec, &block_executor) {
+                    match storage.build_and_execute(
+                        output,
+                        withdrawals,
+                        &client,
+                        chain_spec,
+                        &block_executor,
+                    ) {
                         Ok((sealed_block_with_senders, bundle_state)) => {
                             // send sealed forkchoice update to engine
                             let new_header_hash = sealed_block_with_senders.hash();

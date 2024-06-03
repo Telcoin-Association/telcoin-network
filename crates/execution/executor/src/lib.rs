@@ -18,20 +18,18 @@
 use consensus_metrics::metered_channel::Receiver;
 use reth_beacon_consensus::BeaconEngineMessage;
 use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, Executor as _};
-use reth_interfaces::{
-    executor::{BlockExecutionError, BlockValidationError},
-};
-use reth_node_api::{EngineTypes};
+use reth_interfaces::executor::{BlockExecutionError, BlockValidationError};
+use reth_node_api::EngineTypes;
 use reth_primitives::{
-    constants::{EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT}, proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, ChainSpec, Header, Receipts, SealedBlockWithSenders, SealedHeader, TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256
+    constants::{EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT},
+    proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, ChainSpec,
+    Header, Receipts, SealedBlockWithSenders, SealedHeader, TransactionSigned, Withdrawals, B256,
+    EMPTY_OMMER_ROOT_HASH, U256,
 };
 use reth_provider::{
-    BlockReaderIdExt, BundleStateWithReceipts, CanonStateNotificationSender,
-    StateProviderFactory,
+    BlockReaderIdExt, BundleStateWithReceipts, CanonStateNotificationSender, StateProviderFactory,
 };
-use reth_revm::{
-    database::StateProviderDatabase,
-};
+use reth_revm::database::StateProviderDatabase;
 use std::{collections::HashMap, sync::Arc};
 use tn_types::{now, AutoSealConsensus, BatchAPI, ConsensusOutput};
 use tokio::sync::{mpsc::UnboundedSender, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -267,7 +265,7 @@ impl StorageInner {
         provider: &Provider,
         chain_spec: Arc<ChainSpec>,
         executor: &Executor,
-    ) -> Result<(SealedBlockWithSenders, BundleStateWithReceipts), ExecutorError> 
+    ) -> Result<(SealedBlockWithSenders, BundleStateWithReceipts), ExecutorError>
     where
         Executor: BlockExecutorProvider,
         Provider: StateProviderFactory + BlockReaderIdExt,
@@ -336,7 +334,8 @@ impl StorageInner {
         );
 
         let Block { mut header, body, .. } = block.block;
-        let body = BlockBody { transactions: body, ommers: vec![], withdrawals: withdrawals.clone() };
+        let body =
+            BlockBody { transactions: body, ommers: vec![], withdrawals: withdrawals.clone() };
 
         trace!(target: "execution::executor", ?bundle_state, ?header, ?body, "executed block, calculating state root and completing header");
 
@@ -363,20 +362,14 @@ impl StorageInner {
         let senders_length = senders.len();
 
         // seal the block
-        let block = Block {
-            header,
-            body: transactions,
-            ommers: vec![],
-            withdrawals,
-        };
+        let block = Block { header, body: transactions, ommers: vec![], withdrawals };
         let sealed_block = block.seal_slow();
 
-        let sealed_block_with_senders =
-            SealedBlockWithSenders::new(sealed_block, senders)
-                .ok_or_else(|| {
-                    error!(target: "execution::executor", "Unable to seal block with senders");
-                    ExecutorError::RecoveredTransactionsLength(tx_length, senders_length)
-                })?;
+        let sealed_block_with_senders = SealedBlockWithSenders::new(sealed_block, senders)
+            .ok_or_else(|| {
+                error!(target: "execution::executor", "Unable to seal block with senders");
+                ExecutorError::RecoveredTransactionsLength(tx_length, senders_length)
+            })?;
 
         Ok((sealed_block_with_senders, bundle_state))
     }
@@ -397,10 +390,10 @@ impl StorageInner {
         let mut transactions = vec![];
 
         // TODO: there is a better way to do this, but wait until after execution refactor
-        // 
+        //
         // bathes.iter() { SealedBlockWithSenders.try_from(&batch) }
         // try_from is missing support for withdrawals -> need to add withdrawals to metadata
-        // 
+        //
         // need to decide if executor produces per batch or giant block
 
         // loop through all transactions in order
@@ -422,7 +415,6 @@ impl StorageInner {
                 }
             }
         }
-
 
         Ok(transactions)
 

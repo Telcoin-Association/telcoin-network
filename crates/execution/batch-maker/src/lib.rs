@@ -17,20 +17,16 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 use consensus_metrics::metered_channel::Sender;
-use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider};
-use reth_interfaces::{
-    executor::{BlockExecutionError, BlockValidationError},
-};
-use reth_evm::execute::Executor;
+use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, Executor};
+use reth_interfaces::executor::{BlockExecutionError, BlockValidationError};
 use reth_primitives::{
-    constants::{EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT}, proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, ChainSpec, Header, Receipts, SealedHeader, TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256
+    constants::{EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT},
+    proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, ChainSpec,
+    Header, Receipts, SealedHeader, TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH,
+    U256,
 };
-use reth_provider::{
-    BlockReaderIdExt, BundleStateWithReceipts, StateProviderFactory,
-};
-use reth_revm::{
-    database::StateProviderDatabase,
-};
+use reth_provider::{BlockReaderIdExt, BundleStateWithReceipts, StateProviderFactory};
+use reth_revm::database::StateProviderDatabase;
 use reth_transaction_pool::TransactionPool;
 use std::{
     collections::HashMap,
@@ -300,11 +296,19 @@ impl StorageInner {
 
         debug!(target: "execution::batch_maker", latest=?parent);
 
-        let header = self.build_header_template(&transactions, chain_spec.clone(), &parent, withdrawals.as_ref());
+        let header = self.build_header_template(
+            &transactions,
+            chain_spec.clone(),
+            &parent,
+            withdrawals.as_ref(),
+        );
 
-        let block = Block { header, body: transactions, ommers: vec![], withdrawals: withdrawals.clone() }
-            .with_recovered_senders()
-            .ok_or(BlockExecutionError::Validation(BlockValidationError::SenderRecoveryError))?;
+        let block =
+            Block { header, body: transactions, ommers: vec![], withdrawals: withdrawals.clone() }
+                .with_recovered_senders()
+                .ok_or(BlockExecutionError::Validation(
+                    BlockValidationError::SenderRecoveryError,
+                ))?;
 
         // let senders = TransactionSigned::recover_signers(&block.body, block.body.len())
         //     .ok_or(BlockExecutionError::Validation(BlockValidationError::SenderRecoveryError))?;
@@ -595,8 +599,12 @@ mod tests {
         let withdrawals = Some(Withdrawals::default());
         // create header template
         // warning should appear with RUST_LOG=info
-        let template =
-            storage.write().await.build_header_template(&Vec::new(), chain_spec, &sealed_header, withdrawals.as_ref());
+        let template = storage.write().await.build_header_template(
+            &Vec::new(),
+            chain_spec,
+            &sealed_header,
+            withdrawals.as_ref(),
+        );
         let expected: u64 = system_time + 1;
         assert!(template.timestamp == expected);
     }

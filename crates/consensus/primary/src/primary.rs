@@ -680,8 +680,7 @@ impl PrimaryReceiverHandler {
         if current_time < *header.created_at() {
             if *header.created_at() - current_time <= TOLERANCE_SEC {
                 // for a small difference we simply wait
-                tokio::time::sleep(Duration::from_secs(*header.created_at() - current_time))
-                    .await;
+                tokio::time::sleep(Duration::from_secs(*header.created_at() - current_time)).await;
             } else {
                 // For larger differences return an error, and log it
                 warn!(

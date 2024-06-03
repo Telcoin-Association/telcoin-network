@@ -15,7 +15,10 @@ fn main() {
     #[cfg(not(feature = "faucet"))]
     if let Err(err) =
         telcoin_network::cli::Cli::<NoArgs>::parse().run(|builder, _, tn_datadir| async move {
-            let executor = EthExecutorProvider::new(std::sync::Arc::clone(&builder.node_config.chain), EthEvmConfig::default());
+            let executor = EthExecutorProvider::new(
+                std::sync::Arc::clone(&builder.node_config.chain),
+                EthEvmConfig::default(),
+            );
             launch_node(builder, executor, tn_datadir).await
         })
     {
@@ -27,7 +30,10 @@ fn main() {
     if let Err(err) = telcoin_network::cli::Cli::<FaucetArgs>::parse().run(
         |mut builder, faucet, tn_datadir| async move {
             builder.opt_faucet_args = Some(faucet);
-            let executor = EthExecutorProvider::new(std::sync::Arc::clone(&builder.node_config.chain), EthEvmConfig::default());
+            let executor = EthExecutorProvider::new(
+                std::sync::Arc::clone(&builder.node_config.chain),
+                EthEvmConfig::default(),
+            );
             launch_node(builder, executor, tn_datadir).await
         },
     ) {

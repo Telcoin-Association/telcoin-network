@@ -10,7 +10,9 @@ use reth_interfaces::{
 };
 use reth_primitives::{GotExpected, Hardfork, Receipts, SealedBlockWithSenders, U256};
 use reth_provider::{
-    providers::{BlockchainProvider, BundleStateProvider}, BundleStateDataProvider, BundleStateForkProvider as _, BundleStateWithReceipts, ChainSpecProvider, HeaderProvider, StateProviderFactory, StateRootProvider
+    providers::{BlockchainProvider, BundleStateProvider},
+    BundleStateDataProvider, BundleStateForkProvider as _, BundleStateWithReceipts,
+    ChainSpecProvider, HeaderProvider, StateProviderFactory, StateRootProvider,
 };
 use reth_revm::database::StateProviderDatabase;
 use std::{

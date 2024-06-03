@@ -8,7 +8,10 @@
 //! generic over it.
 
 use enr::{secp256k1::SecretKey, Enr};
-use reth_db::{database::Database, database_metrics::{DatabaseMetadata, DatabaseMetrics}};
+use reth_db::{
+    database::Database,
+    database_metrics::{DatabaseMetadata, DatabaseMetrics},
+};
 use reth_discv4::DEFAULT_DISCOVERY_PORT;
 use reth_eth_wire::DisconnectReason;
 use reth_evm::execute::BlockExecutorProvider;
@@ -19,13 +22,11 @@ use reth_network_api::{
 };
 use reth_network_types::PeerId;
 use reth_node_builder::{
-    components::{NetworkBuilder},
+    components::NetworkBuilder,
     node::{FullNodeTypes, NodeTypes},
     BuilderContext, ConfigureEvm,
 };
-use reth_node_ethereum::{
-    EthEngineTypes,
-};
+use reth_node_ethereum::EthEngineTypes;
 use reth_primitives::NodeRecord;
 use reth_provider::providers::BlockchainProvider;
 use reth_rpc_types::{admin::EthProtocolInfo, NetworkStatus};
@@ -47,8 +48,8 @@ pub struct WorkerNode<DB, Evm> {
 // impl<DB, Evm> WorkerNode<DB, Evm> {
 //     /// Returns an execution layer's [ComponentsBuilder] configured for a Worker node.
 //     pub fn components<Node>(
-//     ) -> ComponentsBuilder<Node, EthereumPoolBuilder, EthereumPayloadBuilder, EthereumNetworkBuilder, EthereumExecutorBuilder>
-//     where
+//     ) -> ComponentsBuilder<Node, EthereumPoolBuilder, EthereumPayloadBuilder,
+// EthereumNetworkBuilder, EthereumExecutorBuilder>     where
 //         Node: FullNodeTypes<Engine = EthEngineTypes>,
 //     {
 //         ComponentsBuilder::default()
