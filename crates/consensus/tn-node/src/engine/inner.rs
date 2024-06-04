@@ -2,6 +2,7 @@
 
 use consensus_metrics::metered_channel::{Receiver, Sender};
 use eyre::Context as _;
+use futures::{stream_select, StreamExt};
 use jsonrpsee::http_client::HttpClient;
 use reth::{
     core::init::init_genesis,
@@ -22,6 +23,7 @@ use reth_db::{
 };
 use reth_evm::execute::BlockExecutorProvider;
 use reth_exex::ExExManagerHandle;
+use reth_network::NetworkEvents;
 use reth_node_builder::{
     components::{NetworkBuilder as _, PayloadServiceBuilder as _, PoolBuilder},
     setup::build_networked_pipeline,
@@ -286,6 +288,9 @@ where
             Box::new(self.task_executor.clone()),
         ));
 
+        // capture static file events before passing ownership
+        let static_file_producer_events = static_file_producer.lock().events();
+
         let pipeline = build_networked_pipeline(
             &self.node_config.clone(),
             &reth_config.stages,
@@ -302,16 +307,19 @@ where
         )
         .await?;
 
-        // TODO: is this necessary?
-        let pipeline_events = pipeline.events();
-        task.set_pipeline_events(pipeline_events);
+        let pipeline_events_for_task = pipeline.events();
+        task.set_pipeline_events(pipeline_events_for_task);
 
+        // capture pipeline events for events handler
+        // TODO: EventStream<_> doesn't impl Clone yet
+        let pipeline_events_for_events_handler = pipeline.events();
+    
         let (beacon_consensus_engine, beacon_engine_handle) = BeaconConsensusEngine::with_channel(
             client.clone(),
             pipeline,
             self.blockchain_db.clone(),
             Box::new(self.task_executor.clone()),
-            Box::new(network),
+            Box::new(network.clone()),
             None,  // max block
             false, // self.debug.continuous,
             payload_builder,
@@ -324,7 +332,6 @@ where
 
         // spawn task to execute consensus output
         self.task_executor.spawn_critical("Execution Engine Task", Box::pin(task));
-        // handles.push(task_executor.spawn_critical("worker mining task", Box::pin(task)));
 
         debug!("awaiting beacon engine task...");
 
@@ -334,6 +341,23 @@ where
             tracing::error!("beacon consensus engine: {res:?}");
             // TODO: return oneshot channel here?
         });
+
+        let events = stream_select!(
+            network.event_listener().map(Into::into),
+            beacon_engine_handle.event_listener().map(Into::into),
+            pipeline_events_for_events_handler.map(Into::into),
+            // pruner_events.map(Into::into),
+            static_file_producer_events.map(Into::into),
+        );
+        ctx.task_executor().spawn_critical(
+            "events task",
+            reth_node_events::node::handle_events(
+                Some(network),
+                Some(head.number),
+                events,
+                self.provider_factory.db_ref().clone(),
+            ),
+        );
 
         // wait for engine to spawn
         tokio::task::yield_now().await;

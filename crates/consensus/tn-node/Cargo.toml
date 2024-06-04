@@ -55,6 +55,7 @@ reth-rpc-types = { workspace = true }
 reth-tasks = { workspace = true }
 reth-stages = { workspace = true }
 reth-exex = { workspace = true }
+reth-node-events = { workspace = true }
 reth-transaction-pool = { workspace = true }
 reth-static-file = { workspace = true }
 reth-ethereum-payload-builder = { workspace = true }

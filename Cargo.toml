@@ -94,6 +94,7 @@ reth-node-api = { git = "https://github.com/paradigmxyz/reth", commit = "39d24b4
 reth-node-builder = { git = "https://github.com/paradigmxyz/reth", commit = "39d24b495f7799eed6d4d184516deaa3e75165e8" }
 reth-node-core = { git = "https://github.com/paradigmxyz/reth", commit = "39d24b495f7799eed6d4d184516deaa3e75165e8" }
 reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", commit = "39d24b495f7799eed6d4d184516deaa3e75165e8" }
+reth-node-events = { git = "https://github.com/paradigmxyz/reth", commit = "39d24b495f7799eed6d4d184516deaa3e75165e8" }
 reth-discv4 = { git = "https://github.com/paradigmxyz/reth", commit = "39d24b495f7799eed6d4d184516deaa3e75165e8" }
 reth-ethereum-payload-builder = { git = "https://github.com/paradigmxyz/reth", commit = "39d24b495f7799eed6d4d184516deaa3e75165e8" }
 reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", commit = "39d24b495f7799eed6d4d184516deaa3e75165e8" }
