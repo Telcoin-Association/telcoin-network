@@ -283,10 +283,12 @@ impl StorageInner {
         let parent = provider.finalized_header()
             .map_err(|e| {
                 error!(target: "execution::executor", "error retrieving provider.finalized_header() {e}");
+                error!(target: "execution::executor", timestamp=?timestamp, beneficiary=?beneficiary, "consensus output info");
                 BlockExecutionError::LatestBlock(e)
             })?
             .ok_or_else(|| {
                 error!(target: "execution::executor", "error retrieving provider.finalized_header() returned `None`");
+                error!(target: "execution::executor", timestamp=?timestamp, beneficiary=?beneficiary, "consensus output info");
                 BlockExecutionError::LatestBlock(reth_provider::ProviderError::FinalizedBlockNotFound)
             })?;
 
@@ -323,28 +325,48 @@ impl StorageInner {
                 BlockExecutionError::LatestBlock(e)
             })?
         );
+        
+        let block_number = block.number;
 
         // execute the block
-        let BlockExecutionOutput { state, receipts, .. } =
+        let BlockExecutionOutput { state, receipts, gas_used } =
             executor.executor(&mut db).execute((&block, U256::ZERO).into())?;
         let bundle_state = BundleStateWithReceipts::new(
             state,
             Receipts::from_block_receipt(receipts),
-            block.number,
+            block_number,
         );
 
         let Block { mut header, body, .. } = block.block;
         let body =
             BlockBody { transactions: body, ommers: vec![], withdrawals: withdrawals.clone() };
 
-        trace!(target: "execution::executor", ?bundle_state, ?header, ?body, "executed block, calculating state root and completing header");
+        debug!(target: "execution::executor", ?bundle_state, ?header, ?body, "executed block, calculating roots to complete header");
 
+        // set header's gas used
+        header.gas_used = gas_used;
+
+        // see reth::crates::payload::ethereum::default_ethereum_payload_builder()
+        //
+        // expensive calculations - update header
+        //
         // calculate state root
         header.state_root = db.state_root(bundle_state.state()).map_err(|e| {
             error!(target: "execution::executor", "Failed to calculate state root on current state: {e}");
             BlockExecutionError::LatestBlock(e)
         })?;
-        trace!(target: "execution::executor", root=?header.state_root, ?body, "calculated state root");
+        header.receipts_root = bundle_state.receipts_root_slow(block_number)
+            .ok_or_else(|| {
+                error!(target: "execution::batch_maker", "error calculating receipts root from bundle state");
+                BlockExecutionError::Other("Failed to create receipts root from bundle state".into())
+            })?;
+        header.logs_bloom = bundle_state.block_logs_bloom(block_number)
+            .ok_or_else(|| {
+                error!(target: "execution::batch_maker", "error calculating logs bloom from bundle state");
+                BlockExecutionError::Other("Failed to calculate logs bloom from bundle state".into())
+            })?;
+
+        trace!(target: "execution::executor", header=?header, ?body, "header updated");
 
         // finally insert into storage
         self.insert_new_block(header.clone(), body);
@@ -364,6 +386,8 @@ impl StorageInner {
         // seal the block
         let block = Block { header, body: transactions, ommers: vec![], withdrawals };
         let sealed_block = block.seal_slow();
+
+        trace!(target: "execution::executor", sealed_block=?sealed_block, "sealed block");
 
         let sealed_block_with_senders = SealedBlockWithSenders::new(sealed_block, senders)
             .ok_or_else(|| {
