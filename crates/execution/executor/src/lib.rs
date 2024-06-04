@@ -325,7 +325,7 @@ impl StorageInner {
                 BlockExecutionError::LatestBlock(e)
             })?
         );
-        
+
         let block_number = block.number;
 
         // execute the block

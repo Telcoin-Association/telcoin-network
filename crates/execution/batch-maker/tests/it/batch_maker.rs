@@ -22,11 +22,12 @@ use reth_tracing::init_test_tracing;
 use reth_transaction_pool::{
     blobstore::InMemoryBlobStore, PoolConfig, TransactionPool, TransactionValidationTaskExecutor,
 };
-use tn_batch_validator::{BatchValidation, BatchValidator};
 use std::{sync::Arc, time::Duration};
 use tn_batch_maker::{BatchMakerBuilder, MiningMode};
+use tn_batch_validator::{BatchValidation, BatchValidator};
 use tn_types::{
-    test_utils::{create_batch_store, get_gas_price, test_genesis, TransactionFactory}, Batch, BatchAPI, Consensus, MetadataAPI, PreSubscribedBroadcastSender
+    test_utils::{create_batch_store, get_gas_price, test_genesis, TransactionFactory},
+    Batch, BatchAPI, Consensus, MetadataAPI, PreSubscribedBroadcastSender,
 };
 use tokio::time::timeout;
 use tracing::debug;
@@ -187,11 +188,7 @@ async fn test_make_batch_el_to_cl() {
 
     // ensure batch validator succeeds
     let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
-    let batch_validator = BatchValidator::new(
-        consensus,
-        blockchain_db.clone(),
-        block_executor,
-    );
+    let batch_validator = BatchValidator::new(consensus, blockchain_db.clone(), block_executor);
 
     let valid_batch_result = batch_validator.validate_batch(&batch).await;
     assert!(valid_batch_result.is_ok());
