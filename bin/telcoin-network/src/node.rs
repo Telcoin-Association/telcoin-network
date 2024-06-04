@@ -208,7 +208,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             database,
             node_config,
             data_dir,
-            executor: ctx.task_executor,
+            task_executor: ctx.task_executor,
             tn_config,
             opt_faucet_args: None,
         };

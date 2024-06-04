@@ -67,7 +67,7 @@ pub struct TnBuilder<DB> {
     /// Task executor to spawn tasks for the node.
     ///
     /// The executor drops tasks when the CLI's TaskManager is dropped.
-    pub executor: TaskExecutor,
+    pub task_executor: TaskExecutor,
     /// Telcoin Network config.
     ///
     /// TODO: consolidate configs

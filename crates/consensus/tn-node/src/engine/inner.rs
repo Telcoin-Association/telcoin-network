@@ -90,7 +90,7 @@ where
     ///
     /// This type is owned by the current runtime and facilitates
     /// a convenient way to spawn tasks that shutdown with the runtime.
-    executor: TaskExecutor,
+    task_executor: TaskExecutor,
     /// Root data directory.
     data_dir: ChainPath<DataDirPath>,
     /// TODO: temporary solution until upstream reth supports public rpc hooks
@@ -118,7 +118,7 @@ where
         evm: Evm,
     ) -> eyre::Result<Self> {
         // deconstruct the builder
-        let TnBuilder { database, node_config, data_dir, executor, tn_config, opt_faucet_args } =
+        let TnBuilder { database, node_config, data_dir, task_executor, tn_config, opt_faucet_args } =
             tn_builder;
 
         // Raise the fd limit of the process.
@@ -148,7 +148,7 @@ where
         debug!(target: "tn::cli", "Spawning stages metrics listener task");
         let (sync_metrics_tx, sync_metrics_rx) = unbounded_channel();
         let sync_metrics_listener = reth_stages::MetricsListener::new(sync_metrics_rx);
-        executor.spawn_critical("stages metrics listener task", sync_metrics_listener);
+        task_executor.spawn_critical("stages metrics listener task", sync_metrics_listener);
 
         // get config from file
         // let reth_config = reth_config::Config::default(); // TODO: probably want to persist this?
@@ -182,7 +182,7 @@ where
 
         // setup the blockchain provider
         let blockchain_db =
-            BlockchainProvider::new(provider_factory.clone(), blockchain_tree.clone())?;
+            BlockchainProvider::new(provider_factory.clone(), blockchain_tree)?;
         let address = *tn_config.execution_address();
 
         Ok(Self {
@@ -192,7 +192,7 @@ where
             provider_factory,
             evm,
             canon_state_notification_sender,
-            executor,
+            task_executor,
             data_dir,
             opt_faucet_args,
             workers: HashMap::default(),
@@ -216,7 +216,7 @@ where
                 prometheus_handle,
                 self.provider_factory.db_ref().clone(),
                 self.provider_factory.static_file_provider(),
-                self.executor.clone(),
+                self.task_executor.clone(),
             )
             .await?;
 
@@ -226,7 +226,7 @@ where
         let ctx = BuilderContext::<PrimaryNode<_, _>>::new(
             head,
             self.blockchain_db.clone(),
-            self.executor.clone(),
+            self.task_executor.clone(),
             self.data_dir.clone(),
             self.node_config.clone(),
             reth_config::Config::default(), // mostly peer / staging configs
@@ -283,7 +283,7 @@ where
 
         hooks.add(StaticFileHook::new(
             static_file_producer.clone(),
-            Box::new(self.executor.clone()),
+            Box::new(self.task_executor.clone()),
         ));
 
         let pipeline = build_networked_pipeline(
@@ -292,7 +292,7 @@ where
             client.clone(),
             Arc::clone(&auto_consensus),
             self.provider_factory.clone(),
-            &self.executor,
+            &self.task_executor,
             sync_metrics_tx,
             None, // prune.node_config.clone(),
             max_block,
@@ -310,8 +310,8 @@ where
             client.clone(),
             pipeline,
             self.blockchain_db.clone(),
-            Box::new(self.executor.clone()),
-            Box::new(network.clone()),
+            Box::new(self.task_executor.clone()),
+            Box::new(network),
             None,  // max block
             false, // self.debug.continuous,
             payload_builder,
@@ -323,13 +323,13 @@ where
         )?;
 
         // spawn task to execute consensus output
-        self.executor.spawn_critical("Execution Engine Task", Box::pin(task));
+        self.task_executor.spawn_critical("Execution Engine Task", Box::pin(task));
         // handles.push(task_executor.spawn_critical("worker mining task", Box::pin(task)));
 
         debug!("awaiting beacon engine task...");
 
         // spawn beacon engine
-        self.executor.spawn_critical_blocking("consensus engine", async move {
+        self.task_executor.spawn_critical_blocking("consensus engine", async move {
             let res = beacon_consensus_engine.await;
             tracing::error!("beacon consensus engine: {res:?}");
             // TODO: return oneshot channel here?
@@ -367,7 +367,7 @@ where
         let ctx = BuilderContext::<WorkerNode<DB, Evm>>::new(
             head,
             self.blockchain_db.clone(),
-            self.executor.clone(),
+            self.task_executor.clone(),
             self.data_dir.clone(),
             self.node_config.clone(),
             reth_config::Config::default(), // mostly peer / staging configs
@@ -408,7 +408,7 @@ where
         .build();
 
         // spawn batch maker mining task
-        self.executor.spawn_critical("batch maker", task);
+        self.task_executor.spawn_critical("batch maker", task);
 
         // let mut hooks = EngineHooks::new();
 
@@ -431,7 +431,7 @@ where
             .with_provider(self.blockchain_db.clone())
             .with_pool(transaction_pool.clone())
             .with_network(network)
-            .with_executor(self.executor.clone())
+            .with_executor(self.task_executor.clone())
             .with_evm_config(EthEvmConfig::default()) // TODO: this should come from self
             .with_events(self.blockchain_db.clone());
 

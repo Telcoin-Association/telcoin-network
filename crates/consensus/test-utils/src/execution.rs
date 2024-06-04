@@ -61,7 +61,7 @@ pub fn default_test_execution_node(
 pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     opt_chain: Option<Arc<ChainSpec>>,
     opt_address: Option<Address>,
-    executor: TaskExecutor,
+    task_executor: TaskExecutor,
     opt_args: Option<Vec<&str>>,
 ) -> eyre::Result<(TnBuilder<Arc<TempDatabase<DatabaseEnv>>>, CliExt)> {
     let tempdir = tempdir().expect("tempdir created").into_path();
@@ -146,7 +146,7 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     let opt_faucet_args = None;
 
     let builder =
-        TnBuilder { database, node_config, data_dir, executor, tn_config, opt_faucet_args };
+        TnBuilder { database, node_config, data_dir, task_executor, tn_config, opt_faucet_args };
 
     Ok((builder, ext))
 }
@@ -173,12 +173,12 @@ pub fn faucet_test_execution_node(
         execution_builder::<FaucetArgs>(opt_chain, opt_address, executor, extended_args)?;
 
     // replace default builder's faucet args
-    let TnBuilder { database, node_config, data_dir, executor, tn_config, .. } = builder;
+    let TnBuilder { database, node_config, data_dir, task_executor, tn_config, .. } = builder;
     let builder = TnBuilder {
         database,
         node_config,
         data_dir,
-        executor,
+        task_executor,
         tn_config,
         opt_faucet_args: Some(faucet),
     };
