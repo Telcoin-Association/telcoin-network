@@ -334,11 +334,8 @@ where
             tracing::error!("beacon consensus engine: {res:?}");
             // TODO: return oneshot channel here?
         });
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        // // handles.push(engine_task);
-
-        // // wait for engine to spawn
+        // wait for engine to spawn
         tokio::task::yield_now().await;
 
         // finalize genesis

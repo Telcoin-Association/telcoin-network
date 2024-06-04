@@ -334,7 +334,6 @@ impl StorageInner {
         let body = BlockBody { transactions: body, ommers: vec![], withdrawals };
 
         trace!(target: "execution::batch_maker", ?bundle_state, ?header, ?body, "executed block, calculating state root and completing header");
-
         
         // set header's gas used
         header.gas_used = gas_used;
