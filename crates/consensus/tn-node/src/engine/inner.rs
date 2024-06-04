@@ -120,8 +120,14 @@ where
         evm: Evm,
     ) -> eyre::Result<Self> {
         // deconstruct the builder
-        let TnBuilder { database, node_config, data_dir, task_executor, tn_config, opt_faucet_args } =
-            tn_builder;
+        let TnBuilder {
+            database,
+            node_config,
+            data_dir,
+            task_executor,
+            tn_config,
+            opt_faucet_args,
+        } = tn_builder;
 
         // Raise the fd limit of the process.
         // Does not do anything on windows.
@@ -183,8 +189,7 @@ where
         debug!(target: "tn::execution", "configured blockchain tree");
 
         // setup the blockchain provider
-        let blockchain_db =
-            BlockchainProvider::new(provider_factory.clone(), blockchain_tree)?;
+        let blockchain_db = BlockchainProvider::new(provider_factory.clone(), blockchain_tree)?;
         let address = *tn_config.execution_address();
 
         Ok(Self {
@@ -313,7 +318,7 @@ where
         // capture pipeline events for events handler
         // TODO: EventStream<_> doesn't impl Clone yet
         let pipeline_events_for_events_handler = pipeline.events();
-    
+
         let (beacon_consensus_engine, beacon_engine_handle) = BeaconConsensusEngine::with_channel(
             client.clone(),
             pipeline,
