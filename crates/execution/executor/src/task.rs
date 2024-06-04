@@ -39,7 +39,7 @@ pub struct MiningTask<Client, Engine: EngineTypes, BlockExecutor> {
     /// Used to notify consumers of new blocks
     canon_state_notification: CanonStateNotificationSender,
     /// The pipeline events to listen on
-    pipe_line_events: Option<EventStream<PipelineEvent>>,
+    pipeline_events: Option<EventStream<PipelineEvent>>,
     /// Receiving end from CL's `Executor`. The `ConsensusOutput` is sent
     /// to the mining task here.
     from_consensus: Receiver<ConsensusOutput>,
@@ -71,7 +71,7 @@ where
             to_engine,
             canon_state_notification,
             queued: Default::default(),
-            pipe_line_events: None,
+            pipeline_events: None,
             from_consensus,
             block_executor,
         }
@@ -79,7 +79,7 @@ where
 
     /// Sets the pipeline events to listen on.
     pub fn set_pipeline_events(&mut self, events: EventStream<PipelineEvent>) {
-        self.pipe_line_events = Some(events);
+        self.pipeline_events = Some(events);
     }
 }
 
@@ -115,7 +115,7 @@ where
                 let to_engine = this.to_engine.clone();
                 let client = this.client.clone();
                 let chain_spec = Arc::clone(&this.chain_spec);
-                let events = this.pipe_line_events.take();
+                let events = this.pipeline_events.take();
                 let canon_state_notification = this.canon_state_notification.clone();
                 let block_executor = this.block_executor.clone();
 
@@ -213,7 +213,8 @@ where
             if let Some(mut fut) = this.insert_task.take() {
                 match fut.poll_unpin(cx) {
                     Poll::Ready(events) => {
-                        this.pipe_line_events = events;
+                        warn!("problem in Poll::Ready??");
+                        this.pipeline_events = events;
                     }
                     Poll::Pending => {
                         this.insert_task = Some(fut);
