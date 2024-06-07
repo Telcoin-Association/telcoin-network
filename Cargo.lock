@@ -10234,6 +10234,7 @@ dependencies = [
  "reth-db",
  "reth-evm",
  "reth-network",
+ "reth-network-p2p",
  "reth-network-types",
  "reth-node-api",
  "reth-payload-builder",

@@ -1,5 +1,6 @@
 //! Error types for building and executing output from consensus.
 
+use reth_evm::execute::BlockExecutionError;
 use thiserror::Error;
 
 /// Executor error types

@@ -1,5 +1,7 @@
 //! Error types for building and executing output from consensus.
 
+use reth_blockchain_tree::error::BlockchainTreeError;
+use reth_evm::execute::{BlockExecutionError, BlockValidationError};
 use reth_primitives::{GotExpected, B256};
 use reth_provider::ProviderError;
 use thiserror::Error;
