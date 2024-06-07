@@ -100,6 +100,7 @@ impl TryFrom<&Batch> for SealedBlockWithSenders {
             body,
             ommers: vec![],
             withdrawals: Some(Withdrawals::new(vec![])),
+            requests: None,
         };
         block.try_seal_with_senders().map_err(Self::Error::RecoverSigners)
     }

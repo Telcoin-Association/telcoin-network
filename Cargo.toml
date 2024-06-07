@@ -105,7 +105,6 @@ revm-primitives = { version = "4.0.0", features = ["std"], default-features = fa
 alloy-chains = "0.1.15"
 alloy-primitives = "0.7.2"
 alloy-sol-types = "0.7.2"
-#revm-inspectors = { git = "https://github.com/paradigmxyz/evm-inspectors", rev = "dc614ee" }
 # matches Cargo.lock
 
 tn-batch-validator = { path = "crates/execution/batch-validator" }
@@ -255,3 +254,9 @@ anemo = { git = "https://github.com/mystenlabs/anemo.git", rev = "1169850e6af127
 anemo-build = { git = "https://github.com/mystenlabs/anemo.git", rev = "1169850e6af127397068cd86764c29b1d49dbe35" }
 anemo-cli = { git = "https://github.com/mystenlabs/anemo.git", rev = "1169850e6af127397068cd86764c29b1d49dbe35" }
 anemo-tower = { git = "https://github.com/mystenlabs/anemo.git", rev = "1169850e6af127397068cd86764c29b1d49dbe35" }
+
+[patch.crates-io]
+revm = { git = "https://github.com/bluealloy/revm", rev = "a28a543" }
+revm-interpreter = { git = "https://github.com/bluealloy/revm", rev = "a28a543" }
+revm-precompile = { git = "https://github.com/bluealloy/revm", rev = "a28a543" }
+revm-primitives = { git = "https://github.com/bluealloy/revm", rev = "a28a543" }
