@@ -1,9 +1,9 @@
 //! Batch validator
 
 use crate::error::BatchValidationError;
-use reth_blockchain_tree::BundleStateDataRef;
+use reth_blockchain_tree::{error::BlockchainTreeError, BundleStateDataRef};
 use reth_db::database::Database;
-use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, Executor};
+use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, BlockValidationError, Executor};
 use reth_primitives::{GotExpected, Hardfork, Receipts, SealedBlockWithSenders, U256};
 use reth_provider::{
     providers::{BlockchainProvider, BundleStateProvider},
@@ -47,7 +47,6 @@ pub trait BatchValidation: Clone + Send + Sync + 'static {
 }
 
 #[async_trait::async_trait]
-// impl<DB, EF> TransactionValidator for BatchValidator<DB, EF>
 impl<DB, Evm> BatchValidation for BatchValidator<DB, Evm>
 where
     DB: Database + Sized + Clone + 'static,
