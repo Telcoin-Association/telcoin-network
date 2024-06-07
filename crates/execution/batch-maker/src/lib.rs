@@ -17,7 +17,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 use consensus_metrics::metered_channel::Sender;
-use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, Executor};
+use reth_evm::execute::{BlockExecutionError, BlockExecutionOutput, BlockExecutorProvider, BlockValidationError, Executor};
 use reth_primitives::{
     constants::{EMPTY_TRANSACTIONS, ETHEREUM_BLOCK_GAS_LIMIT},
     proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, ChainSpec,
@@ -304,7 +304,7 @@ impl StorageInner {
         );
 
         let block =
-            Block { header, body: transactions, ommers: vec![], withdrawals: withdrawals.clone(), requests: vec![] }
+            Block { header, body: transactions, ommers: vec![], withdrawals: withdrawals.clone(), requests: None }
                 .with_recovered_senders()
                 .ok_or(BlockExecutionError::Validation(
                     BlockValidationError::SenderRecoveryError,
@@ -322,7 +322,7 @@ impl StorageInner {
         let block_number = block.number;
 
         // execute the block
-        let BlockExecutionOutput { state, receipts, gas_used, requests } =
+        let BlockExecutionOutput { state, receipts, gas_used, .. } =
             executor.executor(&mut db).execute((&block, U256::ZERO).into())?;
         let bundle_state = BundleStateWithReceipts::new(
             state,
@@ -331,7 +331,7 @@ impl StorageInner {
         );
 
         let Block { mut header, body, .. } = block.block;
-        let body = BlockBody { transactions: body, ommers: vec![], withdrawals, requests: vec![] };
+        let body = BlockBody { transactions: body, ommers: vec![], withdrawals, requests: None };
 
         trace!(target: "execution::batch_maker", ?bundle_state, ?header, ?body, "executed block, calculating state root and completing header");
 
