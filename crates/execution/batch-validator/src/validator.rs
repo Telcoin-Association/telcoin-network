@@ -313,6 +313,7 @@ mod tests {
                 excess_blob_gas: None,
                 parent_beacon_block_root: None,
                 extra_data: Bytes::default(),
+                requests_root: None,
             },
             hex!("ed9242a844ec144e25b58c085184c3c4ae8709226771659badf7e45cdd415c58").into(),
         )

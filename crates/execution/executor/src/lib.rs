@@ -243,6 +243,7 @@ impl StorageInner {
             excess_blob_gas: None,
             extra_data: Default::default(),
             parent_beacon_block_root: None,
+            requests_root: None,
         };
 
         header.transactions_root = if transactions.is_empty() {
@@ -307,6 +308,7 @@ impl StorageInner {
             body: transactions.clone(),
             ommers: vec![],
             withdrawals: withdrawals.clone(),
+            requests: vec![],
         }
         .with_recovered_senders()
         .ok_or(BlockExecutionError::Validation(BlockValidationError::SenderRecoveryError))?;
@@ -328,7 +330,7 @@ impl StorageInner {
         let block_number = block.number;
 
         // execute the block
-        let BlockExecutionOutput { state, receipts, gas_used } =
+        let BlockExecutionOutput { state, receipts, gas_used, requests } =
             executor.executor(&mut db).execute((&block, U256::ZERO).into())?;
         let bundle_state = BundleStateWithReceipts::new(
             state,
@@ -338,7 +340,7 @@ impl StorageInner {
 
         let Block { mut header, body, .. } = block.block;
         let body =
-            BlockBody { transactions: body, ommers: vec![], withdrawals: withdrawals.clone() };
+            BlockBody { transactions: body, ommers: vec![], withdrawals: withdrawals.clone(), requests: vec![] };
 
         debug!(target: "execution::executor", ?bundle_state, ?header, ?body, "executed block, calculating roots to complete header");
 
@@ -383,7 +385,7 @@ impl StorageInner {
         let senders_length = senders.len();
 
         // seal the block
-        let block = Block { header, body: transactions, ommers: vec![], withdrawals };
+        let block = Block { header, body: transactions, ommers: vec![], withdrawals, requests: vec![] };
         let sealed_block = block.seal_slow();
 
         trace!(target: "execution::executor", sealed_block=?sealed_block, "sealed block");
