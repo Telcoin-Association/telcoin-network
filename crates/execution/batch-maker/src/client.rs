@@ -1,11 +1,5 @@
 //! This includes download client implementations for auto sealing miners.
 use crate::Storage;
-use reth_interfaces::p2p::{
-    bodies::client::{BodiesClient, BodiesFut},
-    download::DownloadClient,
-    headers::client::{HeadersClient, HeadersFut, HeadersRequest},
-    priority::Priority,
-};
 use reth_primitives::{
     BlockBody, BlockHashOrNumber, Header, HeadersDirection, PeerId, WithPeerId, B256,
 };

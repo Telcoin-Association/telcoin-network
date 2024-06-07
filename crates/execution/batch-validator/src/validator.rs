@@ -4,10 +4,6 @@ use crate::error::BatchValidationError;
 use reth_blockchain_tree::BundleStateDataRef;
 use reth_db::database::Database;
 use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, Executor};
-use reth_interfaces::{
-    blockchain_tree::{error::BlockchainTreeError, BlockchainTreeViewer},
-    executor::BlockValidationError,
-};
 use reth_primitives::{GotExpected, Hardfork, Receipts, SealedBlockWithSenders, U256};
 use reth_provider::{
     providers::{BlockchainProvider, BundleStateProvider},

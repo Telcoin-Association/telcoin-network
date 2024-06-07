@@ -4,7 +4,6 @@ use eyre::ErrReport;
 use narwhal_executor::SubscriberError;
 use reth::core::init::InitDatabaseError;
 use reth_beacon_consensus::BeaconForkChoiceUpdateError;
-use reth_interfaces::RethError;
 use reth_provider::ProviderError;
 use thiserror::Error;
 use tn_types::WorkerId;
