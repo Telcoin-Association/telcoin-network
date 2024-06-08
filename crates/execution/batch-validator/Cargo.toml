@@ -33,6 +33,7 @@ reth-node-core = { workspace = true }
 reth = { workspace = true }
 reth-beacon-consensus = { workspace = true }
 reth-primitives = { workspace = true, features = ["test-utils"]}
+reth-db-common = { workspace = true }
 
 # integration tests
 

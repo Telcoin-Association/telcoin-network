@@ -87,8 +87,7 @@ async fn test_make_batch_el_to_cl() {
     let db = create_test_rw_db();
 
     // provider
-    let factory = ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), tempdir_path())
-        .expect("provider factory");
+    let factory = ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), StaticFileProvider::read_write(tempdir_path()).expect("static file provider read write created with tempdir path"));
 
     let genesis_hash = init_genesis(factory.clone()).expect("init genesis");
     let blockchain_db = BlockchainProvider::new(factory, Arc::new(NoopBlockchainTree::default()))

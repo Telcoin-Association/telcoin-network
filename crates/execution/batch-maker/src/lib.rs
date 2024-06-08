@@ -412,8 +412,7 @@ mod tests {
         let db = create_test_rw_db();
         // provider
         let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), tempdir_path())
-                .expect("provider factory");
+            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), StaticFileProvider::read_write(tempdir_path()).expect("static file provider read write created with tempdir path"));
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
 
         debug!("genesis hash: {genesis_hash:?}");

@@ -67,6 +67,7 @@ reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-b
 reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.9" }
 reth-config = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.9" }
 reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.9" }
+reth-db-common = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.9" }
 reth-downloaders = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.9" }
 reth-network = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.9" }
 reth-network-api = { git = "https://github.com/paradigmxyz/reth", tag = "v0.2.0-beta.9" }

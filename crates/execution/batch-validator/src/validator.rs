@@ -151,7 +151,8 @@ where
         // read from canonical tree - updated by `Executor` and engine
         //
         // same return as BlockchainTree::canonical_chain()
-        let canonical_block_hashes = self.blockchain_db.canonical_blocks();
+        // let canonical_block_hashes = self.blockchain_db.canonical_blocks();
+        let aasd = self.blockchain_db.canonical_
 
         // from AppendableChain::new_canonical_fork() but with state root validation added
         let state = BundleStateWithReceipts::default();
@@ -259,12 +260,12 @@ mod tests {
         BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
     };
     use reth_db::test_utils::{create_test_rw_db, tempdir_path};
-    use reth_node_core::init::init_genesis;
+    use reth_db_common::init::init_genesis;
     use reth_primitives::{
         constants::EMPTY_WITHDRAWALS, hex, proofs::calculate_transaction_root, Address, Bloom,
         Bytes, ChainSpec, GenesisAccount, Header, SealedHeader, B256, EMPTY_OMMER_ROOT_HASH,
     };
-    use reth_provider::ProviderFactory;
+    use reth_provider::{providers::StaticFileProvider, ProviderFactory};
     use reth_tracing::init_test_tracing;
     use std::str::FromStr;
     use tn_types::{
@@ -341,8 +342,7 @@ mod tests {
         // init genesis
         let db = create_test_rw_db();
         let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), tempdir_path())
-                .expect("provider factory");
+            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), StaticFileProvider::read_write(tempdir_path()).expect("static file provider read write created with tempdir path"));
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
         debug!("genesis hash: {genesis_hash:?}");
 
@@ -454,8 +454,7 @@ mod tests {
         // init genesis
         let db = create_test_rw_db();
         let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), tempdir_path())
-                .expect("provider factory");
+            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), StaticFileProvider::read_write(tempdir_path()).expect("static file provider read write created with tempdir path"));
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
         debug!("genesis hash: {genesis_hash:?}");
 
@@ -563,8 +562,7 @@ mod tests {
         // init genesis
         let db = create_test_rw_db();
         let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), tempdir_path())
-                .expect("provider factory");
+            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), StaticFileProvider::read_write(tempdir_path()).expect("static file provider read write created with tempdir path"));
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
         debug!("genesis hash: {genesis_hash:?}");
 
@@ -673,8 +671,7 @@ mod tests {
         // init genesis
         let db = create_test_rw_db();
         let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), tempdir_path())
-                .expect("provider factory");
+            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), StaticFileProvider::read_write(tempdir_path()).expect("static file provider read write created with tempdir path"));
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
         debug!("genesis hash: {genesis_hash:?}");
 
@@ -825,8 +822,7 @@ mod tests {
         // init genesis
         let db = create_test_rw_db();
         let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), tempdir_path())
-                .expect("provider factory");
+            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), StaticFileProvider::read_write(tempdir_path()).expect("static file provider read write created with tempdir path"));
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
         debug!("genesis hash: {genesis_hash:?}");
 
