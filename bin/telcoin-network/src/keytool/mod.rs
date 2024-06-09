@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 use tn_config::{traits::ConfigTrait, Config};
-use tn_node::dirs::{DataDirPath, TelcoinDirs as _};
+use tn_node::dirs::{default_datadir_args, DataDirPath, TelcoinDirs as _};
 use tracing::{debug, info, warn};
 
 /// Generate keypairs and save them to a file.
@@ -173,7 +173,7 @@ impl KeyArgs {
 
     /// Returns the chain specific path to the data dir.
     fn data_dir(&self) -> ChainPath<DataDirPath> {
-        self.datadir.unwrap_or_chain_default(self.chain.chain)
+        self.datadir.unwrap_or_chain_default(self.chain.chain, default_datadir_args())
     }
 
     /// Returns the path to the config file.

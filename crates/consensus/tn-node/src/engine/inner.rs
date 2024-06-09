@@ -94,7 +94,7 @@ where
     /// a convenient way to spawn tasks that shutdown with the runtime.
     task_executor: TaskExecutor,
     /// Root data directory.
-    data_dir: ChainPath<DataDirPath>,
+    datadir: ChainPath<DataDirPath>,
     /// TODO: temporary solution until upstream reth supports public rpc hooks
     opt_faucet_args: Option<FaucetArgs>,
     /// Collection of execution components by worker.
@@ -123,11 +123,13 @@ where
         let TnBuilder {
             database,
             node_config,
-            data_dir,
             task_executor,
             tn_config,
             opt_faucet_args,
         } = tn_builder;
+
+        // resolve the node's datadir
+        let datadir = node_config.datadir();
 
         // Raise the fd limit of the process.
         // Does not do anything on windows.
@@ -136,7 +138,7 @@ where
         let provider_factory = ProviderFactory::new(
             database.clone(),
             Arc::clone(&node_config.chain),
-            StaticFileProvider::read_write(data_dir.static_files())?,
+            StaticFileProvider::read_write(datadir.static_files())?,
         )
         .with_static_files_metrics();
 
@@ -197,7 +199,7 @@ where
             evm,
             canon_state_notification_sender,
             task_executor,
-            data_dir,
+            datadir,
             opt_faucet_args,
             workers: HashMap::default(),
         })

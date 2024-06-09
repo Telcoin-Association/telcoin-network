@@ -14,7 +14,7 @@ use clap::{Args, Subcommand};
 use reth::dirs::MaybePlatformPath;
 use reth_primitives::ChainSpec;
 use std::{path::PathBuf, sync::Arc};
-use tn_node::dirs::{DataDirPath, TelcoinDirs as _};
+use tn_node::dirs::{default_datadir_args, DataDirPath, TelcoinDirs as _};
 use tn_types::NetworkGenesis;
 
 /// Generate keypairs and save them to a file.
@@ -91,7 +91,7 @@ impl GenesisArgs {
         match &self.command {
             CeremonySubcommand::Initialize => {
                 // TODO: support custom genesis path
-                let datadir = self.datadir.unwrap_or_chain_default(self.chain.chain);
+                let datadir = self.datadir.unwrap_or_chain_default(self.chain.chain, default_datadir_args());
                 let network_genesis = NetworkGenesis::new();
                 network_genesis.write_to_path(datadir.genesis_path())?;
             }

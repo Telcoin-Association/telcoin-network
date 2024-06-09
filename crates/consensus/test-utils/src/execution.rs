@@ -146,7 +146,7 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     let opt_faucet_args = None;
 
     let builder =
-        TnBuilder { database, node_config, data_dir, task_executor, tn_config, opt_faucet_args };
+        TnBuilder { database, node_config, task_executor, tn_config, opt_faucet_args };
 
     Ok((builder, ext))
 }

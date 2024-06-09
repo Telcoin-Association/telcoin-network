@@ -1,11 +1,24 @@
 //! Telcoin Network data directories.
-use reth::dirs::{ChainPath, XdgPath};
+use reth::{args::DatadirArgs, dirs::{ChainPath, MaybePlatformPath, XdgPath}};
 use reth_primitives::Chain;
-use std::{fmt::Debug, path::PathBuf};
+use std::{fmt::Debug, path::PathBuf, str::FromStr as _};
 use tn_types::GENESIS_VALIDATORS_DIR;
 
 /// The path to join for the directory that stores validator keys.
 pub const VALIDATOR_KEYS_DIR: &str = "validator-keys";
+/// The constant for default root directory.
+/// This is a workaround for using TN default dir instead of "reth".
+pub const DEFAULT_ROOT_DIR: &str = "telcoin-network";
+
+/// Workaround for getting default DatadirArgs for reth node config.
+pub fn default_datadir_args() -> DatadirArgs {
+    // TODO: this is inefficient, but the only way to use "telcoin-network" as datadir instead of "reth"
+    DatadirArgs {
+        datadir: MaybePlatformPath::from_str(DEFAULT_ROOT_DIR).expect("default datadir args always work"),
+        // default static path should resolve to: `DEFAULT_ROOT_DIR/<CHAIN_ID>/static_files`
+        static_files_path: None,
+    }
+}
 
 /// Constructs a string to be used as a path for configuration and db paths.
 pub fn config_path_prefix(chain: Chain) -> String {
@@ -16,7 +29,7 @@ pub fn config_path_prefix(chain: Chain) -> String {
 ///
 /// Refer to [dirs_next::data_dir] for cross-platform behavior.
 pub fn data_dir() -> Option<PathBuf> {
-    dirs_next::data_dir().map(|root| root.join("telcoin-network"))
+    dirs_next::data_dir().map(|root| root.join(DEFAULT_ROOT_DIR))
 }
 
 /// Returns the path to the telcoin network database.

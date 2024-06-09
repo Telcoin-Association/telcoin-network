@@ -20,7 +20,7 @@ use reth_primitives::ChainSpec;
 use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 use tn_config::{traits::ConfigTrait, Config};
 use tn_node::{
-    dirs::{DataDirPath, TelcoinDirs as _},
+    dirs::{default_datadir_args, DataDirPath, TelcoinDirs as _},
     engine::TnBuilder,
 };
 use tracing::*;
@@ -139,13 +139,9 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // Does not do anything on windows.
         raise_fd_limit()?;
 
-        // add network name to data dir
-        // TODO: this is inefficient, but the only way to use "telcoin-network" as datadir instead of "reth"
-        let default_args = DatadirArgs {
-            datadir: MaybePlatformPath::from_str("telcoin-network")?,
-            static_files_path: None,
-        };
-        let tn_data_dir = self.datadir.unwrap_or_chain_default(self.chain.chain, default_args);
+        // use TN-specific datadir for finding tn-config
+        let default_args = default_datadir_args();
+        let tn_data_dir = self.datadir.unwrap_or_chain_default(self.chain.chain, default_args.clone());
 
         // TODO: use config or CLI chain spec?
         let config_path = self.config.clone().unwrap_or(tn_data_dir.node_config_path());
@@ -154,12 +150,12 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // get the worker's transaction address from the config
         let Self {
+            // datadir
             // config,
             chain,
             metrics,
             instance,
             with_unused_ports,
-            datadir,
             network,
             rpc,
             txpool,
@@ -204,17 +200,15 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         let database =
             Arc::new(init_db(db_path.clone(), node_config.db.database_args())?.with_metrics());
 
-        // create a reth datadir from tn datadir
-        let chain_for_datadir = node_config.chain.chain();
-        let datadir_path = tn_data_dir.to_string();
-        let reth_datadir = MaybePlatformPath::from_str(&datadir_path)?;
-        let data_dir = reth_datadir.unwrap_or_chain_default(chain_for_datadir);
+        // // create a reth datadir from tn datadir
+        // let chain_for_datadir = node_config.chain.chain();
+        // let datadir_path = tn_data_dir.to_string();
+        // let reth_datadir = MaybePlatformPath::from_str(&datadir_path)?;
 
         // TODO: temporary solution until upstream reth supports public rpc hooks
         let builder = TnBuilder {
             database,
             node_config,
-            data_dir,
             task_executor: ctx.task_executor,
             tn_config,
             opt_faucet_args: None,

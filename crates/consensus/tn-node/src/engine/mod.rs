@@ -62,8 +62,6 @@ pub struct TnBuilder<DB> {
     pub database: DB,
     /// THe node configuration.
     pub node_config: NodeConfig,
-    /// The directory for storing node data.
-    pub data_dir: ChainPath<DataDirPath>,
     /// Task executor to spawn tasks for the node.
     ///
     /// The executor drops tasks when the CLI's TaskManager is dropped.

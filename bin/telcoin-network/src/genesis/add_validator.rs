@@ -7,7 +7,7 @@ use reth::dirs::MaybePlatformPath;
 use reth_primitives::ChainSpec;
 use std::{path::PathBuf, sync::Arc};
 use tn_config::{traits::ConfigTrait, Config};
-use tn_node::dirs::{DataDirPath, TelcoinDirs as _};
+use tn_node::dirs::{default_datadir_args, DataDirPath, TelcoinDirs as _};
 use tn_types::NetworkGenesis;
 
 use crate::args::clap_genesis_parser;
@@ -69,7 +69,7 @@ impl AddValidator {
         info!(target: "genesis::add-validator", "Adding validator to committee");
 
         // add network name to data dir
-        let data_dir = self.datadir.unwrap_or_chain_default(self.chain.chain);
+        let data_dir = self.datadir.unwrap_or_chain_default(self.chain.chain, default_datadir_args());
         let config_path = self.config.clone().unwrap_or(data_dir.node_config_path());
 
         let config = self.load_config(config_path.clone())?;
