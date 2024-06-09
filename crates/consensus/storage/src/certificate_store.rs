@@ -1070,7 +1070,7 @@ mod test {
 
     // async fn test_delete<T: Cache>(store: CertificateStore<T>) {
     /// Test new store with cache.
-    /// 
+    ///
     /// workaround for error:
     /// ```text
     /// thread 'certificate_store::test::test_delete_by_store_type' panicked at crates/consensus/typed-store/src/metrics.rs:268:14:
@@ -1098,7 +1098,7 @@ mod test {
     }
 
     /// Test new store without cache.
-    /// 
+    ///
     /// workaround for error:
     /// ```text
     /// thread 'certificate_store::test::test_delete_by_store_type' panicked at crates/consensus/typed-store/src/metrics.rs:268:14:

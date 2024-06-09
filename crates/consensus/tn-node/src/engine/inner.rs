@@ -32,8 +32,8 @@ use reth_node_ethereum::{
 };
 use reth_primitives::{Address, Head, PruneModes};
 use reth_provider::{
-    providers::{BlockchainProvider, StaticFileProvider}, CanonStateNotificationSender, ProviderFactory,
-    StaticFileProviderFactory as _,
+    providers::{BlockchainProvider, StaticFileProvider},
+    CanonStateNotificationSender, ProviderFactory, StaticFileProviderFactory as _,
 };
 use reth_rpc_types::engine::ForkchoiceState;
 use reth_static_file::StaticFileProducer;
@@ -49,11 +49,11 @@ use tokio::sync::mpsc::unbounded_channel;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info};
 
+use super::{PrimaryNode, TnBuilder};
 use crate::{
     engine::{WorkerNetwork, WorkerNode},
     error::ExecutionError,
 };
-use super::{PrimaryNode, TnBuilder};
 
 /// Inner type for holding execution layer types.
 pub(super) struct ExecutionNodeInner<DB, Evm>
@@ -99,18 +99,10 @@ where
     Evm: BlockExecutorProvider + 'static,
 {
     /// Create a new instance of `Self`.
-    pub(super) fn new(
-        tn_builder: TnBuilder<DB>,
-        evm: Evm,
-    ) -> eyre::Result<Self> {
+    pub(super) fn new(tn_builder: TnBuilder<DB>, evm: Evm) -> eyre::Result<Self> {
         // deconstruct the builder
-        let TnBuilder {
-            database,
-            node_config,
-            task_executor,
-            tn_config,
-            opt_faucet_args,
-        } = tn_builder;
+        let TnBuilder { database, node_config, task_executor, tn_config, opt_faucet_args } =
+            tn_builder;
 
         // resolve the node's datadir
         let datadir = node_config.datadir();
@@ -247,10 +239,8 @@ where
             Arc::new(AutoSealConsensus::new(self.node_config.chain.clone()));
         let mut hooks = EngineHooks::new();
 
-        let static_file_producer = StaticFileProducer::new(
-            self.provider_factory.clone(),
-            PruneModes::default(),
-        );
+        let static_file_producer =
+            StaticFileProducer::new(self.provider_factory.clone(), PruneModes::default());
 
         // let static_file_producer_events = static_file_producer.lock().events();
 

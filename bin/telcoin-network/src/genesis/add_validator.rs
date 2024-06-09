@@ -69,7 +69,8 @@ impl AddValidator {
         info!(target: "genesis::add-validator", "Adding validator to committee");
 
         // add network name to data dir
-        let data_dir = self.datadir.unwrap_or_chain_default(self.chain.chain, default_datadir_args());
+        let data_dir =
+            self.datadir.unwrap_or_chain_default(self.chain.chain, default_datadir_args());
         let config_path = self.config.clone().unwrap_or(data_dir.node_config_path());
 
         let config = self.load_config(config_path.clone())?;

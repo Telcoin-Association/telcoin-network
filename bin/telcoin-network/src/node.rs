@@ -8,7 +8,8 @@ use fdlimit::raise_fd_limit;
 use futures::Future;
 use reth::{
     args::{
-        utils::parse_socket_address, DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, TxPoolArgs
+        utils::parse_socket_address, DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, NetworkArgs,
+        PayloadBuilderArgs, PruningArgs, RpcServerArgs, TxPoolArgs,
     },
     builder::NodeConfig,
     commands::node::NoArgs,
@@ -141,7 +142,8 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // use TN-specific datadir for finding tn-config
         let default_args = default_datadir_args();
-        let tn_datadir = self.datadir.unwrap_or_chain_default(self.chain.chain, default_args.clone());
+        let tn_datadir =
+            self.datadir.unwrap_or_chain_default(self.chain.chain, default_args.clone());
 
         // TODO: use config or CLI chain spec?
         let config_path = self.config.clone().unwrap_or(tn_datadir.node_config_path());

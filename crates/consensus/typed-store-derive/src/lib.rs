@@ -200,7 +200,7 @@ fn extract_generics_names(generics: &Generics) -> Vec<Ident> {
 /// Some(config.build())); Ok(())
 /// }
 /// ```
-/// 
+///
 /// 2. Auto-generated "open" routine
 /// The function "open_tables_read_write" is generated which allows for specifying DB wide options
 /// and custom table configs as mentioned above
@@ -240,7 +240,7 @@ fn extract_generics_names(generics: &Generics) -> Vec<Ident> {
 ///     #[default_options_override_fn = "custom_fn_name1"]
 ///     table4: DBMap<i32, String>,
 /// }
-/// 
+///
 /// #[tokio::main]
 /// async fn main() -> Result<(), Error> {
 ///     use narwhal_typed_store::rocks::MetricConf;
@@ -262,7 +262,7 @@ fn extract_generics_names(generics: &Generics) -> Vec<Ident> {
 ///     Ok(())
 /// }
 /// ```
-/// 
+///
 /// 4. Auto-generated memory stats method
 /// "self.get_memory_usage" is derived to provide memory and cache usage
 ///

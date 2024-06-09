@@ -229,6 +229,7 @@ mod tests {
 
         tn.run(|_, _, _| async move { Ok(()) }).expect("generate keys command");
 
-        Config::load_from_path::<Config>(tempdir.join("telcoin-network.yaml").as_path()).expect("config loaded yaml okay");
+        Config::load_from_path::<Config>(tempdir.join("telcoin-network.yaml").as_path())
+            .expect("config loaded yaml okay");
     }
 }

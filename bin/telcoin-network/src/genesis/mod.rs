@@ -91,7 +91,8 @@ impl GenesisArgs {
         match &self.command {
             CeremonySubcommand::Initialize => {
                 // TODO: support custom genesis path
-                let datadir = self.datadir.unwrap_or_chain_default(self.chain.chain, default_datadir_args());
+                let datadir =
+                    self.datadir.unwrap_or_chain_default(self.chain.chain, default_datadir_args());
                 let network_genesis = NetworkGenesis::new();
                 network_genesis.write_to_path(datadir.genesis_path())?;
             }

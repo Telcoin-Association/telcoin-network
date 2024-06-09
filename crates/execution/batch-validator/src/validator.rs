@@ -4,10 +4,13 @@ use crate::error::BatchValidationError;
 use reth_blockchain_tree::error::BlockchainTreeError;
 use reth_consensus::PostExecutionInput;
 use reth_db::database::Database;
-use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, BlockValidationError, Executor};
+use reth_evm::execute::{
+    BlockExecutionOutput, BlockExecutorProvider, BlockValidationError, Executor,
+};
 use reth_primitives::{GotExpected, Hardfork, Receipts, SealedBlockWithSenders, U256};
 use reth_provider::{
-    providers::BlockchainProvider, BundleStateWithReceipts, ChainSpecProvider, DatabaseProviderFactory, HeaderProvider, StateRootProvider
+    providers::BlockchainProvider, BundleStateWithReceipts, ChainSpecProvider,
+    DatabaseProviderFactory, HeaderProvider, StateRootProvider,
 };
 use reth_revm::database::StateProviderDatabase;
 use std::{
@@ -154,7 +157,6 @@ where
         self.consensus.validate_header_against_parent(&sealed_block, &parent_header)?;
         let block_with_senders = sealed_block.unseal();
 
-
         // NOTE: this diverges from reth-beta approach
         // but is still valid within the context of our consensus
         // because of async network conditions, workers can suggest batches
@@ -175,14 +177,19 @@ where
         //
         // create state provider based on batch's parent
         let db = StateProviderDatabase::new(
-            self.blockchain_db.database_provider_ro()?.state_provider_by_block_number(parent.number)?
+            self.blockchain_db
+                .database_provider_ro()?
+                .state_provider_by_block_number(parent.number)?,
         );
 
         // executor for single block
         let executor = self.executor_factory.executor(db);
         let state = executor.execute((&block_with_senders, U256::MAX).into())?;
         let BlockExecutionOutput { state, receipts, requests, .. } = state;
-        self.consensus.validate_block_post_execution(&block_with_senders, PostExecutionInput::new(&receipts, &requests))?;
+        self.consensus.validate_block_post_execution(
+            &block_with_senders,
+            PostExecutionInput::new(&receipts, &requests),
+        )?;
 
         // create bundle state
         let bundle_state = BundleStateWithReceipts::new(
@@ -197,7 +204,9 @@ where
         //
         // check state root
         let db = StateProviderDatabase::new(
-            self.blockchain_db.database_provider_ro()?.state_provider_by_block_number(parent.number)?
+            self.blockchain_db
+                .database_provider_ro()?
+                .state_provider_by_block_number(parent.number)?,
         );
         let state_root = db.state_root(bundle_state.state())?;
         if block_with_senders.state_root != state_root {
@@ -330,8 +339,12 @@ mod tests {
 
         // init genesis
         let db = create_test_rw_db();
-        let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), StaticFileProvider::read_write(tempdir_path()).expect("static file provider read write created with tempdir path"));
+        let provider_factory = ProviderFactory::new(
+            Arc::clone(&db),
+            Arc::clone(&chain),
+            StaticFileProvider::read_write(tempdir_path())
+                .expect("static file provider read write created with tempdir path"),
+        );
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
         debug!("genesis hash: {genesis_hash:?}");
 
@@ -442,8 +455,12 @@ mod tests {
 
         // init genesis
         let db = create_test_rw_db();
-        let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), StaticFileProvider::read_write(tempdir_path()).expect("static file provider read write created with tempdir path"));
+        let provider_factory = ProviderFactory::new(
+            Arc::clone(&db),
+            Arc::clone(&chain),
+            StaticFileProvider::read_write(tempdir_path())
+                .expect("static file provider read write created with tempdir path"),
+        );
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
         debug!("genesis hash: {genesis_hash:?}");
 
@@ -550,8 +567,12 @@ mod tests {
 
         // init genesis
         let db = create_test_rw_db();
-        let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), StaticFileProvider::read_write(tempdir_path()).expect("static file provider read write created with tempdir path"));
+        let provider_factory = ProviderFactory::new(
+            Arc::clone(&db),
+            Arc::clone(&chain),
+            StaticFileProvider::read_write(tempdir_path())
+                .expect("static file provider read write created with tempdir path"),
+        );
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
         debug!("genesis hash: {genesis_hash:?}");
 
@@ -659,8 +680,12 @@ mod tests {
 
         // init genesis
         let db = create_test_rw_db();
-        let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), StaticFileProvider::read_write(tempdir_path()).expect("static file provider read write created with tempdir path"));
+        let provider_factory = ProviderFactory::new(
+            Arc::clone(&db),
+            Arc::clone(&chain),
+            StaticFileProvider::read_write(tempdir_path())
+                .expect("static file provider read write created with tempdir path"),
+        );
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
         debug!("genesis hash: {genesis_hash:?}");
 
@@ -810,8 +835,12 @@ mod tests {
 
         // init genesis
         let db = create_test_rw_db();
-        let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), StaticFileProvider::read_write(tempdir_path()).expect("static file provider read write created with tempdir path"));
+        let provider_factory = ProviderFactory::new(
+            Arc::clone(&db),
+            Arc::clone(&chain),
+            StaticFileProvider::read_write(tempdir_path())
+                .expect("static file provider read write created with tempdir path"),
+        );
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
         debug!("genesis hash: {genesis_hash:?}");
 

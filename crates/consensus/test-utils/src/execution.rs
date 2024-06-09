@@ -3,7 +3,11 @@
 use clap::{Args, Parser};
 use core::fmt;
 use reth::{
-    args::DatadirArgs, builder::NodeConfig, commands::node::NoArgs, primitives::{Address, ChainSpec}, tasks::TaskExecutor
+    args::DatadirArgs,
+    builder::NodeConfig,
+    commands::node::NoArgs,
+    primitives::{Address, ChainSpec},
+    tasks::TaskExecutor,
 };
 use reth_db::{
     test_utils::{create_test_rw_db, TempDatabase},
@@ -60,12 +64,7 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     task_executor: TaskExecutor,
     opt_args: Option<Vec<&str>>,
 ) -> eyre::Result<(TnBuilder<Arc<TempDatabase<DatabaseEnv>>>, CliExt)> {
-    let default_args = [
-        "telcoin-network",
-        "--dev",
-        "--chain",
-        "adiri",
-    ];
+    let default_args = ["telcoin-network", "--dev", "--chain", "adiri"];
 
     // extend faucet args if provided
     let cli_args = if let Some(args) = opt_args {
@@ -98,10 +97,7 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     let chain = opt_chain.unwrap_or(chain);
 
     let datadir = tempdir()?.into_path().into();
-    let datadir = DatadirArgs {
-        datadir,
-        static_files_path: None,
-    };
+    let datadir = DatadirArgs { datadir, static_files_path: None };
 
     // set up reth node config for engine components
     let node_config = NodeConfig {
@@ -137,8 +133,7 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     // TODO: this a temporary approach until upstream reth supports public rpc hooks
     let opt_faucet_args = None;
 
-    let builder =
-        TnBuilder { database, node_config, task_executor, tn_config, opt_faucet_args };
+    let builder = TnBuilder { database, node_config, task_executor, tn_config, opt_faucet_args };
 
     Ok((builder, ext))
 }

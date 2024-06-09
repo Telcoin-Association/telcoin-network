@@ -17,7 +17,10 @@
 
 use consensus_metrics::metered_channel::Receiver;
 use reth_beacon_consensus::BeaconEngineMessage;
-use reth_evm::execute::{BlockExecutionError, BlockExecutionOutput, BlockExecutorProvider, BlockValidationError, Executor as _};
+use reth_evm::execute::{
+    BlockExecutionError, BlockExecutionOutput, BlockExecutorProvider, BlockValidationError,
+    Executor as _,
+};
 use reth_node_api::EngineTypes;
 use reth_primitives::{
     constants::{EMPTY_TRANSACTIONS, ETHEREUM_BLOCK_GAS_LIMIT},
@@ -339,8 +342,12 @@ impl StorageInner {
         );
 
         let Block { mut header, body, .. } = block.block;
-        let body =
-            BlockBody { transactions: body, ommers: vec![], withdrawals: withdrawals.clone(), requests: None };
+        let body = BlockBody {
+            transactions: body,
+            ommers: vec![],
+            withdrawals: withdrawals.clone(),
+            requests: None,
+        };
 
         debug!(target: "execution::executor", ?bundle_state, ?header, ?body, "executed block, calculating roots to complete header");
 
@@ -385,7 +392,8 @@ impl StorageInner {
         let senders_length = senders.len();
 
         // seal the block
-        let block = Block { header, body: transactions, ommers: vec![], withdrawals, requests: None };
+        let block =
+            Block { header, body: transactions, ommers: vec![], withdrawals, requests: None };
         let sealed_block = block.seal_slow();
 
         trace!(target: "execution::executor", sealed_block=?sealed_block, "sealed block");

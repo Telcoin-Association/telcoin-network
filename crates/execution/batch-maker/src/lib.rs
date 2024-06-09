@@ -17,7 +17,10 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 use consensus_metrics::metered_channel::Sender;
-use reth_evm::execute::{BlockExecutionError, BlockExecutionOutput, BlockExecutorProvider, BlockValidationError, Executor};
+use reth_evm::execute::{
+    BlockExecutionError, BlockExecutionOutput, BlockExecutorProvider, BlockValidationError,
+    Executor,
+};
 use reth_primitives::{
     constants::{EMPTY_TRANSACTIONS, ETHEREUM_BLOCK_GAS_LIMIT},
     proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, ChainSpec,
@@ -303,12 +306,15 @@ impl StorageInner {
             withdrawals.as_ref(),
         );
 
-        let block =
-            Block { header, body: transactions, ommers: vec![], withdrawals: withdrawals.clone(), requests: None }
-                .with_recovered_senders()
-                .ok_or(BlockExecutionError::Validation(
-                    BlockValidationError::SenderRecoveryError,
-                ))?;
+        let block = Block {
+            header,
+            body: transactions,
+            ommers: vec![],
+            withdrawals: withdrawals.clone(),
+            requests: None,
+        }
+        .with_recovered_senders()
+        .ok_or(BlockExecutionError::Validation(BlockValidationError::SenderRecoveryError))?;
 
         trace!(target: "execution::batch_maker", transactions=?&block.body, "executing transactions");
 
@@ -374,7 +380,10 @@ mod tests {
     use reth_db_common::init::init_genesis;
     use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
     use reth_primitives::{alloy_primitives::U160, GenesisAccount};
-    use reth_provider::{providers::{BlockchainProvider, StaticFileProvider}, ProviderFactory};
+    use reth_provider::{
+        providers::{BlockchainProvider, StaticFileProvider},
+        ProviderFactory,
+    };
     use reth_tracing::init_test_tracing;
     use reth_transaction_pool::{
         blobstore::InMemoryBlobStore, PoolConfig, TransactionValidationTaskExecutor,
@@ -411,8 +420,12 @@ mod tests {
         // init genesis
         let db = create_test_rw_db();
         // provider
-        let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), StaticFileProvider::read_write(tempdir_path()).expect("static file provider read write created with tempdir path"));
+        let provider_factory = ProviderFactory::new(
+            Arc::clone(&db),
+            Arc::clone(&chain),
+            StaticFileProvider::read_write(tempdir_path())
+                .expect("static file provider read write created with tempdir path"),
+        );
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
 
         debug!("genesis hash: {genesis_hash:?}");

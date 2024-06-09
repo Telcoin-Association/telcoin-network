@@ -1,5 +1,8 @@
 //! Telcoin Network data directories.
-use reth::{args::DatadirArgs, dirs::{ChainPath, MaybePlatformPath, XdgPath}};
+use reth::{
+    args::DatadirArgs,
+    dirs::{ChainPath, MaybePlatformPath, XdgPath},
+};
 use reth_primitives::Chain;
 use std::{fmt::Debug, path::PathBuf, str::FromStr as _};
 use tn_types::GENESIS_VALIDATORS_DIR;
@@ -12,9 +15,11 @@ pub const DEFAULT_ROOT_DIR: &str = "telcoin-network";
 
 /// Workaround for getting default DatadirArgs for reth node config.
 pub fn default_datadir_args() -> DatadirArgs {
-    // TODO: this is inefficient, but the only way to use "telcoin-network" as datadir instead of "reth"
+    // TODO: this is inefficient, but the only way to use "telcoin-network" as datadir instead of
+    // "reth"
     DatadirArgs {
-        datadir: MaybePlatformPath::from_str(DEFAULT_ROOT_DIR).expect("default datadir args always work"),
+        datadir: MaybePlatformPath::from_str(DEFAULT_ROOT_DIR)
+            .expect("default datadir args always work"),
         // default static path should resolve to: `DEFAULT_ROOT_DIR/<CHAIN_ID>/static_files`
         static_files_path: None,
     }
@@ -163,13 +168,21 @@ mod tests {
     fn test_maybe_data_dir_path() {
         let path = MaybePlatformPath::<DataDirPath>::default();
         let path = path.unwrap_or_chain_default(Chain::from_id(2017), default_datadir_args());
-        assert!(path.as_ref().ends_with("telcoin-network/2017"), "actual default path is: {:?}", path);
+        assert!(
+            path.as_ref().ends_with("telcoin-network/2017"),
+            "actual default path is: {:?}",
+            path
+        );
 
         let db_path = path.db();
         assert!(db_path.ends_with("telcoin-network/2017/db"), "actual db path is: {:?}", db_path);
 
         let static_files_path = path.static_files();
-        assert!(static_files_path.ends_with("telcoin-network/2017/static_files"), "actual static_files path is: {:?}", static_files_path);
+        assert!(
+            static_files_path.ends_with("telcoin-network/2017/static_files"),
+            "actual static_files path is: {:?}",
+            static_files_path
+        );
 
         let path = MaybePlatformPath::<DataDirPath>::from_str("my/path/to/datadir").unwrap();
         let path = path.unwrap_or_chain_default(Chain::from_id(2017), default_datadir_args());
