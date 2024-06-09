@@ -66,8 +66,8 @@ impl ValidateArgs {
         info!(target: "genesis::validate", "validating validators nominated for committee");
 
         // load network genesis
-        let data_dir = self.datadir.unwrap_or_chain_default(self.chain.chain, default_datadir_args());
-        let genesis_path = data_dir.genesis_path();
+        let datadir = self.datadir.unwrap_or_chain_default(self.chain.chain, default_datadir_args());
+        let genesis_path = datadir.genesis_path();
         let network_genesis = NetworkGenesis::load_from_path(genesis_path)?;
         network_genesis.validate()
     }
