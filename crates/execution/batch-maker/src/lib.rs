@@ -374,7 +374,7 @@ mod tests {
     use reth_db_common::init::init_genesis;
     use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
     use reth_primitives::{alloy_primitives::U160, GenesisAccount};
-    use reth_provider::{providers::BlockchainProvider, ProviderFactory};
+    use reth_provider::{providers::{BlockchainProvider, StaticFileProvider}, ProviderFactory};
     use reth_tracing::init_test_tracing;
     use reth_transaction_pool::{
         blobstore::InMemoryBlobStore, PoolConfig, TransactionValidationTaskExecutor,

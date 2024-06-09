@@ -35,7 +35,7 @@ use reth_node_ethereum::{
 };
 use reth_primitives::{Address, Head, PruneModes};
 use reth_provider::{
-    providers::BlockchainProvider, CanonStateNotificationSender, ProviderFactory,
+    providers::{BlockchainProvider, StaticFileProvider}, CanonStateNotificationSender, ProviderFactory,
     StaticFileProviderFactory as _,
 };
 use reth_rpc_types::engine::ForkchoiceState;
@@ -136,8 +136,8 @@ where
         let provider_factory = ProviderFactory::new(
             database.clone(),
             Arc::clone(&node_config.chain),
-            data_dir.static_files(),
-        )?
+            StaticFileProvider::read_write(data_dir.static_files())?,
+        )
         .with_static_files_metrics();
 
         debug!(target: "tn::execution", chain=%node_config.chain.chain, genesis=?node_config.chain.genesis_hash(), "Initializing genesis");
@@ -231,7 +231,6 @@ where
             head,
             self.blockchain_db.clone(),
             self.task_executor.clone(),
-            self.data_dir.clone(),
             self.node_config.clone(),
             reth_config::Config::default(), // mostly peer / staging configs
         );
@@ -279,7 +278,6 @@ where
 
         let static_file_producer = StaticFileProducer::new(
             self.provider_factory.clone(),
-            self.provider_factory.static_file_provider(),
             PruneModes::default(),
         );
 
@@ -394,7 +392,6 @@ where
             head,
             self.blockchain_db.clone(),
             self.task_executor.clone(),
-            self.data_dir.clone(),
             self.node_config.clone(),
             reth_config::Config::default(), // mostly peer / staging configs
         );
