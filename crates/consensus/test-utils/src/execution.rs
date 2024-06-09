@@ -60,8 +60,6 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     task_executor: TaskExecutor,
     opt_args: Option<Vec<&str>>,
 ) -> eyre::Result<(TnBuilder<Arc<TempDatabase<DatabaseEnv>>>, CliExt)> {
-    // let tempdir = tempdir().expect("tempdir created").into_path();
-
     let default_args = [
         "telcoin-network",
         "--dev",
