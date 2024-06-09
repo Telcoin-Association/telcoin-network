@@ -48,6 +48,7 @@ reth-beacon-consensus = { workspace = true }
 reth-blockchain-tree = { workspace = true }
 reth-config = { workspace = true }
 reth-db = { workspace = true, features = ["test-utils"] }
+reth-db-common = { workspace = true }
 reth-evm = { workspace = true }
 
 reth-provider = { workspace = true }

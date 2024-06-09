@@ -371,7 +371,7 @@ mod tests {
     use reth::tasks::TaskManager;
     use reth_blockchain_tree::noop::NoopBlockchainTree;
     use reth_db::test_utils::{create_test_rw_db, tempdir_path};
-    use reth_node_core::init::init_genesis;
+    use reth_db_common::init::init_genesis;
     use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
     use reth_primitives::{alloy_primitives::U160, GenesisAccount};
     use reth_provider::{providers::BlockchainProvider, ProviderFactory};

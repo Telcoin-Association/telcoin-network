@@ -5,7 +5,6 @@ use eyre::Context as _;
 use futures::{stream_select, StreamExt};
 use jsonrpsee::http_client::HttpClient;
 use reth::{
-    core::init::init_genesis,
     dirs::{ChainPath, DataDirPath},
     rpc::builder::{RpcModuleBuilder, RpcServerHandle},
 };
@@ -21,6 +20,7 @@ use reth_db::{
     database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
 };
+use reth_db_common::init::init_genesis;
 use reth_evm::execute::BlockExecutorProvider;
 use reth_exex::ExExManagerHandle;
 use reth_network::NetworkEvents;
@@ -139,9 +139,6 @@ where
             data_dir.static_files(),
         )?
         .with_static_files_metrics();
-
-        // let genesis_hash = init_genesis(db_instance.db.clone(), config.chain.clone())?;
-        // info!(target: "engine", hardforks = config.chain.display_hardforks());
 
         debug!(target: "tn::execution", chain=%node_config.chain.chain, genesis=?node_config.chain.genesis_hash(), "Initializing genesis");
 

@@ -35,6 +35,7 @@ tn-types = { workspace = true, features = ["test-utils"] }
 reth = { workspace = true }
 assert_matches = { workspace = true }
 reth-db = { workspace = true, features = ["test-utils"] }
+reth-db-common = { workspace = true }
 reth-blockchain-tree = { workspace = true }
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
 reth-tracing = { workspace = true }
