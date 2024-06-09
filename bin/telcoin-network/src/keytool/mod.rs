@@ -222,11 +222,13 @@ mod tests {
             "1",
             "--datadir",
             tempdir.to_str().expect("tempdir path clean"),
+            "--address",
+            "0",
         ])
         .expect("cli parsed");
 
         tn.run(|_, _, _| async move { Ok(()) }).expect("generate keys command");
 
-        Config::load_from_path::<Config>(tempdir.as_path()).expect("config loaded yaml okay");
+        Config::load_from_path::<Config>(tempdir.join("telcoin-network.yaml").as_path()).expect("config loaded yaml okay");
     }
 }

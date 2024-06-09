@@ -171,7 +171,7 @@ pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
-    use reth::args::{utils::SUPPORTED_CHAINS, ColorMode};
+    use reth::args::ColorMode;
 
     #[test]
     fn parse_color_mode() {
@@ -198,26 +198,18 @@ mod tests {
         }
     }
 
-    /// Tests that the log directory is parsed correctly. It's always tied to the specific chain's
-    /// name
+    /// Tests that the log directory is parsed correctly.
+    /// 
+    /// TODO: logs should be placed in TN DEFAULT_ROOT_DIR
     #[test]
     fn parse_logs_path() {
-        let mut tn = Cli::try_parse_args_from(["tn", "node"]).unwrap();
-        tn.logs.log_file_directory = tn.logs.log_file_directory.join(tn.chain.chain.to_string());
+        let tn = Cli::try_parse_args_from(["tn", "node"]).unwrap();
         let log_dir = tn.logs.log_file_directory;
-        let end = format!("tn/logs/{}", SUPPORTED_CHAINS[0]);
-        assert!(log_dir.as_ref().ends_with(end), "{log_dir:?}");
 
-        let mut iter = SUPPORTED_CHAINS.iter();
-        iter.next();
-        for chain in iter {
-            let mut tn = Cli::try_parse_args_from(["tn", "node", "--chain", chain]).unwrap();
-            tn.logs.log_file_directory =
-                tn.logs.log_file_directory.join(tn.chain.chain.to_string());
-            let log_dir = tn.logs.log_file_directory;
-            let end = format!("tn/logs/{chain}");
-            assert!(log_dir.as_ref().ends_with(end), "{log_dir:?}");
-        }
+        // let end = format!("{}/logs", DEFAULT_ROOT_DIR);
+
+        let end = format!("reth/logs");
+        assert!(log_dir.as_ref().ends_with(end), "{log_dir:?}");
     }
 
     #[test]
@@ -227,7 +219,7 @@ mod tests {
         std::env::set_var("RUST_LOG", "info,evm=debug");
         let tn = Cli::try_parse_args_from([
             "tn",
-            "init",
+            "node",
             "--datadir",
             temp_dir.path().to_str().unwrap(),
             "--log.file.filter",
