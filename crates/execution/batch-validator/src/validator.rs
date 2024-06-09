@@ -1,13 +1,13 @@
 //! Batch validator
 
 use crate::error::BatchValidationError;
-use reth_blockchain_tree::{error::BlockchainTreeError};
+use reth_blockchain_tree::error::BlockchainTreeError;
 use reth_consensus::PostExecutionInput;
 use reth_db::database::Database;
 use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, BlockValidationError, Executor};
 use reth_primitives::{GotExpected, Hardfork, Receipts, SealedBlockWithSenders, U256};
 use reth_provider::{
-    providers::{BlockchainProvider}, BundleStateWithReceipts, ChainSpecProvider, DatabaseProviderFactory, HeaderProvider, StateRootProvider
+    providers::BlockchainProvider, BundleStateWithReceipts, ChainSpecProvider, DatabaseProviderFactory, HeaderProvider, StateRootProvider
 };
 use reth_revm::database::StateProviderDatabase;
 use std::{
@@ -146,51 +146,21 @@ where
             .ok_or(BlockchainTreeError::CanonicalChain { block_hash: parent.hash })?
             .seal(parent.hash);
 
-        // // read from canonical tree - updated by `Executor` and engine
-        // //
-        // // same return as BlockchainTree::canonical_chain()
-        // // let canonical_block_hashes = self.blockchain_db.canonical_blocks();
-
-
-        // // from AppendableChain::new_canonical_fork() but with state root validation added
-        // let state = BundleStateWithReceipts::default();
-        // let empty = BTreeMap::new();
-
-
-        // // TODO: is BundleStateDataRef even needed to be used here?
-        // //
-        // // is there another approach to getting the StateProvider?
-
-
-        // // get the bundle state provider.
-        // let bundle_state_data_provider = BundleStateDataRef {
-        //     state: &state,
-        //     sidechain_block_hashes: &empty,
-        //     canonical_block_hashes: &canonical_block_hashes,
-        //     canonical_fork: parent,
-        // };
-
         // from AppendableChain::validate_and_execute() - private method
         //
         // ported here to prevent redundant creation of bundle state provider
         // just to check state root
 
         self.consensus.validate_header_against_parent(&sealed_block, &parent_header)?;
-
-        // let (block, senders) = block.into_components();
-        // let block = block.unseal();
-
         let block_with_senders = sealed_block.unseal();
 
-        // let canonical_fork = bundle_state_data_provider.canonical_fork();
 
-        // // NOTE: this diverges from reth-beta approach
-        // // but is still valid within the context of our consensus
-        // // because of async network conditions, workers can suggest batches
-        // // behind the canonical tip
-        // //
-        // // TODO: validate base fee based on parent batch
-        // let state_provider = self.blockchain_db.history_by_block_number(canonical_fork.number)?;
+        // NOTE: this diverges from reth-beta approach
+        // but is still valid within the context of our consensus
+        // because of async network conditions, workers can suggest batches
+        // behind the canonical tip
+        //
+        // TODO: validate base fee based on parent batch
 
         // // capture current state
         // let provider = BundleStateProvider::new(state_provider, bundle_state_data_provider);
@@ -200,8 +170,10 @@ where
         // on `AppendableChain`
         //
         // reth uses `ConsistentDbView`, but this will throw an error if the current tip
-        // doesn't match the one recorded during the db view's initialization
-        // TN anticipates writing several blocks at a time, so tip could potentially always change
+        // doesn't match the one recorded during the db view's initialization.
+        // TN expected to write several blocks at a time, so tip potentially always changing
+        //
+        // create state provider based on batch's parent
         let db = StateProviderDatabase::new(
             self.blockchain_db.database_provider_ro()?.state_provider_by_block_number(parent.number)?
         );
