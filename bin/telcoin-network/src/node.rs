@@ -8,8 +8,7 @@ use fdlimit::raise_fd_limit;
 use futures::Future;
 use reth::{
     args::{
-        utils::parse_socket_address, DatabaseArgs, DebugArgs, DevArgs, NetworkArgs,
-        PayloadBuilderArgs, PruningArgs, RpcServerArgs, TxPoolArgs,
+        utils::parse_socket_address, DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, TxPoolArgs
     },
     builder::NodeConfig,
     commands::node::NoArgs,
@@ -29,16 +28,6 @@ use tracing::*;
 /// Start the node
 #[derive(Debug, Parser)]
 pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
-    /// The path to the data dir for all telcoin-network files and subdirectories.
-    ///
-    /// Defaults to the OS-specific data directory:
-    ///
-    /// - Linux: `$XDG_DATA_HOME/telcoin-network/` or `$HOME/.local/share/telcoin-network/`
-    /// - Windows: `{FOLDERID_RoamingAppData}/telcoin-network/`
-    /// - macOS: `$HOME/Library/Application Support/telcoin-network/`
-    #[arg(long, value_name = "DATA_DIR", verbatim_doc_comment, default_value_t)]
-    pub datadir: MaybePlatformPath<DataDirPath>,
-
     /// The path to the configuration file to use.
     #[arg(long, value_name = "FILE", verbatim_doc_comment)]
     pub config: Option<PathBuf>,
@@ -87,6 +76,18 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// Mutually exclusive with `--instance`.
     #[arg(long, conflicts_with = "instance", global = true)]
     pub with_unused_ports: bool,
+
+    // TODO: this is painful to maintain
+    // need a better way to overwrite reth DataDirPath
+    /// The path to the data dir for all telcoin-network files and subdirectories.
+    ///
+    /// Defaults to the OS-specific data directory:
+    ///
+    /// - Linux: `$XDG_DATA_HOME/telcoin-network/` or `$HOME/.local/share/telcoin-network/`
+    /// - Windows: `{FOLDERID_RoamingAppData}/telcoin-network/`
+    /// - macOS: `$HOME/Library/Application Support/telcoin-network/`
+    #[arg(long, value_name = "DATA_DIR", verbatim_doc_comment, default_value_t)]
+    pub datadir: MaybePlatformPath<DataDirPath>,
 
     /// All networking related arguments
     #[clap(flatten)]
@@ -139,7 +140,12 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         raise_fd_limit()?;
 
         // add network name to data dir
-        let tn_data_dir = self.datadir.unwrap_or_chain_default(self.chain.chain);
+        // TODO: this is inefficient, but the only way to use "telcoin-network" as datadir instead of "reth"
+        let default_args = DatadirArgs {
+            datadir: MaybePlatformPath::from_str("telcoin-network")?,
+            static_files_path: None,
+        };
+        let tn_data_dir = self.datadir.unwrap_or_chain_default(self.chain.chain, default_args);
 
         // TODO: use config or CLI chain spec?
         let config_path = self.config.clone().unwrap_or(tn_data_dir.node_config_path());
@@ -148,12 +154,12 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // get the worker's transaction address from the config
         let Self {
-            // datadir,
             // config,
             chain,
             metrics,
             instance,
             with_unused_ports,
+            datadir,
             network,
             rpc,
             txpool,
@@ -172,6 +178,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             chain,
             metrics,
             instance,
+            datadir: default_args,
             network,
             rpc,
             txpool,
