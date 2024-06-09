@@ -10,7 +10,7 @@
 //! # Examples
 //!
 //! ```
-//! use crate::typed_store::Map;
+//! use crate::traits::Map;
 //! use narwhal_typed_store::{
 //!     rocks::*,
 //!     sally::{SallyColumn, SallyDBOptions},

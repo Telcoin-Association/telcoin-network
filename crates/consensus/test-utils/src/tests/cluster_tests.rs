@@ -45,6 +45,8 @@ async fn basic_cluster_setup() {
         block_vec.push(blocks.clone());
     }
 
+    // assert block_vec isn't empty
+    assert!(block_vec[0].len() > 0);
     // assert first three blocks are the same for all authorities
     assert!(block_vec.windows(2).all(|w| w[0] == w[1]));
 

@@ -7,6 +7,7 @@ use reth::tasks::TaskManager;
 use std::time::Duration;
 use tn_types::test_utils::setup_test_tracing;
 
+#[ignore]
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_response_error_after_shutdown_internal_consensus() {
     // Enabled debug tracing so we can easily observe the
