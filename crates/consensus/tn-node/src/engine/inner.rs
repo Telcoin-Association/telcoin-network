@@ -4,10 +4,7 @@ use consensus_metrics::metered_channel::{Receiver, Sender};
 use eyre::Context as _;
 use futures::{stream_select, StreamExt};
 use jsonrpsee::http_client::HttpClient;
-use reth::{
-    dirs::{ChainPath, DataDirPath},
-    rpc::builder::{RpcModuleBuilder, RpcServerHandle},
-};
+use reth::rpc::builder::{RpcModuleBuilder, RpcServerHandle};
 use reth_auto_seal_consensus::AutoSealConsensus;
 use reth_beacon_consensus::{
     hooks::{EngineHooks, StaticFileHook},
@@ -56,10 +53,7 @@ use crate::{
     engine::{WorkerNetwork, WorkerNode},
     error::ExecutionError,
 };
-
 use super::{PrimaryNode, TnBuilder};
-
-/// Inner type for holding execution layer types.
 
 /// Inner type for holding execution layer types.
 pub(super) struct ExecutionNodeInner<DB, Evm>
@@ -93,8 +87,6 @@ where
     /// This type is owned by the current runtime and facilitates
     /// a convenient way to spawn tasks that shutdown with the runtime.
     task_executor: TaskExecutor,
-    /// Root data directory.
-    datadir: ChainPath<DataDirPath>,
     /// TODO: temporary solution until upstream reth supports public rpc hooks
     opt_faucet_args: Option<FaucetArgs>,
     /// Collection of execution components by worker.
@@ -108,14 +100,6 @@ where
 {
     /// Create a new instance of `Self`.
     pub(super) fn new(
-        // address: Address,
-        // config: NodeConfig,
-        // blockchain_db: BlockchainProvider<DB>,
-        // provider_factory: ProviderFactory<DB>,
-        // evm: Evm,
-        // canon_state_notification_sender: CanonStateNotificationSender,
-        // executor: TaskExecutor,
-        // datadir: ChainPath<DataDirPath>,
         tn_builder: TnBuilder<DB>,
         evm: Evm,
     ) -> eyre::Result<Self> {
@@ -158,12 +142,7 @@ where
         task_executor.spawn_critical("stages metrics listener task", sync_metrics_listener);
 
         // get config from file
-        // let reth_config = reth_config::Config::default(); // TODO: probably want to persist this?
         let prune_config = node_config.prune_config(); //.or(reth_config.prune.clone());
-
-        // let evm_config = EthEvmConfig::default();
-
-        // let evm_config = types.evm_config();
         let tree_config = BlockchainTreeConfig::default();
         let tree_externals =
             TreeExternals::new(provider_factory.clone(), auto_consensus.clone(), evm.clone());
@@ -173,15 +152,6 @@ where
             prune_config.map(|config| config.segments.clone()),
         )?
         .with_sync_metrics_tx(sync_metrics_tx.clone());
-
-        // let tree = node_config.build_blockchain_tree(
-        //     provider_factory.clone(),
-        //     consensus.clone(),
-        //     prune_config,
-        //     sync_metrics_tx.clone(),
-        //     tree_config,
-        //     evm.clone(),
-        // )?;
 
         let canon_state_notification_sender = tree.canon_state_notification_sender();
         let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
@@ -199,7 +169,6 @@ where
             evm,
             canon_state_notification_sender,
             task_executor,
-            datadir,
             opt_faucet_args,
             workers: HashMap::default(),
         })

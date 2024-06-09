@@ -330,7 +330,7 @@ impl StorageInner {
         let block_number = block.number;
 
         // execute the block
-        let BlockExecutionOutput { state, receipts, gas_used, requests } =
+        let BlockExecutionOutput { state, receipts, gas_used, .. } =
             executor.executor(&mut db).execute((&block, U256::ZERO).into())?;
         let bundle_state = BundleStateWithReceipts::new(
             state,
