@@ -1,17 +1,16 @@
 //! Batch validator
 
 use crate::error::BatchValidationError;
-use reth_blockchain_tree::{error::BlockchainTreeError, BundleStateDataRef};
+use reth_blockchain_tree::{error::BlockchainTreeError};
 use reth_consensus::PostExecutionInput;
 use reth_db::database::Database;
 use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, BlockValidationError, Executor};
 use reth_primitives::{GotExpected, Hardfork, Receipts, SealedBlockWithSenders, U256};
 use reth_provider::{
-    providers::{BlockchainProvider, BundleStateProvider}, BundleStateForkProvider as _, BundleStateWithReceipts, ChainSpecProvider, DatabaseProviderFactory, HeaderProvider, StateProviderFactory, StateRootProvider
+    providers::{BlockchainProvider}, BundleStateWithReceipts, ChainSpecProvider, DatabaseProviderFactory, HeaderProvider, StateRootProvider
 };
 use reth_revm::database::StateProviderDatabase;
 use std::{
-    collections::BTreeMap,
     fmt::{Debug, Display},
     sync::Arc,
 };
@@ -203,7 +202,7 @@ where
         // reth uses `ConsistentDbView`, but this will throw an error if the current tip
         // doesn't match the one recorded during the db view's initialization
         // TN anticipates writing several blocks at a time, so tip could potentially always change
-        let mut db = StateProviderDatabase::new(
+        let db = StateProviderDatabase::new(
             self.blockchain_db.database_provider_ro()?.state_provider_by_block_number(parent.number)?
         );
 
@@ -225,7 +224,7 @@ where
         // see reth::blockchain_tree::chain::AppendableChain::validate_and_execute()
         //
         // check state root
-        let mut db = StateProviderDatabase::new(
+        let db = StateProviderDatabase::new(
             self.blockchain_db.database_provider_ro()?.state_provider_by_block_number(parent.number)?
         );
         let state_root = db.state_root(bundle_state.state())?;

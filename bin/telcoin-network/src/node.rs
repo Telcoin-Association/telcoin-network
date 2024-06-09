@@ -8,7 +8,7 @@ use fdlimit::raise_fd_limit;
 use futures::Future;
 use reth::{
     args::{
-        utils::parse_socket_address, DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, TxPoolArgs
+        utils::parse_socket_address, DatabaseArgs, DebugArgs, DevArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, TxPoolArgs
     },
     builder::NodeConfig,
     commands::node::NoArgs,
@@ -17,7 +17,7 @@ use reth::{
 };
 use reth_db::{init_db, DatabaseEnv};
 use reth_primitives::ChainSpec;
-use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tn_config::{traits::ConfigTrait, Config};
 use tn_node::{
     dirs::{default_datadir_args, DataDirPath, TelcoinDirs as _},
