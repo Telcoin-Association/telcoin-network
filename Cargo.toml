@@ -205,7 +205,7 @@ criterion = { version = "0.5.0", features = [
   "html_reports",
 ] }
 
-reqwest = { version = "0.11.20", default_features = false, features = [
+reqwest = { version = "0.12", default_features = false, features = [
   "blocking",
   "json",
   "rustls-tls",
