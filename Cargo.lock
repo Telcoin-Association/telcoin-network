@@ -10179,6 +10179,7 @@ dependencies = [
  "reth",
  "reth-beacon-consensus",
  "reth-blockchain-tree",
+ "reth-consensus",
  "reth-db",
  "reth-db-common",
  "reth-evm",

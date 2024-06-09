@@ -2,13 +2,12 @@
 
 use crate::error::BatchValidationError;
 use reth_blockchain_tree::{error::BlockchainTreeError, BundleStateDataRef};
+use reth_consensus::PostExecutionInput;
 use reth_db::database::Database;
 use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, BlockValidationError, Executor};
 use reth_primitives::{GotExpected, Hardfork, Receipts, SealedBlockWithSenders, U256};
 use reth_provider::{
-    providers::{BlockchainProvider, BundleStateProvider},
-    BundleStateForkProvider as _, BundleStateWithReceipts, ChainSpecProvider, HeaderProvider,
-    StateProviderFactory, StateRootProvider,
+    providers::{BlockchainProvider, BundleStateProvider}, BundleStateForkProvider as _, BundleStateWithReceipts, ChainSpecProvider, DatabaseProviderFactory, HeaderProvider, StateProviderFactory, StateRootProvider
 };
 use reth_revm::database::StateProviderDatabase;
 use std::{
@@ -148,23 +147,29 @@ where
             .ok_or(BlockchainTreeError::CanonicalChain { block_hash: parent.hash })?
             .seal(parent.hash);
 
-        // read from canonical tree - updated by `Executor` and engine
-        //
-        // same return as BlockchainTree::canonical_chain()
-        // let canonical_block_hashes = self.blockchain_db.canonical_blocks();
-        let aasd = self.blockchain_db.canonical_
+        // // read from canonical tree - updated by `Executor` and engine
+        // //
+        // // same return as BlockchainTree::canonical_chain()
+        // // let canonical_block_hashes = self.blockchain_db.canonical_blocks();
 
-        // from AppendableChain::new_canonical_fork() but with state root validation added
-        let state = BundleStateWithReceipts::default();
-        let empty = BTreeMap::new();
 
-        // get the bundle state provider.
-        let bundle_state_data_provider = BundleStateDataRef {
-            state: &state,
-            sidechain_block_hashes: &empty,
-            canonical_block_hashes: &canonical_block_hashes,
-            canonical_fork: parent,
-        };
+        // // from AppendableChain::new_canonical_fork() but with state root validation added
+        // let state = BundleStateWithReceipts::default();
+        // let empty = BTreeMap::new();
+
+
+        // // TODO: is BundleStateDataRef even needed to be used here?
+        // //
+        // // is there another approach to getting the StateProvider?
+
+
+        // // get the bundle state provider.
+        // let bundle_state_data_provider = BundleStateDataRef {
+        //     state: &state,
+        //     sidechain_block_hashes: &empty,
+        //     canonical_block_hashes: &canonical_block_hashes,
+        //     canonical_fork: parent,
+        // };
 
         // from AppendableChain::validate_and_execute() - private method
         //
@@ -178,25 +183,35 @@ where
 
         let block_with_senders = sealed_block.unseal();
 
-        let canonical_fork = bundle_state_data_provider.canonical_fork();
+        // let canonical_fork = bundle_state_data_provider.canonical_fork();
 
-        // NOTE: this diverges from reth-beta approach
-        // but is still valid within the context of our consensus
-        // because of async network conditions, workers can suggest batches
-        // behind the canonical tip
+        // // NOTE: this diverges from reth-beta approach
+        // // but is still valid within the context of our consensus
+        // // because of async network conditions, workers can suggest batches
+        // // behind the canonical tip
+        // //
+        // // TODO: validate base fee based on parent batch
+        // let state_provider = self.blockchain_db.history_by_block_number(canonical_fork.number)?;
+
+        // // capture current state
+        // let provider = BundleStateProvider::new(state_provider, bundle_state_data_provider);
+        // let db = StateProviderDatabase::new(&provider);
+
+        // different approach for creating state provider than reth's `validate_and_execute`
+        // on `AppendableChain`
         //
-        // TODO: validate base fee based on parent batch
-        let state_provider = self.blockchain_db.history_by_block_number(canonical_fork.number)?;
-
-        // capture current state
-        let provider = BundleStateProvider::new(state_provider, bundle_state_data_provider);
-        let db = StateProviderDatabase::new(&provider);
+        // reth uses `ConsistentDbView`, but this will throw an error if the current tip
+        // doesn't match the one recorded during the db view's initialization
+        // TN anticipates writing several blocks at a time, so tip could potentially always change
+        let mut db = StateProviderDatabase::new(
+            self.blockchain_db.database_provider_ro()?.state_provider_by_block_number(parent.number)?
+        );
 
         // executor for single block
         let executor = self.executor_factory.executor(db);
         let state = executor.execute((&block_with_senders, U256::MAX).into())?;
-        let BlockExecutionOutput { state, receipts, .. } = state;
-        self.consensus.validate_block_post_execution(&block_with_senders, &receipts)?;
+        let BlockExecutionOutput { state, receipts, requests, .. } = state;
+        self.consensus.validate_block_post_execution(&block_with_senders, PostExecutionInput::new(&receipts, &requests))?;
 
         // create bundle state
         let bundle_state = BundleStateWithReceipts::new(
@@ -210,7 +225,10 @@ where
         // see reth::blockchain_tree::chain::AppendableChain::validate_and_execute()
         //
         // check state root
-        let state_root = provider.state_root(bundle_state.state())?;
+        let mut db = StateProviderDatabase::new(
+            self.blockchain_db.database_provider_ro()?.state_provider_by_block_number(parent.number)?
+        );
+        let state_root = db.state_root(bundle_state.state())?;
         if block_with_senders.state_root != state_root {
             return Err(BatchValidationError::BodyStateRootDiff(GotExpected {
                 got: state_root,
