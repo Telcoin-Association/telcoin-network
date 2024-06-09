@@ -112,7 +112,7 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     /// }
     ///
     /// Cli::parse()
-    ///     .run(|builder, my_args: FaucetArgs| async move {
+    ///     .run(|builder, my_args: MyArgs| async move {
     ///         // launch the node
     ///
     ///         Ok(())
