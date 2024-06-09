@@ -8,7 +8,7 @@ use fdlimit::raise_fd_limit;
 use futures::Future;
 use reth::{
     args::{
-        utils::parse_socket_address, DatabaseArgs, DebugArgs, DevArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, TxPoolArgs
+        utils::parse_socket_address, DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, TxPoolArgs
     },
     builder::NodeConfig,
     commands::node::NoArgs,
@@ -141,10 +141,10 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // use TN-specific datadir for finding tn-config
         let default_args = default_datadir_args();
-        let tn_data_dir = self.datadir.unwrap_or_chain_default(self.chain.chain, default_args.clone());
+        let tn_datadir = self.datadir.unwrap_or_chain_default(self.chain.chain, default_args.clone());
 
         // TODO: use config or CLI chain spec?
-        let config_path = self.config.clone().unwrap_or(tn_data_dir.node_config_path());
+        let config_path = self.config.clone().unwrap_or(tn_datadir.node_config_path());
         let tn_config: Config = Config::load_from_path(config_path)?;
         info!(target: "telcoin::cli", validator = ?tn_config.validator_info.name, "config loaded");
 
@@ -168,13 +168,19 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             ..
         } = self;
 
+        // create a reth DatadirArgs from tn datadir
+        let datadir = DatadirArgs {
+            datadir: MaybePlatformPath::from(PathBuf::from(tn_datadir.clone())),
+            static_files_path: None,
+        };
+
         // set up reth node config for engine components
         let mut node_config = NodeConfig {
             config: self.config,
             chain,
             metrics,
             instance,
-            datadir: default_args,
+            datadir,
             network,
             rpc,
             txpool,
@@ -195,15 +201,10 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // because database init needs it to register metrics.
         let _ = node_config.install_prometheus_recorder()?;
 
-        let db_path = tn_data_dir.db();
+        let db_path = tn_datadir.db();
         info!(target: "tn::engine", path = ?db_path, "opening database");
         let database =
             Arc::new(init_db(db_path.clone(), node_config.db.database_args())?.with_metrics());
-
-        // // create a reth datadir from tn datadir
-        // let chain_for_datadir = node_config.chain.chain();
-        // let datadir_path = tn_data_dir.to_string();
-        // let reth_datadir = MaybePlatformPath::from_str(&datadir_path)?;
 
         // TODO: temporary solution until upstream reth supports public rpc hooks
         let builder = TnBuilder {
@@ -214,6 +215,6 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             opt_faucet_args: None,
         };
 
-        launcher(builder, ext, tn_data_dir).await
+        launcher(builder, ext, tn_datadir).await
     }
 }
