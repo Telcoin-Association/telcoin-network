@@ -5,7 +5,6 @@ use core::fmt;
 use reth::{
     builder::NodeConfig,
     commands::node::NoArgs,
-    dirs::MaybePlatformPath,
     primitives::{Address, ChainSpec},
     tasks::TaskExecutor,
 };
@@ -19,7 +18,7 @@ use telcoin_network::node::NodeCommand;
 use tempfile::tempdir;
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
-use tn_node::engine::{ExecutionNode, TnBuilder};
+use tn_node::{dirs::default_datadir_args, engine::{ExecutionNode, TnBuilder}};
 
 /// Convnenience type for testing Execution Node.
 pub type TestExecutionNode = ExecutionNode<Arc<TempDatabase<DatabaseEnv>>, EthExecutorProvider>;
@@ -86,7 +85,6 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     let command = NodeCommand::<CliExt>::try_parse_from(cli_args)?;
 
     let NodeCommand {
-        datadir,
         config,
         chain,
         metrics,
@@ -112,6 +110,7 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
         chain,
         metrics,
         instance,
+        datadir: default_datadir_args(),
         network,
         rpc,
         txpool,
@@ -126,12 +125,6 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     let node_config = node_config.with_unused_ports();
 
     let database = create_test_rw_db();
-
-    // create a reth datadir from tn datadir
-    let chain_for_datadir = node_config.chain.chain();
-    let datadir_path = datadir.to_string();
-    let reth_datadir = MaybePlatformPath::from_str(&datadir_path)?;
-    let data_dir = reth_datadir.unwrap_or_chain_default(chain_for_datadir);
     let mut tn_config = Config::default();
 
     // check args then use test defaults
@@ -173,11 +166,10 @@ pub fn faucet_test_execution_node(
         execution_builder::<FaucetArgs>(opt_chain, opt_address, executor, extended_args)?;
 
     // replace default builder's faucet args
-    let TnBuilder { database, node_config, data_dir, task_executor, tn_config, .. } = builder;
+    let TnBuilder { database, node_config, task_executor, tn_config, .. } = builder;
     let builder = TnBuilder {
         database,
         node_config,
-        data_dir,
         task_executor,
         tn_config,
         opt_faucet_args: Some(faucet),
