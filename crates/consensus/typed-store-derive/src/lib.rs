@@ -177,14 +177,14 @@ fn extract_generics_names(generics: &Generics) -> Vec<Ident> {
 ///     table3: DBMap<i32, String>,
 ///     #[default_options_override_fn = "custom_fn_name1"]
 ///     table4: DBMap<i32, String>,
-/// }
+/// } ```
 ///
-/// // b. Options specified by DB opener
-/// // For finer control, we also allow the opener of the DB to specify their own options which
+/// b. Options specified by DB opener
+/// For finer control, we also allow the opener of the DB to specify their own options which
 /// override the defaults set by the definer // This is done via a configurator which gives one a
 /// struct with field similarly named as that of the DB, but of type Options
 ///
-/// #[tokio::main]
+/// ```#[tokio::main]
 /// async fn main() -> Result<(), Error> {
 /// // Get a configurator for this table
 /// let mut config = Tables::configurator();
@@ -210,7 +210,8 @@ fn extract_generics_names(generics: &Generics) -> Vec<Ident> {
 /// like dumping and counting the keys in the tables
 ///
 /// Use the function "Tables::get_read_only_handle" which returns a handle that only allows read
-/// only features ```
+/// only features:
+/// ```
 /// use core::fmt::Error;
 /// use narwhal_typed_store::{
 ///     rocks::{DBMap, DBOptions},
@@ -239,6 +240,7 @@ fn extract_generics_names(generics: &Generics) -> Vec<Ident> {
 ///     #[default_options_override_fn = "custom_fn_name1"]
 ///     table4: DBMap<i32, String>,
 /// }
+/// 
 /// #[tokio::main]
 /// async fn main() -> Result<(), Error> {
 ///     use narwhal_typed_store::rocks::MetricConf;
@@ -260,17 +262,18 @@ fn extract_generics_names(generics: &Generics) -> Vec<Ident> {
 ///     Ok(())
 /// }
 /// ```
+/// 
 /// 4. Auto-generated memory stats method
-/// `self.get_memory_usage` is derived to provide memory and cache usage
+/// "self.get_memory_usage" is derived to provide memory and cache usage
 ///
 /// 5. Other convenience features
-/// `Tables::describe_tables` is used to get a list of the table names and key-value types as string
+/// "Tables::describe_tables" is used to get a list of the table names and key-value types as string
 /// in a BTreeMap
 ///
 /// // Bad usage example
 /// // Structs fields most only be of type Store<K, V> or DMBap<K, V>
-/// // This will fail to compile with error `All struct members must be of type Store<K, V> or
-/// DMBap<K, V>` // #[derive(DBMapUtils)]
+/// // This will fail to compile with error "All struct members must be of type Store<K, V> or
+/// DMBap<K, V>" // #[derive(DBMapUtils)]
 /// // struct BadTables {
 /// //     table1: Store<String, String>,
 /// //     bad_field: u32,
