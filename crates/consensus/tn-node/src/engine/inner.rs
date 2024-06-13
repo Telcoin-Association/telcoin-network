@@ -482,7 +482,7 @@ where
     }
 
     /// Return an database provider.
-    pub fn get_provider(&self) -> BlockchainProvider<DB> {
+    pub(super) fn get_provider(&self) -> BlockchainProvider<DB> {
         self.blockchain_db.clone()
     }
 
@@ -497,5 +497,10 @@ where
             .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
             .http_client();
         Ok(handle)
+    }
+
+    /// Creates a new [ConsensusOutput] listener stream.
+    pub(super) fn consensus_output_listener(&self) -> EventStream<ConsensusOutput> {
+        todo!()
     }
 }

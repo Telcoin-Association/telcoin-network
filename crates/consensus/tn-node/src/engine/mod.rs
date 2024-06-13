@@ -141,4 +141,11 @@ where
         let guard = self.internal.read().await;
         guard.worker_http_client(worker_id)
     }
+
+    /// Creates a new [ConsensusOutput] listener stream.
+    pub async fn consensus_output_listener(&self) -> EventStream<ConsensusOutput> {
+        let guard = self.internal.read().await;
+        // TODO: better to name this: subscribe_to_consensus_output() ?
+        guard.consensus_output_listener()
+    }
 }
