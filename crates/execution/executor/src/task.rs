@@ -10,7 +10,7 @@ use reth_provider::{
 };
 use reth_rpc_types::engine::ForkchoiceState;
 use reth_stages::PipelineEvent;
-use reth_tokio_util::EventStream;
+use reth_tokio_util::{EventSender, EventStream};
 use std::{
     collections::VecDeque,
     future::Future,
@@ -40,6 +40,8 @@ pub struct MiningTask<Client, Engine: EngineTypes, BlockExecutor> {
     canon_state_notification: CanonStateNotificationSender,
     /// The pipeline events to listen on
     pipeline_events: Option<EventStream<PipelineEvent>>,
+    /// Broadcast channel for consensus output
+    event_sender: Option<EventSender<ConsensusOutput>>,
     /// Receiving end from CL's `Executor`. The `ConsensusOutput` is sent
     /// to the mining task here.
     from_consensus: Receiver<ConsensusOutput>,
@@ -72,6 +74,7 @@ where
             canon_state_notification,
             queued: Default::default(),
             pipeline_events: None,
+            event_sender: None,
             from_consensus,
             block_executor,
         }
@@ -80,6 +83,11 @@ where
     /// Sets the pipeline events to listen on.
     pub fn set_pipeline_events(&mut self, events: EventStream<PipelineEvent>) {
         self.pipeline_events = Some(events);
+    }
+
+    /// Sets the consensus events to listen on.
+    pub fn set_event_sender(&mut self, events: EventSender<ConsensusOutput>) {
+        self.event_sender = Some(events);
     }
 }
 
@@ -98,7 +106,12 @@ where
         loop {
             // check if output is available from consensus
             if let Poll::Ready(Some(output)) = this.from_consensus.poll_recv(cx) {
-                // consensus returned output that needs to be executed
+                // try to broadcast output
+                if let Some(stream) = this.event_sender.as_ref() {
+                    stream.notify(output.clone())
+                }
+
+                // que the output for local execution
                 this.queued.push_back(output)
             }
 
