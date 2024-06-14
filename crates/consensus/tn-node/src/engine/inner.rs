@@ -38,6 +38,7 @@ use reth_provider::{
 use reth_rpc_types::engine::ForkchoiceState;
 use reth_static_file::StaticFileProducer;
 use reth_tasks::TaskExecutor;
+use reth_tokio_util::EventStream;
 use reth_transaction_pool::{noop::NoopTransactionPool, TransactionPool};
 use std::{collections::HashMap, sync::Arc};
 use tn_batch_maker::{BatchMakerBuilder, MiningMode};
@@ -500,7 +501,7 @@ where
     }
 
     /// Creates a new [ConsensusOutput] listener stream.
-    pub(super) fn consensus_output_listener(&self) -> EventStream<ConsensusOutput> {
+    pub(super) fn subscribe_to_consensus_output(&self) -> Option<EventStream<ConsensusOutput>> {
         todo!()
     }
 }

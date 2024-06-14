@@ -18,6 +18,7 @@ mod worker;
 pub use primary::*;
 use reth_provider::providers::BlockchainProvider;
 use reth_tasks::TaskExecutor;
+use reth_tokio_util::EventStream;
 use tn_batch_validator::BatchValidator;
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
@@ -143,9 +144,8 @@ where
     }
 
     /// Creates a new [ConsensusOutput] listener stream.
-    pub async fn consensus_output_listener(&self) -> EventStream<ConsensusOutput> {
+    pub async fn subscribe_to_consensus_output(&self) -> Option<EventStream<ConsensusOutput>> {
         let guard = self.internal.read().await;
-        // TODO: better to name this: subscribe_to_consensus_output() ?
-        guard.consensus_output_listener()
+        guard.subscribe_to_consensus_output()
     }
 }
