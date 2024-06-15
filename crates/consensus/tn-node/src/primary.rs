@@ -244,8 +244,8 @@ impl PrimaryNodeInner {
         // The metrics for executor
         // Passing here bc the tx notifier is needed to create the metrics.
         executor_metrics: ExecutorMetrics,
-        // Receiving half goes to the EL Executor
-        tx_notifier: Sender<ConsensusOutput>,
+        // Broadcast channel for output.
+        consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
         // Used for recovering after crashes/restarts
         last_executed_sub_dag_index: u64,
     ) -> SubscriberResult<Vec<JoinHandle<()>>>
@@ -298,7 +298,7 @@ where
             tx_consensus_round_updates,
             registry,
             executor_metrics,
-            tx_notifier,
+            consensus_output_notification_sender,
             // in loo of sui's execution_state:
             last_executed_sub_dag_index,
         )
@@ -355,7 +355,7 @@ where
         tx_consensus_round_updates: watch::Sender<ConsensusRound>,
         registry: &Registry,
         executor_metrics: ExecutorMetrics,
-        tx_notifier: Sender<ConsensusOutput>,
+        consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
         last_executed_sub_dag_index: u64,
     ) -> SubscriberResult<(Vec<JoinHandle<()>>, LeaderSchedule)>
     where
@@ -443,7 +443,7 @@ where
             shutdown_receivers.pop().unwrap(),
             rx_sequence,
             restored_consensus_output,
-            tx_notifier,
+            consensus_output_notification_sender,
             executor_metrics,
         )?;
 

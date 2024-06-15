@@ -23,7 +23,7 @@ use tn_types::{
     AuthorityIdentifier, CertificateDigest, CommittedSubDag, Committee,
     ConditionalBroadcastReceiver, ConsensusOutput, WorkerCache,
 };
-use tokio::task::JoinHandle;
+use tokio::{sync::broadcast, task::JoinHandle};
 use tracing::info;
 
 /// Convenience type representing a serialized transaction.
@@ -56,7 +56,7 @@ impl Executor {
         shutdown_receivers: ConditionalBroadcastReceiver,
         rx_sequence: metered_channel::Receiver<CommittedSubDag>,
         restored_consensus_output: Vec<CommittedSubDag>,
-        tx_notifier: metered_channel::Sender<ConsensusOutput>,
+        consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
         // TODO: this is needed to create the tx_notifier channel
         metrics: ExecutorMetrics,
     ) -> SubscriberResult<JoinHandle<()>>
@@ -81,7 +81,7 @@ impl Executor {
             rx_sequence,
             arc_metrics,
             restored_consensus_output,
-            tx_notifier,
+            consensus_output_notification_sender,
             // execution_state,
         );
 
