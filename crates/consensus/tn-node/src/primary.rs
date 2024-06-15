@@ -19,8 +19,7 @@ use narwhal_network::client::NetworkClient;
 use narwhal_primary::{
     consensus::{
         Bullshark, ChannelMetrics, Consensus, ConsensusMetrics, ConsensusRound, LeaderSchedule,
-    },
-    Primary, PrimaryChannelMetrics, NUM_SHUTDOWN_RECEIVERS,
+    }, Primary, PrimaryChannelMetrics, CHANNEL_CAPACITY, NUM_SHUTDOWN_RECEIVERS
 };
 use narwhal_storage::NodeStorage;
 use prometheus::{IntGauge, Registry};
@@ -28,6 +27,7 @@ use reth_db::{
     database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
 };
+// use reth_eth_wire::broadcast;
 use reth_evm::execute::BlockExecutorProvider;
 use std::{sync::Arc, time::Instant};
 use tn_config::Parameters;
@@ -37,7 +37,7 @@ use tn_types::{
     Round, WorkerCache, BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::{
-    sync::{watch, RwLock},
+    sync::{watch, RwLock, broadcast},
     task::JoinHandle,
 };
 use tracing::{info, instrument};
@@ -57,6 +57,8 @@ struct PrimaryNodeInner {
     tx_shutdown: Option<PreSubscribedBroadcastSender>,
     /// Peer ID used for local connections.
     own_peer_id: Option<PeerId>,
+    /// Consensus broadcast channel.
+    consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
 }
 
 impl PrimaryNodeInner {
@@ -69,7 +71,8 @@ impl PrimaryNodeInner {
     /// method will return an error instead.
     #[instrument(level = "info", skip_all)]
     async fn start<DB, Evm>(
-        &mut self, // The private-public key pair of this authority.
+        &mut self,
+        // The private-public key pair of this authority.
         keypair: BlsKeypair,
         // The private-public network key pair of this authority.
         network_keypair: NetworkKeypair,
@@ -102,19 +105,26 @@ impl PrimaryNodeInner {
         // create a new registry
         let registry = new_registry()?;
 
+        // TODO: is this useful for consensus output?
+        //
         // create the channel to send the shutdown signal
         let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
 
-        // this is what connects the EL and CL
         let executor_metrics = ExecutorMetrics::new(&registry);
-        let (tx_notifier, rx_notifier) = metered_channel::channel(
-            narwhal_primary::CHANNEL_CAPACITY,
-            &executor_metrics.tx_notifier,
-        );
+
+        // // this is what connects the EL and CL
+        // let (tx_notifier, rx_notifier) = metered_channel::channel(
+        //     narwhal_primary::CHANNEL_CAPACITY,
+        //     &executor_metrics.tx_notifier,
+        // );
 
         // used to retrieve the last executed certificate in case of restarts
         let last_executed_sub_dag_index =
             execution_components.last_executed_output().await.expect("execution found HEAD");
+
+        let consensus_output_notification_sender = self.consensus_output_notification_sender.clone();
+        // create receiving channel before spawning primary to ensure messages are not lost
+        let consensus_output_stream = self.consensus_output_notification_sender.subscribe();
 
         // spawn primary if not already running
         let primary_handles = Self::spawn_primary(
@@ -129,13 +139,13 @@ impl PrimaryNodeInner {
             &registry,
             &mut tx_shutdown,
             executor_metrics,
-            tx_notifier,
+            consensus_output_notification_sender,
             last_executed_sub_dag_index,
         )
         .await?;
 
         // start engine
-        execution_components.start_engine(rx_notifier).await?;
+        execution_components.start_engine(consensus_output_stream).await?;
 
         // store the registry
         self.swap_registry(Some(registry));
@@ -452,6 +462,9 @@ pub struct PrimaryNode {
 
 impl PrimaryNode {
     pub fn new(parameters: Parameters, registry_service: RegistryService) -> PrimaryNode {
+        // TODO: what is an appropriate channel capacity? CHANNEL_CAPACITY currently set to 10k which seems really high but is consistent for now
+        let (consensus_output_notification_sender, _receiver) = tokio::sync::broadcast::channel(CHANNEL_CAPACITY);
+
         let inner = PrimaryNodeInner {
             parameters,
             registry_service,
@@ -460,6 +473,7 @@ impl PrimaryNode {
             client: None,
             tx_shutdown: None,
             own_peer_id: None,
+            consensus_output_notification_sender,
         };
 
         Self { internal: Arc::new(RwLock::new(inner)) }
