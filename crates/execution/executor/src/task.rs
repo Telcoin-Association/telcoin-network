@@ -1,5 +1,6 @@
 use crate::Storage;
 use consensus_metrics::metered_channel::Receiver;
+use futures::StreamExt;
 use futures_util::{future::BoxFuture, FutureExt};
 use reth_beacon_consensus::{BeaconEngineMessage, ForkchoiceStatus};
 use reth_evm::execute::BlockExecutorProvider;
@@ -11,6 +12,7 @@ use reth_provider::{
 use reth_rpc_types::engine::ForkchoiceState;
 use reth_stages::PipelineEvent;
 use reth_tokio_util::{EventSender, EventStream};
+use tokio_stream::wrappers::BroadcastStream;
 use std::{
     collections::VecDeque,
     future::Future,
@@ -44,7 +46,7 @@ pub struct MiningTask<Client, Engine: EngineTypes, BlockExecutor> {
     event_sender: Option<EventSender<ConsensusOutput>>,
     /// Receiving end from CL's `Executor`. The `ConsensusOutput` is sent
     /// to the mining task here.
-    from_consensus: Receiver<ConsensusOutput>,
+    consensus_output_stream: BroadcastStream<ConsensusOutput>,
     /// The type used for block execution
     block_executor: BlockExecutor,
 }
@@ -62,7 +64,7 @@ where
         canon_state_notification: CanonStateNotificationSender,
         storage: Storage,
         client: Client,
-        from_consensus: Receiver<ConsensusOutput>,
+        consensus_output_stream: BroadcastStream<ConsensusOutput>,
         block_executor: BlockExecutor,
     ) -> Self {
         Self {
@@ -75,7 +77,7 @@ where
             queued: Default::default(),
             pipeline_events: None,
             event_sender: None,
-            from_consensus,
+            consensus_output_stream,
             block_executor,
         }
     }
@@ -105,14 +107,24 @@ where
         // this executes output from consensus
         loop {
             // check if output is available from consensus
-            if let Poll::Ready(Some(output)) = this.from_consensus.poll_recv(cx) {
-                // try to broadcast output
-                if let Some(stream) = this.event_sender.as_ref() {
-                    stream.notify(output.clone())
-                }
+            match this.consensus_output_stream.poll_next_unpin(cx) {
+                Poll::Ready(Some(Ok(output))) => {
+                    // try to broadcast output
+                    if let Some(stream) = this.event_sender.as_ref() {
+                        stream.notify(output.clone())
+                    }
 
-                // que the output for local execution
-                this.queued.push_back(output)
+                    // que the output for local execution
+                    this.queued.push_back(output)
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    error!(target: "execution::executor", ?e, "for consensus output stream");
+                }
+                Poll::Ready(None) => {
+                    // stream has ended
+                    return Poll::Ready(())
+                }
+                Poll::Pending => { /* nothing to do */ }
             }
 
             if this.insert_task.is_none() {

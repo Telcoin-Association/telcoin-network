@@ -10278,6 +10278,7 @@ dependencies = [
  "thiserror",
  "tn-types",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 

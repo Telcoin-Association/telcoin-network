@@ -29,12 +29,13 @@ use reth_primitives::{
     EMPTY_OMMER_ROOT_HASH, U256,
 };
 use reth_provider::{
-    BlockReaderIdExt, BundleStateWithReceipts, CanonStateNotificationSender, StateProviderFactory,
+    BlockReaderIdExt, BundleStateWithReceipts, CanonStateNotificationSender, StateProviderFactory
 };
 use reth_revm::database::StateProviderDatabase;
+use tokio_stream::wrappers::BroadcastStream;
 use std::{collections::HashMap, sync::Arc};
 use tn_types::{now, AutoSealConsensus, BatchAPI, ConsensusOutput};
-use tokio::sync::{mpsc::UnboundedSender, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tokio::sync::{broadcast, mpsc::UnboundedSender, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{debug, error, trace, warn};
 
 mod client;
@@ -51,7 +52,7 @@ pub struct Executor<Client, Engine: EngineTypes, EvmConfig> {
     client: Client,
     consensus: AutoSealConsensus,
     storage: Storage,
-    from_consensus: Receiver<ConsensusOutput>,
+    from_consensus: broadcast::Receiver<ConsensusOutput>,
     to_engine: UnboundedSender<BeaconEngineMessage<Engine>>,
     canon_state_notification: CanonStateNotificationSender,
     evm_config: EvmConfig,
@@ -68,7 +69,7 @@ where
     pub fn new(
         chain_spec: Arc<ChainSpec>,
         client: Client,
-        from_consensus: Receiver<ConsensusOutput>,
+        from_consensus: broadcast::Receiver<ConsensusOutput>,
         to_engine: UnboundedSender<BeaconEngineMessage<Engine>>,
         canon_state_notification: CanonStateNotificationSender,
         evm_config: EvmConfig,
@@ -105,13 +106,15 @@ where
             evm_config,
         } = self;
         let auto_client = AutoSealClient::new(storage.clone());
+        // cast broadcast channel to stream for convenient iter methods
+        let consensus_output_stream = BroadcastStream::new(from_consensus);
         let task = MiningTask::new(
             Arc::clone(consensus.chain_spec()),
             to_engine,
             canon_state_notification,
             storage,
             client,
-            from_consensus,
+            consensus_output_stream,
             evm_config,
         );
         (consensus, auto_client, task)

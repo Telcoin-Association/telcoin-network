@@ -23,7 +23,7 @@ use tn_batch_validator::BatchValidator;
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
 use tn_types::{ConsensusOutput, NewBatch, WorkerId};
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 pub use worker::*;
 
 use self::inner::ExecutionNodeInner;
@@ -100,7 +100,7 @@ where
     /// Execution engine to produce blocks after consensus.
     pub async fn start_engine(
         &self,
-        from_consensus: Receiver<ConsensusOutput>,
+        from_consensus: broadcast::Receiver<ConsensusOutput>,
     ) -> eyre::Result<()> {
         let guard = self.internal.read().await;
         guard.start_engine(from_consensus).await

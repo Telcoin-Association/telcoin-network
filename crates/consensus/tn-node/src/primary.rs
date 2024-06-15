@@ -124,7 +124,7 @@ impl PrimaryNodeInner {
 
         let consensus_output_notification_sender = self.consensus_output_notification_sender.clone();
         // create receiving channel before spawning primary to ensure messages are not lost
-        let consensus_output_stream = self.consensus_output_notification_sender.subscribe();
+        let consensus_output_rx = self.consensus_output_notification_sender.subscribe();
 
         // spawn primary if not already running
         let primary_handles = Self::spawn_primary(
@@ -145,7 +145,7 @@ impl PrimaryNodeInner {
         .await?;
 
         // start engine
-        execution_components.start_engine(consensus_output_stream).await?;
+        execution_components.start_engine(consensus_output_rx).await?;
 
         // store the registry
         self.swap_registry(Some(registry));

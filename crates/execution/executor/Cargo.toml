@@ -13,6 +13,7 @@ repository.workspace = true
 tn-types = { workspace = true }
 futures-util = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
+tokio-stream = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
