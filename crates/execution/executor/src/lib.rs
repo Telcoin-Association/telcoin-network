@@ -29,13 +29,13 @@ use reth_primitives::{
     EMPTY_OMMER_ROOT_HASH, U256,
 };
 use reth_provider::{
-    BlockReaderIdExt, BundleStateWithReceipts, CanonStateNotificationSender, StateProviderFactory
+    BlockReaderIdExt, BundleStateWithReceipts, CanonStateNotificationSender, StateProviderFactory,
 };
 use reth_revm::database::StateProviderDatabase;
-use tokio_stream::wrappers::BroadcastStream;
 use std::{collections::HashMap, sync::Arc};
 use tn_types::{now, AutoSealConsensus, BatchAPI, ConsensusOutput};
 use tokio::sync::{broadcast, mpsc::UnboundedSender, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, trace, warn};
 
 mod client;
@@ -555,7 +555,7 @@ mod tests {
         let manager = TaskManager::current();
         let executor = manager.executor();
         let execution_node = default_test_execution_node(Some(chain), None, executor)?;
-        let (to_executor, from_consensus) = tn_types::test_channel!(1);
+        let (to_executor, from_consensus) = tokio::sync::broadcast::channel(1);
         execution_node.start_engine(from_consensus).await?;
         tokio::task::yield_now().await;
 
@@ -565,7 +565,7 @@ mod tests {
         //=== Testing begins
 
         // send output to executor
-        let res = to_executor.send(consensus_output).await;
+        let res = to_executor.send(consensus_output);
         debug!("res: {:?}", res);
         assert!(res.is_ok());
 
@@ -699,7 +699,7 @@ mod tests {
         let manager = TaskManager::current();
         let executor = manager.executor();
         let execution_node = default_test_execution_node(Some(chain), None, executor)?;
-        let (to_executor, from_consensus) = tn_types::test_channel!(1);
+        let (to_executor, from_consensus) = tokio::sync::broadcast::channel(1);
         execution_node.start_engine(from_consensus).await?;
         tokio::task::yield_now().await;
 
@@ -709,7 +709,7 @@ mod tests {
         //=== Testing begins
 
         // send output to executor
-        let res = to_executor.send(consensus_output).await;
+        let res = to_executor.send(consensus_output);
         debug!("res: {:?}", res);
         assert!(res.is_ok());
 
