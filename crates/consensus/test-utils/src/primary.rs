@@ -13,10 +13,13 @@ use tn_config::Parameters;
 use tn_node::primary::PrimaryNode;
 use tn_types::{
     test_utils::temp_dir, AuthorityIdentifier, BlsKeypair, ChainIdentifier, Committee,
-    NetworkKeypair, WorkerCache,
+    ConsensusOutput, NetworkKeypair, WorkerCache,
 };
 use tokio::{
-    sync::{broadcast::Sender, mpsc::channel},
+    sync::{
+        broadcast::{self, Sender},
+        mpsc::channel,
+    },
     task::JoinHandle,
 };
 use tracing::info;
@@ -148,5 +151,13 @@ impl PrimaryNodeDetails {
     /// node as still running.
     pub async fn is_running(&self) -> bool {
         self.node.is_running().await
+    }
+
+    /// Subscribe to [ConsensusOutput] broadcast.
+    ///
+    /// NOTE: this broadcasts to all receivers, so it's important to ensure
+    /// no subscriber causes the node's execution receiver to lag
+    pub async fn subscribe_consensus_output(&self) -> broadcast::Receiver<ConsensusOutput> {
+        self.node.subscribe_consensus_output().await
     }
 }

@@ -13,10 +13,10 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use tn_config::Parameters;
 use tn_node::engine::ExecutionNode;
 use tn_types::{
-    AuthorityIdentifier, BlsKeypair, BlsPublicKey, Committee, Multiaddr, NetworkKeypair,
-    WorkerCache, WorkerId,
+    AuthorityIdentifier, BlsKeypair, BlsPublicKey, Committee, ConsensusOutput, Multiaddr,
+    NetworkKeypair, WorkerCache, WorkerId,
 };
-use tokio::sync::{RwLock, RwLockWriteGuard};
+use tokio::sync::{broadcast, RwLock, RwLockWriteGuard};
 use tracing::info;
 
 /// The authority details hold all the necessary structs and details
@@ -350,5 +350,14 @@ impl AuthorityDetails {
             internal.client = Some(client);
         }
         internal.client.as_ref().unwrap().clone()
+    }
+
+    /// Subscribe to [ConsensusOutput] broadcast.
+    ///
+    /// NOTE: this broadcasts to all receivers, so it's important to ensure
+    /// no subscriber causes the node's execution receiver to lag
+    pub async fn subscribe_consensus_output(&self) -> broadcast::Receiver<ConsensusOutput> {
+        let internal = self.internal.read().await;
+        internal.primary.subscribe_consensus_output().await
     }
 }

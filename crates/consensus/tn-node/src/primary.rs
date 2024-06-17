@@ -446,6 +446,9 @@ where
     }
 
     /// Subscribe to [ConsensusOutput] broadcast.
+    ///
+    /// NOTE: this broadcasts to all receivers, so it's important to ensure
+    /// no subscriber causes the node's execution receiver to lag
     pub fn subscribe_consensus_output(&self) -> broadcast::Receiver<ConsensusOutput> {
         self.consensus_output_notification_sender.subscribe()
     }

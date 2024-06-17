@@ -9,7 +9,8 @@ use itertools::Itertools;
 use reth::tasks::TaskExecutor;
 use std::{collections::HashMap, time::Duration};
 use tn_config::Parameters;
-use tn_types::{test_utils::CommitteeFixture, Committee, WorkerCache, WorkerId};
+use tn_types::{test_utils::CommitteeFixture, Committee, ConsensusOutput, WorkerCache, WorkerId};
+use tokio::sync::broadcast;
 use tracing::info;
 
 #[cfg(test)]
@@ -253,5 +254,17 @@ impl Cluster {
 
     fn parameters() -> Parameters {
         Parameters { batch_size: 200, ..Parameters::default() }
+    }
+
+    /// Subscribe to [ConsensusOutput] broadcast.
+    ///
+    /// NOTE: this broadcasts to all receivers, so it's important to ensure
+    /// no subscriber causes the node's execution receiver to lag
+    pub async fn subscribe_consensus_output_by_authority(
+        &self,
+        id: usize,
+    ) -> broadcast::Receiver<ConsensusOutput> {
+        let authority = self.authority(id);
+        authority.subscribe_consensus_output().await
     }
 }
