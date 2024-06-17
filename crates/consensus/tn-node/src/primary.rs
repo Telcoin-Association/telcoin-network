@@ -25,7 +25,6 @@ use reth_db::{
     database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
 };
-// use reth_eth_wire::broadcast;
 use reth_evm::execute::BlockExecutorProvider;
 use std::{sync::Arc, time::Instant};
 use tn_config::Parameters;
@@ -56,6 +55,9 @@ struct PrimaryNodeInner {
     /// Peer ID used for local connections.
     own_peer_id: Option<PeerId>,
     /// Consensus broadcast channel.
+    ///
+    /// NOTE: this broadcasts to all receivers, so it's important to ensure
+    /// no subscriber causes the node's execution receiver to lag
     consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
 }
 

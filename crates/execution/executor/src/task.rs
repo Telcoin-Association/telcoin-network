@@ -10,7 +10,7 @@ use reth_provider::{
 };
 use reth_rpc_types::engine::ForkchoiceState;
 use reth_stages::PipelineEvent;
-use reth_tokio_util::{EventSender, EventStream};
+use reth_tokio_util::EventStream;
 use std::{
     collections::VecDeque,
     future::Future,
@@ -41,8 +41,6 @@ pub struct MiningTask<Client, Engine: EngineTypes, BlockExecutor> {
     canon_state_notification: CanonStateNotificationSender,
     /// The pipeline events to listen on
     pipeline_events: Option<EventStream<PipelineEvent>>,
-    /// Broadcast channel for consensus output
-    event_sender: Option<EventSender<ConsensusOutput>>,
     /// Receiving end from CL's `Executor`. The `ConsensusOutput` is sent
     /// to the mining task here.
     consensus_output_stream: BroadcastStream<ConsensusOutput>,
@@ -75,7 +73,6 @@ where
             canon_state_notification,
             queued: Default::default(),
             pipeline_events: None,
-            event_sender: None,
             consensus_output_stream,
             block_executor,
         }
@@ -84,11 +81,6 @@ where
     /// Sets the pipeline events to listen on.
     pub fn set_pipeline_events(&mut self, events: EventStream<PipelineEvent>) {
         self.pipeline_events = Some(events);
-    }
-
-    /// Sets the consensus events to listen on.
-    pub fn set_event_sender(&mut self, events: EventSender<ConsensusOutput>) {
-        self.event_sender = Some(events);
     }
 }
 
@@ -108,12 +100,7 @@ where
             // check if output is available from consensus
             match this.consensus_output_stream.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(output))) => {
-                    // try to broadcast output
-                    if let Some(stream) = this.event_sender.as_ref() {
-                        stream.notify(output.clone())
-                    }
-
-                    // que the output for local execution
+                    // queue the output for local execution
                     this.queued.push_back(output)
                 }
                 Poll::Ready(Some(Err(e))) => {

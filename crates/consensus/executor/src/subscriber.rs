@@ -169,11 +169,11 @@ impl Subscriber {
                     waiting.push_back(Self::fetch_batches(self.inner.clone(), sub_dag));
                 },
 
-                // Receive consensus messages for which all transaction data is downloaded
-                // and send to the execution layer.
+                // Receive consensus messages after all transaction data is downloaded
+                // then send to the execution layer for final block production.
                 //
                 // NOTE: this broadcasts to all receivers, so it's important to ensure
-                // no receivers causes this node's execution receiver to lag
+                // no receiver causes the node's execution receiver to lag
                 Some(message) = waiting.next() => {
                     if let Err(e) = consensus_output_notification_sender.send(message) {
                         error!("error broadcasting consensus output for authority {}: {}", self.inner.authority_id, e);

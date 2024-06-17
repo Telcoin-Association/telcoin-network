@@ -53,7 +53,6 @@ reth-evm = { workspace = true }
 reth-provider = { workspace = true }
 reth-rpc-types = { workspace = true }
 reth-tasks = { workspace = true }
-reth-tokio-util = { workspace = true }
 reth-stages = { workspace = true }
 reth-exex = { workspace = true }
 reth-node-events = { workspace = true }

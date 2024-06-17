@@ -10371,7 +10371,6 @@ dependencies = [
  "reth-stages",
  "reth-static-file",
  "reth-tasks",
- "reth-tokio-util",
  "reth-tracing",
  "reth-transaction-pool",
  "serde-reflection",
