@@ -258,8 +258,7 @@ impl Cluster {
 
     /// Subscribe to [ConsensusOutput] broadcast.
     ///
-    /// NOTE: this broadcasts to all receivers, so it's important to ensure
-    /// no subscriber causes the node's execution receiver to lag
+    /// NOTE: this broadcasts to all subscribers, but lagging receivers will lose messages
     pub async fn subscribe_consensus_output_by_authority(
         &self,
         id: usize,

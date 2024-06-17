@@ -56,8 +56,7 @@ struct PrimaryNodeInner {
     own_peer_id: Option<PeerId>,
     /// Consensus broadcast channel.
     ///
-    /// NOTE: this broadcasts to all receivers, so it's important to ensure
-    /// no subscriber causes the node's execution receiver to lag
+    /// NOTE: this broadcasts to all subscribers, but lagging receivers will lose messages
     consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
 }
 
@@ -447,8 +446,7 @@ where
 
     /// Subscribe to [ConsensusOutput] broadcast.
     ///
-    /// NOTE: this broadcasts to all receivers, so it's important to ensure
-    /// no subscriber causes the node's execution receiver to lag
+    /// NOTE: this broadcasts to all subscribers, but lagging receivers will lose messages
     pub fn subscribe_consensus_output(&self) -> broadcast::Receiver<ConsensusOutput> {
         self.consensus_output_notification_sender.subscribe()
     }

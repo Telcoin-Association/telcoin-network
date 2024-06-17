@@ -172,8 +172,7 @@ impl Subscriber {
                 // Receive consensus messages after all transaction data is downloaded
                 // then send to the execution layer for final block production.
                 //
-                // NOTE: this broadcasts to all receivers, so it's important to ensure
-                // no receiver causes the node's execution receiver to lag
+                // NOTE: this broadcasts to all subscribers, but lagging receivers will lose messages
                 Some(message) = waiting.next() => {
                     if let Err(e) = consensus_output_notification_sender.send(message) {
                         error!("error broadcasting consensus output for authority {}: {}", self.inner.authority_id, e);
