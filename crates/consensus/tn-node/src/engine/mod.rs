@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use consensus_metrics::metered_channel::{Receiver, Sender};
+use consensus_metrics::metered_channel::Sender;
 use reth_db::{
     database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},

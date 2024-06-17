@@ -1,5 +1,4 @@
 use crate::Storage;
-use consensus_metrics::metered_channel::Receiver;
 use futures::StreamExt;
 use futures_util::{future::BoxFuture, FutureExt};
 use reth_beacon_consensus::{BeaconEngineMessage, ForkchoiceStatus};
@@ -12,7 +11,6 @@ use reth_provider::{
 use reth_rpc_types::engine::ForkchoiceState;
 use reth_stages::PipelineEvent;
 use reth_tokio_util::{EventSender, EventStream};
-use tokio_stream::wrappers::BroadcastStream;
 use std::{
     collections::VecDeque,
     future::Future,
@@ -22,6 +20,7 @@ use std::{
 };
 use tn_types::ConsensusOutput;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
+use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, warn};
 
 /// A Future that listens for new ready transactions and puts new blocks into storage
@@ -122,7 +121,7 @@ where
                 }
                 Poll::Ready(None) => {
                     // stream has ended
-                    return Poll::Ready(())
+                    return Poll::Ready(());
                 }
                 Poll::Pending => { /* nothing to do */ }
             }
@@ -130,7 +129,7 @@ where
             if this.insert_task.is_none() {
                 if this.queued.is_empty() {
                     // nothing to insert
-                    break
+                    break;
                 }
 
                 // ready to queue in new insert task
@@ -192,18 +191,18 @@ where
                                             ForkchoiceStatus::Valid => break,
                                             ForkchoiceStatus::Invalid => {
                                                 error!(target: "execution::executor", ?fcu_response, "Forkchoice update returned invalid response");
-                                                return None
+                                                return None;
                                             }
                                             ForkchoiceStatus::Syncing => {
                                                 debug!(target: "execution::executor", ?fcu_response, "Forkchoice update returned SYNCING, waiting for VALID");
                                                 // wait for the next fork choice update
-                                                continue
+                                                continue;
                                             }
                                         }
                                     }
                                     Err(err) => {
                                         error!(target: "execution::executor", ?err, "Autoseal fork choice update failed");
-                                        return None
+                                        return None;
                                     }
                                 }
                             }
@@ -243,7 +242,7 @@ where
                     }
                     Poll::Pending => {
                         this.insert_task = Some(fut);
-                        break
+                        break;
                     }
                 }
             }

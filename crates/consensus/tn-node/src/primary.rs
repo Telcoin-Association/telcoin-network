@@ -7,10 +7,7 @@ use crate::{
     engine::ExecutionNode, error::NodeError, metrics::new_registry, try_join_all, FuturesUnordered,
 };
 use anemo::PeerId;
-use consensus_metrics::{
-    metered_channel::{self, Sender},
-    RegistryID, RegistryService,
-};
+use consensus_metrics::{metered_channel, RegistryID, RegistryService};
 use fastcrypto::traits::{KeyPair as _, VerifyingKey};
 use narwhal_executor::{
     get_restored_consensus_output, Executor, ExecutorMetrics, SubscriberResult,
@@ -19,7 +16,8 @@ use narwhal_network::client::NetworkClient;
 use narwhal_primary::{
     consensus::{
         Bullshark, ChannelMetrics, Consensus, ConsensusMetrics, ConsensusRound, LeaderSchedule,
-    }, Primary, PrimaryChannelMetrics, CHANNEL_CAPACITY, NUM_SHUTDOWN_RECEIVERS
+    },
+    Primary, PrimaryChannelMetrics, CHANNEL_CAPACITY, NUM_SHUTDOWN_RECEIVERS,
 };
 use narwhal_storage::NodeStorage;
 use prometheus::{IntGauge, Registry};
@@ -37,7 +35,7 @@ use tn_types::{
     Round, WorkerCache, BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::{
-    sync::{watch, RwLock, broadcast},
+    sync::{broadcast, watch, RwLock},
     task::JoinHandle,
 };
 use tracing::{info, instrument};
@@ -122,7 +120,8 @@ impl PrimaryNodeInner {
         let last_executed_sub_dag_index =
             execution_components.last_executed_output().await.expect("execution found HEAD");
 
-        let consensus_output_notification_sender = self.consensus_output_notification_sender.clone();
+        let consensus_output_notification_sender =
+            self.consensus_output_notification_sender.clone();
         // create receiving channel before spawning primary to ensure messages are not lost
         let consensus_output_rx = self.consensus_output_notification_sender.subscribe();
 
@@ -463,7 +462,8 @@ pub struct PrimaryNode {
 impl PrimaryNode {
     pub fn new(parameters: Parameters, registry_service: RegistryService) -> PrimaryNode {
         // TODO: what is an appropriate channel capacity? CHANNEL_CAPACITY currently set to 10k which seems really high but is consistent for now
-        let (consensus_output_notification_sender, _receiver) = tokio::sync::broadcast::channel(CHANNEL_CAPACITY);
+        let (consensus_output_notification_sender, _receiver) =
+            tokio::sync::broadcast::channel(CHANNEL_CAPACITY);
 
         let inner = PrimaryNodeInner {
             parameters,
