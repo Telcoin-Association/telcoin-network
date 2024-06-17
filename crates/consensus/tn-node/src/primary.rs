@@ -461,7 +461,8 @@ pub struct PrimaryNode {
 
 impl PrimaryNode {
     pub fn new(parameters: Parameters, registry_service: RegistryService) -> PrimaryNode {
-        // TODO: what is an appropriate channel capacity? CHANNEL_CAPACITY currently set to 10k which seems really high but is consistent for now
+        // TODO: what is an appropriate channel capacity? CHANNEL_CAPACITY currently set to 10k
+        // which seems really high but is consistent for now
         let (consensus_output_notification_sender, _receiver) =
             tokio::sync::broadcast::channel(CHANNEL_CAPACITY);
 

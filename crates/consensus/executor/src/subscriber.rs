@@ -124,7 +124,10 @@ async fn create_and_run_subscriber(
         rx_sequence,
         inner: Arc::new(Inner { authority_id, committee, worker_cache, client, metrics }),
     };
-    subscriber.run(restored_consensus_output, consensus_output_notification_sender).await.expect("Failed to run subscriber")
+    subscriber
+        .run(restored_consensus_output, consensus_output_notification_sender)
+        .await
+        .expect("Failed to run subscriber")
 }
 
 impl Subscriber {
