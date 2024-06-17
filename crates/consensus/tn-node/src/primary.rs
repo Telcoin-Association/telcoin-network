@@ -118,7 +118,7 @@ impl PrimaryNodeInner {
             self.consensus_output_notification_sender.clone();
 
         // create receiving channel before spawning primary to ensure messages are not lost
-        let consensus_output_rx = self.consensus_output_notification_sender.subscribe();
+        let consensus_output_rx = self.subscribe_consensus_output();
 
         // spawn primary if not already running
         let primary_handles = Self::spawn_primary(
@@ -433,7 +433,6 @@ where
             worker_cache,
             committee.clone(),
             client,
-            // execution_state,
             shutdown_receivers.pop().unwrap(),
             rx_sequence,
             restored_consensus_output,
@@ -441,11 +440,14 @@ where
             executor_metrics,
         )?;
 
-        // let handles =
-        //     executor_handles.into_iter().chain(std::iter::once(consensus_handles)).collect();
         let handles = vec![executor_handle, consensus_handle];
 
         Ok((handles, leader_schedule))
+    }
+
+    /// Subscribe to [ConsensusOutput] broadcast.
+    pub fn subscribe_consensus_output(&self) -> broadcast::Receiver<ConsensusOutput> {
+        self.consensus_output_notification_sender.subscribe()
     }
 }
 
@@ -535,5 +537,10 @@ impl PrimaryNode {
     pub async fn registry(&self) -> Option<(RegistryID, Registry)> {
         let guard = self.internal.read().await;
         guard.registry.clone()
+    }
+
+    pub async fn subscribe_consensus_output(&self) -> broadcast::Receiver<ConsensusOutput> {
+        let guard = self.internal.read().await;
+        guard.consensus_output_notification_sender.subscribe()
     }
 }
