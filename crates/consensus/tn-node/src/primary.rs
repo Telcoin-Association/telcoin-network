@@ -105,18 +105,10 @@ impl PrimaryNodeInner {
         // create a new registry
         let registry = new_registry()?;
 
-        // TODO: is this useful for consensus output?
-        //
         // create the channel to send the shutdown signal
         let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
 
         let executor_metrics = ExecutorMetrics::new(&registry);
-
-        // // this is what connects the EL and CL
-        // let (tx_notifier, rx_notifier) = metered_channel::channel(
-        //     narwhal_primary::CHANNEL_CAPACITY,
-        //     &executor_metrics.tx_notifier,
-        // );
 
         // used to retrieve the last executed certificate in case of restarts
         let last_executed_sub_dag_index =
@@ -124,6 +116,7 @@ impl PrimaryNodeInner {
 
         let consensus_output_notification_sender =
             self.consensus_output_notification_sender.clone();
+
         // create receiving channel before spawning primary to ensure messages are not lost
         let consensus_output_rx = self.consensus_output_notification_sender.subscribe();
 
