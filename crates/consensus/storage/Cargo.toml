@@ -3,9 +3,11 @@ name = "narwhal-storage"
 version.workspace = true
 edition = "2021"
 license = "Apache-2.0"
-authors = ["Grant Kee <grant.kee@telco.in>", "Mysten Labs <build@mystenlabs.com>"]
+authors = [
+    "Grant Kee <grant.kee@telco.in>",
+    "Mysten Labs <build@mystenlabs.com>",
+]
 publish = false
-
 
 [dependencies]
 tempfile.workspace = true

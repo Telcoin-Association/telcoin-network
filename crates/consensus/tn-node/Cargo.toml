@@ -7,6 +7,7 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 
+
 [dependencies]
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
@@ -22,7 +23,9 @@ reth-tracing = { workspace = true }
 reth-node-ethereum = { workspace = true }
 url = { version = "2.3.1", optional = true }
 axum = { workspace = true }
-enr = { workspace = true, default-features = false, features = ["rust-secp256k1"] }
+enr = { workspace = true, default-features = false, features = [
+    "rust-secp256k1",
+] }
 
 fastcrypto = { workspace = true }
 narwhal-executor = { workspace = true }
@@ -84,7 +87,7 @@ serde-reflection = { workspace = true }
 serde_yaml = { workspace = true }
 narwhal-test-utils = { workspace = true }
 reth-tracing = { workspace = true }
-narwhal-network = { workspace = true, features = ["test-utils"]}
+narwhal-network = { workspace = true, features = ["test-utils"] }
 narwhal-primary = { workspace = true }
 assert_matches = { workspace = true }
 tempfile = { workspace = true }

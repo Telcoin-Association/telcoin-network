@@ -6,14 +6,17 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-authors = ["Grant Kee <grant.kee@telco.in>", "Mysten Labs <build@mystenlabs.com>"]
+authors = [
+    "Grant Kee <grant.kee@telco.in>",
+    "Mysten Labs <build@mystenlabs.com>",
+]
 description = "Commonly used types in telcoin network's internal network communication."
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 tn-types = { workspace = true }
-anemo = { workspace = true}
+anemo = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
 indexmap = { version = "1.9.2", features = ["serde"] }

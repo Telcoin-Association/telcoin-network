@@ -3,8 +3,12 @@ name = "tn-types"
 version.workspace = true
 edition = "2021"
 license = "Apache-2.0"
-authors = ["Grant Kee <grant.kee@telco.in>", "Mysten Labs <build@mystenlabs.com>"]
+authors = [
+    "Grant Kee <grant.kee@telco.in>",
+    "Mysten Labs <build@mystenlabs.com>",
+]
 publish = false
+
 
 [dependencies]
 base64 = { workspace = true }
@@ -61,7 +65,14 @@ consensus-metrics = { workspace = true }
 
 [features]
 default = []
-test-utils = ["tempfile", "fdlimit", "reth-tracing", "reth-transaction-pool", "reth-primitives/arbitrary", "reth-provider"]
+test-utils = [
+    "tempfile",
+    "fdlimit",
+    "reth-tracing",
+    "reth-transaction-pool",
+    "reth-primitives/arbitrary",
+    "reth-provider",
+]
 arbitrary = ["reth-primitives/arbitrary"]
 
 [[bench]]

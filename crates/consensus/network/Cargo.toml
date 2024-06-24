@@ -2,7 +2,10 @@
 name = "narwhal-network"
 version.workspace = true
 license = "Apache-2.0"
-authors = ["Grant Kee <grant.kee@telco.in>", "Mysten Labs <build@mystenlabs.com>"]
+authors = [
+    "Grant Kee <grant.kee@telco.in>",
+    "Mysten Labs <build@mystenlabs.com>",
+]
 edition = "2021"
 publish = false
 
@@ -22,6 +25,7 @@ tn-types = { workspace = true }
 telcoin-sync = { workspace = true }
 consensus-metrics = { workspace = true }
 narwhal-network-types = { workspace = true }
+
 
 anemo = { workspace = true }
 anemo-tower = { workspace = true }

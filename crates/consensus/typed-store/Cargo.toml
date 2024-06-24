@@ -2,7 +2,10 @@
 name = "narwhal-typed-store"
 version.workspace = true
 license = "Apache-2.0"
-authors = ["Grant Kee <grant.kee@telco.in>", "Francois Garillot <francois@mystenlabs.com>"]
+authors = [
+    "Grant Kee <grant.kee@telco.in>",
+    "Francois Garillot <francois@mystenlabs.com>",
+]
 description = "a typed database interface"
 repository = "https://github.com/mystenlabs/mysten-infra"
 edition = "2021"
@@ -21,7 +24,7 @@ hdrhistogram = { workspace = true }
 rocksdb = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true , features = ["full", "test-util"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 tracing = { workspace = true }
 telcoin-macros = { workspace = true }
 ouroboros = { workspace = true }

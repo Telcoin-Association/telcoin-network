@@ -1,13 +1,17 @@
 [package]
 name = "mem-utils-derive"
 version.workspace = true
-authors = ["Parity Technologies <admin@parity.io>", "Grant Kee <grant.kee@telco.in>"]
+authors = [
+    "Parity Technologies <admin@parity.io>",
+    "Grant Kee <grant.kee@telco.in>",
+]
 license = "MIT OR Apache-2.0"
 description = "Crate for memory reporting"
 repository = "https://github.com/mystenlabs/mysten-infra"
 edition = "2021"
 rust-version = "1.56.1"
 publish = false
+
 
 [lib]
 path = "lib.rs"

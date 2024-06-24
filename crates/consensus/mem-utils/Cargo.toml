@@ -1,7 +1,11 @@
 [package]
 name = "mem-utils"
 version.workspace = true
-authors = ["Parity Technologies <admin@parity.io>", "Andrew Schran <aschran@mystenlabs.com>", "Grant Kee <grant.kee@telco.in>"]
+authors = [
+    "Parity Technologies <admin@parity.io>",
+    "Andrew Schran <aschran@mystenlabs.com>",
+    "Grant Kee <grant.kee@telco.in>",
+]
 repository = "https://github.com/mystenlabs/mysten-infra"
 description = "Collection of memory related utilities"
 license = "MIT OR Apache-2.0"
@@ -18,7 +22,7 @@ fastcrypto = { workspace = true }
 fastcrypto-tbls = { workspace = true }
 indexmap = { workspace = true }
 roaring = { workspace = true }
-ed25519-consensus = { version = "2.0.1"}
+ed25519-consensus = { version = "2.0.1" }
 smallvec = { version = "1.10.0", optional = true }
 parking_lot = { workspace = true, optional = true }
 once_cell = { workspace = true }

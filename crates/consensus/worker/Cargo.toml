@@ -2,7 +2,10 @@
 name = "narwhal-worker"
 version.workspace = true
 license = "Apache-2.0"
-authors = ["Grant Kee <grant.kee@telco.in>", "Mysten Labs <build@mystenlabs.com>"]
+authors = [
+    "Grant Kee <grant.kee@telco.in>",
+    "Mysten Labs <build@mystenlabs.com>",
+]
 edition = "2021"
 publish = false
 

@@ -1,7 +1,10 @@
 [package]
 name = "consensus-metrics"
 version.workspace = true
-authors = ["Grant Kee <grant.kee@telco.in>", "Mysten Labs <build@mystenlabs.com>"]
+authors = [
+    "Grant Kee <grant.kee@telco.in>",
+    "Mysten Labs <build@mystenlabs.com>",
+]
 license = "Apache-2.0"
 publish = false
 edition = "2021"
