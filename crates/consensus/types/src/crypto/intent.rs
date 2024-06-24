@@ -94,7 +94,7 @@ impl FromStr for Intent {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s: Vec<u8> = decode_bytes_hex(s).map_err(|_| eyre!("Invalid Intent"))?;
         if s.len() != 3 {
-            return Err(eyre!("Invalid Intent"))
+            return Err(eyre!("Invalid Intent"));
         }
         Ok(Self { scope: s[0].try_into()?, version: s[1].try_into()?, app_id: s[2].try_into()? })
     }

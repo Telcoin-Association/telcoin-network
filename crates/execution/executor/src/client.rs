@@ -40,7 +40,7 @@ impl AutoSealClient {
                     hash.into()
                 } else {
                     warn!(target: "execution::executor", num, "no matching block found");
-                    return headers
+                    return headers;
                 }
             }
         };
@@ -57,7 +57,7 @@ impl AutoSealClient {
                 }
                 headers.push(header);
             } else {
-                break
+                break;
             }
         }
 
@@ -74,7 +74,7 @@ impl AutoSealClient {
             if let Some(body) = storage.bodies.get(&hash).cloned() {
                 bodies.push(body);
             } else {
-                break
+                break;
             }
         }
 

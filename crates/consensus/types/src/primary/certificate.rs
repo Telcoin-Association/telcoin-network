@@ -319,7 +319,7 @@ impl CertificateV1 {
                     while !votes.is_empty() && votes.front().unwrap() == sigs.last().unwrap() {
                         votes.pop_front().unwrap();
                     }
-                    return true
+                    return true;
                 }
                 false
             })
@@ -409,7 +409,7 @@ impl CertificateV1 {
 
         // Genesis certificates are always valid.
         if self.round() == 0 && Self::genesis(committee).contains(&self) {
-            return Ok(Certificate::V1(self))
+            return Ok(Certificate::V1(self));
         }
 
         // Save signature verifications when the header is invalid.

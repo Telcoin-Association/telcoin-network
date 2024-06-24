@@ -105,7 +105,7 @@ where
             if this.insert_task.is_none() {
                 if this.queued.is_empty() {
                     // nothing to insert
-                    break
+                    break;
                 }
 
                 // ready to queue in new insert task
@@ -170,7 +170,7 @@ where
                                 }
                                 Err(err) => {
                                     error!(target: "execution::batch_maker", ?err, "Execution's BatchMaker Ack Failed:");
-                                    return None
+                                    return None;
                                 }
                             }
 
@@ -231,7 +231,7 @@ where
                     }
                     Poll::Pending => {
                         this.insert_task = Some(fut);
-                        break
+                        break;
                     }
                 }
             }

@@ -94,17 +94,17 @@ where
                 "Failed to validate total difficulty for block {}: {e}",
                 sealed_block.header.hash()
             );
-            return Err(e.into())
+            return Err(e.into());
         }
 
         if let Err(e) = self.consensus.validate_header(&sealed_block) {
             error!(?sealed_block, "Failed to validate header {}: {e}", sealed_block.header.hash());
-            return Err(e.into())
+            return Err(e.into());
         }
 
         if let Err(e) = self.consensus.validate_block_pre_execution(&sealed_block) {
             error!(?sealed_block, "Failed to validate block {}: {e}", sealed_block.header.hash());
-            return Err(e.into())
+            return Err(e.into());
         }
 
         // the following is taken from BlockchainTree::try_append_canonical_chain()
@@ -139,7 +139,7 @@ where
             .fork(Hardfork::Paris)
             .active_at_ttd(parent_td, U256::ZERO)
         {
-            return Err(BlockValidationError::BlockPreMerge { hash: sealed_block.hash() })?
+            return Err(BlockValidationError::BlockPreMerge { hash: sealed_block.hash() })?;
         }
 
         // retrieve parent header from provider
@@ -213,7 +213,7 @@ where
             return Err(BatchValidationError::BodyStateRootDiff(GotExpected {
                 got: state_root,
                 expected: block_with_senders.state_root,
-            }))
+            }));
         }
 
         Ok(())

@@ -368,7 +368,7 @@ where
                     // calculate v based on EIP-155
                     let v = recovery_id as u64 + chain_id * 2 + 35;
                     let y_odd_parity = v % 2 == 0;
-                    return Ok(y_odd_parity)
+                    return Ok(y_odd_parity);
                 }
             }
         }
@@ -428,7 +428,7 @@ where
 
                         // return the error and check the next request
                         let _ = reply.send(error);
-                        continue
+                        continue;
                     }
 
                     // user's request not in cache - process request

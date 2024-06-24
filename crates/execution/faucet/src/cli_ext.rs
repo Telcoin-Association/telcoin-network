@@ -144,7 +144,7 @@ impl FaucetArgs {
             let ext = FaucetRpcExt::new(provider, pool, config);
 
             info!(target: "faucet", "Google KMS active - merging faucet extension.");
-            return Ok(ext)
+            return Ok(ext);
         }
 
         // TODO: support local/hardcoded hot wallet signatures
