@@ -9,7 +9,6 @@ authors = [
 publish = false
 edition = "2021"
 
-
 [dependencies]
 eyre = { workspace = true }
 async-trait = { workspace = true }

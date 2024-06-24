@@ -26,7 +26,6 @@ telcoin-sync = { workspace = true }
 consensus-metrics = { workspace = true }
 narwhal-network-types = { workspace = true }
 
-
 anemo = { workspace = true }
 anemo-tower = { workspace = true }
 axum = { workspace = true }

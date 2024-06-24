@@ -9,7 +9,6 @@ authors = [
 ]
 publish = false
 
-
 [dependencies]
 base64 = { workspace = true }
 bcs = { workspace = true }
