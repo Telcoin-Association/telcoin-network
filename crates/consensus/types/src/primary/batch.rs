@@ -248,6 +248,8 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for BatchV1 {
     }
 }
 
+// Convenience function for casting `BatchDigest` into EL B256.
+// note: these are both 32-bytes
 impl From<BatchDigest> for B256 {
     fn from(value: BatchDigest) -> Self {
         B256::from_slice(value.as_ref())

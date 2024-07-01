@@ -198,6 +198,8 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for CommittedSubDag {
     }
 }
 
+// Convenience function for casting `ConsensusOutputDigest` into EL B256.
+// note: these are both 32-bytes
 impl From<ConsensusOutputDigest> for B256 {
     fn from(value: ConsensusOutputDigest) -> Self {
         B256::from_slice(value.as_ref())
