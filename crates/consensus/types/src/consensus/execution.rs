@@ -163,6 +163,7 @@ pub struct TNPayloadAttributes {
 
 impl TNPayloadAttributes {
     /// Create a new instance of [Self].
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         parent_block: BlockNumHash,
         ommers: Vec<Header>,
