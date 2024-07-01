@@ -10651,8 +10651,6 @@ dependencies = [
  "reth-config",
  "reth-db",
  "reth-evm",
- "reth-evm-ethereum",
- "reth-execution-types",
  "reth-network",
  "reth-network-p2p",
  "reth-network-peers",

@@ -12,7 +12,7 @@ use reth_primitives::{
     U256,
 };
 use reth_revm::primitives::{
-    BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, SpecId,
+    BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg,
 };
 use reth_rpc_types::{engine::PayloadId, BlockNumHash};
 use std::{convert::Infallible, sync::Arc};
