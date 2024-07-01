@@ -15,10 +15,10 @@ fn temp_dir() -> std::path::PathBuf {
 
 uint::construct_uint! {
     // 32 byte number
+    #[allow(clippy::assign_op_pattern)]
     pub struct Num32(4);
 }
 
-#[allow(clippy::assign_op_pattern)]
 #[test]
 fn test_helpers() {
     let v = vec![];
