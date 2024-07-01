@@ -14,7 +14,6 @@ use reth_stages::PipelineEvent;
 use reth_tokio_util::EventStream;
 use std::{
     collections::VecDeque,
-    fmt::Formatter,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -26,11 +25,11 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, warn};
 
 /// A Future that listens for new ready transactions and puts new blocks into storage
-pub struct MiningTask<Provider, Engine: EngineTypes, BlockExecutor> {
+pub struct MiningTask<Client, Engine: EngineTypes, BlockExecutor> {
     /// The configured chain spec
     chain_spec: Arc<ChainSpec>,
     /// The client used to interact with the state
-    provider: Provider,
+    client: Client,
     /// Single active future that inserts a new block into `storage`
     insert_task: Option<BoxFuture<'static, Option<EventStream<PipelineEvent>>>>,
     /// Shared storage to insert new blocks
@@ -52,7 +51,7 @@ pub struct MiningTask<Provider, Engine: EngineTypes, BlockExecutor> {
 
 // === impl MiningTask ===
 
-impl<Provider, Engine, BlockExecutor> MiningTask<Provider, Engine, BlockExecutor>
+impl<Client, Engine, BlockExecutor> MiningTask<Client, Engine, BlockExecutor>
 where
     Engine: EngineTypes,
 {
@@ -62,13 +61,13 @@ where
         to_engine: UnboundedSender<BeaconEngineMessage<Engine>>,
         canon_state_notification: CanonStateNotificationSender,
         storage: Storage,
-        provider: Provider,
+        client: Client,
         consensus_output_stream: BroadcastStream<ConsensusOutput>,
         block_executor: BlockExecutor,
     ) -> Self {
         Self {
             chain_spec,
-            provider,
+            client,
             insert_task: None,
             storage,
             to_engine,
@@ -86,9 +85,9 @@ where
     }
 }
 
-impl<Provider, Engine, BlockExecutor> Future for MiningTask<Provider, Engine, BlockExecutor>
+impl<Client, Engine, BlockExecutor> Future for MiningTask<Client, Engine, BlockExecutor>
 where
-    Provider: StateProviderFactory + CanonChainTracker + BlockReaderIdExt + Clone + Unpin + 'static,
+    Client: StateProviderFactory + CanonChainTracker + BlockReaderIdExt + Clone + Unpin + 'static,
     Engine: EngineTypes + 'static,
     BlockExecutor: BlockExecutorProvider,
 {
@@ -124,8 +123,9 @@ where
                 // ready to queue in new insert task
                 let storage = this.storage.clone();
                 let output = this.queued.pop_front().expect("not empty");
+
                 let to_engine = this.to_engine.clone();
-                let provider = this.provider.clone();
+                let client = this.client.clone();
                 let chain_spec = Arc::clone(&this.chain_spec);
                 let events = this.pipeline_events.take();
                 let canon_state_notification = this.canon_state_notification.clone();
@@ -134,7 +134,6 @@ where
                 // Create the mining future that creates a block, notifies the engine that drives
                 // the pipeline
                 this.insert_task = Some(Box::pin(async move {
-                    // hold the lock so only one consensus output is processed at a time
                     let mut storage = storage.write().await;
 
                     // TODO: support withdrawals
@@ -143,10 +142,7 @@ where
                     match storage.build_and_execute(
                         output,
                         withdrawals,
-                        // TODO: consider specifying lifetime parameter on BuildArgs
-                        // to pass this as a reference
-                        // currently always wrapped in Arc, so not too inefficient
-                        provider.clone(),
+                        &client,
                         chain_spec,
                         &block_executor,
                     ) {
@@ -201,9 +197,9 @@ where
 
                             // update canon chain for rpc
                             let new_header = sealed_block_with_senders.header.clone();
-                            provider.set_canonical_head(new_header.clone());
-                            provider.set_safe(new_header.clone());
-                            provider.set_finalized(new_header);
+                            client.set_canonical_head(new_header.clone());
+                            client.set_safe(new_header.clone());
+                            client.set_finalized(new_header);
 
                             debug!(target: "execution::executor", header=?sealed_block_with_senders.hash(), "sending block notification");
 
@@ -244,11 +240,11 @@ where
     }
 }
 
-impl<Provider, Engine, EvmConfig> std::fmt::Debug for MiningTask<Provider, Engine, EvmConfig>
+impl<Client, Engine, EvmConfig> std::fmt::Debug for MiningTask<Client, Engine, EvmConfig>
 where
     Engine: EngineTypes,
 {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MiningTask").finish_non_exhaustive()
     }
 }

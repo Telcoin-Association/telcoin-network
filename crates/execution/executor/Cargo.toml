@@ -17,9 +17,7 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 
 reth-primitives = { workspace = true }
-reth-evm-ethereum = { workspace = true }
 reth-chainspec = { workspace = true }
-reth-execution-types = { workspace = true }
 reth-tokio-util = { workspace = true }
 reth-revm = { workspace = true }
 reth-stages = { workspace = true }
@@ -47,7 +45,6 @@ reth-node-api = { workspace = true }
 eyre = { workspace = true }
 futures = { workspace = true }
 tempfile = { workspace = true }
-fastcrypto = { workspace = true }
 
 [dev-dependencies]
 # unit tests
@@ -55,6 +52,7 @@ tn-types = { workspace = true, features = ["test-utils"] }
 assert_matches = { workspace = true }
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
 reth-tracing = { workspace = true }
+fastcrypto = { workspace = true }
 narwhal-test-utils = { workspace = true }
 
 # integration tests

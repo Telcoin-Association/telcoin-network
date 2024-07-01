@@ -32,21 +32,18 @@ use reth_provider::{
     BlockReaderIdExt, CanonStateNotificationSender, ExecutionOutcome, StateProviderFactory,
 };
 use reth_revm::database::StateProviderDatabase;
-use reth_rpc_types::BlockNumHash;
 use std::{collections::HashMap, sync::Arc};
-use tn_types::{now, AutoSealConsensus, BatchAPI, BuildArguments, ConsensusOutput};
+use tn_types::{now, AutoSealConsensus, BatchAPI, ConsensusOutput};
 use tokio::sync::{broadcast, mpsc::UnboundedSender, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, trace, warn};
 
 mod client;
 mod error;
-mod payload_builder;
 mod task;
 
 pub use crate::client::AutoSealClient;
 use error::ExecutorError;
-pub use payload_builder::execute_consensus_output;
 pub use task::MiningTask;
 
 /// Builder type for configuring the setup
@@ -271,7 +268,7 @@ impl StorageInner {
         &mut self,
         output: ConsensusOutput,
         withdrawals: Option<Withdrawals>,
-        provider: Provider,
+        provider: &Provider,
         chain_spec: Arc<ChainSpec>,
         executor: &Executor,
     ) -> Result<(SealedBlockWithSenders, ExecutionOutcome), ExecutorError>
@@ -461,36 +458,6 @@ impl StorageInner {
         // output.batches.into_iter().flat_map(|batches| batches.into_iter().flat_map(|batch|
         // batch.transactions_owned().into_iter().flat_map(|tx|
         // TransactionSigned::decode_enveloped(tx.into())))).collect()
-    }
-    pub(crate) fn build_and_execute2<Provider, Executor>(
-        &mut self,
-        output: ConsensusOutput,
-        withdrawals: Option<Withdrawals>,
-        provider: Provider,
-        chain_spec: Arc<ChainSpec>,
-        executor: &Executor,
-    ) -> Result<(SealedBlockWithSenders, ExecutionOutcome), ExecutorError>
-    where
-        Executor: BlockExecutorProvider,
-        Provider: StateProviderFactory + BlockReaderIdExt,
-    {
-        // TODO: get this from somewhere else
-        let evm_config = reth_evm_ethereum::EthEvmConfig::default();
-        // TODO: get this from storage efficiently
-        // - storage should store each round of consensus output as a Vec<SealedBlock>
-        // - also, only need parent num hash
-        //
-        // Does this need to verify the previous round of consensus was fully executed?
-        let parent_num_hash = BlockNumHash::new(self.best_block, self.best_hash);
-        let build_args = BuildArguments::new(provider, output, parent_num_hash, chain_spec);
-
-        execute_consensus_output(evm_config, build_args)?;
-
-        // TODO:
-        // - how to feed blocks to engine?
-        // - review "batch-execution" concept in reth: BlockExecutorProvider trait
-
-        todo!()
     }
 }
 
