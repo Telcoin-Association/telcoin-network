@@ -219,7 +219,7 @@ async fn spawn_local_testnet(
         let copy = dir.join("genesis/validators");
         for config in std::fs::read_dir(copy)? {
             let entry = config?;
-            std::fs::copy(entry.path(), &copy_path.join(entry.file_name()))?;
+            std::fs::copy(entry.path(), copy_path.join(entry.file_name()))?;
         }
     }
 
@@ -239,11 +239,11 @@ async fn spawn_local_testnet(
 
         // copy genesis files back to validator dirs
         std::fs::copy(
-            &shared_genesis_dir.join("genesis/committee.yaml"),
+            shared_genesis_dir.join("genesis/committee.yaml"),
             dir.join("genesis/committee.yaml"),
         )?;
         std::fs::copy(
-            &shared_genesis_dir.join("genesis/worker_cache.yaml"),
+            shared_genesis_dir.join("genesis/worker_cache.yaml"),
             dir.join("genesis/worker_cache.yaml"),
         )?;
 
