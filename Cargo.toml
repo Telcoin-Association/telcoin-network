@@ -193,7 +193,7 @@ proc-macro2 = "1.0.47"
 quote = "1.0.23"
 rstest = "0.16.0"
 syn = { version = "1.0.104", features = ["full", "derive", "extra-traits"] }
-uint = "0.9.4"
+uint = "0.9.5"
 cfg-if = "1.0.0"
 governor = "0.6.0"
 arc-swap = { version = "1.5.1", features = ["serde"] }
