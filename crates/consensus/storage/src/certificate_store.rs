@@ -725,6 +725,7 @@ mod test {
         )
     }
 
+    #[warn(clippy::type_complexity)]
     fn create_db_maps(
         path: std::path::PathBuf,
     ) -> (
@@ -906,8 +907,8 @@ mod test {
         assert_eq!(highest_round_number, 50);
         for certificate in result {
             assert!(
-                (certificate.round() == last_round_number) ||
-                    (certificate.round() == last_round_number - 1)
+                (certificate.round() == last_round_number)
+                    || (certificate.round() == last_round_number - 1)
             );
         }
         assert!(last_round_number_not_exist.is_none());
