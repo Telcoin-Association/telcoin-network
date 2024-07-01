@@ -725,6 +725,7 @@ mod test {
         )
     }
 
+    #[allow(clippy::type_complexity)]
     fn create_db_maps(
         path: std::path::PathBuf,
     ) -> (

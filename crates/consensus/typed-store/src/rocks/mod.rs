@@ -1442,8 +1442,8 @@ where
         // [`rocksdb::DBWithThreadMode::key_may_exist_cf`] can have false positives,
         // but no false negatives. We use it to short-circuit the absent case
         let readopts = self.opts.readopts();
-        Ok(self.rocksdb.key_may_exist_cf(&self.cf(), &key_buf, &readopts) &&
-            self.rocksdb.get_pinned_cf_opt(&self.cf(), &key_buf, &readopts)?.is_some())
+        Ok(self.rocksdb.key_may_exist_cf(&self.cf(), &key_buf, &readopts)
+            && self.rocksdb.get_pinned_cf_opt(&self.cf(), &key_buf, &readopts)?.is_some())
     }
 
     #[instrument(level = "trace", skip_all, err)]
@@ -1972,9 +1972,9 @@ impl DBOptions {
 
         // Increase write buffer size to 256MiB.
         let write_buffer_size = read_size_from_env(ENV_VAR_MAX_WRITE_BUFFER_SIZE_MB)
-            .unwrap_or(DEFAULT_MAX_WRITE_BUFFER_SIZE_MB) *
-            1024 *
-            1024;
+            .unwrap_or(DEFAULT_MAX_WRITE_BUFFER_SIZE_MB)
+            * 1024
+            * 1024;
         self.options.set_write_buffer_size(write_buffer_size);
         // Since large blobs are not in sst files, reduce the target file size and base level
         // target size.
@@ -2006,9 +2006,9 @@ impl DBOptions {
     pub fn optimize_for_write_throughput(mut self) -> DBOptions {
         // Increase write buffer size to 256MiB.
         let write_buffer_size = read_size_from_env(ENV_VAR_MAX_WRITE_BUFFER_SIZE_MB)
-            .unwrap_or(DEFAULT_MAX_WRITE_BUFFER_SIZE_MB) *
-            1024 *
-            1024;
+            .unwrap_or(DEFAULT_MAX_WRITE_BUFFER_SIZE_MB)
+            * 1024
+            * 1024;
         self.options.set_write_buffer_size(write_buffer_size);
         // Increase write buffers to keep to 6 before slowing down writes.
         let max_write_buffer_number = read_size_from_env(ENV_VAR_MAX_WRITE_BUFFER_NUMBER)
@@ -2032,9 +2032,9 @@ impl DBOptions {
         // Increase sst file size to 128MiB.
         self.options.set_target_file_size_base(
             read_size_from_env(ENV_VAR_TARGET_FILE_SIZE_BASE_MB)
-                .unwrap_or(DEFAULT_TARGET_FILE_SIZE_BASE_MB) as u64 *
-                1024 *
-                1024,
+                .unwrap_or(DEFAULT_TARGET_FILE_SIZE_BASE_MB) as u64
+                * 1024
+                * 1024,
         );
 
         // Increase level 1 target size to 256MiB * 6 ~ 1.5GiB.
@@ -2094,9 +2094,9 @@ pub fn default_db_options() -> DBOptions {
     // future. If you need to modify an option, either update the default value, or override the
     // option in Sui / Narwhal.
     opt.set_db_write_buffer_size(
-        read_size_from_env(ENV_VAR_DB_WRITE_BUFFER_SIZE).unwrap_or(DEFAULT_DB_WRITE_BUFFER_SIZE) *
-            1024 *
-            1024,
+        read_size_from_env(ENV_VAR_DB_WRITE_BUFFER_SIZE).unwrap_or(DEFAULT_DB_WRITE_BUFFER_SIZE)
+            * 1024
+            * 1024,
     );
     opt.set_max_total_wal_size(
         read_size_from_env(ENV_VAR_DB_WAL_SIZE).unwrap_or(DEFAULT_DB_WAL_SIZE) as u64 * 1024 * 1024,
@@ -2375,34 +2375,4 @@ fn big_endian_saturating_add_one(v: &mut [u8]) {
 /// Check if all the bytes in the vector are 0xFF
 fn is_max(v: &[u8]) -> bool {
     v.iter().all(|&x| x == u8::MAX)
-}
-
-#[allow(clippy::assign_op_pattern)]
-#[test]
-fn test_helpers() {
-    let v = vec![];
-    assert!(is_max(&v));
-
-    fn check_add(v: Vec<u8>) {
-        let mut v = v;
-        let num = Num32::from_big_endian(&v);
-        big_endian_saturating_add_one(&mut v);
-        assert!(num + 1 == Num32::from_big_endian(&v));
-    }
-
-    uint::construct_uint! {
-        // 32 byte number
-        #[cfg_attr(feature = "scale-info", derive(TypeInfo))]
-        struct Num32(4);
-    }
-
-    let mut v = vec![255; 32];
-    big_endian_saturating_add_one(&mut v);
-    assert!(Num32::MAX == Num32::from_big_endian(&v));
-
-    check_add(vec![1; 32]);
-    check_add(vec![6; 32]);
-    check_add(vec![254; 32]);
-
-    // TBD: More tests coming with randomized arrays
 }

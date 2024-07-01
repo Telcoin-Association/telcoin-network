@@ -1,6 +1,10 @@
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// TODO: uint crate needs to be refactored for this nightly clippy
+#![allow(clippy::assign_op_pattern)]
+
 use super::*;
 use crate::{
     reopen, retry_transaction, retry_transaction_forever,
@@ -11,6 +15,34 @@ use serde::Deserialize;
 
 fn temp_dir() -> std::path::PathBuf {
     tempfile::tempdir().expect("Failed to open temporary directory").into_path()
+}
+
+uint::construct_uint! {
+    // 32 byte number
+    struct Num32(4);
+}
+
+#[test]
+fn test_helpers() {
+    let v = vec![];
+    assert!(is_max(&v));
+
+    fn check_add(v: Vec<u8>) {
+        let mut v = v;
+        let num = Num32::from_big_endian(&v);
+        big_endian_saturating_add_one(&mut v);
+        assert!(num + 1 == Num32::from_big_endian(&v));
+    }
+
+    let mut v = vec![255; 32];
+    big_endian_saturating_add_one(&mut v);
+    assert!(Num32::MAX == Num32::from_big_endian(&v));
+
+    check_add(vec![1; 32]);
+    check_add(vec![6; 32]);
+    check_add(vec![254; 32]);
+
+    // TBD: More tests coming with randomized arrays
 }
 
 #[rstest]
