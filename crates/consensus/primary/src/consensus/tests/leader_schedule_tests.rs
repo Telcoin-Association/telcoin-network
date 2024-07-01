@@ -187,9 +187,6 @@ async fn test_leader_schedule_from_store() {
 
     store.write_consensus_state(&HashMap::new(), &sub_dag).unwrap();
 
-    // TODO:
-    // bad threshold currently set to 0 causing test to fail
-    //
     // WHEN
     let schedule = LeaderSchedule::from_store(committee, store, 33);
 
