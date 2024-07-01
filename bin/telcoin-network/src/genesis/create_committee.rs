@@ -2,11 +2,10 @@
 
 use clap::Args;
 use reth::dirs::MaybePlatformPath;
-use reth_primitives::ChainSpec;
+use reth_chainspec::ChainSpec;
 use std::{path::PathBuf, sync::Arc};
-use tn_config::{traits::ConfigTrait, Config};
-use tn_node::dirs::{DataDirPath, TelcoinDirs as _};
-use tn_types::NetworkGenesis;
+use tn_node::dirs::{default_datadir_args, DataDirChainPath, DataDirPath};
+use tn_types::{Config, ConfigTrait, NetworkGenesis, TelcoinDirs as _};
 
 use crate::args::clap_genesis_parser;
 use tracing::info;
@@ -33,6 +32,7 @@ pub struct CreateCommitteeArgs {
     /// The GENESIS_DIRECTORY contains more directories:
     /// - committee
     /// - todo
+    ///
     /// Validators add their information to the directory using VCS like
     /// github. Using individual files prevents merge conflicts.
     #[arg(long, value_name = "GENESIS_DIRECTORY", verbatim_doc_comment)]
@@ -69,9 +69,9 @@ impl CreateCommitteeArgs {
         info!(target: "genesis::add-validator", "Adding validator to committee");
 
         // load network genesis
-        let data_dir = self.datadir.unwrap_or_chain_default(self.chain.chain);
-        let genesis_path = data_dir.genesis_path();
-        let network_genesis = NetworkGenesis::load_from_path(genesis_path)?;
+        let data_dir: DataDirChainPath =
+            self.datadir.unwrap_or_chain_default(self.chain.chain, default_datadir_args()).into();
+        let network_genesis = NetworkGenesis::load_from_path(&data_dir)?;
 
         // validate only checks proof of possession for now
         network_genesis.validate()?;

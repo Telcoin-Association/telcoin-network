@@ -11,11 +11,14 @@ use self::{
 use crate::args::clap_genesis_parser;
 use clap::{Args, Subcommand};
 
+use rand::{rngs::StdRng, SeedableRng};
 use reth::dirs::MaybePlatformPath;
-use reth_primitives::ChainSpec;
+use reth_chainspec::ChainSpec;
+use reth_primitives::{keccak256, Address, GenesisAccount, U256};
+use secp256k1::Secp256k1;
 use std::{path::PathBuf, sync::Arc};
-use tn_node::dirs::{DataDirPath, TelcoinDirs as _};
-use tn_types::NetworkGenesis;
+use tn_node::dirs::{default_datadir_args, DataDirChainPath, DataDirPath};
+use tn_types::{Config, ConfigTrait, NetworkGenesis, TelcoinDirs as _};
 
 /// Generate keypairs and save them to a file.
 #[derive(Debug, Args)]
@@ -64,7 +67,7 @@ pub struct GenesisArgs {
 pub enum CeremonySubcommand {
     /// Initialize the genesis directory.
     #[command(name = "init")]
-    Initialize,
+    Initialize(Initialize),
     /// Add validator to committee.
     #[command(name = "add-validator")]
     AddValidator(AddValidator),
@@ -80,6 +83,30 @@ pub enum CeremonySubcommand {
     // - finalize (todo)
 }
 
+/// Capture an optional test account for development.
+#[derive(Debug, Clone, Args)]
+pub struct Initialize {
+    /// Used to add a funded account (by simple text string).  Use this on a dev cluster
+    /// (must provide on all validator genesis inits) to have an account with a deterministically
+    /// derived key. This is ONLY for dev testing, never use this for other chains.
+    #[arg(long)]
+    pub dev_funded_account: Option<String>,
+}
+
+/// Take a string and return the deterministic account derived from it.  This is be used
+/// with similiar functionality in the test client to allow easy testing using simple strings
+/// for accounts.
+fn account_from_word(key_word: &str) -> reth_primitives::alloy_primitives::Address {
+    let seed = keccak256(key_word.as_bytes());
+    let mut rand = <StdRng as SeedableRng>::from_seed(seed.0);
+    let secp = Secp256k1::new();
+    let (_, public_key) = secp.generate_keypair(&mut rand);
+    // strip out the first byte because that should be the SECP256K1_TAG_PUBKEY_UNCOMPRESSED
+    // tag returned by libsecp's uncompressed pubkey serialization
+    let hash = keccak256(&public_key.serialize_uncompressed()[1..]);
+    Address::from_slice(&hash[12..])
+}
+
 impl GenesisArgs {
     /// Execute command
     pub async fn execute(&self) -> eyre::Result<()> {
@@ -89,10 +116,27 @@ impl GenesisArgs {
         // let mut config = self.load_config()?;
 
         match &self.command {
-            CeremonySubcommand::Initialize => {
+            CeremonySubcommand::Initialize(init) => {
                 // TODO: support custom genesis path
-                let datadir = self.datadir.unwrap_or_chain_default(self.chain.chain);
-                let network_genesis = NetworkGenesis::new();
+                let datadir: DataDirChainPath = self
+                    .datadir
+                    .unwrap_or_chain_default(self.chain.chain, default_datadir_args())
+                    .into();
+
+                // TODO: use config or CLI chain spec?
+                let config_path = self.config.clone().unwrap_or(datadir.node_config_path());
+
+                let mut tn_config: Config = Config::load_from_path(&config_path)?;
+                if let Some(acct_str) = &init.dev_funded_account {
+                    let addr = account_from_word(acct_str);
+                    tn_config.genesis.alloc.insert(
+                        addr,
+                        GenesisAccount::default().with_balance(U256::from(10).pow(U256::from(27))), // One Billion TEL
+                    );
+                    Config::store_path(config_path, tn_config.clone())?;
+                }
+
+                let network_genesis = NetworkGenesis::with_chain_spec(tn_config.chain_spec());
                 network_genesis.write_to_path(datadir.genesis_path())?;
             }
             // add validator to the committee file

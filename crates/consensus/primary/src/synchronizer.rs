@@ -318,6 +318,7 @@ impl Inner {
 /// - Validating and accepting certificates received from peers.
 /// - Triggering fetching for certificates and batches.
 /// - Broadcasting created certificates.
+///
 /// `Synchronizer` contains most of the certificate processing logic in Narwhal.
 #[derive(Clone)]
 pub struct Synchronizer {
@@ -326,6 +327,7 @@ pub struct Synchronizer {
 }
 
 impl Synchronizer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         authority_id: AuthorityIdentifier,
         committee: Committee,

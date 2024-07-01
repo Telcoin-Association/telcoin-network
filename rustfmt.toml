@@ -1,11 +1,19 @@
-reorder_imports = true
+# Reorder imports alphabetically
+reorder_imports = true # stable
+# Merge imports into a single use statement.
 imports_granularity = "Crate"
-use_small_heuristics = "Max"
-comment_width = 100
+# vertically align args, etc. if beyond "max_width"
+# default: 100
+use_small_heuristics = "Max" # stable
+# wrap comments if over width
 wrap_comments = true
-binop_separator = "Back"
-trailing_comma = "Vertical"
-trailing_semicolon = false
-use_field_init_shorthand = true
+comment_width = 100
+# Use field initialize shorthand if possible.
+use_field_init_shorthand = true # stable
+# Format code snippet included in doc comments.
 format_code_in_doc_comments = true
+# Max width for code snippets included in doc comments.
+# default: 100
 doc_comment_code_block_width = 100
+# Where to put a binary operator when a binary expression goes multiline.
+binop_separator = "Back"

@@ -7,19 +7,18 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 tn-types = { workspace = true }
 futures-util = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
-tokio-stream = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 
 reth-primitives = { workspace = true }
-reth-interfaces = { workspace = true }
+reth-chainspec = { workspace = true }
+reth-tokio-util = { workspace = true }
 reth-revm = { workspace = true }
 reth-stages = { workspace = true }
 reth-provider = { workspace = true }
@@ -37,8 +36,11 @@ reth-config = { workspace = true }
 reth-tasks = { workspace = true }
 #revm-inspectors = { workspace = true }
 reth-network = { workspace = true }
+reth-network-peers = { workspace = true }
+reth-network-p2p = { workspace = true }
 reth-blockchain-tree = { workspace = true }
 reth-db = { workspace = true }
+reth-evm = { workspace = true }
 reth-node-api = { workspace = true }
 eyre = { workspace = true }
 futures = { workspace = true }

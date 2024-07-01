@@ -8,8 +8,10 @@ use fastcrypto::traits::KeyPair as _;
 use itertools::Itertools;
 use reth::tasks::TaskExecutor;
 use std::{collections::HashMap, time::Duration};
-use tn_config::Parameters;
-use tn_types::{test_utils::CommitteeFixture, Committee, WorkerCache, WorkerId};
+use tn_types::{
+    test_utils::CommitteeFixture, Committee, ConsensusOutput, Parameters, WorkerCache, WorkerId,
+};
+use tokio::sync::broadcast;
 use tracing::info;
 
 #[cfg(test)]
@@ -177,6 +179,7 @@ impl Cluster {
     /// Returns all the running authorities. Any authority that:
     /// * has been started ever
     /// * or has been stopped
+    ///
     /// will not be returned by this method.
     pub async fn authorities(&self) -> Vec<AuthorityDetails> {
         let mut result = Vec::new();
@@ -253,5 +256,16 @@ impl Cluster {
 
     fn parameters() -> Parameters {
         Parameters { batch_size: 200, ..Parameters::default() }
+    }
+
+    /// Subscribe to [ConsensusOutput] broadcast.
+    ///
+    /// NOTE: this broadcasts to all subscribers, but lagging receivers will lose messages
+    pub async fn subscribe_consensus_output_by_authority(
+        &self,
+        id: usize,
+    ) -> broadcast::Receiver<ConsensusOutput> {
+        let authority = self.authority(id);
+        authority.subscribe_consensus_output().await
     }
 }

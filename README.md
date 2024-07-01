@@ -2,7 +2,7 @@
 Consensus layer (CL) is an implemntation of Narwhal and Bullshark.
 Execution layer (EL) is an implementation of reth.
 
-Requires Rust 1.76
+Requires Rust 1.79
 
 ## CLI Usage
 The CLI is used to create validator information, join a committee, and start the network. The following `.env` variables are useful but not required:

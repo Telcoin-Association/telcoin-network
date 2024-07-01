@@ -17,12 +17,15 @@ use narwhal_worker::{
     Worker, CHANNEL_CAPACITY, NUM_SHUTDOWN_RECEIVERS,
 };
 use prometheus::Registry;
-use reth_db::{database::Database, database_metrics::DatabaseMetrics};
-use reth_node_builder::ConfigureEvm;
+use reth_db::{
+    database::Database,
+    database_metrics::{DatabaseMetadata, DatabaseMetrics},
+};
+use reth_evm::execute::BlockExecutorProvider;
 use std::{collections::HashMap, sync::Arc, time::Instant};
-use tn_config::Parameters;
 use tn_types::{
-    BlsPublicKey, Committee, NetworkKeypair, PreSubscribedBroadcastSender, WorkerCache, WorkerId,
+    BlsPublicKey, Committee, NetworkKeypair, Parameters, PreSubscribedBroadcastSender, WorkerCache,
+    WorkerId,
 };
 use tokio::{sync::RwLock, task::JoinHandle};
 use tracing::{info, instrument};
@@ -47,6 +50,7 @@ pub struct WorkerNodeInner {
 impl WorkerNodeInner {
     /// Starts the worker node with the provided info. If the node is already running then this
     /// method will return an error instead.
+    #[allow(clippy::too_many_arguments)]
     #[instrument(level = "info", skip_all)]
     async fn start<DB, Evm>(
         &mut self,
@@ -70,8 +74,8 @@ impl WorkerNodeInner {
         execution_node: &ExecutionNode<DB, Evm>,
     ) -> eyre::Result<()>
     where
-        DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
-        Evm: ConfigureEvm + Clone + 'static,
+        DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
+        Evm: BlockExecutorProvider + Clone + 'static,
     {
         if self.is_running().await {
             return Err(NodeError::NodeAlreadyRunning.into());
@@ -216,6 +220,7 @@ impl WorkerNode {
         Self { internal: Arc::new(RwLock::new(inner)) }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn start<DB, Evm>(
         &self,
         // The primary's public key of this authority.
@@ -237,8 +242,8 @@ impl WorkerNode {
         execution_node: &ExecutionNode<DB, Evm>,
     ) -> eyre::Result<()>
     where
-        DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
-        Evm: ConfigureEvm + Clone + 'static,
+        DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
+        Evm: BlockExecutorProvider + Clone + 'static,
     {
         let mut guard = self.internal.write().await;
         guard
@@ -290,6 +295,7 @@ impl WorkerNodes {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[instrument(level = "info", skip_all)]
     pub async fn start<DB, Evm>(
         &self,
@@ -310,8 +316,8 @@ impl WorkerNodes {
         execution_node: &ExecutionNode<DB, Evm>,
     ) -> eyre::Result<()>
     where
-        DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
-        Evm: ConfigureEvm + Clone + 'static,
+        DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
+        Evm: BlockExecutorProvider + Clone + 'static,
     {
         let worker_ids_running = self.workers_running().await;
         if !worker_ids_running.is_empty() {

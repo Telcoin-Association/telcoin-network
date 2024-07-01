@@ -2,9 +2,8 @@
 
 use eyre::ErrReport;
 use narwhal_executor::SubscriberError;
-use reth::core::init::InitDatabaseError;
 use reth_beacon_consensus::BeaconForkChoiceUpdateError;
-use reth_interfaces::RethError;
+use reth_db_common::init::InitDatabaseError;
 use reth_provider::ProviderError;
 use thiserror::Error;
 use tn_types::WorkerId;
@@ -35,10 +34,6 @@ pub enum ExecutionError {
     /// Error from init genesis
     #[error(transparent)]
     InitGenesis(#[from] InitDatabaseError),
-
-    /// Error creating the blockchain tree
-    #[error(transparent)]
-    Reth(#[from] RethError),
 
     /// Error creating temp db
     #[error(transparent)]

@@ -18,9 +18,10 @@ use gcloud_sdk::{
 };
 use humantime::format_duration;
 use lru_time_cache::LruCache;
+use reth_chainspec::BaseFeeParams;
 use reth_primitives::{
-    Address, BaseFeeParams, FromRecoveredPooledTransaction, Signature as EthSignature, Transaction,
-    TransactionKind, TransactionSigned, TxEip1559, TxHash, B256, U256,
+    Address, FromRecoveredPooledTransaction, Signature as EthSignature, Transaction,
+    TransactionSigned, TxEip1559, TxHash, TxKind, B256, U256,
 };
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_rpc::eth::error::{EthApiError, EthResult, RpcInvalidTransactionError};
@@ -175,7 +176,7 @@ where
                 max_priority_fee_per_gas: gas_price,
                 max_fee_per_gas: gas_price,
                 gas_limit: 1_000_000,
-                to: TransactionKind::Call(to),
+                to: TxKind::Call(to),
                 value: self.transfer_amount,
                 input: Default::default(),
                 access_list: Default::default(),
@@ -195,7 +196,7 @@ where
                 max_priority_fee_per_gas: gas_price,
                 max_fee_per_gas: gas_price,
                 gas_limit: 1_000_000,
-                to: TransactionKind::Call(self.faucet_contract),
+                to: TxKind::Call(self.faucet_contract),
                 value: U256::ZERO,
                 input,
                 access_list: Default::default(),
@@ -272,7 +273,7 @@ where
 
         // create message from slice before consuming digest
         // this is needed to calculate `v` below
-        let message = Message::from_slice(&digest.0)?;
+        let message = Message::from_digest_slice(&digest.0)?;
 
         // assemble digest for signature
         let digest = Some(Digest::Sha256(digest.0.to_vec()));
@@ -368,7 +369,7 @@ where
                     // calculate v based on EIP-155
                     let v = recovery_id as u64 + chain_id * 2 + 35;
                     let y_odd_parity = v % 2 == 0;
-                    return Ok(y_odd_parity)
+                    return Ok(y_odd_parity);
                 }
             }
         }
@@ -428,7 +429,7 @@ where
 
                         // return the error and check the next request
                         let _ = reply.send(error);
-                        continue
+                        continue;
                     }
 
                     // user's request not in cache - process request

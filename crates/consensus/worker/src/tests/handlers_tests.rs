@@ -17,7 +17,6 @@ async fn synchronize() {
     let fixture = CommitteeFixture::builder().randomize_ports(true).build();
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();
-    let authority_id = fixture.authorities().next().unwrap().id();
     let id = 0;
 
     // Create a new test store.
@@ -57,13 +56,11 @@ async fn synchronize() {
         .unwrap();
 
     let handler = PrimaryReceiverHandler {
-        authority_id,
         id,
         committee,
         worker_cache,
         store: store.clone(),
         request_batches_timeout: Duration::from_secs(999),
-        request_batches_retry_nodes: 3, // Not used in this test.
         network: Some(send_network),
         batch_fetcher: None,
         validator: NoopBatchValidator,
@@ -88,7 +85,6 @@ async fn synchronize_versioned_batches() {
     let fixture = CommitteeFixture::builder().randomize_ports(true).build();
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();
-    let authority_id = fixture.authorities().next().unwrap().id();
     let id = 0;
 
     // Create a new test store.
@@ -149,13 +145,11 @@ async fn synchronize_versioned_batches() {
         .unwrap();
 
     let handler_latest_version = PrimaryReceiverHandler {
-        authority_id,
         id,
         committee,
         worker_cache,
         store: store.clone(),
         request_batches_timeout: Duration::from_secs(999),
-        request_batches_retry_nodes: 3, // Not used in this test.
         network: Some(send_network),
         batch_fetcher: None,
         validator: NoopBatchValidator,
@@ -181,7 +175,6 @@ async fn synchronize_when_batch_exists() {
     let fixture = CommitteeFixture::builder().randomize_ports(true).build();
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();
-    let authority_id = fixture.authorities().next().unwrap().id();
     let id = 0;
 
     // Create a new test store.
@@ -191,13 +184,11 @@ async fn synchronize_when_batch_exists() {
     let send_network = random_network();
 
     let handler = PrimaryReceiverHandler {
-        authority_id,
         id,
         committee: committee.clone(),
         worker_cache,
         store: store.clone(),
         request_batches_timeout: Duration::from_secs(999),
-        request_batches_retry_nodes: 3, // Not used in this test.
         network: Some(send_network),
         batch_fetcher: None,
         validator: NoopBatchValidator,

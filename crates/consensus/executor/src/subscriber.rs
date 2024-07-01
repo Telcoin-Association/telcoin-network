@@ -19,7 +19,7 @@ use tn_types::{
     CommittedSubDag, Committee, ConditionalBroadcastReceiver, ConsensusOutput, HeaderAPI,
     MetadataAPI, NetworkPublicKey, Timestamp, WorkerCache, WorkerId,
 };
-use tokio::task::JoinHandle;
+use tokio::{sync::broadcast, task::JoinHandle};
 use tracing::{debug, error, info, warn};
 
 /// The `Subscriber` receives certificates sequenced by the consensus and waits until the
@@ -42,6 +42,7 @@ struct Inner {
     metrics: Arc<ExecutorMetrics>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_subscriber(
     authority_id: AuthorityIdentifier,
     worker_cache: WorkerCache,
@@ -51,7 +52,7 @@ pub fn spawn_subscriber(
     rx_sequence: metered_channel::Receiver<CommittedSubDag>,
     metrics: Arc<ExecutorMetrics>,
     restored_consensus_output: Vec<CommittedSubDag>,
-    tx_notifier: metered_channel::Sender<ConsensusOutput>,
+    consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
     // state: State,
 ) -> JoinHandle<()> {
     // This is ugly but has to be done this way for now
@@ -80,7 +81,7 @@ pub fn spawn_subscriber(
             client,
             metrics,
             restored_consensus_output,
-            tx_notifier,
+            consensus_output_notification_sender,
         ),
         "SubscriberTask"
     )
@@ -107,6 +108,7 @@ pub fn spawn_subscriber(
 //     }
 // }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_and_run_subscriber(
     authority_id: AuthorityIdentifier,
     worker_cache: WorkerCache,
@@ -116,7 +118,7 @@ async fn create_and_run_subscriber(
     client: NetworkClient,
     metrics: Arc<ExecutorMetrics>,
     restored_consensus_output: Vec<CommittedSubDag>,
-    tx_notifier: metered_channel::Sender<ConsensusOutput>,
+    consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
 ) {
     info!("Starting subscriber");
     let subscriber = Subscriber {
@@ -124,7 +126,10 @@ async fn create_and_run_subscriber(
         rx_sequence,
         inner: Arc::new(Inner { authority_id, committee, worker_cache, client, metrics }),
     };
-    subscriber.run(restored_consensus_output, tx_notifier).await.expect("Failed to run subscriber")
+    subscriber
+        .run(restored_consensus_output, consensus_output_notification_sender)
+        .await
+        .expect("Failed to run subscriber")
 }
 
 impl Subscriber {
@@ -135,7 +140,7 @@ impl Subscriber {
     async fn run(
         mut self,
         restored_consensus_output: Vec<CommittedSubDag>,
-        tx_notifier: metered_channel::Sender<ConsensusOutput>,
+        consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
     ) -> SubscriberResult<()> {
         // It's important to have the futures in ordered fashion as we want
         // to guarantee that will deliver to the executor the certificates
@@ -166,10 +171,13 @@ impl Subscriber {
                     waiting.push_back(Self::fetch_batches(self.inner.clone(), sub_dag));
                 },
 
-                // Receive here consensus messages for which we have downloaded all transactions data.
+                // Receive consensus messages after all transaction data is downloaded
+                // then send to the execution layer for final block production.
+                //
+                // NOTE: this broadcasts to all subscribers, but lagging receivers will lose messages
                 Some(message) = waiting.next() => {
-                    if let Err(e) = tx_notifier.send(message).await {
-                        error!("tx_notifier closed for authority {}: {}", self.inner.authority_id, e);
+                    if let Err(e) = consensus_output_notification_sender.send(message) {
+                        error!("error broadcasting consensus output for authority {}: {}", self.inner.authority_id, e);
                         return Ok(());
                     }
                 },

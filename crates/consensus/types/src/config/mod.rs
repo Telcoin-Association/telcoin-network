@@ -28,6 +28,11 @@ pub use committee::*;
 use self::utils::get_available_tcp_port;
 pub mod utils;
 
+pub mod config_traits;
+pub use config_traits::*;
+pub mod configs;
+pub use configs::*;
+
 /// The epoch number.
 pub type Epoch = u64;
 

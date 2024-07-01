@@ -5,8 +5,9 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io::{ErrorKind::NotFound, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
+use tracing::info;
 
 /// Based on `confy` crate.
 /// Problem: reth uses TOML and TN uses yaml, so must replicate the necessary code as a trait.
@@ -19,6 +20,7 @@ pub trait ConfigTrait {
     fn load_from_path<T: Serialize + DeserializeOwned + Default>(
         path: impl AsRef<Path>,
     ) -> eyre::Result<T> {
+        info!(target: "tn::config", path = ?path.as_ref(), "Loading configuration");
         match File::open(&path) {
             Ok(mut file) => {
                 let mut cfg_string = String::new();
@@ -66,4 +68,24 @@ pub trait ConfigTrait {
         f.write_all(s.as_bytes()).with_context(|| "Failed to write configuration file")?;
         Ok(())
     }
+}
+
+/// Telcoin Network specific directories.
+pub trait TelcoinDirs {
+    /// Return the path to `configuration` yaml file.
+    fn node_config_path(&self) -> PathBuf;
+    /// Return the path to the directory that holds
+    /// private keys for the validator operating this node.
+    fn validator_keys_path(&self) -> PathBuf;
+    /// Return the path to `genesis` dir.
+    fn genesis_path(&self) -> PathBuf;
+    /// Return the path to the directory where individual and public validator information is
+    /// collected for genesis.
+    fn validator_info_path(&self) -> PathBuf;
+    /// Return the path to the committee file.
+    fn committee_path(&self) -> PathBuf;
+    /// Return the path to the worker cache file.
+    fn worker_cache_path(&self) -> PathBuf;
+    /// Return the path to narwhal's node storage.
+    fn narwhal_db_path(&self) -> PathBuf;
 }

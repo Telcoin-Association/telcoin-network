@@ -3,7 +3,10 @@ name = "narwhal-test-utils"
 version.workspace = true
 edition = "2021"
 license = "Apache-2.0"
-authors = ["Grant Kee <grant.kee@telco.in>", "Mysten Labs <build@mystenlabs.com>"]
+authors = [
+    "Grant Kee <grant.kee@telco.in>",
+    "Mysten Labs <build@mystenlabs.com>",
+]
 publish = false
 
 [dependencies]
@@ -31,20 +34,20 @@ narwhal-storage = { workspace = true }
 consensus-metrics = { workspace = true }
 narwhal-typed-store = { workspace = true }
 reth-tracing = { workspace = true }
-reth-interfaces = { workspace = true }
+reth-chainspec = { workspace = true }
+
 
 anemo = { workspace = true }
-tn-config = { workspace = true }
 
 # execution
 eyre = { workspace = true }
 reth-node-ethereum = { workspace = true }
 reth-stages = { workspace = true }
-tn-batch-maker = { workspace = true}
-tn-batch-validator = { workspace = true}
+tn-batch-maker = { workspace = true }
+tn-batch-validator = { workspace = true }
 tn-executor = { workspace = true }
 reth = { workspace = true }
-reth-db = { workspace = true, features = ["test-utils"]}
+reth-db = { workspace = true, features = ["test-utils"] }
 reth-transaction-pool = { workspace = true }
 jsonrpsee = { workspace = true }
 clap = { workspace = true, features = ["env"] }

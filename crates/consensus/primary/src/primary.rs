@@ -54,7 +54,7 @@ use std::{
 };
 use tn_types::{
     traits::EncodeDecodeBase64, Authority, AuthorityIdentifier, BlsKeypair, BlsSignature,
-    ChainIdentifier, Committee, Multiaddr, NetworkKeypair, NetworkPublicKey, Protocol,
+    ChainIdentifier, Committee, Multiaddr, NetworkKeypair, NetworkPublicKey, Parameters, Protocol,
     RandomnessPrivateKey, WorkerCache,
 };
 
@@ -63,7 +63,6 @@ use narwhal_network_types::{
     RequestVoteRequest, RequestVoteResponse, SendCertificateRequest, SendCertificateResponse,
     WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimary, WorkerToPrimaryServer,
 };
-use tn_config::Parameters;
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
@@ -680,8 +679,7 @@ impl PrimaryReceiverHandler {
         if current_time < *header.created_at() {
             if *header.created_at() - current_time <= TOLERANCE_SEC {
                 // for a small difference we simply wait
-                tokio::time::sleep(Duration::from_secs(*header.created_at() - current_time))
-                    .await;
+                tokio::time::sleep(Duration::from_secs(*header.created_at() - current_time)).await;
             } else {
                 // For larger differences return an error, and log it
                 warn!(

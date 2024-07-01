@@ -17,12 +17,11 @@ use fastcrypto::{
     bls12381, ed25519,
     error::FastCryptoError,
     hash::{Blake2b256, HashFunction},
-    secp256k1,
     traits::{AggregateAuthenticator, KeyPair, Signer, ToFromBytes, VerifyingKey},
 };
 // This re-export allows using the trait-defined APIs
 pub use fastcrypto::traits;
-use reth_primitives::ChainSpec;
+use reth_chainspec::ChainSpec;
 use serde::Serialize;
 mod intent;
 pub use intent::*;
@@ -55,9 +54,9 @@ pub type NetworkKeypair = ed25519::Ed25519KeyPair;
 // EXECUTION
 //
 /// Public key used for signing transactions in the Execution Layer.
-pub type ExecutionPublicKey = secp256k1::Secp256k1PublicKey;
+pub type ExecutionPublicKey = secp256k1::PublicKey;
 /// Keypair used for signing transactions in the Execution Layer.
-pub type ExecutionKeypair = secp256k1::Secp256k1KeyPair;
+pub type ExecutionKeypair = secp256k1::Keypair;
 
 // TODO: implement randomness
 pub type RandomnessSignature = fastcrypto_tbls::types::Signature;
@@ -82,8 +81,8 @@ pub fn generate_proof_of_possession(
     chain_spec: &ChainSpec,
 ) -> eyre::Result<BlsSignature> {
     let mut msg = keypair.public().as_bytes().to_vec();
-    let chain_bytes = bcs::to_bytes(chain_spec)?;
-    msg.extend_from_slice(chain_bytes.as_slice());
+    let genesis_bytes = bcs::to_bytes(&chain_spec.genesis)?;
+    msg.extend_from_slice(genesis_bytes.as_slice());
     let sig = BlsSignature::new_secure(
         &IntentMessage::new(Intent::telcoin_app(IntentScope::ProofOfPossession), msg),
         keypair,
@@ -102,8 +101,8 @@ pub fn verify_proof_of_possession(
 ) -> eyre::Result<()> {
     public_key.validate().with_context(|| "Provided public key invalid")?;
     let mut msg = public_key.as_bytes().to_vec();
-    let chain_bytes = bcs::to_bytes(chain_spec)?;
-    msg.extend_from_slice(chain_bytes.as_slice());
+    let genesis_bytes = bcs::to_bytes(&chain_spec.genesis)?;
+    msg.extend_from_slice(genesis_bytes.as_slice());
     let result = proof.verify_secure(
         &IntentMessage::new(Intent::telcoin_app(IntentScope::ProofOfPossession), msg),
         public_key,

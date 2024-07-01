@@ -17,31 +17,25 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 use consensus_metrics::metered_channel::Sender;
-use reth_interfaces::{
-    consensus::{Consensus, ConsensusError},
-    executor::{BlockExecutionError, BlockValidationError},
+use reth_chainspec::ChainSpec;
+use reth_evm::execute::{
+    BlockExecutionError, BlockExecutionOutput, BlockExecutorProvider, BlockValidationError,
+    Executor,
 };
-use reth_node_api::ConfigureEvm;
 use reth_primitives::{
-    constants::{EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT},
-    proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, BlockWithSenders,
-    Bloom, ChainSpec, Header, ReceiptWithBloom, SealedBlock, SealedHeader, TransactionSigned, B256,
-    EMPTY_OMMER_ROOT_HASH, U256,
+    constants::{EMPTY_TRANSACTIONS, ETHEREUM_BLOCK_GAS_LIMIT},
+    proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, Header,
+    SealedHeader, TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256,
 };
-use reth_provider::{
-    BlockExecutor, BlockReaderIdExt, BundleStateWithReceipts, StateProviderFactory,
-};
-use reth_revm::{
-    database::StateProviderDatabase, db::states::bundle_state::BundleRetention,
-    processor::EVMProcessor, State,
-};
+use reth_provider::{BlockReaderIdExt, ExecutionOutcome, StateProviderFactory};
+use reth_revm::database::StateProviderDatabase;
 use reth_transaction_pool::TransactionPool;
 use std::{
     collections::HashMap,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tn_types::{now, NewBatch};
+use tn_types::{now, AutoSealConsensus, NewBatch};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{debug, error, trace, warn};
 
@@ -52,47 +46,6 @@ mod task;
 // pub use crate::client::AutoSealClient;
 pub use mode::{FixedBlockTimeMiner, MiningMode, ReadyTransactionMiner};
 pub use task::MiningTask;
-
-/// A consensus implementation intended for local development and testing purposes.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct AutoSealConsensus {
-    /// Configuration
-    chain_spec: Arc<ChainSpec>,
-}
-
-impl AutoSealConsensus {
-    /// Create a new instance of [AutoSealConsensus]
-    pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { chain_spec }
-    }
-}
-
-impl Consensus for AutoSealConsensus {
-    fn validate_header(&self, _header: &SealedHeader) -> Result<(), ConsensusError> {
-        Ok(())
-    }
-
-    fn validate_header_against_parent(
-        &self,
-        _header: &SealedHeader,
-        _parent: &SealedHeader,
-    ) -> Result<(), ConsensusError> {
-        Ok(())
-    }
-
-    fn validate_header_with_total_difficulty(
-        &self,
-        _header: &Header,
-        _total_difficulty: U256,
-    ) -> Result<(), ConsensusError> {
-        Ok(())
-    }
-
-    fn validate_block(&self, _block: &SealedBlock) -> Result<(), ConsensusError> {
-        Ok(())
-    }
-}
 
 /// Builder type for configuring the setup
 #[derive(Debug)]
@@ -155,7 +108,7 @@ where
 
         // (consensus, auto_client, task)
         MiningTask::new(
-            Arc::clone(&consensus.chain_spec),
+            Arc::clone(consensus.chain_spec()),
             mode,
             to_worker,
             storage,
@@ -261,7 +214,8 @@ impl StorageInner {
         &self,
         transactions: &[TransactionSigned],
         chain_spec: Arc<ChainSpec>,
-        parent: SealedHeader,
+        parent: &SealedHeader,
+        withdrawals: Option<&Withdrawals>,
     ) -> Header {
         // // check previous block for base fee
         // let base_fee_per_gas = self
@@ -270,6 +224,8 @@ impl StorageInner {
         //     .and_then(|parent| parent.next_block_base_fee(chain_spec.base_fee_params));
 
         // use finalized parent for this batch base fee
+        //
+        // TODO: use this worker's previous batch for base fee instead?
         let base_fee_per_gas =
             parent.next_block_base_fee(chain_spec.base_fee_params_at_timestamp(now()));
 
@@ -280,7 +236,7 @@ impl StorageInner {
             state_root: Default::default(),
             transactions_root: Default::default(),
             receipts_root: Default::default(),
-            withdrawals_root: Some(EMPTY_WITHDRAWALS),
+            withdrawals_root: withdrawals.map(|w| proofs::calculate_withdrawals_root(w)),
             logs_bloom: Default::default(),
             difficulty: U256::ZERO,
             number: parent.number + 1,
@@ -294,6 +250,7 @@ impl StorageInner {
             excess_blob_gas: None,
             extra_data: Default::default(),
             parent_beacon_block_root: None,
+            requests_root: None,
         };
 
         header.transactions_root = if transactions.is_empty() {
@@ -314,109 +271,23 @@ impl StorageInner {
         header
     }
 
-    /// Executes the block with the given block and senders, on the provided [EVMProcessor].
-    ///
-    /// This returns the poststate from execution and post-block changes, as well as the gas used.
-    pub(crate) fn execute<EvmConfig>(
-        &mut self,
-        block: &BlockWithSenders,
-        executor: &mut EVMProcessor<'_, EvmConfig>,
-    ) -> Result<(BundleStateWithReceipts, u64), BlockExecutionError>
-    where
-        EvmConfig: ConfigureEvm,
-    {
-        trace!(target: "execution::batch_maker", transactions=?&block.body, "executing transactions");
-        // TODO: there isn't really a parent beacon block root here, so not sure whether or not to
-        // call the 4788 beacon contract
-
-        // set the first block to find the correct index in bundle state
-        executor.set_first_block(block.number);
-
-        let (receipts, gas_used) = executor.execute_transactions(block, U256::ZERO)?;
-
-        // Save receipts.
-        executor.save_receipts(receipts)?;
-
-        // add post execution state change
-        // Withdrawals, rewards etc.
-        executor.apply_post_execution_state_change(block, U256::ZERO)?;
-
-        // merge transitions
-        executor.db_mut().merge_transitions(BundleRetention::Reverts);
-
-        // apply post block changes
-        Ok((executor.take_output_state(), gas_used))
-    }
-
-    /// Fills in the post-execution header fields based on the given BundleState and gas used.
-    /// In doing this, the state root is calculated and the final header is returned.
-    pub(crate) fn complete_header<S: StateProviderFactory>(
-        &self,
-        mut header: Header,
-        bundle_state: &BundleStateWithReceipts,
-        client: &S,
-        gas_used: u64,
-    ) -> Result<Header, BlockExecutionError> {
-        let receipts = bundle_state.receipts_by_block(header.number);
-        header.receipts_root = if receipts.is_empty() {
-            EMPTY_RECEIPTS
-        } else {
-            let receipts_with_bloom = receipts
-                .iter()
-                .map(|r| (*r).clone().expect("receipts have not been pruned").into())
-                .collect::<Vec<ReceiptWithBloom>>();
-            header.logs_bloom =
-                receipts_with_bloom.iter().fold(Bloom::ZERO, |bloom, r| bloom | r.bloom);
-            proofs::calculate_receipt_root(&receipts_with_bloom)
-        };
-
-        header.gas_used = gas_used;
-
-        // calculate the state root
-        let state_root = client
-            .latest()
-            .map_err(|e| {
-                error!(target: "execution::batch_maker", "error retrieving client.latest() {e}");
-                BlockExecutionError::LatestBlock(e)
-            })?
-            .state_root(bundle_state.state())
-            .map_err(|e| {
-                error!(target: "execution::batch_maker", "error calculating state root: {e}");
-                BlockExecutionError::LatestBlock(e)
-            })?;
-        header.state_root = state_root;
-        Ok(header)
-    }
-
-    /// Builds and executes a new block with the given transactions, on the provided [EVMProcessor].
+    /// Builds and executes a new block with the given transactions, on the provided executor.
     ///
     /// This returns the header of the executed block, as well as the poststate from execution.
-    pub(crate) fn build_and_execute<EvmConfig>(
+    pub(crate) fn build_and_execute<Provider, Executor>(
         &mut self,
         transactions: Vec<TransactionSigned>,
-        client: &(impl StateProviderFactory + BlockReaderIdExt),
+        withdrawals: Option<Withdrawals>,
+        provider: &Provider,
         chain_spec: Arc<ChainSpec>,
-        evm_config: EvmConfig,
-    ) -> Result<(SealedHeader, BundleStateWithReceipts), BlockExecutionError>
+        executor: &Executor,
+    ) -> Result<(SealedHeader, ExecutionOutcome), BlockExecutionError>
     where
-        EvmConfig: ConfigureEvm,
+        Executor: BlockExecutorProvider,
+        Provider: StateProviderFactory + BlockReaderIdExt,
     {
         // use the last canonical block for next batch
-        debug!(target: "execution::batch_maker", latest=?client.latest_header().unwrap());
-
-        // TODO: ensure forkchoice updated is sent to engine as components start up
-        let parent = client.finalized_header()
-            .map_err(|e| {
-                error!(target: "execution::batch_maker", "error retrieving client.finalized_header() {e}");
-                BlockExecutionError::LatestBlock(e)
-            })?;
-        // .ok_or_else(|| {
-        //     error!("error retrieving client.finalized_header() returned `None`");
-        //     BlockExecutionError::ProviderError
-        // })?;
-
-        debug!(target: "execution::batch_maker", finalized=?parent);
-        let parent = client.latest_header()
+        let parent = provider.latest_header()
             .map_err(|e| {
                 error!(target: "execution::batch_maker", "error retrieving client.latest_header() {e}");
                 BlockExecutionError::LatestBlock(e)
@@ -426,41 +297,63 @@ impl StorageInner {
                 BlockExecutionError::LatestBlock(reth_provider::ProviderError::FinalizedBlockNotFound)
             })?;
 
-        let header = self.build_header_template(&transactions, chain_spec.clone(), parent);
+        debug!(target: "execution::batch_maker", latest=?parent);
 
-        let block = Block { header, body: transactions, ommers: vec![], withdrawals: None }
-            .with_recovered_senders()
-            .ok_or(BlockExecutionError::Validation(BlockValidationError::SenderRecoveryError))?;
+        let header = self.build_header_template(
+            &transactions,
+            chain_spec.clone(),
+            &parent,
+            withdrawals.as_ref(),
+        );
 
-        // let senders = TransactionSigned::recover_signers(&block.body, block.body.len())
-        //     .ok_or(BlockExecutionError::Validation(BlockValidationError::SenderRecoveryError))?;
+        let block = Block {
+            header,
+            body: transactions,
+            ommers: vec![],
+            withdrawals: withdrawals.clone(),
+            requests: None,
+        }
+        .with_recovered_senders()
+        .ok_or(BlockExecutionError::Validation(BlockValidationError::SenderRecoveryError))?;
 
         trace!(target: "execution::batch_maker", transactions=?&block.body, "executing transactions");
 
-        // now execute the block
-        let db = State::builder()
-            .with_database_boxed(Box::new(StateProviderDatabase::new(client
-            .latest()
-            .map_err(|e| {
-                error!(target: "execution::batch_maker", "error retrieving client.latest() {e}");
-                BlockExecutionError::LatestBlock(e)
-            })?)))
-            .with_bundle_update()
-            .build();
+        // TODO: should this use the latest or finalized for next batch?
+        //
+        // for now, keep it consistent with latest block retrieved for header template
+        let mut db = StateProviderDatabase::new(
+            provider.latest().map_err(BlockExecutionError::LatestBlock)?,
+        );
 
-        let mut executor = EVMProcessor::new_with_state(chain_spec, db, evm_config);
+        let block_number = block.number;
 
-        let (bundle_state, gas_used) = self.execute(&block, &mut executor)?;
+        // execute the block
+        let BlockExecutionOutput { state, receipts, gas_used, .. } =
+            executor.executor(&mut db).execute((&block, U256::ZERO).into())?;
+        let bundle_state = ExecutionOutcome::new(state, receipts.into(), block_number, vec![]);
 
-        let Block { header, body, .. } = block.block;
-        let body = BlockBody { transactions: body, ommers: vec![], withdrawals: None };
+        let Block { mut header, body, .. } = block.block;
+        let body = BlockBody { transactions: body, ommers: vec![], withdrawals, requests: None };
 
         trace!(target: "execution::batch_maker", ?bundle_state, ?header, ?body, "executed block, calculating state root and completing header");
 
-        // fill in the rest of the fields
-        let header = self.complete_header(header, &bundle_state, client, gas_used)?;
+        // set header's gas used
+        header.gas_used = gas_used;
 
-        trace!(target: "execution::batch_maker", root=?header.state_root, ?body, "calculated root");
+        // see reth::crates::payload::ethereum::default_ethereum_payload_builder()
+        //
+        // expensive calculations - update header
+        header.state_root = db.state_root(bundle_state.state())?;
+        header.receipts_root = bundle_state.receipts_root_slow(block_number)
+            .ok_or_else(|| {
+                error!(target: "execution::batch_maker", "error calculating receipts root from bundle state");
+                BlockExecutionError::Other("Failed to create receipts root from bundle state".into())
+            })?;
+        header.logs_bloom = bundle_state.block_logs_bloom(block_number)
+            .ok_or_else(|| {
+                error!(target: "execution::batch_maker", "error calculating logs bloom from bundle state");
+                BlockExecutionError::Other("Failed to calculate logs bloom from bundle state".into())
+            })?;
 
         // finally insert into storage
         self.insert_new_block(header.clone(), body);
@@ -480,10 +373,13 @@ mod tests {
     use reth::tasks::TaskManager;
     use reth_blockchain_tree::noop::NoopBlockchainTree;
     use reth_db::test_utils::{create_test_rw_db, tempdir_path};
-    use reth_node_core::init::init_genesis;
-    use reth_node_ethereum::EthEvmConfig;
+    use reth_db_common::init::init_genesis;
+    use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
     use reth_primitives::{alloy_primitives::U160, GenesisAccount};
-    use reth_provider::{providers::BlockchainProvider, ProviderFactory};
+    use reth_provider::{
+        providers::{BlockchainProvider, StaticFileProvider},
+        ProviderFactory,
+    };
     use reth_tracing::init_test_tracing;
     use reth_transaction_pool::{
         blobstore::InMemoryBlobStore, PoolConfig, TransactionValidationTaskExecutor,
@@ -520,15 +416,18 @@ mod tests {
         // init genesis
         let db = create_test_rw_db();
         // provider
-        let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), tempdir_path())
-                .expect("provider factory");
+        let provider_factory = ProviderFactory::new(
+            Arc::clone(&db),
+            Arc::clone(&chain),
+            StaticFileProvider::read_write(tempdir_path())
+                .expect("static file provider read write created with tempdir path"),
+        );
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
 
         debug!("genesis hash: {genesis_hash:?}");
 
         let blockchain_db =
-            BlockchainProvider::new(provider_factory, NoopBlockchainTree::default())
+            BlockchainProvider::new(provider_factory, Arc::new(NoopBlockchainTree::default()))
                 .expect("test blockchain provider");
 
         // task manger
@@ -553,6 +452,8 @@ mod tests {
         let address = Address::from(U160::from(33));
 
         let evm_config = EthEvmConfig::default();
+        let block_executor = EthExecutorProvider::new(chain.clone(), evm_config);
+
         // build batch maker
         let task = BatchMakerBuilder::new(
             Arc::clone(&chain),
@@ -561,7 +462,7 @@ mod tests {
             to_worker,
             mining_mode,
             address,
-            evm_config,
+            block_executor,
         )
         .build();
 
@@ -707,10 +608,15 @@ mod tests {
         // create storage with the same sealed header so timestamps are the same
         let storage = Storage::new(sealed_header.clone(), address);
 
+        let withdrawals = Some(Withdrawals::default());
         // create header template
         // warning should appear with RUST_LOG=info
-        let template =
-            storage.write().await.build_header_template(&Vec::new(), chain_spec, sealed_header);
+        let template = storage.write().await.build_header_template(
+            &Vec::new(),
+            chain_spec,
+            &sealed_header,
+            withdrawals.as_ref(),
+        );
         let expected: u64 = system_time + 1;
         assert!(template.timestamp == expected);
     }

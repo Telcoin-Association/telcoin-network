@@ -19,8 +19,8 @@ async fn basic_cluster_setup() {
     // start the cluster will all the possible nodes
     cluster.start(Some(4), Some(1), None).await;
 
-    // give some time for nodes to bootstrap
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // give some time for nodes to bootstrap and build blocks
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // fetch all the running authorities
     let authorities = cluster.authorities().await;
@@ -37,7 +37,7 @@ async fn basic_cluster_setup() {
         let db = el.get_provider().await;
         let blocks = db.block_range(0..=3).expect("at least 3 blocks");
 
-        println!("{:?}\n\n\n", authority.id);
+        println!("\n\n\nblocks for authority {:?}:", authority.id);
         for block in blocks.iter() {
             println!("\n{block:?}");
         }
@@ -45,6 +45,8 @@ async fn basic_cluster_setup() {
         block_vec.push(blocks.clone());
     }
 
+    // assert block_vec isn't empty
+    assert!(!block_vec[0].is_empty());
     // assert first three blocks are the same for all authorities
     assert!(block_vec.windows(2).all(|w| w[0] == w[1]));
 

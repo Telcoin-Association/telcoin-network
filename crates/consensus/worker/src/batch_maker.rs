@@ -68,6 +68,7 @@ pub struct BatchMaker {
 }
 
 impl BatchMaker {
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn spawn(
         id: WorkerId,

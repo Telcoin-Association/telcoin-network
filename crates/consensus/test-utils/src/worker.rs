@@ -8,11 +8,10 @@ use narwhal_network::client::NetworkClient;
 use narwhal_storage::NodeStorage;
 use prometheus::Registry;
 use std::path::PathBuf;
-use tn_config::Parameters;
 use tn_node::{metrics::worker_metrics_registry, worker::WorkerNode};
 use tn_types::{
     test_utils::temp_dir, AuthorityIdentifier, BlsPublicKey, Committee, Multiaddr, NetworkKeypair,
-    WorkerCache, WorkerId,
+    Parameters, WorkerCache, WorkerId,
 };
 use tracing::info;
 

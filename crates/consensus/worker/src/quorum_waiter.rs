@@ -42,6 +42,7 @@ pub struct QuorumWaiter {
 
 impl QuorumWaiter {
     /// Spawn a new QuorumWaiter.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn spawn(
         authority: Authority,

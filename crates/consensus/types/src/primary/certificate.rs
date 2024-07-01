@@ -9,9 +9,6 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::{collections::VecDeque, fmt};
 
-#[cfg(any(test, feature = "arbitrary"))]
-use proptest_derive::Arbitrary;
-
 use crate::{
     config::{AuthorityIdentifier, Committee, Epoch, Stake, WorkerCache},
     crypto::{
@@ -319,7 +316,7 @@ impl CertificateV1 {
                     while !votes.is_empty() && votes.front().unwrap() == sigs.last().unwrap() {
                         votes.pop_front().unwrap();
                     }
-                    return true
+                    return true;
                 }
                 false
             })
@@ -409,7 +406,7 @@ impl CertificateV1 {
 
         // Genesis certificates are always valid.
         if self.round() == 0 && Self::genesis(committee).contains(&self) {
-            return Ok(Certificate::V1(self))
+            return Ok(Certificate::V1(self));
         }
 
         // Save signature verifications when the header is invalid.
@@ -484,7 +481,6 @@ pub fn validate_received_certificate_version(
 }
 
 /// Certificate digest.
-#[cfg_attr(any(test, feature = "arbitrary"), derive(Arbitrary))]
 #[derive(
     Clone, Copy, Serialize, Deserialize, Default, MallocSizeOf, PartialEq, Eq, Hash, PartialOrd, Ord,
 )]

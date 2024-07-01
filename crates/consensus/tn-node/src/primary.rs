@@ -7,10 +7,7 @@ use crate::{
     engine::ExecutionNode, error::NodeError, metrics::new_registry, try_join_all, FuturesUnordered,
 };
 use anemo::PeerId;
-use consensus_metrics::{
-    metered_channel::{self, Sender},
-    RegistryID, RegistryService,
-};
+use consensus_metrics::{metered_channel, RegistryID, RegistryService};
 use fastcrypto::traits::{KeyPair as _, VerifyingKey};
 use narwhal_executor::{
     get_restored_consensus_output, Executor, ExecutorMetrics, SubscriberResult,
@@ -20,21 +17,23 @@ use narwhal_primary::{
     consensus::{
         Bullshark, ChannelMetrics, Consensus, ConsensusMetrics, ConsensusRound, LeaderSchedule,
     },
-    Primary, PrimaryChannelMetrics, NUM_SHUTDOWN_RECEIVERS,
+    Primary, PrimaryChannelMetrics, CHANNEL_CAPACITY, NUM_SHUTDOWN_RECEIVERS,
 };
 use narwhal_storage::NodeStorage;
 use prometheus::{IntGauge, Registry};
-use reth_db::{database::Database, database_metrics::DatabaseMetrics};
-use reth_node_builder::ConfigureEvm;
+use reth_db::{
+    database::Database,
+    database_metrics::{DatabaseMetadata, DatabaseMetrics},
+};
+use reth_evm::execute::BlockExecutorProvider;
 use std::{sync::Arc, time::Instant};
-use tn_config::Parameters;
 use tn_types::{
     AuthorityIdentifier, BlsKeypair, BlsPublicKey, Certificate, ChainIdentifier, Committee,
-    ConditionalBroadcastReceiver, ConsensusOutput, NetworkKeypair, PreSubscribedBroadcastSender,
-    Round, WorkerCache, BAD_NODES_STAKE_THRESHOLD,
+    ConditionalBroadcastReceiver, ConsensusOutput, NetworkKeypair, Parameters,
+    PreSubscribedBroadcastSender, Round, WorkerCache, BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::{
-    sync::{watch, RwLock},
+    sync::{broadcast, watch, RwLock},
     task::JoinHandle,
 };
 use tracing::{info, instrument};
@@ -54,6 +53,10 @@ struct PrimaryNodeInner {
     tx_shutdown: Option<PreSubscribedBroadcastSender>,
     /// Peer ID used for local connections.
     own_peer_id: Option<PeerId>,
+    /// Consensus broadcast channel.
+    ///
+    /// NOTE: this broadcasts to all subscribers, but lagging receivers will lose messages
+    consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
 }
 
 impl PrimaryNodeInner {
@@ -64,9 +67,11 @@ impl PrimaryNodeInner {
 
     /// Starts the primary node with the provided info. If the node is already running then this
     /// method will return an error instead.
+    #[allow(clippy::too_many_arguments)]
     #[instrument(level = "info", skip_all)]
     async fn start<DB, Evm>(
-        &mut self, // The private-public key pair of this authority.
+        &mut self,
+        // The private-public key pair of this authority.
         keypair: BlsKeypair,
         // The private-public network key pair of this authority.
         network_keypair: NetworkKeypair,
@@ -87,8 +92,8 @@ impl PrimaryNodeInner {
         execution_components: &ExecutionNode<DB, Evm>,
     ) -> eyre::Result<()>
     where
-        DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
-        Evm: ConfigureEvm + Clone + 'static,
+        DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
+        Evm: BlockExecutorProvider + Clone + 'static,
     {
         if self.is_running().await {
             return Err(NodeError::NodeAlreadyRunning.into());
@@ -102,16 +107,17 @@ impl PrimaryNodeInner {
         // create the channel to send the shutdown signal
         let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
 
-        // this is what connects the EL and CL
         let executor_metrics = ExecutorMetrics::new(&registry);
-        let (tx_notifier, rx_notifier) = metered_channel::channel(
-            narwhal_primary::CHANNEL_CAPACITY,
-            &executor_metrics.tx_notifier,
-        );
 
         // used to retrieve the last executed certificate in case of restarts
         let last_executed_sub_dag_index =
             execution_components.last_executed_output().await.expect("execution found HEAD");
+
+        let consensus_output_notification_sender =
+            self.consensus_output_notification_sender.clone();
+
+        // create receiving channel before spawning primary to ensure messages are not lost
+        let consensus_output_rx = self.subscribe_consensus_output();
 
         // spawn primary if not already running
         let primary_handles = Self::spawn_primary(
@@ -126,13 +132,13 @@ impl PrimaryNodeInner {
             &registry,
             &mut tx_shutdown,
             executor_metrics,
-            tx_notifier,
+            consensus_output_notification_sender,
             last_executed_sub_dag_index,
         )
         .await?;
 
         // start engine
-        execution_components.start_engine(rx_notifier).await?;
+        execution_components.start_engine(consensus_output_rx).await?;
 
         // store the registry
         self.swap_registry(Some(registry));
@@ -206,6 +212,7 @@ impl PrimaryNodeInner {
 
     /// Spawn a new primary. Optionally also spawn the consensus and a client executing
     /// transactions.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_primary(
         // The private-public key pair of this authority.
         keypair: BlsKeypair,
@@ -231,8 +238,8 @@ impl PrimaryNodeInner {
         // The metrics for executor
         // Passing here bc the tx notifier is needed to create the metrics.
         executor_metrics: ExecutorMetrics,
-        // Receiving half goes to the EL Executor
-        tx_notifier: Sender<ConsensusOutput>,
+        // Broadcast channel for output.
+        consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
         // Used for recovering after crashes/restarts
         last_executed_sub_dag_index: u64,
     ) -> SubscriberResult<Vec<JoinHandle<()>>>
@@ -285,7 +292,7 @@ where
             tx_consensus_round_updates,
             registry,
             executor_metrics,
-            tx_notifier,
+            consensus_output_notification_sender,
             // in loo of sui's execution_state:
             last_executed_sub_dag_index,
         )
@@ -328,6 +335,7 @@ where
     ///
     /// TODO: Executor metrics is needed to create the metered channel. This
     /// could be done a better way, but bigger priorities right now.
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_consensus(
         authority_id: AuthorityIdentifier,
         worker_cache: WorkerCache,
@@ -342,7 +350,7 @@ where
         tx_consensus_round_updates: watch::Sender<ConsensusRound>,
         registry: &Registry,
         executor_metrics: ExecutorMetrics,
-        tx_notifier: Sender<ConsensusOutput>,
+        consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
         last_executed_sub_dag_index: u64,
     ) -> SubscriberResult<(Vec<JoinHandle<()>>, LeaderSchedule)>
     where
@@ -426,19 +434,23 @@ where
             worker_cache,
             committee.clone(),
             client,
-            // execution_state,
             shutdown_receivers.pop().unwrap(),
             rx_sequence,
             restored_consensus_output,
-            tx_notifier,
+            consensus_output_notification_sender,
             executor_metrics,
         )?;
 
-        // let handles =
-        //     executor_handles.into_iter().chain(std::iter::once(consensus_handles)).collect();
         let handles = vec![executor_handle, consensus_handle];
 
         Ok((handles, leader_schedule))
+    }
+
+    /// Subscribe to [ConsensusOutput] broadcast.
+    ///
+    /// NOTE: this broadcasts to all subscribers, but lagging receivers will lose messages
+    pub fn subscribe_consensus_output(&self) -> broadcast::Receiver<ConsensusOutput> {
+        self.consensus_output_notification_sender.subscribe()
     }
 }
 
@@ -449,6 +461,11 @@ pub struct PrimaryNode {
 
 impl PrimaryNode {
     pub fn new(parameters: Parameters, registry_service: RegistryService) -> PrimaryNode {
+        // TODO: what is an appropriate channel capacity? CHANNEL_CAPACITY currently set to 10k
+        // which seems really high but is consistent for now
+        let (consensus_output_notification_sender, _receiver) =
+            tokio::sync::broadcast::channel(CHANNEL_CAPACITY);
+
         let inner = PrimaryNodeInner {
             parameters,
             registry_service,
@@ -457,11 +474,13 @@ impl PrimaryNode {
             client: None,
             tx_shutdown: None,
             own_peer_id: None,
+            consensus_output_notification_sender,
         };
 
         Self { internal: Arc::new(RwLock::new(inner)) }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn start<DB, Evm>(
         &self,
         // The private-public key pair of this authority.
@@ -484,8 +503,8 @@ impl PrimaryNode {
         execution_components: &ExecutionNode<DB, Evm>,
     ) -> eyre::Result<()>
     where
-        DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
-        Evm: ConfigureEvm + Clone + 'static,
+        DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
+        Evm: BlockExecutorProvider + Clone + 'static,
     {
         let mut guard = self.internal.write().await;
         guard.client = Some(client.clone());
@@ -522,5 +541,10 @@ impl PrimaryNode {
     pub async fn registry(&self) -> Option<(RegistryID, Registry)> {
         let guard = self.internal.read().await;
         guard.registry.clone()
+    }
+
+    pub async fn subscribe_consensus_output(&self) -> broadcast::Receiver<ConsensusOutput> {
+        let guard = self.internal.read().await;
+        guard.consensus_output_notification_sender.subscribe()
     }
 }

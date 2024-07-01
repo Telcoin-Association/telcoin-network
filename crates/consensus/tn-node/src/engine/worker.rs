@@ -8,31 +8,33 @@
 //! generic over it.
 
 use enr::{secp256k1::SecretKey, Enr};
-use reth_db::database::Database;
+use reth_db::{
+    database::Database,
+    database_metrics::{DatabaseMetadata, DatabaseMetrics},
+};
 use reth_discv4::DEFAULT_DISCOVERY_PORT;
 use reth_eth_wire::DisconnectReason;
+use reth_evm::execute::BlockExecutorProvider;
 use reth_network::NetworkHandle;
 use reth_network_api::{
-    NetworkError, NetworkInfo, PeerInfo, PeerKind, Peers, PeersInfo, Reputation,
+    NetworkError, NetworkInfo, NetworkStatus, PeerInfo, PeerKind, Peers, PeersInfo, Reputation,
     ReputationChangeKind,
 };
+use reth_network_peers::{NodeRecord, PeerId};
 use reth_node_builder::{
-    components::{ComponentsBuilder, NetworkBuilder},
+    components::NetworkBuilder,
     node::{FullNodeTypes, NodeTypes},
-    BuilderContext, ConfigureEvm,
+    BuilderContext,
 };
-use reth_node_ethereum::{
-    node::{EthereumNetworkBuilder, EthereumPayloadBuilder, EthereumPoolBuilder},
-    EthEngineTypes, EthEvmConfig,
-};
-use reth_primitives::{NodeRecord, PeerId};
-use reth_rpc_types::{admin::EthProtocolInfo, NetworkStatus};
+use reth_node_ethereum::EthEngineTypes;
+use reth_provider::providers::BlockchainProvider;
+use reth_rpc_types::admin::EthProtocolInfo;
 use reth_transaction_pool::TransactionPool;
 use std::{
     marker::PhantomData,
     net::{IpAddr, SocketAddr},
 };
-use tn_types::{adiri_chain_spec, BlockchainProviderType};
+use tn_types::adiri_chain_spec;
 
 /// Type configuration for a regular Telcoin node.
 #[derive(Debug, Default, Clone, Copy)]
@@ -42,43 +44,23 @@ pub struct WorkerNode<DB, Evm> {
     evm: PhantomData<Evm>,
 }
 
-impl<DB, Evm> WorkerNode<DB, Evm> {
-    /// Returns an execution layer's [ComponentsBuilder] configured for a Worker node.
-    pub fn components<Node>(
-    ) -> ComponentsBuilder<Node, EthereumPoolBuilder, EthereumPayloadBuilder, EthereumNetworkBuilder>
-    where
-        Node: FullNodeTypes<Engine = EthEngineTypes>,
-    {
-        ComponentsBuilder::default()
-            .node_types::<Node>()
-            .pool(EthereumPoolBuilder::default())
-            .payload(EthereumPayloadBuilder::default())
-            .network(EthereumNetworkBuilder::default())
-    }
-}
-
 impl<DB, Evm> NodeTypes for WorkerNode<DB, Evm>
 where
-    DB: Send + Sync + 'static,
-    Evm: Send + Sync + 'static,
+    DB: Send + Sync + Unpin + 'static,
+    Evm: Send + Sync + Unpin + 'static,
 {
     type Primitives = ();
     type Engine = EthEngineTypes;
-    type Evm = EthEvmConfig;
-
-    fn evm_config(&self) -> Self::Evm {
-        EthEvmConfig::default()
-    }
 }
 
 impl<DB, Evm> FullNodeTypes for WorkerNode<DB, Evm>
 where
-    DB: Database + Unpin + Clone + 'static,
-    Evm: ConfigureEvm + Clone + 'static,
+    DB: Database + DatabaseMetadata + DatabaseMetrics + Unpin + Clone + 'static,
+    Evm: BlockExecutorProvider + Clone + 'static,
 {
     type DB = DB;
 
-    type Provider = BlockchainProviderType<DB, Evm>;
+    type Provider = BlockchainProvider<DB>;
 }
 
 /// A builder for the worker's "network".
@@ -145,11 +127,6 @@ impl NetworkInfo for WorkerNetwork {
 
     fn is_initially_syncing(&self) -> bool {
         false
-    }
-
-    #[cfg(feature = "optimism")]
-    fn sequencer_endpoint(&self) -> Option<&str> {
-        None
     }
 }
 

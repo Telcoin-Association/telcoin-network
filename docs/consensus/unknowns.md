@@ -35,3 +35,9 @@ This still has the problem of:
     - this is what ethereum already does though
         - as long as all the batches aren't identical, there is some optimization here
         - problem for down the road to solve
+    - in the worst case, every peer worker produces the same batch
+        - only one batch would be needed to execute the next canonical block
+            - first batch executes, all others are duplicates, none have an effect
+        - this would be wasteful storage, but as long as execution filters out wasteful data, nodes only need the canonical tip to start producing batches
+            - are there attack surfaces to this level of trust?
+                - a batch with invalid parent block would not receive votes

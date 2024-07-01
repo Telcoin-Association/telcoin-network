@@ -203,6 +203,7 @@ impl RandomnessState {
 }
 
 impl StateHandler {
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn spawn(
         chain: &ChainIdentifier,

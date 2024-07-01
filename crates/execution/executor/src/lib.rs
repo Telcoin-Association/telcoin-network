@@ -15,30 +15,27 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-use consensus_metrics::metered_channel::Receiver;
 use reth_beacon_consensus::BeaconEngineMessage;
-use reth_interfaces::{
-    consensus::{Consensus, ConsensusError},
-    executor::{BlockExecutionError, BlockValidationError},
+use reth_chainspec::ChainSpec;
+use reth_evm::execute::{
+    BlockExecutionError, BlockExecutionOutput, BlockExecutorProvider, BlockValidationError,
+    Executor as _,
 };
-use reth_node_api::{ConfigureEvm, EngineTypes};
+use reth_node_api::EngineTypes;
 use reth_primitives::{
-    constants::{EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, ETHEREUM_BLOCK_GAS_LIMIT},
-    proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, BlockWithSenders,
-    Bloom, ChainSpec, Header, ReceiptWithBloom, SealedBlock, SealedBlockWithSenders, SealedHeader,
-    TransactionSigned, B256, EMPTY_OMMER_ROOT_HASH, U256,
+    constants::{EMPTY_TRANSACTIONS, ETHEREUM_BLOCK_GAS_LIMIT},
+    proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, Header,
+    SealedBlockWithSenders, SealedHeader, TransactionSigned, Withdrawals, B256,
+    EMPTY_OMMER_ROOT_HASH, U256,
 };
 use reth_provider::{
-    BlockExecutor, BlockReaderIdExt, BundleStateWithReceipts, CanonStateNotificationSender,
-    StateProviderFactory,
+    BlockReaderIdExt, CanonStateNotificationSender, ExecutionOutcome, StateProviderFactory,
 };
-use reth_revm::{
-    database::StateProviderDatabase, db::states::bundle_state::BundleRetention,
-    processor::EVMProcessor, State,
-};
+use reth_revm::database::StateProviderDatabase;
 use std::{collections::HashMap, sync::Arc};
-use tn_types::{now, BatchAPI, ConsensusOutput};
-use tokio::sync::{mpsc::UnboundedSender, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tn_types::{now, AutoSealConsensus, BatchAPI, ConsensusOutput};
+use tokio::sync::{broadcast, mpsc::UnboundedSender, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, trace, warn};
 
 mod client;
@@ -49,54 +46,13 @@ pub use crate::client::AutoSealClient;
 use error::ExecutorError;
 pub use task::MiningTask;
 
-/// A consensus implementation intended for local development and testing purposes.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct AutoSealConsensus {
-    /// Configuration
-    chain_spec: Arc<ChainSpec>,
-}
-
-impl AutoSealConsensus {
-    /// Create a new instance of [AutoSealConsensus]
-    pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { chain_spec }
-    }
-}
-
-impl Consensus for AutoSealConsensus {
-    fn validate_header(&self, _header: &SealedHeader) -> Result<(), ConsensusError> {
-        Ok(())
-    }
-
-    fn validate_header_against_parent(
-        &self,
-        _header: &SealedHeader,
-        _parent: &SealedHeader,
-    ) -> Result<(), ConsensusError> {
-        Ok(())
-    }
-
-    fn validate_header_with_total_difficulty(
-        &self,
-        _header: &Header,
-        _total_difficulty: U256,
-    ) -> Result<(), ConsensusError> {
-        Ok(())
-    }
-
-    fn validate_block(&self, _block: &SealedBlock) -> Result<(), ConsensusError> {
-        Ok(())
-    }
-}
-
 /// Builder type for configuring the setup
 #[derive(Debug)]
 pub struct Executor<Client, Engine: EngineTypes, EvmConfig> {
     client: Client,
     consensus: AutoSealConsensus,
     storage: Storage,
-    from_consensus: Receiver<ConsensusOutput>,
+    from_consensus: broadcast::Receiver<ConsensusOutput>,
     to_engine: UnboundedSender<BeaconEngineMessage<Engine>>,
     canon_state_notification: CanonStateNotificationSender,
     evm_config: EvmConfig,
@@ -113,7 +69,7 @@ where
     pub fn new(
         chain_spec: Arc<ChainSpec>,
         client: Client,
-        from_consensus: Receiver<ConsensusOutput>,
+        from_consensus: broadcast::Receiver<ConsensusOutput>,
         to_engine: UnboundedSender<BeaconEngineMessage<Engine>>,
         canon_state_notification: CanonStateNotificationSender,
         evm_config: EvmConfig,
@@ -150,13 +106,15 @@ where
             evm_config,
         } = self;
         let auto_client = AutoSealClient::new(storage.clone());
+        // cast broadcast channel to stream for convenient iter methods
+        let consensus_output_stream = BroadcastStream::new(from_consensus);
         let task = MiningTask::new(
-            Arc::clone(&consensus.chain_spec),
+            Arc::clone(consensus.chain_spec()),
             to_engine,
             canon_state_notification,
             storage,
             client,
-            from_consensus,
+            consensus_output_stream,
             evm_config,
         );
         (consensus, auto_client, task)
@@ -258,6 +216,7 @@ impl StorageInner {
         parent: SealedHeader,
         timestamp: u64,
         beneficiary: Address,
+        withdrawals: Option<&Withdrawals>,
     ) -> Header {
         // // check previous block for base fee
         // let base_fee_per_gas = self
@@ -276,7 +235,7 @@ impl StorageInner {
             state_root: Default::default(),
             transactions_root: Default::default(),
             receipts_root: Default::default(),
-            withdrawals_root: None,
+            withdrawals_root: withdrawals.map(|w| proofs::calculate_withdrawals_root(w)),
             logs_bloom: Default::default(),
             difficulty: U256::ZERO,
             number: parent.number + 1,
@@ -290,6 +249,7 @@ impl StorageInner {
             excess_blob_gas: None,
             extra_data: Default::default(),
             parent_beacon_block_root: None,
+            requests_root: None,
         };
 
         header.transactions_root = if transactions.is_empty() {
@@ -301,98 +261,21 @@ impl StorageInner {
         header
     }
 
-    /// Executes the block with the given block and senders, on the provided [EVMProcessor].
-    ///
-    /// This returns the poststate from execution and post-block changes, as well as the gas used.
-    pub(crate) fn execute<EvmConfig>(
-        &mut self,
-        block: &BlockWithSenders,
-        executor: &mut EVMProcessor<'_, EvmConfig>,
-    ) -> Result<(BundleStateWithReceipts, u64), ExecutorError>
-    where
-        EvmConfig: ConfigureEvm,
-    {
-        trace!(target: "execution::executor", transactions=?&block.body, "executing transactions");
-        // TODO: there isn't really a parent beacon block root here, so not sure whether or not to
-        // call the 4788 beacon contract
-
-        // set the first block to find the correct index in bundle state
-        executor.set_first_block(block.number);
-
-        let (receipts, gas_used) = executor.execute_transactions(block, U256::ZERO)?;
-
-        // Save receipts.
-        executor.save_receipts(receipts)?;
-
-        // add post execution state change
-        // Withdrawals, rewards etc.
-        executor.apply_post_execution_state_change(block, U256::ZERO)?;
-
-        // merge transitions
-        executor.db_mut().merge_transitions(BundleRetention::Reverts);
-
-        // apply post block changes
-        Ok((executor.take_output_state(), gas_used))
-    }
-
-    /// Fills in the post-execution header fields based on the given BundleState and gas used.
-    /// In doing this, the state root is calculated and the final header is returned.
-    pub(crate) fn complete_header<S: StateProviderFactory>(
-        &self,
-        mut header: Header,
-        bundle_state: &BundleStateWithReceipts,
-        client: &S,
-        gas_used: u64,
-    ) -> Result<Header, ExecutorError> {
-        let receipts = bundle_state.receipts_by_block(header.number);
-        header.receipts_root = if receipts.is_empty() {
-            EMPTY_RECEIPTS
-        } else {
-            let receipts_with_bloom = receipts
-                .iter()
-                .map(|r| (*r).clone().expect("receipts have not been pruned").into())
-                .collect::<Vec<ReceiptWithBloom>>();
-            header.logs_bloom =
-                receipts_with_bloom.iter().fold(Bloom::ZERO, |bloom, r| bloom | r.bloom);
-            proofs::calculate_receipt_root(&receipts_with_bloom)
-        };
-
-        header.gas_used = gas_used;
-
-        // calculate the state root
-        let state_root = client
-            .latest()
-            .map_err(|e| {
-                error!(target: "execution::executor", "error retrieving client.latest() {e}");
-                BlockExecutionError::LatestBlock(e)
-            })?
-            .state_root(bundle_state.state())
-            .map_err(|e| {
-                error!(target: "execution::executor", "error calculating state root: {e}");
-                BlockExecutionError::LatestBlock(e)
-            })?;
-        header.state_root = state_root;
-        Ok(header)
-    }
-
-    /// Builds and executes a new block with the given transactions, on the provided [EVMProcessor].
+    /// Builds and executes a new block with the given transactions, on the provided executor.
     ///
     /// This returns the header of the executed block, as well as the poststate from execution.
-    pub(crate) fn build_and_execute<EvmConfig>(
+    pub(crate) fn build_and_execute<Provider, Executor>(
         &mut self,
         output: ConsensusOutput,
-        client: &(impl StateProviderFactory + BlockReaderIdExt),
+        withdrawals: Option<Withdrawals>,
+        provider: &Provider,
         chain_spec: Arc<ChainSpec>,
-        evm_config: EvmConfig,
-        // ) -> Result<(SealedHeader, BundleStateWithReceipts, Vec<TransactionSigned>,
-        // Vec<Address>), BlockExecutionError> {
-    ) -> Result<(SealedBlockWithSenders, BundleStateWithReceipts), ExecutorError>
+        executor: &Executor,
+    ) -> Result<(SealedBlockWithSenders, ExecutionOutcome), ExecutorError>
     where
-        EvmConfig: ConfigureEvm,
+        Executor: BlockExecutorProvider,
+        Provider: StateProviderFactory + BlockReaderIdExt,
     {
-        // use the last canonical block for next batch
-        debug!(target: "execution::executor", latest=?client.latest_header());
-
         // capture timestamp and beneficiary before consuming output
         let timestamp = output.committed_at();
         let beneficiary = output.beneficiary();
@@ -400,78 +283,125 @@ impl StorageInner {
         // try to recover transactions and signers
         let transactions = self.try_recover_transactions(output)?;
 
-        // TODO: ensure forkchoice updated is sent to engine as components start up
-        let parent = client.finalized_header()
+        // TODO: save this in memory for faster execution
+        //
+        // use the last canonical block for next batch
+        let parent = provider.finalized_header()
             .map_err(|e| {
-                error!(target: "execution::batch_maker", "error retrieving client.finalized_header() {e}");
+                error!(target: "execution::executor", "error retrieving provider.finalized_header() {e}");
+                error!(target: "execution::executor", timestamp=?timestamp, beneficiary=?beneficiary, "consensus output info");
                 BlockExecutionError::LatestBlock(e)
+            })?
+            .ok_or_else(|| {
+                error!(target: "execution::executor", "error retrieving provider.finalized_header() returned `None`");
+                error!(target: "execution::executor", timestamp=?timestamp, beneficiary=?beneficiary, "consensus output info");
+                BlockExecutionError::LatestBlock(reth_provider::ProviderError::FinalizedBlockNotFound)
             })?;
 
         debug!(target: "execution::executor", finalized=?parent);
 
-        let parent = client.latest_header()
-           .map_err(|e| {
-                error!(target: "execution::batch_maker", "error retrieving client.latest_header() {e}");
-                BlockExecutionError::LatestBlock(e)
-            })?
-            .ok_or_else(|| {
-                error!(target: "execution::batch_maker", "error retrieving client.latest_header() returned `None`");
-                BlockExecutionError::LatestBlock(reth_provider::ProviderError::FinalizedBlockNotFound)
-            })?;
         let header = self.build_header_template(
             &transactions,
             chain_spec.clone(),
             parent,
             timestamp,
             beneficiary,
+            withdrawals.as_ref(),
         );
 
         let block = Block {
             header: header.clone(),
             body: transactions.clone(),
             ommers: vec![],
-            withdrawals: None,
+            withdrawals: withdrawals.clone(),
+            requests: None,
         }
         .with_recovered_senders()
         .ok_or(BlockExecutionError::Validation(BlockValidationError::SenderRecoveryError))?;
 
-        trace!(target: "execution::executor", transactions=?&block.body, "executing transactions");
-
-        // now execute the block
-        let db = State::builder()
-            .with_database_boxed(Box::new(StateProviderDatabase::new(client.latest().unwrap())))
-            .with_bundle_update()
-            .build();
-        let mut executor = EVMProcessor::new_with_state(chain_spec, db, evm_config);
-
-        let (bundle_state, gas_used) = self.execute(&block, &mut executor)?;
-
-        let header = block.block.header.clone();
-        let body = BlockBody { transactions, ommers: vec![], withdrawals: None };
+        // take ownership of senders for final result
         let senders = block.senders.clone();
 
-        trace!(target: "execution::executor", ?bundle_state, ?header, ?body, "executed block, calculating state root and completing header");
+        trace!(target: "execution::executor", transactions=?&block.body, "executing transactions");
 
-        // fill in the rest of the fields
-        let header = self.complete_header(header, &bundle_state, client, gas_used)?;
+        let mut db = StateProviderDatabase::new(
+            // need to use finalized block - not latest (aka - "pending")
+            provider.state_by_block_hash(self.best_hash)
+            .map_err(|e| {
+                error!(target: "execution::executor", "error retrieving provider.state_by_block_hash() {e}");
+                BlockExecutionError::LatestBlock(e)
+            })?
+        );
 
-        trace!(target: "execution::executor", root=?header.state_root, ?body, "calculated root");
+        let block_number = block.number;
+
+        // execute the block
+        let BlockExecutionOutput { state, receipts, gas_used, .. } =
+            executor.executor(&mut db).execute((&block, U256::ZERO).into())?;
+        let bundle_state = ExecutionOutcome::new(state, receipts.into(), block_number, vec![]);
+
+        let Block { mut header, body, .. } = block.block;
+        let body = BlockBody {
+            transactions: body,
+            ommers: vec![],
+            withdrawals: withdrawals.clone(),
+            requests: None,
+        };
+
+        debug!(target: "execution::executor", ?bundle_state, ?header, ?body, "executed block, calculating roots to complete header");
+
+        // set header's gas used
+        header.gas_used = gas_used;
+
+        // see reth::crates::payload::ethereum::default_ethereum_payload_builder()
+        //
+        // expensive calculations - update header
+        //
+        // calculate state root
+        header.state_root = db.state_root(bundle_state.state()).map_err(|e| {
+            error!(target: "execution::executor", "Failed to calculate state root on current state: {e}");
+            BlockExecutionError::LatestBlock(e)
+        })?;
+        header.receipts_root = bundle_state.receipts_root_slow(block_number)
+            .ok_or_else(|| {
+                error!(target: "execution::batch_maker", "error calculating receipts root from bundle state");
+                BlockExecutionError::Other("Failed to create receipts root from bundle state".into())
+            })?;
+        header.logs_bloom = bundle_state.block_logs_bloom(block_number)
+            .ok_or_else(|| {
+                error!(target: "execution::batch_maker", "error calculating logs bloom from bundle state");
+                BlockExecutionError::Other("Failed to calculate logs bloom from bundle state".into())
+            })?;
+
+        trace!(target: "execution::executor", header=?header, ?body, "header updated");
 
         // finally insert into storage
         self.insert_new_block(header.clone(), body);
 
-        // TODO: am I okay with this approach?
+        // TODO: calculate hash somewhere else after Storage cleanup
+        //
         // prevents re-hashing the header, but if removing Storage, then `insert_new_block` won't
         // have the hash anymore
         //
         // set new header with hash that should have been updated by insert_new_block
-        let sealed_block_with_senders = block.seal(self.best_hash);
+        // let new_header = header.seal(self.best_hash);
 
-        // let sealed_block = block.seal_slow();
+        // TODO: clean this up
+        let tx_length = transactions.len();
+        let senders_length = senders.len();
 
-        debug!(target: "execution::executor", ?sealed_block_with_senders, ?senders, "attempting to seal block with senders");
-        // let sealed_block_with_senders = SealedBlockWithSenders::new(sealed_block, senders)
-        //     .ok_or(ExecutorError::UnevenSendersForSealedBlock)?;
+        // seal the block
+        let block =
+            Block { header, body: transactions, ommers: vec![], withdrawals, requests: None };
+        let sealed_block = block.seal_slow();
+
+        trace!(target: "execution::executor", sealed_block=?sealed_block, "sealed block");
+
+        let sealed_block_with_senders = SealedBlockWithSenders::new(sealed_block, senders)
+            .ok_or_else(|| {
+                error!(target: "execution::executor", "Unable to seal block with senders");
+                ExecutorError::RecoveredTransactionsLength(tx_length, senders_length)
+            })?;
 
         Ok((sealed_block_with_senders, bundle_state))
     }
@@ -486,37 +416,44 @@ impl StorageInner {
         &self,
         output: ConsensusOutput,
     ) -> Result<Vec<TransactionSigned>, ExecutorError> {
-        // collect recovered txs and senders
+        // collect recovered txs
+        //
+        // do not recover senders here to ensure consistency with upstream reth
         let mut transactions = vec![];
-        // let mut senders = vec![];
+
+        // TODO: there is a better way to do this, but wait until after execution refactor
+        //
+        // bathes.iter() { SealedBlockWithSenders.try_from(&batch) }
+        // try_from is missing support for withdrawals -> need to add withdrawals to metadata
+        //
+        // need to decide if executor produces per batch or giant block
 
         // loop through all transactions in order
         for batches in output.batches.into_iter() {
             for batch in batches.iter() {
+                // TODO: use batch -> SealedBlockWithSenders::try_from()
                 for tx in batch.transactions_owned() {
                     // batches must be validated by this point,
                     // so encoding and decoding has already happened
                     // and is not expected to fail
                     let recovered =
                         TransactionSigned::decode_enveloped(&mut tx.as_ref()).map_err(|e| {
-                            // error!(target: "execution::executor", "Failed to decode enveloped tx:
-                            // {tx:?}");
+                            error!(target: "execution::executor", "Failed to decode enveloped tx: {tx:?}");
                             ExecutorError::DecodeTransaction(e)
                         })?;
-                    // let sender =
-                    // recovered.recover_signer().
-                    // ok_or(BlockExecutionError::Validation(BlockValidationError::SenderRecoveryError))?
-                    // ;
+
+                    // collect transaction + signer
                     transactions.push(recovered);
-                    // senders.push(sender);
                 }
             }
         }
+
         Ok(transactions)
 
         // TODO: optimize by returning `impl Iterator<Item = Vec<Bytes>` and using `flat_map` to
         // return an iter of nested vecs since this is the only place where
-        // `.transactions_owned` method is used. this would save memory allocation discussion: https://users.rust-lang.org/t/how-far-to-take-iterators-to-avoid-for-loops/30167/10
+        // `.transactions_owned` method is used. this would save memory allocation discussion:
+        // https://users.rust-lang.org/t/how-far-to-take-iterators-to-avoid-for-loops/30167/10
         //
         // output.batches.into_iter().flat_map(|batches| batches.into_iter().flat_map(|batch|
         // batch.transactions_owned().into_iter().flat_map(|tx|
@@ -614,7 +551,7 @@ mod tests {
         let manager = TaskManager::current();
         let executor = manager.executor();
         let execution_node = default_test_execution_node(Some(chain), None, executor)?;
-        let (to_executor, from_consensus) = tn_types::test_channel!(1);
+        let (to_executor, from_consensus) = tokio::sync::broadcast::channel(1);
         execution_node.start_engine(from_consensus).await?;
         tokio::task::yield_now().await;
 
@@ -624,7 +561,7 @@ mod tests {
         //=== Testing begins
 
         // send output to executor
-        let res = to_executor.send(consensus_output).await;
+        let res = to_executor.send(consensus_output);
         debug!("res: {:?}", res);
         assert!(res.is_ok());
 
@@ -641,6 +578,147 @@ mod tests {
 
         // ensure canonical tip is the next block
         // assert_eq!(canonical_tip.header, storage_sealed_header);
+
+        // ensure database and provider are updated
+        let canonical_hash = canonical_tip.hash();
+
+        // wait for forkchoice to finish updating
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut current_finalized_header = provider
+                .finalized_header()
+                .expect("blockchain db has some finalized header 1")
+                .expect("some finalized header 2");
+            while canonical_hash != current_finalized_header.hash() {
+                // sleep - then look up finalized in db again
+                println!("\nwaiting for engine to complete forkchoice update...\n");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                current_finalized_header = provider
+                    .finalized_header()
+                    .expect("blockchain db has some finalized header 1")
+                    .expect("some finalized header 2");
+            }
+            tx.send(current_finalized_header)
+        });
+
+        let current_finalized_header = timeout(too_long, rx)
+            .await
+            .expect("next canonical block created within time")
+            .expect("finalized block retrieved from db");
+
+        debug!("update completed...");
+        assert_eq!(canonical_hash, current_finalized_header.hash());
+
+        // assert canonical tip contains all txs and senders in batches
+        assert_eq!(canonical_tip.block.body, txs_in_output);
+        assert_eq!(canonical_tip.block.beneficiary, beneficiary);
+        assert_eq!(canonical_tip.senders, senders_in_output);
+        Ok(())
+    }
+
+    /// TODO: test fails because all transactions must pass or everything fails during execution.
+    #[tokio::test]
+    async fn test_execute_consensus_output_with_duplicate_transactions() -> eyre::Result<()> {
+        init_test_tracing();
+
+        //=== Consensus
+        //
+        // create consensus output bc transactions in batches
+        // are randomly generated
+        //
+        // for each tx, seed address with funds in genesis
+        //
+        // TODO: this does not use a "real" `ConsensusOutput`
+        //
+        // refactor with valid data once test util helpers are in place
+        let leader = Certificate::default();
+        let sub_dag_index = 1;
+        let reputation_scores = ReputationScores::default();
+        let previous_sub_dag = None;
+        let mut batches = tn_types::test_utils::batches(4); // create 4 batches
+
+        // duplicate transactions for one batch
+        //
+        // TODO: test batches use default metadata. only transactions are unique.
+        //
+        // replace last batch with clone of the first - causes duplicate transaction
+        batches[3] = batches[0].clone();
+
+        let beneficiary = Address::from_str("0xdbdbdb2cbd23b783741e8d7fcf51e459b497e4a6")
+            .expect("beneficiary address from str");
+        let consensus_output = ConsensusOutput {
+            sub_dag: CommittedSubDag::new(
+                vec![Certificate::default()],
+                leader,
+                sub_dag_index,
+                reputation_scores,
+                previous_sub_dag,
+            )
+            .into(),
+            batches: vec![batches.clone()],
+            beneficiary,
+        };
+
+        //=== Execution
+
+        let genesis = adiri_genesis();
+
+        // collect txs and addresses for later assertions
+        let mut txs_in_output = vec![];
+        let mut senders_in_output = vec![];
+
+        let mut accounts_to_seed = Vec::new();
+        for batch in batches.into_iter() {
+            for tx in batch.transactions_owned() {
+                let tx_signed = TransactionSigned::decode_enveloped(&mut tx.as_ref())
+                    .expect("decode tx signed");
+                let address = tx_signed.recover_signer().expect("signer recoverable");
+                txs_in_output.push(tx_signed);
+                senders_in_output.push(address);
+                // fund account with 99mil TEL
+                let account = (
+                    address,
+                    GenesisAccount::default().with_balance(
+                        U256::from_str("0x51E410C0F93FE543000000")
+                            .expect("account balance is parsed"),
+                    ),
+                );
+                accounts_to_seed.push(account);
+            }
+        }
+        debug!("accounts to seed: {accounts_to_seed:?}");
+
+        // genesis
+        let genesis = genesis.extend_accounts(accounts_to_seed);
+        let chain: Arc<ChainSpec> = Arc::new(genesis.into());
+
+        let manager = TaskManager::current();
+        let executor = manager.executor();
+        let execution_node = default_test_execution_node(Some(chain), None, executor)?;
+        let (to_executor, from_consensus) = tokio::sync::broadcast::channel(1);
+        execution_node.start_engine(from_consensus).await?;
+        tokio::task::yield_now().await;
+
+        let provider = execution_node.get_provider().await;
+        let mut canon_state_notification_receiver = provider.subscribe_to_canonical_state();
+
+        //=== Testing begins
+
+        // send output to executor
+        let res = to_executor.send(consensus_output);
+        debug!("res: {:?}", res);
+        assert!(res.is_ok());
+
+        // wait for next canonical block
+        let too_long = Duration::from_secs(5);
+        let canon_update = timeout(too_long, canon_state_notification_receiver.recv())
+            .await
+            .expect("next canonical block created within time")
+            .expect("canon update is Some()");
+
+        assert_matches!(canon_update, CanonStateNotification::Commit { .. });
+        let canonical_tip = canon_update.tip();
+        debug!("canon update: {:?}", canonical_tip);
 
         // ensure database and provider are updated
         let canonical_hash = canonical_tip.hash();

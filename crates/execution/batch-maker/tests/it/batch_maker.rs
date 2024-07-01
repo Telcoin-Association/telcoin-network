@@ -11,22 +11,27 @@ use narwhal_network_types::MockWorkerToPrimary;
 use narwhal_typed_store::Map;
 use narwhal_worker::{metrics::WorkerMetrics, BatchMaker, NUM_SHUTDOWN_RECEIVERS};
 use prometheus::Registry;
-use reth::tasks::TaskManager;
+use reth::{beacon_consensus::EthBeaconConsensus, tasks::TaskManager};
 use reth_blockchain_tree::noop::NoopBlockchainTree;
+use reth_chainspec::ChainSpec;
 use reth_db::test_utils::{create_test_rw_db, tempdir_path};
-use reth_node_core::init::init_genesis;
-use reth_node_ethereum::EthEvmConfig;
-use reth_primitives::{alloy_primitives::U160, Address, ChainSpec, TransactionSigned, U256};
-use reth_provider::{providers::BlockchainProvider, ProviderFactory};
+use reth_db_common::init::init_genesis;
+use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
+use reth_primitives::{alloy_primitives::U160, Address, TransactionSigned, U256};
+use reth_provider::{
+    providers::{BlockchainProvider, StaticFileProvider},
+    ProviderFactory,
+};
 use reth_tracing::init_test_tracing;
 use reth_transaction_pool::{
     blobstore::InMemoryBlobStore, PoolConfig, TransactionPool, TransactionValidationTaskExecutor,
 };
 use std::{sync::Arc, time::Duration};
 use tn_batch_maker::{BatchMakerBuilder, MiningMode};
+use tn_batch_validator::{BatchValidation, BatchValidator};
 use tn_types::{
     test_utils::{create_batch_store, get_gas_price, test_genesis, TransactionFactory},
-    Batch, BatchAPI, MetadataAPI, PreSubscribedBroadcastSender,
+    Batch, BatchAPI, Consensus, MetadataAPI, PreSubscribedBroadcastSender,
 };
 use tokio::time::timeout;
 use tracing::debug;
@@ -86,11 +91,15 @@ async fn test_make_batch_el_to_cl() {
     let db = create_test_rw_db();
 
     // provider
-    let factory = ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), tempdir_path())
-        .expect("provider factory");
+    let factory = ProviderFactory::new(
+        Arc::clone(&db),
+        Arc::clone(&chain),
+        StaticFileProvider::read_write(tempdir_path())
+            .expect("static file provider read write created with tempdir path"),
+    );
 
     let genesis_hash = init_genesis(factory.clone()).expect("init genesis");
-    let blockchain_db = BlockchainProvider::new(factory, NoopBlockchainTree::default())
+    let blockchain_db = BlockchainProvider::new(factory, Arc::new(NoopBlockchainTree::default()))
         .expect("test blockchain provider");
 
     debug!("genesis hash: {genesis_hash:?}");
@@ -113,6 +122,7 @@ async fn test_make_batch_el_to_cl() {
     let address = Address::from(U160::from(333));
 
     let evm_config = EthEvmConfig::default();
+    let block_executor = EthExecutorProvider::new(chain.clone(), evm_config);
 
     // build execution batch maker
     let task = BatchMakerBuilder::new(
@@ -122,7 +132,7 @@ async fn test_make_batch_el_to_cl() {
         to_worker,
         mining_mode,
         address,
-        evm_config,
+        block_executor.clone(),
     )
     .build();
 
@@ -183,6 +193,13 @@ async fn test_make_batch_el_to_cl() {
         .await
         .expect("new batch created within time")
         .expect("new batch is Some()");
+
+    // ensure batch validator succeeds
+    let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
+    let batch_validator = BatchValidator::new(consensus, blockchain_db.clone(), block_executor);
+
+    let valid_batch_result = batch_validator.validate_batch(&batch).await;
+    assert!(valid_batch_result.is_ok());
 
     // ensure expected transaction is in batch
     let expected_batch = Batch::new(vec![transaction1.envelope_encoded().into()]);

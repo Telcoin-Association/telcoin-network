@@ -34,12 +34,11 @@ use std::{
     time::Duration,
 };
 use tn_batch_validator::NoopBatchValidator;
-use tn_config::Parameters;
 use tn_types::{
     now,
     test_utils::{make_optimal_signed_certificates, temp_dir, CommitteeFixture},
     AuthorityIdentifier, Certificate, CertificateAPI, ChainIdentifier, Committee, Header,
-    HeaderAPI, PreSubscribedBroadcastSender, SignatureVerificationState,
+    HeaderAPI, Parameters, PreSubscribedBroadcastSender, SignatureVerificationState,
 };
 use tokio::{sync::watch, time::timeout};
 
@@ -536,18 +535,13 @@ async fn test_request_vote_accept_missing_parents() {
         header: test_header,
         parents: round_2_missing.clone(),
     });
-    assert!(request
-        .extensions_mut()
-        .insert(network.downgrade())
-        .is_none());
+    assert!(request.extensions_mut().insert(network.downgrade()).is_none());
     assert!(request
         .extensions_mut()
         .insert(anemo::PeerId(author.network_public_key().0.to_bytes()))
         .is_none());
 
-    let result = timeout(Duration::from_secs(5), handler.request_vote(request))
-        .await
-        .unwrap();
+    let result = timeout(Duration::from_secs(5), handler.request_vote(request)).await.unwrap();
     assert!(result.is_ok(), "{:?}", result);
 }
 

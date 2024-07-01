@@ -7,8 +7,6 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 tracing = { workspace = true }
 humantime = { workspace = true }
@@ -16,6 +14,7 @@ futures = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 reth = { workspace = true }
 reth-primitives = { workspace = true }
+reth-chainspec = { workspace = true }
 reth-provider = { workspace = true }
 reth-rpc = { workspace = true }
 reth-tasks = { workspace = true }
@@ -29,12 +28,15 @@ alloy-sol-types = { workspace = true }
 jsonrpsee = { workspace = true, features = ["macros"] }
 
 # google cloud feature
-gcloud-sdk = { version = "0.24.3", default-features = false, features = ["google-cloud-kms-v1", "tls-webpki-roots"] }
+gcloud-sdk = { version = "=0.24.6", default-features = false, features = [
+    "google-cloud-kms-v1",
+    "tls-webpki-roots",
+] }
 k256 = "0.13.3"
 ecdsa = { version = "0.16.9", features = ["pem"] }
-secp256k1 = "0.27.0"
+secp256k1 = { workspace = true }
 tonic = { workspace = true }
-cfg-if = { workspace = true}
+cfg-if = { workspace = true }
 
 [dev-dependencies]
 reth-tracing = { workspace = true }

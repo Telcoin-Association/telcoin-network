@@ -22,6 +22,7 @@ use tokio::sync::watch;
 
 // A test validator that rejects every batch
 #[derive(Clone)]
+#[allow(dead_code)]
 struct NilBatchValidator;
 #[async_trait]
 impl BatchValidation for NilBatchValidator {

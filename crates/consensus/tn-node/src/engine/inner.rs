@@ -1,36 +1,42 @@
 //! Inner-execution node components for both Worker and Primary execution.
 
-use consensus_metrics::metered_channel::{Receiver, Sender};
+use consensus_metrics::metered_channel::Sender;
 use eyre::Context as _;
+use futures::{stream_select, StreamExt};
 use jsonrpsee::http_client::HttpClient;
-use reth::{
-    core::init::init_genesis,
-    dirs::{ChainPath, DataDirPath},
-    rpc::builder::{RpcModuleBuilder, RpcServerHandle},
-};
+use reth::rpc::builder::{config::RethRpcServerConfig, RpcModuleBuilder, RpcServerHandle};
 use reth_auto_seal_consensus::AutoSealConsensus;
 use reth_beacon_consensus::{
     hooks::{EngineHooks, StaticFileHook},
-    BeaconConsensus, BeaconConsensusEngine, MIN_BLOCKS_FOR_PIPELINE_RUN,
+    BeaconConsensusEngine, EthBeaconConsensus, MIN_BLOCKS_FOR_PIPELINE_RUN,
 };
 use reth_blockchain_tree::{
     BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
 };
-use reth_db::{database::Database, database_metrics::DatabaseMetrics};
+use reth_db::{
+    database::Database,
+    database_metrics::{DatabaseMetadata, DatabaseMetrics},
+};
+use reth_db_common::init::init_genesis;
+use reth_evm::execute::BlockExecutorProvider;
 use reth_exex::ExExManagerHandle;
-use reth_interfaces::consensus::Consensus;
+use reth_network::NetworkEvents;
 use reth_node_builder::{
+    common::WithConfigs,
     components::{NetworkBuilder as _, PayloadServiceBuilder as _, PoolBuilder},
     setup::build_networked_pipeline,
-    BuilderContext, ConfigureEvm, NodeConfig, RethRpcConfig,
+    BuilderContext, NodeConfig,
 };
 use reth_node_ethereum::{
     node::{EthereumNetworkBuilder, EthereumPayloadBuilder, EthereumPoolBuilder},
     EthEvmConfig,
 };
 use reth_primitives::{Address, Head};
-use reth_provider::{providers::BlockchainProvider, CanonStateNotificationSender, ProviderFactory};
-use reth_revm::EvmProcessorFactory;
+use reth_provider::{
+    providers::{BlockchainProvider, StaticFileProvider},
+    CanonStateNotificationSender, ProviderFactory, StaticFileProviderFactory as _,
+};
+use reth_prune::PruneModes;
 use reth_rpc_types::engine::ForkchoiceState;
 use reth_static_file::StaticFileProducer;
 use reth_tasks::TaskExecutor;
@@ -40,24 +46,22 @@ use tn_batch_maker::{BatchMakerBuilder, MiningMode};
 use tn_batch_validator::BatchValidator;
 use tn_executor::Executor;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
-use tn_types::{BlockchainProviderType, ConsensusOutput, NewBatch, WorkerId};
-use tokio::sync::mpsc::unbounded_channel;
+use tn_types::{Consensus, ConsensusOutput, NewBatch, WorkerId};
+use tokio::sync::{broadcast, mpsc::unbounded_channel};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info};
 
+use super::{PrimaryNode, TnBuilder};
 use crate::{
     engine::{WorkerNetwork, WorkerNode},
     error::ExecutionError,
 };
 
-use super::{PrimaryNode, TnBuilder};
-
-/// Inner type for holding execution layer types.
-
 /// Inner type for holding execution layer types.
 pub(super) struct ExecutionNodeInner<DB, Evm>
 where
     DB: Database + Clone + Unpin + 'static,
-    Evm: ConfigureEvm + 'static,
+    Evm: BlockExecutorProvider + 'static,
 {
     /// The [Address] for the authority used as the suggested beneficiary.
     ///
@@ -70,7 +74,7 @@ where
     /// help TN stay in-sync with the Ethereum community.
     node_config: NodeConfig,
     /// Type that fetches data from the database.
-    blockchain_db: BlockchainProviderType<DB, Evm>,
+    blockchain_db: BlockchainProvider<DB>,
     /// Provider factory is held by the blockchain db, but there isn't a publicly
     /// available way to get a cloned copy.
     /// TODO: add a method to `BlockchainProvider` in upstream reth
@@ -84,9 +88,7 @@ where
     ///
     /// This type is owned by the current runtime and facilitates
     /// a convenient way to spawn tasks that shutdown with the runtime.
-    executor: TaskExecutor,
-    /// Root data directory.
-    data_dir: ChainPath<DataDirPath>,
+    task_executor: TaskExecutor,
     /// TODO: temporary solution until upstream reth supports public rpc hooks
     opt_faucet_args: Option<FaucetArgs>,
     /// Collection of execution components by worker.
@@ -95,25 +97,17 @@ where
 
 impl<DB, Evm> ExecutionNodeInner<DB, Evm>
 where
-    DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
-    Evm: ConfigureEvm + 'static,
+    DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
+    Evm: BlockExecutorProvider + 'static,
 {
     /// Create a new instance of `Self`.
-    pub(super) fn new(
-        // address: Address,
-        // config: NodeConfig,
-        // blockchain_db: BlockchainProviderType<DB, Evm>,
-        // provider_factory: ProviderFactory<DB>,
-        // evm: Evm,
-        // canon_state_notification_sender: CanonStateNotificationSender,
-        // executor: TaskExecutor,
-        // datadir: ChainPath<DataDirPath>,
-        tn_builder: TnBuilder<DB>,
-        evm: Evm,
-    ) -> eyre::Result<Self> {
+    pub(super) fn new(tn_builder: TnBuilder<DB>, evm: Evm) -> eyre::Result<Self> {
         // deconstruct the builder
-        let TnBuilder { database, node_config, data_dir, executor, tn_config, opt_faucet_args } =
+        let TnBuilder { database, node_config, task_executor, tn_config, opt_faucet_args } =
             tn_builder;
+
+        // resolve the node's datadir
+        let datadir = node_config.datadir();
 
         // Raise the fd limit of the process.
         // Does not do anything on windows.
@@ -122,12 +116,9 @@ where
         let provider_factory = ProviderFactory::new(
             database.clone(),
             Arc::clone(&node_config.chain),
-            data_dir.static_files_path(),
-        )?
+            StaticFileProvider::read_write(datadir.static_files())?,
+        )
         .with_static_files_metrics();
-
-        // let genesis_hash = init_genesis(db_instance.db.clone(), config.chain.clone())?;
-        // info!(target: "engine", hardforks = config.chain.display_hardforks());
 
         debug!(target: "tn::execution", chain=%node_config.chain.chain, genesis=?node_config.chain.genesis_hash(), "Initializing genesis");
 
@@ -142,44 +133,26 @@ where
         debug!(target: "tn::cli", "Spawning stages metrics listener task");
         let (sync_metrics_tx, sync_metrics_rx) = unbounded_channel();
         let sync_metrics_listener = reth_stages::MetricsListener::new(sync_metrics_rx);
-        executor.spawn_critical("stages metrics listener task", sync_metrics_listener);
+        task_executor.spawn_critical("stages metrics listener task", sync_metrics_listener);
 
         // get config from file
-        // let reth_config = reth_config::Config::default(); // TODO: probably want to persist this?
-        let prune_config = node_config.prune_config()?; //.or(reth_config.prune.clone());
-
-        // let evm_config = EthEvmConfig::default();
-
-        // let evm_config = types.evm_config();
+        let prune_config = node_config.prune_config(); //.or(reth_config.prune.clone());
         let tree_config = BlockchainTreeConfig::default();
-        let tree_externals = TreeExternals::new(
-            provider_factory.clone(),
-            auto_consensus.clone(),
-            EvmProcessorFactory::new(node_config.chain.clone(), evm.clone()),
-        );
+        let tree_externals =
+            TreeExternals::new(provider_factory.clone(), auto_consensus.clone(), evm.clone());
         let tree = BlockchainTree::new(
             tree_externals,
             tree_config,
-            prune_config.as_ref().map(|config| config.segments.clone()),
+            prune_config.map(|config| config.segments.clone()),
         )?
         .with_sync_metrics_tx(sync_metrics_tx.clone());
 
-        // let tree = node_config.build_blockchain_tree(
-        //     provider_factory.clone(),
-        //     consensus.clone(),
-        //     prune_config,
-        //     sync_metrics_tx.clone(),
-        //     tree_config,
-        //     evm.clone(),
-        // )?;
-
         let canon_state_notification_sender = tree.canon_state_notification_sender();
-        let blockchain_tree = ShareableBlockchainTree::new(tree);
+        let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
         debug!(target: "tn::execution", "configured blockchain tree");
 
         // setup the blockchain provider
-        let blockchain_db =
-            BlockchainProvider::new(provider_factory.clone(), blockchain_tree.clone())?;
+        let blockchain_db = BlockchainProvider::new(provider_factory.clone(), blockchain_tree)?;
         let address = *tn_config.execution_address();
 
         Ok(Self {
@@ -189,8 +162,7 @@ where
             provider_factory,
             evm,
             canon_state_notification_sender,
-            executor,
-            data_dir,
+            task_executor,
             opt_faucet_args,
             workers: HashMap::default(),
         })
@@ -202,7 +174,7 @@ where
     /// All tasks are spawned with the [ExecutionNodeInner]'s [TaskManager].
     pub(super) async fn start_engine(
         &self,
-        from_consensus: Receiver<ConsensusOutput>,
+        from_consensus: broadcast::Receiver<ConsensusOutput>,
     ) -> eyre::Result<()> {
         // TODO: start metrics endpoint - need to update Generics
         //
@@ -213,7 +185,7 @@ where
                 prometheus_handle,
                 self.provider_factory.db_ref().clone(),
                 self.provider_factory.static_file_provider(),
-                self.executor.clone(),
+                self.task_executor.clone(),
             )
             .await?;
 
@@ -223,12 +195,11 @@ where
         let ctx = BuilderContext::<PrimaryNode<_, _>>::new(
             head,
             self.blockchain_db.clone(),
-            self.executor.clone(),
-            self.data_dir.clone(),
-            self.node_config.clone(),
-            reth_config::Config::default(), // mostly peer / staging configs
-            // TODO: generic doesn't work here
-            EthEvmConfig::default(),
+            self.task_executor.clone(),
+            WithConfigs {
+                config: self.node_config.clone(),
+                toml_config: reth_config::Config::default(),
+            },
         );
 
         // let components_builder = PrimaryNode::<DB, _>::components();
@@ -252,6 +223,7 @@ where
 
         // engine channel
         let (to_engine, from_engine) = unbounded_channel();
+        let beacon_engine_stream = UnboundedReceiverStream::from(from_engine);
 
         // build executor
         let (_, client, mut task) = Executor::new(
@@ -271,26 +243,25 @@ where
             Arc::new(AutoSealConsensus::new(self.node_config.chain.clone()));
         let mut hooks = EngineHooks::new();
 
-        let static_file_producer = StaticFileProducer::new(
-            self.provider_factory.clone(),
-            self.provider_factory.static_file_provider(),
-            self.node_config.prune_config()?.unwrap_or_default().segments,
-        );
+        let static_file_producer =
+            StaticFileProducer::new(self.provider_factory.clone(), PruneModes::default());
 
         // let static_file_producer_events = static_file_producer.lock().events();
 
         hooks.add(StaticFileHook::new(
             static_file_producer.clone(),
-            Box::new(self.executor.clone()),
+            Box::new(self.task_executor.clone()),
         ));
 
-        let mut pipeline = build_networked_pipeline(
-            &self.node_config.clone(),
+        // capture static file events before passing ownership
+        let static_file_producer_events = static_file_producer.lock().events();
+
+        let pipeline = build_networked_pipeline(
             &reth_config.stages,
             client.clone(),
             Arc::clone(&auto_consensus),
             self.provider_factory.clone(),
-            &self.executor,
+            &self.task_executor,
             sync_metrics_tx,
             None, // prune.node_config.clone(),
             max_block,
@@ -300,43 +271,58 @@ where
         )
         .await?;
 
-        // TODO: is this necessary?
-        let pipeline_events = pipeline.events();
-        task.set_pipeline_events(pipeline_events);
+        let pipeline_events_for_task = pipeline.events();
+        task.set_pipeline_events(pipeline_events_for_task);
+
+        // capture pipeline events for events handler
+        // TODO: EventStream<_> doesn't impl Clone yet
+        let pipeline_events_for_events_handler = pipeline.events();
 
         let (beacon_consensus_engine, beacon_engine_handle) = BeaconConsensusEngine::with_channel(
             client.clone(),
             pipeline,
             self.blockchain_db.clone(),
-            Box::new(self.executor.clone()),
+            Box::new(self.task_executor.clone()),
             Box::new(network.clone()),
-            None,  // max block
-            false, // self.debug.continuous,
+            None, // max block
             payload_builder,
             None, // initial_target
             MIN_BLOCKS_FOR_PIPELINE_RUN,
             to_engine,
-            from_engine,
+            Box::pin(beacon_engine_stream), // unbounded stream
             hooks,
         )?;
 
         // spawn task to execute consensus output
-        self.executor.spawn_critical("Execution Engine Task", Box::pin(task));
-        // handles.push(task_executor.spawn_critical("worker mining task", Box::pin(task)));
+        self.task_executor.spawn_critical("Execution Engine Task", Box::pin(task));
 
         debug!("awaiting beacon engine task...");
 
         // spawn beacon engine
-        self.executor.spawn_critical_blocking("consensus engine", async move {
+        self.task_executor.spawn_critical_blocking("consensus engine", async move {
             let res = beacon_consensus_engine.await;
             tracing::error!("beacon consensus engine: {res:?}");
             // TODO: return oneshot channel here?
         });
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        // // handles.push(engine_task);
+        let events = stream_select!(
+            network.event_listener().map(Into::into),
+            beacon_engine_handle.event_listener().map(Into::into),
+            pipeline_events_for_events_handler.map(Into::into),
+            // pruner_events.map(Into::into),
+            static_file_producer_events.map(Into::into),
+        );
+        ctx.task_executor().spawn_critical(
+            "events task",
+            reth_node_events::node::handle_events(
+                Some(network),
+                Some(head.number),
+                events,
+                self.provider_factory.db_ref().clone(),
+            ),
+        );
 
-        // // wait for engine to spawn
+        // wait for engine to spawn
         tokio::task::yield_now().await;
 
         // finalize genesis
@@ -368,12 +354,11 @@ where
         let ctx = BuilderContext::<WorkerNode<DB, Evm>>::new(
             head,
             self.blockchain_db.clone(),
-            self.executor.clone(),
-            self.data_dir.clone(),
-            self.node_config.clone(),
-            reth_config::Config::default(), // mostly peer / staging configs
-            // TODO: self.evm generic doesn't work
-            EthEvmConfig::default(),
+            self.task_executor.clone(),
+            WithConfigs {
+                config: self.node_config.clone(),
+                toml_config: reth_config::Config::default(), /* mostly peer / staging configs */
+            },
         );
 
         // default tx pool
@@ -411,7 +396,7 @@ where
         .build();
 
         // spawn batch maker mining task
-        self.executor.spawn_critical("batch maker", task);
+        self.task_executor.spawn_critical("batch maker", task);
 
         // let mut hooks = EngineHooks::new();
 
@@ -434,8 +419,8 @@ where
             .with_provider(self.blockchain_db.clone())
             .with_pool(transaction_pool.clone())
             .with_network(network)
-            .with_executor(self.executor.clone())
-            .with_evm_config(self.evm.clone())
+            .with_executor(self.task_executor.clone())
+            .with_evm_config(EthEvmConfig::default()) // TODO: this should come from self
             .with_events(self.blockchain_db.clone());
 
         //.node_configure namespaces
@@ -471,13 +456,10 @@ where
         // validate batches using beaacon consensus
         // to ensure inner-chain compatibility
         let consensus: Arc<dyn Consensus> =
-            Arc::new(BeaconConsensus::new(self.node_config.chain.clone()));
+            Arc::new(EthBeaconConsensus::new(self.node_config.chain.clone()));
+
         // batch validator
-        BatchValidator::<DB, Evm>::new(
-            consensus,
-            self.blockchain_db.clone(),
-            EvmProcessorFactory::new(self.node_config.chain.clone(), self.evm.clone()),
-        )
+        BatchValidator::<DB, Evm>::new(consensus, self.blockchain_db.clone(), self.evm.clone())
     }
 
     /// Fetch the last executed stated from the database.
@@ -504,7 +486,7 @@ where
     }
 
     /// Return an database provider.
-    pub fn get_provider(&self) -> BlockchainProviderType<DB, Evm> {
+    pub(super) fn get_provider(&self) -> BlockchainProvider<DB> {
         self.blockchain_db.clone()
     }
 

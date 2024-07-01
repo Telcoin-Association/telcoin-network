@@ -3,30 +3,35 @@ name = "tn-types"
 version.workspace = true
 edition = "2021"
 license = "Apache-2.0"
-authors = ["Grant Kee <grant.kee@telco.in>", "Mysten Labs <build@mystenlabs.com>"]
+authors = [
+    "Grant Kee <grant.kee@telco.in>",
+    "Mysten Labs <build@mystenlabs.com>",
+    "Steven Stanfield <steve@telcoin.org>",
+]
 publish = false
 
 [dependencies]
 base64 = { workspace = true }
 bcs = { workspace = true }
+reth-payload-primitives = { workspace = true }
 reth-primitives = { workspace = true }
-reth-blockchain-tree = { workspace = true }
+reth-chainspec = { workspace = true }
 reth-db = { workspace = true }
 reth-revm = { workspace = true }
+reth-rpc-types = { workspace = true }
 derive_builder = { workspace = true }
 enum_dispatch = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
 prometheus = { workspace = true }
 proptest = { workspace = true }
-proptest-derive = { workspace = true }
-#prost = { workspace = true }
 rand = { workspace = true }
 roaring = { workspace = true }
 serde = { workspace = true }
 serde_with = { workspace = true }
 serde_json = { workspace = true }
 serde_repr = { workspace = true }
+humantime-serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 tonic = { workspace = true }
@@ -44,13 +49,15 @@ telcoin-sync = { workspace = true }
 alloy-rlp = { workspace = true }
 schemars = { version = "0.8.16" }
 serde_yaml = { workspace = true }
-reth-provider = { workspace = true }
+secp256k1 = { workspace = true }
+reth-consensus = { workspace = true }
 
 # optional dependencies for test-utils
 tempfile = { workspace = true, optional = true }
 fdlimit = { workspace = true, optional = true }
 reth-tracing = { workspace = true, optional = true }
 reth-transaction-pool = { workspace = true, optional = true }
+reth-provider = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -59,17 +66,16 @@ fdlimit = { workspace = true }
 tn-types = { path = ".", features = ["test-utils"] }
 consensus-metrics = { workspace = true }
 
-secp256k1 = "0.27.0"
-
-#serde_test = { workspace = true }
-#narwhal-test-utils = { workspace = true }
-
-#[target.'cfg(not(target_env = "msvc"))'.build-dependencies]
-#protobuf-src = { workspace = true }
-
 [features]
 default = []
-test-utils = ["tempfile", "fdlimit", "reth-tracing", "reth-transaction-pool", "reth-primitives/arbitrary"]
+test-utils = [
+    "tempfile",
+    "fdlimit",
+    "reth-tracing",
+    "reth-transaction-pool",
+    "reth-primitives/arbitrary",
+    "reth-provider",
+]
 arbitrary = ["reth-primitives/arbitrary"]
 
 [[bench]]

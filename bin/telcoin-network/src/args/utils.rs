@@ -1,7 +1,8 @@
 //! Utilities for parsing args
 
-use reth::{args::utils::genesis_value_parser, dirs::MaybePlatformPath};
-use reth_primitives::{Address, ChainSpec};
+use reth::{args::utils::chain_value_parser, dirs::MaybePlatformPath};
+use reth_chainspec::ChainSpec;
+use reth_primitives::Address;
 use std::{str::FromStr, sync::Arc};
 use tn_node::dirs::DataDirPath;
 use tn_types::adiri_chain_spec_arc;
@@ -19,7 +20,7 @@ pub fn tn_platform_path(value: &str) -> eyre::Result<MaybePlatformPath<DataDirPa
 pub fn clap_genesis_parser(value: &str) -> eyre::Result<Arc<ChainSpec>, eyre::Error> {
     let chain = match value {
         "adiri" => adiri_chain_spec_arc(),
-        _ => genesis_value_parser(value)?,
+        _ => chain_value_parser(value)?,
     };
 
     Ok(chain)

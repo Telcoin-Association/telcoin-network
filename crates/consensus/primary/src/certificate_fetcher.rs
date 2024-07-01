@@ -96,6 +96,7 @@ struct CertificateFetcherState {
 }
 
 impl CertificateFetcher {
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn spawn(
         authority_id: AuthorityIdentifier,

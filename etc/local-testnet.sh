@@ -38,6 +38,9 @@ mkdir -p $SHARED_GENESISDIR
 # number of validators
 LENGTH="${#VALIDATORS[@]}"
 
+RELEASE="debug"
+cargo build --bin telcoin-network
+
 # for validator in "${VALIDATORS[@]}"; do
 for ((i=0; i<$LENGTH; i++)); do
     VALIDATOR="${VALIDATORS[$i]}"
@@ -50,13 +53,13 @@ for ((i=0; i<$LENGTH; i++)); do
     fi
 
     echo "creating datadir for ${VALIDATOR}"
-    cargo run --bin telcoin-network -- genesis init --datadir "${DATADIR}"
+    target/${RELEASE}/telcoin-network genesis init --datadir "${DATADIR}" --dev-funded-account test-source
 
     echo "creating validator keys"
-    cargo run --bin telcoin-network -- keytool generate validator --datadir "${DATADIR}" --address "${ADDRESS}"
+    target/${RELEASE}/telcoin-network keytool generate validator --datadir "${DATADIR}" --address "${ADDRESS}"
 
     echo "creating validator info for genesis"
-    cargo run --bin telcoin-network -- genesis add-validator --datadir "${DATADIR}"
+    target/${RELEASE}/telcoin-network genesis add-validator --datadir "${DATADIR}"
 
     # cp validator info into shared genesis dir
     echo "copying validator info to shared genesis dir"
@@ -67,7 +70,7 @@ for ((i=0; i<$LENGTH; i++)); do
 done
 
 # create committee and worker cache yamls
-cargo run --bin telcoin-network -- genesis create-committee --datadir "${ROOTDIR}"
+target/${RELEASE}/telcoin-network genesis create-committee --datadir "${ROOTDIR}"
 
 for ((i=0; i<$LENGTH; i++)); do
     VALIDATOR="${VALIDATORS[$i]}"
@@ -80,6 +83,6 @@ for ((i=0; i<$LENGTH; i++)); do
 
     if [ "$START" = true ]; then
         # start validator
-        cargo run --bin telcoin-network -- node --datadir "${DATADIR}" --dev --chain adiri --instance "${INSTANCE}"
+        target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" --chain adiri --instance "${INSTANCE}" --http > "${ROOTDIR}/${VALIDATOR}.log" &
     fi
 done

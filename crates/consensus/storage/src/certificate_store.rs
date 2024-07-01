@@ -163,6 +163,7 @@ impl Cache for CertificateStoreCache {
 /// An implementation that basically disables the caching functionality when used for
 /// CertificateStore.
 #[derive(Clone)]
+#[allow(dead_code)]
 struct NoCache {}
 
 impl Cache for NoCache {
@@ -724,6 +725,7 @@ mod test {
         )
     }
 
+    #[allow(clippy::type_complexity)]
     fn create_db_maps(
         path: std::path::PathBuf,
     ) -> (
@@ -1068,13 +1070,45 @@ mod test {
         assert!(store.is_empty());
     }
 
+    // async fn test_delete<T: Cache>(store: CertificateStore<T>) {
+    /// Test new store with cache.
+    ///
+    /// workaround for error:
+    /// ```text
+    /// thread 'certificate_store::test::test_delete_by_store_type' panicked at crates/consensus/typed-store/src/metrics.rs:268:14:
+    /// called `Result::unwrap()` on an `Err` value: AlreadyReg
+    /// ```
     #[tokio::test]
-    async fn test_delete_by_store_type() {
-        test_delete(new_store(temp_dir())).await;
-        test_delete(new_store_no_cache(temp_dir())).await;
+    async fn test_delete_cache_store() {
+        let store = new_store(temp_dir());
+        // GIVEN
+        // create certificates for 10 rounds
+        let certs = certificates(10);
+
+        // store them in both main and secondary index
+        store.write_all(certs.clone()).unwrap();
+
+        // WHEN now delete a couple of certificates
+        let to_delete = certs.iter().take(2).map(|c| c.digest()).collect::<Vec<_>>();
+
+        store.delete(to_delete[0]).unwrap();
+        store.delete(to_delete[1]).unwrap();
+
+        // THEN
+        assert!(store.read(to_delete[0]).unwrap().is_none());
+        assert!(store.read(to_delete[1]).unwrap().is_none());
     }
 
-    async fn test_delete<T: Cache>(store: CertificateStore<T>) {
+    /// Test new store without cache.
+    ///
+    /// workaround for error:
+    /// ```text
+    /// thread 'certificate_store::test::test_delete_by_store_type' panicked at crates/consensus/typed-store/src/metrics.rs:268:14:
+    /// called `Result::unwrap()` on an `Err` value: AlreadyReg
+    /// ```
+    #[tokio::test]
+    async fn test_delete_no_cache_store() {
+        let store = new_store_no_cache(temp_dir());
         // GIVEN
         // create certificates for 10 rounds
         let certs = certificates(10);
@@ -1094,12 +1128,28 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_delete_all_by_store_type() {
-        test_delete_all(new_store(temp_dir())).await;
-        test_delete_all(new_store_no_cache(temp_dir())).await;
+    async fn test_delete_all_cache_store() {
+        let store = new_store(temp_dir());
+        // GIVEN
+        // create certificates for 10 rounds
+        let certs = certificates(10);
+
+        // store them in both main and secondary index
+        store.write_all(certs.clone()).unwrap();
+
+        // WHEN now delete a couple of certificates
+        let to_delete = certs.iter().take(2).map(|c| c.digest()).collect::<Vec<_>>();
+
+        store.delete_all(to_delete.clone()).unwrap();
+
+        // THEN
+        assert!(store.read(to_delete[0]).unwrap().is_none());
+        assert!(store.read(to_delete[1]).unwrap().is_none());
     }
 
-    async fn test_delete_all<T: Cache>(store: CertificateStore<T>) {
+    #[tokio::test]
+    async fn test_delete_all_no_cache_store() {
+        let store = new_store_no_cache(temp_dir());
         // GIVEN
         // create certificates for 10 rounds
         let certs = certificates(10);

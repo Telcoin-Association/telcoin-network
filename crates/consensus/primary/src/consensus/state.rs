@@ -295,6 +295,7 @@ pub struct Consensus {
 }
 
 impl Consensus {
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn spawn(
         committee: Committee,

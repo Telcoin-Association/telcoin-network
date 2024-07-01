@@ -221,6 +221,7 @@ impl Certifier {
         Ok(vote)
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[instrument(level = "debug", skip_all, fields(header_digest = ?header.digest()))]
     async fn propose_header(
         authority_id: AuthorityIdentifier,

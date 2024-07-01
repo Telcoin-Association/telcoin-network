@@ -1,13 +1,15 @@
 [package]
 name = "telcoin-sync"
-authors = ["Grant Kee <grant.kee@telco.in>", "Mysten Labs <build@mystenlabs.com>"]
+authors = [
+    "Grant Kee <grant.kee@telco.in>",
+    "Mysten Labs <build@mystenlabs.com>",
+]
 license = "Apache-2.0"
 version.workspace = true
 edition = "2021"
 publish = false
 
 [dependencies]
-# 
 tokio = { workspace = true, features = ["sync"] }
 parking_lot = { workspace = true }
 

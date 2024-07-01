@@ -6,8 +6,6 @@ use fastcrypto::{
     signature_service::SignatureService,
     traits::{Signer, VerifyingKey},
 };
-#[cfg(any(test, feature = "arbitrary"))]
-use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -151,7 +149,6 @@ impl VoteV1 {
 }
 
 /// Hash a Vote based on the crate's `DIGEST_LENGTH`
-#[cfg_attr(any(test, feature = "arbitrary"), derive(Arbitrary))]
 #[derive(Clone, Serialize, Deserialize, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Copy)]
 pub struct VoteDigest([u8; crypto::DIGEST_LENGTH]);
 

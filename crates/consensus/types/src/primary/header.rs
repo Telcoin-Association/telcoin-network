@@ -6,8 +6,6 @@ use fastcrypto_tbls::{tbls::ThresholdBls, types::ThresholdBls12381MinSig};
 use indexmap::IndexMap;
 use mem_utils::MallocSizeOf;
 use once_cell::sync::OnceCell;
-#[cfg(any(test, feature = "arbitrary"))]
-use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt};
 
@@ -302,7 +300,6 @@ impl HeaderV1 {
 }
 
 /// The slice of bytes for the header's digest.
-#[cfg_attr(any(test, feature = "arbitrary"), derive(Arbitrary))]
 #[derive(
     Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash, PartialOrd, Ord, MallocSizeOf,
 )]

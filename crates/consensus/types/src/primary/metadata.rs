@@ -5,11 +5,8 @@
 //! [SealedHeader]. The Batch itself contains the
 //! raw transactions, which are used during validation
 //! to recreate the included [SealedHeader].
-use enum_dispatch::enum_dispatch;
-
 use crate::{now, TimestampSec};
-#[cfg(any(test, feature = "arbitrary"))]
-use proptest_derive::Arbitrary;
+use enum_dispatch::enum_dispatch;
 use reth_primitives::SealedHeader;
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +19,6 @@ use serde::{Deserialize, Serialize};
 /// safety or liveness.
 ///
 /// This is a versioned `Metadata` type
-#[cfg_attr(any(test, feature = "arbitrary"), derive(Arbitrary))]
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq /* , MallocSizeOf */)]
 #[enum_dispatch(MetadataAPI)]
 pub enum VersionedMetadata {
@@ -85,7 +81,6 @@ pub trait MetadataAPI {
 }
 
 /// Metadata for batches.
-#[cfg_attr(any(test, feature = "arbitrary"), derive(Arbitrary))]
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default, Eq /* , MallocSizeOf */)]
 pub struct MetadataV1 {
     /// Timestamp of when the entity created. This is generated

@@ -1,26 +1,23 @@
 //! Batch validator
 
 use crate::error::BatchValidationError;
-use reth_blockchain_tree::BundleStateDataRef;
+use reth_blockchain_tree::error::BlockchainTreeError;
+use reth_consensus::PostExecutionInput;
 use reth_db::database::Database;
-use reth_interfaces::{
-    blockchain_tree::{error::BlockchainTreeError, BlockchainTreeViewer},
-    consensus::Consensus,
-    executor::BlockValidationError,
+use reth_evm::execute::{
+    BlockExecutionOutput, BlockExecutorProvider, BlockValidationError, Executor,
 };
-use reth_node_api::ConfigureEvm;
 use reth_primitives::{GotExpected, Hardfork, SealedBlockWithSenders, U256};
 use reth_provider::{
-    providers::BundleStateProvider, BundleStateDataProvider, BundleStateWithReceipts,
-    ChainSpecProvider, ExecutorFactory, HeaderProvider, StateProviderFactory, StateRootProvider,
+    providers::BlockchainProvider, ChainSpecProvider, DatabaseProviderFactory, HeaderProvider,
+    StateRootProvider,
 };
-use reth_revm::EvmProcessorFactory;
+use reth_revm::database::StateProviderDatabase;
 use std::{
-    collections::BTreeMap,
     fmt::{Debug, Display},
     sync::Arc,
 };
-use tn_types::{Batch, BlockchainProviderType};
+use tn_types::{Batch, Consensus};
 use tracing::{debug, error};
 
 /// Batch validator
@@ -28,16 +25,16 @@ use tracing::{debug, error};
 pub struct BatchValidator<DB, Evm>
 where
     DB: Database + Clone + 'static,
-    Evm: ConfigureEvm + 'static,
+    Evm: BlockExecutorProvider + 'static,
 {
     /// Validation methods for beacon consensus.
     ///
     /// Required to remain fully compatible with Ethereum.
     consensus: Arc<dyn Consensus>,
     /// Database provider to encompass tree and provider factory.
-    blockchain_db: BlockchainProviderType<DB, Evm>,
+    blockchain_db: BlockchainProvider<DB>,
     /// The executor factory to execute blocks with.
-    executor_factory: EvmProcessorFactory<Evm>,
+    executor_factory: Evm,
 }
 
 /// Defines the validation procedure for receiving either a new single transaction (from a client)
@@ -51,11 +48,10 @@ pub trait BatchValidation: Clone + Send + Sync + 'static {
 }
 
 #[async_trait::async_trait]
-// impl<DB, EF> TransactionValidator for BatchValidator<DB, EF>
 impl<DB, Evm> BatchValidation for BatchValidator<DB, Evm>
 where
     DB: Database + Sized + Clone + 'static,
-    Evm: ConfigureEvm + Clone + 'static,
+    Evm: BlockExecutorProvider + Clone + 'static,
 {
     /// Error type for batch validation
     type Error = BatchValidationError;
@@ -67,6 +63,8 @@ where
     /// BlockchainTree has several useful methods, but they are private. The publicly exposed
     /// methods would result in canonicalizing batches, which is undesireable. It is possible to
     /// append then revert the batch, but this is also very inefficient.
+    ///
+    /// The validator flow follows: `reth::blockchain_tree::blockchain_tree::validate_block` method.
     async fn validate_batch(&self, batch: &Batch) -> Result<(), Self::Error> {
         // check sui + reth
         //
@@ -96,17 +94,17 @@ where
                 "Failed to validate total difficulty for block {}: {e}",
                 sealed_block.header.hash()
             );
-            return Err(e.into())
+            return Err(e.into());
         }
 
         if let Err(e) = self.consensus.validate_header(&sealed_block) {
             error!(?sealed_block, "Failed to validate header {}: {e}", sealed_block.header.hash());
-            return Err(e.into())
+            return Err(e.into());
         }
 
-        if let Err(e) = self.consensus.validate_block(&sealed_block) {
+        if let Err(e) = self.consensus.validate_block_pre_execution(&sealed_block) {
             error!(?sealed_block, "Failed to validate block {}: {e}", sealed_block.header.hash());
-            return Err(e.into())
+            return Err(e.into());
         }
 
         // the following is taken from BlockchainTree::try_append_canonical_chain()
@@ -141,7 +139,7 @@ where
             .fork(Hardfork::Paris)
             .active_at_ttd(parent_td, U256::ZERO)
         {
-            return Err(BlockValidationError::BlockPreMerge { hash: sealed_block.hash() })?
+            return Err(BlockValidationError::BlockPreMerge { hash: sealed_block.hash() })?;
         }
 
         // retrieve parent header from provider
@@ -151,36 +149,13 @@ where
             .ok_or(BlockchainTreeError::CanonicalChain { block_hash: parent.hash })?
             .seal(parent.hash);
 
-        // read from canonical tree - updated by `Executor` and engine
-        //
-        // same return as BlockchainTree::canonical_chain()
-        let canonical_block_hashes = self.blockchain_db.canonical_blocks();
-
-        // from AppendableChain::new_canonical_fork() but with state root validation added
-        let state = BundleStateWithReceipts::default();
-        let empty = BTreeMap::new();
-
-        // get the bundle state provider.
-        let bundle_state_data_provider = BundleStateDataRef {
-            state: &state,
-            sidechain_block_hashes: &empty,
-            canonical_block_hashes: &canonical_block_hashes,
-            canonical_fork: parent,
-        };
-
         // from AppendableChain::validate_and_execute() - private method
         //
         // ported here to prevent redundant creation of bundle state provider
         // just to check state root
 
         self.consensus.validate_header_against_parent(&sealed_block, &parent_header)?;
-
-        // let (block, senders) = block.into_components();
-        // let block = block.unseal();
-
         let block_with_senders = sealed_block.unseal();
-
-        let canonical_fork = bundle_state_data_provider.canonical_fork();
 
         // NOTE: this diverges from reth-beta approach
         // but is still valid within the context of our consensus
@@ -188,25 +163,50 @@ where
         // behind the canonical tip
         //
         // TODO: validate base fee based on parent batch
-        let state_provider = self.blockchain_db.history_by_block_number(canonical_fork.number)?;
 
-        let provider = BundleStateProvider::new(state_provider, bundle_state_data_provider);
+        // // capture current state
+        // let provider = BundleStateProvider::new(state_provider, bundle_state_data_provider);
+        // let db = StateProviderDatabase::new(&provider);
 
-        let mut executor = self.executor_factory.with_state(&provider);
-        executor.execute_and_verify_receipt(&block_with_senders, U256::MAX)?;
-        let bundle_state = executor.take_output_state();
+        // different approach for creating state provider than reth's `validate_and_execute`
+        // on `AppendableChain`
+        //
+        // reth uses `ConsistentDbView`, but this will throw an error if the current tip
+        // doesn't match the one recorded during the db view's initialization.
+        // TN expected to write several blocks at a time, so tip potentially always changing
+        //
+        // create state provider based on batch's parent
+        let db = StateProviderDatabase::new(
+            self.blockchain_db
+                .database_provider_ro()?
+                .state_provider_by_block_number(parent.number)?,
+        );
+
+        // executor for single block
+        let executor = self.executor_factory.executor(db);
+        let state = executor.execute((&block_with_senders, U256::MAX).into())?;
+        let BlockExecutionOutput { state, receipts, requests, .. } = state;
+        self.consensus.validate_block_post_execution(
+            &block_with_senders,
+            PostExecutionInput::new(&receipts, &requests),
+        )?;
 
         // TODO: enable ParallelStateRoot feature (or AsyncStateRoot)
         // for better perfomance
         // see reth::blockchain_tree::chain::AppendableChain::validate_and_execute()
         //
         // check state root
-        let state_root = provider.state_root(bundle_state.state())?;
+        let db = StateProviderDatabase::new(
+            self.blockchain_db
+                .database_provider_ro()?
+                .state_provider_by_block_number(parent.number)?,
+        );
+        let state_root = db.state_root(&state)?;
         if block_with_senders.state_root != state_root {
             return Err(BatchValidationError::BodyStateRootDiff(GotExpected {
                 got: state_root,
                 expected: block_with_senders.state_root,
-            }))
+            }));
         }
 
         Ok(())
@@ -216,13 +216,13 @@ where
 impl<DB, Evm> BatchValidator<DB, Evm>
 where
     DB: Database + Clone,
-    Evm: ConfigureEvm,
+    Evm: BlockExecutorProvider,
 {
     /// Create a new instance of [Self]
     pub fn new(
         consensus: Arc<dyn Consensus>,
-        blockchain_db: BlockchainProviderType<DB, Evm>,
-        executor_factory: EvmProcessorFactory<Evm>,
+        blockchain_db: BlockchainProvider<DB>,
+        executor_factory: Evm,
     ) -> Self {
         Self { consensus, blockchain_db, executor_factory }
     }
@@ -246,18 +246,18 @@ impl BatchValidation for NoopBatchValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reth_beacon_consensus::BeaconConsensus;
+    use reth_beacon_consensus::EthBeaconConsensus;
     use reth_blockchain_tree::{
         BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
     };
+    use reth_chainspec::ChainSpec;
     use reth_db::test_utils::{create_test_rw_db, tempdir_path};
-    use reth_node_core::init::init_genesis;
-    use reth_node_ethereum::EthEvmConfig;
+    use reth_db_common::init::init_genesis;
     use reth_primitives::{
         constants::EMPTY_WITHDRAWALS, hex, proofs::calculate_transaction_root, Address, Bloom,
-        Bytes, ChainSpec, GenesisAccount, Header, SealedHeader, B256, EMPTY_OMMER_ROOT_HASH,
+        Bytes, GenesisAccount, Header, SealedHeader, B256, EMPTY_OMMER_ROOT_HASH,
     };
-    use reth_provider::ProviderFactory;
+    use reth_provider::{providers::StaticFileProvider, ProviderFactory};
     use reth_tracing::init_test_tracing;
     use std::str::FromStr;
     use tn_types::{
@@ -305,6 +305,7 @@ mod tests {
                 excess_blob_gas: None,
                 parent_beacon_block_root: None,
                 extra_data: Bytes::default(),
+                requests_root: None,
             },
             hex!("ed9242a844ec144e25b58c085184c3c4ae8709226771659badf7e45cdd415c58").into(),
         )
@@ -332,21 +333,22 @@ mod tests {
 
         // init genesis
         let db = create_test_rw_db();
-        let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), tempdir_path())
-                .expect("provider factory");
+        let provider_factory = ProviderFactory::new(
+            Arc::clone(&db),
+            Arc::clone(&chain),
+            StaticFileProvider::read_write(tempdir_path())
+                .expect("static file provider read write created with tempdir path"),
+        );
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
         debug!("genesis hash: {genesis_hash:?}");
 
         // configure blockchain tree
-        let consensus: Arc<dyn Consensus> = Arc::new(BeaconConsensus::new(chain.clone()));
-
-        let evm_config = EthEvmConfig::default();
+        let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
 
         let tree_externals = TreeExternals::new(
             provider_factory.clone(),
             Arc::clone(&consensus),
-            EvmProcessorFactory::new(chain.clone(), evm_config),
+            reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
         );
         let tree_config = BlockchainTreeConfig::default();
         let tree = BlockchainTree::new(
@@ -356,11 +358,11 @@ mod tests {
         )
         .expect("blockchain tree is valid");
 
-        let blockchain_tree = ShareableBlockchainTree::new(tree);
+        let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
 
         // provider
         let blockchain_db =
-            BlockchainProviderType::new(provider_factory.clone(), blockchain_tree.clone())
+            BlockchainProvider::new(provider_factory.clone(), blockchain_tree.clone())
                 .expect("blockchain db valid");
 
         // get gas price before passing db
@@ -370,7 +372,7 @@ mod tests {
         let batch_validator = BatchValidator::new(
             Arc::clone(&consensus),
             blockchain_db,
-            EvmProcessorFactory::new(chain.clone(), evm_config),
+            reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
         );
 
         let sealed_header = next_valid_sealed_header();
@@ -447,21 +449,22 @@ mod tests {
 
         // init genesis
         let db = create_test_rw_db();
-        let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), tempdir_path())
-                .expect("provider factory");
+        let provider_factory = ProviderFactory::new(
+            Arc::clone(&db),
+            Arc::clone(&chain),
+            StaticFileProvider::read_write(tempdir_path())
+                .expect("static file provider read write created with tempdir path"),
+        );
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
         debug!("genesis hash: {genesis_hash:?}");
 
         // configure blockchain tree
-        let consensus: Arc<dyn Consensus> = Arc::new(BeaconConsensus::new(chain.clone()));
-
-        let evm_config = EthEvmConfig::default();
+        let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
 
         let tree_externals = TreeExternals::new(
             provider_factory.clone(),
             Arc::clone(&consensus),
-            EvmProcessorFactory::new(chain.clone(), evm_config),
+            reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
         );
         let tree_config = BlockchainTreeConfig::default();
         let tree = BlockchainTree::new(
@@ -471,18 +474,18 @@ mod tests {
         )
         .expect("blockchain tree is valid");
 
-        let blockchain_tree = ShareableBlockchainTree::new(tree);
+        let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
 
         // provider
         let blockchain_db =
-            BlockchainProviderType::new(provider_factory.clone(), blockchain_tree.clone())
+            BlockchainProvider::new(provider_factory.clone(), blockchain_tree.clone())
                 .expect("blockchain db valid");
 
         // batch validator
         let batch_validator = BatchValidator::new(
             Arc::clone(&consensus),
             blockchain_db.clone(),
-            EvmProcessorFactory::new(chain.clone(), evm_config),
+            reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
         );
 
         // tx factory - [0; 32] seed address - nonce 0-2
@@ -558,21 +561,22 @@ mod tests {
 
         // init genesis
         let db = create_test_rw_db();
-        let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), tempdir_path())
-                .expect("provider factory");
+        let provider_factory = ProviderFactory::new(
+            Arc::clone(&db),
+            Arc::clone(&chain),
+            StaticFileProvider::read_write(tempdir_path())
+                .expect("static file provider read write created with tempdir path"),
+        );
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
         debug!("genesis hash: {genesis_hash:?}");
 
         // configure blockchain tree
-        let consensus: Arc<dyn Consensus> = Arc::new(BeaconConsensus::new(chain.clone()));
-
-        let evm_config = EthEvmConfig::default();
+        let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
 
         let tree_externals = TreeExternals::new(
             provider_factory.clone(),
             Arc::clone(&consensus),
-            EvmProcessorFactory::new(chain.clone(), evm_config),
+            reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
         );
         let tree_config = BlockchainTreeConfig::default();
         let tree = BlockchainTree::new(
@@ -582,18 +586,18 @@ mod tests {
         )
         .expect("blockchain tree is valid");
 
-        let blockchain_tree = ShareableBlockchainTree::new(tree);
+        let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
 
         // provider
         let blockchain_db =
-            BlockchainProviderType::new(provider_factory.clone(), blockchain_tree.clone())
+            BlockchainProvider::new(provider_factory.clone(), blockchain_tree.clone())
                 .expect("blockchain db valid");
 
         // batch validator
         let batch_validator = BatchValidator::new(
             Arc::clone(&consensus),
             blockchain_db.clone(),
-            EvmProcessorFactory::new(chain.clone(), evm_config),
+            reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
         );
 
         // tx factory - [0; 32] seed address - nonce 0-2
@@ -670,21 +674,22 @@ mod tests {
 
         // init genesis
         let db = create_test_rw_db();
-        let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), tempdir_path())
-                .expect("provider factory");
+        let provider_factory = ProviderFactory::new(
+            Arc::clone(&db),
+            Arc::clone(&chain),
+            StaticFileProvider::read_write(tempdir_path())
+                .expect("static file provider read write created with tempdir path"),
+        );
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
         debug!("genesis hash: {genesis_hash:?}");
 
         // configure blockchain tree
-        let consensus: Arc<dyn Consensus> = Arc::new(BeaconConsensus::new(chain.clone()));
-
-        let evm_config = EthEvmConfig::default();
+        let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
 
         let tree_externals = TreeExternals::new(
             provider_factory.clone(),
             Arc::clone(&consensus),
-            EvmProcessorFactory::new(chain.clone(), evm_config),
+            reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
         );
         let tree_config = BlockchainTreeConfig::default();
         let tree = BlockchainTree::new(
@@ -694,18 +699,18 @@ mod tests {
         )
         .expect("blockchain tree is valid");
 
-        let blockchain_tree = ShareableBlockchainTree::new(tree);
+        let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
 
         // provider
         let blockchain_db =
-            BlockchainProviderType::new(provider_factory.clone(), blockchain_tree.clone())
+            BlockchainProvider::new(provider_factory.clone(), blockchain_tree.clone())
                 .expect("blockchain db valid");
 
         // batch validator
         let batch_validator = BatchValidator::new(
             Arc::clone(&consensus),
             blockchain_db.clone(),
-            EvmProcessorFactory::new(chain.clone(), evm_config),
+            reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
         );
 
         // tx factory - [0; 32] seed address - nonce 0-2
@@ -824,21 +829,22 @@ mod tests {
 
         // init genesis
         let db = create_test_rw_db();
-        let provider_factory =
-            ProviderFactory::new(Arc::clone(&db), Arc::clone(&chain), tempdir_path())
-                .expect("provider factory");
+        let provider_factory = ProviderFactory::new(
+            Arc::clone(&db),
+            Arc::clone(&chain),
+            StaticFileProvider::read_write(tempdir_path())
+                .expect("static file provider read write created with tempdir path"),
+        );
         let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
         debug!("genesis hash: {genesis_hash:?}");
 
         // configure blockchain tree
-        let consensus: Arc<dyn Consensus> = Arc::new(BeaconConsensus::new(chain.clone()));
-
-        let evm_config = EthEvmConfig::default();
+        let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
 
         let tree_externals = TreeExternals::new(
             provider_factory.clone(),
             Arc::clone(&consensus),
-            EvmProcessorFactory::new(chain.clone(), evm_config),
+            reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
         );
         let tree_config = BlockchainTreeConfig::default();
         let tree = BlockchainTree::new(
@@ -848,18 +854,18 @@ mod tests {
         )
         .expect("blockchain tree is valid");
 
-        let blockchain_tree = ShareableBlockchainTree::new(tree);
+        let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
 
         // provider
         let blockchain_db =
-            BlockchainProviderType::new(provider_factory.clone(), blockchain_tree.clone())
+            BlockchainProvider::new(provider_factory.clone(), blockchain_tree.clone())
                 .expect("blockchain db valid");
 
         // batch validator
         let batch_validator = BatchValidator::new(
             Arc::clone(&consensus),
             blockchain_db.clone(),
-            EvmProcessorFactory::new(chain.clone(), evm_config),
+            reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
         );
 
         // tx factory - [0; 32] seed address - nonce 0-2
@@ -956,5 +962,6 @@ mod tests {
     // invalid batch types for the rest of the sealed header:
     // - logs bloom
     // - sealed block number
+    // - BlockGasUsed
     // etc.
 }

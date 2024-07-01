@@ -252,7 +252,7 @@ fn test_determinism() {
 /// * weak references to leaders
 /// * missing leaders
 /// * missing certificates
-
+///
 /// Note: the slow nodes precede of the failures_probability - meaning that first we calculate the
 /// failures per round and then the behaviour of the slow nodes to ensure that we'll always produce
 /// 2f+1 certificates per round.
@@ -282,8 +282,8 @@ fn generate_randomised_dag(
 /// This method creates a DAG using the following quality properties under consideration:
 /// * nodes that don't create certificates at all for some rounds (failures)
 /// * leaders that don't get enough support (f+1) for their immediate round
-/// * slow nodes - nodes that create certificates but might not be referenced by nodes of
-/// subsequent rounds.
+/// * slow nodes - nodes that create certificates but might not be referenced by nodes of subsequent
+///   rounds.
 pub fn make_certificates_with_parameters(
     seed: u64,
     committee: &Committee,
@@ -463,6 +463,7 @@ pub fn make_certificates_with_parameters(
 
 /// Creates various execution plans (`test_iterations` in total) by permuting the order we feed the
 /// DAG certificates to consensus and compare the output to ensure is the same.
+#[allow(clippy::too_many_arguments)]
 fn generate_and_run_execution_plans(
     original_certificates: VecDeque<Certificate>,
     test_iterations: u64,

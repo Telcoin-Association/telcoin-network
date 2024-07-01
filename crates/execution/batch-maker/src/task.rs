@@ -1,8 +1,9 @@
 use crate::{mode::MiningMode, Storage};
 use consensus_metrics::metered_channel::Sender;
 use futures_util::{future::BoxFuture, FutureExt};
-use reth_node_api::ConfigureEvm;
-use reth_primitives::{ChainSpec, IntoRecoveredTransaction};
+use reth_chainspec::ChainSpec;
+use reth_evm::execute::BlockExecutorProvider;
+use reth_primitives::{IntoRecoveredTransaction, Withdrawals};
 use reth_provider::{BlockReaderIdExt, CanonChainTracker, StateProviderFactory};
 use reth_stages::PipelineEvent;
 use reth_transaction_pool::{TransactionPool, ValidPoolTransaction};
@@ -19,7 +20,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
 /// A Future that listens for new ready transactions and puts new blocks into storage
-pub struct MiningTask<Client, Pool: TransactionPool, EvmConfig> {
+pub struct MiningTask<Client, Pool: TransactionPool, BlockExecutor> {
     /// The configured chain spec
     chain_spec: Arc<ChainSpec>,
     /// The client used to interact with the state
@@ -44,13 +45,13 @@ pub struct MiningTask<Client, Pool: TransactionPool, EvmConfig> {
     // canon_state_notification: CanonStateNotificationSender,
     /// The pipeline events to listen on
     pipe_line_events: Option<UnboundedReceiverStream<PipelineEvent>>,
-    /// The type that defines how to configure the EVM.
-    evm_config: EvmConfig,
+    /// The type used for block execution
+    block_executor: BlockExecutor,
 }
 
 // === impl MiningTask ===
 
-impl<EvmConfig, Client, Pool: TransactionPool> MiningTask<Client, Pool, EvmConfig> {
+impl<Client, Pool: TransactionPool, BlockExecutor> MiningTask<Client, Pool, BlockExecutor> {
     /// Creates a new instance of the task
     pub(crate) fn new(
         chain_spec: Arc<ChainSpec>,
@@ -60,7 +61,7 @@ impl<EvmConfig, Client, Pool: TransactionPool> MiningTask<Client, Pool, EvmConfi
         storage: Storage,
         client: Client,
         pool: Pool,
-        evm_config: EvmConfig,
+        block_executor: BlockExecutor,
     ) -> Self {
         Self {
             chain_spec,
@@ -73,7 +74,7 @@ impl<EvmConfig, Client, Pool: TransactionPool> MiningTask<Client, Pool, EvmConfi
             // canon_state_notification,
             queued: Default::default(),
             pipe_line_events: None,
-            evm_config,
+            block_executor,
         }
     }
 
@@ -83,12 +84,12 @@ impl<EvmConfig, Client, Pool: TransactionPool> MiningTask<Client, Pool, EvmConfi
     }
 }
 
-impl<EvmConfig, Client, Pool> Future for MiningTask<Client, Pool, EvmConfig>
+impl<BlockExecutor, Client, Pool> Future for MiningTask<Client, Pool, BlockExecutor>
 where
+    BlockExecutor: BlockExecutorProvider,
     Client: StateProviderFactory + CanonChainTracker + BlockReaderIdExt + Clone + Unpin + 'static,
     Pool: TransactionPool + Unpin + 'static,
     <Pool as TransactionPool>::Transaction: IntoRecoveredTransaction,
-    EvmConfig: ConfigureEvm + Clone + Unpin + Send + Sync + 'static,
 {
     type Output = ();
 
@@ -105,7 +106,7 @@ where
             if this.insert_task.is_none() {
                 if this.queued.is_empty() {
                     // nothing to insert
-                    break
+                    break;
                 }
 
                 // ready to queue in new insert task
@@ -117,7 +118,7 @@ where
                 let chain_spec = Arc::clone(&this.chain_spec);
                 let pool = this.pool.clone();
                 let events = this.pipe_line_events.take();
-                let evm_config = this.evm_config.clone();
+                let block_executor = this.block_executor.clone();
 
                 // Create the mining future that creates a batch and sends it to the CL
                 this.insert_task = Some(Box::pin(async move {
@@ -133,11 +134,15 @@ where
                         })
                         .unzip();
 
+                    // TODO: support withdrawals
+                    let withdrawals = Some(Withdrawals::default());
+
                     match storage.build_and_execute(
                         transactions.clone(),
+                        withdrawals,
                         &client,
                         chain_spec,
-                        evm_config,
+                        &block_executor,
                     ) {
                         Ok((new_header, _bundle_state)) => {
                             // TODO: make this a future
@@ -166,7 +171,7 @@ where
                                 }
                                 Err(err) => {
                                     error!(target: "execution::batch_maker", ?err, "Execution's BatchMaker Ack Failed:");
-                                    return None
+                                    return None;
                                 }
                             }
 
@@ -227,7 +232,7 @@ where
                     }
                     Poll::Pending => {
                         this.insert_task = Some(fut);
-                        break
+                        break;
                     }
                 }
             }
