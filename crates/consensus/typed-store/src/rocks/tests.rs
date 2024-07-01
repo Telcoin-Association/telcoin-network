@@ -1,6 +1,10 @@
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// TODO: uint crate needs to be refactored for this nightly clippy
+#![allow(clippy::assign_op_pattern)]
+
 use super::*;
 use crate::{
     reopen, retry_transaction, retry_transaction_forever,
@@ -16,7 +20,7 @@ fn temp_dir() -> std::path::PathBuf {
 uint::construct_uint! {
     // 32 byte number
     #[allow(clippy::assign_op_pattern)]
-    pub struct Num32(4);
+    struct Num32(4);
 }
 
 #[test]
