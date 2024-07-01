@@ -12,7 +12,10 @@ use narwhal_primary::{
 use narwhal_storage::NodeStorage;
 
 use prometheus::Registry;
-use tn_types::test_utils::{temp_dir, CommitteeFixture};
+use tn_types::{
+    test_utils::{temp_dir, CommitteeFixture},
+    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+};
 
 use std::{collections::BTreeSet, sync::Arc};
 use tokio::sync::watch;
@@ -58,14 +61,13 @@ async fn test_recovery() {
     const GC_DEPTH: Round = 50;
     const NUM_SUB_DAGS_PER_SCHEDULE: u64 = 100;
     let metrics = Arc::new(ConsensusMetrics::new(&Registry::new()));
-    let bad_nodes_stake_threshold = 0;
     let bullshark = Bullshark::new(
         committee.clone(),
         consensus_store.clone(),
         metrics.clone(),
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
-        bad_nodes_stake_threshold,
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     );
 
     let _consensus_handle = Consensus::spawn(

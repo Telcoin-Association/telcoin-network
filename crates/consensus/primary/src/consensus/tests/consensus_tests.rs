@@ -167,11 +167,10 @@ async fn test_consensus_recovery_with_bullshark() {
     let consensus_store = storage.consensus_store;
     let certificate_store = storage.certificate_store;
 
-    let bad_nodes_stake_threshold = 0;
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
         consensus_store.clone(),
-        bad_nodes_stake_threshold,
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     );
     let bullshark = Bullshark::new(
         committee.clone(),
@@ -179,7 +178,7 @@ async fn test_consensus_recovery_with_bullshark() {
         metrics.clone(),
         num_sub_dags_per_schedule,
         leader_schedule,
-        bad_nodes_stake_threshold,
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     );
 
     let consensus_handle = Consensus::spawn(

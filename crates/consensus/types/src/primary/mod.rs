@@ -13,6 +13,16 @@ pub use header::*;
 pub use metadata::*;
 pub use vote::*;
 
+/// For now, use 0 to prevent any removal of bad nodes since validator sets
+/// are static.
+///
+/// The following note is quoted from sui regarding a default of `20`.
+/// Taking a baby step approach, we consider only 20% by stake as bad nodes so
+/// we have a 80% by stake of nodes participating in the
+/// leader committee. That allow us for more redundancy in
+/// case we have validators under performing - since the
+/// responsibility is shared amongst more nodes. We can increase that once we do
+/// have higher confidence.
 pub const DEFAULT_BAD_NODES_STAKE_THRESHOLD: u64 = 0;
 
 /// The round number.

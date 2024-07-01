@@ -197,16 +197,6 @@ impl LeaderSchedule {
                     &committee,
                     commit.leader_round(),
                     &commit.reputation_score(),
-                    // protocol_config.consensus_bad_nodes_stake_threshold():
-                    //
-                    // Taking a baby step approach, we consider only 20% by stake as bad nodes so
-                    // we have a 80% by stake of nodes participating in the
-                    // leader committee. That allow us for more redundancy in
-                    // case we have validators under performing - since the
-                    // responsibility is shared amongst more nodes. We can increase that once we do
-                    // have higher confidence.
-                    //
-                    // for now, use 0
                     bad_nodes_stake_threshold,
                 )
             },

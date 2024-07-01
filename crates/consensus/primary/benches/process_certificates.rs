@@ -14,7 +14,7 @@ use prometheus::Registry;
 use std::{collections::BTreeSet, sync::Arc};
 use tn_types::{
     test_utils::{make_optimal_certificates, temp_dir, CommitteeFixture},
-    Certificate, Round,
+    Certificate, Round, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::time::Instant;
 
@@ -48,7 +48,6 @@ pub fn process_certificates(c: &mut Criterion) {
             certificates.iter().map(|cert| bcs::to_bytes(&cert).unwrap().len()).sum();
         consensus_group.throughput(Throughput::Bytes(data_size as u64));
 
-        let bad_nodes_stake_threshold = 0;
         let mut ordering_engine = Bullshark {
             committee: committee.clone(),
             store: store.consensus_store,
@@ -57,7 +56,7 @@ pub fn process_certificates(c: &mut Criterion) {
             max_inserted_certificate_round: 0,
             num_sub_dags_per_schedule: 100,
             leader_schedule: LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
-            bad_nodes_stake_threshold,
+            bad_nodes_stake_threshold: DEFAULT_BAD_NODES_STAKE_THRESHOLD,
         };
         consensus_group.bench_with_input(
             BenchmarkId::new("batched", certificates.len()),
