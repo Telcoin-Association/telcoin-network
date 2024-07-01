@@ -463,7 +463,7 @@ pub fn make_certificates_with_parameters(
 
 /// Creates various execution plans (`test_iterations` in total) by permuting the order we feed the
 /// DAG certificates to consensus and compare the output to ensure is the same.
-#[warn(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn generate_and_run_execution_plans(
     original_certificates: VecDeque<Certificate>,
     test_iterations: u64,
