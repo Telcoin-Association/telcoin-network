@@ -2392,7 +2392,7 @@ fn test_helpers() {
 
     uint::construct_uint! {
         // 32 byte number
-        struct Num32(4);
+        pub struct Num32(4);
     }
 
     let mut v = vec![255; 32];
