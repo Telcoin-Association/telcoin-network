@@ -185,7 +185,11 @@ impl LeaderSchedule {
     /// Restores the LeaderSchedule by using the storage. It will attempt to retrieve the last
     /// committed "final" ReputationScores and use them to create build a LeaderSwapTable to use
     /// for the LeaderSchedule.
-    pub fn from_store(committee: Committee, store: Arc<ConsensusStore>) -> Self {
+    pub fn from_store(
+        committee: Committee,
+        store: Arc<ConsensusStore>,
+        bad_nodes_stake_threshold: u64,
+    ) -> Self {
         let table = store.read_latest_commit_with_final_reputation_scores().map_or(
             LeaderSwapTable::default(),
             |commit| {
@@ -203,7 +207,7 @@ impl LeaderSchedule {
                     // have higher confidence.
                     //
                     // for now, use 0
-                    0,
+                    bad_nodes_stake_threshold,
                 )
             },
         );

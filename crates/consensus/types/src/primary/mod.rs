@@ -13,7 +13,7 @@ pub use header::*;
 pub use metadata::*;
 pub use vote::*;
 
-pub const BAD_NODES_STAKE_THRESHOLD: u64 = 0;
+pub const DEFAULT_BAD_NODES_STAKE_THRESHOLD: u64 = 0;
 
 /// The round number.
 pub type Round = u64;

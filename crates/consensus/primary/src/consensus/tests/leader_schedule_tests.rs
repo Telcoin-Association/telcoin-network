@@ -9,6 +9,7 @@ use std::{
 };
 
 use narwhal_storage::ConsensusStore;
+use reth_tracing::init_test_tracing;
 use tn_types::AuthorityIdentifier;
 
 use tn_types::{
@@ -160,6 +161,7 @@ async fn test_leader_schedule() {
 /// TODO: this test is failing - I think it's due to bad stake threshold
 #[tokio::test]
 async fn test_leader_schedule_from_store() {
+    init_test_tracing();
     // GIVEN
     let fixture = CommitteeFixture::builder().build();
     let committee = fixture.committee();
@@ -189,7 +191,7 @@ async fn test_leader_schedule_from_store() {
     // bad threshold currently set to 0 causing test to fail
     //
     // WHEN
-    let schedule = LeaderSchedule::from_store(committee, store);
+    let schedule = LeaderSchedule::from_store(committee, store, 33);
 
     // THEN the stored schedule should be returned and eventually the low score leader should be
     // swapped with a high score one.

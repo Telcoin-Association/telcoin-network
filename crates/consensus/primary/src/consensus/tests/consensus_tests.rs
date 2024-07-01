@@ -11,6 +11,7 @@ use prometheus::Registry;
 use tn_types::{
     test_utils::{temp_dir, CommitteeFixture},
     Certificate, CertificateAPI, HeaderAPI, PreSubscribedBroadcastSender, ReputationScores,
+    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::sync::watch;
 
@@ -64,14 +65,18 @@ async fn test_consensus_recovery_with_bullshark() {
 
     let gc_depth = 50;
     let metrics = Arc::new(ConsensusMetrics::new(&Registry::new()));
-    let leader_schedule = LeaderSchedule::from_store(committee.clone(), consensus_store.clone());
+    let leader_schedule = LeaderSchedule::from_store(
+        committee.clone(),
+        consensus_store.clone(),
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
     let bullshark = Bullshark::new(
         committee.clone(),
         consensus_store.clone(),
         metrics.clone(),
         num_sub_dags_per_schedule,
         leader_schedule.clone(),
-        33,
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     );
 
     let consensus_handle = Consensus::spawn(
@@ -162,8 +167,12 @@ async fn test_consensus_recovery_with_bullshark() {
     let consensus_store = storage.consensus_store;
     let certificate_store = storage.certificate_store;
 
-    let leader_schedule = LeaderSchedule::from_store(committee.clone(), consensus_store.clone());
     let bad_nodes_stake_threshold = 0;
+    let leader_schedule = LeaderSchedule::from_store(
+        committee.clone(),
+        consensus_store.clone(),
+        bad_nodes_stake_threshold,
+    );
     let bullshark = Bullshark::new(
         committee.clone(),
         consensus_store.clone(),

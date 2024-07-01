@@ -30,7 +30,7 @@ use std::{sync::Arc, time::Instant};
 use tn_types::{
     AuthorityIdentifier, BlsKeypair, BlsPublicKey, Certificate, ChainIdentifier, Committee,
     ConditionalBroadcastReceiver, ConsensusOutput, NetworkKeypair, Parameters,
-    PreSubscribedBroadcastSender, Round, WorkerCache, BAD_NODES_STAKE_THRESHOLD,
+    PreSubscribedBroadcastSender, Round, WorkerCache, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::{
     sync::{broadcast, watch, RwLock},
@@ -401,8 +401,11 @@ where
         }
         consensus_metrics.recovered_consensus_output.inc_by(num_sub_dags);
 
-        let leader_schedule =
-            LeaderSchedule::from_store(committee.clone(), store.consensus_store.clone());
+        let leader_schedule = LeaderSchedule::from_store(
+            committee.clone(),
+            store.consensus_store.clone(),
+            DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+        );
 
         // Spawn the consensus core who only sequences transactions.
         let ordering_engine = Bullshark::new(
@@ -411,7 +414,7 @@ where
             consensus_metrics.clone(),
             Self::CONSENSUS_SCHEDULE_CHANGE_SUB_DAGS,
             leader_schedule.clone(),
-            BAD_NODES_STAKE_THRESHOLD,
+            DEFAULT_BAD_NODES_STAKE_THRESHOLD,
         );
         let consensus_handle = Consensus::spawn(
             committee.clone(),
