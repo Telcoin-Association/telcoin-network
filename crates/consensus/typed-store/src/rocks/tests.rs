@@ -19,7 +19,6 @@ fn temp_dir() -> std::path::PathBuf {
 
 uint::construct_uint! {
     // 32 byte number
-    #[allow(clippy::assign_op_pattern)]
     struct Num32(4);
 }
 
