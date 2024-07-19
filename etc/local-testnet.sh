@@ -87,6 +87,8 @@ for ((i=0; i<$LENGTH; i++)); do
         # start validator
         target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
            --chain adiri \
+           --dev \
+           --disable-discovery \
            --instance "${INSTANCE}" \
            --metrics "${METRICS}" \
            --consensus-metrics "${CONSENSUS_METRICS}" \
