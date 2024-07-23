@@ -202,7 +202,7 @@ where
 
 /// Construct a canonical block from a worker's block that reached consensus.
 #[inline]
-fn build_block_from_batch_payload<'a, EvmConfig, Provider>(
+fn build_block_from_batch_payload<EvmConfig, Provider>(
     evm_config: &EvmConfig,
     payload: TNPayload,
     provider: &Provider,
@@ -460,7 +460,7 @@ where
 /// Extend the canonical tip with one block, despite no blocks from workers are included in the
 /// output from consensus.
 #[inline]
-fn build_block_from_empty_payload<'a, Provider>(
+fn build_block_from_empty_payload<Provider>(
     payload: TNPayload,
     provider: &Provider,
     chain_spec: Arc<ChainSpec>,

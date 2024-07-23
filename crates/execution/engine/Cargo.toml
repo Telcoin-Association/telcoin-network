@@ -35,4 +35,5 @@ reth-tracing = { workspace = true }
 # unit tests
 eyre = { workspace = true }
 narwhal-test-utils = { workspace = true }
+reth-tasks = { workspace = true }
 tn-types = { workspace = true, features = ["test-utils"] }
