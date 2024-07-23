@@ -2,6 +2,11 @@
 //!
 //! This module contains the logic for execution.
 
+use super::TnBuilder;
+use crate::{
+    engine::{WorkerNetwork, WorkerNode},
+    error::ExecutionError,
+};
 use consensus_metrics::metered_channel::Sender;
 use jsonrpsee::http_client::HttpClient;
 use reth::rpc::builder::{config::RethRpcServerConfig, RpcModuleBuilder, RpcServerHandle};
@@ -34,12 +39,6 @@ use tn_types::{Consensus, ConsensusOutput, NewBatch, WorkerId};
 use tokio::sync::{broadcast, mpsc::unbounded_channel};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info};
-
-use super::TnBuilder;
-use crate::{
-    engine::{WorkerNetwork, WorkerNode},
-    error::ExecutionError,
-};
 
 /// Inner type for holding execution layer types.
 pub(super) struct ExecutionNodeInner<DB, Evm, CE>
