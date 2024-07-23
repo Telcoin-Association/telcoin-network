@@ -28,11 +28,9 @@ use std::sync::Arc;
 use tn_types::{BuildArguments, TNPayload, TNPayloadAttributes};
 use tracing::{debug, error, warn};
 
-/// Constructs an Ethereum transaction payload using the best transactions from the pool.
+/// Execute output from consensus to extend the canonical chain.
 ///
-/// Given build arguments including an Ethereum client, transaction pool,
-/// and configuration, this function creates a transaction payload. Returns
-/// a result indicating success with the payload or an error in case of failure.
+/// The function handles all types of output, included multiple blocks and empty blocks.
 #[inline]
 pub fn execute_consensus_output<EvmConfig, Provider>(
     evm_config: EvmConfig,
@@ -202,6 +200,7 @@ where
     Ok(canonical_header)
 }
 
+/// Construct a canonical block from a worker's block that reached consensus.
 #[inline]
 fn build_block_from_batch_payload<'a, EvmConfig, Provider>(
     evm_config: &EvmConfig,
@@ -458,6 +457,8 @@ where
     Ok(sealed_block_with_senders)
 }
 
+/// Extend the canonical tip with one block, despite no blocks from workers are included in the
+/// output from consensus.
 #[inline]
 fn build_block_from_empty_payload<'a, Provider>(
     payload: TNPayload,

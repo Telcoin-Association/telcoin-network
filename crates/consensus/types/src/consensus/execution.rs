@@ -260,7 +260,8 @@ impl PayloadBuilderAttributes for TNPayload {
             coinbase: self.suggested_fee_recipient(),
             timestamp: U256::from(self.timestamp()),
             // leave difficulty zero
-            // this value is useful for post-execution, but worker's block is created with this value
+            // this value is useful for post-execution, but worker's block is created with this
+            // value
             difficulty: U256::ZERO,
             prevrandao: Some(self.prev_randao()),
             gas_limit,

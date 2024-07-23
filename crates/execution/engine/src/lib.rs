@@ -72,7 +72,7 @@ pub struct ExecutorEngine<BT, CE, Tasks> {
     consensus_output_stream: BroadcastStream<ConsensusOutput>,
     /// The [SealedHeader] of the last fully-executed block.
     ///
-    /// This information is reflects the current finalized block number and hash.
+    /// This information reflects the current finalized block number and hash.
     parent_header: SealedHeader,
 }
 
