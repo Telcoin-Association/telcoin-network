@@ -7,7 +7,13 @@
     html_favicon_url = "https://www.telco.in/logos/TEL.svg",
     issue_tracker_base_url = "https://github.com/telcoin-association/telcoin-network/issues/"
 )]
-#![warn(missing_debug_implementations, missing_docs, unreachable_pub, rustdoc::all)]
+#![warn(
+    missing_debug_implementations,
+    missing_docs,
+    unreachable_pub,
+    rustdoc::all,
+    unused_crate_dependencies
+)]
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
@@ -1063,8 +1069,8 @@ mod tests {
 
             // expect blocks 4 and 8 to be empty (no txs bc they are duplicates)
             // sub 1 to account for loop idx starting at 0
-            if idx == expected_duplicate_block_num_round_1 - 1 ||
-                idx == expected_duplicate_block_num_round_2 - 1
+            if idx == expected_duplicate_block_num_round_1 - 1
+                || idx == expected_duplicate_block_num_round_2 - 1
             {
                 assert!(block.senders.is_empty());
                 assert!(block.body.is_empty());
