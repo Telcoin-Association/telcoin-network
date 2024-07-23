@@ -10,10 +10,10 @@ use reth_primitives::{
     constants::{
         EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE,
     },
-    proofs, public_key_to_address, sign_message, Address, Block, BlockBody,
-    FromRecoveredPooledTransaction, Genesis, GenesisAccount, Header, PooledTransactionsElement,
-    SealedHeader, Signature, Transaction, TransactionSigned, TxEip1559, TxHash, TxKind,
-    Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256,
+    proofs, public_key_to_address, sign_message, Address, Block, FromRecoveredPooledTransaction,
+    Genesis, GenesisAccount, Header, PooledTransactionsElement, SealedHeader, Signature,
+    Transaction, TransactionSigned, TxEip1559, TxHash, TxKind, Withdrawals, B256,
+    EMPTY_OMMER_ROOT_HASH, U256,
 };
 use reth_provider::{BlockReaderIdExt, ExecutionOutcome, StateProviderFactory};
 use reth_revm::database::StateProviderDatabase;

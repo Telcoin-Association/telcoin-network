@@ -3,7 +3,6 @@
 //! This module contains the logic for execution.
 
 use consensus_metrics::metered_channel::Sender;
-use futures::StreamExt;
 use jsonrpsee::http_client::HttpClient;
 use reth::rpc::builder::{config::RethRpcServerConfig, RpcModuleBuilder, RpcServerHandle};
 use reth_auto_seal_consensus::AutoSealConsensus;
@@ -12,10 +11,8 @@ use reth_blockchain_tree::{
     BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
 };
 use reth_db::{
-    cursor::DbCursorRO,
     database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
-    transaction::DbTx,
 };
 use reth_db_common::init::init_genesis;
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
@@ -24,8 +21,7 @@ use reth_node_ethereum::{node::EthereumPoolBuilder, EthEvmConfig};
 use reth_primitives::Address;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
-    BlockIdReader, CanonStateNotificationSender, HeaderProvider, ProviderFactory,
-    StaticFileProviderFactory as _,
+    BlockIdReader, HeaderProvider, ProviderFactory, StaticFileProviderFactory as _,
 };
 use reth_tasks::TaskExecutor;
 use reth_transaction_pool::TransactionPool;
@@ -72,8 +68,6 @@ where
     evm_config: CE,
     /// The Evm configuration type.
     evm_executor: Evm,
-    /// Broadcasting channel for canonical state changes.
-    canon_state_notification_sender: CanonStateNotificationSender,
     /// The task executor is responsible for executing
     /// and spawning tasks to the runtime.
     ///
@@ -147,7 +141,6 @@ where
         )?
         .with_sync_metrics_tx(sync_metrics_tx.clone());
 
-        let canon_state_notification_sender = tree.canon_state_notification_sender();
         let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
         debug!(target: "tn::execution", "configured blockchain tree");
 
@@ -162,7 +155,6 @@ where
             provider_factory,
             evm_config,
             evm_executor,
-            canon_state_notification_sender,
             task_executor,
             opt_faucet_args,
             workers: HashMap::default(),
@@ -198,7 +190,6 @@ where
         let tn_engine = ExecutorEngine::new(
             self.blockchain_db.clone(),
             self.evm_config.clone(),
-            self.task_executor.clone(),
             self.node_config.debug.max_block,
             BroadcastStream::new(from_consensus),
             parent_header,
