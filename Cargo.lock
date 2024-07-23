@@ -10657,6 +10657,7 @@ dependencies = [
  "reth-provider",
  "reth-revm",
  "reth-tasks",
+ "reth-tracing",
  "thiserror",
  "tn-types",
  "tokio",

@@ -1069,8 +1069,8 @@ mod tests {
 
             // expect blocks 4 and 8 to be empty (no txs bc they are duplicates)
             // sub 1 to account for loop idx starting at 0
-            if idx == expected_duplicate_block_num_round_1 - 1
-                || idx == expected_duplicate_block_num_round_2 - 1
+            if idx == expected_duplicate_block_num_round_1 - 1 ||
+                idx == expected_duplicate_block_num_round_2 - 1
             {
                 assert!(block.senders.is_empty());
                 assert!(block.body.is_empty());
