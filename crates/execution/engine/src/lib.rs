@@ -32,7 +32,7 @@ use std::{
     task::{Context, Poll},
 };
 use tn_types::{BuildArguments, ConsensusOutput};
-use tokio::sync::oneshot;
+use tokio::{sync::oneshot, task::JoinHandle};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{error, info, trace, warn};
 
@@ -54,7 +54,7 @@ pub struct ExecutorEngine<BT, CE, Tasks> {
     queued: VecDeque<ConsensusOutput>,
     /// Single active future that executes consensus output on a blocking thread and then returns
     /// the result through a oneshot channel.
-    insert_task: Option<PendingExecutionTask>,
+    pending_task: Option<PendingExecutionTask>,
     /// The type used to query both the database and the blockchain tree.
     blockchain: BT,
     /// EVM configuration for executing transactions and building blocks.
@@ -65,7 +65,7 @@ pub struct ExecutorEngine<BT, CE, Tasks> {
     /// track the subdag index from consensus output. The index is also considered the "round" of
     /// consensus and is included in executed blocks as  the block's `nonce` value.
     ///
-    /// note: this is primarily useful for debugging and testing
+    /// NOTE: this is primarily useful for debugging and testing
     max_round: Option<u64>,
     /// Receiving end from CL's `Executor`. The `ConsensusOutput` is sent
     /// to the mining task here.
@@ -105,7 +105,7 @@ where
     ) -> Self {
         Self {
             queued: Default::default(),
-            insert_task: None,
+            pending_task: None,
             blockchain,
             evm_config,
             executor,
@@ -134,14 +134,17 @@ where
         let build_args = BuildArguments::new(provider, output, parent);
         let (tx, rx) = oneshot::channel();
 
-        // spawn blocking task and return oneshot receiver
-        self.executor.spawn_blocking(Box::pin(async move {
+        // spawn blocking task and return future
+        tokio::task::spawn_blocking(|| {
+            // this is safe to call on blocking thread without a semaphore bc it's held in Self::pending_tesk as a single `Option`
             let result = execute_consensus_output(evm_config, build_args);
             match tx.send(result) {
                 Ok(()) => (),
-                Err(e) => error!(target: "engine", ?e, "error sending result from execute_consensus_output"),
+                Err(e) => {
+                    error!(target: "engine", ?e, "error sending result from execute_consensus_output")
+                }
             }
-        }));
+        });
 
         // oneshot receiver for execution result
         rx
@@ -217,7 +220,7 @@ where
                     // only return if there are no current tasks and the queue is empty
                     // otherwise, let the loop continue so any remaining tasks and queued output is
                     // executed
-                    if this.insert_task.is_none() && this.queued.is_empty() {
+                    if this.pending_task.is_none() && this.queued.is_empty() {
                         return Poll::Ready(Ok(()));
                     }
                 }
@@ -229,18 +232,18 @@ where
             //
             // note: it's important that the previous consensus output finishes executing before
             // inserting the next task to ensure the parent sealed header is finalized
-            if this.insert_task.is_none() {
+            if this.pending_task.is_none() {
                 if this.queued.is_empty() {
                     // nothing to insert
                     break;
                 }
 
                 // ready to begin executing next round of consensus
-                this.insert_task = Some(this.spawn_execution_task());
+                this.pending_task = Some(this.spawn_execution_task());
             }
 
             // poll receiver that returns output execution result
-            if let Some(mut receiver) = this.insert_task.take() {
+            if let Some(mut receiver) = this.pending_task.take() {
                 match receiver.poll_unpin(cx) {
                     Poll::Ready(res) => {
                         let finalized_header = res.map_err(Into::into).and_then(|res| res);
@@ -259,7 +262,7 @@ where
                         // allow loop to continue: poll broadcast stream for next output
                     }
                     Poll::Pending => {
-                        this.insert_task = Some(receiver);
+                        this.pending_task = Some(receiver);
 
                         // break loop and return Poll::Pending
                         break;
@@ -277,7 +280,7 @@ impl<BT, CE, Tasks> std::fmt::Debug for ExecutorEngine<BT, CE, Tasks> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecutorEngine")
             .field("queued", &self.queued.len())
-            .field("insert_task", &self.insert_task.is_some())
+            .field("pending_task", &self.pending_task.is_some())
             .field("max_round", &self.max_round)
             .field("parent_header", &self.parent_header)
             .finish_non_exhaustive()
@@ -1070,8 +1073,8 @@ mod tests {
 
             // expect blocks 4 and 8 to be empty (no txs bc they are duplicates)
             // sub 1 to account for loop idx starting at 0
-            if idx == expected_duplicate_block_num_round_1 - 1 ||
-                idx == expected_duplicate_block_num_round_2 - 1
+            if idx == expected_duplicate_block_num_round_1 - 1
+                || idx == expected_duplicate_block_num_round_2 - 1
             {
                 assert!(block.senders.is_empty());
                 assert!(block.body.is_empty());
