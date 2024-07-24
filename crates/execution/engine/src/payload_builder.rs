@@ -186,7 +186,9 @@ where
 
     // finalize the last block executed from consensus output and update chain info
     //
-    // this removes canonical blocks from the tree, but still need to set_finalized
+    // this removes canonical blocks from the tree, stores the finalized block number in the
+    // database, but still need to set_finalized afterwards for utilization in-memory for
+    // components, like RPC
     provider.finalize_block(canonical_header.number)?;
     provider.set_finalized(canonical_header.clone());
     debug!(target: "engine::payload", "setting finalized block number...{:?}", canonical_header.number);
