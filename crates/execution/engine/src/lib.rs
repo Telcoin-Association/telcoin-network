@@ -401,6 +401,9 @@ mod tests {
         assert_eq!(last_block_num, expected_block_height);
         // assert canonical tip and finalized block are equal
         assert_eq!(canonical_tip, final_block);
+        // assert last executed output is correct and finalized
+        let last_output = execution_node.last_executed_output().await?;
+        assert_eq!(last_output, sub_dag_index); // round of consensus
 
         // pull newly executed block from database (skip genesis)
         let expected_block = provider
@@ -688,6 +691,9 @@ mod tests {
         assert_eq!(last_block_num, expected_block_height);
         // assert canonical tip and finalized block are equal
         assert_eq!(canonical_tip, final_block);
+        // assert last executed output is correct and finalized
+        let last_output = execution_node.last_executed_output().await?;
+        assert_eq!(last_output, sub_dag_index_2); // round of consensus
 
         // pull newly executed blocks from database (skip genesis)
         //
@@ -1041,6 +1047,9 @@ mod tests {
         assert_eq!(last_block_num, expected_block_height);
         // assert canonical tip and finalized block are equal
         assert_eq!(canonical_tip, final_block);
+        // assert last executed output is correct and finalized
+        let last_output = execution_node.last_executed_output().await?;
+        assert_eq!(last_output, sub_dag_index_2); // round of consensus
 
         // pull newly executed blocks from database (skip genesis)
         //
@@ -1069,8 +1078,8 @@ mod tests {
 
             // expect blocks 4 and 8 to be empty (no txs bc they are duplicates)
             // sub 1 to account for loop idx starting at 0
-            if idx == expected_duplicate_block_num_round_1 - 1 ||
-                idx == expected_duplicate_block_num_round_2 - 1
+            if idx == expected_duplicate_block_num_round_1 - 1
+                || idx == expected_duplicate_block_num_round_2 - 1
             {
                 assert!(block.senders.is_empty());
                 assert!(block.body.is_empty());
@@ -1358,6 +1367,9 @@ mod tests {
         assert_eq!(last_block_num, expected_block_height);
         // assert canonical tip and finalized block are equal
         assert_eq!(canonical_tip, final_block);
+        // assert last executed output is correct and finalized
+        let last_output = execution_node.last_executed_output().await?;
+        assert_eq!(last_output, 1);
 
         Ok(())
     }
