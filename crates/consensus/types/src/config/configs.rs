@@ -177,11 +177,11 @@ pub struct Parameters {
 
 impl Parameters {
     fn default_header_num_of_batches_threshold() -> usize {
-        32
+        5
     }
 
     fn default_max_header_num_of_batches() -> usize {
-        1_000
+        10
     }
 
     fn default_max_header_delay() -> Duration {
@@ -189,7 +189,7 @@ impl Parameters {
     }
 
     fn default_min_header_delay() -> Duration {
-        Duration::from_secs_f64(1.0)
+        Duration::from_secs(5)
     }
 
     fn default_gc_depth() -> u64 {
@@ -209,7 +209,7 @@ impl Parameters {
     }
 
     fn default_max_batch_delay() -> Duration {
-        Duration::from_millis(100)
+        Duration::from_secs(1)
     }
 
     fn default_max_concurrent_requests() -> usize {
