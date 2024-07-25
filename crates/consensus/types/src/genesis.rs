@@ -114,6 +114,9 @@ fn adiri_genesis_raw() -> &'static str {
         },
         "0xDEC366b889A53B93CFa561076c03C18b0b4D6C93": {
             "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
+        },
+        "0x8903d35F5F941bc0C6977DBf40d0cB067473e8f2": {
+            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
         }
     },
     "number": "0x0",
@@ -626,18 +629,23 @@ mod tests {
         assert!(network_genesis.validate().is_ok())
     }
     #[test]
-    fn test_delete_me() {
+    fn delete_me() {
         let max = reth_primitives::U256::MAX;
-        let nu = max
-            .checked_sub(
-                reth_primitives::U256::from(10)
-                    .checked_pow(reth_primitives::U256::from(18))
-                    .unwrap(),
-            )
+        let tenk = reth_primitives::U256::from(10)
+            .checked_pow(reth_primitives::U256::from(18))
+            .unwrap()
+            .checked_mul(reth_primitives::U256::from(10_000))
             .unwrap();
+        // let nu = max
+        //     .checked_sub(
+        //         reth_primitives::U256::from(10)
+        //             .checked_pow(reth_primitives::U256::from(18))
+        //             .unwrap(),
+        //     )
+        //     .unwrap();
         // 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
         // 0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff
-        println!("{:#x}", nu);
+        println!("{:#x}", tenk);
     }
 
     #[test]
