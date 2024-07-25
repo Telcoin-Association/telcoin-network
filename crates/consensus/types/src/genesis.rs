@@ -197,8 +197,8 @@ impl NetworkGenesis {
             let path = entry.path();
 
             // Check if it's a file and has the .yaml extension and does not start with '.'
-            if path.is_file() &&
-                path.file_name().and_then(OsStr::to_str).map_or(true, |s| !s.starts_with('.'))
+            if path.is_file()
+                && path.file_name().and_then(OsStr::to_str).map_or(true, |s| !s.starts_with('.'))
             {
                 // TODO: checking this is probably more trouble than it's worth
                 // && path.extension().and_then(OsStr::to_str) == Some("yaml")
@@ -627,25 +627,6 @@ mod tests {
         }
         // validate
         assert!(network_genesis.validate().is_ok())
-    }
-    #[test]
-    fn delete_me() {
-        let max = reth_primitives::U256::MAX;
-        let tenk = reth_primitives::U256::from(10)
-            .checked_pow(reth_primitives::U256::from(18))
-            .unwrap()
-            .checked_mul(reth_primitives::U256::from(10_000))
-            .unwrap();
-        // let nu = max
-        //     .checked_sub(
-        //         reth_primitives::U256::from(10)
-        //             .checked_pow(reth_primitives::U256::from(18))
-        //             .unwrap(),
-        //     )
-        //     .unwrap();
-        // 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
-        // 0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff
-        println!("{:#x}", tenk);
     }
 
     #[test]

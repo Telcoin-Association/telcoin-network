@@ -408,7 +408,6 @@ mod tests {
         debug!("transaction 3: {transaction3:?}");
 
         let txs = vec![transaction1.clone(), transaction2.clone(), transaction3.clone()];
-        let tx_root = calculate_transaction_root(&txs);
 
         let transactions = vec![
             transaction1.envelope_encoded().into(),
