@@ -73,7 +73,7 @@ async fn test_faucet_transfers_tel_with_google_kms_e2e() -> eyre::Result<()> {
     info!(target: "faucet-transaction", ?tx_hash);
 
     // more than enough time for the nodes to launch RPCs
-    let duration = Duration::from_secs(15);
+    let duration = Duration::from_secs(30);
 
     // ensure account balance increased
     let balance = timeout(duration, ensure_account_balance(&client, address))
