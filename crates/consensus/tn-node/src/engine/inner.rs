@@ -365,8 +365,14 @@ where
         // recover finalized block's nonce: this is the last subdag index from consensus (round)
         let finalized_block_num =
             self.blockchain_db.database_provider_ro()?.last_finalized_block_number()?;
+        let last_round_of_consensus = self
+            .blockchain_db
+            .database_provider_ro()?
+            .header_by_number(finalized_block_num)?
+            .map(|opt| opt.nonce)
+            .unwrap_or(0);
 
-        Ok(finalized_block_num)
+        Ok(last_round_of_consensus)
     }
 
     /// Return an database provider.
