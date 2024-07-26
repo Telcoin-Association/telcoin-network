@@ -40,12 +40,16 @@ impl<V: BatchValidation> WorkerToWorker for WorkerReceiverHandler<V> {
         &self,
         request: anemo::Request<WorkerBatchMessage>,
     ) -> Result<anemo::Response<()>, anemo::rpc::Status> {
+        // own peer id for error handling
+        let peer_id = request.peer_id().map(|id| id.clone());
         let message = request.into_body();
+        // validate batch - log error if invalid
         if let Err(err) = self.validator.validate_batch(&message.batch).await {
             return Err(anemo::rpc::Status::new_with_message(
                 StatusCode::BadRequest,
                 format!(
-                    "Invalid batch: {err}\nsealed_header:{:?}",
+                    "Invalid batch from peer {:?}: {err}\nsealed_header:\n{:?}",
+                    peer_id,
                     &message.batch.versioned_metadata().sealed_header(),
                 ),
             ));
