@@ -256,8 +256,8 @@ mod tests {
     use reth_db::test_utils::{create_test_rw_db, tempdir_path};
     use reth_db_common::init::init_genesis;
     use reth_primitives::{
-        constants::EMPTY_WITHDRAWALS, hex, Address, Bloom,
-        Bytes, GenesisAccount, Header, SealedHeader, B256, EMPTY_OMMER_ROOT_HASH,
+        constants::EMPTY_WITHDRAWALS, hex, Address, Bloom, Bytes, GenesisAccount, Header,
+        SealedHeader, B256, EMPTY_OMMER_ROOT_HASH,
     };
     use reth_provider::{providers::StaticFileProvider, ProviderFactory};
     use reth_prune::PruneModes;
