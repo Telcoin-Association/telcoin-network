@@ -44,7 +44,10 @@ impl<V: BatchValidation> WorkerToWorker for WorkerReceiverHandler<V> {
         if let Err(err) = self.validator.validate_batch(&message.batch).await {
             return Err(anemo::rpc::Status::new_with_message(
                 StatusCode::BadRequest,
-                format!("Invalid batch: {err}"),
+                format!(
+                    "Invalid batch: {err}\nsealed_header:{:?}",
+                    &message.batch.versioned_metadata().sealed_header(),
+                ),
             ));
         }
         let digest = message.batch.digest();
