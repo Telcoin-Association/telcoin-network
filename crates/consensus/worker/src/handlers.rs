@@ -41,7 +41,7 @@ impl<V: BatchValidation> WorkerToWorker for WorkerReceiverHandler<V> {
         request: anemo::Request<WorkerBatchMessage>,
     ) -> Result<anemo::Response<()>, anemo::rpc::Status> {
         // own peer id for error handling
-        let peer_id = request.peer_id().map(|id| id.clone());
+        let peer_id = request.peer_id().copied();
         let message = request.into_body();
         // validate batch - log error if invalid
         if let Err(err) = self.validator.validate_batch(&message.batch).await {
