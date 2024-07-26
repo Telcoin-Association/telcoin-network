@@ -56,7 +56,7 @@ impl<V: BatchValidation> WorkerToWorker for WorkerReceiverHandler<V> {
         }
         let digest = message.batch.digest();
 
-        let mut batch = message.batch.clone();
+        let mut batch = message.batch;
 
         // Set received_at timestamp for remote batch.
         batch.versioned_metadata_mut().set_received_at(now());
