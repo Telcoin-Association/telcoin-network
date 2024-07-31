@@ -16,4 +16,4 @@ format_code_in_doc_comments = true
 # default: 100
 doc_comment_code_block_width = 100
 # Where to put a binary operator when a binary expression goes multiline.
-binop_separator = "Back"
+#binop_separator = "Back"
