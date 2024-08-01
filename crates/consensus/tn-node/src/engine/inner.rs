@@ -311,15 +311,21 @@ where
 
         if let Some(faucet_args) = self.opt_faucet_args.take() {
             // create extension from CLI args
-            let faucet_ext = faucet_args
-                .create_rpc_extension(self.blockchain_db.clone(), transaction_pool.clone())?;
+            match faucet_args
+                .create_rpc_extension(self.blockchain_db.clone(), transaction_pool.clone())
+            {
+                Ok(faucet_ext) => {
+                    // add faucet module
+                    if let Err(e) = server.merge_configured(faucet_ext.into_rpc()) {
+                        error!(target: "faucet", "Error merging faucet rpc module: {e:?}");
+                    }
 
-            // add faucet module
-            if let Err(e) = server.merge_configured(faucet_ext.into_rpc()) {
-                error!(target: "faucet", "Error merging faucet rpc module: {e:?}");
+                    info!(target: "tn::execution", "faucet rpc extension successfully merged");
+                }
+                Err(e) => {
+                    error!(target: "faucet", "Error creating faucet rpc module: {e:?}");
+                }
             }
-
-            info!(target: "tn::execution", "faucet rpc extension successfully merged");
         }
 
         // start the server

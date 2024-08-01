@@ -24,7 +24,7 @@ use reth_revm::{
 };
 use std::sync::Arc;
 use tn_types::{BuildArguments, TNPayload, TNPayloadAttributes};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Execute output from consensus to extend the canonical chain.
 ///
@@ -183,6 +183,7 @@ where
     //
     // see: reth/crates/consensus/beacon/src/engine/mod.rs:update_canon_chain
     provider.set_canonical_head(canonical_header.clone());
+    info!(target: "engine::payload", "canonical head for round {:?}: {:?} - {:?}", canonical_header.nonce, canonical_header.number, canonical_header.hash());
 
     // finalize the last block executed from consensus output and update chain info
     //
@@ -191,7 +192,6 @@ where
     // components, like RPC
     provider.finalize_block(canonical_header.number)?;
     provider.set_finalized(canonical_header.clone());
-    debug!(target: "engine::payload", "setting finalized block number...{:?}", canonical_header.number);
 
     // update safe block last because this is less time sensitive but still needs to happen
     provider.set_safe(canonical_header.clone());

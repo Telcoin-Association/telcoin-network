@@ -82,20 +82,41 @@ fn adiri_genesis_raw() -> &'static str {
     "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
     "coinbase": "0x0000000000000000000000000000000000000000",
     "alloc": {
-        "0x781e3f2014d83dB831df4cAA3BA78aEc57396B50": {
-            "balance": "0x4a47e3c12448f4ad000000"
-        },
         "0xe626ce81714cb7777b1bf8ad2323963fb3398ad5": {
-            "balance": "0x4a47e3c12448f4ad000000"
+            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
         },
         "0xb3fabbd1d2edde4d9ced3ce352859ce1bebf7907": {
-            "balance": "0x4a47e3c12448f4ad000000"
+            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
         },
         "0xa3478861957661b2d8974d9309646a71271d98b9": {
-            "balance": "0x4a47e3c12448f4ad000000"
+            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
         },
         "0xe69151677e5aec0b4fc0a94bfcaf20f6f0f975eb": {
-            "balance": "0x4a47e3c12448f4ad000000"
+            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
+        },
+        "0x781e3f2014d83dB831df4cAA3BA78aEc57396B50": {
+            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
+        },
+        "0x4f264cc3709f35f39b1fc0c2c1110141b8c44370": {
+            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
+        },
+        "0xc1612C97537c2CC62a11FC4516367AB6F62d4B23": {
+            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
+        },
+        "0x649a2C65C69130a2Bfe891965A267DD39233cb3a": {
+            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
+        },
+        "0x9F35A76bE2a3A84FF0c0A6365CD3C5CeB3a7FD97": {
+            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
+        },
+        "0x8133Be861AD5C9Dea396E5dE5BA1B0154E87e925": {
+            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
+        },
+        "0xDEC366b889A53B93CFa561076c03C18b0b4D6C93": {
+            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
+        },
+        "0x8903d35F5F941bc0C6977DBf40d0cB067473e8f2": {
+            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
         }
     },
     "number": "0x0",

@@ -3091,6 +3091,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethereum-tx-sign"
+version = "6.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b13a263688dba5fd4822fc57e022c221ed25c12495939f1246b14de2f7db69d2"
+dependencies = [
+ "bytes",
+ "hex",
+ "num-traits",
+ "rlp",
+ "secp256k1 0.27.0",
+ "serde",
+ "serde_derive",
+ "tiny-keccak",
+]
+
+[[package]]
 name = "ethereum-types"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4436,6 +4452,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29c15563dc2726973df627357ce0c9ddddbea194836909d655df6a75d2cf296d"
 dependencies = [
  "wasm-bindgen",
+]
+
+[[package]]
+name = "jsonrpc"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3662a38d341d77efecb73caf01420cfa5aa63c0253fd7bc05289ef9f6616e1bf"
+dependencies = [
+ "base64 0.13.1",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -10757,7 +10784,9 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "consensus-metrics",
+ "const-hex",
  "const-str",
+ "ethereum-tx-sign",
  "eyre",
  "fastcrypto",
  "fdlimit",
@@ -10765,6 +10794,7 @@ dependencies = [
  "gcloud-sdk",
  "humantime",
  "hyper 0.14.30",
+ "jsonrpc",
  "jsonrpsee",
  "k256",
  "metrics 0.23.0",

@@ -1,4 +1,4 @@
-FROM rust:1.76-slim-bookworm as builder
+FROM rust:1.79-slim-bookworm as builder
 
 WORKDIR /usr/src/telcoin-network
 

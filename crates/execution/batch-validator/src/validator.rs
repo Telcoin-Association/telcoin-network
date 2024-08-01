@@ -256,8 +256,8 @@ mod tests {
     use reth_db::test_utils::{create_test_rw_db, tempdir_path};
     use reth_db_common::init::init_genesis;
     use reth_primitives::{
-        constants::EMPTY_WITHDRAWALS, hex, proofs::calculate_transaction_root, Address, Bloom,
-        Bytes, GenesisAccount, Header, SealedHeader, B256, EMPTY_OMMER_ROOT_HASH,
+        constants::EMPTY_WITHDRAWALS, hex, Address, Bloom, Bytes, GenesisAccount, Header,
+        SealedHeader, B256, EMPTY_OMMER_ROOT_HASH,
     };
     use reth_provider::{providers::StaticFileProvider, ProviderFactory};
     use reth_prune::PruneModes;
@@ -277,13 +277,13 @@ mod tests {
         SealedHeader::new(
             Header {
                 parent_hash: hex!(
-                    "ba38f8818e0e269baf7db26a4d26b834c00b5236a4304bfa1372d2860b3b51d0"
+                    "0a908204acf0691cb8924082269df1c40deea2d7f2201e82a28cf07bd2a3d4ce"
                 )
                 .into(),
                 ommers_hash: EMPTY_OMMER_ROOT_HASH,
                 beneficiary: hex!("0000000000000000000000000000000000000000").into(),
                 state_root: hex!(
-                    "9d3625e9ee3fb54d6a31350a77e8412c49b2df5e2e4c4513d7f7e1cfe8a2575e"
+                    "82d9a09efc5f9f408c45a1a0e205d8a09ee156781a0d7221ee913a8130d95cd0"
                 )
                 .into(),
                 transactions_root: hex!(
@@ -406,10 +406,6 @@ mod tests {
             value, // 1 TEL
         );
         debug!("transaction 3: {transaction3:?}");
-
-        let txs = vec![transaction1.clone(), transaction2.clone(), transaction3.clone()];
-        let tx_root = calculate_transaction_root(&txs);
-        println!("\n\ntx_root: {tx_root:?}");
 
         let transactions = vec![
             transaction1.envelope_encoded().into(),

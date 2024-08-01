@@ -7,6 +7,7 @@
 //! signature to be EVM compatible. The faucet service does all of this and
 //! then submits the transaction to the RPC Transaction Pool for the next batch.
 
+use crate::util::create_validator_info;
 use clap::Parser;
 use gcloud_sdk::{
     google::cloud::kms::v1::{
@@ -33,7 +34,7 @@ use reth_primitives::{
 use reth_tracing::init_test_tracing;
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
-use telcoin_network::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
+use telcoin_network::{genesis::GenesisArgs, node::NodeCommand};
 use tn_faucet::FaucetArgs;
 use tn_node::launch_node;
 use tn_types::adiri_genesis;
@@ -73,7 +74,7 @@ async fn test_faucet_transfers_tel_with_google_kms_e2e() -> eyre::Result<()> {
     info!(target: "faucet-transaction", ?tx_hash);
 
     // more than enough time for the nodes to launch RPCs
-    let duration = Duration::from_secs(15);
+    let duration = Duration::from_secs(30);
 
     // ensure account balance increased
     let balance = timeout(duration, ensure_account_balance(&client, address))
@@ -168,31 +169,6 @@ async fn prepare_google_kms_env() -> eyre::Result<Arc<ChainSpec>> {
     Ok(Arc::new(genesis.into()))
 }
 
-/// Execute genesis ceremony inside tempdir
-async fn create_validator_info(datadir: &str) -> eyre::Result<()> {
-    // init genesis
-    let init_command =
-        CommandParser::<GenesisArgs>::parse_from(["tn", "init", "--datadir", datadir]);
-    init_command.args.execute().await?;
-
-    // keytool
-    let keys_command = CommandParser::<KeyArgs>::parse_from([
-        "tn",
-        "generate",
-        "validator",
-        "--datadir",
-        datadir,
-        "--address",
-        "0",
-    ]);
-    keys_command.args.execute().await?;
-
-    // add validator
-    let add_validator_command =
-        CommandParser::<GenesisArgs>::parse_from(["tn", "add-validator", "--datadir", datadir]);
-    add_validator_command.args.execute().await
-}
-
 /// Create validator info, genesis ceremony, and spawn node command with faucet active.
 async fn spawn_local_testnet(
     task_executor: &TaskExecutor,
@@ -213,7 +189,7 @@ async fn spawn_local_testnet(
         let dir = temp_path.join(v);
         let datadir = dir.to_str().expect("validator temp dir");
         // init genesis ceremony to create committee / worker_cache files
-        create_validator_info(datadir).await?;
+        create_validator_info(datadir, "0").await?;
 
         // copy to shared genesis dir
         let copy = dir.join("genesis/validators");

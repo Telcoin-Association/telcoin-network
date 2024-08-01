@@ -150,7 +150,8 @@ impl FaucetArgs {
 
         // TODO: support local/hardcoded hot wallet signatures
         warn!(target: "faucet", "Google KMS inactive - skipping faucet extension.");
-        todo!("Only Google KMS supported right now.")
+        Err(eyre::Report::msg("Google KMS inactive - skipping faucet extension."))
+        //todo!("Only Google KMS supported right now.")
     }
 }
 
