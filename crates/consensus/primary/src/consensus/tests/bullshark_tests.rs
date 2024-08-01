@@ -362,10 +362,10 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
         let (outcome, committed) =
             bullshark.process_certificate(&mut state, certificate.clone()).unwrap();
 
-        if certificate.round() == 7 ||
-            certificate.round() == 9 ||
-            certificate.round() == 11 ||
-            certificate.round() == 13
+        if certificate.round() == 7
+            || certificate.round() == 9
+            || certificate.round() == 11
+            || certificate.round() == 13
         {
             assert_eq!(outcome, Outcome::NotEnoughSupportForLeader);
         }

@@ -68,8 +68,8 @@ where
 }
 impl MallocSizeOf for fastcrypto_tbls::polynomial::Poly<fastcrypto::groups::bls12381::G2Element> {
     fn size_of(&self, _ops: &mut crate::MallocSizeOfOps) -> usize {
-        (self.degree() as usize + 1) *
-            std::mem::size_of::<fastcrypto::groups::bls12381::G2Element>()
+        (self.degree() as usize + 1)
+            * std::mem::size_of::<fastcrypto::groups::bls12381::G2Element>()
     }
 }
 malloc_size_of_is_0!(fastcrypto::groups::bls12381::G1Element);
@@ -80,10 +80,10 @@ malloc_size_of_is_0!(std::collections::hash_map::RandomState);
 // indexmap
 impl<K: MallocSizeOf, V: MallocSizeOf, S> MallocShallowSizeOf for indexmap::IndexMap<K, V, S> {
     fn shallow_size_of(&self, _ops: &mut crate::MallocSizeOfOps) -> usize {
-        self.capacity() *
-            (std::mem::size_of::<K>() +
-                std::mem::size_of::<V>() +
-                (2 * std::mem::size_of::<usize>()))
+        self.capacity()
+            * (std::mem::size_of::<K>()
+                + std::mem::size_of::<V>()
+                + (2 * std::mem::size_of::<usize>()))
     }
 }
 impl<K: MallocSizeOf, V: MallocSizeOf, S> MallocSizeOf for indexmap::IndexMap<K, V, S> {

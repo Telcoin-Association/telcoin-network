@@ -834,16 +834,16 @@ impl PrimaryToPrimary for PrimaryReceiverHandler {
             anemo::rpc::Status::new_with_message(
                 match e {
                     // Report unretriable errors as 400 Bad Request.
-                    DagError::InvalidSignature |
-                    DagError::InvalidEpoch { .. } |
-                    DagError::InvalidHeaderDigest |
-                    DagError::HeaderHasBadWorkerIds(_) |
-                    DagError::HeaderHasInvalidParentRoundNumbers(_) |
-                    DagError::HeaderHasDuplicateParentAuthorities(_) |
-                    DagError::AlreadyVoted(_, _, _) |
-                    DagError::AlreadyVotedNewerHeader(_, _, _) |
-                    DagError::HeaderRequiresQuorum(_) |
-                    DagError::TooOld(_, _, _) => anemo::types::response::StatusCode::BadRequest,
+                    DagError::InvalidSignature
+                    | DagError::InvalidEpoch { .. }
+                    | DagError::InvalidHeaderDigest
+                    | DagError::HeaderHasBadWorkerIds(_)
+                    | DagError::HeaderHasInvalidParentRoundNumbers(_)
+                    | DagError::HeaderHasDuplicateParentAuthorities(_)
+                    | DagError::AlreadyVoted(_, _, _)
+                    | DagError::AlreadyVotedNewerHeader(_, _, _)
+                    | DagError::HeaderRequiresQuorum(_)
+                    | DagError::TooOld(_, _, _) => anemo::types::response::StatusCode::BadRequest,
                     // All other errors are retriable.
                     _ => anemo::types::response::StatusCode::Unknown,
                 },

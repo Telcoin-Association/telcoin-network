@@ -393,9 +393,9 @@ impl Bullshark {
     }
 
     fn report_leader_on_time_metrics(&mut self, certificate_round: Round, state: &ConsensusState) {
-        if certificate_round > self.max_inserted_certificate_round &&
-            certificate_round % 2 == 0 &&
-            certificate_round > 2
+        if certificate_round > self.max_inserted_certificate_round
+            && certificate_round % 2 == 0
+            && certificate_round > 2
         {
             let previous_leader_round = certificate_round - 2;
 

@@ -175,8 +175,8 @@ impl ConsensusState {
             }
         }
 
-        Ok(certificate.round() >
-            last_committed.get(&certificate.origin()).cloned().unwrap_or_default())
+        Ok(certificate.round()
+            > last_committed.get(&certificate.origin()).cloned().unwrap_or_default())
     }
 
     /// Update and clean up internal state after committing a certificate.

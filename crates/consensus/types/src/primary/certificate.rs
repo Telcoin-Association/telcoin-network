@@ -226,10 +226,10 @@ impl CertificateAPI for CertificateV1 {
 
     fn aggregated_signature(&self) -> Option<&BlsAggregateSignatureBytes> {
         match &self.signature_verification_state {
-            SignatureVerificationState::VerifiedDirectly(bytes) |
-            SignatureVerificationState::Unverified(bytes) |
-            SignatureVerificationState::VerifiedIndirectly(bytes) |
-            SignatureVerificationState::Unsigned(bytes) => Some(bytes),
+            SignatureVerificationState::VerifiedDirectly(bytes)
+            | SignatureVerificationState::Unverified(bytes)
+            | SignatureVerificationState::VerifiedIndirectly(bytes)
+            | SignatureVerificationState::Unsigned(bytes) => Some(bytes),
             SignatureVerificationState::Genesis => None,
         }
     }
@@ -434,9 +434,9 @@ impl CertificateV1 {
 
     fn verify_signature(mut self, pks: Vec<BlsPublicKey>) -> DagResult<Certificate> {
         let aggregrate_signature_bytes = match self.signature_verification_state {
-            SignatureVerificationState::VerifiedIndirectly(_) |
-            SignatureVerificationState::VerifiedDirectly(_) |
-            SignatureVerificationState::Genesis => return Ok(Certificate::V1(self)),
+            SignatureVerificationState::VerifiedIndirectly(_)
+            | SignatureVerificationState::VerifiedDirectly(_)
+            | SignatureVerificationState::Genesis => return Ok(Certificate::V1(self)),
             SignatureVerificationState::Unverified(ref bytes) => bytes,
             SignatureVerificationState::Unsigned(_) => {
                 return Err(DagError::CertificateRequiresQuorum);

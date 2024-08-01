@@ -180,9 +180,9 @@ impl RandomnessState {
         }
 
         // Once we have enough Confirmations, process them and update shares.
-        if self.dkg_output.is_none() &&
-            !self.confirmations.is_empty() &&
-            self.used_messages.is_some()
+        if self.dkg_output.is_none()
+            && !self.confirmations.is_empty()
+            && self.used_messages.is_some()
         {
             match self.party.complete(
                 self.used_messages.as_ref().expect("checked above"),

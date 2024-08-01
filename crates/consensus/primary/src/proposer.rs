@@ -318,8 +318,8 @@ impl Proposer {
         // If this node is going to be the leader of the next round, we set a lower max
         // timeout value to increase its chance of being included in the dag. As leaders are elected
         // on even rounds only we apply the reduced max delay only for those ones.
-        if (self.round + 1) % 2 == 0 &&
-            self.leader_schedule.leader(self.round + 1).id() == self.authority_id
+        if (self.round + 1) % 2 == 0
+            && self.leader_schedule.leader(self.round + 1).id() == self.authority_id
         {
             self.max_header_delay / 2
         } else {
@@ -335,9 +335,9 @@ impl Proposer {
         // of committing the leader. Pay attention that we use here the leader_schedule to figure
         // out the next leader.
         let next_round = self.round + 1;
-        if self.committee.size() > 1 &&
-            next_round % 2 == 0 &&
-            self.leader_schedule.leader(next_round).id() == self.authority_id
+        if self.committee.size() > 1
+            && next_round % 2 == 0
+            && self.leader_schedule.leader(next_round).id() == self.authority_id
         {
             return Duration::ZERO;
         }
@@ -346,9 +346,9 @@ impl Proposer {
         // nodes of the leader_schedule. By doing this we keep the proposal rate as high as possible
         // which leads to higher round rate and also acting as a score booster to the less strong
         // nodes as well.
-        if self.committee.size() > 1 &&
-            next_round % 2 != 0 &&
-            self.committee.leader(next_round).id() == self.authority_id
+        if self.committee.size() > 1
+            && next_round % 2 != 0
+            && self.committee.leader(next_round).id() == self.authority_id
         {
             return Duration::ZERO;
         }
@@ -445,9 +445,9 @@ impl Proposer {
             let enough_digests = self.digests.len() >= self.header_num_of_batches_threshold;
             let max_delay_timed_out = max_delay_timer.is_elapsed();
             let min_delay_timed_out = min_delay_timer.is_elapsed();
-            let should_create_header = (max_delay_timed_out ||
-                ((enough_digests || min_delay_timed_out) && advance)) &&
-                enough_parents;
+            let should_create_header = (max_delay_timed_out
+                || ((enough_digests || min_delay_timed_out) && advance))
+                && enough_parents;
 
             debug!(
                 "Proposer loop starts: round={} enough_parents={} enough_digests={} advance={} max_delay_timed_out={} min_delay_timed_out={} should_create_header={}",

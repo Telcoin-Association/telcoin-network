@@ -192,9 +192,9 @@ impl Certifier {
 
         // Verify the vote. Note that only the header digest is signed by the vote.
         ensure!(
-            vote.header_digest() == header.digest() &&
-                vote.origin() == header.author() &&
-                vote.author() == authority,
+            vote.header_digest() == header.digest()
+                && vote.origin() == header.author()
+                && vote.author() == authority,
             DagError::UnexpectedVote(vote.header_digest())
         );
         // Possible equivocations.
@@ -333,9 +333,9 @@ impl Certifier {
                 panic!("Storage failure: killing node.");
             }
             Err(
-                e @ DagError::TooOld(..) |
-                e @ DagError::VoteTooOld(..) |
-                e @ DagError::InvalidEpoch { .. },
+                e @ DagError::TooOld(..)
+                | e @ DagError::VoteTooOld(..)
+                | e @ DagError::InvalidEpoch { .. },
             ) => debug!("{e}"),
             Err(e) => warn!("{e}"),
         }

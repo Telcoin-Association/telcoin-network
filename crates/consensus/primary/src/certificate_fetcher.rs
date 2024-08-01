@@ -349,8 +349,8 @@ async fn fetch_certificates_helper(
         .map(|(_, _, network_key)| network_key)
         .collect();
     peers.shuffle(&mut ThreadRng::default());
-    let fetch_timeout = PARALLEL_FETCH_REQUEST_INTERVAL_SECS * peers.len().try_into().unwrap() +
-        PARALLEL_FETCH_REQUEST_ADDITIONAL_TIMEOUT;
+    let fetch_timeout = PARALLEL_FETCH_REQUEST_INTERVAL_SECS * peers.len().try_into().unwrap()
+        + PARALLEL_FETCH_REQUEST_ADDITIONAL_TIMEOUT;
     let fetch_callback = async move {
         debug!("Starting to fetch certificates");
         let mut fut = FuturesUnordered::new();
