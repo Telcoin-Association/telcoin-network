@@ -33,6 +33,7 @@ jobs:
         with:
           project_id: "telcoin-network"
           workload_identity_provider: "projects/505253602811/locations/global/workloadIdentityPools/github/providers/github-provider"
+          service_account: "github-action@telcoin-network.iam.gserviceaccount.com"
         if: matrix.os == 'ubuntu-latest' || github.event_name == 'push'
 
       - name: install nightly toolchain
