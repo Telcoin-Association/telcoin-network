@@ -10,33 +10,57 @@ env:
 
 jobs:
   fmt-clippy:
-
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v2
-    - name: Format
-      run: |
-          cargo version
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy
+      - name: cargo +nightly fmt
+        run: |
           rustc --version
-          cargo fmt --verbose -- --check
-    - name: Clippy
-      run: |
-          cargo version
+          cargo +nightly version
+          cargo +nightly fmt --verbose -- --check
+      - name: cargo +nightly clippy
+        run: |
           rustc --version
-          cargo clippy --verbose --all --all-features -- -D warnings
+          cargo +nightly version
+          cargo +nightly clippy --version
+          cargo +nightly clippy --verbose --all --all-features -- -D warnings
 
   rust-tests:
-
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v2
-    - name: Tests
-      run: |
-          uname -a
-          df -h
-          free
-          cargo version
-          rustc --version
-          cargo test --all --all-features --workspace --verbose
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - name: Get all feature combinations
+        id: get-features
+        run: |
+          FEATURES=$(cargo metadata --format-version=1 | jq -r '.packages[0].features | keys[]' | sort)
+          echo "features=$FEATURES" >> $GITHUB_OUTPUT
+      - name: Run tests for all feature combinations
+        run: |
+          for feature in ${{ steps.get-features.outputs.features }}; do
+            echo "Testing with feature: $feature"
+            cargo test --workspace --no-default-features --features $feature
+          done
+      - name: Run tests with all features
+        run: cargo test --workspace --all-features
+      - name: Run tests with no features
+        run: cargo test --workspace --no-default-features
+
+    # steps:
+    # - uses: actions/checkout@v2
+    # - name: Tests
+    #   run: |
+    #     uname -a
+    #     df -h
+    #     free
+    #     cargo version
+    #     rustc --version
+    #     cargo test --all --all-features --workspace --verbose
