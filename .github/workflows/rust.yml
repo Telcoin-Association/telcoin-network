@@ -4,9 +4,11 @@ on:
   pull_request:
 
 env:
+  CARGO_INCREMENTAL: 0 # disable incremental compilation
   RUSTFLAGS: -Dwarnings
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   fmt-clippy:
@@ -38,24 +40,12 @@ jobs:
           profile: minimal
           toolchain: stable
           override: true
-      - name: Get all feature combinations
-        id: get-features
-        # run: |
-        #   FEATURES=$(cargo metadata --format-version=1 | jq -r '.packages[0].features | keys[]' | sort)
-        #   echo "features=$FEATURES" >> $GITHUB_OUTPUT
-        run: |
-          WORKSPACE_NAME=$(cargo metadata --format-version=1 | jq -r '.workspace_members[0]' | cut -d' ' -f1)
-          FEATURES=$(cargo metadata --format-version=1 | jq -r --arg name "$WORKSPACE_NAME" '.packages[] | select(.name == $name) | .features | keys[]' | sort | tr '\n' ' ')
-          echo "features<<EOF" >> $GITHUB_OUTPUT
-          echo "$FEATURES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-      - name: Run tests for all feature combinations
-        run: |
-          for feature in ${{ steps.get-features.outputs.features }}; do
-            echo "Testing with feature: $feature"
-            cargo test --workspace --no-default-features --features $feature
-          done
-      - name: Run tests with all features
-        run: cargo test --workspace --all-features
-      - name: Run tests with no features
-        run: cargo test --workspace --no-default-features
+      # inspired by https://matklad.github.io/2021/09/04/fast-rust-builds.html#CI-Workflow
+      - name: compile
+        run: cargo test --no-run --locked
+      - name: test default features
+        run: cargo test --workspace --no-default-features -- --nocapture --quiet
+      - name: test all features
+        run: cargo test --workspace --all-features -- --nocapture --quiet
+      - name: Run tests with faucet feature
+        run: cargo test --workspace --no-default-features --features faucet -- --nocapture --quiet
