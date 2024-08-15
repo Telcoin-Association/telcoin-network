@@ -16,7 +16,7 @@
 
 #![allow(clippy::all)]
 
-extern crate proc_macro2;
+use proc_macro2;
 #[macro_use]
 extern crate syn;
 #[macro_use]
