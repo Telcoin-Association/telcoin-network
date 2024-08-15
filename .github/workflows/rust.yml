@@ -40,9 +40,15 @@ jobs:
           override: true
       - name: Get all feature combinations
         id: get-features
+        # run: |
+        #   FEATURES=$(cargo metadata --format-version=1 | jq -r '.packages[0].features | keys[]' | sort)
+        #   echo "features=$FEATURES" >> $GITHUB_OUTPUT
         run: |
-          FEATURES=$(cargo metadata --format-version=1 | jq -r '.packages[0].features | keys[]' | sort)
-          echo "features=$FEATURES" >> $GITHUB_OUTPUT
+          WORKSPACE_NAME=$(cargo metadata --format-version=1 | jq -r '.workspace_members[0]' | cut -d' ' -f1)
+          FEATURES=$(cargo metadata --format-version=1 | jq -r --arg name "$WORKSPACE_NAME" '.packages[] | select(.name == $name) | .features | keys[]' | sort | tr '\n' ' ')
+          echo "features<<EOF" >> $GITHUB_OUTPUT
+          echo "$FEATURES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
       - name: Run tests for all feature combinations
         run: |
           for feature in ${{ steps.get-features.outputs.features }}; do
