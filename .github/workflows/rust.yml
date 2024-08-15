@@ -11,28 +11,13 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
-  changes:
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: read
-    outputs:
-      proc_macros: ${{ steps.filter.outputs.proc_macros }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@1441771bbfdd59dcd748680ee64ebd8faab1a242
-        id: filter
-        with:
-          filters: |
-            proc_macros:
-              - 'crates/proc-macro-api/**'
-              - 'crates/proc-macro-srv/**'
-              - 'crates/proc-macro-srv-cli/**'
   rust:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest] # macos-latest
+        os: [ubuntu-latest] # macos-latest?
+
     # Add "id-token" for google jwt
     permissions:
       contents: "read"
