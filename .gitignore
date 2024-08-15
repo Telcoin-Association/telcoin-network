@@ -21,3 +21,6 @@ local-validators
 
 # specific account ONLY for unit tests
 gcloud-credentials.json
+
+# Ignore generated credentials from google-github-actions/auth
+gha-creds-*.json

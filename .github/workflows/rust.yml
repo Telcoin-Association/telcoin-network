@@ -5,47 +5,68 @@ on:
 
 env:
   CARGO_INCREMENTAL: 0 # disable incremental compilation
-  RUSTFLAGS: -Dwarnings
+  RUSTFLAGS: "-D warnings -D unused_extern_crates"
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
-  fmt-clippy:
-    runs-on: ubuntu-latest
+  rust:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest] # macos-latest
+    # Add "id-token" for google jwt
+    permissions:
+      contents: "read"
+      id-token: "write"
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rs/toolchain@master
-        with:
-          toolchain: nightly
-          components: rustfmt, clippy
-      - name: cargo +nightly fmt
+      - name: checkout repo
+        uses: actions/checkout@v4
+
+      - name: install nightly toolchain
         run: |
-          rustc --version
-          cargo +nightly version
-          cargo +nightly fmt --verbose -- --check
-      - name: cargo +nightly clippy
+          rustup update --no-self-update nightly
+          rustup default nightly
+          rustup component add --toolchain nightly rustfmt rust-src clippy
+
+      # inspired by https://matklad.github.io/2021/09/04/fast-rust-builds.html#CI-Workflow
+      - name: cache deps
+        uses: Swatinem/rust-cache@9bdad043e88c75890e36ad3bbc8d27f0090dd609
+        with:
+          key: ${{ env.RUST_CHANNEL }}
+
+      - name: compile (tests)
+        run: cargo test --no-run --locked
+
+        # It's faster to `test` before `build` ¯\_(ツ)_/¯
+      - name: compile (workspace)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build --quiet
+
+      # faucet tests with google KMS
+      - name: google auth
+        uses: "google-github-actions/auth@v2"
+        with:
+          project_id: "telcoin-network"
+          workload_identity_provider: "projects/505253602811/locations/global/workloadIdentityPools/github/providers/github-provider"
+        if: matrix.os == 'ubuntu-latest' || github.event_name == 'push'
+
+      - name: run tests
+        if: matrix.os == 'ubuntu-latest' || github.event_name == 'push'
+        run: cargo test --workspace --no-default-features --features faucet -- --nocapture --quiet
+
+      - name: clippy
         run: |
           rustc --version
           cargo +nightly version
           cargo +nightly clippy --version
           cargo +nightly clippy --verbose --all --all-features -- -D warnings
 
-  rust-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rs/toolchain@master
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-      # inspired by https://matklad.github.io/2021/09/04/fast-rust-builds.html#CI-Workflow
-      - name: compile
-        run: cargo test --no-run --locked
-      - name: test default features
-        run: cargo test --workspace --no-default-features -- --nocapture --quiet
-      - name: test all features
-        run: cargo test --workspace --all-features -- --nocapture --quiet
-      - name: Run tests with faucet feature
-        run: cargo test --workspace --no-default-features --features faucet -- --nocapture --quiet
+      - name: fmt
+        run: |
+          rustc --version
+          cargo +nightly version
+          cargo +nightly fmt --verbose -- --check
