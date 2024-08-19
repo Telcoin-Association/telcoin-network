@@ -18,7 +18,7 @@ RPC_ENDPOINT="https://rpc.adiri.tel"
 FUNCTION_CALL="gitCommitHashAttested(bytes32)"
 
 # Format the commit hash as a bytes32 value
-FORMATTED_HASH="0x$(printf '%064s' ${CURRENT_COMMIT_HASH} | tr ' ' '0')"
+FORMATTED_HASH="$(printf '%064s' ${CURRENT_COMMIT_HASH} | tr ' ' '0')"
 
 # Use cast to call the contract
 RESULT=$(cast call ${CONTRACT_ADDRESS} "${FUNCTION_CALL} ${FORMATTED_HASH}" --rpc-url ${RPC_ENDPOINT})
