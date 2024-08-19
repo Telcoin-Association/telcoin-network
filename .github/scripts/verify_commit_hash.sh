@@ -6,7 +6,7 @@
 set -e  # Exit immediately if a command exits with a non-zero status
 
 # Get the current commit hash
-CURRENT_COMMIT_HASH=$(git rev-parse HEAD)
+COMMIT_HASH=$(git rev-parse HEAD)
 
 # adiri contract details
 #
@@ -19,7 +19,8 @@ CHAIN_ID="2017"
 FUNCTION_CALL="gitCommitHashAttested(bytes20)"
 
 # Use cast to call the contract
-RESULT=$(cast call ${CONTRACT_ADDRESS} "${FUNCTION_CALL}" "${CURRENT_COMMIT_HASH}" --rpc-url ${RPC_ENDPOINT} --chain ${CHAIN_ID})
+RESULT=$(cast call --rpc-url ${RPC_ENDPOINT} --chain ${CHAIN_ID} \
+    ${CONTRACT_ADDRESS} "${FUNCTION_CALL}" "${COMMIT_HASH}")
 
 # Check if the result is true (1) or false (0)
 if [[ "${RESULT: -1}" == "1" ]]; then

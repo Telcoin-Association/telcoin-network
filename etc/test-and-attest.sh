@@ -31,7 +31,7 @@ COMMIT_HASH=$(git rev-parse HEAD)
 echo "attesting git hash: ${COMMIT_HASH}"
 
 # Use cast to call the contract and return early if current HEAD attestation present
-ALREADY_ATTESTED=$(cast call --rpc-url ${RPC_ENDPOINT} --chain "${CHAIN_ID}" \
+ALREADY_ATTESTED=$(cast call --rpc-url ${RPC_ENDPOINT} --chain ${CHAIN_ID} \
     ${CONTRACT_ADDRESS} "${VERIFY_CALL}" "${COMMIT_HASH}" )
 
 # Check if the result is true (1) or false (0)
