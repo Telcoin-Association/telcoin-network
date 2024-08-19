@@ -41,6 +41,8 @@ jobs:
         uses: foundry-rs/foundry-toolchain@v1
 
       - name: verify commit hash on adiri
+        env:
+          COMMIT_HASH: ${{ github.sha }}
         run: .github/scripts/verify_commit_hash.sh
 
       # # faucet tests with google KMS

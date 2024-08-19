@@ -5,9 +5,6 @@
 
 set -e  # Exit immediately if a command exits with a non-zero status
 
-# Get the commit SHA that triggered the workflow
-COMMIT_HASH="${{ github.sha }}"
-
 # adiri contract details
 #
 # NOTE: this contract must match local test-and-attest.sh
@@ -18,6 +15,10 @@ RPC_ENDPOINT="https://rpc.adiri.tel"
 FUNCTION_CALL="gitCommitHashAttested(bytes20)"
 
 # Use cast to call the contract
+#
+# NOTE: COMMIT_HASH is set in .workflow through GitHub context
+# other approaches return different commit hashes than the one
+# that triggered this workflow
 RESULT=$(cast call --rpc-url ${RPC_ENDPOINT} \
     ${CONTRACT_ADDRESS} "${FUNCTION_CALL}" "${COMMIT_HASH}")
 
