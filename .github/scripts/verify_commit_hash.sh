@@ -19,7 +19,7 @@ CHAIN_ID="2017"
 FUNCTION_CALL="gitCommitHashAttested(bytes20)"
 
 # Use cast to call the contract
-RESULT=$(cast call ${CONTRACT_ADDRESS} "${FUNCTION_CALL}" "${CURRENT_COMMIT_HASH}" --rpc-url ${RPC_ENDPOINT} --chain "${CHAIN_ID}")
+RESULT=$(cast call ${CONTRACT_ADDRESS} "${FUNCTION_CALL}" "${CURRENT_COMMIT_HASH}" --rpc-url ${RPC_ENDPOINT} --chain ${CHAIN_ID})
 
 # Check if the result is true (1) or false (0)
 if [[ "${RESULT: -1}" == "1" ]]; then
