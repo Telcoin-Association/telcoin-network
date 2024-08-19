@@ -82,7 +82,7 @@ fmt:
 
 # clippy formatter + try to fix problems
 clippy:
-	cargo +nightly clippy --all --all-features --fix ;
+	cargo +nightly clippy --workspace --all-features --fix ;
 
 # login to gcloud artifact registry for managing docker images
 docker-login:
