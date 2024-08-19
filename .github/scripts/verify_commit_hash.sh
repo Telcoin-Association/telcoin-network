@@ -6,7 +6,7 @@
 set -e  # Exit immediately if a command exits with a non-zero status
 
 # Get the commit SHA that triggered the workflow
-COMMIT_HASH="${GITHUB_SHA}"
+COMMIT_HASH="${{ github.sha }}"
 
 # adiri contract details
 #
