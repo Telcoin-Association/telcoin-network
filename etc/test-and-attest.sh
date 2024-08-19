@@ -11,6 +11,38 @@ SECONDS=0
 
 set -e  # Exit immediately if a command exits with a non-zero status
 
+# load environment variables
+source .env
+
+# Verify required variables are loaded
+if [ -z "$GITHUB_ATTESTATION_PRIVATE_KEY" ]; then
+    echo "Private key not set."
+    exit 1
+fi
+
+# NOTE: this contract must match CI
+CONTRACT_ADDRESS="0x1f2f25561a11762bdffd91014c6d0e49af334447"
+RPC_ENDPOINT="https://rpc.adiri.tel"
+ATTEST_CALL="attestGitCommitHash(bytes20,bool)"
+VERIFY_CALL="gitCommitHashAttested(bytes20)"
+CHAIN_ID="2017"
+PRIVATE_KEY=${GITHUB_ATTESTATION_PRIVATE_KEY}
+COMMIT_HASH=$(git rev-parse HEAD)
+echo "attesting git hash: ${COMMIT_HASH}"
+
+# Use cast to call the contract and return early if current HEAD attestation present
+ALREADY_ATTESTED=$(cast call --rpc-url ${RPC_ENDPOINT} --chain "${CHAIN_ID}" \
+    ${CONTRACT_ADDRESS} "${VERIFY_CALL}" "${COMMIT_HASH}" )
+
+# Check if the result is true (1) or false (0)
+if [[ "${ALREADY_ATTESTED: -1}" == "1" ]]; then
+    echo "Commit hash ${COMMIT_HASH} already attested on-chain."
+    echo "Nothing to update."
+    exit 0
+fi
+
+# TODO: ensure enough balance for estimated cost
+
 # Navigate to the project root directory for workspace, .rustfmt.toml, etc.
 cd "$(dirname "$0")/.."
 
@@ -58,30 +90,26 @@ echo "fmt passed"
 # If we've reached this point, all checks have passed
 #
 
-# Step 6: Get the latest commit hash
-COMMIT_HASH=$(git rev-parse HEAD)
-echo "attesting git hash: ${COMMIT_HASH}"
-
-# Step 7: Load environment variables
-source .env
-
-# Step 8: create and submit transaction
+# create and submit transaction
 #
-# NOTE: this contract must match CI
-CONTRACT_ADDRESS="0x1f2f25561a11762bdffd91014c6d0e49af334447"
-RPC_ENDPOINT="https://rpc.adiri.tel"
-
-# Construct the function call
-FUNCTION_CALL="attestCommitHash(bytes20)"
-PRIVATE_KEY=${GITHUB_ATTESTATION_PRIVATE_KEY}
-
 # Send the transaction using cast
-TX_HASH=$(cast send --private-key ${PRIVATE_KEY} \
+output=$(cast send --private-key ${PRIVATE_KEY} \
     --rpc-url ${RPC_ENDPOINT} \
+    --chain "2017" \
     ${CONTRACT_ADDRESS} \
-    "${FUNCTION_CALL}" "${COMMIT_HASH}")
+    "${ATTEST_CALL}" "${COMMIT_HASH}" "true")
 
-echo "Transaction sent. Hash: ${TX_HASH}"
+# Check if the cast command was successful
+if [ $? -ne 0 ]; then
+    echo "failed to submit tx"
+    exit 1
+fi
+
+echo "\nTransaction output: ${output}\n"
+
+# Extract transaction hash using awk
+TX_HASH=$(echo "$output" | grep 'transactionHash' | grep -v 'logs' | awk '{print $NF}')
+
 echo "https://telscan.io/tx/${TX_HASH}"
 echo "Contract state update initiated with commit hash: ${COMMIT_HASH}"
 echo "Script took ${SECONDS}s to complete"
