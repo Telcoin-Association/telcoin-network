@@ -157,7 +157,7 @@ async fn test_get_network_peers_from_admin_server() {
     assert_eq!(19, resp.len());
 
     // Test getting all connected peers for primary 1
-    let resp = reqwest::get(format!(
+    let mut resp = reqwest::get(format!(
         "http://127.0.0.1:{}/peers",
         primary_1_parameters.network_admin_server.primary_network_admin_server_port
     ))
@@ -167,6 +167,20 @@ async fn test_get_network_peers_from_admin_server() {
     .await
     .unwrap();
 
+    let mut i = 0;
+    while i < 10 && resp.is_empty() {
+        i += 1;
+        std::thread::sleep(Duration::from_millis(1000));
+        resp = reqwest::get(format!(
+            "http://127.0.0.1:{}/peers",
+            primary_1_parameters.network_admin_server.primary_network_admin_server_port
+        ))
+        .await
+        .unwrap()
+        .json::<Vec<String>>()
+        .await
+        .unwrap();
+    }
     // Assert we returned 1 peers (only 1 worker spawned)
     assert_eq!(1, resp.len());
 
