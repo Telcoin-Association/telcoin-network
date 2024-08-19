@@ -87,11 +87,11 @@ echo "tests for workspace: default, all features, and no default features passed
 # check clippy
 #
 # default features
-cargo clippy +nightly --workspace -- -D warnings
+cargo +nightly clippy --workspace -- -D warnings
 # all features
 cargo +nightly clippy --workspace --all-features -- -D warnings
 # no default features
-cargo clippy +nightly --workspace --no-default-features -- -D warnings
+cargo +nightly clippy --workspace --no-default-features -- -D warnings
 
 echo "clippy for workspace: default, all features, and no default features passed"
 
@@ -99,7 +99,7 @@ echo "clippy for workspace: default, all features, and no default features passe
 for feature in "faucet" "redb" "rocksdb" "test-utils"
 do
     cargo test --workspace --features "${feature}" --no-fail-fast -- --show-output
-    cargo clippy +nightly --workspace --features "${feature}" -- -D warnings
+    cargo +nightly clippy --workspace --features "${feature}" -- -D warnings
     echo "tests and clippy passed for single feature: ${feature}"
 done
 
