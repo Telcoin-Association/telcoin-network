@@ -15,6 +15,12 @@ CARGO_TERM_COLOR=always
 RUST_BACKTRACE=1
 CARGO_PROFILE_DEV_DEBUG=0
 
+# Check for un-commited changes
+if [ -n "$(git status --porcelain)" ]; then
+    echo "Error: please commit changes before attesting HEAD commit hash."
+    exit 1
+fi
+
 # Step 1: compile tests
 cargo test --no-run --locked
 

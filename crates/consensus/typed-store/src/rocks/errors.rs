@@ -26,6 +26,7 @@ pub enum TypedStoreError {
     RetryableTransactionError,
 }
 
+#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Eq, PartialEq, Hash, Debug, Error)]
 pub(crate) struct RocksErrorDef {
     message: String,
@@ -49,6 +50,7 @@ impl Display for RocksErrorDef {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug, Error)]
 pub(crate) enum BincodeErrorDef {
     Io(String),
