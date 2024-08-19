@@ -5,8 +5,8 @@
 
 set -e  # Exit immediately if a command exits with a non-zero status
 
-# Get the current commit hash
-COMMIT_HASH=$(git rev-parse HEAD)
+# Get the commit SHA that triggered the workflow
+COMMIT_HASH="${GITHUB_SHA}"
 
 # adiri contract details
 #
