@@ -48,7 +48,7 @@ CONTRACT_ADDRESS="0x1f2f25561a11762bdffd91014c6d0e49af334447"
 RPC_ENDPOINT="https://rpc.adiri.tel"
 
 # Construct the function call
-FUNCTION_CALL="attestCommitHash(bytes32)"
+FUNCTION_CALL="attestCommitHash(bytes20)"
 PRIVATE_KEY=${GITHUB_ATTESTATION_PRIVATE_KEY}
 
 # Send the transaction using cast
