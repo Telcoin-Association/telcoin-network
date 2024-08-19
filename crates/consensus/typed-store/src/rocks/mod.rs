@@ -602,9 +602,9 @@ impl DBOptions {
 
         // Increase write buffer size to 256MiB.
         let write_buffer_size = read_size_from_env(ENV_VAR_MAX_WRITE_BUFFER_SIZE_MB)
-            .unwrap_or(DEFAULT_MAX_WRITE_BUFFER_SIZE_MB) *
-            1024 *
-            1024;
+            .unwrap_or(DEFAULT_MAX_WRITE_BUFFER_SIZE_MB)
+            * 1024
+            * 1024;
         self.options.set_write_buffer_size(write_buffer_size);
         // Since large blobs are not in sst files, reduce the target file size and base level
         // target size.
@@ -636,9 +636,9 @@ impl DBOptions {
     pub fn optimize_for_write_throughput(mut self) -> DBOptions {
         // Increase write buffer size to 256MiB.
         let write_buffer_size = read_size_from_env(ENV_VAR_MAX_WRITE_BUFFER_SIZE_MB)
-            .unwrap_or(DEFAULT_MAX_WRITE_BUFFER_SIZE_MB) *
-            1024 *
-            1024;
+            .unwrap_or(DEFAULT_MAX_WRITE_BUFFER_SIZE_MB)
+            * 1024
+            * 1024;
         self.options.set_write_buffer_size(write_buffer_size);
         // Increase write buffers to keep to 6 before slowing down writes.
         let max_write_buffer_number = read_size_from_env(ENV_VAR_MAX_WRITE_BUFFER_NUMBER)
@@ -662,9 +662,9 @@ impl DBOptions {
         // Increase sst file size to 128MiB.
         self.options.set_target_file_size_base(
             read_size_from_env(ENV_VAR_TARGET_FILE_SIZE_BASE_MB)
-                .unwrap_or(DEFAULT_TARGET_FILE_SIZE_BASE_MB) as u64 *
-                1024 *
-                1024,
+                .unwrap_or(DEFAULT_TARGET_FILE_SIZE_BASE_MB) as u64
+                * 1024
+                * 1024,
         );
 
         // Increase level 1 target size to 256MiB * 6 ~ 1.5GiB.
@@ -724,9 +724,9 @@ pub fn default_db_options() -> DBOptions {
     // future. If you need to modify an option, either update the default value, or override the
     // option in Sui / Narwhal.
     opt.set_db_write_buffer_size(
-        read_size_from_env(ENV_VAR_DB_WRITE_BUFFER_SIZE).unwrap_or(DEFAULT_DB_WRITE_BUFFER_SIZE) *
-            1024 *
-            1024,
+        read_size_from_env(ENV_VAR_DB_WRITE_BUFFER_SIZE).unwrap_or(DEFAULT_DB_WRITE_BUFFER_SIZE)
+            * 1024
+            * 1024,
     );
     opt.set_max_total_wal_size(
         read_size_from_env(ENV_VAR_DB_WAL_SIZE).unwrap_or(DEFAULT_DB_WAL_SIZE) as u64 * 1024 * 1024,

@@ -379,8 +379,8 @@ impl Database for RocksDatabase {
         // [`rocksdb::DBWithThreadMode::key_may_exist_cf`] can have false positives,
         // but no false negatives. We use it to short-circuit the absent case
         let readopts = self.opts.readopts();
-        Ok(self.rocksdb.key_may_exist_cf(&cf, &key_buf, &readopts) &&
-            self.rocksdb.get_pinned_cf_opt(&cf, &key_buf, &readopts)?.is_some())
+        Ok(self.rocksdb.key_may_exist_cf(&cf, &key_buf, &readopts)
+            && self.rocksdb.get_pinned_cf_opt(&cf, &key_buf, &readopts)?.is_some())
     }
 
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
