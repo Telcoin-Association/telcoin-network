@@ -6,6 +6,9 @@
 #
 # This approach is adopted due to CI limitations using GitHub actions.
 
+# Reset SECONDS to zero at the beginning of the script
+SECONDS=0
+
 set -e  # Exit immediately if a command exits with a non-zero status
 
 # set environment
@@ -15,7 +18,7 @@ CARGO_TERM_COLOR=always
 RUST_BACKTRACE=1
 CARGO_PROFILE_DEV_DEBUG=0
 
-# Check for un-commited changes
+# Check for un-committed changes
 if [ -n "$(git status --porcelain)" ]; then
     echo "Error: please commit changes before attesting HEAD commit hash."
     exit 1
@@ -76,3 +79,4 @@ TX_HASH=$(cast send --private-key ${PRIVATE_KEY} \
 echo "Transaction sent. Hash: ${TX_HASH}"
 echo "https://telscan.io/tx/${TX_HASH}"
 echo "Contract state update initiated with commit hash: ${COMMIT_HASH}"
+echo "Script took ${SECONDS}s to complete"
