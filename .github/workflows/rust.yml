@@ -42,7 +42,7 @@ jobs:
 
       - name: verify commit hash on adiri
         env:
-          COMMIT_HASH: ${{ github.sha }}
+          COMMIT_HASH: ${{ github.event.pull_request.head.sha }}
         run: .github/scripts/verify_commit_hash.sh
 
       # # faucet tests with google KMS
