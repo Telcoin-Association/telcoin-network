@@ -12,7 +12,7 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
-  rust:
+  verify-on-chain:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

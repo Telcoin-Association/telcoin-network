@@ -9,26 +9,36 @@
 set -e  # Exit immediately if a command exits with a non-zero status
 
 # set environment
-CARGO_INCREMENTAL: 0 # disable incremental compilation
-RUSTFLAGS: "-D warnings -D unused_extern_crates"
-CARGO_TERM_COLOR: always
-RUST_BACKTRACE: 1
-CARGO_PROFILE_DEV_DEBUG: 0
+CARGO_INCREMENTAL=0 # disable incremental compilation
+RUSTFLAGS="-D warnings -D unused_extern_crates"
+CARGO_TERM_COLOR=always
+RUST_BACKTRACE=1
+CARGO_PROFILE_DEV_DEBUG=0
 
 # Step 1: compile tests
 cargo test --no-run --locked
 
+echo "finished building tests"
+
 # Step 2: compile workspace
-cargo build --workspace --all-features --quite
+cargo build --workspace --all-features --quiet
+
+echo "finished compiling workspace"
 
 # Step 3: run all tests
-cargo test --workspace --all-features --no-fail-fast -- --test-threads 4 ;
+cargo test --workspace --all-features --no-fail-fast -- --show-output ;
+
+echo "tests for workspace --all-features passed"
 
 # Step 4: Check clippy
-cargo +nighly clippy --workspace --all-features -- -D warnings
+cargo +nightly clippy --workspace --all-features -- -D warnings
+
+echo "clippy passed"
 
 # Step 5: Check cargo fmt
 cargo +nightly fmt -- --check
+
+echo "fmt passed"
 
 #
 # If we've reached this point, all checks have passed

@@ -105,7 +105,7 @@ async fn test_get_network_peers_from_admin_server() {
     );
 
     // Wait for tasks to start
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let registry_1 = Registry::new();
     let metrics_1 = Metrics::new_with_registry(&registry_1);
