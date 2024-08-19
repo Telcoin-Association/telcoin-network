@@ -2,6 +2,7 @@
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 use async_trait::async_trait;
 use fastcrypto::encoding::{Encoding, Hex};
@@ -15,7 +16,7 @@ use prometheus::Registry;
 use tn_batch_validator::NoopBatchValidator;
 use tn_types::{
     test_utils::{temp_dir, CommitteeFixture},
-    ChainIdentifier,
+    Batch, ChainIdentifier,
 };
 use tokio::sync::watch;
 
@@ -50,14 +51,7 @@ impl BatchValidation for NilBatchValidator {
 //     };
 
 //     // Create a new test store.
-//     let batch_store = rocks::DBMap::<BatchDigest, Batch>::open(
-//         temp_dir(),
-//         MetricConf::default(),
-//         None,
-//         Some("batches"),
-//         &ReadWriteOptions::default(),
-//     )
-//     .unwrap();
+//     let batch_store = MemDB::<BatchDigest, Batch>::open().unwrap();
 
 //     let registry = Registry::new();
 //     let metrics = Metrics::new_with_registry(&registry);
@@ -130,14 +124,7 @@ impl BatchValidation for NilBatchValidator {
 //     };
 
 //     // Create a new test store.
-//     let batch_store = rocks::DBMap::<BatchDigest, Batch>::open(
-//         temp_dir(),
-//         MetricConf::default(),
-//         None,
-//         Some("batches"),
-//         &ReadWriteOptions::default(),
-//     )
-//     .unwrap();
+//     let batch_store = MemDB::<BatchDigest, Batch>::open().unwrap();
 
 //     let registry = Registry::new();
 //     let metrics = Metrics::new_with_registry(&registry);
@@ -245,14 +232,7 @@ impl BatchValidation for NilBatchValidator {
 //     };
 
 //     // Create a new test store.
-//     let batch_store = rocks::DBMap::<BatchDigest, Batch>::open(
-//         temp_dir(),
-//         MetricConf::default(),
-//         None,
-//         Some("batches"),
-//         &ReadWriteOptions::default(),
-//     )
-//     .unwrap();
+//     let batch_store = MemDB::<BatchDigest, Batch>::open().unwrap();
 
 //     let registry = Registry::new();
 //     let metrics = Metrics::new_with_registry(&registry);

@@ -8,7 +8,7 @@ use assert_matches::assert_matches;
 use fastcrypto::hash::Hash;
 use narwhal_network::client::NetworkClient;
 use narwhal_network_types::MockWorkerToPrimary;
-use narwhal_typed_store::Map;
+use narwhal_typed_store::{open_db, tables::Batches, traits::Database};
 use narwhal_worker::{metrics::WorkerMetrics, BatchMaker, NUM_SHUTDOWN_RECEIVERS};
 use reth::{beacon_consensus::EthBeaconConsensus, tasks::TaskManager};
 use reth_blockchain_tree::noop::NoopBlockchainTree;
@@ -26,10 +26,11 @@ use reth_transaction_pool::{
     blobstore::InMemoryBlobStore, PoolConfig, TransactionPool, TransactionValidationTaskExecutor,
 };
 use std::{sync::Arc, time::Duration};
+use tempfile::TempDir;
 use tn_batch_maker::{BatchMakerBuilder, MiningMode};
 use tn_batch_validator::{BatchValidation, BatchValidator};
 use tn_types::{
-    test_utils::{create_batch_store, get_gas_price, test_genesis, TransactionFactory},
+    test_utils::{get_gas_price, test_genesis, TransactionFactory},
     Batch, BatchAPI, Consensus, MetadataAPI, PreSubscribedBroadcastSender,
 };
 use tokio::time::timeout;
@@ -47,7 +48,8 @@ async fn test_make_batch_el_to_cl() {
     //
 
     let network_client = NetworkClient::new_with_empty_id();
-    let store = create_batch_store();
+    let temp_dir = TempDir::new().unwrap();
+    let store = open_db(temp_dir.path());
     let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
     let (tx_quorum_waiter, mut rx_quorum_waiter) = tn_types::test_channel!(1);
     let node_metrics = WorkerMetrics::default();
@@ -216,12 +218,12 @@ async fn test_make_batch_el_to_cl() {
 
     // ensure enough time passes for store to pass
     let _ = tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    let first_batch = store.safe_iter().next();
+    let first_batch = store.iter::<Batches>().next();
     debug!("first batch? {:?}", first_batch);
 
     // Ensure the batch is stored
     let batch_from_store = store
-        .get(&expected_batch.digest())
+        .get::<Batches>(&expected_batch.digest())
         .expect("store searched for batch")
         .expect("batch in store");
     let sealed_header_from_batch_store = batch_from_store.versioned_metadata().sealed_header();

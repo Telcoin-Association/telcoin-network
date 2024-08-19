@@ -11,6 +11,7 @@ use consensus_metrics::{
 use fastcrypto::hash::Hash as _;
 use narwhal_primary_metrics::PrimaryMetrics;
 use narwhal_storage::ProposerStore;
+use narwhal_typed_store::traits::Database;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
@@ -48,7 +49,7 @@ const DEFAULT_HEADER_RESEND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The proposer creates new headers and send them to the core for broadcasting and further
 /// processing.
-pub struct Proposer {
+pub struct Proposer<DB: Database> {
     /// The id of this primary.
     authority_id: AuthorityIdentifier,
     /// The committee information.
@@ -82,7 +83,7 @@ pub struct Proposer {
     tx_headers: Sender<Header>,
 
     /// The proposer store for persisting the last header.
-    proposer_store: ProposerStore,
+    proposer_store: ProposerStore<DB>,
     /// The current round of the dag.
     round: Round,
     /// Last time the round has been updated
@@ -113,13 +114,13 @@ pub struct Proposer {
     leader_schedule: LeaderSchedule,
 }
 
-impl Proposer {
+impl<DB: Database + 'static> Proposer<DB> {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn spawn(
         authority_id: AuthorityIdentifier,
         committee: Committee,
-        proposer_store: ProposerStore,
+        proposer_store: ProposerStore<DB>,
         header_num_of_batches_threshold: usize,
         max_header_num_of_batches: usize,
         max_header_delay: Duration,

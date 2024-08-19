@@ -8,6 +8,7 @@ use crate::consensus::{
 };
 use fastcrypto::hash::Hash;
 use narwhal_storage::ConsensusStore;
+use narwhal_typed_store::DatabaseType;
 use std::{collections::VecDeque, sync::Arc};
 use tn_types::{Committee, Stake};
 
@@ -27,7 +28,7 @@ pub struct Bullshark {
     /// The committee information.
     pub committee: Committee,
     /// Persistent storage to safe ensure crash-recovery.
-    pub store: Arc<ConsensusStore>,
+    pub store: Arc<ConsensusStore<DatabaseType>>,
     /// The most recent round of inserted certificate
     pub max_inserted_certificate_round: Round,
     pub metrics: Arc<ConsensusMetrics>,
@@ -46,7 +47,7 @@ impl Bullshark {
     /// Create a new Bullshark consensus instance.
     pub fn new(
         committee: Committee,
-        store: Arc<ConsensusStore>,
+        store: Arc<ConsensusStore<DatabaseType>>,
         metrics: Arc<ConsensusMetrics>,
         num_sub_dags_per_schedule: u64,
         leader_schedule: LeaderSchedule,

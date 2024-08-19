@@ -4,7 +4,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use narwhal_network_types::{MockWorkerToWorker, WorkerToWorkerServer};
+use narwhal_typed_store::open_db;
 use std::vec;
+use tempfile::TempDir;
 use tn_types::test_utils::{batch, random_network, CommitteeFixture};
 
 use super::*;
@@ -20,7 +22,8 @@ async fn synchronize() {
     let id = 0;
 
     // Create a new test store.
-    let store = tn_types::test_utils::create_batch_store();
+    let temp_dir = TempDir::new().unwrap();
+    let store = open_db(temp_dir.path());
 
     // Create network with mock behavior to respond to RequestBatches request.
     let target_primary = fixture.authorities().nth(1).unwrap();
@@ -67,14 +70,14 @@ async fn synchronize() {
     };
 
     // Verify the batch is not in store
-    assert!(store.get(&digest).unwrap().is_none());
+    assert!(store.get::<Batches>(&digest).unwrap().is_none());
 
     // Send a sync request.
     let request = anemo::Request::new(message);
     handler.synchronize(request).await.unwrap();
 
     // Verify it is now stored
-    assert!(store.get(&digest).unwrap().is_some());
+    assert!(store.get::<Batches>(&digest).unwrap().is_some());
 }
 
 #[tokio::test]
@@ -87,7 +90,8 @@ async fn synchronize_when_batch_exists() {
     let id = 0;
 
     // Create a new test store.
-    let store = tn_types::test_utils::create_batch_store();
+    let temp_dir = TempDir::new().unwrap();
+    let store = open_db(temp_dir.path());
 
     // Create network without mock behavior since it will not be needed.
     let send_network = random_network();
@@ -107,7 +111,7 @@ async fn synchronize_when_batch_exists() {
     let batch = batch();
     let batch_id = batch.digest();
     let missing = vec![batch_id];
-    store.insert(&batch_id, &batch).unwrap();
+    store.insert::<Batches>(&batch_id, &batch).unwrap();
 
     // Send a sync request.
     let target_primary = fixture.authorities().nth(1).unwrap();

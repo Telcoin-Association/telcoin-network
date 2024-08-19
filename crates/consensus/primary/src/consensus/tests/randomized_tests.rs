@@ -9,6 +9,7 @@ use crate::consensus::{
 use fastcrypto::hash::{Hash, HashFunction};
 use futures::{stream::FuturesUnordered, StreamExt};
 use narwhal_storage::ConsensusStore;
+use narwhal_typed_store::DatabaseType;
 use rand::{
     distributions::{Bernoulli, Distribution},
     prelude::SliceRandom,
@@ -472,7 +473,7 @@ fn generate_and_run_execution_plans(
     dag_rounds: Round,
     run_id: u64,
     modes: FailureModes,
-    store: Arc<ConsensusStore>,
+    store: Arc<ConsensusStore<DatabaseType>>,
 ) {
     println!(
         "Running execution plans for run_id {} for rounds={}, committee={}, gc_depth={}, modes={:?}",

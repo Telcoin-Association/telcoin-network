@@ -32,7 +32,7 @@ use narwhal_network::{
     failpoints::FailpointsMakeCallbackHandler,
     metrics::MetricsMakeCallbackHandler,
 };
-use narwhal_typed_store::rocks::DBMap;
+use narwhal_typed_store::DatabaseType;
 use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, thread::sleep, time::Duration};
 use tn_batch_validator::BatchValidation;
 use tn_types::{
@@ -42,7 +42,7 @@ use tn_types::{
 
 use narwhal_network_types::{PrimaryToWorkerServer, WorkerToWorkerServer};
 use tap::TapFallible;
-use tn_types::{Batch, BatchDigest, ConditionalBroadcastReceiver, PreSubscribedBroadcastSender};
+use tn_types::{ConditionalBroadcastReceiver, PreSubscribedBroadcastSender};
 use tokio::task::JoinHandle;
 use tower::ServiceBuilder;
 use tracing::{error, info};
@@ -71,7 +71,7 @@ pub struct Worker {
     /// The configuration parameters
     parameters: Parameters,
     /// The persistent storage.
-    store: DBMap<BatchDigest, Batch>,
+    store: DatabaseType,
 }
 
 impl Worker {
@@ -85,7 +85,7 @@ impl Worker {
         parameters: Parameters,
         validator: impl BatchValidation,
         client: NetworkClient,
-        store: DBMap<BatchDigest, Batch>,
+        store: DatabaseType,
         metrics: Metrics,
         tx_shutdown: &mut PreSubscribedBroadcastSender,
         // for EL batch maker

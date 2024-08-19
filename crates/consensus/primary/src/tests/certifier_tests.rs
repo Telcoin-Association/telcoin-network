@@ -12,6 +12,7 @@ use narwhal_network_types::{MockPrimaryToPrimary, PrimaryToPrimaryServer, Reques
 use narwhal_primary_metrics::PrimaryChannelMetrics;
 use rand::{rngs::StdRng, SeedableRng};
 use std::num::NonZeroUsize;
+use tempfile::TempDir;
 use tn_types::{
     test_utils::CommitteeFixture, BlsKeypair, CertificateAPI, PreSubscribedBroadcastSender,
     SignatureVerificationState,
@@ -140,6 +141,7 @@ use tokio::sync::watch;
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn propose_header_and_form_certificate_v2() {
+    let temp_dir = TempDir::new().unwrap();
     reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder().randomize_ports(true).build();
     let committee = fixture.committee();
@@ -158,7 +160,7 @@ async fn propose_header_and_form_certificate_v2() {
     let (tx_parents, _rx_parents) = tn_types::test_channel!(1);
     let (_tx_consensus_round_updates, rx_consensus_round_updates) =
         watch::channel(ConsensusRound::new(0, 0));
-    let (certificate_store, payload_store) = create_db_stores();
+    let (certificate_store, payload_store, _) = create_db_stores(temp_dir.path());
 
     // Create a fake header.
     let proposed_header = primary.header(&committee);
@@ -246,6 +248,7 @@ async fn propose_header_and_form_certificate_v2() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn propose_header_failure() {
+    let temp_dir = TempDir::new().unwrap();
     reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder().randomize_ports(true).build();
     let committee = fixture.committee();
@@ -264,7 +267,7 @@ async fn propose_header_failure() {
     let (tx_parents, _rx_parents) = tn_types::test_channel!(1);
     let (_tx_consensus_round_updates, rx_consensus_round_updates) =
         watch::channel(ConsensusRound::default());
-    let (certificate_store, payload_store) = create_db_stores();
+    let (certificate_store, payload_store, _) = create_db_stores(temp_dir.path());
 
     // Create a fake header.
     let proposed_header = primary.header(&committee);
@@ -374,7 +377,8 @@ async fn run_vote_aggregator_with_param(
     let (tx_parents, _rx_parents) = tn_types::test_channel!(1);
     let (_tx_consensus_round_updates, rx_consensus_round_updates) =
         watch::channel(ConsensusRound::new(0, 0));
-    let (certificate_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let (certificate_store, payload_store, _) = create_db_stores(temp_dir.path());
 
     // Create a fake header.
     let proposed_header = primary.header(&committee);
@@ -484,7 +488,8 @@ async fn test_shutdown_core() {
         watch::channel(ConsensusRound::new(0, 0));
 
     // Create test stores.
-    let (certificate_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let (certificate_store, payload_store, _) = create_db_stores(temp_dir.path());
 
     // Make a synchronizer for the core.
     let synchronizer = Arc::new(Synchronizer::new(

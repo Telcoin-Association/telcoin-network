@@ -19,6 +19,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tempfile::TempDir;
 use tn_types::{
     error::DagError,
     test_utils::{make_optimal_signed_certificates, mock_signed_certificate, CommitteeFixture},
@@ -46,7 +47,8 @@ async fn accept_certificates() {
         watch::channel(ConsensusRound::default());
 
     // Create test stores.
-    let (certificate_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let (certificate_store, payload_store, _) = create_db_stores(temp_dir.path());
 
     // Make a synchronizer.
     let synchronizer = Arc::new(Synchronizer::new(
@@ -125,7 +127,8 @@ async fn accept_suspended_certificates() {
     let authority_id = primary.id();
     let client = NetworkClient::new_from_keypair(&primary.network_keypair());
 
-    let (certificate_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let (certificate_store, payload_store, _) = create_db_stores(temp_dir.path());
     let (tx_certificate_fetcher, _rx_certificate_fetcher) = tn_types::test_channel!(100);
     let (tx_new_certificates, _rx_new_certificates) = tn_types::test_channel!(100);
     let (tx_parents, _rx_parents) = tn_types::test_channel!(100);
@@ -224,7 +227,8 @@ async fn synchronizer_recover_basic() {
         watch::channel(ConsensusRound::default());
 
     // Create test stores.
-    let (certificate_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let (certificate_store, payload_store, _) = create_db_stores(temp_dir.path());
 
     // Make Synchronizer.
     let synchronizer = Arc::new(Synchronizer::new(
@@ -324,7 +328,8 @@ async fn synchronizer_recover_partial_certs() {
         watch::channel(ConsensusRound::default());
 
     // Create test stores.
-    let (certificate_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let (certificate_store, payload_store, _) = create_db_stores(temp_dir.path());
 
     // Make a synchronizer.
     let synchronizer = Arc::new(Synchronizer::new(
@@ -422,7 +427,8 @@ async fn synchronizer_recover_previous_round() {
         watch::channel(ConsensusRound::default());
 
     // Create test stores.
-    let (certificate_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let (certificate_store, payload_store, _) = create_db_stores(temp_dir.path());
 
     // Make a synchronizer.
     let synchronizer = Arc::new(Synchronizer::new(
@@ -511,7 +517,8 @@ async fn deliver_certificate_using_store() {
     let metrics = Arc::new(PrimaryMetrics::default());
     let primary_channel_metrics = PrimaryChannelMetrics::default();
 
-    let (certificates_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let (certificates_store, payload_store, _) = create_db_stores(temp_dir.path());
     let (tx_certificate_fetcher, _rx_certificate_fetcher) = tn_types::test_channel!(1);
     let (tx_new_certificates, _rx_new_certificates) = tn_types::test_channel!(100);
     let (tx_parents, _rx_parents) = tn_types::test_channel!(100);
@@ -568,7 +575,8 @@ async fn deliver_certificate_not_found_parents() {
     let metrics = Arc::new(PrimaryMetrics::default());
     let primary_channel_metrics = PrimaryChannelMetrics::default();
 
-    let (certificates_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let (certificates_store, payload_store, _) = create_db_stores(temp_dir.path());
     let (tx_certificate_fetcher, mut rx_certificate_fetcher) = tn_types::test_channel!(1);
     let (tx_new_certificates, _rx_new_certificates) = tn_types::test_channel!(100);
     let (tx_parents, _rx_parents) = tn_types::test_channel!(100);
@@ -634,7 +642,8 @@ async fn sanitize_fetched_certificates() {
     let metrics = Arc::new(PrimaryMetrics::default());
     let primary_channel_metrics = PrimaryChannelMetrics::default();
 
-    let (certificates_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let (certificates_store, payload_store, _) = create_db_stores(temp_dir.path());
     let (tx_certificate_fetcher, _rx_certificate_fetcher) = tn_types::test_channel!(1);
     let (tx_new_certificates, _rx_new_certificates) = tn_types::test_channel!(10000);
     let (tx_parents, _rx_parents) = tn_types::test_channel!(10000);
@@ -744,7 +753,8 @@ async fn sync_batches_drops_old() {
     let author = fixture.authorities().nth(2).unwrap();
     let client = NetworkClient::new_from_keypair(&primary.network_keypair());
 
-    let (certificate_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let (certificate_store, payload_store, _) = create_db_stores(temp_dir.path());
     let (tx_certificate_fetcher, _rx_certificate_fetcher) = tn_types::test_channel!(1);
     let (tx_new_certificates, _rx_new_certificates) = tn_types::test_channel!(100);
     let (tx_parents, _rx_parents) = tn_types::test_channel!(100);
@@ -822,7 +832,8 @@ async fn gc_suspended_certificates() {
     let primary = fixture.authorities().next().unwrap();
     let client = NetworkClient::new_from_keypair(&primary.network_keypair());
 
-    let (certificate_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let (certificate_store, payload_store, _) = create_db_stores(temp_dir.path());
     let (tx_certificate_fetcher, _rx_certificate_fetcher) = tn_types::test_channel!(100);
     let (tx_new_certificates, mut rx_new_certificates) = tn_types::test_channel!(100);
     let (tx_parents, _rx_parents) = tn_types::test_channel!(100);

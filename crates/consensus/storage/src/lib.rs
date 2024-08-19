@@ -11,11 +11,11 @@ mod vote_digest_store;
 
 pub use certificate_store::*;
 pub use consensus_store::*;
-use narwhal_typed_store::TypedStoreError;
 pub use node_store::*;
 pub use payload_store::*;
 pub use proposer_store::*;
 pub use vote_digest_store::*;
 
 /// Convenience type to propagate store errors.
-pub type StoreResult<T> = Result<T, TypedStoreError>;
+/// Use eyre- just YOLO these errors for now...
+pub type StoreResult<T> = eyre::Result<T>;

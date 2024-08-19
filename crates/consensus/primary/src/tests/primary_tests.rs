@@ -21,7 +21,10 @@ use narwhal_network_types::{
     FetchCertificatesRequest, MockPrimaryToWorker, PrimaryToPrimary, RequestVoteRequest,
 };
 use narwhal_primary_metrics::{PrimaryChannelMetrics, PrimaryMetrics};
-use narwhal_storage::{NodeStorage, VoteDigestStore};
+use narwhal_storage::{
+    CertificateStore, CertificateStoreCache, NodeStorage, PayloadStore, VoteDigestStore,
+};
+use narwhal_typed_store::open_db;
 use narwhal_worker::{
     metrics::{Metrics, WorkerChannelMetrics},
     Worker,
@@ -33,6 +36,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tempfile::TempDir;
 use tn_batch_validator::NoopBatchValidator;
 use tn_types::{
     now,
@@ -301,7 +305,8 @@ async fn test_request_vote_has_missing_parents() {
         tn_types::test_utils::test_network(target.network_keypair(), target.network_address());
     let client = NetworkClient::new_from_keypair(&target.network_keypair());
 
-    let (certificate_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let (certificate_store, payload_store, vote_digest_store) = create_db_stores(temp_dir.path());
     let (tx_certificate_fetcher, _rx_certificate_fetcher) = tn_types::test_channel!(1);
     let (tx_new_certificates, _rx_new_certificates) = tn_types::test_channel!(100);
     let (tx_parents, _rx_parents) = tn_types::test_channel!(100);
@@ -331,7 +336,7 @@ async fn test_request_vote_has_missing_parents() {
         synchronizer: synchronizer.clone(),
         signature_service,
         certificate_store: certificate_store.clone(),
-        vote_digest_store: VoteDigestStore::new_for_tests(),
+        vote_digest_store,
         rx_narwhal_round_updates,
         parent_digests: Default::default(),
         metrics: metrics.clone(),
@@ -443,7 +448,16 @@ async fn test_request_vote_accept_missing_parents() {
         tn_types::test_utils::test_network(target.network_keypair(), target.network_address());
     let client = NetworkClient::new_from_keypair(&target.network_keypair());
 
-    let (certificate_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let db = open_db(temp_dir.path());
+    let (certificate_store, payload_store, vote_digest_store) = (
+        CertificateStore::new(
+            db.clone(),
+            CertificateStoreCache::new(NonZeroUsize::new(100).unwrap(), None),
+        ),
+        PayloadStore::new(db.clone()),
+        VoteDigestStore::new(db),
+    );
     let (tx_certificate_fetcher, _rx_certificate_fetcher) = tn_types::test_channel!(1);
     let (tx_new_certificates, _rx_new_certificates) = tn_types::test_channel!(100);
     let (tx_parents, _rx_parents) = tn_types::test_channel!(100);
@@ -473,7 +487,7 @@ async fn test_request_vote_accept_missing_parents() {
         synchronizer: synchronizer.clone(),
         signature_service,
         certificate_store: certificate_store.clone(),
-        vote_digest_store: VoteDigestStore::new_for_tests(),
+        vote_digest_store,
         rx_narwhal_round_updates,
         parent_digests: Default::default(),
         metrics: metrics.clone(),
@@ -574,7 +588,8 @@ async fn test_request_vote_missing_batches() {
         tn_types::test_utils::test_network(primary.network_keypair(), primary.network_address());
     let client = NetworkClient::new_from_keypair(&primary.network_keypair());
 
-    let (certificate_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let (certificate_store, payload_store, vote_digest_store) = create_db_stores(temp_dir.path());
     let (tx_certificate_fetcher, _rx_certificate_fetcher) = tn_types::test_channel!(1);
     let (tx_new_certificates, _rx_new_certificates) = tn_types::test_channel!(100);
     let (tx_parents, _rx_parents) = tn_types::test_channel!(100);
@@ -604,7 +619,7 @@ async fn test_request_vote_missing_batches() {
         synchronizer: synchronizer.clone(),
         signature_service,
         certificate_store: certificate_store.clone(),
-        vote_digest_store: VoteDigestStore::new_for_tests(),
+        vote_digest_store,
         rx_narwhal_round_updates,
         parent_digests: Default::default(),
         metrics: metrics.clone(),
@@ -696,7 +711,8 @@ async fn test_request_vote_already_voted() {
         tn_types::test_utils::test_network(primary.network_keypair(), primary.network_address());
     let client = NetworkClient::new_from_keypair(&primary.network_keypair());
 
-    let (certificate_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let (certificate_store, payload_store, vote_digest_store) = create_db_stores(temp_dir.path());
     let (tx_certificate_fetcher, _rx_certificate_fetcher) = tn_types::test_channel!(1);
     let (tx_new_certificates, _rx_new_certificates) = tn_types::test_channel!(100);
     let (tx_parents, _rx_parents) = tn_types::test_channel!(100);
@@ -727,7 +743,7 @@ async fn test_request_vote_already_voted() {
         synchronizer: synchronizer.clone(),
         signature_service,
         certificate_store: certificate_store.clone(),
-        vote_digest_store: VoteDigestStore::new_for_tests(),
+        vote_digest_store,
         rx_narwhal_round_updates,
         parent_digests: Default::default(),
         metrics: metrics.clone(),
@@ -849,7 +865,16 @@ async fn test_fetch_certificates_handler() {
     let primary_channel_metrics = PrimaryChannelMetrics::default();
     let client = NetworkClient::new_from_keypair(&primary.network_keypair());
 
-    let (certificate_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let db = open_db(temp_dir.path());
+    let (certificate_store, payload_store, vote_digest_store) = (
+        CertificateStore::new(
+            db.clone(),
+            CertificateStoreCache::new(NonZeroUsize::new(100).unwrap(), None),
+        ),
+        PayloadStore::new(db.clone()),
+        VoteDigestStore::new(db),
+    );
     let (tx_certificate_fetcher, _rx_certificate_fetcher) = tn_types::test_channel!(1);
     let (tx_new_certificates, _rx_new_certificates) = tn_types::test_channel!(100);
     let (tx_parents, _rx_parents) = tn_types::test_channel!(100);
@@ -879,7 +904,7 @@ async fn test_fetch_certificates_handler() {
         synchronizer: synchronizer.clone(),
         signature_service,
         certificate_store: certificate_store.clone(),
-        vote_digest_store: VoteDigestStore::new_for_tests(),
+        vote_digest_store,
         rx_narwhal_round_updates,
         parent_digests: Default::default(),
         metrics: metrics.clone(),
@@ -991,7 +1016,16 @@ async fn test_request_vote_created_at_in_future() {
         tn_types::test_utils::test_network(primary.network_keypair(), primary.network_address());
     let client = NetworkClient::new_from_keypair(&primary.network_keypair());
 
-    let (certificate_store, payload_store) = create_db_stores();
+    let temp_dir = TempDir::new().unwrap();
+    let db = open_db(temp_dir.path());
+    let (certificate_store, payload_store, vote_digest_store) = (
+        CertificateStore::new(
+            db.clone(),
+            CertificateStoreCache::new(NonZeroUsize::new(100).unwrap(), None),
+        ),
+        PayloadStore::new(db.clone()),
+        VoteDigestStore::new(db),
+    );
     let (tx_certificate_fetcher, _rx_certificate_fetcher) = tn_types::test_channel!(1);
     let (tx_new_certificates, _rx_new_certificates) = tn_types::test_channel!(100);
     let (tx_parents, _rx_parents) = tn_types::test_channel!(100);
@@ -1021,7 +1055,7 @@ async fn test_request_vote_created_at_in_future() {
         synchronizer: synchronizer.clone(),
         signature_service,
         certificate_store: certificate_store.clone(),
-        vote_digest_store: VoteDigestStore::new_for_tests(),
+        vote_digest_store,
         rx_narwhal_round_updates,
         parent_digests: Default::default(),
         metrics: metrics.clone(),

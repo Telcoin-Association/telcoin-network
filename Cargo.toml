@@ -17,7 +17,6 @@ members = [
     "crates/consensus/telcoin-sync",
     "crates/consensus/test-utils",
     "crates/consensus/typed-store",
-    "crates/consensus/typed-store-derive",
     "crates/consensus/worker",
     "crates/consensus/primary-metrics",
 
@@ -218,7 +217,6 @@ narwhal-executor = { path = "./crates/consensus/executor" }
 narwhal-network = { path = "./crates/consensus/network" }
 narwhal-worker = { path = "./crates/consensus/worker" }
 narwhal-typed-store = { path = "./crates/consensus/typed-store" }
-narwhal-typed-store-derive = { path = "./crates/consensus/typed-store-derive" }
 narwhal-storage = { path = "./crates/consensus/storage" }
 narwhal-primary = { path = "./crates/consensus/primary" }
 narwhal-test-utils = { path = "./crates/consensus/test-utils" }
@@ -296,14 +294,6 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
 ] }
-
-rocksdb = { version = "0.22.0", features = [
-    "snappy",
-    "lz4",
-    "zstd",
-    "zlib",
-    "multi-threaded-cf",
-], default-features = false }
 
 axum = { version = "0.6.6", default-features = false, features = [
     "headers",

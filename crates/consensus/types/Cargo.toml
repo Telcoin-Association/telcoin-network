@@ -44,7 +44,6 @@ anemo = { workspace = true }
 once_cell = { workspace = true }
 match_opt = { workspace = true }
 multiaddr = { workspace = true }
-narwhal-typed-store = { workspace = true }
 telcoin-sync = { workspace = true }
 alloy-rlp = { workspace = true }
 

@@ -6,7 +6,6 @@ use crate::{
     config::Epoch, crypto, CertificateDigest, HeaderDigest, Round, TimestampSec, VoteDigest,
 };
 use fastcrypto::hash::Digest;
-use narwhal_typed_store::StoreError;
 use std::sync::Arc;
 use telcoin_sync::sync::notify_once::NotifyOnce;
 use thiserror::Error;
@@ -30,7 +29,9 @@ pub type DagResult<T> = Result<T, DagError>;
 // Notification for certificate accepted.
 pub type AcceptNotification = Arc<NotifyOnce>;
 
-#[derive(Clone, Debug, Error)]
+pub type StoreError = eyre::Report;
+
+#[derive(Debug, Error)]
 pub enum DagError {
     #[error("Channel {0} has closed unexpectedly")]
     ClosedChannel(String),

@@ -23,6 +23,7 @@ prometheus.workspace = true
 lru.workspace = true
 parking_lot.workspace = true
 tap.workspace = true
+eyre = { workspace = true }
 
 [dev-dependencies]
 tn-types = { workspace = true, features = ["test-utils"] }

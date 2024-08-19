@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use narwhal_storage::ConsensusStore;
+use narwhal_typed_store::DatabaseType;
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 use std::{
@@ -187,7 +188,7 @@ impl LeaderSchedule {
     /// for the LeaderSchedule.
     pub fn from_store(
         committee: Committee,
-        store: Arc<ConsensusStore>,
+        store: Arc<ConsensusStore<DatabaseType>>,
         bad_nodes_stake_threshold: u64,
     ) -> Self {
         let table = store.read_latest_commit_with_final_reputation_scores().map_or(

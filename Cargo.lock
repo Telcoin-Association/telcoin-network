@@ -5664,6 +5664,7 @@ dependencies = [
 name = "narwhal-storage"
 version = "0.1.0"
 dependencies = [
+ "eyre",
  "fastcrypto",
  "futures",
  "lru 0.10.1",
@@ -5736,13 +5737,13 @@ dependencies = [
  "fdlimit",
  "hdrhistogram",
  "itertools 0.10.5",
- "narwhal-typed-store-derive",
  "once_cell",
  "ouroboros",
  "proc-macro2",
  "prometheus",
  "quote",
  "rand 0.8.5",
+ "redb",
  "rocksdb",
  "rstest",
  "serde",
@@ -5751,23 +5752,10 @@ dependencies = [
  "telcoin-macros",
  "tempfile",
  "thiserror",
+ "tn-types",
  "tokio",
  "tracing",
  "uint",
-]
-
-[[package]]
-name = "narwhal-typed-store-derive"
-version = "0.1.0"
-dependencies = [
- "eyre",
- "narwhal-typed-store",
- "proc-macro2",
- "quote",
- "rocksdb",
- "syn 2.0.72",
- "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -7146,6 +7134,15 @@ name = "recvmsg"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
+
+[[package]]
+name = "redb"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6dd20d3cdeb9c7d2366a0b16b93b35b75aec15309fbeb7ce477138c9f68c8c0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "redox_syscall"
@@ -11065,6 +11062,7 @@ dependencies = [
  "reth-stages",
  "reth-tracing",
  "reth-transaction-pool",
+ "tempfile",
  "tn-batch-validator",
  "tn-types",
  "tokio",
@@ -11268,7 +11266,6 @@ dependencies = [
  "match_opt",
  "mem-utils",
  "multiaddr 0.17.1",
- "narwhal-typed-store",
  "once_cell",
  "prometheus",
  "proptest",

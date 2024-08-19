@@ -1,53 +1,21 @@
-use std::num::NonZeroUsize;
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
-use narwhal_storage::{CertificateStore, CertificateStoreCache, PayloadStore, PayloadToken};
-use narwhal_typed_store::{
-    reopen, rocks,
-    rocks::{DBMap, MetricConf, ReadWriteOptions},
-};
-use tn_types::{
-    test_utils::{
-        temp_dir, CERTIFICATES_CF, CERTIFICATE_DIGEST_BY_ORIGIN_CF, CERTIFICATE_DIGEST_BY_ROUND_CF,
-        PAYLOAD_CF,
-    },
-    AuthorityIdentifier, BatchDigest, Certificate, CertificateDigest, Round, WorkerId,
-};
 
-pub fn create_db_stores() -> (CertificateStore, PayloadStore) {
-    // Create a new test store.
-    let rocksdb = rocks::open_cf(
-        temp_dir(),
-        None,
-        MetricConf::default(),
-        &[
-            CERTIFICATES_CF,
-            CERTIFICATE_DIGEST_BY_ROUND_CF,
-            CERTIFICATE_DIGEST_BY_ORIGIN_CF,
-            PAYLOAD_CF,
-        ],
-    )
-    .expect("Failed creating database");
+use narwhal_storage::{CertificateStore, CertificateStoreCache, PayloadStore, VoteDigestStore};
+use narwhal_typed_store::{open_db, DatabaseType};
+use std::num::NonZeroUsize;
 
-    let (
-        certificate_map,
-        certificate_digest_by_round_map,
-        certificate_digest_by_origin_map,
-        payload_map,
-    ) = reopen!(&rocksdb,
-        CERTIFICATES_CF;<CertificateDigest, Certificate>,
-        CERTIFICATE_DIGEST_BY_ROUND_CF;<(Round, AuthorityIdentifier), CertificateDigest>,
-        CERTIFICATE_DIGEST_BY_ORIGIN_CF;<(AuthorityIdentifier, Round), CertificateDigest>,
-        PAYLOAD_CF;<(BatchDigest, WorkerId), PayloadToken>);
-
+pub fn create_db_stores<P: AsRef<std::path::Path> + Send>(
+    path: P,
+) -> (CertificateStore, PayloadStore<DatabaseType>, VoteDigestStore<DatabaseType>) {
+    let db = open_db(path);
     (
         CertificateStore::new(
-            certificate_map,
-            certificate_digest_by_round_map,
-            certificate_digest_by_origin_map,
+            db.clone(),
             CertificateStoreCache::new(NonZeroUsize::new(100).unwrap(), None),
         ),
-        PayloadStore::new(payload_map),
+        PayloadStore::new(db.clone()),
+        VoteDigestStore::new(db),
     )
 }

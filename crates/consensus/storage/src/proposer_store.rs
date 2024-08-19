@@ -3,37 +3,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::StoreResult;
-use narwhal_typed_store::{
-    reopen,
-    rocks::{open_cf, DBMap, MetricConf, ReadWriteOptions},
-    Map,
-};
+use narwhal_typed_store::{tables::LastProposed, traits::Database};
 use telcoin_macros::fail_point;
 use tn_types::Header;
 
-pub type ProposerKey = u32;
+pub use narwhal_typed_store::ProposerKey;
 
 pub const LAST_PROPOSAL_KEY: ProposerKey = 0;
 
 /// The storage for the proposer
 #[derive(Clone)]
-pub struct ProposerStore {
+pub struct ProposerStore<DB: Database> {
     /// Holds the Last Header that was proposed by the Proposer.
-    last_proposed: DBMap<ProposerKey, Header>,
+    last_proposed: DB,
 }
 
-impl ProposerStore {
-    pub fn new(last_proposed: DBMap<ProposerKey, Header>) -> ProposerStore {
+impl<DB: Database> ProposerStore<DB> {
+    pub fn new(last_proposed: DB) -> ProposerStore<DB> {
         Self { last_proposed }
-    }
-
-    pub fn new_for_tests() -> ProposerStore {
-        const LAST_PROPOSED_CF: &str = "last_proposed";
-        let rocksdb =
-            open_cf(tempfile::tempdir().unwrap(), None, MetricConf::default(), &[LAST_PROPOSED_CF])
-                .expect("Cannot open database");
-        let last_proposed_map = reopen!(&rocksdb, LAST_PROPOSED_CF;<ProposerKey, Header>);
-        ProposerStore::new(last_proposed_map)
     }
 
     /// Inserts a proposed header into the store
@@ -41,7 +28,7 @@ impl ProposerStore {
     pub fn write_last_proposed(&self, header: &Header) -> StoreResult<()> {
         fail_point!("narwhal-store-before-write");
 
-        let result = self.last_proposed.insert(&LAST_PROPOSAL_KEY, header);
+        let result = self.last_proposed.insert::<LastProposed>(&LAST_PROPOSAL_KEY, header);
 
         fail_point!("narwhal-store-after-write");
         result
@@ -49,18 +36,21 @@ impl ProposerStore {
 
     /// Get the last header
     pub fn get_last_proposed(&self) -> StoreResult<Option<Header>> {
-        self.last_proposed.get(&LAST_PROPOSAL_KEY)
+        self.last_proposed.get::<LastProposed>(&LAST_PROPOSAL_KEY)
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::{ProposerStore, LAST_PROPOSAL_KEY};
-    use narwhal_typed_store::Map;
+    use crate::LAST_PROPOSAL_KEY;
+    use narwhal_typed_store::{open_db, tables::LastProposed, traits::Database};
+    use tempfile::TempDir;
     use tn_types::{
         test_utils::{fixture_batch_with_transactions, CommitteeFixture},
         CertificateDigest, Header, HeaderV1Builder, Round,
     };
+
+    use super::ProposerStore;
 
     pub fn create_header_for_round(round: Round) -> Header {
         let builder = HeaderV1Builder::default();
@@ -80,26 +70,28 @@ mod test {
 
     #[tokio::test]
     async fn test_writes() {
-        let store = ProposerStore::new_for_tests();
+        let temp_dir = TempDir::new().unwrap();
+        let store = ProposerStore::new(open_db(temp_dir.path()));
         let header_1 = create_header_for_round(1);
 
         let out = store.write_last_proposed(&header_1);
         assert!(out.is_ok());
 
-        let result = store.last_proposed.get(&LAST_PROPOSAL_KEY).unwrap();
+        let result = store.last_proposed.get::<LastProposed>(&LAST_PROPOSAL_KEY).unwrap();
         assert_eq!(result.unwrap(), header_1);
 
         let header_2 = create_header_for_round(2);
         let out = store.write_last_proposed(&header_2);
         assert!(out.is_ok());
 
-        let should_exist = store.last_proposed.get(&LAST_PROPOSAL_KEY).unwrap();
+        let should_exist = store.last_proposed.get::<LastProposed>(&LAST_PROPOSAL_KEY).unwrap();
         assert_eq!(should_exist.unwrap(), header_2);
     }
 
     #[tokio::test]
     async fn test_reads() {
-        let store = ProposerStore::new_for_tests();
+        let temp_dir = TempDir::new().unwrap();
+        let store = ProposerStore::new(open_db(temp_dir.path()));
 
         let should_not_exist = store.get_last_proposed().unwrap();
         assert_eq!(should_not_exist, None);

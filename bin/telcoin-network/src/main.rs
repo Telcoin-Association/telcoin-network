@@ -17,10 +17,8 @@ fn main() {
     if let Err(err) =
         telcoin_network::cli::Cli::<NoArgs>::parse().run(|builder, _, tn_datadir| async move {
             let evm_config = EthEvmConfig::default();
-            let executor = EthExecutorProvider::new(
-                Arc::clone(&builder.node_config.chain),
-                evm_config,
-            );
+            let executor =
+                EthExecutorProvider::new(Arc::clone(&builder.node_config.chain), evm_config);
             launch_node(builder, executor, evm_config, &tn_datadir).await
         })
     {

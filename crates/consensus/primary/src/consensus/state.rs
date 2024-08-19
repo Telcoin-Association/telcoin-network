@@ -9,6 +9,7 @@ use crate::consensus::{bullshark::Bullshark, utils::gc_round, ConsensusError, Co
 use consensus_metrics::{metered_channel, spawn_logged_monitored_task};
 use fastcrypto::hash::Hash;
 use narwhal_storage::{CertificateStore, ConsensusStore};
+use narwhal_typed_store::DatabaseType;
 use std::{
     cmp::{max, Ordering},
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -298,7 +299,7 @@ impl Consensus {
     pub fn spawn(
         committee: Committee,
         gc_depth: Round,
-        store: Arc<ConsensusStore>,
+        store: Arc<ConsensusStore<DatabaseType>>,
         cert_store: CertificateStore,
         rx_shutdown: ConditionalBroadcastReceiver,
         rx_new_certificates: metered_channel::Receiver<Certificate>,

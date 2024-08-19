@@ -2,11 +2,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{NodeStorage, PayloadToken};
+use crate::PayloadToken;
 use narwhal_typed_store::{
-    reopen,
-    rocks::{open_cf, DBMap, MetricConf, ReadWriteOptions},
-    Map, TypedStoreError,
+    tables::Payload,
+    traits::{Database, DbTx, DbTxMut},
 };
 use std::sync::Arc;
 use telcoin_macros::fail_point;
@@ -15,35 +14,22 @@ use tn_types::{BatchDigest, WorkerId};
 
 /// Store of the batch digests for the primary node for the own created batches.
 #[derive(Clone)]
-pub struct PayloadStore {
-    store: DBMap<(BatchDigest, WorkerId), PayloadToken>,
+pub struct PayloadStore<DB: Database> {
+    store: DB, // Payload
 
     /// Senders to notify for a write that happened for the specified batch digest and worker id
     notify_subscribers: Arc<NotifyRead<(BatchDigest, WorkerId), ()>>,
 }
 
-impl PayloadStore {
-    pub fn new(payload_store: DBMap<(BatchDigest, WorkerId), PayloadToken>) -> Self {
-        Self { store: payload_store, notify_subscribers: Arc::new(NotifyRead::new()) }
+impl<DB: Database> PayloadStore<DB> {
+    pub fn new(store: DB) -> Self {
+        Self { store, notify_subscribers: Arc::new(NotifyRead::new()) }
     }
 
-    pub fn new_for_tests() -> Self {
-        let rocksdb = open_cf(
-            tempfile::tempdir().unwrap(),
-            None,
-            MetricConf::default(),
-            &[NodeStorage::PAYLOAD_CF],
-        )
-        .expect("Cannot open database");
-        let map =
-            reopen!(&rocksdb, NodeStorage::PAYLOAD_CF;<(BatchDigest, WorkerId), PayloadToken>);
-        PayloadStore::new(map)
-    }
-
-    pub fn write(&self, digest: &BatchDigest, worker_id: &WorkerId) -> Result<(), TypedStoreError> {
+    pub fn write(&self, digest: &BatchDigest, worker_id: &WorkerId) -> eyre::Result<()> {
         fail_point!("narwhal-store-before-write");
 
-        self.store.insert(&(*digest, *worker_id), &0u8)?;
+        self.store.insert::<Payload>(&(*digest, *worker_id), &0u8)?;
         self.notify_subscribers.notify(&(*digest, *worker_id), &());
 
         fail_point!("narwhal-store-after-write");
@@ -55,27 +41,23 @@ impl PayloadStore {
     pub fn write_all(
         &self,
         keys: impl IntoIterator<Item = (BatchDigest, WorkerId)> + Clone,
-    ) -> Result<(), TypedStoreError> {
+    ) -> eyre::Result<()> {
         fail_point!("narwhal-store-before-write");
-
-        self.store.multi_insert(keys.clone().into_iter().map(|e| (e, 0u8)))?;
-
-        keys.into_iter().for_each(|(digest, worker_id)| {
+        let mut txn = self.store.write_txn()?;
+        for (digest, worker_id) in keys {
+            txn.insert::<Payload>(&(digest, worker_id), &0u8)?;
             self.notify_subscribers.notify(&(digest, worker_id), &());
-        });
+        }
 
+        txn.commit()?;
         fail_point!("narwhal-store-after-write");
         Ok(())
     }
 
     /// Queries the store whether the batch with provided `digest` and `worker_id` exists. It
     /// returns `true` if exists, `false` otherwise.
-    pub fn contains(
-        &self,
-        digest: BatchDigest,
-        worker_id: WorkerId,
-    ) -> Result<bool, TypedStoreError> {
-        self.store.get(&(digest, worker_id)).map(|result| result.is_some())
+    pub fn contains(&self, digest: BatchDigest, worker_id: WorkerId) -> eyre::Result<bool> {
+        self.store.contains_key::<Payload>(&(digest, worker_id))
     }
 
     /// When called the method will wait until the entry of batch with `digest` and `worker_id`
@@ -84,7 +66,7 @@ impl PayloadStore {
         &self,
         digest: BatchDigest,
         worker_id: WorkerId,
-    ) -> Result<(), TypedStoreError> {
+    ) -> eyre::Result<()> {
         let receiver = self.notify_subscribers.register_one(&(digest, worker_id));
 
         // let's read the value because we might have missed the opportunity
@@ -106,21 +88,26 @@ impl PayloadStore {
     pub fn read_all(
         &self,
         keys: impl IntoIterator<Item = (BatchDigest, WorkerId)>,
-    ) -> Result<Vec<Option<PayloadToken>>, TypedStoreError> {
-        self.store.multi_get(keys)
+    ) -> eyre::Result<Vec<Option<PayloadToken>>> {
+        let txn = self.store.read_txn()?;
+        keys.into_iter().map(|key| txn.get::<Payload>(&key)).collect()
     }
 
     #[allow(clippy::let_and_return)]
     pub fn remove_all(
         &self,
         keys: impl IntoIterator<Item = (BatchDigest, WorkerId)>,
-    ) -> Result<(), TypedStoreError> {
+    ) -> eyre::Result<()> {
         fail_point!("narwhal-store-before-write");
+        let mut txn = self.store.write_txn()?;
 
-        let result = self.store.multi_remove(keys);
+        for key in keys.into_iter() {
+            txn.remove::<Payload>(&key)?;
+        }
 
+        txn.commit()?;
         fail_point!("narwhal-store-after-write");
-        result
+        Ok(())
     }
 }
 
@@ -129,11 +116,15 @@ mod tests {
     use crate::PayloadStore;
     use fastcrypto::hash::Hash;
     use futures::future::join_all;
+    use narwhal_typed_store::open_db;
+    use tempfile::TempDir;
     use tn_types::Batch;
 
     #[tokio::test]
     async fn test_notify_read() {
-        let store = PayloadStore::new_for_tests();
+        let temp_dir = TempDir::new().unwrap();
+        let db = open_db(temp_dir.path());
+        let store = PayloadStore::new(db);
 
         // run the tests a few times
         let batch: Batch = tn_types::test_utils::fixture_batch_with_transactions(10);

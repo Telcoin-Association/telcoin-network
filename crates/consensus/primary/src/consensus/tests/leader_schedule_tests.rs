@@ -9,7 +9,9 @@ use std::{
 };
 
 use narwhal_storage::ConsensusStore;
+use narwhal_typed_store::open_db;
 use reth_tracing::init_test_tracing;
+use tempfile::TempDir;
 use tn_types::AuthorityIdentifier;
 
 use tn_types::{
@@ -166,7 +168,8 @@ async fn test_leader_schedule_from_store() {
     let fixture = CommitteeFixture::builder().build();
     let committee = fixture.committee();
     let authority_ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
-    let store = Arc::new(ConsensusStore::new_for_tests());
+    let temp_dir = TempDir::new().unwrap();
+    let store = Arc::new(ConsensusStore::new(open_db(temp_dir.path())));
 
     // Create a leader schedule with a default swap table, so no authority will be swapped and find
     // the leader at position 2. We expect the leader of round 2 to be the authority of position

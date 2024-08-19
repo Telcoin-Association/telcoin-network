@@ -42,6 +42,7 @@ use narwhal_network::{
 };
 use narwhal_primary_metrics::{Metrics, PrimaryMetrics};
 use narwhal_storage::{CertificateStore, PayloadStore, ProposerStore, VoteDigestStore};
+use narwhal_typed_store::{traits::Database, DatabaseType};
 use parking_lot::Mutex;
 use std::{
     cmp::Reverse,
@@ -105,9 +106,9 @@ impl Primary {
         parameters: Parameters,
         client: NetworkClient,
         certificate_store: CertificateStore,
-        proposer_store: ProposerStore,
-        payload_store: PayloadStore,
-        vote_digest_store: VoteDigestStore,
+        proposer_store: ProposerStore<DatabaseType>,
+        payload_store: PayloadStore<DatabaseType>,
+        vote_digest_store: VoteDigestStore<DatabaseType>,
         tx_new_certificates: Sender<Certificate>,
         rx_committed_certificates: Receiver<(Round, Vec<Certificate>)>,
         rx_consensus_round_updates: watch::Receiver<ConsensusRound>,
@@ -500,7 +501,7 @@ impl Primary {
 
 /// Defines how the network receiver handles incoming primary messages.
 #[derive(Clone)]
-struct PrimaryReceiverHandler {
+struct PrimaryReceiverHandler<DB: Database> {
     /// The id of this primary.
     authority_id: AuthorityIdentifier,
     committee: Committee,
@@ -510,7 +511,7 @@ struct PrimaryReceiverHandler {
     signature_service: SignatureService<BlsSignature, { tn_types::INTENT_MESSAGE_LENGTH }>,
     certificate_store: CertificateStore,
     /// The store to persist the last voted round per authority, used to ensure idempotence.
-    vote_digest_store: VoteDigestStore,
+    vote_digest_store: VoteDigestStore<DB>,
     /// Get a signal when the round changes.
     rx_narwhal_round_updates: watch::Receiver<Round>,
     /// Known parent digests that are being fetched from header proposers.
@@ -522,7 +523,7 @@ struct PrimaryReceiverHandler {
 }
 
 #[allow(clippy::result_large_err)]
-impl PrimaryReceiverHandler {
+impl<DB: Database> PrimaryReceiverHandler<DB> {
     fn find_next_round(
         &self,
         origin: AuthorityIdentifier,
@@ -533,7 +534,7 @@ impl PrimaryReceiverHandler {
         while let Some(round) = self
             .certificate_store
             .next_round_number(origin, current_round)
-            .map_err(|e| anemo::rpc::Status::from_error(Box::new(e)))?
+            .map_err(|e| anemo::rpc::Status::unknown(format!("unknown error: {e}")))?
         {
             if !skip_rounds.contains(&round) {
                 return Ok(Some(round));
@@ -803,7 +804,7 @@ impl PrimaryReceiverHandler {
 }
 
 #[async_trait]
-impl PrimaryToPrimary for PrimaryReceiverHandler {
+impl<DB: Database + 'static> PrimaryToPrimary for PrimaryReceiverHandler<DB> {
     async fn send_certificate(
         &self,
         request: anemo::Request<SendCertificateRequest>,
@@ -909,7 +910,7 @@ impl PrimaryToPrimary for PrimaryReceiverHandler {
             match self
                 .certificate_store
                 .read_by_index(*origin, round)
-                .map_err(|e| anemo::rpc::Status::from_error(Box::new(e)))?
+                .map_err(|e| anemo::rpc::Status::unknown(format!("unknown error: {e}")))?
             {
                 Some(cert) => {
                     response.certificates.push(cert);
@@ -950,7 +951,7 @@ impl PrimaryToPrimary for PrimaryReceiverHandler {
 #[derive(Clone)]
 struct WorkerReceiverHandler {
     tx_our_digests: Sender<OurDigestMessage>,
-    payload_store: PayloadStore,
+    payload_store: PayloadStore<DatabaseType>,
 }
 
 #[async_trait]

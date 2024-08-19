@@ -14,14 +14,12 @@ use consensus_metrics::{
 use fastcrypto::hash::Hash;
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use narwhal_network::{client::NetworkClient, WorkerToPrimaryClient};
-use narwhal_typed_store::{rocks::DBMap, Map};
+use narwhal_typed_store::{tables::Batches, traits::Database};
 use std::sync::Arc;
 use tn_types::{NewBatch, WorkerId};
 
 use narwhal_network_types::WorkerOwnBatchMessage;
-use tn_types::{
-    error::DagError, now, Batch, BatchAPI, BatchDigest, ConditionalBroadcastReceiver, MetadataAPI,
-};
+use tn_types::{error::DagError, now, Batch, BatchAPI, ConditionalBroadcastReceiver, MetadataAPI};
 use tokio::{
     task::JoinHandle,
     time::{Duration, Instant},
@@ -39,7 +37,7 @@ pub const MAX_PARALLEL_BATCH: usize = 100;
 pub mod batch_maker_tests;
 
 /// Process batches from EL into sealed batches for CL.
-pub struct BatchMaker {
+pub struct BatchMaker<DB: Database> {
     /// Our worker's id.
     id: WorkerId,
     /// TODO: remove this
@@ -64,10 +62,10 @@ pub struct BatchMaker {
     /// The network client to send our batches to the primary.
     client: NetworkClient,
     /// The batch store to store our own batches.
-    store: DBMap<BatchDigest, Batch>,
+    store: DB,
 }
 
-impl BatchMaker {
+impl<DB: Database + Clone + 'static> BatchMaker<DB> {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn spawn(
@@ -79,7 +77,7 @@ impl BatchMaker {
         tx_quorum_waiter: Sender<(Batch, tokio::sync::oneshot::Sender<()>)>,
         node_metrics: Arc<WorkerMetrics>,
         client: NetworkClient,
-        store: DBMap<BatchDigest, Batch>,
+        store: DB,
     ) -> JoinHandle<()> {
         spawn_logged_monitored_task!(
             async move {
@@ -258,7 +256,7 @@ impl BatchMaker {
             // Now save it to disk
             let digest = batch.digest();
 
-            if let Err(e) = store.insert(&digest, &batch) {
+            if let Err(e) = store.insert::<Batches>(&digest, &batch) {
                 error!("Store failed with error: {:?}", e);
                 return;
             }

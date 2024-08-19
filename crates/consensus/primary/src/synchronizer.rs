@@ -18,6 +18,7 @@ use narwhal_network::{
 };
 use narwhal_primary_metrics::{PrimaryChannelMetrics, PrimaryMetrics};
 use narwhal_storage::{CertificateStore, PayloadStore};
+use narwhal_typed_store::DatabaseType;
 use parking_lot::Mutex;
 use std::{
     cmp::min,
@@ -84,7 +85,7 @@ struct Inner {
     certificate_store: CertificateStore,
     // The persistent store of the available batch digests produced either via our own workers
     // or others workers.
-    payload_store: PayloadStore,
+    payload_store: PayloadStore<DatabaseType>,
     // Send missing certificates to the `CertificateFetcher`.
     tx_certificate_fetcher: Sender<CertificateFetcherCommand>,
     // Send certificates to be accepted into a separate task that runs
@@ -336,7 +337,7 @@ impl Synchronizer {
         gc_depth: Round,
         client: NetworkClient,
         certificate_store: CertificateStore,
-        payload_store: PayloadStore,
+        payload_store: PayloadStore<DatabaseType>,
         tx_certificate_fetcher: Sender<CertificateFetcherCommand>,
         tx_new_certificates: Sender<Certificate>,
         tx_parents: Sender<(Vec<Certificate>, Round)>,

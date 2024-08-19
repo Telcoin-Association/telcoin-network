@@ -18,7 +18,7 @@ macro_rules! ensure {
 
 pub type SubscriberResult<T> = Result<T, SubscriberError>;
 
-#[derive(Debug, Error, Clone)]
+#[derive(Debug, Error)]
 pub enum SubscriberError {
     #[error("channel {0} closed unexpectedly")]
     ClosedChannel(String),

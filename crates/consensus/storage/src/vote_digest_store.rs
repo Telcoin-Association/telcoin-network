@@ -2,55 +2,35 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::NodeStorage;
-use narwhal_typed_store::{
-    reopen,
-    rocks::{open_cf, DBMap, MetricConf, ReadWriteOptions},
-    Map, TypedStoreError,
-};
+use narwhal_typed_store::{tables::Votes, traits::Database};
 use telcoin_macros::fail_point;
 use tn_types::{AuthorityIdentifier, Vote, VoteAPI, VoteInfo};
 
 /// The storage for the last votes digests per authority
 #[derive(Clone)]
-pub struct VoteDigestStore {
-    store: DBMap<AuthorityIdentifier, VoteInfo>,
+pub struct VoteDigestStore<DB: Database> {
+    store: DB,
 }
 
-impl VoteDigestStore {
-    pub fn new(vote_digest_store: DBMap<AuthorityIdentifier, VoteInfo>) -> VoteDigestStore {
-        Self { store: vote_digest_store }
-    }
-
-    pub fn new_for_tests() -> VoteDigestStore {
-        let rocksdb = open_cf(
-            tempfile::tempdir().unwrap(),
-            None,
-            MetricConf::default(),
-            &[NodeStorage::VOTES_CF],
-        )
-        .expect("Cannot open database");
-        let map = reopen!(&rocksdb, NodeStorage::VOTES_CF;<AuthorityIdentifier, VoteInfo>);
-        VoteDigestStore::new(map)
+impl<DB: Database> VoteDigestStore<DB> {
+    pub fn new(store: DB) -> VoteDigestStore<DB> {
+        Self { store }
     }
 
     /// Insert the vote's basic details into the database for the corresponding
     /// header author key.
     #[allow(clippy::let_and_return)]
-    pub fn write(&self, vote: &Vote) -> Result<(), TypedStoreError> {
+    pub fn write(&self, vote: &Vote) -> eyre::Result<()> {
         fail_point!("narwhal-store-before-write");
 
-        let result = self.store.insert(&vote.origin(), &vote.into());
+        let result = self.store.insert::<Votes>(&vote.origin(), &vote.into());
 
         fail_point!("narwhal-store-after-write");
         result
     }
 
     /// Read the vote info based on the provided corresponding header author key
-    pub fn read(
-        &self,
-        header_author: &AuthorityIdentifier,
-    ) -> Result<Option<VoteInfo>, TypedStoreError> {
-        self.store.get(header_author)
+    pub fn read(&self, header_author: &AuthorityIdentifier) -> eyre::Result<Option<VoteInfo>> {
+        self.store.get::<Votes>(header_author)
     }
 }

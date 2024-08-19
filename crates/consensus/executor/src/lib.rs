@@ -8,6 +8,7 @@ mod subscriber;
 mod metrics;
 
 pub use errors::{SubscriberError, SubscriberResult};
+use narwhal_typed_store::DatabaseType;
 pub use state::ExecutionIndices;
 
 pub use crate::metrics::ExecutorMetrics;
@@ -94,7 +95,7 @@ impl Executor {
 }
 
 pub async fn get_restored_consensus_output(
-    consensus_store: Arc<ConsensusStore>,
+    consensus_store: Arc<ConsensusStore<DatabaseType>>,
     certificate_store: CertificateStore,
     // execution_state: &State,
 
