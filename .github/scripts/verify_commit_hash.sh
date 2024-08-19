@@ -18,7 +18,7 @@ RPC_ENDPOINT="https://rpc.adiri.tel"
 FUNCTION_CALL="gitCommitHashAttested(bytes20)"
 
 # Use cast to call the contract
-RESULT=$(cast call ${CONTRACT_ADDRESS} "${FUNCTION_CALL} ${CURRENT_COMMIT_HASH}" --rpc-url ${RPC_ENDPOINT})
+RESULT=$(cast call ${CONTRACT_ADDRESS} "${FUNCTION_CALL}" "${CURRENT_COMMIT_HASH}" --rpc-url ${RPC_ENDPOINT})
 
 # Check if the result is true (1) or false (0)
 if [ "$RESULT" == "1" ]; then

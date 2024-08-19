@@ -55,7 +55,7 @@ PRIVATE_KEY=${GITHUB_ATTESTATION_PRIVATE_KEY}
 TX_HASH=$(cast send --private-key ${PRIVATE_KEY} \
     --rpc-url ${RPC_ENDPOINT} \
     ${CONTRACT_ADDRESS} \
-    "${FUNCTION_CALL} ${COMMIT_HASH}")
+    "${FUNCTION_CALL}" "${COMMIT_HASH}")
 
 echo "Transaction sent. Hash: ${TX_HASH}"
 echo "https://telscan.io/tx/${TX_HASH}"
