@@ -11,6 +11,11 @@ SECONDS=0
 
 set -e  # Exit immediately if a command exits with a non-zero status
 
+# Navigate to the project root directory for workspace, .rustfmt.toml, etc.
+cd "$(dirname "$0")/.."
+
+echo "executing bash script from $(pwd)"
+
 # set environment
 CARGO_INCREMENTAL=0 # disable incremental compilation
 RUSTFLAGS="-D warnings -D unused_extern_crates"
