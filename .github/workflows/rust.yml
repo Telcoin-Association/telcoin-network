@@ -34,9 +34,6 @@ jobs:
     # alternative approach for now using local tests and submitting signed txs
     # to adiri.
     steps:
-      - name: checkout repo
-        uses: actions/checkout@v4
-
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
 
@@ -44,6 +41,9 @@ jobs:
         env:
           COMMIT_HASH: ${{ github.event.pull_request.head.sha }}
         run: .github/scripts/verify_commit_hash.sh
+
+      # - name: checkout repo
+      #   uses: actions/checkout@v4
 
       # # faucet tests with google KMS
       # - name: google auth

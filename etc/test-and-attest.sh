@@ -61,25 +61,47 @@ if [ -n "$(git status --porcelain)" ]; then
     exit 1
 fi
 
-# Step 1: compile tests
+# compile tests
 cargo test --no-run --locked
 
 echo "finished building tests"
 
-# Step 2: compile workspace
+# compile workspace
 cargo build --workspace --all-features --quiet
 
 echo "finished compiling workspace"
 
-# Step 3: run all tests
+#
+# run tests
+#
+# default features
+cargo test --workspace --no-fail-fast -- --show-output ;
+# all features
 cargo test --workspace --all-features --no-fail-fast -- --show-output ;
+# no default features
+cargo test --workspace --no-default-features --no-fail-fast -- --show-output;
 
-echo "tests for workspace --all-features passed"
+echo "tests for workspace: default, all features, and no default features passed"
 
-# Step 4: Check clippy
+#
+# check clippy
+#
+# default features
+cargo clippy +nightly --workspace -- -D warnings
+# all features
 cargo +nightly clippy --workspace --all-features -- -D warnings
+# no default features
+cargo clippy +nightly --workspace --no-default-features -- -D warnings
 
-echo "clippy passed"
+echo "clippy for workspace: default, all features, and no default features passed"
+
+# Run tests and clippy for each individual feature
+for feature in "faucet" "redb" "rocksdb" "test-utils"
+do
+    cargo test --workspace --features "${feature}" --no-fail-fast -- --show-output
+    cargo clippy +nightly --workspace --features "${feature}" -- -D warnings
+    echo "tests and clippy passed for single feature: ${feature}"
+done
 
 # Step 5: Check cargo fmt
 cargo +nightly fmt -- --check
