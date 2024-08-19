@@ -34,16 +34,17 @@ jobs:
     # alternative approach for now using local tests and submitting signed txs
     # to adiri.
     steps:
+      # checkout repo to use `verify_commit_hash.sh`
+      - name: checkout repo
+        uses: actions/checkout@v4
+      # install foundry toolchain for casting txs
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
-
+      # query adiri for commit hash
       - name: verify commit hash on adiri
         env:
           COMMIT_HASH: ${{ github.event.pull_request.head.sha }}
         run: .github/scripts/verify_commit_hash.sh
-
-      # - name: checkout repo
-      #   uses: actions/checkout@v4
 
       # # faucet tests with google KMS
       # - name: google auth
