@@ -1,4 +1,4 @@
-.PHONY: help udeps check test test-faucet fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators
+.PHONY: help attest udeps check test test-faucet fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators
 
 # full path for the Makefile
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -7,6 +7,9 @@ BASE_DIR:=$(shell basename $(ROOT_DIR))
 .DEFAULT: help
 
 help:
+	@echo ;
+	@echo "make attest" ;
+	@echo "    :::> Run CI locally and submit signed attestation to Adiri testnet." ;
 	@echo ;
 	@echo "make udeps" ;
 	@echo "    :::> Check unused dependencies in the entire project by package." ;
@@ -54,6 +57,10 @@ help:
 	@echo "    :::> Run 4 validators locally (outside of docker)." ;
 	@echo ;
 
+# run CI locally and submit attestation githash to on-chain program
+attest:
+	./etc/test-and-attest.sh ;
+
 # check for unused dependencies
 udeps:
 	find . -type f -name Cargo.toml -exec sed -rne 's/^name = "(.*)"/\1/p' {} + | xargs -I {} sh -c "echo '\n\n{}:' && cargo +nightly udeps --package {}" ;
@@ -81,7 +88,7 @@ clippy:
 docker-login:
 	gcloud auth application-default login ;
 	gcloud auth configure-docker us-docker.pkg.dev ;
-	
+
 # build and push latest adiri image for amd64 and arm64
 docker-adiri:
 	docker buildx build -f ./etc/Dockerfile --platform linux/amd64,linux/arm64 -t us-docker.pkg.dev/telcoin-network/tn-public/adiri . --push ;

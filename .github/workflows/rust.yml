@@ -2,6 +2,7 @@ name: Rust
 
 on:
   pull_request:
+    branches: [main]
 
 env:
   CARGO_INCREMENTAL: 0 # disable incremental compilation
@@ -18,43 +19,58 @@ jobs:
       matrix:
         os: [ubuntu-latest] # macos-latest?
 
-    # Add "id-token" for google jwt
-    permissions:
-      contents: "read"
-      id-token: "write"
+    # # Add "id-token" for google jwt
+    # permissions:
+    #   contents: "read"
+    #   id-token: "write"
 
+    # checkout repo and deny clippy/format warnings
+    #
+    # The commented out code is the progress towards running faucet tests in CI.
+    # It doesn't work right now due to a configuration error, which fails to
+    # authorize the incoming request.
+    #
+    # There is concern with this approach on an open-source repo, so taking an
+    # alternative approach for now using local tests and submitting signed txs
+    # to adiri.
     steps:
       - name: checkout repo
         uses: actions/checkout@v4
 
-      # faucet tests with google KMS
-      - name: google auth
-        uses: "google-github-actions/auth@v2"
-        with:
-          project_id: "telcoin-network"
-          workload_identity_provider: "projects/505253602811/locations/global/workloadIdentityPools/github/providers/github-provider"
-          service_account: "github-action@telcoin-network.iam.gserviceaccount.com"
-        if: matrix.os == 'ubuntu-latest' || github.event_name == 'push'
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
 
-      - name: install nightly toolchain
-        run: |
-          rustup update --no-self-update nightly
-          rustup default nightly
-          rustup component add --toolchain nightly rustfmt rust-src clippy
+      - name: verify commit hash on adiri
+        run: .github/scripts/verify_commit_hash.sh
 
-      # inspired by https://matklad.github.io/2021/09/04/fast-rust-builds.html#CI-Workflow
-      - name: cache deps
-        uses: Swatinem/rust-cache@9bdad043e88c75890e36ad3bbc8d27f0090dd609
-        with:
-          key: ${{ env.RUST_CHANNEL }}
+      # # faucet tests with google KMS
+      # - name: google auth
+      #   uses: "google-github-actions/auth@v2"
+      #   with:
+      #     project_id: "telcoin-network"
+      #     workload_identity_provider: "projects/505253602811/locations/global/workloadIdentityPools/github/providers/github-provider"
+      #     service_account: "github-action@telcoin-network.iam.gserviceaccount.com"
+      #   if: matrix.os == 'ubuntu-latest' || github.event_name == 'push'
 
-      - name: compile (tests)
-        run: cargo test --no-run --locked
+      # - name: install nightly toolchain
+      #   run: |
+      #     rustup update --no-self-update nightly
+      #     rustup default nightly
+      #     rustup component add --toolchain nightly rustfmt rust-src clippy
 
-        # It's faster to `test` before `build` ¯\_(ツ)_/¯
-      - name: compile (workspace)
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo build --quiet
+      # # inspired by https://matklad.github.io/2021/09/04/fast-rust-builds.html#CI-Workflow
+      # - name: cache deps
+      #   uses: Swatinem/rust-cache@9bdad043e88c75890e36ad3bbc8d27f0090dd609
+      #   with:
+      #     key: ${{ env.RUST_CHANNEL }}
+
+      # - name: compile (tests)
+      #   run: cargo test --no-run --locked
+
+      #   # It's faster to `test` before `build` ¯\_(ツ)_/¯
+      # - name: compile (workspace)
+      #   if: matrix.os == 'ubuntu-latest'
+      #   run: cargo build --quiet
 
       # # faucet tests with google KMS
       # - name: google auth
@@ -64,19 +80,19 @@ jobs:
       #     workload_identity_provider: "projects/505253602811/locations/global/workloadIdentityPools/github/providers/github-provider"
       #   if: matrix.os == 'ubuntu-latest' || github.event_name == 'push'
 
-      - name: run tests
-        if: matrix.os == 'ubuntu-latest' || github.event_name == 'push'
-        run: cargo test --workspace --no-default-features --features faucet -- --nocapture --quiet
+      # - name: run tests
+      #   if: matrix.os == 'ubuntu-latest' || github.event_name == 'push'
+      #   run: cargo test --workspace --no-default-features --features faucet -- --nocapture --quiet
 
-      - name: clippy
-        run: |
-          rustc --version
-          cargo +nightly version
-          cargo +nightly clippy --version
-          cargo +nightly clippy --verbose --all --all-features -- -D warnings
+      # - name: clippy
+      #   run: |
+      #     rustc --version
+      #     cargo +nightly version
+      #     cargo +nightly clippy --version
+      #     cargo +nightly clippy --verbose --all --all-features -- -D warnings
 
-      - name: fmt
-        run: |
-          rustc --version
-          cargo +nightly version
-          cargo +nightly fmt --verbose -- --check
+      # - name: fmt
+      #   run: |
+      #     rustc --version
+      #     cargo +nightly version
+      #     cargo +nightly fmt --verbose -- --check
