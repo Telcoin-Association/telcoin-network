@@ -25,7 +25,7 @@ CONTRACT_ADDRESS="0x1f2f25561a11762bdffd91014c6d0e49af334447"
 RPC_ENDPOINT="https://rpc.adiri.tel"
 ATTEST_CALL="attestGitCommitHash(bytes20,bool)"
 VERIFY_CALL="gitCommitHashAttested(bytes20)"
-CHAIN_ID="2017"
+CHAIN_ID=2017
 PRIVATE_KEY=${GITHUB_ATTESTATION_PRIVATE_KEY}
 COMMIT_HASH=$(git rev-parse HEAD)
 echo "attesting git hash: ${COMMIT_HASH}"
