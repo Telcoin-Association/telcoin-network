@@ -6,6 +6,9 @@ BASE_DIR:=$(shell basename $(ROOT_DIR))
 
 .DEFAULT: help
 
+# Default tag is latest if not specified
+TAG ?= latest
+
 help:
 	@echo ;
 	@echo "make attest" ;
@@ -91,7 +94,7 @@ docker-login:
 
 # build and push latest adiri image for amd64 and arm64
 docker-adiri:
-	docker buildx build -f ./etc/Dockerfile --platform linux/amd64,linux/arm64 -t us-docker.pkg.dev/telcoin-network/tn-public/adiri . --push ;
+	docker buildx build -f ./etc/Dockerfile --platform linux/amd64,linux/arm64 -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
 
 # push local adiri:latest to the gcloud artifact registry
 docker-push:
