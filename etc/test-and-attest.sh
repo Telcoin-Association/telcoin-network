@@ -79,10 +79,9 @@ echo "default tests and specific faucet it test passing"
 # check clippy
 #
 # default features
-cargo +nightly clippy --workspace -- -D warnings &
+cargo +nightly clippy --workspace -- -D warnings
 # all features
-cargo +nightly clippy --workspace --all-features -- -D warnings &
-wait
+cargo +nightly clippy --workspace --all-features -- -D warnings
 
 echo "clippy for workspace: default and all features passed"
 
