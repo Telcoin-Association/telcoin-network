@@ -18,14 +18,14 @@ use jsonrpsee::{core::client::ClientT, rpc_params};
 use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicKey as PubKey};
 use narwhal_test_utils::faucet_test_execution_node;
 use reth_primitives::{
-    alloy_primitives::U160, public_key_to_address, Address, GenesisAccount, TransactionSigned,
+    alloy_primitives::U160, hex, public_key_to_address, Address, GenesisAccount, TransactionSigned,
     U256,
 };
 use reth_tasks::TaskManager;
 use reth_tracing::init_test_tracing;
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
-use tn_faucet::{parse_u256_from_decimal_value, MintTo};
+use tn_faucet::Drip;
 use tn_types::{adiri_genesis, test_channel, BatchAPI, NewBatch};
 use tokio::time::timeout;
 
@@ -169,17 +169,16 @@ async fn test_faucet_transfers_stablecoin_with_google_kms() -> eyre::Result<()> 
     let tx = batch_txs.first().expect("first batch tx from faucet");
     let recovered = TransactionSigned::decode_enveloped(&mut tx.as_ref())?;
 
-    // faucet defaults to 1 TEL as "TRANSFER_AMOUNT" set by clap via `parse_u256_from_decimal_value`
-    let amount: U256 = parse_u256_from_decimal_value("1").unwrap();
-    let contract_params: Vec<u8> = MintTo::abi_encode_params(&(&user_address, amount));
+    let faucet_contract = hex!("0e26ade1f5a99bd6b5d40f870a87bfe143db68b6").into();
+    let contract_params: Vec<u8> = Drip::abi_encode_params(&(&contract_address, &user_address));
 
-    // keccak256("mintTo(address,uint256)")[0..4]
-    let selector = [68, 154, 82, 248];
+    // keccak256("Drip(address,address)")[0..4]
+    let selector = [235, 56, 57, 167];
     let expected_input = [&selector, &contract_params[..]].concat();
 
     // assert recovered transaction
     assert_eq!(tx_hash, recovered.hash_ref().to_string());
-    assert_eq!(recovered.transaction.to(), Some(contract_address));
+    assert_eq!(recovered.transaction.to(), Some(faucet_contract));
     assert_eq!(recovered.transaction.input(), &expected_input);
 
     // ensure duplicate request is error
