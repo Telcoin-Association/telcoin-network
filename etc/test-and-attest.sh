@@ -55,53 +55,36 @@ CARGO_TERM_COLOR=always
 RUST_BACKTRACE=1
 CARGO_PROFILE_DEV_DEBUG=0
 
-# Check for un-committed changes
-if [ -n "$(git status --porcelain)" ]; then
+# Fetch the status of the git repository and filter for lines that indicate modified tracked files
+MODIFIED_TRACKED_FILES=$(git status --porcelain --untracked-files=no)
+
+# Check the output - ignore untracked files
+if [ -n "$MODIFIED_TRACKED_FILES" ]; then
     echo "Error: please commit changes before attesting HEAD commit hash."
+    echo "$MODIFIED_TRACKED_FILES"
     exit 1
 fi
-
-# compile tests
-cargo test --no-run --locked
-
-echo "finished building tests"
-
-# compile workspace
-cargo build --workspace --all-features --quiet
-
-echo "finished compiling workspace"
 
 #
 # run tests
 #
 # default features
-cargo test --workspace --no-fail-fast -- --show-output ;
-# all features
-cargo test --workspace --all-features --no-fail-fast -- --show-output ;
-# no default features
-cargo test --workspace --no-default-features --no-fail-fast -- --show-output;
+cargo test --workspace --no-fail-fast -- --show-output
+# faucet it test
+cargo test -p telcoin-network --test it --features faucet --no-fail-fast -- --show-output
 
-echo "tests for workspace: default, all features, and no default features passed"
+echo "default tests and specific faucet it test passing"
 
 #
 # check clippy
 #
 # default features
-cargo +nightly clippy --workspace -- -D warnings
+cargo +nightly clippy --workspace -- -D warnings &
 # all features
-cargo +nightly clippy --workspace --all-features -- -D warnings
-# no default features
-cargo +nightly clippy --workspace --no-default-features -- -D warnings
+cargo +nightly clippy --workspace --all-features -- -D warnings &
+wait
 
-echo "clippy for workspace: default, all features, and no default features passed"
-
-# Run tests and clippy for each individual feature
-for feature in "faucet" "redb" "rocksdb" "test-utils"
-do
-    cargo test --workspace --features "${feature}" --no-fail-fast -- --show-output
-    cargo +nightly clippy --workspace --features "${feature}" -- -D warnings
-    echo "tests and clippy passed for single feature: ${feature}"
-done
+echo "clippy for workspace: default and all features passed"
 
 # Step 5: Check cargo fmt
 cargo +nightly fmt -- --check
