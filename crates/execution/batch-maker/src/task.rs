@@ -1,11 +1,14 @@
-use crate::{mode::MiningMode, Storage};
+use crate::{mode::MiningMode, pool::maintain::changed_accounts_iter, Storage};
 use consensus_metrics::metered_channel::Sender;
-use futures_util::{future::BoxFuture, FutureExt};
+use futures_util::{future::BoxFuture, FutureExt, StreamExt};
 use reth_blockchain_tree::{BlockValidationKind, BlockchainTreeEngine};
 use reth_chainspec::ChainSpec;
 use reth_evm::execute::BlockExecutorProvider;
 use reth_primitives::{IntoRecoveredTransaction, SealedBlock, Withdrawals};
-use reth_provider::{BlockReaderIdExt, CanonChainTracker, StateProviderFactory};
+use reth_provider::{
+    BlockReaderIdExt, CanonChainTracker, CanonStateNotification, CanonStateSubscriptions,
+    StateProviderFactory,
+};
 use reth_stages::PipelineEvent;
 use reth_transaction_pool::{
     CanonicalStateUpdate, TransactionPool, TransactionPoolExt, ValidPoolTransaction,
@@ -92,6 +95,7 @@ where
     BlockExecutor: BlockExecutorProvider,
     Provider: StateProviderFactory
         + CanonChainTracker
+        + CanonStateSubscriptions
         + BlockReaderIdExt
         + BlockchainTreeEngine
         + Clone
@@ -103,25 +107,44 @@ where
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut canon_update = self.provider.canonical_state_stream();
         let this = self.get_mut();
 
         // loop to poll the tx miner and send the next batch to Worker's `BatchMaker`
-        'main: loop {
+        loop {
             // check for canon updates before mining the transaction pool
-            loop {
+            while let Poll::Ready(Some(canon_update)) = canon_update.poll_next_unpin(cx) {
                 // poll canon updates stream and update pool `.on_canon_update`
-                // then maintenance task will handle worker's pending block update
+                //
+                // maintenance task will handle worker's pending block update
+                match canon_update {
+                    CanonStateNotification::Commit { new } => {
+                        // TODO: ensure the engine's update includes all accounts that changed during execution
+                        warn!(target: "Canon update inside batch maker!!!!\n", ?new);
+                        // // update pool with worker's pending block update
+                        let (blocks, state) = new.inner();
+                        let tip = blocks.tip();
 
-                // // update pool with worker's pending block update
-                // let update = CanonicalStateUpdate {
-                //     new_tip: &tip.block,          // parent
-                //     pending_block_base_fee,       // current
-                //     pending_block_blob_fee: None, // current
-                //     changed_accounts,             // engine
-                //     mined_transactions,           // empty
-                // };
-                // pool.on_canonical_state_change(update);
-                todo!()
+                        let mut changed_accounts = Vec::with_capacity(state.state().len());
+                        for acc in changed_accounts_iter(state) {
+                            changed_accounts.push(acc);
+                        }
+
+                        // TODO: these should have already been mined when the worker proposed its block
+                        let mined_transactions = blocks.transaction_hashes().collect();
+
+                        // Canonical update
+                        let update = CanonicalStateUpdate {
+                            new_tip: &tip.block,
+                            pending_block_base_fee,
+                            pending_block_blob_fee: None,
+                            changed_accounts,
+                            mined_transactions,
+                        };
+                        this.pool.on_canonical_state_change(update);
+                    }
+                    _ => unreachable!("reorgs can never happen"),
+                }
             }
 
             if let Poll::Ready(transactions) = this.miner.poll(&this.pool, cx) {

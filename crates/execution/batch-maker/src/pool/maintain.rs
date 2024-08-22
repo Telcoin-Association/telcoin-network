@@ -462,7 +462,7 @@ where
 }
 
 /// Extracts all changed accounts from the `BundleState`
-fn changed_accounts_iter(
+pub(crate) fn changed_accounts_iter(
     execution_outcome: &ExecutionOutcome,
 ) -> impl Iterator<Item = ChangedAccount> + '_ {
     execution_outcome
