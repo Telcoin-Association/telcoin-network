@@ -8,18 +8,15 @@ use assert_matches::assert_matches;
 use fastcrypto::hash::Hash;
 use narwhal_network::client::NetworkClient;
 use narwhal_network_types::MockWorkerToPrimary;
+use narwhal_test_utils::default_test_execution_node;
 use narwhal_typed_store::{open_db, tables::Batches, traits::Database};
 use narwhal_worker::{metrics::WorkerMetrics, BatchMaker, NUM_SHUTDOWN_RECEIVERS};
 use reth::{beacon_consensus::EthBeaconConsensus, tasks::TaskManager};
-use reth_blockchain_tree::noop::NoopBlockchainTree;
+use reth_blockchain_tree::BlockchainTreeViewer;
 use reth_chainspec::ChainSpec;
-use reth_db::test_utils::{create_test_rw_db, tempdir_path};
-use reth_db_common::init::init_genesis;
 use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
-use reth_primitives::{alloy_primitives::U160, Address, TransactionSigned, U256};
-use reth_provider::{
-    providers::{BlockchainProvider, StaticFileProvider},
-    ProviderFactory,
+use reth_primitives::{
+    alloy_primitives::U160, Address, BlockBody, SealedBlock, TransactionSigned, Withdrawals, U256,
 };
 use reth_tracing::init_test_tracing;
 use reth_transaction_pool::{
@@ -88,26 +85,13 @@ async fn test_make_batch_el_to_cl() {
     let head_timestamp = genesis.timestamp;
     let chain: Arc<ChainSpec> = Arc::new(genesis.into());
 
-    // temp db
-    let db = create_test_rw_db();
-
-    // provider
-    let factory = ProviderFactory::new(
-        Arc::clone(&db),
-        Arc::clone(&chain),
-        StaticFileProvider::read_write(tempdir_path())
-            .expect("static file provider read write created with tempdir path"),
-    );
-
-    let genesis_hash = init_genesis(factory.clone()).expect("init genesis");
-    let blockchain_db = BlockchainProvider::new(factory, Arc::new(NoopBlockchainTree::default()))
-        .expect("test blockchain provider");
-
-    debug!("genesis hash: {genesis_hash:?}");
-
     // task manger
     let manager = TaskManager::current();
     let executor = manager.executor();
+
+    let execution_node = default_test_execution_node(Some(chain.clone()), None, executor.clone())
+        .expect("default execution node");
+    let blockchain_db = execution_node.get_provider().await;
 
     // txpool
     let blob_store = InMemoryBlobStore::default();
@@ -239,4 +223,22 @@ async fn test_make_batch_el_to_cl() {
     // ensure tx2 & tx3 are in the pool still
     assert!(txpool.contains(transaction2.hash_ref()));
     assert!(txpool.contains(transaction3.hash_ref()));
+
+    // assert batch appears as pending block in blockchain_tree
+    let pending = blockchain_db.pending_block();
+    let proposed_header = batch_from_store.versioned_metadata().sealed_header();
+    let expected = SealedBlock::new(
+        proposed_header.clone(),
+        BlockBody {
+            transactions: vec![decoded_batch_tx],
+            ommers: vec![],
+            withdrawals: Some(Withdrawals::new(vec![])),
+            requests: None,
+        },
+    );
+    assert_eq!(pending, Some(expected));
+
+    let tip = blockchain_db.canonical_tip();
+    // assert genesis is still canonical tip
+    assert_eq!(tip.hash, chain.genesis_hash());
 }
