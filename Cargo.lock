@@ -11060,6 +11060,7 @@ dependencies = [
  "futures-util",
  "narwhal-network",
  "narwhal-network-types",
+ "narwhal-test-utils",
  "narwhal-typed-store",
  "narwhal-worker",
  "prometheus",

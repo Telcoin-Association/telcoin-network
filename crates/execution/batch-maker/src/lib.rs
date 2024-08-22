@@ -43,14 +43,14 @@ use tracing::{debug, error, trace, warn};
 mod mode;
 mod task;
 
-// pub use crate::client::AutoSealClient;
+// pub use crate::client::AutoSealProvider;
 pub use mode::{FixedBlockTimeMiner, MiningMode, ReadyTransactionMiner};
 pub use task::MiningTask;
 
 /// Builder type for configuring the setup
 #[derive(Debug)]
-pub struct BatchMakerBuilder<Client, Pool, EvmConfig> {
-    client: Client,
+pub struct BatchMakerBuilder<Provider, Pool, EvmConfig> {
+    provider: Provider,
     consensus: AutoSealConsensus,
     pool: Pool,
     mode: MiningMode,
@@ -61,15 +61,15 @@ pub struct BatchMakerBuilder<Client, Pool, EvmConfig> {
 
 // === impl AutoSealBuilder ===
 
-impl<Client, Pool, EvmConfig> BatchMakerBuilder<Client, Pool, EvmConfig>
+impl<Provider, Pool, EvmConfig> BatchMakerBuilder<Provider, Pool, EvmConfig>
 where
-    Client: BlockReaderIdExt,
+    Provider: BlockReaderIdExt,
     Pool: TransactionPool,
 {
     /// Creates a new builder instance to configure all parts.
     pub fn new(
         chain_spec: Arc<ChainSpec>,
-        client: Client,
+        provider: Provider,
         pool: Pool,
         to_worker: Sender<NewBatch>,
         mode: MiningMode,
@@ -77,7 +77,7 @@ where
         evm_config: EvmConfig,
         // TODO: pass max_block here to shut down batch maker?
     ) -> Self {
-        let latest_header = client
+        let latest_header = provider
             .latest_header()
             .ok()
             .flatten()
@@ -85,7 +85,7 @@ where
 
         Self {
             storage: Storage::new(latest_header, address),
-            client,
+            provider,
             consensus: AutoSealConsensus::new(chain_spec),
             pool,
             mode,
@@ -102,17 +102,17 @@ where
 
     /// Consumes the type and returns all components
     #[track_caller]
-    pub fn build(self) -> MiningTask<Client, Pool, EvmConfig> {
-        let Self { client, consensus, pool, mode, storage, to_worker, evm_config } = self;
-        // let auto_client = AutoSealClient::new(storage.clone());
+    pub fn build(self) -> MiningTask<Provider, Pool, EvmConfig> {
+        let Self { provider, consensus, pool, mode, storage, to_worker, evm_config } = self;
+        // let auto_provider = AutoSealProvider::new(storage.clone());
 
-        // (consensus, auto_client, task)
+        // (consensus, auto_provider, task)
         MiningTask::new(
             Arc::clone(consensus.chain_spec()),
             mode,
             to_worker,
             storage,
-            client,
+            provider,
             pool,
             evm_config,
         )
@@ -293,7 +293,7 @@ impl StorageInner {
         provider: &Provider,
         chain_spec: Arc<ChainSpec>,
         executor: &Executor,
-    ) -> Result<(SealedHeader, ExecutionOutcome), BlockExecutionError>
+    ) -> Result<(SealedHeader, BlockBody, ExecutionOutcome), BlockExecutionError>
     where
         Executor: BlockExecutorProvider,
         Provider: StateProviderFactory + BlockReaderIdExt,
@@ -368,12 +368,12 @@ impl StorageInner {
             })?;
 
         // finally insert into storage
-        self.insert_new_block(header.clone(), body);
+        self.insert_new_block(header.clone(), body.clone());
 
         // set new header with hash that should have been updated by insert_new_block
         let new_header = header.seal(self.best_hash);
 
-        Ok((new_header, bundle_state))
+        Ok((new_header, body, bundle_state))
     }
 }
 
@@ -382,11 +382,16 @@ mod tests {
     use super::*;
     use assert_matches::assert_matches;
     use fastcrypto::hash::Hash;
+    use narwhal_test_utils::default_test_execution_node;
     use reth::tasks::TaskManager;
     use reth_blockchain_tree::noop::NoopBlockchainTree;
+    use reth_blockchain_tree::{BlockchainTreeEngine, BlockchainTreeViewer};
+    use reth_db::tables;
     use reth_db::test_utils::{create_test_rw_db, tempdir_path};
+    use reth_db::transaction::DbTxMut;
     use reth_db_common::init::init_genesis;
     use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
+    use reth_primitives::SealedBlock;
     use reth_primitives::{alloy_primitives::U160, GenesisAccount};
     use reth_provider::{
         providers::{BlockchainProvider, StaticFileProvider},
@@ -400,7 +405,7 @@ mod tests {
     use tn_types::{
         adiri_chain_spec_arc, adiri_genesis,
         test_utils::{get_gas_price, TransactionFactory},
-        BatchAPI,
+        BatchAPI, MetadataAPI,
     };
     use tokio::time::timeout;
 
@@ -425,26 +430,12 @@ mod tests {
         let head_timestamp = genesis.timestamp;
         let chain: Arc<ChainSpec> = Arc::new(genesis.into());
 
-        // init genesis
-        let db = create_test_rw_db();
-        // provider
-        let provider_factory = ProviderFactory::new(
-            Arc::clone(&db),
-            Arc::clone(&chain),
-            StaticFileProvider::read_write(tempdir_path())
-                .expect("static file provider read write created with tempdir path"),
-        );
-        let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
-
-        debug!("genesis hash: {genesis_hash:?}");
-
-        let blockchain_db =
-            BlockchainProvider::new(provider_factory, Arc::new(NoopBlockchainTree::default()))
-                .expect("test blockchain provider");
-
-        // task manger
         let manager = TaskManager::current();
         let executor = manager.executor();
+        let execution_node =
+            default_test_execution_node(Some(chain.clone()), None, executor.clone())
+                .expect("default execution node");
+        let blockchain_db = execution_node.get_provider().await;
 
         // txpool
         let blob_store = InMemoryBlobStore::default();
@@ -552,34 +543,6 @@ mod tests {
         let digest = new_batch.batch.digest();
         let _ack = new_batch.ack.send(digest);
 
-        // // retrieve block number 1 from storage
-        // //
-        // // at this point, we know the task has completed because
-        // // the task's Storage write lock must be dropped for the
-        // // read lock to be available here
-        // let storage_header = client
-        //     .get_headers_with_priority(
-        //         HeadersRequest { start: 1.into(), limit: 1, direction: HeadersDirection::Rising
-        // },         Priority::Normal,
-        //     )
-        //     .await
-        //     .expect("header is available from storage")
-        //     .into_data()
-        //     .first()
-        //     .expect("header included")
-        //     .to_owned();
-
-        // debug!("awaited first reply from storage header");
-
-        // let storage_sealed_header = storage_header.seal_slow();
-
-        // debug!("storage sealed header: {storage_sealed_header:?}");
-
-        // // TODO: this isn't the right thing to test bc storage should be removed
-        // //
-        // assert_eq!(new_batch.batch.versioned_metadata().sealed_header(), &storage_sealed_header);
-        // assert_eq!(storage_sealed_header.beneficiary, address);
-
         // yield to try and give pool a chance to update
         tokio::task::yield_now().await;
 
@@ -593,6 +556,24 @@ mod tests {
         // ensure tx2 & tx3 are in the pool still
         assert!(txpool.contains(transaction2.hash_ref()));
         assert!(txpool.contains(transaction3.hash_ref()));
+
+        // assert batch appears as pending block in blockchain_tree
+        let pending = blockchain_db.pending_block();
+        let proposed_header = new_batch.batch.versioned_metadata().sealed_header();
+        let expected = SealedBlock::new(
+            proposed_header.clone(),
+            BlockBody {
+                transactions: vec![decoded_batch_tx],
+                ommers: vec![],
+                withdrawals: Some(Withdrawals::new(vec![])),
+                requests: None,
+            },
+        );
+        assert_eq!(pending, Some(expected));
+
+        let tip = blockchain_db.canonical_tip();
+        // assert genesis is still canonical tip
+        assert_eq!(tip.hash, chain.genesis_hash());
     }
 
     #[tokio::test]

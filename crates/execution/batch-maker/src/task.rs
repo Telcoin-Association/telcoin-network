@@ -1,9 +1,10 @@
 use crate::{mode::MiningMode, Storage};
 use consensus_metrics::metered_channel::Sender;
 use futures_util::{future::BoxFuture, FutureExt};
+use reth_blockchain_tree::{BlockValidationKind, BlockchainTreeEngine};
 use reth_chainspec::ChainSpec;
 use reth_evm::execute::BlockExecutorProvider;
-use reth_primitives::{IntoRecoveredTransaction, Withdrawals};
+use reth_primitives::{IntoRecoveredTransaction, SealedBlock, Withdrawals};
 use reth_provider::{BlockReaderIdExt, CanonChainTracker, StateProviderFactory};
 use reth_stages::PipelineEvent;
 use reth_transaction_pool::{TransactionPool, ValidPoolTransaction};
@@ -20,11 +21,11 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
 /// A Future that listens for new ready transactions and puts new blocks into storage
-pub struct MiningTask<Client, Pool: TransactionPool, BlockExecutor> {
+pub struct MiningTask<Provider, Pool: TransactionPool, BlockExecutor> {
     /// The configured chain spec
     chain_spec: Arc<ChainSpec>,
-    /// The client used to interact with the state
-    client: Client,
+    /// The provider used to interact with the state
+    provider: Provider,
     /// The active miner
     miner: MiningMode,
     /// Single active future that inserts a new block into `storage`
@@ -51,7 +52,7 @@ pub struct MiningTask<Client, Pool: TransactionPool, BlockExecutor> {
 
 // === impl MiningTask ===
 
-impl<Client, Pool: TransactionPool, BlockExecutor> MiningTask<Client, Pool, BlockExecutor> {
+impl<Provider, Pool: TransactionPool, BlockExecutor> MiningTask<Provider, Pool, BlockExecutor> {
     /// Creates a new instance of the task
     pub(crate) fn new(
         chain_spec: Arc<ChainSpec>,
@@ -59,13 +60,13 @@ impl<Client, Pool: TransactionPool, BlockExecutor> MiningTask<Client, Pool, Bloc
         to_worker: Sender<NewBatch>,
         // canon_state_notification: CanonStateNotificationSender,
         storage: Storage,
-        client: Client,
+        provider: Provider,
         pool: Pool,
         block_executor: BlockExecutor,
     ) -> Self {
         Self {
             chain_spec,
-            client,
+            provider,
             miner,
             insert_task: None,
             storage,
@@ -84,10 +85,16 @@ impl<Client, Pool: TransactionPool, BlockExecutor> MiningTask<Client, Pool, Bloc
     }
 }
 
-impl<BlockExecutor, Client, Pool> Future for MiningTask<Client, Pool, BlockExecutor>
+impl<BlockExecutor, Provider, Pool> Future for MiningTask<Provider, Pool, BlockExecutor>
 where
     BlockExecutor: BlockExecutorProvider,
-    Client: StateProviderFactory + CanonChainTracker + BlockReaderIdExt + Clone + Unpin + 'static,
+    Provider: StateProviderFactory
+        + CanonChainTracker
+        + BlockReaderIdExt
+        + BlockchainTreeEngine
+        + Clone
+        + Unpin
+        + 'static,
     Pool: TransactionPool + Unpin + 'static,
     <Pool as TransactionPool>::Transaction: IntoRecoveredTransaction,
 {
@@ -114,7 +121,7 @@ where
                 let transactions = this.queued.pop_front().expect("not empty");
 
                 let to_worker = this.to_worker.clone();
-                let client = this.client.clone();
+                let provider = this.provider.clone();
                 let chain_spec = Arc::clone(&this.chain_spec);
                 let pool = this.pool.clone();
                 let events = this.pipe_line_events.take();
@@ -140,11 +147,11 @@ where
                     match storage.build_and_execute(
                         transactions.clone(),
                         withdrawals,
-                        &client,
+                        &provider,
                         chain_spec,
                         &block_executor,
                     ) {
-                        Ok((new_header, _bundle_state)) => {
+                        Ok((new_header, body, _bundle_state)) => {
                             // TODO: make this a future
                             //
                             // send the new update to the engine, this will trigger the engine
@@ -159,7 +166,7 @@ where
                                         // convert txs to bytes
                                         tx_bytes,
                                         // versioned metadata for peer validation
-                                        new_header.into(),
+                                        new_header.clone().into(),
                                     ),
                                     ack,
                                 })
@@ -168,6 +175,20 @@ where
                             match rx.await {
                                 Ok(digest) => {
                                     debug!(target: "execution::batch_maker", ?digest, "Batch sealed:");
+                                    // create sealed block with header and transactions
+                                    // use defaults for ommers, withdrawals, and
+                                    let sealed_block = SealedBlock::new(new_header, body);
+                                    match provider.insert_block_without_senders(
+                                        sealed_block,
+                                        BlockValidationKind::SkipStateRootValidation,
+                                    ) {
+                                        Ok(res) => {
+                                            debug!(target: "execution::batch_maker", ?res, "insert own batch OK")
+                                        }
+                                        Err(err) => {
+                                            error!(target: "execution::batch_maker", ?err, "failed to add own worker block to tree:")
+                                        }
+                                    }
                                 }
                                 Err(err) => {
                                     error!(target: "execution::batch_maker", ?err, "Execution's BatchMaker Ack Failed:");
@@ -242,8 +263,8 @@ where
     }
 }
 
-impl<EvmConfig, Client, Pool: TransactionPool> std::fmt::Debug
-    for MiningTask<Client, Pool, EvmConfig>
+impl<EvmConfig, Provider, Pool: TransactionPool> std::fmt::Debug
+    for MiningTask<Provider, Pool, EvmConfig>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MiningTask").finish_non_exhaustive()
