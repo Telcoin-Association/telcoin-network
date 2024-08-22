@@ -26,12 +26,15 @@ use reth_primitives::{
 };
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_tasks::TaskSpawner;
-use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool};
+use reth_transaction_pool::{
+    PoolTransaction, TransactionEvent, TransactionOrigin, TransactionPool,
+};
 use secp256k1::{
     ecdsa::{RecoverableSignature, RecoveryId, Signature},
     Message, SECP256K1,
 };
 use std::{
+    collections::HashMap,
     future::Future,
     pin::Pin,
     task::{ready, Context, Poll},
@@ -42,7 +45,7 @@ use tokio::sync::{
     oneshot,
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 /// Service for managing requests.
 ///
@@ -66,6 +69,8 @@ pub(crate) struct FaucetService<Provider, Pool, Tasks> {
     pub(crate) provider: Provider,
     /// The pool for submitting transactions.
     pub(crate) pool: Pool,
+    /// Pending requests
+    pub(crate) pending_requests: HashMap<(Address, Address), TxHash>,
     /// The cache for verifying an address hasn't exceeded time-based request limit.
     ///
     /// The cache maps a user's address with the contract's address to the time of the request.
@@ -140,11 +145,9 @@ where
                 Ok(signature) => {
                     let tx_for_pool =
                         TransactionSigned::from_transaction_and_signature(transaction, signature);
-                    let res = submit_transaction(pool, tx_for_pool).await;
-                    if res.is_ok() {
-                        // forward address to update cache
-                        let _ = add_to_cache.send((user, contract));
-                    }
+                    // submit transaction and subscribe to events
+                    let res =
+                        submit_transaction(pool, tx_for_pool, add_to_cache, user, contract).await;
                     // reply to rpc
                     let _ = reply.send(res);
                 }
@@ -393,6 +396,8 @@ where
         loop {
             // listen for cache updates
             while let Poll::Ready(Some((address, contract))) = this.update_cache_rx.poll_recv(cx) {
+                // remove from pending requests
+                this.pending_requests.remove(&(address, contract));
                 // insert user's address and contract address into LRU cache
                 this.lru_cache.insert((address, contract), SystemTime::now());
             }
@@ -410,6 +415,13 @@ where
                         // native token transfer
                         Address::ZERO
                     };
+
+                    // check pending requests
+                    if let Some(hash) = this.pending_requests.get(&(address, contract_address)) {
+                        // return pending tx hash to user
+                        let _ = reply.send(Ok(*hash));
+                        continue;
+                    }
 
                     // check the cache for user's address
                     // use `::peek` so cache timer doesn't reset
@@ -443,7 +455,13 @@ where
     }
 }
 
-async fn submit_transaction<Pool>(pool: Pool, tx: TransactionSigned) -> EthResult<TxHash>
+async fn submit_transaction<Pool>(
+    pool: Pool,
+    tx: TransactionSigned,
+    add_to_cache: UnboundedSender<(Address, Address)>,
+    user: Address,
+    contract: Address,
+) -> EthResult<TxHash>
 where
     Pool: TransactionPool + Clone + 'static,
 {
@@ -454,6 +472,36 @@ where
         Err(_) => return Err(EthApiError::TransactionConversionError),
     };
 
-    let hash = pool.add_transaction(TransactionOrigin::Local, pool_transaction).await?;
-    Ok(hash)
+    // submit tx and subscribe to events
+    let mut tx_events =
+        pool.add_transaction_and_subscribe(TransactionOrigin::Local, pool_transaction).await?;
+
+    let tx_hash = tx_events.hash();
+
+    // spawn task to listen for mining event, then update lru cache
+    tokio::task::spawn(async move {
+        // process events until tx mined
+        // drain the notification stream
+        while let Some(event) = tx_events.next().await {
+            debug!(target: "faucet", ?event, "tx event received:");
+            match event {
+                TransactionEvent::Mined(_block_hash) => {
+                    let _ = add_to_cache.send((user, contract));
+                    // end loop
+                    break;
+                }
+                _ => (/* ignore other events */),
+            }
+
+            // this can happen for replace, discard, and mined events
+            //
+            // if the tx was mined successfully, then loop already broke
+            if event.is_final() {
+                warn!("faucet transaction did not get mined: {event:?}");
+                break;
+            }
+        }
+    });
+
+    Ok(tx_hash)
 }

@@ -7,7 +7,9 @@ use reth_evm::execute::BlockExecutorProvider;
 use reth_primitives::{IntoRecoveredTransaction, SealedBlock, Withdrawals};
 use reth_provider::{BlockReaderIdExt, CanonChainTracker, StateProviderFactory};
 use reth_stages::PipelineEvent;
-use reth_transaction_pool::{TransactionPool, ValidPoolTransaction};
+use reth_transaction_pool::{
+    CanonicalStateUpdate, TransactionPool, TransactionPoolExt, ValidPoolTransaction,
+};
 use std::{
     collections::VecDeque,
     future::Future,
@@ -95,7 +97,7 @@ where
         + Clone
         + Unpin
         + 'static,
-    Pool: TransactionPool + Unpin + 'static,
+    Pool: TransactionPool + TransactionPoolExt + Unpin + 'static,
     <Pool as TransactionPool>::Transaction: IntoRecoveredTransaction,
 {
     type Output = ();
@@ -119,7 +121,6 @@ where
                 // ready to queue in new insert task
                 let storage = this.storage.clone();
                 let transactions = this.queued.pop_front().expect("not empty");
-
                 let to_worker = this.to_worker.clone();
                 let provider = this.provider.clone();
                 let chain_spec = Arc::clone(&this.chain_spec);
@@ -231,9 +232,18 @@ where
                             // might need to extend the trait onto another pool impl
                             //
                             // clear all transactions from pool once batch is sealed
-                            pool.remove_transactions(
-                                transactions.iter().map(|tx| tx.hash()).collect(),
-                            );
+                            // pool.remove_transactions(
+                            //     transactions.iter().map(|tx| tx.hash()).collect(),
+                            // );
+
+                            // // update pool
+                            pool.on_canonical_state_change(CanonicalStateUpdate {
+                                new_tip: new_header,
+                                pending_block_base_fee: todo!(),
+                                pending_block_blob_fee: todo!(),
+                                changed_accounts: todo!(),
+                                mined_transactions: todo!(),
+                            });
 
                             drop(storage);
                         }
