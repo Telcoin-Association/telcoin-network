@@ -238,13 +238,15 @@ pub async fn maintain_transaction_pool<Provider, P, C, W, Tasks>(
 
         // select of account reloads and new canonical state updates which should arrive at the rate
         // of the worker block proposal time (default 1s)
+        //
+        // NOTE: reth expects this task to run ~12s
         tokio::select! {
             res = &mut reload_accounts_fut =>  {
                 reloaded = Some(res);
             }
             ev = worker_events.next() =>  {
                  if ev.is_none() {
-                    // the stream ended, we are done
+                    // the stream ended - task is done
                     break;
                 }
                 event = ev;

@@ -4,7 +4,9 @@ use futures_util::{future::BoxFuture, FutureExt, StreamExt};
 use reth_blockchain_tree::{BlockValidationKind, BlockchainTreeEngine};
 use reth_chainspec::ChainSpec;
 use reth_evm::execute::BlockExecutorProvider;
-use reth_primitives::{IntoRecoveredTransaction, SealedBlock, Withdrawals};
+use reth_primitives::{
+    constants::MIN_PROTOCOL_BASE_FEE, IntoRecoveredTransaction, SealedBlock, Withdrawals,
+};
 use reth_provider::{
     BlockReaderIdExt, CanonChainTracker, CanonStateNotification, CanonStateSubscriptions,
     StateProviderFactory,
@@ -53,6 +55,8 @@ pub struct MiningTask<Provider, Pool: TransactionPool, BlockExecutor> {
     pipe_line_events: Option<UnboundedReceiverStream<PipelineEvent>>,
     /// The type used for block execution
     block_executor: BlockExecutor,
+    /// The worker's current base fee.
+    base_fee: Option<u64>,
 }
 
 // === impl MiningTask ===
@@ -81,6 +85,7 @@ impl<Provider, Pool: TransactionPool, BlockExecutor> MiningTask<Provider, Pool, 
             queued: Default::default(),
             pipe_line_events: None,
             block_executor,
+            base_fee: None,
         }
     }
 
@@ -133,14 +138,17 @@ where
                         // TODO: these should have already been mined when the worker proposed its block
                         let mined_transactions = blocks.transaction_hashes().collect();
 
+                        let pending_block_base_fee = this.base_fee.unwrap_or(MIN_PROTOCOL_BASE_FEE);
+
                         // Canonical update
                         let update = CanonicalStateUpdate {
-                            new_tip: &tip.block,
-                            pending_block_base_fee,
-                            pending_block_blob_fee: None,
-                            changed_accounts,
-                            mined_transactions,
+                            new_tip: &tip.block,          // finalized block
+                            pending_block_base_fee,       // current base fee for worker
+                            pending_block_blob_fee: None, // current base fee for worker
+                            changed_accounts,             // finalized block
+                            mined_transactions, // finalized block (but these should be a noop)
                         };
+
                         this.pool.on_canonical_state_change(update);
                     }
                     _ => unreachable!("reorgs can never happen"),
@@ -219,6 +227,12 @@ where
                                     // create sealed block with header and transactions
                                     // use defaults for ommers, withdrawals, and
                                     let sealed_block = SealedBlock::new(new_header, body);
+
+                                    // trying to insert the pending block here will get
+                                    // removed when the next round of consensus is executed
+                                    // because finalize_block removes forks
+                                    //
+                                    // TODO: insert block WITH senders since these were just used
                                     match provider.insert_block_without_senders(
                                         sealed_block,
                                         BlockValidationKind::SkipStateRootValidation,
@@ -230,6 +244,10 @@ where
                                             error!(target: "execution::batch_maker", ?err, "failed to add own worker block to tree:")
                                         }
                                     }
+
+                                    // TODO: send WorkerBlockUpdate through channel for maintenance task
+                                    //
+                                    //
                                 }
                                 Err(err) => {
                                     error!(target: "execution::batch_maker", ?err, "Execution's BatchMaker Ack Failed:");
@@ -276,18 +294,18 @@ where
                             //     transactions.iter().map(|tx| tx.hash()).collect(),
                             // );
 
-                            // the pool should update in two ways:
-                            // - canon update should update the pool
-                            // - the worker's proposed pending block should update
+                            // // the pool should update in two ways:
+                            // // - canon update should update the pool
+                            // // - the worker's proposed pending block should update
 
-                            // // update pool
-                            pool.on_canonical_state_change(CanonicalStateUpdate {
-                                new_tip: new_header,
-                                pending_block_base_fee: todo!(),
-                                pending_block_blob_fee: todo!(),
-                                changed_accounts: todo!(),
-                                mined_transactions: todo!(),
-                            });
+                            // // // update pool
+                            // pool.on_canonical_state_change(CanonicalStateUpdate {
+                            //     new_tip: new_header,
+                            //     pending_block_base_fee: todo!(),
+                            //     pending_block_blob_fee: todo!(),
+                            //     changed_accounts: todo!(),
+                            //     mined_transactions: todo!(),
+                            // });
 
                             drop(storage);
                         }
