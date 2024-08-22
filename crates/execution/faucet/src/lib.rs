@@ -20,7 +20,7 @@ use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use reth_transaction_pool::TransactionPool;
 use secp256k1::constants::PUBLIC_KEY_SIZE;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedSender},
     oneshot,
@@ -123,6 +123,7 @@ impl Faucet {
             request_rx: UnboundedReceiverStream::new(rx),
             provider,
             pool,
+            pending_requests: HashMap::new(),
             lru_cache,
             chain_id,
             transfer_amount,
