@@ -384,19 +384,10 @@ mod tests {
     use fastcrypto::hash::Hash;
     use narwhal_test_utils::default_test_execution_node;
     use reth::tasks::TaskManager;
-    use reth_blockchain_tree::noop::NoopBlockchainTree;
-    use reth_blockchain_tree::{BlockchainTreeEngine, BlockchainTreeViewer};
-    use reth_db::tables;
-    use reth_db::test_utils::{create_test_rw_db, tempdir_path};
-    use reth_db::transaction::DbTxMut;
-    use reth_db_common::init::init_genesis;
+    use reth_blockchain_tree::BlockchainTreeViewer;
     use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
     use reth_primitives::SealedBlock;
     use reth_primitives::{alloy_primitives::U160, GenesisAccount};
-    use reth_provider::{
-        providers::{BlockchainProvider, StaticFileProvider},
-        ProviderFactory,
-    };
     use reth_tracing::init_test_tracing;
     use reth_transaction_pool::{
         blobstore::InMemoryBlobStore, PoolConfig, TransactionValidationTaskExecutor,

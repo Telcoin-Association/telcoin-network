@@ -11067,8 +11067,6 @@ dependencies = [
  "reth",
  "reth-blockchain-tree",
  "reth-chainspec",
- "reth-db",
- "reth-db-common",
  "reth-evm",
  "reth-node-core",
  "reth-node-ethereum",
