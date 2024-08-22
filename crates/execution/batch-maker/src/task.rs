@@ -106,7 +106,24 @@ where
         let this = self.get_mut();
 
         // loop to poll the tx miner and send the next batch to Worker's `BatchMaker`
-        loop {
+        'main: loop {
+            // check for canon updates before mining the transaction pool
+            loop {
+                // poll canon updates stream and update pool `.on_canon_update`
+                // then maintenance task will handle worker's pending block update
+
+                // // update pool with worker's pending block update
+                // let update = CanonicalStateUpdate {
+                //     new_tip: &tip.block,          // parent
+                //     pending_block_base_fee,       // current
+                //     pending_block_blob_fee: None, // current
+                //     changed_accounts,             // engine
+                //     mined_transactions,           // empty
+                // };
+                // pool.on_canonical_state_change(update);
+                todo!()
+            }
+
             if let Poll::Ready(transactions) = this.miner.poll(&this.pool, cx) {
                 // miner returned a set of transaction that we feed to the producer
                 this.queued.push_back(transactions);
@@ -235,6 +252,10 @@ where
                             // pool.remove_transactions(
                             //     transactions.iter().map(|tx| tx.hash()).collect(),
                             // );
+
+                            // the pool should update in two ways:
+                            // - canon update should update the pool
+                            // - the worker's proposed pending block should update
 
                             // // update pool
                             pool.on_canonical_state_change(CanonicalStateUpdate {

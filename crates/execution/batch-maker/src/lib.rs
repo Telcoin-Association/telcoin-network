@@ -39,8 +39,8 @@ use tn_types::{now, AutoSealConsensus, NewBatch};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{debug, error, trace, warn};
 
-// mod client;
 mod mode;
+mod pool;
 mod task;
 
 // pub use crate::client::AutoSealProvider;

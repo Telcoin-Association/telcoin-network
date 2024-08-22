@@ -116,6 +116,7 @@ secp256k1 = { version = "0.29", default-features = false, features = [
 #reth-payload-builder = { path = "../reth/crates/payload/builder" }
 #reth-basic-payload-builder = { path = "../reth/crates/payload/basic" }
 #reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.3" }
+#reth-fs-util = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.3" }
 
 reth = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.3" }
 reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.3" }
@@ -166,6 +167,7 @@ reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.3
 reth-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.3" }
 reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.3" }
 reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.3" }
+reth-fs-util = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.3" }
 
 alloy-rlp = "0.3.7"
 
