@@ -26,7 +26,9 @@ use reth_primitives::{
     keccak256, proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber,
     Header, SealedHeader, TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256,
 };
-use reth_provider::{BlockReaderIdExt, ExecutionOutcome, StateProviderFactory};
+use reth_provider::{
+    BlockReaderIdExt, CanonStateNotifications, ExecutionOutcome, StateProviderFactory,
+};
 use reth_revm::database::StateProviderDatabase;
 use reth_transaction_pool::TransactionPool;
 use std::{
@@ -60,7 +62,6 @@ pub use task::MiningTask;
 //
 // - impl Future for BlockProposer like Engine
 
-
 pub struct BlockBuilder<BT, Pool, CE> {
     /// Single active future that executes consensus output on a blocking thread and then returns
     /// the result through a oneshot channel.
@@ -77,12 +78,11 @@ pub struct BlockBuilder<BT, Pool, CE> {
     max_round: Option<u64>,
     /// Receiving end from CL's `Executor`. The `ConsensusOutput` is sent
     /// to the mining task here.
-    consensus_output_stream: BroadcastStream<ConsensusOutput>,
+    canonical_stream_updates: CanonStateNotifications,
     /// The [SealedHeader] of the last fully-executed block.
     ///
     /// This information reflects the current finalized block number and hash.
     parent_header: SealedHeader,
-
 }
 
 /// Builder type for configuring the setup
