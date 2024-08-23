@@ -16,6 +16,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 use consensus_metrics::metered_channel::Sender;
+use error::BlockBuilderResult;
 use reth_chainspec::ChainSpec;
 use reth_evm::execute::{
     BlockExecutionError, BlockExecutionOutput, BlockExecutorProvider, BlockValidationError,
@@ -37,9 +38,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tn_types::{now, AutoSealConsensus, NewBatch};
-use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tokio::sync::{oneshot, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{debug, error, trace, warn};
 
+// mod block_builder;
+mod error;
 mod mode;
 mod pool;
 mod task;
@@ -62,12 +65,18 @@ pub use task::MiningTask;
 //
 // - impl Future for BlockProposer like Engine
 
+/// Type alias for the blocking task that executes consensus output and returns the finalized
+/// `SealedHeader`.
+type PendingExecutionTask = oneshot::Receiver<BlockBuilderResult<SealedHeader>>;
+
 pub struct BlockBuilder<BT, Pool, CE> {
     /// Single active future that executes consensus output on a blocking thread and then returns
     /// the result through a oneshot channel.
     pending_task: Option<PendingExecutionTask>,
     /// The type used to query both the database and the blockchain tree.
     blockchain: BT,
+    /// The transaction pool with pending transactions.
+    pool: Pool,
     /// EVM configuration for executing transactions and building blocks.
     evm_config: CE,
     /// Optional round of consensus to finish executing before then returning. The value is used to

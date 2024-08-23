@@ -11096,6 +11096,7 @@ dependencies = [
  "reth",
  "reth-blockchain-tree",
  "reth-chainspec",
+ "reth-errors",
  "reth-evm",
  "reth-fs-util",
  "reth-metrics",

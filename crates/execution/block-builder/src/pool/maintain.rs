@@ -14,7 +14,7 @@
 // use reth_tasks::TaskSpawner;
 // use reth_execution_types::ExecutionOutcome;
 // use reth_fs_util::FsPathError;
-use super::{metrics::MaintainPoolMetrics, WorkerBlockUpdate};
+use super::metrics::MaintainPoolMetrics;
 use futures_util::{
     future::{BoxFuture, Fuse, FusedFuture},
     FutureExt, Stream, StreamExt,
@@ -40,6 +40,7 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
 };
+use tn_types::WorkerBlockUpdate;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, trace, warn};
 
