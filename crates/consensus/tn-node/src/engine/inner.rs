@@ -8,6 +8,7 @@ use crate::{
     error::ExecutionError,
 };
 use consensus_metrics::metered_channel::Sender;
+use eyre::OptionExt as _;
 use jsonrpsee::http_client::HttpClient;
 use reth::rpc::{
     builder::{config::RethRpcServerConfig, RpcModuleBuilder, RpcServerHandle},
@@ -26,7 +27,7 @@ use reth_db_common::init::init_genesis;
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use reth_node_builder::{common::WithConfigs, components::PoolBuilder, BuilderContext, NodeConfig};
 use reth_node_ethereum::{node::EthereumPoolBuilder, EthEvmConfig};
-use reth_primitives::Address;
+use reth_primitives::{Address, SealedHeader};
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     DatabaseProviderFactory, FinalizedBlockReader, HeaderProvider, ProviderFactory,
@@ -37,7 +38,7 @@ use reth_tasks::TaskExecutor;
 use reth_transaction_pool::TransactionPool;
 use std::{collections::HashMap, sync::Arc};
 use tn_batch_validator::BatchValidator;
-use tn_block_maker::{BatchMakerBuilder, MiningMode};
+use tn_block_maker::{BlockMakerBuilder, MiningMode};
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
 use tn_types::{Consensus, ConsensusOutput, NewBatch, WorkerId};
@@ -63,6 +64,8 @@ where
     /// help TN stay in-sync with the Ethereum community.
     node_config: NodeConfig,
     /// Type that fetches data from the database.
+    ///
+    /// Also used to subscribe to canonical updates after executing consensus output.
     blockchain_db: BlockchainProvider<DB>,
     /// Provider factory is held by the blockchain db, but there isn't a publicly
     /// available way to get a cloned copy.
@@ -184,11 +187,9 @@ where
             )
             .await?;
 
-        let head = self.node_config.lookup_head(self.provider_factory.clone())?;
-
         // TODO: call hooks?
 
-        let parent_header = self.blockchain_db.sealed_header(head.number)?.expect("Failed to retrieve sealed header from head's block number while starting executor engine");
+        let parent_header = self.get_parent_header()?;
 
         // spawn execution engine to extend canonical tip
         let tn_engine = ExecutorEngine::new(
@@ -238,6 +239,10 @@ where
         to_worker: Sender<NewBatch>,
         worker_id: WorkerId,
     ) -> eyre::Result<()> {
+        //
+        // TODO: add worker block broadcast stream here for others to subscribe
+        //
+
         // TODO: both start_engine and start_batch_maker lookup head
         let head = self.node_config.lookup_head(self.provider_factory.clone())?;
 
@@ -263,7 +268,7 @@ where
         let max_transactions = 10;
         let mining_mode =
             MiningMode::instant(max_transactions, transaction_pool.pending_transactions_listener());
-        let task = BatchMakerBuilder::new(
+        let task = BlockMakerBuilder::new(
             Arc::clone(&self.node_config.chain),
             self.blockchain_db.clone(),
             transaction_pool.clone(),
@@ -349,6 +354,18 @@ where
             self.blockchain_db.clone(),
             self.evm_executor.clone(),
         )
+    }
+
+    /// Both engine and block makers need to pull the head block from storage on startup.
+    ///
+    /// This is a helper method to ensure consistency when starting either task.
+    fn get_parent_header(&self) -> eyre::Result<SealedHeader> {
+        let head = self.node_config.lookup_head(self.provider_factory.clone())?;
+        let parent_header = self
+            .blockchain_db
+            .sealed_header(head.number)?
+            .ok_or_eyre("Failed to retrieve sealed header from head's block number")?;
+        Ok(parent_header)
     }
 
     /// Fetch the last executed state from the database.

@@ -25,7 +25,7 @@ use reth_transaction_pool::{
 use std::{sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tn_batch_validator::{BatchValidation, BatchValidator};
-use tn_block_maker::{BatchMakerBuilder, MiningMode};
+use tn_block_maker::{BlockMakerBuilder, MiningMode};
 use tn_types::{
     test_utils::{get_gas_price, test_genesis, TransactionFactory},
     Batch, BatchAPI, Consensus, MetadataAPI, PreSubscribedBroadcastSender,
@@ -110,7 +110,7 @@ async fn test_make_batch_el_to_cl() {
     let block_executor = EthExecutorProvider::new(chain.clone(), evm_config);
 
     // build execution batch maker
-    let task = BatchMakerBuilder::new(
+    let task = BlockMakerBuilder::new(
         Arc::clone(&chain),
         blockchain_db.clone(),
         txpool.clone(),

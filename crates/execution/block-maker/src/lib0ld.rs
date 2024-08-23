@@ -1,4 +1,5 @@
-//! The worker's block maker monitors a transaction pool populated by incoming transactios through the worker's RPC.
+//! A [Consensus] implementation for local testing purposes
+//! that automatically seals blocks.
 //!
 //! The Mining task polls a [MiningMode], and will return a list of transactions that are ready to
 //! be mined.
@@ -44,20 +45,6 @@ mod task;
 
 pub use mode::{FixedBlockTimeMiner, MiningMode, ReadyTransactionMiner};
 pub use task::MiningTask;
-
-// blockchain provider
-// tx pool
-// consensus
-// max round
-// broadcast channel for sending WorkerBlocks after they're sealed
-// canon state updates subscriber channel to receive
-
-// initial approach:
-// - mine block when txpool pending tx notification received
-//      - try to fill up entire block
-//      - early network could be small blocks but faster than timer approach
-//
-// - impl Future for BlockProposer
 
 /// Builder type for configuring the setup
 #[derive(Debug)]
