@@ -51,13 +51,39 @@ pub use task::MiningTask;
 // max round
 // broadcast channel for sending WorkerBlocks after they're sealed
 // canon state updates subscriber channel to receive
+// basefee
 
 // initial approach:
 // - mine block when txpool pending tx notification received
 //      - try to fill up entire block
 //      - early network could be small blocks but faster than timer approach
 //
-// - impl Future for BlockProposer
+// - impl Future for BlockProposer like Engine
+
+
+pub struct BlockBuilder<BT, Pool, CE> {
+    /// Single active future that executes consensus output on a blocking thread and then returns
+    /// the result through a oneshot channel.
+    pending_task: Option<PendingExecutionTask>,
+    /// The type used to query both the database and the blockchain tree.
+    blockchain: BT,
+    /// EVM configuration for executing transactions and building blocks.
+    evm_config: CE,
+    /// Optional round of consensus to finish executing before then returning. The value is used to
+    /// track the subdag index from consensus output. The index is also considered the "round" of
+    /// consensus and is included in executed blocks as  the block's `nonce` value.
+    ///
+    /// NOTE: this is primarily useful for debugging and testing
+    max_round: Option<u64>,
+    /// Receiving end from CL's `Executor`. The `ConsensusOutput` is sent
+    /// to the mining task here.
+    consensus_output_stream: BroadcastStream<ConsensusOutput>,
+    /// The [SealedHeader] of the last fully-executed block.
+    ///
+    /// This information reflects the current finalized block number and hash.
+    parent_header: SealedHeader,
+
+}
 
 /// Builder type for configuring the setup
 #[derive(Debug)]

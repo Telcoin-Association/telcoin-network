@@ -5729,7 +5729,7 @@ dependencies = [
  "telcoin-network",
  "tempfile",
  "tn-batch-validator",
- "tn-block-maker",
+ "tn-block-builder",
  "tn-engine",
  "tn-faucet",
  "tn-node",
@@ -11077,7 +11077,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tn-block-maker"
+name = "tn-block-builder"
 version = "0.1.0"
 dependencies = [
  "alloy-rlp",
@@ -11144,7 +11144,7 @@ dependencies = [
  "reth-tracing",
  "reth-transaction-pool",
  "thiserror",
- "tn-block-maker",
+ "tn-block-builder",
  "tn-types",
  "tokio",
  "tokio-stream",
@@ -11252,7 +11252,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tn-batch-validator",
- "tn-block-maker",
+ "tn-block-builder",
  "tn-engine",
  "tn-faucet",
  "tn-types",

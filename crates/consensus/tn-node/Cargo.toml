@@ -63,7 +63,7 @@ reth-transaction-pool = { workspace = true }
 reth-static-file = { workspace = true }
 reth-ethereum-payload-builder = { workspace = true }
 tn-engine = { workspace = true }
-tn-block-maker = { workspace = true }
+tn-block-builder = { workspace = true }
 tn-batch-validator = { workspace = true }
 jsonrpsee = { workspace = true }
 fdlimit = { workspace = true }

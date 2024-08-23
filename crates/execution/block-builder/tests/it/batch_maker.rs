@@ -25,7 +25,7 @@ use reth_transaction_pool::{
 use std::{sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tn_batch_validator::{BatchValidation, BatchValidator};
-use tn_block_maker::{BlockMakerBuilder, MiningMode};
+use tn_block_builder::{BlockMakerBuilder, MiningMode};
 use tn_types::{
     test_utils::{get_gas_price, test_genesis, TransactionFactory},
     Batch, BatchAPI, Consensus, MetadataAPI, PreSubscribedBroadcastSender,

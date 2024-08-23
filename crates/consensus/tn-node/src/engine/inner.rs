@@ -38,7 +38,7 @@ use reth_tasks::TaskExecutor;
 use reth_transaction_pool::TransactionPool;
 use std::{collections::HashMap, sync::Arc};
 use tn_batch_validator::BatchValidator;
-use tn_block_maker::{BlockMakerBuilder, MiningMode};
+use tn_block_builder::{BlockMakerBuilder, MiningMode};
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
 use tn_types::{Consensus, ConsensusOutput, NewBatch, WorkerId};

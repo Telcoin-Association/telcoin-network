@@ -45,7 +45,7 @@ anemo = { workspace = true }
 eyre = { workspace = true }
 reth-node-ethereum = { workspace = true }
 reth-stages = { workspace = true }
-tn-block-maker = { workspace = true }
+tn-block-builder = { workspace = true }
 tn-batch-validator = { workspace = true }
 tn-engine = { workspace = true }
 reth = { workspace = true }

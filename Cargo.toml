@@ -21,7 +21,7 @@ members = [
     "crates/consensus/primary-metrics",
 
     # execution
-    "crates/execution/block-maker",
+    "crates/execution/block-builder",
     "crates/execution/batch-validator",
     "crates/execution/faucet",
     "crates/execution/engine",
@@ -202,7 +202,7 @@ tn-batch-validator = { path = "crates/execution/batch-validator" }
 tn-engine = { path = "crates/execution/engine" }
 
 # block maker
-tn-block-maker = { path = "crates/execution/block-maker" }
+tn-block-builder = { path = "crates/execution/block-builder" }
 futures-util = "0.3.25"
 jsonrpsee = { version = "0.23" }
 assert_matches = { version = "1.5.0" }
