@@ -31,8 +31,8 @@ use reth_provider::{
 };
 use reth_tasks::TaskSpawner;
 use reth_transaction_pool::{
-    error::PoolError, BlockInfo, CanonicalStateUpdate, ChangedAccount, TransactionPool,
-    TransactionPoolExt,
+    error::PoolError, BlockInfo, CanonicalStateUpdate, ChangedAccount, TransactionOrigin,
+    TransactionPool, TransactionPoolExt,
 };
 use std::{
     borrow::Borrow,
@@ -505,7 +505,7 @@ where
         })
         .collect::<Vec<_>>();
 
-    let outcome = pool.add_transactions(crate::TransactionOrigin::Local, pool_transactions).await;
+    let outcome = pool.add_transactions(TransactionOrigin::Local, pool_transactions).await;
 
     info!(target: "txpool", txs_file =?file_path, num_txs=%outcome.len(), "Successfully reinserted local transactions from file");
     reth_fs_util::remove_file(file_path)?;
@@ -586,10 +586,6 @@ pub async fn backup_local_transactions_task<P>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        blobstore::InMemoryBlobStore, validate::EthTransactionValidatorBuilder,
-        CoinbaseTipOrdering, EthPooledTransaction, Pool, PoolTransaction, TransactionOrigin,
-    };
     use reth_chainspec::MAINNET;
     use reth_fs_util as fs;
     use reth_primitives::{hex, PooledTransactionsElement, U256};

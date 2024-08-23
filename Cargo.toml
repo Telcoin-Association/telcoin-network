@@ -21,7 +21,7 @@ members = [
     "crates/consensus/primary-metrics",
 
     # execution
-    "crates/execution/batch-maker",
+    "crates/execution/block-maker",
     "crates/execution/batch-validator",
     "crates/execution/faucet",
     "crates/execution/engine",
@@ -201,8 +201,8 @@ alloy-sol-types = "0.7.7"
 tn-batch-validator = { path = "crates/execution/batch-validator" }
 tn-engine = { path = "crates/execution/engine" }
 
-# batch maker
-tn-batch-maker = { path = "crates/execution/batch-maker" }
+# block maker
+tn-block-maker = { path = "crates/execution/block-maker" }
 futures-util = "0.3.25"
 jsonrpsee = { version = "0.23" }
 assert_matches = { version = "1.5.0" }

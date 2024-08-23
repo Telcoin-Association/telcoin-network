@@ -22,7 +22,7 @@ use reth_transaction_pool::{
     blobstore::InMemoryBlobStore, PoolConfig, TransactionPool, TransactionValidationTaskExecutor,
 };
 use std::{collections::VecDeque, str::FromStr as _, sync::Arc, time::Duration};
-use tn_batch_maker::{BatchMakerBuilder, MiningMode};
+use tn_block_maker::{BatchMakerBuilder, MiningMode};
 use tn_engine::ExecutorEngine;
 use tn_types::test_utils::test_genesis;
 use tn_types::{

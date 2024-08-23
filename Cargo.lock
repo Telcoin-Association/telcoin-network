@@ -5728,8 +5728,8 @@ dependencies = [
  "reth-transaction-pool",
  "telcoin-network",
  "tempfile",
- "tn-batch-maker",
  "tn-batch-validator",
+ "tn-block-maker",
  "tn-engine",
  "tn-faucet",
  "tn-node",
@@ -11050,7 +11050,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
-name = "tn-batch-maker"
+name = "tn-batch-validator"
+version = "0.1.0"
+dependencies = [
+ "alloy-rlp",
+ "async-trait",
+ "reth",
+ "reth-beacon-consensus",
+ "reth-blockchain-tree",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-db",
+ "reth-db-common",
+ "reth-evm",
+ "reth-node-core",
+ "reth-node-ethereum",
+ "reth-primitives",
+ "reth-provider",
+ "reth-prune",
+ "reth-revm",
+ "reth-tracing",
+ "thiserror",
+ "tn-types",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "tn-block-maker"
 version = "0.1.0"
 dependencies = [
  "alloy-rlp",
@@ -11092,33 +11119,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tn-batch-validator"
-version = "0.1.0"
-dependencies = [
- "alloy-rlp",
- "async-trait",
- "reth",
- "reth-beacon-consensus",
- "reth-blockchain-tree",
- "reth-chainspec",
- "reth-consensus",
- "reth-db",
- "reth-db-common",
- "reth-evm",
- "reth-node-core",
- "reth-node-ethereum",
- "reth-primitives",
- "reth-provider",
- "reth-prune",
- "reth-revm",
- "reth-tracing",
- "thiserror",
- "tn-types",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "tn-engine"
 version = "0.1.0"
 dependencies = [
@@ -11144,7 +11144,7 @@ dependencies = [
  "reth-tracing",
  "reth-transaction-pool",
  "thiserror",
- "tn-batch-maker",
+ "tn-block-maker",
  "tn-types",
  "tokio",
  "tokio-stream",
@@ -11251,8 +11251,8 @@ dependencies = [
  "serde_yaml 0.8.26",
  "tempfile",
  "thiserror",
- "tn-batch-maker",
  "tn-batch-validator",
+ "tn-block-maker",
  "tn-engine",
  "tn-faucet",
  "tn-types",

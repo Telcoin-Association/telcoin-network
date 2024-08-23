@@ -40,6 +40,6 @@ tn-types = { workspace = true, features = ["test-utils"] }
 # it tests
 reth-node-ethereum = { workspace = true }
 reth-transaction-pool = { workspace = true }
-tn-batch-maker = { workspace = true }
+tn-block-maker = { workspace = true }
 prometheus = { workspace = true }
 consensus-metrics = { workspace = true }
