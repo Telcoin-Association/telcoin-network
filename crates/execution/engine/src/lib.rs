@@ -19,7 +19,7 @@
 
 mod error;
 mod payload_builder;
-use error::EngineResult;
+use error::{EngineResult, TnEngineError};
 use futures::{Future, StreamExt};
 use futures_util::FutureExt;
 pub use payload_builder::execute_consensus_output;
@@ -126,25 +126,30 @@ where
             + CanonChainTracker
             + Clone,
     {
-        let output = self.queued.pop_front().expect("not empty");
-        let provider = self.blockchain.clone();
-        let evm_config = self.evm_config.clone();
-        let parent = self.parent_header.clone();
-        let build_args = BuildArguments::new(provider, output, parent);
         let (tx, rx) = oneshot::channel();
 
-        // spawn blocking task and return future
-        tokio::task::spawn_blocking(|| {
-            // this is safe to call on blocking thread without a semaphore bc it's held in
-            // Self::pending_tesk as a single `Option`
-            let result = execute_consensus_output(evm_config, build_args);
-            match tx.send(result) {
-                Ok(()) => (),
-                Err(e) => {
-                    error!(target: "engine", ?e, "error sending result from execute_consensus_output")
+        // pop next output in queue and execute
+        if let Some(output) = self.queued.pop_front() {
+            let provider = self.blockchain.clone();
+            let evm_config = self.evm_config.clone();
+            let parent = self.parent_header.clone();
+            let build_args = BuildArguments::new(provider, output, parent);
+
+            // spawn blocking task and return future
+            tokio::task::spawn_blocking(|| {
+                // this is safe to call on blocking thread without a semaphore bc it's held in
+                // Self::pending_tesk as a single `Option`
+                let result = execute_consensus_output(evm_config, build_args);
+                match tx.send(result) {
+                    Ok(()) => (),
+                    Err(e) => {
+                        error!(target: "engine", ?e, "error sending result from execute_consensus_output")
+                    }
                 }
-            }
-        });
+            });
+        } else {
+            let _ = tx.send(Err(TnEngineError::EmptyQueue));
+        }
 
         // oneshot receiver for execution result
         rx

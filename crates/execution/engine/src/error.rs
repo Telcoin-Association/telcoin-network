@@ -36,6 +36,9 @@ pub enum TnEngineError {
     /// The executed block failed to become part of the canonical chain.
     #[error("Blockchain tree failed to make_canonical: {0}")]
     Canonical(#[from] CanonicalError),
+    /// The queued output that triggered the engine build was not found.
+    #[error("Engine trying to build from empty queue.")]
+    EmptyQueue,
     /// The oneshot channel that receives the result from executing output on a blocking thread.
     #[error("The oneshot channel sender inside blocking task dropped during output execution.")]
     ChannelClosed,
