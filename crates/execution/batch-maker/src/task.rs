@@ -112,13 +112,13 @@ where
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut canon_update = self.provider.canonical_state_stream();
+        let mut canon_updates = self.provider.canonical_state_stream();
         let this = self.get_mut();
 
         // loop to poll the tx miner and send the next batch to Worker's `BatchMaker`
         loop {
             // check for canon updates before mining the transaction pool
-            while let Poll::Ready(Some(canon_update)) = canon_update.poll_next_unpin(cx) {
+            while let Poll::Ready(Some(canon_update)) = canon_updates.poll_next_unpin(cx) {
                 // poll canon updates stream and update pool `.on_canon_update`
                 //
                 // maintenance task will handle worker's pending block update
@@ -126,7 +126,7 @@ where
                     CanonStateNotification::Commit { new } => {
                         // TODO: ensure the engine's update includes all accounts that changed during execution
                         warn!(target: "Canon update inside batch maker!!!!\n", ?new);
-                        // // update pool with worker's pending block update
+                        // update pool based with canonical tip update
                         let (blocks, state) = new.inner();
                         let tip = blocks.tip();
 
@@ -149,24 +149,28 @@ where
                             mined_transactions, // finalized block (but these should be a noop)
                         };
 
+                        // sync fn so this will block until all pool updates are complete
                         this.pool.on_canonical_state_change(update);
                     }
-                    _ => unreachable!("reorgs can never happen"),
+                    _ => unreachable!("TN reorgs are impossible"),
                 }
             }
 
+            // poll pool for pending transactions and add to queue
             if let Poll::Ready(transactions) = this.miner.poll(&this.pool, cx) {
                 // miner returned a set of transaction that we feed to the producer
                 this.queued.push_back(transactions);
             }
 
+            // only build one block at a time
             if this.insert_task.is_none() {
+                // check queue
                 if this.queued.is_empty() {
                     // nothing to insert
                     break;
                 }
 
-                // ready to queue in new insert task
+                // ready to start next insert task
                 let storage = this.storage.clone();
                 let transactions = this.queued.pop_front().expect("not empty");
                 let to_worker = this.to_worker.clone();
