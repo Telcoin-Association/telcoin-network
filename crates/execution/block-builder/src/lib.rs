@@ -122,7 +122,7 @@ pub struct BlockBuilder<BT, Pool, CE> {
     /// The number of blocks this block builder has built.
     ///
     /// NOTE: this is only used when `max_blocks` is specified.
-    num_blocks_built: Option<usize>,
+    num_builds: Option<usize>,
 
     // TODO: consider using a container struct for these values
     /// The [SealedHeader] of the last fully-executed block.
@@ -163,7 +163,7 @@ where
         let canonical_state_updates = blockchain.canonical_state_stream();
 
         // start at 0 if max_builds specified
-        let num_blocks_built = max_builds.map(|_| 0);
+        let num_builds = max_builds.map(|_| 0);
 
         Self {
             pending_task,
@@ -174,7 +174,7 @@ where
             canonical_state_updates,
             to_worker,
             max_builds,
-            num_blocks_built,
+            num_builds,
             parent_header,
             base_fee,
         }
@@ -341,8 +341,7 @@ where
                         this.parent_header = finalized_header?;
 
                         // check max_builds
-                        if this.max_builds.is_some()
-                            && this.has_reached_max_build(this.num_blocks_built)
+                        if this.max_builds.is_some() && this.has_reached_max_build(this.num_builds)
                         {
                             // immediately terminate if the specified max consensus round is reached
                             return Poll::Ready(Ok(()));
