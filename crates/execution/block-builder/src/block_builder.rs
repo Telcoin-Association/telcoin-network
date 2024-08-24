@@ -2,7 +2,7 @@
 ///
 /// Returns a result indicating success with the payload or an error in case of failure.
 #[inline]
-pub fn worker_block_builder<EvmConfig, Pool, Provider>(
+pub fn build_worker_block<EvmConfig, Pool, Provider>(
     evm_config: EvmConfig,
     args: BuildArguments<Pool, Provider, EthPayloadBuilderAttributes, EthBuiltPayload>,
 ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>

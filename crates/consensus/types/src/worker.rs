@@ -11,6 +11,7 @@ pub type WorkerBlockUpdateSender = broadcast::Sender<WorkerBlockUpdate>;
 pub type WorkerBlockUpdates = broadcast::Receiver<WorkerBlockUpdate>;
 
 /// The information from a worker's pending block proposal that is streamed to the transaction pool's maintenance task for updating transaction status.
+#[derive(Clone, Debug)]
 pub struct WorkerBlockUpdate {
     /// The finalized, canonical tip used to propose this block.
     pub parent: SealedBlock,
