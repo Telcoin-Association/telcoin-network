@@ -221,6 +221,7 @@ where
     // I can get the state root section below to compile using `db.commit(state)`.
     //
     // TODO: create `CachedReads` during batch validation?
+    // same problem with worker's block_builder.
     let mut cached_reads = CachedReads::default();
     let mut db =
         State::builder().with_database_ref(cached_reads.as_db(state)).with_bundle_update().build();

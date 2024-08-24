@@ -53,7 +53,7 @@ use tn_types::{now, AutoSealConsensus, NewBatch, WorkerBlockUpdateSender};
 use tokio::sync::{broadcast, oneshot, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{debug, error, trace, warn};
 
-// mod block_builder;
+mod block_builder;
 mod error;
 mod pool;
 
@@ -341,10 +341,13 @@ where
                         this.parent_header = finalized_header?;
 
                         // check max_builds
-                        if this.max_builds.is_some() && this.has_reached_max_build(this.num_builds)
-                        {
-                            // immediately terminate if the specified max consensus round is reached
-                            return Poll::Ready(Ok(()));
+                        if this.max_builds.is_some() {
+                            // increase num builds
+                            this.num_builds = this.num_builds.map(|n| n + 1);
+                            if this.has_reached_max_build(this.num_builds) {
+                                // immediately terminate if the specified max number of blocks were built
+                                return Poll::Ready(Ok(()));
+                            }
                         }
 
                         // allow loop to continue: check for engine updates
