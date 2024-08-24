@@ -258,7 +258,9 @@ where
                         this.parent_header = finalized_header?;
 
                         // check max_round
-                        if this.has_reached_max_round(this.parent_header.nonce) {
+                        if this.max_round.is_some()
+                            && this.has_reached_max_round(this.parent_header.nonce)
+                        {
                             // immediately terminate if the specified max consensus round is reached
                             return Poll::Ready(Ok(()));
                         }

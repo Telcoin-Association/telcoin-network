@@ -55,12 +55,7 @@ use tracing::{debug, error, trace, warn};
 
 // mod block_builder;
 mod error;
-mod mode;
 mod pool;
-mod task;
-
-pub use mode::{FixedBlockTimeMiner, MiningMode, ReadyTransactionMiner};
-pub use task::MiningTask;
 
 // blockchain provider
 // tx pool
@@ -250,25 +245,21 @@ where
         // rx
     }
 
-    /// Check if the task has reached the maximum number of blocks to build as specified by `max_round`.
+    /// Check if the task has reached the maximum number of blocks to build as specified by `max_builds`.
     ///
     /// Note: this is mainly for testing and debugging purposes.
-    fn has_reached_max_round(&self, progress: u64) -> bool {
-        let has_reached_max_round =
-            self.max_round.map(|target| progress >= target).unwrap_or_default();
-        if has_reached_max_round {
+    fn has_reached_max_build(&self, progress: Option<usize>) -> bool {
+        let has_reached_max_build = progress >= self.max_builds;
+        if has_reached_max_build {
             trace!(
                 target: "engine",
                 ?progress,
-                max_round = ?self.max_round,
+                max_round = ?self.max_builds,
                 "Consensus engine reached max round for consensus"
             );
         }
-        has_reached_max_round
+        has_reached_max_build
     }
-}
-
-
 }
 
 /// The [BlockBuilder] is a future that loops through the following:
@@ -349,8 +340,10 @@ where
                         // ensure no errors then store last executed header in memory
                         this.parent_header = finalized_header?;
 
-                        // check max_round
-                        if this.has_reached_max_round(this.parent_header.nonce) {
+                        // check max_builds
+                        if this.max_builds.is_some()
+                            && this.has_reached_max_build(this.num_blocks_built)
+                        {
                             // immediately terminate if the specified max consensus round is reached
                             return Poll::Ready(Ok(()));
                         }

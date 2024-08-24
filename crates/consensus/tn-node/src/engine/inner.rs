@@ -38,7 +38,7 @@ use reth_tasks::TaskExecutor;
 use reth_transaction_pool::TransactionPool;
 use std::{collections::HashMap, sync::Arc};
 use tn_batch_validator::BatchValidator;
-use tn_block_builder::{BlockMakerBuilder, MiningMode};
+use tn_block_builder::BlockBuilder;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
 use tn_types::{Consensus, ConsensusOutput, NewBatch, WorkerId};
@@ -265,22 +265,24 @@ where
         let network = WorkerNetwork::default();
 
         // build batch maker
-        let max_transactions = 10;
-        let mining_mode =
-            MiningMode::instant(max_transactions, transaction_pool.pending_transactions_listener());
-        let task = BlockMakerBuilder::new(
-            Arc::clone(&self.node_config.chain),
-            self.blockchain_db.clone(),
-            transaction_pool.clone(),
-            to_worker,
-            mining_mode,
-            self.address,
-            self.evm_executor.clone(),
-        )
-        .build();
+        // let max_transactions = 10;
+        // let mining_mode =
+        //     MiningMode::instant(max_transactions, transaction_pool.pending_transactions_listener());
+        // let task = BlockBuilder::new(
+        //     Arc::clone(&self.node_config.chain),
+        //     self.blockchain_db.clone(),
+        //     transaction_pool.clone(),
+        //     to_worker,
+        //     mining_mode,
+        //     self.address,
+        //     self.evm_executor.clone(),
+        // )
+        // .build();
+
+        let task = todo!();
 
         // spawn batch maker mining task
-        self.task_executor.spawn_critical("batch maker", task);
+        // self.task_executor.spawn_critical("batch maker", task);
 
         // let mut hooks = EngineHooks::new();
 

@@ -1,4 +1,4 @@
-use crate::{mode::MiningMode, pool::maintain::changed_accounts_iter, Storage};
+use crate::{mode::MiningMode, pool::maintain::changed_accounts_iter};
 use consensus_metrics::metered_channel::Sender;
 use futures_util::{future::BoxFuture, FutureExt, StreamExt};
 use reth_blockchain_tree::{BlockValidationKind, BlockchainTreeEngine};
