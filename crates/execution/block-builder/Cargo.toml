@@ -29,6 +29,7 @@ reth-node-ethereum = { workspace = true }
 reth-tasks = { workspace = true }
 reth-metrics = { workspace = true }
 reth-fs-util = { workspace = true }
+reth-evm-ethereum = { workspace = true }
 metrics = { workspace = true }
 thiserror = { workspace = true }
 alloy-rlp = { workspace = true }

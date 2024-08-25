@@ -1,5 +1,8 @@
 //! Types for interacting with the worker.
 
+use std::sync::Arc;
+
+use reth_chainspec::ChainSpec;
 use reth_primitives::{Address, SealedBlock, SealedBlockWithSenders, SealedHeader};
 use reth_provider::ExecutionOutcome;
 use reth_revm::primitives::{BlockEnv, CfgEnvWithHandlerCfg};
@@ -54,6 +57,18 @@ pub struct WorkerBlockBuilderArgs<Pool, Provider> {
     pub beneficiary: Address,
 }
 
+impl<Pool, Provider> WorkerBlockBuilderArgs<Pool, Provider> {
+    /// Create a new instance of [Self].
+    pub fn new(
+        provider: Provider,
+        pool: Pool,
+        block_config: PendingBlockConfig,
+        beneficiary: Address,
+    ) -> Self {
+        Self { provider, pool, block_config, beneficiary }
+    }
+}
+
 /// The configuration to use for building the next worker block.
 #[derive(Debug)]
 pub struct PendingBlockConfig {
@@ -63,4 +78,21 @@ pub struct PendingBlockConfig {
     pub initialized_block_env: BlockEnv,
     /// Configuration for the environment.
     pub initialized_cfg: CfgEnvWithHandlerCfg,
+    /// The chain spec.
+    pub chain_spec: Arc<ChainSpec>,
+    /// The timestamp (sec) for when this block was built.
+    pub timestamp: u64,
+}
+
+impl PendingBlockConfig {
+    /// Creates a new instance of [Self].
+    pub fn new(
+        parent: SealedBlock,
+        initialized_block_env: BlockEnv,
+        initialized_cfg: CfgEnvWithHandlerCfg,
+        chain_spec: Arc<ChainSpec>,
+        timestamp: u64,
+    ) -> Self {
+        Self { parent, initialized_block_env, initialized_cfg, chain_spec, timestamp }
+    }
 }

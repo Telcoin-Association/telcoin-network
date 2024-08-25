@@ -242,10 +242,13 @@ impl PayloadBuilderAttributes for TNPayload {
         let cfg = CfgEnv::default().with_chain_id(chain_spec.chain().id());
 
         // ensure we're not missing any timestamp based hardforks
+        //
+        // TODO: this returns "SHANGHAI"
+        // - need to support Cancun and Prague
         let spec_id = revm_spec_by_timestamp_after_merge(chain_spec, self.timestamp());
 
-        // use the blob excess gas and price set by the worker during batch creation
-        let blob_excess_gas_and_price = Some(BlobExcessGasAndPrice::new(0));
+        // TODO: use the blob excess gas and price set by the worker during batch creation
+        let blob_excess_gas_and_price = None;
 
         // use the basefee set by the worker during batch creation
         let basefee = U256::from(self.attributes.base_fee_per_gas);
@@ -266,7 +269,7 @@ impl PayloadBuilderAttributes for TNPayload {
             prevrandao: Some(self.prev_randao()),
             gas_limit,
             basefee,
-            // calculate excess gas based on parent block's blob gas usage
+            // TODO: this should be set by worker after Cancun upgrade
             blob_excess_gas_and_price,
         };
 

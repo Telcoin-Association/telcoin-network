@@ -15,6 +15,7 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+pub use block_builder::build_worker_block;
 use consensus_metrics::metered_channel::Sender;
 use error::BlockBuilderResult;
 use futures_util::{FutureExt, StreamExt};
@@ -28,6 +29,7 @@ use reth_evm::{
     },
     ConfigureEvm,
 };
+use reth_evm_ethereum::revm_spec_by_timestamp_after_merge;
 use reth_primitives::{
     constants::{EMPTY_TRANSACTIONS, ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE},
     keccak256, proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber,
@@ -36,10 +38,13 @@ use reth_primitives::{
 };
 use reth_provider::{
     BlockReaderIdExt, CanonChainTracker, CanonStateNotification, CanonStateNotificationStream,
-    CanonStateNotifications, CanonStateSubscriptions, Chain, ExecutionOutcome,
+    CanonStateNotifications, CanonStateSubscriptions, Chain, ChainSpecProvider, ExecutionOutcome,
     StateProviderFactory,
 };
-use reth_revm::database::StateProviderDatabase;
+use reth_revm::{
+    database::StateProviderDatabase,
+    primitives::{BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg},
+};
 use reth_transaction_pool::{CanonicalStateUpdate, TransactionPool, TransactionPoolExt};
 use std::{
     collections::HashMap,
@@ -49,7 +54,10 @@ use std::{
     task::{Context, Poll},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tn_types::{now, AutoSealConsensus, NewBatch, WorkerBlockUpdate, WorkerBlockUpdateSender};
+use tn_types::{
+    now, AutoSealConsensus, NewBatch, PendingBlockConfig, WorkerBlockBuilderArgs,
+    WorkerBlockUpdate, WorkerBlockUpdateSender,
+};
 use tokio::sync::{broadcast, oneshot, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{debug, error, trace, warn};
 
@@ -123,6 +131,8 @@ pub struct BlockBuilder<BT, Pool, CE> {
     ///
     /// NOTE: this is only used when `max_blocks` is specified.
     num_builds: Option<usize>,
+    /// The address for worker block's beneficiary.
+    pub(crate) address: Address,
 
     // TODO: consider using a container struct for these values
     //
@@ -143,8 +153,15 @@ pub struct BlockBuilder<BT, Pool, CE> {
 
 impl<BT, Pool, CE> BlockBuilder<BT, Pool, CE>
 where
-    BT: CanonStateSubscriptions,
-    Pool: TransactionPoolExt,
+    BT: CanonStateSubscriptions
+        + ChainSpecProvider
+        + StateProviderFactory
+        + BlockchainTreeEngine
+        + CanonChainTracker
+        + Clone
+        + 'static,
+    Pool: TransactionPoolExt + 'static,
+    CE: ConfigureEvm + Clone,
 {
     /// Create a new instance of [Self].
     pub fn new(
@@ -154,6 +171,7 @@ where
         evm_config: CE,
         to_worker: Sender<NewBatch>,
         max_builds: Option<usize>,
+        address: Address,
         parent_block: SealedBlock,
         base_fee: Option<u64>,
     ) -> Self {
@@ -177,6 +195,7 @@ where
             to_worker,
             max_builds,
             num_builds,
+            address,
             parent_block,
             base_fee,
         }
@@ -219,32 +238,97 @@ where
     ///
     /// This approach allows the engine to yield back to the runtime while executing blocks.
     /// Executing blocks is cpu intensive, so a blocking task is used.
-    fn spawn_execution_task(&mut self) -> PendingExecutionTask
-    where
-        BT: StateProviderFactory + BlockchainTreeEngine + CanonChainTracker + Clone,
-    {
-        todo!()
-        // let provider = self.blockchain.clone();
-        // let evm_config = self.evm_config.clone();
-        // let parent = self.parent_header.clone();
-        // let build_args = WorkerBuildArguments::new(provider, output, parent);
-        // let (tx, rx) = oneshot::channel();
+    fn spawn_execution_task(&mut self) -> PendingExecutionTask {
+        let evm_config = self.evm_config.clone();
+        let provider = self.blockchain.clone();
+        let parent = self.parent_block.clone();
+        let pool = self.pool.clone();
+        let timestamp = now();
+        let chain_spec = provider.chain_spec();
 
-        // // spawn blocking task and return future
-        // tokio::task::spawn_blocking(|| {
-        //     // this is safe to call on blocking thread without a semaphore bc it's held in
-        //     // Self::pending_tesk as a single `Option`
-        //     let result = build_worker_block(evm_config, build_args);
-        //     match tx.send(result) {
-        //         Ok(()) => (),
-        //         Err(e) => {
-        //             error!(target: "engine", ?e, "error sending result from execute_consensus_output")
-        //         }
-        //     }
-        // });
+        // TODO: this is needs further scrutiny
+        //
+        // see https://eips.ethereum.org/EIPS/eip-4399
+        //
+        // The right way is to provide the prevrandao from CL,
+        // then peers ensure this block is less than 2 rounds behind.
+        // logic:
+        // - 1 round of consensus -> worker updates
+        // - this block produced
+        // - this block sent to peers (async)
+        // - peer updates with 2 roud of consensus
+        // - peer receives this block
+        // - this block is valid because it was built off round 1
+        //      - if this block was built off round 0, then it's invalid
+        //      - ensure parent timestamp and this timestamp is (2 * max block duration)
+        //
+        // For now: this provides sufficent randomness for on-chain security,
+        // but requires an unacceptable amount of trust in the node operator
+        let prevrandao = parent.parent_beacon_block_root.unwrap_or_else(|| B256::random());
+        let (cfg, block_env) =
+            self.cfg_and_block_env(chain_spec.as_ref(), &parent, timestamp, prevrandao);
+        let config = PendingBlockConfig::new(parent, block_env, cfg, chain_spec, timestamp);
+        let build_args = WorkerBlockBuilderArgs::new(provider, pool, config, self.address);
+        let (tx, rx) = oneshot::channel();
 
-        // // oneshot receiver for execution result
-        // rx
+        // spawn blocking task and return future
+        tokio::task::spawn_blocking(|| {
+            // this is safe to call on blocking thread without a semaphore bc it's held in
+            // Self::pending_tesk as a single `Option`
+            let result = build_worker_block(evm_config, build_args);
+            match tx.send(result) {
+                Ok(()) => (),
+                Err(e) => {
+                    error!(target: "engine", ?e, "error sending result from execute_consensus_output")
+                }
+            }
+        });
+
+        // oneshot receiver for execution result
+        rx
+    }
+
+    /// Returns the configured [`CfgEnvWithHandlerCfg`] and [`BlockEnv`] for the targeted payload
+    /// (that has the `parent` as its parent).
+    ///
+    /// The `chain_spec` is used to determine the correct chain id and hardfork for the payload
+    /// based on its timestamp.
+    ///
+    /// Block related settings are derived from the `parent` block and the configured attributes.
+    ///
+    /// NOTE: This is only intended for beacon consensus (after merge).
+    fn cfg_and_block_env(
+        &self,
+        chain_spec: &ChainSpec,
+        parent: &Header,
+        timestamp: u64,
+        prev_randao: B256,
+    ) -> (CfgEnvWithHandlerCfg, BlockEnv) {
+        // configure evm env based on parent block
+        let cfg = CfgEnv::default().with_chain_id(chain_spec.chain().id());
+
+        // ensure we're not missing any timestamp based hardforks
+        let spec_id = revm_spec_by_timestamp_after_merge(chain_spec, now());
+
+        // TODO: support blobs with Cancun upgrade
+        let blob_excess_gas_and_price = None;
+
+        let mut gas_limit = U256::from(parent.gas_limit);
+
+        let block_env = BlockEnv {
+            number: U256::from(parent.number + 1),
+            coinbase: self.address,
+            timestamp: U256::from(timestamp),
+            difficulty: U256::ZERO,
+            prevrandao: Some(prev_randao),
+            gas_limit,
+            // calculate basefee based on parent block's gas usage
+            basefee: self.base_fee.map(U256::from).unwrap_or_default(),
+            // calculate excess gas based on parent block's blob gas usage
+            blob_excess_gas_and_price,
+        };
+
+        (CfgEnvWithHandlerCfg::new_with_spec_id(cfg, spec_id), block_env)
     }
 
     /// Check if the task has reached the maximum number of blocks to build as specified by `max_builds`.
@@ -283,6 +367,7 @@ where
     BT: StateProviderFactory
         + CanonChainTracker
         + CanonStateSubscriptions
+        + ChainSpecProvider
         + BlockReaderIdExt
         + BlockchainTreeEngine
         + Clone

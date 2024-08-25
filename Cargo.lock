@@ -11098,6 +11098,7 @@ dependencies = [
  "reth-chainspec",
  "reth-errors",
  "reth-evm",
+ "reth-evm-ethereum",
  "reth-fs-util",
  "reth-metrics",
  "reth-node-core",

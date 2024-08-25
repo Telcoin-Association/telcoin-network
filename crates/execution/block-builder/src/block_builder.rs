@@ -14,7 +14,7 @@ use reth_revm::{
     DatabaseCommit, State,
 };
 use reth_transaction_pool::{BestTransactionsAttributes, TransactionPool};
-use tn_types::{now, PendingBlockConfig, WorkerBlockBuilderArgs, WorkerBlockUpdate};
+use tn_types::{PendingBlockConfig, WorkerBlockBuilderArgs, WorkerBlockUpdate};
 use tracing::{debug, warn};
 
 use crate::error::{BlockBuilderError, BlockBuilderResult};
@@ -29,11 +29,17 @@ pub fn build_worker_block<EvmConfig, Pool, Provider>(
 ) -> BlockBuilderResult<WorkerBlockUpdate>
 where
     EvmConfig: ConfigureEvm,
-    Provider: StateProviderFactory + ChainSpecProvider,
+    Provider: StateProviderFactory,
     Pool: TransactionPool,
 {
     let WorkerBlockBuilderArgs { provider, pool, block_config, beneficiary } = args;
-    let PendingBlockConfig { parent, initialized_block_env, initialized_cfg } = block_config;
+    let PendingBlockConfig {
+        parent,
+        initialized_block_env,
+        initialized_cfg,
+        chain_spec,
+        timestamp,
+    } = block_config;
     let state_provider = provider.state_by_block_hash(parent.hash())?;
     let state = StateProviderDatabase::new(state_provider);
 
@@ -50,7 +56,6 @@ where
         State::builder().with_database_ref(cached_reads.as_db(state)).with_bundle_update().build();
 
     debug!(target: "block_builder", parent_hash = ?parent.hash(), parent_number = parent.number, "building new payload");
-    let chain_spec = provider.chain_spec();
     let block_gas_limit: u64 =
         initialized_block_env.gas_limit.try_into().unwrap_or(chain_spec.max_gas_limit);
     let base_fee = initialized_block_env.basefee.to::<u64>();
@@ -240,8 +245,6 @@ where
     // and 4788 contract call
     db.merge_transitions(BundleRetention::PlainState);
 
-    // TODO: use this and return WorkerBlockUpdate
-    //
     let execution_outcome =
         ExecutionOutcome::new(db.take_bundle(), vec![receipts].into(), block_number, vec![]);
     let receipts_root =
@@ -291,7 +294,7 @@ where
         receipts_root,
         withdrawals_root: Some(EMPTY_WITHDRAWALS),
         logs_bloom,
-        timestamp: now(),
+        timestamp,
         mix_hash: Default::default(),
         nonce: 0,
         base_fee_per_gas: Some(base_fee),
@@ -305,27 +308,6 @@ where
         excess_blob_gas,
         requests_root: None,
     };
-
-    // TODO: this is easy to manipulate
-    //
-    // calculate mix hash as a source of randomness
-    // - consensus output digest from parent (beacon block root)
-    // - timestamp
-    //
-    // see https://eips.ethereum.org/EIPS/eip-4399
-    //
-    // idea;
-    // - use peer proposed block digest as prevrandao
-    // - logic to check this prevrandao vs timestamp of vote for first peer
-    //   in the new round that this worker signed?
-    //      - what if this is the only peer with transactions/block to propose?
-    //
-    // For now: this provides sufficent randomness for on-chain security,
-    // but requires trust in the validator node operator
-    if let Some(root) = parent.parent_beacon_block_root {
-        header.mix_hash =
-            keccak256([root.as_slice(), header.timestamp.to_le_bytes().as_slice()].concat());
-    }
 
     // TODO: is there a better way?
     //
