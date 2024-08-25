@@ -4,16 +4,6 @@
 //!
 //! see reth-v0.1.3 transaction_pool/src/maintain.rs
 
-// use crate::{
-//     blobstore::{BlobStoreCanonTracker, BlobStoreUpdates},
-//     error::PoolError,
-//     metrics::MaintainPoolMetrics,
-//     traits::{CanonicalStateUpdate, ChangedAccount, TransactionPool, TransactionPoolExt},
-//     BlockInfo,
-// };
-// use reth_tasks::TaskSpawner;
-// use reth_execution_types::ExecutionOutcome;
-// use reth_fs_util::FsPathError;
 use super::metrics::MaintainPoolMetrics;
 use futures_util::{
     future::{BoxFuture, Fuse, FusedFuture},

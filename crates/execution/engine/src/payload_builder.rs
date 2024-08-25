@@ -272,7 +272,7 @@ where
     let txs = batch_block.into_transactions_ecrecovered();
 
     for tx in txs {
-        // // TODO: support blob gas with cancun genesis hardfork
+        // TODO: support blob gas with cancun genesis hardfork
         // //
         // // There's only limited amount of blob space available per block, so we need to check if
         // // the EIP-4844 can still fit in the block

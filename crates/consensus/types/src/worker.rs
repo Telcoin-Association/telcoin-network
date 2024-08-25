@@ -15,11 +15,27 @@ pub type WorkerBlockUpdates = broadcast::Receiver<WorkerBlockUpdate>;
 #[derive(Clone, Debug)]
 pub struct WorkerBlockUpdate {
     /// The finalized, canonical tip used to propose this block.
-    pub parent: SealedBlock,
+    parent: SealedBlock,
     /// The sealed block the worker is proposing.
-    pub pending: SealedBlockWithSenders,
+    pending: SealedBlockWithSenders,
     /// The state from execution outcome.
-    pub state: ExecutionOutcome,
+    state: ExecutionOutcome,
+}
+
+impl WorkerBlockUpdate {
+    /// Create new instance of [Self].
+    pub fn new(
+        parent: SealedBlock,
+        pending: SealedBlockWithSenders,
+        state: ExecutionOutcome,
+    ) -> Self {
+        Self { parent, pending, state }
+    }
+
+    /// Return a reference to the worker block's parent.
+    pub fn parent(&self) -> &SealedBlock {
+        &self.parent
+    }
 }
 
 /// The arguments passed to the worker's block builder.

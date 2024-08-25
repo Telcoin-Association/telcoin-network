@@ -31,8 +31,8 @@ use reth_evm::{
 use reth_primitives::{
     constants::{EMPTY_TRANSACTIONS, ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE},
     keccak256, proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber,
-    Header, IntoRecoveredTransaction, SealedHeader, TransactionSigned, Withdrawals, B256,
-    EMPTY_OMMER_ROOT_HASH, U256,
+    Header, IntoRecoveredTransaction, SealedBlock, SealedHeader, TransactionSigned, Withdrawals,
+    B256, EMPTY_OMMER_ROOT_HASH, U256,
 };
 use reth_provider::{
     BlockReaderIdExt, CanonChainTracker, CanonStateNotification, CanonStateNotificationStream,
@@ -49,7 +49,7 @@ use std::{
     task::{Context, Poll},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tn_types::{now, AutoSealConsensus, NewBatch, WorkerBlockUpdateSender};
+use tn_types::{now, AutoSealConsensus, NewBatch, WorkerBlockUpdate, WorkerBlockUpdateSender};
 use tokio::sync::{broadcast, oneshot, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{debug, error, trace, warn};
 
@@ -74,7 +74,7 @@ mod pool;
 
 /// Type alias for the blocking task that executes consensus output and returns the finalized
 /// `SealedHeader`.
-type PendingExecutionTask = oneshot::Receiver<BlockBuilderResult<SealedHeader>>;
+type PendingExecutionTask = oneshot::Receiver<BlockBuilderResult<WorkerBlockUpdate>>;
 
 /// The type that builds blocks for workers to propose.
 ///
@@ -125,10 +125,12 @@ pub struct BlockBuilder<BT, Pool, CE> {
     num_builds: Option<usize>,
 
     // TODO: consider using a container struct for these values
+    //
     /// The [SealedHeader] of the last fully-executed block.
     ///
     /// This information reflects the current finalized block number and hash.
-    parent_header: SealedHeader,
+    parent_block: SealedBlock,
+    //
     /// The current base fee used to build the next block.
     ///
     /// This value is updated after constructing a block and used to update
@@ -152,7 +154,7 @@ where
         evm_config: CE,
         to_worker: Sender<NewBatch>,
         max_builds: Option<usize>,
-        parent_header: SealedHeader,
+        parent_block: SealedBlock,
         base_fee: Option<u64>,
     ) -> Self {
         // create broadcast channels
@@ -175,7 +177,7 @@ where
             to_worker,
             max_builds,
             num_builds,
-            parent_header,
+            parent_block,
             base_fee,
         }
     }
@@ -335,10 +337,14 @@ where
             if let Some(mut receiver) = this.pending_task.take() {
                 match receiver.poll_unpin(cx) {
                     Poll::Ready(res) => {
-                        let finalized_header = res.map_err(Into::into).and_then(|res| res);
+                        // TODO: best way to handle if pending txs in pool
+                        // but execution fails? Although unlikely, this approach
+                        // would produce an empty worker block which should not happen.
+
+                        let worker_update = res.map_err(Into::into).and_then(|res| res)?;
 
                         // ensure no errors then store last executed header in memory
-                        this.parent_header = finalized_header?;
+                        this.parent_block = worker_update.parent().clone();
 
                         // check max_builds
                         if this.max_builds.is_some() {
@@ -350,7 +356,20 @@ where
                             }
                         }
 
-                        // allow loop to continue: check for engine updates
+                        // TODO: should this be background or directly call pool.on_canonical_state_change()
+                        // - maintenance track is non blocking BUT
+                        // - maintenance task could be queued, canonical state updates, the maintenance task overwrites parent block
+                        //      - race condition
+                        //
+                        // Just call it here.
+                        //
+                        // apply worker update
+                        // NOTE: this is blocking
+                        // - better to have maintenance task that always checks canon and worker updates?
+                        // need to ensure that worker update's parent block can't overwrite canon update tip
+
+                        // loop again to check for engine updates
+                        continue;
                     }
                     Poll::Pending => {
                         this.pending_task = Some(receiver);

@@ -250,12 +250,12 @@ where
             if let Some(mut receiver) = this.pending_task.take() {
                 match receiver.poll_unpin(cx) {
                     Poll::Ready(res) => {
-                        let finalized_header = res.map_err(Into::into).and_then(|res| res);
+                        let finalized_header = res.map_err(Into::into).and_then(|res| res)?;
                         // TODO: broadcast engine event
                         // this.pipeline_events = events;
                         //
-                        // ensure no errors then store last executed header in memory
-                        this.parent_header = finalized_header?;
+                        // store last executed header in memory
+                        this.parent_header = finalized_header;
 
                         // check max_round
                         if this.max_round.is_some()
