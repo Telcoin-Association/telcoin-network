@@ -1,19 +1,16 @@
 //! The logic for building worker blocks.
 
-use reth_errors::RethError;
 use reth_evm::ConfigureEvm;
 use reth_payload_builder::database::CachedReads;
 use reth_primitives::{
-    constants::{eip4844::MAX_DATA_GAS_PER_BLOCK, BEACON_NONCE, EMPTY_WITHDRAWALS},
-    keccak256, proofs, Block, Header, IntoRecoveredTransaction, Receipt, SealedHeader, Withdrawals,
-    EMPTY_OMMER_ROOT_HASH, U256,
+    constants::EMPTY_WITHDRAWALS, keccak256, proofs, Block, Header, IntoRecoveredTransaction,
+    Receipt, SealedBlockWithSenders, Withdrawals, EMPTY_OMMER_ROOT_HASH, U256,
 };
 use reth_provider::{ChainSpecProvider, ExecutionOutcome, StateProviderFactory};
 use reth_revm::{
     database::StateProviderDatabase,
     db::states::bundle_state::BundleRetention,
     primitives::{EVMError, EnvWithHandlerCfg, InvalidTransaction, ResultAndState},
-    state_change::apply_blockhashes_update,
     DatabaseCommit, State,
 };
 use reth_transaction_pool::{BestTransactionsAttributes, TransactionPool};
@@ -35,7 +32,7 @@ where
     Provider: StateProviderFactory + ChainSpecProvider,
     Pool: TransactionPool,
 {
-    let WorkerBlockBuilderArgs { provider, pool, block_config } = args;
+    let WorkerBlockBuilderArgs { provider, pool, block_config, beneficiary } = args;
     let PendingBlockConfig { parent, initialized_block_env, initialized_cfg } = block_config;
     let state_provider = provider.state_by_block_hash(parent.hash())?;
     let state = StateProviderDatabase::new(state_provider);
@@ -46,26 +43,22 @@ where
     //
     // TODO: create `CachedReads` during batch validation?
     // same problem with engine's payload_builder
+    //
+    // it would be great for txpool to manage this on tx validation
     let mut cached_reads = CachedReads::default();
     let mut db =
         State::builder().with_database_ref(cached_reads.as_db(state)).with_bundle_update().build();
 
     debug!(target: "block_builder", parent_hash = ?parent.hash(), parent_number = parent.number, "building new payload");
     let chain_spec = provider.chain_spec();
-    let mut cumulative_gas_used = 0;
-    let mut sum_blob_gas_used = 0;
     let block_gas_limit: u64 =
         initialized_block_env.gas_limit.try_into().unwrap_or(chain_spec.max_gas_limit);
     let base_fee = initialized_block_env.basefee.to::<u64>();
-
-    let mut executed_txs = Vec::new();
 
     let mut best_txs = pool.best_transactions_with_attributes(BestTransactionsAttributes::new(
         base_fee,
         initialized_block_env.get_blob_gasprice().map(|gasprice| gasprice as u64),
     ));
-
-    let mut total_fees = U256::ZERO;
 
     let block_number = initialized_block_env.number.to::<u64>();
 
@@ -90,17 +83,26 @@ where
     // })?;
 
     // TODO: TN needs to support this
-    // apply eip-2935 blockhashes update
-    apply_blockhashes_update(
-        &mut db,
-        &chain_spec,
-        initialized_block_env.timestamp.to::<u64>(),
-        block_number,
-        parent.hash(),
-    )
-    .map_err(|e| BlockBuilderError::Reth(e.into()))?;
+    // // apply eip-2935 blockhashes update
+    // apply_blockhashes_update(
+    //     &mut db,
+    //     &chain_spec,
+    //     initialized_block_env.timestamp.to::<u64>(),
+    //     block_number,
+    //     parent.hash(),
+    // )
+    // .map_err(|e| BlockBuilderError::Reth(e.into()))?;
 
+    // collect data for successful transactions
+    // let mut sum_blob_gas_used = 0;
+    let mut cumulative_gas_used = 0;
     let mut receipts = Vec::new();
+    let mut senders = Vec::new();
+    let mut total_fees = U256::ZERO;
+    let mut executed_txs = Vec::new();
+
+    // begin loop through sorted "best" transactions in pending pool
+    // and execute them to build the block
     while let Some(pool_tx) = best_txs.next() {
         // ensure we still have capacity for this transaction
         if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
@@ -129,6 +131,7 @@ where
         //     }
         // }
 
+        // create env for EVM
         let env = EnvWithHandlerCfg::new_with_cfg_env(
             initialized_cfg.clone(),
             initialized_block_env.clone(),
@@ -138,6 +141,7 @@ where
         // Configure the environment for the block.
         let mut evm = evm_config.evm_with_env(&mut db, env);
 
+        // EVM execution
         let ResultAndState { result, state } = match evm.transact() {
             Ok(res) => res,
             Err(err) => {
@@ -202,6 +206,7 @@ where
         total_fees += U256::from(miner_fee) * U256::from(gas_used);
 
         // append transaction to the list of executed transactions
+        senders.push(tx.signer());
         executed_txs.push(tx.into_signed());
     }
 
@@ -252,10 +257,10 @@ where
     // create the block header
     let transactions_root = proofs::calculate_transaction_root(&executed_txs);
 
-    // initialize empty blob sidecars at first. If cancun is active then this will
-    let mut blob_sidecars = Vec::new();
-    let mut excess_blob_gas = None;
-    let mut blob_gas_used = None;
+    // // initialize empty blob sidecars at first. If cancun is active then this will
+    // let mut blob_sidecars = Vec::new();
+    let excess_blob_gas = None;
+    let blob_gas_used = None;
 
     // // only determine cancun fields when active
     // if chain_spec.is_cancun_active_at_timestamp(attributes.timestamp) {
@@ -277,10 +282,10 @@ where
     //     blob_gas_used = Some(sum_blob_gas_used);
     // }
 
-    let header = Header {
+    let mut header = Header {
         parent_hash: parent.hash(),
         ommers_hash: EMPTY_OMMER_ROOT_HASH,
-        beneficiary: initialized_block_env.coinbase,
+        beneficiary,
         state_root,
         transactions_root,
         receipts_root,
@@ -313,6 +318,7 @@ where
     // - use peer proposed block digest as prevrandao
     // - logic to check this prevrandao vs timestamp of vote for first peer
     //   in the new round that this worker signed?
+    //      - what if this is the only peer with transactions/block to propose?
     //
     // For now: this provides sufficent randomness for on-chain security,
     // but requires trust in the validator node operator
@@ -336,15 +342,18 @@ where
     // seal the block
     let block = Block { header, body: executed_txs, ommers: vec![], withdrawals, requests };
 
-    let pending = block.seal_slow();
-    debug!(target: "block_builder", ?pending, "sealed built block");
+    let sealed_block = block.seal_slow();
+    debug!(target: "block_builder", ?sealed_block, "sealed built block");
+
+    // create SealedBlockWithSenders for worker update
+    let pending = SealedBlockWithSenders::new(sealed_block, senders)
+        .ok_or(BlockBuilderError::SealBlockWithSenders)?;
 
     // extend the payload with the blob sidecars from the executed txs
     // payload.extend_sidecars(blob_sidecars);
 
-    // TODO: return WorkerBlockUpdate and total_fees?
-    // what are total_fees used for?
-    let build = WorkerBlockUpdate::new(parent, pending, state);
+    // TODO: add total_fees to worker metrics
+    let build = WorkerBlockUpdate::new(parent, pending, execution_outcome);
 
     Ok(build)
 }

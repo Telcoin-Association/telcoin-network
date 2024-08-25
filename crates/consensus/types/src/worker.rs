@@ -1,6 +1,6 @@
 //! Types for interacting with the worker.
 
-use reth_primitives::{SealedBlock, SealedBlockWithSenders, SealedHeader};
+use reth_primitives::{Address, SealedBlock, SealedBlockWithSenders, SealedHeader};
 use reth_provider::ExecutionOutcome;
 use reth_revm::primitives::{BlockEnv, CfgEnvWithHandlerCfg};
 use tokio::sync::broadcast;
@@ -15,11 +15,11 @@ pub type WorkerBlockUpdates = broadcast::Receiver<WorkerBlockUpdate>;
 #[derive(Clone, Debug)]
 pub struct WorkerBlockUpdate {
     /// The finalized, canonical tip used to propose this block.
-    parent: SealedBlock,
+    pub parent: SealedBlock,
     /// The sealed block the worker is proposing.
-    pending: SealedBlockWithSenders,
+    pub pending: SealedBlockWithSenders,
     /// The state from execution outcome.
-    state: ExecutionOutcome,
+    pub state: ExecutionOutcome,
 }
 
 impl WorkerBlockUpdate {
@@ -50,13 +50,15 @@ pub struct WorkerBlockBuilderArgs<Pool, Provider> {
     // PendingBlockConfig
     // NextBlockConfig
     pub block_config: PendingBlockConfig,
+    /// The worker primary's address.
+    pub beneficiary: Address,
 }
 
 /// The configuration to use for building the next worker block.
 #[derive(Debug)]
 pub struct PendingBlockConfig {
     /// The parent to use for building the next block.
-    pub parent: SealedHeader,
+    pub parent: SealedBlock,
     /// Pre-configured block environment.
     pub initialized_block_env: BlockEnv,
     /// Configuration for the environment.
