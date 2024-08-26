@@ -1,4 +1,8 @@
 //! The logic for building worker blocks.
+//!
+//! This is called by the block_builder once pending transactions are picked up.
+//!
+//! The
 
 use reth_evm::ConfigureEvm;
 use reth_payload_builder::database::CachedReads;
@@ -32,13 +36,14 @@ where
     Provider: StateProviderFactory,
     Pool: TransactionPool,
 {
-    let WorkerBlockBuilderArgs { provider, pool, block_config, beneficiary } = args;
+    let WorkerBlockBuilderArgs { provider, pool, block_config } = args;
     let PendingBlockConfig {
         parent,
         initialized_block_env,
         initialized_cfg,
         chain_spec,
         timestamp,
+        beneficiary,
     } = block_config;
     let state_provider = provider.state_by_block_hash(parent.hash())?;
     let state = StateProviderDatabase::new(state_provider);
@@ -60,6 +65,7 @@ where
         initialized_block_env.gas_limit.try_into().unwrap_or(chain_spec.max_gas_limit);
     let base_fee = initialized_block_env.basefee.to::<u64>();
 
+    // NOTE: this holds a `read` lock on the tx pool
     let mut best_txs = pool.best_transactions_with_attributes(BestTransactionsAttributes::new(
         base_fee,
         initialized_block_env.get_blob_gasprice().map(|gasprice| gasprice as u64),

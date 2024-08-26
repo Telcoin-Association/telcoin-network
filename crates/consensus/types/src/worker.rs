@@ -53,19 +53,12 @@ pub struct WorkerBlockBuilderArgs<Pool, Provider> {
     // PendingBlockConfig
     // NextBlockConfig
     pub block_config: PendingBlockConfig,
-    /// The worker primary's address.
-    pub beneficiary: Address,
 }
 
 impl<Pool, Provider> WorkerBlockBuilderArgs<Pool, Provider> {
     /// Create a new instance of [Self].
-    pub fn new(
-        provider: Provider,
-        pool: Pool,
-        block_config: PendingBlockConfig,
-        beneficiary: Address,
-    ) -> Self {
-        Self { provider, pool, block_config, beneficiary }
+    pub fn new(provider: Provider, pool: Pool, block_config: PendingBlockConfig) -> Self {
+        Self { provider, pool, block_config }
     }
 }
 
@@ -82,6 +75,8 @@ pub struct PendingBlockConfig {
     pub chain_spec: Arc<ChainSpec>,
     /// The timestamp (sec) for when this block was built.
     pub timestamp: u64,
+    /// The worker primary's address.
+    pub beneficiary: Address,
 }
 
 impl PendingBlockConfig {
@@ -92,6 +87,7 @@ impl PendingBlockConfig {
         initialized_cfg: CfgEnvWithHandlerCfg,
         chain_spec: Arc<ChainSpec>,
         timestamp: u64,
+        beneficiary: Address,
     ) -> Self {
         Self { parent, initialized_block_env, initialized_cfg, chain_spec, timestamp }
     }

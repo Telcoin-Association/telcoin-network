@@ -98,9 +98,9 @@ where
     .boxed()
 }
 
-/// Maintains the state of the transaction pool by handling new blocks and reorgs.
+/// Maintains the state of the transaction pool by handling new blocks.
 ///
-/// This listens for any new blocks and reorgs and updates the transaction pool's state accordingly
+/// This listens for any new worker blocks or canonical updates from the engine then updates the transaction pool's state accordingly.
 pub async fn maintain_transaction_pool<Provider, P, C, W, Tasks>(
     provider: Provider,
     pool: P,

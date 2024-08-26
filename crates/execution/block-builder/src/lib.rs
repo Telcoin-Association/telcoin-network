@@ -1,10 +1,6 @@
-//! The worker's block maker monitors a transaction pool populated by incoming transactios through the worker's RPC.
+//! The worker's block maker monitors a transaction pool populated by incoming transactions through the worker's RPC.
 //!
-//! The Mining task polls a [MiningMode], and will return a list of transactions that are ready to
-//! be mined.
-//!
-//! These downloaders poll the miner, assemble the block, and return transactions that are ready to
-//! be mined.
+//! The block maker is a future that
 
 #![doc(
     html_logo_url = "https://www.telco.in/logos/TEL.svg",
@@ -86,7 +82,11 @@ type PendingExecutionTask = oneshot::Receiver<BlockBuilderResult<WorkerBlockUpda
 
 /// The type that builds blocks for workers to propose.
 ///
-/// This is a future that polls the transaction pool for pending transactions and tries to build the next worker block.
+/// This is a future that:
+/// - listens for canonical state changes and updates the tx pool
+/// - polls the transaction pool for pending transactions
+///     - tries to build the next worker block when there transactions are available
+/// -
 #[derive(Debug)]
 pub struct BlockBuilder<BT, Pool, CE> {
     /// Single active future that executes consensus output on a blocking thread and then returns
@@ -217,7 +217,8 @@ where
             changed_accounts.push(acc);
         }
 
-        // TODO: these should have already been mined when the worker proposed its block?
+        // TODO: these should have already been mined when the worker proposed its block
+        // but still needs to be included for any txs mined by peers
         let mined_transactions = blocks.transaction_hashes().collect();
         let pending_block_base_fee = self.base_fee.unwrap_or(MIN_PROTOCOL_BASE_FEE);
 
@@ -267,8 +268,9 @@ where
         let prevrandao = parent.parent_beacon_block_root.unwrap_or_else(|| B256::random());
         let (cfg, block_env) =
             self.cfg_and_block_env(chain_spec.as_ref(), &parent, timestamp, prevrandao);
-        let config = PendingBlockConfig::new(parent, block_env, cfg, chain_spec, timestamp);
-        let build_args = WorkerBlockBuilderArgs::new(provider, pool, config, self.address);
+        let config =
+            PendingBlockConfig::new(parent, block_env, cfg, chain_spec, timestamp, self.address);
+        let build_args = WorkerBlockBuilderArgs::new(provider, pool, config);
         let (tx, rx) = oneshot::channel();
 
         // spawn blocking task and return future
@@ -313,7 +315,7 @@ where
         // TODO: support blobs with Cancun upgrade
         let blob_excess_gas_and_price = None;
 
-        let mut gas_limit = U256::from(parent.gas_limit);
+        let gas_limit = U256::from(parent.gas_limit);
 
         let block_env = BlockEnv {
             number: U256::from(parent.number + 1),
@@ -384,6 +386,9 @@ where
 
         loop {
             // check for canon updates before mining the transaction pool
+            //
+            // this is critical to ensure worker's block is building off canonical tip
+            // block until canon updates are applied
             while let Poll::Ready(Some(canon_update)) =
                 this.canonical_state_updates.poll_next_unpin(cx)
             {
@@ -409,7 +414,10 @@ where
                 // create upstream PR for reth
 
                 // check for pending transactions
-                if this.pool.pool_size().pending == 0 {
+                //
+                // considered using: pool.pool_size().pending
+                // but this calculates size for all sub-pools
+                if this.pool.pending_transactions().len() == 0 {
                     // nothing pending
                     break;
                 }
@@ -431,16 +439,6 @@ where
                         // ensure no errors then store last executed header in memory
                         this.parent_block = worker_update.parent().clone();
 
-                        // check max_builds
-                        if this.max_builds.is_some() {
-                            // increase num builds
-                            this.num_builds = this.num_builds.map(|n| n + 1);
-                            if this.has_reached_max_build(this.num_builds) {
-                                // immediately terminate if the specified max number of blocks were built
-                                return Poll::Ready(Ok(()));
-                            }
-                        }
-
                         // TODO: should this be background or directly call pool.on_canonical_state_change()
                         // - maintenance track is non blocking BUT
                         // - maintenance task could be queued, canonical state updates, the maintenance task overwrites parent block
@@ -451,7 +449,37 @@ where
                         // apply worker update
                         // NOTE: this is blocking
                         // - better to have maintenance task that always checks canon and worker updates?
-                        // need to ensure that worker update's parent block can't overwrite canon update tip
+                        // - need to ensure that worker update's parent block can't overwrite canon update tip
+                        // - also need to ensure pool isn't updated while building block
+
+                        // broadcast worker update
+                        //
+                        // the tx pool maintenance task should pick this up?
+                        // or is it better to just do it here?
+                        //
+
+                        // From parkinglot docs:
+                        //
+                        // read lock:
+                        // Locks this RwLock with shared read access, blocking the current thread until it can be acquired.
+                        // The calling thread will be blocked until there are no more writers which hold the lock. There may be other readers currently inside the lock when this method returns.
+                        // Note that attempts to recursively acquire a read lock on a RwLock when the current thread already holds one may result in a deadlock.
+                        // Returns an RAII guard which will release this thread's shared access once it is dropped.
+
+                        // write lock:
+                        // Locks this RwLock with exclusive write access, blocking the current thread until it can be acquired.
+                        // This function will not return while other writers or other readers currently have access to the lock.
+                        // Returns an RAII guard which will drop the write access of this RwLock when dropped
+
+                        // check max_builds
+                        if this.max_builds.is_some() {
+                            // increase num builds
+                            this.num_builds = this.num_builds.map(|n| n + 1);
+                            if this.has_reached_max_build(this.num_builds) {
+                                // immediately terminate if the specified max number of blocks were built
+                                return Poll::Ready(Ok(()));
+                            }
+                        }
 
                         // loop again to check for engine updates
                         continue;
