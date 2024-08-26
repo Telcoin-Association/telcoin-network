@@ -61,6 +61,29 @@ impl Default for PoolMaintenanceConfig {
 //
 // TODO: can this task support the "pending" block inquiry?
 
+//
+//
+// new strategy:
+// - collect and combine all canon updates
+// - extend any worker updates as well with the canon ones
+// - apply pool on change once at the end
+// - if no messages, return pending
+//
+// engine updates:
+// - update this canonical_tip
+// - extend changed accounts
+// - extend mined transactions
+//
+// worker updates:
+// - update this base fee
+// - extend changed accounts
+// - extend mined transactions
+//
+// then apply pool update
+//
+//  TODO: short-circuit rpc looking up pending block
+//  TODO: either faucet subscribes to worker block updates OR keeps track of x amount of transactions it successfully submitted to keep track of own-nonce
+
 /// Long-running task that updates the transaction pool based on new worker block builds and engine execution.
 pub struct MaintainTxPool<Provider, Pool, C, W> {
     /// The configuration for pool maintenance.
