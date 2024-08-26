@@ -89,6 +89,6 @@ impl PendingBlockConfig {
         timestamp: u64,
         beneficiary: Address,
     ) -> Self {
-        Self { parent, initialized_block_env, initialized_cfg, chain_spec, timestamp }
+        Self { parent, initialized_block_env, initialized_cfg, chain_spec, timestamp, beneficiary }
     }
 }

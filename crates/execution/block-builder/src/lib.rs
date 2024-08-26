@@ -15,7 +15,6 @@ pub use block_builder::build_worker_block;
 use consensus_metrics::metered_channel::Sender;
 use error::BlockBuilderResult;
 use futures_util::{FutureExt, StreamExt};
-use pool::maintain::changed_accounts_iter;
 use reth_blockchain_tree::BlockchainTreeEngine;
 use reth_chainspec::ChainSpec;
 use reth_evm::{
