@@ -28,8 +28,11 @@ use reth_transaction_pool::{
 use std::{
     borrow::Borrow,
     collections::HashSet,
+    future::Future,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    pin::Pin,
+    task::{Context, Poll},
 };
 use tn_types::WorkerBlockUpdate;
 use tokio::sync::oneshot;
@@ -37,16 +40,118 @@ use tracing::{debug, error, info, trace, warn};
 
 /// Additional settings for maintaining the transaction pool
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MaintainPoolConfig {
+pub struct PoolMaintenanceConfig {
     /// Maximum number of accounts to reload from state at once when updating the transaction pool.
     ///
     /// Default: 100
     pub max_reload_accounts: usize,
 }
 
-impl Default for MaintainPoolConfig {
+impl Default for PoolMaintenanceConfig {
     fn default() -> Self {
         Self { max_reload_accounts: 100 }
+    }
+}
+
+// maintenance task listens to canon state updates and applies those
+// then listens to worker block updates and drains those (should only ever be 1)
+// then checks for reloaded accounts request
+//
+// TODO: can this task support the "pending" block inquiry?
+
+/// Long-running task that updates the transaction pool based on new worker block builds and engine execution.
+pub struct MaintainTxPool<Provider, Pool, C, W, F> {
+    /// The configuration for pool maintenance.
+    config: PoolMaintenanceConfig,
+    /// The type used to query the database.
+    provider: Provider,
+    /// The transaction pool to maintain.
+    pool: Pool,
+    /// The stream for canonical state updates.
+    canon_events: C,
+    /// The stream for worker block updates.
+    ///
+    /// These are notifications for when the worker has successfully built a new block and guarantees to broadcast the block. The underlying promise is that this newly built block is stored in the database and the worker will continue to broadcast the block until it reaches a quorum of votes.
+    worker_events: W,
+    /// The current pending block for the worker.
+    ///
+    /// This is the last seen block the worker built.
+    pending_block: PendingBlockTracker,
+    /// Accounts that are out of sync with the pool.
+    dirty_addresses: HashSet<Address>,
+    /// The current state of maintenance.
+    maintenance_state: MaintainedPoolState,
+    /// Metrics for maintenance.
+    metrics: MaintainPoolMetrics,
+    /// The future that reloads accounts from database.
+    reload_accounts_fut: Fuse<F>,
+}
+
+impl<Provider, Pool, C, W, F> MaintainTxPool<Provider, Pool, C, W, F>
+where
+    F: Future,
+{
+    /// Create a new instance of [Self].
+    pub fn new(
+        config: PoolMaintenanceConfig,
+        provider: Provider,
+        pool: Pool,
+        canon_events: C,
+        worker_events: W,
+    ) -> Self {
+        let metrics = MaintainPoolMetrics::default();
+
+        // TODO: keep track of mined blob transaction so we can clean finalized transactions
+        // let mut blob_store_tracker = BlobStoreCanonTracker::default();
+
+        // keeps track of the pending worker's block
+        let pending_block = PendingBlockTracker::new(None);
+
+        // keeps track of any dirty accounts that we know of are out of sync with the pool
+        let dirty_addresses = HashSet::new();
+
+        // keeps track of the state of the pool wrt to blocks
+        let maintenance_state = MaintainedPoolState::InSync;
+
+        // the future that reloads accounts from state
+        let reload_accounts_fut = Fuse::terminated();
+
+        Self {
+            config,
+            provider,
+            pool,
+            canon_events,
+            worker_events,
+            pending_block,
+            dirty_addresses,
+            maintenance_state,
+            metrics,
+            reload_accounts_fut,
+        }
+    }
+}
+
+impl<Provider, Pool, C, W, F> Future for MaintainTxPool<Provider, Pool, C, W, F>
+where
+    Provider: StateProviderFactory + BlockReaderIdExt + ChainSpecProvider + Clone + Send + 'static,
+    Pool: TransactionPoolExt + 'static,
+    C: Stream<Item = CanonStateNotification> + Send + Unpin + 'static,
+    W: Stream<Item = WorkerBlockUpdate> + Send + Unpin + 'static,
+    F: Future + Unpin,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let PoolMaintenanceConfig { max_reload_accounts } = self.config;
+        let this = self.get_mut();
+
+        // update loop that drains all canon updates and worker updates
+        // then updates the pool
+        loop {
+            trace!(target: "txpool", state=?)
+        }
+
+        Poll::Pending
     }
 }
 
@@ -57,7 +162,7 @@ pub fn maintain_transaction_pool_future<Provider, P, C, W, Tasks>(
     canon_events: C,
     worker_events: W,
     task_spawner: Tasks,
-    config: MaintainPoolConfig,
+    config: PoolMaintenanceConfig,
 ) -> BoxFuture<'static, ()>
 where
     Provider: StateProviderFactory + BlockReaderIdExt + ChainSpecProvider + Clone + Send + 'static,
@@ -89,7 +194,7 @@ pub async fn maintain_transaction_pool<Provider, P, C, W, Tasks>(
     mut canon_events: C,
     mut worker_events: W,
     task_spawner: Tasks,
-    config: MaintainPoolConfig,
+    config: PoolMaintenanceConfig,
 ) where
     Provider: StateProviderFactory + BlockReaderIdExt + ChainSpecProvider + Clone + Send + 'static,
     P: TransactionPoolExt + 'static,
@@ -98,7 +203,7 @@ pub async fn maintain_transaction_pool<Provider, P, C, W, Tasks>(
     Tasks: TaskSpawner + 'static,
 {
     let metrics = MaintainPoolMetrics::default();
-    let MaintainPoolConfig { max_reload_accounts, .. } = config;
+    let PoolMaintenanceConfig { max_reload_accounts, .. } = config;
     // ensure the pool points to latest state
     if let Ok(Some(latest)) = provider.header_by_number_or_tag(BlockNumberOrTag::Latest) {
         let latest = latest.seal_slow();
@@ -120,7 +225,7 @@ pub async fn maintain_transaction_pool<Provider, P, C, W, Tasks>(
 
     // keeps track of the latest finalized block
     let mut last_finalized_block =
-        FinalizedBlockTracker::new(provider.finalized_block_number().ok().flatten());
+        PendingBlockTracker::new(provider.finalized_block_number().ok().flatten());
 
     // keeps track of any dirty accounts that we know of are out of sync with the pool
     let mut dirty_addresses = HashSet::new();
@@ -304,11 +409,11 @@ pub async fn maintain_transaction_pool<Provider, P, C, W, Tasks>(
     }
 }
 
-struct FinalizedBlockTracker {
+struct PendingBlockTracker {
     last_finalized_block: Option<BlockNumber>,
 }
 
-impl FinalizedBlockTracker {
+impl PendingBlockTracker {
     const fn new(last_finalized_block: Option<BlockNumber>) -> Self {
         Self { last_finalized_block }
     }

@@ -4,14 +4,6 @@ mod backup;
 pub mod maintain;
 mod metrics;
 
-// maintenance task listens to canon state updates and applies those
-// then listens to worker block updates and drains those (should only ever be 1)
-// then checks for reloaded accounts request
-//
-// TODO: can this task support the "pending" block inquiry?
-/// Long-running task that updates the transaction pool based on new worker block builds and engine execution.
-pub struct MaintainTxPool;
-
 // tests for all mods
 #[cfg(test)]
 mod tests {
