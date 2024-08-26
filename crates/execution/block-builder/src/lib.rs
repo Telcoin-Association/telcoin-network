@@ -200,40 +200,6 @@ where
         }
     }
 
-    /// This method is called when a canonical state update is received.
-    ///
-    /// Trigger the maintenance task to Update pool before building the next block.
-    fn process_canon_state_update(&self, update: Arc<Chain>) {
-        // TODO: ensure the engine's update includes all accounts that changed during execution
-        warn!(target: "Canon update inside block builder!!!!\n", ?update);
-
-        // update pool based with canonical tip update
-        let (blocks, state) = update.inner();
-        let tip = blocks.tip();
-
-        let mut changed_accounts = Vec::with_capacity(state.state().len());
-        for acc in changed_accounts_iter(state) {
-            changed_accounts.push(acc);
-        }
-
-        // TODO: these should have already been mined when the worker proposed its block
-        // but still needs to be included for any txs mined by peers
-        let mined_transactions = blocks.transaction_hashes().collect();
-        let pending_block_base_fee = self.base_fee.unwrap_or(MIN_PROTOCOL_BASE_FEE);
-
-        // Canonical update
-        let update = CanonicalStateUpdate {
-            new_tip: &tip.block,          // finalized block
-            pending_block_base_fee,       // current base fee for worker
-            pending_block_blob_fee: None, // current base fee for worker
-            changed_accounts,             // finalized block
-            mined_transactions,           // finalized block (but these should be a noop)
-        };
-
-        // sync fn so self will block until all pool updates are complete
-        self.pool.on_canonical_state_change(update);
-    }
-
     /// Spawns a blocking task to execute consensus output.
     ///
     /// This approach allows the engine to yield back to the runtime while executing blocks.
@@ -384,23 +350,23 @@ where
         let this = self.get_mut();
 
         loop {
-            // check for canon updates before mining the transaction pool
-            //
-            // this is critical to ensure worker's block is building off canonical tip
-            // block until canon updates are applied
-            while let Poll::Ready(Some(canon_update)) =
-                this.canonical_state_updates.poll_next_unpin(cx)
-            {
-                // poll canon updates stream and update pool `.on_canon_update`
-                //
-                // maintenance task will handle worker's pending block update
-                match canon_update {
-                    CanonStateNotification::Commit { new } => {
-                        this.process_canon_state_update(new);
-                    }
-                    _ => unreachable!("TN reorgs are impossible"),
-                }
-            }
+            // // check for canon updates before mining the transaction pool
+            // //
+            // // this is critical to ensure worker's block is building off canonical tip
+            // // block until canon updates are applied
+            // while let Poll::Ready(Some(canon_update)) =
+            //     this.canonical_state_updates.poll_next_unpin(cx)
+            // {
+            //     // poll canon updates stream and update pool `.on_canon_update`
+            //     //
+            //     // maintenance task will handle worker's pending block update
+            //     match canon_update {
+            //         CanonStateNotification::Commit { new } => {
+            //             this.process_canon_state_update(new);
+            //         }
+            //         _ => unreachable!("TN reorgs are impossible"),
+            //     }
+            // }
 
             // only insert task if there is none
             //

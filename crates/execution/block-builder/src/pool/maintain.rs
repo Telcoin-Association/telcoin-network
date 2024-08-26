@@ -13,12 +13,13 @@ use futures_util::{
 };
 use reth_fs_util::FsPathError;
 use reth_primitives::{
-    Address, BlockHash, BlockNumber, BlockNumberOrTag, FromRecoveredPooledTransaction,
-    PooledTransactionsElementEcRecovered, TransactionSigned, TryFromRecoveredTransaction, U256,
+    constants::MIN_PROTOCOL_BASE_FEE, Address, BlockHash, BlockNumber, BlockNumberOrTag,
+    FromRecoveredPooledTransaction, PooledTransactionsElementEcRecovered, TransactionSigned,
+    TryFromRecoveredTransaction, U256,
 };
 use reth_provider::{
-    BlockReaderIdExt, CanonStateNotification, ChainSpecProvider, ExecutionOutcome, ProviderError,
-    StateProviderFactory,
+    BlockReaderIdExt, CanonStateNotification, Chain, ChainSpecProvider, ExecutionOutcome,
+    ProviderError, StateProviderFactory,
 };
 use reth_tasks::TaskSpawner;
 use reth_transaction_pool::{
@@ -32,6 +33,7 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 use tn_types::WorkerBlockUpdate;
@@ -60,7 +62,7 @@ impl Default for PoolMaintenanceConfig {
 // TODO: can this task support the "pending" block inquiry?
 
 /// Long-running task that updates the transaction pool based on new worker block builds and engine execution.
-pub struct MaintainTxPool<Provider, Pool, C, W, F> {
+pub struct MaintainTxPool<Provider, Pool, C, W> {
     /// The configuration for pool maintenance.
     config: PoolMaintenanceConfig,
     /// The type used to query the database.
@@ -68,7 +70,7 @@ pub struct MaintainTxPool<Provider, Pool, C, W, F> {
     /// The transaction pool to maintain.
     pool: Pool,
     /// The stream for canonical state updates.
-    canon_events: C,
+    canonical_state_updates: C,
     /// The stream for worker block updates.
     ///
     /// These are notifications for when the worker has successfully built a new block and guarantees to broadcast the block. The underlying promise is that this newly built block is stored in the database and the worker will continue to broadcast the block until it reaches a quorum of votes.
@@ -83,21 +85,23 @@ pub struct MaintainTxPool<Provider, Pool, C, W, F> {
     maintenance_state: MaintainedPoolState,
     /// Metrics for maintenance.
     metrics: MaintainPoolMetrics,
-    /// The future that reloads accounts from database.
-    reload_accounts_fut: Fuse<F>,
+
+    /// The worker's current base fee.
+    basefee: Option<u64>,
 }
 
-impl<Provider, Pool, C, W, F> MaintainTxPool<Provider, Pool, C, W, F>
+impl<Provider, Pool, C, W> MaintainTxPool<Provider, Pool, C, W>
 where
-    F: Future,
+    Pool: TransactionPoolExt,
 {
     /// Create a new instance of [Self].
     pub fn new(
         config: PoolMaintenanceConfig,
         provider: Provider,
         pool: Pool,
-        canon_events: C,
+        canonical_state_updates: C,
         worker_events: W,
+        basefee: Option<u64>,
     ) -> Self {
         let metrics = MaintainPoolMetrics::default();
 
@@ -113,42 +117,169 @@ where
         // keeps track of the state of the pool wrt to blocks
         let maintenance_state = MaintainedPoolState::InSync;
 
-        // the future that reloads accounts from state
-        let reload_accounts_fut = Fuse::terminated();
-
         Self {
             config,
             provider,
             pool,
-            canon_events,
+            canonical_state_updates,
             worker_events,
             pending_block,
             dirty_addresses,
             maintenance_state,
             metrics,
-            reload_accounts_fut,
+            basefee,
         }
+    }
+
+    /// This method is called when a canonical state update is received.
+    ///
+    /// Trigger the maintenance task to Update pool before building the next block.
+    fn process_canon_state_update(&self, update: Arc<Chain>) {
+        // TODO: ensure the engine's update includes all accounts that changed during execution
+        warn!(target: "Canon update inside block builder!!!!\n", ?update);
+
+        // update pool based with canonical tip update
+        let (blocks, state) = update.inner();
+        let tip = blocks.tip();
+
+        let mut changed_accounts = Vec::with_capacity(state.state().len());
+        for acc in changed_accounts_iter(state) {
+            changed_accounts.push(acc);
+        }
+
+        // TODO: these should have already been mined when the worker proposed its block
+        // but still needs to be included for any txs mined by peers
+        let mined_transactions = blocks.transaction_hashes().collect();
+        let pending_block_base_fee = self.basefee.unwrap_or(MIN_PROTOCOL_BASE_FEE);
+
+        // Canonical update
+        let update = CanonicalStateUpdate {
+            new_tip: &tip.block,          // finalized block
+            pending_block_base_fee,       // current base fee for worker
+            pending_block_blob_fee: None, // current base fee for worker
+            changed_accounts,             // finalized block
+            mined_transactions,           // finalized block (but these should be a noop)
+        };
+
+        // sync fn so self will block until all pool updates are complete
+        self.pool.on_canonical_state_change(update);
     }
 }
 
-impl<Provider, Pool, C, W, F> Future for MaintainTxPool<Provider, Pool, C, W, F>
+impl<Provider, Pool, C, W> Future for MaintainTxPool<Provider, Pool, C, W>
 where
-    Provider: StateProviderFactory + BlockReaderIdExt + ChainSpecProvider + Clone + Send + 'static,
-    Pool: TransactionPoolExt + 'static,
+    Provider: StateProviderFactory
+        + BlockReaderIdExt
+        + ChainSpecProvider
+        + Clone
+        + Send
+        + Unpin
+        + 'static,
+    Pool: TransactionPoolExt + Unpin + 'static,
     C: Stream<Item = CanonStateNotification> + Send + Unpin + 'static,
     W: Stream<Item = WorkerBlockUpdate> + Send + Unpin + 'static,
-    F: Future + Unpin,
 {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let PoolMaintenanceConfig { max_reload_accounts } = self.config;
+
+        // The future that reloads accounts from database.
+        let mut reload_accounts_fut = Fuse::terminated();
+
         let this = self.get_mut();
 
         // update loop that drains all canon updates and worker updates
         // then updates the pool
         loop {
-            trace!(target: "txpool", state=?)
+            trace!(target: "txpool", state=?this.maintenance_state, "awaiting new worker block or canonical udpate");
+
+            this.metrics.set_dirty_accounts_len(this.dirty_addresses.len());
+            let pool_info = this.pool.block_info();
+
+            // after performing a pool update after a new block we have some time to properly update
+            // dirty accounts and correct if the pool drifted from current state, for example after
+            // restart or a pipeline run
+            if this.maintenance_state.is_drifted() {
+                this.metrics.inc_drift();
+                // assuming all senders are dirty
+                this.dirty_addresses = this.pool.unique_senders();
+                // make sure we toggle the state back to in sync
+                this.maintenance_state = MaintainedPoolState::InSync;
+            }
+
+            // reload accounts that are out-of-sync in chunks
+            if !this.dirty_addresses.is_empty() && reload_accounts_fut.is_terminated() {
+                let (tx, rx) = oneshot::channel();
+                let c = this.provider.clone();
+                let at = pool_info.last_seen_block_hash;
+                let fut = if this.dirty_addresses.len() > max_reload_accounts {
+                    // need to chunk accounts to reload
+                    let accs_to_reload = this
+                        .dirty_addresses
+                        .iter()
+                        .copied()
+                        .take(max_reload_accounts)
+                        .collect::<Vec<_>>();
+                    for acc in &accs_to_reload {
+                        // make sure we remove them from the dirty set
+                        this.dirty_addresses.remove(acc);
+                    }
+                    async move {
+                        let res = load_accounts(c, at, accs_to_reload.into_iter());
+                        let _ = tx.send(res);
+                    }
+                    .boxed()
+                } else {
+                    // can fetch all dirty accounts at once
+                    let accs_to_reload = std::mem::take(&mut this.dirty_addresses);
+                    async move {
+                        let res = load_accounts(c, at, accs_to_reload.into_iter());
+                        let _ = tx.send(res);
+                    }
+                    .boxed()
+                };
+                reload_accounts_fut = rx.fuse();
+                tokio::task::spawn_blocking(|| fut);
+            }
+
+            // check the reloaded accounts future
+
+            // check for canon updates first
+            //
+            // this is critical to ensure worker's block is building off canonical tip
+            while let Poll::Ready(Some(canon_update)) =
+                this.canonical_state_updates.poll_next_unpin(cx)
+            {
+                // TODO: this needs to update `self` with new tip info
+                // for broadcasting worker update
+
+                // TODO: ensure that engine's canon update includes `Chain` with all updates
+                // instead of multiple updates
+
+                // poll canon updates stream and update pool `.on_canon_update`
+                //
+                // maintenance task will handle worker's pending block update
+                match canon_update {
+                    CanonStateNotification::Commit { new } => {
+                        this.process_canon_state_update(new);
+                    }
+                    _ => unreachable!("TN reorgs are impossible"),
+                }
+            }
+
+            // drain all worker block updates
+            while let Poll::Ready(Some(WorkerBlockUpdate { parent, pending, state })) =
+                this.worker_events.poll_next_unpin(cx)
+            {
+                // update pending block
+                // update basefee
+                // update pool with basefee
+                // update
+            }
+
+            // TODO: REMOVE THIS BREAK - removes warning for now
+            break;
         }
 
         Poll::Pending
