@@ -2,7 +2,7 @@
 //!
 //! This module contains the logic for execution.
 
-use super::{pending_block::PendingWorkerBlock, TnBuilder, WorkerComponents};
+use super::{PendingBlockWatchChannels, TnBuilder, WorkerComponents};
 use crate::{
     engine::{WorkerNetwork, WorkerNode},
     error::ExecutionError,
@@ -40,8 +40,8 @@ use tn_batch_maker::{BatchMakerBuilder, MiningMode};
 use tn_batch_validator::BatchValidator;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
-use tn_types::{Consensus, ConsensusOutput, NewBatch, WorkerId};
-use tokio::sync::{broadcast, mpsc::unbounded_channel, RwLock};
+use tn_types::{Consensus, ConsensusOutput, NewBatch, PendingWorkerBlock, WorkerId};
+use tokio::sync::{broadcast, mpsc::unbounded_channel, watch, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info};
 
@@ -259,6 +259,9 @@ where
         // TODO: this is basically noop and missing some functionality
         let network = WorkerNetwork::default();
 
+        // watch channel for new batches
+        let (watch_tx, watch_rx) = watch::channel(PendingWorkerBlock::default());
+
         // build batch maker
         let max_transactions = 10;
         let mining_mode =
@@ -271,6 +274,7 @@ where
             mining_mode,
             self.address,
             self.evm_executor.clone(),
+            watch_tx.clone(),
         )
         .build();
 
@@ -311,9 +315,11 @@ where
 
         if let Some(faucet_args) = self.opt_faucet_args.take() {
             // create extension from CLI args
-            match faucet_args
-                .create_rpc_extension(self.blockchain_db.clone(), transaction_pool.clone())
-            {
+            match faucet_args.create_rpc_extension(
+                self.blockchain_db.clone(),
+                transaction_pool.clone(),
+                watch_rx.clone(),
+            ) {
                 Ok(faucet_ext) => {
                     // add faucet module
                     if let Err(e) = server.merge_configured(faucet_ext.into_rpc()) {
@@ -332,7 +338,8 @@ where
         let server_config = self.node_config.rpc.rpc_server_config();
         let rpc_handle = server_config.start(&server).await?;
 
-        let components = WorkerComponents::new(rpc_handle);
+        let components =
+            WorkerComponents::new(rpc_handle, PendingBlockWatchChannels::new(watch_tx, watch_rx));
 
         self.workers.insert(worker_id, components);
         Ok(())
@@ -421,8 +428,10 @@ where
             .workers
             .get(worker_id)
             .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
-            .pending()
+            .pending_block_receiver()
+            .borrow()
             .latest();
+
         Ok(state)
     }
 }

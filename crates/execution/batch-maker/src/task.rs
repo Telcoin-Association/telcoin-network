@@ -14,8 +14,8 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
-use tn_types::{Batch, NewBatch};
-use tokio::sync::oneshot;
+use tn_types::{Batch, NewBatch, PendingWorkerBlock};
+use tokio::sync::{oneshot, watch};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
@@ -47,6 +47,8 @@ pub struct MiningTask<Client, Pool: TransactionPool, BlockExecutor> {
     pipe_line_events: Option<UnboundedReceiverStream<PipelineEvent>>,
     /// The type used for block execution
     block_executor: BlockExecutor,
+    /// The watch channel that shares the current pending worker block.
+    watch_tx: watch::Sender<PendingWorkerBlock>,
 }
 
 // === impl MiningTask ===
@@ -62,6 +64,7 @@ impl<Client, Pool: TransactionPool, BlockExecutor> MiningTask<Client, Pool, Bloc
         client: Client,
         pool: Pool,
         block_executor: BlockExecutor,
+        watch_tx: watch::Sender<PendingWorkerBlock>,
     ) -> Self {
         Self {
             chain_spec,
@@ -75,6 +78,7 @@ impl<Client, Pool: TransactionPool, BlockExecutor> MiningTask<Client, Pool, Bloc
             queued: Default::default(),
             pipe_line_events: None,
             block_executor,
+            watch_tx,
         }
     }
 

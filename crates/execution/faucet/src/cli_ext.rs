@@ -15,6 +15,8 @@ use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_transaction_pool::TransactionPool;
 use secp256k1::PublicKey;
 use std::{str::FromStr, time::Duration};
+use tn_types::PendingWorkerBlock;
+use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 /// Args for running the faucet.
@@ -99,6 +101,7 @@ impl FaucetArgs {
         &self,
         provider: Provider,
         pool: Pool,
+        watch_rx: watch::Receiver<PendingWorkerBlock>,
     ) -> eyre::Result<FaucetRpcExt>
     where
         Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
@@ -142,7 +145,7 @@ impl FaucetArgs {
                 wallet,
             };
 
-            let ext = FaucetRpcExt::new(provider, pool, config);
+            let ext = FaucetRpcExt::new(provider, pool, config, watch_rx);
 
             info!(target: "faucet", "Google KMS active - merging faucet extension.");
             return Ok(ext);
@@ -152,41 +155,6 @@ impl FaucetArgs {
         warn!(target: "faucet", "Google KMS inactive - skipping faucet extension.");
         Err(eyre::Report::msg("Google KMS inactive - skipping faucet extension."))
         //todo!("Only Google KMS supported right now.")
-    }
-}
-
-/// Installs the "faucet" rpc namespace.
-impl FaucetArgs {
-    /// Allows for registering additional RPC modules for the transports.
-    ///
-    /// This is expected to call the merge functions of [reth_rpc_builder::TransportRpcModules], for
-    /// example [reth_rpc_builder::TransportRpcModules::merge_configured]
-    fn _extend_rpc_modules<Provider, Pool>(
-        &mut self,
-        provider: Provider,
-        pool: Pool,
-        modules: &mut TransportRpcModules,
-    ) -> eyre::Result<()>
-    where
-        Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
-        Pool: TransactionPool + Unpin + Clone + 'static,
-    {
-        // only support google kms for now
-        if self.google_kms {
-            // create faucet rpc namespace
-            let ext = self.create_rpc_extension(provider, pool)?;
-
-            // add faucet module
-            if let Err(e) = modules.merge_configured(ext.into_rpc()) {
-                error!(target: "faucet", "Error merging faucet rpc module: {e:?}");
-            }
-
-            info!(target: "faucet", "Google KMS active - faucet extension merged.");
-        } else {
-            warn!(target: "faucet", "Google KMS inactive - skipping faucet extension.");
-        };
-
-        Ok(())
     }
 }
 

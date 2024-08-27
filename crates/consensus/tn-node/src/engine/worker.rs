@@ -34,25 +34,52 @@ use reth_transaction_pool::TransactionPool;
 use std::{
     marker::PhantomData,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
 };
-use tn_types::adiri_chain_spec;
+use tn_types::{adiri_chain_spec, PendingWorkerBlock};
+use tokio::sync::watch;
 
-use super::pending_block::PendingWorkerBlock;
+/// Convenience type for managing worker watch channels for pending block.
+#[derive(Clone, Debug)]
+pub(super) struct PendingBlockWatchChannels {
+    /// The sending half of the watch channel.
+    sender: watch::Sender<PendingWorkerBlock>,
+    /// The receiving half of the watch channel.
+    receiver: watch::Receiver<PendingWorkerBlock>,
+}
+
+impl PendingBlockWatchChannels {
+    /// Create a new instance of [Self].
+    pub fn new(
+        sender: watch::Sender<PendingWorkerBlock>,
+        receiver: watch::Receiver<PendingWorkerBlock>,
+    ) -> Self {
+        Self { sender, receiver }
+    }
+
+    /// Return an owned sender channel.
+    pub fn sender(&self) -> watch::Sender<PendingWorkerBlock> {
+        self.sender.clone()
+    }
+
+    /// Return an owned receiver channel.
+    pub fn receiver(&self) -> watch::Receiver<PendingWorkerBlock> {
+        self.receiver.clone()
+    }
+}
 
 /// Execution components on a per-worker basis.
 #[derive(Debug)]
 pub(super) struct WorkerComponents {
     /// The RPC handle.
     rpc_handle: RpcServerHandle,
-    /// The current pending block.
-    pending: Arc<PendingWorkerBlock>,
+    /// The current pending block watch channel.
+    pending_channels: PendingBlockWatchChannels,
 }
 
 impl WorkerComponents {
     /// Create a new instance of [Self].
-    pub fn new(rpc_handle: RpcServerHandle) -> Self {
-        Self { rpc_handle, pending: Default::default() }
+    pub fn new(rpc_handle: RpcServerHandle, pending_channels: PendingBlockWatchChannels) -> Self {
+        Self { rpc_handle, pending_channels }
     }
 
     /// Return a reference to the rpc handle
@@ -60,9 +87,14 @@ impl WorkerComponents {
         &self.rpc_handle
     }
 
-    /// Return the current pending block's state.
-    pub fn pending(&self) -> Arc<PendingWorkerBlock> {
-        self.pending.clone()
+    /// Return the pending block watch channels.
+    pub fn pending_channels(&self) -> PendingBlockWatchChannels {
+        self.pending_channels.clone()
+    }
+
+    /// Return a receiver for pending block watch channel.
+    pub fn pending_block_receiver(&self) -> watch::Receiver<PendingWorkerBlock> {
+        self.pending_channels.receiver()
     }
 }
 

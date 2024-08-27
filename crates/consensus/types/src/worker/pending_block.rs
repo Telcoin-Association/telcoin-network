@@ -1,4 +1,6 @@
 //! This is an experimental approach to supporting pending blocks for workers.
+//!
+//! Use a watch channel?
 
 use reth_primitives::Address;
 use reth_provider::ExecutionOutcome;
@@ -14,8 +16,8 @@ pub struct PendingWorkerBlock {
 
 impl PendingWorkerBlock {
     /// Create a new instance of [Self].
-    pub fn new() -> Self {
-        Self { state: None }
+    pub fn new(state: Option<ExecutionOutcome>) -> Self {
+        Self { state }
     }
 
     /// Return data for worker's current pending block.

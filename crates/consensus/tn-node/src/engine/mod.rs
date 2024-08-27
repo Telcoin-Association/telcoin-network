@@ -19,7 +19,6 @@ use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use reth_node_builder::NodeConfig;
 use std::sync::Arc;
 mod inner;
-mod pending_block;
 mod worker;
 
 use self::inner::ExecutionNodeInner;

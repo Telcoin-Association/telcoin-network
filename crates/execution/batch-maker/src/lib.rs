@@ -35,8 +35,8 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tn_types::{now, AutoSealConsensus, NewBatch};
-use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tn_types::{now, AutoSealConsensus, NewBatch, PendingWorkerBlock};
+use tokio::sync::{watch, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{debug, error, trace, warn};
 
 // mod client;
@@ -57,6 +57,7 @@ pub struct BatchMakerBuilder<Client, Pool, EvmConfig> {
     storage: Storage,
     to_worker: Sender<NewBatch>,
     evm_config: EvmConfig,
+    watch_tx: watch::Sender<PendingWorkerBlock>,
 }
 
 // === impl AutoSealBuilder ===
@@ -75,6 +76,7 @@ where
         mode: MiningMode,
         address: Address,
         evm_config: EvmConfig,
+        watch_tx: watch::Sender<PendingWorkerBlock>,
         // TODO: pass max_block here to shut down batch maker?
     ) -> Self {
         let latest_header = client
@@ -91,6 +93,7 @@ where
             mode,
             to_worker,
             evm_config,
+            watch_tx,
         }
     }
 
@@ -103,7 +106,7 @@ where
     /// Consumes the type and returns all components
     #[track_caller]
     pub fn build(self) -> MiningTask<Client, Pool, EvmConfig> {
-        let Self { client, consensus, pool, mode, storage, to_worker, evm_config } = self;
+        let Self { client, consensus, pool, mode, storage, to_worker, evm_config, watch_tx } = self;
         // let auto_client = AutoSealClient::new(storage.clone());
 
         // (consensus, auto_client, task)
@@ -115,6 +118,7 @@ where
             client,
             pool,
             evm_config,
+            watch_tx,
         )
     }
 }

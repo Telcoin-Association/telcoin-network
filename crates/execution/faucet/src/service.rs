@@ -37,9 +37,10 @@ use std::{
     task::{ready, Context, Poll},
     time::{Duration, SystemTime},
 };
+use tn_types::PendingWorkerBlock;
 use tokio::sync::{
     mpsc::{UnboundedReceiver, UnboundedSender},
-    oneshot,
+    oneshot, watch,
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
@@ -92,6 +93,10 @@ pub(crate) struct FaucetService<Provider, Pool, Tasks> {
     ///
     /// Addresses received on this channel are added to the LRU cache.
     pub(crate) update_cache_rx: UnboundedReceiver<(Address, Address)>,
+    /// The watch channel for tracking the worker's latest pending block.
+    ///
+    /// The pending block is updated right before transactions are removed from the tx pool.
+    pub(crate) watch_rx: watch::Receiver<PendingWorkerBlock>,
 }
 
 impl<Provider, Pool, Tasks> FaucetService<Provider, Pool, Tasks>
@@ -237,9 +242,12 @@ where
             return Ok(tx_count);
         }
 
-        // lookup account nonce in db
+        // lookup account nonce in db and compare it to pending worker block
         let state = self.provider.latest()?;
-        Ok(state.account_nonce(address)?.unwrap_or_default())
+        let latest_nonce = state.account_nonce(address)?.unwrap_or_default();
+        let pending_nonce = self.watch_rx.borrow().account_nonce(&address).unwrap_or_default();
+
+        Ok(std::cmp::max(latest_nonce, pending_nonce))
     }
 
     /// Taken from rpc/src/eth/api/fees.rs

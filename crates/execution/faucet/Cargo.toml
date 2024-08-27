@@ -38,10 +38,10 @@ ecdsa = { version = "0.16.9", features = ["pem"] }
 secp256k1 = { workspace = true }
 tonic = { workspace = true }
 cfg-if = { workspace = true }
+tn-types = { workspace = true }
 
 [dev-dependencies]
 reth-tracing = { workspace = true }
-tn-types = { workspace = true }
 consensus-metrics = { workspace = true }
 narwhal-test-utils = { workspace = true }
 prometheus = { workspace = true }

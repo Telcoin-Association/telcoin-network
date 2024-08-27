@@ -21,9 +21,10 @@ use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use reth_transaction_pool::TransactionPool;
 use secp256k1::constants::PUBLIC_KEY_SIZE;
 use std::time::Duration;
+use tn_types::PendingWorkerBlock;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedSender},
-    oneshot,
+    oneshot, watch,
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 mod cli_ext;
@@ -109,6 +110,7 @@ impl Faucet {
         pool: Pool,
         executor: Tasks,
         config: FaucetConfig,
+        watch_rx: watch::Receiver<PendingWorkerBlock>,
     ) -> (Self, FaucetService<Provider, Pool, Tasks>) {
         let (to_service, rx) = unbounded_channel();
         let FaucetConfig { wait_period, transfer_amount, chain_id, wallet } = config;
@@ -131,6 +133,7 @@ impl Faucet {
             wallet,
             add_to_cache_tx,
             update_cache_rx,
+            watch_rx,
         };
         let faucet = Self { to_service };
         (faucet, service)
@@ -144,12 +147,13 @@ impl Faucet {
         provider: Provider,
         pool: Pool,
         config: FaucetConfig,
+        watch_rx: watch::Receiver<PendingWorkerBlock>,
     ) -> Self
     where
         Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
         Pool: TransactionPool + Unpin + Clone + 'static,
     {
-        Self::spawn_with(provider, pool, config, TokioTaskExecutor::default())
+        Self::spawn_with(provider, pool, config, TokioTaskExecutor::default(), watch_rx)
     }
 
     /// Creates a new async LRU backed cache service task and spawns it to a new task via
@@ -161,13 +165,14 @@ impl Faucet {
         pool: Pool,
         config: FaucetConfig,
         executor: Tasks,
+        watch_rx: watch::Receiver<PendingWorkerBlock>,
     ) -> Self
     where
         Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
         Pool: TransactionPool + Unpin + Clone + 'static,
         Tasks: TaskSpawner + Clone + 'static,
     {
-        let (this, service) = Self::create(provider, pool, executor.clone(), config);
+        let (this, service) = Self::create(provider, pool, executor.clone(), config, watch_rx);
 
         executor.spawn_critical("faucet cache", Box::pin(service));
         this
