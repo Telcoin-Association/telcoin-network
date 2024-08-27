@@ -26,8 +26,8 @@ use reth_provider::{providers::BlockchainProvider, ExecutionOutcome};
 use reth_tasks::TaskExecutor;
 use tn_batch_validator::BatchValidator;
 use tn_faucet::FaucetArgs;
-use tn_types::{Config, ConsensusOutput, NewBatch, WorkerId};
-use tokio::sync::{broadcast, RwLock};
+use tn_types::{Config, ConsensusOutput, NewBatch, PendingWorkerBlock, WorkerId};
+use tokio::sync::{broadcast, watch, RwLock};
 pub use worker::*;
 
 /// The struct used to build the execution nodes.
@@ -141,5 +141,14 @@ where
     ) -> eyre::Result<Option<ExecutionOutcome>> {
         let guard = self.internal.read().await;
         guard.worker_pending_block(worker_id)
+    }
+
+    /// Return a worker's sending channel for pending block updates.
+    pub async fn worker_pending_block_sender(
+        &self,
+        worker_id: &WorkerId,
+    ) -> eyre::Result<watch::Sender<PendingWorkerBlock>> {
+        let guard = self.internal.read().await;
+        guard.worker_pending_block_sender(worker_id)
     }
 }

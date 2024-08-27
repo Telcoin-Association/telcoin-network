@@ -123,6 +123,7 @@ where
                 let pool = this.pool.clone();
                 let events = this.pipe_line_events.take();
                 let block_executor = this.block_executor.clone();
+                let worker_update = this.watch_tx.clone();
 
                 // Create the mining future that creates a batch and sends it to the CL
                 this.insert_task = Some(Box::pin(async move {
@@ -148,7 +149,7 @@ where
                         chain_spec,
                         &block_executor,
                     ) {
-                        Ok((new_header, _bundle_state)) => {
+                        Ok((new_header, state)) => {
                             // TODO: make this a future
                             //
                             // send the new update to the engine, this will trigger the engine
@@ -206,6 +207,9 @@ where
                             // let _ = canon_state_notification
                             //     .send(reth_provider::CanonStateNotification::Commit { new: chain
                             // });
+
+                            // update execution state on watch channel
+                            let _ = worker_update.send(PendingWorkerBlock::new(Some(state)));
 
                             // TODO: is this the best place to remove transactions?
                             // should the miner poll this like payload builder?

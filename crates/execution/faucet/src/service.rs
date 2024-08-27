@@ -246,6 +246,7 @@ where
         let state = self.provider.latest()?;
         let latest_nonce = state.account_nonce(address)?.unwrap_or_default();
         let pending_nonce = self.watch_rx.borrow().account_nonce(&address).unwrap_or_default();
+        debug!(target: "faucet", ?latest_nonce, ?pending_nonce, "comparing faucet nonces");
 
         Ok(std::cmp::max(latest_nonce, pending_nonce))
     }

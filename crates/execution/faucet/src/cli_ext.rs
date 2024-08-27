@@ -16,7 +16,7 @@ use secp256k1::PublicKey;
 use std::{str::FromStr, time::Duration};
 use tn_types::PendingWorkerBlock;
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Args for running the faucet.
 /// Used to build the faucet config.

@@ -87,14 +87,14 @@ impl WorkerComponents {
         &self.rpc_handle
     }
 
-    /// Return the pending block watch channels.
-    pub fn pending_channels(&self) -> PendingBlockWatchChannels {
-        self.pending_channels.clone()
-    }
-
     /// Return a receiver for pending block watch channel.
     pub fn pending_block_receiver(&self) -> watch::Receiver<PendingWorkerBlock> {
         self.pending_channels.receiver()
+    }
+
+    /// Return a sender for pending block watch channel.
+    pub fn pending_block_sender(&self) -> watch::Sender<PendingWorkerBlock> {
+        self.pending_channels.sender()
     }
 }
 

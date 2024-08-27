@@ -469,7 +469,7 @@ mod tests {
 
         let evm_config = EthEvmConfig::default();
         let block_executor = EthExecutorProvider::new(chain.clone(), evm_config);
-        let (tx, rx) = watch::channel(PendingWorkerBlock::default());
+        let (tx, _rx) = watch::channel(PendingWorkerBlock::default());
 
         // build batch maker
         let task = BatchMakerBuilder::new(

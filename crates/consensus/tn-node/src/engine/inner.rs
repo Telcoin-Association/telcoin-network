@@ -10,7 +10,7 @@ use crate::{
 use consensus_metrics::metered_channel::Sender;
 use jsonrpsee::http_client::HttpClient;
 use reth::rpc::{
-    builder::{config::RethRpcServerConfig, RpcModuleBuilder, RpcServerHandle},
+    builder::{config::RethRpcServerConfig, RpcModuleBuilder},
     eth::EthApi,
 };
 use reth_auto_seal_consensus::AutoSealConsensus;
@@ -41,7 +41,7 @@ use tn_batch_validator::BatchValidator;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
 use tn_types::{Consensus, ConsensusOutput, NewBatch, PendingWorkerBlock, WorkerId};
-use tokio::sync::{broadcast, mpsc::unbounded_channel, watch, RwLock};
+use tokio::sync::{broadcast, mpsc::unbounded_channel, watch};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info};
 
@@ -433,5 +433,19 @@ where
             .latest();
 
         Ok(state)
+    }
+
+    /// Return a worker's sending channel for pending block updates.
+    pub(super) fn worker_pending_block_sender(
+        &self,
+        worker_id: &WorkerId,
+    ) -> eyre::Result<watch::Sender<PendingWorkerBlock>> {
+        let sender = self
+            .workers
+            .get(worker_id)
+            .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
+            .pending_block_sender();
+
+        Ok(sender)
     }
 }
