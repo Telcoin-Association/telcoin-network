@@ -31,9 +31,9 @@ use tn_batch_maker::{BatchMakerBuilder, MiningMode};
 use tn_batch_validator::{BatchValidation, BatchValidator};
 use tn_types::{
     test_utils::{get_gas_price, test_genesis, TransactionFactory},
-    Batch, BatchAPI, Consensus, MetadataAPI, PreSubscribedBroadcastSender,
+    Batch, BatchAPI, Consensus, MetadataAPI, PendingWorkerBlock, PreSubscribedBroadcastSender,
 };
-use tokio::time::timeout;
+use tokio::{sync::watch, time::timeout};
 use tracing::debug;
 
 #[tokio::test]
@@ -124,6 +124,7 @@ async fn test_make_batch_el_to_cl() {
 
     let evm_config = EthEvmConfig::default();
     let block_executor = EthExecutorProvider::new(chain.clone(), evm_config);
+    let (tx, _rx) = watch::channel(PendingWorkerBlock::default());
 
     // build execution batch maker
     let task = BatchMakerBuilder::new(
@@ -134,6 +135,7 @@ async fn test_make_batch_el_to_cl() {
         mining_mode,
         address,
         block_executor.clone(),
+        tx,
     )
     .build();
 

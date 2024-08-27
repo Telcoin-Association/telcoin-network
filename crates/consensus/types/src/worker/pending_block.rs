@@ -7,7 +7,8 @@ use reth_provider::ExecutionOutcome;
 
 /// The type that holds the worker's pending block.
 ///
-/// The value is stored in memory and updated each time a worker's batch maker broadcasts a new batch.
+/// The value is stored in memory and updated each time a worker's batch maker broadcasts a new
+/// batch.
 #[derive(Debug, Default)]
 pub struct PendingWorkerBlock {
     /// The state from the worker's newest batch.
