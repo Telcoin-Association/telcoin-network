@@ -2,7 +2,7 @@
 //!
 //! This module contains the logic for execution.
 
-use super::TnBuilder;
+use super::{pending_block::PendingWorkerBlock, TnBuilder, WorkerComponents};
 use crate::{
     engine::{WorkerNetwork, WorkerNode},
     error::ExecutionError,
@@ -29,8 +29,8 @@ use reth_node_ethereum::{node::EthereumPoolBuilder, EthEvmConfig};
 use reth_primitives::Address;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
-    DatabaseProviderFactory, FinalizedBlockReader, HeaderProvider, ProviderFactory,
-    StaticFileProviderFactory as _,
+    DatabaseProviderFactory, ExecutionOutcome, FinalizedBlockReader, HeaderProvider,
+    ProviderFactory, StaticFileProviderFactory as _,
 };
 use reth_prune::PruneModes;
 use reth_tasks::TaskExecutor;
@@ -41,7 +41,7 @@ use tn_batch_validator::BatchValidator;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
 use tn_types::{Consensus, ConsensusOutput, NewBatch, WorkerId};
-use tokio::sync::{broadcast, mpsc::unbounded_channel};
+use tokio::sync::{broadcast, mpsc::unbounded_channel, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info};
 
@@ -81,7 +81,7 @@ where
     /// TODO: temporary solution until upstream reth supports public rpc hooks
     opt_faucet_args: Option<FaucetArgs>,
     /// Collection of execution components by worker.
-    workers: HashMap<WorkerId, RpcServerHandle>,
+    workers: HashMap<WorkerId, WorkerComponents>,
     // TODO: add Pool to self.workers for direct access (tests)
 }
 
@@ -332,7 +332,9 @@ where
         let server_config = self.node_config.rpc.rpc_server_config();
         let rpc_handle = server_config.start(&server).await?;
 
-        self.workers.insert(worker_id, rpc_handle);
+        let components = WorkerComponents::new(rpc_handle);
+
+        self.workers.insert(worker_id, components);
         Ok(())
     }
 
@@ -405,7 +407,22 @@ where
             .workers
             .get(worker_id)
             .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
+            .rpc_handle()
             .http_client();
         Ok(handle)
+    }
+
+    /// Return a worker's pending block state if it exists.
+    pub(super) fn worker_pending_block(
+        &self,
+        worker_id: &WorkerId,
+    ) -> eyre::Result<Option<ExecutionOutcome>> {
+        let state = self
+            .workers
+            .get(worker_id)
+            .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
+            .pending()
+            .latest();
+        Ok(state)
     }
 }

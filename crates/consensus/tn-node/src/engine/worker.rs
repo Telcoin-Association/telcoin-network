@@ -8,6 +8,7 @@
 //! generic over it.
 
 use enr::{secp256k1::SecretKey, Enr};
+use reth::rpc::builder::RpcServerHandle;
 use reth_db::{
     database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
@@ -33,8 +34,37 @@ use reth_transaction_pool::TransactionPool;
 use std::{
     marker::PhantomData,
     net::{IpAddr, SocketAddr},
+    sync::Arc,
 };
 use tn_types::adiri_chain_spec;
+
+use super::pending_block::PendingWorkerBlock;
+
+/// Execution components on a per-worker basis.
+#[derive(Debug)]
+pub(super) struct WorkerComponents {
+    /// The RPC handle.
+    rpc_handle: RpcServerHandle,
+    /// The current pending block.
+    pending: Arc<PendingWorkerBlock>,
+}
+
+impl WorkerComponents {
+    /// Create a new instance of [Self].
+    pub fn new(rpc_handle: RpcServerHandle) -> Self {
+        Self { rpc_handle, pending: Default::default() }
+    }
+
+    /// Return a reference to the rpc handle
+    pub fn rpc_handle(&self) -> &RpcServerHandle {
+        &self.rpc_handle
+    }
+
+    /// Return the current pending block's state.
+    pub fn pending(&self) -> Arc<PendingWorkerBlock> {
+        self.pending.clone()
+    }
+}
 
 /// Type configuration for a regular worker node.
 #[derive(Debug, Default, Clone, Copy)]

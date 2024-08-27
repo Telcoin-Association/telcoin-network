@@ -23,7 +23,7 @@ mod pending_block;
 mod worker;
 
 use self::inner::ExecutionNodeInner;
-use reth_provider::providers::BlockchainProvider;
+use reth_provider::{providers::BlockchainProvider, ExecutionOutcome};
 use reth_tasks::TaskExecutor;
 use tn_batch_validator::BatchValidator;
 use tn_faucet::FaucetArgs;
@@ -133,5 +133,14 @@ where
     ) -> eyre::Result<Option<jsonrpsee::http_client::HttpClient>> {
         let guard = self.internal.read().await;
         guard.worker_http_client(worker_id)
+    }
+
+    /// Return the worker's current pending block state.
+    pub async fn worker_pending_block(
+        &self,
+        worker_id: &WorkerId,
+    ) -> eyre::Result<Option<ExecutionOutcome>> {
+        let guard = self.internal.read().await;
+        guard.worker_pending_block(worker_id)
     }
 }
