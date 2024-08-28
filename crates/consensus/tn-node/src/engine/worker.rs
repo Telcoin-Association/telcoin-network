@@ -23,20 +23,23 @@ use reth_network_api::{
 };
 use reth_network_peers::{NodeRecord, PeerId};
 use reth_node_builder::{
-    components::NetworkBuilder,
+    components::{NetworkBuilder, PoolBuilder},
     node::{FullNodeTypes, NodeTypes},
     BuilderContext,
 };
 use reth_node_ethereum::EthEngineTypes;
 use reth_provider::providers::BlockchainProvider;
 use reth_rpc_types::admin::EthProtocolInfo;
-use reth_transaction_pool::TransactionPool;
+use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool, TransactionPool};
 use std::{
     marker::PhantomData,
     net::{IpAddr, SocketAddr},
 };
 use tn_types::{adiri_chain_spec, PendingWorkerBlock};
 use tokio::sync::watch;
+
+/// The explicit type for the worker's transaction pool.
+pub type WorkerTxPool<DB> = EthTransactionPool<BlockchainProvider<DB>, DiskFileBlobStore>;
 
 /// Convenience type for managing worker watch channels for pending block.
 #[derive(Clone, Debug)]
@@ -68,23 +71,33 @@ impl PendingBlockWatchChannels {
 }
 
 /// Execution components on a per-worker basis.
-#[derive(Debug)]
-pub(super) struct WorkerComponents {
+pub(super) struct WorkerComponents<DB> {
     /// The RPC handle.
     rpc_handle: RpcServerHandle,
     /// The current pending block watch channel.
     pending_channels: PendingBlockWatchChannels,
+    /// The worker's transaction pool.
+    pool: WorkerTxPool<DB>,
 }
 
-impl WorkerComponents {
+impl<DB> WorkerComponents<DB> {
     /// Create a new instance of [Self].
-    pub fn new(rpc_handle: RpcServerHandle, pending_channels: PendingBlockWatchChannels) -> Self {
-        Self { rpc_handle, pending_channels }
+    pub async fn new(
+        rpc_handle: RpcServerHandle,
+        pending_channels: PendingBlockWatchChannels,
+        pool: WorkerTxPool<DB>,
+    ) -> Self {
+        Self { rpc_handle, pending_channels, pool }
     }
 
     /// Return a reference to the rpc handle
     pub fn rpc_handle(&self) -> &RpcServerHandle {
         &self.rpc_handle
+    }
+
+    /// Return a reference to the worker's transaction pool.
+    pub fn pool(&self) -> WorkerTxPool<DB> {
+        self.pool.clone()
     }
 
     /// Return a receiver for pending block watch channel.

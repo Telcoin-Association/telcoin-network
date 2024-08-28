@@ -134,6 +134,15 @@ where
         guard.worker_http_client(worker_id)
     }
 
+    /// Return an owned instance of the worker's transaction pool.
+    pub async fn worker_transaction_pool(
+        &self,
+        worker_id: &WorkerId,
+    ) -> eyre::Result<WorkerTxPool<DB>> {
+        let guard = self.internal.read().await;
+        guard.worker_transaction_pool(worker_id)
+    }
+
     /// Return the worker's current pending block state.
     pub async fn worker_pending_block(
         &self,

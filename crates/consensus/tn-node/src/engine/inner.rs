@@ -2,7 +2,7 @@
 //!
 //! This module contains the logic for execution.
 
-use super::{PendingBlockWatchChannels, TnBuilder, WorkerComponents};
+use super::{PendingBlockWatchChannels, TnBuilder, WorkerComponents, WorkerTxPool};
 use crate::{
     engine::{WorkerNetwork, WorkerNode},
     error::ExecutionError,
@@ -24,7 +24,9 @@ use reth_db::{
 };
 use reth_db_common::init::init_genesis;
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
-use reth_node_builder::{common::WithConfigs, components::PoolBuilder, BuilderContext, NodeConfig};
+use reth_node_builder::{
+    common::WithConfigs, components::PoolBuilder, BuilderContext, FullNodeTypes, NodeConfig,
+};
 use reth_node_ethereum::{node::EthereumPoolBuilder, EthEvmConfig};
 use reth_primitives::Address;
 use reth_provider::{
@@ -34,7 +36,10 @@ use reth_provider::{
 };
 use reth_prune::PruneModes;
 use reth_tasks::TaskExecutor;
-use reth_transaction_pool::TransactionPool;
+use reth_transaction_pool::{
+    blobstore::DiskFileBlobStore, EthTransactionPool, EthTransactionValidator, Pool,
+    TransactionPool, TransactionValidationTaskExecutor,
+};
 use std::{collections::HashMap, sync::Arc};
 use tn_batch_maker::{BatchMakerBuilder, MiningMode};
 use tn_batch_validator::BatchValidator;
@@ -81,7 +86,7 @@ where
     /// TODO: temporary solution until upstream reth supports public rpc hooks
     opt_faucet_args: Option<FaucetArgs>,
     /// Collection of execution components by worker.
-    workers: HashMap<WorkerId, WorkerComponents>,
+    workers: HashMap<WorkerId, WorkerComponents<DB>>,
     // TODO: add Pool to self.workers for direct access (tests)
 }
 
@@ -338,8 +343,12 @@ where
         let server_config = self.node_config.rpc.rpc_server_config();
         let rpc_handle = server_config.start(&server).await?;
 
-        let components =
-            WorkerComponents::new(rpc_handle, PendingBlockWatchChannels::new(watch_tx, watch_rx));
+        let components = WorkerComponents::new(
+            rpc_handle,
+            PendingBlockWatchChannels::new(watch_tx, watch_rx),
+            transaction_pool,
+        )
+        .await;
 
         self.workers.insert(worker_id, components);
         Ok(())
@@ -417,6 +426,19 @@ where
             .rpc_handle()
             .http_client();
         Ok(handle)
+    }
+
+    /// Return a worker's transaction pool if it exists.
+    pub(super) fn worker_transaction_pool(
+        &self,
+        worker_id: &WorkerId,
+    ) -> eyre::Result<WorkerTxPool<DB>> {
+        let tx_pool = self
+            .workers
+            .get(worker_id)
+            .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
+            .pool();
+        Ok(tx_pool)
     }
 
     /// Return a worker's pending block state if it exists.

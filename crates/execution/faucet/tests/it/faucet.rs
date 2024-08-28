@@ -119,6 +119,8 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     // - no pending txs in pool
     // - batch is not final (stored in db)
     // - faucet must obtain correct nonce from worker's pending block watch channel
+    //
+    // TODO: new batch won't come bc tx is not in pending pool due to nonce gap
     let new_batch: NewBatch = timeout(duration, next_batch.recv()).await?.expect("batch received");
     let batch_txs = new_batch.batch.transactions();
     let tx = batch_txs.first().expect("first batch tx from faucet");
