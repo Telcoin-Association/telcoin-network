@@ -20,10 +20,11 @@ use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicK
 use narwhal_test_utils::faucet_test_execution_node;
 use reth_primitives::{
     alloy_primitives::U160, hex, public_key_to_address, Address, GenesisAccount, TransactionSigned,
-    U256,
+    B256, U256,
 };
 use reth_tasks::TaskManager;
 use reth_tracing::init_test_tracing;
+use reth_transaction_pool::TransactionPool;
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
 use tn_faucet::Drip;
@@ -67,7 +68,6 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     // create engine node
     let execution_node = faucet_test_execution_node(true, Some(chain), None, executor)?;
 
-    println!("starting batch maker...");
     let worker_id = 0;
     let (to_worker, mut next_batch) = test_channel!(1);
 
@@ -110,8 +110,9 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
 
     debug!("requesting second valid transaction....");
     let random_address = Address::random();
-    let tx_hash =
+    let tx_str =
         client.request::<String, _>("faucet_transfer", rpc_params![random_address]).await?;
+    let tx_hash = B256::from_str(&tx_str)?;
 
     // try to submit another valid request
     //
@@ -120,18 +121,14 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     // - batch is not final (stored in db)
     // - faucet must obtain correct nonce from worker's pending block watch channel
     //
-    // TODO: new batch won't come bc tx is not in pending pool due to nonce gap
-    let new_batch: NewBatch = timeout(duration, next_batch.recv()).await?.expect("batch received");
-    let batch_txs = new_batch.batch.transactions();
-    let tx = batch_txs.first().expect("first batch tx from faucet");
-    let recovered = TransactionSigned::decode_enveloped(&mut tx.as_ref())?;
-
-    // assert recovered transaction
-    assert_eq!(tx_hash, recovered.hash_ref().to_string());
-    assert_eq!(recovered.transaction.to(), Some(address));
-    assert_eq!(recovered.transaction.nonce(), 0);
-
-    Ok(())
+    // NOTE: new batch won't come bc tx is not in pending pool due to nonce gap
+    // so query the tx pool directly
+    let tx_pool = execution_node.get_worker_transaction_pool(&worker_id).await?;
+    let pool_tx = tx_pool.get(&tx_hash).expect("tx in pool");
+    let recovered = pool_tx.transaction.transaction();
+    assert_eq!(&tx_hash, recovered.hash_ref());
+    assert_eq!(recovered.transaction.to(), Some(random_address));
+    Ok(assert_eq!(recovered.transaction.nonce(), 1))
 }
 
 #[tokio::test]

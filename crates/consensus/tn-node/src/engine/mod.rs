@@ -135,7 +135,7 @@ where
     }
 
     /// Return an owned instance of the worker's transaction pool.
-    pub async fn worker_transaction_pool(
+    pub async fn get_worker_transaction_pool(
         &self,
         worker_id: &WorkerId,
     ) -> eyre::Result<WorkerTxPool<DB>> {
