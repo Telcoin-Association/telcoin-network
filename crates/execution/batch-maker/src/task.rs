@@ -55,6 +55,7 @@ pub struct MiningTask<Client, Pool: TransactionPool, BlockExecutor> {
 
 impl<Client, Pool: TransactionPool, BlockExecutor> MiningTask<Client, Pool, BlockExecutor> {
     /// Creates a new instance of the task
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         chain_spec: Arc<ChainSpec>,
         miner: MiningMode,

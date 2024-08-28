@@ -23,7 +23,7 @@ impl PendingWorkerBlock {
 
     /// Return data for worker's current pending block.
     pub fn latest(&self) -> Option<ExecutionOutcome> {
-        self.state.as_ref().map(|d| d.clone())
+        self.state.clone()
     }
 
     /// Return the account nonce if it exists.

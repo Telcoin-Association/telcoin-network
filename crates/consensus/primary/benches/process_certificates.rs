@@ -10,6 +10,7 @@ use narwhal_primary::consensus::{
     Bullshark, ConsensusMetrics, ConsensusState, LeaderSchedule, LeaderSwapTable,
 };
 use narwhal_storage::NodeStorage;
+use narwhal_typed_store::open_db;
 use std::{collections::BTreeSet, sync::Arc};
 use tn_types::{
     test_utils::{make_optimal_certificates, temp_dir, CommitteeFixture},

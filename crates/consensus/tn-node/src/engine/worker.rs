@@ -23,7 +23,7 @@ use reth_network_api::{
 };
 use reth_network_peers::{NodeRecord, PeerId};
 use reth_node_builder::{
-    components::{NetworkBuilder, PoolBuilder},
+    components::NetworkBuilder,
     node::{FullNodeTypes, NodeTypes},
     BuilderContext,
 };

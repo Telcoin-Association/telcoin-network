@@ -25,7 +25,7 @@ use reth_db::{
 use reth_db_common::init::init_genesis;
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use reth_node_builder::{
-    common::WithConfigs, components::PoolBuilder, BuilderContext, FullNodeTypes, NodeConfig,
+    common::WithConfigs, components::PoolBuilder, BuilderContext, NodeConfig,
 };
 use reth_node_ethereum::{node::EthereumPoolBuilder, EthEvmConfig};
 use reth_primitives::Address;
@@ -36,10 +36,7 @@ use reth_provider::{
 };
 use reth_prune::PruneModes;
 use reth_tasks::TaskExecutor;
-use reth_transaction_pool::{
-    blobstore::DiskFileBlobStore, EthTransactionPool, EthTransactionValidator, Pool,
-    TransactionPool, TransactionValidationTaskExecutor,
-};
+use reth_transaction_pool::TransactionPool;
 use std::{collections::HashMap, sync::Arc};
 use tn_batch_maker::{BatchMakerBuilder, MiningMode};
 use tn_batch_validator::BatchValidator;

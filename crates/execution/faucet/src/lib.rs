@@ -202,17 +202,17 @@ mod tests {
         GoogleApi, GoogleAuthMiddleware, GoogleEnvironment,
     };
     use k256::PublicKey as PubKey;
-    use narwhal_test_utils::faucet_test_execution_node;
-    use reth_chainspec::ChainSpec;
+    
+    
     use reth_primitives::{keccak256, public_key_to_address, Signature as RSignature, U256};
-    use reth_tasks::{TaskManager, TokioTaskExecutor};
+    
     use reth_tracing::init_test_tracing;
     use secp256k1::{
         ecdsa::{RecoverableSignature, RecoveryId, Signature},
         Message, PublicKey, SECP256K1,
     };
-    use std::{str::FromStr as _, sync::Arc};
-    use tn_types::{test_channel, test_utils::test_genesis};
+    
+    
     use tokio::sync::oneshot;
 
     /// Test the response from the following request to Google Cloud KMS

@@ -68,6 +68,7 @@ where
     Pool: TransactionPool,
 {
     /// Creates a new builder instance to configure all parts.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         chain_spec: Arc<ChainSpec>,
         client: Client,
