@@ -102,17 +102,23 @@ where
 
         // loop to poll the tx miner and send the next batch to Worker's `BatchMaker`
         loop {
+            error!(target: "execution::batch_maker", "begin loop");
             if let Poll::Ready(transactions) = this.miner.poll(&this.pool, cx) {
+                error!(target: "execution::batch_maker", "miner polled READY");
                 // miner returned a set of transaction that we feed to the producer
                 this.queued.push_back(transactions);
             }
 
+            error!(target: "execution::batch_maker", "checking insert_task...");
             if this.insert_task.is_none() {
+                error!(target: "execution::batch_maker", "insert task is none");
                 if this.queued.is_empty() {
+                    error!(target: "execution::batch_maker", "queued is EMPTY");
                     // nothing to insert
                     break;
                 }
 
+                error!(target: "execution::batch_maker", "queue not empty - starting next task...");
                 // ready to queue in new insert task
                 let storage = this.storage.clone();
                 let transactions = this.queued.pop_front().expect("not empty");
@@ -127,7 +133,9 @@ where
 
                 // Create the mining future that creates a batch and sends it to the CL
                 this.insert_task = Some(Box::pin(async move {
+                    error!(target: "execution::batch_maker", "obtaining lock for storage...");
                     let mut storage = storage.write().await;
+                    error!(target: "execution::batch_maker", "lock obtained :D");
 
                     let (transactions, tx_bytes): (Vec<_>, Vec<_>) = transactions
                         .into_iter()
@@ -142,6 +150,7 @@ where
                     // TODO: support withdrawals
                     let withdrawals = Some(Withdrawals::default());
 
+                    error!(target: "execution::batch_maker", "calling build and execute...");
                     match storage.build_and_execute(
                         transactions.clone(),
                         withdrawals,
@@ -150,11 +159,13 @@ where
                         &block_executor,
                     ) {
                         Ok((new_header, state)) => {
+                            error!(target: "execution::batch_maker", "build successful");
                             // TODO: make this a future
                             //
                             // send the new update to the engine, this will trigger the engine
                             // to download and execute the block we just inserted
                             let (ack, rx) = oneshot::channel();
+                            error!(target: "execution::batch_maker", "sending to worker!");
                             let _ = to_worker
                                 .send(NewBatch {
                                     batch: Batch::new_with_metadata(
@@ -207,6 +218,7 @@ where
                             // let _ = canon_state_notification
                             //     .send(reth_provider::CanonStateNotification::Commit { new: chain
                             // });
+                            error!(target: "execution::batch_maker", "sending worker update");
 
                             // update execution state on watch channel
                             let _ = worker_update.send(PendingWorkerBlock::new(Some(state)));
@@ -221,6 +233,7 @@ where
                             pool.remove_transactions(
                                 transactions.iter().map(|tx| tx.hash()).collect(),
                             );
+                            error!(target: "execution::batch_maker", "removed from pool");
 
                             drop(storage);
                         }

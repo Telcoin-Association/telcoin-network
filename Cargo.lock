@@ -11152,6 +11152,7 @@ dependencies = [
  "consensus-metrics",
  "ecdsa",
  "eyre",
+ "fastcrypto",
  "futures",
  "gcloud-sdk",
  "humantime",

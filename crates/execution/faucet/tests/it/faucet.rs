@@ -8,6 +8,7 @@
 //! then submits the transaction to the RPC Transaction Pool for the next batch.
 
 use alloy_sol_types::SolType;
+use fastcrypto::hash::Hash;
 use gcloud_sdk::{
     google::cloud::kms::v1::{
         key_management_service_client::KeyManagementServiceClient, GetPublicKeyRequest,
@@ -28,6 +29,7 @@ use std::{str::FromStr, sync::Arc, time::Duration};
 use tn_faucet::Drip;
 use tn_types::{adiri_genesis, test_channel, BatchAPI, NewBatch};
 use tokio::time::timeout;
+use tracing::debug;
 
 #[tokio::test]
 async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
@@ -88,6 +90,10 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
 
     // wait for canon event or timeout
     let new_batch: NewBatch = timeout(duration, next_batch.recv()).await?.expect("batch received");
+    let digest = new_batch.batch.digest();
+
+    // send ack to worker
+    let _ = new_batch.ack.send(digest);
 
     let batch_txs = new_batch.batch.transactions();
     let tx = batch_txs.first().expect("first batch tx from faucet");
@@ -96,10 +102,34 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     // assert recovered transaction
     assert_eq!(tx_hash, recovered.hash_ref().to_string());
     assert_eq!(recovered.transaction.to(), Some(address));
+    assert_eq!(recovered.transaction.nonce(), 0);
 
     // ensure duplicate request is error
     let response = client.request::<String, _>("faucet_transfer", rpc_params![address]).await;
-    Ok(assert!(response.is_err()))
+    assert!(response.is_err());
+
+    debug!("requesting second valid transaction....");
+    let random_address = Address::random();
+    let tx_hash =
+        client.request::<String, _>("faucet_transfer", rpc_params![random_address]).await?;
+
+    // try to submit another valid request
+    //
+    // at this point:
+    // - no pending txs in pool
+    // - batch is not final (stored in db)
+    // - faucet must obtain correct nonce from worker's pending block watch channel
+    let new_batch: NewBatch = timeout(duration, next_batch.recv()).await?.expect("batch received");
+    let batch_txs = new_batch.batch.transactions();
+    let tx = batch_txs.first().expect("first batch tx from faucet");
+    let recovered = TransactionSigned::decode_enveloped(&mut tx.as_ref())?;
+
+    // assert recovered transaction
+    assert_eq!(tx_hash, recovered.hash_ref().to_string());
+    assert_eq!(recovered.transaction.to(), Some(address));
+    assert_eq!(recovered.transaction.nonce(), 0);
+
+    Ok(())
 }
 
 #[tokio::test]
