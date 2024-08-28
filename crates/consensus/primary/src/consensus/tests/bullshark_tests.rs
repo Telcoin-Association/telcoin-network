@@ -45,7 +45,7 @@ async fn order_leaders() {
         state.try_insert(&certificate).unwrap();
     }
 
-    let store = make_consensus_store(open_db(&tn_types::test_utils::temp_dir()));
+    let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
     let bullshark = Bullshark::new(
         committee,
@@ -116,7 +116,7 @@ async fn commit_one_with_leader_schedule_change() {
         let gc_depth = 50;
         let sub_dags_per_schedule = 3;
         let mut state = ConsensusState::new(metrics.clone(), gc_depth);
-        let store = make_consensus_store(open_db(&tn_types::test_utils::temp_dir()));
+        let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
         let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
         let bad_nodes_stake_threshold = 33;
         let mut bullshark = Bullshark::new(
@@ -226,7 +226,7 @@ async fn not_enough_support_with_leader_schedule_change() {
     let gc_depth = 50;
     let sub_dags_per_schedule = 4;
     let mut state = ConsensusState::new(metrics.clone(), gc_depth);
-    let store = make_consensus_store(open_db(&tn_types::test_utils::temp_dir()));
+    let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
 
     let bad_nodes_stake_threshold = 33;
@@ -345,7 +345,7 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
     let gc_depth = 50;
     let sub_dags_per_schedule = 4;
     let mut state = ConsensusState::new(metrics.clone(), gc_depth);
-    let store = make_consensus_store(open_db(&tn_types::test_utils::temp_dir()));
+    let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
 
     let bad_nodes_stake_threshold = 33;
@@ -447,8 +447,8 @@ async fn commit_one() {
 
     let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
 
-    let store = make_consensus_store(open_db(&tn_types::test_utils::temp_dir()));
-    let cert_store = make_certificate_store(open_db(&tn_types::test_utils::temp_dir()));
+    let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
+    let cert_store = make_certificate_store(open_db(tn_types::test_utils::temp_dir()));
     let gc_depth = 50;
     let metrics = Arc::new(ConsensusMetrics::default());
 
@@ -526,8 +526,8 @@ async fn dead_node() {
 
     let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
 
-    let store = make_consensus_store(open_db(&tn_types::test_utils::temp_dir()));
-    let cert_store = make_certificate_store(open_db(&tn_types::test_utils::temp_dir()));
+    let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
+    let cert_store = make_certificate_store(open_db(tn_types::test_utils::temp_dir()));
     let gc_depth = 50;
     let metrics = Arc::new(ConsensusMetrics::default());
 
@@ -680,8 +680,8 @@ async fn not_enough_support() {
 
     let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
 
-    let store = make_consensus_store(open_db(&tn_types::test_utils::temp_dir()));
-    let cert_store = make_certificate_store(open_db(&tn_types::test_utils::temp_dir()));
+    let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
+    let cert_store = make_certificate_store(open_db(tn_types::test_utils::temp_dir()));
     let gc_depth = 50;
     let metrics = Arc::new(ConsensusMetrics::default());
 
@@ -798,8 +798,8 @@ async fn missing_leader() {
 
     let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
 
-    let store = make_consensus_store(open_db(&tn_types::test_utils::temp_dir()));
-    let cert_store = make_certificate_store(open_db(&tn_types::test_utils::temp_dir()));
+    let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
+    let cert_store = make_certificate_store(open_db(tn_types::test_utils::temp_dir()));
     let gc_depth = 50;
     let metrics = Arc::new(ConsensusMetrics::default());
     let bullshark = Bullshark::new(
@@ -874,8 +874,8 @@ async fn committed_round_after_restart() {
         &ids,
     );
 
-    let store = make_consensus_store(open_db(&tn_types::test_utils::temp_dir()));
-    let cert_store = make_certificate_store(open_db(&tn_types::test_utils::temp_dir()));
+    let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
+    let cert_store = make_certificate_store(open_db(tn_types::test_utils::temp_dir()));
 
     for input_round in (1..=11usize).step_by(2) {
         // Spawn consensus and create related channels.
@@ -973,7 +973,7 @@ async fn delayed_certificates_are_rejected() {
         &ids,
     );
 
-    let store = make_consensus_store(open_db(&tn_types::test_utils::temp_dir()));
+    let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
     let mut state = ConsensusState::new(metrics.clone(), gc_depth);
 
     let mut bullshark = Bullshark::new(
@@ -1027,7 +1027,7 @@ async fn submitting_equivocating_certificate_should_error() {
         &ids,
     );
 
-    let store = make_consensus_store(open_db(&tn_types::test_utils::temp_dir()));
+    let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
     let mut state = ConsensusState::new(metrics.clone(), gc_depth);
     let mut bullshark = Bullshark::new(
         committee.clone(),
@@ -1088,7 +1088,7 @@ async fn reset_consensus_scores_on_every_schedule_change() {
         &ids,
     );
 
-    let store = make_consensus_store(open_db(&tn_types::test_utils::temp_dir()));
+    let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
     let mut state = ConsensusState::new(metrics.clone(), gc_depth);
     let mut bullshark = Bullshark::new(
         committee.clone(),
@@ -1159,8 +1159,8 @@ async fn restart_with_new_committee() {
             watch::channel(ConsensusRound::new(0, 0));
 
         let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
-        let store = make_consensus_store(open_db(&tn_types::test_utils::temp_dir()));
-        let cert_store = make_certificate_store(open_db(&tn_types::test_utils::temp_dir()));
+        let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
+        let cert_store = make_certificate_store(open_db(tn_types::test_utils::temp_dir()));
         let gc_depth = 50;
         let metrics = Arc::new(ConsensusMetrics::default());
         let bullshark = Bullshark::new(
@@ -1279,7 +1279,7 @@ async fn garbage_collection_basic() {
         );
 
     // Create Bullshark consensus engine
-    let store = make_consensus_store(open_db(&tn_types::test_utils::temp_dir()));
+    let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
 
     let metrics = Arc::new(ConsensusMetrics::default());
     let mut state = ConsensusState::new(metrics.clone(), GC_DEPTH);
@@ -1374,7 +1374,7 @@ async fn slow_node() {
     });
 
     // Create Bullshark consensus engine
-    let store = make_consensus_store(open_db(&tn_types::test_utils::temp_dir()));
+    let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
     let metrics = Arc::new(ConsensusMetrics::default());
     let mut state = ConsensusState::new(metrics.clone(), GC_DEPTH);
     let mut bullshark = Bullshark::new(
@@ -1541,7 +1541,7 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
     certificates.extend(certificates_5_to_7);
 
     // Create Bullshark consensus engine
-    let store = make_consensus_store(open_db(&tn_types::test_utils::temp_dir()));
+    let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
     let metrics = Arc::new(ConsensusMetrics::default());
     let mut state = ConsensusState::new(metrics.clone(), GC_DEPTH);
     let mut bullshark = Bullshark::new(
