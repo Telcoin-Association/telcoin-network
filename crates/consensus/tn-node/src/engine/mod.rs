@@ -140,7 +140,7 @@ where
         worker_id: &WorkerId,
     ) -> eyre::Result<WorkerTxPool<DB>> {
         let guard = self.internal.read().await;
-        guard.worker_transaction_pool(worker_id)
+        guard.get_worker_transaction_pool(worker_id)
     }
 
     /// Return the worker's current pending block state.

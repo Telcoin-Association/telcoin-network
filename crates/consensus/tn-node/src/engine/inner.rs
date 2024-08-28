@@ -24,9 +24,7 @@ use reth_db::{
 };
 use reth_db_common::init::init_genesis;
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
-use reth_node_builder::{
-    common::WithConfigs, components::PoolBuilder, BuilderContext, NodeConfig,
-};
+use reth_node_builder::{common::WithConfigs, components::PoolBuilder, BuilderContext, NodeConfig};
 use reth_node_ethereum::{node::EthereumPoolBuilder, EthEvmConfig};
 use reth_primitives::Address;
 use reth_provider::{
@@ -426,7 +424,7 @@ where
     }
 
     /// Return a worker's transaction pool if it exists.
-    pub(super) fn worker_transaction_pool(
+    pub(super) fn get_worker_transaction_pool(
         &self,
         worker_id: &WorkerId,
     ) -> eyre::Result<WorkerTxPool<DB>> {
@@ -435,6 +433,7 @@ where
             .get(worker_id)
             .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
             .pool();
+
         Ok(tx_pool)
     }
 
