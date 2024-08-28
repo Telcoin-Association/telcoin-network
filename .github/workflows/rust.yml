@@ -3,6 +3,7 @@ name: Rust
 on:
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, review_requested, ready_for_review]
 
 env:
   CARGO_INCREMENTAL: 0 # disable incremental compilation
@@ -12,7 +13,15 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
+  fail_if_pull_request_is_draft:
+    if: github.event.pull_request.draft == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fails in order to indicate that pull request needs to be marked as ready to review and unit tests workflow needs to pass.
+        run: exit 1
+
   verify-on-chain:
+    if: github.event.pull_request.draft == false
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
