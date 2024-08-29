@@ -38,6 +38,7 @@ use telcoin_network::{genesis::GenesisArgs, node::NodeCommand};
 use tn_faucet::FaucetArgs;
 use tn_node::launch_node;
 use tn_types::adiri_genesis;
+use tn_types::test_utils::TransactionFactory;
 use tokio::{runtime::Handle, task::JoinHandle, time::timeout};
 use tracing::{error, info};
 
@@ -61,7 +62,11 @@ async fn test_faucet_transfers_tel_with_google_kms_e2e() -> eyre::Result<()> {
 
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    let address = Address::from(U160::from(8991));
+    /// Address: 0xb14d3c4f5fbfbcfb98af2d330000d49c95b93aa7
+    ///
+    /// NOTE: this is not funded at genesis.
+    let mut tx_factory = TransactionFactory::new_random();
+    let address = tx_factory.address();
     let client = HttpClientBuilder::default().build("http://127.0.0.1:8545")?;
 
     // assert starting balance is 0
@@ -77,11 +82,11 @@ async fn test_faucet_transfers_tel_with_google_kms_e2e() -> eyre::Result<()> {
     let duration = Duration::from_secs(30);
 
     // ensure account balance increased
-    let balance = timeout(duration, ensure_account_balance(&client, address))
-        .await?
-        .expect("balance timeout");
     let expected_balance = U256::from_str("0xde0b6b3a7640000")?; // 1*10^18 (1 TEL)
-    assert_eq!(balance, expected_balance);
+    let _ =
+        timeout(duration, ensure_account_balance_infinite_loop(&client, address, expected_balance))
+            .await?
+            .expect("expected balance timeout");
 
     // duplicate request is err
     assert!(client.request::<String, _>("faucet_transfer", rpc_params![address]).await.is_err());
@@ -92,11 +97,52 @@ async fn test_faucet_transfers_tel_with_google_kms_e2e() -> eyre::Result<()> {
     // the faucet's address in the state
     //
     // this tests that the read to provider.latest() is accurate
+    let tx = tx_factory.create_eip1559(
+        chain,
+        1_000_000_000,
+        Address::random(),
+        U256::from_str("0xaffffffffffffff").expect("U256 from str for tx factory"),
+    );
+
+    let tx_bytes = tx.envelope_encoded();
+    let tx_hash: String = client.request("eth_sendRawTransaction", rpc_params![tx_bytes]).await?;
+
+    // ensure account balance decreased
+    let expected_balance = U256::from_str("0x2e0b6b3a761c1c9")?; // 1*10^18 (1 TEL)
+    let _ =
+        timeout(duration, ensure_account_balance_infinite_loop(&client, address, expected_balance))
+            .await?
+            .expect("expected balance timeout");
+
     //
     // use balance checker to ensure account balance decreases
     //
     // then request another faucet drip with random address
     // then check balance
+    // assert starting balance is 0
+    let random_address = Address::random();
+    let starting_balance: String =
+        client.request("eth_getBalance", rpc_params!(random_address)).await?;
+    println!("starting balance: {starting_balance:?}");
+    assert_eq!(U256::from_str(&starting_balance)?, U256::ZERO);
+
+    let tx_hash: String = client.request("faucet_transfer", rpc_params![random_address]).await?;
+    info!(target: "faucet-transaction", ?tx_hash);
+
+    // ensure account balance increased
+    let expected_balance = U256::from_str("0xde0b6b3a7640000")?; // 1*10^18 (1 TEL)
+    let _ = timeout(
+        duration,
+        ensure_account_balance_infinite_loop(&client, random_address, expected_balance),
+    )
+    .await?
+    .expect("expected balance random account timeout");
+
+    // duplicate request is err
+    assert!(client
+        .request::<String, _>("faucet_transfer", rpc_params![random_address])
+        .await
+        .is_err());
     Ok(())
 }
 
@@ -289,11 +335,17 @@ async fn spawn_local_testnet(
 /// RPC request to continually check until an account balance is above 0.
 ///
 /// Warning: this should only be called with a timeout - could result in infinite loop otherwise.
-async fn ensure_account_balance(client: &HttpClient, address: Address) -> eyre::Result<U256> {
+async fn ensure_account_balance_infinite_loop(
+    client: &HttpClient,
+    address: Address,
+    expected_bal: U256,
+) -> eyre::Result<U256> {
     while let Ok(bal) = client.request::<String, _>("eth_getBalance", rpc_params!(address)).await {
         println!("bal: {bal:?}");
         let balance = U256::from_str(&bal)?;
-        if balance > U256::ZERO {
+
+        // return Ok if expected bal
+        if balance == expected_bal {
             return Ok(balance);
         }
 
