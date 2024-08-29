@@ -82,7 +82,7 @@ pub(super) struct WorkerComponents<DB> {
 
 impl<DB> WorkerComponents<DB> {
     /// Create a new instance of [Self].
-    pub async fn new(
+    pub fn new(
         rpc_handle: RpcServerHandle,
         pending_channels: PendingBlockWatchChannels,
         pool: WorkerTxPool<DB>,

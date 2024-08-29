@@ -342,8 +342,7 @@ where
             rpc_handle,
             PendingBlockWatchChannels::new(watch_tx, watch_rx),
             transaction_pool,
-        )
-        .await;
+        );
 
         self.workers.insert(worker_id, components);
         Ok(())
