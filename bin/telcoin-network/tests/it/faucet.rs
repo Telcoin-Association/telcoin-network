@@ -90,12 +90,12 @@ async fn test_faucet_transfers_tel_with_google_kms_e2e() -> eyre::Result<()> {
     // duplicate request is err
     assert!(client.request::<String, _>("faucet_transfer", rpc_params![address]).await.is_err());
 
-    // TODO:
-    // submit another tx from account that just got dripped
+    // NOW:
+    // submit another tx from the account that just got dripped
     // so the the worker's watch channel updates to a new block that doesn't have
     // the faucet's address in the state
     //
-    // this tests that the read to provider.latest() is accurate
+    // this creates scenario for faucet to rely on provider.latest() for accuracy
     let tx = tx_factory.create_eip1559(
         chain,
         1_000_000_000,
@@ -103,32 +103,32 @@ async fn test_faucet_transfers_tel_with_google_kms_e2e() -> eyre::Result<()> {
         U256::from_str("0xaffffffffffffff").expect("U256 from str for tx factory"),
     );
 
+    // submit tx through rpc
     let tx_bytes = tx.envelope_encoded();
     let tx_hash: String = client.request("eth_sendRawTransaction", rpc_params![tx_bytes]).await?;
 
     // ensure account balance decreased
-    let expected_balance = U256::from_str("0x2e0b6b3a761c1c9")?; // 1*10^18 (1 TEL)
+    let expected_balance = U256::from_str("0x2e0b6b3a761c1c9")?;
     let _ =
         timeout(duration, ensure_account_balance_infinite_loop(&client, address, expected_balance))
             .await?
             .expect("expected balance timeout");
 
+    // request another faucet drip for random address
     //
-    // use balance checker to ensure account balance decreases
-    //
-    // then request another faucet drip with random address
-    // then check balance
     // assert starting balance is 0
     let random_address = Address::random();
     let starting_balance: String =
         client.request("eth_getBalance", rpc_params!(random_address)).await?;
-    println!("starting balance: {starting_balance:?}");
     assert_eq!(U256::from_str(&starting_balance)?, U256::ZERO);
 
     let tx_hash: String = client.request("faucet_transfer", rpc_params![random_address]).await?;
     info!(target: "faucet-transaction", ?tx_hash);
 
     // ensure account balance increased
+    //
+    // account balance is only updates on final execution
+    // finding the expected balance in time means the faucet successfully used the correct nonce
     let expected_balance = U256::from_str("0xde0b6b3a7640000")?; // 1*10^18 (1 TEL)
     let _ = timeout(
         duration,
