@@ -86,6 +86,17 @@ async fn test_faucet_transfers_tel_with_google_kms_e2e() -> eyre::Result<()> {
     // duplicate request is err
     assert!(client.request::<String, _>("faucet_transfer", rpc_params![address]).await.is_err());
 
+    // TODO:
+    // submit another tx from account that just got dripped
+    // so the the worker's watch channel updates to a new block that doesn't have
+    // the faucet's address in the state
+    //
+    // this tests that the read to provider.latest() is accurate
+    //
+    // use balance checker to ensure account balance decreases
+    //
+    // then request another faucet drip with random address
+    // then check balance
     Ok(())
 }
 
