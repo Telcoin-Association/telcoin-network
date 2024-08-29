@@ -37,8 +37,7 @@ use std::{str::FromStr, sync::Arc, time::Duration};
 use telcoin_network::{genesis::GenesisArgs, node::NodeCommand};
 use tn_faucet::FaucetArgs;
 use tn_node::launch_node;
-use tn_types::adiri_genesis;
-use tn_types::test_utils::TransactionFactory;
+use tn_types::{adiri_genesis, test_utils::TransactionFactory};
 use tokio::{runtime::Handle, task::JoinHandle, time::timeout};
 use tracing::{error, info};
 
