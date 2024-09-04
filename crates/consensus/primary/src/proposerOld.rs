@@ -3,27 +3,21 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{consensus::LeaderSchedule, error::ProposerResult};
+use crate::consensus::LeaderSchedule;
 use consensus_metrics::{
     metered_channel::{Receiver, Sender},
     spawn_logged_monitored_task,
 };
 use fastcrypto::hash::Hash as _;
-use futures::FutureExt;
 use narwhal_primary_metrics::PrimaryMetrics;
 use narwhal_storage::ProposerStore;
 use narwhal_typed_store::traits::Database;
-use reth_primitives::B256;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
-    future::Future,
-    pin::Pin,
     sync::Arc,
-    task::{ready, Context, Poll},
 };
 use tn_types::{AuthorityIdentifier, Committee, WorkerId};
-use tokio_stream::wrappers::BroadcastStream;
 
 use tn_types::{
     error::{DagError, DagResult},
@@ -33,21 +27,18 @@ use tn_types::{
 use tokio::{
     sync::{oneshot, watch},
     task::JoinHandle,
-    time::{sleep, sleep_until, Duration, Instant, Interval},
+    time::{sleep, sleep_until, Duration, Instant},
 };
-use tracing::{debug, enabled, error, info, trace, warn};
+use tracing::{debug, enabled, error, info, trace};
 
-/// Messages sent to the proposer about this primary's own workers' block digests
+/// Messages sent to the proposer about our own batch digests
 #[derive(Debug)]
 pub struct OurDigestMessage {
-    /// The digest for the worker's block that reached quorum.
     pub digest: BatchDigest,
-    /// The worker that produced this block.
     pub worker_id: WorkerId,
-    /// The timestamp for when the block was created.
     pub timestamp: TimestampSec,
     /// A channel to send an () as an ack after this digest is processed by the primary.
-    pub ack_channel: oneshot::Sender<()>,
+    pub ack_channel: Option<oneshot::Sender<()>>,
 }
 
 #[cfg(test)]
@@ -70,21 +61,17 @@ pub struct Proposer<DB: Database> {
     header_num_of_batches_threshold: usize,
     /// The maximum number of batches in header.
     max_header_num_of_batches: usize,
-    /// The minimum duration between generating headers.
-    min_header_delay: Duration,
-    /// The maximum duration to wait for conditions like having leader in parents.
+    /// The maximum delay to wait for conditions like having leader in parents.
     max_header_delay: Duration,
-    /// The minimum interval measured between generating headers.
-    min_delay_timer: Interval,
-    /// The maximum interval measured for conditions like having leader in parents.
-    max_delay_timer: Interval,
+    /// The minimum delay between generating headers.
+    min_header_delay: Duration,
     /// The delay to wait until resending the last proposed header if proposer
-    /// hasn't proposed anything new since then.
-    header_resend_timeout: Interval,
-    /// The latest header.
-    opt_latest_header: Option<Header>,
+    /// hasn't proposed anything new since then. If None is provided then the
+    /// default value will be used instead.
+    header_resend_timeout: Option<Duration>,
+
     /// Receiver for shutdown.
-    rx_shutdown_stream: BroadcastStream<()>,
+    rx_shutdown: ConditionalBroadcastReceiver,
     /// Receives the parents to include in the next header (along with their round number) from
     /// core.
     rx_parents: Receiver<(Vec<Certificate>, Round)>,
@@ -94,6 +81,7 @@ pub struct Proposer<DB: Database> {
     rx_system_messages: Receiver<SystemMessage>,
     /// Sends newly created headers to the `Certifier`.
     tx_headers: Sender<Header>,
+
     /// The proposer store for persisting the last header.
     proposer_store: ProposerStore<DB>,
     /// The current round of the dag.
@@ -111,30 +99,25 @@ pub struct Proposer<DB: Database> {
     digests: VecDeque<OurDigestMessage>,
     /// Holds the system messages waiting to be included in the next header.
     system_messages: Vec<SystemMessage>,
+
     /// Holds the map of proposed previous round headers and their digest messages, to ensure that
     /// all batches' digest included will eventually be re-sent.
     proposed_headers: BTreeMap<Round, (Header, VecDeque<OurDigestMessage>, Vec<SystemMessage>)>,
     /// Committed headers channel on which we get updates on which of
     /// our own headers have been committed.
     rx_committed_own_headers: Receiver<(Round, Vec<Round>)>,
+
     /// Metrics handler
     metrics: Arc<PrimaryMetrics>,
     /// The consensus leader schedule to be used in order to resolve the leader needed for the
     /// protocol advancement.
     leader_schedule: LeaderSchedule,
-    /// The watch channel for observing execution results.
-    ///
-    /// Proposer must include the finalized parent hash from the previously executed round to ensure execution results are consistent.
-    execution_result: watch::Receiver<B256>,
 }
 
 impl<DB: Database + 'static> Proposer<DB> {
-    /// Create a new instance of Self.
-    ///
-    /// The proposer's intervals and genesis certificate are created in this function.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    pub fn new(
+    pub fn spawn(
         authority_id: AuthorityIdentifier,
         committee: Committee,
         proposer_store: ProposerStore<DB>,
@@ -152,58 +135,48 @@ impl<DB: Database + 'static> Proposer<DB> {
         rx_committed_own_headers: Receiver<(Round, Vec<Round>)>,
         metrics: Arc<PrimaryMetrics>,
         leader_schedule: LeaderSchedule,
-        execution_result: watch::Receiver<B256>,
-    ) -> Self {
-        // TODO: include EL genesis hash in committee for epoch?
-        //
-        // NO: bc the first round should include EL genesis hash in primary proposed header.
+    ) -> JoinHandle<()> {
         let genesis = Certificate::genesis(&committee);
-        let header_resend_timeout = header_resend_timeout.unwrap_or(DEFAULT_HEADER_RESEND_TIMEOUT);
-        // create min/max delay intervals
-        let min_delay_timer = tokio::time::interval(min_header_delay);
-        let max_delay_timer = tokio::time::interval(max_header_delay);
-        let header_resend_timeout = tokio::time::interval(header_resend_timeout);
-        let rx_shutdown_stream = BroadcastStream::new(rx_shutdown.receiver);
+        spawn_logged_monitored_task!(
+            async move {
+                Self {
+                    authority_id,
+                    committee,
+                    header_num_of_batches_threshold,
+                    max_header_num_of_batches,
+                    max_header_delay,
+                    min_header_delay,
+                    header_resend_timeout,
 
-        Self {
-            authority_id,
-            committee,
-            header_num_of_batches_threshold,
-            max_header_num_of_batches,
-            min_header_delay,
-            max_header_delay,
-            min_delay_timer,
-            max_delay_timer,
-            header_resend_timeout,
-            opt_latest_header: None,
-            rx_shutdown_stream,
-            rx_parents,
-            rx_our_digests,
-            rx_system_messages,
-            tx_headers,
-            tx_narwhal_round_updates,
-            proposer_store,
-            round: 0,
-            last_round_timestamp: None,
-            last_parents: genesis,
-            last_leader: None,
-            digests: VecDeque::with_capacity(2 * max_header_num_of_batches),
-            system_messages: Vec::new(),
-            proposed_headers: BTreeMap::new(),
-            rx_committed_own_headers,
-            metrics,
-            leader_schedule,
-            execution_result,
-        }
+                    rx_shutdown,
+                    rx_parents,
+                    rx_our_digests,
+                    rx_system_messages,
+                    tx_headers,
+                    tx_narwhal_round_updates,
+                    proposer_store,
+                    round: 0,
+                    last_round_timestamp: None,
+                    last_parents: genesis,
+                    last_leader: None,
+                    digests: VecDeque::with_capacity(2 * max_header_num_of_batches),
+                    system_messages: Vec::new(),
+                    proposed_headers: BTreeMap::new(),
+                    rx_committed_own_headers,
+                    metrics,
+                    leader_schedule,
+                }
+                .run()
+                .await;
+            },
+            "ProposerTask"
+        )
     }
 
-    /// Creates a new Header, persists it to database
-    /// and sends it to core for processing.
-    ///
-    /// If successful, return the number of batch digests included in header.
+    /// make_header creates a new Header, persists it to database
+    /// and sends it to core for processing. If successful, it returns
+    /// the number of batch digests included in header.
     async fn make_header(&mut self) -> DagResult<(Header, usize)> {
-        // TODO: check the watch channel
-
         // Make a new header.
         let header = self.create_new_header().await?;
 
@@ -224,17 +197,14 @@ impl<DB: Database + 'static> Proposer<DB> {
         Ok((header, num_of_included_digests))
     }
 
-    /// Creates a new header.
-    ///
-    /// This method ensures proposer is protected against equivocation.
-    ///
-    /// If a different header was already produced for the same round, then
-    /// this method returns the earlier header. Otherwise the newly created header is returned.
+    // Creates a new header. Also the method ensures we are protected against equivocation.
+    // If we detect that a different header has been already produced for the same round, then
+    // this method returns the earlier header. Otherwise the newly created header will be returned.
     async fn create_new_header(&mut self) -> DagResult<Header> {
         let this_round = self.round;
         let this_epoch = self.committee.epoch();
 
-        // check if header is already built for this round
+        // Check if we already have stored a header for this round.
         if let Some(last_header) = self.proposer_store.get_last_proposed()? {
             if last_header.round() == this_round && last_header.epoch() == this_epoch {
                 // We have already produced a header for the current round, idempotent re-send
@@ -476,8 +446,7 @@ impl<DB: Database + 'static> Proposer<DB> {
             let enough_digests = self.digests.len() >= self.header_num_of_batches_threshold;
             let max_delay_timed_out = max_delay_timer.is_elapsed();
             let min_delay_timed_out = min_delay_timer.is_elapsed();
-            let execution_complete =
-                self.execution_result.changed().await.expect("watch sender channel dropped");
+            let execution_complete = watch_channel.is_updated()?;
 
             let should_create_header = (max_delay_timed_out
                 || ((enough_digests || min_delay_timed_out) && advance))
@@ -495,7 +464,7 @@ impl<DB: Database + 'static> Proposer<DB> {
 
             // make can verify and return an error since there is already logic to panic if this is broken
 
-            if should_create_header {
+            if should_create_header && execution_complete {
                 if max_delay_timed_out {
                     // It is expected that this timer expires from time to time. If it expires too
                     // often, it either means some validators are Byzantine or
@@ -769,187 +738,5 @@ impl<DB: Database + 'static> Proposer<DB> {
             // update metrics
             self.metrics.num_of_pending_batches_in_proposer.set(self.digests.len() as i64);
         }
-    }
-
-    /// Conditions are met to propose the next header.
-    ///
-    /// Update Self and make the header to propose.
-    fn propose_next_header(&mut self, reason: &str) {
-        // Advance to the next round.
-        self.round += 1;
-        let _ = self.tx_narwhal_round_updates.send(self.round);
-
-        debug!("Proposer advanced to round {}", self.round);
-
-        // Update the metrics
-        self.metrics.current_round.set(self.round as i64);
-        let current_timestamp = now();
-        if let Some(t) = &self.last_round_timestamp {
-            self.metrics
-                .proposal_latency
-                .with_label_values(&[reason])
-                .observe(Duration::from_millis(current_timestamp - t).as_secs_f64());
-        }
-        self.last_round_timestamp = Some(current_timestamp);
-        debug!("Dag moved to round {}", self.round);
-
-        // Make a new header.
-        match self.make_header().await {
-            Err(e @ DagError::ShuttingDown) => debug!("{e}"),
-            Err(e) => panic!("Unexpected error: {e}"),
-            Ok((header, digests)) => {
-                // Save the header
-                opt_latest_header = Some(header);
-                header_repeat_timer = Box::pin(sleep(header_resend_timeout));
-
-                self.metrics
-                    .num_of_batch_digests_in_header
-                    .with_label_values(&[reason])
-                    .observe(digests as f64);
-            }
-        }
-
-        // Reset advance flag.
-        advance = false;
-
-        // Reschedule the timer.
-        let timer_start = Instant::now();
-        max_delay_timer.as_mut().reset(timer_start + self.max_delay());
-        min_delay_timer.as_mut().reset(timer_start + self.min_delay());
-    }
-}
-
-/// The Future impl for proposer.
-///
-/// The future is responsible for:
-/// - re-propose the header if the repeat timer expires
-/// - handle this primary's own committed headers
-/// - update parent count when peer certificates received
-/// - process own workers' block digests for proposing in own header
-/// - process system messages to include in proposed header
-/// - listen for shutdown receiver
-impl<DB> Future for Proposer<DB>
-where
-    DB: Database + Unpin,
-{
-    type Output = ProposerResult<()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let mut advance = true;
-
-        info!(
-            target: "primary::proposer",
-            "Proposer on node {} has started successfully with header resend timeout {:?}.",
-            this.authority_id, this.header_resend_timeout
-        );
-
-        loop {
-            // check for shutdown signal
-            //
-            // returns None if no shutdown signal received
-            if let Some(shutdown) = this.rx_shutdown_stream.poll_next(cx) {
-                debug!(target: "primary::proposer", round=this.round, "Proposer received shutdown signal...");
-                return Poll::Ready(Ok(()));
-            }
-
-            // check for new system messages
-            if let Poll::Ready(Some(msg)) = this.rx_system_messages.poll_recv(cx) {
-                debug!(target: "primary::proposer", round=this.round, "Proposer received system message");
-                self.system_messages.push(msg);
-            }
-
-            // check for new digests from workers
-            if let Poll::Ready(Some(block)) = this.rx_our_digests.poll_recv(cx) {
-                debug!(target: "primary::proposer", round=this.round, "Proposer received digest");
-
-                // send ack back to worker
-                //
-                // ack implies that the block is recorded on the primary
-                // and will be tracked until the block is included.
-                //
-                // primary will attempt to propose this digest until it is sequenced
-                // or the epoch concludes.
-                //
-                // however, this will not persist primary crashes
-                let _ = block.ack_channel.send(());
-                this.digests.push_back(block);
-            }
-
-            // check for new parent certificates
-            if let Poll::Ready(Some((certs, round))) = this.rx_parents.poll_recv(cx) {
-                debug!(target: "primary::proposer", this_round=this.round, parent_round=round, num_parents=certs.len(), "Proposer received parents");
-
-                // TODO: handle rx_parents in self.method
-            }
-
-            // Check if a new header can be proposed.
-            //
-            // New headers are proposed when:
-            //
-            // 1) a quorum of parents (certificates) received for the current round
-            // 2) the execution layer successfully executed the previous round (parent hash)
-            // 3) One of the following:
-            // - the timer expired
-            //  - this primary timed out on the leader
-            //  - or quit trying to gather enough votes for the leader
-            // - the worker created enough blocks (header_num_of_batches_threshold)
-            //  - this is happy path
-            //  - vote for leader or leader already has enough votes to trigger commit
-            let enough_parents = !this.last_parents.is_empty();
-            let execution_complete = this.execution_result.has_changed()?;
-            let max_delay_timed_out = this.max_delay_timer.poll_tick(cx).is_ready();
-            let min_delay_timed_out = this.min_delay_timer.poll_tick(cx).is_ready();
-            let enough_digests = this.digests.len() >= this.header_num_of_batches_threshold;
-
-            let should_create_header = (max_delay_timed_out
-                || ((enough_digests || min_delay_timed_out) && advance))
-                && enough_parents;
-
-            debug!(
-                target: "primary::proposer",
-                round=this.round,
-                enough_parents,
-                enough_digests,
-                advance,
-                min_delay_timed_out,
-                max_delay_timed_out,
-                should_create_header,
-                ?execution_complete,
-                "Proposer polled...",
-            );
-
-            // if both conditions are met, create the next header
-            if should_create_header && execution_complete {
-                if max_delay_timed_out {
-                    // It is expected that this timer expires from time to time. If it expires too
-                    // often, it either means some validators are Byzantine or
-                    // that the network is experiencing periods of asynchrony.
-                    //
-                    // In practice, the latter scenario means we misconfigured the parameter
-                    // called `max_header_delay`.
-                    warn!(target: "primary::proposer", "Timer expired for round {}", this.round);
-                }
-
-                // obtain reason for metrics
-                let reason = if max_delay_timed_out {
-                    "max_timeout"
-                } else if enough_digests {
-                    "threshold_size_reached"
-                } else {
-                    "min_timeout"
-                };
-
-                this.propose_next_header(reason);
-
-                // Recheck condition and reset time out flags.
-                continue;
-            }
-
-            // TODO: remove this break
-            break;
-        }
-
-        Poll::Pending
     }
 }

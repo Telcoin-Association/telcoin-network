@@ -117,12 +117,7 @@ async fn propose_payload_and_repropose_after_n_seconds() {
     let created_at_ts = 0;
     let (tx_ack, rx_ack) = tokio::sync::oneshot::channel();
     tx_our_digests
-        .send(OurDigestMessage {
-            digest,
-            worker_id,
-            timestamp: created_at_ts,
-            ack_channel: Some(tx_ack),
-        })
+        .send(OurDigestMessage { digest, worker_id, timestamp: created_at_ts, ack_channel: tx_ack })
         .await
         .unwrap();
 
@@ -144,7 +139,7 @@ async fn propose_payload_and_repropose_after_n_seconds() {
                 digest: batch_id,
                 worker_id,
                 timestamp: created_at,
-                ack_channel: Some(tx_ack),
+                ack_channel: tx_ack,
             })
             .await
             .unwrap();
@@ -235,12 +230,7 @@ async fn equivocation_protection() {
     let created_at_ts = 0;
     let (tx_ack, rx_ack) = tokio::sync::oneshot::channel();
     tx_our_digests
-        .send(OurDigestMessage {
-            digest,
-            worker_id,
-            timestamp: created_at_ts,
-            ack_channel: Some(tx_ack),
-        })
+        .send(OurDigestMessage { digest, worker_id, timestamp: created_at_ts, ack_channel: tx_ack })
         .await
         .unwrap();
 
@@ -301,7 +291,7 @@ async fn equivocation_protection() {
     let worker_id = 0;
     let (tx_ack, rx_ack) = tokio::sync::oneshot::channel();
     tx_our_digests
-        .send(OurDigestMessage { digest, worker_id, timestamp: 0, ack_channel: Some(tx_ack) })
+        .send(OurDigestMessage { digest, worker_id, timestamp: 0, ack_channel: tx_ack })
         .await
         .unwrap();
 

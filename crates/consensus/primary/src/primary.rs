@@ -26,7 +26,7 @@ use anemo_tower::{
 use async_trait::async_trait;
 use consensus_metrics::{
     metered_channel::{channel_with_total, Receiver, Sender},
-    monitored_scope,
+    monitored_scope, spawn_logged_monitored_task,
 };
 use fastcrypto::{
     hash::Hash,
@@ -445,6 +445,28 @@ impl Primary {
             metrics.node_metrics.clone(),
             leader_schedule,
         );
+
+        // let proposer = Proposer::new(
+        //     authority.id(),
+        //     committee.clone(),
+        //     proposer_store,
+        //     parameters.header_num_of_batches_threshold,
+        //     parameters.max_header_num_of_batches,
+        //     parameters.max_header_delay,
+        //     parameters.min_header_delay,
+        //     None,
+        //     tx_shutdown.subscribe(),
+        //     rx_parents,
+        //     rx_our_digests,
+        //     rx_system_messages,
+        //     tx_headers,
+        //     tx_narwhal_round_updates,
+        //     rx_committed_own_headers,
+        //     metrics.node_metrics.clone(),
+        //     leader_schedule,
+        // );
+
+        // let proposer_handle = spawn_logged_monitored_task!(proposer, "ProposerTask");
 
         let mut handles = vec![
             core_handle,
@@ -969,7 +991,7 @@ impl<DB: Database> WorkerToPrimary for WorkerReceiverHandler<DB> {
                 digest: message.digest,
                 worker_id: message.worker_id,
                 timestamp: *message.metadata.created_at(),
-                ack_channel: Some(tx_ack),
+                ack_channel: tx_ack,
             })
             .await
             .map(|_| anemo::Response::new(()))
