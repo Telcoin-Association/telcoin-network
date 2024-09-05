@@ -126,12 +126,15 @@ pub struct Proposer<DB: Database> {
     ///
     /// Proposer must include the finalized parent hash from the previously executed round to ensure execution results are consistent.
     execution_result: watch::Receiver<B256>,
+    /// Flag if enough conditions are met to advance the round.
+    advance_round: bool,
 }
 
 impl<DB: Database + 'static> Proposer<DB> {
     /// Create a new instance of Self.
     ///
     /// The proposer's intervals and genesis certificate are created in this function.
+    /// Also set `advance_round` to true.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
@@ -194,6 +197,7 @@ impl<DB: Database + 'static> Proposer<DB> {
             metrics,
             leader_schedule,
             execution_result,
+            advance_round: true,
         }
     }
 
@@ -771,6 +775,91 @@ impl<DB: Database + 'static> Proposer<DB> {
         }
     }
 
+    /// Process certificates received for this round.
+    ///
+    /// If the certificates are valid, include them as parents for the next header.
+    fn process_parents(&mut self, parents: Vec<Certificate>, round: Round) -> ProposerResult<()> {
+        // Sanity check: verify provided certs are of the correct round & epoch.
+        for parent in parents.iter() {
+            if parent.round() != round {
+                error!("Proposer received certificate {parent:?} that failed to match expected round {round}. This should not be possible.");
+            }
+        }
+
+        // Compare the parents' round number with our current round.
+        match round.cmp(&self.round) {
+            Ordering::Greater => {
+                // proposer accepts a future round then jumps ahead in case it was
+                // late (or just joined the network).
+                self.round = round;
+                let _ = self.tx_narwhal_round_updates.send(self.round);
+                self.last_parents = parents;
+
+                // Reset advance flag.
+                self.advance_round = false;
+
+                // Extend max_delay_timer to properly wait for the previous round's leader
+                //
+                // min_delay_timer should not be extended: the network moves at
+                // the interval of min_header_delay. Delaying header creation for
+                // another min_header_delay after receiving parents from a higher
+                // round and cancelling proposing, makes it very likely that higher
+                // round parents will be received and header creation will be cancelled
+                // again. So min_delay_timer is disabled to get the proposer in sync
+                // with the quorum.
+                // If the node becomes leader, disabling min_delay_timer to propose as
+                // soon as possible is the right thing to do as well.
+                let timer_start = Instant::now();
+
+                // TODO: how to do this with interval instead of sleep?
+
+                // self.max_delay_timer.reset();
+                // self.min_delay_timer.reset();
+
+                todo!()
+            }
+            Ordering::Less => {
+                debug!(
+                    "Proposer ignoring older parents, round={} parent.round={}",
+                    self.round, round
+                );
+                // Ignore parents from older rounds.
+            }
+            Ordering::Equal => {
+                // The core gives us the parents the first time they are enough to form a quorum.
+                // Then it keeps giving us all the extra parents.
+                self.last_parents.extend(parents);
+
+                // As the schedule can change after an odd round proposal - when the new schedule algorithm is
+                // enabled - make sure that the timer is reset correctly for the round leader. No harm doing
+                // this here as well.
+                if self.min_delay() == Duration::ZERO {
+                    min_delay_timer.as_mut().reset(Instant::now());
+                }
+            }
+        }
+
+        // Check whether we can advance to the next round. Note that if we timeout,
+        // we ignore this check and advance anyway.
+        self.advance_round = if self.ready() {
+            if !self.advance_round {
+                debug!(target: "primary::proposer", "Ready to advance from round {}", self.round,);
+            }
+            true
+        } else {
+            false
+        };
+        debug!(target: "primary::proposer", advance_round=self.advance_round, round=self.round, "Proposer processed parents result");
+
+        let round_type = if self.round % 2 == 0 { "even" } else { "odd" };
+
+        self.metrics
+            .proposer_ready_to_advance
+            .with_label_values(&[&self.advance_round.to_string(), round_type])
+            .inc();
+        Ok(())
+    }
+
     /// Conditions are met to propose the next header.
     ///
     /// Update Self and make the header to propose.
@@ -881,6 +970,7 @@ where
                 debug!(target: "primary::proposer", this_round=this.round, parent_round=round, num_parents=certs.len(), "Proposer received parents");
 
                 // TODO: handle rx_parents in self.method
+                this.process_parents(certs, round)?;
             }
 
             // Check if a new header can be proposed.
