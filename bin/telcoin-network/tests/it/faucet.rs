@@ -8,7 +8,7 @@
 //! then submits the transaction to the RPC Transaction Pool for the next batch.
 
 use crate::util::create_validator_info;
-use alloy::sol;
+use alloy_sol_types::sol;
 use clap::Parser;
 use gcloud_sdk::{
     google::cloud::kms::v1::{

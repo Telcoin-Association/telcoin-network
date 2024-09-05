@@ -167,6 +167,7 @@ reth-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.
 reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.3" }
 reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.3" }
 reth-libmdbx = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.3" }
+reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.3" }
 
 revm = { version = "12.1.0", features = [
     "std",
@@ -177,8 +178,14 @@ revm-primitives = { version = "7.1", features = [
     "std",
 ], default-features = false }
 
-alloy = "0.3"
-alloy-rlp = "0.3.7"
+alloy-contract = { version = "0.2.1", default-features = false }
+alloy-provider = { version = "0.2.1", default-features = false }
+alloy-signer = { version = "0.2.1", default-features = false }
+alloy-signer-local = { version = "0.2.1", default-features = false }
+alloy-network = { version = "0.2.1", default-features = false }
+alloy-rlp = { version = "0.3.4", default-features = false }
+alloy-sol-types = { version = "0.7.2", default-features = false }
+
 tn-batch-validator = { path = "crates/execution/batch-validator" }
 tn-engine = { path = "crates/execution/engine" }
 
