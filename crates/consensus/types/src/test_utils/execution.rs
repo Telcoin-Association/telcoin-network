@@ -22,14 +22,13 @@ use reth_primitives::{
     constants::{
         EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE,
     },
-    proofs, public_key_to_address, sign_message, Address, Block, Bytes,
-    FromRecoveredPooledTransaction, Genesis, GenesisAccount, Header, PooledTransactionsElement,
-    SealedHeader, Signature, Transaction, TransactionSigned, TxEip1559, TxHash, TxKind,
-    Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256,
+    proofs, public_key_to_address, sign_message, Address, Block, Bytes, Genesis, GenesisAccount,
+    Header, PooledTransactionsElement, SealedHeader, Signature, Transaction, TransactionSigned,
+    TxEip1559, TxHash, TxKind, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256,
 };
 use reth_provider::{BlockReaderIdExt, ExecutionOutcome, StateProviderFactory};
 use reth_revm::database::StateProviderDatabase;
-use reth_transaction_pool::{TransactionOrigin, TransactionPool};
+use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool};
 use secp256k1::Secp256k1;
 use std::{str::FromStr as _, sync::Arc};
 use tracing::debug;
@@ -456,7 +455,7 @@ impl TransactionFactory {
         let pooled_tx =
             PooledTransactionsElement::try_from_broadcast(tx).expect("tx valid for pool");
         let recovered = pooled_tx.try_into_ecrecovered().expect("tx is recovered");
-        let transaction = <Pool::Transaction>::from_recovered_pooled_transaction(recovered);
+        let transaction = <Pool::Transaction>::from_pooled(recovered);
 
         pool.add_transaction(TransactionOrigin::Local, transaction)
             .await
@@ -471,7 +470,7 @@ impl TransactionFactory {
         let pooled_tx =
             PooledTransactionsElement::try_from_broadcast(tx).expect("tx valid for pool");
         let recovered = pooled_tx.try_into_ecrecovered().expect("tx is recovered");
-        let transaction = <Pool::Transaction>::from_recovered_pooled_transaction(recovered);
+        let transaction = <Pool::Transaction>::from_pooled(recovered);
 
         debug!("transaction: \n{transaction:?}\n");
 

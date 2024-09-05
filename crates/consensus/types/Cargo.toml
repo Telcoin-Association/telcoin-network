@@ -66,7 +66,7 @@ alloy-provider = { workspace = true, optional = true }
 alloy-signer = { workspace = true, optional = true }
 alloy-signer-local = { workspace = true, optional = true }
 alloy-network = { workspace = true, optional = true }
-alloy-sol-types = { workspace = true, optional = true }
+alloy-sol-types = { workspace = true, features = ["json"], optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -90,7 +90,7 @@ test-utils = [
     "alloy-network",
     "alloy-signer",
     "alloy-signer-local",
-    "alloy-sol-types",
+    "alloy-sol-types/json",
 ]
 arbitrary = ["reth-primitives/arbitrary"]
 
