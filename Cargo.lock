@@ -11110,6 +11110,7 @@ dependencies = [
  "reth-rpc-types",
  "reth-tracing",
  "reth-transaction-pool",
+ "reth-trie",
  "roaring",
  "schemars",
  "secp256k1 0.29.0",
