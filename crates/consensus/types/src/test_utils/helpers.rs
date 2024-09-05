@@ -16,7 +16,7 @@ use rand::{
     rngs::{OsRng, StdRng},
     thread_rng, Rng, RngCore, SeedableRng,
 };
-use reth_primitives::{Address, U256};
+use reth_primitives::{Address, Bytes, U256};
 use reth_tracing::tracing_subscriber::EnvFilter;
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
@@ -171,7 +171,10 @@ pub fn transaction_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Transaction {
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
 
     // random transaction
-    tx_factory.create_eip1559(chain, gas_price, Address::ZERO, value).envelope_encoded().into()
+    tx_factory
+        .create_eip1559(chain, gas_price, Some(Address::ZERO), value, Bytes::new())
+        .envelope_encoded()
+        .into()
 }
 
 pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Batch {
@@ -196,7 +199,10 @@ pub fn transaction() -> Transaction {
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
 
     // random transaction
-    tx_factory.create_eip1559(chain, gas_price, Address::ZERO, value).envelope_encoded().into()
+    tx_factory
+        .create_eip1559(chain, gas_price, Some(Address::ZERO), value, Bytes::new())
+        .envelope_encoded()
+        .into()
 
     // // generate random value transactions, but the length will be always 100 bytes
     // (0..100).map(|_v| rand::random::<u8>()).collect()
@@ -321,6 +327,7 @@ pub fn make_certificates(
 }
 
 /// Creates certificates for the provided rounds but also having slow nodes.
+///
 /// `range`: the rounds for which we intend to create the certificates for
 /// `initial_parents`: the parents to use when start creating the certificates
 /// `keys`: the authorities for which it will create certificates for
@@ -389,7 +396,9 @@ pub struct TestLeaderConfiguration {
 }
 
 /// Creates fully connected DAG for the dictated rounds but with specific conditions for the
-/// leaders. By providing the `leader_configuration` we can dictate the setup for specific leaders
+/// leaders.
+///
+/// By providing the `leader_configuration` we can dictate the setup for specific leaders
 /// of specific rounds. For a leader the following can be configured:
 /// * whether a leader will exist or not for a round
 /// * whether a leader will receive enough support from the next round
@@ -484,6 +493,7 @@ pub fn make_certificates_with_leader_configuration(
 }
 
 /// Returns the parents that should be used as part of a newly created certificate.
+///
 /// The `slow_nodes` parameter is used to dictate which parents to exclude and not use. The slow
 /// node will not be used under some probability which is provided as part of the tuple.
 /// If probability to use it is 0.0, then the parent node will NEVER be used.

@@ -71,6 +71,13 @@ reth-transaction-pool = { workspace = true, optional = true }
 reth-provider = { workspace = true, optional = true }
 reth-evm = { workspace = true, optional = true }
 
+alloy = { workspace = true, features = [
+    "contract",
+    "signers",
+    "signer-local",
+    "network",
+],  optional = true }
+
 [dev-dependencies]
 criterion = { workspace = true }
 tempfile = { workspace = true }
@@ -88,6 +95,7 @@ test-utils = [
     "reth-primitives/arbitrary",
     "reth-provider",
     "reth-evm",
+    "alloy",
 ]
 arbitrary = ["reth-primitives/arbitrary"]
 

@@ -230,6 +230,7 @@ impl<F: Future> Future for MonitoredScopeFuture<F> {
 }
 
 /// Create a metric that measures the uptime from when this metric was constructed.
+///
 /// The metric is labeled with the provided 'version' label (this should generally be of the
 /// format: 'semver-gitrevision') and the provided 'chain_identifier' label.
 pub fn uptime_metric(

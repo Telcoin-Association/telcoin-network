@@ -17,9 +17,8 @@ use redb::{
     Database as ReDatabase, ReadOnlyTable, ReadTransaction, ReadableTable, ReadableTableMetadata,
     TableDefinition, WriteTransaction,
 };
-use serde::{de::DeserializeOwned, Serialize};
 
-use crate::traits::{DBIter, Database, DbTx, DbTxMut, Table};
+use crate::traits::{DBIter, Database, DbTx, DbTxMut, KeyT, Table, ValueT};
 
 use super::{
     metrics::ReDbMetrics,
@@ -74,7 +73,8 @@ impl DbTxMut for ReDbTxMut {
 
     fn clear_table<T: crate::traits::Table>(&mut self) -> eyre::Result<()> {
         let td = TableDefinition::<KeyWrap<T::Key>, ValWrap<T::Value>>::new(T::NAME);
-        self.tx.open_table(td)?.retain(|_, _| false)?;
+        self.tx.delete_table(td)?;
+        self.tx.open_table(td)?;
         Ok(())
     }
 
@@ -330,8 +330,8 @@ impl Database for ReDB {
 #[self_referencing(pub_extras)]
 pub struct ReDBIter<'a, K, V>
 where
-    K: Serialize + DeserializeOwned + Ord + Clone + Send + Sync + Debug + 'static,
-    V: Serialize + DeserializeOwned + Clone + Send + Sync + Debug + 'static,
+    K: KeyT,
+    V: ValueT,
 {
     guard: RwLockReadGuard<'a, ReDatabase>,
     #[borrows(mut guard)]
@@ -343,8 +343,8 @@ where
 
 impl<'a, K, V> Iterator for ReDBIter<'a, K, V>
 where
-    K: Serialize + DeserializeOwned + Ord + Clone + Send + Sync + Debug + 'static,
-    V: Serialize + DeserializeOwned + Clone + Send + Sync + Debug + 'static,
+    K: KeyT,
+    V: ValueT,
 {
     type Item = (K, V);
 
@@ -359,18 +359,12 @@ mod test {
 
     use tempfile::tempdir;
 
-    use crate::traits::{Database, DbTxMut, Table};
+    use crate::{
+        test::{db_simp_bench, TestTable},
+        traits::{Database, DbTxMut},
+    };
 
     use super::ReDB;
-
-    #[derive(Debug)]
-    struct TestTable {}
-    impl Table for TestTable {
-        type Key = u64;
-        type Value = String;
-
-        const NAME: &'static str = "TestTable";
-    }
 
     fn open_db(path: &Path) -> ReDB {
         let db = ReDB::open(path).expect("Cannot open database");
@@ -610,5 +604,13 @@ mod test {
             let val = db.get::<TestTable>(&k).expect("Failed to get inserted key");
             assert_eq!(Some(v), val);
         }
+    }
+
+    #[test]
+    fn test_redb_dbsimpbench() {
+        // Init a DB
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_db(temp_dir.path());
+        db_simp_bench(db, "ReDb");
     }
 }

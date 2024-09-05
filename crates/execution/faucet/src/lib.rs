@@ -15,7 +15,7 @@ use gcloud_sdk::{
 };
 use lru_time_cache::LruCache;
 use reth::rpc::server_types::eth::{EthApiError, EthResult};
-use reth_primitives::{hex, Address, TxHash, U256};
+use reth_primitives::{Address, TxHash};
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use reth_transaction_pool::TransactionPool;
@@ -40,7 +40,6 @@ pub type GoogleKMSClient = GoogleApi<KeyManagementServiceClient<GoogleAuthMiddle
 pub type Secp256k1PubKeyBytes = [u8; PUBLIC_KEY_SIZE];
 /// The abi encoded type parameters for the drip method
 /// of the faucet contract deployed at contract address.
-///
 /// pub for integration test
 pub type Drip = alloy_sol_types::sol! { (address, address) };
 
@@ -49,12 +48,15 @@ pub struct FaucetConfig {
     /// The amount of time recipients must wait between transfers
     /// specified in seconds.
     pub wait_period: Duration,
-    /// The amount of TEL to transfer to each recipient.
-    pub transfer_amount: U256,
     /// The chain id
     pub chain_id: u64,
     /// Sensitive information regarding the wallet hot-signing transactions
     pub wallet: FaucetWallet,
+    /// Onchain faucet contract address for testing
+    /// The faucet manages the stablecoin and native token drip amounts
+    /// as well as whether or not a given stablecoin or the native token is enabled
+    /// for drips and for the frontend to query
+    pub contract_address: Address,
 }
 
 /// The account details used by the faucet to create and sign transactions.
@@ -113,21 +115,19 @@ impl Faucet {
         watch_rx: watch::Receiver<PendingWorkerBlock>,
     ) -> (Self, FaucetService<Provider, Pool, Tasks>) {
         let (to_service, rx) = unbounded_channel();
-        let FaucetConfig { wait_period, transfer_amount, chain_id, wallet } = config;
+        let FaucetConfig { wait_period, chain_id, wallet, contract_address } = config;
 
         // Construct an `LruCache` of `<String, SystemTime>`s, limited by 24hr expiry time
         let lru_cache = LruCache::with_expiry_duration(wait_period);
         let (add_to_cache_tx, update_cache_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let faucet_contract = hex!("0e26ade1f5a99bd6b5d40f870a87bfe143db68b6").into();
         let service = FaucetService {
-            faucet_contract,
+            faucet_contract: contract_address,
             request_rx: UnboundedReceiverStream::new(rx),
             provider,
             pool,
             lru_cache,
             chain_id,
-            transfer_amount,
             wait_period,
             executor,
             wallet,
@@ -212,6 +212,7 @@ mod tests {
     };
 
     use tokio::sync::oneshot;
+    use tracing::debug;
 
     /// Test the response from the following request to Google Cloud KMS
     /// ```rust
@@ -429,7 +430,7 @@ mod tests {
             .into_inner()
             .signature;
 
-        println!("kms response:\n {:?}", signed_data);
+        debug!("kms response:\n {:?}", signed_data);
 
         let pem_pubkey = kms_client
             .get()
@@ -439,6 +440,6 @@ mod tests {
             .into_inner()
             .pem;
 
-        println!("public key:\n {:?}", pem_pubkey);
+        debug!("public key:\n {:?}", pem_pubkey);
     }
 }

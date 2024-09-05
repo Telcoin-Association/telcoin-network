@@ -289,6 +289,7 @@ impl<BT, CE> std::fmt::Debug for ExecutorEngine<BT, CE> {
 #[cfg(test)]
 mod tests {
     use crate::ExecutorEngine;
+
     use fastcrypto::hash::Hash as _;
     use narwhal_test_utils::default_test_execution_node;
     use reth_blockchain_tree::BlockchainTreeViewer;

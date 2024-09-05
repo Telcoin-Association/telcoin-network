@@ -16,7 +16,7 @@ use reth_chainspec::ChainSpec;
 use reth_db::test_utils::{create_test_rw_db, tempdir_path};
 use reth_db_common::init::init_genesis;
 use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
-use reth_primitives::{alloy_primitives::U160, Address, TransactionSigned, U256};
+use reth_primitives::{alloy_primitives::U160, Address, Bytes, TransactionSigned, U256};
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     ProviderFactory,
@@ -148,24 +148,27 @@ async fn test_make_batch_el_to_cl() {
     let transaction1 = tx_factory.create_eip1559(
         chain.clone(),
         gas_price,
-        Address::ZERO,
+        Some(Address::ZERO),
         value, // 1 TEL
+        Bytes::new(),
     );
     debug!("transaction 1: {transaction1:?}");
 
     let transaction2 = tx_factory.create_eip1559(
         chain.clone(),
         gas_price,
-        Address::ZERO,
+        Some(Address::ZERO),
         value, // 1 TEL
+        Bytes::new(),
     );
     debug!("transaction 2: {transaction2:?}");
 
     let transaction3 = tx_factory.create_eip1559(
         chain.clone(),
         gas_price,
-        Address::ZERO,
+        Some(Address::ZERO),
         value, // 1 TEL
+        Bytes::new(),
     );
     debug!("transaction 3: {transaction3:?}");
 

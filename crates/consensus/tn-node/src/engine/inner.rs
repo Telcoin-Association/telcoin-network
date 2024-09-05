@@ -35,7 +35,7 @@ use reth_provider::{
 use reth_prune::PruneModes;
 use reth_tasks::TaskExecutor;
 use reth_transaction_pool::TransactionPool;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tn_batch_maker::{BatchMakerBuilder, MiningMode};
 use tn_batch_validator::BatchValidator;
 use tn_engine::ExecutorEngine;
@@ -233,6 +233,7 @@ where
         Ok(())
     }
 
+    /// The worker's RPC, TX pool, and block builder
     pub(super) async fn start_batch_maker(
         &mut self,
         to_worker: Sender<NewBatch>,
@@ -464,5 +465,16 @@ where
             .pending_block_sender();
 
         Ok(sender)
+    /// Return a worker's local Http address if the RpcServer exists.
+    pub(super) fn worker_http_local_address(
+        &self,
+        worker_id: &WorkerId,
+    ) -> eyre::Result<Option<SocketAddr>> {
+        let addr = self
+            .workers
+            .get(worker_id)
+            .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
+            .http_local_addr();
+        Ok(addr)
     }
 }

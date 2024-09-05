@@ -41,6 +41,12 @@ tn-node = { workspace = true }
 narwhal-network = { workspace = true }
 consensus-metrics = { workspace = true }
 tn-faucet = { workspace = true, optional = true }
+alloy = { workspace = true, features = [
+    "contract",
+    "signers",
+    "signer-local",
+    "network",
+] }
 
 # config
 serde_yaml = { workspace = true }
@@ -63,6 +69,7 @@ tikv-jemallocator = { workspace = true, optional = true }
 reth-basic-payload-builder = { workspace = true }
 reth-payload-builder = { workspace = true }
 tempfile = { workspace = true }
+tn-types = { workspace = true, features = ["test-utils"] }
 
 # Used for integration testing.
 ethereum-tx-sign = "6.1.3"

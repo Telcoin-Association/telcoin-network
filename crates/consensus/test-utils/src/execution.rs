@@ -148,11 +148,16 @@ pub fn faucet_test_execution_node(
     opt_chain: Option<Arc<ChainSpec>>,
     opt_address: Option<Address>,
     executor: TaskExecutor,
+    faucet_proxy_address: Address,
 ) -> eyre::Result<TestExecutionNode> {
     let faucet_args = ["--google-kms"];
 
     // TODO: support non-google-kms faucet
     let extended_args = if google_kms { Some(faucet_args.to_vec()) } else { None };
+    // always include default expected faucet derived from `TransactionFactory::default`
+    let faucet = faucet_proxy_address.to_string();
+    let extended_args =
+        extended_args.map(|opt| [opt, vec!["--contract-address", &faucet]].concat().to_vec());
 
     // execution builder + faucet args
     let (builder, faucet) =

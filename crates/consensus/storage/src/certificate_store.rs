@@ -49,7 +49,9 @@ impl CertificateStoreCacheMetrics {
 }
 
 /// A cache trait to be used as temporary in-memory store when accessing the underlying
-/// certificate_store. Using the cache allows to skip db access giving us benefits
+/// certificate_store.
+///
+/// Using the cache allows to skip db access giving us benefits
 /// both on less disk access (when value not in db's cache) and also avoiding any additional
 /// deserialization costs.
 pub trait Cache {
@@ -206,8 +208,9 @@ impl Cache for NoCache {
     }
 }
 
-/// The main storage when we have to deal with certificates. It maintains
-/// two storages, one main which saves the certificates by their ids, and a
+/// The main storage when we have to deal with certificates.
+///
+/// It maintains two storages, one main which saves the certificates by their ids, and a
 /// secondary one which acts as an index to allow us fast retrieval based
 /// for queries based in certificate rounds.
 /// It also offers pub/sub capabilities in write events. By using the

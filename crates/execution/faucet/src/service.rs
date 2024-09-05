@@ -76,8 +76,6 @@ pub(crate) struct FaucetService<Provider, Pool, Tasks> {
     pub(crate) lru_cache: LruCache<(Address, Address), SystemTime>,
     /// The chain id for constructing transactions.
     pub(crate) chain_id: u64,
-    /// The amount to transfer (specified in `FaucetConfig`).
-    pub(crate) transfer_amount: U256,
     /// The amount of time the LRU cache retains an address (specified in `FaucetConfig`).
     pub(crate) wait_period: Duration,
     /// The type that can spawn tasks onto the runtime.
@@ -173,20 +171,8 @@ where
         let nonce = self.get_transaction_count()?;
         let gas_price = self.gas_price()?;
 
-        let transaction = if contract.is_zero() {
-            // native token transaction
-            Transaction::Eip1559(TxEip1559 {
-                chain_id: self.chain_id,
-                nonce,
-                max_priority_fee_per_gas: gas_price,
-                max_fee_per_gas: gas_price,
-                gas_limit: 1_000_000,
-                to: TxKind::Call(to),
-                value: self.transfer_amount,
-                input: Default::default(),
-                access_list: Default::default(),
-            })
-        } else {
+        // TNFaucet.sol will drip native TEL when called with RPC param `contract == address(0)`
+        let transaction = {
             // hardcoded selector: keccak256("drip(address,address)")[0..4] == 0xeb3839a7
             let selector = [235, 56, 57, 167];
             // encode params

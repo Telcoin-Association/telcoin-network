@@ -42,7 +42,9 @@ tn-types = { workspace = true }
 
 [dev-dependencies]
 reth-tracing = { workspace = true }
-consensus-metrics = { workspace = true }
-narwhal-test-utils = { workspace = true }
 prometheus = { workspace = true }
 fastcrypto = { workspace = true }
+tn-types = { workspace = true, features = ["test-utils"] }
+consensus-metrics = { workspace = true }
+narwhal-test-utils = { workspace = true }
+alloy = { workspace = true, features = ["contract", "consensus"] }

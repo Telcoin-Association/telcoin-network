@@ -1,38 +1,23 @@
 use bincode::Options as _;
 use redb::{Key, TypeName, Value};
-use serde::{de::DeserializeOwned, Serialize};
-use std::{fmt::Debug, ops::Deref};
+use std::{fmt::Debug, marker::PhantomData};
+
+use crate::traits::{KeyT, ValueT};
 
 #[derive(Debug)]
-pub struct KeyWrap<K: Serialize + DeserializeOwned + Ord + Clone + Send + Sync + Debug + 'static>(
-    pub(crate) K,
-);
-impl<K> Key for KeyWrap<K>
-where
-    K: Serialize + DeserializeOwned + Ord + Clone + Send + Sync + Debug + 'static,
-{
+pub struct KeyWrap<K: KeyT>(PhantomData<K>);
+impl<K: KeyT> Key for KeyWrap<K> {
     fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
-        let d1 = KeyWrap::<K>::from_bytes(data1);
-        let d2 = KeyWrap::<K>::from_bytes(data2);
-        d1.cmp(&d2)
+        // If we want to do a typed compare use this:
+        //let d1 = KeyWrap::<K>::from_bytes(data1);
+        //let d2 = KeyWrap::<K>::from_bytes(data2);
+        //d1.cmp(&d2)
+        // Do a byte compare
+        data1.cmp(data2)
     }
 }
 
-impl<K> Deref for KeyWrap<K>
-where
-    K: Serialize + DeserializeOwned + Ord + Clone + Send + Sync + Debug + 'static,
-{
-    type Target = K;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<K> Value for KeyWrap<K>
-where
-    K: Serialize + DeserializeOwned + Ord + Clone + Send + Sync + Debug + 'static,
-{
+impl<K: KeyT> Value for KeyWrap<K> {
     type SelfType<'a> = K
     where
         Self: 'a;
@@ -75,13 +60,8 @@ where
 }
 
 #[derive(Debug)]
-pub struct ValWrap<V: Serialize + DeserializeOwned + Clone + Send + Sync + Debug + 'static>(
-    pub(crate) V,
-);
-impl<V> Value for ValWrap<V>
-where
-    V: Serialize + DeserializeOwned + Clone + Send + Sync + Debug + 'static,
-{
+pub struct ValWrap<V: ValueT>(PhantomData<V>);
+impl<V: ValueT> Value for ValWrap<V> {
     type SelfType<'a> = V
     where
         Self: 'a;
