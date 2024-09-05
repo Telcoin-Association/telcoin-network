@@ -3,12 +3,14 @@
 
 //! Collection of test utilities.
 
+mod artifacts;
 mod authority;
 mod builder;
 mod committee;
 mod execution;
 mod helpers;
 mod worker;
+pub use artifacts::*;
 pub use authority::*;
 pub use builder::*;
 pub use committee::*;
