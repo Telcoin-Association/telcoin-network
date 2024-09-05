@@ -3,18 +3,13 @@
 
 //! Specific test utils for execution layer
 use crate::{adiri_genesis, now, Batch, BatchAPI, ExecutionKeypair, MetadataAPI, TimestampSec};
-// use alloy::{
-//     network::EthereumWallet,
-//     providers::{Provider, ProviderBuilder},
-//     signers::{k256::FieldBytes, local::PrivateKeySigner},
-//     sol,
-//     sol_types::SolValue,
-// };
-use alloy_network::EthereumWallet;
-use alloy_providers::{Provider, ProviderBuilder};
-use alloy_signer::k256::FieldBytes;
-use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::{sol, SolValue};
+use alloy::{
+    network::EthereumWallet,
+    providers::{Provider, ProviderBuilder},
+    signers::{k256::FieldBytes, local::PrivateKeySigner},
+    sol,
+    sol_types::SolValue,
+};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use reth_chainspec::{BaseFeeParams, ChainSpec};
 use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, Executor as _};
