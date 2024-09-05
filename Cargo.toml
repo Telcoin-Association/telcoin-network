@@ -177,25 +177,8 @@ revm-primitives = { version = "7.1", features = [
     "std",
 ], default-features = false }
 
-alloy = "0.2"
+alloy = "0.3"
 alloy-rlp = "0.3.7"
-alloy-rpc-types = { version = "0.2", default-features = false, features = [
-    "eth",
-] }
-alloy-rpc-types-anvil = { version = "0.2", default-features = false }
-alloy-rpc-types-beacon = { version = "0.2", default-features = false }
-alloy-rpc-types-admin = { version = "0.2", default-features = false }
-alloy-rpc-types-txpool = { version = "0.2", default-features = false }
-alloy-rpc-types-engine = { version = "0.2", default-features = false }
-alloy-rpc-types-eth = { version = "0.2", default-features = false }
-alloy-rpc-types-mev = { version = "0.2", default-features = false }
-alloy-rpc-types-trace = { version = "0.2", default-features = false }
-
-alloy-chains = "0.1.23"
-alloy-primitives = "0.7.7"
-alloy-sol-types = "0.7.7"
-# matches Cargo.lock
-
 tn-batch-validator = { path = "crates/execution/batch-validator" }
 tn-engine = { path = "crates/execution/engine" }
 

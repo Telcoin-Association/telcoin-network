@@ -25,7 +25,7 @@ clap = { workspace = true, features = ["env"] }
 eyre = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }
 lru_time_cache = { version = "0.11.11" }
-alloy-sol-types = { workspace = true }
+alloy = { workspace = true, features = ["sol-types"] }
 jsonrpsee = { workspace = true, features = ["macros"] }
 
 # google cloud feature
