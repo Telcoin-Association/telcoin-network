@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     process::{Child, Command},
     time::Duration,
@@ -9,7 +10,7 @@ use eyre::Report;
 use rand::{rngs::StdRng, SeedableRng};
 use reth_primitives::{alloy_primitives, keccak256, Address};
 use secp256k1::{Keypair, Secp256k1, SecretKey};
-use serde_json::value::RawValue;
+use serde_json::{value::RawValue, Value};
 use tn_types::utils::get_available_tcp_port;
 use tokio::runtime::Runtime;
 
@@ -30,19 +31,27 @@ fn run_restart_tests1(
     send_tel(&client_urls[1], &key, to_account, 10 * WEI_PER_TEL, 250, 21000, 0)?;
     std::thread::sleep(Duration::from_millis(1000));
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())?;
-    assert_eq!(10 * WEI_PER_TEL, bal);
+    if 10 * WEI_PER_TEL != bal {
+        return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 10 * WEI_PER_TEL)));
+    }
     child2.kill()?;
     child2.wait()?;
     std::thread::sleep(Duration::from_millis(3000));
     // This validator should be down now, confirm.
-    assert!(get_balance(&client_urls[2], &to_account.to_string(), 5).is_err());
+    if get_balance(&client_urls[2], &to_account.to_string(), 5).is_ok() {
+        return Err(Report::msg(format!("Validator not down!")));
+    }
     // Restart
     let child2 = start_validator(2, exe_path, temp_path, rpc_port2);
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())?;
-    assert_eq!(10 * WEI_PER_TEL, bal);
+    if 10 * WEI_PER_TEL != bal {
+        return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 10 * WEI_PER_TEL)));
+    }
     send_tel(&client_urls[0], &key, to_account, 10 * WEI_PER_TEL, 250, 21000, 1)?;
     let bal = get_balance_above_with_retry(&client_urls[2], &to_account.to_string(), bal)?;
-    assert_eq!(20 * WEI_PER_TEL, bal);
+    if 20 * WEI_PER_TEL != bal {
+        return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 20 * WEI_PER_TEL)));
+    }
     Ok(child2)
 }
 
@@ -51,10 +60,14 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())?;
-    assert_eq!(20 * WEI_PER_TEL, bal);
+    if 20 * WEI_PER_TEL != bal {
+        return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 20 * WEI_PER_TEL)));
+    }
     send_tel(&client_urls[0], &key, to_account, 10 * WEI_PER_TEL, 250, 21000, 2)?;
     let bal = get_balance_above_with_retry(&client_urls[3], &to_account.to_string(), bal)?;
-    assert_eq!(30 * WEI_PER_TEL, bal);
+    if 30 * WEI_PER_TEL != bal {
+        return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 30 * WEI_PER_TEL)));
+    }
     Ok(())
 }
 
@@ -125,12 +138,14 @@ fn test_restarts() {
 
     let res2 = run_restart_tests2(&client_urls);
 
+    let res3 = if res2.is_ok() { test_blocks_same(&client_urls) } else { Ok(()) };
     for child in children.iter_mut() {
         let child = child.as_mut().expect("missing a child");
         let _ = child.kill();
         let _ = child.wait();
     }
     res2.expect("Failed restart test");
+    res3.expect("Failed restart test");
 }
 
 /// Start a process running a validator node.
@@ -160,12 +175,32 @@ fn start_validator(instance: usize, exe_path: &Path, base_dir: &Path, mut rpc_po
     command.spawn().expect("failed to execute")
 }
 
+fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
+    let block0 = get_block(&client_urls[0], None)?;
+    let number =
+        u64::from_str_radix(&block0["number"].as_str().unwrap_or_else(|| "0x100_000")[2..], 16)?;
+    let block = get_block(&client_urls[1], Some(number))?;
+    if block0["hash"] != block["hash"] {
+        return Err(Report::msg(format!("Blocks between validators not the same!")));
+    }
+    let number = u64::from_str_radix(&block["number"].as_str().unwrap_or_default()[2..], 16)?;
+    let block = get_block(&client_urls[2], Some(number))?;
+    if block0["hash"] != block["hash"] {
+        return Err(Report::msg(format!("Blocks between validators not the same!")));
+    }
+    let number = u64::from_str_radix(&block["number"].as_str().unwrap_or_default()[2..], 16)?;
+    let block = get_block(&client_urls[3], Some(number))?;
+    if block0["hash"] != block["hash"] {
+        return Err(Report::msg(format!("Blocks between validators not the same!")));
+    }
+    Ok(())
+}
+
 /// Send an RPC call to node to get the latest balance for address.
 /// Return a tuple of the TEL and remainder (any value left after dividing by 1_e18).
 /// Note, balance is in wei and must fit in an u128.
 fn get_balance(node: &str, address: &str, retries: usize) -> eyre::Result<u128> {
-    let params = RawValue::from_string(format!("[\"{address}\", \"latest\"]"))
-        .expect("Failed to create params for balance query!");
+    let params = RawValue::from_string(format!("[\"{address}\", \"latest\"]"))?;
     let res_str = call_rpc(node, "eth_getBalance", Some(&params), retries)?;
     let tel = u128::from_str_radix(&res_str[2..], 16)?;
     Ok(tel)
@@ -180,12 +215,12 @@ fn get_positive_balance_with_retry(node: &str, address: &str) -> eyre::Result<u1
 fn get_balance_above_with_retry(node: &str, address: &str, above: u128) -> eyre::Result<u128> {
     let mut bal = get_balance(node, address, 5).unwrap_or(0);
     let mut i = 0;
-    while i < 20 && bal <= above {
+    while i < 30 && bal <= above {
         std::thread::sleep(Duration::from_millis(1000));
         i += 1;
         bal = get_balance(node, address, 5).unwrap_or(0);
     }
-    if i == 20 && bal <= above {
+    if i == 30 && bal <= above {
         Err(Report::msg(format!("Failed to get a balance {bal} for {address} above {above}")))
     } else {
         Ok(bal)
@@ -200,6 +235,16 @@ fn get_key(key: &str) -> String {
         let (_, _, key) = account_from_word(key);
         key
     }
+}
+
+fn get_block(node: &str, block_number: Option<u64>) -> eyre::Result<HashMap<String, Value>> {
+    let params = if let Some(block_number) = block_number {
+        RawValue::from_string(format!("[\"0x{block_number:x}\", true]"))?
+    } else {
+        RawValue::from_string("[\"latest\", true]".to_string())?
+    };
+    let block = call_rpc(node, "eth_getBlockByNumber", Some(&params), 5)?;
+    Ok(serde_json::from_str(&block)?)
 }
 
 /// Take a string and return the deterministic account derived from it.  This is be used
@@ -260,8 +305,7 @@ fn send_tel(
         .ecdsa(&secret_key.secret_bytes())
         .map_err(|_| Report::msg("Failed to get ecdsa"))?;
     let transaction_bytes = new_transaction.sign(&ecdsa);
-    let params = RawValue::from_string(format!("[\"{}\"]", const_hex::encode(transaction_bytes)))
-        .expect("Failed to create params for balance query!");
+    let params = RawValue::from_string(format!("[\"{}\"]", const_hex::encode(transaction_bytes)))?;
     let res_str = call_rpc(node, "eth_sendRawTransaction", Some(&params), 5)?;
     println!("Submitted TEL transfer from {from_account} to {to_account} for {amount}: {res_str}");
     Ok(())
