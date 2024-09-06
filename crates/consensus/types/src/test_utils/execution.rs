@@ -496,7 +496,7 @@ where
 /// Helper to deploy implementation contract for an eXYZ
 pub async fn deploy_contract_stablecoin(
     rpc_url: &str,
-    tx_factory: &TransactionFactory,
+    tx_factory: &mut TransactionFactory,
 ) -> eyre::Result<Address> {
     // stablecoin interface
     sol!(
