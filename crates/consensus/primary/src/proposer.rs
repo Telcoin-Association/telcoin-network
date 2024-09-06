@@ -897,6 +897,89 @@ where
                 this.process_parents(certs, round)?;
             }
 
+            // TODO: use `while` instead of `if`?
+            // - should be fairly caught up all the time, but still?
+            //
+            // check for previous headers that were committed
+            while let Poll::Ready(Some((commit_round, committed_headers))) =
+                this.rx_committed_own_headers.poll_recv(cx)
+            {
+                debug!(target: "primary::proposer", round=this.round, "received committed update for own header");
+
+                // remove committed headers from pending
+                let mut max_committed_round = 0;
+                for round in committed_headers {
+                    max_committed_round = max_committed_round.max(round);
+                    // try to remove - log warning if round is missing
+                    if this.proposed_headers.remove(&round).is_none() {
+                        warn!("Proposer's own committed header not found at round {round}, probably because of restarts.");
+                    };
+                }
+
+                // Now for any round below the current commit round we re-insert
+                // the batches into the digests we need to send, effectively re-sending
+                // them in FIFO order.
+
+                // re-insert batches for any proposed header from a round below the current commit
+                //
+                // ensure batches are FIFO as this is effectively re-sending them
+                //
+                // payloads: oldest -> newest
+                let mut digests_to_resend = VecDeque::new();
+                // Oldest to newest system messages.
+                let mut system_messages_to_resend = Vec::new();
+                // Oldest to newest rounds.
+                let mut retransmit_rounds = Vec::new();
+
+                // loop through proposed headers in order by round
+                // for (header_round, (_header, included_digests, included_system_messages)) in
+                for (header_round, header) in &mut self.proposed_headers {
+                    // break once headers pass the committed round
+                    if *header_round > max_committed_round {
+                        break;
+                    }
+
+                    // TODO: this relates to a similar error above
+                    // `OurDigestMessage` isn't sufficient:
+                    // - need to use oneshot channel, but have to clone
+                    // - what info is needed here to rebuild old headers and create new ones?
+                    //
+                    // need to update this.digests type to use a better struct
+                    //
+
+                    let mut system_messages = header.system_messages().clone().to_vec();
+
+                    // Add payloads and system messages from oldest to newest.
+                    digests_to_resend.append(included_digests);
+                    system_messages_to_resend.append(&mut system_messages);
+                    retransmit_rounds.push(*header_round);
+                }
+
+                if !retransmit_rounds.is_empty() {
+                    let num_digests_to_resend = digests_to_resend.len();
+                    let num_system_messages_to_resend = system_messages_to_resend.len();
+                    // Since all of the values are roughly newer than existing stored values,
+                    // prepend for the next header.
+                    digests_to_resend.append(&mut self.digests);
+                    self.digests = digests_to_resend;
+                    system_messages_to_resend.append(&mut self.system_messages);
+                    self.system_messages = system_messages_to_resend;
+
+                    // Now delete the headers with batches we re-transmit
+                    for round in &retransmit_rounds {
+                        self.proposed_headers.remove(round);
+                    }
+
+                    debug!(
+                        "Retransmit {num_digests_to_resend} batches and {num_system_messages_to_resend} system messages in undelivered headers {retransmit_rounds:?} at commit round {commit_round:?}, remaining headers {}",
+                        self.proposed_headers.len()
+                    );
+
+                    self.metrics.proposer_resend_headers.inc_by(retransmit_rounds.len() as u64);
+                    self.metrics.proposer_resend_batches.inc_by(num_digests_to_resend as u64);
+                }
+            }
+
             // poll receiver that returns proposed header result
             //
             // if the pending header needs more time, break loop and return pending
