@@ -62,7 +62,7 @@ async fn test_faucet_transfers_tel_with_google_kms_e2e() -> eyre::Result<()> {
     )
     .await?;
 
-    info!(target: "faucet-test", "nodes started. sleeping for 10s...");
+    info!(target: "faucet-test", "nodes started - sleeping for 10s...");
 
     tokio::time::sleep(Duration::from_secs(10)).await;
 
@@ -74,12 +74,13 @@ async fn test_faucet_transfers_tel_with_google_kms_e2e() -> eyre::Result<()> {
     let default_deployer_address = tx_factory.address();
     let deployer_balance: String =
         client.request("eth_getBalance", rpc_params!(default_deployer_address)).await?;
+
     debug!(target: "faucet-test", "Deployer starting balance: {deployer_balance:?}");
     assert_eq!(U256::from_str(&deployer_balance)?, U256::MAX);
+    info!(target: "faucet-test", "deploying contract and initializing faucet...");
 
     // deploy faucet contracts and initialize
     let empty_tokens_array = vec![];
-    info!(target: "faucet-test", "deploying contract and initializing faucet...");
     let _faucet_contract = deploy_contract_faucet_initialize(
         chain.clone(),
         &rpc_url,
@@ -99,6 +100,7 @@ async fn test_faucet_transfers_tel_with_google_kms_e2e() -> eyre::Result<()> {
         client.request("eth_getBalance", rpc_params!(random_address)).await?;
     debug!(target: "faucet-test", "starting balance: {starting_balance:?}");
     assert_eq!(U256::from_str(&starting_balance)?, U256::ZERO);
+
     let tx_hash: String = client.request("faucet_transfer", rpc_params![random_address]).await?;
     info!(target: "faucet-test", ?tx_hash, "valid faucet transfer tx hash");
 
@@ -139,8 +141,8 @@ async fn test_faucet_transfers_tel_with_google_kms_e2e() -> eyre::Result<()> {
     // submit tx through rpc
     let tx_bytes = tx.envelope_encoded();
     let tx_hash: String = client.request("eth_sendRawTransaction", rpc_params![tx_bytes]).await?;
-
     info!(target: "faucet-test", ?tx_hash, "tx submitted :D");
+
     // ensure account balance decreased
     let expected_balance = U256::from_str("0x2e0b6b3a761c1c9")?;
     let _ = timeout(
@@ -149,11 +151,11 @@ async fn test_faucet_transfers_tel_with_google_kms_e2e() -> eyre::Result<()> {
     )
     .await?
     .expect("expected balance timeout");
-    info!(target: "faucet-test", ?expected_balance, "account balance decreased. requesting from faucet again...");
 
     // request another faucet drip for random address
     //
     // assert starting balance is 0
+    info!(target: "faucet-test", ?expected_balance, "account balance decreased. requesting from faucet again...");
     let random_address = Address::random();
     let starting_balance: String =
         client.request("eth_getBalance", rpc_params!(random_address)).await?;
@@ -173,9 +175,9 @@ async fn test_faucet_transfers_tel_with_google_kms_e2e() -> eyre::Result<()> {
     )
     .await?
     .expect("expected balance random account timeout");
-    info!(target: "faucet-test", "account balance updated. submitting duplicate request and shutting down...");
 
     // duplicate request is err
+    info!(target: "faucet-test", "account balance updated. submitting duplicate request and shutting down...");
     assert!(client
         .request::<String, _>("faucet_transfer", rpc_params![random_address])
         .await

@@ -7,7 +7,11 @@
 //! signature to be EVM compatible. The faucet service does all of this and
 //! then submits the transaction to the RPC Transaction Pool for the next batch.
 
-use alloy::{sol, SolType, SolValue};
+use alloy::{
+    sol,
+    sol_types::{SolType, SolValue},
+};
+use fastcrypto::hash::Hash;
 use gcloud_sdk::{
     google::cloud::kms::v1::{
         key_management_service_client::KeyManagementServiceClient, GetPublicKeyRequest,
@@ -150,6 +154,7 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
         kms_address,
     )
         .abi_encode_params();
+
     let grant_role_call = [&grant_role_selector, &grant_role_params[..]].concat().into();
 
     // assemble eip1559 transactions using constructed datas
@@ -164,6 +169,7 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
             faucet_create_data.clone().into(),
         )
         .envelope_encoded();
+
     // faucet deployment will be `factory_address`'s first transaction
     let faucet_proxy_address = factory_address.create(0);
     let role_tx_raw = tx_factory
@@ -231,6 +237,7 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
 
     // start batch maker
     execution_node.start_batch_maker(to_worker, worker_id).await?;
+
     // create client
     let client = execution_node.worker_http_client(&worker_id).await?.expect("worker rpc client");
     tracing::info!("got client: {:?}", client);
@@ -284,7 +291,7 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     let pool_tx = tx_pool.get(&tx_hash).expect("tx in pool");
     let recovered = pool_tx.transaction.transaction();
     assert_eq!(&tx_hash, recovered.hash_ref());
-    assert_eq!(recovered.transaction.to(), Some(random_address));
+    assert_eq!(recovered.transaction.to(), Some(faucet_proxy_address));
     Ok(assert_eq!(recovered.transaction.nonce(), 1))
 }
 

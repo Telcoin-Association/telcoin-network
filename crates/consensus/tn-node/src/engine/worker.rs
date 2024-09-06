@@ -267,10 +267,10 @@ impl Peers for WorkerNetwork {
 
     fn connect_peer_kind(
         &self,
-        peer: PeerId,
-        kind: PeerKind,
-        tcp_addr: SocketAddr,
-        udp_addr: Option<SocketAddr>,
+        _peer: PeerId,
+        _kind: PeerKind,
+        _tcp_addr: SocketAddr,
+        _udp_addr: Option<SocketAddr>,
     ) {
         // unimplemented!
     }

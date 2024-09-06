@@ -30,7 +30,7 @@ use reth_primitives::Address;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     DatabaseProviderFactory, ExecutionOutcome, FinalizedBlockReader, HeaderProvider,
-    ProviderFactory, StaticFileProviderFactory as _,
+    ProviderFactory,
 };
 use reth_prune::PruneModes;
 use reth_tasks::TaskExecutor;
