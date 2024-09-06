@@ -94,7 +94,7 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
 
     // extend genesis accounts to fund factory_address and etch impl bytecode on faucet_impl
     let faucet_impl_address = Address::random();
-    let faucet_bytecode = STABLECOINMANAGER_RUNTIMECODE.clone();
+    let faucet_bytecode = *STABLECOINMANAGER_RUNTIMECODE;
     let mut tx_factory = TransactionFactory::new();
     let factory_address = tx_factory.address();
     let tmp_genesis = tmp_genesis.extend_accounts(
@@ -102,7 +102,7 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
             (factory_address, GenesisAccount::default().with_balance(U256::MAX)),
             (
                 faucet_impl_address,
-                GenesisAccount::default().with_code(Some(faucet_bytecode.clone().into())),
+                GenesisAccount::default().with_code(Some(faucet_bytecode.into())),
             ),
         ]
         .into_iter(),
@@ -188,7 +188,7 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
         .expect("faucet address missing from bundle state")
         .storage;
 
-    let faucet_proxy_bytecode = ERC1967PROXY_RUNTIMECODE.clone();
+    let faucet_proxy_bytecode = *ERC1967PROXY_RUNTIMECODE;
 
     // real genesis: configure genesis accounts for proxy deployment & faucet_role
     let genesis_accounts = vec![
@@ -460,7 +460,7 @@ async fn test_faucet_transfers_stablecoin_with_google_kms() -> eyre::Result<()> 
         .expect("faucet address missing from bundle state")
         .storage;
 
-    let faucet_proxy_bytecode = ERC1967PROXY_RUNTIMECODE.clone();
+    let faucet_proxy_bytecode = *ERC1967PROXY_RUNTIMECODE;
 
     // real genesis: configure genesis accounts for proxy deployment & faucet_role
     let genesis_accounts = vec![
