@@ -45,13 +45,6 @@ use tn_types::{
 use tokio::{runtime::Handle, task::JoinHandle, time::timeout};
 use tracing::{debug, error, info};
 
-sol!(
-    #[allow(clippy::too_many_arguments)]
-    #[sol(rpc)]
-    Stablecoin,
-    "../../crates/consensus/types/src/test_utils/artifacts/Stablecoin.json"
-);
-
 #[tokio::test]
 async fn test_faucet_transfers_tel_with_google_kms_e2e() -> eyre::Result<()> {
     init_test_tracing();
