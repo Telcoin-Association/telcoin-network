@@ -59,6 +59,30 @@ pub struct OurDigestMessage {
     pub ack_channel: oneshot::Sender<()>,
 }
 
+impl OurDigestMessage {
+    /// Process the message.
+    ///
+    /// Splits the message into components required for processing the batch.
+    fn process(self) -> (oneshot::Sender<()>, ProposerDigest) {
+        let OurDigestMessage { digest, worker_id, timestamp, ack_channel } = self;
+        let digest = ProposerDigest { digest, worker_id, timestamp };
+        (ack_channel, digest)
+    }
+}
+
+/// The returned type for processing `[OurDigestMessage]`.
+///
+/// Contains all the information needed to propose the new header.
+#[derive(Debug)]
+struct ProposerDigest {
+    /// The digest for the worker's block that reached quorum.
+    pub digest: BatchDigest,
+    /// The worker that produced this block.
+    pub worker_id: WorkerId,
+    /// The timestamp for when the block was created.
+    pub timestamp: TimestampSec,
+}
+
 #[cfg(test)]
 #[path = "tests/proposer_tests.rs"]
 pub mod proposer_tests;
@@ -117,7 +141,7 @@ pub struct Proposer<DB: Database> {
     last_leader: Option<Certificate>,
     /// Holds the batches' digests waiting to be included in the next header.
     /// Digests are roughly oldest to newest, and popped in FIFO order from the front.
-    digests: VecDeque<OurDigestMessage>,
+    digests: VecDeque<ProposerDigest>,
     /// Holds the system messages waiting to be included in the next header.
     system_messages: Vec<SystemMessage>,
     /// Holds the map of proposed previous round headers and their digest messages, to ensure that
@@ -873,20 +897,22 @@ where
             }
 
             // check for new digests from workers
-            if let Poll::Ready(Some(block)) = this.rx_our_digests.poll_recv(cx) {
+            if let Poll::Ready(Some(msg)) = this.rx_our_digests.poll_recv(cx) {
                 debug!(target: "primary::proposer", round=this.round, "Proposer received digest");
 
                 // send ack back to worker
                 //
                 // ack implies that the block is recorded on the primary
-                // and will be tracked until the block is included.
+                // and will be tracked until the block is included
                 //
                 // primary will attempt to propose this digest until it is sequenced
-                // or the epoch concludes.
+                // or the epoch concludes
                 //
                 // however, this will not persist primary crashes
-                let _ = block.ack_channel.send(());
-                this.digests.push_back(block);
+
+                let (ack, digest) = msg.process();
+                let _ = ack.send(());
+                this.digests.push_back(digest);
             }
 
             // check for new parent certificates
@@ -948,6 +974,7 @@ where
                     //
 
                     let mut system_messages = header.system_messages().clone().to_vec();
+                    let mut digests = todo!()
 
                     // Add payloads and system messages from oldest to newest.
                     digests_to_resend.append(included_digests);
