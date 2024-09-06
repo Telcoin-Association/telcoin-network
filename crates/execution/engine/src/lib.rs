@@ -24,6 +24,7 @@ use futures::{Future, StreamExt};
 use futures_util::FutureExt;
 pub use payload_builder::execute_consensus_output;
 use reth_blockchain_tree::BlockchainTreeEngine;
+use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
 use reth_primitives::SealedHeader;
 use reth_provider::{
@@ -121,7 +122,7 @@ where
     fn spawn_execution_task(&mut self) -> PendingExecutionTask
     where
         BT: StateProviderFactory
-            + ChainSpecProvider
+            + ChainSpecProvider<ChainSpec = ChainSpec>
             + BlockchainTreeEngine
             + CanonChainTracker
             + Clone,
@@ -188,7 +189,7 @@ where
         + CanonChainTracker
         + StageCheckpointReader
         + StateProviderFactory
-        + ChainSpecProvider
+        + ChainSpecProvider<ChainSpec = ChainSpec>
         + Clone
         + Unpin
         + 'static,

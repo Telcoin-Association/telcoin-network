@@ -7,7 +7,7 @@
 //! wallet within the time period.
 
 use crate::{Drip, FaucetWallet, GoogleKMSClient, Secp256k1PubKeyBytes};
-use alloy_sol_types::SolType;
+use alloy::sol_types::SolType;
 use futures::StreamExt;
 use gcloud_sdk::{
     google::cloud::kms::v1::{
@@ -21,8 +21,8 @@ use lru_time_cache::LruCache;
 use reth::rpc::server_types::eth::{EthApiError, EthResult, RpcInvalidTransactionError};
 use reth_chainspec::BaseFeeParams;
 use reth_primitives::{
-    Address, FromRecoveredPooledTransaction, Signature as EthSignature, Transaction,
-    TransactionSigned, TxEip1559, TxHash, TxKind, B256, U256,
+    Address, Signature as EthSignature, Transaction, TransactionSigned, TxEip1559, TxHash, TxKind,
+    B256, U256,
 };
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_tasks::TaskSpawner;
@@ -445,7 +445,7 @@ where
     let recovered = tx.try_into_ecrecovered().or(Err(EthApiError::InvalidTransactionSignature))?;
 
     let pool_transaction = match recovered.try_into() {
-        Ok(converted) => <Pool::Transaction>::from_recovered_pooled_transaction(converted),
+        Ok(converted) => <Pool::Transaction>::from_pooled(converted),
         Err(_) => return Err(EthApiError::TransactionConversionError),
     };
 

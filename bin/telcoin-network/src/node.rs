@@ -14,6 +14,7 @@ use reth::{
     },
     builder::NodeConfig,
     dirs::MaybePlatformPath,
+    prometheus_exporter::install_prometheus_recorder,
     CliContext,
 };
 use reth_chainspec::ChainSpec;
@@ -219,8 +220,15 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // create node builders for Primary and Worker
         //
         // Register the prometheus recorder before creating the database,
-        // because database init needs it to register metrics.
-        let _ = node_config.install_prometheus_recorder()?;
+        // then start metrics
+        //
+        // reth calls this in node command for CLI
+        // to capture db startup metrics
+        // metrics for TN are unrefined and outside the scope of this PR
+        //
+        // this is a best-guess attempt to capture data from the exectuion layer
+        // but more work is needed to ensure proper metric collection
+        let _ = install_prometheus_recorder();
 
         let db_path = tn_datadir.db();
         info!(target: "tn::engine", path = ?db_path, "opening database");

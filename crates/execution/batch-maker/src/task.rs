@@ -94,7 +94,6 @@ where
     BlockExecutor: BlockExecutorProvider,
     Client: StateProviderFactory + CanonChainTracker + BlockReaderIdExt + Clone + Unpin + 'static,
     Pool: TransactionPool + Unpin + 'static,
-    <Pool as TransactionPool>::Transaction: IntoRecoveredTransaction,
 {
     type Output = ();
 

@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Specific test utils for execution layer
-use crate::{adiri_genesis, now, Batch, BatchAPI, ExecutionKeypair, MetadataAPI, TimestampSec};
+use super::contract_artifacts::{ERC1967PROXY_INITCODE, STABLECOIN_INITCODE};
+use crate::{
+    adiri_genesis, now, test_utils::contract_artifacts::STABLECOINMANAGER_INITCODE, Batch,
+    BatchAPI, ExecutionKeypair, MetadataAPI, TimestampSec,
+};
 use alloy::{
-    network::EthereumWallet,
+    network::{EthereumWallet, TransactionBuilder},
     providers::{Provider, ProviderBuilder},
     signers::{k256::FieldBytes, local::PrivateKeySigner},
     sol,
@@ -23,6 +27,7 @@ use reth_primitives::{
 };
 use reth_provider::{BlockReaderIdExt, ExecutionOutcome, StateProviderFactory};
 use reth_revm::database::StateProviderDatabase;
+use reth_rpc_types::TransactionRequest;
 use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool};
 use reth_trie::HashedPostState;
 use secp256k1::Secp256k1;
@@ -491,23 +496,47 @@ where
 /// Helper to deploy implementation contract for an eXYZ
 pub async fn deploy_contract_stablecoin(
     rpc_url: &str,
-    tx_factory: &TransactionFactory,
+    tx_factory: &mut TransactionFactory,
 ) -> eyre::Result<Address> {
-    // stablecoin abi
+    // stablecoin interface
     sol!(
         #[allow(clippy::too_many_arguments)]
         #[sol(rpc)]
-        Stablecoin,
-        "src/test_utils/artifacts/Stablecoin.json"
+        contract Stablecoin {
+            function initialize(
+                string memory name_,
+                string memory symbol_,
+                uint8 decimals_
+            ) external;
+            function decimals() external view returns (uint8);
+            function mint(uint256 value) external;
+            function mintTo(
+                address account,
+                uint256 value
+            ) external;
+            function burn(uint256 value) external;
+            function burnFrom(
+                address account,
+                uint256 value
+            ) external;
+        }
     );
 
     let signer: PrivateKeySigner = tx_factory.get_default_signer()?;
     let wallet = EthereumWallet::from(signer);
     let provider =
         ProviderBuilder::new().with_recommended_fillers().wallet(wallet).on_http(rpc_url.parse()?);
-    let stablecoin_contract = Stablecoin::deploy(&provider).await?;
+    let factory_address = tx_factory.address();
+    let current_nonce = provider.get_transaction_count(factory_address).await?;
+    let stablecoin_contract = factory_address.create(current_nonce);
+    let tx = TransactionRequest::default().with_deploy_code(STABLECOIN_INITCODE);
+    let sent = provider.send_transaction(tx).await.expect("Failed to deploy stablecoin");
+    let _receipt = sent.get_receipt().await?;
 
-    Ok(*stablecoin_contract.address())
+    // manually increment nonce
+    tx_factory.inc_nonce();
+
+    Ok(Address(*stablecoin_contract))
 }
 
 /// Helper to deploy implementation contract for the canonical Telcoin faucet
@@ -521,22 +550,39 @@ pub async fn deploy_contract_faucet_initialize(
     deployed_token_bytes: Vec<Address>,
     tx_factory: &mut TransactionFactory,
 ) -> eyre::Result<Address> {
+    sol!(
+        #[sol(rpc)]
+        contract StablecoinManager {
+            struct StablecoinManagerInitParams {
+                address admin_;
+                address maintainer_;
+                address[] tokens_;
+                uint256 initMaxLimit;
+                uint256 initMinLimit;
+                address[] authorizedFaucets_;
+                uint256 dripAmount_;
+                uint256 nativeDripAmount_;
+            }
+
+            function initialize(StablecoinManagerInitParams calldata initParams) external;
+            function grantRole(bytes32 role, address account) external;
+        }
+    );
+
     let signer: PrivateKeySigner = tx_factory.get_default_signer()?;
     let wallet = EthereumWallet::from(signer);
     let provider =
         ProviderBuilder::new().with_recommended_fillers().wallet(wallet).on_http(rpc_url.parse()?);
 
-    sol!(
-        #[sol(rpc)]
-        StablecoinManager,
-        "src/test_utils/artifacts/StablecoinManager.json"
-    );
+    let factory_address = tx_factory.address();
+    let current_nonce = provider.get_transaction_count(factory_address).await?;
+    let faucet_impl = factory_address.create(current_nonce);
+    let tx = TransactionRequest::default().with_deploy_code(STABLECOINMANAGER_INITCODE);
+    let sent = provider.send_transaction(tx).await.expect("Failed to deploy faucet impl");
+    let _receipt = sent.get_receipt().await?;
 
-    // deploy faucet implementation contract
-    let initial_faucet_implementation = StablecoinManager::deploy(&provider).await?;
     // manually increment nonce
     tx_factory.inc_nonce();
-    let faucet_impl = *initial_faucet_implementation.address();
     debug!("Faucet implementation deployed to: {}", faucet_impl);
 
     // deploy canonical faucet (proxy)
@@ -588,6 +634,7 @@ pub async fn deploy_contract_faucet_initialize(
         )
         .envelope_encoded();
     let _tx_hash = provider.send_raw_transaction(grant_role_tx.as_ref()).await?;
+
     debug!("Successfully granted faucet fole to: {}", faucet_contract);
 
     // fund faucet with some tel
@@ -602,33 +649,46 @@ pub async fn deploy_contract_faucet_initialize(
 }
 
 /// Helper function to deploy an ERC1967 proxy contract
+/// Note that `init_bytes` should be abi-encoded bytes used for `ERC1967::constructor()`
 pub async fn deploy_contract_proxy(
     rpc_url: &str,
     implementation: Address,
     init_bytes: Bytes,
     tx_factory: &mut TransactionFactory,
 ) -> eyre::Result<Address> {
-    // ERC1967Proxy abi
+    // ERC1967Proxy interface
     sol!(
+        #[allow(clippy::too_many_arguments)]
         #[sol(rpc)]
-        ERC1967Proxy,
-        "src/test_utils/artifacts/ERC1967Proxy.json"
+        contract ERC1967Proxy {
+            constructor(address implementation, bytes memory _data);
+        }
     );
 
     let signer: PrivateKeySigner = tx_factory.get_default_signer()?;
     let wallet = EthereumWallet::from(signer);
     let provider =
         ProviderBuilder::new().with_recommended_fillers().wallet(wallet).on_http(rpc_url.parse()?);
-    let proxy_contract = ERC1967Proxy::deploy(provider, implementation, init_bytes).await?;
+
+    let factory_address = tx_factory.address();
+    let current_nonce = provider.get_transaction_count(factory_address).await?;
+    let proxy_contract = factory_address.create(current_nonce);
+    let constructor_args = (implementation, init_bytes).abi_encode_params();
+    let initcode_and_constructor_args =
+        [ERC1967PROXY_INITCODE.as_slice(), &constructor_args[..]].concat();
+    let tx = TransactionRequest::default().with_deploy_code(initcode_and_constructor_args);
+    let sent = provider.send_transaction(tx).await.expect("Failed to deploy faucet impl");
+    let _receipt = sent.get_receipt().await?;
+
+    debug!("Successfully deployed proxy contract to {}", proxy_contract);
+    // manually increment nonce
     tx_factory.inc_nonce();
 
-    Ok(*proxy_contract.address())
+    Ok(Address(*proxy_contract))
 }
 
 #[cfg(test)]
 mod tests {
-
-    // use std::str::FromStr;
 
     use super::*;
     #[test]

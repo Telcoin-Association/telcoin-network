@@ -168,6 +168,7 @@ reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag 
 reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 reth-libmdbx = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
+reth-execution-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 
 revm = { version = "14.0.0", features = [
     "std",
@@ -188,7 +189,7 @@ tn-engine = { path = "crates/execution/engine" }
 # batch maker
 tn-batch-maker = { path = "crates/execution/batch-maker" }
 futures-util = "0.3.25"
-jsonrpsee = { version = "0.23" }
+jsonrpsee = { version = "0.24" }
 assert_matches = { version = "1.5.0" }
 
 # common

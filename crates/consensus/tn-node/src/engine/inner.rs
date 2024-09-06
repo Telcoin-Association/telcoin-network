@@ -10,7 +10,7 @@ use crate::{
 use consensus_metrics::metered_channel::Sender;
 use jsonrpsee::http_client::HttpClient;
 use reth::rpc::{
-    builder::{config::RethRpcServerConfig, RpcModuleBuilder},
+    builder::{config::RethRpcServerConfig, RpcModuleBuilder, RpcServerHandle},
     eth::EthApi,
 };
 use reth_auto_seal_consensus::AutoSealConsensus;
@@ -173,17 +173,6 @@ where
         &self,
         from_consensus: broadcast::Receiver<ConsensusOutput>,
     ) -> eyre::Result<()> {
-        // start metrics
-        let prometheus_handle = self.node_config.install_prometheus_recorder()?;
-        self.node_config
-            .start_metrics_endpoint(
-                prometheus_handle,
-                self.provider_factory.db_ref().clone(),
-                self.provider_factory.static_file_provider(),
-                self.task_executor.clone(),
-            )
-            .await?;
-
         let head = self.node_config.lookup_head(self.provider_factory.clone())?;
 
         // TODO: call hooks?
@@ -383,7 +372,7 @@ where
         //
         // recover finalized block's nonce: this is the last subdag index from consensus (round)
         let finalized_block_num =
-            self.blockchain_db.database_provider_ro()?.last_finalized_block_number()?;
+            self.blockchain_db.database_provider_ro()?.last_finalized_block_number()?.unwrap_or(0);
         let last_round_of_consensus = self
             .blockchain_db
             .database_provider_ro()?
@@ -409,17 +398,22 @@ where
         self.evm_executor.clone()
     }
 
+    /// Return a worker's RpcServerHandle if the RpcServer exists.
+    pub(super) fn worker_rpc_handle(&self, worker_id: &WorkerId) -> eyre::Result<&RpcServerHandle> {
+        let handle = self
+            .workers
+            .get(worker_id)
+            .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
+            .rpc_handle();
+        Ok(handle)
+    }
+
     /// Return a worker's HttpClient if the RpcServer exists.
     pub(super) fn worker_http_client(
         &self,
         worker_id: &WorkerId,
     ) -> eyre::Result<Option<HttpClient>> {
-        let handle = self
-            .workers
-            .get(worker_id)
-            .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
-            .rpc_handle()
-            .http_client();
+        let handle = self.worker_rpc_handle(worker_id)?.http_client();
         Ok(handle)
     }
 
@@ -465,16 +459,14 @@ where
             .pending_block_sender();
 
         Ok(sender)
+    }
+
     /// Return a worker's local Http address if the RpcServer exists.
     pub(super) fn worker_http_local_address(
         &self,
         worker_id: &WorkerId,
     ) -> eyre::Result<Option<SocketAddr>> {
-        let addr = self
-            .workers
-            .get(worker_id)
-            .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
-            .http_local_addr();
+        let addr = self.worker_rpc_handle(worker_id)?.http_local_addr();
         Ok(addr)
     }
 }

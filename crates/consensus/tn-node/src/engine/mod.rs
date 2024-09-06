@@ -159,6 +159,7 @@ where
     ) -> eyre::Result<watch::Sender<PendingWorkerBlock>> {
         let guard = self.internal.read().await;
         guard.worker_pending_block_sender(worker_id)
+    }
 
     /// Return an HTTP local address for submitting transactions to the RPC.
     pub async fn worker_http_local_address(

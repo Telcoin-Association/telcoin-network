@@ -22,6 +22,7 @@ use reth_evm::execute::{
     BlockExecutionError, BlockExecutionOutput, BlockExecutorProvider, BlockValidationError,
     Executor,
 };
+use reth_execution_errors::InternalBlockExecutionError;
 use reth_primitives::{
     constants::{EMPTY_TRANSACTIONS, ETHEREUM_BLOCK_GAS_LIMIT},
     keccak256, proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber,
@@ -30,6 +31,7 @@ use reth_primitives::{
 use reth_provider::{BlockReaderIdExt, ExecutionOutcome, StateProviderFactory};
 use reth_revm::database::StateProviderDatabase;
 use reth_transaction_pool::TransactionPool;
+use reth_trie::HashedPostState;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -307,11 +309,11 @@ impl StorageInner {
         let parent = provider.latest_header()
             .map_err(|e| {
                 error!(target: "execution::batch_maker", "error retrieving client.latest_header() {e}");
-                BlockExecutionError::LatestBlock(e)
+                BlockExecutionError::Internal(InternalBlockExecutionError::LatestBlock(e))
             })?
             .ok_or_else(|| {
                 error!(target: "execution::batch_maker", "error retrieving client.latest_header() returned `None`");
-                BlockExecutionError::LatestBlock(reth_provider::ProviderError::FinalizedBlockNotFound)
+                BlockExecutionError::Internal(InternalBlockExecutionError::LatestBlock(reth_provider::ProviderError::FinalizedBlockNotFound))
             })?;
 
         debug!(target: "execution::batch_maker", latest=?parent);
@@ -338,9 +340,9 @@ impl StorageInner {
         // TODO: should this use the latest or finalized for next batch?
         //
         // for now, keep it consistent with latest block retrieved for header template
-        let mut db = StateProviderDatabase::new(
-            provider.latest().map_err(BlockExecutionError::LatestBlock)?,
-        );
+        let mut db = StateProviderDatabase::new(provider.latest().map_err(|e| {
+            BlockExecutionError::Internal(InternalBlockExecutionError::LatestBlock(e))
+        })?);
 
         let block_number = block.number;
 
@@ -360,16 +362,17 @@ impl StorageInner {
         // see reth::crates::payload::ethereum::default_ethereum_payload_builder()
         //
         // expensive calculations - update header
-        header.state_root = db.state_root(bundle_state.state())?;
+        let hashed_state = HashedPostState::from_bundle_state(&bundle_state.state().state);
+        header.state_root = db.state_root(hashed_state)?;
         header.receipts_root = bundle_state.receipts_root_slow(block_number)
             .ok_or_else(|| {
                 error!(target: "execution::batch_maker", "error calculating receipts root from bundle state");
-                BlockExecutionError::Other("Failed to create receipts root from bundle state".into())
+                BlockExecutionError::msg("Failed to create receipts root from bundle state".to_string())
             })?;
         header.logs_bloom = bundle_state.block_logs_bloom(block_number)
             .ok_or_else(|| {
                 error!(target: "execution::batch_maker", "error calculating logs bloom from bundle state");
-                BlockExecutionError::Other("Failed to calculate logs bloom from bundle state".into())
+                BlockExecutionError::msg("Failed to calculate logs bloom from bundle state".to_string())
             })?;
 
         // finally insert into storage

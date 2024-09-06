@@ -9,6 +9,7 @@
 
 use enr::{secp256k1::SecretKey, Enr};
 use reth::rpc::builder::RpcServerHandle;
+use reth_chainspec::ChainSpec;
 use reth_db::{
     database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
@@ -126,6 +127,7 @@ where
 {
     type Primitives = ();
     type Engine = EthEngineTypes;
+    type ChainSpec = ChainSpec;
 }
 
 impl<DB, Evm> FullNodeTypes for WorkerNode<DB, Evm>
@@ -261,5 +263,15 @@ impl Peers for WorkerNetwork {
 
     async fn reputation_by_id(&self, _peer_id: PeerId) -> Result<Option<Reputation>, NetworkError> {
         Ok(None)
+    }
+
+    fn connect_peer_kind(
+        &self,
+        peer: PeerId,
+        kind: PeerKind,
+        tcp_addr: SocketAddr,
+        udp_addr: Option<SocketAddr>,
+    ) {
+        // unimplemented!
     }
 }

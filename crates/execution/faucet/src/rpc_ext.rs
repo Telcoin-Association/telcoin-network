@@ -2,7 +2,6 @@
 
 use super::Faucet;
 use crate::FaucetConfig;
-use async_trait::async_trait;
 use jsonrpsee::proc_macros::rpc;
 use reth::rpc::server_types::eth::EthResult;
 use reth_primitives::{Address, TxHash};
@@ -13,7 +12,6 @@ use tokio::sync::watch;
 
 /// Faucet that disperses 1 TEL every 24hours per requesting address.
 #[rpc(server, namespace = "faucet")]
-#[async_trait]
 pub trait FaucetRpcExtApi {
     /// Transfer TEL to an address
     #[method(name = "transfer")]
@@ -25,7 +23,7 @@ pub struct FaucetRpcExt {
     faucet: Faucet,
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl FaucetRpcExtApiServer for FaucetRpcExt {
     /// Faucet method.
     ///

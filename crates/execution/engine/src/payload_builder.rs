@@ -22,6 +22,7 @@ use reth_revm::{
     primitives::{EVMError, EnvWithHandlerCfg, ResultAndState},
     DatabaseCommit, State,
 };
+use reth_trie::HashedPostState;
 use std::sync::Arc;
 use tn_types::{BuildArguments, TNPayload, TNPayloadAttributes};
 use tracing::{debug, error, info, warn};
@@ -36,7 +37,10 @@ pub fn execute_consensus_output<EvmConfig, Provider>(
 ) -> EngineResult<SealedHeader>
 where
     EvmConfig: ConfigureEvm,
-    Provider: StateProviderFactory + ChainSpecProvider + BlockchainTreeEngine + CanonChainTracker,
+    Provider: StateProviderFactory
+        + ChainSpecProvider<ChainSpec = ChainSpec>
+        + BlockchainTreeEngine
+        + CanonChainTracker,
 {
     let BuildArguments { provider, mut output, parent_header } = args;
     debug!(target: "engine", ?output, "executing output");
@@ -381,11 +385,12 @@ where
     let receipts_root =
         execution_outcome.receipts_root_slow(block_number).expect("Number is in range");
     let logs_bloom = execution_outcome.block_logs_bloom(block_number).expect("Number is in range");
+    let hashed_state = HashedPostState::from_bundle_state(&execution_outcome.state().state);
 
     // calculate the state root
     let state_root = {
         let state_provider = db.database.0.inner.borrow_mut();
-        state_provider.db.state_root(execution_outcome.state())?
+        state_provider.db.state_root(hashed_state)?
     };
 
     // create the block header
@@ -495,7 +500,8 @@ where
 
     // calculate the state root
     let bundle_state = db.take_bundle();
-    let state_root = db.database.state_root(&bundle_state).map_err(|err| {
+    let hashed_state = HashedPostState::from_bundle_state(&bundle_state.state);
+    let state_root = db.database.state_root(hashed_state).map_err(|err| {
         warn!(target: "engine",
             parent_hash=%payload.attributes.parent_header.hash(),
             %err,

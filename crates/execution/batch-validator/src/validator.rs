@@ -14,6 +14,7 @@ use reth_provider::{
     StateRootProvider,
 };
 use reth_revm::database::StateProviderDatabase;
+use reth_trie::HashedPostState;
 use std::{
     fmt::{Debug, Display},
     sync::Arc,
@@ -203,7 +204,8 @@ where
                 .database_provider_ro()?
                 .state_provider_by_block_number(parent.number)?,
         );
-        let state_root = db.state_root(&state)?;
+        let hashed_state = HashedPostState::from_bundle_state(&state.state);
+        let state_root = db.state_root(hashed_state)?;
         if block_with_senders.state_root != state_root {
             return Err(BatchValidationError::BodyStateRootDiff(GotExpected {
                 got: state_root,
