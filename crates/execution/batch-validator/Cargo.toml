@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 tn-types = { workspace = true }
 reth-consensus = { workspace = true }
+reth-trie = { workspace = true }
 reth-provider = { workspace = true }
 reth-primitives = { workspace = true }
 reth-chainspec = { workspace = true }

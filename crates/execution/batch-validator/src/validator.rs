@@ -14,6 +14,7 @@ use reth_provider::{
     StateRootProvider,
 };
 use reth_revm::database::StateProviderDatabase;
+use reth_trie::HashedPostState;
 use std::{
     fmt::{Debug, Display},
     sync::Arc,
@@ -39,8 +40,9 @@ where
 }
 
 /// Defines the validation procedure for receiving either a new single transaction (from a client)
-/// of a batch of transactions (from another validator). Invalid transactions will not receive
-/// further processing.
+/// of a batch of transactions (from another validator).
+///
+/// Invalid transactions will not receive further processing.
 #[async_trait::async_trait]
 pub trait BatchValidation: Clone + Send + Sync + 'static {
     type Error: Display + Debug + Send + Sync + 'static;
@@ -202,7 +204,8 @@ where
                 .database_provider_ro()?
                 .state_provider_by_block_number(parent.number)?,
         );
-        let state_root = db.state_root(&state)?;
+        let hashed_state = HashedPostState::from_bundle_state(&state.state);
+        let state_root = db.state_root(hashed_state)?;
         if block_with_senders.state_root != state_root {
             return Err(BatchValidationError::BodyStateRootDiff(GotExpected {
                 got: state_root,
@@ -386,24 +389,27 @@ mod tests {
         let transaction1 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 1: {transaction1:?}");
 
         let transaction2 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 2: {transaction2:?}");
 
         let transaction3 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 3: {transaction3:?}");
 
@@ -490,24 +496,27 @@ mod tests {
         let transaction1 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 1: {transaction1:?}");
 
         let transaction2 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 2: {transaction2:?}");
 
         let transaction3 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 3: {transaction3:?}");
 
@@ -598,24 +607,27 @@ mod tests {
         let transaction1 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 1: {transaction1:?}");
 
         let transaction2 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 2: {transaction2:?}");
 
         let transaction3 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 3: {transaction3:?}");
 
@@ -707,24 +719,27 @@ mod tests {
         let transaction1 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 1: {transaction1:?}");
 
         let transaction2 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 2: {transaction2:?}");
 
         let transaction3 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 3: {transaction3:?}");
 
@@ -858,24 +873,27 @@ mod tests {
         let transaction1 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 1: {transaction1:?}");
 
         let transaction2 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 2: {transaction2:?}");
 
         let transaction3 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 3: {transaction3:?}");
 

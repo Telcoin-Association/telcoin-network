@@ -4,7 +4,9 @@
 
 use std::net::{TcpListener, TcpStream};
 
-/// Return an ephemeral, available port. On unix systems, the port returned will be in the
+/// Return an ephemeral, available port.
+///
+/// On unix systems, the port returned will be in the
 /// TIME_WAIT state ensuring that the OS won't hand out this port for some grace period.
 /// Callers should be able to bind to this port given they use SO_REUSEADDR.
 pub fn get_available_tcp_port(host: &str) -> Option<u16> {

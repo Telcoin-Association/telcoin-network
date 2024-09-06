@@ -8,6 +8,8 @@
 //! generic over it.
 
 use enr::{secp256k1::SecretKey, Enr};
+use reth::rpc::builder::RpcServerHandle;
+use reth_chainspec::ChainSpec;
 use reth_db::{
     database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
@@ -29,12 +31,86 @@ use reth_node_builder::{
 use reth_node_ethereum::EthEngineTypes;
 use reth_provider::providers::BlockchainProvider;
 use reth_rpc_types::admin::EthProtocolInfo;
-use reth_transaction_pool::TransactionPool;
+use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool, TransactionPool};
 use std::{
     marker::PhantomData,
     net::{IpAddr, SocketAddr},
 };
-use tn_types::adiri_chain_spec;
+use tn_types::{adiri_chain_spec, PendingWorkerBlock};
+use tokio::sync::watch;
+
+/// The explicit type for the worker's transaction pool.
+pub type WorkerTxPool<DB> = EthTransactionPool<BlockchainProvider<DB>, DiskFileBlobStore>;
+
+/// Convenience type for managing worker watch channels for pending block.
+#[derive(Clone, Debug)]
+pub(super) struct PendingBlockWatchChannels {
+    /// The sending half of the watch channel.
+    sender: watch::Sender<PendingWorkerBlock>,
+    /// The receiving half of the watch channel.
+    receiver: watch::Receiver<PendingWorkerBlock>,
+}
+
+impl PendingBlockWatchChannels {
+    /// Create a new instance of [Self].
+    pub fn new(
+        sender: watch::Sender<PendingWorkerBlock>,
+        receiver: watch::Receiver<PendingWorkerBlock>,
+    ) -> Self {
+        Self { sender, receiver }
+    }
+
+    /// Return an owned sender channel.
+    pub fn sender(&self) -> watch::Sender<PendingWorkerBlock> {
+        self.sender.clone()
+    }
+
+    /// Return an owned receiver channel.
+    pub fn receiver(&self) -> watch::Receiver<PendingWorkerBlock> {
+        self.receiver.clone()
+    }
+}
+
+/// Execution components on a per-worker basis.
+pub(super) struct WorkerComponents<DB> {
+    /// The RPC handle.
+    rpc_handle: RpcServerHandle,
+    /// The current pending block watch channel.
+    pending_channels: PendingBlockWatchChannels,
+    /// The worker's transaction pool.
+    pool: WorkerTxPool<DB>,
+}
+
+impl<DB> WorkerComponents<DB> {
+    /// Create a new instance of [Self].
+    pub fn new(
+        rpc_handle: RpcServerHandle,
+        pending_channels: PendingBlockWatchChannels,
+        pool: WorkerTxPool<DB>,
+    ) -> Self {
+        Self { rpc_handle, pending_channels, pool }
+    }
+
+    /// Return a reference to the rpc handle
+    pub fn rpc_handle(&self) -> &RpcServerHandle {
+        &self.rpc_handle
+    }
+
+    /// Return a reference to the worker's transaction pool.
+    pub fn pool(&self) -> WorkerTxPool<DB> {
+        self.pool.clone()
+    }
+
+    /// Return a receiver for pending block watch channel.
+    pub fn pending_block_receiver(&self) -> watch::Receiver<PendingWorkerBlock> {
+        self.pending_channels.receiver()
+    }
+
+    /// Return a sender for pending block watch channel.
+    pub fn pending_block_sender(&self) -> watch::Sender<PendingWorkerBlock> {
+        self.pending_channels.sender()
+    }
+}
 
 /// Type configuration for a regular worker node.
 #[derive(Debug, Default, Clone, Copy)]
@@ -51,6 +127,7 @@ where
 {
     type Primitives = ();
     type Engine = EthEngineTypes;
+    type ChainSpec = ChainSpec;
 }
 
 impl<DB, Evm> FullNodeTypes for WorkerNode<DB, Evm>
@@ -186,5 +263,15 @@ impl Peers for WorkerNetwork {
 
     async fn reputation_by_id(&self, _peer_id: PeerId) -> Result<Option<Reputation>, NetworkError> {
         Ok(None)
+    }
+
+    fn connect_peer_kind(
+        &self,
+        _peer: PeerId,
+        _kind: PeerKind,
+        _tcp_addr: SocketAddr,
+        _udp_addr: Option<SocketAddr>,
+    ) {
+        // unimplemented!
     }
 }

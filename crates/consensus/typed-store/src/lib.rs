@@ -217,6 +217,7 @@ mod test {
 
         let start = std::time::Instant::now();
         let mut i = 0;
+        #[allow(clippy::explicit_counter_loop)]
         for (k, v) in db.iter::<TestTable>() {
             assert_eq!(k, i);
             assert_eq!(v, i.to_string());

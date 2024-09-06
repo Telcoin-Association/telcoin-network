@@ -2,16 +2,16 @@
 
 use super::Faucet;
 use crate::FaucetConfig;
-use async_trait::async_trait;
 use jsonrpsee::proc_macros::rpc;
 use reth::rpc::server_types::eth::EthResult;
 use reth_primitives::{Address, TxHash};
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_transaction_pool::TransactionPool;
+use tn_types::PendingWorkerBlock;
+use tokio::sync::watch;
 
 /// Faucet that disperses 1 TEL every 24hours per requesting address.
 #[rpc(server, namespace = "faucet")]
-#[async_trait]
 pub trait FaucetRpcExtApi {
     /// Transfer TEL to an address
     #[method(name = "transfer")]
@@ -23,7 +23,7 @@ pub struct FaucetRpcExt {
     faucet: Faucet,
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl FaucetRpcExtApiServer for FaucetRpcExt {
     /// Faucet method.
     ///
@@ -40,12 +40,17 @@ impl FaucetRpcExtApiServer for FaucetRpcExt {
 
 impl FaucetRpcExt {
     /// Create new instance
-    pub fn new<Provider, Pool>(provider: Provider, pool: Pool, config: FaucetConfig) -> Self
+    pub fn new<Provider, Pool>(
+        provider: Provider,
+        pool: Pool,
+        config: FaucetConfig,
+        watch_rx: watch::Receiver<PendingWorkerBlock>,
+    ) -> Self
     where
         Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
         Pool: TransactionPool + Unpin + Clone + 'static,
     {
-        let faucet = Faucet::spawn(provider, pool, config);
+        let faucet = Faucet::spawn(provider, pool, config, watch_rx);
 
         Self { faucet }
     }

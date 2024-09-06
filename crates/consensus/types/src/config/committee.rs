@@ -403,7 +403,7 @@ impl Committee {
 
     /// Return the network addresses that are present in the current committee but that are absent
     /// from the new committee (provided as argument).
-    pub fn network_diff<'a>(&'a self, other: &'a Self) -> HashSet<&Multiaddr> {
+    pub fn network_diff<'a>(&'a self, other: &'a Self) -> HashSet<&'a Multiaddr> {
         self.get_all_network_addresses()
             .difference(&other.get_all_network_addresses())
             .cloned()

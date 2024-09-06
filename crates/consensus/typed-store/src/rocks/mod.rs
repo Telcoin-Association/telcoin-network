@@ -63,6 +63,7 @@ const ROCKSDB_PROPERTY_TOTAL_BLOB_FILES_SIZE: &CStr =
 mod tests;
 
 /// Repeatedly attempt an Optimistic Transaction until it succeeds.
+///
 /// Since many callsites (e.g. the consensus handler) cannot proceed in the case of failed writes,
 /// this will loop forever until the transaction succeeds.
 #[macro_export]

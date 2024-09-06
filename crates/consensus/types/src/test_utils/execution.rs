@@ -2,7 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Specific test utils for execution layer
-use crate::{adiri_genesis, now, Batch, BatchAPI, ExecutionKeypair, MetadataAPI, TimestampSec};
+use super::contract_artifacts::{ERC1967PROXY_INITCODE, STABLECOIN_INITCODE};
+use crate::{
+    adiri_genesis, now, test_utils::contract_artifacts::STABLECOINMANAGER_INITCODE, Batch,
+    BatchAPI, ExecutionKeypair, MetadataAPI, TimestampSec,
+};
+use alloy::{
+    network::{EthereumWallet, TransactionBuilder},
+    providers::{Provider, ProviderBuilder},
+    signers::{k256::FieldBytes, local::PrivateKeySigner},
+    sol,
+    sol_types::SolValue,
+};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use reth_chainspec::{BaseFeeParams, ChainSpec};
 use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, Executor as _};
@@ -10,16 +21,18 @@ use reth_primitives::{
     constants::{
         EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE,
     },
-    proofs, public_key_to_address, sign_message, Address, Block, FromRecoveredPooledTransaction,
-    Genesis, GenesisAccount, Header, PooledTransactionsElement, SealedHeader, Signature,
-    Transaction, TransactionSigned, TxEip1559, TxHash, TxKind, Withdrawals, B256,
-    EMPTY_OMMER_ROOT_HASH, U256,
+    proofs, public_key_to_address, sign_message, Address, Block, Bytes, Genesis, GenesisAccount,
+    Header, PooledTransactionsElement, SealedHeader, Signature, Transaction, TransactionSigned,
+    TxEip1559, TxHash, TxKind, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256,
 };
 use reth_provider::{BlockReaderIdExt, ExecutionOutcome, StateProviderFactory};
 use reth_revm::database::StateProviderDatabase;
-use reth_transaction_pool::{TransactionOrigin, TransactionPool};
+use reth_rpc_types::TransactionRequest;
+use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool};
+use reth_trie::HashedPostState;
 use secp256k1::Secp256k1;
 use std::{str::FromStr as _, sync::Arc};
+use tracing::debug;
 
 /// Adiri genesis with funded [TransactionFactory] default account.
 pub fn test_genesis() -> Genesis {
@@ -82,6 +95,7 @@ pub fn seeded_genesis_from_random_batches<'a>(
 /// Optional parameters to pass to the `execute_test_batch` function.
 ///
 /// These optional parameters are used to replace default in the batch's header if included.
+#[derive(Debug, Default)]
 pub struct OptionalTestBatchParams {
     /// Optional beneficiary address.
     ///
@@ -195,20 +209,20 @@ pub fn execute_test_batch<P, E>(
         .executor(&mut db)
         .execute((&block, U256::ZERO).into())
         .expect("executor can execute test batch transactions");
-    let bundle_state = ExecutionOutcome::new(state, receipts.into(), block_number, vec![]);
+    let execution_outcome = ExecutionOutcome::new(state, receipts.into(), block_number, vec![]);
+    let hashed_state = HashedPostState::from_bundle_state(&execution_outcome.state().state);
 
     // retrieve header to update values post-execution
     let Block { mut header, .. } = block.block;
 
     // update header
     header.gas_used = gas_used;
-    header.state_root = db
-        .state_root(bundle_state.state())
-        .expect("state root calculation during test batch execution");
-    header.receipts_root = bundle_state
+    header.state_root =
+        db.state_root(hashed_state).expect("state root calculation during test batch execution");
+    header.receipts_root = execution_outcome
         .receipts_root_slow(block_number)
         .expect("receipts root calculation during test batch execution");
-    header.logs_bloom = bundle_state
+    header.logs_bloom = execution_outcome
         .block_logs_bloom(block_number)
         .expect("logs bloom calculation during test batch execution");
 
@@ -216,6 +230,100 @@ pub fn execute_test_batch<P, E>(
     let sealed_header = header.seal_slow();
     let md = batch.versioned_metadata_mut();
     md.update_header(sealed_header);
+}
+
+/// Test utility to execute batch and return execution outcome.
+///
+/// NOTE: this is loosely based on reth's auto-seal consensus
+pub fn execution_outcome_from_test_batch_<P, E>(
+    batch: &Batch,
+    parent: &SealedHeader,
+    optional_params: OptionalTestBatchParams,
+    provider: &P,
+    executor: &E,
+) -> ExecutionOutcome
+where
+    P: StateProviderFactory + BlockReaderIdExt,
+    E: BlockExecutorProvider,
+{
+    // deconstruct optional parameters for header
+    let OptionalTestBatchParams {
+        beneficiary_opt,
+        withdrawals_opt,
+        timestamp_opt,
+        mix_hash_opt,
+        base_fee_per_gas_opt,
+    } = optional_params;
+
+    // create "empty" header with default values
+    let mut header = Header {
+        parent_hash: parent.hash(),
+        ommers_hash: EMPTY_OMMER_ROOT_HASH,
+        beneficiary: beneficiary_opt.unwrap_or_else(|| Address::random()),
+        state_root: Default::default(),
+        transactions_root: Default::default(),
+        receipts_root: Default::default(),
+        withdrawals_root: Some(
+            withdrawals_opt
+                .clone()
+                .map_or(EMPTY_WITHDRAWALS, |w| proofs::calculate_withdrawals_root(&w)),
+        ),
+        logs_bloom: Default::default(),
+        difficulty: U256::ZERO,
+        number: parent.number + 1,
+        gas_limit: ETHEREUM_BLOCK_GAS_LIMIT,
+        gas_used: 0,
+        timestamp: timestamp_opt.unwrap_or_else(now),
+        mix_hash: mix_hash_opt.unwrap_or_else(|| B256::random()),
+        nonce: 0,
+        base_fee_per_gas: base_fee_per_gas_opt.or(Some(MIN_PROTOCOL_BASE_FEE)),
+        blob_gas_used: None,
+        excess_blob_gas: None,
+        extra_data: Default::default(),
+        parent_beacon_block_root: None,
+        requests_root: None,
+    };
+
+    // decode batch transactions
+    let mut txs = vec![];
+    for tx in batch.transactions_owned() {
+        let tx_signed =
+            TransactionSigned::decode_enveloped(&mut tx.as_ref()).expect("decode tx signed");
+        txs.push(tx_signed);
+    }
+
+    // update header's transactions root
+    header.transactions_root = if batch.transactions().is_empty() {
+        EMPTY_TRANSACTIONS
+    } else {
+        proofs::calculate_transaction_root(&txs)
+    };
+
+    // recover senders from block
+    let block = Block {
+        header,
+        body: txs,
+        ommers: vec![],
+        withdrawals: withdrawals_opt.clone(),
+        requests: None,
+    }
+    .with_recovered_senders()
+    .expect("unable to recover senders while executing test batch");
+
+    // create execution db
+    let mut db = StateProviderDatabase::new(
+        provider.latest().expect("provider retrieves latest during test batch execution"),
+    );
+
+    // convenience
+    let block_number = block.number;
+
+    // execute the block
+    let BlockExecutionOutput { state, receipts, .. } = executor
+        .executor(&mut db)
+        .execute((&block, U256::ZERO).into())
+        .expect("executor can execute test batch transactions");
+    ExecutionOutcome::new(state, receipts.into(), block_number, vec![])
 }
 
 /// Transaction factory
@@ -273,7 +381,7 @@ impl TransactionFactory {
     }
 
     /// Increment nonce after a transaction was created and signed.
-    fn inc_nonce(&mut self) {
+    pub fn inc_nonce(&mut self) {
         self.nonce += 1;
     }
 
@@ -282,9 +390,15 @@ impl TransactionFactory {
         &mut self,
         chain: Arc<ChainSpec>,
         gas_price: u128,
-        to: Address,
+        to: Option<Address>,
         value: U256,
+        input: Bytes,
     ) -> TransactionSigned {
+        let tx_kind = match to {
+            Some(address) => TxKind::Call(address),
+            None => TxKind::Create,
+        };
+
         // Eip1559
         let transaction = Transaction::Eip1559(TxEip1559 {
             chain_id: chain.chain.id(),
@@ -292,9 +406,9 @@ impl TransactionFactory {
             max_priority_fee_per_gas: 0,
             max_fee_per_gas: gas_price,
             gas_limit: 1_000_000,
-            to: TxKind::Call(to),
+            to: tx_kind,
             value,
-            input: Default::default(),
+            input,
             access_list: Default::default(),
         });
 
@@ -318,6 +432,14 @@ impl TransactionFactory {
         signature.expect("failed to sign transaction")
     }
 
+    /// Helper to instantiate an `alloy-signer-local::PrivateKeySigner` wrapping the default account
+    pub fn get_default_signer(&self) -> eyre::Result<PrivateKeySigner> {
+        // circumvent Secp256k1 <> k256 type incompatibility via FieldBytes intermediary
+        let binding = self.keypair.secret_key().secret_bytes();
+        let secret_bytes_array = FieldBytes::from_slice(&binding);
+        Ok(PrivateKeySigner::from_field_bytes(secret_bytes_array)?)
+    }
+
     /// Create and submit the next transaction to the provided [TransactionPool].
     pub async fn create_and_submit_eip1559_pool_tx<Pool>(
         &mut self,
@@ -330,11 +452,11 @@ impl TransactionFactory {
     where
         Pool: TransactionPool,
     {
-        let tx = self.create_eip1559(chain, gas_price, to, value);
+        let tx = self.create_eip1559(chain, gas_price, Some(to), value, Bytes::new());
         let pooled_tx =
             PooledTransactionsElement::try_from_broadcast(tx).expect("tx valid for pool");
         let recovered = pooled_tx.try_into_ecrecovered().expect("tx is recovered");
-        let transaction = <Pool::Transaction>::from_recovered_pooled_transaction(recovered);
+        let transaction = <Pool::Transaction>::from_pooled(recovered);
 
         pool.add_transaction(TransactionOrigin::Local, transaction)
             .await
@@ -349,9 +471,9 @@ impl TransactionFactory {
         let pooled_tx =
             PooledTransactionsElement::try_from_broadcast(tx).expect("tx valid for pool");
         let recovered = pooled_tx.try_into_ecrecovered().expect("tx is recovered");
-        let transaction = <Pool::Transaction>::from_recovered_pooled_transaction(recovered);
+        let transaction = <Pool::Transaction>::from_pooled(recovered);
 
-        println!("transaction: \n{transaction:?}\n");
+        debug!("transaction: \n{transaction:?}\n");
 
         pool.add_transaction(TransactionOrigin::Local, transaction)
             .await
@@ -371,10 +493,202 @@ where
     header.next_block_base_fee(BaseFeeParams::ethereum()).unwrap_or_default().into()
 }
 
+/// Helper to deploy implementation contract for an eXYZ
+pub async fn deploy_contract_stablecoin(
+    rpc_url: &str,
+    tx_factory: &mut TransactionFactory,
+) -> eyre::Result<Address> {
+    // stablecoin interface
+    sol!(
+        #[allow(clippy::too_many_arguments)]
+        #[sol(rpc)]
+        contract Stablecoin {
+            function initialize(
+                string memory name_,
+                string memory symbol_,
+                uint8 decimals_
+            ) external;
+            function decimals() external view returns (uint8);
+            function mint(uint256 value) external;
+            function mintTo(
+                address account,
+                uint256 value
+            ) external;
+            function burn(uint256 value) external;
+            function burnFrom(
+                address account,
+                uint256 value
+            ) external;
+        }
+    );
+
+    let signer: PrivateKeySigner = tx_factory.get_default_signer()?;
+    let wallet = EthereumWallet::from(signer);
+    let provider =
+        ProviderBuilder::new().with_recommended_fillers().wallet(wallet).on_http(rpc_url.parse()?);
+    let factory_address = tx_factory.address();
+    let current_nonce = provider.get_transaction_count(factory_address).await?;
+    let stablecoin_contract = factory_address.create(current_nonce);
+    let tx = TransactionRequest::default().with_deploy_code(STABLECOIN_INITCODE);
+    let sent = provider.send_transaction(tx).await.expect("Failed to deploy stablecoin");
+    let _receipt = sent.get_receipt().await?;
+
+    // manually increment nonce
+    tx_factory.inc_nonce();
+
+    Ok(Address(*stablecoin_contract))
+}
+
+/// Helper to deploy implementation contract for the canonical Telcoin faucet
+///
+/// Since Alloy doesn't yet offer utilities for the `CREATE2`, we rebuild and submit deploy and
+/// upgrade transactions to derive the expected faucet proxy address
+pub async fn deploy_contract_faucet_initialize(
+    chain: Arc<ChainSpec>,
+    rpc_url: &str,
+    kms_address: Address,
+    deployed_token_bytes: Vec<Address>,
+    tx_factory: &mut TransactionFactory,
+) -> eyre::Result<Address> {
+    sol!(
+        #[sol(rpc)]
+        contract StablecoinManager {
+            struct StablecoinManagerInitParams {
+                address admin_;
+                address maintainer_;
+                address[] tokens_;
+                uint256 initMaxLimit;
+                uint256 initMinLimit;
+                address[] authorizedFaucets_;
+                uint256 dripAmount_;
+                uint256 nativeDripAmount_;
+            }
+
+            function initialize(StablecoinManagerInitParams calldata initParams) external;
+            function grantRole(bytes32 role, address account) external;
+        }
+    );
+
+    let signer: PrivateKeySigner = tx_factory.get_default_signer()?;
+    let wallet = EthereumWallet::from(signer);
+    let provider =
+        ProviderBuilder::new().with_recommended_fillers().wallet(wallet).on_http(rpc_url.parse()?);
+
+    let factory_address = tx_factory.address();
+    let current_nonce = provider.get_transaction_count(factory_address).await?;
+    let faucet_impl = factory_address.create(current_nonce);
+    let tx = TransactionRequest::default().with_deploy_code(STABLECOINMANAGER_INITCODE);
+    let sent = provider.send_transaction(tx).await.expect("Failed to deploy faucet impl");
+    let _receipt = sent.get_receipt().await?;
+
+    // manually increment nonce
+    tx_factory.inc_nonce();
+    debug!("Faucet implementation deployed to: {}", faucet_impl);
+
+    // deploy canonical faucet (proxy)
+    // keccak256(initialize((address,address,address[],uint256,uint256,address[],uint256,uint256))
+    // == 0x16ada6b1
+    let faucet_init_selector = [22, 173, 166, 177];
+    let admin: Address = tx_factory.address();
+    let init_max_limit = U256::MAX;
+    let init_min_limit = U256::from(1_000);
+    let kms_faucets = vec![kms_address];
+    let xyz_amount = U256::from(10).checked_pow(U256::from(6)).expect("1e18 doesn't overflow U256"); // 100 $XYZ
+    let tel_amount =
+        U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256"); // 1 $TEL
+
+    let init_params = StablecoinManager::StablecoinManagerInitParams {
+        admin_: admin,
+        maintainer_: admin,
+        tokens_: deployed_token_bytes,
+        initMaxLimit: init_max_limit,
+        initMinLimit: init_min_limit,
+        authorizedFaucets_: kms_faucets,
+        dripAmount_: xyz_amount,
+        nativeDripAmount_: tel_amount,
+    }
+    .abi_encode();
+    let init_call = [&faucet_init_selector, &init_params[..]].concat().into();
+
+    let faucet_contract =
+        deploy_contract_proxy(rpc_url, faucet_impl, init_call, tx_factory).await?;
+    debug!("Successfully deployed canonical faucet to: {}", faucet_contract);
+
+    // grant faucet role to kms address
+    // 0x2f2ff15d
+    let gas_price = provider.get_gas_price().await?;
+    let grant_role_selector = [47, 47, 241, 93];
+    let grant_role_params = (
+        B256::from_str("0xaecf5761d3ba769b4631978eb26cb84eae66bcaca9c3f0f4ecde3feb2f4cf144")?,
+        kms_address,
+    )
+        .abi_encode_params();
+    let grant_role_call = [&grant_role_selector, &grant_role_params[..]].concat().into();
+    let grant_role_tx = tx_factory
+        .create_eip1559(
+            chain.clone(),
+            gas_price,
+            Some(faucet_contract),
+            U256::ZERO,
+            grant_role_call,
+        )
+        .envelope_encoded();
+    let _tx_hash = provider.send_raw_transaction(grant_role_tx.as_ref()).await?;
+
+    debug!("Successfully granted faucet fole to: {}", faucet_contract);
+
+    // fund faucet with some tel
+    let value = U256::from(10_000_000_000_000_000_000u128);
+    let fund_faucet_tx = tx_factory
+        .create_eip1559(chain, gas_price, Some(faucet_contract), value, Bytes::new())
+        .envelope_encoded();
+    let tx_hash = provider.send_raw_transaction(fund_faucet_tx.as_ref()).await?.watch().await?;
+    debug!("Faucet contract successfully brought up to date and funded in tx: {}", tx_hash);
+
+    Ok(faucet_contract)
+}
+
+/// Helper function to deploy an ERC1967 proxy contract
+/// Note that `init_bytes` should be abi-encoded bytes used for `ERC1967::constructor()`
+pub async fn deploy_contract_proxy(
+    rpc_url: &str,
+    implementation: Address,
+    init_bytes: Bytes,
+    tx_factory: &mut TransactionFactory,
+) -> eyre::Result<Address> {
+    // ERC1967Proxy interface
+    sol!(
+        #[allow(clippy::too_many_arguments)]
+        #[sol(rpc)]
+        contract ERC1967Proxy {
+            constructor(address implementation, bytes memory _data);
+        }
+    );
+
+    let signer: PrivateKeySigner = tx_factory.get_default_signer()?;
+    let wallet = EthereumWallet::from(signer);
+    let provider =
+        ProviderBuilder::new().with_recommended_fillers().wallet(wallet).on_http(rpc_url.parse()?);
+
+    let factory_address = tx_factory.address();
+    let current_nonce = provider.get_transaction_count(factory_address).await?;
+    let proxy_contract = factory_address.create(current_nonce);
+    let constructor_args = (implementation, init_bytes).abi_encode_params();
+    let initcode_and_constructor_args =
+        [ERC1967PROXY_INITCODE.as_slice(), &constructor_args[..]].concat();
+    let tx = TransactionRequest::default().with_deploy_code(initcode_and_constructor_args);
+    let sent = provider.send_transaction(tx).await.expect("Failed to deploy faucet impl");
+    let _receipt = sent.get_receipt().await?;
+
+    debug!("Successfully deployed proxy contract to {}", proxy_contract);
+    // manually increment nonce
+    tx_factory.inc_nonce();
+
+    Ok(Address(*proxy_contract))
+}
+
 #[cfg(test)]
 mod tests {
-    use reth_primitives::hex;
-    // use std::str::FromStr;
 
     use super::*;
     #[test]
@@ -387,10 +701,10 @@ mod tests {
         let keypair = ExecutionKeypair::from_secret_key(&secp, &secret_key);
 
         // let private = base64::encode(keypair.secret.as_bytes());
-        let secret = keypair.secret_bytes();
-        println!("secret: {:?}", hex::encode(secret));
-        let pubkey = keypair.public_key().serialize();
-        println!("public: {:?}", hex::encode(pubkey));
+        let _secret = keypair.secret_bytes();
+        // println!("secret: {:?}", hex::encode(secret));
+        let _pubkey = keypair.public_key().serialize();
+        // println!("public: {:?}", hex::encode(pubkey));
 
         // 9bf49a6a0755f953811fce125f2683d50429c3bb49e074147e0089a52eae155f
         // println!("{:?}", hex::encode(bytes));

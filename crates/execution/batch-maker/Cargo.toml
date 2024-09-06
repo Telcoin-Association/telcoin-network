@@ -24,6 +24,8 @@ reth-transaction-pool = { workspace = true }
 reth-payload-builder = { workspace = true }
 reth-node-core = { workspace = true }
 reth-node-ethereum = { workspace = true }
+reth-trie = { workspace = true }
+reth-execution-errors = { workspace = true }
 
 consensus-metrics = { workspace = true }
 

@@ -2,7 +2,7 @@
 //!
 //! This module contains the logic for execution.
 
-use super::TnBuilder;
+use super::{PendingBlockWatchChannels, TnBuilder, WorkerComponents, WorkerTxPool};
 use crate::{
     engine::{WorkerNetwork, WorkerNode},
     error::ExecutionError,
@@ -29,19 +29,19 @@ use reth_node_ethereum::{node::EthereumPoolBuilder, EthEvmConfig};
 use reth_primitives::Address;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
-    DatabaseProviderFactory, FinalizedBlockReader, HeaderProvider, ProviderFactory,
-    StaticFileProviderFactory as _,
+    DatabaseProviderFactory, ExecutionOutcome, FinalizedBlockReader, HeaderProvider,
+    ProviderFactory,
 };
 use reth_prune::PruneModes;
 use reth_tasks::TaskExecutor;
 use reth_transaction_pool::TransactionPool;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tn_batch_maker::{BatchMakerBuilder, MiningMode};
 use tn_batch_validator::BatchValidator;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
-use tn_types::{Consensus, ConsensusOutput, NewBatch, WorkerId};
-use tokio::sync::{broadcast, mpsc::unbounded_channel};
+use tn_types::{Consensus, ConsensusOutput, NewBatch, PendingWorkerBlock, WorkerId};
+use tokio::sync::{broadcast, mpsc::unbounded_channel, watch};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info};
 
@@ -81,7 +81,7 @@ where
     /// TODO: temporary solution until upstream reth supports public rpc hooks
     opt_faucet_args: Option<FaucetArgs>,
     /// Collection of execution components by worker.
-    workers: HashMap<WorkerId, RpcServerHandle>,
+    workers: HashMap<WorkerId, WorkerComponents<DB>>,
     // TODO: add Pool to self.workers for direct access (tests)
 }
 
@@ -173,17 +173,6 @@ where
         &self,
         from_consensus: broadcast::Receiver<ConsensusOutput>,
     ) -> eyre::Result<()> {
-        // start metrics
-        let prometheus_handle = self.node_config.install_prometheus_recorder()?;
-        self.node_config
-            .start_metrics_endpoint(
-                prometheus_handle,
-                self.provider_factory.db_ref().clone(),
-                self.provider_factory.static_file_provider(),
-                self.task_executor.clone(),
-            )
-            .await?;
-
         let head = self.node_config.lookup_head(self.provider_factory.clone())?;
 
         // TODO: call hooks?
@@ -233,6 +222,7 @@ where
         Ok(())
     }
 
+    /// The worker's RPC, TX pool, and block builder
     pub(super) async fn start_batch_maker(
         &mut self,
         to_worker: Sender<NewBatch>,
@@ -259,6 +249,9 @@ where
         // TODO: this is basically noop and missing some functionality
         let network = WorkerNetwork::default();
 
+        // watch channel for new batches
+        let (watch_tx, watch_rx) = watch::channel(PendingWorkerBlock::default());
+
         // build batch maker
         let max_transactions = 10;
         let mining_mode =
@@ -271,6 +264,7 @@ where
             mining_mode,
             self.address,
             self.evm_executor.clone(),
+            watch_tx.clone(),
         )
         .build();
 
@@ -311,9 +305,11 @@ where
 
         if let Some(faucet_args) = self.opt_faucet_args.take() {
             // create extension from CLI args
-            match faucet_args
-                .create_rpc_extension(self.blockchain_db.clone(), transaction_pool.clone())
-            {
+            match faucet_args.create_rpc_extension(
+                self.blockchain_db.clone(),
+                transaction_pool.clone(),
+                watch_rx.clone(),
+            ) {
                 Ok(faucet_ext) => {
                     // add faucet module
                     if let Err(e) = server.merge_configured(faucet_ext.into_rpc()) {
@@ -332,7 +328,13 @@ where
         let server_config = self.node_config.rpc.rpc_server_config();
         let rpc_handle = server_config.start(&server).await?;
 
-        self.workers.insert(worker_id, rpc_handle);
+        let components = WorkerComponents::new(
+            rpc_handle,
+            PendingBlockWatchChannels::new(watch_tx, watch_rx),
+            transaction_pool,
+        );
+
+        self.workers.insert(worker_id, components);
         Ok(())
     }
 
@@ -370,7 +372,7 @@ where
         //
         // recover finalized block's nonce: this is the last subdag index from consensus (round)
         let finalized_block_num =
-            self.blockchain_db.database_provider_ro()?.last_finalized_block_number()?;
+            self.blockchain_db.database_provider_ro()?.last_finalized_block_number()?.unwrap_or(0);
         let last_round_of_consensus = self
             .blockchain_db
             .database_provider_ro()?
@@ -396,16 +398,75 @@ where
         self.evm_executor.clone()
     }
 
+    /// Return a worker's RpcServerHandle if the RpcServer exists.
+    pub(super) fn worker_rpc_handle(&self, worker_id: &WorkerId) -> eyre::Result<&RpcServerHandle> {
+        let handle = self
+            .workers
+            .get(worker_id)
+            .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
+            .rpc_handle();
+        Ok(handle)
+    }
+
     /// Return a worker's HttpClient if the RpcServer exists.
     pub(super) fn worker_http_client(
         &self,
         worker_id: &WorkerId,
     ) -> eyre::Result<Option<HttpClient>> {
-        let handle = self
+        let handle = self.worker_rpc_handle(worker_id)?.http_client();
+        Ok(handle)
+    }
+
+    /// Return a worker's transaction pool if it exists.
+    pub(super) fn get_worker_transaction_pool(
+        &self,
+        worker_id: &WorkerId,
+    ) -> eyre::Result<WorkerTxPool<DB>> {
+        let tx_pool = self
             .workers
             .get(worker_id)
             .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
-            .http_client();
-        Ok(handle)
+            .pool();
+
+        Ok(tx_pool)
+    }
+
+    /// Return a worker's pending block state if it exists.
+    pub(super) fn worker_pending_block(
+        &self,
+        worker_id: &WorkerId,
+    ) -> eyre::Result<Option<ExecutionOutcome>> {
+        let state = self
+            .workers
+            .get(worker_id)
+            .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
+            .pending_block_receiver()
+            .borrow()
+            .latest();
+
+        Ok(state)
+    }
+
+    /// Return a worker's sending channel for pending block updates.
+    pub(super) fn worker_pending_block_sender(
+        &self,
+        worker_id: &WorkerId,
+    ) -> eyre::Result<watch::Sender<PendingWorkerBlock>> {
+        let sender = self
+            .workers
+            .get(worker_id)
+            .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
+            .pending_block_sender();
+
+        Ok(sender)
+    }
+
+    /// Return a worker's local Http address if the RpcServer exists.
+    pub(super) fn worker_http_local_address(
+        &self,
+        worker_id: &WorkerId,
+    ) -> eyre::Result<Option<SocketAddr>> {
+        let addr = self.worker_rpc_handle(worker_id)?.http_local_addr();
+        Ok(addr)
     }
 }

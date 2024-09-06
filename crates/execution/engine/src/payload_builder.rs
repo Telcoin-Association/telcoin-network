@@ -22,6 +22,7 @@ use reth_revm::{
     primitives::{EVMError, EnvWithHandlerCfg, ResultAndState},
     DatabaseCommit, State,
 };
+use reth_trie::HashedPostState;
 use std::sync::Arc;
 use tn_types::{BuildArguments, TNPayload, TNPayloadAttributes};
 use tracing::{debug, error, info, warn};
@@ -36,10 +37,13 @@ pub fn execute_consensus_output<EvmConfig, Provider>(
 ) -> EngineResult<SealedHeader>
 where
     EvmConfig: ConfigureEvm,
-    Provider: StateProviderFactory + ChainSpecProvider + BlockchainTreeEngine + CanonChainTracker,
+    Provider: StateProviderFactory
+        + ChainSpecProvider<ChainSpec = ChainSpec>
+        + BlockchainTreeEngine
+        + CanonChainTracker,
 {
     let BuildArguments { provider, mut output, parent_header } = args;
-    debug!(target: "tn::engine", ?output, "executing output");
+    debug!(target: "engine", ?output, "executing output");
     // TODO: create "sealed consensus" type that contains hash and output
     //
     // create ommers while converting Batch to SealedBlockWithSenders
@@ -110,7 +114,7 @@ where
         let next_canonical_block =
             build_block_from_empty_payload(payload, &provider, provider.chain_spec())?;
 
-        debug!(target: "execution::executor", ?next_canonical_block, "empty block");
+        debug!(target: "engine", ?next_canonical_block, "empty block");
 
         // update header for next block execution in loop
         canonical_header = next_canonical_block.header.clone();
@@ -118,7 +122,7 @@ where
         // add block to the tree and skip state root validation
         provider
             .insert_block(next_canonical_block, BlockValidationKind::SkipStateRootValidation).inspect_err(|e| {
-                error!(target: "engine::payload_builder", header=?canonical_header, ?e, "failed to insert next canonical block");
+                error!(target: "engine", header=?canonical_header, ?e, "failed to insert next canonical block");
             })?;
     } else {
         // loop and construct blocks with transactions
@@ -154,7 +158,7 @@ where
                 block,
             )?;
 
-            debug!(target: "engine::payload_builder", ?next_canonical_block, "worker's block executed");
+            debug!(target: "engine", ?next_canonical_block, "worker's block executed");
 
             // update header for next block execution in loop
             canonical_header = next_canonical_block.header.clone();
@@ -162,7 +166,7 @@ where
             // add block to the tree and skip state root validation
             provider
                 .insert_block(next_canonical_block, BlockValidationKind::SkipStateRootValidation).inspect_err(|e| {
-                    error!(target: "engine::payload_builder", header=?canonical_header, ?e, "failed to insert next canonical block");
+                    error!(target: "engine", header=?canonical_header, ?e, "failed to insert next canonical block");
                 })?;
         }
     } // end block execution for round
@@ -183,7 +187,7 @@ where
     //
     // see: reth/crates/consensus/beacon/src/engine/mod.rs:update_canon_chain
     provider.set_canonical_head(canonical_header.clone());
-    info!(target: "engine::payload", "canonical head for round {:?}: {:?} - {:?}", canonical_header.nonce, canonical_header.number, canonical_header.hash());
+    info!(target: "engine", "canonical head for round {:?}: {:?} - {:?}", canonical_header.nonce, canonical_header.number, canonical_header.hash());
 
     // finalize the last block executed from consensus output and update chain info
     //
@@ -305,7 +309,7 @@ where
                     //
                     // it's possible that another worker's batch included this transaction
                     EVMError::Transaction(err) => {
-                        warn!(target: "execution::executor", tx_hash=?tx.hash(), ?err);
+                        warn!(target: "engine", tx_hash=?tx.hash(), ?err);
 
                         // TODO: collect metrics here
 
@@ -381,11 +385,12 @@ where
     let receipts_root =
         execution_outcome.receipts_root_slow(block_number).expect("Number is in range");
     let logs_bloom = execution_outcome.block_logs_bloom(block_number).expect("Number is in range");
+    let hashed_state = HashedPostState::from_bundle_state(&execution_outcome.state().state);
 
     // calculate the state root
     let state_root = {
         let state_provider = db.database.0.inner.borrow_mut();
-        state_provider.db.state_root(execution_outcome.state())?
+        state_provider.db.state_root(hashed_state)?
     };
 
     // create the block header
@@ -470,7 +475,7 @@ where
 {
     let state =
         provider.state_by_block_hash(payload.attributes.parent_header.hash()).map_err(|err| {
-            warn!(target: "engine::payload_builder",
+            warn!(target: "engine",
                 parent_hash=%payload.attributes.parent_header.hash(),
                 %err,
                 "failed to get state for empty output",
@@ -495,8 +500,9 @@ where
 
     // calculate the state root
     let bundle_state = db.take_bundle();
-    let state_root = db.database.state_root(&bundle_state).map_err(|err| {
-        warn!(target: "engine::payload_builder",
+    let hashed_state = HashedPostState::from_bundle_state(&bundle_state.state);
+    let state_root = db.database.state_root(hashed_state).map_err(|err| {
+        warn!(target: "engine",
             parent_hash=%payload.attributes.parent_header.hash(),
             %err,
             "failed to calculate state root for empty output"

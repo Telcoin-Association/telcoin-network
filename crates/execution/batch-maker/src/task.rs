@@ -14,8 +14,8 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
-use tn_types::{Batch, NewBatch};
-use tokio::sync::oneshot;
+use tn_types::{Batch, NewBatch, PendingWorkerBlock};
+use tokio::sync::{oneshot, watch};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
@@ -47,12 +47,15 @@ pub struct MiningTask<Client, Pool: TransactionPool, BlockExecutor> {
     pipe_line_events: Option<UnboundedReceiverStream<PipelineEvent>>,
     /// The type used for block execution
     block_executor: BlockExecutor,
+    /// The watch channel that shares the current pending worker block.
+    watch_tx: watch::Sender<PendingWorkerBlock>,
 }
 
 // === impl MiningTask ===
 
 impl<Client, Pool: TransactionPool, BlockExecutor> MiningTask<Client, Pool, BlockExecutor> {
     /// Creates a new instance of the task
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         chain_spec: Arc<ChainSpec>,
         miner: MiningMode,
@@ -62,6 +65,7 @@ impl<Client, Pool: TransactionPool, BlockExecutor> MiningTask<Client, Pool, Bloc
         client: Client,
         pool: Pool,
         block_executor: BlockExecutor,
+        watch_tx: watch::Sender<PendingWorkerBlock>,
     ) -> Self {
         Self {
             chain_spec,
@@ -75,6 +79,7 @@ impl<Client, Pool: TransactionPool, BlockExecutor> MiningTask<Client, Pool, Bloc
             queued: Default::default(),
             pipe_line_events: None,
             block_executor,
+            watch_tx,
         }
     }
 
@@ -89,7 +94,6 @@ where
     BlockExecutor: BlockExecutorProvider,
     Client: StateProviderFactory + CanonChainTracker + BlockReaderIdExt + Clone + Unpin + 'static,
     Pool: TransactionPool + Unpin + 'static,
-    <Pool as TransactionPool>::Transaction: IntoRecoveredTransaction,
 {
     type Output = ();
 
@@ -119,6 +123,7 @@ where
                 let pool = this.pool.clone();
                 let events = this.pipe_line_events.take();
                 let block_executor = this.block_executor.clone();
+                let worker_update = this.watch_tx.clone();
 
                 // Create the mining future that creates a batch and sends it to the CL
                 this.insert_task = Some(Box::pin(async move {
@@ -144,7 +149,7 @@ where
                         chain_spec,
                         &block_executor,
                     ) {
-                        Ok((new_header, _bundle_state)) => {
+                        Ok((new_header, state)) => {
                             // TODO: make this a future
                             //
                             // send the new update to the engine, this will trigger the engine
@@ -202,6 +207,9 @@ where
                             // let _ = canon_state_notification
                             //     .send(reth_provider::CanonStateNotification::Commit { new: chain
                             // });
+
+                            // update execution state on watch channel
+                            let _ = worker_update.send(PendingWorkerBlock::new(Some(state)));
 
                             // TODO: is this the best place to remove transactions?
                             // should the miner poll this like payload builder?

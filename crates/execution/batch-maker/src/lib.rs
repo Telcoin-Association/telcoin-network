@@ -22,6 +22,7 @@ use reth_evm::execute::{
     BlockExecutionError, BlockExecutionOutput, BlockExecutorProvider, BlockValidationError,
     Executor,
 };
+use reth_execution_errors::InternalBlockExecutionError;
 use reth_primitives::{
     constants::{EMPTY_TRANSACTIONS, ETHEREUM_BLOCK_GAS_LIMIT},
     keccak256, proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber,
@@ -30,13 +31,14 @@ use reth_primitives::{
 use reth_provider::{BlockReaderIdExt, ExecutionOutcome, StateProviderFactory};
 use reth_revm::database::StateProviderDatabase;
 use reth_transaction_pool::TransactionPool;
+use reth_trie::HashedPostState;
 use std::{
     collections::HashMap,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tn_types::{now, AutoSealConsensus, NewBatch};
-use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tn_types::{now, AutoSealConsensus, NewBatch, PendingWorkerBlock};
+use tokio::sync::{watch, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{debug, error, trace, warn};
 
 // mod client;
@@ -57,6 +59,7 @@ pub struct BatchMakerBuilder<Client, Pool, EvmConfig> {
     storage: Storage,
     to_worker: Sender<NewBatch>,
     evm_config: EvmConfig,
+    watch_tx: watch::Sender<PendingWorkerBlock>,
 }
 
 // === impl AutoSealBuilder ===
@@ -67,6 +70,7 @@ where
     Pool: TransactionPool,
 {
     /// Creates a new builder instance to configure all parts.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         chain_spec: Arc<ChainSpec>,
         client: Client,
@@ -75,6 +79,7 @@ where
         mode: MiningMode,
         address: Address,
         evm_config: EvmConfig,
+        watch_tx: watch::Sender<PendingWorkerBlock>,
         // TODO: pass max_block here to shut down batch maker?
     ) -> Self {
         let latest_header = client
@@ -91,6 +96,7 @@ where
             mode,
             to_worker,
             evm_config,
+            watch_tx,
         }
     }
 
@@ -103,7 +109,7 @@ where
     /// Consumes the type and returns all components
     #[track_caller]
     pub fn build(self) -> MiningTask<Client, Pool, EvmConfig> {
-        let Self { client, consensus, pool, mode, storage, to_worker, evm_config } = self;
+        let Self { client, consensus, pool, mode, storage, to_worker, evm_config, watch_tx } = self;
         // let auto_client = AutoSealClient::new(storage.clone());
 
         // (consensus, auto_client, task)
@@ -115,6 +121,7 @@ where
             client,
             pool,
             evm_config,
+            watch_tx,
         )
     }
 }
@@ -302,11 +309,11 @@ impl StorageInner {
         let parent = provider.latest_header()
             .map_err(|e| {
                 error!(target: "execution::batch_maker", "error retrieving client.latest_header() {e}");
-                BlockExecutionError::LatestBlock(e)
+                BlockExecutionError::Internal(InternalBlockExecutionError::LatestBlock(e))
             })?
             .ok_or_else(|| {
                 error!(target: "execution::batch_maker", "error retrieving client.latest_header() returned `None`");
-                BlockExecutionError::LatestBlock(reth_provider::ProviderError::FinalizedBlockNotFound)
+                BlockExecutionError::Internal(InternalBlockExecutionError::LatestBlock(reth_provider::ProviderError::FinalizedBlockNotFound))
             })?;
 
         debug!(target: "execution::batch_maker", latest=?parent);
@@ -333,9 +340,9 @@ impl StorageInner {
         // TODO: should this use the latest or finalized for next batch?
         //
         // for now, keep it consistent with latest block retrieved for header template
-        let mut db = StateProviderDatabase::new(
-            provider.latest().map_err(BlockExecutionError::LatestBlock)?,
-        );
+        let mut db = StateProviderDatabase::new(provider.latest().map_err(|e| {
+            BlockExecutionError::Internal(InternalBlockExecutionError::LatestBlock(e))
+        })?);
 
         let block_number = block.number;
 
@@ -355,16 +362,17 @@ impl StorageInner {
         // see reth::crates::payload::ethereum::default_ethereum_payload_builder()
         //
         // expensive calculations - update header
-        header.state_root = db.state_root(bundle_state.state())?;
+        let hashed_state = HashedPostState::from_bundle_state(&bundle_state.state().state);
+        header.state_root = db.state_root(hashed_state)?;
         header.receipts_root = bundle_state.receipts_root_slow(block_number)
             .ok_or_else(|| {
                 error!(target: "execution::batch_maker", "error calculating receipts root from bundle state");
-                BlockExecutionError::Other("Failed to create receipts root from bundle state".into())
+                BlockExecutionError::msg("Failed to create receipts root from bundle state".to_string())
             })?;
         header.logs_bloom = bundle_state.block_logs_bloom(block_number)
             .ok_or_else(|| {
                 error!(target: "execution::batch_maker", "error calculating logs bloom from bundle state");
-                BlockExecutionError::Other("Failed to calculate logs bloom from bundle state".into())
+                BlockExecutionError::msg("Failed to calculate logs bloom from bundle state".to_string())
             })?;
 
         // finally insert into storage
@@ -387,7 +395,7 @@ mod tests {
     use reth_db::test_utils::{create_test_rw_db, tempdir_path};
     use reth_db_common::init::init_genesis;
     use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
-    use reth_primitives::{alloy_primitives::U160, GenesisAccount};
+    use reth_primitives::{alloy_primitives::U160, Bytes, GenesisAccount};
     use reth_provider::{
         providers::{BlockchainProvider, StaticFileProvider},
         ProviderFactory,
@@ -465,6 +473,7 @@ mod tests {
 
         let evm_config = EthEvmConfig::default();
         let block_executor = EthExecutorProvider::new(chain.clone(), evm_config);
+        let (tx, _rx) = watch::channel(PendingWorkerBlock::default());
 
         // build batch maker
         let task = BatchMakerBuilder::new(
@@ -475,6 +484,7 @@ mod tests {
             mining_mode,
             address,
             block_executor,
+            tx,
         )
         .build();
 
@@ -486,8 +496,9 @@ mod tests {
         let transaction1 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 1: {transaction1:?}");
         debug!("transaction 1 encoded: {:?}", transaction1.clone().envelope_encoded());
@@ -495,8 +506,9 @@ mod tests {
         let transaction2 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 2: {transaction2:?}");
         debug!("transaction 2 encoded: {:?}", transaction2.clone().envelope_encoded());
@@ -504,8 +516,9 @@ mod tests {
         let transaction3 = tx_factory.create_eip1559(
             chain.clone(),
             gas_price,
-            Address::ZERO,
+            Some(Address::ZERO),
             value, // 1 TEL
+            Bytes::new(),
         );
         debug!("transaction 3: {transaction3:?}");
         debug!("transaction 3 encoded: {:?}", transaction3.clone().envelope_encoded());

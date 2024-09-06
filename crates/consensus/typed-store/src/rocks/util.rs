@@ -6,6 +6,7 @@ use rocksdb::{CompactionDecision, MergeOperands};
 use std::cmp::Ordering;
 
 /// custom rocksdb merge operator used for storing objects with reference counts
+///
 /// important: reference count field must be 64-bit integer and must be last in struct declaration
 /// should be used with immutable objects only
 pub fn reference_count_merge_operator(

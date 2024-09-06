@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
 
 /// This structure contains a cell for a single value.
+///
 /// The cell can be written only once, and can be read many times.
 /// Readers are provided with async API, that waits for write to happen.
 /// This is similar to tokio::sync::watch, except one difference:
