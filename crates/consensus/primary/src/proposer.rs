@@ -1,7 +1,19 @@
-// Copyright(C) Facebook, Inc. and its affiliates.
 // Copyright (c) Telcoin, LLC
+// Copyright(C) Facebook, Inc. and its affiliates.
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+
+//! The Proposer is responsible for proposing the primary's next header when certain conditions are met.
+//!
+//! This is the first task in the primary's header cycle. The Proposer processes messages from the
+//! `Primary::StateHandler` to track which proposed headers were successfully committed. If a header
+//! is not committed before it's round advances, the failed header's block digests are included in a
+//! fresh header in FIFO order.
+//!
+//! Successfully created Headers are sent to the `Primary::Certifier`, where they are reliably broadcast
+//! to voting peers. Headers are stored in the `ProposerStore` before they are sent to the Certifier.
+//!
+//! The Proposer is also responsible for processing Worker block's that reach quorum.
 
 use crate::{
     consensus::LeaderSchedule,
@@ -262,7 +274,7 @@ impl<DB: Database + 'static> Proposer<DB> {
     ) -> ProposerResult<Header> {
         // make new header
 
-        // check that the included timestamp is consistent with the parents
+        // check that the included timestamp is consistent with the parent's timestamp
         //
         // ie) the current time is *after* the timestamp in all included headers
         //
@@ -793,7 +805,7 @@ impl<DB: Database + 'static> Proposer<DB> {
                     }
                 };
 
-                // spawn tokio task to create, store, and send new header
+                // spawn tokio task to create, store, and send new header to certifier
                 tokio::task::spawn(async move {
                     let proposal = Proposer::g_propose_header(
                         current_round,
