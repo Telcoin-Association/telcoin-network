@@ -14,6 +14,9 @@
 //! to voting peers. Headers are stored in the `ProposerStore` before they are sent to the Certifier.
 //!
 //! The Proposer is also responsible for processing Worker block's that reach quorum.
+//! Collections of worker blocks that reach quorum are included in each header. If the Proposer's header
+//! fails to be committed, then block digests from the failed round are included in the next header
+//! once the Proposer's round advances.
 
 use crate::{
     consensus::LeaderSchedule,
@@ -25,9 +28,11 @@ use consensus_metrics::{
 };
 use fastcrypto::hash::Hash as _;
 use futures::{FutureExt, StreamExt};
+use indexmap::IndexMap;
 use narwhal_primary_metrics::PrimaryMetrics;
 use narwhal_storage::ProposerStore;
 use narwhal_typed_store::traits::Database;
+use reth::providers::ProviderResult;
 use reth_primitives::B256;
 use std::{
     cmp::Ordering,
@@ -266,7 +271,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         proposer_store: ProposerStore<DB>,
         tx_headers: Sender<Header>,
         parents: Vec<Certificate>,
-        digests: VecDeque<OurDigestMessage>,
+        digests: VecDeque<ProposerDigest>,
         system_messages: Vec<SystemMessage>,
         reason: String,
         metrics: Arc<PrimaryMetrics>,
@@ -350,6 +355,9 @@ impl<DB: Database + 'static> Proposer<DB> {
         //     digests.len(),
         //     avg_inclusion_secs,
         // );
+
+        // TODO: is this metric measured elsewhere?
+        // self.metrics.proposer_batch_latency.observe(batch_inclusion_secs);
 
         // store and send newly built header
         let _ = Proposer::g_store_and_send_header(
@@ -717,6 +725,89 @@ impl<DB: Database + 'static> Proposer<DB> {
         Ok(())
     }
 
+    /// Process notifications that Proposer's own headers have been committed in the DAG for a
+    /// particular round.
+    ///
+    /// Committed headers are removed from the collection of `self.proposed_headers`. Headers
+    /// that are skipped with no hope of being committed (proposed in a previous round) are also
+    /// removed after adding the expired header's proposed block digests and system messages to
+    /// the beginning of the queue.
+    ///
+    /// This method ensures worker blocks that were previously proposed but weren't committed are reproposed.
+    fn process_committed_headers(&mut self, commit_round: Round, committed_headers: Vec<Round>) {
+        // remove committed headers from pending
+        let mut max_committed_round = 0;
+        for round in committed_headers {
+            max_committed_round = max_committed_round.max(round);
+            // try to remove - log warning if round is missing
+            if self.proposed_headers.remove(&round).is_none() {
+                warn!("Proposer's own committed header not found at round {round}, probably because of restarts.");
+            };
+        }
+
+        // Now for any round below the current commit round we re-insert
+        // the batches into the digests we need to send, effectively re-sending
+        // them in FIFO order.
+
+        // re-insert batches for any proposed header from a round below the current commit
+        //
+        // ensure batches are FIFO as this is effectively re-sending them
+        //
+        // payloads: oldest -> newest
+        let mut digests_to_resend = VecDeque::new();
+        // Oldest to newest system messages.
+        let mut system_messages_to_resend = Vec::new();
+        // Oldest to newest rounds.
+        let mut retransmit_rounds = Vec::new();
+
+        // loop through proposed headers in order by round
+        for (header_round, header) in &mut self.proposed_headers {
+            // break once headers pass the committed round
+            if *header_round > max_committed_round {
+                break;
+            }
+
+            let mut system_messages = header.system_messages().to_vec();
+            let mut digests = header
+                .payload()
+                .into_iter()
+                .map(|(k, v)| ProposerDigest { digest: *k, worker_id: v.0, timestamp: v.1 })
+                .collect();
+
+            // Add payloads and system messages from oldest to newest.
+            digests_to_resend.append(&mut digests);
+            system_messages_to_resend.append(&mut system_messages);
+            retransmit_rounds.push(*header_round);
+        }
+
+        if !retransmit_rounds.is_empty() {
+            let num_digests_to_resend = digests_to_resend.len();
+            let num_system_messages_to_resend = system_messages_to_resend.len();
+
+            // prepend missing batches from previous round and update `self`
+            digests_to_resend.append(&mut self.digests);
+            self.digests = digests_to_resend;
+            system_messages_to_resend.append(&mut self.system_messages);
+            self.system_messages = system_messages_to_resend;
+
+            // remove the old headers that failed
+            // the proposed blocks are included in the next header
+            for round in &retransmit_rounds {
+                self.proposed_headers.remove(round);
+            }
+
+            // TODO: observe this warning and possibly reduce it to a debug
+            warn!(
+                target: "primary::proposer",
+                "Repropose {num_digests_to_resend} worker blocks and {num_system_messages_to_resend} system messages in undelivered headers {retransmit_rounds:?} at commit round {commit_round:?}, remaining headers {}",
+                self.proposed_headers.len()
+            );
+
+            self.metrics.proposer_resend_headers.inc_by(retransmit_rounds.len() as u64);
+            self.metrics.proposer_resend_batches.inc_by(num_digests_to_resend as u64);
+        }
+    }
+
     /// Conditions are met to propose the next header.
     ///
     /// Update Self and make the header to propose.
@@ -842,7 +933,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         // track latest header
         self.opt_latest_header = Some(header.clone());
 
-        // reset interval for resending header
+        // reset interval for header timeout
         self.header_resend_timeout.reset();
 
         // Reset advance flag.
@@ -860,8 +951,8 @@ impl<DB: Database + 'static> Proposer<DB> {
         self.min_delay_timer.reset();
         self.max_delay_timer.reset();
 
-        // Register the header by the current round, to remember that we need to commit
-        // it, or re-include the batch digests and system messages that it contains.
+        // track header so proposer can repropose the digests and system messages
+        // if this header fails to be committed for some reason
         self.proposed_headers.insert(header.round(), header);
 
         Ok(())
@@ -908,20 +999,18 @@ where
                 this.system_messages.push(msg);
             }
 
-            // check for new digests from workers
+            // check for new digests from workers and send ack back to worker
+            //
+            // ack to worker implies that the block is recorded on the primary
+            // and will be tracked until the block is included
+            // ie) primary will attempt to propose this digest until it is
+            // committed/sequenced in the DAG or the epoch concludes
+            //
+            // NOTE: this will not persist primary restarts
             if let Poll::Ready(Some(msg)) = this.rx_our_digests.poll_recv(cx) {
                 debug!(target: "primary::proposer", round=this.round, "Proposer received digest");
 
-                // send ack back to worker
-                //
-                // ack implies that the block is recorded on the primary
-                // and will be tracked until the block is included
-                //
-                // primary will attempt to propose this digest until it is sequenced
-                // or the epoch concludes
-                //
-                // however, this will not persist primary crashes
-
+                // parse message into parts
                 let (ack, digest) = msg.process();
                 let _ = ack.send(());
                 this.digests.push_back(digest);
@@ -930,13 +1019,11 @@ where
             // check for new parent certificates
             if let Poll::Ready(Some((certs, round))) = this.rx_parents.poll_recv(cx) {
                 debug!(target: "primary::proposer", this_round=this.round, parent_round=round, num_parents=certs.len(), "Proposer received parents");
-
-                // TODO: handle rx_parents in self.method
                 this.process_parents(certs, round)?;
             }
 
             // TODO: use `while` instead of `if`?
-            // - should be fairly caught up all the time, but still?
+            // - should be up-to-date all the time, but better to ensure Proposer is caught up
             //
             // check for previous headers that were committed
             while let Poll::Ready(Some((commit_round, committed_headers))) =
@@ -944,84 +1031,13 @@ where
             {
                 debug!(target: "primary::proposer", round=this.round, "received committed update for own header");
 
-                // remove committed headers from pending
-                let mut max_committed_round = 0;
-                for round in committed_headers {
-                    max_committed_round = max_committed_round.max(round);
-                    // try to remove - log warning if round is missing
-                    if this.proposed_headers.remove(&round).is_none() {
-                        warn!("Proposer's own committed header not found at round {round}, probably because of restarts.");
-                    };
-                }
-
-                // Now for any round below the current commit round we re-insert
-                // the batches into the digests we need to send, effectively re-sending
-                // them in FIFO order.
-
-                // re-insert batches for any proposed header from a round below the current commit
-                //
-                // ensure batches are FIFO as this is effectively re-sending them
-                //
-                // payloads: oldest -> newest
-                let mut digests_to_resend = VecDeque::new();
-                // Oldest to newest system messages.
-                let mut system_messages_to_resend = Vec::new();
-                // Oldest to newest rounds.
-                let mut retransmit_rounds = Vec::new();
-
-                // loop through proposed headers in order by round
-                // for (header_round, (_header, included_digests, included_system_messages)) in
-                for (header_round, header) in &mut self.proposed_headers {
-                    // break once headers pass the committed round
-                    if *header_round > max_committed_round {
-                        break;
-                    }
-
-                    // TODO: this relates to a similar error above
-                    // `OurDigestMessage` isn't sufficient:
-                    // - need to use oneshot channel, but have to clone
-                    // - what info is needed here to rebuild old headers and create new ones?
-                    //
-                    // need to update this.digests type to use a better struct
-                    //
-
-                    let mut system_messages = header.system_messages().clone().to_vec();
-                    let mut digests = todo!()
-
-                    // Add payloads and system messages from oldest to newest.
-                    digests_to_resend.append(included_digests);
-                    system_messages_to_resend.append(&mut system_messages);
-                    retransmit_rounds.push(*header_round);
-                }
-
-                if !retransmit_rounds.is_empty() {
-                    let num_digests_to_resend = digests_to_resend.len();
-                    let num_system_messages_to_resend = system_messages_to_resend.len();
-                    // Since all of the values are roughly newer than existing stored values,
-                    // prepend for the next header.
-                    digests_to_resend.append(&mut self.digests);
-                    self.digests = digests_to_resend;
-                    system_messages_to_resend.append(&mut self.system_messages);
-                    self.system_messages = system_messages_to_resend;
-
-                    // Now delete the headers with batches we re-transmit
-                    for round in &retransmit_rounds {
-                        self.proposed_headers.remove(round);
-                    }
-
-                    debug!(
-                        "Retransmit {num_digests_to_resend} batches and {num_system_messages_to_resend} system messages in undelivered headers {retransmit_rounds:?} at commit round {commit_round:?}, remaining headers {}",
-                        self.proposed_headers.len()
-                    );
-
-                    self.metrics.proposer_resend_headers.inc_by(retransmit_rounds.len() as u64);
-                    self.metrics.proposer_resend_batches.inc_by(num_digests_to_resend as u64);
-                }
+                this.process_committed_headers(commit_round, committed_headers);
             }
 
             // poll receiver that returns proposed header result
             //
             // if the pending header needs more time, break loop and return pending
+            // NOTE: proposer only holds one pending header at a time
             if let Some(mut receiver) = this.pending_header.take() {
                 match receiver.poll_unpin(cx) {
                     Poll::Ready(res) => {
@@ -1046,9 +1062,9 @@ where
             // TODO:
             //
             // if this timer goes off, then certifier confirmed receipt but
-            // proposer never received that this header reached quorum ??? (commited??)
+            // proposer never received that this header reached quorum ??? (committed??)
             //
-            // where does `rx_committed_own_headers` get messages?
+            // where does `rx_committed_own_headers` get messages within this loop?
             //
             // check if the resent timeout has elapsed
             if this.header_resend_timeout.poll_tick(cx).is_ready() {
