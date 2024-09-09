@@ -32,7 +32,7 @@ pub struct StateHandler {
     rx_committed_certificates: Receiver<(Round, Vec<Certificate>)>,
     /// Channel to signal committee changes.
     rx_shutdown: ConditionalBroadcastReceiver,
-    /// A channel to update the committed rounds
+    /// A channel to update the the proposer's committed rounds.
     tx_committed_own_headers: Option<Sender<(Round, Vec<Round>)>>,
     /// A channel to send system messages to the proposer.
     tx_system_messages: Sender<SystemMessage>,

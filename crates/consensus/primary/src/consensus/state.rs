@@ -7,6 +7,7 @@
 
 use crate::consensus::{bullshark::Bullshark, utils::gc_round, ConsensusError, ConsensusMetrics};
 use consensus_metrics::{metered_channel, spawn_logged_monitored_task};
+use eyre::OptionExt;
 use fastcrypto::hash::Hash;
 use narwhal_storage::{CertificateStore, ConsensusStore};
 use narwhal_typed_store::traits::Database;
@@ -425,7 +426,7 @@ impl<DB: Database> Consensus<DB> {
                     if !committed_certificates.is_empty(){
                         // Highest committed certificate round is the leader round / commit round
                         // expected by primary.
-                        let leader_commit_round = committed_certificates.iter().map(|c| c.round()).max().unwrap();
+                        let leader_commit_round = committed_certificates.iter().map(|c| c.round()).max().ok_or_eyre("committed certificates not empty")?;
 
                         self.tx_committed_certificates
                             .send((leader_commit_round, committed_certificates))

@@ -555,6 +555,22 @@ impl<DB: Database> PrimaryReceiverHandler<DB> {
     ) -> DagResult<RequestVoteResponse> {
         let header = &request.body().header;
         let committee = self.committee.clone();
+
+        // TODO: retrieve blocknumhash for the request
+        // let block_numhash = self.get_block_numhash(&header.parent);
+        //
+        // send thru mpsc to state handler to retrieve the EL hash for
+        // this parent by header's Round
+        //
+        // TODO: what if return's None?
+        // - if number but wrong hash, invalid
+        // - if number missing, then...
+        //      - spawn task with oneshot channel
+        //      - task checks in memory
+        //
+        // could be Arc<HashMap<Round, BlockNumHash>> with a size limit
+        // with epoch constraints (256 rounds, then epoch over)
+
         header.validate(&committee, &self.worker_cache)?;
 
         let num_parents = request.body().parents.len();

@@ -163,8 +163,9 @@ pub struct Proposer<DB: Database> {
     /// Holds the map of proposed previous round headers and their digest messages, to ensure that
     /// all batches' digest included will eventually be re-sent.
     proposed_headers: BTreeMap<Round, Header>,
-    /// Committed headers channel on which we get updates on which of
-    /// our own headers have been committed.
+    /// Receiver for updates when Self's headers were committed by consensus.
+    ///
+    /// NOTE: this does not mean the header was executed yet.
     rx_committed_own_headers: Receiver<(Round, Vec<Round>)>,
     /// Metrics handler
     metrics: Arc<PrimaryMetrics>,
@@ -416,129 +417,6 @@ impl<DB: Database + 'static> Proposer<DB> {
             .observe(num_digests as f64);
 
         result
-    }
-
-    /// Creates a new header.
-    ///
-    /// This method ensures proposer is protected against equivocation.
-    ///
-    /// If a different header was already produced for the same round, then
-    /// this method returns the earlier header. Otherwise the newly created header is returned.
-    async fn create_new_header(&mut self) -> DagResult<Header> {
-        let this_round = self.round;
-        let this_epoch = self.committee.epoch();
-
-        // TODO: check proposer store before calling this method
-        //
-        // check if header is already built for this round
-        if let Some(last_header) = self.proposer_store.get_last_proposed()? {
-            if last_header.round() == this_round && last_header.epoch() == this_epoch {
-                // We have already produced a header for the current round, idempotent re-send
-                debug!("Proposer re-using existing header for round {this_round}");
-                self.last_parents.clear(); // Clear parents that are now invalid for next round.
-                return Ok(last_header);
-            }
-        }
-
-        // Make a new header.
-        let num_of_digests = self.digests.len().min(self.max_header_num_of_batches);
-        let header_digests: VecDeque<_> = self.digests.drain(..num_of_digests).collect();
-        let system_messages = std::mem::take(&mut self.system_messages);
-        let parents = std::mem::take(&mut self.last_parents);
-
-        // Here we check that the timestamp we will include in the header is consistent with the
-        // parents, ie our current time is *after* the timestamp in all the included headers. If
-        // not we log an error and hope a kind operator fixes the clock.
-        let parent_max_time = parents.iter().map(|c| *c.header().created_at()).max().unwrap_or(0);
-        let current_time = now();
-        if current_time < parent_max_time {
-            let drift_ms = parent_max_time - current_time;
-            error!(
-                "Current time {} earlier than max parent time {}, sleeping for {}ms until max parent time.",
-                current_time, parent_max_time, drift_ms,
-            );
-            self.metrics.header_max_parent_wait_ms.inc_by(drift_ms);
-            sleep(Duration::from_millis(drift_ms)).await;
-        }
-
-        let header: Header = HeaderV1::new(
-            self.authority_id,
-            this_round,
-            this_epoch,
-            header_digests.iter().map(|m| (m.digest, (m.worker_id, m.timestamp))).collect(),
-            system_messages.clone(),
-            parents.iter().map(|x| x.digest()).collect(),
-        )
-        .into();
-
-        let leader_and_support = if this_round % 2 == 0 {
-            let authority = self.leader_schedule.leader(this_round);
-            if self.authority_id == authority.id() {
-                "even_round_is_leader"
-            } else {
-                "even_round_not_leader"
-            }
-        } else {
-            let authority = self.leader_schedule.leader(this_round - 1);
-            if parents.iter().any(|c| c.origin() == authority.id()) {
-                "odd_round_gives_support"
-            } else {
-                "odd_round_no_support"
-            }
-        };
-        self.metrics.headers_proposed.with_label_values(&[leader_and_support]).inc();
-        self.metrics.header_parents.observe(parents.len() as f64);
-
-        if enabled!(tracing::Level::TRACE) {
-            let mut msg = format!("Created header {header:?} with parent certificates:\n");
-            for parent in parents.iter() {
-                msg.push_str(&format!("{parent:?}\n"));
-            }
-            trace!(msg);
-        } else {
-            debug!("Created header {header:?}");
-        }
-
-        // Update metrics related to latency
-        let mut total_inclusion_secs = 0.0;
-        for digest in &header_digests {
-            let batch_inclusion_secs =
-                Duration::from_millis(*header.created_at() - digest.timestamp).as_secs_f64();
-            total_inclusion_secs += batch_inclusion_secs;
-
-            // NOTE: This log entry is used to compute performance.
-            tracing::debug!(
-                    "Batch {:?} from worker {} took {} seconds from creation to be included in a proposed header",
-                    digest.digest,
-                    digest.worker_id,
-                    batch_inclusion_secs
-                );
-            self.metrics.proposer_batch_latency.observe(batch_inclusion_secs);
-        }
-
-        // NOTE: This log entry is used to compute performance.
-        let (header_creation_secs, avg_inclusion_secs) =
-            if let Some(digest) = header_digests.front() {
-                (
-                    Duration::from_millis(*header.created_at() - digest.timestamp).as_secs_f64(),
-                    total_inclusion_secs / header_digests.len() as f64,
-                )
-            } else {
-                (self.max_header_delay.as_secs_f64(), 0.0)
-            };
-        debug!(
-            "Header {:?} was created in {} seconds. Contains {} batches, with average delay {} seconds.",
-            header.digest(),
-            header_creation_secs,
-            header_digests.len(),
-            avg_inclusion_secs,
-        );
-
-        // Register the header by the current round, to remember that we need to commit
-        // it, or re-include the batch digests and system messages that it contains.
-        self.proposed_headers.insert(this_round, (header.clone(), header_digests, system_messages));
-
-        Ok(header)
     }
 
     fn max_delay(&self) -> Duration {

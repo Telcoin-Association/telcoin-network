@@ -258,7 +258,7 @@ where
                 store,
                 tx_shutdown.subscribe_n(3),
                 rx_new_certificates,
-                tx_committed_certificates.clone(),
+                tx_committed_certificates,
                 tx_consensus_round_updates,
                 executor_metrics,
                 consensus_output_notification_sender,
