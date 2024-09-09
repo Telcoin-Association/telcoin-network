@@ -38,8 +38,11 @@ mkdir -p $SHARED_GENESISDIR
 # number of validators
 LENGTH="${#VALIDATORS[@]}"
 
-RELEASE="debug"
-cargo build --bin telcoin-network
+# Use RELEASE="debug" below and remove the --release to use a debug build
+RELEASE="release"
+cargo build --bin telcoin-network --release
+# Example of using redb for the consensus DB
+#cargo build --bin telcoin-network --features redb --release
 
 # for validator in "${VALIDATORS[@]}"; do
 for ((i=0; i<$LENGTH; i++)); do

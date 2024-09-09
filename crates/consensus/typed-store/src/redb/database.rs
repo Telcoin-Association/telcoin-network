@@ -174,6 +174,9 @@ impl Database for ReDB {
         Ok(ReDbTx { tx })
     }
 
+    /// ReDb can only allows one write txn at a time.  Calling this with an existing transaction
+    /// open will block until it closes.  This can be problematic when used directly in async
+    /// code.  Note that the LayeredDatabase handles this issues.
     fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
         let tx = self.db.read().begin_write()?;
         Ok(ReDbTxMut { tx })

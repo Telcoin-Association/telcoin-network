@@ -366,7 +366,6 @@ impl Database for RocksDatabase {
         Ok(RocksDbTxMut { db: self.clone(), txn })
     }
 
-    //fn write_txn<'txn>(&'txn self) -> eyre::Result<Self::TXMut<'txn>> {
     fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
         let txn = self.rocksdb.transaction()?;
         Ok(RocksDbTxMut { db: self.clone(), txn })

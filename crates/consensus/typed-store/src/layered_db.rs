@@ -78,19 +78,29 @@ fn db_run<DB: Database>(db: DB, rx: Receiver<DBMessage<DB>>) {
     let mut txn = None;
     while let Ok(msg) = rx.recv() {
         match msg {
-            DBMessage::StartTxn => match db.write_txn() {
-                Ok(ntxn) => txn = Some(ntxn),
-                Err(e) => tracing::error!("DB ERROR getting write txn (background): {e}"),
-            },
+            DBMessage::StartTxn => {
+                if let Some((_txn, count)) = &mut txn {
+                    *count += 1;
+                } else {
+                    match db.write_txn() {
+                        Ok(ntxn) => txn = Some((ntxn, 1)),
+                        Err(e) => tracing::error!("DB ERROR getting write txn (background): {e}"),
+                    }
+                }
+            }
             DBMessage::CommitTxn => {
-                if let Some(txn) = txn.take() {
-                    if let Err(e) = txn.commit() {
-                        tracing::error!("DB TXN Commit: {e}")
+                if let Some((current_txn, count)) = txn.take() {
+                    if count <= 1 {
+                        if let Err(e) = current_txn.commit() {
+                            tracing::error!("DB TXN Commit: {e}")
+                        }
+                    } else {
+                        txn = Some((current_txn, count - 1));
                     }
                 }
             }
             DBMessage::Insert(ins) => {
-                if let Some(txn) = &mut txn {
+                if let Some((txn, _)) = &mut txn {
                     if let Err(e) = ins.insert_txn(txn) {
                         tracing::error!("DB TXN Insert: {e}")
                     }
@@ -99,7 +109,7 @@ fn db_run<DB: Database>(db: DB, rx: Receiver<DBMessage<DB>>) {
                 }
             }
             DBMessage::Remove(rm) => {
-                if let Some(txn) = &mut txn {
+                if let Some((txn, _)) = &mut txn {
                     if let Err(e) = rm.remove_txn(txn) {
                         tracing::error!("DB TXN Remove: {e}")
                     }
@@ -108,7 +118,7 @@ fn db_run<DB: Database>(db: DB, rx: Receiver<DBMessage<DB>>) {
                 }
             }
             DBMessage::Clear(clr) => {
-                if let Some(txn) = &mut txn {
+                if let Some((txn, _)) = &mut txn {
                     if let Err(e) = clr.clear_table_txn(txn) {
                         tracing::error!("DB TXN Clear table: {e}")
                     }
@@ -119,6 +129,7 @@ fn db_run<DB: Database>(db: DB, rx: Receiver<DBMessage<DB>>) {
             DBMessage::Shutdown => break,
         }
     }
+    tracing::info!("Layerd DB thread Shutdown complete");
 }
 
 /// Implement the Database trait with an in-memory store.
@@ -140,10 +151,13 @@ impl<DB: Database> Drop for LayeredDatabase<DB> {
             tracing::info!("LayeredDatabase Dropping, shutting down DB thread");
             if let Err(e) = self.tx.send(DBMessage::Shutdown) {
                 tracing::error!("Error while trying to send shutdown to layered DB thread {e}");
+                return; // The thread may not shutdown so don't try to join...
             }
             // We can not be here without a thread handle so unwraps OK.
             if let Err(e) = Arc::into_inner(self.thread.take().unwrap()).unwrap().join() {
                 tracing::error!("Error while waiting for shutdown of layered DB thread {e:?}");
+            } else {
+                tracing::info!("LayeredDatabase Dropped, DB thread is shutdown");
             }
         }
     }
@@ -179,6 +193,9 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         Ok(LayeredDbTx { mem_db: self.mem_db.clone() })
     }
 
+    /// Note that write transactions for the layerd DB will be "overlapped" and committed when the
+    /// last commit happens. Also, all write operations are saved in memory then passed to
+    /// thread for persistance in the background so operations will return quickly.
     fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
         self.tx.send(DBMessage::StartTxn).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
         Ok(LayeredDbTxMut { mem_db: self.mem_db.clone(), tx: self.tx.clone() })
@@ -302,6 +319,19 @@ enum DBMessage<DB: Database> {
     Remove(Box<dyn RemoveTrait<DB>>),
     Clear(Box<dyn ClearTrait<DB>>),
     Shutdown,
+}
+
+impl<DB: Database> Debug for DBMessage<DB> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DBMessage::StartTxn => write!(f, "StartTxn"),
+            DBMessage::CommitTxn => write!(f, "CommitTxn"),
+            DBMessage::Insert(_) => write!(f, "Insert"),
+            DBMessage::Remove(_) => write!(f, "Remove"),
+            DBMessage::Clear(_) => write!(f, "Clear"),
+            DBMessage::Shutdown => write!(f, "Shutdown"),
+        }
+    }
 }
 
 #[cfg(test)]
