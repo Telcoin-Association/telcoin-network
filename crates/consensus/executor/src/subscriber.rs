@@ -136,23 +136,20 @@ impl Subscriber {
     /// Returns the max number of sub-dag to fetch payloads concurrently.
     const MAX_PENDING_PAYLOADS: usize = 1000;
 
-    /// Main loop connecting to the consensus to listen to sequence messages.
+    /// Main loop connecting to consensus that listens to sequenced messages.
     async fn run(
         mut self,
         restored_consensus_output: Vec<CommittedSubDag>,
         consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
     ) -> SubscriberResult<()> {
-        // It's important to have the futures in ordered fashion as we want
-        // to guarantee that will deliver to the executor the certificates
-        // in the same order we received from rx_sequence. So it doesn't
-        // matter if we somehow managed to fetch the batches from a later
-        // certificate. Unless the earlier certificate's payload has been
-        // fetched, no later certificate will be delivered.
+        // Futures are ordered to guarantee that the engine receives
+        // certificates in the same order as the DAG (rx_sequence)
+        //
+        // worker blocks received from later certificates are held until
+        // the preceeding certificate payloads are all downloaded from peers
         let mut waiting = FuturesOrdered::new();
 
-        // First handle any consensus output messages that were restored due to a restart.
-        // This needs to happen before we start listening on rx_sequence and receive messages
-        // sequenced after these.
+        // process restored consensus output messages first in case of node restarts
         for message in restored_consensus_output {
             let future = Self::fetch_batches(self.inner.clone(), message);
             waiting.push_back(future);
@@ -172,7 +169,7 @@ impl Subscriber {
                 },
 
                 // Receive consensus messages after all transaction data is downloaded
-                // then send to the execution layer for final block production.
+                // then send to the execution layer for final block production
                 //
                 // NOTE: this broadcasts to all subscribers, but lagging receivers will lose messages
                 Some(message) = waiting.next() => {

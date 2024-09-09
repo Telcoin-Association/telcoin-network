@@ -117,6 +117,14 @@ impl PrimaryNodeInner {
         // create receiving channel before spawning primary to ensure messages are not lost
         let consensus_output_rx = self.subscribe_consensus_output();
 
+        // TODO: when does this get initialized?
+        // - with last_executed_output?
+        // - TnEngine::new holds these?
+        // - for now, pass them in here for most flexibility
+        //
+        // the watch channel for latest engine state
+        let engine_watch_channel = watch::channel(init)
+
         // spawn primary if not already running
         let primary_handles = self
             .spawn_primary(
@@ -321,25 +329,6 @@ where
             narwhal_primary::CHANNEL_CAPACITY,
             &channel_metrics.tx_sequence,
         );
-
-        // TODO: this may need to be adjusted depending on how TN executes output
-        //
-        // if executor engine executes-per-batch:
-        //  - executing consensus output per batch ~> 1 batch == 1 block
-        //  - use nonce or mixed hash or difficulty to track the output's "last committed subdag"
-        //  - how to handle restart mid-execution?
-        //      - only some of the batches completed
-        //      - so, don't use `last_executed_sub_dag_index + 1`
-        //          - use just `last_executed_sub_dag_index` and re-execute the output again
-        //          - less efficient, but ensures correctness
-        //          - maybe there's a way to optimize this like only re-execute if the
-        //            blocks/batches don't match the output batch count?
-        //              - but this is probably unlikely to happen anyway
-        //                  - ie) crashes/restarts at a clean execution boundary
-        //
-        // for now, all batches are contained within a single block, (ie 1 consensus output = 1
-        // executed block) so use block number for restored consensus output
-        // since block number == last_executed_sub_dag_index
 
         // Check for any sub-dags that have been sent by consensus but were not processed by the
         // executor.

@@ -32,8 +32,7 @@ use indexmap::IndexMap;
 use narwhal_primary_metrics::PrimaryMetrics;
 use narwhal_storage::ProposerStore;
 use narwhal_typed_store::traits::Database;
-use reth::providers::ProviderResult;
-use reth_primitives::B256;
+use reth_primitives::{BlockNumHash, B256};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
@@ -175,7 +174,7 @@ pub struct Proposer<DB: Database> {
     /// The watch channel for observing execution results.
     ///
     /// Proposer must include the finalized parent hash from the previously executed round to ensure execution results are consistent.
-    execution_result: watch::Receiver<B256>,
+    execution_result: watch::Receiver<BlockNumHash>,
     /// Flag if enough conditions are met to advance the round.
     advance_round: bool,
     /// The optional pending header that the proposer has decided to build.
@@ -210,7 +209,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         rx_committed_own_headers: Receiver<(Round, Vec<Round>)>,
         metrics: Arc<PrimaryMetrics>,
         leader_schedule: LeaderSchedule,
-        execution_result: watch::Receiver<B256>,
+        execution_result: watch::Receiver<BlockNumHash>,
     ) -> Self {
         // TODO: include EL genesis hash in committee for epoch?
         //

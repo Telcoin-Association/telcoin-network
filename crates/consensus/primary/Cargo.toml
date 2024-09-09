@@ -45,6 +45,7 @@ tn-types = { workspace = true }
 narwhal-storage = { workspace = true }
 narwhal-typed-store = { workspace = true }
 telcoin-macros = { workspace = true }
+indexmap = { workspace = true }
 
 telcoin-sync = { workspace = true }
 consensus-metrics = { workspace = true }

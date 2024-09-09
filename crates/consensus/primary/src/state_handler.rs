@@ -26,8 +26,8 @@ pub mod state_handler_tests;
 
 /// Updates Narwhal system state based on certificates received from consensus.
 pub struct StateHandler {
+    /// Primary's id.
     authority_id: AuthorityIdentifier,
-
     /// Receives the ordered certificates from consensus.
     rx_committed_certificates: Receiver<(Round, Vec<Certificate>)>,
     /// Channel to signal committee changes.
@@ -36,11 +36,10 @@ pub struct StateHandler {
     tx_committed_own_headers: Option<Sender<(Round, Vec<Round>)>>,
     /// A channel to send system messages to the proposer.
     tx_system_messages: Sender<SystemMessage>,
-
     /// If set, generates Narwhal system messages for random beacon
     /// DKG and randomness generation.
     randomness_state: Option<RandomnessState>,
-
+    /// The WAN for primary to primary communication.
     network: anemo::Network,
 }
 
@@ -174,7 +173,7 @@ impl RandomnessState {
                     let _ = tx_system_messages.send(SystemMessage::DkgConfirmation(conf)).await;
                 }
                 Err(fastcrypto::error::FastCryptoError::NotEnoughInputs) => (), /* wait for more */
-                // input
+                // bad input
                 Err(e) => debug!("Error while merging randomness DKG messages: {e:?}"),
             }
         }

@@ -44,6 +44,7 @@ use narwhal_primary_metrics::{Metrics, PrimaryMetrics};
 use narwhal_storage::{CertificateStore, PayloadStore, ProposerStore, VoteDigestStore};
 use narwhal_typed_store::traits::Database;
 use parking_lot::Mutex;
+use reth_primitives::BlockNumHash;
 use std::{
     cmp::Reverse,
     collections::{btree_map::Entry, BTreeMap, BTreeSet, BinaryHeap, HashMap},
@@ -115,6 +116,7 @@ impl Primary {
         tx_shutdown: &mut PreSubscribedBroadcastSender,
         leader_schedule: LeaderSchedule,
         metrics: &Metrics,
+        execution_result: watch::Receiver<BlockNumHash>,
     ) -> Vec<JoinHandle<()>> {
         // Write the parameters to the logs.
         parameters.tracing();
@@ -426,7 +428,7 @@ impl Primary {
 
         // When the `Synchronizer` collects enough parent certificates, the `Proposer` generates
         // a new header with new batch digests from our workers and sends it to the `Certifier`.
-        let proposer_handle = Proposer::spawn(
+        let proposer = Proposer::new(
             authority.id(),
             committee.clone(),
             proposer_store,
@@ -446,27 +448,7 @@ impl Primary {
             leader_schedule,
         );
 
-        // let proposer = Proposer::new(
-        //     authority.id(),
-        //     committee.clone(),
-        //     proposer_store,
-        //     parameters.header_num_of_batches_threshold,
-        //     parameters.max_header_num_of_batches,
-        //     parameters.max_header_delay,
-        //     parameters.min_header_delay,
-        //     None,
-        //     tx_shutdown.subscribe(),
-        //     rx_parents,
-        //     rx_our_digests,
-        //     rx_system_messages,
-        //     tx_headers,
-        //     tx_narwhal_round_updates,
-        //     rx_committed_own_headers,
-        //     metrics.node_metrics.clone(),
-        //     leader_schedule,
-        // );
-
-        // let proposer_handle = spawn_logged_monitored_task!(proposer, "ProposerTask");
+        let proposer_handle = spawn_logged_monitored_task!(proposer, "ProposerTask");
 
         let mut handles = vec![
             core_handle,
