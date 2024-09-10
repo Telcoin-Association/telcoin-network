@@ -5248,6 +5248,7 @@ dependencies = [
  "governor",
  "indexmap 1.9.3",
  "itertools 0.10.5",
+ "lru 0.10.1",
  "mockall",
  "narwhal-executor",
  "narwhal-network",

@@ -1,0 +1,34 @@
+//! Error types for primary's Proposer task.
+
+use tn_types::Header;
+use tokio::sync::{mpsc, oneshot, watch};
+
+/// Result alias for [`StateHandlerError`].
+pub(crate) type StateHandlerResult<T> = Result<T, StateHandlerError>;
+
+/// Core error variants when executing the output from consensus and extending the canonical block.
+#[derive(Debug, thiserror::Error)]
+pub enum StateHandlerError {
+    /// The watch channel that receives the result from executing output on a blocking thread.
+    #[error(
+        "The watch channel sender for primary's proposer dropped while building the next header."
+    )]
+    WatchChannelClosed,
+    /// The oneshot channel that receives the result from executing output on a blocking thread.
+    #[error(
+        "The oneshot channel sender inside new header task dropped while builing the next header."
+    )]
+    OneshotChannelClosed,
+}
+
+impl From<watch::error::RecvError> for ProposerError {
+    fn from(_: watch::error::RecvError) -> Self {
+        Self::WatchChannelClosed
+    }
+}
+
+impl From<oneshot::error::RecvError> for ProposerError {
+    fn from(_: oneshot::error::RecvError) -> Self {
+        Self::OneshotChannelClosed
+    }
+}

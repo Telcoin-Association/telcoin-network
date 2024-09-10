@@ -133,6 +133,8 @@ pub struct Proposer<DB: Database> {
     /// The latest header.
     opt_latest_header: Option<Header>,
     /// Receiver for shutdown.
+    ///
+    /// Also used to signal committee change.
     rx_shutdown_stream: BroadcastStream<()>,
     /// Receives the parents to include in the next header (along with their round number) from
     /// core.
