@@ -9,11 +9,9 @@ use consensus_metrics::{
 use fastcrypto::groups;
 use fastcrypto_tbls::{dkg, nodes};
 use futures::{FutureExt, StreamExt};
+use reth_primitives::BlockNumHash;
 use std::{
-    collections::VecDeque,
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
+    collections::VecDeque, future::Future, num::NonZero, pin::Pin, task::{Context, Poll}
 };
 use tap::TapFallible;
 use tn_types::{AuthorityIdentifier, ChainIdentifier, Committee, RandomnessPrivateKey};
@@ -23,7 +21,6 @@ use tn_types::{
 use tokio::{sync::oneshot, task::JoinHandle};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info, warn};
-
 use crate::error::StateHandlerResult;
 
 type PkG = groups::bls12381::G2Element;
@@ -32,6 +29,8 @@ type EncG = groups::bls12381::G2Element;
 #[cfg(test)]
 #[path = "tests/state_handler_tests.rs"]
 pub mod state_handler_tests;
+
+const DEFAULT_EXECUTION_RESULT_SIZE: usize = 10;
 
 /// Type alias for the async task that updates state.
 type PendingStateUpdate = oneshot::Receiver<StateHandlerResult<()>>;
@@ -65,6 +64,23 @@ pub struct StateHandler {
     ///
     /// This value is `Some` when consensus commits certificates in the DAG.
     pending_update: Option<PendingStateUpdate>,
+
+    /// Receiver for requests for a round's `[BlockNumHash]`.
+    ///
+    /// - The proposer requests this? Or does it just track the watch channel itself?
+    /// - Validator would request this
+    ///     - I think headers can come in from a previous round so this needs to track a few rounds
+    ///     - if the last seen round is less than the requested round, wait for execution to update
+    rx_state_request: Receiver<(Round, oneshot::Sender<Option<BlockNumHash>>)>,
+    /// LRU cache to keep the map from growing infinitely large for now.
+    ///
+    /// TODO: just use hashmap for epoch once epochs in place
+    execution_state: lru::LruCache<Round, BlockNumHash>,
+    /// TODO: can't use a watch channel here because state handler MUST receive
+    /// every update for round.
+    ///
+    /// track canonical notifications stream?
+    execution_updates: todo!(),
 }
 
 /// TODO: update
@@ -251,6 +267,7 @@ impl StateHandler {
         randomness_private_key: RandomnessPrivateKey,
         network: anemo::Network,
         beacon_delta: Option<u16>,
+        rx_state_request: Receiver<(Round, oneshot::Sender<Option<BlockNumHash>>)>,
     ) -> Self {
         let rx_shutdown_stream = BroadcastStream::new(rx_shutdown.receiver);
         Self {
@@ -268,6 +285,8 @@ impl StateHandler {
             network,
             updates_queue: Default::default(),
             pending_update: None,
+            rx_state_request,
+            execution_state: lru::LruCache::new(NonZero::new(DEFAULT_EXECUTION_RESULT_SIZE))
         }
     }
 
@@ -325,6 +344,12 @@ impl StateHandler {
                     self.handle_sequenced(commit_round, certificates).await;
                 },
 
+                //
+                // new idea:
+                // track: watch.changed()
+                // - last seen BlockNumHash
+                // - LRU with HashMap<Round, BlockNumHash>
+
                 // _ = self.rx_shutdown.receiver.recv() => {
                 //     // shutdown network
                 //     let _ = self.network.shutdown().await.tap_err(|err|{
@@ -340,64 +365,69 @@ impl StateHandler {
     }
 }
 
-// impl Future for StateHandler {
-//     type Output = StateHandlerResult<()>;
+impl Future for StateHandler {
+    type Output = StateHandlerResult<()>;
 
-//     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-//         let this = self.get_mut();
-//         loop {
-//             // check for shutdown signal
-//             //
-//             // okay to shutdown here because other primary tasks are expected to shutdown too
-//             // ie) no point completing the proposal if certifier is down
-//             if let Poll::Ready(Some(_shutdown)) = this.rx_shutdown_stream.poll_next_unpin(cx) {
-//                 // shutdown network
-//                 let network = this.network.clone();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        loop {
+            // check for shutdown signal
+            //
+            // okay to shutdown here because other primary tasks are expected to shutdown too
+            // ie) no point completing the proposal if certifier is down
+            if let Poll::Ready(Some(_shutdown)) = this.rx_shutdown_stream.poll_next_unpin(cx) {
+                // shutdown network
+                let network = this.network.clone();
 
-//                 // attempt to shutdown network
-//                 tokio::task::spawn(async move {
-//                     let _ = network
-//                         .shutdown()
-//                         .await
-//                         .tap_err(|err| error!(target: "primary::state_handler", "Error while shutting down network: {err}"));
-//                 });
+                // attempt to shutdown network
+                tokio::task::spawn(async move {
+                    let _ = network
+                        .shutdown()
+                        .await
+                        .tap_err(|err| error!(target: "primary::state_handler", "Error while shutting down network: {err}"));
+                });
 
-//                 debug!(target: "primary::state_handler", "State handler shutting down");
+                debug!(target: "primary::state_handler", "State handler shutting down");
 
-//                 return Poll::Ready(Ok(()));
-//             }
+                return Poll::Ready(Ok(()));
+            }
 
-//             // poll receiver that returns when state update is complete
-//             //
-//             // if the update isn't complete, break loop and return pending
-//             if let Some(mut receiver) = this.pending_update.take() {
-//                 match receiver.poll_unpin(cx) {
-//                     Poll::Ready(res) => {
-//                         this.handle_proposal_result(res);
+            // respond to any requests for execution state
+            while let Poll::Ready(Some((round, reply))) = this.rx_state_request.poll_recv(cx) {
+                // trying to validate header
 
-//                         // continue the loop to propose the next header
-//                         continue;
-//                     }
-//                     Poll::Pending => {
-//                         this.pending_header = Some(receiver);
+                // spawn a task for request
+                // this could take a while if waiting for execution to complete
 
-//                         // skip checking conditions for proposing next header
-//                         // since only one header is proposed at a time, there is no need to check
-//                         // timers, parents, execution progress, etc.
-//                         break;
-//                     }
-//                 }
-//             }
+                tokio::spawn(async move {
 
-//             if let Poll::Ready(Some((commit_round, certificates))) =
-//                 this.rx_committed_certificates.poll_recv(cx)
-//             {
-//                 this.handle_sequenced(commit_round, certificates);
-//             };
+                })
+                todo!()
+            }
 
-//             // TODO: remove this break
-//             break;
-//         }
-//         Poll::Pending
-//     }
-// }
+            // poll receiver that returns when state update is complete
+            //
+            // if the update isn't complete, break loop and return pending
+            if let Some(mut receiver) = this.pending_update.take() {
+                match receiver.poll_unpin(cx) {
+                    Poll::Ready(res) => {
+                        todo!()
+                    }
+                    Poll::Pending => {
+                        todo!()
+                    }
+                }
+            }
+
+            if let Poll::Ready(Some((commit_round, certificates))) =
+                this.rx_committed_certificates.poll_recv(cx)
+            {
+                this.handle_sequenced(commit_round, certificates);
+            };
+
+            // TODO: remove this break
+            break;
+        }
+        Poll::Pending
+    }
+}
