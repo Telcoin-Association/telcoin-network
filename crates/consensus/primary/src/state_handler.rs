@@ -30,7 +30,8 @@ type EncG = groups::bls12381::G2Element;
 #[path = "tests/state_handler_tests.rs"]
 pub mod state_handler_tests;
 
-const DEFAULT_EXECUTION_RESULT_SIZE: usize = 10;
+// TODO: is this even necessary?
+const DEFAULT_EXECUTION_RESULT_SIZE: usize = 8;
 
 /// Type alias for the async task that updates state.
 type PendingStateUpdate = oneshot::Receiver<StateHandlerResult<()>>;
