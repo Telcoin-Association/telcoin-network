@@ -677,7 +677,7 @@ mod test {
     };
     use tn_types::{
         test_utils::{temp_dir, CommitteeFixture},
-        AuthorityIdentifier, Certificate, CertificateAPI, CertificateDigest, HeaderAPI,
+        AuthorityIdentifier, Certificate, CertificateDigest,
     };
 
     fn new_store<DB: Database>(db: DB) -> CertificateStore<DB> {

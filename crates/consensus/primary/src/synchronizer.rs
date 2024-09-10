@@ -39,8 +39,7 @@ use narwhal_network_types::{
 use tn_types::{
     ensure,
     error::{AcceptNotification, DagError, DagResult},
-    Certificate, CertificateAPI, CertificateDigest, Header, HeaderAPI, Round,
-    SignatureVerificationState,
+    Certificate, CertificateDigest, Header, Round, SignatureVerificationState,
 };
 use tokio::{
     sync::{broadcast, oneshot, watch, MutexGuard},

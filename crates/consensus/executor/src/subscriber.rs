@@ -15,9 +15,9 @@ use std::{
     vec,
 };
 use tn_types::{
-    AuthorityIdentifier, Batch, BatchAPI, BatchDigest, Certificate, CertificateAPI,
-    CommittedSubDag, Committee, ConditionalBroadcastReceiver, ConsensusOutput, HeaderAPI,
-    MetadataAPI, NetworkPublicKey, Timestamp, WorkerCache, WorkerId,
+    AuthorityIdentifier, BlockHash, Certificate, CommittedSubDag, Committee,
+    ConditionalBroadcastReceiver, ConsensusOutput, NetworkPublicKey, Timestamp, WorkerBlock,
+    WorkerCache, WorkerId,
 };
 use tokio::{sync::broadcast, task::JoinHandle};
 use tracing::{debug, error, info, warn};
@@ -225,7 +225,7 @@ impl Subscriber {
 
         let mut batch_digests_and_workers: HashMap<
             NetworkPublicKey,
-            (HashSet<BatchDigest>, HashSet<NetworkPublicKey>),
+            (HashSet<BlockHash>, HashSet<NetworkPublicKey>),
         > = HashMap::new();
 
         for cert in &sub_dag.certificates {
@@ -290,7 +290,7 @@ impl Subscriber {
     ) -> Vec<NetworkPublicKey> {
         // Can include own authority and worker, but worker will always check local storage when
         // fetching paylods.
-        let authorities = certificate.signed_authorities(&inner.committee);
+        let authorities = certificate.signed_authorities_with_committee(&inner.committee);
         authorities
             .into_iter()
             .filter_map(|authority| {
@@ -313,9 +313,9 @@ impl Subscriber {
         inner: &Inner,
         batch_digests_and_workers: HashMap<
             NetworkPublicKey,
-            (HashSet<BatchDigest>, HashSet<NetworkPublicKey>),
+            (HashSet<BlockHash>, HashSet<NetworkPublicKey>),
         >,
-    ) -> HashMap<BatchDigest, Batch> {
+    ) -> HashMap<BlockHash, WorkerBlock> {
         let mut fetched_batches = HashMap::new();
 
         for (worker_name, (digests, known_workers)) in batch_digests_and_workers {
@@ -349,9 +349,8 @@ impl Subscriber {
         fetched_batches
     }
 
-    fn record_fetched_batch_metrics(inner: &Inner, batch: &Batch, digest: &BatchDigest) {
-        let metadata = batch.versioned_metadata();
-        if let Some(received_at) = metadata.received_at() {
+    fn record_fetched_batch_metrics(inner: &Inner, batch: &WorkerBlock, digest: &BlockHash) {
+        if let Some(received_at) = batch.received_at() {
             let remote_duration = received_at.elapsed().as_secs_f64();
             debug!(
                 "Batch was fetched for execution after being received from another worker {}s ago.",
@@ -363,7 +362,7 @@ impl Subscriber {
                 .with_label_values(&["other"])
                 .observe(remote_duration);
         } else {
-            let local_duration = batch.versioned_metadata().created_at().elapsed().as_secs_f64();
+            let local_duration = batch.created_at().elapsed().as_secs_f64();
             debug!(
                 "Batch was fetched for execution after being created locally {}s ago.",
                 local_duration
@@ -375,7 +374,7 @@ impl Subscriber {
                 .observe(local_duration);
         };
 
-        let batch_fetch_duration = batch.versioned_metadata().created_at().elapsed().as_secs_f64();
+        let batch_fetch_duration = batch.created_at().elapsed().as_secs_f64();
         inner.metrics.batch_execution_latency.observe(batch_fetch_duration);
         debug!(
             "Batch {:?} took {} seconds since it has been created to when it has been fetched for execution",

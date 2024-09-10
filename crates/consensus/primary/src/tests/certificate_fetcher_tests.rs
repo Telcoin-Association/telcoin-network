@@ -24,10 +24,9 @@ use reth_tracing::init_test_tracing;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tn_types::{
-    test_utils::CommitteeFixture, AuthorityIdentifier, BatchDigest, BlsAggregateSignatureBytes,
-    Certificate, CertificateAPI, CertificateDigest, Epoch, Header, HeaderAPI, HeaderDigest,
-    PreSubscribedBroadcastSender, Round, SignatureVerificationState, SystemMessage, TimestampSec,
-    WorkerId,
+    test_utils::CommitteeFixture, AuthorityIdentifier, BlockHash, BlsAggregateSignatureBytes,
+    Certificate, CertificateDigest, Epoch, Header, HeaderDigest, PreSubscribedBroadcastSender,
+    Round, SignatureVerificationState, SystemMessage, TimestampSec, WorkerId,
 };
 use tokio::{
     sync::{
@@ -146,7 +145,7 @@ struct BadHeader {
     pub round: Round,
     pub epoch: Epoch,
     pub created_at: TimestampSec,
-    pub payload: IndexMap<BatchDigest, WorkerId>,
+    pub payload: IndexMap<BlockHash, WorkerId>,
     pub system_messages: Vec<SystemMessage>,
     pub parents: BTreeSet<CertificateDigest>,
     pub id: OnceCell<HeaderDigest>,

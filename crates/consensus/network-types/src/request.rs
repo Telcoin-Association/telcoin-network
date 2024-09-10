@@ -3,8 +3,8 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use tn_types::{
-    AuthorityIdentifier, Batch, BatchDigest, Certificate, Header, NetworkPublicKey, Round,
-    VersionedMetadata, WorkerId,
+    AuthorityIdentifier, BlockHash, Certificate, Header, NetworkPublicKey, Round,
+    TransactionSigned, WorkerBlock, WorkerId,
 };
 use tracing::warn;
 
@@ -101,7 +101,7 @@ impl FetchCertificatesRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FetchBatchesRequest {
     /// Missing batch digests to fetch from peers.
-    pub digests: HashSet<BatchDigest>,
+    pub digests: HashSet<BlockHash>,
     /// The network public key of the peers.
     pub known_workers: HashSet<NetworkPublicKey>,
 }
@@ -112,11 +112,11 @@ pub struct FetchBatchesRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MissingBatchesRequest {
     /// Missing batches
-    pub digests: HashSet<BatchDigest>,
+    pub digests: HashSet<BlockHash>,
 }
 
-impl From<HashSet<BatchDigest>> for MissingBatchesRequest {
-    fn from(digests: HashSet<BatchDigest>) -> Self {
+impl From<HashSet<BlockHash>> for MissingBatchesRequest {
+    fn from(digests: HashSet<BlockHash>) -> Self {
         Self { digests }
     }
 }
@@ -127,7 +127,7 @@ impl From<HashSet<BatchDigest>> for MissingBatchesRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RequestBatchesRequest {
     /// Vec of requested batches' digests
-    pub batch_digests: Vec<BatchDigest>,
+    pub batch_digests: Vec<BlockHash>,
 }
 
 /// Worker's batch maker request to EL after timer goes off.
@@ -147,16 +147,16 @@ impl From<WorkerId> for BuildBatchRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SealBatchRequest {
     /// Collection of transactions encoded as bytes.
-    pub payload: Vec<Vec<u8>>,
+    pub payload: Vec<TransactionSigned>,
     /// Execution data for validation.
-    pub metadata: VersionedMetadata,
+    pub worker_block: WorkerBlock,
 }
 
 /// Used by workers to validate a peer's batch using EL.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ValidateBatchRequest {
     /// The peer's batch to validate.
-    pub batch: Batch,
+    pub batch: WorkerBlock,
     /// The worker's id.
     ///
     /// TODO: this is redundant because
@@ -165,8 +165,8 @@ pub struct ValidateBatchRequest {
     pub worker_id: WorkerId,
 }
 
-impl From<SealBatchRequest> for Batch {
+impl From<SealBatchRequest> for WorkerBlock {
     fn from(value: SealBatchRequest) -> Self {
-        Batch::new_with_metadata(value.payload, value.metadata)
+        WorkerBlock::new(value.payload, value.worker_block.sealed_header.clone())
     }
 }

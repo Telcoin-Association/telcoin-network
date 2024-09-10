@@ -6,8 +6,8 @@
 //! Committe fixture for all authorities and their workers within a committee for a specific epoch.
 use super::{fixture_batch_with_transactions, AuthorityFixture, Builder};
 use crate::{
-    Certificate, CertificateDigest, Committee, Epoch, Header, HeaderAPI, HeaderV1Builder, Round,
-    Vote, VoteAPI, WorkerCache,
+    Certificate, CertificateDigest, Committee, Epoch, Header, HeaderBuilder, Round, Vote,
+    WorkerCache,
 };
 use std::collections::BTreeSet;
 
@@ -89,16 +89,15 @@ impl CommitteeFixture {
             .authorities
             .iter()
             .map(|a| {
-                let builder = HeaderV1Builder::default();
-                let header = builder
+                let builder = HeaderBuilder::default();
+                builder
                     .author(a.id())
                     .round(round)
                     .epoch(0)
                     .parents(parents.clone())
                     .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
                     .build()
-                    .unwrap();
-                Header::V1(header)
+                    .unwrap()
             })
             .collect();
 

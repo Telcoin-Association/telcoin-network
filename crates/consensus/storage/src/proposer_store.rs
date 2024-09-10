@@ -47,25 +47,24 @@ mod test {
     use tempfile::TempDir;
     use tn_types::{
         test_utils::{fixture_batch_with_transactions, CommitteeFixture},
-        CertificateDigest, Header, HeaderV1Builder, Round,
+        CertificateDigest, Header, HeaderBuilder, Round,
     };
 
     use super::ProposerStore;
 
     pub fn create_header_for_round(round: Round) -> Header {
-        let builder = HeaderV1Builder::default();
+        let builder = HeaderBuilder::default();
         let fixture = CommitteeFixture::builder().randomize_ports(true).build();
         let primary = fixture.authorities().next().unwrap();
         let id = primary.id();
-        let header = builder
+        builder
             .author(id)
             .round(round)
             .epoch(fixture.committee().epoch())
             .parents([CertificateDigest::default()].iter().cloned().collect())
             .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
             .build()
-            .unwrap();
-        Header::V1(header)
+            .unwrap()
     }
 
     #[tokio::test]

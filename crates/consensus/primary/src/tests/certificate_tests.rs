@@ -11,8 +11,8 @@ use rand::{
 };
 use std::num::NonZeroUsize;
 use tn_types::{
-    test_utils::CommitteeFixture, AuthorityIdentifier, BlsKeypair, Certificate, CertificateAPI,
-    SignatureVerificationState, Vote, VoteAPI,
+    test_utils::CommitteeFixture, AuthorityIdentifier, BlsKeypair, Certificate,
+    SignatureVerificationState, Vote,
 };
 
 #[test]

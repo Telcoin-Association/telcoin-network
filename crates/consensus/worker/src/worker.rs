@@ -37,7 +37,7 @@ use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, thread::sleep, time::D
 use tn_batch_validator::BatchValidation;
 use tn_types::{
     traits::KeyPair as _, Authority, AuthorityIdentifier, Committee, Multiaddr, NetworkKeypair,
-    NetworkPublicKey, NewBatch, Parameters, Protocol, WorkerCache, WorkerId,
+    NetworkPublicKey, NewWorkerBlock, Parameters, Protocol, WorkerCache, WorkerId,
 };
 
 use narwhal_network_types::{PrimaryToWorkerServer, WorkerToWorkerServer};
@@ -90,7 +90,7 @@ impl<DB: Database> Worker<DB> {
         tx_shutdown: &mut PreSubscribedBroadcastSender,
         // for EL batch maker
         channel_metrics: Arc<WorkerChannelMetrics>,
-        rx_batch_maker: Receiver<NewBatch>,
+        rx_batch_maker: Receiver<NewWorkerBlock>,
     ) -> Vec<JoinHandle<()>> {
         let worker_name = keypair.public().clone();
         let worker_peer_id = PeerId(worker_name.0.to_bytes());
@@ -433,7 +433,7 @@ impl<DB: Database> Worker<DB> {
         channel_metrics: Arc<WorkerChannelMetrics>,
         client: NetworkClient,
         network: anemo::Network,
-        rx_batch_maker: Receiver<NewBatch>,
+        rx_batch_maker: Receiver<NewWorkerBlock>,
     ) -> Vec<JoinHandle<()>> {
         info!("Starting handler for transactions");
 

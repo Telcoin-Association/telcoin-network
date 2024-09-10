@@ -7,6 +7,7 @@ use super::*;
 use crate::NUM_SHUTDOWN_RECEIVERS;
 use narwhal_network_types::MockWorkerToPrimary;
 use narwhal_typed_store::open_db;
+use reth_primitives::SealedHeader;
 use tempfile::TempDir;
 use tn_types::{test_utils::transaction, PreSubscribedBroadcastSender};
 
@@ -43,12 +44,15 @@ async fn make_batch() {
     // Send enough transactions to seal a batch.
     let tx = transaction();
     let (ack, batch1_rx) = tokio::sync::oneshot::channel();
-    let new_batch_1 = NewBatch { batch: Batch::new(vec![tx.clone(), tx.clone()]), ack };
+    let new_batch_1 = NewWorkerBlock {
+        block: WorkerBlock::new(vec![tx.clone(), tx.clone()], SealedHeader::default()),
+        ack,
+    };
 
     tx_batch_maker.send(new_batch_1).await.unwrap();
 
     // Ensure the batch is as expected.
-    let expected_batch = Batch::new(vec![tx.clone(), tx.clone()]);
+    let expected_batch = WorkerBlock::new(vec![tx.clone(), tx.clone()], SealedHeader::default());
     let (batch, resp) = rx_quorum_waiter.recv().await.unwrap();
 
     assert_eq!(batch.transactions(), expected_batch.transactions());

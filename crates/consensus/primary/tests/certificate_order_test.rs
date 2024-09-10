@@ -7,8 +7,7 @@ use rand::{rngs::OsRng, seq::SliceRandom};
 use std::{collections::BTreeSet, num::NonZeroUsize};
 use tn_types::{
     test_utils::{AuthorityFixture, CommitteeFixture},
-    AuthorityIdentifier, BlsPublicKey, BlsSignature, Certificate, Committee, Header, HeaderV1,
-    Stake, Vote, VoteAPI,
+    AuthorityIdentifier, BlsPublicKey, BlsSignature, Certificate, Committee, Header, Stake, Vote,
 };
 
 #[tokio::test]
@@ -25,7 +24,7 @@ async fn test_certificate_signers_are_ordered() {
     // The authority that creates the Header
     let authority = authorities[0];
 
-    let header = HeaderV1::new(authority.id(), 1, 1, IndexMap::new(), Vec::new(), BTreeSet::new());
+    let header = Header::new(authority.id(), 1, 1, IndexMap::new(), Vec::new(), BTreeSet::new());
 
     // WHEN
     let mut votes: Vec<(AuthorityIdentifier, BlsSignature)> = Vec::new();
@@ -35,11 +34,7 @@ async fn test_certificate_signers_are_ordered() {
     for authority in &authorities[1..=3] {
         sorted_signers.push(authority.keypair().public().clone());
 
-        let vote = Vote::new_with_signer(
-            &Header::V1(header.clone()),
-            &authority.id(),
-            authority.keypair(),
-        );
+        let vote = Vote::new_with_signer(&header.clone(), &authority.id(), authority.keypair());
         votes.push((vote.author(), vote.signature().clone()));
     }
 
@@ -47,7 +42,7 @@ async fn test_certificate_signers_are_ordered() {
     votes.shuffle(&mut OsRng);
 
     // Create a certificate
-    let certificate = Certificate::new_unverified(&committee, Header::V1(header), votes).unwrap();
+    let certificate = Certificate::new_unverified(&committee, header, votes).unwrap();
 
     let (stake, signers) = certificate.signed_by(&committee);
 

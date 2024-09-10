@@ -12,7 +12,7 @@ use narwhal_typed_store::traits::Database;
 use std::{collections::VecDeque, sync::Arc};
 use tn_types::{Committee, Stake};
 
-use tn_types::{Certificate, CertificateAPI, CommittedSubDag, HeaderAPI, ReputationScores, Round};
+use tn_types::{Certificate, CommittedSubDag, ReputationScores, Round};
 use tokio::time::Instant;
 use tracing::{debug, error_span};
 

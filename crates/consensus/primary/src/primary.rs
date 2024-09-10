@@ -67,8 +67,8 @@ use narwhal_network_types::{
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
-    now, validate_received_certificate_version, Certificate, CertificateAPI, CertificateDigest,
-    Header, HeaderAPI, MetadataAPI, PreSubscribedBroadcastSender, Round, Vote, VoteInfoAPI,
+    now, validate_received_certificate_version, Certificate, CertificateDigest, Header,
+    PreSubscribedBroadcastSender, Round, Vote,
 };
 use tokio::{
     sync::{oneshot, watch},
@@ -988,7 +988,7 @@ impl<DB: Database> WorkerToPrimary for WorkerReceiverHandler<DB> {
             .send(OurDigestMessage {
                 digest: message.digest,
                 worker_id: message.worker_id,
-                timestamp: *message.metadata.created_at(),
+                timestamp: message.worker_block.created_at(),
                 ack_channel: tx_ack,
             })
             .await

@@ -139,7 +139,7 @@ where
                 ommers.clone(),
                 ommers_root,
                 block_index as u64,
-                batch_digest.into(),
+                batch_digest,
                 &output,
                 output_digest.into(),
                 base_fee_per_gas,

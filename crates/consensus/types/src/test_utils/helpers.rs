@@ -3,10 +3,9 @@
 
 //! Helper methods for creating useful structs during tests.
 use crate::{
-    adiri_chain_spec_arc, to_intent_message, AuthorityIdentifier, Batch, BatchDigest, BlsKeypair,
-    BlsSignature, Certificate, CertificateAPI, CertificateDigest, Committee, Epoch, Header,
-    HeaderAPI, HeaderV1Builder, Multiaddr, NetworkKeypair, Round, Stake, TimestampSec, Transaction,
-    ValidatorSignature, WorkerId,
+    adiri_chain_spec_arc, to_intent_message, AuthorityIdentifier, BlsKeypair, BlsSignature,
+    Certificate, CertificateDigest, Committee, Epoch, HeaderBuilder, Multiaddr, NetworkKeypair,
+    Round, Stake, TimestampSec, ValidatorSignature, WorkerBlock, WorkerId,
 };
 use fastcrypto::{hash::Hash, traits::KeyPair as _};
 use indexmap::IndexMap;
@@ -16,7 +15,7 @@ use rand::{
     rngs::{OsRng, StdRng},
     thread_rng, Rng, RngCore, SeedableRng,
 };
-use reth_primitives::{Address, Bytes, U256};
+use reth_primitives::{Address, BlockHash, Bytes, SealedHeader, TransactionSigned, U256};
 use reth_tracing::tracing_subscriber::EnvFilter;
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
@@ -127,8 +126,8 @@ pub fn random_key() -> BlsKeypair {
 ////////////////////////////////////////////////////////////////
 /// Headers, Votes, Certificates
 ////////////////////////////////////////////////////////////////
-pub fn fixture_payload(number_of_batches: u8) -> IndexMap<BatchDigest, (WorkerId, TimestampSec)> {
-    let mut payload: IndexMap<BatchDigest, (WorkerId, TimestampSec)> = IndexMap::new();
+pub fn fixture_payload(number_of_batches: u8) -> IndexMap<BlockHash, (WorkerId, TimestampSec)> {
+    let mut payload: IndexMap<BlockHash, (WorkerId, TimestampSec)> = IndexMap::new();
 
     for _ in 0..number_of_batches {
         let batch_digest = batch().digest();
@@ -141,17 +140,24 @@ pub fn fixture_payload(number_of_batches: u8) -> IndexMap<BatchDigest, (WorkerId
 
 /// will create a batch with randomly formed transactions
 /// dictated by the parameter number_of_transactions
-pub fn fixture_batch_with_transactions(number_of_transactions: u32) -> Batch {
+pub fn fixture_batch_with_transactions(number_of_transactions: u32) -> WorkerBlock {
     let transactions = (0..number_of_transactions).map(|_v| transaction()).collect();
 
-    Batch::new(transactions)
+    // Put some random bytes in the header so that tests will have unique headers.
+    let r: Vec<u8> = (0..32).map(|_v| rand::random::<u8>()).collect();
+    let header = reth_primitives::Header {
+        nonce: rand::random::<u64>(),
+        extra_data: r.into(),
+        ..Default::default()
+    };
+    WorkerBlock::new(transactions, header.seal_slow())
 }
 
 pub fn fixture_payload_with_rand<R: Rng + ?Sized>(
     number_of_batches: u8,
     rand: &mut R,
-) -> IndexMap<BatchDigest, (WorkerId, TimestampSec)> {
-    let mut payload: IndexMap<BatchDigest, (WorkerId, TimestampSec)> = IndexMap::new();
+) -> IndexMap<BlockHash, (WorkerId, TimestampSec)> {
+    let mut payload: IndexMap<BlockHash, (WorkerId, TimestampSec)> = IndexMap::new();
 
     for _ in 0..number_of_batches {
         let batch_digest = batch_with_rand(rand).digest();
@@ -163,7 +169,7 @@ pub fn fixture_payload_with_rand<R: Rng + ?Sized>(
 }
 
 /// Create a transaction with a randomly generated keypair.
-pub fn transaction_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Transaction {
+pub fn transaction_with_rand<R: Rng + ?Sized>(rand: &mut R) -> TransactionSigned {
     let mut tx_factory = TransactionFactory::new_random_from_seed(rand);
     let chain = adiri_chain_spec_arc();
     // TODO: this is excessively high, but very unlikely to ever fail
@@ -171,18 +177,18 @@ pub fn transaction_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Transaction {
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
 
     // random transaction
-    tx_factory
-        .create_eip1559(chain, gas_price, Some(Address::ZERO), value, Bytes::new())
-        .envelope_encoded()
-        .into()
+    tx_factory.create_eip1559(chain, gas_price, Some(Address::ZERO), value, Bytes::new())
 }
 
-pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Batch {
-    Batch::new(vec![transaction_with_rand(rand), transaction_with_rand(rand)])
+pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R) -> WorkerBlock {
+    WorkerBlock::new(
+        vec![transaction_with_rand(rand), transaction_with_rand(rand)],
+        SealedHeader::default(),
+    )
 }
 
 // Fixture
-pub fn transaction() -> Transaction {
+pub fn transaction() -> TransactionSigned {
     // TODO: make this better
     //
     // The fn is complicated bc everything boils down to this fn
@@ -199,10 +205,7 @@ pub fn transaction() -> Transaction {
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
 
     // random transaction
-    tx_factory
-        .create_eip1559(chain, gas_price, Some(Address::ZERO), value, Bytes::new())
-        .envelope_encoded()
-        .into()
+    tx_factory.create_eip1559(chain, gas_price, Some(Address::ZERO), value, Bytes::new())
 
     // // generate random value transactions, but the length will be always 100 bytes
     // (0..100).map(|_v| rand::random::<u8>()).collect()
@@ -213,14 +216,21 @@ pub fn transaction() -> Transaction {
 ////////////////////////////////////////////////////////////////
 
 // Fixture
-pub fn batch() -> Batch {
+pub fn batch() -> WorkerBlock {
     let transactions = vec![transaction(), transaction()];
-    Batch::new(transactions)
+    // Put some random bytes in the header so that tests will have unique headers.
+    let r: Vec<u8> = (0..32).map(|_v| rand::random::<u8>()).collect();
+    let header = reth_primitives::Header {
+        nonce: rand::random::<u64>(),
+        extra_data: r.into(),
+        ..Default::default()
+    };
+    WorkerBlock::new(transactions, header.seal_slow())
 }
 
 /// generate multiple fixture batches. The number of generated batches
 /// are dictated by the parameter num_of_batches.
-pub fn batches(num_of_batches: usize) -> Vec<Batch> {
+pub fn batches(num_of_batches: usize) -> Vec<WorkerBlock> {
     let mut batches = Vec::new();
 
     for i in 1..num_of_batches + 1 {
@@ -230,14 +240,14 @@ pub fn batches(num_of_batches: usize) -> Vec<Batch> {
     batches
 }
 
-pub fn batch_with_transactions(num_of_transactions: usize) -> Batch {
+pub fn batch_with_transactions(num_of_transactions: usize) -> WorkerBlock {
     let mut transactions = Vec::new();
 
     for _ in 0..num_of_transactions {
         transactions.push(transaction());
     }
 
-    Batch::new(transactions)
+    WorkerBlock::new(transactions, SealedHeader::default())
 }
 
 /// Creates one certificate per authority starting and finishing at the specified rounds
@@ -603,7 +613,7 @@ pub fn mock_certificate_with_rand<R: RngCore + ?Sized>(
     parents: BTreeSet<CertificateDigest>,
     rand: &mut R,
 ) -> (CertificateDigest, Certificate) {
-    let header_builder = HeaderV1Builder::default();
+    let header_builder = HeaderBuilder::default();
     let header = header_builder
         .author(origin)
         .round(round)
@@ -612,7 +622,7 @@ pub fn mock_certificate_with_rand<R: RngCore + ?Sized>(
         .payload(fixture_payload_with_rand(1, rand))
         .build()
         .unwrap();
-    let certificate = Certificate::new_unsigned(committee, Header::V1(header), Vec::new()).unwrap();
+    let certificate = Certificate::new_unsigned(committee, header, Vec::new()).unwrap();
     (certificate.digest(), certificate)
 }
 
@@ -636,7 +646,7 @@ pub fn mock_certificate_with_epoch(
     epoch: Epoch,
     parents: BTreeSet<CertificateDigest>,
 ) -> (CertificateDigest, Certificate) {
-    let header_builder = HeaderV1Builder::default();
+    let header_builder = HeaderBuilder::default();
     let header = header_builder
         .author(origin)
         .round(round)
@@ -645,7 +655,7 @@ pub fn mock_certificate_with_epoch(
         .payload(fixture_payload(1))
         .build()
         .unwrap();
-    let certificate = Certificate::new_unsigned(committee, Header::V1(header), Vec::new()).unwrap();
+    let certificate = Certificate::new_unsigned(committee, header, Vec::new()).unwrap();
     (certificate.digest(), certificate)
 }
 
@@ -657,7 +667,7 @@ pub fn mock_signed_certificate(
     parents: BTreeSet<CertificateDigest>,
     committee: &Committee,
 ) -> (CertificateDigest, Certificate) {
-    let header_builder = HeaderV1Builder::default()
+    let header_builder = HeaderBuilder::default()
         .author(origin)
         .payload(fixture_payload(1))
         .round(round)
@@ -666,15 +676,14 @@ pub fn mock_signed_certificate(
 
     let header = header_builder.build().unwrap();
 
-    let cert =
-        Certificate::new_unsigned(committee, Header::V1(header.clone()), Vec::new()).unwrap();
+    let cert = Certificate::new_unsigned(committee, header.clone(), Vec::new()).unwrap();
 
     let mut votes = Vec::new();
     for (name, signer) in signers {
         let sig = BlsSignature::new_secure(&to_intent_message(cert.header().digest()), signer);
         votes.push((*name, sig))
     }
-    let cert = Certificate::new_unverified(committee, Header::V1(header), votes).unwrap();
+    let cert = Certificate::new_unverified(committee, header, votes).unwrap();
     (cert.digest(), cert)
 }
 

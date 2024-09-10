@@ -39,7 +39,7 @@ async fn wait_for_quorum() {
 
     // Make a batch.
     let batch = batch();
-    let message = WorkerBatchMessage { batch: batch.clone() };
+    let message = WorkerBatchMessage { worker_block: batch.clone() };
 
     // Spawn enough listeners to acknowledge our batches.
     let mut listener_handles = Vec::new();
@@ -93,7 +93,7 @@ async fn pipeline_for_quorum() {
 
     // Make a batch.
     let batch = batch();
-    let message = WorkerBatchMessage { batch: batch.clone() };
+    let message = WorkerBatchMessage { worker_block: batch.clone() };
 
     // Spawn enough listeners to acknowledge our batches.
     let mut listener_handles = Vec::new();

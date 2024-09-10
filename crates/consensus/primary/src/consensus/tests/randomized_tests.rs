@@ -26,7 +26,7 @@ use tn_types::{Authority, AuthorityIdentifier, Committee, Stake};
 
 use tn_types::{
     test_utils::{mock_certificate_with_rand, CommitteeFixture},
-    Certificate, CertificateAPI, CertificateDigest, HeaderAPI, Round,
+    Certificate, CertificateDigest, Round,
 };
 #[allow(unused_imports)]
 use tokio::sync::mpsc::channel;

@@ -19,7 +19,7 @@ use std::{
     fmt::{Debug, Display},
     sync::Arc,
 };
-use tn_types::{Batch, Consensus};
+use tn_types::{Consensus, WorkerBlock};
 use tracing::{debug, error};
 
 /// Batch validator
@@ -47,7 +47,7 @@ where
 pub trait BatchValidation: Clone + Send + Sync + 'static {
     type Error: Display + Debug + Send + Sync + 'static;
     /// Determines if this batch can be voted on
-    async fn validate_batch(&self, b: &Batch) -> Result<(), Self::Error>;
+    async fn validate_batch(&self, b: &WorkerBlock) -> Result<(), Self::Error>;
 }
 
 #[async_trait::async_trait]
@@ -68,7 +68,7 @@ where
     /// append then revert the batch, but this is also very inefficient.
     ///
     /// The validator flow follows: `reth::blockchain_tree::blockchain_tree::validate_block` method.
-    async fn validate_batch(&self, batch: &Batch) -> Result<(), Self::Error> {
+    async fn validate_batch(&self, batch: &WorkerBlock) -> Result<(), Self::Error> {
         // check sui + reth
         //
         // ensure well-formed batch
@@ -242,7 +242,7 @@ pub struct NoopBatchValidator;
 impl BatchValidation for NoopBatchValidator {
     type Error = BatchValidationError;
 
-    async fn validate_batch(&self, _batch: &Batch) -> Result<(), Self::Error> {
+    async fn validate_batch(&self, _batch: &WorkerBlock) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -269,7 +269,6 @@ mod tests {
     use tn_types::{
         adiri_genesis,
         test_utils::{get_gas_price, TransactionFactory},
-        VersionedMetadata,
     };
 
     /// Return the next valid batch
@@ -413,13 +412,8 @@ mod tests {
         );
         debug!("transaction 3: {transaction3:?}");
 
-        let transactions = vec![
-            transaction1.envelope_encoded().into(),
-            transaction2.envelope_encoded().into(),
-            transaction3.envelope_encoded().into(),
-        ];
-        let metadata = VersionedMetadata::new(sealed_header.clone());
-        let batch = Batch::new_with_metadata(transactions, metadata);
+        let transactions = vec![transaction1, transaction2, transaction3];
+        let batch = WorkerBlock::new(transactions, sealed_header.clone());
 
         let result = batch_validator.validate_batch(&batch).await;
 
@@ -526,13 +520,8 @@ mod tests {
         let mut sealed_header = next_valid_sealed_header();
         sealed_header.set_parent_hash(wrong_parent_hash);
 
-        let transactions = vec![
-            transaction1.envelope_encoded().into(),
-            transaction2.envelope_encoded().into(),
-            transaction3.envelope_encoded().into(),
-        ];
-        let metadata = VersionedMetadata::new(sealed_header.clone());
-        let batch = Batch::new_with_metadata(transactions, metadata);
+        let transactions = vec![transaction1, transaction2, transaction3];
+        let batch = WorkerBlock::new(transactions, sealed_header.clone());
 
         let result = batch_validator.validate_batch(&batch).await;
 
@@ -638,13 +627,8 @@ mod tests {
         .into();
         sealed_header.set_state_root(wrong_state_root);
 
-        let transactions = vec![
-            transaction1.envelope_encoded().into(),
-            transaction2.envelope_encoded().into(),
-            transaction3.envelope_encoded().into(),
-        ];
-        let metadata = VersionedMetadata::new(sealed_header.clone());
-        let batch = Batch::new_with_metadata(transactions, metadata);
+        let transactions = vec![transaction1, transaction2, transaction3];
+        let batch = WorkerBlock::new(transactions, sealed_header.clone());
 
         let result = batch_validator.validate_batch(&batch).await;
 
@@ -792,13 +776,8 @@ mod tests {
         //     hex!("ed9242a844ec144e25b58c085184c3c4ae8709226771659badf7e45cdd415c58").into(),
         // );
 
-        let transactions = vec![
-            transaction1.envelope_encoded().into(),
-            transaction2.envelope_encoded().into(),
-            transaction3.envelope_encoded().into(),
-        ];
-        let metadata = VersionedMetadata::new(sealed_header.clone());
-        let batch = Batch::new_with_metadata(transactions, metadata);
+        let transactions = vec![transaction1, transaction2, transaction3];
+        let batch = WorkerBlock::new(transactions, sealed_header.clone());
 
         let result = batch_validator.validate_batch(&batch).await;
 
@@ -942,13 +921,8 @@ mod tests {
         //     hex!("ed9242a844ec144e25b58c085184c3c4ae8709226771659badf7e45cdd415c58").into(),
         // );
 
-        let transactions = vec![
-            transaction1.envelope_encoded().into(),
-            transaction2.envelope_encoded().into(),
-            transaction3.envelope_encoded().into(),
-        ];
-        let metadata = VersionedMetadata::new(sealed_header.clone());
-        let batch = Batch::new_with_metadata(transactions, metadata);
+        let transactions = vec![transaction1, transaction2, transaction3];
+        let batch = WorkerBlock::new(transactions, sealed_header.clone());
 
         let result = batch_validator.validate_batch(&batch).await;
 

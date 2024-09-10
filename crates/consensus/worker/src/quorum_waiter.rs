@@ -5,13 +5,12 @@
 
 use crate::{batch_maker::MAX_PARALLEL_BATCH, metrics::WorkerMetrics};
 use consensus_metrics::{metered_channel::Receiver, monitored_future, spawn_logged_monitored_task};
-use fastcrypto::hash::Hash;
 use futures::stream::{futures_unordered::FuturesUnordered, StreamExt as _};
 use narwhal_network::{CancelOnDropHandler, ReliableNetwork};
 use narwhal_network_types::WorkerBatchMessage;
 use std::{sync::Arc, time::Duration};
 use tn_types::{
-    Authority, Batch, Committee, ConditionalBroadcastReceiver, Stake, WorkerCache, WorkerId,
+    Authority, Committee, ConditionalBroadcastReceiver, Stake, WorkerBlock, WorkerCache, WorkerId,
 };
 use tokio::{task::JoinHandle, time::timeout};
 use tracing::{trace, warn};
@@ -33,7 +32,7 @@ pub struct QuorumWaiter {
     /// Receiver for shutdown.
     rx_shutdown: ConditionalBroadcastReceiver,
     /// Input Channel to receive commands.
-    rx_quorum_waiter: Receiver<(Batch, tokio::sync::oneshot::Sender<()>)>,
+    rx_quorum_waiter: Receiver<(WorkerBlock, tokio::sync::oneshot::Sender<()>)>,
     /// A network sender to broadcast the batches to the other workers.
     network: anemo::Network,
     /// Record metrics for quorum waiter.
@@ -50,7 +49,7 @@ impl QuorumWaiter {
         committee: Committee,
         worker_cache: WorkerCache,
         rx_shutdown: ConditionalBroadcastReceiver,
-        rx_quorum_waiter: Receiver<(Batch, tokio::sync::oneshot::Sender<()>)>,
+        rx_quorum_waiter: Receiver<(WorkerBlock, tokio::sync::oneshot::Sender<()>)>,
         network: anemo::Network,
         metrics: Arc<WorkerMetrics>,
     ) -> JoinHandle<()> {
@@ -103,7 +102,7 @@ impl QuorumWaiter {
                         .map(|(name, info)| (name, info.name))
                         .collect();
                     let (primary_names, worker_names): (Vec<_>, _) = workers.into_iter().unzip();
-                    let message  = WorkerBatchMessage{batch: batch.clone()};
+                    let message  = WorkerBatchMessage{worker_block: batch.clone()};
                     let handlers = self.network.broadcast(worker_names, &message);
                     let timer = self.metrics.batch_broadcast_quorum_latency.start_timer();
 

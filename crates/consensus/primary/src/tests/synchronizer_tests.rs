@@ -24,8 +24,7 @@ use tempfile::TempDir;
 use tn_types::{
     error::DagError,
     test_utils::{make_optimal_signed_certificates, mock_signed_certificate, CommitteeFixture},
-    BlsAggregateSignatureBytes, Certificate, CertificateAPI, Committee, Header, HeaderAPI, Round,
-    SignatureVerificationState,
+    BlsAggregateSignatureBytes, Certificate, Committee, Round, SignatureVerificationState,
 };
 use tokio::sync::watch;
 
@@ -790,13 +789,11 @@ async fn sync_batches_drops_old() {
 
     let mut certificates = HashMap::new();
     for _ in 0..3 {
-        let header = Header::V1(
-            author
-                .header_builder(&fixture.committee())
-                .with_payload_batch(tn_types::test_utils::fixture_batch_with_transactions(10), 0, 0)
-                .build()
-                .unwrap(),
-        );
+        let header = author
+            .header_builder(&fixture.committee())
+            .with_payload_batch(tn_types::test_utils::fixture_batch_with_transactions(10), 0, 0)
+            .build()
+            .unwrap();
 
         let certificate = fixture.certificate(&header);
         let digest = certificate.clone().digest();
@@ -807,15 +804,13 @@ async fn sync_batches_drops_old() {
             payload_store.write(digest, worker_id).unwrap();
         }
     }
-    let test_header = Header::V1(
-        author
-            .header_builder(&fixture.committee())
-            .round(2)
-            .parents(certificates.keys().cloned().collect())
-            .with_payload_batch(tn_types::test_utils::fixture_batch_with_transactions(10), 1, 0)
-            .build()
-            .unwrap(),
-    );
+    let test_header = author
+        .header_builder(&fixture.committee())
+        .round(2)
+        .parents(certificates.keys().cloned().collect())
+        .with_payload_batch(tn_types::test_utils::fixture_batch_with_transactions(10), 1, 0)
+        .build()
+        .unwrap();
 
     tokio::task::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;

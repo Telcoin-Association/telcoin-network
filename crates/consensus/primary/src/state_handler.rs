@@ -16,7 +16,7 @@ use std::{
 use tap::TapFallible;
 use tn_types::{AuthorityIdentifier, ChainIdentifier, Committee, RandomnessPrivateKey};
 use tn_types::{
-    Certificate, CertificateAPI, ConditionalBroadcastReceiver, HeaderAPI, Round, SystemMessage,
+    Certificate, ConditionalBroadcastReceiver, Round, SystemMessage,
 };
 use tokio::{sync::oneshot, task::JoinHandle};
 use tokio_stream::wrappers::BroadcastStream;

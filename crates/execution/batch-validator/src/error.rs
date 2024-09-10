@@ -5,7 +5,7 @@ use reth_evm::execute::{BlockExecutionError, BlockValidationError};
 use reth_primitives::{GotExpected, B256};
 use reth_provider::ProviderError;
 use thiserror::Error;
-use tn_types::{BatchConversionError, ConsensusError};
+use tn_types::{ConsensusError, WorkerBlockConversionError};
 
 /// Batch validation error types
 #[derive(Error, Debug)]
@@ -15,7 +15,7 @@ pub enum BatchValidationError {
     Execution(#[from] BlockExecutionError),
     /// Errors for converting batch into sealed block
     #[error(transparent)]
-    IntoSealedBlock(#[from] BatchConversionError),
+    IntoSealedBlock(#[from] WorkerBlockConversionError),
     /// Provider error.
     #[error(transparent)]
     Provider(#[from] ProviderError),

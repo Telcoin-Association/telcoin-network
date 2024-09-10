@@ -10,7 +10,7 @@ use narwhal_typed_store::{
 use std::sync::Arc;
 use telcoin_macros::fail_point;
 use telcoin_sync::sync::notify_read::NotifyRead;
-use tn_types::{BatchDigest, WorkerId};
+use tn_types::{BlockHash, WorkerId};
 
 /// Store of the batch digests for the primary node for the own created batches.
 #[derive(Clone)]
@@ -18,7 +18,7 @@ pub struct PayloadStore<DB> {
     store: DB, // Payload
 
     /// Senders to notify for a write that happened for the specified batch digest and worker id
-    notify_subscribers: Arc<NotifyRead<(BatchDigest, WorkerId), ()>>,
+    notify_subscribers: Arc<NotifyRead<(BlockHash, WorkerId), ()>>,
 }
 
 impl<DB: Database> PayloadStore<DB> {
@@ -26,7 +26,7 @@ impl<DB: Database> PayloadStore<DB> {
         Self { store, notify_subscribers: Arc::new(NotifyRead::new()) }
     }
 
-    pub fn write(&self, digest: &BatchDigest, worker_id: &WorkerId) -> eyre::Result<()> {
+    pub fn write(&self, digest: &BlockHash, worker_id: &WorkerId) -> eyre::Result<()> {
         fail_point!("narwhal-store-before-write");
 
         self.store.insert::<Payload>(&(*digest, *worker_id), &0u8)?;
@@ -40,7 +40,7 @@ impl<DB: Database> PayloadStore<DB> {
     /// be stored.
     pub fn write_all(
         &self,
-        keys: impl IntoIterator<Item = (BatchDigest, WorkerId)> + Clone,
+        keys: impl IntoIterator<Item = (BlockHash, WorkerId)> + Clone,
     ) -> eyre::Result<()> {
         fail_point!("narwhal-store-before-write");
         let mut txn = self.store.write_txn()?;
@@ -56,7 +56,7 @@ impl<DB: Database> PayloadStore<DB> {
 
     /// Queries the store whether the batch with provided `digest` and `worker_id` exists. It
     /// returns `true` if exists, `false` otherwise.
-    pub fn contains(&self, digest: BatchDigest, worker_id: WorkerId) -> eyre::Result<bool> {
+    pub fn contains(&self, digest: BlockHash, worker_id: WorkerId) -> eyre::Result<bool> {
         self.store.contains_key::<Payload>(&(digest, worker_id))
     }
 
@@ -64,7 +64,7 @@ impl<DB: Database> PayloadStore<DB> {
     /// becomes available.
     pub async fn notify_contains(
         &self,
-        digest: BatchDigest,
+        digest: BlockHash,
         worker_id: WorkerId,
     ) -> eyre::Result<()> {
         let receiver = self.notify_subscribers.register_one(&(digest, worker_id));
@@ -87,7 +87,7 @@ impl<DB: Database> PayloadStore<DB> {
 
     pub fn read_all(
         &self,
-        keys: impl IntoIterator<Item = (BatchDigest, WorkerId)>,
+        keys: impl IntoIterator<Item = (BlockHash, WorkerId)>,
     ) -> eyre::Result<Vec<Option<PayloadToken>>> {
         let txn = self.store.read_txn()?;
         keys.into_iter().map(|key| txn.get::<Payload>(&key)).collect()
@@ -96,7 +96,7 @@ impl<DB: Database> PayloadStore<DB> {
     #[allow(clippy::let_and_return)]
     pub fn remove_all(
         &self,
-        keys: impl IntoIterator<Item = (BatchDigest, WorkerId)>,
+        keys: impl IntoIterator<Item = (BlockHash, WorkerId)>,
     ) -> eyre::Result<()> {
         fail_point!("narwhal-store-before-write");
         let mut txn = self.store.write_txn()?;
@@ -114,11 +114,10 @@ impl<DB: Database> PayloadStore<DB> {
 #[cfg(test)]
 mod tests {
     use crate::PayloadStore;
-    use fastcrypto::hash::Hash;
     use futures::future::join_all;
     use narwhal_typed_store::open_db;
     use tempfile::TempDir;
-    use tn_types::Batch;
+    use tn_types::WorkerBlock;
 
     #[tokio::test]
     async fn test_notify_read() {
@@ -127,7 +126,7 @@ mod tests {
         let store = PayloadStore::new(db);
 
         // run the tests a few times
-        let batch: Batch = tn_types::test_utils::fixture_batch_with_transactions(10);
+        let batch: WorkerBlock = tn_types::test_utils::fixture_batch_with_transactions(10);
         let id = batch.digest();
         let worker_id = 0;
 

@@ -4,7 +4,7 @@
 
 use narwhal_typed_store::{tables::Votes, traits::Database};
 use telcoin_macros::fail_point;
-use tn_types::{AuthorityIdentifier, Vote, VoteAPI, VoteInfo};
+use tn_types::{AuthorityIdentifier, Vote, VoteInfo};
 
 /// The storage for the last votes digests per authority
 #[derive(Clone)]

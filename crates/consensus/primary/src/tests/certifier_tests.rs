@@ -15,7 +15,7 @@ use rand::{rngs::StdRng, SeedableRng};
 use std::num::NonZeroUsize;
 use tempfile::TempDir;
 use tn_types::{
-    test_utils::CommitteeFixture, BlsKeypair, CertificateAPI, PreSubscribedBroadcastSender,
+    test_utils::CommitteeFixture, BlsKeypair, PreSubscribedBroadcastSender,
     SignatureVerificationState,
 };
 use tokio::sync::watch;

@@ -10,7 +10,6 @@ use std::{
 
 use anemo::Network;
 use async_trait::async_trait;
-use fastcrypto::hash::Hash;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use itertools::Itertools;
 use narwhal_network::WorkerRpc;
@@ -23,7 +22,7 @@ use rand::{rngs::ThreadRng, seq::SliceRandom};
 use tn_types::NetworkPublicKey;
 
 use narwhal_network_types::{RequestBatchesRequest, RequestBatchesResponse};
-use tn_types::{now, Batch, BatchAPI, BatchDigest, MetadataAPI};
+use tn_types::{now, BlockHash, WorkerBlock};
 use tokio::{
     select,
     time::{sleep, sleep_until, Instant},
@@ -61,9 +60,9 @@ impl<DB: Database> BatchFetcher<DB> {
     /// This function performs infinite retries and blocks until all batches are available.
     pub async fn fetch(
         &self,
-        digests: HashSet<BatchDigest>,
+        digests: HashSet<BlockHash>,
         known_workers: HashSet<NetworkPublicKey>,
-    ) -> HashMap<BatchDigest, Batch> {
+    ) -> HashMap<BlockHash, WorkerBlock> {
         debug!(
             "Attempting to fetch {} digests from {} workers",
             digests.len(),
@@ -114,14 +113,14 @@ impl<DB: Database> BatchFetcher<DB> {
                 select! {
                     result = futures.next() => {
                         if let Some(remote_batches) = result {
-                            let new_batches: HashMap<_, _> = remote_batches.iter().filter(|(d, _)| remaining_digests.remove(d)).collect();
+                            let new_batches: HashMap<_, _> = remote_batches.iter().filter(|(d, _)| remaining_digests.remove(*d)).collect();
 
                             // Set received_at timestamp for remote batches.
                             let mut updated_new_batches = HashMap::new();
                             let mut txn = self.batch_store.write_txn().expect("unable to create DB transaction!");
                             for (digest, batch) in new_batches {
                                 let mut batch = (*batch).clone();
-                                batch.versioned_metadata_mut().set_received_at(now());
+                                batch.set_received_at(now());
                                 updated_new_batches.insert(*digest, batch.clone());
                                 // Also persist the batches, so they are available after restarts.
                                 if let Err(e) = txn.insert::<Batches>(digest, &batch) {
@@ -151,7 +150,7 @@ impl<DB: Database> BatchFetcher<DB> {
         }
     }
 
-    async fn fetch_local(&self, digests: HashSet<BatchDigest>) -> HashMap<BatchDigest, Batch> {
+    async fn fetch_local(&self, digests: HashSet<BlockHash>) -> HashMap<BlockHash, WorkerBlock> {
         let mut fetched_batches = HashMap::new();
         if digests.is_empty() {
             return fetched_batches;
@@ -180,8 +179,8 @@ impl<DB: Database> BatchFetcher<DB> {
     async fn fetch_remote(
         &self,
         worker: NetworkPublicKey,
-        digests: HashSet<BatchDigest>,
-    ) -> HashMap<BatchDigest, Batch> {
+        digests: HashSet<BlockHash>,
+    ) -> HashMap<BlockHash, WorkerBlock> {
         // TODO: Make these config parameters
         let max_timeout = Duration::from_secs(60);
         let mut timeout = Duration::from_secs(10);
@@ -236,10 +235,10 @@ impl<DB: Database> BatchFetcher<DB> {
     /// Issue request_batches RPC and verifies response integrity
     async fn safe_request_batches(
         &self,
-        digests_to_fetch: HashSet<BatchDigest>,
+        digests_to_fetch: HashSet<BlockHash>,
         worker: NetworkPublicKey,
         timeout: Duration,
-    ) -> eyre::Result<HashMap<BatchDigest, Batch>> {
+    ) -> eyre::Result<HashMap<BlockHash, WorkerBlock>> {
         let mut fetched_batches = HashMap::new();
         if digests_to_fetch.is_empty() {
             return Ok(fetched_batches);
@@ -293,7 +292,7 @@ impl<'a> Drop for PendingGuard<'a> {
 pub trait RequestBatchesNetwork: Send + Sync {
     async fn request_batches(
         &self,
-        batch_digests: Vec<BatchDigest>,
+        batch_digests: Vec<BlockHash>,
         worker: NetworkPublicKey,
         timeout: Duration,
     ) -> eyre::Result<RequestBatchesResponse>;
@@ -307,7 +306,7 @@ struct RequestBatchesNetworkImpl {
 impl RequestBatchesNetwork for RequestBatchesNetworkImpl {
     async fn request_batches(
         &self,
-        batch_digests: Vec<BatchDigest>,
+        batch_digests: Vec<BlockHash>,
         worker: NetworkPublicKey,
         timeout: Duration,
     ) -> eyre::Result<RequestBatchesResponse> {
@@ -323,8 +322,9 @@ mod tests {
     use fastcrypto::traits::KeyPair;
     use narwhal_typed_store::open_db;
     use rand::rngs::StdRng;
+    use reth_primitives::{Header, SealedHeader};
     use tempfile::TempDir;
-    use tn_types::NetworkKeypair;
+    use tn_types::{test_utils::transaction, NetworkKeypair};
 
     // // TODO: Remove once we have removed BatchV1 from the codebase.
     // // Case #1: Receive BatchV1 but network is upgraded past v11 so we fail because we expect
@@ -415,8 +415,12 @@ mod tests {
         let mut network = TestRequestBatchesNetwork::new();
         let temp_dir = TempDir::new().unwrap();
         let batch_store = open_db(temp_dir.path());
-        let batch1 = Batch::new(vec![vec![1]]);
-        let batch2 = Batch::new(vec![vec![2]]);
+        let mut header = Header::default();
+        header.nonce = 1;
+        let batch1 = WorkerBlock::new(vec![transaction()], header.seal_slow());
+        let mut header = Header::default();
+        header.nonce = 2;
+        let batch2 = WorkerBlock::new(vec![transaction()], header.seal_slow());
         let (digests, known_workers) = (
             HashSet::from_iter(vec![batch1.digest(), batch2.digest()]),
             HashSet::from_iter(test_pks(&[1, 2])),
@@ -437,11 +441,11 @@ mod tests {
         // Reset metadata from the fetched and expected batches
         for batch in fetched_batches.values_mut() {
             // assert received_at was set to some value before resetting.
-            assert!(batch.versioned_metadata().received_at().is_some());
-            batch.versioned_metadata_mut().set_received_at(0);
+            assert!(batch.received_at().is_some());
+            batch.set_received_at(0);
         }
         for batch in expected_batches.values_mut() {
-            batch.versioned_metadata_mut().set_received_at(0);
+            batch.set_received_at(0);
         }
         assert_eq!(fetched_batches, expected_batches);
         assert_eq!(
@@ -461,9 +465,9 @@ mod tests {
         let mut network = TestRequestBatchesNetwork::new();
         let temp_dir = TempDir::new().unwrap();
         let batch_store = open_db(temp_dir.path());
-        let batch1 = Batch::new(vec![vec![1]]);
-        let batch2 = Batch::new(vec![vec![2]]);
-        let batch3 = Batch::new(vec![vec![3]]);
+        let batch1 = WorkerBlock::new(vec![transaction()], SealedHeader::default());
+        let batch2 = WorkerBlock::new(vec![transaction()], SealedHeader::default());
+        let batch3 = WorkerBlock::new(vec![transaction()], SealedHeader::default());
         let (digests, known_workers) = (
             HashSet::from_iter(vec![batch1.digest(), batch2.digest(), batch3.digest()]),
             HashSet::from_iter(test_pks(&[1, 2, 3])),
@@ -496,9 +500,9 @@ mod tests {
         let mut network = TestRequestBatchesNetwork::new();
         let temp_dir = TempDir::new().unwrap();
         let batch_store = open_db(temp_dir.path());
-        let batch1 = Batch::new(vec![vec![1]]);
-        let batch2 = Batch::new(vec![vec![2]]);
-        let batch3 = Batch::new(vec![vec![3]]);
+        let batch1 = WorkerBlock::new(vec![transaction()], SealedHeader::default());
+        let batch2 = WorkerBlock::new(vec![transaction()], SealedHeader::default());
+        let batch3 = WorkerBlock::new(vec![transaction()], SealedHeader::default());
         let (digests, known_workers) = (
             HashSet::from_iter(vec![batch1.digest(), batch2.digest(), batch3.digest()]),
             HashSet::from_iter(test_pks(&[2, 3, 4])),
@@ -522,11 +526,11 @@ mod tests {
         // Reset metadata from the fetched and expected batches
         for batch in fetched_batches.values_mut() {
             // assert received_at was set to some value before resetting.
-            assert!(batch.versioned_metadata().received_at().is_some());
-            batch.versioned_metadata_mut().set_received_at(0);
+            assert!(batch.received_at().is_some());
+            batch.set_received_at(0);
         }
         for batch in expected_batches.values_mut() {
-            batch.versioned_metadata_mut().set_received_at(0);
+            batch.set_received_at(0);
         }
 
         assert_eq!(fetched_batches, expected_batches);
@@ -537,9 +541,15 @@ mod tests {
         let mut network = TestRequestBatchesNetwork::new();
         let temp_dir = TempDir::new().unwrap();
         let batch_store = open_db(temp_dir.path());
-        let batch1 = Batch::new(vec![vec![1]]);
-        let batch2 = Batch::new(vec![vec![2]]);
-        let batch3 = Batch::new(vec![vec![3]]);
+        let mut header = Header::default();
+        header.nonce = 1;
+        let batch1 = WorkerBlock::new(vec![transaction()], header.seal_slow());
+        let mut header = Header::default();
+        header.nonce = 2;
+        let batch2 = WorkerBlock::new(vec![transaction()], header.seal_slow());
+        let mut header = Header::default();
+        header.nonce = 3;
+        let batch3 = WorkerBlock::new(vec![transaction()], header.seal_slow());
         let (digests, known_workers) = (
             HashSet::from_iter(vec![batch1.digest(), batch2.digest(), batch3.digest()]),
             HashSet::from_iter(test_pks(&[1, 2, 3, 4])),
@@ -565,13 +575,13 @@ mod tests {
         for batch in fetched_batches.values_mut() {
             if batch.digest() != batch1.digest() {
                 // assert received_at was set to some value for remote batches before resetting.
-                assert!(batch.versioned_metadata().received_at().is_some());
-                batch.versioned_metadata_mut().set_received_at(0);
+                assert!(batch.received_at().is_some());
+                batch.set_received_at(0);
             }
         }
         for batch in expected_batches.values_mut() {
             if batch.digest() != batch1.digest() {
-                batch.versioned_metadata_mut().set_received_at(0);
+                batch.set_received_at(0);
             }
         }
 
@@ -587,16 +597,23 @@ mod tests {
         let mut expected_batches = Vec::new();
         let mut local_digests = Vec::new();
         // 6 batches available locally with response size limit of 2
-        for i in 0..num_digests / 2 {
-            let batch = Batch::new(vec![vec![i]]);
+        let mut nonce = 0;
+        for _i in 0..num_digests / 2 {
+            let mut header = Header::default();
+            header.nonce = nonce;
+            nonce += 1;
+            let batch = WorkerBlock::new(vec![transaction()], header.seal_slow());
             local_digests.push(batch.digest());
             batch_store.insert::<Batches>(&batch.digest(), &batch).unwrap();
             network.put(&[1, 2, 3], batch.clone());
             expected_batches.push(batch);
         }
         // 6 batches available remotely with response size limit of 2
-        for i in (num_digests / 2)..num_digests {
-            let batch = Batch::new(vec![vec![i]]);
+        for _i in (num_digests / 2)..num_digests {
+            let mut header = Header::default();
+            header.nonce = nonce;
+            nonce += 1;
+            let batch = WorkerBlock::new(vec![transaction()], header.seal_slow());
             network.put(&[1, 2, 3], batch.clone());
             expected_batches.push(batch);
         }
@@ -620,13 +637,13 @@ mod tests {
         for batch in fetched_batches.values_mut() {
             if !local_digests.contains(&batch.digest()) {
                 // assert received_at was set to some value for remote batches before resetting.
-                assert!(batch.versioned_metadata().received_at().is_some());
-                batch.versioned_metadata_mut().set_received_at(0);
+                assert!(batch.received_at().is_some());
+                batch.set_received_at(0);
             }
         }
         for batch in expected_batches.values_mut() {
             if !local_digests.contains(&batch.digest()) {
-                batch.versioned_metadata_mut().set_received_at(0);
+                batch.set_received_at(0);
             }
         }
 
@@ -638,7 +655,7 @@ mod tests {
     #[derive(Clone)]
     struct TestRequestBatchesNetwork {
         // Worker name -> batch digests it has -> batches.
-        data: HashMap<NetworkPublicKey, HashMap<BatchDigest, Batch>>,
+        data: HashMap<NetworkPublicKey, HashMap<BlockHash, WorkerBlock>>,
     }
 
     impl TestRequestBatchesNetwork {
@@ -646,7 +663,7 @@ mod tests {
             Self { data: HashMap::new() }
         }
 
-        pub fn put(&mut self, keys: &[u8], batch: Batch) {
+        pub fn put(&mut self, keys: &[u8], batch: WorkerBlock) {
             for key in keys {
                 let key = test_pk(*key);
                 let entry = self.data.entry(key).or_default();
@@ -659,7 +676,7 @@ mod tests {
     impl RequestBatchesNetwork for TestRequestBatchesNetwork {
         async fn request_batches(
             &self,
-            digests: Vec<BatchDigest>,
+            digests: Vec<BlockHash>,
             worker: NetworkPublicKey,
             _timeout: Duration,
         ) -> eyre::Result<RequestBatchesResponse> {

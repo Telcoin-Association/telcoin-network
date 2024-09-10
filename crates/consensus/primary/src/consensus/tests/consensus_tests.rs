@@ -10,8 +10,8 @@ use narwhal_storage::NodeStorage;
 use narwhal_typed_store::open_db;
 use tempfile::TempDir;
 use tn_types::{
-    test_utils::CommitteeFixture, Certificate, CertificateAPI, HeaderAPI,
-    PreSubscribedBroadcastSender, ReputationScores, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    test_utils::CommitteeFixture, Certificate, PreSubscribedBroadcastSender, ReputationScores,
+    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::sync::watch;
 

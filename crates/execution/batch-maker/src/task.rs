@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
-use tn_types::{Batch, NewBatch, PendingWorkerBlock};
+use tn_types::{NewWorkerBlock, PendingWorkerBlock, WorkerBlock};
 use tokio::sync::{oneshot, watch};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
@@ -38,7 +38,7 @@ pub struct MiningTask<Client, Pool: TransactionPool, BlockExecutor> {
     /// Sending half of channel to worker.
     ///
     /// Worker recieves batch and forwards to `quorum_waiter`.
-    to_worker: Sender<NewBatch>,
+    to_worker: Sender<NewWorkerBlock>,
     // /// Used to notify consumers of new blocks
     // ///
     // /// TODO: can this be used anywhere else?
@@ -59,7 +59,7 @@ impl<Client, Pool: TransactionPool, BlockExecutor> MiningTask<Client, Pool, Bloc
     pub(crate) fn new(
         chain_spec: Arc<ChainSpec>,
         miner: MiningMode,
-        to_worker: Sender<NewBatch>,
+        to_worker: Sender<NewWorkerBlock>,
         // canon_state_notification: CanonStateNotificationSender,
         storage: Storage,
         client: Client,
@@ -129,21 +129,16 @@ where
                 this.insert_task = Some(Box::pin(async move {
                     let mut storage = storage.write().await;
 
-                    let (transactions, tx_bytes): (Vec<_>, Vec<_>) = transactions
-                        .into_iter()
-                        .map(|tx| {
-                            let signed = tx.to_recovered_transaction().into_signed();
-                            // cast transaction into bytes as Vec<u8>
-                            let tx_bytes = signed.envelope_encoded().into();
-                            (signed, tx_bytes)
-                        })
-                        .unzip();
+                    let txns: Vec<_> = transactions
+                        .iter()
+                        .map(|tx| tx.to_recovered_transaction().into_signed())
+                        .collect();
 
                     // TODO: support withdrawals
                     let withdrawals = Some(Withdrawals::default());
 
                     match storage.build_and_execute(
-                        transactions.clone(),
+                        txns.clone(),
                         withdrawals,
                         &client,
                         chain_spec,
@@ -156,15 +151,15 @@ where
                             // to download and execute the block we just inserted
                             let (ack, rx) = oneshot::channel();
                             let _ = to_worker
-                                .send(NewBatch {
-                                    batch: Batch::new_with_metadata(
+                                .send(NewWorkerBlock {
+                                    block: WorkerBlock::new(
                                         // TODO: make batch `TransactionSigned` then convert to
                                         // bytes in `.digest` impl
                                         // NOTE: a `Batch` is a `SealedBlock`
                                         // convert txs to bytes
-                                        tx_bytes,
+                                        txns,
                                         // versioned metadata for peer validation
-                                        new_header.into(),
+                                        new_header,
                                     ),
                                     ack,
                                 })
@@ -219,7 +214,7 @@ where
                             //
                             // clear all transactions from pool once batch is sealed
                             pool.remove_transactions(
-                                transactions.iter().map(|tx| tx.hash()).collect(),
+                                transactions.iter().map(|tx| *(tx.hash())).collect(),
                             );
 
                             drop(storage);

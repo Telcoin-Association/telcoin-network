@@ -3,7 +3,7 @@
 use reth_blockchain_tree::error::InsertBlockError;
 use reth_errors::{CanonicalError, ProviderError, RethError};
 use reth_revm::primitives::EVMError;
-use tn_types::BatchConversionError;
+use tn_types::WorkerBlockConversionError;
 use tokio::sync::oneshot;
 
 /// Result alias for [`TNEngineError`].
@@ -23,7 +23,7 @@ pub enum TnEngineError {
     EvmExecution(#[from] EVMError<ProviderError>),
     /// Error converting batch to `SealedBlockWithSenders`.
     #[error(transparent)]
-    Batch(#[from] BatchConversionError),
+    Batch(#[from] WorkerBlockConversionError),
     /// The next batch digest is missing.
     #[error("Missing next batch digest for recovered sealed block with senders.")]
     NextBatchDigestMissing,

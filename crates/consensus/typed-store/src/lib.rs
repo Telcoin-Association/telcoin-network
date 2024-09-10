@@ -64,8 +64,8 @@ macro_rules! tables {
 pub mod tables {
     use super::{PayloadToken, ProposerKey};
     use tn_types::{
-        AuthorityIdentifier, Batch, BatchDigest, Certificate, CertificateDigest, ConsensusCommit,
-        Header, Round, SequenceNumber, VoteInfo, WorkerId,
+        AuthorityIdentifier, BlockHash, Certificate, CertificateDigest, ConsensusCommit, Header,
+        Round, SequenceNumber, VoteInfo, WorkerBlock, WorkerId,
     };
 
     tables!(
@@ -74,8 +74,8 @@ pub mod tables {
         Certificates;crate::CERTIFICATES_CF;<CertificateDigest, Certificate>,
         CertificateDigestByRound;crate::CERTIFICATE_DIGEST_BY_ROUND_CF;<(Round, AuthorityIdentifier), CertificateDigest>,
         CertificateDigestByOrigin;crate::CERTIFICATE_DIGEST_BY_ORIGIN_CF;<(AuthorityIdentifier, Round), CertificateDigest>,
-        Payload;crate::PAYLOAD_CF;<(BatchDigest, WorkerId), PayloadToken>,
-        Batches;crate::BATCHES_CF;<BatchDigest, Batch>,
+        Payload;crate::PAYLOAD_CF;<(BlockHash, WorkerId), PayloadToken>,
+        Batches;crate::BATCHES_CF;<BlockHash, WorkerBlock>,
         LastCommitted;crate::LAST_COMMITTED_CF;<AuthorityIdentifier, Round>,
         CommittedSubDag;crate::COMMITTED_SUB_DAG_INDEX_CF;<SequenceNumber, ConsensusCommit>
     );

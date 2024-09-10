@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::consensus::ConsensusState;
 use std::collections::HashSet;
-use tn_types::{Certificate, CertificateAPI, HeaderAPI, Round};
+use tn_types::{Certificate, Round};
 use tracing::debug;
 
 /// Flatten the dag referenced by the input certificate. This is a classic depth-first search

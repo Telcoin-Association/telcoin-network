@@ -9,7 +9,7 @@ use narwhal_typed_store::open_db;
 use tempfile::TempDir;
 use tn_types::{
     test_utils::{fixture_payload, CommitteeFixture},
-    PreSubscribedBroadcastSender,
+    BlockHash, PreSubscribedBroadcastSender,
 };
 
 #[tokio::test]
@@ -112,7 +112,7 @@ async fn propose_payload_and_repropose_after_n_seconds() {
     let r: Vec<u8> = (0..32).map(|_v| rand::random::<u8>()).collect();
     b.copy_from_slice(r.as_slice());
 
-    let digest = BatchDigest(b);
+    let digest: BlockHash = b.into();
     let worker_id = 0;
     let created_at_ts = 0;
     let (tx_ack, rx_ack) = tokio::sync::oneshot::channel();
@@ -128,7 +128,7 @@ async fn propose_payload_and_repropose_after_n_seconds() {
     assert!(header.validate(&committee, &worker_cache).is_ok());
 
     // WHEN available batches are more than the maximum ones
-    let batches: IndexMap<BatchDigest, (WorkerId, TimestampSec)> =
+    let batches: IndexMap<BlockHash, (WorkerId, TimestampSec)> =
         fixture_payload((max_num_of_batches * 2) as u8);
 
     let mut ack_list = vec![];
@@ -225,7 +225,7 @@ async fn equivocation_protection() {
     let r: Vec<u8> = (0..32).map(|_v| rand::random::<u8>()).collect();
     b.copy_from_slice(r.as_slice());
 
-    let digest = BatchDigest(b);
+    let digest: BlockHash = b.into();
     let worker_id = 0;
     let created_at_ts = 0;
     let (tx_ack, rx_ack) = tokio::sync::oneshot::channel();
@@ -287,7 +287,7 @@ async fn equivocation_protection() {
     let r: Vec<u8> = (0..32).map(|_v| rand::random::<u8>()).collect();
     b.copy_from_slice(r.as_slice());
 
-    let digest = BatchDigest(b);
+    let digest: BlockHash = b.into();
     let worker_id = 0;
     let (tx_ack, rx_ack) = tokio::sync::oneshot::channel();
     tx_our_digests

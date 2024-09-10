@@ -7,7 +7,7 @@
 use super::WorkerFixture;
 use crate::{
     Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, Certificate, Committee, Header,
-    HeaderV1Builder, Multiaddr, NetworkKeypair, NetworkPublicKey, Round, Stake, Vote, WorkerId,
+    HeaderBuilder, Multiaddr, NetworkKeypair, NetworkPublicKey, Round, Stake, Vote, WorkerId,
     WorkerIndex,
 };
 use fastcrypto::{
@@ -105,25 +105,18 @@ impl AuthorityFixture {
 
     /// Create a [Header] with a default payload based on the [Committee] argument.
     pub fn header(&self, committee: &Committee) -> Header {
-        let header = self.header_builder(committee).payload(Default::default()).build().unwrap();
-        Header::V1(header)
+        self.header_builder(committee).payload(Default::default()).build().unwrap()
     }
 
     /// Create a [Header] with a default payload based on the [Committee] and [Round] arguments.
     pub fn header_with_round(&self, committee: &Committee, round: Round) -> Header {
-        let header = self
-            .header_builder(committee)
-            .payload(Default::default())
-            .round(round)
-            .build()
-            .unwrap();
-        Header::V1(header)
+        self.header_builder(committee).payload(Default::default()).round(round).build().unwrap()
     }
 
     /// Return a [HeaderV1Builder] for round 1. The builder is constructed
     /// with a genesis certificate as the parent.
-    pub fn header_builder(&self, committee: &Committee) -> HeaderV1Builder {
-        HeaderV1Builder::default()
+    pub fn header_builder(&self, committee: &Committee) -> HeaderBuilder {
+        HeaderBuilder::default()
             .author(self.id())
             .round(1)
             .epoch(committee.epoch())

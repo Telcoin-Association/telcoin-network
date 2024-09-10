@@ -31,6 +31,8 @@ pub use genesis::*;
 mod worker;
 pub use worker::*;
 
+pub use reth_primitives::{BlockHash, TransactionSigned};
+
 /// Collection of database test utilities
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;

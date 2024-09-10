@@ -26,7 +26,7 @@ use reth_provider::{providers::BlockchainProvider, ExecutionOutcome};
 use reth_tasks::TaskExecutor;
 use tn_batch_validator::BatchValidator;
 use tn_faucet::FaucetArgs;
-use tn_types::{Config, ConsensusOutput, NewBatch, PendingWorkerBlock, WorkerId};
+use tn_types::{Config, ConsensusOutput, NewWorkerBlock, PendingWorkerBlock, WorkerId};
 use tokio::sync::{broadcast, watch, RwLock};
 pub use worker::*;
 
@@ -88,7 +88,7 @@ where
     /// Batch maker
     pub async fn start_batch_maker(
         &self,
-        to_worker: Sender<NewBatch>,
+        to_worker: Sender<NewWorkerBlock>,
         worker_id: WorkerId,
     ) -> eyre::Result<()> {
         let mut guard = self.internal.write().await;

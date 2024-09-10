@@ -23,8 +23,7 @@ use tn_types::{AuthorityIdentifier, Committee, NetworkPublicKey};
 use narwhal_network_types::{FetchCertificatesRequest, FetchCertificatesResponse};
 use tn_types::{
     error::{DagError, DagResult},
-    validate_received_certificate_version, Certificate, CertificateAPI,
-    ConditionalBroadcastReceiver, HeaderAPI, Round,
+    validate_received_certificate_version, Certificate, ConditionalBroadcastReceiver, Round,
 };
 use tokio::{
     sync::watch,

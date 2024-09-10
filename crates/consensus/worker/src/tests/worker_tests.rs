@@ -16,7 +16,7 @@ use narwhal_typed_store::open_db;
 use prometheus::Registry;
 use tempfile::TempDir;
 use tn_batch_validator::NoopBatchValidator;
-use tn_types::{test_utils::CommitteeFixture, Batch, ChainIdentifier};
+use tn_types::{test_utils::CommitteeFixture, ChainIdentifier, WorkerBlock};
 use tokio::sync::watch;
 
 // A test validator that rejects every batch
@@ -27,7 +27,7 @@ struct NilBatchValidator;
 impl BatchValidation for NilBatchValidator {
     type Error = eyre::Report;
 
-    async fn validate_batch(&self, _txs: &Batch) -> Result<(), Self::Error> {
+    async fn validate_batch(&self, _txs: &WorkerBlock) -> Result<(), Self::Error> {
         eyre::bail!("Invalid batch");
     }
 }

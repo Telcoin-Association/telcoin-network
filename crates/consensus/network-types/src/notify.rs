@@ -3,13 +3,13 @@
 //! These messages are passed as unreliable send and
 //! don't expect a response.
 use serde::{Deserialize, Serialize};
-use tn_types::{AuthorityIdentifier, Batch, BatchDigest, VersionedMetadata, WorkerId};
+use tn_types::{AuthorityIdentifier, BlockHash, WorkerBlock, WorkerId};
 
 /// Used by the primary to request that the worker sync the target missing batches.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerSynchronizeMessage {
     /// Batch digests that need to be synchronized from peers.
-    pub digests: Vec<BatchDigest>,
+    pub digests: Vec<BlockHash>,
     /// The peer worker's authority.
     pub target: AuthorityIdentifier,
     // Used to indicate to the worker that it does not need to fully validate
@@ -22,18 +22,18 @@ pub struct WorkerSynchronizeMessage {
 #[derive(Clone, Serialize, Deserialize, Eq, PartialEq, Debug)]
 pub struct WorkerOwnBatchMessage {
     /// The worker's batch digest.
-    pub digest: BatchDigest,
+    pub digest: BlockHash,
     /// The worker's id.
     pub worker_id: WorkerId,
     /// The metadata for the sealed batch.
-    pub metadata: VersionedMetadata,
+    pub worker_block: WorkerBlock,
 }
 
 /// Used by worker to inform primary it received a batch from another authority.
 #[derive(Clone, Serialize, Deserialize, Eq, PartialEq, Debug)]
 pub struct WorkerOthersBatchMessage {
     /// The peer worker's batch digest.
-    pub digest: BatchDigest,
+    pub digest: BlockHash,
     /// The worker's id.
     pub worker_id: WorkerId,
 }
@@ -42,5 +42,5 @@ pub struct WorkerOthersBatchMessage {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerBatchMessage {
     /// The sending worker's batch.
-    pub batch: Batch,
+    pub worker_block: WorkerBlock,
 }

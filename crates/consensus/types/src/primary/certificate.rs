@@ -1,5 +1,4 @@
 use base64::{engine::general_purpose, Engine};
-use enum_dispatch::enum_dispatch;
 use fastcrypto::{
     hash::{Digest, Hash},
     traits::AggregateAuthenticator,
@@ -18,196 +17,14 @@ use crate::{
     error::{DagError, DagResult},
     now,
     serde::NarwhalBitmap,
-    Header, HeaderAPI, HeaderV1, Round, TimestampSec,
+    Header, Round, TimestampSec,
 };
 
-/// Versioned certificate. Certificates are the output of consensus.
-#[derive(Clone, Serialize, Deserialize, MallocSizeOf)]
-#[enum_dispatch(CertificateAPI)]
-pub enum Certificate {
-    /// V1 - based on sui's V2
-    V1(CertificateV1),
-}
-
-// TODO: Revisit if we should not impl Default for Certificate
-impl Default for Certificate {
-    fn default() -> Self {
-        Self::V1(CertificateV1::default())
-    }
-}
-
-impl Certificate {
-    /// TODO: Add version number and match on that
-    pub fn genesis(committee: &Committee) -> Vec<Self> {
-        CertificateV1::genesis(committee).into_iter().map(Self::V1).collect()
-    }
-
-    // /// Create genesis with header payload for [CertificateV1]
-    // pub fn genesis_with_payload(
-    //     committee: &Committee,
-    //     batch: Batch,
-    // ) -> Vec<Self> {
-    //     CertificateV1::genesis_with_payload(committee, batch).into_iter().map(Self::V1).collect()
-    // }
-
-    /// Create a new, unsafe certificate that checks stake, but does not verify authority
-    /// signatures.
-    pub fn new_unverified(
-        committee: &Committee,
-        header: Header,
-        votes: Vec<(AuthorityIdentifier, BlsSignature)>,
-    ) -> DagResult<Certificate> {
-        CertificateV1::new_unverified(committee, header, votes)
-    }
-
-    /// Create a new, unsafe certificate without verifying authority signatures or stake.
-    pub fn new_unsigned(
-        committee: &Committee,
-        header: Header,
-        votes: Vec<(AuthorityIdentifier, BlsSignature)>,
-    ) -> DagResult<Certificate> {
-        CertificateV1::new_unsigned(committee, header, votes)
-    }
-
-    /// Return the group of authorities that signed this certificate.
-    ///
-    /// This function requires that certificate was verified against given committee
-    pub fn signed_authorities(&self, committee: &Committee) -> Vec<BlsPublicKey> {
-        match self {
-            Certificate::V1(certificate) => certificate.signed_authorities(committee),
-        }
-    }
-
-    /// Return the total stake and group of authorities that formed the committee for this
-    /// certificate.
-    pub fn signed_by(&self, committee: &Committee) -> (Stake, Vec<BlsPublicKey>) {
-        match self {
-            Certificate::V1(certificate) => certificate.signed_by(committee),
-        }
-    }
-
-    /// Verify the certificate's authority signatures.
-    pub fn verify(
-        self,
-        committee: &Committee,
-        worker_cache: &WorkerCache,
-    ) -> DagResult<Certificate> {
-        match self {
-            Certificate::V1(certificate) => certificate.verify(committee, worker_cache),
-        }
-    }
-
-    /// The certificate's round.
-    pub fn round(&self) -> Round {
-        match self {
-            Certificate::V1(certificate) => certificate.round(),
-        }
-    }
-
-    /// The certificate's epoch.
-    pub fn epoch(&self) -> Epoch {
-        match self {
-            Certificate::V1(certificate) => certificate.epoch(),
-        }
-    }
-
-    /// The author of the certificate.
-    pub fn origin(&self) -> AuthorityIdentifier {
-        match self {
-            Certificate::V1(certificate) => certificate.origin(),
-        }
-    }
-}
-
-impl Hash<{ crypto::DIGEST_LENGTH }> for Certificate {
-    type TypedDigest = CertificateDigest;
-
-    fn digest(&self) -> CertificateDigest {
-        match self {
-            Certificate::V1(data) => data.digest(),
-        }
-    }
-}
-
-/// API for certificates based on version.
-#[enum_dispatch]
-pub trait CertificateAPI {
-    /// The header for the certificate.
-    fn header(&self) -> &Header;
-
-    /// The aggregate signature for the certriciate.
-    fn aggregated_signature(&self) -> Option<&BlsAggregateSignatureBytes>;
-
-    /// The bitmap of signed authorities for the certificate.
-    ///
-    /// This is the aggregate signature of all authorities for the certificate.
-    fn signed_authorities(&self) -> &roaring::RoaringBitmap;
-
-    /// The time (sec) when the certificate was created.
-    fn created_at(&self) -> &TimestampSec;
-
-    /// TODO: better docs
-    /// State of the Signature verification
-    fn signature_verification_state(&self) -> &SignatureVerificationState;
-
-    /// TODO: better docs
-    /// Set the state of the Signature verification.
-    fn set_signature_verification_state(&mut self, state: SignatureVerificationState);
-
-    /// Change the certificate's header.
-    ///
-    /// Only Used for testing.
-    #[cfg(any(test, feature = "test-utils"))]
-    fn update_header(&mut self, header: Header);
-
-    /// Return a mutable reference to the header.
-    ///
-    /// Only Used for testing.
-    #[cfg(any(test, feature = "test-utils"))]
-    fn header_mut(&mut self) -> &mut Header;
-
-    /// Change the certificate's created_at timestamp.
-    ///
-    /// Only Used for testing.
-    #[cfg(any(test, feature = "test-utils"))]
-    fn update_created_at(&mut self, timestamp: TimestampSec);
-}
-
-// Holds BlsAggregateSignatureBytes but with the added layer to specify the
-// signatures verification state. This will be used to take advantage of the
-// certificate chain that is formed via the DAG by only verifying the
-// leaves of the certificate chain when they are fetched from validators
-// during catchup.
-#[derive(Clone, Serialize, Deserialize, MallocSizeOf, Debug)]
-pub enum SignatureVerificationState {
-    // This state occurs when the certificate has not yet received a quorum of
-    // signatures.
-    Unsigned(BlsAggregateSignatureBytes),
-    // This state occurs when a certificate has just been received from the network
-    // and has not been verified yet.
-    Unverified(BlsAggregateSignatureBytes),
-    // This state occurs when a certificate was either created locally, received
-    // via brodacast, or fetched but was not the parent of another certificate.
-    // Therefore this certificate had to be verified directly.
-    VerifiedDirectly(BlsAggregateSignatureBytes),
-    // This state occurs when the cert was a parent of another fetched certificate
-    // that was verified directly, then this certificate is verified indirectly.
-    VerifiedIndirectly(BlsAggregateSignatureBytes),
-    // This state occurs only for genesis certificates which always has valid
-    // signatures bytes but the bytes are garbage so we don't mark them as verified.
-    Genesis,
-}
-
-impl Default for SignatureVerificationState {
-    fn default() -> Self {
-        SignatureVerificationState::Unsigned(BlsAggregateSignatureBytes::default())
-    }
-}
-
+/// Certificates are the output of consensus.
 /// The certificate issued after a successful round of consensus.
 #[serde_as]
-#[derive(Clone, Serialize, Deserialize, Default, Debug, MallocSizeOf)]
-pub struct CertificateV1 {
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct Certificate {
     /// Certificate's header.
     pub header: Header,
     /// Container for [BlsAggregateSignatureBytes].
@@ -219,66 +36,17 @@ pub struct CertificateV1 {
     pub created_at: TimestampSec,
 }
 
-impl CertificateAPI for CertificateV1 {
-    fn header(&self) -> &Header {
-        &self.header
-    }
-
-    fn aggregated_signature(&self) -> Option<&BlsAggregateSignatureBytes> {
-        match &self.signature_verification_state {
-            SignatureVerificationState::VerifiedDirectly(bytes)
-            | SignatureVerificationState::Unverified(bytes)
-            | SignatureVerificationState::VerifiedIndirectly(bytes)
-            | SignatureVerificationState::Unsigned(bytes) => Some(bytes),
-            SignatureVerificationState::Genesis => None,
-        }
-    }
-
-    fn signature_verification_state(&self) -> &SignatureVerificationState {
-        &self.signature_verification_state
-    }
-
-    fn created_at(&self) -> &TimestampSec {
-        &self.created_at
-    }
-
-    fn set_signature_verification_state(&mut self, state: SignatureVerificationState) {
-        self.signature_verification_state = state;
-    }
-
-    fn signed_authorities(&self) -> &roaring::RoaringBitmap {
-        &self.signed_authorities
-    }
-
-    // Used for testing.
-
-    #[cfg(any(test, feature = "test-utils"))]
-    fn update_header(&mut self, header: Header) {
-        self.header = header;
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    fn header_mut(&mut self) -> &mut Header {
-        &mut self.header
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    fn update_created_at(&mut self, timestamp: TimestampSec) {
-        self.created_at = timestamp;
-    }
-}
-
-impl CertificateV1 {
+impl Certificate {
     /// Create a genesis certificate with empty payload.
     pub fn genesis(committee: &Committee) -> Vec<Self> {
         committee
             .authorities()
             .map(|authority| Self {
-                header: Header::V1(HeaderV1 {
+                header: Header {
                     author: authority.id(),
                     epoch: committee.epoch(),
                     ..Default::default()
-                }),
+                },
                 ..Self::default()
             })
             .collect()
@@ -362,18 +130,18 @@ impl CertificateV1 {
             SignatureVerificationState::Unverified(aggregate_signature_bytes)
         };
 
-        Ok(Certificate::V1(CertificateV1 {
+        Ok(Certificate {
             header,
             signature_verification_state,
             signed_authorities,
             created_at: now(),
-        }))
+        })
     }
 
     /// Return the group of authorities that signed this certificate.
     ///
     /// This function requires that certificate was verified against given committee
-    pub fn signed_authorities(&self, committee: &Committee) -> Vec<BlsPublicKey> {
+    pub fn signed_authorities_with_committee(&self, committee: &Committee) -> Vec<BlsPublicKey> {
         assert_eq!(committee.epoch(), self.epoch());
         let (_stake, pks) = self.signed_by(committee);
         pks
@@ -417,7 +185,7 @@ impl CertificateV1 {
 
         // Genesis certificates are always valid.
         if self.round() == 0 && Self::genesis(committee).contains(&self) {
-            return Ok(Certificate::V1(self));
+            return Ok(self);
         }
 
         // Save signature verifications when the header is invalid.
@@ -436,7 +204,7 @@ impl CertificateV1 {
         let aggregrate_signature_bytes = match self.signature_verification_state {
             SignatureVerificationState::VerifiedIndirectly(_)
             | SignatureVerificationState::VerifiedDirectly(_)
-            | SignatureVerificationState::Genesis => return Ok(Certificate::V1(self)),
+            | SignatureVerificationState::Genesis => return Ok(self),
             SignatureVerificationState::Unverified(ref bytes) => bytes,
             SignatureVerificationState::Unsigned(_) => {
                 return Err(DagError::CertificateRequiresQuorum);
@@ -453,7 +221,7 @@ impl CertificateV1 {
         self.signature_verification_state =
             SignatureVerificationState::VerifiedDirectly(aggregrate_signature_bytes.clone());
 
-        Ok(Certificate::V1(self))
+        Ok(self)
     }
 
     /// The certificate's round.
@@ -470,6 +238,103 @@ impl CertificateV1 {
     pub fn origin(&self) -> AuthorityIdentifier {
         self.header.author()
     }
+
+    /// The header for the certificate.
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    /// The aggregate signature for the certriciate.
+    pub fn aggregated_signature(&self) -> Option<&BlsAggregateSignatureBytes> {
+        match &self.signature_verification_state {
+            SignatureVerificationState::VerifiedDirectly(bytes)
+            | SignatureVerificationState::Unverified(bytes)
+            | SignatureVerificationState::VerifiedIndirectly(bytes)
+            | SignatureVerificationState::Unsigned(bytes) => Some(bytes),
+            SignatureVerificationState::Genesis => None,
+        }
+    }
+
+    /// TODO: better docs
+    /// State of the Signature verification
+    pub fn signature_verification_state(&self) -> &SignatureVerificationState {
+        &self.signature_verification_state
+    }
+
+    /// The time (sec) when the certificate was created.
+    pub fn created_at(&self) -> &TimestampSec {
+        &self.created_at
+    }
+
+    /// TODO: better docs
+    /// Set the state of the Signature verification.
+    pub fn set_signature_verification_state(&mut self, state: SignatureVerificationState) {
+        self.signature_verification_state = state;
+    }
+
+    /// The bitmap of signed authorities for the certificate.
+    ///
+    /// This is the aggregate signature of all authorities for the certificate.
+    pub fn signed_authorities(&self) -> &roaring::RoaringBitmap {
+        &self.signed_authorities
+    }
+
+    // Used for testing.
+
+    /// Change the certificate's header.
+    ///
+    /// Only Used for testing.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn update_header(&mut self, header: Header) {
+        self.header = header;
+    }
+
+    /// Return a mutable reference to the header.
+    ///
+    /// Only Used for testing.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn header_mut(&mut self) -> &mut Header {
+        &mut self.header
+    }
+
+    /// Change the certificate's created_at timestamp.
+    ///
+    /// Only Used for testing.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn update_created_at(&mut self, timestamp: TimestampSec) {
+        self.created_at = timestamp;
+    }
+}
+
+// Holds BlsAggregateSignatureBytes but with the added layer to specify the
+// signatures verification state. This will be used to take advantage of the
+// certificate chain that is formed via the DAG by only verifying the
+// leaves of the certificate chain when they are fetched from validators
+// during catchup.
+#[derive(Clone, Serialize, Deserialize, MallocSizeOf, Debug)]
+pub enum SignatureVerificationState {
+    // This state occurs when the certificate has not yet received a quorum of
+    // signatures.
+    Unsigned(BlsAggregateSignatureBytes),
+    // This state occurs when a certificate has just been received from the network
+    // and has not been verified yet.
+    Unverified(BlsAggregateSignatureBytes),
+    // This state occurs when a certificate was either created locally, received
+    // via brodacast, or fetched but was not the parent of another certificate.
+    // Therefore this certificate had to be verified directly.
+    VerifiedDirectly(BlsAggregateSignatureBytes),
+    // This state occurs when the cert was a parent of another fetched certificate
+    // that was verified directly, then this certificate is verified indirectly.
+    VerifiedIndirectly(BlsAggregateSignatureBytes),
+    // This state occurs only for genesis certificates which always has valid
+    // signatures bytes but the bytes are garbage so we don't mark them as verified.
+    Genesis,
+}
+
+impl Default for SignatureVerificationState {
+    fn default() -> Self {
+        SignatureVerificationState::Unsigned(BlsAggregateSignatureBytes::default())
+    }
 }
 
 // Certificate version is validated against network protocol version. If CertificateV1
@@ -479,15 +344,11 @@ impl CertificateV1 {
 pub fn validate_received_certificate_version(
     mut certificate: Certificate,
 ) -> eyre::Result<Certificate> {
-    match certificate {
-        Certificate::V1(_) => {
-            // CertificateV1 was received from the network so we need to mark
-            // certificate aggregated signature state as unverified.
-            certificate.set_signature_verification_state(SignatureVerificationState::Unverified(
-                certificate.aggregated_signature().ok_or(eyre::eyre!("Invalid signature"))?.clone(),
-            ));
-        }
-    };
+    // CertificateV1 was received from the network so we need to mark
+    // certificate aggregated signature state as unverified.
+    certificate.set_signature_verification_state(SignatureVerificationState::Unverified(
+        certificate.aggregated_signature().ok_or(eyre::eyre!("Invalid signature"))?.clone(),
+    ));
     Ok(certificate)
 }
 
@@ -528,7 +389,7 @@ impl fmt::Display for CertificateDigest {
     }
 }
 
-impl Hash<{ crypto::DIGEST_LENGTH }> for CertificateV1 {
+impl Hash<{ crypto::DIGEST_LENGTH }> for Certificate {
     type TypedDigest = CertificateDigest;
 
     fn digest(&self) -> CertificateDigest {
@@ -538,29 +399,19 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for CertificateV1 {
 
 impl fmt::Debug for Certificate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        match self {
-            Certificate::V1(data) => write!(
-                f,
-                "{}: C{}({}, {}, E{})",
-                data.digest(),
-                data.round(),
-                data.origin(),
-                data.header.digest(),
-                data.epoch()
-            ),
-        }
+        write!(
+            f,
+            "{}: C{}({}, {}, E{})",
+            self.digest(),
+            self.round(),
+            self.origin(),
+            self.header.digest(),
+            self.epoch()
+        )
     }
 }
 
 impl PartialEq for Certificate {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Certificate::V1(data), Certificate::V1(other_data)) => data.eq(other_data),
-        }
-    }
-}
-
-impl PartialEq for CertificateV1 {
     fn eq(&self, other: &Self) -> bool {
         let mut ret = self.header().digest() == other.header().digest();
         ret &= self.round() == other.round();

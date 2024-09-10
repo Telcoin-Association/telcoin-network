@@ -1,6 +1,5 @@
 //! Vote implementation for consensus
 use base64::{engine::general_purpose, Engine};
-use enum_dispatch::enum_dispatch;
 use fastcrypto::{
     hash::{Digest, Hash},
     signature_service::SignatureService,
@@ -14,67 +13,13 @@ use crate::{
     crypto::{
         self, to_intent_message, BlsPublicKey, BlsSignature, IntentMessage, ValidatorSignature,
     },
-    Header, HeaderAPI, HeaderDigest, Round,
+    Header, HeaderDigest, Round,
 };
 
 /// A Vote on a Header is a claim by the voting authority that all payloads and the full history
 /// of Certificates included in the Header are available.
 #[derive(Clone, Serialize, Deserialize)]
-#[enum_dispatch(VoteAPI)]
-pub enum Vote {
-    /// Version 1
-    V1(VoteV1),
-}
-
-impl Vote {
-    // TODO: Add version number and match on that
-    /// Create a new instance of [Vote]
-    pub async fn new(
-        header: &Header,
-        author: &AuthorityIdentifier,
-        signature_service: &SignatureService<BlsSignature, { crypto::INTENT_MESSAGE_LENGTH }>,
-    ) -> Self {
-        Vote::V1(VoteV1::new(header, author, signature_service).await)
-    }
-
-    /// TODO: docs
-    pub fn new_with_signer<S>(header: &Header, author: &AuthorityIdentifier, signer: &S) -> Self
-    where
-        S: Signer<BlsSignature>,
-    {
-        Vote::V1(VoteV1::new_with_signer(header, author, signer))
-    }
-}
-
-impl Hash<{ crypto::DIGEST_LENGTH }> for Vote {
-    type TypedDigest = VoteDigest;
-
-    fn digest(&self) -> VoteDigest {
-        match self {
-            Vote::V1(data) => data.digest(),
-        }
-    }
-}
-
-#[enum_dispatch]
-pub trait VoteAPI {
-    /// TODO
-    fn header_digest(&self) -> HeaderDigest;
-    /// TODO
-    fn round(&self) -> Round;
-    /// TODO
-    fn epoch(&self) -> Epoch;
-    /// TODO
-    fn origin(&self) -> AuthorityIdentifier;
-    /// TODO
-    fn author(&self) -> AuthorityIdentifier;
-    /// TODO
-    fn signature(&self) -> &<BlsPublicKey as VerifyingKey>::Sig;
-}
-
-/// VoteV1
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct VoteV1 {
+pub struct Vote {
     /// HeaderDigest, round, epoch and origin for the header being voted on.
     pub header_digest: HeaderDigest,
     /// Round for this vote.
@@ -89,28 +34,9 @@ pub struct VoteV1 {
     pub signature: <BlsPublicKey as VerifyingKey>::Sig,
 }
 
-impl VoteAPI for VoteV1 {
-    fn header_digest(&self) -> HeaderDigest {
-        self.header_digest
-    }
-    fn round(&self) -> Round {
-        self.round
-    }
-    fn epoch(&self) -> Epoch {
-        self.epoch
-    }
-    fn origin(&self) -> AuthorityIdentifier {
-        self.origin
-    }
-    fn author(&self) -> AuthorityIdentifier {
-        self.author
-    }
-    fn signature(&self) -> &<BlsPublicKey as VerifyingKey>::Sig {
-        &self.signature
-    }
-}
-
-impl VoteV1 {
+impl Vote {
+    // TODO: Add version number and match on that
+    /// Create a new instance of [Vote]
     pub async fn new(
         header: &Header,
         author: &AuthorityIdentifier,
@@ -128,6 +54,7 @@ impl VoteV1 {
         Self { signature, ..vote }
     }
 
+    /// TODO: docs
     pub fn new_with_signer<S>(header: &Header, author: &AuthorityIdentifier, signer: &S) -> Self
     where
         S: Signer<BlsSignature>,
@@ -145,6 +72,25 @@ impl VoteV1 {
         let signature = BlsSignature::new_secure(&to_intent_message(vote_digest), signer);
 
         Self { signature, ..vote }
+    }
+
+    pub fn header_digest(&self) -> HeaderDigest {
+        self.header_digest
+    }
+    pub fn round(&self) -> Round {
+        self.round
+    }
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+    pub fn origin(&self) -> AuthorityIdentifier {
+        self.origin
+    }
+    pub fn author(&self) -> AuthorityIdentifier {
+        self.author
+    }
+    pub fn signature(&self) -> &<BlsPublicKey as VerifyingKey>::Sig {
+        &self.signature
     }
 }
 
@@ -196,11 +142,10 @@ impl fmt::Display for VoteDigest {
     }
 }
 
-impl Hash<{ crypto::DIGEST_LENGTH }> for VoteV1 {
+impl Hash<{ crypto::DIGEST_LENGTH }> for Vote {
     type TypedDigest = VoteDigest;
 
     fn digest(&self) -> VoteDigest {
-        // VoteDigest(self.header_digest().0)
         self.header_digest.into()
     }
 }
@@ -226,20 +171,7 @@ impl PartialEq for Vote {
 }
 
 #[derive(Clone, Serialize, Deserialize, Eq, PartialEq, Debug)]
-#[enum_dispatch(VoteInfoAPI)]
-pub enum VoteInfo {
-    V1(VoteInfoV1),
-}
-
-#[enum_dispatch]
-pub trait VoteInfoAPI {
-    fn epoch(&self) -> Epoch;
-    fn round(&self) -> Round;
-    fn vote_digest(&self) -> VoteDigest;
-}
-
-#[derive(Clone, Serialize, Deserialize, Eq, PartialEq, Debug)]
-pub struct VoteInfoV1 {
+pub struct VoteInfo {
     /// The latest Epoch for which a vote was sent to given authority
     pub epoch: Epoch,
     /// The latest round for which a vote was sent to given authority
@@ -248,30 +180,22 @@ pub struct VoteInfoV1 {
     pub vote_digest: VoteDigest,
 }
 
-impl VoteInfoAPI for VoteInfoV1 {
-    fn epoch(&self) -> Epoch {
+impl VoteInfo {
+    pub fn epoch(&self) -> Epoch {
         self.epoch
     }
 
-    fn round(&self) -> Round {
+    pub fn round(&self) -> Round {
         self.round
     }
 
-    fn vote_digest(&self) -> VoteDigest {
+    pub fn vote_digest(&self) -> VoteDigest {
         self.vote_digest
-    }
-}
-
-impl From<&VoteV1> for VoteInfoV1 {
-    fn from(vote: &VoteV1) -> Self {
-        VoteInfoV1 { epoch: vote.epoch(), round: vote.round(), vote_digest: vote.digest() }
     }
 }
 
 impl From<&Vote> for VoteInfo {
     fn from(vote: &Vote) -> Self {
-        match vote {
-            Vote::V1(vote) => VoteInfo::V1(VoteInfoV1::from(vote)),
-        }
+        VoteInfo { epoch: vote.epoch(), round: vote.round(), vote_digest: vote.digest() }
     }
 }

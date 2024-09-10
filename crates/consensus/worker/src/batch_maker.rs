@@ -11,15 +11,14 @@ use consensus_metrics::{
     metered_channel::{Receiver, Sender},
     monitored_scope, spawn_logged_monitored_task,
 };
-use fastcrypto::hash::Hash;
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use narwhal_network::{client::NetworkClient, WorkerToPrimaryClient};
 use narwhal_typed_store::{tables::Batches, traits::Database};
 use std::sync::Arc;
-use tn_types::{NewBatch, WorkerId};
+use tn_types::{NewWorkerBlock, WorkerId};
 
 use narwhal_network_types::WorkerOwnBatchMessage;
-use tn_types::{error::DagError, now, Batch, BatchAPI, ConditionalBroadcastReceiver, MetadataAPI};
+use tn_types::{error::DagError, ConditionalBroadcastReceiver, WorkerBlock};
 use tokio::{
     task::JoinHandle,
     time::{Duration, Instant},
@@ -51,9 +50,9 @@ pub struct BatchMaker<DB: Database> {
     /// Receiver for shutdown.
     rx_shutdown: ConditionalBroadcastReceiver,
     /// Channel to receive transactions from the network.
-    rx_batch_maker: Receiver<NewBatch>,
+    rx_batch_maker: Receiver<NewWorkerBlock>,
     /// Output channel to deliver sealed batches to the `QuorumWaiter`.
-    tx_quorum_waiter: Sender<(Batch, tokio::sync::oneshot::Sender<()>)>,
+    tx_quorum_waiter: Sender<(WorkerBlock, tokio::sync::oneshot::Sender<()>)>,
     /// Metrics handler
     node_metrics: Arc<WorkerMetrics>,
     /// The timestamp of the batch creation.
@@ -73,8 +72,8 @@ impl<DB: Database + Clone + 'static> BatchMaker<DB> {
         _batch_size_limit: usize,
         _max_batch_delay: Duration,
         rx_shutdown: ConditionalBroadcastReceiver,
-        rx_batch_maker: Receiver<NewBatch>,
-        tx_quorum_waiter: Sender<(Batch, tokio::sync::oneshot::Sender<()>)>,
+        rx_batch_maker: Receiver<NewWorkerBlock>,
+        tx_quorum_waiter: Sender<(WorkerBlock, tokio::sync::oneshot::Sender<()>)>,
         node_metrics: Arc<WorkerMetrics>,
         client: NetworkClient,
         store: DB,
@@ -145,22 +144,22 @@ impl<DB: Database + Clone + 'static> BatchMaker<DB> {
     async fn seal<'a>(
         &self,
         // timeout: bool,
-        new_batch: NewBatch,
+        new_batch: NewWorkerBlock,
         // size: usize,
         // response: BatchResponse,
     ) -> Option<BoxFuture<'a, ()>> {
         #[cfg(feature = "benchmark")]
         {
-            let digest = new_batch.batch.digest();
+            let digest = new_batch.block.digest();
 
             // Look for sample txs (they all start with 0) and gather their txs id (the next 8
             // bytes).
             let tx_ids: Vec<_> = new_batch
-                .batch
+                .block
                 .transactions()
                 .iter()
-                .filter(|tx| tx[0] == 0u8 && tx.len() > 8)
-                .filter_map(|tx| tx[1..9].try_into().ok())
+                .filter(|tx| tx.hash[0] == 0u8 && tx.hash.len() > 8)
+                .filter_map(|tx| tx.hash[1..9].try_into().ok())
                 .collect();
 
             let size = tx_ids.len();
@@ -176,13 +175,13 @@ impl<DB: Database + Clone + 'static> BatchMaker<DB> {
                 // that's useful for debugging and tracking the lifetime of messages between
                 // Narwhal and clients.
                 let tracking_ids: Vec<_> = new_batch
-                    .batch
+                    .block
                     .transactions()
                     .iter()
                     .map(|tx| {
-                        let len = tx.len();
+                        let len = tx.hash.len();
                         if len >= 8 {
-                            (&tx[0..8]).read_u64::<BigEndian>().unwrap_or_default()
+                            (&tx.hash[0..8]).read_u64::<BigEndian>().unwrap_or_default()
                         } else {
                             0
                         }
@@ -199,8 +198,8 @@ impl<DB: Database + Clone + 'static> BatchMaker<DB> {
             tracing::info!("Batch {:?} contains {} B", digest, size);
         }
 
-        let NewBatch { mut batch, ack } = new_batch;
-        let size = batch.size();
+        let NewWorkerBlock { block, ack } = new_batch;
+        let size = block.size();
 
         // TODO: include timeout vs size_reached in `NewBatch`
         // let reason = if timeout { "timeout" } else { "size_reached" };
@@ -210,7 +209,7 @@ impl<DB: Database + Clone + 'static> BatchMaker<DB> {
 
         // Send the batch through the deliver channel for further processing.
         let (notify_done, broadcasted_to_quorum) = tokio::sync::oneshot::channel();
-        if self.tx_quorum_waiter.send((batch.clone(), notify_done)).await.is_err() {
+        if self.tx_quorum_waiter.send((block.clone(), notify_done)).await.is_err() {
             tracing::debug!("{}", DagError::ShuttingDown);
             return None;
         }
@@ -219,7 +218,7 @@ impl<DB: Database + Clone + 'static> BatchMaker<DB> {
 
         tracing::debug!(
             "Batch {:?} took {} seconds to create due to {}",
-            batch.digest(),
+            block.digest(),
             batch_creation_duration,
             reason
         );
@@ -237,11 +236,6 @@ impl<DB: Database + Clone + 'static> BatchMaker<DB> {
         let store = self.store.clone();
         let worker_id = self.id;
 
-        // The batch has been sealed so we can officially set its creation time
-        // for latency calculations.
-        batch.versioned_metadata_mut().set_created_at(now());
-        let metadata = batch.versioned_metadata().clone();
-
         Some(Box::pin(async move {
             // Also wait quorum broadcast here.
             //
@@ -254,15 +248,15 @@ impl<DB: Database + Clone + 'static> BatchMaker<DB> {
             }
 
             // Now save it to disk
-            let digest = batch.digest();
+            let digest = block.digest();
 
-            if let Err(e) = store.insert::<Batches>(&digest, &batch) {
+            if let Err(e) = store.insert::<Batches>(&digest, &block) {
                 error!("Store failed with error: {:?}", e);
                 return;
             }
 
             // Send the batch to the primary.
-            let message = WorkerOwnBatchMessage { digest, worker_id, metadata };
+            let message = WorkerOwnBatchMessage { digest, worker_id, worker_block: block.clone() };
             if let Err(e) = client.report_own_batch(message).await {
                 warn!("Failed to report our batch: {}", e);
                 // Drop all response handlers to signal error, since we

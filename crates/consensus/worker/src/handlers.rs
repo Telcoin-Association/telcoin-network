@@ -7,7 +7,6 @@ use crate::batch_fetcher::BatchFetcher;
 use anemo::{types::response::StatusCode, Network};
 use async_trait::async_trait;
 use eyre::Result;
-use fastcrypto::hash::Hash;
 use itertools::Itertools;
 use narwhal_network::{client::NetworkClient, WorkerToPrimaryClient};
 use narwhal_network_types::{
@@ -21,7 +20,7 @@ use narwhal_typed_store::{
 };
 use std::{collections::HashSet, time::Duration};
 use tn_batch_validator::BatchValidation;
-use tn_types::{now, BatchAPI, Committee, MetadataAPI, WorkerCache, WorkerId};
+use tn_types::{now, Committee, WorkerCache, WorkerId};
 use tracing::{debug, trace};
 
 #[cfg(test)]
@@ -47,22 +46,22 @@ impl<V: BatchValidation, DB: Database> WorkerToWorker for WorkerReceiverHandler<
         let peer_id = request.peer_id().copied();
         let message = request.into_body();
         // validate batch - log error if invalid
-        if let Err(err) = self.validator.validate_batch(&message.batch).await {
+        if let Err(err) = self.validator.validate_batch(&message.worker_block).await {
             return Err(anemo::rpc::Status::new_with_message(
                 StatusCode::BadRequest,
                 format!(
                     "Invalid batch from peer {:?}: {err}\nsealed_header:\n{:?}",
                     peer_id,
-                    &message.batch.versioned_metadata().sealed_header(),
+                    &message.worker_block.sealed_header(),
                 ),
             ));
         }
-        let digest = message.batch.digest();
+        let digest = message.worker_block.digest();
 
-        let mut batch = message.batch;
+        let mut batch = message.worker_block;
 
         // Set received_at timestamp for remote batch.
-        batch.versioned_metadata_mut().set_received_at(now());
+        batch.set_received_at(now());
         self.store.insert::<Batches>(&digest, &batch).map_err(|e| {
             anemo::rpc::Status::internal(format!("failed to write to batch store: {e:?}"))
         })?;
@@ -210,7 +209,7 @@ impl<V: BatchValidation, DB: Database> PrimaryToWorker for PrimaryReceiverHandle
             let digest = batch.digest();
             if missing.remove(&digest) {
                 // Set received_at timestamp for remote batch.
-                batch.versioned_metadata_mut().set_received_at(now());
+                batch.set_received_at(now());
                 let mut tx = self.store.write_txn().map_err(|e| {
                     anemo::rpc::Status::internal(format!(
                         "failed to create batch transaction to commit: {e:?}"
