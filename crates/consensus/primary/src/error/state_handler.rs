@@ -1,4 +1,4 @@
-//! Error types for primary's Proposer task.
+//! Error types for primary's StateHandler task.
 
 use tn_types::Header;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -21,7 +21,7 @@ pub enum StateHandlerError {
     OneshotChannelClosed,
 }
 
-impl From<watch::error::RecvError> for ProposerError {
+impl From<watch::error::RecvError> for StateHandlerError {
     fn from(_: watch::error::RecvError) -> Self {
         Self::WatchChannelClosed
     }
