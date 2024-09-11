@@ -211,6 +211,7 @@ impl Committee {
 
     /// Updates the committee internal secondary indexes.
     pub fn load(&mut self) {
+        assert!(self.authorities_by_id.len() > 1, "committee size must be larger that 1");
         self.authorities_by_id = (0_u16..)
             .zip(self.authorities.iter_mut())
             .map(|(identifier, (_key, authority))| {

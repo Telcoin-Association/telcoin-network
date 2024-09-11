@@ -452,10 +452,9 @@ impl<DB: Database + 'static> Proposer<DB> {
         // nodes of the leader_schedule. By doing this we keep the proposal rate as high as possible
         // which leads to higher round rate and also acting as a score booster to the less strong
         // nodes as well.
-        if self.committee.size() > 1
-            && next_round % 2 != 0
-            && self.committee.leader(next_round).id() == self.authority_id
-        {
+
+        // NOTE: committee size is asserted >1 during Committee::load()
+        if next_round % 2 != 0 && self.committee.leader(next_round).id() == self.authority_id {
             return Duration::ZERO;
         }
 
@@ -508,8 +507,8 @@ impl<DB: Database + 'static> Proposer<DB> {
         }
 
         // return true if either:
-        // - votes_for_leader meets committe threshold
-        // - or a quorum of no_votes
+        // - enough votes for availability (f+1)
+        // - a quorum of no_votes (2f+1)
         votes_for_leader >= self.committee.validity_threshold()
             || no_votes >= self.committee.quorum_threshold()
     }
@@ -535,7 +534,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         // Sanity check: verify provided certs are of the correct round & epoch.
         for parent in parents.iter() {
             if parent.round() != round {
-                error!("Proposer received certificate {parent:?} that failed to match expected round {round}. This should not be possible.");
+                error!(target: "primary::proposer", "Proposer received certificate {parent:?} that failed to match expected round {round}. This should not be possible.");
             }
         }
 
@@ -550,20 +549,15 @@ impl<DB: Database + 'static> Proposer<DB> {
 
                 // Reset advance flag.
                 self.advance_round = false;
+                // TODO: remove this and OLD WAY after PR review
+                // @STEVE: please double check these methods are correct
 
-                // Extend max_delay_timer to properly wait for the previous round's leader
+                // NOTE: min_delay_timer is marked as `ready()` but max_delay_timer is reset to wait the appropriate amount of time for the previous round's leader.
                 //
-                // min_delay_timer should not be extended: the network moves at
-                // the interval of min_header_delay. Delaying header creation for
-                // another min_header_delay after receiving parents from a higher
-                // round and cancelling proposing, makes it very likely that higher
-                // round parents will be received and header creation will be cancelled
-                // again. So min_delay_timer is disabled to get the proposer in sync
-                // with the quorum.
-                // If the node becomes leader, disabling min_delay_timer to propose as
-                // soon as possible is the right thing to do as well.
+                // Disabling min_delay_timer will trigger next proposal attempt. It's important to propose next header ASAP so this node doesn't fall behind again. If proposer waits another min_header_delay after receiving parents from a future round, it's likely that more parents from another future round will arrive while this node tries to catch up. Disabling min_delay_timer is should help node sync with quorum. This is also important in case this node becomes the leader.
+                self.max_delay_timer.reset();
+                self.min_delay_timer.reset_immediately();
 
-                // TODO: how to do this with interval instead of sleep?
                 // OLD WAY:
                 // let timer_start = Instant::now();
                 // max_delay_timer
@@ -572,10 +566,6 @@ impl<DB: Database + 'static> Proposer<DB> {
                 // min_delay_timer
                 //     .as_mut()
                 //     .reset(timer_start);
-
-                // TODO: is this interval equivalent to sleep approach?
-                self.max_delay_timer.reset();
-                self.min_delay_timer.reset_immediately();
             }
             Ordering::Less => {
                 debug!(
@@ -586,20 +576,15 @@ impl<DB: Database + 'static> Proposer<DB> {
                 // Ignore parents from older rounds.
             }
             Ordering::Equal => {
-                // The core gives us the parents the first time they are enough to form a quorum.
-                // Then it keeps giving us all the extra parents.
+                // certs arrive from synchronizer once quorum is reached
+                // so these are extra parents
                 self.last_parents.extend(parents);
-
-                // As the schedule can change after an odd round proposal - when the new schedule algorithm is
-                // enabled - make sure that the timer is reset correctly for the round leader. No harm doing
-                // this here as well.
-
                 // the schedule can change after an odd round proposal
                 //
                 // need to ensure the timer is reset correctly for the round leader
                 // no harm doing this here as well
                 if self.min_delay() == Duration::ZERO {
-                    // triggers min_delay_timer READY
+                    // triggers min_delay_timer ready()
                     self.min_delay_timer.reset_immediately();
                 }
             }
@@ -607,7 +592,7 @@ impl<DB: Database + 'static> Proposer<DB> {
 
         // check conditions for advancing the round
         //
-        // if max_delay_timer expires, this check is ignored and the round is advanced
+        // if max_delay_timer expires, this check is ignored and the round is advanced regardless
         debug!(target: "primary::proposer", advance_round=self.advance_round, round=self.round, "proposer checking if self.ready()...");
         self.advance_round = self.ready();
         debug!(target: "primary::proposer", advance_round=self.advance_round, round=self.round, "round status after checking conditions");
@@ -641,13 +626,9 @@ impl<DB: Database + 'static> Proposer<DB> {
             };
         }
 
-        // Now for any round below the current commit round we re-insert
-        // the batches into the digests we need to send, effectively re-sending
-        // them in FIFO order.
-
         // re-insert batches for any proposed header from a round below the current commit
         //
-        // ensure batches are FIFO as this is effectively re-sending them
+        // ensure batches are FIFO to re-send them
         //
         // payloads: oldest -> newest
         let mut digests_to_resend = VecDeque::new();
@@ -670,7 +651,7 @@ impl<DB: Database + 'static> Proposer<DB> {
                 .map(|(k, v)| ProposerDigest { digest: *k, worker_id: v.0, timestamp: v.1 })
                 .collect();
 
-            // Add payloads and system messages from oldest to newest.
+            // add payloads and system messages from oldest to newest
             digests_to_resend.append(&mut digests);
             system_messages_to_resend.append(&mut system_messages);
             retransmit_rounds.push(*header_round);
