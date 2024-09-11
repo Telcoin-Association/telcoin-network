@@ -92,7 +92,7 @@ impl OurDigestMessage {
 #[derive(Debug)]
 struct ProposerDigest {
     /// The digest for the worker's block that reached quorum.
-    pub digest: BatchDigest,
+    pub digest: BlockHash,
     /// The worker that produced this block.
     pub worker_id: WorkerId,
     /// The timestamp for when the block was created.
@@ -458,33 +458,36 @@ impl<DB: Database + 'static> Proposer<DB> {
         {
             return Duration::ZERO;
         }
+
         self.min_header_delay
     }
 
     /// Update the last leader certificate.
+    ///
+    /// This is called after processing parent certificates during even rounds.
+    /// The returned boolean indicates if `Self::last_leader` was updated.
     fn update_leader(&mut self) -> bool {
         let leader = self.leader_schedule.leader(self.round);
-        self.last_leader = self
-            .last_parents
-            .iter()
-            .find(|x| {
-                if x.origin() == leader.id() {
-                    debug!("Got leader {:?} for round {}", x, self.round);
-                    true
-                } else {
-                    false
-                }
-            })
-            .cloned();
+        self.last_leader =
+            self.last_parents.iter().find(|cert| cert.origin() == leader.id()).cloned();
+
+        debug!(target: "primary::proposer", leader=?self.last_leader, round=self.round, "Last leader for round?");
 
         self.last_leader.is_some()
     }
 
-    /// Check whether if this validator is the leader of the round, or if we have
-    /// (i) f+1 votes for the leader, (ii) 2f+1 nodes not voting for the leader,
-    /// (iii) there is no leader to vote for.
+    /// Check if proposer has received enough votes to elect a new leader for the round.
+    ///
+    /// This method returns true for any of the following:
+    /// - if this primary is the leader for the next round
+    /// - f+1 votes for a new leader
+    /// - 2f+1 nodes didn't vote for a new leader
+    /// - there is no leader to vote for
+    ///
+    /// This is called after processing parent certificates during odd rounds.
     fn enough_votes(&self) -> bool {
         if self.leader_schedule.leader(self.round + 1).id() == self.authority_id {
+            debug!(target: "primary::proposer", "enough_votes eval to true - this node anticipated leader for next round");
             return true;
         }
 
@@ -504,13 +507,20 @@ impl<DB: Database + 'static> Proposer<DB> {
             }
         }
 
-        let mut enough_votes = votes_for_leader >= self.committee.validity_threshold();
-        enough_votes |= no_votes >= self.committee.quorum_threshold();
-        enough_votes
+        // return true if either:
+        // - votes_for_leader meets committe threshold
+        // - or a quorum of no_votes
+        votes_for_leader >= self.committee.validity_threshold()
+            || no_votes >= self.committee.quorum_threshold()
     }
 
-    /// Whether we can advance the DAG or need to wait for the leader/more votes.
-    /// Note that if we timeout, we ignore this check and advance anyway.
+    /// Check if conditions support advancing the round for the DAG.
+    ///
+    /// Odd rounds check if there are enough votes for a new leader.
+    /// Even rounds check if there is the new leader certificate is in `Self::last_parents`.
+    ///
+    /// This method is called from `Self::process_parents`.
+    /// NOTE: this value is ignored if max_delay_timer expires.
     fn ready(&mut self) -> bool {
         match self.round % 2 {
             0 => self.update_leader(),
@@ -552,17 +562,24 @@ impl<DB: Database + 'static> Proposer<DB> {
                 // with the quorum.
                 // If the node becomes leader, disabling min_delay_timer to propose as
                 // soon as possible is the right thing to do as well.
-                let timer_start = Instant::now();
 
                 // TODO: how to do this with interval instead of sleep?
+                // OLD WAY:
+                // let timer_start = Instant::now();
+                // max_delay_timer
+                //     .as_mut()
+                //     .reset(timer_start + self.max_delay());
+                // min_delay_timer
+                //     .as_mut()
+                //     .reset(timer_start);
 
-                // self.max_delay_timer.reset();
-                // self.min_delay_timer.reset();
-
-                todo!()
+                // TODO: is this interval equivalent to sleep approach?
+                self.max_delay_timer.reset();
+                self.min_delay_timer.reset_immediately();
             }
             Ordering::Less => {
                 debug!(
+                    target: "primary::proposer",
                     "Proposer ignoring older parents, round={} parent.round={}",
                     self.round, round
                 );
@@ -576,26 +593,27 @@ impl<DB: Database + 'static> Proposer<DB> {
                 // As the schedule can change after an odd round proposal - when the new schedule algorithm is
                 // enabled - make sure that the timer is reset correctly for the round leader. No harm doing
                 // this here as well.
+
+                // the schedule can change after an odd round proposal
+                //
+                // need to ensure the timer is reset correctly for the round leader
+                // no harm doing this here as well
                 if self.min_delay() == Duration::ZERO {
-                    min_delay_timer.as_mut().reset(Instant::now());
+                    // triggers min_delay_timer READY
+                    self.min_delay_timer.reset_immediately();
                 }
             }
         }
 
-        // Check whether we can advance to the next round. Note that if we timeout,
-        // we ignore this check and advance anyway.
-        self.advance_round = if self.ready() {
-            if !self.advance_round {
-                debug!(target: "primary::proposer", "Ready to advance from round {}", self.round,);
-            }
-            true
-        } else {
-            false
-        };
-        debug!(target: "primary::proposer", advance_round=self.advance_round, round=self.round, "Proposer processed parents result");
+        // check conditions for advancing the round
+        //
+        // if max_delay_timer expires, this check is ignored and the round is advanced
+        debug!(target: "primary::proposer", advance_round=self.advance_round, round=self.round, "proposer checking if self.ready()...");
+        self.advance_round = self.ready();
+        debug!(target: "primary::proposer", advance_round=self.advance_round, round=self.round, "round status after checking conditions");
 
+        // update metrics
         let round_type = if self.round % 2 == 0 { "even" } else { "odd" };
-
         self.metrics
             .proposer_ready_to_advance
             .with_label_values(&[&self.advance_round.to_string(), round_type])
@@ -955,20 +973,21 @@ where
             // New headers are proposed when:
             //
             // 1) a quorum of parents (certificates) received for the current round
-            // 2) the execution layer successfully executed the previous round (parent hash)
+            // 2) the execution layer successfully executed the previous round (parent `BlockNumHash`)
             // 3) One of the following:
-            // - the timer expired
-            //  - this primary timed out on the leader
-            //  - or quit trying to gather enough votes for the leader
+            // - the timer expired:
+            //      - this primary timed out on the leader
+            //      - or quit trying to gather enough votes for the leader
             // - the worker created enough blocks (header_num_of_batches_threshold)
-            //  - this is happy path
-            //  - vote for leader or leader already has enough votes to trigger commit
+            //      - this is happy path
+            //      - vote for leader or leader already has enough votes to trigger commit
             let enough_parents = !this.last_parents.is_empty();
             let execution_complete = this.execution_result.has_changed()?;
             let max_delay_timed_out = this.max_delay_timer.poll_tick(cx).is_ready();
             let min_delay_timed_out = this.min_delay_timer.poll_tick(cx).is_ready();
             let enough_digests = this.digests.len() >= this.header_num_of_batches_threshold;
 
+            // evaluate conditions for bool value
             let should_create_header = (max_delay_timed_out
                 || ((enough_digests || min_delay_timed_out) && this.advance_round))
                 && enough_parents;
