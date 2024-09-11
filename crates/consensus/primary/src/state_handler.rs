@@ -8,20 +8,14 @@ use consensus_metrics::{
 };
 use fastcrypto::groups;
 use fastcrypto_tbls::{dkg, nodes};
-use futures::{FutureExt, StreamExt};
-use reth_primitives::BlockNumHash;
-use std::{
-    collections::VecDeque, future::Future, num::NonZero, pin::Pin, task::{Context, Poll}
-};
-use tap::TapFallible;
 use tn_types::{AuthorityIdentifier, ChainIdentifier, Committee, RandomnessPrivateKey};
+
+use tap::TapFallible;
 use tn_types::{
-    Certificate, ConditionalBroadcastReceiver, Round, SystemMessage,
+    Certificate, CertificateAPI, ConditionalBroadcastReceiver, HeaderAPI, Round, SystemMessage,
 };
-use tokio::{sync::oneshot, task::JoinHandle};
-use tokio_stream::wrappers::BroadcastStream;
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
-use crate::error::StateHandlerResult;
 
 type PkG = groups::bls12381::G2Element;
 type EncG = groups::bls12381::G2Element;
@@ -30,69 +24,24 @@ type EncG = groups::bls12381::G2Element;
 #[path = "tests/state_handler_tests.rs"]
 pub mod state_handler_tests;
 
-// TODO: is this even necessary?
-const DEFAULT_EXECUTION_RESULT_SIZE: usize = 8;
-
-/// Type alias for the async task that updates state.
-type PendingStateUpdate = oneshot::Receiver<StateHandlerResult<()>>;
-
 /// Updates Narwhal system state based on certificates received from consensus.
 pub struct StateHandler {
-    /// Primary's id.
     authority_id: AuthorityIdentifier,
+
     /// Receives the ordered certificates from consensus.
-    ///
-    /// TODO: use `committedcertificates` type!
     rx_committed_certificates: Receiver<(Round, Vec<Certificate>)>,
-    /// Receiver for shutdown.
-    ///
-    /// Shutdown is used to signal committee change.
-    rx_shutdown_stream: BroadcastStream<()>,
-    /// Sending half to notify the `Proposer` about a committed header.
-    ///
-    /// Committed headers are sequenced in the consensus DAG.
-    tx_committed_own_headers: Sender<(Round, Vec<Round>)>,
+    /// Channel to signal committee changes.
+    rx_shutdown: ConditionalBroadcastReceiver,
+    /// A channel to update the committed rounds
+    tx_committed_own_headers: Option<Sender<(Round, Vec<Round>)>>,
     /// A channel to send system messages to the proposer.
     tx_system_messages: Sender<SystemMessage>,
+
     /// If set, generates Narwhal system messages for random beacon
     /// DKG and randomness generation.
     randomness_state: Option<RandomnessState>,
-    /// The WAN for primary to primary communication.
+
     network: anemo::Network,
-    /// Queue for updates received from consensus.
-    updates_queue: VecDeque<CommittedCertificates>,
-    /// The optional task that updates state after certificates were committed by consensus.
-    ///
-    /// This value is `Some` when consensus commits certificates in the DAG.
-    pending_update: Option<PendingStateUpdate>,
-
-    /// Receiver for requests for a round's `[BlockNumHash]`.
-    ///
-    /// - The proposer requests this? Or does it just track the watch channel itself?
-    /// - Validator would request this
-    ///     - I think headers can come in from a previous round so this needs to track a few rounds
-    ///     - if the last seen round is less than the requested round, wait for execution to update
-    rx_state_request: Receiver<(Round, oneshot::Sender<Option<BlockNumHash>>)>,
-    /// LRU cache to keep the map from growing infinitely large for now.
-    ///
-    /// TODO: just use hashmap for epoch once epochs in place
-    execution_state: lru::LruCache<Round, BlockNumHash>,
-    /// TODO: can't use a watch channel here because state handler MUST receive
-    /// every update for round.
-    ///
-    /// track canonical notifications stream?
-    execution_updates: todo!(),
-}
-
-/// TODO: update
-/// Container type for tracking consensus updates that affect state handler.
-struct CommittedCertificates {
-    ///
-    /// TODO: is this the round of the certificate or current round?
-    ///
-    pub round: Round,
-    /// Committed certificates.
-    pub certificates: Vec<Certificate>,
 }
 
 // Internal state for randomness DKG and generation.
@@ -225,7 +174,7 @@ impl RandomnessState {
                     let _ = tx_system_messages.send(SystemMessage::DkgConfirmation(conf)).await;
                 }
                 Err(fastcrypto::error::FastCryptoError::NotEnoughInputs) => (), /* wait for more */
-                // bad input
+                // input
                 Err(e) => debug!("Error while merging randomness DKG messages: {e:?}"),
             }
         }
@@ -254,27 +203,24 @@ impl RandomnessState {
 }
 
 impl StateHandler {
-    /// Create a new instance of Self.
-    // #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
-    pub fn new(
+    pub fn spawn(
         chain: &ChainIdentifier,
         authority_id: AuthorityIdentifier,
         committee: Committee,
         rx_committed_certificates: Receiver<(Round, Vec<Certificate>)>,
         rx_shutdown: ConditionalBroadcastReceiver,
-        tx_committed_own_headers: Sender<(Round, Vec<Round>)>,
+        tx_committed_own_headers: Option<Sender<(Round, Vec<Round>)>>,
         tx_system_messages: Sender<SystemMessage>,
         randomness_private_key: RandomnessPrivateKey,
         network: anemo::Network,
         beacon_delta: Option<u16>,
-        rx_state_request: Receiver<(Round, oneshot::Sender<Option<BlockNumHash>>)>,
-    ) -> Self {
-        let rx_shutdown_stream = BroadcastStream::new(rx_shutdown.receiver);
-        Self {
+    ) -> JoinHandle<()> {
+        let state_handler = Self {
             authority_id,
             rx_committed_certificates,
-            rx_shutdown_stream,
+            rx_shutdown,
             tx_committed_own_headers,
             tx_system_messages,
             randomness_state: RandomnessState::try_new(
@@ -284,15 +230,17 @@ impl StateHandler {
                 beacon_delta,
             ),
             network,
-            updates_queue: Default::default(),
-            pending_update: None,
-            rx_state_request,
-            execution_state: lru::LruCache::new(NonZero::new(DEFAULT_EXECUTION_RESULT_SIZE))
-        }
+        };
+        spawn_logged_monitored_task!(
+            async move {
+                state_handler.run().await;
+            },
+            "StateHandlerTask"
+        )
     }
 
-    fn handle_sequenced(&mut self, commit_round: Round, certificates: Vec<Certificate>) {
-        // filter own blocks that were committed
+    async fn handle_sequenced(&mut self, commit_round: Round, certificates: Vec<Certificate>) {
+        // Now we are going to signal which of our own batches have been committed.
         let own_rounds_committed: Vec<_> = certificates
             .iter()
             .filter_map(|cert| {
@@ -303,14 +251,13 @@ impl StateHandler {
                 }
             })
             .collect();
-        debug!(target: "primary::state_handler", "Own committed rounds {:?} at round {:?}", own_rounds_committed, commit_round);
+        debug!("Own committed rounds {:?} at round {:?}", own_rounds_committed, commit_round);
 
-        let (tx, rx) = oneshot::channel();
-        // spawn async task to handle sequence update
-        tokio::task::spawn(async move {
-            // report headers to the proposer
-            let _ = self.tx_committed_own_headers.send((commit_round, own_rounds_committed)).await;
-        });
+        // If a reporting channel is available send the committed own
+        // headers to it.
+        if let Some(sender) = &self.tx_committed_own_headers {
+            let _ = sender.send((commit_round, own_rounds_committed)).await;
+        }
 
         // Process committed system messages.
         if let Some(randomness_state) = self.randomness_state.as_mut() {
@@ -345,90 +292,17 @@ impl StateHandler {
                     self.handle_sequenced(commit_round, certificates).await;
                 },
 
-                //
-                // new idea:
-                // track: watch.changed()
-                // - last seen BlockNumHash
-                // - LRU with HashMap<Round, BlockNumHash>
+                _ = self.rx_shutdown.receiver.recv() => {
+                    // shutdown network
+                    let _ = self.network.shutdown().await.tap_err(|err|{
+                        error!("Error while shutting down network: {err}")
+                    });
 
-                // _ = self.rx_shutdown.receiver.recv() => {
-                //     // shutdown network
-                //     let _ = self.network.shutdown().await.tap_err(|err|{
-                //         error!("Error while shutting down network: {err}")
-                //     });
+                    warn!("Network has shutdown");
 
-                //     warn!("Network has shutdown");
-
-                //     return;
-                // }
-            }
-        }
-    }
-}
-
-impl Future for StateHandler {
-    type Output = StateHandlerResult<()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        loop {
-            // check for shutdown signal
-            //
-            // okay to shutdown here because other primary tasks are expected to shutdown too
-            // ie) no point completing the proposal if certifier is down
-            if let Poll::Ready(Some(_shutdown)) = this.rx_shutdown_stream.poll_next_unpin(cx) {
-                // shutdown network
-                let network = this.network.clone();
-
-                // attempt to shutdown network
-                tokio::task::spawn(async move {
-                    let _ = network
-                        .shutdown()
-                        .await
-                        .tap_err(|err| error!(target: "primary::state_handler", "Error while shutting down network: {err}"));
-                });
-
-                debug!(target: "primary::state_handler", "State handler shutting down");
-
-                return Poll::Ready(Ok(()));
-            }
-
-            // respond to any requests for execution state
-            while let Poll::Ready(Some((round, reply))) = this.rx_state_request.poll_recv(cx) {
-                // trying to validate header
-
-                // spawn a task for request
-                // this could take a while if waiting for execution to complete
-
-                tokio::spawn(async move {
-
-                })
-                todo!()
-            }
-
-            // poll receiver that returns when state update is complete
-            //
-            // if the update isn't complete, break loop and return pending
-            if let Some(mut receiver) = this.pending_update.take() {
-                match receiver.poll_unpin(cx) {
-                    Poll::Ready(res) => {
-                        todo!()
-                    }
-                    Poll::Pending => {
-                        todo!()
-                    }
+                    return;
                 }
             }
-
-            if let Poll::Ready(Some((commit_round, certificates))) =
-                this.rx_committed_certificates.poll_recv(cx)
-            {
-                this.handle_sequenced(commit_round, certificates);
-            };
-
-            // TODO: remove this break
-            break;
         }
-        Poll::Pending
     }
 }
