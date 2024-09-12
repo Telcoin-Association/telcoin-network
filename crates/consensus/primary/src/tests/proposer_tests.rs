@@ -39,7 +39,10 @@ async fn test_empty_proposal() {
 
     // simulate current execution HEAD at genesis
     let execution_update = (0, BlockNumHash::new(0, adiri_chain_spec().genesis_hash()));
-    let (tx_watch, rx_watch) = watch::channel(execution_update);
+    let (_tx, mut rx_watch) = watch::channel(execution_update);
+
+    // update watch channel on startup to trigger has_changed()
+    rx_watch.mark_changed();
 
     // Spawn the proposer.
     let proposer_store = ProposerStore::new(db);
@@ -63,9 +66,6 @@ async fn test_empty_proposal() {
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
         rx_watch, // el updates
     );
-
-    // update watch channel on startup to trigger has_changed()
-    tx_watch.send(execution_update).expect("watch channel update for genesis");
 
     let _proposer_handle = spawn_logged_monitored_task!(proposer_task, "proposer test empty");
 
@@ -103,7 +103,10 @@ async fn test_propose_payload_fatal_timer() {
 
     // simulate current execution HEAD at genesis
     let execution_update = (0, BlockNumHash::new(0, adiri_chain_spec().genesis_hash()));
-    let (tx_watch, rx_watch) = watch::channel(execution_update);
+    let (_tx, mut rx_watch) = watch::channel(execution_update);
+
+    // update watch channel on startup to trigger has_changed()
+    rx_watch.mark_changed();
 
     // Spawn the proposer.
     let temp_dir = TempDir::new().unwrap();
@@ -130,9 +133,6 @@ async fn test_propose_payload_fatal_timer() {
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
         rx_watch, // el data
     );
-
-    // update watch channel on startup to trigger has_changed()
-    tx_watch.send(execution_update).expect("watch channel update for genesis");
 
     let proposer_handle = spawn_logged_monitored_task!(proposer_task, "proposer test empty");
 
@@ -247,7 +247,10 @@ async fn test_equivocation_protection_after_restart() {
     let metrics = Arc::new(PrimaryMetrics::default());
     // simulate current execution HEAD at genesis
     let execution_update = (0, BlockNumHash::new(0, adiri_chain_spec().genesis_hash()));
-    let (tx_watch, rx_watch) = watch::channel(execution_update);
+    let (_tx, mut rx_watch) = watch::channel(execution_update);
+
+    // update watch channel on startup to trigger has_changed()
+    rx_watch.mark_changed();
 
     // Spawn the proposer.
     let proposer_task = Proposer::new(
@@ -272,9 +275,6 @@ async fn test_equivocation_protection_after_restart() {
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
         rx_watch, // el updates
     );
-
-    // update watch channel on startup to trigger has_changed()
-    tx_watch.send(execution_update).expect("watch channel update for genesis");
 
     let proposer_handle = spawn_logged_monitored_task!(proposer_task, "proposer test empty");
 

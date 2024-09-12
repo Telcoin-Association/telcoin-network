@@ -703,6 +703,8 @@ impl<DB: Database + 'static> Proposer<DB> {
         //
         // TODO: borrow and update watch channel to include EL data
         //
+        // update watch channel to listen for next change
+        // let parent = self.watch_execution_layer.bo
 
         // Advance to the next round.
         self.round += 1;
