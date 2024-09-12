@@ -24,30 +24,25 @@ use crate::{
     consensus::LeaderSchedule,
     error::{ProposerError, ProposerResult},
 };
-use consensus_metrics::{
-    metered_channel::{Receiver, Sender},
-    spawn_logged_monitored_task,
-};
+use consensus_metrics::metered_channel::{Receiver, Sender};
 use fastcrypto::hash::Hash as _;
 use futures::{FutureExt, StreamExt};
-use indexmap::IndexMap;
 use narwhal_primary_metrics::PrimaryMetrics;
 use narwhal_storage::ProposerStore;
 use narwhal_typed_store::traits::Database;
-use reth_primitives::{BlockNumHash, B256};
+use reth_primitives::BlockNumHash;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
     future::Future,
     pin::Pin,
     sync::Arc,
-    task::{ready, Context, Poll},
+    task::{Context, Poll},
 };
 use tn_types::{AuthorityIdentifier, Committee, Epoch, WorkerId};
 use tokio_stream::wrappers::BroadcastStream;
 
 use tn_types::{
-    error::{DagError, DagResult},
     now, BlockHash, Certificate, ConditionalBroadcastReceiver, Header, Round, SystemMessage,
     TimestampSec,
 };
@@ -56,8 +51,7 @@ use tokio::{
         oneshot::{self, error::RecvError},
         watch,
     },
-    task::JoinHandle,
-    time::{sleep, sleep_until, Duration, Instant, Interval},
+    time::{sleep, Duration, Interval},
 };
 use tracing::{debug, enabled, error, info, trace, warn};
 
@@ -126,12 +120,11 @@ pub struct Proposer<DB: Database> {
     /// The maximum duration to wait for conditions like having leader in parents.
     max_header_delay: Duration,
     /// The minimum interval measured between generating headers.
-    min_delay_timer: Interval,
+    min_delay_interval: Interval,
     /// The maximum interval measured for conditions like having leader in parents.
-    max_delay_timer: Interval,
-    /// The delay to wait until resending the last proposed header if proposer
-    /// hasn't proposed anything new since then.
-    header_resend_timeout: Interval,
+    max_delay_interval: Interval,
+    /// The maximum delay the proposer will wait to send to certifier. This interval expires if the proposer cannot send to certifier within a certain amount of time.
+    fatal_header_timeout: Interval,
     /// The latest header.
     opt_latest_header: Option<Header>,
     /// Receiver for shutdown.
@@ -139,7 +132,7 @@ pub struct Proposer<DB: Database> {
     /// Also used to signal committee change.
     rx_shutdown_stream: BroadcastStream<()>,
     /// Receives the parents to include in the next header (along with their round number) from
-    /// core.
+    /// `Synchronizer`.
     rx_parents: Receiver<(Vec<Certificate>, Round)>,
     /// Receives the batches' digests from our workers.
     rx_our_digests: Receiver<OurDigestMessage>,
@@ -206,7 +199,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         max_header_num_of_batches: usize,
         max_header_delay: Duration,
         min_header_delay: Duration,
-        header_resend_timeout: Option<Duration>,
+        fatal_header_timeout: Option<Duration>,
         rx_shutdown: ConditionalBroadcastReceiver,
         rx_parents: Receiver<(Vec<Certificate>, Round)>,
         rx_our_digests: Receiver<OurDigestMessage>,
@@ -222,11 +215,11 @@ impl<DB: Database + 'static> Proposer<DB> {
         //
         // NO: bc the first round should include EL genesis hash in primary proposed header.
         let genesis = Certificate::genesis(&committee);
-        let header_resend_timeout = header_resend_timeout.unwrap_or(DEFAULT_HEADER_RESEND_TIMEOUT);
+        let fatal_header_timeout = fatal_header_timeout.unwrap_or(DEFAULT_HEADER_RESEND_TIMEOUT);
         // create min/max delay intervals
-        let min_delay_timer = tokio::time::interval(min_header_delay);
-        let max_delay_timer = tokio::time::interval(max_header_delay);
-        let header_resend_timeout = tokio::time::interval(header_resend_timeout);
+        let min_delay_interval = tokio::time::interval(min_header_delay);
+        let max_delay_interval = tokio::time::interval(max_header_delay);
+        let fatal_header_timeout = tokio::time::interval(fatal_header_timeout);
         let rx_shutdown_stream = BroadcastStream::new(rx_shutdown.receiver);
 
         Self {
@@ -236,9 +229,9 @@ impl<DB: Database + 'static> Proposer<DB> {
             max_header_num_of_batches,
             min_header_delay,
             max_header_delay,
-            min_delay_timer,
-            max_delay_timer,
-            header_resend_timeout,
+            min_delay_interval,
+            max_delay_interval,
+            fatal_header_timeout,
             opt_latest_header: None,
             rx_shutdown_stream,
             rx_parents,
@@ -322,7 +315,7 @@ impl<DB: Database + 'static> Proposer<DB> {
             }
             trace!(msg);
         } else {
-            debug!("Created header {header:?}");
+            debug!(target: "primary::proposer", "created new header {header:?}");
         }
 
         // Update metrics related to latency
@@ -333,12 +326,12 @@ impl<DB: Database + 'static> Proposer<DB> {
             total_inclusion_secs += batch_inclusion_secs;
 
             // NOTE: This log entry is used to compute performance.
-            tracing::debug!(
-                    "Batch {:?} from worker {} took {} seconds from creation to be included in a proposed header",
-                    digest.digest,
-                    digest.worker_id,
-                    batch_inclusion_secs
-                );
+            debug!(
+                "Batch {:?} from worker {} took {} seconds from creation to be included in a proposed header",
+                digest.digest,
+                digest.worker_id,
+                batch_inclusion_secs
+            );
             metrics.proposer_batch_latency.observe(batch_inclusion_secs);
         }
 
@@ -351,6 +344,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         } else {
             (max_delay.as_secs_f64(), 0.0)
         };
+
         debug!(
             target: "primary::proposer",
             "Header {:?} was created in {} seconds. Contains {} batches, with average delay {} seconds.",
@@ -387,6 +381,9 @@ impl<DB: Database + 'static> Proposer<DB> {
         Ok(header)
     }
 
+    /// Store the header in the `ProposerStore` and send to `Certifier`.
+    ///
+    /// If `fatal_header_timeout` expires, this method is responsible. All other code is sync.
     async fn store_and_send_header(
         header: &Header,
         proposer_store: ProposerStore<DB>,
@@ -416,7 +413,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         result
     }
 
-    /// Calculate the max delay to use when resetting the max_delay_timer.
+    /// Calculate the max delay to use when resetting the max_delay_interval.
     ///
     /// The max delay is reduced when this authority expects to become the leader of the next round.
     /// Reducing the max delay increases its chance of being included in the DAG. Leaders are only
@@ -434,7 +431,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         }
     }
 
-    /// Calculate the min delay to use when resetting the min_delay_timer.
+    /// Calculate the min delay to use when resetting the min_delay_interval.
     ///
     /// The min delay is reduced when this authority expects to become the leader of the next round.
     /// Reducing the min delay increases the chances of successfully committing a leader.
@@ -521,7 +518,7 @@ impl<DB: Database + 'static> Proposer<DB> {
     /// Even rounds check if there is the new leader certificate is in `Self::last_parents`.
     ///
     /// This method is called from `Self::process_parents`.
-    /// NOTE: this value is ignored if max_delay_timer expires.
+    /// NOTE: this value is ignored if max_delay_interval expires.
     fn ready(&mut self) -> bool {
         match self.round % 2 {
             0 => self.update_leader(),
@@ -551,19 +548,19 @@ impl<DB: Database + 'static> Proposer<DB> {
                 self.last_parents = parents;
                 // Reset advance flag.
                 self.advance_round = false;
-                // NOTE: min_delay_timer is marked as `ready()` but max_delay_timer is reset to wait
+                // NOTE: min_delay_interval is marked as `ready()` but max_delay_interval is reset to wait
                 // the appropriate amount of time for the previous round's leader.
                 //
-                // Disabling min_delay_timer will expidite the next proposal attempt. It's important to
+                // Disabling min_delay_interval will expidite the next proposal attempt. It's important to
                 // propose next header ASAP so this node doesn't fall behind again. If proposer
                 // waits another min_header_delay after receiving parents from a future round, it's
                 // likely that more parents from another future round will arrive while this node
                 // tries to catch up.
                 //
-                // Disabling min_delay_timer should help node sync with quorum.
+                // Disabling min_delay_interval should help node sync with quorum.
                 // This is also important if this node expects to become the leader for the next round.
-                self.max_delay_timer.reset_after(self.calc_max_delay());
-                self.min_delay_timer.reset_immediately();
+                self.max_delay_interval.reset_after(self.calc_max_delay());
+                self.min_delay_interval.reset_immediately();
             }
             Ordering::Less => {
                 debug!(
@@ -579,18 +576,18 @@ impl<DB: Database + 'static> Proposer<DB> {
                 self.last_parents.extend(parents);
                 // the schedule can change after an odd round proposal
                 //
-                // need to ensure the timer is reset correctly for the round leader
+                // need to ensure the interval is reset correctly for the round leader
                 // no harm doing this here as well
                 if self.calc_min_delay().is_zero() {
-                    // min_delay_timer is ready
-                    self.min_delay_timer.reset_immediately();
+                    // min_delay_interval is ready
+                    self.min_delay_interval.reset_immediately();
                 }
             }
         }
 
         // check conditions for advancing the round
         //
-        // if max_delay_timer expires, this check is ignored and the round is advanced regardless
+        // if max_delay_interval expires, this check is ignored and the round is advanced regardless
         debug!(target: "primary::proposer", advance_round=self.advance_round, round=self.round, "proposer checking if self.ready()...");
         self.advance_round = self.ready();
         debug!(target: "primary::proposer", advance_round=self.advance_round, round=self.round, "round status after checking conditions");
@@ -802,7 +799,7 @@ impl<DB: Database + 'static> Proposer<DB> {
 
     /// Process the result from proposing the header.
     ///
-    /// The oneshot channel is ready, indicating a result from the header proposal process. Update `self` to track latest header, reset the header timeout, min/max delay timers, insert the proposed header, and indicate round should not be advanced yet.
+    /// The oneshot channel is ready, indicating a result from the header proposal process. Update `self` to track latest header, reset the header timeout, min/max delay intervals, insert the proposed header, and indicate round should not be advanced yet.
     ///
     /// This is the only time `Self::header_resend_timeout` gets reset.
     fn handle_proposal_result(
@@ -815,12 +812,12 @@ impl<DB: Database + 'static> Proposer<DB> {
         // track latest header
         self.opt_latest_header = Some(header.clone());
         // reset interval for header timeout
-        self.header_resend_timeout.reset();
+        self.fatal_header_timeout.reset();
         // Reset advance flag.
         self.advance_round = false;
-        // reschedule timers
-        self.min_delay_timer.reset_after(self.calc_min_delay());
-        self.max_delay_timer.reset_after(self.calc_max_delay());
+        // reschedule intervals
+        self.min_delay_interval.reset_after(self.calc_min_delay());
+        self.max_delay_interval.reset_after(self.calc_max_delay());
         // track header so proposer can repropose the digests and system messages
         // if this header fails to be committed for some reason
         self.proposed_headers.insert(header.round(), header);
@@ -831,13 +828,14 @@ impl<DB: Database + 'static> Proposer<DB> {
 
 /// The Future impl for proposer.
 ///
-/// The future is responsible for:
-/// - re-propose the header if the repeat timer expires
-/// - handle this primary's own committed headers
-/// - update parent count when peer certificates received
-/// - process own workers' block digests for proposing in own header
-/// - process system messages to include in proposed header
+/// The future does the following:
 /// - listen for shutdown receiver
+/// - receive system messages to include in next proposed header
+/// - receive own workers' block digests for proposing in own header
+/// - receive a quorum of parents from the synchronizer for the previous round
+/// - handle this primary's own committed headers
+/// - propose the next header when conditions are right
+/// - return an error if unable to send next header to certifier
 impl<DB> Future for Proposer<DB>
 where
     DB: Database,
@@ -850,7 +848,7 @@ where
         info!(
             target: "primary::proposer",
             "Proposer on node {} has started successfully with header resend timeout {:?}.",
-            this.authority_id, this.header_resend_timeout
+            this.authority_id, this.fatal_header_timeout
         );
 
         loop {
@@ -877,7 +875,7 @@ where
             // committed/sequenced in the DAG or the epoch concludes
             //
             // NOTE: this will not persist primary restarts
-            if let Poll::Ready(Some(msg)) = this.rx_our_digests.poll_recv(cx) {
+            while let Poll::Ready(Some(msg)) = this.rx_our_digests.poll_recv(cx) {
                 debug!(target: "primary::proposer", round=this.round, "Proposer received digest");
 
                 // parse message into parts
@@ -887,14 +885,12 @@ where
             }
 
             // check for new parent certificates
-            if let Poll::Ready(Some((certs, round))) = this.rx_parents.poll_recv(cx) {
+            // synchronizer sends collection of certificates when there is quorum (2f+1)
+            while let Poll::Ready(Some((certs, round))) = this.rx_parents.poll_recv(cx) {
                 debug!(target: "primary::proposer", this_round=this.round, parent_round=round, num_parents=certs.len(), "Proposer received parents");
                 this.process_parents(certs, round)?;
             }
 
-            // TODO: use `while` instead of `if`?
-            // - should be up-to-date all the time, but better to ensure Proposer is caught up
-            //
             // check for previous headers that were committed
             while let Poll::Ready(Some((commit_round, committed_headers))) =
                 this.rx_committed_own_headers.poll_recv(cx)
@@ -916,27 +912,24 @@ where
                         continue;
                     }
                     Poll::Pending => {
-                        // if still pending, check the header resend timeout
+                        // if still pending, check the fatal header timeout
                         //
-                        // if header resend interval expires, then certifier confirmed receipt but
-                        // proposer never received that this header reached quorum ??? (committed??)
+                        // if fatal_header_timeout interval expires, then proposer was unable to send to certifier
+                        // which is considered fatal and should never happen
                         //
-                        // check if the resent timeout has elapsed
-                        let receiver = if this.header_resend_timeout.poll_tick(cx).is_ready() {
-                            warn!(target: "primary::proposer", round=this.round, "Proposer header_resent_timeout triggered");
-                            let reason = "header_resend_timeout".to_string();
-                            // reads from proposer store and sends the existing header
-                            let new_pending = this.propose_next_header(reason)?;
-                            new_pending
-                        } else {
-                            receiver
-                        };
+                        // the only way this interval expires is if tx_headers.send() hangs
+                        if this.fatal_header_timeout.poll_tick(cx).is_ready() {
+                            error!(target: "primary::proposer", round=this.round, "Proposer header_resent_timeout triggered");
+                            return Poll::Ready(Err(ProposerError::FatalHeaderTimeout(
+                                this.fatal_header_timeout.period(),
+                            )));
+                        }
 
                         this.pending_header = Some(receiver);
 
                         // skip checking conditions for proposing next header
                         // since only one header is proposed at a time, there is no need to check
-                        // timers, parents, execution progress, etc.
+                        // intervals, parents, execution progress, etc.
                         break;
                     }
                 }
@@ -951,7 +944,7 @@ where
             // 2) the execution layer successfully executed the previous round (parent
             //    `BlockNumHash`)
             // 3) One of the following:
-            // - the timer expired:
+            // - the interval expired:
             //      - this primary timed out on the leader
             //      - or quit trying to gather enough votes for the leader
             // - the worker created enough blocks (header_num_of_batches_threshold)
@@ -959,8 +952,8 @@ where
             //      - vote for leader or leader already has enough votes to trigger commit
             let enough_parents = !this.last_parents.is_empty();
             let execution_complete = this.execution_result.has_changed()?;
-            let max_delay_timed_out = this.max_delay_timer.poll_tick(cx).is_ready();
-            let min_delay_timed_out = this.min_delay_timer.poll_tick(cx).is_ready();
+            let max_delay_timed_out = this.max_delay_interval.poll_tick(cx).is_ready();
+            let min_delay_timed_out = this.min_delay_interval.poll_tick(cx).is_ready();
             let enough_digests = this.digests.len() >= this.header_num_of_batches_threshold;
 
             // evaluate conditions for bool value
@@ -984,13 +977,13 @@ where
             // if both conditions are met, create the next header
             if should_create_header && execution_complete {
                 if max_delay_timed_out {
-                    // It is expected that this timer expires from time to time. If it expires too
-                    // often, it either means some validators are Byzantine or
-                    // that the network is experiencing periods of asynchrony.
+                    // expect this interval to expire occassionally
                     //
-                    // In practice, the latter scenario means we misconfigured the parameter
-                    // called `max_header_delay`.
-                    warn!(target: "primary::proposer", "Timer expired for round {}", this.round);
+                    // if it expires too often, it either means some validators are Byzantine or
+                    // that the network is experiencing periods of asynchrony
+                    //
+                    // periods of asynchrony possibly caused by misconfigured `max_header_delay`
+                    warn!(target: "primary::proposer", interval=?this.max_delay_interval.period(), "max delay interval expired for round {}", this.round);
                 }
 
                 // obtain reason for metrics
@@ -1006,7 +999,7 @@ where
                 let pending_header = this.propose_next_header(reason.to_string())?;
                 this.pending_header = Some(pending_header);
 
-                // Recheck condition and reset time out flags.
+                // ensure everything is caught up before poll pending
                 continue;
             }
         }
@@ -1019,7 +1012,7 @@ where
 mod tests {
 
     #[tokio::test]
-    async fn test_reset_timer_goes_off() {
+    async fn test_reset_interval_goes_off() {
         todo!()
     }
 }

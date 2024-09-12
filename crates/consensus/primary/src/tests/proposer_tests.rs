@@ -309,3 +309,8 @@ async fn equivocation_protection() {
         assert_eq!(header, new_header);
     }
 }
+
+#[tokio::test]
+async fn test_reset_interval_goes_off() {
+    todo!()
+}
