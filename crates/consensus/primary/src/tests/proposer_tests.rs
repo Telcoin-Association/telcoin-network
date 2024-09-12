@@ -312,5 +312,118 @@ async fn equivocation_protection() {
 
 #[tokio::test]
 async fn test_reset_interval_goes_off() {
-    todo!()
+    let fixture = CommitteeFixture::builder().build();
+    let committee = fixture.committee();
+    let worker_cache = fixture.worker_cache();
+    let primary = fixture.authorities().next().unwrap();
+    let name = primary.id();
+    // long enough to build header but not too long for tests
+    let fatal_header_interval = Duration::from_secs(3);
+
+    let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+    let (tx_parents, rx_parents) = tn_types::test_channel!(1);
+    let (tx_our_digests, rx_our_digests) = tn_types::test_channel!(1);
+    let (_tx_system_messages, rx_system_messages) = tn_types::test_channel!(1);
+    let (_tx_committed_own_headers, rx_committed_own_headers) = tn_types::test_channel!(1);
+    let (tx_headers, mut rx_headers) = tn_types::test_channel!(1);
+    let (tx_narwhal_round_updates, _rx_narwhal_round_updates) = watch::channel(0u64);
+
+    let metrics = Arc::new(PrimaryMetrics::default());
+
+    let max_num_of_batches = 10;
+
+    // Spawn the proposer.
+    let temp_dir = TempDir::new().unwrap();
+    let proposer_store = ProposerStore::new(open_db(temp_dir.path()));
+    let _proposer_handle = Proposer::spawn(
+        name,
+        committee.clone(),
+        proposer_store,
+        /* header_num_of_batches_threshold */ 1,
+        /* max_header_num_of_batches */ max_num_of_batches,
+        /* max_header_delay */
+        Duration::from_millis(1_000_000), // Ensure it is not triggered.
+        /* min_header_delay */
+        Duration::from_millis(1_000_000), // Ensure it is not triggered.
+        Some(header_resend_delay),
+        tx_shutdown.subscribe(),
+        /* rx_core */ rx_parents,
+        /* rx_workers */ rx_our_digests,
+        rx_system_messages,
+        /* tx_core */ tx_headers,
+        tx_narwhal_round_updates,
+        rx_committed_own_headers,
+        metrics,
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+    );
+
+    // Send enough digests for the header payload.
+    let mut b = [0u8; 32];
+    let r: Vec<u8> = (0..32).map(|_v| rand::random::<u8>()).collect();
+    b.copy_from_slice(r.as_slice());
+
+    let digest: BlockHash = b.into();
+    let worker_id = 0;
+    let created_at_ts = 0;
+    let (tx_ack, rx_ack) = tokio::sync::oneshot::channel();
+    tx_our_digests
+        .send(OurDigestMessage { digest, worker_id, timestamp: created_at_ts, ack_channel: tx_ack })
+        .await
+        .unwrap();
+
+    // Ensure the proposer makes a correct header from the provided payload.
+    let header = rx_headers.recv().await.unwrap();
+    assert_eq!(header.round(), 1);
+    assert_eq!(header.payload().get(&digest), Some(&(worker_id, created_at_ts)));
+    assert!(header.validate(&committee, &worker_cache).is_ok());
+
+    // WHEN available batches are more than the maximum ones
+    let batches: IndexMap<BlockHash, (WorkerId, TimestampSec)> =
+        fixture_payload((max_num_of_batches * 2) as u8);
+
+    let mut ack_list = vec![];
+    for (batch_id, (worker_id, created_at)) in batches {
+        let (tx_ack, rx_ack) = tokio::sync::oneshot::channel();
+        tx_our_digests
+            .send(OurDigestMessage {
+                digest: batch_id,
+                worker_id,
+                timestamp: created_at,
+                ack_channel: tx_ack,
+            })
+            .await
+            .unwrap();
+
+        ack_list.push(rx_ack);
+
+        tokio::task::yield_now().await;
+    }
+
+    // AND send some parents to advance the round
+    let parents: Vec<_> =
+        fixture.headers().iter().take(4).map(|h| fixture.certificate(h)).collect();
+
+    let result = tx_parents.send((parents, 1)).await;
+    assert!(result.is_ok());
+
+    // THEN the header should contain max_num_of_batches
+    let header = rx_headers.recv().await.unwrap();
+    assert_eq!(header.round(), 2);
+    assert_eq!(header.payload().len(), max_num_of_batches);
+    assert!(rx_ack.await.is_ok());
+
+    // Check all batches are acked.
+    for rx_ack in ack_list {
+        assert!(rx_ack.await.is_ok());
+    }
+
+    // WHEN wait to fetch again from the rx_headers a few times.
+    // In theory after header_resend_delay we should receive again
+    // the last created header.
+    for _ in 0..3 {
+        let resent_header = rx_headers.recv().await.unwrap();
+
+        // THEN should be the exact same as the last sent
+        assert_eq!(header, resent_header);
+    }
 }

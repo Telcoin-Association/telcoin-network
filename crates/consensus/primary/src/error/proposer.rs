@@ -27,7 +27,8 @@ pub enum ProposerError {
     /// Error writing to the proposer store.
     #[error("Failed to write new header to proposer store: {0}")]
     StoreError(String),
-    /// The fatal header timeout expired. This can only happen if the send channel to Certifier hangs for longer than specified duration.
+    /// The fatal header timeout expired. This can only happen if the send channel to Certifier
+    /// hangs for longer than specified duration.
     #[error("Fatal: proposed header still pending after {0:?}")]
     FatalHeaderTimeout(Duration),
 }

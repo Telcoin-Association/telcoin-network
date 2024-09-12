@@ -99,7 +99,9 @@ struct ProposerDigest {
 #[path = "tests/proposer_tests.rs"]
 pub mod proposer_tests;
 
-const DEFAULT_HEADER_RESEND_TIMEOUT: Duration = Duration::from_secs(60);
+/// The default amount of time the proposer should wait after trying to forward the proposed header
+/// to the certifier before returning an error.
+const DEFAULT_FATAL_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The proposer creates new headers and send them to the core for broadcasting and further
 /// processing.
@@ -123,7 +125,8 @@ pub struct Proposer<DB: Database> {
     min_delay_interval: Interval,
     /// The maximum interval measured for conditions like having leader in parents.
     max_delay_interval: Interval,
-    /// The maximum delay the proposer will wait to send to certifier. This interval expires if the proposer cannot send to certifier within a certain amount of time.
+    /// The maximum delay the proposer will wait to send to certifier. This interval expires if the
+    /// proposer cannot send to certifier within a certain amount of time.
     fatal_header_timeout: Interval,
     /// The latest header.
     opt_latest_header: Option<Header>,
@@ -215,7 +218,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         //
         // NO: bc the first round should include EL genesis hash in primary proposed header.
         let genesis = Certificate::genesis(&committee);
-        let fatal_header_timeout = fatal_header_timeout.unwrap_or(DEFAULT_HEADER_RESEND_TIMEOUT);
+        let fatal_header_timeout = fatal_header_timeout.unwrap_or(DEFAULT_FATAL_HEADER_TIMEOUT);
         // create min/max delay intervals
         let min_delay_interval = tokio::time::interval(min_header_delay);
         let max_delay_interval = tokio::time::interval(max_header_delay);
@@ -364,8 +367,10 @@ impl<DB: Database + 'static> Proposer<DB> {
 
     /// Bypass creating another header and return header.
     ///
-    /// This is a convenience method to help the flow of proposing new headers and reproposing headers. Headers are reproposed under certain conditions:
-    /// - during a restart when the last proposed header in Self::proposer_store is from the current round.
+    /// This is a convenience method to help the flow of proposing new headers and reproposing
+    /// headers. Headers are reproposed under certain conditions:
+    /// - during a restart when the last proposed header in Self::proposer_store is from the current
+    ///   round.
     /// -
     async fn repropose_header(
         header: Header,
@@ -548,17 +553,20 @@ impl<DB: Database + 'static> Proposer<DB> {
                 self.last_parents = parents;
                 // Reset advance flag.
                 self.advance_round = false;
-                // NOTE: min_delay_interval is marked as `ready()` but max_delay_interval is reset to wait
-                // the appropriate amount of time for the previous round's leader.
+                // NOTE: min_delay_interval is marked as `ready()` but max_delay_interval is reset
+                // to wait the appropriate amount of time for the previous round's
+                // leader.
                 //
-                // Disabling min_delay_interval will expidite the next proposal attempt. It's important to
-                // propose next header ASAP so this node doesn't fall behind again. If proposer
-                // waits another min_header_delay after receiving parents from a future round, it's
-                // likely that more parents from another future round will arrive while this node
+                // Disabling min_delay_interval will expidite the next proposal attempt. It's
+                // important to propose next header ASAP so this node doesn't fall
+                // behind again. If proposer waits another min_header_delay after
+                // receiving parents from a future round, it's likely that more
+                // parents from another future round will arrive while this node
                 // tries to catch up.
                 //
                 // Disabling min_delay_interval should help node sync with quorum.
-                // This is also important if this node expects to become the leader for the next round.
+                // This is also important if this node expects to become the leader for the next
+                // round.
                 self.max_delay_interval.reset_after(self.calc_max_delay());
                 self.min_delay_interval.reset_immediately();
             }
@@ -684,7 +692,8 @@ impl<DB: Database + 'static> Proposer<DB> {
 
     /// Conditions are met to propose the next header.
     ///
-    /// This method ensures proposer is protected against equivocation and sends the next header to the Certifier.
+    /// This method ensures proposer is protected against equivocation and sends the next header to
+    /// the Certifier.
     ///
     /// If a different header was already produced for the same round, then
     /// this method returns the earlier header. Otherwise the newly created header is returned.
@@ -799,7 +808,9 @@ impl<DB: Database + 'static> Proposer<DB> {
 
     /// Process the result from proposing the header.
     ///
-    /// The oneshot channel is ready, indicating a result from the header proposal process. Update `self` to track latest header, reset the header timeout, min/max delay intervals, insert the proposed header, and indicate round should not be advanced yet.
+    /// The oneshot channel is ready, indicating a result from the header proposal process. Update
+    /// `self` to track latest header, reset the header timeout, min/max delay intervals, insert the
+    /// proposed header, and indicate round should not be advanced yet.
     ///
     /// This is the only time `Self::header_resend_timeout` gets reset.
     fn handle_proposal_result(
@@ -914,8 +925,9 @@ where
                     Poll::Pending => {
                         // if still pending, check the fatal header timeout
                         //
-                        // if fatal_header_timeout interval expires, then proposer was unable to send to certifier
-                        // which is considered fatal and should never happen
+                        // if fatal_header_timeout interval expires, then proposer was unable to
+                        // send to certifier which is considered fatal and
+                        // should never happen
                         //
                         // the only way this interval expires is if tx_headers.send() hangs
                         if this.fatal_header_timeout.poll_tick(cx).is_ready() {
