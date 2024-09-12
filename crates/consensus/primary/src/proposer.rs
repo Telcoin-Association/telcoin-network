@@ -3,20 +3,22 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Proposer is responsible for proposing the primary's next header when certain conditions are met.
+//! The Proposer is responsible for proposing the primary's next header when certain conditions are
+//! met.
 //!
 //! This is the first task in the primary's header cycle. The Proposer processes messages from the
 //! `Primary::StateHandler` to track which proposed headers were successfully committed. If a header
 //! is not committed before it's round advances, the failed header's block digests are included in a
 //! fresh header in FIFO order.
 //!
-//! Successfully created Headers are sent to the `Primary::Certifier`, where they are reliably broadcast
-//! to voting peers. Headers are stored in the `ProposerStore` before they are sent to the Certifier.
+//! Successfully created Headers are sent to the `Primary::Certifier`, where they are reliably
+//! broadcast to voting peers. Headers are stored in the `ProposerStore` before they are sent to the
+//! Certifier.
 //!
 //! The Proposer is also responsible for processing Worker block's that reach quorum.
-//! Collections of worker blocks that reach quorum are included in each header. If the Proposer's header
-//! fails to be committed, then block digests from the failed round are included in the next header
-//! once the Proposer's round advances.
+//! Collections of worker blocks that reach quorum are included in each header. If the Proposer's
+//! header fails to be committed, then block digests from the failed round are included in the next
+//! header once the Proposer's round advances.
 
 use crate::{
     consensus::LeaderSchedule,
@@ -176,7 +178,8 @@ pub struct Proposer<DB: Database> {
     leader_schedule: LeaderSchedule,
     /// The watch channel for observing execution results.
     ///
-    /// Proposer must include the finalized parent hash from the previously executed round to ensure execution results are consistent.
+    /// Proposer must include the finalized parent hash from the previously executed round to
+    /// ensure execution results are consistent.
     execution_result: watch::Receiver<BlockNumHash>,
     /// Flag if enough conditions are met to advance the round.
     advance_round: bool,
@@ -263,9 +266,8 @@ impl<DB: Database + 'static> Proposer<DB> {
     ///
     /// This task is spawned outside of `Self`.
     ///
-    /// - current_header: caller checks to see if there is already a header
-    ///   built for this round. If current_header.is_some() the proposer
-    ///   uses this header instead of building a new one.
+    /// - current_header: caller checks to see if there is already a header built for this round. If
+    ///   current_header.is_some() the proposer uses this header instead of building a new one.
     async fn g_propose_header(
         current_round: Round,
         current_epoch: Epoch,
@@ -350,8 +352,8 @@ impl<DB: Database + 'static> Proposer<DB> {
         //     (self.max_header_delay.as_secs_f64(), 0.0)
         // };
         // debug!(
-        //     "Header {:?} was created in {} seconds. Contains {} batches, with average delay {} seconds.",
-        //     header.digest(),
+        //     "Header {:?} was created in {} seconds. Contains {} batches, with average delay {}
+        // seconds.",     header.digest(),
         //     header_creation_secs,
         //     digests.len(),
         //     avg_inclusion_secs,
@@ -422,7 +424,9 @@ impl<DB: Database + 'static> Proposer<DB> {
 
     /// Calculate the max delay to use when resetting the max_delay_timer.
     ///
-    /// The max delay is reduced when this authority expects to become the leader of the next round. Reducing the max delay increases its chance of being included in the DAG. Leaders are only elected on even rounds, so the normal max delay interval is used for odd rounds.
+    /// The max delay is reduced when this authority expects to become the leader of the next round.
+    /// Reducing the max delay increases its chance of being included in the DAG. Leaders are only
+    /// elected on even rounds, so the normal max delay interval is used for odd rounds.
     fn calc_max_delay(&self) -> Duration {
         // check next round
         let next_round = self.round + 1;
@@ -438,9 +442,13 @@ impl<DB: Database + 'static> Proposer<DB> {
 
     /// Calculate the min delay to use when resetting the min_delay_timer.
     ///
-    /// The min delay is reduced when this authority expects to become the leader of the next round. Reducing the min delay increases the chances of successfully committing a leader.
+    /// The min delay is reduced when this authority expects to become the leader of the next round.
+    /// Reducing the min delay increases the chances of successfully committing a leader.
     ///
-    /// NOTE: If the next round is even, the leader schedule is used to identify the next leader. If the next round is odd, the whole committee is used in order to keep the proposal rate as high as possible (which leads to a higher round rates). Using the entire committee here also helps boost scores for weaker nodes that may be trying to resync.
+    /// NOTE: If the next round is even, the leader schedule is used to identify the next leader. If
+    /// the next round is odd, the whole committee is used in order to keep the proposal rate as
+    /// high as possible (which leads to a higher round rates). Using the entire committee here also
+    /// helps boost scores for weaker nodes that may be trying to resync.
     fn calc_min_delay(&self) -> Duration {
         // check next round
         let next_round = self.round + 1;
@@ -549,23 +557,17 @@ impl<DB: Database + 'static> Proposer<DB> {
 
                 // Reset advance flag.
                 self.advance_round = false;
-                // TODO: remove this and OLD WAY after PR review
-                // @STEVE: please double check these methods are correct
-
-                // NOTE: min_delay_timer is marked as `ready()` but max_delay_timer is reset to wait the appropriate amount of time for the previous round's leader.
+                // NOTE: min_delay_timer is marked as `ready()` but max_delay_timer is reset to wait
+                // the appropriate amount of time for the previous round's leader.
                 //
-                // Disabling min_delay_timer will trigger next proposal attempt. It's important to propose next header ASAP so this node doesn't fall behind again. If proposer waits another min_header_delay after receiving parents from a future round, it's likely that more parents from another future round will arrive while this node tries to catch up. Disabling min_delay_timer is should help node sync with quorum. This is also important in case this node becomes the leader.
-                self.max_delay_timer.reset_at(Instant::now() + self.calc_max_delay());
+                // Disabling min_delay_timer will trigger next proposal attempt. It's important to
+                // propose next header ASAP so this node doesn't fall behind again. If proposer
+                // waits another min_header_delay after receiving parents from a future round, it's
+                // likely that more parents from another future round will arrive while this node
+                // tries to catch up. Disabling min_delay_timer is should help node sync with
+                // quorum. This is also important in case this node becomes the leader.
+                self.max_delay_timer.reset_after(self.calc_max_delay());
                 self.min_delay_timer.reset_immediately();
-
-                // OLD WAY:
-                // let timer_start = Instant::now();
-                // max_delay_timer
-                //     .as_mut()
-                //     .reset(timer_start + self.max_delay());
-                // min_delay_timer
-                //     .as_mut()
-                //     .reset(timer_start);
             }
             Ordering::Less => {
                 debug!(
@@ -614,7 +616,8 @@ impl<DB: Database + 'static> Proposer<DB> {
     /// removed after adding the expired header's proposed block digests and system messages to
     /// the beginning of the queue.
     ///
-    /// This method ensures worker blocks that were previously proposed but weren't committed are reproposed.
+    /// This method ensures worker blocks that were previously proposed but weren't committed are
+    /// reproposed.
     fn process_committed_headers(&mut self, commit_round: Round, committed_headers: Vec<Round>) {
         // remove committed headers from pending
         let mut max_committed_round = 0;
@@ -817,19 +820,9 @@ impl<DB: Database + 'static> Proposer<DB> {
         // Reset advance flag.
         self.advance_round = false;
 
-        //
-        // TODO: ensure new methods for Intances are equivalent to old sleep approach:
-        //
-        // Reschedule the timer.
-        // let timer_start = Instant::now();
-        //
-        // max_delay_timer.as_mut().reset(timer_start + self.max_delay());
-        // min_delay_timer.as_mut().reset(timer_start + self.min_delay());
-
         // reschedule timers
-        let timer_start = Instant::now();
-        self.min_delay_timer.reset_at(timer_start + self.calc_min_delay());
-        self.max_delay_timer.reset_at(timer_start + self.calc_max_delay());
+        self.min_delay_timer.reset_after(self.calc_min_delay());
+        self.max_delay_timer.reset_after(self.calc_max_delay());
 
         // track header so proposer can repropose the digests and system messages
         // if this header fails to be committed for some reason
@@ -957,7 +950,8 @@ where
             // New headers are proposed when:
             //
             // 1) a quorum of parents (certificates) received for the current round
-            // 2) the execution layer successfully executed the previous round (parent `BlockNumHash`)
+            // 2) the execution layer successfully executed the previous round (parent
+            //    `BlockNumHash`)
             // 3) One of the following:
             // - the timer expired:
             //      - this primary timed out on the leader
