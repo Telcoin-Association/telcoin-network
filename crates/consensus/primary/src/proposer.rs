@@ -53,7 +53,7 @@ use tokio::{
     },
     time::{sleep, Duration, Interval},
 };
-use tracing::{debug, enabled, error, info, trace, warn};
+use tracing::{debug, enabled, error, trace, warn};
 
 /// Type alias for the async task that creates, stores, and sends the proposer's new header.
 type PendingHeaderTask = oneshot::Receiver<ProposerResult<Header>>;
@@ -172,11 +172,11 @@ pub struct Proposer<DB: Database> {
     /// The consensus leader schedule to be used in order to resolve the leader needed for the
     /// protocol advancement.
     leader_schedule: LeaderSchedule,
-    /// The watch channel for observing execution results.
+    /// The watch channel for observing final execution after rounds of consensus.
     ///
-    /// Proposer must include the finalized parent hash from the previously executed round to
+    /// Proposer must include the finalized parent number and hash from the previously executed round to
     /// ensure execution results are consistent.
-    execution_result: watch::Receiver<(Round, BlockNumHash)>,
+    watch_execution_layer: watch::Receiver<(Round, BlockNumHash)>,
     /// Flag if enough conditions are met to advance the round.
     advance_round: bool,
     /// The optional pending header that the proposer has decided to build.
@@ -212,7 +212,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         rx_committed_own_headers: Receiver<(Round, Vec<Round>)>,
         metrics: Arc<PrimaryMetrics>,
         leader_schedule: LeaderSchedule,
-        execution_result: watch::Receiver<(Round, BlockNumHash)>,
+        watch_execution_layer: watch::Receiver<(Round, BlockNumHash)>,
     ) -> Self {
         // TODO: include EL genesis hash in committee for epoch?
         //
@@ -222,7 +222,9 @@ impl<DB: Database + 'static> Proposer<DB> {
         // create min/max delay intervals
         let min_delay_interval = tokio::time::interval(min_header_delay);
         let max_delay_interval = tokio::time::interval(max_header_delay);
-        let fatal_header_timeout = tokio::time::interval(fatal_header_timeout);
+        let mut fatal_header_timeout = tokio::time::interval(fatal_header_timeout);
+        // reset interval because first tick completes immediately
+        fatal_header_timeout.reset();
         let rx_shutdown_stream = BroadcastStream::new(rx_shutdown.receiver);
 
         Self {
@@ -253,7 +255,7 @@ impl<DB: Database + 'static> Proposer<DB> {
             rx_committed_own_headers,
             metrics,
             leader_schedule,
-            execution_result,
+            watch_execution_layer,
             advance_round: true,
             pending_header: None,
         }
@@ -289,13 +291,13 @@ impl<DB: Database + 'static> Proposer<DB> {
         let parent_max_time = parents.iter().map(|c| *c.header().created_at()).max().unwrap_or(0);
         let current_time = now();
         if current_time < parent_max_time {
-            let drift_ms = parent_max_time - current_time;
+            let drift_sec = parent_max_time - current_time;
             error!(
                 "Current time {} earlier than max parent time {}, sleeping for {}ms until max parent time.",
-                current_time, parent_max_time, drift_ms,
+                current_time, parent_max_time, drift_sec,
             );
-            metrics.header_max_parent_wait_ms.inc_by(drift_ms);
-            sleep(Duration::from_millis(drift_ms)).await;
+            metrics.header_max_parent_wait_ms.inc_by(drift_sec);
+            sleep(Duration::from_secs(drift_sec)).await;
         }
 
         let header = Header::new(
@@ -751,7 +753,7 @@ impl<DB: Database + 'static> Proposer<DB> {
                         metrics,
                     )
                     .await;
-                    tx.send(res);
+                    let _ = tx.send(res);
                 });
             }
             // create new header
@@ -797,7 +799,7 @@ impl<DB: Database + 'static> Proposer<DB> {
                     )
                     .await;
 
-                    tx.send(proposal);
+                    let _ = tx.send(proposal);
                 });
             }
         }
@@ -856,13 +858,12 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        info!(
-            target: "primary::proposer",
-            "Proposer on node {} has started successfully with header resend timeout {:?}.",
-            this.authority_id, this.fatal_header_timeout
-        );
-
+        debug!(target: "primary::proposer", round=this.round, "begin loop...");
         loop {
+            // tick intervals to ensure they advance
+            let max_delay_timed_out = this.max_delay_interval.poll_tick(cx).is_ready();
+            let min_delay_timed_out = this.min_delay_interval.poll_tick(cx).is_ready();
+
             // check for shutdown signal
             //
             // okay to shutdown here because other primary tasks are expected to shutdown too
@@ -917,7 +918,8 @@ where
             if let Some(mut receiver) = this.pending_header.take() {
                 match receiver.poll_unpin(cx) {
                     Poll::Ready(res) => {
-                        this.handle_proposal_result(res);
+                        debug!(target: "primary::proposer", "pending header task complete!");
+                        this.handle_proposal_result(res)?;
 
                         // continue the loop to propose the next header
                         continue;
@@ -963,9 +965,7 @@ where
             //      - this is happy path
             //      - vote for leader or leader already has enough votes to trigger commit
             let enough_parents = !this.last_parents.is_empty();
-            let execution_complete = this.execution_result.has_changed()?;
-            let max_delay_timed_out = this.max_delay_interval.poll_tick(cx).is_ready();
-            let min_delay_timed_out = this.min_delay_interval.poll_tick(cx).is_ready();
+            let execution_complete = this.watch_execution_layer.has_changed()?;
             let enough_digests = this.digests.len() >= this.header_num_of_batches_threshold;
 
             // evaluate conditions for bool value
@@ -983,11 +983,13 @@ where
                 max_delay_timed_out,
                 should_create_header,
                 ?execution_complete,
+                pending_header=this.pending_header.is_some(),
                 "Proposer polled...",
             );
 
             // if both conditions are met, create the next header
             if should_create_header && execution_complete {
+                debug!(target: "primary::proposer", "proposing next header!");
                 if max_delay_timed_out {
                     // expect this interval to expire occassionally
                     //
@@ -1014,17 +1016,13 @@ where
                 // ensure everything is caught up before poll pending
                 continue;
             }
+
+            debug!(target: "primary::proposer", "nothing to do - breaking loop");
+            // break if unable to propose header
+            break;
         }
 
+        debug!(target: "primary::proposer", "outside loop - return Poll::Pending");
         Poll::Pending
-    }
-}
-
-#[cfg(test)]
-mod tests {
-
-    #[tokio::test]
-    async fn test_reset_interval_goes_off() {
-        todo!()
     }
 }

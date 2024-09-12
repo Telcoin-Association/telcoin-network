@@ -116,7 +116,7 @@ impl Primary {
         tx_shutdown: &mut PreSubscribedBroadcastSender,
         leader_schedule: LeaderSchedule,
         metrics: &Metrics,
-        execution_result: watch::Receiver<(Round, BlockNumHash)>,
+        el_watch_channel: watch::Receiver<(Round, BlockNumHash)>,
     ) -> Vec<JoinHandle<()>> {
         // Write the parameters to the logs.
         parameters.tracing();
@@ -446,14 +446,19 @@ impl Primary {
             rx_committed_own_headers,
             metrics.node_metrics.clone(),
             leader_schedule,
+            el_watch_channel,
         );
 
-        let proposer_handle = spawn_logged_monitored_task!(proposer, "ProposerTask");
+        // TODO: include this with other handles
+        let _proposer_handle = spawn_logged_monitored_task!(proposer, "ProposerTask");
 
+        // TODO: all handles should return error
+        //
+        // can't include proposer handle yet
         let mut handles = vec![
             core_handle,
             certificate_fetcher_handle,
-            proposer_handle,
+            // proposer_handle,
             connection_monitor_handle,
         ];
         handles.extend(admin_handles);

@@ -211,7 +211,6 @@ impl Committee {
 
     /// Updates the committee internal secondary indexes.
     pub fn load(&mut self) {
-        assert!(self.authorities_by_id.len() > 1, "committee size must be larger that 1");
         self.authorities_by_id = (0_u16..)
             .zip(self.authorities.iter_mut())
             .map(|(identifier, (_key, authority))| {
@@ -224,6 +223,7 @@ impl Committee {
 
         self.validity_threshold = self.calculate_validity_threshold().get();
         self.quorum_threshold = self.calculate_quorum_threshold().get();
+        assert!(self.authorities_by_id.len() > 1, "committee size must be larger that 1");
     }
 
     /// Returns the current epoch.

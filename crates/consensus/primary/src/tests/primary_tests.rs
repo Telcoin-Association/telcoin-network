@@ -30,6 +30,7 @@ use narwhal_worker::{
     Worker,
 };
 use prometheus::Registry;
+use reth_primitives::BlockNumHash;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     num::NonZeroUsize,
@@ -39,7 +40,7 @@ use std::{
 use tempfile::TempDir;
 use tn_batch_validator::NoopBatchValidator;
 use tn_types::{
-    now,
+    adiri_chain_spec, now,
     test_utils::{make_optimal_signed_certificates, CommitteeFixture},
     AuthorityIdentifier, Certificate, ChainIdentifier, Committee, Parameters,
     PreSubscribedBroadcastSender, SignatureVerificationState,
@@ -89,6 +90,9 @@ async fn test_get_network_peers_from_admin_server() {
         watch::channel(ConsensusRound::default());
 
     let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+    // simulate current execution HEAD at genesis
+    let (tx_watch, rx_watch) =
+        watch::channel((0, BlockNumHash::new(0, adiri_chain_spec().genesis_hash())));
 
     // Spawn Primary 1
     Primary::spawn(
@@ -110,6 +114,7 @@ async fn test_get_network_peers_from_admin_server() {
         &mut tx_shutdown,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
         &narwhal_primary_metrics::Metrics::default(),
+        rx_watch.clone(),
     );
 
     // Wait for tasks to start
@@ -243,6 +248,7 @@ async fn test_get_network_peers_from_admin_server() {
         &mut tx_shutdown_2,
         LeaderSchedule::new(committee, LeaderSwapTable::default()),
         &narwhal_primary_metrics::Metrics::default(),
+        rx_watch,
     );
 
     // Wait for tasks to start

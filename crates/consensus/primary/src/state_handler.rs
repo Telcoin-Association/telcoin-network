@@ -11,9 +11,7 @@ use fastcrypto_tbls::{dkg, nodes};
 use tn_types::{AuthorityIdentifier, ChainIdentifier, Committee, RandomnessPrivateKey};
 
 use tap::TapFallible;
-use tn_types::{
-    Certificate, CertificateAPI, ConditionalBroadcastReceiver, HeaderAPI, Round, SystemMessage,
-};
+use tn_types::{Certificate, ConditionalBroadcastReceiver, Round, SystemMessage};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 

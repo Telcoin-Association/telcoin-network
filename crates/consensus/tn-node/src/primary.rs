@@ -25,6 +25,7 @@ use reth_db::{
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
 };
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
+use reth_rpc_types::BlockNumHash;
 use std::{sync::Arc, time::Instant};
 use tn_types::{
     AuthorityIdentifier, BlsKeypair, BlsPublicKey, Certificate, ChainIdentifier, Committee,
@@ -123,7 +124,7 @@ impl PrimaryNodeInner {
         // - for now, pass them in here for most flexibility
         //
         // the watch channel for latest engine state
-        let engine_watch_channel = watch::channel(init);
+        let (tx_engine, engine_watch_channel) = watch::channel(todo!());
 
         // spawn primary if not already running
         let primary_handles = self
@@ -139,6 +140,7 @@ impl PrimaryNodeInner {
                 executor_metrics,
                 consensus_output_notification_sender,
                 last_executed_sub_dag_index,
+                engine_watch_channel,
             )
             .await?;
 
@@ -223,6 +225,8 @@ impl PrimaryNodeInner {
         consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
         // Used for recovering after crashes/restarts
         last_executed_sub_dag_index: u64,
+        // watch channel for execution layer state
+        engine_watch_channel: watch::Receiver<(Round, BlockNumHash)>,
     ) -> SubscriberResult<Vec<JoinHandle<()>>>
 where
         // State: ExecutionState + Send + Sync + 'static,
@@ -291,6 +295,7 @@ where
             tx_shutdown,
             leader_schedule,
             &self.primary_metrics,
+            engine_watch_channel,
         );
         handles.extend(primary_handles);
 
