@@ -116,7 +116,7 @@ impl Primary {
         tx_shutdown: &mut PreSubscribedBroadcastSender,
         leader_schedule: LeaderSchedule,
         metrics: &Metrics,
-        execution_result: watch::Receiver<BlockNumHash>,
+        execution_result: watch::Receiver<(Round, BlockNumHash)>,
     ) -> Vec<JoinHandle<()>> {
         // Write the parameters to the logs.
         parameters.tracing();

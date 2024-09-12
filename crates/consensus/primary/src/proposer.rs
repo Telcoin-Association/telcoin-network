@@ -180,13 +180,14 @@ pub struct Proposer<DB: Database> {
     ///
     /// Proposer must include the finalized parent hash from the previously executed round to
     /// ensure execution results are consistent.
-    execution_result: watch::Receiver<BlockNumHash>,
+    execution_result: watch::Receiver<(Round, BlockNumHash)>,
     /// Flag if enough conditions are met to advance the round.
     advance_round: bool,
     /// The optional pending header that the proposer has decided to build.
     ///
     /// This value is `Some` when conditions are met to propose the next header.
-    /// The task within is responsible for creating, storing, and sending the new header.
+    /// The task within is responsible for creating, storing, and sending the new header
+    /// to the `Certifier`.
     pending_header: Option<PendingHeaderTask>,
 }
 
@@ -215,7 +216,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         rx_committed_own_headers: Receiver<(Round, Vec<Round>)>,
         metrics: Arc<PrimaryMetrics>,
         leader_schedule: LeaderSchedule,
-        execution_result: watch::Receiver<BlockNumHash>,
+        execution_result: watch::Receiver<(Round, BlockNumHash)>,
     ) -> Self {
         // TODO: include EL genesis hash in committee for epoch?
         //
@@ -268,7 +269,7 @@ impl<DB: Database + 'static> Proposer<DB> {
     ///
     /// - current_header: caller checks to see if there is already a header built for this round. If
     ///   current_header.is_some() the proposer uses this header instead of building a new one.
-    async fn g_propose_header(
+    async fn propose_header(
         current_round: Round,
         current_epoch: Epoch,
         authority_id: AuthorityIdentifier,
@@ -280,6 +281,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         reason: String,
         metrics: Arc<PrimaryMetrics>,
         leader_and_support: String,
+        max_delay: Duration,
     ) -> ProposerResult<Header> {
         // make new header
 
@@ -309,6 +311,7 @@ impl<DB: Database + 'static> Proposer<DB> {
             parents.iter().map(|x| x.digest()).collect(),
         );
 
+        // update metrics before sending/storing header
         metrics.headers_proposed.with_label_values(&[&leader_and_support]).inc();
         metrics.header_parents.observe(parents.len() as f64);
 
@@ -326,7 +329,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         let mut total_inclusion_secs = 0.0;
         for digest in &digests {
             let batch_inclusion_secs =
-                Duration::from_millis(*header.created_at() - digest.timestamp).as_secs_f64();
+                Duration::from_secs(*header.created_at() - digest.timestamp).as_secs_f64();
             total_inclusion_secs += batch_inclusion_secs;
 
             // NOTE: This log entry is used to compute performance.
@@ -339,61 +342,52 @@ impl<DB: Database + 'static> Proposer<DB> {
             metrics.proposer_batch_latency.observe(batch_inclusion_secs);
         }
 
-        // TODO: make this a metric if really necessary
-        // otherwise, remove this calculation
-        //
-        // // NOTE: This log entry is used to compute performance.
-        // let (header_creation_secs, avg_inclusion_secs) = if let Some(digest) = digests.front() {
-        //     (
-        //         Duration::from_millis(*header.created_at() - digest.timestamp).as_secs_f64(),
-        //         total_inclusion_secs / digests.len() as f64,
-        //     )
-        // } else {
-        //     (self.max_header_delay.as_secs_f64(), 0.0)
-        // };
-        // debug!(
-        //     "Header {:?} was created in {} seconds. Contains {} batches, with average delay {}
-        // seconds.",     header.digest(),
-        //     header_creation_secs,
-        //     digests.len(),
-        //     avg_inclusion_secs,
-        // );
-
-        // TODO: is this metric measured elsewhere?
-        // self.metrics.proposer_batch_latency.observe(batch_inclusion_secs);
+        // NOTE: This log entry is used to compute performance.
+        let (header_creation_secs, avg_inclusion_secs) = if let Some(digest) = digests.front() {
+            (
+                Duration::from_secs(*header.created_at() - digest.timestamp).as_secs_f64(),
+                total_inclusion_secs / digests.len() as f64,
+            )
+        } else {
+            (max_delay.as_secs_f64(), 0.0)
+        };
+        debug!(
+            target: "primary::proposer",
+            "Header {:?} was created in {} seconds. Contains {} batches, with average delay {} seconds.",
+            header.digest(),
+            header_creation_secs,
+            digests.len(),
+            avg_inclusion_secs,
+        );
 
         // store and send newly built header
-        let _ = Proposer::g_store_and_send_header(
-            &header,
-            proposer_store,
-            tx_headers,
-            &reason,
-            metrics,
-        )
-        .await?;
+        let _ =
+            Proposer::store_and_send_header(&header, proposer_store, tx_headers, &reason, metrics)
+                .await?;
 
         Ok(header)
     }
-    async fn g_repropose_header(
+
+    /// Bypass creating another header and return header.
+    ///
+    /// This is a convenience method to help the flow of proposing new headers and reproposing headers. Headers are reproposed under certain conditions:
+    /// - during a restart when the last proposed header in Self::proposer_store is from the current round.
+    /// -
+    async fn repropose_header(
         header: Header,
         proposer_store: ProposerStore<DB>,
         tx_headers: Sender<Header>,
         reason: String,
         metrics: Arc<PrimaryMetrics>,
     ) -> ProposerResult<Header> {
-        let _ = Proposer::g_store_and_send_header(
-            &header,
-            proposer_store,
-            tx_headers,
-            &reason,
-            metrics,
-        )
-        .await?;
+        let _ =
+            Proposer::store_and_send_header(&header, proposer_store, tx_headers, &reason, metrics)
+                .await?;
 
         Ok(header)
     }
 
-    async fn g_store_and_send_header(
+    async fn store_and_send_header(
         header: &Header,
         proposer_store: ProposerStore<DB>,
         tx_headers: Sender<Header>,
@@ -552,20 +546,22 @@ impl<DB: Database + 'static> Proposer<DB> {
                 // proposer accepts a future round then jumps ahead in case it was
                 // late (or just joined the network).
                 self.round = round;
+                // broadcast new round
                 let _ = self.tx_narwhal_round_updates.send(self.round);
                 self.last_parents = parents;
-
                 // Reset advance flag.
                 self.advance_round = false;
                 // NOTE: min_delay_timer is marked as `ready()` but max_delay_timer is reset to wait
                 // the appropriate amount of time for the previous round's leader.
                 //
-                // Disabling min_delay_timer will trigger next proposal attempt. It's important to
+                // Disabling min_delay_timer will expidite the next proposal attempt. It's important to
                 // propose next header ASAP so this node doesn't fall behind again. If proposer
                 // waits another min_header_delay after receiving parents from a future round, it's
                 // likely that more parents from another future round will arrive while this node
-                // tries to catch up. Disabling min_delay_timer is should help node sync with
-                // quorum. This is also important in case this node becomes the leader.
+                // tries to catch up.
+                //
+                // Disabling min_delay_timer should help node sync with quorum.
+                // This is also important if this node expects to become the leader for the next round.
                 self.max_delay_timer.reset_after(self.calc_max_delay());
                 self.min_delay_timer.reset_immediately();
             }
@@ -617,13 +613,13 @@ impl<DB: Database + 'static> Proposer<DB> {
     /// the beginning of the queue.
     ///
     /// This method ensures worker blocks that were previously proposed but weren't committed are
-    /// reproposed.
+    /// added back to the queue so their transactions are included in the next proposal.
     fn process_committed_headers(&mut self, commit_round: Round, committed_headers: Vec<Round>) {
         // remove committed headers from pending
         let mut max_committed_round = 0;
         for round in committed_headers {
             max_committed_round = max_committed_round.max(round);
-            // try to remove - log warning if round is missing
+            // try to remove round - log warning if round is missing
             if self.proposed_headers.remove(&round).is_none() {
                 warn!("Proposer's own committed header not found at round {round}, probably because of restarts.");
             };
@@ -691,9 +687,7 @@ impl<DB: Database + 'static> Proposer<DB> {
 
     /// Conditions are met to propose the next header.
     ///
-    /// Update Self and make the header to propose.
-    ///
-    /// This method ensures proposer is protected against equivocation.
+    /// This method ensures proposer is protected against equivocation and sends the next header to the Certifier.
     ///
     /// If a different header was already produced for the same round, then
     /// this method returns the earlier header. Otherwise the newly created header is returned.
@@ -725,6 +719,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         let current_epoch = self.committee.epoch();
         let current_round = self.round;
 
+        // TODO: is this an unnecessary call for every proposal?
         // check if proposer store's last header is from this round
         let last_proposed = self
             .proposer_store
@@ -732,7 +727,6 @@ impl<DB: Database + 'static> Proposer<DB> {
             .map_err(|e| ProposerError::StoreError(e.to_string()))?;
         let possible_header_to_repropose =
             last_proposed.filter(|h| h.round() == current_round && h.epoch() == current_epoch);
-
         let proposer_store = self.proposer_store.clone();
         let tx_headers = self.tx_headers.clone();
         let metrics = self.metrics.clone();
@@ -740,9 +734,10 @@ impl<DB: Database + 'static> Proposer<DB> {
         match possible_header_to_repropose {
             // resend header
             Some(header) => {
+                warn!(target: "primary::proposer", current_round, current_epoch, header=?header, "reproposing header");
                 tokio::task::spawn(async move {
                     // use this instead of store_and_send to because rx always expects a Header
-                    let res = Proposer::g_repropose_header(
+                    let res = Proposer::repropose_header(
                         header,
                         proposer_store,
                         tx_headers,
@@ -761,6 +756,7 @@ impl<DB: Database + 'static> Proposer<DB> {
                 let system_messages = std::mem::take(&mut self.system_messages);
                 let parents = std::mem::take(&mut self.last_parents);
                 let authority_id = self.authority_id;
+                let min_delay = self.min_header_delay; // copy
                 let leader_and_support = if current_round % 2 == 0 {
                     let authority = self.leader_schedule.leader(current_round);
                     if self.authority_id == authority.id() {
@@ -779,7 +775,7 @@ impl<DB: Database + 'static> Proposer<DB> {
 
                 // spawn tokio task to create, store, and send new header to certifier
                 tokio::task::spawn(async move {
-                    let proposal = Proposer::g_propose_header(
+                    let proposal = Proposer::propose_header(
                         current_round,
                         current_epoch,
                         authority_id,
@@ -791,6 +787,7 @@ impl<DB: Database + 'static> Proposer<DB> {
                         reason,
                         metrics,
                         leader_and_support.to_string(),
+                        min_delay,
                     )
                     .await;
 
@@ -803,7 +800,11 @@ impl<DB: Database + 'static> Proposer<DB> {
         Ok(rx)
     }
 
-    /// The oneshot channel is ready, indicating a result from the header proposal process.
+    /// Process the result from proposing the header.
+    ///
+    /// The oneshot channel is ready, indicating a result from the header proposal process. Update `self` to track latest header, reset the header timeout, min/max delay timers, insert the proposed header, and indicate round should not be advanced yet.
+    ///
+    /// This is the only time `Self::header_resend_timeout` gets reset.
     fn handle_proposal_result(
         &mut self,
         result: std::result::Result<ProposerResult<Header>, RecvError>,
@@ -813,17 +814,13 @@ impl<DB: Database + 'static> Proposer<DB> {
 
         // track latest header
         self.opt_latest_header = Some(header.clone());
-
         // reset interval for header timeout
         self.header_resend_timeout.reset();
-
         // Reset advance flag.
         self.advance_round = false;
-
         // reschedule timers
         self.min_delay_timer.reset_after(self.calc_min_delay());
         self.max_delay_timer.reset_after(self.calc_max_delay());
-
         // track header so proposer can repropose the digests and system messages
         // if this header fails to be committed for some reason
         self.proposed_headers.insert(header.round(), header);
@@ -843,7 +840,7 @@ impl<DB: Database + 'static> Proposer<DB> {
 /// - listen for shutdown receiver
 impl<DB> Future for Proposer<DB>
 where
-    DB: Database + Unpin,
+    DB: Database,
 {
     type Output = ProposerResult<()>;
 
@@ -903,7 +900,6 @@ where
                 this.rx_committed_own_headers.poll_recv(cx)
             {
                 debug!(target: "primary::proposer", round=this.round, "received committed update for own header");
-
                 this.process_committed_headers(commit_round, committed_headers);
             }
 
@@ -920,6 +916,22 @@ where
                         continue;
                     }
                     Poll::Pending => {
+                        // if still pending, check the header resend timeout
+                        //
+                        // if header resend interval expires, then certifier confirmed receipt but
+                        // proposer never received that this header reached quorum ??? (committed??)
+                        //
+                        // check if the resent timeout has elapsed
+                        let receiver = if this.header_resend_timeout.poll_tick(cx).is_ready() {
+                            warn!(target: "primary::proposer", round=this.round, "Proposer header_resent_timeout triggered");
+                            let reason = "header_resend_timeout".to_string();
+                            // reads from proposer store and sends the existing header
+                            let new_pending = this.propose_next_header(reason)?;
+                            new_pending
+                        } else {
+                            receiver
+                        };
+
                         this.pending_header = Some(receiver);
 
                         // skip checking conditions for proposing next header
@@ -931,20 +943,6 @@ where
             }
 
             // proposer doesn't have a pending header
-            //
-            // TODO:
-            //
-            // if this timer goes off, then certifier confirmed receipt but
-            // proposer never received that this header reached quorum ??? (committed??)
-            //
-            // where does `rx_committed_own_headers` get messages within this loop?
-            //
-            // check if the resent timeout has elapsed
-            if this.header_resend_timeout.poll_tick(cx).is_ready() {
-                warn!(target: "primary::proposer", round=this.round, "Proposer header_resent_timeout triggered");
-                todo!()
-            }
-
             // Check if conditions are met for proposing a new header
             //
             // New headers are proposed when:
@@ -1004,7 +1002,9 @@ where
                     "min_timeout"
                 };
 
-                this.propose_next_header(reason.to_string());
+                // propose header
+                let pending_header = this.propose_next_header(reason.to_string())?;
+                this.pending_header = Some(pending_header);
 
                 // Recheck condition and reset time out flags.
                 continue;
@@ -1012,5 +1012,14 @@ where
         }
 
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[tokio::test]
+    async fn test_reset_timer_goes_off() {
+        todo!()
     }
 }
