@@ -123,7 +123,7 @@ impl PrimaryNodeInner {
         // - for now, pass them in here for most flexibility
         //
         // the watch channel for latest engine state
-        // let engine_watch_channel = watch::channel(init)
+        let engine_watch_channel = watch::channel(init)
 
         // spawn primary if not already running
         let primary_handles = self
