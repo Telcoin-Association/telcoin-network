@@ -420,11 +420,14 @@ impl<DB: Database + 'static> Proposer<DB> {
         result
     }
 
-    fn max_delay(&self) -> Duration {
-        // If this node is going to be the leader of the next round, we set a lower max
-        // timeout value to increase its chance of being included in the dag. As leaders are elected
-        // on even rounds only we apply the reduced max delay only for those ones.
-        if (self.round + 1) % 2 == 0
+    /// Calculate the max delay to use when resetting the max_delay_timer.
+    ///
+    /// The max delay is reduced when this authority expects to become the leader of the next round. Reducing the max delay increases its chance of being included in the DAG. Leaders are only elected on even rounds, so the normal max delay interval is used for odd rounds.
+    fn calc_max_delay(&self) -> Duration {
+        // check next round
+        let next_round = self.round + 1;
+
+        if next_round % 2 == 0
             && self.leader_schedule.leader(self.round + 1).id() == self.authority_id
         {
             self.max_header_delay / 2
@@ -433,32 +436,29 @@ impl<DB: Database + 'static> Proposer<DB> {
         }
     }
 
-    fn min_delay(&self) -> Duration {
-        // TODO: consider even out the boost provided by the even/odd rounds so we avoid perpetually
-        // boosting the nodes and affect the scores.
-        // If this node is going to be the leader of the next round and there are more than
-        // 1 primary in the committee, we use a lower min delay value to increase the chance
-        // of committing the leader. Pay attention that we use here the leader_schedule to figure
-        // out the next leader.
+    /// Calculate the min delay to use when resetting the min_delay_timer.
+    ///
+    /// The min delay is reduced when this authority expects to become the leader of the next round. Reducing the min delay increases the chances of successfully committing a leader.
+    ///
+    /// NOTE: If the next round is even, the leader schedule is used to identify the next leader. If the next round is odd, the whole committee is used in order to keep the proposal rate as high as possible (which leads to a higher round rates). Using the entire committee here also helps boost scores for weaker nodes that may be trying to resync.
+    fn calc_min_delay(&self) -> Duration {
+        // check next round
         let next_round = self.round + 1;
-        if self.committee.size() > 1
-            && next_round % 2 == 0
-            && self.leader_schedule.leader(next_round).id() == self.authority_id
-        {
-            return Duration::ZERO;
-        }
 
-        // Give a boost on the odd rounds to a node by using the whole committee here, not just the
-        // nodes of the leader_schedule. By doing this we keep the proposal rate as high as possible
-        // which leads to higher round rate and also acting as a score booster to the less strong
-        // nodes as well.
-
+        // compare:
+        // - leader schedule for even rounds
+        // - entire committee for odd rounds
+        //
         // NOTE: committee size is asserted >1 during Committee::load()
-        if next_round % 2 != 0 && self.committee.leader(next_round).id() == self.authority_id {
-            return Duration::ZERO;
+        if next_round % 2 == 0 && self.leader_schedule.leader(next_round).id() == self.authority_id
+        {
+            Duration::ZERO
+        } else if next_round % 2 != 0 && self.committee.leader(next_round).id() == self.authority_id
+        {
+            Duration::ZERO
+        } else {
+            self.min_header_delay
         }
-
-        self.min_header_delay
     }
 
     /// Update the last leader certificate.
@@ -555,7 +555,7 @@ impl<DB: Database + 'static> Proposer<DB> {
                 // NOTE: min_delay_timer is marked as `ready()` but max_delay_timer is reset to wait the appropriate amount of time for the previous round's leader.
                 //
                 // Disabling min_delay_timer will trigger next proposal attempt. It's important to propose next header ASAP so this node doesn't fall behind again. If proposer waits another min_header_delay after receiving parents from a future round, it's likely that more parents from another future round will arrive while this node tries to catch up. Disabling min_delay_timer is should help node sync with quorum. This is also important in case this node becomes the leader.
-                self.max_delay_timer.reset();
+                self.max_delay_timer.reset_at(Instant::now() + self.calc_max_delay());
                 self.min_delay_timer.reset_immediately();
 
                 // OLD WAY:
@@ -583,8 +583,8 @@ impl<DB: Database + 'static> Proposer<DB> {
                 //
                 // need to ensure the timer is reset correctly for the round leader
                 // no harm doing this here as well
-                if self.min_delay() == Duration::ZERO {
-                    // triggers min_delay_timer ready()
+                if self.calc_min_delay().is_zero() {
+                    // min_delay_timer is ready
                     self.min_delay_timer.reset_immediately();
                 }
             }
@@ -657,6 +657,7 @@ impl<DB: Database + 'static> Proposer<DB> {
             retransmit_rounds.push(*header_round);
         }
 
+        // process rounds that need to be retransmitted
         if !retransmit_rounds.is_empty() {
             let num_digests_to_resend = digests_to_resend.len();
             let num_system_messages_to_resend = system_messages_to_resend.len();
@@ -825,8 +826,10 @@ impl<DB: Database + 'static> Proposer<DB> {
         // max_delay_timer.as_mut().reset(timer_start + self.max_delay());
         // min_delay_timer.as_mut().reset(timer_start + self.min_delay());
 
-        self.min_delay_timer.reset();
-        self.max_delay_timer.reset();
+        // reschedule timers
+        let timer_start = Instant::now();
+        self.min_delay_timer.reset_at(timer_start + self.calc_min_delay());
+        self.max_delay_timer.reset_at(timer_start + self.calc_max_delay());
 
         // track header so proposer can repropose the digests and system messages
         // if this header fails to be committed for some reason
