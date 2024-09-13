@@ -39,10 +39,9 @@ use std::{
     task::{Context, Poll},
 };
 use tn_types::{
-    now, BlockHash, Certificate, ConditionalBroadcastReceiver, Header, Round, SystemMessage,
-    TimestampSec,
+    now, AuthorityIdentifier, BlockHash, Certificate, Committee, ConditionalBroadcastReceiver,
+    Epoch, Header, Round, SystemMessage, TimestampSec, WorkerId,
 };
-use tn_types::{AuthorityIdentifier, Committee, Epoch, WorkerId};
 use tokio::{
     sync::{
         oneshot::{self, error::RecvError},
