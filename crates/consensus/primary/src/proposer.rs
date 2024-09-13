@@ -206,9 +206,6 @@ impl<DB: Database + 'static> Proposer<DB> {
         metrics: Arc<PrimaryMetrics>,
         leader_schedule: LeaderSchedule,
     ) -> Self {
-        // TODO: include EL genesis hash in committee for epoch?
-        //
-        // NO: bc the first round should include EL genesis hash in primary proposed header.
         let genesis = Certificate::genesis(&committee);
         let fatal_header_timeout = fatal_header_timeout.unwrap_or(DEFAULT_FATAL_HEADER_TIMEOUT);
         // create min/max delay intervals
