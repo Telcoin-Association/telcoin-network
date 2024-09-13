@@ -962,6 +962,7 @@ where
 
             debug!(
                 target: "primary::proposer",
+                authority=?this.authority_id,
                 round=this.round,
                 enough_parents,
                 enough_digests,

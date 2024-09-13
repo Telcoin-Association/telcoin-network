@@ -107,7 +107,7 @@ impl<DB: Database> Certifier<DB> {
         let core = async move { self.run().await };
 
         match core.await {
-            Err(err @ DagError::ShuttingDown) => debug!("{:?}", err),
+            Err(err @ DagError::ShuttingDown) => error!("{:?}", err),
             Err(err) => panic!("{:?}", err),
             Ok(_) => {}
         }
@@ -287,12 +287,12 @@ impl<DB: Database> Certifier<DB> {
                                 &header,
                             )?;
                         },
-                        Some(Err(e)) => debug!("failed to get vote for header {header:?}: {e:?}"),
+                        Some(Err(e)) => error!("failed to get vote for header {header:?}: {e:?}"),
                         None => break,
                     }
                 },
                 _ = &mut cancel => {
-                    debug!("canceling Header proposal {header} for round {}", header.round());
+                    warn!("canceling Header proposal {header} for round {}", header.round());
                     return Err(DagError::Canceled)
                 },
             }
@@ -338,7 +338,7 @@ impl<DB: Database> Certifier<DB> {
                 | e @ DagError::VoteTooOld(..)
                 | e @ DagError::InvalidEpoch { .. },
             ) => debug!("{e}"),
-            Err(e) => warn!("{e}"),
+            Err(e) => warn!("inside process_result: {e}"),
         }
     }
 
@@ -387,6 +387,7 @@ impl<DB: Database> Certifier<DB> {
                         Ok(Err(e)) => Err(e),
                         Err(e) => {
                             if e.is_cancelled() {
+                                error!("Certifier error: task cancelled! Shutting down...");
                                 // Ungraceful shutdown.
                                 Err(DagError::ShuttingDown)
                             } else if e.is_panic() {
