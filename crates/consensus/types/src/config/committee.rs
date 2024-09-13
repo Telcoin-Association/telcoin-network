@@ -223,6 +223,7 @@ impl Committee {
 
         self.validity_threshold = self.calculate_validity_threshold().get();
         self.quorum_threshold = self.calculate_quorum_threshold().get();
+        assert!(self.authorities_by_id.len() > 1, "committee size must be larger that 1");
     }
 
     /// Returns the current epoch.

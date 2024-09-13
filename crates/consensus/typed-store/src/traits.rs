@@ -46,7 +46,7 @@ pub trait DbTxMut {
 
 pub type DBIter<'i, T> = Box<dyn Iterator<Item = (<T as Table>::Key, <T as Table>::Value)> + 'i>;
 
-pub trait Database: Send + Sync + Clone + 'static {
+pub trait Database: Send + Sync + Clone + Unpin + 'static {
     type TX<'txn>: DbTx + Send + Debug + 'txn
     where
         Self: 'txn;

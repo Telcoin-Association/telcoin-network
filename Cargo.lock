@@ -5262,6 +5262,7 @@ dependencies = [
  "tn-node",
  "tn-types",
  "tokio",
+ "tokio-stream",
  "tower",
  "tracing",
 ]

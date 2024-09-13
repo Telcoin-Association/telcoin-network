@@ -26,7 +26,7 @@ use anemo_tower::{
 use async_trait::async_trait;
 use consensus_metrics::{
     metered_channel::{channel_with_total, Receiver, Sender},
-    monitored_scope,
+    monitored_scope, spawn_logged_monitored_task,
 };
 use fastcrypto::{
     hash::Hash,
@@ -205,7 +205,7 @@ impl Primary {
             inflight_limit::InflightLimitLayer::new(1, inflight_limit::WaitMode::ReturnError),
         ))
         // Allow only one inflight FetchCertificates RPC at a time per peer.
-        // These are already a batch request; an individual peer should never need more than one.
+        // These are already a block request; an individual peer should never need more than one.
         .add_layer_for_fetch_certificates(InboundRequestLayer::new(
             inflight_limit::InflightLimitLayer::new(1, inflight_limit::WaitMode::ReturnError),
         ));
@@ -425,8 +425,8 @@ impl Primary {
         );
 
         // When the `Synchronizer` collects enough parent certificates, the `Proposer` generates
-        // a new header with new batch digests from our workers and sends it to the `Certifier`.
-        let proposer_handle = Proposer::spawn(
+        // a new header with new block digests from our workers and sends it to the `Certifier`.
+        let proposer = Proposer::new(
             authority.id(),
             committee.clone(),
             proposer_store,
@@ -446,10 +446,16 @@ impl Primary {
             leader_schedule,
         );
 
+        // TODO: include this with other handles
+        let _proposer_handle = spawn_logged_monitored_task!(proposer, "ProposerTask");
+
+        // TODO: all handles should return error
+        //
+        // can't include proposer handle yet
         let mut handles = vec![
             core_handle,
             certificate_fetcher_handle,
-            proposer_handle,
+            // proposer_handle,
             connection_monitor_handle,
         ];
         handles.extend(admin_handles);
@@ -551,6 +557,22 @@ impl<DB: Database> PrimaryReceiverHandler<DB> {
     ) -> DagResult<RequestVoteResponse> {
         let header = &request.body().header;
         let committee = self.committee.clone();
+
+        // TODO: retrieve blocknumhash for the request
+        // let block_numhash = self.get_block_numhash(&header.parent);
+        //
+        // send thru mpsc to state handler to retrieve the EL hash for
+        // this parent by header's Round
+        //
+        // TODO: what if return's None?
+        // - if number but wrong hash, invalid
+        // - if number missing, then...
+        //      - spawn task with oneshot channel
+        //      - task checks in memory
+        //
+        // could be Arc<HashMap<Round, BlockNumHash>> with a size limit
+        // with epoch constraints (256 rounds, then epoch over)
+
         header.validate(&committee, &self.worker_cache)?;
 
         let num_parents = request.body().parents.len();
@@ -648,7 +670,7 @@ impl<DB: Database> PrimaryReceiverHandler<DB> {
             DagError::HeaderRequiresQuorum(header.digest())
         );
 
-        // Synchronize all batches referenced in the header.
+        // Synchronize all blocks referenced in the header.
         self.synchronizer.sync_header_batches(header, /* max_age */ 0).await?;
 
         // Check that the time of the header is smaller than the current time. If not but the
@@ -969,7 +991,7 @@ impl<DB: Database> WorkerToPrimary for WorkerReceiverHandler<DB> {
                 digest: message.digest,
                 worker_id: message.worker_id,
                 timestamp: message.worker_block.created_at(),
-                ack_channel: Some(tx_ack),
+                ack_channel: tx_ack,
             })
             .await
             .map(|_| anemo::Response::new(()))
