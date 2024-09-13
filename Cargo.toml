@@ -230,7 +230,7 @@ bincode = "1.3.3"
 proptest = "1.5.0"
 proptest-derive = "0.4"
 serde-reflection = "0.3.6"
-indexmap = { version = "1.9.2", features = ["serde"] }
+indexmap = { version = "2.5.0", features = ["serde"] }
 itertools = "0.10.5"
 once_cell = "1.18.0"
 prometheus = "0.13.3"

@@ -50,7 +50,7 @@ pub struct Header {
     /// The timestamp for when the header was requested to be created.
     pub created_at: TimestampSec,
     /// IndexMap of the [BatchDigest] to the [WorkerId] and [TimestampSec]
-    #[serde(with = "indexmap::serde_seq")]
+    #[serde(with = "indexmap::map::serde_seq")]
     pub payload: IndexMap<BlockHash, (WorkerId, TimestampSec)>,
     /// Collection of [SystemMessage]s.
     pub system_messages: Vec<SystemMessage>,
