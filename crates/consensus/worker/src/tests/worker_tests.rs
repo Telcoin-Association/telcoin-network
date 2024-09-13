@@ -14,9 +14,12 @@ use narwhal_storage::NodeStorage;
 
 use narwhal_typed_store::open_db;
 use prometheus::Registry;
+use reth_primitives::BlockNumHash;
 use tempfile::TempDir;
 use tn_batch_validator::NoopBatchValidator;
-use tn_types::{test_utils::CommitteeFixture, ChainIdentifier, WorkerBlock};
+use tn_types::{
+    adiri_chain_spec, adiri_genesis, test_utils::CommitteeFixture, ChainIdentifier, WorkerBlock,
+};
 use tokio::sync::watch;
 
 // A test validator that rejects every batch
@@ -354,6 +357,10 @@ async fn get_network_peers_from_admin_server() {
         watch::channel(ConsensusRound::default());
     let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
 
+    // proposer's watch channel
+    let el_genesis = (0, BlockNumHash::new(0, adiri_chain_spec().genesis_hash()));
+    let (_tx, rx_watch) = watch::channel(el_genesis);
+
     // Spawn Primary 1
     Primary::spawn(
         authority_1.authority().clone(),
@@ -374,6 +381,7 @@ async fn get_network_peers_from_admin_server() {
         &mut tx_shutdown,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
         &narwhal_primary_metrics::Metrics::default(),
+        rx_watch,
     );
 
     // Wait for tasks to start
@@ -470,6 +478,10 @@ async fn get_network_peers_from_admin_server() {
 
     let mut tx_shutdown_2 = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
 
+    // proposer's watch channel
+    let el_genesis = (0, BlockNumHash::new(0, adiri_chain_spec().genesis_hash()));
+    let (_tx, rx_watch) = watch::channel(el_genesis);
+
     // Spawn Primary 2
     Primary::spawn(
         authority_2.authority().clone(),
@@ -490,6 +502,7 @@ async fn get_network_peers_from_admin_server() {
         &mut tx_shutdown_2,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
         &narwhal_primary_metrics::Metrics::default(),
+        rx_watch,
     );
 
     // Wait for tasks to start

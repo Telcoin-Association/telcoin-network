@@ -286,7 +286,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         el_parent: BlockNumHash,
     ) -> ProposerResult<Header> {
         // make new header
-
+        //
         // check that the included timestamp is consistent with the parent's timestamp
         //
         // ie) the current time is *after* the timestamp in all included headers

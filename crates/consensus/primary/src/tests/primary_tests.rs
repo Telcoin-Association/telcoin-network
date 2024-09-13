@@ -91,7 +91,7 @@ async fn test_get_network_peers_from_admin_server() {
 
     let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
     // simulate current execution HEAD at genesis
-    let (tx_watch, rx_watch) =
+    let (_tx, rx_watch) =
         watch::channel((0, BlockNumHash::new(0, adiri_chain_spec().genesis_hash())));
 
     // Spawn Primary 1
