@@ -39,10 +39,7 @@ async fn test_empty_proposal() {
 
     // simulate current execution HEAD at genesis
     let execution_update = (0, BlockNumHash::new(0, adiri_chain_spec().genesis_hash()));
-    let (_tx, mut rx_watch) = watch::channel(execution_update);
-
-    // update watch channel on startup to trigger has_changed()
-    rx_watch.mark_changed();
+    let (_tx, rx_watch) = watch::channel(execution_update);
 
     // Spawn the proposer.
     let proposer_store = ProposerStore::new(db);
@@ -103,10 +100,7 @@ async fn test_propose_payload_fatal_timer() {
 
     // simulate current execution HEAD at genesis
     let execution_update = (0, BlockNumHash::new(0, adiri_chain_spec().genesis_hash()));
-    let (_tx, mut rx_watch) = watch::channel(execution_update);
-
-    // update watch channel on startup to trigger has_changed()
-    rx_watch.mark_changed();
+    let (tx_watch, rx_watch) = watch::channel(execution_update);
 
     // Spawn the proposer.
     let temp_dir = TempDir::new().unwrap();
@@ -154,6 +148,9 @@ async fn test_propose_payload_fatal_timer() {
     assert_eq!(header.round(), 1);
     assert_eq!(header.payload().get(&digest), Some(&(worker_id, created_at_ts)));
     assert!(header.validate(&committee, &worker_cache).is_ok());
+
+    // update watch channel to simulate execution progress
+    tx_watch.send((1, BlockNumHash::new(1, B256::random()))).expect("el watch channel updated");
 
     tracing::error!(target: "primary", "ASSERTED HEADER IN TEST :D");
 
@@ -205,6 +202,9 @@ async fn test_propose_payload_fatal_timer() {
     }
     tracing::error!(target: "primary", "all acks received");
 
+    // update watch channel to simulate execution progress
+    tx_watch.send((2, BlockNumHash::new(2, B256::random()))).expect("el watch channel updated");
+
     // fill tx_headers before round 3 (capacity 1) to simulate to trigger fatal timer
     // use the same header for convenience, makes no difference
     // just fill the send channel - don't call recv()
@@ -229,6 +229,7 @@ async fn test_propose_payload_fatal_timer() {
 
 #[tokio::test]
 async fn test_equivocation_protection_after_restart() {
+    init_test_tracing();
     let fixture = CommitteeFixture::builder().build();
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();
@@ -247,10 +248,7 @@ async fn test_equivocation_protection_after_restart() {
     let metrics = Arc::new(PrimaryMetrics::default());
     // simulate current execution HEAD at genesis
     let execution_update = (0, BlockNumHash::new(0, adiri_chain_spec().genesis_hash()));
-    let (_tx, mut rx_watch) = watch::channel(execution_update);
-
-    // update watch channel on startup to trigger has_changed()
-    rx_watch.mark_changed();
+    let (_tx, rx_watch) = watch::channel(execution_update);
 
     // Spawn the proposer.
     let proposer_task = Proposer::new(
@@ -315,9 +313,11 @@ async fn test_equivocation_protection_after_restart() {
     let (tx_narwhal_round_updates, _rx_narwhal_round_updates) = watch::channel(0u64);
     let (_tx_committed_own_headers, rx_committed_own_headers) = tn_types::test_channel!(1);
     let metrics = Arc::new(PrimaryMetrics::default());
-    // simulate current execution HEAD at genesis
-    let execution_update = (0, BlockNumHash::new(0, adiri_chain_spec().genesis_hash()));
-    let (tx_watch, rx_watch) = watch::channel(execution_update);
+    // simulate current execution HEAD at genesis for different round
+    //
+    // proposer doesn't verify EL data, just includes it in the header
+    let execution_update_restart = (1, BlockNumHash::new(0, adiri_chain_spec().genesis_hash()));
+    let (_tx, rx_watch) = watch::channel(execution_update_restart);
 
     let proposer_task = Proposer::new(
         authority_id,
@@ -341,9 +341,6 @@ async fn test_equivocation_protection_after_restart() {
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
         rx_watch, // el updates
     );
-
-    // update watch channel on startup to trigger has_changed()
-    tx_watch.send(execution_update).expect("watch channel update for genesis");
 
     let _proposer_handle = spawn_logged_monitored_task!(proposer_task, "proposer test empty");
 

@@ -212,7 +212,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         rx_committed_own_headers: Receiver<(Round, Vec<Round>)>,
         metrics: Arc<PrimaryMetrics>,
         leader_schedule: LeaderSchedule,
-        watch_execution_layer: watch::Receiver<(Round, BlockNumHash)>,
+        mut watch_execution_layer: watch::Receiver<(Round, BlockNumHash)>,
     ) -> Self {
         // TODO: include EL genesis hash in committee for epoch?
         //
@@ -226,6 +226,9 @@ impl<DB: Database + 'static> Proposer<DB> {
         // reset interval because first tick completes immediately
         fatal_header_timeout.reset();
         let rx_shutdown_stream = BroadcastStream::new(rx_shutdown.receiver);
+
+        // mark watch channel as changed to trigger first round
+        watch_execution_layer.mark_changed();
 
         Self {
             authority_id,
@@ -280,6 +283,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         metrics: Arc<PrimaryMetrics>,
         leader_and_support: String,
         max_delay: Duration,
+        el_parent: BlockNumHash,
     ) -> ProposerResult<Header> {
         // make new header
 
@@ -349,6 +353,11 @@ impl<DB: Database + 'static> Proposer<DB> {
         } else {
             (max_delay.as_secs_f64(), 0.0)
         };
+
+        //
+        // TODO: !!! this math is wrong - unix timestamp way off
+        //
+        // ~~~~~!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
         debug!(
             target: "primary::proposer",
@@ -700,12 +709,6 @@ impl<DB: Database + 'static> Proposer<DB> {
     /// If a different header was already produced for the same round, then
     /// this method returns the earlier header. Otherwise the newly created header is returned.
     fn propose_next_header(&mut self, reason: String) -> ProposerResult<PendingHeaderTask> {
-        //
-        // TODO: borrow and update watch channel to include EL data
-        //
-        // update watch channel to listen for next change
-        // let parent = self.watch_execution_layer.bo
-
         // Advance to the next round.
         self.round += 1;
         let _ = self.tx_narwhal_round_updates.send(self.round);
@@ -783,6 +786,14 @@ impl<DB: Database + 'static> Proposer<DB> {
                     }
                 };
 
+                // update watch channel to listen for next change
+                let (el_round, el_parent) =
+                    self.watch_execution_layer.borrow_and_update().to_owned();
+
+                assert_eq!(el_round, self.round - 1, "proposer and execution state differ");
+
+                debug!(target: "primary::proposer", round=self.round, el_round, ?el_parent, "execution layer data for proposer's header");
+
                 // spawn tokio task to create, store, and send new header to certifier
                 tokio::task::spawn(async move {
                     let proposal = Proposer::propose_header(
@@ -798,6 +809,7 @@ impl<DB: Database + 'static> Proposer<DB> {
                         metrics,
                         leader_and_support.to_string(),
                         min_delay,
+                        el_parent,
                     )
                     .await;
 
