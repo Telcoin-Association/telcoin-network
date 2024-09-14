@@ -335,8 +335,7 @@ impl<DB: Database> Certifier<DB> {
     }
 
     /// Logs Certifier errors as appropriate.
-    fn process_result(result: &DagResult<()>) {
-        debug!(target: "primary::certifier", ?result, "processing result...");
+    fn process_result(&self, result: &DagResult<()>) {
         match result {
             Ok(()) => (),
             Err(DagError::StoreError(e)) => {
@@ -348,7 +347,7 @@ impl<DB: Database> Certifier<DB> {
                 | e @ DagError::VoteTooOld(..)
                 | e @ DagError::InvalidEpoch { .. },
             ) => debug!("{e}"),
-            Err(e) => warn!("inside process_result: {e}"),
+            Err(e) => warn!("{:?} - {e}", self.authority_id),
         }
     }
 
@@ -418,7 +417,7 @@ impl<DB: Database> Certifier<DB> {
                 }
             };
 
-            Self::process_result(&result);
+            self.process_result(&result);
         }
     }
 }
