@@ -150,7 +150,7 @@ impl<DB: Database> Certifier<DB> {
                     .flatten()
                     .collect();
                 if parents.len() != expected_count {
-                    warn!("tried to read {expected_count} missing certificates requested by remote primary for vote request, but only found {}", parents.len());
+                    error!("tried to read {expected_count} missing certificates requested by remote primary for vote request, but only found {}", parents.len());
                     return Err(DagError::ProposedHeaderMissingCertificates);
                 }
                 parents
@@ -169,8 +169,8 @@ impl<DB: Database> Certifier<DB> {
                     missing_parents = response.missing;
                 }
                 Err(status) => {
-                    error!(target: "primary::certifier", ?status, "error requesting vote");
                     if status.status() == anemo::types::response::StatusCode::BadRequest {
+                        error!(target: "primary::certifier", ?status, ?header, "bad request for requested vote");
                         return Err(DagError::NetworkError(format!(
                             "irrecoverable error requesting vote for {header}: {status:?}"
                         )));
