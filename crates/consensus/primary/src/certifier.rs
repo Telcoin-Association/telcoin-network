@@ -113,8 +113,8 @@ impl<DB: Database> Certifier<DB> {
         }
     }
 
-    // Requests a vote for a Header from the given peer. Retries indefinitely until either a
-    // vote is received, or a permanent error is returned.
+    /// Requests a vote for a Header from the given peer. Retries indefinitely until either a
+    /// vote is received, or a permanent error is returned.
     #[instrument(level = "debug", skip_all, fields(header_digest = ?header.digest()))]
     async fn request_vote(
         network: anemo::Network,
@@ -124,6 +124,7 @@ impl<DB: Database> Certifier<DB> {
         target: NetworkPublicKey,
         header: Header,
     ) -> DagResult<Vote> {
+        debug!(target: "primary::certifier", ?authority, ?header, "requesting vote for header...");
         let peer_id = anemo::PeerId(target.0.to_bytes());
         let peer = network.waiting_peer(peer_id);
 
@@ -161,15 +162,17 @@ impl<DB: Database> Certifier<DB> {
             match client.request_vote(request).await {
                 Ok(response) => {
                     let response = response.into_body();
+                    debug!(target: "primary::certifier", ?authority, ?response, "Ok response received after request vote");
                     if response.vote.is_some() {
                         break response.vote.unwrap();
                     }
                     missing_parents = response.missing;
                 }
                 Err(status) => {
+                    error!(target: "primary::certifier", ?status, "error requesting vote");
                     if status.status() == anemo::types::response::StatusCode::BadRequest {
                         return Err(DagError::NetworkError(format!(
-                            "unrecoverable error requesting vote for {header}: {status:?}"
+                            "irrecoverable error requesting vote for {header}: {status:?}"
                         )));
                     }
                     missing_parents = Vec::new();
@@ -235,8 +238,10 @@ impl<DB: Database> Certifier<DB> {
         header: Header,
         mut cancel: oneshot::Receiver<()>,
     ) -> DagResult<Certificate> {
+        debug!(target: "primary::certifier", ?authority_id, "proposing header");
         if header.epoch() != committee.epoch() {
-            debug!(
+            error!(
+                target: "primary::certifier",
                 "Certifier received mismatched header proposal for epoch {}, currently at epoch {}",
                 header.epoch(),
                 committee.epoch()
@@ -279,6 +284,8 @@ impl<DB: Database> Certifier<DB> {
             let mut next_request = requests.next();
             tokio::select! {
                 result = &mut next_request => {
+                    debug!(target: "primary::certifier", ?authority_id, ?result, "next request in unordered futures");
+
                     match result {
                         Some(Ok(vote)) => {
                             certificate = votes_aggregator.append(
@@ -292,7 +299,7 @@ impl<DB: Database> Certifier<DB> {
                     }
                 },
                 _ = &mut cancel => {
-                    warn!("canceling Header proposal {header} for round {}", header.round());
+                    warn!(target: "primary::certifier", "canceling Header proposal {header} for round {}", header.round());
                     return Err(DagError::Canceled)
                 },
             }
@@ -325,8 +332,9 @@ impl<DB: Database> Certifier<DB> {
         Ok(certificate)
     }
 
-    // Logs Certifier errors as appropriate.
+    /// Logs Certifier errors as appropriate.
     fn process_result(result: &DagResult<()>) {
+        debug!(target: "primary::certifier", ?result, "processing result...");
         match result {
             Ok(()) => (),
             Err(DagError::StoreError(e)) => {
@@ -342,14 +350,15 @@ impl<DB: Database> Certifier<DB> {
         }
     }
 
-    // Main loop listening to incoming messages.
+    /// Main loop listening to incoming messages.
     pub async fn run(mut self) -> DagResult<Self> {
-        info!("Core on node {} has started successfully.", self.authority_id);
+        info!(target: "primary::certifier", "Certifier on node {} has started successfully.", self.authority_id);
         loop {
             let result = tokio::select! {
                 // We also receive here our new headers created by the `Proposer`.
                 // TODO: move logic into Proposer.
                 Some(header) = self.rx_headers.recv() => {
+                    debug!(target: "primary::certifier", authority=?self.authority_id, ?header, "header received!");
                     let (tx_cancel, rx_cancel) = oneshot::channel();
                     if let Some(cancel) = self.cancel_proposed_header {
                         let _ = cancel.send(());
@@ -363,6 +372,7 @@ impl<DB: Database> Certifier<DB> {
                     let metrics = self.metrics.clone();
                     let network = self.network.clone();
                     fail_point_async!("narwhal-delay");
+                    debug!(target: "primary::certifier", authority=?self.authority_id, "spawning proposer header task...");
                     self.propose_header_tasks.spawn(monitored_future!(Self::propose_header(
                         name,
                         committee,
@@ -379,6 +389,7 @@ impl<DB: Database> Certifier<DB> {
                 // Process certificates formed after receiving enough votes.
                 // TODO: move logic into Proposer.
                 Some(result) = self.propose_header_tasks.join_next() => {
+                    debug!(target: "primary::certifier", authority=?self.authority_id, ?result, "joining next propose_header_task");
                     match result {
                         Ok(Ok(certificate)) => {
                             fail_point_async!("narwhal-delay");
