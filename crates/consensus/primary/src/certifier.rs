@@ -169,6 +169,8 @@ impl<DB: Database> Certifier<DB> {
                     missing_parents = response.missing;
                 }
                 Err(status) => {
+                    // TODO: why does this error out so much?
+                    error!(target: "primary::certifier", ?status, ?header, "bad request for requested vote");
                     if status.status() == anemo::types::response::StatusCode::BadRequest {
                         error!(target: "primary::certifier", ?status, ?header, "bad request for requested vote");
                         return Err(DagError::NetworkError(format!(
