@@ -846,7 +846,7 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        debug!(target: "primary::proposer", round=this.round, "begin loop...");
+        debug!(target: "primary::proposer", authority=?this.authority_id, round=this.round, "begin loop...");
         loop {
             // tick intervals to ensure they advance
             let max_delay_timed_out = this.max_delay_interval.poll_tick(cx).is_ready();
@@ -857,13 +857,13 @@ where
             // okay to shutdown here because other primary tasks are expected to shutdown too
             // ie) no point completing the proposal if certifier is down
             if let Poll::Ready(Some(_shutdown)) = this.rx_shutdown_stream.poll_next_unpin(cx) {
-                debug!(target: "primary::proposer", round=this.round, "Proposer received shutdown signal...");
+                debug!(target: "primary::proposer", authority=?this.authority_id, round=this.round, "Proposer received shutdown signal...");
                 return Poll::Ready(Ok(()));
             }
 
             // check for new system messages
             if let Poll::Ready(Some(msg)) = this.rx_system_messages.poll_recv(cx) {
-                debug!(target: "primary::proposer", round=this.round, "Proposer received system message");
+                debug!(target: "primary::proposer", authority=?this.authority_id, round=this.round, "Proposer received system message");
                 this.system_messages.push(msg);
             }
 
@@ -876,7 +876,7 @@ where
             //
             // NOTE: this will not persist primary restarts
             while let Poll::Ready(Some(msg)) = this.rx_our_digests.poll_recv(cx) {
-                debug!(target: "primary::proposer", round=this.round, "Proposer received digest");
+                debug!(target: "primary::proposer", authority=?this.authority_id, round=this.round, "Proposer received digest");
 
                 // parse message into parts
                 let (ack, digest) = msg.process();
@@ -887,7 +887,7 @@ where
             // check for new parent certificates
             // synchronizer sends collection of certificates when there is quorum (2f+1)
             while let Poll::Ready(Some((certs, round))) = this.rx_parents.poll_recv(cx) {
-                debug!(target: "primary::proposer", this_round=this.round, parent_round=round, num_parents=certs.len(), "Proposer received parents");
+                debug!(target: "primary::proposer", authority=?this.authority_id, this_round=this.round, parent_round=round, num_parents=certs.len(), "Proposer received parents");
                 this.process_parents(certs, round)?;
             }
 
@@ -895,7 +895,7 @@ where
             while let Poll::Ready(Some((commit_round, committed_headers))) =
                 this.rx_committed_own_headers.poll_recv(cx)
             {
-                debug!(target: "primary::proposer", round=this.round, "received committed update for own header");
+                debug!(target: "primary::proposer", authority=?this.authority_id, round=this.round, "received committed update for own header");
                 this.process_committed_headers(commit_round, committed_headers);
             }
 
@@ -906,7 +906,7 @@ where
             if let Some(mut receiver) = this.pending_header.take() {
                 match receiver.poll_unpin(cx) {
                     Poll::Ready(res) => {
-                        debug!(target: "primary::proposer", "pending header task complete!");
+                        debug!(target: "primary::proposer", authority=?this.authority_id, "pending header task complete!");
                         this.handle_proposal_result(res)?;
 
                         // continue the loop to propose the next header
@@ -976,7 +976,7 @@ where
 
             // if both conditions are met, create the next header
             if should_create_header {
-                debug!(target: "primary::proposer", "proposing next header!");
+                debug!(target: "primary::proposer", authority=?this.authority_id, "proposing next header!");
                 if max_delay_timed_out {
                     // expect this interval to expire occassionally
                     //
@@ -1004,12 +1004,10 @@ where
                 continue;
             }
 
-            debug!(target: "primary::proposer", "nothing to do - breaking loop");
             // break if unable to propose header
             break;
         }
 
-        debug!(target: "primary::proposer", "outside loop - return Poll::Pending");
         Poll::Pending
     }
 }

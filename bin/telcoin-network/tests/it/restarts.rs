@@ -108,7 +108,7 @@ fn test_restarts() -> eyre::Result<()> {
     let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");
     // create temp path for test
     let temp_path = tmp_guard.path().to_path_buf();
-    let rt = Runtime::new().expect("tokio failed");
+    let rt = Runtime::new()?;
     rt.block_on(config_local_testnet(temp_path.clone())).expect("failed to config");
     let mut exe_path =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("Missing CARGO_MANIFEST_DIR!"));
@@ -135,6 +135,8 @@ fn test_restarts() -> eyre::Result<()> {
     // run restart tests1
     let res1 = run_restart_tests1(&client_urls, &mut child2, &exe_path, &temp_path, rpc_ports[2]);
     let is_ok = res1.is_ok();
+
+    // kill child2 if successfully restarted
     match res1 {
         Ok(mut child2_restarted) => {
             child2_restarted.kill()?;
@@ -144,6 +146,8 @@ fn test_restarts() -> eyre::Result<()> {
             tracing::error!(target: "restart-test", "Got error: {err}");
         }
     }
+
+    // kill all children (child2 should be dead)
     for (i, child) in children.iter_mut().enumerate() {
         // Best effort to kill all the other nodes.
         if i != 2 {
