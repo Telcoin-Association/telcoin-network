@@ -544,7 +544,7 @@ impl<DB: Database> Synchronizer<DB> {
                 if let Some(cert) = highest_created_certificate {
                     // Error can be ignored.
                     if tx_own_certificate_broadcast.send(cert).is_err() {
-                        error!("Failed to populate initial certificate to send to peers!");
+                        error!(target: "primary::synchronizer", "Failed to populate initial certificate to send to peers!");
                     }
                 }
             },
@@ -708,13 +708,22 @@ impl<DB: Database> Synchronizer<DB> {
     pub async fn accept_own_certificate(&self, certificate: Certificate) -> DagResult<()> {
         // Process the new certificate.
         match self.process_certificate_internal(certificate.clone(), false, false).await {
-            Ok(_) => {}
-            _result @ Err(DagError::ShuttingDown) => return Err(DagError::ShuttingDown),
-            Err(e) => panic!("Failed to process locally-created certificate: {e}"),
+            Ok(_) => {
+                trace!(target: "primary::synchronizer", authority=?self.inner.authority_id, ?certificate, "successfully processed certificate")
+            }
+            result @ Err(DagError::ShuttingDown) => {
+                error!(target: "primary::synchronizer", authority=?self.inner.authority_id, ?certificate, ?result, "failed to process certificate internally - shutting down...");
+                return Err(DagError::ShuttingDown);
+            }
+            Err(e) => {
+                error!(target: "primary::synchronizer", authority=?self.inner.authority_id, ?certificate, "failed to process certificate internally - PANIC");
+                panic!("Failed to process locally-created certificate: {e}")
+            }
         };
 
         // Broadcast the certificate.
-        if self.inner.tx_own_certificate_broadcast.send(certificate.clone()).is_err() {
+        if let Err(e) = self.inner.tx_own_certificate_broadcast.send(certificate.clone()) {
+            error!(target: "primary::synchronizer", authority=?self.inner.authority_id, ?certificate, ?e, "failed to broadcast certificate!");
             return Err(DagError::ShuttingDown);
         }
 
@@ -1067,24 +1076,28 @@ impl<DB: Database> Synchronizer<DB> {
         }
 
         loop {
+            trace!(target: "primary::synchronizer", authority=?authority_id, "start loop for push certificate");
             tokio::select! {
                 result = rx_own_certificate_broadcast.recv() => {
+                    trace!(target: "primary::synchronizer", authority=?authority_id, "rx_own_certificate_broadcast received");
                     let cert = match result {
                         Ok(cert) => cert,
                         Err(broadcast::error::RecvError::Closed) => {
-                            trace!("Certificate sender {authority_id} is shutting down!");
+                            trace!(target: "primary::synchronizer", "Certificate sender {authority_id} is shutting down!");
                             return;
                         }
                         Err(broadcast::error::RecvError::Lagged(e)) => {
-                            warn!("Certificate broadcaster {authority_id} lagging! {e}");
+                            warn!(target: "primary::synchronizer", "Certificate broadcaster {authority_id} lagging! {e}");
                             // Re-run the loop to receive again.
                             continue;
                         }
                     };
+                    trace!(target: "primary::synchronizer", authority=?authority_id, ?cert);
                     let request = Request::new(SendCertificateRequest { certificate: cert.clone() }).with_timeout(PUSH_TIMEOUT);
                     requests.push_back(send_certificate(client.clone(),request, cert));
                 }
                 Some((cert, resp)) = requests.next() => {
+                    trace!(target: "primary::synchronizer", authority=?authority_id, ?resp, ?cert, "next request");
                     backoff_multiplier = match resp {
                         Ok(_) => {
                             0
@@ -1135,7 +1148,7 @@ impl<DB: Database> Synchronizer<DB> {
         is_certified: bool,
     ) -> DagResult<()> {
         if header.author() == inner.authority_id {
-            debug!("skipping sync_batches for header {header}: no need to sync payload from own workers");
+            debug!("skipping sync_gatches for header {header}: no need to sync payload from own workers");
             return Ok(());
         }
 

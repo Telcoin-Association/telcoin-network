@@ -129,6 +129,9 @@ fn test_restarts() -> eyre::Result<()> {
         *child = Some(start_validator(i, &exe_path, &temp_path, rpc_port));
     }
 
+    // sleep for nodes to start
+    std::thread::sleep(Duration::from_secs(30));
+
     // pass &mut to `run_restart_tests1` to shutdown child in case of error
     let mut child2 = children[2].take().expect("missing child 2");
 
@@ -252,7 +255,7 @@ fn get_positive_balance_with_retry(node: &str, address: &str) -> eyre::Result<u1
 fn get_balance_above_with_retry(node: &str, address: &str, above: u128) -> eyre::Result<u128> {
     let mut bal = get_balance(node, address, 5).unwrap_or(0);
     let mut i = 0;
-    while i < 60 && bal <= above {
+    while i < 30 && bal <= above {
         std::thread::sleep(Duration::from_millis(1000));
         i += 1;
         bal = get_balance(node, address, 5).unwrap_or(0);

@@ -104,11 +104,15 @@ impl<DB: Database> Certifier<DB> {
 
     #[instrument(level = "info", skip_all)]
     async fn run_inner(self) {
+        // copy authority id for errors
+        let authority = self.authority_id;
         let core = async move { self.run().await };
 
         match core.await {
-            Err(err @ DagError::ShuttingDown) => error!("{:?}", err),
-            Err(err) => panic!("{:?}", err),
+            Err(err @ DagError::ShuttingDown) => {
+                error!(target: "primary::certifier", ?authority, "{:?}", err)
+            }
+            Err(err) => panic!("{:?} - {:?}", authority, err),
             Ok(_) => {}
         }
     }
@@ -170,9 +174,9 @@ impl<DB: Database> Certifier<DB> {
                 }
                 Err(status) => {
                     // TODO: why does this error out so much?
-                    error!(target: "primary::certifier", ?status, ?header, "bad request for requested vote");
+                    error!(target: "primary::certifier", ?authority, ?status, ?header, "bad request for requested vote");
                     if status.status() == anemo::types::response::StatusCode::BadRequest {
-                        error!(target: "primary::certifier", ?status, ?header, "bad request for requested vote");
+                        error!(target: "primary::certifier", ?authority, ?status, ?header, "fatal request for requested vote");
                         return Err(DagError::NetworkError(format!(
                             "irrecoverable error requesting vote for {header}: {status:?}"
                         )));
@@ -296,12 +300,12 @@ impl<DB: Database> Certifier<DB> {
                                 &header,
                             )?;
                         },
-                        Some(Err(e)) => error!("failed to get vote for header {header:?}: {e:?}"),
+                        Some(Err(e)) => error!(target: "primary::certifier", ?authority_id, "failed to get vote for header {header:?}: {e:?}"),
                         None => break,
                     }
                 },
                 _ = &mut cancel => {
-                    warn!(target: "primary::certifier", "canceling Header proposal {header} for round {}", header.round());
+                    warn!(target: "primary::certifier", ?authority_id, "canceling Header proposal {header} for round {}", header.round());
                     return Err(DagError::Canceled)
                 },
             }
@@ -325,11 +329,11 @@ impl<DB: Database> Certifier<DB> {
                     };
                     msg.push_str(&parent_msg);
                 }
-                warn!(msg);
+                warn!(target: "primary::certifier", ?authority_id, msg, "inside propose_header");
             }
             DagError::CouldNotFormCertificate(header.digest())
         })?;
-        debug!("Assembled {certificate:?}");
+        debug!(target: "primary::certifier", ?authority_id, "Assembled {certificate:?}");
 
         Ok(certificate)
     }
@@ -339,15 +343,17 @@ impl<DB: Database> Certifier<DB> {
         match result {
             Ok(()) => (),
             Err(DagError::StoreError(e)) => {
-                error!("{e}");
+                error!(target: "primary::certifier", authority=?self.authority_id, "PANIC - {e}");
                 panic!("Storage failure: killing node.");
             }
             Err(
                 e @ DagError::TooOld(..)
                 | e @ DagError::VoteTooOld(..)
                 | e @ DagError::InvalidEpoch { .. },
-            ) => debug!("{e}"),
-            Err(e) => warn!("{:?} - {e}", self.authority_id),
+            ) => debug!(target: "primary::certifier", authority=?self.authority_id, "{e}"),
+            Err(e) => {
+                warn!(target: "primary::certifier", "processing result: {:?} - {e}", self.authority_id)
+            }
         }
     }
 
@@ -399,14 +405,16 @@ impl<DB: Database> Certifier<DB> {
                         Ok(Err(e)) => Err(e),
                         Err(e) => {
                             if e.is_cancelled() {
-                                error!("Certifier error: task cancelled! Shutting down...");
+                                error!(target: "primary::certifier", authority=?self.authority_id, "Certifier error: task cancelled! Shutting down...");
                                 // Ungraceful shutdown.
                                 Err(DagError::ShuttingDown)
                             } else if e.is_panic() {
+                                error!(target: "primary::certifier", authority=?self.authority_id, "PANIC");
                                 // propagate panics.
                                 std::panic::resume_unwind(e.into_panic());
                             } else {
-                                panic!("propose header task failed: {e}");
+                                error!(target: "primary::certifier", authority=?self.authority_id, "PANIC");
+                                panic!("propose header task failed: {:?} - {e}", self.authority_id);
                             }
                         },
                     }
