@@ -9,7 +9,7 @@ pub mod traits;
 
 use layered_db::LayeredDatabase;
 #[cfg(feature = "reth-libmdbx")]
-use mdbx_db::MdbxDatabase;
+use mdbx::MdbxDatabase;
 #[cfg(feature = "redb")]
 use redb::database::ReDB;
 #[cfg(feature = "rocksdb")]
@@ -25,7 +25,7 @@ pub mod rocks;
 
 pub mod layered_db;
 #[cfg(feature = "reth-libmdbx")]
-pub mod mdbx_db;
+pub mod mdbx;
 pub mod mem_db;
 
 pub use tn_types::error::StoreError;

@@ -16,8 +16,8 @@ uint::construct_uint! {
     struct Num32(4);
 }
 
-#[tokio::test]
-async fn test_rocksdb_helpers() {
+#[test]
+fn test_rocksdb_helpers() {
     let v = vec![];
     assert!(is_max(&v));
 
@@ -43,96 +43,96 @@ fn open_db(path: &Path) -> RocksDatabase {
     RocksDatabase::open_db_with_table::<TestTable, &Path>(path).expect("Cannot open database")
 }
 
-#[tokio::test]
-async fn test_rocksdb_open() {}
+#[test]
+fn test_rocksdb_open() {}
 
-#[tokio::test]
-async fn test_rocksdb_contains_key() {
+#[test]
+fn test_rocksdb_contains_key() {
     let temp_dir = TempDir::new().unwrap();
     let db = open_db(temp_dir.path());
     test_contains_key(db)
 }
 
-#[tokio::test]
-async fn test_rocksdb_get() {
+#[test]
+fn test_rocksdb_get() {
     let temp_dir = TempDir::new().unwrap();
     let db = open_db(temp_dir.path());
     test_get(db)
 }
 
-#[tokio::test]
-async fn test_rocksdb_multi_get() {
+#[test]
+fn test_rocksdb_multi_get() {
     let temp_dir = TempDir::new().unwrap();
     let db = open_db(temp_dir.path());
     test_multi_get(db)
 }
 
-#[tokio::test]
-async fn test_rocksdb_skip() {
+#[test]
+fn test_rocksdb_skip() {
     let temp_dir = TempDir::new().unwrap();
     let db = open_db(temp_dir.path());
     test_skip(db)
 }
 
-#[tokio::test]
-async fn test_rocksdb_skip_to_previous_simple() {
+#[test]
+fn test_rocksdb_skip_to_previous_simple() {
     let temp_dir = TempDir::new().unwrap();
     let db = open_db(temp_dir.path());
     test_skip_to_previous_simple(db)
 }
 
-#[tokio::test]
-async fn test_rocksdb_iter_skip_to_previous_gap() {
+#[test]
+fn test_rocksdb_iter_skip_to_previous_gap() {
     let temp_dir = TempDir::new().unwrap();
     let db = open_db(temp_dir.path());
     test_iter_skip_to_previous_gap(db)
 }
 
-#[tokio::test]
-async fn test_rocksdb_remove() {
+#[test]
+fn test_rocksdb_remove() {
     let temp_dir = TempDir::new().unwrap();
     let db = open_db(temp_dir.path());
     test_remove(db)
 }
 
-#[tokio::test]
-async fn test_rocksdb_iter() {
+#[test]
+fn test_rocksdb_iter() {
     let temp_dir = TempDir::new().unwrap();
     let db = open_db(temp_dir.path());
     test_iter(db)
 }
 
-#[tokio::test]
-async fn test_rocksdb_iter_reverse() {
+#[test]
+fn test_rocksdb_iter_reverse() {
     let temp_dir = TempDir::new().unwrap();
     let db = open_db(temp_dir.path());
     test_iter_reverse(db)
 }
 
-#[tokio::test]
-async fn test_rocksdb_clear() {
+#[test]
+fn test_rocksdb_clear() {
     let temp_dir = TempDir::new().unwrap();
     let db = open_db(temp_dir.path());
     test_clear(db)
 }
 
-#[tokio::test]
-async fn test_rocksdb_is_empty() {
+#[test]
+fn test_rocksdb_is_empty() {
     let temp_dir = TempDir::new().unwrap();
     let db = open_db(temp_dir.path());
     test_is_empty(db)
 }
 
-#[tokio::test]
-async fn test_rocksdb_multi_insert() {
+#[test]
+fn test_rocksdb_multi_insert() {
     // Init a DB
     let temp_dir = TempDir::new().unwrap();
     let db = open_db(temp_dir.path());
     test_multi_insert(db)
 }
 
-#[tokio::test]
-async fn test_rocksdb_multi_remove() {
+#[test]
+fn test_rocksdb_multi_remove() {
     // Init a DB
     let temp_dir = TempDir::new().unwrap();
     let db = open_db(temp_dir.path());
@@ -152,8 +152,8 @@ fn increment_counter(db: &RocksDBMap<String, ObjectWithRefCount>, key: &str, val
     batch.write().unwrap();
 }
 
-#[tokio::test]
-async fn refcount_test() {
+#[test]
+fn refcount_test() {
     let key = "key".to_string();
     let mut options = rocksdb::Options::default();
     options.set_merge_operator(
@@ -188,8 +188,8 @@ async fn refcount_test() {
     assert_eq!(value.ref_count, iterations - 1);
 }
 
-#[tokio::test]
-async fn refcount_with_compaction_test() {
+#[test]
+fn refcount_with_compaction_test() {
     let key = "key".to_string();
     let mut options = rocksdb::Options::default();
     options.set_merge_operator(
@@ -235,8 +235,8 @@ async fn refcount_with_compaction_test() {
 }
 */
 
-#[tokio::test]
-async fn test_rocksdb_dbsimpbench() {
+#[test]
+fn test_rocksdb_dbsimpbench() {
     // Init a DB
     let temp_dir = TempDir::new().unwrap();
     let db = open_db(temp_dir.path());

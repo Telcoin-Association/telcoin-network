@@ -13,7 +13,6 @@ edition = "2021"
 eyre = { workspace = true }
 async-trait = { workspace = true }
 backoff = { workspace = true }
-bcs = { workspace = true }
 reth-primitives = { workspace = true }
 cfg-if = { workspace = true }
 futures = { workspace = true }
@@ -55,7 +54,6 @@ anemo-tower = { workspace = true }
 [dev-dependencies]
 dashmap = { workspace = true }
 async-trait = { workspace = true }
-bincode = { workspace = true }
 criterion = { workspace = true }
 futures = { workspace = true }
 narwhal-executor = { workspace = true }

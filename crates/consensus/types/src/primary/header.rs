@@ -12,7 +12,7 @@ use std::{collections::BTreeSet, fmt};
 
 use crate::{
     config::{AuthorityIdentifier, Committee, Epoch, WorkerCache, WorkerId},
-    crypto,
+    crypto, encode,
     error::{DagError, DagResult},
     now, CertificateDigest, Round, TimestampSec, VoteDigest, WorkerBlock,
 };
@@ -284,7 +284,7 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for Header {
 
     fn digest(&self) -> HeaderDigest {
         let mut hasher = crypto::DefaultHashFunction::new();
-        hasher.update(bcs::to_bytes(&self).expect("Serialization should not fail"));
+        hasher.update(encode(&self));
         HeaderDigest(hasher.finalize().into())
     }
 }

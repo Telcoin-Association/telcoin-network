@@ -8,7 +8,6 @@ pub(crate) mod iter;
 pub mod metrics;
 pub mod util;
 
-use bincode::Options;
 use metrics::SamplingInterval;
 use rocksdb::{
     checkpoint::Checkpoint, AsColumnFamilyRef, BlockBasedOptions, BottommostLevelCompaction,
@@ -23,7 +22,6 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tap::TapFallible;
 use tracing::{info, instrument, warn};
 
 pub use errors::TypedStoreError;
@@ -525,11 +523,13 @@ impl<'a> Iterator for RocksDBIter<'a> {
 }
 
 pub fn read_size_from_env(var_name: &str) -> Option<usize> {
-    env::var(var_name)
-        .ok()?
-        .parse::<usize>()
-        .tap_err(|e| warn!("Env var {} does not contain valid usize integer: {}", var_name, e))
-        .ok()
+    match env::var(var_name).ok()?.parse::<usize>() {
+        Ok(size) => Some(size),
+        Err(e) => {
+            warn!("Env var {} does not contain valid usize integer: {}", var_name, e);
+            None
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -762,62 +762,12 @@ fn get_block_options(block_cache_size_mb: usize) -> BlockBasedOptions {
     block_options
 }
 
-/// Opens a database with options, and a number of column families that are created if they do not
-/// exist.
-#[instrument(level="debug", skip_all, fields(path = ?path.as_ref(), cf = ?opt_cfs), err)]
-pub fn open_cf<P: AsRef<Path>>(
-    path: P,
-    db_options: Option<rocksdb::Options>,
-    metric_conf: MetricConf,
-    opt_cfs: &[&str],
-) -> Result<Arc<RocksDB>, TypedStoreError> {
-    let options = db_options.unwrap_or_else(|| default_db_options().options);
-    let column_descriptors: Vec<_> = opt_cfs.iter().map(|name| (*name, options.clone())).collect();
-    open_cf_opts(path, Some(options.clone()), metric_conf, &column_descriptors[..])
-}
-
 fn prepare_db_options(db_options: Option<rocksdb::Options>) -> rocksdb::Options {
     // Customize database options
     let mut options = db_options.unwrap_or_else(|| default_db_options().options);
     options.create_if_missing(true);
     options.create_missing_column_families(true);
     options
-}
-
-/// Opens a database with options, and a number of column families with individual options that are
-/// created if they do not exist.
-#[instrument(level="debug", skip_all, fields(path = ?path.as_ref()), err)]
-pub fn open_cf_opts<P: AsRef<Path>>(
-    path: P,
-    db_options: Option<rocksdb::Options>,
-    metric_conf: MetricConf,
-    opt_cfs: &[(&str, rocksdb::Options)],
-) -> Result<Arc<RocksDB>, TypedStoreError> {
-    let path = path.as_ref();
-    // In the simulator, we intercept the wall clock in the test thread only. This causes problems
-    // because rocksdb uses the simulated clock when creating its background threads, but then
-    // those threads see the real wall clock (because they are not the test thread), which causes
-    // rocksdb to panic. The `nondeterministic` macro evaluates expressions in new threads, which
-    // resolves the issue.
-    //
-    // This is a no-op in non-simulator builds.
-
-    let cfs = populate_missing_cfs(opt_cfs, path)?;
-    nondeterministic!({
-        let options = prepare_db_options(db_options);
-        let rocksdb = {
-            rocksdb::DBWithThreadMode::<MultiThreaded>::open_cf_descriptors(
-                &options,
-                path,
-                cfs.into_iter().map(|(name, opts)| ColumnFamilyDescriptor::new(name, opts)),
-            )?
-        };
-        Ok(Arc::new(RocksDB::DBWithThreadMode(DBWithThreadModeWrapper {
-            underlying: rocksdb,
-            metric_conf,
-            db_path: PathBuf::from(path),
-        })))
-    })
 }
 
 /// Opens a database with options, and a number of column families with individual options that are
@@ -930,19 +880,6 @@ pub fn list_tables(path: std::path::PathBuf) -> eyre::Result<Vec<String>> {
                 })
                 .collect()
         })
-}
-
-/// TODO: Good description of why we're doing this : RocksDB stores keys in BE and has a seek operator on iterators, see `https://github.com/facebook/rocksdb/wiki/Iterator#introduction`
-#[inline]
-pub fn be_fix_int_ser<S>(t: &S) -> Result<Vec<u8>, TypedStoreError>
-where
-    S: ?Sized + serde::Serialize,
-{
-    bincode::DefaultOptions::new()
-        .with_big_endian()
-        .with_fixint_encoding()
-        .serialize(t)
-        .map_err(|e| e.into())
 }
 
 #[derive(Clone)]

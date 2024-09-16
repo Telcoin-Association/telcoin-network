@@ -1,13 +1,22 @@
 // Copyright (c) Telcoin, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, fmt::Debug, marker::PhantomData, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt::Debug,
+    marker::PhantomData,
+    sync::{
+        mpsc::{self, SyncSender},
+        Arc,
+    },
+    time::Duration,
+};
 
-use bincode::Options;
 use dashmap::DashMap;
 use ouroboros::self_referencing;
 use parking_lot::{RwLock, RwLockReadGuard};
-use serde::{Deserialize, Serialize};
+use prometheus::{default_registry, register_int_gauge_with_registry, IntGauge, Registry};
+use tn_types::{decode, decode_key, encode, encode_key};
 
 use crate::traits::{DBIter, Database, DbTx, DbTxMut, Table};
 
@@ -15,7 +24,7 @@ type StoreType = DashMap<&'static str, Arc<RwLock<BTreeMap<Vec<u8>, Vec<u8>>>>>;
 
 fn get<T: crate::traits::Table>(store: &StoreType, key: &T::Key) -> eyre::Result<Option<T::Value>> {
     if let Some(table) = store.get(T::NAME) {
-        let key_bytes = encode(key);
+        let key_bytes = encode_key(key);
         if let Some(val_bytes) = table.read().get(&key_bytes) {
             let val = decode(val_bytes);
             return Ok(Some(val));
@@ -49,7 +58,7 @@ impl DbTx for MemDbTxMut {
 impl DbTxMut for MemDbTxMut {
     fn insert<T: Table>(&mut self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
         if let Some(table) = self.store.get(T::NAME) {
-            let key_bytes = encode(key);
+            let key_bytes = encode_key(key);
             let value_bytes = encode(value);
             table.write().insert(key_bytes, value_bytes);
         }
@@ -58,7 +67,7 @@ impl DbTxMut for MemDbTxMut {
 
     fn remove<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
         if let Some(table) = self.store.get(T::NAME) {
-            let key_bytes = encode(key);
+            let key_bytes = encode_key(key);
             table.write().remove(&key_bytes);
         }
         Ok(())
@@ -83,16 +92,69 @@ impl DbTxMut for MemDbTxMut {
 /// roll-backs this should be fine.
 #[derive(Clone, Debug)]
 pub struct MemDatabase {
-    store: StoreType,
+    store: Arc<StoreType>,
+    metrics: Arc<RwLock<MemDBMetrics>>,
+    shutdown_tx: Arc<SyncSender<()>>,
+}
+
+impl Drop for MemDatabase {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.shutdown_tx) <= 1 {
+            tracing::info!(target: "telcoin::memdb", "MemDatabase Dropping, shutting down metrics thread");
+            // shutdown_tx is a sync sender with no buffer so this should block until the thread
+            // reads it and shuts down.
+            if let Err(e) = self.shutdown_tx.send(()) {
+                tracing::error!(target: "telcoin::memdb",
+                    "Error while trying to send shutdown to MemDatabase metrics thread {e}"
+                );
+            }
+        }
+    }
 }
 
 impl MemDatabase {
     pub fn new() -> Self {
-        Self { store: DashMap::new() }
+        let store: Arc<StoreType> = Arc::new(DashMap::new());
+        let metrics = Arc::new(RwLock::new(MemDBMetrics::default()));
+        let (shutdown_tx, rx) = mpsc::sync_channel::<()>(0);
+
+        let store_cloned = Arc::clone(&store);
+        let metrics_cloned = metrics.clone();
+        // Spawn thread to update metrics from MemDB stats every 30 seconds.
+        std::thread::spawn(move || {
+            tracing::info!(target: "telcoin::memdb", "Starting MemDB metrics thread");
+            while let Err(mpsc::RecvTimeoutError::Timeout) =
+                rx.recv_timeout(Duration::from_secs(30))
+            {
+                for kv in &*store_cloned {
+                    if let Some(m) = metrics_cloned.read().table_counts.get(kv.key()) {
+                        m.set(kv.value().read().len().try_into().unwrap_or(-1));
+                    }
+                }
+            }
+            tracing::info!(target: "telcoin::memdb", "Ending MemDB metrics thread");
+        });
+
+        Self { store, metrics, shutdown_tx: Arc::new(shutdown_tx) }
     }
 
     pub fn open_table<T: Table>(&self) {
         self.store.insert(T::NAME, Arc::new(RwLock::new(BTreeMap::new())));
+        match register_int_gauge_with_registry!(
+            format!("memdb_{}_count", T::NAME),
+            format!("Entries in the {} memory table.", T::NAME),
+            default_registry(),
+        ) {
+            Ok(m) => {
+                self.metrics.write().table_counts.insert(T::NAME, m);
+            }
+            Err(e) => {
+                // This will happen for tests.  Nothing really to do, if the guage is missing then
+                // the metrics thread will just not update it... Log at debug level
+                // in case something else is going on and someone is debugging.
+                tracing::debug!(target: "telcoin::memdb", "Error adding metrics for table {}: {e}", T::NAME)
+            }
+        }
     }
 }
 
@@ -112,16 +174,16 @@ impl Database for MemDatabase {
         Self: 'txn;
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
-        Ok(MemDbTx { store: self.store.clone() })
+        Ok(MemDbTx { store: (*self.store).clone() })
     }
 
     fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
-        Ok(MemDbTxMut { store: self.store.clone() })
+        Ok(MemDbTxMut { store: (*self.store).clone() })
     }
 
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
         if let Some(table) = self.store.get(T::NAME) {
-            let key_bytes = encode(key);
+            let key_bytes = encode_key(key);
             return Ok(table.read().contains_key(&key_bytes));
         }
         Ok(false)
@@ -133,7 +195,7 @@ impl Database for MemDatabase {
 
     fn insert<T: Table>(&self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
         if let Some(table) = self.store.get(T::NAME) {
-            let key_bytes = encode(key);
+            let key_bytes = encode_key(key);
             let value_bytes = encode(value);
             table.write().insert(key_bytes, value_bytes);
         }
@@ -142,7 +204,7 @@ impl Database for MemDatabase {
 
     fn remove<T: Table>(&self, key: &T::Key) -> eyre::Result<()> {
         if let Some(table) = self.store.get(T::NAME) {
-            let key_bytes = encode(key);
+            let key_bytes = encode_key(key);
             table.write().remove(&key_bytes);
         }
         Ok(())
@@ -200,7 +262,7 @@ impl Database for MemDatabase {
                     .build(),
                     iter_builder: |table: &'_ TabAndGuard<T>| {
                         table.with(|fields| {
-                            let key_bytes = encode(key);
+                            let key_bytes = encode_key(key);
                             let iter = Box::new(
                                 fields.guard.iter().skip_while(move |(k, _)| **k < key_bytes),
                             );
@@ -243,7 +305,7 @@ impl Database for MemDatabase {
 
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
         if let Some(table) = self.store.get(T::NAME) {
-            let key_bytes = encode(key);
+            let key_bytes = encode_key(key);
             let mut last = None;
             let guard = table.read();
             for (k, v) in guard.iter() {
@@ -253,7 +315,7 @@ impl Database for MemDatabase {
                 last = Some((k, v));
             }
             last.map(|(key_bytes, value_bytes)| {
-                let key = decode(key_bytes);
+                let key = decode_key(key_bytes);
                 let value = decode(value_bytes);
                 (key, value)
             })
@@ -265,7 +327,7 @@ impl Database for MemDatabase {
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
         if let Some(table) = self.store.get(T::NAME) {
             table.read().last_key_value().map(|(key_bytes, value_bytes)| {
-                let key = decode(key_bytes);
+                let key = decode_key(key_bytes);
                 let value = decode(value_bytes);
                 (key, value)
             })
@@ -273,22 +335,6 @@ impl Database for MemDatabase {
             None
         }
     }
-}
-
-fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> T {
-    bincode::DefaultOptions::new()
-        .with_big_endian()
-        .with_fixint_encoding()
-        .deserialize(bytes)
-        .expect("Invalid bytes!")
-}
-
-fn encode<T: Serialize>(obj: &T) -> Vec<u8> {
-    bincode::DefaultOptions::new()
-        .with_big_endian()
-        .with_fixint_encoding()
-        .serialize(obj)
-        .expect("Can not serialize!")
 }
 
 #[self_referencing]
@@ -321,19 +367,42 @@ impl<T: Table> Iterator for MemDBIter<T> {
     fn next(&mut self) -> Option<Self::Item> {
         self.with_mut(|fields| {
             fields.iter.next().map(|(key_bytes, value_bytes)| {
-                let key = bincode::DefaultOptions::new()
-                    .with_big_endian()
-                    .with_fixint_encoding()
-                    .deserialize(key_bytes)
-                    .expect("Invalid bytes!");
-                let value = bincode::DefaultOptions::new()
-                    .with_big_endian()
-                    .with_fixint_encoding()
-                    .deserialize(value_bytes)
-                    .expect("Invalid bytes!");
+                let key = decode_key(key_bytes);
+                let value = decode(value_bytes);
                 (key, value)
             })
         })
+    }
+}
+
+#[derive(Debug)]
+struct MemDBMetrics {
+    table_counts: HashMap<&'static str, IntGauge>,
+}
+
+impl MemDBMetrics {
+    fn try_new(_registry: &Registry) -> Result<Self, prometheus::Error> {
+        Ok(Self { table_counts: HashMap::default() })
+    }
+}
+
+impl Default for MemDBMetrics {
+    fn default() -> Self {
+        // try_new() should not fail except under certain conditions with testing (see comment
+        // below). This pushes the panic or retry decision lower and supporting try_new
+        // allways a user to deal with errors if desired (have a non-panic option).
+        // We always want do use default_registry() when not in test.
+        match Self::try_new(default_registry()) {
+            Ok(metrics) => metrics,
+            Err(_) => {
+                // If we are in a test then don't panic on prometheus errors (usually an already
+                // registered error) but try again with a new Registry. This is not
+                // great for prod code, however should not happen, but will happen in tests due to
+                // how Rust runs them so lets just gloss over it. cfg(test) does not
+                // always work as expected.
+                Self::try_new(&Registry::new()).expect("Prometheus error, are you using it wrong?")
+            }
+        }
     }
 }
 

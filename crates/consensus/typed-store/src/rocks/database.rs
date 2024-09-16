@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use rocksdb::{properties, AsColumnFamilyRef, Transaction};
-use tracing::error;
+use tn_types::{decode, encode, encode_key};
 
 use crate::{
     rocks::CF_METRICS_REPORT_PERIOD_MILLIS,
@@ -11,10 +11,18 @@ use crate::{
     BATCHES_CF, CERTIFICATES_CF, CERTIFICATE_DIGEST_BY_ORIGIN_CF, CERTIFICATE_DIGEST_BY_ROUND_CF,
     COMMITTED_SUB_DAG_INDEX_CF, LAST_COMMITTED_CF, LAST_PROPOSED_CF, PAYLOAD_CF, VOTES_CF,
 };
-use std::{fmt::Debug, path::Path, sync::Arc, time::Duration};
+use std::{
+    fmt::Debug,
+    path::Path,
+    sync::{
+        mpsc::{self, SyncSender},
+        Arc,
+    },
+    time::Duration,
+};
 
 use super::{
-    be_fix_int_ser, default_db_options,
+    default_db_options,
     iter::Iter,
     metrics::{DBMetrics, RocksDBPerfContext, SamplingInterval},
     open_cf_opts_transactional, MetricConf, ReadWriteOptions, METRICS_ERROR,
@@ -39,11 +47,8 @@ impl<'txn> DbTx for RocksDbTxMut<'txn> {
             .rocksdb
             .cf_handle(T::NAME)
             .unwrap_or_else(|| panic!("invalid table {}", T::NAME));
-        let key_buf = be_fix_int_ser(key)?;
-        Ok(self
-            .txn
-            .get_cf(&cf, key_buf)
-            .map(|res| res.and_then(|bytes| bcs::from_bytes::<T::Value>(&bytes).ok()))?)
+        let key_buf = encode_key(key);
+        Ok(self.txn.get_cf(&cf, key_buf).map(|res| res.map(|bytes| decode::<T::Value>(&bytes)))?)
     }
 }
 
@@ -67,8 +72,8 @@ impl<'txn> DbTxMut for RocksDbTxMut<'txn> {
             .start_timer();
         let perf_ctx =
             if self.db.write_sample_interval.sample() { Some(RocksDBPerfContext) } else { None };
-        let key_buf = be_fix_int_ser(key)?;
-        let value_buf = bcs::to_bytes(value)?;
+        let key_buf = encode_key(key);
+        let value_buf = encode(value);
         self.db
             .db_metrics
             .op_metrics
@@ -97,7 +102,7 @@ impl<'txn> DbTxMut for RocksDbTxMut<'txn> {
             .start_timer();
         let perf_ctx =
             if self.db.write_sample_interval.sample() { Some(RocksDBPerfContext) } else { None };
-        let key_buf = be_fix_int_ser(key)?;
+        let key_buf = encode_key(key);
         self.txn.delete_cf(&cf, key_buf)?;
         self.db.db_metrics.op_metrics.rocksdb_deletes.with_label_values(&[T::NAME]).inc();
         if perf_ctx.is_some() {
@@ -129,13 +134,16 @@ pub struct RocksDatabase {
     get_sample_interval: SamplingInterval,
     write_sample_interval: SamplingInterval,
     iter_sample_interval: SamplingInterval,
-    metrics_task_cancel_handle: Arc<Option<tokio::sync::oneshot::Sender<()>>>,
+    //metrics_task_cancel_handle: Arc<Option<tokio::sync::oneshot::Sender<()>>>,
+    metrics_task_cancel_handle: Arc<Option<SyncSender<()>>>,
 }
 
 impl Drop for RocksDatabase {
     fn drop(&mut self) {
-        let _ = Arc::get_mut(&mut self.metrics_task_cancel_handle)
-            .map(|c| c.take().map(|c| c.send(())));
+        if Arc::strong_count(&self.metrics_task_cancel_handle) <= 1 {
+            let _ = Arc::get_mut(&mut self.metrics_task_cancel_handle)
+                .map(|c| c.take().map(|c| c.send(())));
+        }
     }
 }
 
@@ -148,28 +156,19 @@ impl RocksDatabase {
         let db_cloned = db.clone();
         let db_metrics = Arc::new(DBMetrics::default());
         let db_metrics_cloned = db_metrics.clone();
-        let (sender, mut recv) = tokio::sync::oneshot::channel();
+        let (sender, recv) = mpsc::sync_channel::<()>(0);
         let cfs: Arc<Vec<(&'static str, Arc<DBMetrics>)>> =
             Arc::new(opt_cfs.iter().map(|(cf, _)| (*cf, Arc::new(DBMetrics::default()))).collect());
-        tokio::task::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_millis(CF_METRICS_REPORT_PERIOD_MILLIS));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        let cfs_cloned = cfs.clone();
-                        for (cf, db_metrics) in cfs_cloned.iter() {
-                            let db_metrics = db_metrics.clone();
-                            let cf = *cf;
-                            let db_cloned = db_cloned.clone();
-                            if let Err(e) = tokio::task::spawn_blocking(move || {
-                                Self::report_metrics(&db_cloned, cf, &db_metrics);
-                            }).await {
-                                error!("Failed to log metrics with error: {}", e);
-                            }
-                        }
-                    }
-                    _ = &mut recv => break,
+        std::thread::spawn(move || {
+            while let Err(mpsc::RecvTimeoutError::Timeout) =
+                recv.recv_timeout(Duration::from_millis(CF_METRICS_REPORT_PERIOD_MILLIS))
+            {
+                let cfs_cloned = cfs.clone();
+                for (cf, db_metrics) in cfs_cloned.iter() {
+                    let db_metrics = db_metrics.clone();
+                    let cf = *cf;
+                    let db_cloned = db_cloned.clone();
+                    Self::report_metrics(&db_cloned, cf, &db_metrics);
                 }
             }
         });
@@ -374,7 +373,7 @@ impl Database for RocksDatabase {
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
         let cf =
             self.rocksdb.cf_handle(T::NAME).unwrap_or_else(|| panic!("invalid table {}", T::NAME));
-        let key_buf = be_fix_int_ser(key)?;
+        let key_buf = encode_key(key);
         // [`rocksdb::DBWithThreadMode::key_may_exist_cf`] can have false positives,
         // but no false negatives. We use it to short-circuit the absent case
         let readopts = self.opts.readopts();
@@ -393,7 +392,7 @@ impl Database for RocksDatabase {
             .start_timer();
         let perf_ctx =
             if self.get_sample_interval.sample() { Some(RocksDBPerfContext) } else { None };
-        let key_buf = be_fix_int_ser(key)?;
+        let key_buf = encode_key(key);
         let res = self.rocksdb.get_pinned_cf_opt(&cf, &key_buf, &self.opts.readopts())?;
         self.db_metrics
             .op_metrics
@@ -404,7 +403,7 @@ impl Database for RocksDatabase {
             self.db_metrics.read_perf_ctx_metrics.report_metrics(T::NAME);
         }
         match res {
-            Some(data) => Ok(Some(bcs::from_bytes(&data)?)),
+            Some(data) => Ok(Some(decode(&data))),
             None => Ok(None),
         }
     }
@@ -420,8 +419,8 @@ impl Database for RocksDatabase {
             .start_timer();
         let perf_ctx =
             if self.write_sample_interval.sample() { Some(RocksDBPerfContext) } else { None };
-        let key_buf = be_fix_int_ser(key)?;
-        let value_buf = bcs::to_bytes(value)?;
+        let key_buf = encode_key(key);
+        let value_buf = encode(value);
         self.db_metrics
             .op_metrics
             .rocksdb_put_bytes
@@ -445,7 +444,7 @@ impl Database for RocksDatabase {
             .start_timer();
         let perf_ctx =
             if self.write_sample_interval.sample() { Some(RocksDBPerfContext) } else { None };
-        let key_buf = be_fix_int_ser(key)?;
+        let key_buf = encode_key(key);
         self.rocksdb.delete_cf(&cf, key_buf, &self.opts.writeopts())?;
         self.db_metrics.op_metrics.rocksdb_deletes.with_label_values(&[T::NAME]).inc();
         if perf_ctx.is_some() {

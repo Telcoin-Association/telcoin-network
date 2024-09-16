@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::str::FromStr;
 
+use crate::try_decode;
+
 pub const INTENT_PREFIX_LENGTH: usize = 3;
 
 /// The version here is to distinguish between signing different versions of the struct
@@ -26,7 +28,7 @@ pub enum IntentVersion {
 impl TryFrom<u8> for IntentVersion {
     type Error = eyre::Report;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        bcs::from_bytes(&[value]).map_err(|_| eyre!("Invalid IntentVersion"))
+        try_decode(&[value])
     }
 }
 
@@ -47,7 +49,7 @@ pub enum AppId {
 impl TryFrom<u8> for AppId {
     type Error = eyre::Report;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        bcs::from_bytes(&[value]).map_err(|_| eyre!("Invalid AppId"))
+        try_decode(&[value])
     }
 }
 
@@ -78,7 +80,7 @@ pub enum IntentScope {
 impl TryFrom<u8> for IntentScope {
     type Error = eyre::Report;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        bcs::from_bytes(&[value]).map_err(|_| eyre!("Invalid IntentScope"))
+        try_decode(&[value])
     }
 }
 

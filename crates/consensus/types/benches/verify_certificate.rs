@@ -8,6 +8,7 @@ use criterion::{
 use fastcrypto::{hash::Hash, traits::KeyPair};
 use std::collections::BTreeSet;
 use tn_types::{
+    encode,
     test_utils::{make_optimal_signed_certificates, CommitteeFixture},
     Certificate,
 };
@@ -30,7 +31,7 @@ pub fn verify_certificates(c: &mut Criterion) {
             make_optimal_signed_certificates(1..=1, &genesis, &committee, keys.as_slice());
         let certificate = certificates.front().unwrap().clone();
 
-        let data_size: usize = bcs::to_bytes(&certificate).unwrap().len();
+        let data_size: usize = encode(&certificate).len();
         bench_group.throughput(Throughput::Bytes(data_size as u64));
 
         bench_group.bench_with_input(
