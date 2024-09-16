@@ -36,3 +36,6 @@ pub use reth_primitives::{BlockHash, TransactionSigned};
 /// Collection of database test utilities
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
+
+mod codec;
+pub use codec::*;

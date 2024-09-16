@@ -13,7 +13,7 @@ use crate::{
     crypto::{
         self, to_intent_message, BlsPublicKey, BlsSignature, IntentMessage, ValidatorSignature,
     },
-    Header, HeaderDigest, Round,
+    encode, Header, HeaderDigest, Round,
 };
 
 /// A Vote on a Header is a claim by the voting authority that all payloads and the full history
@@ -122,10 +122,7 @@ impl From<VoteDigest> for Digest<{ crypto::INTENT_MESSAGE_LENGTH }> {
         // let intent_message = to_intent_message(HeaderDigest(digest.0));
         let intent_message: IntentMessage<HeaderDigest> = to_intent_message(digest.into());
         Digest {
-            digest: bcs::to_bytes(&intent_message)
-                .expect("Serialization message should not fail")
-                .try_into()
-                .expect("INTENT_MESSAGE_LENGTH is correct"),
+            digest: encode(&intent_message).try_into().expect("INTENT_MESSAGE_LENGTH is correct"),
         }
     }
 }

@@ -1,8 +1,8 @@
 //! The ouput from consensus (bullshark)
 
 use crate::{
-    crypto, Certificate, CertificateDigest, ReputationScores, Round, SequenceNumber, TimestampSec,
-    WorkerBlock, WorkerBlockConversionError,
+    crypto, encode, Certificate, CertificateDigest, ReputationScores, Round, SequenceNumber,
+    TimestampSec, WorkerBlock, WorkerBlockConversionError,
 };
 use fastcrypto::hash::{Digest, Hash, HashFunction};
 use reth_primitives::{keccak256, Address, BlockHash, Header, SealedBlockWithSenders, B256};
@@ -237,17 +237,9 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for CommittedSubDag {
             hasher.update(cert.digest());
         }
         hasher.update(self.leader.digest());
-        hasher.update(
-            bcs::to_bytes(&self.sub_dag_index).unwrap_or_else(|_| {
-                panic!("Serialization of {} should not fail", self.sub_dag_index)
-            }),
-        );
-        hasher.update(bcs::to_bytes(&self.reputation_score).unwrap_or_else(|_| {
-            panic!("Serialization of {:?} should not fail", self.reputation_score)
-        }));
-        hasher.update(bcs::to_bytes(&self.commit_timestamp).unwrap_or_else(|_| {
-            panic!("Serialization of {} should not fail", self.commit_timestamp)
-        }));
+        hasher.update(encode(&self.sub_dag_index));
+        hasher.update(encode(&self.reputation_score));
+        hasher.update(encode(&self.commit_timestamp));
         ConsensusOutputDigest(hasher.finalize().into())
     }
 }

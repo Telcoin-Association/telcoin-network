@@ -47,13 +47,11 @@ impl SamplingInterval {
         let counter = Arc::new(AtomicU64::new(1));
         if !once_every_duration.is_zero() {
             let counter = counter.clone();
-            tokio::task::spawn(async move {
-                loop {
-                    if counter.load(Ordering::SeqCst) > after_num_ops {
-                        counter.store(0, Ordering::SeqCst);
-                    }
-                    tokio::time::sleep(once_every_duration).await;
+            std::thread::spawn(move || loop {
+                if counter.load(Ordering::SeqCst) > after_num_ops {
+                    counter.store(0, Ordering::SeqCst);
                 }
+                std::thread::sleep(once_every_duration);
             });
         }
         SamplingInterval { once_every_duration, after_num_ops, counter }

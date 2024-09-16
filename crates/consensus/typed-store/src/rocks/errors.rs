@@ -2,8 +2,6 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use bincode::ErrorKind as BincodeErrorKind;
-
 use rocksdb::Error as RocksError;
 use serde::{Deserialize, Serialize};
 use std::{fmt, fmt::Display};
@@ -86,39 +84,5 @@ impl fmt::Display for BincodeErrorDef {
             ),
             BincodeErrorDef::Custom(ref s) => s.fmt(fmt),
         }
-    }
-}
-
-impl From<bincode::Error> for BincodeErrorDef {
-    fn from(err: bincode::Error) -> Self {
-        match err.as_ref() {
-            BincodeErrorKind::Io(ioerr) => BincodeErrorDef::Io(ioerr.to_string()),
-            BincodeErrorKind::InvalidUtf8Encoding(utf8err) => {
-                BincodeErrorDef::InvalidUtf8Encoding(utf8err.to_string())
-            }
-            BincodeErrorKind::InvalidBoolEncoding(byte) => {
-                BincodeErrorDef::InvalidBoolEncoding(*byte)
-            }
-            BincodeErrorKind::InvalidCharEncoding => BincodeErrorDef::InvalidCharEncoding,
-            BincodeErrorKind::InvalidTagEncoding(tag) => BincodeErrorDef::InvalidTagEncoding(*tag),
-            BincodeErrorKind::DeserializeAnyNotSupported => {
-                BincodeErrorDef::DeserializeAnyNotSupported
-            }
-            BincodeErrorKind::SizeLimit => BincodeErrorDef::SizeLimit,
-            BincodeErrorKind::SequenceMustHaveLength => BincodeErrorDef::SequenceMustHaveLength,
-            BincodeErrorKind::Custom(str) => BincodeErrorDef::Custom(str.to_owned()),
-        }
-    }
-}
-
-impl From<bcs::Error> for TypedStoreError {
-    fn from(err: bcs::Error) -> Self {
-        TypedStoreError::SerializationError(format!("{err}"))
-    }
-}
-
-impl From<bincode::Error> for TypedStoreError {
-    fn from(err: bincode::Error) -> Self {
-        TypedStoreError::SerializationError(format!("{err}"))
     }
 }

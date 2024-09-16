@@ -352,7 +352,7 @@ mod test {
     use super::LayeredDatabase;
     #[cfg(feature = "redb")]
     use crate::redb::ReDB;
-    use crate::{mdbx_db::MdbxDatabase, test::*};
+    use crate::{mdbx::MdbxDatabase, test::*};
     use std::path::Path;
     use tempfile::tempdir;
 

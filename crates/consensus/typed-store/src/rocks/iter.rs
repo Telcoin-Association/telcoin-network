@@ -4,12 +4,11 @@
 
 use std::{marker::PhantomData, sync::Arc};
 
-use bincode::Options;
 use prometheus::{Histogram, HistogramTimer};
 use rocksdb::Direction;
+use tn_types::{decode, encode_key, try_decode_key};
 
 use super::{
-    be_fix_int_ser,
     errors::TypedStoreError,
     metrics::{DBMetrics, RocksDBPerfContext},
     RocksDBRawIter,
@@ -72,13 +71,12 @@ impl<'a, K: DeserializeOwned, V: DeserializeOwned> Iterator for Iter<'a, K, V> {
             self.is_initialized = true;
         }
         if self.db_iter.valid() {
-            let config = bincode::DefaultOptions::new().with_big_endian().with_fixint_encoding();
             let raw_key = self.db_iter.key().expect("Valid iterator failed to get key");
             let raw_value = self.db_iter.value().expect("Valid iterator failed to get value");
             self.bytes_scanned_counter += raw_key.len() + raw_value.len();
             self.keys_returned_counter += 1;
-            let key = config.deserialize(raw_key).ok();
-            let value = bcs::from_bytes(raw_value).ok();
+            let key = try_decode_key(raw_key).ok();
+            let value = Some(decode(raw_value));
             match self.direction {
                 Direction::Forward => self.db_iter.next(),
                 Direction::Reverse => self.db_iter.prev(),
@@ -110,7 +108,7 @@ impl<'a, K: Serialize, V> Iter<'a, K, V> {
     /// the key.
     pub fn skip_to(mut self, key: &K) -> Result<Self, TypedStoreError> {
         self.is_initialized = true;
-        self.db_iter.seek(be_fix_int_ser(key)?);
+        self.db_iter.seek(encode_key(key));
         Ok(self)
     }
 
@@ -119,7 +117,7 @@ impl<'a, K: Serialize, V> Iter<'a, K, V> {
     /// no element prior to it, it returns an empty iterator.
     pub fn skip_prior_to(mut self, key: &K) -> Result<Self, TypedStoreError> {
         self.is_initialized = true;
-        self.db_iter.seek_for_prev(be_fix_int_ser(key)?);
+        self.db_iter.seek_for_prev(encode_key(key));
         Ok(self)
     }
 

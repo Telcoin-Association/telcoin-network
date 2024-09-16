@@ -1995,12 +1995,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "collectable"
-version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08abddbaad209601e53c7dd4308d8c04c06f17bb7df006434e586a22b83be45a"
-
-[[package]]
 name = "colorchoice"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3597,11 +3591,7 @@ version = "7.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "765c9198f173dd59ce26ff9f95ef0aafd0a0fe01fb9d72841bc5066a4c06511d"
 dependencies = [
- "base64 0.21.7",
  "byteorder",
- "crossbeam-channel",
- "flate2",
- "nom",
  "num-traits",
 ]
 
@@ -5136,8 +5126,6 @@ name = "narwhal-executor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bcs",
- "bincode",
  "bytes",
  "consensus-metrics",
  "fastcrypto",
@@ -5173,7 +5161,6 @@ dependencies = [
  "axum",
  "axum-server",
  "backoff",
- "bincode",
  "bytes",
  "consensus-metrics",
  "dashmap 6.1.0",
@@ -5221,8 +5208,6 @@ dependencies = [
  "anemo-tower",
  "async-trait",
  "backoff",
- "bcs",
- "bincode",
  "bytes",
  "cfg-if",
  "consensus-metrics",
@@ -5346,35 +5331,21 @@ dependencies = [
 name = "narwhal-typed-store"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "bcs",
- "bincode",
- "collectable",
  "dashmap 6.1.0",
  "eyre",
  "fdlimit",
- "hdrhistogram",
- "itertools 0.10.5",
- "once_cell",
  "ouroboros",
  "page_size",
  "parking_lot 0.12.3",
- "proc-macro2",
  "prometheus",
- "quote",
- "rand 0.8.5",
  "redb",
  "reth-libmdbx",
  "rocksdb",
- "rstest",
  "serde",
- "syn 2.0.77",
- "tap",
  "telcoin-macros",
  "tempfile",
  "thiserror",
  "tn-types",
- "tokio",
  "tracing",
  "uint",
 ]
@@ -9422,32 +9393,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rstest"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b07f2d176c472198ec1e6551dc7da28f1c089652f66a7b722676c2238ebc0edf"
-dependencies = [
- "futures",
- "futures-timer",
- "rstest_macros",
- "rustc_version 0.4.1",
-]
-
-[[package]]
-name = "rstest_macros"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7229b505ae0706e64f37ffc54a9c163e11022a6636d58fe1f3f52018257ff9f7"
-dependencies = [
- "cfg-if",
- "proc-macro2",
- "quote",
- "rustc_version 0.4.1",
- "syn 1.0.109",
- "unicode-ident",
-]
-
-[[package]]
 name = "ruint"
 version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11028,6 +10973,7 @@ dependencies = [
  "anemo",
  "base64 0.21.7",
  "bcs",
+ "bincode",
  "consensus-metrics",
  "criterion",
  "derive_builder",

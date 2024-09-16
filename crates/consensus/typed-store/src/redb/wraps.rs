@@ -1,18 +1,15 @@
-use bincode::Options as _;
 use redb::{Key, TypeName, Value};
 use std::{fmt::Debug, marker::PhantomData};
 
 use crate::traits::{KeyT, ValueT};
+use tn_types::{decode, decode_key, encode, encode_key};
 
 #[derive(Debug)]
 pub struct KeyWrap<K: KeyT>(PhantomData<K>);
 impl<K: KeyT> Key for KeyWrap<K> {
     fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
-        // If we want to do a typed compare use this:
-        //let d1 = KeyWrap::<K>::from_bytes(data1);
-        //let d2 = KeyWrap::<K>::from_bytes(data2);
-        //d1.cmp(&d2)
         // Do a byte compare
+        // We use encode_key/decode_key so this is fine.
         data1.cmp(data2)
     }
 }
@@ -35,11 +32,7 @@ impl<K: KeyT> Value for KeyWrap<K> {
     where
         Self: 'a,
     {
-        bincode::DefaultOptions::new()
-            .with_big_endian()
-            .with_fixint_encoding()
-            .deserialize(data)
-            .expect("Invalid bytes!")
+        decode_key(data)
     }
 
     fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
@@ -47,11 +40,7 @@ impl<K: KeyT> Value for KeyWrap<K> {
         Self: 'a,
         Self: 'b,
     {
-        bincode::DefaultOptions::new()
-            .with_big_endian()
-            .with_fixint_encoding()
-            .serialize(value)
-            .expect("Can not serialize!")
+        encode_key(value)
     }
 
     fn type_name() -> TypeName {
@@ -78,11 +67,7 @@ impl<V: ValueT> Value for ValWrap<V> {
     where
         Self: 'a,
     {
-        bincode::DefaultOptions::new()
-            .with_big_endian()
-            .with_fixint_encoding()
-            .deserialize(data)
-            .expect("Invalid bytes!")
+        decode(data)
     }
 
     fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
@@ -90,11 +75,7 @@ impl<V: ValueT> Value for ValWrap<V> {
         Self: 'a,
         Self: 'b,
     {
-        bincode::DefaultOptions::new()
-            .with_big_endian()
-            .with_fixint_encoding()
-            .serialize(value)
-            .expect("Can not serialize!")
+        encode(value)
     }
 
     fn type_name() -> redb::TypeName {

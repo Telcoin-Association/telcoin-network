@@ -90,17 +90,17 @@ impl DbTxMut for ReDbTxMut {
 #[derive(Clone)]
 pub struct ReDB {
     db: Arc<RwLock<ReDatabase>>,
-    shutdown_tx: SyncSender<bool>,
+    shutdown_tx: SyncSender<()>,
 }
 
 impl Drop for ReDB {
     fn drop(&mut self) {
         if Arc::strong_count(&self.db) <= 2 {
-            tracing::info!("ReDb Dropping, shutting down metrics thread");
+            tracing::info!(target: "telcoin::redb", "ReDb Dropping, shutting down metrics thread");
             // shutdown_tx is a sync sender with no buffer so this should block until the thread
             // reads it and shutsdown.
-            if let Err(e) = self.shutdown_tx.send(true) {
-                tracing::error!("Error while trying to send shutdown to redb metrics thread {e}");
+            if let Err(e) = self.shutdown_tx.send(()) {
+                tracing::error!(target: "telcoin::redb", "Error while trying to send shutdown to redb metrics thread {e}");
             }
         }
     }
@@ -110,18 +110,18 @@ impl ReDB {
     pub fn open<P: AsRef<Path>>(path: P) -> eyre::Result<ReDB> {
         let db = Arc::new(RwLock::new(ReDatabase::create(path.as_ref().join("redb"))?));
         let db_cloned = Arc::clone(&db);
-        let (shutdown_tx, rx) = mpsc::sync_channel::<bool>(0);
+        let (shutdown_tx, rx) = mpsc::sync_channel::<()>(0);
 
         // Spawn thread to update metrics from ReDB stats every 2 seconds.
         std::thread::spawn(move || {
-            tracing::info!("Starting ReDb metrics thread");
+            tracing::info!(target: "telcoin::redb", "Starting ReDb metrics thread");
             let metrics = ReDbMetrics::default();
             while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(Duration::from_secs(2))
             {
                 match db_cloned.read().begin_write() {
                     Ok(txn) => match txn.stats() {
                         Ok(status) => {
-                            tracing::trace!("ReDb metrics thread {status:?}");
+                            tracing::trace!(target: "telcoin::redb", "ReDb metrics thread {status:?}");
                             metrics.tree_height.set(status.tree_height() as i64);
                             metrics
                                 .allocated_pages
@@ -142,15 +142,15 @@ impl ReDB {
                             metrics.page_size.set(status.page_size().try_into().unwrap_or(-1));
                         }
                         Err(e) => {
-                            tracing::error!("Error while trying to get redb status: {e}");
+                            tracing::error!(target: "telcoin::redb", "Error while trying to get redb status: {e}");
                         }
                     },
                     Err(e) => {
-                        tracing::error!("Error while trying to get redb status: {e}");
+                        tracing::error!(target: "telcoin::redb", "Error while trying to get redb status: {e}");
                     }
                 }
             }
-            tracing::info!("Ending ReDb metrics thread");
+            tracing::info!(target: "telcoin::redb", "Ending ReDb metrics thread");
         });
 
         Ok(ReDB { db, shutdown_tx })

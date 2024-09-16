@@ -1,32 +1,26 @@
 // Copyright (c) Telcoin, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{marker::PhantomData, path::Path};
+use std::{
+    marker::PhantomData,
+    path::Path,
+    sync::{
+        mpsc::{self, SyncSender},
+        Arc,
+    },
+    time::Duration,
+};
 
-use bincode::Options;
 use reth_libmdbx::{
     ffi::MDBX_dbi, Cursor, DatabaseFlags, Environment, Geometry, PageSize, Transaction, WriteFlags,
     RO, RW,
 };
-use serde::{Deserialize, Serialize};
+use tn_types::{decode, decode_key, encode, encode_key};
 
-use crate::traits::{Database, DbTx, DbTxMut, KeyT, Table, ValueT};
-
-fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> T {
-    bincode::DefaultOptions::new()
-        .with_big_endian()
-        .with_fixint_encoding()
-        .deserialize(bytes)
-        .expect("Invalid bytes!")
-}
-
-fn encode<T: Serialize>(obj: &T) -> Vec<u8> {
-    bincode::DefaultOptions::new()
-        .with_big_endian()
-        .with_fixint_encoding()
-        .serialize(obj)
-        .expect("Can not serialize!")
-}
+use crate::{
+    mdbx::metrics::MdbxMetrics,
+    traits::{Database, DbTx, DbTxMut, KeyT, Table, ValueT},
+};
 
 /// Wrapper for the libmdbx transaction.
 #[derive(Debug)]
@@ -48,7 +42,7 @@ impl MdbxTx {
 
 impl DbTx for MdbxTx {
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        let key_buf = encode(key);
+        let key_buf = encode_key(key);
         let v = self
             .inner
             .get::<Vec<u8>>(self.get_dbi::<T>()?, &key_buf[..])
@@ -73,7 +67,7 @@ impl MdbxTxMut {
 
 impl DbTx for MdbxTxMut {
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        let key_buf = encode(key);
+        let key_buf = encode_key(key);
         let v = self
             .inner
             .get::<Vec<u8>>(self.get_dbi::<T>()?, &key_buf[..])
@@ -88,14 +82,14 @@ impl DbTxMut for MdbxTxMut {
         key: &T::Key,
         value: &T::Value,
     ) -> eyre::Result<()> {
-        let key_buf = encode(key);
+        let key_buf = encode_key(key);
         let value_buf = encode(value);
         self.inner.put(self.get_dbi::<T>()?, key_buf, value_buf, WriteFlags::UPSERT)?;
         Ok(())
     }
 
     fn remove<T: crate::traits::Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
-        let key_buf = encode(key);
+        let key_buf = encode_key(key);
         self.inner.del(self.get_dbi::<T>()?, key_buf, None)?;
         Ok(())
     }
@@ -115,6 +109,20 @@ impl DbTxMut for MdbxTxMut {
 pub struct MdbxDatabase {
     /// Libmdbx-sys environment.
     inner: Environment,
+    shutdown_tx: Arc<SyncSender<()>>,
+}
+
+impl Drop for MdbxDatabase {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.shutdown_tx) <= 1 {
+            tracing::info!(target: "telcoin::mdbx", "MDBX Dropping, shutting down metrics thread");
+            // shutdown_tx is a sync sender with no buffer so this should block until the thread
+            // reads it and shuts down.
+            if let Err(e) = self.shutdown_tx.send(()) {
+                tracing::error!(target: "telcoin::mdbx", "Error while trying to send shutdown to MDBX metrics thread {e}");
+            }
+        }
+    }
 }
 
 const GIGABYTE: usize = 1024 * 1024 * 1024;
@@ -151,7 +159,37 @@ impl MdbxDatabase {
                 page_size: Some(PageSize::Set(default_page_size())),
             })
             .open(path.as_ref())?;
-        Ok(MdbxDatabase { inner: env })
+
+        let (shutdown_tx, rx) = mpsc::sync_channel::<()>(0);
+
+        let db_cloned = env.clone();
+        // Spawn thread to update metrics from MDBX stats every 2 seconds.
+        std::thread::spawn(move || {
+            tracing::info!(target: "telcoin::mdbx", "Starting MDBX metrics thread");
+            let metrics = MdbxMetrics::default();
+            while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(Duration::from_secs(2))
+            {
+                match db_cloned.stat() {
+                    Ok(status) => {
+                        tracing::trace!(target: "telcoin::mdbx", "MDBX metrics thread {status:?}");
+                        metrics.page_size.set(status.page_size().into());
+                        metrics.depth.set(status.depth().into());
+                        metrics.branch_pages.set(status.branch_pages().try_into().unwrap_or(-1));
+                        metrics.leaf_pages.set(status.leaf_pages().try_into().unwrap_or(-1));
+                        metrics
+                            .overflow_pages
+                            .set(status.overflow_pages().try_into().unwrap_or(-1));
+                        metrics.entries.set(status.entries().try_into().unwrap_or(-1));
+                    }
+                    Err(e) => {
+                        tracing::error!(target: "telcoin::mdbx", "Error while trying to get MDBX status: {e}");
+                    }
+                }
+            }
+            tracing::info!(target: "telcoin::mdbx", "Ending MDBX metrics thread");
+        });
+
+        Ok(MdbxDatabase { inner: env, shutdown_tx: Arc::new(shutdown_tx) })
     }
 
     pub fn open_table<T: Table>(&self) -> eyre::Result<()> {
@@ -259,7 +297,7 @@ impl Database for MdbxDatabase {
             .ok()?
             .last::<Vec<u8>, Vec<u8>>()
             .ok()?
-            .map(|(k, v)| (decode::<T::Key>(&k), decode::<T::Value>(&v)))
+            .map(|(k, v)| (decode_key::<T::Key>(&k), decode::<T::Value>(&v)))
     }
 }
 
@@ -282,7 +320,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Ok(result) = self.cursor.next::<Vec<u8>, Vec<u8>>() {
-            result.map(|(k, v)| (decode::<K>(&k), decode::<V>(&v)))
+            result.map(|(k, v)| (decode_key::<K>(&k), decode::<V>(&v)))
         } else {
             None
         }
@@ -314,10 +352,10 @@ where
                 .cursor
                 .last::<Vec<u8>, Vec<u8>>()
                 .ok()?
-                .map(|(k, v)| (decode::<K>(&k), decode::<V>(&v)));
+                .map(|(k, v)| (decode_key::<K>(&k), decode::<V>(&v)));
         }
         if let Ok(result) = self.cursor.prev::<Vec<u8>, Vec<u8>>() {
-            result.map(|(k, v)| (decode::<K>(&k), decode::<V>(&v)))
+            result.map(|(k, v)| (decode_key::<K>(&k), decode::<V>(&v)))
         } else {
             None
         }

@@ -26,6 +26,8 @@ use serde::Serialize;
 mod intent;
 pub use intent::*;
 
+use crate::encode;
+
 //
 // CONSENSUS
 //
@@ -81,7 +83,7 @@ pub fn generate_proof_of_possession(
     chain_spec: &ChainSpec,
 ) -> eyre::Result<BlsSignature> {
     let mut msg = keypair.public().as_bytes().to_vec();
-    let genesis_bytes = bcs::to_bytes(&chain_spec.genesis)?;
+    let genesis_bytes = encode(&chain_spec.genesis);
     msg.extend_from_slice(genesis_bytes.as_slice());
     let sig = BlsSignature::new_secure(
         &IntentMessage::new(Intent::telcoin_app(IntentScope::ProofOfPossession), msg),
@@ -101,7 +103,7 @@ pub fn verify_proof_of_possession(
 ) -> eyre::Result<()> {
     public_key.validate().with_context(|| "Provided public key invalid")?;
     let mut msg = public_key.as_bytes().to_vec();
-    let genesis_bytes = bcs::to_bytes(&chain_spec.genesis)?;
+    let genesis_bytes = encode(&chain_spec.genesis);
     msg.extend_from_slice(genesis_bytes.as_slice());
     let result = proof.verify_secure(
         &IntentMessage::new(Intent::telcoin_app(IntentScope::ProofOfPossession), msg),
@@ -134,7 +136,7 @@ impl ValidatorSignature for BlsSignature {
     where
         T: Serialize,
     {
-        let message = bcs::to_bytes(&value).expect("Message serialization should not fail");
+        let message = encode(&value);
         secret.sign(&message)
     }
 
@@ -146,7 +148,7 @@ impl ValidatorSignature for BlsSignature {
     where
         T: Serialize,
     {
-        let message = bcs::to_bytes(&value).expect("Message serialization should not fail");
+        let message = encode(&value);
         public_key.verify(&message, self)
     }
 }
@@ -170,7 +172,7 @@ impl ValidatorAggregateSignature for BlsAggregateSignature {
     where
         T: Serialize,
     {
-        let message = bcs::to_bytes(&value).expect("Message serialization should not fail");
+        let message = encode(&value);
         self.verify(pks, &message)
     }
 }
