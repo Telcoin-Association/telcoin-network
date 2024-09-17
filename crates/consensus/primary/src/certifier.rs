@@ -110,10 +110,13 @@ impl<DB: Database> Certifier<DB> {
 
         match core.await {
             Err(err @ DagError::ShuttingDown) => {
-                error!(target: "primary::certifier", ?authority, "{:?}", err)
+                error!(target: "primary::certifier", ?authority, ?err, "core error")
             }
-            Err(err) => panic!("{:?} - {:?}", authority, err),
-            Ok(_) => {}
+            Err(err) => {
+                error!(target: "primary::certifier", ?authority, ?err, "PANIC");
+                panic!("{:?} - {:?}", authority, err)
+            }
+            Ok(_) => info!(target: "primary::certifier", ?authority, "run_inner complete"),
         }
     }
 
