@@ -22,6 +22,7 @@ mod inner;
 mod worker;
 
 use self::inner::ExecutionNodeInner;
+use narwhal_typed_store::traits::Database as ConsensusDatabase;
 use reth_provider::{providers::BlockchainProvider, ExecutionOutcome};
 use reth_tasks::TaskExecutor;
 use tn_block_validator::BlockValidator;
@@ -77,12 +78,13 @@ where
     }
 
     /// Execution engine to produce blocks after consensus.
-    pub async fn start_engine(
+    pub async fn start_engine<PDB: ConsensusDatabase + Unpin>(
         &self,
         from_consensus: broadcast::Receiver<ConsensusOutput>,
+        consensus_persist_db: Option<PDB>,
     ) -> eyre::Result<()> {
         let guard = self.internal.read().await;
-        guard.start_engine(from_consensus).await
+        guard.start_engine(from_consensus, consensus_persist_db).await
     }
 
     /// Batch maker

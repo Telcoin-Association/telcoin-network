@@ -11,7 +11,7 @@ use narwhal_primary::{
 };
 use narwhal_storage::NodeStorage;
 
-use narwhal_typed_store::open_db;
+use narwhal_typed_store::{open_db, DatabaseType, RawDatabaseType};
 use tempfile::TempDir;
 use tn_types::{test_utils::CommitteeFixture, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
 
@@ -27,7 +27,7 @@ async fn test_recovery() {
     let temp_dir = TempDir::new().unwrap();
     let _ = std::fs::create_dir_all(temp_dir.path());
     let db = open_db(temp_dir.path());
-    let storage = NodeStorage::reopen(db);
+    let storage = NodeStorage::<DatabaseType, RawDatabaseType>::reopen(db, None);
 
     let consensus_store = storage.consensus_store;
     let certificate_store = storage.certificate_store;

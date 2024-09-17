@@ -22,7 +22,7 @@ use narwhal_network_types::{
 };
 use narwhal_primary_metrics::{PrimaryChannelMetrics, PrimaryMetrics};
 use narwhal_storage::{CertificateStore, NodeStorage, PayloadStore, VoteDigestStore};
-use narwhal_typed_store::open_db;
+use narwhal_typed_store::{open_db, DatabaseType, RawDatabaseType};
 use narwhal_worker::{
     metrics::{Metrics, WorkerChannelMetrics},
     Worker,
@@ -64,7 +64,7 @@ async fn test_get_network_peers_from_admin_server() {
     let temp_dir = TempDir::new().unwrap();
     let _ = std::fs::create_dir_all(temp_dir.path());
     let db = open_db(temp_dir.path());
-    let store = NodeStorage::reopen(db);
+    let store = NodeStorage::<DatabaseType, RawDatabaseType>::reopen(db, None);
     let client_1 = NetworkClient::new_from_keypair(&authority_1.network_keypair());
 
     let (tx_new_certificates, _rx_new_certificates) = consensus_metrics::metered_channel::channel(

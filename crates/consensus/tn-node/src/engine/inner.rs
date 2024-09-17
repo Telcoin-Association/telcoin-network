@@ -9,6 +9,7 @@ use crate::{
 };
 use consensus_metrics::metered_channel::Sender;
 use jsonrpsee::http_client::HttpClient;
+use narwhal_typed_store::traits::Database as ConsensusDatabase;
 use reth::rpc::{
     builder::{config::RethRpcServerConfig, RpcModuleBuilder, RpcServerHandle},
     eth::EthApi,
@@ -169,9 +170,10 @@ where
     ///
     /// The method is consumed by [PrimaryNodeInner::start].
     /// All tasks are spawned with the [ExecutionNodeInner]'s [TaskManager].
-    pub(super) async fn start_engine(
+    pub(super) async fn start_engine<PDB: ConsensusDatabase + Unpin>(
         &self,
         from_consensus: broadcast::Receiver<ConsensusOutput>,
+        consensus_persist_db: Option<PDB>,
     ) -> eyre::Result<()> {
         let head = self.node_config.lookup_head(self.provider_factory.clone())?;
 
@@ -186,6 +188,7 @@ where
             self.node_config.debug.max_block,
             BroadcastStream::new(from_consensus),
             parent_header,
+            consensus_persist_db,
         );
 
         // spawn tn engine

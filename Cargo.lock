@@ -10826,6 +10826,7 @@ dependencies = [
  "futures",
  "futures-util",
  "narwhal-test-utils",
+ "narwhal-typed-store",
  "reth-blockchain-tree",
  "reth-chainspec",
  "reth-errors",

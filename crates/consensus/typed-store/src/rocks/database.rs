@@ -9,7 +9,8 @@ use crate::{
     rocks::CF_METRICS_REPORT_PERIOD_MILLIS,
     traits::{DBIter, Database, DbTx, DbTxMut, Table},
     BATCHES_CF, CERTIFICATES_CF, CERTIFICATE_DIGEST_BY_ORIGIN_CF, CERTIFICATE_DIGEST_BY_ROUND_CF,
-    COMMITTED_SUB_DAG_INDEX_CF, LAST_COMMITTED_CF, LAST_PROPOSED_CF, PAYLOAD_CF, VOTES_CF,
+    COMMITTED_SUB_DAG_INDEX_CF, LAST_COMMITTED_CF, LAST_PROPOSED_CF, PAYLOAD_CF, SUB_DAG_CF,
+    VOTES_CF,
 };
 use std::{
     fmt::Debug,
@@ -210,6 +211,31 @@ impl RocksDatabase {
             ),
             (LAST_COMMITTED_CF, cf_options.clone()),
             (COMMITTED_SUB_DAG_INDEX_CF, cf_options),
+        ];
+        let rocksdb = open_cf_opts_transactional(
+            path,
+            Some(db_options.options),
+            metrics_conf,
+            &column_family_options,
+        )
+        .expect("Cannot open database");
+        Ok(Self::new(rocksdb, &crate::rocks::ReadWriteOptions::default(), &column_family_options))
+    }
+
+    pub fn open_persist_consensus_db<P: AsRef<Path>>(path: P) -> eyre::Result<RocksDatabase> {
+        let db_options = default_db_options().optimize_db_for_write_throughput(2);
+        let mut metrics_conf = MetricConf::with_db_name("consensus_persist");
+        metrics_conf.read_sample_interval = SamplingInterval::new(Duration::from_secs(60), 0);
+        let cf_options = db_options.options.clone();
+        let column_family_options = vec![
+            (
+                BATCHES_CF,
+                default_db_options()
+                    .optimize_for_write_throughput()
+                    .optimize_for_large_values_no_scan(1 << 10)
+                    .options,
+            ),
+            (SUB_DAG_CF, cf_options),
         ];
         let rocksdb = open_cf_opts_transactional(
             path,

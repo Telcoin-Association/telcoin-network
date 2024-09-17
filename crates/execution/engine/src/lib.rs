@@ -22,6 +22,10 @@ mod payload_builder;
 use error::EngineResult;
 use futures::{Future, StreamExt};
 use futures_util::FutureExt;
+use narwhal_typed_store::{
+    tables::{SubDags, WorkerBlocks},
+    traits::{Database as ConsensusDatabase, DbTxMut},
+};
 pub use payload_builder::execute_consensus_output;
 use reth_blockchain_tree::BlockchainTreeEngine;
 use reth_chainspec::ChainSpec;
@@ -54,7 +58,7 @@ type PendingExecutionTask = oneshot::Receiver<EngineResult<SealedHeader>>;
 /// channel is dropped. If the sending channel is dropped, the engine attempts to execute any
 /// remaining output that is queued up before shutting itself down gracefully. If the maximum round
 /// is reached, the engine shuts down immediately.
-pub struct ExecutorEngine<BT, CE> {
+pub struct ExecutorEngine<BT, CE, PDB> {
     /// The backlog of output from consensus that's ready to be executed.
     queued: VecDeque<ConsensusOutput>,
     /// Single active future that executes consensus output on a blocking thread and then returns
@@ -77,9 +81,12 @@ pub struct ExecutorEngine<BT, CE> {
     ///
     /// This information reflects the current finalized block number and hash.
     parent_header: SealedHeader,
+    /// An optional DB that persists WorkerBlocks and CommittedSubDags for latter
+    /// playback/examination.
+    consensus_persist_db: Option<PDB>,
 }
 
-impl<BT, CE> ExecutorEngine<BT, CE>
+impl<BT, CE, PDB> ExecutorEngine<BT, CE, PDB>
 where
     BT: BlockchainTreeEngine
         + BlockReader
@@ -89,6 +96,7 @@ where
         + ChainSpecProvider
         + 'static,
     CE: ConfigureEvm,
+    PDB: ConsensusDatabase,
 {
     /// Create a new instance of the [`ExecutorEngine`] using the given channel to configure
     /// the [`ConsensusOutput`] communication channel.
@@ -103,6 +111,7 @@ where
         max_round: Option<u64>,
         consensus_output_stream: BroadcastStream<ConsensusOutput>,
         parent_header: SealedHeader,
+        consensus_persist_db: Option<PDB>,
     ) -> Self {
         Self {
             queued: Default::default(),
@@ -112,6 +121,7 @@ where
             max_round,
             consensus_output_stream,
             parent_header,
+            consensus_persist_db,
         }
     }
 
@@ -133,9 +143,32 @@ where
         let parent = self.parent_header.clone();
         let build_args = BuildArguments::new(provider, output, parent);
         let (tx, rx) = oneshot::channel();
+        let consensus_persist_db = self.consensus_persist_db.clone();
 
         // spawn blocking task and return future
         tokio::task::spawn_blocking(|| {
+            let sub_dag = build_args.output.sub_dag.clone();
+            if let Some(pdb) = consensus_persist_db {
+                // If we have a persistant DB for consensus output then save to it.
+                match pdb.write_txn() {
+                    Ok(mut txn) => {
+                        if let Err(e) = txn.insert::<SubDags>(&sub_dag.sub_dag_index, &sub_dag) {
+                            tracing::error!(target: "engine", ?e, "error saving a committed sub dag to persistant storage!")
+                        }
+                        for wb in build_args.output.blocks.iter().flatten() {
+                            if let Err(e) = txn.insert::<WorkerBlocks>(&wb.digest(), wb) {
+                                tracing::error!(target: "engine", ?e, "error saving a worker block to persistant storage!")
+                            }
+                        }
+                        if let Err(e) = txn.commit() {
+                            tracing::error!(target: "engine", ?e, "error saving committing to persistant storage!")
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(target: "engine", ?e, "error getting a transaction on persistant storage!")
+                    }
+                }
+            }
             // this is safe to call on blocking thread without a semaphore bc it's held in
             // Self::pending_tesk as a single `Option`
             let result = execute_consensus_output(evm_config, build_args);
@@ -181,7 +214,7 @@ where
 ///
 /// If the broadcast stream is closed, the engine will attempt to execute all remaining tasks and
 /// any output that is queued.
-impl<BT, CE> Future for ExecutorEngine<BT, CE>
+impl<BT, CE, PDB> Future for ExecutorEngine<BT, CE, PDB>
 where
     BT: BlockchainTreeEngine
         + BlockReader
@@ -194,6 +227,7 @@ where
         + Unpin
         + 'static,
     CE: ConfigureEvm,
+    PDB: ConsensusDatabase + Unpin,
 {
     type Output = EngineResult<()>;
 
@@ -276,7 +310,7 @@ where
     }
 }
 
-impl<BT, CE> std::fmt::Debug for ExecutorEngine<BT, CE> {
+impl<BT, CE, PDB> std::fmt::Debug for ExecutorEngine<BT, CE, PDB> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecutorEngine")
             .field("queued", &self.queued.len())
@@ -293,6 +327,7 @@ mod tests {
 
     use fastcrypto::hash::Hash as _;
     use narwhal_test_utils::default_test_execution_node;
+    use narwhal_typed_store::RawDatabaseType;
     use reth_blockchain_tree::BlockchainTreeViewer;
     use reth_chainspec::ChainSpec;
     use reth_primitives::{
@@ -370,6 +405,7 @@ mod tests {
             max_round,
             consensus_output_stream,
             genesis_header.clone(),
+            Option::<RawDatabaseType>::None,
         );
 
         // send output
@@ -650,6 +686,7 @@ mod tests {
             max_round,
             consensus_output_stream,
             parent,
+            Option::<RawDatabaseType>::None,
         );
 
         // queue the first output - simulate already received from channel
@@ -1002,6 +1039,7 @@ mod tests {
             max_round,
             consensus_output_stream,
             parent,
+            Option::<RawDatabaseType>::None,
         );
 
         // queue the first output - simulate already received from channel
@@ -1329,6 +1367,7 @@ mod tests {
             max_round,
             consensus_output_stream,
             parent,
+            Option::<RawDatabaseType>::None,
         );
 
         // queue both output - simulate already received from channel

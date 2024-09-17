@@ -6,7 +6,7 @@ use engine::{ExecutionNode, TnBuilder};
 use futures::{future::try_join_all, stream::FuturesUnordered};
 use narwhal_network::client::NetworkClient;
 pub use narwhal_storage::NodeStorage;
-use narwhal_typed_store::open_db;
+use narwhal_typed_store::{open_db, open_persist_db};
 use reth_db::{
     database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
@@ -58,7 +58,9 @@ where
     // In case the DB dir does not yet exist.
     let _ = std::fs::create_dir_all(&narwhal_db_path);
     let db = open_db(&narwhal_db_path);
-    let node_storage = NodeStorage::reopen(db);
+    let _ = std::fs::create_dir_all(narwhal_db_path.join("persist"));
+    let pdb = open_persist_db(narwhal_db_path.join("persist"));
+    let node_storage = NodeStorage::reopen(db, Some(pdb));
 
     info!(target: "telcoin::cli", "node storage open");
 

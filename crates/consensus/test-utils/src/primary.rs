@@ -7,7 +7,7 @@ use narwhal_executor::SerializedTransaction;
 use narwhal_network::client::NetworkClient;
 use narwhal_primary::consensus::ConsensusMetrics;
 use narwhal_storage::NodeStorage;
-use narwhal_typed_store::open_db;
+use narwhal_typed_store::{open_db, open_persist_db};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc};
 use tn_node::primary::PrimaryNode;
 use tn_types::{
@@ -103,7 +103,8 @@ impl PrimaryNodeDetails {
         // In case the DB dir does not yet exist.
         let _ = std::fs::create_dir_all(&store_path);
         let db = open_db(&store_path);
-        let primary_store = NodeStorage::reopen(db);
+        let pdb = open_persist_db(store_path.join("persist"));
+        let primary_store = NodeStorage::reopen(db, Some(pdb));
 
         self.node
             .start(

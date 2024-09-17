@@ -16,7 +16,7 @@ use redb::database::ReDB;
 use rocks::database::RocksDatabase;
 use tables::{
     CertificateDigestByOrigin, CertificateDigestByRound, Certificates, CommittedSubDag,
-    LastCommitted, LastProposed, Payload, Votes, WorkerBlocks,
+    LastCommitted, LastProposed, Payload, SubDags, Votes, WorkerBlocks,
 };
 #[cfg(feature = "redb")]
 pub mod redb;
@@ -45,6 +45,7 @@ const PAYLOAD_CF: &str = "payload";
 const BATCHES_CF: &str = "batches";
 const LAST_COMMITTED_CF: &str = "last_committed";
 const COMMITTED_SUB_DAG_INDEX_CF: &str = "committed_sub_dag";
+const SUB_DAG_CF: &str = "sub_dag";
 
 macro_rules! tables {
     ( $($table:ident;$name:expr;<$K:ty, $V:ty>),*) => {
@@ -64,8 +65,8 @@ macro_rules! tables {
 pub mod tables {
     use super::{PayloadToken, ProposerKey};
     use tn_types::{
-        AuthorityIdentifier, BlockHash, Certificate, CertificateDigest, ConsensusCommit, Header,
-        Round, SequenceNumber, VoteInfo, WorkerBlock, WorkerId,
+        AuthorityIdentifier, BlockHash, Certificate, CertificateDigest, CommittedSubDag as SubDag,
+        ConsensusCommit, Header, Round, SequenceNumber, VoteInfo, WorkerBlock, WorkerId,
     };
 
     tables!(
@@ -77,18 +78,21 @@ pub mod tables {
         Payload;crate::PAYLOAD_CF;<(BlockHash, WorkerId), PayloadToken>,
         WorkerBlocks;crate::BATCHES_CF;<BlockHash, WorkerBlock>,
         LastCommitted;crate::LAST_COMMITTED_CF;<AuthorityIdentifier, Round>,
-        CommittedSubDag;crate::COMMITTED_SUB_DAG_INDEX_CF;<SequenceNumber, ConsensusCommit>
+        CommittedSubDag;crate::COMMITTED_SUB_DAG_INDEX_CF;<SequenceNumber, ConsensusCommit>,
+        SubDags;crate::SUB_DAG_CF;<SequenceNumber, SubDag>
     );
 }
 
 // mdbx is  the default, if redb is set then is used and otherwise if rocksdb is set it is used (so
 // proirity is mdbx -> redb -> rocks)
 #[cfg(all(feature = "reth-libmdbx", not(feature = "redb"), not(feature = "rocksdb")))]
-pub type DatabaseType = LayeredDatabase<MdbxDatabase>;
+pub type RawDatabaseType = MdbxDatabase;
 #[cfg(all(feature = "rocksdb", not(feature = "redb")))]
-pub type DatabaseType = LayeredDatabase<RocksDatabase>;
+pub type RawDatabaseType = RocksDatabase;
 #[cfg(feature = "redb")]
-pub type DatabaseType = LayeredDatabase<ReDB>;
+pub type RawDatabaseType = ReDB;
+
+pub type DatabaseType = LayeredDatabase<RawDatabaseType>;
 
 /// Open the configured DB with the required tables.
 /// This will return a concrete type for the currently configured Database.
@@ -102,6 +106,24 @@ pub fn open_db<Path: AsRef<std::path::Path> + Send>(store_path: Path) -> Databas
     return _open_rocks(store_path);
     #[cfg(feature = "redb")]
     return _open_redb(store_path);
+    panic!("No DB configured!")
+}
+
+/// Open the configured DB with the required tables.
+///
+/// This will return a concrete type for the currently configured Database.
+/// This returns an non-layerd DB that is intended to store consesus output for later
+/// playback/review.
+#[allow(unreachable_code)] // Need this so it compiles cleanly with or either redb or rocks.
+pub fn open_persist_db<Path: AsRef<std::path::Path> + Send>(store_path: Path) -> RawDatabaseType {
+    // Open the right DB based on feature flags.  The default is ReDB unless the rocksdb flag is
+    // set.
+    #[cfg(all(feature = "reth-libmdbx", not(feature = "redb"), not(feature = "rocksdb")))]
+    return _open_persist_mdbx(store_path);
+    #[cfg(all(feature = "rocksdb", not(feature = "redb")))]
+    return _open_persist_rocks(store_path);
+    #[cfg(feature = "redb")]
+    return _open_persist_redb(store_path);
     panic!("No DB configured!")
 }
 
@@ -134,6 +156,15 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db
 }
 
+/// Open or reopen all the storage of the node backed by MDBX (no memory layer).
+#[cfg(feature = "reth-libmdbx")]
+fn _open_persist_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> MdbxDatabase {
+    let db = MdbxDatabase::open(store_path).expect("Cannot open database");
+    db.open_table::<WorkerBlocks>().expect("failed to open table!");
+    db.open_table::<SubDags>().expect("failed to open table!");
+    db
+}
+
 /// Open or reopen all the storage of the node backed by rocks DB.
 #[cfg(feature = "rocksdb")]
 fn _open_rocks<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabase<RocksDatabase> {
@@ -149,6 +180,12 @@ fn _open_rocks<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDataba
     db.open_table::<LastCommitted>();
     db.open_table::<CommittedSubDag>();
     db
+}
+
+/// Open or reopen all the storage of the node backed by rocks DB.
+#[cfg(feature = "rocksdb")]
+fn _open_persist_rocks<P: AsRef<std::path::Path> + Send>(store_path: P) -> RocksDatabase {
+    RocksDatabase::open_persist_consensus_db(store_path).expect("Can not open database.")
 }
 
 /// Open or reopen all the storage of the node backed by ReDB.
@@ -175,6 +212,15 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<WorkerBlocks>();
     db.open_table::<LastCommitted>();
     db.open_table::<CommittedSubDag>();
+    db
+}
+
+/// Open or reopen all the storage of the node backed by ReDB.
+#[cfg(feature = "redb")]
+fn _open_persist_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> ReDB {
+    let db = ReDB::open(store_path).expect("Cannot open database");
+    db.open_table::<WorkerBlocks>().expect("failed to open table!");
+    db.open_table::<SubDags>().expect("failed to open table!");
     db
 }
 

@@ -68,7 +68,7 @@ impl PrimaryNodeInner {
     /// method will return an error instead.
     #[allow(clippy::too_many_arguments)]
     #[instrument(name = "primary_node", skip_all)]
-    async fn start<DB, Evm, CE, CDB>(
+    async fn start<DB, Evm, CE, CDB, PCDB>(
         &mut self,
         // The private-public key pair of this authority.
         keypair: BlsKeypair,
@@ -83,7 +83,7 @@ impl PrimaryNodeInner {
         client: NetworkClient,
         // The node's store
         // TODO: replace this by a path so the method can open independent storage
-        store: &NodeStorage<CDB>,
+        store: &NodeStorage<CDB, PCDB>,
         // // The state used by the client to execute transactions.
         // execution_state: State,
 
@@ -95,6 +95,7 @@ impl PrimaryNodeInner {
         Evm: BlockExecutorProvider + Clone + 'static,
         CE: ConfigureEvm,
         CDB: ConsensusDatabase,
+        PCDB: ConsensusDatabase + Unpin,
     {
         if self.is_running().await {
             return Err(NodeError::NodeAlreadyRunning.into());
@@ -135,7 +136,9 @@ impl PrimaryNodeInner {
             .await?;
 
         // start engine
-        execution_components.start_engine(consensus_output_rx).await?;
+        execution_components
+            .start_engine(consensus_output_rx, store.consensus_persist_store.clone())
+            .await?;
 
         // now keep the handlers
         self.handles.clear();
@@ -189,7 +192,7 @@ impl PrimaryNodeInner {
     /// Spawn a new primary. Optionally also spawn the consensus and a client executing
     /// transactions.
     #[allow(clippy::too_many_arguments)]
-    pub async fn spawn_primary<CDB: ConsensusDatabase>(
+    pub async fn spawn_primary<CDB: ConsensusDatabase, PCDB: ConsensusDatabase>(
         &self,
         // The private-public key pair of this authority.
         keypair: BlsKeypair,
@@ -202,7 +205,7 @@ impl PrimaryNodeInner {
         // Client for communications.
         client: NetworkClient,
         // The node's storage.
-        store: &NodeStorage<CDB>,
+        store: &NodeStorage<CDB, PCDB>,
         chain: ChainIdentifier,
         // // The state used by the client to execute transactions.
         // execution_state: State,
@@ -296,13 +299,13 @@ where
     /// TODO: Executor metrics is needed to create the metered channel. This
     /// could be done a better way, but bigger priorities right now.
     #[allow(clippy::too_many_arguments)]
-    async fn spawn_consensus<CDB: ConsensusDatabase>(
+    async fn spawn_consensus<CDB: ConsensusDatabase, PCDB: ConsensusDatabase>(
         &self,
         authority_id: AuthorityIdentifier,
         worker_cache: WorkerCache,
         committee: Committee,
         client: NetworkClient,
-        store: &NodeStorage<CDB>,
+        store: &NodeStorage<CDB, PCDB>,
         mut shutdown_receivers: Vec<ConditionalBroadcastReceiver>,
         rx_new_certificates: metered_channel::Receiver<Certificate>,
         tx_committed_certificates: metered_channel::Sender<(Round, Vec<Certificate>)>,
@@ -443,7 +446,7 @@ impl PrimaryNode {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn start<DB, Evm, CE, CDB>(
+    pub async fn start<DB, Evm, CE, CDB, PCDB>(
         &self,
         // The private-public key pair of this authority.
         keypair: BlsKeypair,
@@ -458,7 +461,7 @@ impl PrimaryNode {
         client: NetworkClient,
         // The node's store
         // TODO: replace this by a path so the method can open and independent storage
-        store: &NodeStorage<CDB>,
+        store: &NodeStorage<CDB, PCDB>,
         // // The state used by the client to execute transactions.
         // execution_state: State,
         // Execution components needed to spawn the EL Executor
@@ -469,6 +472,7 @@ impl PrimaryNode {
         Evm: BlockExecutorProvider + Clone + 'static,
         CE: ConfigureEvm,
         CDB: ConsensusDatabase,
+        PCDB: ConsensusDatabase + Unpin,
     {
         let mut guard = self.internal.write().await;
         guard.client = Some(client.clone());

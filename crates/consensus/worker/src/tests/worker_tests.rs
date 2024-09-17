@@ -12,7 +12,7 @@ use narwhal_primary::{
 };
 use narwhal_storage::NodeStorage;
 
-use narwhal_typed_store::open_db;
+use narwhal_typed_store::{open_db, DatabaseType, RawDatabaseType};
 use prometheus::Registry;
 use tempfile::TempDir;
 use tn_block_validator::NoopBlockValidator;
@@ -345,7 +345,7 @@ async fn get_network_peers_from_admin_server() {
     let temp_dir = TempDir::new().unwrap();
     let _ = std::fs::create_dir_all(temp_dir.path());
     let db = open_db(temp_dir.path());
-    let store = NodeStorage::reopen(db);
+    let store = NodeStorage::<DatabaseType, RawDatabaseType>::reopen(db, None);
 
     let (tx_new_certificates, _rx_new_certificates) =
         tn_types::test_new_certificates_channel!(CHANNEL_CAPACITY);

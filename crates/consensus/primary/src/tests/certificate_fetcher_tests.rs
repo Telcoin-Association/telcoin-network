@@ -18,7 +18,7 @@ use narwhal_network_types::{
 };
 use narwhal_primary_metrics::{PrimaryChannelMetrics, PrimaryMetrics};
 use narwhal_storage::{CertificateStore, NodeStorage};
-use narwhal_typed_store::{open_db, traits::Database};
+use narwhal_typed_store::{open_db, traits::Database, DatabaseType, RawDatabaseType};
 use once_cell::sync::OnceCell;
 use reth_tracing::init_test_tracing;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
@@ -185,7 +185,7 @@ async fn fetch_certificates_v1_basic() {
     let temp_dir = TempDir::new().unwrap();
     let _ = std::fs::create_dir_all(temp_dir.path());
     let db = open_db(temp_dir.path());
-    let store = NodeStorage::reopen(db);
+    let store = NodeStorage::<DatabaseType, RawDatabaseType>::reopen(db, None);
     let certificate_store = store.certificate_store.clone();
     let payload_store = store.payload_store.clone();
 

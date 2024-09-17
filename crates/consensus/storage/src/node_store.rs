@@ -15,18 +15,19 @@ pub use narwhal_typed_store::PayloadToken;
 
 /// All the data stores of the node.
 #[derive(Clone)]
-pub struct NodeStorage<DB> {
+pub struct NodeStorage<DB, PDB> {
     pub proposer_store: ProposerStore<DB>,
     pub vote_digest_store: VoteDigestStore<DB>,
     pub certificate_store: CertificateStore<DB>,
     pub payload_store: PayloadStore<DB>,
     pub batch_store: DB,
     pub consensus_store: Arc<ConsensusStore<DB>>,
+    pub consensus_persist_store: Option<PDB>,
 }
 
-impl<DB: Database> NodeStorage<DB> {
+impl<DB: Database, PDB: Database> NodeStorage<DB, PDB> {
     /// Open or reopen all the storage of the node.
-    pub fn reopen(db: DB) -> NodeStorage<DB> {
+    pub fn reopen(db: DB, consensus_persist_store: Option<PDB>) -> NodeStorage<DB, PDB> {
         let proposer_store = ProposerStore::new(db.clone());
         let vote_digest_store = VoteDigestStore::new(db.clone());
 
@@ -42,6 +43,7 @@ impl<DB: Database> NodeStorage<DB> {
             payload_store,
             batch_store,
             consensus_store,
+            consensus_persist_store,
         }
     }
 }

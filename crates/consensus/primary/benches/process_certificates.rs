@@ -10,7 +10,7 @@ use narwhal_primary::consensus::{
     Bullshark, ConsensusMetrics, ConsensusState, LeaderSchedule, LeaderSwapTable,
 };
 use narwhal_storage::NodeStorage;
-use narwhal_typed_store::open_db;
+use narwhal_typed_store::{open_db, RawDatabaseType};
 use std::{collections::BTreeSet, sync::Arc};
 use tn_types::{
     encode,
@@ -43,7 +43,7 @@ pub fn process_certificates(c: &mut Criterion) {
         // In case the DB dir does not yet exist.
         let _ = std::fs::create_dir_all(&store_path);
         let db = open_db(store_path);
-        let store = NodeStorage::reopen(db);
+        let store = NodeStorage::reopen(db, Option::<RawDatabaseType>::None);
         let metrics = Arc::new(ConsensusMetrics::default());
 
         let mut state = ConsensusState::new(metrics.clone(), gc_depth);
