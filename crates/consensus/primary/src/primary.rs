@@ -39,30 +39,15 @@ use narwhal_network::{
 use narwhal_primary_metrics::Metrics;
 use narwhal_storage::{CertificateStore, PayloadStore, ProposerStore, VoteDigestStore};
 use narwhal_typed_store::traits::Database;
-use std::{
-    collections::HashMap,
-    net::Ipv4Addr,
-    sync::Arc,
-    thread::sleep,
-    time::Duration,
-};
+use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, thread::sleep, time::Duration};
 use tn_types::{
-    traits::EncodeDecodeBase64, Authority, BlsKeypair,
-    ChainIdentifier, Committee, Multiaddr, NetworkKeypair, NetworkPublicKey, Parameters, Protocol,
-    RandomnessPrivateKey, WorkerCache,
+    traits::EncodeDecodeBase64, Authority, BlsKeypair, ChainIdentifier, Committee, Multiaddr,
+    NetworkKeypair, NetworkPublicKey, Parameters, Protocol, RandomnessPrivateKey, WorkerCache,
 };
 
-use narwhal_network_types::{
-    PrimaryToPrimaryServer, WorkerToPrimaryServer,
-};
-use tn_types::{
-    Certificate,
-    PreSubscribedBroadcastSender, Round,
-};
-use tokio::{
-    sync::watch,
-    task::JoinHandle,
-};
+use narwhal_network_types::{PrimaryToPrimaryServer, WorkerToPrimaryServer};
+use tn_types::{Certificate, PreSubscribedBroadcastSender, Round};
+use tokio::{sync::watch, task::JoinHandle};
 use tower::ServiceBuilder;
 use tracing::{error, info};
 
