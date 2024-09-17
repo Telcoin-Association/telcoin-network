@@ -30,7 +30,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
     time::{sleep, timeout, Instant},
 };
-use tracing::{debug, error, instrument, trace, warn};
+use tracing::{debug, error, instrument, trace};
 
 #[cfg(test)]
 #[path = "tests/certificate_fetcher_tests.rs"]

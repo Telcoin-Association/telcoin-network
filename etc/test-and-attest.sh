@@ -66,14 +66,10 @@ if [ -n "$MODIFIED_TRACKED_FILES" ]; then
 fi
 
 #
-# run tests
-#
-# default features
-cargo test --workspace --no-fail-fast -- --show-output
-# faucet it test
-cargo test -p telcoin-network --test it --features faucet --no-fail-fast -- --show-output
+# check cargo fmt first
+cargo +nightly fmt -- --check
 
-echo "default tests and specific faucet it test passing"
+echo "fmt passed"
 
 #
 # check clippy
@@ -85,10 +81,15 @@ cargo +nightly clippy --workspace --all-features -- -D warnings
 
 echo "clippy for workspace: default and all features passed"
 
-# Step 5: Check cargo fmt
-cargo +nightly fmt -- --check
+#
+# run tests
+#
+# default features
+cargo test --workspace --no-fail-fast -- --show-output
+# faucet it test
+cargo test -p telcoin-network --test it --features faucet --no-fail-fast -- --show-output
 
-echo "fmt passed"
+echo "default tests and specific faucet it test passing"
 
 #
 # If we've reached this point, all checks have passed
