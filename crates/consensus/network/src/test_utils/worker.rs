@@ -1,3 +1,5 @@
+//! Mock implementations for Worker to Primary/Worker.
+use anemo::async_trait;
 use narwhal_network_types::{
     RequestBlocksRequest, RequestBlocksResponse, WorkerBlockMessage, WorkerToWorker,
     WorkerToWorkerServer,
@@ -30,6 +32,7 @@ impl WorkerToWorkerMockServer {
     }
 }
 
+#[async_trait]
 impl WorkerToWorker for WorkerToWorkerMockServer {
     async fn report_block(
         &self,

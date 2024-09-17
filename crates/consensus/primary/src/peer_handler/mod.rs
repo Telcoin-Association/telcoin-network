@@ -7,11 +7,12 @@
 //!
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
-use crate::synchronizer::Synchronizer;
+use crate::{proposer::OurDigestMessage, synchronizer::Synchronizer};
+use consensus_metrics::metered_channel::Sender;
 use fastcrypto::{hash::Hash, signature_service::SignatureService};
 use narwhal_network_types::{RequestVoteRequest, RequestVoteResponse};
 use narwhal_primary_metrics::PrimaryMetrics;
-use narwhal_storage::{CertificateStore, VoteDigestStore};
+use narwhal_storage::{CertificateStore, PayloadStore, VoteDigestStore};
 use narwhal_typed_store::traits::Database;
 use parking_lot::Mutex;
 use std::{
@@ -32,6 +33,20 @@ use tracing::{debug, error, warn};
 
 mod primary;
 mod worker;
+
+/// Defines how the network receiver handles incoming workers messages.
+#[derive(Clone)]
+pub(super) struct WorkerReceiverHandler<DB> {
+    tx_our_digests: Sender<OurDigestMessage>,
+    payload_store: PayloadStore<DB>,
+}
+
+impl<DB: Database> WorkerReceiverHandler<DB> {
+    /// Create a new instance of Self.
+    pub fn new(tx_our_digests: Sender<OurDigestMessage>, payload_store: PayloadStore<DB>) -> Self {
+        Self { tx_our_digests, payload_store }
+    }
+}
 
 /// Defines how the network receiver handles incoming primary messages.
 #[derive(Clone)]
@@ -58,6 +73,34 @@ pub(super) struct PrimaryReceiverHandler<DB> {
 
 #[allow(clippy::result_large_err)]
 impl<DB: Database> PrimaryReceiverHandler<DB> {
+    /// Create a new instance of Self.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        authority_id: AuthorityIdentifier,
+        committee: Committee,
+        worker_cache: WorkerCache,
+        synchronizer: Arc<Synchronizer<DB>>,
+        signature_service: SignatureService<BlsSignature, { tn_types::INTENT_MESSAGE_LENGTH }>,
+        certificate_store: CertificateStore<DB>,
+        vote_digest_store: VoteDigestStore<DB>,
+        rx_narwhal_round_updates: watch::Receiver<Round>,
+        parent_digests: Arc<Mutex<BTreeMap<(Round, CertificateDigest), AuthorityIdentifier>>>,
+        metrics: Arc<PrimaryMetrics>,
+    ) -> Self {
+        Self {
+            authority_id,
+            committee,
+            worker_cache,
+            synchronizer,
+            signature_service,
+            certificate_store,
+            vote_digest_store,
+            rx_narwhal_round_updates,
+            parent_digests,
+            metrics,
+        }
+    }
+
     fn find_next_round(
         &self,
         origin: AuthorityIdentifier,

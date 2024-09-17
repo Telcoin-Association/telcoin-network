@@ -1,3 +1,36 @@
+// Copyright (c) Telcoin, LLC
+// Copyright (c) 2021, Facebook, Inc. and its affiliates
+// Copyright (c) Mysten Labs, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Primary Receiver Handler is the entrypoint for peer network requests.
+//!
+//! This module includes implementations for when the primary receives network
+//! requests from it's own workers and other primaries.
+
+use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
+    time::{Duration, Instant},
+};
+
+use anemo::{async_trait, types::response::StatusCode};
+use consensus_metrics::monitored_scope;
+use narwhal_network_types::{
+    FetchCertificatesRequest, FetchCertificatesResponse, PrimaryToPrimary, RequestVoteRequest,
+    RequestVoteResponse, SendCertificateRequest, SendCertificateResponse,
+};
+use narwhal_typed_store::traits::Database;
+use tn_types::{error::DagError, validate_received_certificate_version};
+use tracing::{debug, instrument, warn};
+
+use super::PrimaryReceiverHandler;
+
+/// Maximum duration to fetch certificates from local storage.
+const FETCH_CERTIFICATES_MAX_HANDLER_TIME: Duration = Duration::from_secs(10);
+
+// TODO: anemo still uses async_trait
+#[async_trait]
 impl<DB: Database> PrimaryToPrimary for PrimaryReceiverHandler<DB> {
     async fn send_certificate(
         &self,
@@ -47,7 +80,7 @@ impl<DB: Database> PrimaryToPrimary for PrimaryReceiverHandler<DB> {
         })
     }
 
-    #[instrument(level = "debug", skip_all, peer = ?request.peer_id())]
+    #[instrument(level = "debug", skip_all, fields(peer = ?request.peer_id()))]
     async fn fetch_certificates(
         &self,
         request: anemo::Request<FetchCertificatesRequest>,

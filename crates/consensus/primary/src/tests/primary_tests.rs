@@ -334,18 +334,18 @@ async fn test_request_vote_has_missing_parents() {
         metrics.clone(),
         &primary_channel_metrics,
     ));
-    let handler = PrimaryReceiverHandler {
-        authority_id: target_id,
-        committee: fixture.committee(),
-        worker_cache: worker_cache.clone(),
-        synchronizer: synchronizer.clone(),
+    let handler = PrimaryReceiverHandler::new(
+        target_id,
+        fixture.committee(),
+        worker_cache.clone(),
+        synchronizer.clone(),
         signature_service,
-        certificate_store: certificate_store.clone(),
+        certificate_store.clone(),
         vote_digest_store,
         rx_narwhal_round_updates,
-        parent_digests: Default::default(),
-        metrics: metrics.clone(),
-    };
+        Default::default(),
+        metrics.clone(),
+    );
 
     // Make some mock certificates that are parents of our new header.
     let committee: Committee = fixture.committee();
@@ -483,18 +483,18 @@ async fn test_request_vote_accept_missing_parents() {
         metrics.clone(),
         &primary_channel_metrics,
     ));
-    let handler = PrimaryReceiverHandler {
-        authority_id: target_id,
-        committee: fixture.committee(),
-        worker_cache: worker_cache.clone(),
-        synchronizer: synchronizer.clone(),
+    let handler = PrimaryReceiverHandler::new(
+        target_id,
+        fixture.committee(),
+        worker_cache.clone(),
+        synchronizer.clone(),
         signature_service,
-        certificate_store: certificate_store.clone(),
+        certificate_store.clone(),
         vote_digest_store,
         rx_narwhal_round_updates,
-        parent_digests: Default::default(),
-        metrics: metrics.clone(),
-    };
+        Default::default(),
+        metrics.clone(),
+    );
 
     // Make some mock certificates that are parents of our new header.
     let committee: Committee = fixture.committee();
@@ -614,18 +614,18 @@ async fn test_request_vote_missing_batches() {
         metrics.clone(),
         &primary_channel_metrics,
     ));
-    let handler = PrimaryReceiverHandler {
+    let handler = PrimaryReceiverHandler::new(
         authority_id,
-        committee: fixture.committee(),
-        worker_cache: worker_cache.clone(),
-        synchronizer: synchronizer.clone(),
+        fixture.committee(),
+        worker_cache.clone(),
+        synchronizer.clone(),
         signature_service,
-        certificate_store: certificate_store.clone(),
+        certificate_store.clone(),
         vote_digest_store,
         rx_narwhal_round_updates,
-        parent_digests: Default::default(),
-        metrics: metrics.clone(),
-    };
+        Default::default(),
+        metrics.clone(),
+    );
 
     // Make some mock certificates that are parents of our new header.
     let mut certificates = HashMap::new();
@@ -735,18 +735,18 @@ async fn test_request_vote_already_voted() {
         &primary_channel_metrics,
     ));
 
-    let handler = PrimaryReceiverHandler {
-        authority_id: id,
-        committee: fixture.committee(),
-        worker_cache: worker_cache.clone(),
-        synchronizer: synchronizer.clone(),
+    let handler = PrimaryReceiverHandler::new(
+        id,
+        fixture.committee(),
+        worker_cache.clone(),
+        synchronizer.clone(),
         signature_service,
-        certificate_store: certificate_store.clone(),
+        certificate_store.clone(),
         vote_digest_store,
         rx_narwhal_round_updates,
-        parent_digests: Default::default(),
-        metrics: metrics.clone(),
-    };
+        Default::default(),
+        metrics.clone(),
+    );
 
     // Make some mock certificates that are parents of our new header.
     let mut certificates = HashMap::new();
@@ -890,18 +890,18 @@ async fn test_fetch_certificates_handler() {
         metrics.clone(),
         &primary_channel_metrics,
     ));
-    let handler = PrimaryReceiverHandler {
-        authority_id: id,
-        committee: fixture.committee(),
-        worker_cache: worker_cache.clone(),
-        synchronizer: synchronizer.clone(),
+    let handler = PrimaryReceiverHandler::new(
+        id,
+        fixture.committee(),
+        worker_cache.clone(),
+        synchronizer.clone(),
         signature_service,
-        certificate_store: certificate_store.clone(),
+        certificate_store.clone(),
         vote_digest_store,
         rx_narwhal_round_updates,
-        parent_digests: Default::default(),
-        metrics: metrics.clone(),
-    };
+        Default::default(),
+        metrics.clone(),
+    );
 
     let mut current_round: Vec<_> = Certificate::genesis(&fixture.committee())
         .into_iter()
@@ -1041,18 +1041,18 @@ async fn test_request_vote_created_at_in_future() {
         metrics.clone(),
         &primary_channel_metrics,
     ));
-    let handler = PrimaryReceiverHandler {
-        authority_id: id,
-        committee: fixture.committee(),
-        worker_cache: worker_cache.clone(),
-        synchronizer: synchronizer.clone(),
+    let handler = PrimaryReceiverHandler::new(
+        id,
+        fixture.committee(),
+        worker_cache.clone(),
+        synchronizer.clone(),
         signature_service,
-        certificate_store: certificate_store.clone(),
+        certificate_store.clone(),
         vote_digest_store,
         rx_narwhal_round_updates,
-        parent_digests: Default::default(),
-        metrics: metrics.clone(),
-    };
+        Default::default(),
+        metrics.clone(),
+    );
 
     // Make some mock certificates that are parents of our new header.
     let mut certificates = HashMap::new();

@@ -7,14 +7,14 @@ use crate::{
     certificate_fetcher::CertificateFetcher,
     certifier::Certifier,
     consensus::{ConsensusRound, LeaderSchedule},
-    peer_handler::PrimaryReceiverHandler,
-    proposer::{OurDigestMessage, Proposer},
+    peer_handler::{PrimaryReceiverHandler, WorkerReceiverHandler},
+    proposer::Proposer,
     state_handler::StateHandler,
     synchronizer::Synchronizer,
 };
 use anemo::{
     codegen::InboundRequestLayer,
-    types::{response::StatusCode, Address, PeerInfo},
+    types::{Address, PeerInfo},
     Network, PeerId,
 };
 use anemo_tower::{
@@ -24,13 +24,8 @@ use anemo_tower::{
     set_header::{SetRequestHeaderLayer, SetResponseHeaderLayer},
     trace::{DefaultMakeSpan, DefaultOnFailure, TraceLayer},
 };
-use async_trait::async_trait;
-use consensus_metrics::{
-    metered_channel::{channel_with_total, Receiver, Sender},
-    monitored_scope,
-};
+use consensus_metrics::metered_channel::{channel_with_total, Receiver, Sender};
 use fastcrypto::{
-    hash::Hash,
     serde_helpers::ToFromByteArray,
     signature_service::SignatureService,
     traits::{KeyPair as _, ToFromBytes},
@@ -41,41 +36,35 @@ use narwhal_network::{
     failpoints::FailpointsMakeCallbackHandler,
     metrics::MetricsMakeCallbackHandler,
 };
-use narwhal_primary_metrics::{Metrics, PrimaryMetrics};
+use narwhal_primary_metrics::Metrics;
 use narwhal_storage::{CertificateStore, PayloadStore, ProposerStore, VoteDigestStore};
 use narwhal_typed_store::traits::Database;
 use std::{
-    cmp::Reverse,
-    collections::{btree_map::Entry, BTreeMap, BTreeSet, BinaryHeap, HashMap},
+    collections::HashMap,
     net::Ipv4Addr,
     sync::Arc,
     thread::sleep,
     time::Duration,
 };
 use tn_types::{
-    traits::EncodeDecodeBase64, Authority, AuthorityIdentifier, BlsKeypair, BlsSignature,
+    traits::EncodeDecodeBase64, Authority, BlsKeypair,
     ChainIdentifier, Committee, Multiaddr, NetworkKeypair, NetworkPublicKey, Parameters, Protocol,
     RandomnessPrivateKey, WorkerCache,
 };
 
 use narwhal_network_types::{
-    FetchCertificatesRequest, FetchCertificatesResponse, PrimaryToPrimary, PrimaryToPrimaryServer,
-    RequestVoteRequest, RequestVoteResponse, SendCertificateRequest, SendCertificateResponse,
-    WorkerOthersBlockMessage, WorkerOwnBlockMessage, WorkerToPrimary, WorkerToPrimaryServer,
+    PrimaryToPrimaryServer, WorkerToPrimaryServer,
 };
 use tn_types::{
-    ensure,
-    error::{DagError, DagResult},
-    now, validate_received_certificate_version, Certificate, CertificateDigest, Header,
-    PreSubscribedBroadcastSender, Round, Vote,
+    Certificate,
+    PreSubscribedBroadcastSender, Round,
 };
 use tokio::{
-    sync::{oneshot, watch},
+    sync::watch,
     task::JoinHandle,
-    time::Instant,
 };
 use tower::ServiceBuilder;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, info};
 
 #[cfg(test)]
 #[path = "tests/primary_tests.rs"]
@@ -86,9 +75,6 @@ pub const CHANNEL_CAPACITY: usize = 10_000;
 
 /// The number of shutdown receivers to create on startup. We need one per component loop.
 pub const NUM_SHUTDOWN_RECEIVERS: u64 = 27;
-
-/// Maximum duration to fetch certificates from local storage.
-const FETCH_CERTIFICATES_MAX_HANDLER_TIME: Duration = Duration::from_secs(10);
 
 pub struct Primary;
 
@@ -187,18 +173,18 @@ impl Primary {
         let address = authority.primary_network_address();
         let address =
             address.replace(0, |_protocol| Some(Protocol::Ip4(Ipv4Addr::UNSPECIFIED))).unwrap();
-        let mut primary_service = PrimaryToPrimaryServer::new(PrimaryReceiverHandler {
-            authority_id: authority.id(),
-            committee: committee.clone(),
-            worker_cache: worker_cache.clone(),
-            synchronizer: synchronizer.clone(),
-            signature_service: signature_service.clone(),
-            certificate_store: certificate_store.clone(),
+        let mut primary_service = PrimaryToPrimaryServer::new(PrimaryReceiverHandler::new(
+            authority.id(),
+            committee.clone(),
+            worker_cache.clone(),
+            synchronizer.clone(),
+            signature_service.clone(),
+            certificate_store.clone(),
             vote_digest_store,
             rx_narwhal_round_updates,
-            parent_digests: Default::default(),
-            metrics: metrics.node_metrics.clone(),
-        })
+            Default::default(),
+            metrics.node_metrics.clone(),
+        ))
         // Allow only one inflight RequestVote RPC at a time per peer.
         // This is required for correctness.
         .add_layer_for_request_vote(InboundRequestLayer::new(
@@ -220,7 +206,7 @@ impl Primary {
             );
         }
 
-        let worker_receiver_handler = WorkerReceiverHandler { tx_our_digests, payload_store };
+        let worker_receiver_handler = WorkerReceiverHandler::new(tx_our_digests, payload_store);
 
         client.set_worker_to_primary_local_handler(Arc::new(worker_receiver_handler.clone()));
 

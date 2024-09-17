@@ -1,10 +1,24 @@
-/// Defines how the network receiver handles incoming workers messages.
-#[derive(Clone)]
-struct WorkerReceiverHandler<DB> {
-    tx_our_digests: Sender<OurDigestMessage>,
-    payload_store: PayloadStore<DB>,
-}
+// Copyright (c) Telcoin, LLC
+// Copyright (c) 2021, Facebook, Inc. and its affiliates
+// Copyright (c) Mysten Labs, Inc.
+// SPDX-License-Identifier: Apache-2.0
 
+//! Primary Receiver Handler is the entrypoint for peer network requests.
+//!
+//! This module includes implementations for when the primary receives network
+//! requests from it's own workers and other primaries.
+
+use anemo::async_trait;
+use narwhal_network_types::{WorkerOthersBlockMessage, WorkerOwnBlockMessage, WorkerToPrimary};
+use narwhal_typed_store::traits::Database;
+use tokio::sync::oneshot;
+
+use crate::proposer::OurDigestMessage;
+
+use super::WorkerReceiverHandler;
+
+// TODO: anemo still uses async_trait
+#[async_trait]
 impl<DB: Database> WorkerToPrimary for WorkerReceiverHandler<DB> {
     async fn report_own_block(
         &self,
