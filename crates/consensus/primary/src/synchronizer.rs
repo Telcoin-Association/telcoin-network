@@ -401,7 +401,9 @@ impl<DB: Database> Synchronizer<DB> {
                         inner_proposer.append_certificate_in_aggregator(certificate).await
                     {
                         debug!(
-                            "Failed to recover certificate, assuming Narwhal is shutting down. {e}"
+                            target: "primary::synchronizer",
+                            ?e,
+                            "failed to recover certificate for aggregator - shutting down"
                         );
                         return;
                     }
@@ -427,30 +429,29 @@ impl<DB: Database> Synchronizer<DB> {
                         // definitely be started. For other reasons of
                         // timing out, there is no harm to start fetching either.
                         let Some(inner) = weak_inner.upgrade() else {
-                            debug!("Synchronizer is shutting down.");
+                            error!(target: "primary::synchronizer", "failed to upgrade weak pointer while re-fetching rx_consensus_round_updates - shutting down");
                             return;
                         };
-                        if inner
-                            .tx_certificate_fetcher
-                            .send(CertificateFetcherCommand::Kick)
-                            .await
-                            .is_err()
+                        if let Err(e) =
+                            inner.tx_certificate_fetcher.send(CertificateFetcherCommand::Kick).await
                         {
-                            debug!("Synchronizer is shutting down.");
+                            error!(target: "primary::synchronizer", ?e, "failed to send on tx_certificate_fetcher");
                             return;
                         }
                         inner.metrics.synchronizer_gc_timeout.inc();
-                        warn!("No consensus commit happened for {:?}, triggering certificate fetching.", FETCH_TRIGGER_TIMEOUT);
+                        warn!(target: "primary::synchronizer", "No consensus commit happened for {:?}, triggering certificate fetching.", FETCH_TRIGGER_TIMEOUT);
                         continue;
                     };
-                    if result.is_err() {
-                        debug!("Synchronizer is shutting down.");
+
+                    if let Err(e) = result {
+                        error!(target: "primary::synchronizer", ?e, "failed to received rx_consensus_round_updates - shutting down...");
                         return;
                     }
+
                     let _scope = monitored_scope("Synchronizer::gc_iteration");
                     let gc_round = rx_consensus_round_updates.borrow().gc_round;
                     let Some(inner) = weak_inner.upgrade() else {
-                        debug!("Synchronizer is shutting down.");
+                        error!(target: "primary::synchronizer", "failed to upgrade weak pointer after fetching rx_consensus_round_updates - shutting down");
                         return;
                     };
                     // this is the only task updating gc_round
@@ -525,15 +526,19 @@ impl<DB: Database> Synchronizer<DB> {
         spawn_logged_monitored_task!(
             async move {
                 let Ok(network) = client.get_primary_network().await else {
-                    error!("Failed to get primary Network!");
+                    error!(target:"primary::synchronizer", "Failed to get primary Network!");
                     return;
                 };
+
+                debug!(target:"primary::synchronizer", "awaiting lock for certificate senders...");
                 let mut senders = inner_senders.certificate_senders.lock();
+                debug!(target:"primary::synchronizer", "certificate senders mutex lock obtained");
                 for (name, _, network_key) in inner_senders
                     .committee
                     .others_primaries_by_id(inner_senders.authority_id)
                     .into_iter()
                 {
+                    debug!(target:"primary::synchronizer", ?name, "spawning sender for peer");
                     senders.spawn(Self::push_certificates(
                         network.clone(),
                         name,
@@ -543,8 +548,8 @@ impl<DB: Database> Synchronizer<DB> {
                 }
                 if let Some(cert) = highest_created_certificate {
                     // Error can be ignored.
-                    if tx_own_certificate_broadcast.send(cert).is_err() {
-                        error!(target: "primary::synchronizer", "Failed to populate initial certificate to send to peers!");
+                    if let Err(e) = tx_own_certificate_broadcast.send(cert) {
+                        error!(target: "primary::synchronizer", ?e, "failed to broadcast certificate inside broadcast task");
                     }
                 }
             },
@@ -1092,12 +1097,12 @@ impl<DB: Database> Synchronizer<DB> {
                             continue;
                         }
                     };
-                    trace!(target: "primary::synchronizer", authority=?authority_id, ?cert);
+                    trace!(target: "primary::synchronizer", authority=?authority_id, ?cert, "successfully received own cert broadcast");
                     let request = Request::new(SendCertificateRequest { certificate: cert.clone() }).with_timeout(PUSH_TIMEOUT);
                     requests.push_back(send_certificate(client.clone(),request, cert));
                 }
                 Some((cert, resp)) = requests.next() => {
-                    trace!(target: "primary::synchronizer", authority=?authority_id, ?resp, ?cert, "next request");
+                    trace!(target: "primary::synchronizer", authority=?authority_id, ?resp, ?cert, "next cert request");
                     backoff_multiplier = match resp {
                         Ok(_) => {
                             0
