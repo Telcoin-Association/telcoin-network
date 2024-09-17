@@ -388,6 +388,16 @@ impl<DB: Database> Synchronizer<DB> {
             state: tokio::sync::Mutex::new(State::default()),
         });
 
+        // prevents race condition during startup when first proposed header fails during tx_own_certificate_broadcast.send()
+        let broadcast_targets: Vec<(_, _, _)> = inner
+            .committee
+            .others_primaries_by_id(authority_id)
+            .into_iter()
+            .map(|(name, _addr, network_key)| {
+                (name, tx_own_certificate_broadcast.subscribe(), network_key)
+            })
+            .collect();
+
         // Start a task to recover parent certificates for proposer.
         let inner_proposer = inner.clone();
         spawn_logged_monitored_task!(
@@ -533,17 +543,15 @@ impl<DB: Database> Synchronizer<DB> {
                 debug!(target:"primary::synchronizer", "awaiting lock for certificate senders...");
                 let mut senders = inner_senders.certificate_senders.lock();
                 debug!(target:"primary::synchronizer", "certificate senders mutex lock obtained");
-                for (name, _, network_key) in inner_senders
-                    .committee
-                    .others_primaries_by_id(inner_senders.authority_id)
-                    .into_iter()
+                for (name, rx_own_certificate_broadcast, network_key) in
+                    broadcast_targets.into_iter()
                 {
                     debug!(target:"primary::synchronizer", ?name, "spawning sender for peer");
                     senders.spawn(Self::push_certificates(
                         network.clone(),
                         name,
                         network_key,
-                        tx_own_certificate_broadcast.subscribe(),
+                        rx_own_certificate_broadcast,
                     ));
                 }
                 if let Some(cert) = highest_created_certificate {
