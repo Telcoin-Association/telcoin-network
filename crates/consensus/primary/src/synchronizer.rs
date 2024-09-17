@@ -439,29 +439,29 @@ impl<DB: Database> Synchronizer<DB> {
                         // definitely be started. For other reasons of
                         // timing out, there is no harm to start fetching either.
                         let Some(inner) = weak_inner.upgrade() else {
-                            error!(target: "primary::synchronizer", "failed to upgrade weak pointer while re-fetching rx_consensus_round_updates - shutting down");
+                            error!(target: "primary::synchronizer::gc", "failed to upgrade weak pointer while re-fetching rx_consensus_round_updates - shutting down");
                             return;
                         };
                         if let Err(e) =
                             inner.tx_certificate_fetcher.send(CertificateFetcherCommand::Kick).await
                         {
-                            error!(target: "primary::synchronizer", ?e, "failed to send on tx_certificate_fetcher");
+                            error!(target: "primary::synchronizer::gc", ?e, "failed to send on tx_certificate_fetcher");
                             return;
                         }
                         inner.metrics.synchronizer_gc_timeout.inc();
-                        warn!(target: "primary::synchronizer", "No consensus commit happened for {:?}, triggering certificate fetching.", FETCH_TRIGGER_TIMEOUT);
+                        warn!(target: "primary::synchronizer::gc", "No consensus commit happened for {:?}, triggering certificate fetching.", FETCH_TRIGGER_TIMEOUT);
                         continue;
                     };
 
                     if let Err(e) = result {
-                        error!(target: "primary::synchronizer", ?e, "failed to received rx_consensus_round_updates - shutting down...");
+                        error!(target: "primary::synchronizer::gc", ?e, "failed to received rx_consensus_round_updates - shutting down...");
                         return;
                     }
 
                     let _scope = monitored_scope("Synchronizer::gc_iteration");
                     let gc_round = rx_consensus_round_updates.borrow().gc_round;
                     let Some(inner) = weak_inner.upgrade() else {
-                        error!(target: "primary::synchronizer", "failed to upgrade weak pointer after fetching rx_consensus_round_updates - shutting down");
+                        error!(target: "primary::synchronizer::gc", "failed to upgrade weak pointer - shutting down");
                         return;
                     };
                     // this is the only task updating gc_round
@@ -479,9 +479,15 @@ impl<DB: Database> Synchronizer<DB> {
                             suspended_cert.into_iter().chain(suspended_children_certs.into_iter())
                         {
                             match inner.accept_suspended_certificate(&state, suspended).await {
-                                Ok(()) => {}
-                                Err(DagError::ShuttingDown) => return,
+                                Ok(()) => {
+                                    trace!(target: "primary::synchronizer::gc", "accepted suspended cert")
+                                }
+                                Err(DagError::ShuttingDown) => {
+                                    error!(target: "primary::synchronizer::gc", "error accepting suspended cert - shutting down...");
+                                    return;
+                                }
                                 Err(e) => {
+                                    error!(target: "primary::synchronizer::gc", ?e, "error accepting suspended cert - PANIC");
                                     panic!("Unexpected error accepting certificate during GC! {e}")
                                 }
                             }
@@ -501,7 +507,7 @@ impl<DB: Database> Synchronizer<DB> {
                     let Some((certificates, result_sender, early_suspend)) =
                         rx_certificate_acceptor.recv().await
                     else {
-                        debug!("Synchronizer is shutting down.");
+                        error!(target: "primary::synchronizer::accept_certificates", "error on rx_certificate_acceptor.recv() - synchronizer is shutting down...");
                         return;
                     };
 
@@ -518,7 +524,7 @@ impl<DB: Database> Synchronizer<DB> {
                     }
 
                     let Some(inner) = weak_inner.upgrade() else {
-                        debug!("Synchronizer is shutting down.");
+                        error!(target: "primary::synchronizer::accept_certificates", "failed to upgrade weak pointer - shutting down");
                         return;
                     };
                     // Ignore error if receiver has been dropped.
@@ -536,17 +542,17 @@ impl<DB: Database> Synchronizer<DB> {
         spawn_logged_monitored_task!(
             async move {
                 let Ok(network) = client.get_primary_network().await else {
-                    error!(target:"primary::synchronizer", "Failed to get primary Network!");
+                    error!(target:"primary::synchronizer::broadcast_certificates", "failed to get primary network!");
                     return;
                 };
 
-                debug!(target:"primary::synchronizer", "awaiting lock for certificate senders...");
+                trace!(target:"primary::synchronizer::broadcast_certificates", "awaiting lock for certificate senders...");
                 let mut senders = inner_senders.certificate_senders.lock();
-                debug!(target:"primary::synchronizer", "certificate senders mutex lock obtained");
+                trace!(target:"primary::synchronizer::broadcast_certificates", "certificate senders mutex lock obtained");
                 for (name, rx_own_certificate_broadcast, network_key) in
                     broadcast_targets.into_iter()
                 {
-                    debug!(target:"primary::synchronizer", ?name, "spawning sender for peer");
+                    trace!(target:"primary::synchronizer::broadcast_certificates", ?name, "spawning sender for peer");
                     senders.spawn(Self::push_certificates(
                         network.clone(),
                         name,
@@ -557,7 +563,7 @@ impl<DB: Database> Synchronizer<DB> {
                 if let Some(cert) = highest_created_certificate {
                     // Error can be ignored.
                     if let Err(e) = tx_own_certificate_broadcast.send(cert) {
-                        error!(target: "primary::synchronizer", ?e, "failed to broadcast certificate inside broadcast task");
+                        error!(target: "primary::synchronizer::broadcast_certificates", ?e, "failed to broadcast certificate inside broadcast task");
                     }
                 }
             },
@@ -582,7 +588,7 @@ impl<DB: Database> Synchronizer<DB> {
                             };
 
                             let Some(inner) = weak_inner.upgrade() else {
-                                debug!("Synchronizer is shutting down.");
+                                error!(target: "primary::synchronizer::synchronize_blocks", "failed to upgrade weak pointer - shutting down");
                                 return;
                             };
 
@@ -591,14 +597,14 @@ impl<DB: Database> Synchronizer<DB> {
                             });
                         },
                         Some(result) = batch_tasks.join_next() => {
-                            if let Err(err) = result  {
-                                error!("Error when synchronizing batches: {err:?}")
+                            if let Err(e) = result  {
+                                error!(target: "primary::synchronizer::synchronize_blocks", ?e, "error when synchronizing blocks")
                             }
                         }
                     }
                 }
             },
-            "Synchronizer::SyncrhonizeBatches"
+            "Synchronizer::SyncrhonizeBlocks"
         );
 
         Self { inner }
@@ -751,6 +757,7 @@ impl<DB: Database> Synchronizer<DB> {
 
         // NOTE: This log entry is used to compute performance.
         debug!(
+            target: "primary::synchronizer",
             "Header {:?} at round {} with {} batches, took {} seconds to be materialized to a certificate {:?}",
             certificate.header().digest(),
             certificate.header().round(),
@@ -833,8 +840,8 @@ impl<DB: Database> Synchronizer<DB> {
         for task in verify_tasks.into_iter() {
             // Any certificates that fail to be verified should cancel the entire
             // batch of fetched certficates.
-            let idx_and_certs = task.await.map_err(|err| {
-                error!("Cancelling due to {err:?}");
+            let idx_and_certs = task.await.map_err(|e| {
+                error!(target: "primary::synchronizer", ?e, "verify task cancelled");
                 DagError::Canceled
             })??;
             for (idx, cert) in idx_and_certs {
@@ -864,7 +871,7 @@ impl<DB: Database> Synchronizer<DB> {
         let _scope = monitored_scope("Synchronizer::process_certificate_internal");
         let digest = certificate.digest();
         if self.inner.certificate_store.contains(&digest)? {
-            trace!("Certificate {digest:?} has already been processed. Skip processing.");
+            trace!(target: "primary::synchronizer", "Certificate {digest:?} has already been processed. Skip processing.");
             self.inner.metrics.duplicate_certificates_processed.inc();
             return Ok(());
         }
@@ -872,7 +879,7 @@ impl<DB: Database> Synchronizer<DB> {
         // See comments above `try_accept_fetched_certificate()` for details.
         if early_suspend {
             if let Some(notify) = self.inner.state.lock().await.check_suspended(&digest) {
-                trace!("Certificate {digest:?} is still suspended. Skip processing.");
+                trace!(target: "primary::synchronizer", ?digest, "certificate is still suspended - returning suspended error...");
                 self.inner.metrics.certificates_suspended.with_label_values(&["dedup"]).inc();
                 return Err(DagError::Suspended(notify));
             }
@@ -882,7 +889,7 @@ impl<DB: Database> Synchronizer<DB> {
             certificate = self.sanitize_certificate(certificate)?;
         }
 
-        debug!("Processing certificate {:?} round:{:?}", certificate, certificate.round());
+        debug!(target: "primary::synchronizer", round=certificate.round(), ?certificate, "processing certificate");
 
         let certificate_source =
             if self.inner.authority_id.eq(&certificate.origin()) { "own" } else { "other" };
@@ -916,7 +923,7 @@ impl<DB: Database> Synchronizer<DB> {
         // Instruct workers to download any missing batches referenced in this certificate.
         // Since this header got certified, we are sure that all the data it refers to (ie. its
         // batches and its parents) are available. We can thus continue the processing of
-        // the certificate without blocking on batch synchronization.
+        // the certificate without blocking on block synchronization.
         let header = certificate.header().clone();
         let max_age = self.inner.gc_depth.saturating_sub(1);
         self.inner
@@ -932,6 +939,9 @@ impl<DB: Database> Synchronizer<DB> {
                 .send(CertificateFetcherCommand::Ancestors(certificate.clone()))
                 .await
                 .map_err(|_| DagError::ShuttingDown)?;
+
+            error!(target: "primary::synchronizer", "processed certificate that is too new");
+
             return Err(DagError::TooNew(
                 certificate.digest().into(),
                 certificate.round(),
@@ -1002,7 +1012,7 @@ impl<DB: Database> Synchronizer<DB> {
         let mut result = Ok(());
 
         for certificate in certificates {
-            debug!("Processing certificate {:?} with lock", certificate);
+            debug!(target: "primary::synchronizer", ?certificate, "processing certificate with lock");
             let digest = certificate.digest();
 
             // Ensure parents are checked if !early_suspend.
@@ -1011,7 +1021,7 @@ impl<DB: Database> Synchronizer<DB> {
                 // Re-check if the certificate has been suspended, which can happen before the lock
                 // is acquired.
                 if let Some(notify) = state.check_suspended(&digest) {
-                    trace!("Certificate {digest:?} is still suspended. Skip processing.");
+                    trace!(target: "primary::synchronizer", "Certificate {digest:?} is still suspended. Skip processing.");
                     inner.metrics.certificates_suspended.with_label_values(&["dedup_locked"]).inc();
                     result = Err(DagError::Suspended(notify));
                     continue;
@@ -1161,7 +1171,7 @@ impl<DB: Database> Synchronizer<DB> {
         is_certified: bool,
     ) -> DagResult<()> {
         if header.author() == inner.authority_id {
-            debug!("skipping sync_gatches for header {header}: no need to sync payload from own workers");
+            debug!(target: "primary::synchronizer", "skipping sync_gatches for header - no need to sync payload from own workers");
             return Ok(());
         }
 
@@ -1418,6 +1428,7 @@ impl State {
     ) -> Vec<SuspendedCertificate> {
         // Validate that the parent certificate is no longer suspended.
         if let Some(suspended_cert) = self.suspended.remove(&digest) {
+            error!(target: "primary::synchronizer", ?digest, "cert is still suspended, but should not have missing parents");
             panic!(
                 "Certificate {:?} should have no missing parent, but is still suspended (missing parents {:?})",
                 suspended_cert.certificate,
