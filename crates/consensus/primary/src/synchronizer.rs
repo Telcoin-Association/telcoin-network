@@ -388,7 +388,8 @@ impl<DB: Database> Synchronizer<DB> {
             state: tokio::sync::Mutex::new(State::default()),
         });
 
-        // prevents race condition during startup when first proposed header fails during tx_own_certificate_broadcast.send()
+        // prevents race condition during startup when first proposed header fails during
+        // tx_own_certificate_broadcast.send()
         let broadcast_targets: Vec<(_, _, _)> = inner
             .committee
             .others_primaries_by_id(authority_id)
