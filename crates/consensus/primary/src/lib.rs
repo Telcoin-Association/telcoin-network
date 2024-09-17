@@ -8,6 +8,7 @@ mod aggregators;
 mod certificate_fetcher;
 mod certifier;
 pub mod consensus;
+mod peer_handler;
 mod primary;
 mod proposer;
 mod state_handler;
