@@ -136,7 +136,7 @@ fn test_restarts() -> eyre::Result<()> {
     let res1 = run_restart_tests1(&client_urls, &mut child2, &exe_path, &temp_path, rpc_ports[2]);
     let is_ok = res1.is_ok();
 
-    // kill child2 if successfully restarted
+    // kill new child2 if successfully restarted
     match res1 {
         Ok(mut child2_restarted) => {
             child2_restarted.kill()?;
@@ -147,13 +147,14 @@ fn test_restarts() -> eyre::Result<()> {
         }
     }
 
-    // kill all children (child2 should be dead)
+    // kill all children (child2 should already be dead)
     for (i, child) in children.iter_mut().enumerate() {
         // Best effort to kill all the other nodes.
         if i != 2 {
             let child = child.as_mut().expect("missing a child");
-            let _ = child.kill();
-            let _ = child.wait();
+            child.kill()?;
+            child.wait()?;
+            debug!(target: "restart-test", "kill and wait on child{i} complete");
         }
     }
 
