@@ -22,7 +22,7 @@ pub fn batch_digest(c: &mut Criterion) {
             (0..512).map(move |_| transaction_with_rand(rand)).collect::<Vec<TransactionSigned>>()
         };
         let batch = WorkerBlock::new(
-            (0..size).map(move |_| tx_gen(prand)).flatten().collect::<Vec<_>>(),
+            (0..size).flat_map(move |_| tx_gen(prand)).collect::<Vec<_>>(),
             SealedHeader::default(),
         );
         digest_group.throughput(Throughput::Bytes(512 * size as u64));

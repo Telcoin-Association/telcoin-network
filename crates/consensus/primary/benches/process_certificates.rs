@@ -13,6 +13,7 @@ use narwhal_storage::NodeStorage;
 use narwhal_typed_store::open_db;
 use std::{collections::BTreeSet, sync::Arc};
 use tn_types::{
+    encode,
     test_utils::{make_optimal_certificates, temp_dir, CommitteeFixture},
     Certificate, Round, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
@@ -47,8 +48,7 @@ pub fn process_certificates(c: &mut Criterion) {
 
         let mut state = ConsensusState::new(metrics.clone(), gc_depth);
 
-        let data_size: usize =
-            certificates.iter().map(|cert| bcs::to_bytes(&cert).unwrap().len()).sum();
+        let data_size: usize = certificates.iter().map(|cert| encode(&cert).len()).sum();
         consensus_group.throughput(Throughput::Bytes(data_size as u64));
 
         let mut ordering_engine = Bullshark {
