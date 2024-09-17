@@ -246,7 +246,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                 }
             }
             Err(e) => {
-                warn!("Failed to read from certificate store: {e}");
+                error!(target: "primary::cert_fetcher", ?e, "failed to read from certificate store");
                 return;
             }
         };
@@ -265,7 +265,7 @@ impl<DB: Database> CertificateFetcher<DB> {
             last_written_round < *target_round
         });
         if self.targets.is_empty() {
-            debug!("Certificates have caught up. Skip fetching.");
+            debug!(target: "primary::cert_fetcher", "Certificates have caught up. Skip fetching.");
             return;
         }
 
@@ -273,6 +273,7 @@ impl<DB: Database> CertificateFetcher<DB> {
         let committee = self.committee.clone();
 
         debug!(
+            target: "primary::cert_fetcher",
             "Starting task to fetch missing certificates: max target {}, gc round {:?}",
             self.targets.values().max().unwrap_or(&0),
             gc_round
@@ -284,13 +285,13 @@ impl<DB: Database> CertificateFetcher<DB> {
             let now = Instant::now();
             match run_fetch_task(state.clone(), committee, gc_round, written_rounds).await {
                 Ok(_) => {
-                    debug!(
+                    debug!(target: "primary::cert_fetcher",
                         "Finished task to fetch certificates successfully, elapsed = {}s",
                         now.elapsed().as_secs_f64()
                     );
                 }
                 Err(e) => {
-                    warn!("Error from fetch certificates task: {e}");
+                    error!(target: "primary::cert_fetcher", ?e, "Error from fetch certificates task");
                 }
             };
 
@@ -318,6 +319,7 @@ async fn run_fetch_task<DB: Database>(
     let Some(response) =
         fetch_certificates_helper(state.authority_id, &state.network, &committee, request).await
     else {
+        error!(target: "primary::cert_fetcher", "error awaiting fetch_certificates_helper");
         return Err(DagError::NoCertificateFetched);
     };
 
@@ -326,7 +328,7 @@ async fn run_fetch_task<DB: Database>(
     process_certificates_helper(response, &state.synchronizer, state.metrics.clone()).await?;
     state.metrics.certificate_fetcher_num_certificates_processed.inc_by(num_certs_fetched as u64);
 
-    debug!("Successfully fetched and processed {num_certs_fetched} certificates");
+    debug!(target: "primary::cert_fetcher", "Successfully fetched and processed {num_certs_fetched} certificates");
     Ok(())
 }
 
@@ -340,7 +342,7 @@ async fn fetch_certificates_helper(
     request: FetchCertificatesRequest,
 ) -> Option<FetchCertificatesResponse> {
     let _scope = monitored_scope("FetchingCertificatesFromPeers");
-    trace!("Start sending fetch certificates requests");
+    trace!(target: "primary::cert_fetcher", "Start sending fetch certificates requests");
     // TODO: make this a config parameter.
     let request_interval = PARALLEL_FETCH_REQUEST_INTERVAL_SECS;
     let mut peers: Vec<NetworkPublicKey> = committee
@@ -352,7 +354,7 @@ async fn fetch_certificates_helper(
     let fetch_timeout = PARALLEL_FETCH_REQUEST_INTERVAL_SECS * peers.len().try_into().unwrap()
         + PARALLEL_FETCH_REQUEST_ADDITIONAL_TIMEOUT;
     let fetch_callback = async move {
-        debug!("Starting to fetch certificates");
+        debug!(target: "primary::cert_fetcher", "Starting to fetch certificates");
         let mut fut = FuturesUnordered::new();
         // Loop until one peer returns with certificates, or no peer does.
         loop {
@@ -360,10 +362,10 @@ async fn fetch_certificates_helper(
                 let request = Request::new(request.clone())
                     .with_timeout(PARALLEL_FETCH_REQUEST_INTERVAL_SECS * 2);
                 fut.push(monitored_future!(async move {
-                    debug!("Sending out fetch request in parallel to {peer}");
+                    debug!(target: "primary::cert_fetcher", "Sending out fetch request in parallel to {peer}");
                     let result = network.fetch_certificates(&peer, request).await;
                     if let Ok(resp) = &result {
-                        debug!("Fetched {} certificates from peer {peer}", resp.certificates.len());
+                        debug!(target: "primary::cert_fetcher", "Fetched {} certificates from peer {peer}", resp.certificates.len());
                     }
                     result
                 }));
@@ -379,12 +381,12 @@ async fn fetch_certificates_helper(
                         return Some(resp);
                     }
                     Some(Err(e)) => {
-                        debug!("Failed to fetch certificates: {e}");
+                        debug!(target: "primary::cert_fetcher", "Failed to fetch certificates: {e}");
                         // Issue request to another primary immediately.
                         continue;
                     }
                     None => {
-                        debug!("No peer can be reached for fetching certificates!");
+                        debug!(target: "primary::cert_fetcher", "No peer can be reached for fetching certificates!");
                         // Last or all requests to peers may have failed immediately, so wait
                         // before returning to avoid retrying fetching immediately.
                         sleep(request_interval).await;
@@ -401,7 +403,7 @@ async fn fetch_certificates_helper(
     match timeout(fetch_timeout, fetch_callback).await {
         Ok(result) => result,
         Err(e) => {
-            debug!("Timed out fetching certificates: {e}");
+            debug!(target: "primary::cert_fetcher", "Timed out fetching certificates: {e}");
             None
         }
     }
@@ -413,7 +415,7 @@ async fn process_certificates_helper<DB: Database>(
     synchronizer: &Synchronizer<DB>,
     _metrics: Arc<PrimaryMetrics>,
 ) -> DagResult<()> {
-    trace!("Start sending fetched certificates to processing");
+    trace!(target: "primary::cert_fetcher", "Start sending fetched certificates to processing");
     if response.certificates.len() > MAX_CERTIFICATES_TO_FETCH {
         return Err(DagError::TooManyFetchedCertificatesReturned(
             response.certificates.len(),
@@ -429,7 +431,7 @@ async fn process_certificates_helper<DB: Database>(
         .into_iter()
         .map(|cert| {
             validate_received_certificate_version(cert).map_err(|err| {
-                error!("fetched certficate processing error: {err}");
+                error!(target: "primary::cert_fetcher", "fetched certficate processing error: {err}");
                 DagError::InvalidCertificateVersion
             })
         })
@@ -442,7 +444,7 @@ async fn process_certificates_helper<DB: Database>(
 
     synchronizer.try_accept_fetched_certificates(certificates).await?;
 
-    trace!("Fetched certificates have been processed");
+    trace!(target: "primary::cert_fetcher", "Fetched certificates have been processed");
 
     Ok(())
 }
