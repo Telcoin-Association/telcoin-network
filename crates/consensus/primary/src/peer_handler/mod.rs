@@ -7,6 +7,7 @@
 //!
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
+use crate::synchronizer::Synchronizer;
 use fastcrypto::{hash::Hash, signature_service::SignatureService};
 use narwhal_network_types::{RequestVoteRequest, RequestVoteResponse};
 use narwhal_primary_metrics::PrimaryMetrics;
@@ -29,7 +30,8 @@ use tn_types::{
 use tokio::sync::watch;
 use tracing::{debug, error, warn};
 
-use crate::synchronizer::Synchronizer;
+mod primary;
+mod worker;
 
 /// Defines how the network receiver handles incoming primary messages.
 #[derive(Clone)]

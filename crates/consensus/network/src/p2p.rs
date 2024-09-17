@@ -7,7 +7,6 @@ use crate::{
     CancelOnDropHandler, RetryConfig,
 };
 use anemo::PeerId;
-use async_trait::async_trait;
 use eyre::{format_err, Result};
 use narwhal_network_types::{
     FetchCertificatesRequest, FetchCertificatesResponse, PrimaryToPrimaryClient,
@@ -60,7 +59,6 @@ where
 // Primary-to-Primary
 //
 
-#[async_trait]
 impl PrimaryToPrimaryRpc for anemo::Network {
     async fn fetch_certificates(
         &self,
@@ -97,7 +95,6 @@ impl ReliableNetwork<WorkerBlockMessage> for anemo::Network {
     }
 }
 
-#[async_trait]
 impl WorkerRpc for anemo::Network {
     async fn request_blocks(
         &self,

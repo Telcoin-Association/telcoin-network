@@ -7,6 +7,7 @@ use crate::{
     certificate_fetcher::CertificateFetcher,
     certifier::Certifier,
     consensus::{ConsensusRound, LeaderSchedule},
+    peer_handler::PrimaryReceiverHandler,
     proposer::{OurDigestMessage, Proposer},
     state_handler::StateHandler,
     synchronizer::Synchronizer,

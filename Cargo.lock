@@ -5157,7 +5157,6 @@ dependencies = [
  "anemo",
  "anemo-tower",
  "anyhow",
- "async-trait",
  "axum",
  "axum-server",
  "backoff",

@@ -1,4 +1,3 @@
-#[async_trait]
 impl<DB: Database> PrimaryToPrimary for PrimaryReceiverHandler<DB> {
     async fn send_certificate(
         &self,

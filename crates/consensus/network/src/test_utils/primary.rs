@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use async_trait::async_trait;
 use narwhal_network_types::{
     FetchBlocksRequest, FetchBlocksResponse, FetchCertificatesRequest, FetchCertificatesResponse,
     PrimaryToPrimary, PrimaryToPrimaryServer, PrimaryToWorker, PrimaryToWorkerServer,
@@ -37,7 +36,6 @@ impl PrimaryToPrimaryMockServer {
     }
 }
 
-#[async_trait]
 impl PrimaryToPrimary for PrimaryToPrimaryMockServer {
     async fn send_certificate(
         &self,
@@ -90,7 +88,6 @@ impl PrimaryToWorkerMockServer {
     }
 }
 
-#[async_trait]
 impl PrimaryToWorker for PrimaryToWorkerMockServer {
     async fn synchronize(
         &self,

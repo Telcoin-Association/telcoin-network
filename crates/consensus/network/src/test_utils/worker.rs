@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use narwhal_network_types::{
     RequestBlocksRequest, RequestBlocksResponse, WorkerBlockMessage, WorkerToWorker,
     WorkerToWorkerServer,
@@ -31,7 +30,6 @@ impl WorkerToWorkerMockServer {
     }
 }
 
-#[async_trait]
 impl WorkerToWorker for WorkerToWorkerMockServer {
     async fn report_block(
         &self,

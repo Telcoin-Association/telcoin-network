@@ -5,7 +5,6 @@ struct WorkerReceiverHandler<DB> {
     payload_store: PayloadStore<DB>,
 }
 
-#[async_trait]
 impl<DB: Database> WorkerToPrimary for WorkerReceiverHandler<DB> {
     async fn report_own_block(
         &self,
