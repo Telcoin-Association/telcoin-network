@@ -293,7 +293,7 @@ impl fmt::Debug for Header {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         write!(
             f,
-            "{}: B{}({}, E{}, {}B)",
+            "{}: B{}(v{}, e{}, {}wbs)",
             self.digest(),
             self.round(),
             self.author(),
