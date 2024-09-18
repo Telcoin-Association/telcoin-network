@@ -16,6 +16,7 @@ use tn_types::utils::get_available_tcp_port;
 use tokio::runtime::Runtime;
 use tracing::{debug, error};
 
+/// One unit of TEL (10^18) measured in wei.
 const WEI_PER_TEL: u128 = 1_000_000_000_000_000_000;
 
 /// Run the first part tests, broken up like this to allow more robust node shutdown.
@@ -173,14 +174,19 @@ fn test_restarts() -> eyre::Result<()> {
 
     let res2 = run_restart_tests2(&client_urls);
 
-    let res3 = if res2.is_ok() { test_blocks_same(&client_urls) } else { Ok(()) };
+    // test blocks are the same if res2 is okay - otherwise use error from res2
+    let final_result = if res2.is_ok() { test_blocks_same(&client_urls) } else { res2 };
+
+    // kill children before returnin final_result
     for child in children.iter_mut() {
         let child = child.as_mut().expect("missing a child");
         let _ = child.kill();
         let _ = child.wait();
+        debug!(target: "restart-test", "kill and wait on child complete for final result");
     }
-    res2?;
-    res3
+
+    // contains res2 if failure
+    final_result
 }
 
 /// Start a process running a validator node.

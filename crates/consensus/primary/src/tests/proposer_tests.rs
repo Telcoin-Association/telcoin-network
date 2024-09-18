@@ -1,7 +1,9 @@
-// Copyright(C) Facebook, Inc. and its affiliates.
 // Copyright (c) Telcoin, LLC
+// Copyright(C) Facebook, Inc. and its affiliates.
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+
+//! Proposer unit tests.
 use super::*;
 use crate::{consensus::LeaderSwapTable, NUM_SHUTDOWN_RECEIVERS};
 use consensus_metrics::spawn_logged_monitored_task;
@@ -36,10 +38,6 @@ async fn test_empty_proposal() {
     let temp_dir = TempDir::new().unwrap();
     let db = open_db(temp_dir.path());
 
-    // simulate current execution HEAD at genesis
-    // let execution_update = (0, BlockNumHash::new(0, adiri_chain_spec().genesis_hash()));
-    // let (_tx, rx_watch) = watch::channel(execution_update);
-
     // Spawn the proposer.
     let proposer_store = ProposerStore::new(db);
     let proposer_task = Proposer::new(
@@ -55,12 +53,11 @@ async fn test_empty_proposal() {
         /* synchronizer */ rx_parents,
         /* rx_workers */ rx_our_digests,
         rx_system_messages,
-        /* tx_core */ tx_headers,
+        /* tx_synchronizer */ tx_headers,
         tx_narwhal_round_updates,
         rx_committed_own_headers,
         metrics,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
-        // rx_watch, // el updates
     );
 
     let _proposer_handle = spawn_logged_monitored_task!(proposer_task, "proposer test empty");
@@ -97,10 +94,6 @@ async fn test_propose_payload_fatal_timer() {
 
     let max_num_of_batches = 10;
 
-    // simulate current execution HEAD at genesis
-    // let execution_update = (0, BlockNumHash::new(0, adiri_chain_spec().genesis_hash()));
-    // let (tx_watch, rx_watch) = watch::channel(execution_update);
-
     // Spawn the proposer.
     let temp_dir = TempDir::new().unwrap();
     let proposer_store = ProposerStore::new(open_db(temp_dir.path()));
@@ -119,12 +112,11 @@ async fn test_propose_payload_fatal_timer() {
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
         rx_system_messages,
-        /* tx_core */ tx_headers.clone(),
+        /* tx_synchronizer */ tx_headers.clone(),
         tx_narwhal_round_updates,
         rx_committed_own_headers,
         metrics,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
-        // rx_watch, // el data
     );
 
     let proposer_handle = spawn_logged_monitored_task!(proposer_task, "proposer test empty");
@@ -245,9 +237,6 @@ async fn test_equivocation_protection_after_restart() {
     let (tx_narwhal_round_updates, _rx_narwhal_round_updates) = watch::channel(0u64);
     let (_tx_committed_own_headers, rx_committed_own_headers) = tn_types::test_channel!(1);
     let metrics = Arc::new(PrimaryMetrics::default());
-    // simulate current execution HEAD at genesis
-    // let execution_update = (0, BlockNumHash::new(0, adiri_chain_spec().genesis_hash()));
-    // let (_tx, rx_watch) = watch::channel(execution_update);
 
     // Spawn the proposer.
     let proposer_task = Proposer::new(
@@ -265,12 +254,11 @@ async fn test_equivocation_protection_after_restart() {
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
         rx_system_messages,
-        /* tx_core */ tx_headers,
+        /* tx_synchronizer */ tx_headers,
         tx_narwhal_round_updates,
         rx_committed_own_headers,
         metrics,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
-        // rx_watch, // el updates
     );
 
     let proposer_handle = spawn_logged_monitored_task!(proposer_task, "proposer test empty");
@@ -312,11 +300,6 @@ async fn test_equivocation_protection_after_restart() {
     let (tx_narwhal_round_updates, _rx_narwhal_round_updates) = watch::channel(0u64);
     let (_tx_committed_own_headers, rx_committed_own_headers) = tn_types::test_channel!(1);
     let metrics = Arc::new(PrimaryMetrics::default());
-    // simulate current execution HEAD at genesis for different round
-    //
-    // proposer doesn't verify EL data, just includes it in the header
-    // let execution_update_restart = (1, BlockNumHash::new(0, adiri_chain_spec().genesis_hash()));
-    // let (_tx, rx_watch) = watch::channel(execution_update_restart);
 
     let proposer_task = Proposer::new(
         authority_id,
@@ -333,12 +316,11 @@ async fn test_equivocation_protection_after_restart() {
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
         rx_system_messages,
-        /* tx_core */ tx_headers,
+        /* tx_synchronizer */ tx_headers,
         tx_narwhal_round_updates,
         rx_committed_own_headers,
         metrics,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
-        // rx_watch, // el updates
     );
 
     let _proposer_handle = spawn_logged_monitored_task!(proposer_task, "proposer test empty");

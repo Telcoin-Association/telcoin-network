@@ -50,7 +50,7 @@ use tokio::{
     time::{sleep, Duration, Interval},
 };
 use tokio_stream::wrappers::BroadcastStream;
-use tracing::{debug, enabled, error, info, trace, warn};
+use tracing::{debug, enabled, error, trace, warn};
 
 /// Type alias for the async task that creates, stores, and sends the proposer's new header.
 type PendingHeaderTask = oneshot::Receiver<ProposerResult<Header>>;
@@ -268,20 +268,20 @@ impl<DB: Database + 'static> Proposer<DB> {
         leader_and_support: String,
         max_delay: Duration,
     ) -> ProposerResult<Header> {
-        // make new header
-
         // check that the included timestamp is consistent with the parent's timestamp
         //
         // ie) the current time is *after* the timestamp in all included headers
         //
         // if not: log an error and sleep
-        let parent_max_time = parents.iter().map(|c| *c.header().created_at()).max().unwrap_or(0);
+        let latest_parent = parents.iter().map(|c| *c.header().created_at()).max().unwrap_or(0);
         let current_time = now();
-        if current_time < parent_max_time {
-            let drift_sec = parent_max_time - current_time;
+        if current_time < latest_parent {
+            let drift_sec = latest_parent - current_time;
             error!(
-                "Current time {} earlier than max parent time {}, sleeping for {}ms until max parent time.",
-                current_time, parent_max_time, drift_sec,
+                ?current_time,
+                ?latest_parent,
+                "Current time earlier than most recent parent! Sleeping for {}sec until max parent time...",
+                drift_sec,
             );
             metrics.header_max_parent_wait_ms.inc_by(drift_sec);
             sleep(Duration::from_secs(drift_sec)).await;
@@ -317,7 +317,7 @@ impl<DB: Database + 'static> Proposer<DB> {
                 Duration::from_secs(*header.created_at() - digest.timestamp).as_secs_f64();
             total_inclusion_secs += batch_inclusion_secs;
 
-            // NOTE: This log entry is used to compute performance.
+            // NOTE: this log entry is used to measure performance
             trace!(
                 "Batch {:?} from worker {} took {} seconds from creation to be included in a proposed header",
                 digest.digest,
@@ -327,7 +327,7 @@ impl<DB: Database + 'static> Proposer<DB> {
             metrics.proposer_batch_latency.observe(batch_inclusion_secs);
         }
 
-        // NOTE: This log entry is used to compute performance.
+        // NOTE: this log entry is used to measure performance
         let (header_creation_secs, avg_inclusion_secs) = if let Some(digest) = digests.front() {
             (
                 Duration::from_secs(*header.created_at() - digest.timestamp).as_secs_f64(),
@@ -336,11 +336,6 @@ impl<DB: Database + 'static> Proposer<DB> {
         } else {
             (max_delay.as_secs_f64(), 0.0)
         };
-
-        //
-        // TODO: !!! this math is wrong - unix timestamp way off
-        //
-        // ~~~~~!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
         trace!(
             target: "primary::proposer",
@@ -398,7 +393,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         #[cfg(feature = "benchmark")]
         for digest in header.payload().keys() {
             // NOTE: This log entry is used to compute performance.
-            info!("Created {} -> {:?}", header, digest);
+            tracing::info!(target: "primary::proposer", "Created {} -> {:?}", header, digest);
         }
 
         // Send the new header to the `Certifier` that will broadcast and certify it.
@@ -1026,7 +1021,7 @@ where
                 continue;
             }
 
-            // break if unable to propose header
+            // unable to propose header
             break;
         }
 
