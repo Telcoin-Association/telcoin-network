@@ -50,7 +50,7 @@ use tokio::{
     time::{sleep, Duration, Interval},
 };
 use tokio_stream::wrappers::BroadcastStream;
-use tracing::{debug, enabled, error, trace, warn};
+use tracing::{debug, enabled, error, info, trace, warn};
 
 /// Type alias for the async task that creates, stores, and sends the proposer's new header.
 type PendingHeaderTask = oneshot::Receiver<ProposerResult<Header>>;
@@ -300,14 +300,14 @@ impl<DB: Database + 'static> Proposer<DB> {
         metrics.headers_proposed.with_label_values(&[&leader_and_support]).inc();
         metrics.header_parents.observe(parents.len() as f64);
 
-        if enabled!(tracing::Level::TRACE) {
+        if enabled!(target: "primary::proposer", tracing::Level::TRACE) {
             let mut msg = format!("Created header {header:?} with parent certificates:\n");
             for parent in parents.iter() {
                 msg.push_str(&format!("{parent:?}\n"));
             }
-            trace!(msg);
+            trace!(target: "primary::proposer", ?header, ?msg, "created new header");
         } else {
-            debug!(target: "primary::proposer", "created new header {header:?}");
+            debug!(target: "primary::proposer", ?header, parents=?header.parents(), "created new header");
         }
 
         // Update metrics related to latency
@@ -318,7 +318,7 @@ impl<DB: Database + 'static> Proposer<DB> {
             total_inclusion_secs += batch_inclusion_secs;
 
             // NOTE: This log entry is used to compute performance.
-            debug!(
+            trace!(
                 "Batch {:?} from worker {} took {} seconds from creation to be included in a proposed header",
                 digest.digest,
                 digest.worker_id,
@@ -342,7 +342,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         //
         // ~~~~~!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-        debug!(
+        trace!(
             target: "primary::proposer",
             "Header {:?} was created in {} seconds. Contains {} batches, with average delay {} seconds.",
             header.digest(),
@@ -532,13 +532,20 @@ impl<DB: Database + 'static> Proposer<DB> {
         // Sanity check: verify provided certs are of the correct round & epoch.
         for parent in parents.iter() {
             if parent.round() != round {
-                error!(target: "primary::proposer", "Proposer received certificate {parent:?} that failed to match expected round {round}. This should not be possible.");
+                error!(target: "primary::proposer", "received certificate {parent:?} that failed to match expected round {round}. This should not be possible.");
             }
         }
 
         // Compare the parents' round number with our current round.
         match round.cmp(&self.round) {
             Ordering::Greater => {
+                trace!(
+                    target: "primary::proposer",
+                    authority=?self.authority_id,
+                    round=?self.round,
+                    parent_round=?round,
+                    "processing parents from future round - advacing to catch up...",
+                );
                 // proposer accepts a future round then jumps ahead in case it was
                 // late (or just joined the network).
                 self.round = round;
@@ -565,14 +572,23 @@ impl<DB: Database + 'static> Proposer<DB> {
                 self.min_delay_interval.reset_immediately();
             }
             Ordering::Less => {
-                debug!(
+                trace!(
                     target: "primary::proposer",
-                    "Proposer ignoring older parents, round={} parent.round={}",
-                    self.round, round
+                    authority=?self.authority_id,
+                    round=?self.round,
+                    parent_round=?round,
+                    "ignoring older parents",
                 );
                 // Ignore parents from older rounds.
             }
             Ordering::Equal => {
+                trace!(
+                    target: "primary::proposer",
+                    authority=?self.authority_id,
+                    round=?self.round,
+                    parent_round=?round,
+                    "adding parents for current round",
+                );
                 // certs arrive from synchronizer once quorum is reached
                 // so these are extra parents
                 self.last_parents.extend(parents);
@@ -590,9 +606,9 @@ impl<DB: Database + 'static> Proposer<DB> {
         // check conditions for advancing the round
         //
         // if max_delay_interval expires, this check is ignored and the round is advanced regardless
-        debug!(target: "primary::proposer", advance_round=self.advance_round, round=self.round, "proposer checking if self.ready()...");
+        trace!(target: "primary::proposer", authority=?self.authority_id, advance_round=self.advance_round, round=self.round, "checking if self.ready()...");
         self.advance_round = self.ready();
-        debug!(target: "primary::proposer", advance_round=self.advance_round, round=self.round, "round status after checking conditions");
+        debug!(target: "primary::proposer", authority=?self.authority_id, advance_round=self.advance_round, round=self.round, "parents");
 
         // update metrics
         let round_type = if self.round % 2 == 0 { "even" } else { "odd" };
@@ -620,7 +636,7 @@ impl<DB: Database + 'static> Proposer<DB> {
             max_committed_round = max_committed_round.max(round);
             // try to remove round - log warning if round is missing
             if self.proposed_headers.remove(&round).is_none() {
-                warn!("Proposer's own committed header not found at round {round}, probably because of restarts.");
+                warn!("own committed header not found at round {round}, probably because of restarts.");
             };
         }
 
@@ -696,8 +712,6 @@ impl<DB: Database + 'static> Proposer<DB> {
         self.round += 1;
         let _ = self.tx_narwhal_round_updates.send(self.round);
 
-        debug!(target: "primary::proposer", round=self.round, "Proposer advanced round");
-
         // Update the metrics
         self.metrics.current_round.set(self.round as i64);
         let current_timestamp = now();
@@ -708,7 +722,7 @@ impl<DB: Database + 'static> Proposer<DB> {
                 .observe(Duration::from_millis(current_timestamp - t).as_secs_f64());
         }
         self.last_round_timestamp = Some(current_timestamp);
-        debug!("Dag moved to round {}", self.round);
+        debug!(target: "primary::proposer", authority=?self.authority_id, round=self.round, "advanced round - proposing next block...");
 
         // oneshot channel to spawn a task
         let (tx, rx) = oneshot::channel();
@@ -730,7 +744,10 @@ impl<DB: Database + 'static> Proposer<DB> {
         match possible_header_to_repropose {
             // resend header
             Some(header) => {
-                warn!(target: "primary::proposer", current_round, current_epoch, header=?header, "reproposing header");
+                warn!(target: "primary::proposer", authority=?self.authority_id, current_round, current_epoch, header=?header, "reproposing header");
+                // clear parents if reproposing after restart
+                self.last_parents.clear();
+
                 tokio::task::spawn(async move {
                     // use this instead of store_and_send to because rx always expects a Header
                     let res = Proposer::repropose_header(
@@ -846,7 +863,6 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        debug!(target: "primary::proposer", authority=?this.authority_id, round=this.round, "begin loop...");
         loop {
             // tick intervals to ensure they advance
             let max_delay_timed_out = this.max_delay_interval.poll_tick(cx).is_ready();
@@ -857,13 +873,13 @@ where
             // okay to shutdown here because other primary tasks are expected to shutdown too
             // ie) no point completing the proposal if certifier is down
             if let Poll::Ready(Some(_shutdown)) = this.rx_shutdown_stream.poll_next_unpin(cx) {
-                debug!(target: "primary::proposer", authority=?this.authority_id, round=this.round, "Proposer received shutdown signal...");
+                warn!(target: "primary::proposer", authority=?this.authority_id, round=this.round, "received shutdown signal...");
                 return Poll::Ready(Ok(()));
             }
 
             // check for new system messages
             if let Poll::Ready(Some(msg)) = this.rx_system_messages.poll_recv(cx) {
-                debug!(target: "primary::proposer", authority=?this.authority_id, round=this.round, "Proposer received system message");
+                debug!(target: "primary::proposer", authority=?this.authority_id, round=this.round, "received system message");
                 this.system_messages.push(msg);
             }
 
@@ -876,7 +892,7 @@ where
             //
             // NOTE: this will not persist primary restarts
             while let Poll::Ready(Some(msg)) = this.rx_our_digests.poll_recv(cx) {
-                debug!(target: "primary::proposer", authority=?this.authority_id, round=this.round, "Proposer received digest");
+                debug!(target: "primary::proposer", authority=?this.authority_id, round=this.round, "received digest");
 
                 // parse message into parts
                 let (ack, digest) = msg.process();
@@ -886,8 +902,13 @@ where
 
             // check for new parent certificates
             // synchronizer sends collection of certificates when there is quorum (2f+1)
+            //
+            // TODO: synchronizer will send empty Vec<Certificate> for old round
+            // - this node round: 11
+            // - synchronizer receives certs from restarted node at round 10
+            // - this debug goes off with empty vec for round 10 (during restart it test)
             while let Poll::Ready(Some((certs, round))) = this.rx_parents.poll_recv(cx) {
-                debug!(target: "primary::proposer", authority=?this.authority_id, this_round=this.round, parent_round=round, num_parents=certs.len(), "Proposer received parents");
+                debug!(target: "primary::proposer", authority=?this.authority_id, this_round=this.round, parent_round=round, num_parents=certs.len(), "received parents");
                 this.process_parents(certs, round)?;
             }
 
@@ -921,7 +942,7 @@ where
                         //
                         // the only way this interval expires is if tx_headers.send() hangs
                         if this.fatal_header_timeout.poll_tick(cx).is_ready() {
-                            error!(target: "primary::proposer", round=this.round, "Proposer header_resent_timeout triggered");
+                            error!(target: "primary::proposer", round=this.round, "header_resent_timeout triggered");
                             return Poll::Ready(Err(ProposerError::FatalHeaderTimeout(
                                 this.fatal_header_timeout.period(),
                             )));
@@ -971,12 +992,11 @@ where
                 max_delay_timed_out,
                 should_create_header,
                 pending_header=this.pending_header.is_some(),
-                "Proposer polled...",
+                "polled...",
             );
 
             // if both conditions are met, create the next header
             if should_create_header {
-                debug!(target: "primary::proposer", authority=?this.authority_id, "proposing next header!");
                 if max_delay_timed_out {
                     // expect this interval to expire occassionally
                     //
@@ -995,6 +1015,8 @@ where
                 } else {
                     "min_timeout"
                 };
+
+                debug!(target: "primary::proposer", authority=?this.authority_id, ?reason, "proposing next header!");
 
                 // propose header
                 let pending_header = this.propose_next_header(reason.to_string())?;
