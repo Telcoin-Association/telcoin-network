@@ -30,22 +30,24 @@ fn run_restart_tests1(
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
     // send tel and kill child2 if error
-    send_tel(&client_urls[1], &key, to_account, 10 * WEI_PER_TEL, 250, 21000, 0).map_err(|e| {
-        child2.kill().expect("child2 killed after error received");
-        child2.wait().expect("child2 waited to die after error received");
-        e
-    })?;
+    send_tel(&client_urls[1], &key, to_account, 10 * WEI_PER_TEL, 250, 21000, 0).inspect_err(
+        |e| {
+            child2.kill().expect("child2 killed after error received");
+            child2.wait().expect("child2 waited to die after error received");
+            error!(target: "restart-test", ?e);
+        },
+    )?;
 
     // sleep
     std::thread::sleep(Duration::from_millis(1000));
     debug!(target: "restart-test", "calling get_positive_balance_with_retry in tests1...");
 
     // get positive bal and kill child2 if error
-    let bal =
-        get_positive_balance_with_retry(&client_urls[2], &to_account.to_string()).map_err(|e| {
+    let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
+        .inspect_err(|e| {
             child2.kill().expect("child2 killed after error received");
             child2.wait().expect("child2 waited to die after error received");
-            e
+            error!(target: "restart-test", ?e);
         })?;
 
     if 10 * WEI_PER_TEL != bal {

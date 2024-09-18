@@ -254,6 +254,7 @@ impl<DB: Database + 'static> Proposer<DB> {
     ///
     /// - current_header: caller checks to see if there is already a header built for this round. If
     ///   current_header.is_some() the proposer uses this header instead of building a new one.
+    #[allow(clippy::too_many_arguments)]
     async fn propose_header(
         current_round: Round,
         current_epoch: Epoch,
@@ -347,9 +348,8 @@ impl<DB: Database + 'static> Proposer<DB> {
         );
 
         // store and send newly built header
-        let _ =
-            Proposer::store_and_send_header(&header, proposer_store, tx_headers, &reason, metrics)
-                .await?;
+        Proposer::store_and_send_header(&header, proposer_store, tx_headers, &reason, metrics)
+            .await?;
 
         Ok(header)
     }
@@ -368,9 +368,8 @@ impl<DB: Database + 'static> Proposer<DB> {
         reason: String,
         metrics: Arc<PrimaryMetrics>,
     ) -> ProposerResult<Header> {
-        let _ =
-            Proposer::store_and_send_header(&header, proposer_store, tx_headers, &reason, metrics)
-                .await?;
+        Proposer::store_and_send_header(&header, proposer_store, tx_headers, &reason, metrics)
+            .await?;
 
         Ok(header)
     }
@@ -443,10 +442,9 @@ impl<DB: Database + 'static> Proposer<DB> {
         // - entire committee for odd rounds
         //
         // NOTE: committee size is asserted >1 during Committee::load()
-        if next_round % 2 == 0 && self.leader_schedule.leader(next_round).id() == self.authority_id
-        {
-            Duration::ZERO
-        } else if next_round % 2 != 0 && self.committee.leader(next_round).id() == self.authority_id
+        if (next_round % 2 == 0
+            && self.leader_schedule.leader(next_round).id() == self.authority_id)
+            || (next_round % 2 != 0 && self.committee.leader(next_round).id() == self.authority_id)
         {
             Duration::ZERO
         } else {
