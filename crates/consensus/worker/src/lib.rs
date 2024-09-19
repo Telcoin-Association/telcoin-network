@@ -7,7 +7,7 @@
 
 mod block_fetcher;
 mod block_provider;
-mod handlers;
+mod network;
 mod quorum_waiter;
 mod worker;
 

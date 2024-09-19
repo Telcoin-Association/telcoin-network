@@ -2,6 +2,7 @@
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+use crate::metrics::{Metrics, WorkerMetrics};
 use crate::{
     block_fetcher::WorkerBlockFetcher,
     block_provider::BlockProvider,
@@ -32,16 +33,15 @@ use narwhal_network::{
     failpoints::FailpointsMakeCallbackHandler,
     metrics::MetricsMakeCallbackHandler,
 };
+use narwhal_network_types::{PrimaryToWorkerServer, WorkerToWorkerServer};
 use narwhal_typed_store::traits::Database;
 use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, thread::sleep, time::Duration};
+use tap::TapFallible;
 use tn_block_validator::BlockValidation;
 use tn_types::{
     traits::KeyPair as _, Authority, AuthorityIdentifier, Committee, Multiaddr, NetworkKeypair,
     NetworkPublicKey, NewWorkerBlock, Parameters, Protocol, WorkerCache, WorkerId,
 };
-
-use narwhal_network_types::{PrimaryToWorkerServer, WorkerToWorkerServer};
-use tap::TapFallible;
 use tn_types::{ConditionalBroadcastReceiver, PreSubscribedBroadcastSender};
 use tokio::task::JoinHandle;
 use tower::ServiceBuilder;
@@ -54,9 +54,7 @@ pub mod worker_tests;
 /// The default channel capacity for each channel of the worker.
 pub const CHANNEL_CAPACITY: usize = 1_000;
 
-use crate::metrics::{Metrics, WorkerMetrics};
-// use crate::transactions_server::TxServer;
-
+/// The main worker struct that holds all information needed for worker.
 pub struct Worker<DB> {
     /// This authority.
     authority: Authority,

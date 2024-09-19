@@ -3,6 +3,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+//! The network interface for WAN worker communication and LAN communication with this worker's primary.
+
 use crate::block_fetcher::WorkerBlockFetcher;
 use anemo::{types::response::StatusCode, Network};
 use async_trait::async_trait;
@@ -30,9 +32,13 @@ pub mod handlers_tests;
 /// Defines how the network receiver handles incoming workers messages.
 #[derive(Clone)]
 pub struct WorkerReceiverHandler<V, DB> {
+    /// This worker's id.
     pub id: WorkerId,
+    /// The interface for communicating with this worker's primary.
     pub client: NetworkClient,
+    /// Database for storing worker blocks received from peers.
     pub store: DB,
+    /// The type that validates worker blocks received from peers.
     pub validator: V,
 }
 
@@ -112,21 +118,21 @@ impl<V: BlockValidation, DB: Database> WorkerToWorker for WorkerReceiverHandler<
 
 /// Defines how the network receiver handles incoming primary messages.
 pub struct PrimaryReceiverHandler<V, DB> {
-    // The id of this worker.
+    /// The id of this worker.
     pub id: WorkerId,
-    // The committee information.
+    /// The committee information.
     pub committee: Committee,
-    // The worker information cache.
+    /// The worker information cache.
     pub worker_cache: WorkerCache,
-    // The batch store
+    /// The batch store
     pub store: DB,
-    // Timeout on RequestBatches RPC.
+    /// Timeout on RequestBatches RPC.
     pub request_batches_timeout: Duration,
-    // Synchronize header payloads from other workers.
+    /// Synchronize header payloads from other workers.
     pub network: Option<Network>,
-    // Fetch certificate payloads from other workers.
+    /// Fetch certificate payloads from other workers.
     pub batch_fetcher: Option<WorkerBlockFetcher<DB>>,
-    // Validate incoming batches
+    /// Validate incoming batches
     pub validator: V,
 }
 
