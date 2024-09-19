@@ -2,7 +2,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::StoreResult;
+use crate::{StoreResult, ROUNDS_TO_KEEP};
 use narwhal_typed_store::{
     tables::{CommittedSubDag as CommittedSubDagTable, LastCommitted},
     traits::{Database, DbTxMut},
@@ -48,6 +48,30 @@ impl<DB: Database> ConsensusStore<DB> {
             txn.insert::<LastCommitted>(id, round)?;
         }
         txn.insert::<CommittedSubDagTable>(&sub_dag.sub_dag_index, &commit)?;
+        txn.commit()?;
+        self.gc_rounds(sub_dag.sub_dag_index)?;
+        Ok(())
+    }
+
+    /// Deletes all sub dags for a seq number before target_seq.
+    fn gc_rounds(&self, target_seq: SequenceNumber) -> StoreResult<()> {
+        if target_seq <= ROUNDS_TO_KEEP {
+            return Ok(());
+        }
+        let target_seq = target_seq - ROUNDS_TO_KEEP;
+        let mut dags = Vec::new();
+        for (seq, _) in self.db.iter::<CommittedSubDagTable>() {
+            if seq < target_seq {
+                dags.push(seq);
+            } else {
+                // We are done, all following seq will be greater.
+                break;
+            }
+        }
+        let mut txn = self.db.write_txn()?;
+        for seq in dags {
+            txn.remove::<CommittedSubDagTable>(&seq)?;
+        }
         txn.commit()?;
         Ok(())
     }

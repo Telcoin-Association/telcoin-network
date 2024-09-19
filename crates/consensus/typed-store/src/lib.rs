@@ -10,15 +10,15 @@ pub mod traits;
 use layered_db::LayeredDatabase;
 #[cfg(feature = "reth-libmdbx")]
 use mdbx::MdbxDatabase;
-#[cfg(feature = "redb")]
-use redb::database::ReDB;
+// Always build redb, we use it as the default for persistant consensus data.
+pub use redb::database::ReDB;
 #[cfg(feature = "rocksdb")]
 use rocks::database::RocksDatabase;
 use tables::{
     CertificateDigestByOrigin, CertificateDigestByRound, Certificates, CommittedSubDag,
     LastCommitted, LastProposed, Payload, Votes, WorkerBlocks,
 };
-#[cfg(feature = "redb")]
+// Always build redb, we use it as the default for persistant consensus data.
 pub mod redb;
 #[cfg(feature = "rocksdb")]
 pub mod rocks;
@@ -45,6 +45,7 @@ const PAYLOAD_CF: &str = "payload";
 const BATCHES_CF: &str = "batches";
 const LAST_COMMITTED_CF: &str = "last_committed";
 const COMMITTED_SUB_DAG_INDEX_CF: &str = "committed_sub_dag";
+const SUB_DAG_CF: &str = "sub_dag";
 
 macro_rules! tables {
     ( $($table:ident;$name:expr;<$K:ty, $V:ty>),*) => {
@@ -64,8 +65,8 @@ macro_rules! tables {
 pub mod tables {
     use super::{PayloadToken, ProposerKey};
     use tn_types::{
-        AuthorityIdentifier, BlockHash, Certificate, CertificateDigest, ConsensusCommit, Header,
-        Round, SequenceNumber, VoteInfo, WorkerBlock, WorkerId,
+        AuthorityIdentifier, BlockHash, Certificate, CertificateDigest, CommittedSubDag as SubDag,
+        ConsensusCommit, Header, Round, SequenceNumber, VoteInfo, WorkerBlock, WorkerId,
     };
 
     tables!(
@@ -77,7 +78,8 @@ pub mod tables {
         Payload;crate::PAYLOAD_CF;<(BlockHash, WorkerId), PayloadToken>,
         WorkerBlocks;crate::BATCHES_CF;<BlockHash, WorkerBlock>,
         LastCommitted;crate::LAST_COMMITTED_CF;<AuthorityIdentifier, Round>,
-        CommittedSubDag;crate::COMMITTED_SUB_DAG_INDEX_CF;<SequenceNumber, ConsensusCommit>
+        CommittedSubDag;crate::COMMITTED_SUB_DAG_INDEX_CF;<SequenceNumber, ConsensusCommit>,
+        SubDags;crate::SUB_DAG_CF;<SequenceNumber, SubDag>
     );
 }
 

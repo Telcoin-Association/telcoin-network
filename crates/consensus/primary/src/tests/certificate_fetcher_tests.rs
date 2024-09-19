@@ -185,7 +185,7 @@ async fn fetch_certificates_v1_basic() {
     let temp_dir = TempDir::new().unwrap();
     let _ = std::fs::create_dir_all(temp_dir.path());
     let db = open_db(temp_dir.path());
-    let store = NodeStorage::reopen(db, None);
+    let store = NodeStorage::reopen(db);
     let certificate_store = store.certificate_store.clone();
     let payload_store = store.payload_store.clone();
 
@@ -474,9 +474,10 @@ async fn fetch_certificates_v1_basic() {
 
     verify_certificates_in_store(
         &certificate_store,
-        &certificates[0..(target_index)],
-        18,  // 14 fetched certs verified directly + the initial 4 inserted
-        310, // to be verified indirectly
+        &certificates[(target_index - 60)..(target_index)],
+        4,  /* 18,  // 14 fetched certs verified directly + the initial 4 inserted (what's left
+             * in the range) */
+        56, //310, // to be verified indirectly (what's left in the range)
     )
     .await;
 

@@ -345,7 +345,7 @@ async fn get_network_peers_from_admin_server() {
     let temp_dir = TempDir::new().unwrap();
     let _ = std::fs::create_dir_all(temp_dir.path());
     let db = open_db(temp_dir.path());
-    let store = NodeStorage::reopen(db, None);
+    let store = NodeStorage::reopen(db);
 
     let (tx_new_certificates, _rx_new_certificates) =
         tn_types::test_new_certificates_channel!(CHANNEL_CAPACITY);

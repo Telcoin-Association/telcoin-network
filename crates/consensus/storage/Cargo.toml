@@ -10,20 +10,16 @@ authors = [
 publish = false
 
 [dependencies]
-tempfile.workspace = true
 fastcrypto.workspace = true
 telcoin-sync.workspace = true
-futures.workspace = true
-tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 tracing.workspace = true
 tn-types = { workspace = true }
 narwhal-typed-store = { workspace = true }
 telcoin-macros.workspace = true
-prometheus.workspace = true
-lru.workspace = true
-parking_lot.workspace = true
-tap.workspace = true
 eyre = { workspace = true }
 
 [dev-dependencies]
 tn-types = { workspace = true, features = ["test-utils"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+futures.workspace = true

@@ -103,7 +103,7 @@ impl PrimaryNodeDetails {
         // In case the DB dir does not yet exist.
         let _ = std::fs::create_dir_all(&store_path);
         let db = open_db(&store_path);
-        let primary_store = NodeStorage::reopen(db, None);
+        let primary_store = NodeStorage::reopen(db);
 
         self.node
             .start(

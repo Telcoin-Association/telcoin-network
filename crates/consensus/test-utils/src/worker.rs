@@ -71,7 +71,7 @@ where {
         // In case the DB dir does not yet exist.
         let _ = std::fs::create_dir_all(&store_path);
         let db = open_db(&store_path);
-        let worker_store = NodeStorage::reopen(db, None);
+        let worker_store = NodeStorage::reopen(db);
 
         info!(target: "cluster::worker", "starting worker-{} for authority {}", self.id, self.name);
 

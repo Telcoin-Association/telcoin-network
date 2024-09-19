@@ -7,7 +7,6 @@ use crate::{
     traits::{PrimaryToWorkerClient, WorkerToPrimaryClient},
 };
 use anemo::{Network, PeerId, Request};
-use async_trait::async_trait;
 use narwhal_network_types::{
     FetchBlocksRequest, FetchBlocksResponse, PrimaryToWorker, WorkerOthersBlockMessage,
     WorkerOwnBlockMessage, WorkerSynchronizeMessage, WorkerToPrimary,
@@ -185,7 +184,6 @@ impl NetworkClient {
 
 // TODO: extract common logic for cancelling on shutdown.
 
-#[async_trait]
 impl PrimaryToWorkerClient for NetworkClient {
     async fn synchronize(
         &self,
@@ -221,7 +219,6 @@ impl PrimaryToWorkerClient for NetworkClient {
     }
 }
 
-#[async_trait]
 impl WorkerToPrimaryClient for NetworkClient {
     async fn report_own_block(
         &self,

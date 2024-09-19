@@ -27,7 +27,7 @@ async fn test_recovery() {
     let temp_dir = TempDir::new().unwrap();
     let _ = std::fs::create_dir_all(temp_dir.path());
     let db = open_db(temp_dir.path());
-    let storage = NodeStorage::reopen(db, None);
+    let storage = NodeStorage::reopen(db);
 
     let consensus_store = storage.consensus_store;
     let certificate_store = storage.certificate_store;

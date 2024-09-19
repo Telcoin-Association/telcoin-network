@@ -40,7 +40,7 @@ async fn test_consensus_recovery_with_bullshark() {
     let temp_dir = TempDir::new().unwrap();
     let _ = std::fs::create_dir_all(temp_dir.path());
     let db = open_db(temp_dir.path());
-    let storage = NodeStorage::reopen(db, None);
+    let storage = NodeStorage::reopen(db);
 
     let consensus_store = storage.consensus_store;
     let certificate_store = storage.certificate_store;
@@ -170,7 +170,7 @@ async fn test_consensus_recovery_with_bullshark() {
     let temp_dir = TempDir::new().unwrap();
     let _ = std::fs::create_dir_all(temp_dir.path());
     let db = open_db(temp_dir.path());
-    let storage = NodeStorage::reopen(db, None);
+    let storage = NodeStorage::reopen(db);
 
     let consensus_store = storage.consensus_store;
     let certificate_store = storage.certificate_store;

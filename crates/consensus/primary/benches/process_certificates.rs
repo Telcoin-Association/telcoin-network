@@ -43,7 +43,7 @@ pub fn process_certificates(c: &mut Criterion) {
         // In case the DB dir does not yet exist.
         let _ = std::fs::create_dir_all(&store_path);
         let db = open_db(store_path);
-        let store = NodeStorage::reopen(db, None);
+        let store = NodeStorage::reopen(db);
         let metrics = Arc::new(ConsensusMetrics::default());
 
         let mut state = ConsensusState::new(metrics.clone(), gc_depth);

@@ -1,8 +1,9 @@
+use std::future::Future;
+
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 use crate::{error::LocalClientError, CancelOnDropHandler};
-use async_trait::async_trait;
 use eyre::Result;
 use narwhal_network_types::{
     FetchBlocksRequest, FetchBlocksResponse, FetchCertificatesRequest, FetchCertificatesResponse,
@@ -34,48 +35,44 @@ pub trait ReliableNetwork<Request: Clone + Send + Sync> {
     }
 }
 
-#[async_trait]
 pub trait PrimaryToPrimaryRpc {
-    async fn fetch_certificates(
+    fn fetch_certificates(
         &self,
         peer: &NetworkPublicKey,
         request: impl anemo::types::request::IntoRequest<FetchCertificatesRequest> + Send,
-    ) -> Result<FetchCertificatesResponse>;
+    ) -> impl Future<Output = Result<FetchCertificatesResponse>>;
 }
 
-#[async_trait]
 pub trait PrimaryToWorkerClient {
-    async fn synchronize(
+    fn synchronize(
         &self,
         worker_name: NetworkPublicKey,
         request: WorkerSynchronizeMessage,
-    ) -> Result<(), LocalClientError>;
+    ) -> impl Future<Output = Result<(), LocalClientError>>;
 
-    async fn fetch_batches(
+    fn fetch_batches(
         &self,
         worker_name: NetworkPublicKey,
         request: FetchBlocksRequest,
-    ) -> Result<FetchBlocksResponse, LocalClientError>;
+    ) -> impl Future<Output = Result<FetchBlocksResponse, LocalClientError>>;
 }
 
-#[async_trait]
 pub trait WorkerToPrimaryClient {
-    async fn report_own_block(
+    fn report_own_block(
         &self,
         request: WorkerOwnBlockMessage,
-    ) -> Result<(), LocalClientError>;
+    ) -> impl Future<Output = Result<(), LocalClientError>>;
 
-    async fn report_others_block(
+    fn report_others_block(
         &self,
         request: WorkerOthersBlockMessage,
-    ) -> Result<(), LocalClientError>;
+    ) -> impl Future<Output = Result<(), LocalClientError>>;
 }
 
-#[async_trait]
 pub trait WorkerRpc {
-    async fn request_blocks(
+    fn request_blocks(
         &self,
         peer: &NetworkPublicKey,
         request: impl anemo::types::request::IntoRequest<RequestBlocksRequest> + Send,
-    ) -> Result<RequestBlocksResponse>;
+    ) -> impl Future<Output = Result<RequestBlocksResponse>>;
 }

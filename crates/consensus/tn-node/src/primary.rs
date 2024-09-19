@@ -111,9 +111,6 @@ impl PrimaryNodeInner {
         let last_executed_sub_dag_index =
             execution_components.last_executed_output().await.expect("execution found HEAD");
 
-        let consensus_output_notification_sender =
-            self.consensus_output_notification_sender.clone();
-
         // create receiving channel before spawning primary to ensure messages are not lost
         let consensus_output_rx = self.subscribe_consensus_output();
 
@@ -129,7 +126,6 @@ impl PrimaryNodeInner {
                 chain,
                 &mut tx_shutdown,
                 executor_metrics,
-                consensus_output_notification_sender,
                 last_executed_sub_dag_index,
             )
             .await?;
@@ -211,8 +207,6 @@ impl PrimaryNodeInner {
         // The metrics for executor
         // Passing here bc the tx notifier is needed to create the metrics.
         executor_metrics: ExecutorMetrics,
-        // Broadcast channel for output.
-        consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
         // Used for recovering after crashes/restarts
         last_executed_sub_dag_index: u64,
     ) -> SubscriberResult<Vec<JoinHandle<()>>>
@@ -253,7 +247,6 @@ where
                 tx_committed_certificates.clone(),
                 tx_consensus_round_updates,
                 executor_metrics,
-                consensus_output_notification_sender,
                 // in loo of sui's execution_state:
                 last_executed_sub_dag_index,
             )
@@ -308,7 +301,6 @@ where
         tx_committed_certificates: metered_channel::Sender<(Round, Vec<Certificate>)>,
         tx_consensus_round_updates: watch::Sender<ConsensusRound>,
         executor_metrics: ExecutorMetrics,
-        consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
         last_executed_sub_dag_index: u64,
     ) -> SubscriberResult<(Vec<JoinHandle<()>>, LeaderSchedule)>
     where
@@ -397,7 +389,7 @@ where
             shutdown_receivers.pop().unwrap(),
             rx_sequence,
             restored_consensus_output,
-            consensus_output_notification_sender,
+            self.consensus_output_notification_sender.clone(),
             executor_metrics,
         )?;
 

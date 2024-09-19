@@ -5,8 +5,9 @@ use crate::{primary::PrimaryNode, worker::WorkerNode};
 use engine::{ExecutionNode, TnBuilder};
 use futures::{future::try_join_all, stream::FuturesUnordered};
 use narwhal_network::client::NetworkClient;
-pub use narwhal_storage::{CertificateStoreCacheMetrics, NodeStorage};
+pub use narwhal_storage::NodeStorage;
 use narwhal_typed_store::open_db;
+use persist_consensus::PersistConsensus;
 use reth_db::{
     database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
@@ -22,6 +23,7 @@ pub mod dirs;
 pub mod engine;
 mod error;
 pub mod metrics;
+mod persist_consensus;
 pub mod primary;
 pub mod worker;
 
@@ -58,13 +60,16 @@ where
     // In case the DB dir does not yet exist.
     let _ = std::fs::create_dir_all(&narwhal_db_path);
     let db = open_db(&narwhal_db_path);
-    let node_storage = NodeStorage::reopen(db, None);
+    let node_storage = NodeStorage::reopen(db);
 
     info!(target: "telcoin::cli", "node storage open");
 
     let network_client =
         NetworkClient::new_from_public_key(config.validator_info.primary_network_key());
     let primary = PrimaryNode::new(config.parameters.clone());
+    let persist_db_path = narwhal_db_path.join("persist_consensus");
+    let _ = std::fs::create_dir_all(&persist_db_path);
+    let persist_consensus = PersistConsensus::new(persist_db_path);
     let (worker_id, _worker_info) = config.workers().first_worker()?;
     let worker = WorkerNode::new(*worker_id, config.parameters.clone());
 
@@ -101,6 +106,10 @@ where
         worker_cache.all_workers().len() == committee.size(),
         "each validator within committee must have one worker"
     );
+
+    // Start persist consensus output, do this before primary starts to be 100% sure of getting all
+    // messages.
+    persist_consensus.start(primary.subscribe_consensus_output().await).await;
 
     // start the primary
     primary
