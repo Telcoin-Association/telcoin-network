@@ -142,8 +142,8 @@ fn test_restarts() -> eyre::Result<()> {
     // kill new child2 if successfully restarted
     match res1 {
         Ok(mut child2_restarted) => {
-            child2_restarted.kill()?;
-            child2_restarted.wait()?;
+            let _ = child2_restarted.kill();
+            let _ = child2_restarted.wait();
         }
         Err(err) => {
             tracing::error!(target: "restart-test", "Got error: {err}");
@@ -155,8 +155,8 @@ fn test_restarts() -> eyre::Result<()> {
         // Best effort to kill all the other nodes.
         if i != 2 {
             let child = child.as_mut().expect("missing a child");
-            child.kill()?;
-            child.wait()?;
+            let _ = child.kill();
+            let _ = child.wait();
             debug!(target: "restart-test", "kill and wait on child{i} complete");
         }
     }
@@ -254,13 +254,13 @@ fn get_positive_balance_with_retry(node: &str, address: &str) -> eyre::Result<u1
     get_balance_above_with_retry(node, address, 0)
 }
 
-/// Retry up to 60 times to retrieve an account balance > above.
+/// Retry up to 30 times to retrieve an account balance > above.
 ///
 /// Max time to get balance is 1min.
 fn get_balance_above_with_retry(node: &str, address: &str, above: u128) -> eyre::Result<u128> {
     let mut bal = get_balance(node, address, 5).unwrap_or(0);
     let mut i = 0;
-    while i < 60 && bal <= above {
+    while i < 30 && bal <= above {
         std::thread::sleep(Duration::from_millis(1000));
         i += 1;
         bal = get_balance(node, address, 5).unwrap_or(0);
