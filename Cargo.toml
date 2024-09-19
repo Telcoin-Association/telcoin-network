@@ -180,7 +180,7 @@ revm-primitives = { version = "9.0", features = [
 ], default-features = false }
 
 # eth
-alloy = { version = "0.3.1", features = ["full"] }
+alloy = { version = "0.3.6", features = ["full"] }
 alloy-rlp = "0.3.4"
 
 tn-block-validator = { path = "crates/execution/block-validator" }
@@ -321,5 +321,5 @@ anemo-cli = { git = "https://github.com/mystenlabs/anemo.git", rev = "e609f7697e
 anemo-tower = { git = "https://github.com/mystenlabs/anemo.git", rev = "e609f7697ed6169bf0760882a0b6c032a57e4f3b" }
 tikv-jemallocator = "0.5.4"
 
-[patch.crates-io]
-alloy-sol-type-parser = { git = "https://github.com/alloy-rs/core", commit = "6bd4aeddc899c7649c2ce9be383fd5a3d4c0b691" }
+# [patch.crates-io]
+# alloy-sol-type-parser = { git = "https://github.com/alloy-rs/core", commit = "6bd4aeddc899c7649c2ce9be383fd5a3d4c0b691" }
