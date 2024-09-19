@@ -2,12 +2,11 @@
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
-use crate::metrics::{Metrics, WorkerMetrics};
 use crate::{
     block_fetcher::WorkerBlockFetcher,
     block_provider::BlockProvider,
-    handlers::{PrimaryReceiverHandler, WorkerReceiverHandler},
-    metrics::WorkerChannelMetrics,
+    metrics::{Metrics, WorkerChannelMetrics, WorkerMetrics},
+    network::{PrimaryReceiverHandler, WorkerReceiverHandler},
     quorum_waiter::QuorumWaiter,
     NUM_SHUTDOWN_RECEIVERS,
 };
@@ -39,10 +38,10 @@ use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, thread::sleep, time::D
 use tap::TapFallible;
 use tn_block_validator::BlockValidation;
 use tn_types::{
-    traits::KeyPair as _, Authority, AuthorityIdentifier, Committee, Multiaddr, NetworkKeypair,
-    NetworkPublicKey, NewWorkerBlock, Parameters, Protocol, WorkerCache, WorkerId,
+    traits::KeyPair as _, Authority, AuthorityIdentifier, Committee, ConditionalBroadcastReceiver,
+    Multiaddr, NetworkKeypair, NetworkPublicKey, NewWorkerBlock, Parameters,
+    PreSubscribedBroadcastSender, Protocol, WorkerCache, WorkerId,
 };
-use tn_types::{ConditionalBroadcastReceiver, PreSubscribedBroadcastSender};
 use tokio::task::JoinHandle;
 use tower::ServiceBuilder;
 use tracing::{error, info};
@@ -349,7 +348,7 @@ impl<DB: Database> Worker<DB> {
             shutdown_receivers.pop().unwrap(),
         );
 
-        let client_flow_handles = worker.handle_clients_transactions(
+        let client_flow_handles = worker.spawn_block_proposals(
             vec![
                 shutdown_receivers.pop().unwrap(),
                 shutdown_receivers.pop().unwrap(),
@@ -424,7 +423,7 @@ impl<DB: Database> Worker<DB> {
     }
 
     /// Spawn all tasks responsible to handle clients transactions.
-    fn handle_clients_transactions(
+    fn spawn_block_proposals(
         &self,
         mut shutdown_receivers: Vec<ConditionalBroadcastReceiver>,
         node_metrics: Arc<WorkerMetrics>,
@@ -435,39 +434,15 @@ impl<DB: Database> Worker<DB> {
     ) -> Vec<JoinHandle<()>> {
         info!("Starting handler for transactions");
 
-        // let (_tx_batch_maker, rx_batch_maker) = channel_with_total(
-        //     CHANNEL_CAPACITY,
-        //     &channel_metrics.tx_batch_maker,
-        //     &channel_metrics.tx_batch_maker_total,
-        // );
         let (tx_quorum_waiter, rx_quorum_waiter) = channel_with_total(
             CHANNEL_CAPACITY,
             &channel_metrics.tx_quorum_waiter,
             &channel_metrics.tx_quorum_waiter_total,
         );
 
-        // // We first receive clients' transactions from the network.
-        // let address = self
-        //     .worker_cache
-        //     .worker(self.authority.protocol_key(), &self.id)
-        //     .expect("Our public key or worker id is not in the worker cache")
-        //     .transactions;
-        // let address =
-        //     address.replace(0, |_protocol| Some(Protocol::Ip4(Ipv4Addr::UNSPECIFIED))).unwrap();
-
-        // let tx_server_handle = TxServer::spawn(
-        //     address.clone(),
-        //     shutdown_receivers.pop().unwrap(),
-        //     endpoint_metrics,
-        //     tx_batch_maker,
-        //     validator,
-        // );
-
-        // The transactions are sent to the `BatchMaker` that assembles them into batches. It then
-        // broadcasts (in a reliable manner) the batches to all other workers that share the
-        // same `id` as us. Finally, it gathers the 'cancel handlers' of the messages and
-        // send them to the `QuorumWaiter`.
-        let batch_maker_handle = BlockProvider::spawn(
+        // Receives a fully executed worker block from execution layer and reliably broadcasts to
+        // peers with the same `id` before passing off to the `QuorumWaiter`.
+        let block_provider_handle = BlockProvider::spawn(
             self.id,
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
@@ -479,8 +454,8 @@ impl<DB: Database> Worker<DB> {
             self.store.clone(),
         );
 
-        // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of the batch. It
-        // then forwards the batch to the `Processor`.
+        // The `QuorumWaiter` waits for 2f authorities to acknowledge receiving the block
+        // before forwarding the block to the `Processor`
         let quorum_waiter_handle = QuorumWaiter::spawn(
             self.authority.clone(),
             self.id,
@@ -492,6 +467,6 @@ impl<DB: Database> Worker<DB> {
             node_metrics,
         );
 
-        vec![batch_maker_handle, quorum_waiter_handle]
+        vec![block_provider_handle, quorum_waiter_handle]
     }
 }
