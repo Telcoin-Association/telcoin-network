@@ -5,8 +5,7 @@
 
 //! Aggregate certificates for the round.
 use std::collections::HashSet;
-use tn_types::Certificate;
-use tn_types::{AuthorityIdentifier, Committee, Stake};
+use tn_types::{AuthorityIdentifier, Certificate, Committee, Stake};
 use tracing::trace;
 
 /// Aggregate certificates until quorum is reached
@@ -29,7 +28,8 @@ impl CertificatesAggregator {
 
     /// Append the certificate to the collection.
     ///
-    /// This method protects against equivocation by keeping track of peers that have already issued certificates.
+    /// This method protects against equivocation by keeping track of peers that have already issued
+    /// certificates.
     pub(crate) fn append(
         &mut self,
         certificate: Certificate,
