@@ -21,7 +21,7 @@ use tracing::{trace, warn};
 pub(crate) struct VotesAggregator {
     /// The accumulated amount of voting power in favor of a proposed header.
     ///
-    /// This amount is authorities_seen to verify enough voting power to reach quorum within the committee.
+    /// This amount is used to verify enough voting power to reach quorum within the committee.
     weight: Stake,
     /// The vote received from a peer.
     votes: Vec<(AuthorityIdentifier, BlsSignature)>,
@@ -32,12 +32,16 @@ pub(crate) struct VotesAggregator {
 }
 
 impl VotesAggregator {
+    /// Create a new instance of `Self`.
     pub(crate) fn new(metrics: Arc<PrimaryMetrics>) -> Self {
         metrics.votes_received_last_round.set(0);
 
         Self { weight: 0, votes: Vec::new(), authorities_seen: HashSet::new(), metrics }
     }
 
+    /// Append the vote to the collection.
+    ///
+    /// This method protects against equivocation by keeping track of peers that have already voted.
     pub(crate) fn append(
         &mut self,
         vote: Vote,

@@ -4,17 +4,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Aggregate certificates for the round.
-use fastcrypto::hash::{Digest, Hash};
-use narwhal_primary_metrics::PrimaryMetrics;
-use std::{collections::HashSet, sync::Arc};
-use tn_types::{
-    ensure,
-    error::{DagError, DagResult},
-    to_intent_message, BlsAggregateSignature, BlsSignature, Certificate, Header,
-    SignatureVerificationState, ValidatorAggregateSignature, ValidatorSignature, Vote,
-};
+use std::collections::HashSet;
+use tn_types::Certificate;
 use tn_types::{AuthorityIdentifier, Committee, Stake};
-use tracing::warn;
+use tracing::trace;
 
 /// Aggregate certificates until quorum is reached
 pub struct CertificatesAggregator {
@@ -24,35 +17,45 @@ pub struct CertificatesAggregator {
     weight: Stake,
     /// The certificates aggregated for this round.
     certificates: Vec<Certificate>,
-    ///
+    /// The collection of authority ids that have already voted.
     authorities_seen: HashSet<AuthorityIdentifier>,
 }
 
 impl CertificatesAggregator {
-    pub fn new() -> Self {
+    /// Create a new instance of `Self`.
+    pub(crate) fn new() -> Self {
         Self { weight: 0, certificates: Vec::new(), authorities_seen: HashSet::new() }
     }
 
-    pub fn append(
+    /// Append the certificate to the collection.
+    ///
+    /// This method protects against equivocation by keeping track of peers that have already issued certificates.
+    pub(crate) fn append(
         &mut self,
         certificate: Certificate,
         committee: &Committee,
     ) -> Option<Vec<Certificate>> {
         let origin = certificate.origin();
 
-        // Ensure it is the first time this authority votes.
+        // ensure authority hasn't issued certificate already
         if !self.authorities_seen.insert(origin) {
             return None;
         }
 
+        // accumulate certificates and voting power
         self.certificates.push(certificate);
         self.weight += committee.stake_by_id(origin);
+
+        // check for quorum
         if self.weight >= committee.quorum_threshold() {
-            // Note that we do not reset the weight here. If this function is called again and
-            // the proposer didn't yet advance round, we can add extra certificates as parents.
-            // This is required when running Bullshark as consensus.
+            trace!(target: "primary::certificate_aggregator", "quorum reached");
+            // NOTE: do not reset the weight here
+            //
+            // this method could be called again if the proposer doesn't
+            // advance the round
             return Some(self.certificates.drain(..).collect());
         }
+
         None
     }
 }
