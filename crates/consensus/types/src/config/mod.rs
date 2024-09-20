@@ -140,7 +140,12 @@ impl Default for PrimaryInfo {
 
 // TODO: This actually represents voting power (out of 10,000) and not amount staked.
 // Consider renaming to `VotingPower`.
+/// The voting power an authority has within the committee.
 pub type Stake = u64;
+
+/// The unique identifier for a worker (per primary).
+///
+/// Workers communicate with peers of the same `WorkerId`.
 pub type WorkerId = u16;
 
 /// Information for the worker
