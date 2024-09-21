@@ -386,17 +386,17 @@ impl Primary {
 
         // The `CertificateFetcher` waits to receive all the ancestors of a certificate before
         // looping it back to the `Synchronizer` for further processing.
-        let certificate_fetcher_handle = CertificateFetcher::spawn(
-            authority.id(),
-            committee.clone(),
-            network.clone(),
-            certificate_store,
-            rx_consensus_round_updates,
-            tx_shutdown.subscribe(),
-            rx_certificate_fetcher,
-            synchronizer,
-            metrics.node_metrics.clone(),
-        );
+        // let certificate_fetcher_handle = CertificateFetcher::new(
+        //     authority.id(),
+        //     committee.clone(),
+        //     network.clone(),
+        //     certificate_store,
+        //     rx_consensus_round_updates,
+        //     tx_shutdown.subscribe(),
+        //     rx_certificate_fetcher,
+        //     synchronizer,
+        //     metrics.node_metrics.clone(),
+        // );
 
         // When the `Synchronizer` collects enough parent certificates, the `Proposer` generates
         // a new header with new block digests from our workers and sends it to the `Certifier`.
@@ -428,7 +428,7 @@ impl Primary {
         // can't include proposer handle yet
         let mut handles = vec![
             core_handle,
-            certificate_fetcher_handle,
+            // certificate_fetcher_handle,
             // proposer_handle,
             connection_monitor_handle,
         ];

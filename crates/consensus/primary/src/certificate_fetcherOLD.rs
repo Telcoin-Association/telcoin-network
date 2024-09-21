@@ -47,19 +47,6 @@ const PARALLEL_FETCH_REQUEST_INTERVAL_SECS: Duration = Duration::from_secs(5);
 /// The timeout for an iteration of parallel fetch requests over all peers is:
 /// num peers * PARALLEL_FETCH_REQUEST_INTERVAL_SECS + PARALLEL_FETCH_REQUEST_ADDITIONAL_TIMEOUT
 const PARALLEL_FETCH_REQUEST_ADDITIONAL_TIMEOUT: Duration = Duration::from_secs(15);
-/// Convenience type that contains all information needed to fetch missing certificates.
-struct FetchArgs<DB> {
-    /// Identity of the current authority.
-    authority_id: AuthorityIdentifier,
-    /// Network client to fetch certificates from other primaries.
-    network: anemo::Network,
-    /// Accepts Certificates into local storage.
-    synchronizer: Synchronizer<DB>,
-    /// The metrics handler
-    metrics: Arc<PrimaryMetrics>,
-    /// The committee information.
-    committee: Committee,
-}
 
 #[derive(Clone, Debug)]
 /// Variations of the type of certificate to fetch.
@@ -67,9 +54,7 @@ pub enum CertificateFetcherCommand {
     /// Fetch the certificate and its ancestors.
     Ancestors(Certificate),
     /// Fetch once from a random primary.
-    ///
-    /// This command is used as a fallback attempt to receive any certificate from any primary after a period of time without receiving any certificates from the network.
-    Any,
+    Kick,
 }
 
 /// The CertificateFetcher is responsible for fetching certificates that this primary is missing
@@ -81,14 +66,8 @@ pub enum CertificateFetcherCommand {
 /// be accepted by this primary. After a fetch completes, another one will start immediately if
 /// there are more certificates missing ancestors.
 pub(crate) struct CertificateFetcher<DB> {
-    /// Identity of the current authority.
-    authority_id: AuthorityIdentifier,
-    /// Network client to fetch certificates from other primaries.
-    network: anemo::Network,
-    /// Accepts Certificates into local storage.
-    synchronizer: Synchronizer<DB>,
-    /// The metrics handler
-    metrics: Arc<PrimaryMetrics>,
+    /// Internal state of CertificateFetcher.
+    state: Arc<CertificateFetcherState<DB>>,
     /// The committee information.
     committee: Committee,
     /// Persistent storage for certificates. Read-only usage.
@@ -110,11 +89,22 @@ pub(crate) struct CertificateFetcher<DB> {
     fetch_certificates_task: JoinSet<()>,
 }
 
+/// Thread-safe internal state of CertificateFetcher shared with its fetch task.
+struct CertificateFetcherState<DB> {
+    /// Identity of the current authority.
+    authority_id: AuthorityIdentifier,
+    /// Network client to fetch certificates from other primaries.
+    network: anemo::Network,
+    /// Accepts Certificates into local storage.
+    synchronizer: Arc<Synchronizer<DB>>,
+    /// The metrics handler
+    metrics: Arc<PrimaryMetrics>,
+}
+
 impl<DB: Database> CertificateFetcher<DB> {
-    /// Create a new instance of `Self`.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    pub(crate) fn new(
+    pub fn spawn(
         authority_id: AuthorityIdentifier,
         committee: Committee,
         network: anemo::Network,
@@ -122,53 +112,124 @@ impl<DB: Database> CertificateFetcher<DB> {
         rx_consensus_round_updates: watch::Receiver<ConsensusRound>,
         rx_shutdown: ConditionalBroadcastReceiver,
         rx_certificate_fetcher: Receiver<CertificateFetcherCommand>,
-        synchronizer: Synchronizer<DB>,
+        synchronizer: Arc<Synchronizer<DB>>,
         metrics: Arc<PrimaryMetrics>,
-    ) -> Self {
-        Self {
-            authority_id,
-            network,
-            synchronizer,
-            metrics,
-            committee,
-            certificate_store,
-            rx_consensus_round_updates,
-            rx_shutdown,
-            rx_certificate_fetcher,
-            targets: BTreeMap::new(),
-            fetch_certificates_task: JoinSet::new(),
+    ) -> JoinHandle<()> {
+        let state =
+            Arc::new(CertificateFetcherState { authority_id, network, synchronizer, metrics });
+
+        spawn_logged_monitored_task!(
+            async move {
+                Self {
+                    state,
+                    committee,
+                    certificate_store,
+                    rx_consensus_round_updates,
+                    rx_shutdown,
+                    rx_certificate_fetcher,
+                    targets: BTreeMap::new(),
+                    fetch_certificates_task: JoinSet::new(),
+                }
+                .run()
+                .await;
+            },
+            "CertificateFetcherTask"
+        )
+    }
+
+    async fn run(&mut self) {
+        loop {
+            tokio::select! {
+                Some(command) = self.rx_certificate_fetcher.recv() => {
+                    let certificate = match command {
+                        CertificateFetcherCommand::Ancestors(certificate) => certificate,
+                        CertificateFetcherCommand::Kick => {
+                            // Kick start a fetch task if there is no other task running.
+                            if self.fetch_certificates_task.is_empty() {
+                                self.kickstart();
+                            }
+                            continue;
+                        }
+                    };
+                    let header = &certificate.header();
+                    if header.epoch() != self.committee.epoch() {
+                        continue;
+                    }
+                    // Unnecessary to validate the header and certificate further, since it has
+                    // already been validated.
+
+                    if let Some(r) = self.targets.get(&header.author()) {
+                        if header.round() <= *r {
+                            // Ignore fetch request when we already need to sync to a later
+                            // certificate from the same authority. Although this certificate may
+                            // not be the parent of the later certificate, this should be ok
+                            // because eventually a child of this certificate will miss parents and
+                            // get inserted into the targets.
+                            //
+                            // Basically, it is ok to stop fetching without this certificate.
+                            // If this certificate becomes a parent of other certificates, another
+                            // fetch will be triggered eventually because of missing certificates.
+                            continue;
+                        }
+                    }
+
+                    // The header should have been verified as part of the certificate.
+                    match self.certificate_store.last_round_number(header.author()) {
+                        Ok(r) => {
+                            if header.round() <= r.unwrap_or(0) {
+                                // Ignore fetch request. Possibly the certificate was processed
+                                // while the message is in the queue.
+                                continue;
+                            }
+                            // Otherwise, continue to update fetch targets.
+                        }
+                        Err(e) => {
+                            // If this happens, it is most likely due to serialization error.
+                            error!("Failed to read latest round for {}: {}", header.author(), e);
+                            continue;
+                        }
+                    };
+
+                    // Update the target rounds for the authority.
+                    self.targets.insert(header.author(), header.round());
+
+                    // Kick start a fetch task if there is no other task running.
+                    if self.fetch_certificates_task.is_empty() {
+                        self.kickstart();
+                    }
+                },
+                Some(result) = self.fetch_certificates_task.join_next(), if !self.fetch_certificates_task.is_empty() => {
+                    match result {
+                        Ok(()) => {},
+                        Err(e) => {
+                            if e.is_cancelled() {
+                                // avoid crashing on ungraceful shutdown
+                            } else if e.is_panic() {
+                                // propagate panics.
+                                std::panic::resume_unwind(e.into_panic());
+                            } else {
+                                panic!("fetch certificates task failed: {e}");
+                            }
+                        },
+                    };
+
+                    // Kick start another fetch task after the previous one terminates.
+                    // If all targets have been fetched, the new task will clean up the targets and exit.
+                    if self.fetch_certificates_task.is_empty() {
+                        self.kickstart();
+                    }
+                },
+                _ = self.rx_shutdown.receiver.recv() => {
+                    return
+                }
+            }
         }
     }
 
-    /// Convenience method for obtaining all the information needed to fetch missing certificates.
-    fn fetch_args(&self) -> FetchArgs<DB> {
-        // Skip fetching certificates that already exist locally.
-        let mut written_rounds = BTreeMap::<AuthorityIdentifier, BTreeSet<Round>>::new();
-        for authority in self.committee.authorities() {
-            // Initialize written_rounds for all authorities, because the handler only sends back
-            // certificates for the set of authorities here.
-            written_rounds.insert(authority.id(), BTreeSet::new());
-        }
-        FetchArgs {
-            authority_id: self.authority_id,
-            network: self.network.clone(),
-            synchronizer: self.synchronizer.clone(),
-            metrics: self.metrics.clone(),
-            committee: self.committee.clone(),
-        }
-    }
-
-    /// Fallback attempt to retrieve certificates from the network.
-    ///
-    /// This method is triggered by `Synchronizer` after a period of time where no commits have happened in consensus.
-    ///
-    /// !!!!!!!!!!!!!!!!!!!!!!!!!!
-    /// TODO: cleanup comment here
-    ///
-    /// Starts a task to fetch missing certificates from other primaries.
-    /// A call to kickstart() can be triggered by a certificate with missing parents or the end of a
-    /// fetch task. Each iteration of kickstart() updates the target rounds, and iterations will
-    /// continue until there are no more target rounds to catch up to.
+    // Starts a task to fetch missing certificates from other primaries.
+    // A call to kickstart() can be triggered by a certificate with missing parents or the end of a
+    // fetch task. Each iteration of kickstart() updates the target rounds, and iterations will
+    // continue until there are no more target rounds to catch up to.
     #[allow(clippy::mutable_key_type)]
     fn kickstart(&mut self) {
         // Skip fetching certificates at or below the gc round.
@@ -208,7 +269,6 @@ impl<DB: Database> CertificateFetcher<DB> {
             // fetch will be triggered eventually because of missing certificates.
             last_written_round < *target_round
         });
-
         if self.targets.is_empty() {
             debug!(target: "primary::cert_fetcher", "Certificates have caught up. Skip fetching.");
             return;
@@ -230,8 +290,7 @@ impl<DB: Database> CertificateFetcher<DB> {
             let now = Instant::now();
             match run_fetch_task(state.clone(), committee, gc_round, written_rounds).await {
                 Ok(_) => {
-                    debug!(
-                        target: "primary::cert_fetcher",
+                    debug!(target: "primary::cert_fetcher",
                         "Finished task to fetch certificates successfully, elapsed = {}s",
                         now.elapsed().as_secs_f64()
                     );

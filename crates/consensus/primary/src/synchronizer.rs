@@ -444,7 +444,7 @@ impl<DB: Database> Synchronizer<DB> {
                             return;
                         };
                         if let Err(e) =
-                            inner.tx_certificate_fetcher.send(CertificateFetcherCommand::Kick).await
+                            inner.tx_certificate_fetcher.send(CertificateFetcherCommand::Any).await
                         {
                             error!(target: "primary::synchronizer::gc", ?e, "failed to send on tx_certificate_fetcher");
                             return;
