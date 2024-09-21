@@ -1,9 +1,9 @@
-FROM rust:1.79-slim-bookworm AS builder
+FROM rust:1.81-slim-bookworm AS builder
 
 WORKDIR /usr/src/telcoin-network
 
 RUN apt-get update \
-    && apt-get install -y build-essential cmake libclang-16-dev \
+    && apt-get install -y build-essential cmake libclang-16-dev pkg-config libssl-dev libapr1-dev \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -20,6 +20,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Production Image
 FROM debian:bookworm-slim
+
+# resolves: 'openssl: error while loading shared libraries: libssl.so.3: cannot open shared object file: No such file or directory'
+RUN apt-get update \
+    && apt-get install -y libapr1-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 # specify user id for nonroot
 ENV USER_ID=1101
