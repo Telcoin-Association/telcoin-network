@@ -9,7 +9,7 @@ use anemo::Request;
 use consensus_metrics::{
     metered_channel::Receiver, monitored_future, monitored_scope, spawn_logged_monitored_task,
 };
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use narwhal_network::PrimaryToPrimaryRpc;
 use narwhal_primary_metrics::PrimaryMetrics;
 use narwhal_storage::CertificateStore;
@@ -17,10 +17,15 @@ use narwhal_typed_store::traits::Database;
 use rand::{rngs::ThreadRng, seq::SliceRandom};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::Duration,
 };
 use tn_types::{AuthorityIdentifier, Committee, NetworkPublicKey};
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::BroadcastStream;
 
 use narwhal_network_types::{FetchCertificatesRequest, FetchCertificatesResponse};
 use tn_types::{
@@ -32,7 +37,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
     time::{sleep, timeout, Instant},
 };
-use tracing::{debug, error, instrument, trace};
+use tracing::{debug, error, instrument, trace, warn};
 
 #[cfg(test)]
 #[path = "tests/certificate_fetcher_tests.rs"]
@@ -96,7 +101,7 @@ pub(crate) struct CertificateFetcher<DB> {
     /// Receiver for signal of round changes.
     rx_consensus_round_updates: watch::Receiver<ConsensusRound>,
     /// Receiver for shutdown.
-    rx_shutdown: ConditionalBroadcastReceiver,
+    rx_shutdown_stream: BroadcastStream<()>,
     /// Receives certificates with missing parents from the `Synchronizer`.
     rx_certificate_fetcher: Receiver<CertificateFetcherCommand>,
     /// Map of validator to target rounds that local store must catch up to.
@@ -125,6 +130,7 @@ impl<DB: Database> CertificateFetcher<DB> {
         synchronizer: Synchronizer<DB>,
         metrics: Arc<PrimaryMetrics>,
     ) -> Self {
+        let rx_shutdown_stream = BroadcastStream::new(rx_shutdown.receiver);
         Self {
             authority_id,
             network,
@@ -133,7 +139,7 @@ impl<DB: Database> CertificateFetcher<DB> {
             committee,
             certificate_store,
             rx_consensus_round_updates,
-            rx_shutdown,
+            rx_shutdown_stream,
             rx_certificate_fetcher,
             targets: BTreeMap::new(),
             fetch_certificates_task: JoinSet::new(),
@@ -214,7 +220,6 @@ impl<DB: Database> CertificateFetcher<DB> {
             return;
         }
 
-        let state = self.state.clone();
         let committee = self.committee.clone();
 
         debug!(
@@ -253,7 +258,7 @@ impl<DB: Database> CertificateFetcher<DB> {
 #[allow(clippy::mutable_key_type)]
 #[instrument(level = "debug", skip_all)]
 async fn run_fetch_task<DB: Database>(
-    state: Arc<CertificateFetcherState<DB>>,
+    state: FetchArgs<DB>,
     committee: Committee,
     gc_round: Round,
     written_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>>,
@@ -289,6 +294,7 @@ async fn fetch_certificates_helper(
 ) -> Option<FetchCertificatesResponse> {
     let _scope = monitored_scope("FetchingCertificatesFromPeers");
     trace!(target: "primary::cert_fetcher", "Start sending fetch certificates requests");
+
     // TODO: make this a config parameter.
     let request_interval = PARALLEL_FETCH_REQUEST_INTERVAL_SECS;
     let mut peers: Vec<NetworkPublicKey> = committee
@@ -299,6 +305,7 @@ async fn fetch_certificates_helper(
     peers.shuffle(&mut ThreadRng::default());
     let fetch_timeout = PARALLEL_FETCH_REQUEST_INTERVAL_SECS * peers.len().try_into().unwrap()
         + PARALLEL_FETCH_REQUEST_ADDITIONAL_TIMEOUT;
+
     let fetch_callback = async move {
         debug!(target: "primary::cert_fetcher", "Starting to fetch certificates");
         let mut fut = FuturesUnordered::new();
@@ -316,7 +323,9 @@ async fn fetch_certificates_helper(
                     result
                 }));
             }
+
             let mut interval = Box::pin(sleep(request_interval));
+
             tokio::select! {
                 res = fut.next() => match res {
                     Some(Ok(resp)) => {
@@ -346,6 +355,7 @@ async fn fetch_certificates_helper(
             };
         }
     };
+
     match timeout(fetch_timeout, fetch_callback).await {
         Ok(result) => result,
         Err(e) => {
@@ -393,4 +403,42 @@ async fn process_certificates_helper<DB: Database>(
     trace!(target: "primary::cert_fetcher", "Fetched certificates have been processed");
 
     Ok(())
+}
+
+impl<DB> Future for CertificateFetcher<DB>
+where
+    DB: Database,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        // check for shutdown signal
+        //
+        // okay to shutdown here because other primary tasks are expected to shutdown too
+        // ie) no point completing the proposal if certifier is down
+        if let Poll::Ready(Some(_shutdown)) = this.rx_shutdown_stream.poll_next_unpin(cx) {
+            warn!(target: "primary::cert_fetcher", authority=?this.authority_id, "received shutdown signal...");
+            return Poll::Ready(());
+        }
+
+        // process requests to fetch certificates
+        while let Poll::Ready(Some(fetch)) = this.rx_certificate_fetcher.poll_recv(cx) {
+            todo!()
+        }
+
+        // poll certificate fetch task
+        // if let Some(mut receiver) = this.fetch_certificate_task.take() {
+        //     match receiver.poll_unpin(cx) {
+        //         Poll::Ready(res) => {
+        //             debug!(target: "primary::proposer", authority=?this.authority_id, "pending header task complete!");
+        //             this.handle_proposal_result(res)?;
+        //             // continue the loop to propose the next header
+        //             continue;
+        //         }
+        //     }
+        // }
+
+        Poll::Pending
+    }
 }
