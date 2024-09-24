@@ -19,6 +19,17 @@ use tracing::{debug, error};
 /// One unit of TEL (10^18) measured in wei.
 const WEI_PER_TEL: u128 = 1_000_000_000_000_000_000;
 
+/// Helper function to shutdown child processes and log errors.
+fn kill_child(child: &mut Child) {
+    if let Err(e) = child.kill() {
+        error!(target: "restart-test", ?e, "error killing child");
+    }
+
+    if let Err(e) = child.wait() {
+        error!(target: "restart-test", ?e, "error waiting for child to die");
+    }
+}
+
 /// Run the first part tests, broken up like this to allow more robust node shutdown.
 fn run_restart_tests1(
     client_urls: &[String; 4],
@@ -32,8 +43,7 @@ fn run_restart_tests1(
     // send tel and kill child2 if error
     send_tel(&client_urls[1], &key, to_account, 10 * WEI_PER_TEL, 250, 21000, 0).inspect_err(
         |e| {
-            child2.kill().expect("child2 killed after error received");
-            child2.wait().expect("child2 waited to die after error received");
+            kill_child(child2);
             error!(target: "restart-test", ?e);
         },
     )?;
@@ -45,22 +55,21 @@ fn run_restart_tests1(
     // get positive bal and kill child2 if error
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
         .inspect_err(|e| {
-            child2.kill().expect("child2 killed after error received");
-            child2.wait().expect("child2 waited to die after error received");
+            kill_child(child2);
             error!(target: "restart-test", ?e);
         })?;
 
     if 10 * WEI_PER_TEL != bal {
         error!(target: "restart-test", "tests1: 10 * WEI_PER_TEL != bal - returning error!");
-        child2.kill().expect("child2 killed after error received");
-        child2.wait().expect("child2 waited to die after error received");
+        kill_child(child2);
         return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 10 * WEI_PER_TEL)));
     }
+
     debug!(target: "restart-test", "killing child2...");
-    child2.kill()?;
-    child2.wait()?;
-    debug!(target: "restart-test", "child2.wait() success! sleeping...");
+    kill_child(child2);
+    debug!(target: "restart-test", "child2 dead :D sleeping...");
     std::thread::sleep(Duration::from_millis(3000));
+
     // This validator should be down now, confirm.
     if get_balance(&client_urls[2], &to_account.to_string(), 5).is_ok() {
         error!(target: "restart-test", "tests1: get_balancer worked for shutdown validator - returning error!");
@@ -70,19 +79,30 @@ fn run_restart_tests1(
     debug!(target: "restart-test", "restarting child2...");
     // Restart
     let mut child2 = start_validator(2, exe_path, temp_path, rpc_port2);
-    let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())?;
+    let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
+        .inspect_err(|e| {
+            kill_child(&mut child2);
+            error!(target: "restart-test", ?e);
+        })?;
     if 10 * WEI_PER_TEL != bal {
         error!(target: "restart-test", "tests1 after restart: 10 * WEI_PER_TEL != bal - returning error!");
-        child2.kill().expect("child2 killed after error received");
-        child2.wait().expect("child2 waited to die after error received");
+        kill_child(&mut child2);
         return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 10 * WEI_PER_TEL)));
     }
-    send_tel(&client_urls[0], &key, to_account, 10 * WEI_PER_TEL, 250, 21000, 1)?;
-    let bal = get_balance_above_with_retry(&client_urls[2], &to_account.to_string(), bal)?;
+    send_tel(&client_urls[0], &key, to_account, 10 * WEI_PER_TEL, 250, 21000, 1).inspect_err(
+        |e| {
+            kill_child(&mut child2);
+            error!(target: "restart-test", ?e);
+        },
+    )?;
+    let bal = get_balance_above_with_retry(&client_urls[2], &to_account.to_string(), bal)
+        .inspect_err(|e| {
+            kill_child(&mut child2);
+            error!(target: "restart-test", ?e);
+        })?;
     if 20 * WEI_PER_TEL != bal {
         error!(target: "restart-test", "tests1 after restart: 20 * WEI_PER_TEL != bal - returning error!");
-        child2.kill().expect("child2 killed after error received");
-        child2.wait().expect("child2 waited to die after error received");
+        kill_child(&mut child2);
         return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 20 * WEI_PER_TEL)));
     }
     Ok(child2)
@@ -142,10 +162,10 @@ fn test_restarts() -> eyre::Result<()> {
     // kill new child2 if successfully restarted
     match res1 {
         Ok(mut child2_restarted) => {
-            let _ = child2_restarted.kill();
-            let _ = child2_restarted.wait();
+            kill_child(&mut child2_restarted);
         }
         Err(err) => {
+            // run_restart_tests1 shutsdown child2 on error
             tracing::error!(target: "restart-test", "Got error: {err}");
         }
     }
@@ -155,8 +175,7 @@ fn test_restarts() -> eyre::Result<()> {
         // Best effort to kill all the other nodes.
         if i != 2 {
             let child = child.as_mut().expect("missing a child");
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_child(child);
             debug!(target: "restart-test", "kill and wait on child{i} complete");
         }
     }
@@ -182,8 +201,7 @@ fn test_restarts() -> eyre::Result<()> {
     // kill children before returnin final_result
     for child in children.iter_mut() {
         let child = child.as_mut().expect("missing a child");
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_child(child);
         debug!(target: "restart-test", "kill and wait on child complete for final result");
     }
 
