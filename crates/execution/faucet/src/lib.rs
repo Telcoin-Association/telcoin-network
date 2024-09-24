@@ -443,3 +443,23 @@ mod tests {
         debug!("public key:\n {:?}", pem_pubkey);
     }
 }
+
+#[tokio::test]
+async fn test_deployment() {
+    use jsonrpsee::core::client::ClientT;
+    // load balancer for adiri testnet
+    let rpc_url = "https://adiri.tel".to_string();
+    let client = jsonrpsee::http_client::HttpClientBuilder::default()
+        .build(&rpc_url)
+        .expect("rpc client created");
+
+    // make 100 requests
+    for _ in 0..100 {
+        let random_address = Address::random();
+        let tx: &String = &client
+            .request("faucet_transfer", jsonrpsee::rpc_params!(random_address))
+            .await
+            .expect("all good for {random_address:?}");
+        println!("{tx:?}");
+    }
+}

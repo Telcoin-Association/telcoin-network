@@ -301,6 +301,9 @@ where
         // Configure the environment for the block.
         let mut evm = evm_config.evm_with_env(&mut db, env);
 
+        // handle new basefee
+        // evm.context.evm.env.block.basefee = tx.transaction
+
         let ResultAndState { result, state } = match evm.transact() {
             Ok(res) => res,
             Err(err) => {
