@@ -11,11 +11,12 @@ use futures_util::{
     future::{BoxFuture, Fuse, FusedFuture},
     FutureExt, Stream, StreamExt,
 };
+use reth_chainspec::ChainSpec;
+use reth_execution_types::ChangedAccount;
 use reth_fs_util::FsPathError;
 use reth_primitives::{
     constants::MIN_PROTOCOL_BASE_FEE, Address, BlockHash, BlockNumber, BlockNumberOrTag,
-    FromRecoveredPooledTransaction, PooledTransactionsElementEcRecovered, TransactionSigned,
-    TryFromRecoveredTransaction, U256,
+    PooledTransactionsElementEcRecovered, TransactionSigned, U256,
 };
 use reth_provider::{
     BlockReaderIdExt, CanonStateNotification, Chain, ChainSpecProvider, ExecutionOutcome,
@@ -23,8 +24,8 @@ use reth_provider::{
 };
 use reth_tasks::TaskSpawner;
 use reth_transaction_pool::{
-    error::PoolError, BlockInfo, CanonicalStateUpdate, ChangedAccount, TransactionOrigin,
-    TransactionPool, TransactionPoolExt,
+    error::PoolError, BlockInfo, CanonicalStateUpdate, TransactionOrigin, TransactionPool,
+    TransactionPoolExt,
 };
 use std::{
     borrow::Borrow,
@@ -319,7 +320,12 @@ pub fn maintain_transaction_pool_future<Provider, P, C, W, Tasks>(
     config: PoolMaintenanceConfig,
 ) -> BoxFuture<'static, ()>
 where
-    Provider: StateProviderFactory + BlockReaderIdExt + ChainSpecProvider + Clone + Send + 'static,
+    Provider: StateProviderFactory
+        + BlockReaderIdExt
+        + ChainSpecProvider<ChainSpec = ChainSpec>
+        + Clone
+        + Send
+        + 'static,
     P: TransactionPoolExt + 'static,
     C: Stream<Item = CanonStateNotification> + Send + Unpin + 'static,
     W: Stream<Item = WorkerBlockUpdate> + Send + Unpin + 'static,
@@ -350,7 +356,12 @@ pub async fn maintain_transaction_pool<Provider, P, C, W, Tasks>(
     task_spawner: Tasks,
     config: PoolMaintenanceConfig,
 ) where
-    Provider: StateProviderFactory + BlockReaderIdExt + ChainSpecProvider + Clone + Send + 'static,
+    Provider: StateProviderFactory
+        + BlockReaderIdExt
+        + ChainSpecProvider<ChainSpec = ChainSpec>
+        + Clone
+        + Send
+        + 'static,
     P: TransactionPoolExt + 'static,
     C: Stream<Item = CanonStateNotification> + Send + Unpin + 'static,
     W: Stream<Item = WorkerBlockUpdate> + Send + Unpin + 'static,

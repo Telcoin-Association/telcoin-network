@@ -21,6 +21,7 @@ members = [
     "crates/consensus/primary-metrics",
 
     # execution
+    "crates/execution/block-builder",
     "crates/execution/block-proposer",
     "crates/execution/block-validator",
     "crates/execution/faucet",
@@ -169,6 +170,7 @@ reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 reth-libmdbx = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 reth-execution-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
+reth-fs-util = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 
 revm = { version = "14.0.0", features = [
     "std",

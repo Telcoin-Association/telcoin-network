@@ -50,7 +50,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tn_types::{
-    now, AutoSealConsensus, NewBatch, PendingBlockConfig, WorkerBlockBuilderArgs,
+    now, AutoSealConsensus, NewWorkerBlock, PendingBlockConfig, WorkerBlockBuilderArgs,
     WorkerBlockUpdate, WorkerBlockUpdateSender,
 };
 use tokio::sync::{broadcast, oneshot, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -117,7 +117,7 @@ pub struct BlockBuilder<BT, Pool, CE> {
     /// The worker's block maker sends an ack once the block has been stored in db
     /// which guarantees the worker will attempt to broadcast the new block until
     /// quorum is reached.
-    to_worker: Sender<NewBatch>,
+    to_worker: Sender<NewWorkerBlock>,
     /// Optional number of blocks to build before shutting down.
     ///
     /// Engine can produce multiple blocks per round of consensus, so this number may not
@@ -153,7 +153,7 @@ pub struct BlockBuilder<BT, Pool, CE> {
 impl<BT, Pool, CE> BlockBuilder<BT, Pool, CE>
 where
     BT: CanonStateSubscriptions
-        + ChainSpecProvider
+        + ChainSpecProvider<ChainSpec = ChainSpec>
         + StateProviderFactory
         + BlockchainTreeEngine
         + CanonChainTracker
@@ -168,7 +168,7 @@ where
         blockchain: BT,
         pool: Pool,
         evm_config: CE,
-        to_worker: Sender<NewBatch>,
+        to_worker: Sender<NewWorkerBlock>,
         max_builds: Option<usize>,
         address: Address,
         parent_block: SealedBlock,
@@ -339,7 +339,7 @@ where
     BT: StateProviderFactory
         + CanonChainTracker
         + CanonStateSubscriptions
-        + ChainSpecProvider
+        + ChainSpecProvider<ChainSpec = ChainSpec>
         + BlockReaderIdExt
         + BlockchainTreeEngine
         + Clone
@@ -367,7 +367,8 @@ where
                 // maintenance task will handle worker's pending block update
                 match canon_update {
                     CanonStateNotification::Commit { new } => {
-                        this.process_canon_state_update(new);
+                        // this.process_canon_state_update(new);
+                        todo!()
                     }
                     _ => unreachable!("TN reorgs are impossible"),
                 }

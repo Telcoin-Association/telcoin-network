@@ -6,13 +6,13 @@ use std::{
 };
 
 use reth_errors::ProviderError;
+use reth_execution_types::ChangedAccount;
 use reth_fs_util::FsPathError;
-use reth_primitives::{
-    Address, BlockHash, IntoRecoveredTransaction, TransactionSigned, TryFromRecoveredTransaction,
-    U256,
-};
+use reth_primitives::{Address, BlockHash, IntoRecoveredTransaction, TransactionSigned, U256};
 use reth_provider::{ExecutionOutcome, StateProviderFactory};
-use reth_transaction_pool::{error::PoolError, ChangedAccount, TransactionOrigin, TransactionPool};
+use reth_transaction_pool::{
+    error::PoolError, PoolTransaction, TransactionOrigin, TransactionPool,
+};
 use tracing::{debug, error, info, trace, warn};
 
 /// Settings for local transaction backup task
@@ -110,7 +110,7 @@ where
         .filter_map(|tx| tx.try_ecrecovered())
         .filter_map(|tx| {
             // Filter out errors
-            <P as TransactionPool>::Transaction::try_from_recovered_transaction(tx).ok()
+            <P::Transaction as PoolTransaction>::try_from_consensus(tx).ok()
         })
         .collect::<Vec<_>>();
 

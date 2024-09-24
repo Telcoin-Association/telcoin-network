@@ -18,6 +18,7 @@ use reth_revm::{
     DatabaseCommit, State,
 };
 use reth_transaction_pool::{BestTransactionsAttributes, TransactionPool};
+use reth_trie::HashedPostState;
 use tn_types::{PendingBlockConfig, WorkerBlockBuilderArgs, WorkerBlockUpdate};
 use tracing::{debug, warn};
 
@@ -260,7 +261,9 @@ where
     // calculate the state root
     let state_root = {
         let state_provider = db.database.0.inner.borrow_mut();
-        state_provider.db.state_root(execution_outcome.state())?
+        state_provider
+            .db
+            .state_root(HashedPostState::from_bundle_state(&execution_outcome.state().state))?
     };
 
     // create the block header

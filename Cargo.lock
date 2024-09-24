@@ -10676,6 +10676,52 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
+name = "tn-block-builder"
+version = "0.1.0"
+dependencies = [
+ "alloy-rlp",
+ "anemo",
+ "assert_matches",
+ "consensus-metrics",
+ "fastcrypto",
+ "futures-util",
+ "metrics 0.23.0",
+ "narwhal-network",
+ "narwhal-network-types",
+ "narwhal-test-utils",
+ "narwhal-typed-store",
+ "narwhal-worker",
+ "prometheus",
+ "reth",
+ "reth-blockchain-tree",
+ "reth-chainspec",
+ "reth-errors",
+ "reth-evm",
+ "reth-evm-ethereum",
+ "reth-execution-types",
+ "reth-fs-util",
+ "reth-metrics",
+ "reth-node-core",
+ "reth-node-ethereum",
+ "reth-payload-builder",
+ "reth-primitives",
+ "reth-provider",
+ "reth-revm",
+ "reth-stages",
+ "reth-tasks",
+ "reth-tracing",
+ "reth-transaction-pool",
+ "reth-trie",
+ "tempfile",
+ "thiserror",
+ "tn-block-validator",
+ "tn-types",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
 name = "tn-block-proposer"
 version = "0.1.0"
 dependencies = [
