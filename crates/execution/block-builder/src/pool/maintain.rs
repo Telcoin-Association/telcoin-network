@@ -159,8 +159,7 @@ where
     ///
     /// Trigger the maintenance task to Update pool before building the next block.
     fn process_canon_state_update(&self, update: Arc<Chain>) {
-        // TODO: ensure the engine's update includes all accounts that changed during execution
-        warn!(target: "Canon update inside block builder!!!!\n", ?update);
+        trace!(target: "worker::pool_maintenance", ?update, "canon state update from engine");
 
         // update pool based with canonical tip update
         let (blocks, state) = update.inner();
@@ -171,18 +170,24 @@ where
             changed_accounts.push(acc);
         }
 
-        // TODO: these should have already been mined when the worker proposed its block
-        // but still needs to be included for any txs mined by peers
+        // remove any transactions that were mined
+        //
+        // NOTE: this worker's txs should already be removed during the block building process
         let mined_transactions = blocks.transaction_hashes().collect();
+
+        // TODO: basefee should come from engine's watch channel
+        // and engine should update basefee then make round canonical
+        //
+        // the watch channel MUST be updated before the canon notification
         let pending_block_base_fee = self.basefee.unwrap_or(MIN_PROTOCOL_BASE_FEE);
 
         // Canonical update
         let update = CanonicalStateUpdate {
             new_tip: &tip.block,          // finalized block
-            pending_block_base_fee,       // current base fee for worker
-            pending_block_blob_fee: None, // current base fee for worker
-            changed_accounts,             // finalized block
-            mined_transactions,           // finalized block (but these should be a noop)
+            pending_block_base_fee,       // current base fee for worker (network-wide)
+            pending_block_blob_fee: None, // current base fee for worker (network-wide)
+            changed_accounts,             // entire round of consensus
+            mined_transactions,           // entire round of consensus
         };
 
         // sync fn so self will block until all pool updates are complete

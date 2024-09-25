@@ -171,16 +171,21 @@ where
         }
     } // end block execution for round
 
-    // TODO: should this be called in loop?
-    // - batch maker relies on this tip to produce next block
-    // - tx pool will update, rpc, etc.
+    // broadcast new base_fee after executing round
     //
-    // for now: only make canonical after entire output executed
-    // - more efficient
-    // - guarantees consistent state after node restarts
+    // ensure this value is updated before making the round canonical
+    // because pool maintenance task needs the protocol's new base fee
+    // before it can accurately process the canon_state_notification update
     //
+    // TODO: actually impl this
+    // basefee_watch.send(new_base_fee);
+
     // NOTE: this makes all blocks canonical, commits them to the database,
-    // and broadcasts new tip on `canon_state_notification_sender`
+    // and broadcasts new chain on `canon_state_notification_sender`
+    //
+    // the canon_state_notifications include every block executed in this round
+    //
+    // the worker's pool maintenance task subcribes to these events
     provider.make_canonical(canonical_header.hash())?;
 
     // set last executed header as the tracked header
