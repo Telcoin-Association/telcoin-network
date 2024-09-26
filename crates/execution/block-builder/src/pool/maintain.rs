@@ -37,7 +37,6 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
-use tn_types::WorkerBlockUpdate;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, trace, warn};
 
@@ -86,7 +85,7 @@ impl Default for PoolMaintenanceConfig {
 //  TODO: either faucet subscribes to worker block updates OR keeps track of x amount of transactions it successfully submitted to keep track of own-nonce
 
 /// Long-running task that updates the transaction pool based on new worker block builds and engine execution.
-pub struct MaintainTxPool<Provider, Pool, C, W> {
+pub struct MaintainTxPool<Provider, Pool, C> {
     /// The configuration for pool maintenance.
     config: PoolMaintenanceConfig,
     /// The type used to query the database.
@@ -95,10 +94,6 @@ pub struct MaintainTxPool<Provider, Pool, C, W> {
     pool: Pool,
     /// The stream for canonical state updates.
     canonical_state_updates: C,
-    /// The stream for worker block updates.
-    ///
-    /// These are notifications for when the worker has successfully built a new block and guarantees to broadcast the block. The underlying promise is that this newly built block is stored in the database and the worker will continue to broadcast the block until it reaches a quorum of votes.
-    worker_events: W,
     /// The current pending block for the worker.
     ///
     /// This is the last seen block the worker built.
@@ -112,9 +107,16 @@ pub struct MaintainTxPool<Provider, Pool, C, W> {
 
     /// The worker's current base fee.
     basefee: Option<u64>,
+
+    /// The task for reloading dirty accounts.
+    reload_accounts_task: Option<ReloadAccountsTask>,
 }
 
-impl<Provider, Pool, C, W> MaintainTxPool<Provider, Pool, C, W>
+/// The task for reloading drifted accounts.
+type ReloadAccountsTask =
+    oneshot::Receiver<Result<LoadedAccounts, Box<(HashSet<Address>, ProviderError)>>>;
+
+impl<Provider, Pool, C> MaintainTxPool<Provider, Pool, C>
 where
     Pool: TransactionPoolExt,
 {
@@ -124,7 +126,6 @@ where
         provider: Provider,
         pool: Pool,
         canonical_state_updates: C,
-        worker_events: W,
         basefee: Option<u64>,
     ) -> Self {
         let metrics = MaintainPoolMetrics::default();
@@ -141,17 +142,20 @@ where
         // keeps track of the state of the pool wrt to blocks
         let maintenance_state = MaintainedPoolState::InSync;
 
+        // assume account state is clean
+        let reload_accounts_task = None;
+
         Self {
             config,
             provider,
             pool,
             canonical_state_updates,
-            worker_events,
             pending_block,
             dirty_addresses,
             maintenance_state,
             metrics,
             basefee,
+            reload_accounts_task,
         }
     }
 
@@ -195,7 +199,7 @@ where
     }
 }
 
-impl<Provider, Pool, C, W> Future for MaintainTxPool<Provider, Pool, C, W>
+impl<Provider, Pool, C> Future for MaintainTxPool<Provider, Pool, C>
 where
     Provider: StateProviderFactory
         + BlockReaderIdExt
@@ -206,15 +210,11 @@ where
         + 'static,
     Pool: TransactionPoolExt + Unpin + 'static,
     C: Stream<Item = CanonStateNotification> + Send + Unpin + 'static,
-    W: Stream<Item = WorkerBlockUpdate> + Send + Unpin + 'static,
 {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let PoolMaintenanceConfig { max_reload_accounts } = self.config;
-
-        // The future that reloads accounts from database.
-        let mut reload_accounts_fut = Fuse::terminated();
 
         let this = self.get_mut();
 
@@ -225,10 +225,57 @@ where
 
             this.metrics.set_dirty_accounts_len(this.dirty_addresses.len());
             let pool_info = this.pool.block_info();
+            // check for canon updates first
+            //
+            // this is critical to ensure worker's block is building off canonical tip
+            while let Poll::Ready(Some(canon_update)) =
+                this.canonical_state_updates.poll_next_unpin(cx)
+            {
+                // poll canon updates stream and update pool `.on_canon_update`
+                //
+                // maintenance task will handle worker's pending block update
+                match canon_update {
+                    CanonStateNotification::Commit { new } => {
+                        this.process_canon_state_update(new);
+                    }
+                    _ => unreachable!("TN reorgs are impossible"),
+                }
+            }
 
-            // after performing a pool update after a new block we have some time to properly update
-            // dirty accounts and correct if the pool drifted from current state, for example after
-            // restart or a pipeline run
+            // check the reloaded accounts future
+            if let Some(mut receiver) = this.reload_accounts_task.take() {
+                match receiver.poll_unpin(cx) {
+                    Poll::Ready(reloaded) => {
+                        match reloaded {
+                            Ok(Ok(LoadedAccounts { accounts, failed_to_load })) => {
+                                // reloaded accounts successfully
+                                // extend accounts we failed to load from database
+                                this.dirty_addresses.extend(failed_to_load);
+                                // update the pool with the loaded accounts
+                                this.pool.update_accounts(accounts);
+                            }
+                            Ok(Err(res)) => {
+                                // Failed to load accounts from state
+                                let (accs, err) = *res;
+                                debug!(target: "worker::pool_maintenance", %err, "failed to load accounts");
+                                this.dirty_addresses.extend(accs);
+                            }
+                            Err(_) => {
+                                // failed to receive the accounts, sender dropped, only possible if task panicked
+                                this.maintenance_state = MaintainedPoolState::Drifted;
+                            }
+                        }
+                    }
+                    Poll::Pending => {
+                        this.reload_accounts_task = Some(receiver);
+
+                        // nothing to do - already polled canon update
+                        break;
+                    }
+                }
+            }
+
+            // properly update pool after canon update in case pool has drifted
             if this.maintenance_state.is_drifted() {
                 this.metrics.inc_drift();
                 // assuming all senders are dirty
@@ -238,7 +285,7 @@ where
             }
 
             // reload accounts that are out-of-sync in chunks
-            if !this.dirty_addresses.is_empty() && reload_accounts_fut.is_terminated() {
+            if !this.dirty_addresses.is_empty() && this.reload_accounts_task.is_none() {
                 let (tx, rx) = oneshot::channel();
                 let c = this.provider.clone();
                 let at = pool_info.last_seen_block_hash;
@@ -268,46 +315,14 @@ where
                     }
                     .boxed()
                 };
-                reload_accounts_fut = rx.fuse();
+                this.reload_accounts_task = Some(rx);
                 tokio::task::spawn_blocking(|| fut);
+
+                // loop once to poll future
+                continue;
             }
 
-            // check the reloaded accounts future
-
-            // check for canon updates first
-            //
-            // this is critical to ensure worker's block is building off canonical tip
-            while let Poll::Ready(Some(canon_update)) =
-                this.canonical_state_updates.poll_next_unpin(cx)
-            {
-                // TODO: this needs to update `self` with new tip info
-                // for broadcasting worker update
-
-                // TODO: ensure that engine's canon update includes `Chain` with all updates
-                // instead of multiple updates
-
-                // poll canon updates stream and update pool `.on_canon_update`
-                //
-                // maintenance task will handle worker's pending block update
-                match canon_update {
-                    CanonStateNotification::Commit { new } => {
-                        this.process_canon_state_update(new);
-                    }
-                    _ => unreachable!("TN reorgs are impossible"),
-                }
-            }
-
-            // drain all worker block updates
-            while let Poll::Ready(Some(WorkerBlockUpdate { parent, pending, state })) =
-                this.worker_events.poll_next_unpin(cx)
-            {
-                // update pending block
-                // update basefee
-                // update pool with basefee
-                // update
-            }
-
-            // TODO: REMOVE THIS BREAK - removes warning for now
+            // nothing to do
             break;
         }
 
@@ -333,19 +348,10 @@ where
         + 'static,
     P: TransactionPoolExt + 'static,
     C: Stream<Item = CanonStateNotification> + Send + Unpin + 'static,
-    W: Stream<Item = WorkerBlockUpdate> + Send + Unpin + 'static,
     Tasks: TaskSpawner + 'static,
 {
     async move {
-        maintain_transaction_pool(
-            provider,
-            pool,
-            canon_events,
-            worker_events,
-            task_spawner,
-            config,
-        )
-        .await;
+        maintain_transaction_pool(provider, pool, canon_events, task_spawner, config).await;
     }
     .boxed()
 }
@@ -353,11 +359,10 @@ where
 /// Maintains the state of the transaction pool by handling new blocks.
 ///
 /// This listens for any new worker blocks or canonical updates from the engine then updates the transaction pool's state accordingly.
-pub async fn maintain_transaction_pool<Provider, P, C, W, Tasks>(
+pub async fn maintain_transaction_pool<Provider, P, C, Tasks>(
     provider: Provider,
     pool: P,
     mut canon_events: C,
-    mut worker_events: W,
     task_spawner: Tasks,
     config: PoolMaintenanceConfig,
 ) where
@@ -369,7 +374,6 @@ pub async fn maintain_transaction_pool<Provider, P, C, W, Tasks>(
         + 'static,
     P: TransactionPoolExt + 'static,
     C: Stream<Item = CanonStateNotification> + Send + Unpin + 'static,
-    W: Stream<Item = WorkerBlockUpdate> + Send + Unpin + 'static,
     Tasks: TaskSpawner + 'static,
 {
     let metrics = MaintainPoolMetrics::default();
