@@ -17,44 +17,26 @@ use error::BlockBuilderResult;
 use futures_util::{FutureExt, StreamExt};
 use reth_blockchain_tree::BlockchainTreeEngine;
 use reth_chainspec::ChainSpec;
-use reth_evm::{
-    execute::{
-        BlockExecutionError, BlockExecutionOutput, BlockExecutorProvider, BlockValidationError,
-        Executor,
-    },
-    ConfigureEvm,
-};
+use reth_evm::ConfigureEvm;
 use reth_evm_ethereum::revm_spec_by_timestamp_after_merge;
-use reth_primitives::{
-    constants::{EMPTY_TRANSACTIONS, ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE},
-    keccak256, proofs, Address, Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber,
-    Header, IntoRecoveredTransaction, SealedBlock, SealedHeader, TransactionSigned, Withdrawals,
-    B256, EMPTY_OMMER_ROOT_HASH, U256,
-};
+use reth_primitives::{Address, Header, IntoRecoveredTransaction, SealedBlock, B256, U256};
 use reth_provider::{
     BlockReaderIdExt, CanonChainTracker, CanonStateNotification, CanonStateNotificationStream,
-    CanonStateNotifications, CanonStateSubscriptions, Chain, ChainSpecProvider, ExecutionOutcome,
-    StateProviderFactory,
+    CanonStateSubscriptions, ChainSpecProvider, StateProviderFactory,
 };
-use reth_revm::{
-    database::StateProviderDatabase,
-    primitives::{BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg},
-};
-use reth_transaction_pool::{CanonicalStateUpdate, TransactionPool, TransactionPoolExt};
+use reth_revm::primitives::{BlockEnv, CfgEnv, CfgEnvWithHandlerCfg};
+use reth_transaction_pool::{TransactionPool, TransactionPoolExt};
 use std::{
-    collections::HashMap,
     future::Future,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
-    time::{SystemTime, UNIX_EPOCH},
 };
 use tn_types::{
-    now, AutoSealConsensus, NewWorkerBlock, PendingBlockConfig, WorkerBlockBuilderArgs,
-    WorkerBlockUpdate, WorkerBlockUpdateSender,
+    now, NewWorkerBlock, PendingBlockConfig, WorkerBlockBuilderArgs, WorkerBlockUpdate,
+    WorkerBlockUpdateSender,
 };
-use tokio::sync::{broadcast, oneshot, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use tracing::{debug, error, trace, warn};
+use tokio::sync::{broadcast, oneshot};
+use tracing::{error, trace, warn};
 
 mod block_builder;
 mod error;
