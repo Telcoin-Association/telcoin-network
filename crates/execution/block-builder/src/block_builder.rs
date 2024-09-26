@@ -137,8 +137,9 @@ where
         //         // invalid, which removes its dependent transactions from
         //         // the iterator. This is similar to the gas limit condition
         //         // for regular transactions above.
-        //         tracing::trace!(target: "block_builder", tx=?tx.hash, ?sum_blob_gas_used, ?tx_blob_gas, "skipping blob transaction because it would exceed the max data gas per block");
-        //         best_txs.mark_invalid(&pool_tx);
+        //         tracing::trace!(target: "block_builder", tx=?tx.hash, ?sum_blob_gas_used,
+        // ?tx_blob_gas, "skipping blob transaction because it would exceed the max data gas per
+        // block");         best_txs.mark_invalid(&pool_tx);
         //         continue;
         //     }
         // }
@@ -226,10 +227,10 @@ where
     // let (requests, requests_root) = if chain_spec
     //     .is_prague_active_at_timestamp(attributes.timestamp)
     // {
-    //     let deposit_requests = parse_deposits_from_receipts(&chain_spec, receipts.iter().flatten())
-    //         .map_err(|err| BlockBuilderError::Reth(RethError::Execution(err.into())))?;
-    //     let withdrawal_requests = post_block_withdrawal_requests_contract_call(
-    //         &evm_config,
+    //     let deposit_requests = parse_deposits_from_receipts(&chain_spec,
+    // receipts.iter().flatten())         .map_err(|err|
+    // BlockBuilderError::Reth(RethError::Execution(err.into())))?;     let withdrawal_requests
+    // = post_block_withdrawal_requests_contract_call(         &evm_config,
     //         &mut db,
     //         &initialized_cfg,
     //         &initialized_block_env,

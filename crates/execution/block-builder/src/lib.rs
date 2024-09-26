@@ -1,4 +1,5 @@
-//! The worker's block maker monitors a transaction pool populated by incoming transactions through the worker's RPC.
+//! The worker's block maker monitors a transaction pool populated by incoming transactions through
+//! the worker's RPC.
 //!
 //! The block maker is a future that
 
@@ -80,10 +81,10 @@ pub struct BlockBuilder<BT, Pool, CE> {
     pool: Pool,
     /// EVM configuration for executing transactions and building blocks.
     evm_config: CE,
-    // /// Optional round of consensus to finish executing before then returning. The value is used to
-    // /// track the subdag index from consensus output. The index is also considered the "round" of
-    // /// consensus and is included in executed blocks as  the block's `nonce` value.
-    // ///
+    // /// Optional round of consensus to finish executing before then returning. The value is used
+    // to /// track the subdag index from consensus output. The index is also considered the
+    // "round" of /// consensus and is included in executed blocks as  the block's `nonce`
+    // value. ///
     // /// NOTE: this is primarily useful for debugging and testing
     // max_round: Option<u64>,
     /// The sending side of broadcast channel when a worker has successfully proposed a new block.
@@ -117,7 +118,6 @@ pub struct BlockBuilder<BT, Pool, CE> {
     pub(crate) address: Address,
 
     // TODO: consider using a container struct for these values
-    //
     /// The [SealedHeader] of the last fully-executed block (see TN Engine).
     ///
     /// This information is from the current finalized block number and hash.
@@ -286,7 +286,8 @@ where
         (CfgEnvWithHandlerCfg::new_with_spec_id(cfg, spec_id), block_env)
     }
 
-    /// Check if the task has reached the maximum number of blocks to build as specified by `max_builds`.
+    /// Check if the task has reached the maximum number of blocks to build as specified by
+    /// `max_builds`.
     ///
     /// Note: this is mainly for testing and debugging purposes.
     fn has_reached_max_build(&self, progress: Option<usize>) -> bool {
@@ -393,17 +394,21 @@ where
                         // ensure no errors then store last executed header in memory
                         this.parent_block = worker_update.parent().clone();
 
-                        // TODO: should this be background or directly call pool.on_canonical_state_change()
+                        // TODO: should this be background or directly call
+                        // pool.on_canonical_state_change()
                         // - maintenance track is non blocking BUT
-                        // - maintenance task could be queued, canonical state updates, the maintenance task overwrites parent block
+                        // - maintenance task could be queued, canonical state updates, the
+                        //   maintenance task overwrites parent block
                         //      - race condition
                         //
                         // Just call it here.
                         //
                         // apply worker update
                         // NOTE: this is blocking
-                        // - better to have maintenance task that always checks canon and worker updates?
-                        // - need to ensure that worker update's parent block can't overwrite canon update tip
+                        // - better to have maintenance task that always checks canon and worker
+                        //   updates?
+                        // - need to ensure that worker update's parent block can't overwrite canon
+                        //   update tip
                         // - also need to ensure pool isn't updated while building block
 
                         // broadcast worker update
@@ -415,22 +420,29 @@ where
                         // From parkinglot docs:
                         //
                         // read lock:
-                        // Locks this RwLock with shared read access, blocking the current thread until it can be acquired.
-                        // The calling thread will be blocked until there are no more writers which hold the lock. There may be other readers currently inside the lock when this method returns.
-                        // Note that attempts to recursively acquire a read lock on a RwLock when the current thread already holds one may result in a deadlock.
-                        // Returns an RAII guard which will release this thread's shared access once it is dropped.
+                        // Locks this RwLock with shared read access, blocking the current thread
+                        // until it can be acquired. The calling thread will
+                        // be blocked until there are no more writers which hold the lock. There may
+                        // be other readers currently inside the lock when this method returns.
+                        // Note that attempts to recursively acquire a read lock on a RwLock when
+                        // the current thread already holds one may result in a deadlock.
+                        // Returns an RAII guard which will release this thread's shared access once
+                        // it is dropped.
 
                         // write lock:
-                        // Locks this RwLock with exclusive write access, blocking the current thread until it can be acquired.
-                        // This function will not return while other writers or other readers currently have access to the lock.
-                        // Returns an RAII guard which will drop the write access of this RwLock when dropped
+                        // Locks this RwLock with exclusive write access, blocking the current
+                        // thread until it can be acquired. This function
+                        // will not return while other writers or other readers currently have
+                        // access to the lock. Returns an RAII guard which
+                        // will drop the write access of this RwLock when dropped
 
                         // check max_builds
                         if this.max_builds.is_some() {
                             // increase num builds
                             this.num_builds = this.num_builds.map(|n| n + 1);
                             if this.has_reached_max_build(this.num_builds) {
-                                // immediately terminate if the specified max number of blocks were built
+                                // immediately terminate if the specified max number of blocks were
+                                // built
                                 return Poll::Ready(Ok(()));
                             }
                         }

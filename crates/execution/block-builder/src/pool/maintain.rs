@@ -1,6 +1,7 @@
 //! Maintenance task for worker's transction pool.
 //!
-//! This background task monitors when the worker has mined the next block to update the transaction pool.
+//! This background task monitors when the worker has mined the next block to update the transaction
+//! pool.
 //!
 //! see reth-v0.1.3 transaction_pool/src/maintain.rs
 
@@ -68,9 +69,11 @@ impl Default for PoolMaintenanceConfig {
 // then apply pool update
 //
 //  TODO: short-circuit rpc looking up pending block
-//  TODO: either faucet subscribes to worker block updates OR keeps track of x amount of transactions it successfully submitted to keep track of own-nonce
+//  TODO: either faucet subscribes to worker block updates OR keeps track of x amount of
+// transactions it successfully submitted to keep track of own-nonce
 
-/// Long-running task that updates the transaction pool based on new worker block builds and engine execution.
+/// Long-running task that updates the transaction pool based on new worker block builds and engine
+/// execution.
 pub struct MaintainTxPool<Provider, Pool, C> {
     /// The configuration for pool maintenance.
     config: PoolMaintenanceConfig,
@@ -239,7 +242,8 @@ where
                                 this.dirty_addresses.extend(accs);
                             }
                             Err(_) => {
-                                // failed to receive the accounts, sender dropped, only possible if task panicked
+                                // failed to receive the accounts, sender dropped, only possible if
+                                // task panicked
                                 this.maintenance_state = MaintainedPoolState::Drifted;
                             }
                         }
