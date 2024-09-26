@@ -798,9 +798,13 @@ checksum = "398a977d774db13446b8cead8cfa9517aebf9e03fc8a1512892dc1e03e70bb04"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
+ "arbitrary",
+ "derive_arbitrary",
  "derive_more 1.0.0",
  "hashbrown 0.14.5",
  "nybbles",
+ "proptest",
+ "proptest-derive",
  "serde",
  "smallvec",
  "tracing",
@@ -3549,6 +3553,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hash-db"
+version = "0.15.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d23bd4e7b5eda0d0f3a307e8b381fdc8ba9000f26fbe912250c0a4cc3956364a"
+
+[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5603,6 +5613,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95f06be0417d97f81fe4e5c86d7d01b392655a9cac9c19a848aa033e18937b23"
 dependencies = [
  "alloy-rlp",
+ "arbitrary",
  "const-hex",
  "proptest",
  "serde",
@@ -6061,6 +6072,15 @@ name = "pkg-config"
 version = "0.3.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d231b230927b5e4ad203db57bbcbee2802f6bce620b1e4a9024a07d94e2907ec"
+
+[[package]]
+name = "plain_hasher"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e19e6491bdde87c2c43d70f4c194bc8a758f2eb732df00f61e43f7362e3b4cc"
+dependencies = [
+ "crunchy",
+]
 
 [[package]]
 name = "plotters"
@@ -7100,11 +7120,14 @@ name = "reth-chain-state"
 version = "1.0.6"
 source = "git+https://github.com/paradigmxyz/reth?tag=v1.0.6#c228fe15808c3acbf18dc3af1a03ef5cbdcda07a"
 dependencies = [
+ "alloy-signer",
+ "alloy-signer-local",
  "auto_impl",
  "derive_more 1.0.0",
  "metrics 0.23.0",
  "parking_lot 0.12.3",
  "pin-project 1.1.5",
+ "rand 0.8.5",
  "reth-chainspec",
  "reth-errors",
  "reth-execution-types",
@@ -7112,6 +7135,7 @@ dependencies = [
  "reth-primitives",
  "reth-storage-api",
  "reth-trie",
+ "revm",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -8474,6 +8498,7 @@ dependencies = [
  "dashmap 6.1.0",
  "itertools 0.13.0",
  "metrics 0.23.0",
+ "once_cell",
  "parking_lot 0.12.3",
  "rayon",
  "reth-blockchain-tree-api",
@@ -9053,6 +9078,7 @@ dependencies = [
  "reth-trie-common",
  "revm",
  "tracing",
+ "triehash",
 ]
 
 [[package]]
@@ -9065,10 +9091,13 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-trie",
+ "arbitrary",
  "bytes",
  "derive_more 1.0.0",
+ "hash-db",
  "itertools 0.13.0",
  "nybbles",
+ "plain_hasher",
  "reth-codecs",
  "reth-primitives-traits",
  "revm-primitives",
@@ -10142,6 +10171,7 @@ version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c5e1a9a646d36c3599cd173a41282daf47c44583ad367b8e6837255952e5c67"
 dependencies = [
+ "arbitrary",
  "serde",
 ]
 
@@ -11452,6 +11482,16 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
+]
+
+[[package]]
+name = "triehash"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1631b201eb031b563d2e85ca18ec8092508e262a3196ce9bd10a67ec87b9f5c"
+dependencies = [
+ "hash-db",
+ "rlp",
 ]
 
 [[package]]
