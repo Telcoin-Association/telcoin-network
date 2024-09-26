@@ -20,7 +20,10 @@ use reth_blockchain_tree::BlockchainTreeEngine;
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
 use reth_evm_ethereum::revm_spec_by_timestamp_after_merge;
-use reth_primitives::{Address, Header, IntoRecoveredTransaction, SealedBlock, B256, U256};
+use reth_primitives::{
+    constants::EMPTY_WITHDRAWALS, proofs, Address, Header, IntoRecoveredTransaction, SealedBlock,
+    SealedHeader, TxHash, B256, EMPTY_OMMER_ROOT_HASH, U256,
+};
 use reth_provider::{
     BlockReaderIdExt, CanonChainTracker, CanonStateNotification, CanonStateNotificationStream,
     CanonStateSubscriptions, ChainSpecProvider, StateProviderFactory,
@@ -30,14 +33,16 @@ use reth_transaction_pool::{TransactionPool, TransactionPoolExt};
 use std::{
     future::Future,
     pin::Pin,
-    task::{Context, Poll},
+    sync::mpsc::Receiver,
+    task::{Context, Poll, Waker},
 };
 use tn_types::{
     now, NewWorkerBlock, PendingBlockConfig, WorkerBlockBuilderArgs, WorkerBlockUpdate,
     WorkerBlockUpdateSender,
 };
-use tokio::sync::{broadcast, oneshot};
-use tracing::{error, trace, warn};
+use tokio::sync::{broadcast, oneshot, watch};
+use tokio_stream::wrappers::ReceiverStream;
+use tracing::{debug, error, trace, warn};
 
 mod block_builder;
 mod error;
@@ -59,9 +64,8 @@ pub use pool::{maintain_transaction_pool_future, PoolMaintenanceConfig};
 //
 // - impl Future for BlockProposer like Engine
 
-/// Type alias for the blocking task that executes consensus output and returns the finalized
-/// `SealedHeader`.
-type PendingExecutionTask = oneshot::Receiver<BlockBuilderResult<WorkerBlockUpdate>>;
+/// Type alias for the blocking task that locks the tx pool and builds the next worker block.
+type BlockBuildingTask = oneshot::Receiver<BlockBuilderResult<WorkerBlockUpdate>>;
 
 /// The type that builds blocks for workers to propose.
 ///
@@ -74,7 +78,7 @@ type PendingExecutionTask = oneshot::Receiver<BlockBuilderResult<WorkerBlockUpda
 pub struct BlockBuilder<BT, Pool, CE> {
     /// Single active future that executes consensus output on a blocking thread and then returns
     /// the result through a oneshot channel.
-    pending_task: Option<PendingExecutionTask>,
+    pending_task: Option<BlockBuildingTask>,
     /// The type used to query both the database and the blockchain tree.
     blockchain: BT,
     /// The transaction pool with pending transactions.
@@ -115,22 +119,28 @@ pub struct BlockBuilder<BT, Pool, CE> {
     /// NOTE: this is only used when `max_blocks` is specified.
     num_builds: Option<usize>,
     /// The address for worker block's beneficiary.
-    pub(crate) address: Address,
-
-    // TODO: consider using a container struct for these values
+    address: Address,
+    /// Receiver stream for pending transactions in the pool.
+    pending_tx_hashes_stream: ReceiverStream<TxHash>,
     /// The [SealedHeader] of the last fully-executed block (see TN Engine).
     ///
     /// This information is from the current finalized block number and hash.
-    parent_block: SealedBlock,
-    //
-    /// The current base fee used to build the next block.
+    parent: SealedHeader,
+    /// The watch channel containing the latest base fee.
     ///
-    /// This value is updated after constructing a block and used to update
-    /// transaction pool and RPC even during canonical updates.
+    /// Basefees are updated by the engine after a new round of consensus was executed and should
+    /// be uniform across all workers using building off the same parent. Worker uses the basefee
+    /// from the latest round of consensus for proposing it's next blocks. The basefee included in
+    /// the worker's block is used by the engine during final execution. Peers validate that the
+    /// worker's basefee is correct based on it's parent.
+    basefee: watch::Receiver<u64>,
+    /// The maximum amount of gas for a worker block.
     ///
-    /// Workers have an independent base fee market and the canon state updates
-    /// from the engine would overwrite them otherwise.
-    base_fee: Option<u64>,
+    /// NOTE: transactions are not executed at this stage, so the worker measures the amount of gas
+    /// specified by a transaction's gas limit.
+    gas_limit: u64,
+    /// The maximum size of collected transactions, measured in bytes.
+    max_size: usize,
 }
 
 impl<BT, Pool, CE> BlockBuilder<BT, Pool, CE>
@@ -147,15 +157,17 @@ where
 {
     /// Create a new instance of [Self].
     pub fn new(
-        pending_task: Option<PendingExecutionTask>,
         blockchain: BT,
         pool: Pool,
         evm_config: CE,
         to_worker: Sender<NewWorkerBlock>,
         max_builds: Option<usize>,
         address: Address,
-        parent_block: SealedBlock,
-        base_fee: Option<u64>,
+        parent: SealedHeader,
+        pending_tx_hashes_stream: ReceiverStream<TxHash>,
+        basefee: watch::Receiver<u64>,
+        gas_limit: u64,
+        max_size: usize,
     ) -> Self {
         // create broadcast channels
         // NOTE: it's important that worker updates are processed quickly
@@ -168,7 +180,7 @@ where
         let num_builds = max_builds.map(|_| 0);
 
         Self {
-            pending_task,
+            pending_task: None,
             blockchain,
             pool,
             evm_config,
@@ -178,8 +190,11 @@ where
             max_builds,
             num_builds,
             address,
-            parent_block,
-            base_fee,
+            parent,
+            pending_tx_hashes_stream,
+            basefee,
+            gas_limit,
+            max_size,
         }
     }
 
@@ -187,13 +202,22 @@ where
     ///
     /// This approach allows the engine to yield back to the runtime while executing blocks.
     /// Executing blocks is cpu intensive, so a blocking task is used.
-    fn spawn_execution_task(&mut self) -> PendingExecutionTask {
+    fn spawn_execution_task(&self, basefee: u64) -> BlockBuildingTask {
         let evm_config = self.evm_config.clone();
         let provider = self.blockchain.clone();
-        let parent = self.parent_block.clone();
+        let parent = self.parent.clone();
         let pool = self.pool.clone();
-        let timestamp = now();
         let chain_spec = provider.chain_spec();
+
+        // TODO: use ms for worker block and sec for final block?
+        //
+        // sometimes worker block are produced too quickly in certain configs (<1s)
+        // resulting in batch timestamp == parent timestamp
+        let mut timestamp = now();
+        if timestamp == parent.timestamp {
+            warn!(target: "execution::block_builder", "new block timestamp same as parent - setting offset by 1sec");
+            timestamp = parent.timestamp + 1;
+        }
 
         // TODO: this is needs further scrutiny
         //
@@ -215,11 +239,20 @@ where
         // but requires an unacceptable amount of trust in the node operator
         //
         // TODO: move final execution to ENGINE - do not rely on mix hash at worker level
-        let prevrandao = parent.parent_beacon_block_root.unwrap_or_else(|| B256::random());
-        let (cfg, block_env) =
-            self.cfg_and_block_env(chain_spec.as_ref(), &parent, timestamp, prevrandao);
-        let config =
-            PendingBlockConfig::new(parent, block_env, cfg, chain_spec, timestamp, self.address);
+        // let prevrandao = parent.parent_beacon_block_root.unwrap_or_else(|| B256::random());
+        // let (cfg, block_env) =
+        //     self.cfg_and_block_env(chain_spec.as_ref(), &parent, timestamp, prevrandao);
+
+        let config = PendingBlockConfig::new(
+            parent,
+            chain_spec,
+            timestamp,
+            self.address,
+            basefee,
+            None,           // TODO: no support for blobs yet
+            self.gas_limit, // in wei
+            self.max_size,  // in bytes
+        );
         let build_args = WorkerBlockBuilderArgs::new(provider, pool, config);
         let (tx, rx) = oneshot::channel();
 
@@ -227,7 +260,7 @@ where
         tokio::task::spawn_blocking(|| {
             // this is safe to call on blocking thread without a semaphore bc it's held in
             // Self::pending_tesk as a single `Option`
-            let result = build_worker_block(evm_config, build_args);
+            let result = build_worker_block(build_args);
             match tx.send(result) {
                 Ok(()) => (),
                 Err(e) => {
@@ -238,138 +271,6 @@ where
 
         // oneshot receiver for execution result
         rx
-    }
-
-    /// Pull pending transactions from the pool and propose the next block.
-    fn build_block(&self) -> BlockBuilderResult<WorkerBlockUpdate> {
-        // This method needs:
-        // - block gas limit
-        // - basefee
-        // - block number
-        // - beneficiary
-
-        debug!(target: "block_builder", parent_hash = ?parent.hash(), parent_number = parent.number, "building new payload");
-        let block_gas_limit: u64 =
-            initialized_block_env.gas_limit.try_into().unwrap_or(chain_spec.max_gas_limit);
-
-        let base_fee = initialized_block_env.basefee.to::<u64>();
-        // NOTE: this holds a `read` lock on the tx pool
-        let mut best_txs = pool.best_transactions_with_attributes(BestTransactionsAttributes::new(
-            base_fee,
-            initialized_block_env.get_blob_gasprice().map(|gasprice| gasprice as u64),
-        ));
-
-        let block_number = initialized_block_env.number.to::<u64>();
-
-        // collect data for successful transactions
-        // let mut sum_blob_gas_used = 0;
-        let mut cumulative_gas_used = 0;
-        let mut receipts = Vec::new();
-        let mut senders = Vec::new();
-        let mut total_fees = U256::ZERO;
-        let mut executed_txs = Vec::new();
-
-        // begin loop through sorted "best" transactions in pending pool
-        // and execute them to build the block
-        while let Some(pool_tx) = best_txs.next() {
-            // ensure we still have capacity for this transaction
-            if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
-                // we can't fit this transaction into the block, so we need to mark it as invalid
-                // which also removes all dependent transaction from the iterator before we can
-                // continue
-                best_txs.mark_invalid(&pool_tx);
-                continue;
-            }
-
-            // convert tx to a signed transaction
-            let tx = pool_tx.to_recovered_transaction();
-            // append transaction to the list of executed transactions
-            senders.push(tx.signer());
-            executed_txs.push(tx.into_signed());
-        }
-
-        let transactions_root = proofs::calculate_transaction_root(&executed_txs);
-
-        // create header
-        let mut header = Header {
-            parent_hash: parent.hash(),
-            ommers_hash: EMPTY_OMMER_ROOT_HASH,
-            beneficiary,
-            state_root,
-            transactions_root,
-            receipts_root,
-            withdrawals_root: Some(EMPTY_WITHDRAWALS),
-            logs_bloom,
-            timestamp,
-            mix_hash: Default::default(),
-            nonce: 0,
-            base_fee_per_gas: Some(base_fee),
-            number: parent.number + 1,
-            gas_limit: block_gas_limit,
-            difficulty: U256::ZERO,
-            gas_used: cumulative_gas_used,
-            extra_data: Default::default(),
-            parent_beacon_block_root: None,
-            blob_gas_used,
-            excess_blob_gas,
-            requests_root: None,
-        };
-
-        // TODO: use ms for worker block and sec for final block?
-        //
-        // sometimes worker block are produced too quickly (<1s)
-        // resulting in batch timestamp == parent timestamp
-        if header.timestamp == parent.timestamp {
-            warn!(target: "execution::batch_maker", "header template timestamp same as parent");
-            header.timestamp = parent.timestamp + 1;
-        }
-        todo!()
-    }
-
-    /// Returns the configured [`CfgEnvWithHandlerCfg`] and [`BlockEnv`] for the targeted payload
-    /// (that has the `parent` as its parent).
-    ///
-    /// The `chain_spec` is used to determine the correct chain id and hardfork for the payload
-    /// based on its timestamp.
-    ///
-    /// Block related settings are derived from the `parent` block and the configured attributes.
-    ///
-    /// NOTE: This is only intended for beacon consensus (after merge).
-    fn cfg_and_block_env(
-        &self,
-        chain_spec: &ChainSpec,
-        parent: &Header,
-        timestamp: u64,
-        prev_randao: B256,
-    ) -> (CfgEnvWithHandlerCfg, BlockEnv) {
-        // configure evm env based on parent block (finalized block from latest consensus round)
-        let cfg = CfgEnv::default().with_chain_id(chain_spec.chain().id());
-
-        // ensure we're not missing any timestamp based hardforks
-        let spec_id = revm_spec_by_timestamp_after_merge(chain_spec, now());
-
-        // TODO: support blobs with Cancun upgrade
-        let blob_excess_gas_and_price = None;
-
-        let gas_limit = U256::from(parent.gas_limit);
-
-        let block_env = BlockEnv {
-            number: U256::from(parent.number + 1),
-            // NOTE: important so this primary receives any tips
-            coinbase: self.address,
-            timestamp: U256::from(timestamp),
-            difficulty: U256::ZERO,
-            prevrandao: Some(prev_randao),
-            gas_limit,
-            // TODO: engine should update basefees after executing round
-            //
-            // calculate basefee based on parent block's gas usage
-            basefee: self.base_fee.map(U256::from).unwrap_or_default(),
-            // calculate excess gas based on parent block's blob gas usage
-            blob_excess_gas_and_price,
-        };
-
-        (CfgEnvWithHandlerCfg::new_with_spec_id(cfg, spec_id), block_env)
     }
 
     /// Check if the task has reached the maximum number of blocks to build as specified by
@@ -424,23 +325,43 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
+        //
+        // TODO:
+        // Should the pending transaction notification stream be used to signal wakeup?
+        // pros:
+        //  - canon updates happen infrequently (~5s currently), so if no txs for a while,
+        //    then no pending task, so no wakeup
+        //
+        // cons:
+        //  - could trigger this task to wake up frequently, but maybe that's a good thing
+        //    since this is one of the worker's primary responsibilities
+        //
+        // also need to check basefee for changed? or should this not matter?
+        // don't want a race condition where this task wakes up before canon update received...
+        //
+        // ideally they would be sent on the same channel, but working around reth right now
+
         loop {
             // check for canon updates before mining the transaction pool
             //
             // this is critical to ensure worker's block is building off canonical tip
             // block until canon updates are applied
-            while let Poll::Ready(Some(canon_update)) =
-                this.canonical_state_updates.poll_next_unpin(cx)
-            {
-                // poll canon updates stream and update pool `.on_canon_update`
-                //
-                // maintenance task will handle worker's pending block update
-                match canon_update {
-                    CanonStateNotification::Commit { new } => {
-                        // this.process_canon_state_update(new);
-                        todo!()
+            while let Poll::Ready(update) = this.canonical_state_updates.poll_next_unpin(cx) {
+                match update {
+                    Some(canon_update) => {
+                        // poll canon updates stream and update pool `.on_canon_update`
+                        //
+                        // maintenance task will handle worker's pending block update
+                        match canon_update {
+                            CanonStateNotification::Commit { new } => {
+                                // update parent information
+                                this.parent = new.tip().header.clone();
+                            }
+                            _ => unreachable!("TN reorgs are impossible"),
+                        }
                     }
-                    _ => unreachable!("TN reorgs are impossible"),
+                    // stream closed
+                    None => return Poll::Ready(Ok(())),
                 }
             }
 
@@ -464,11 +385,15 @@ where
                 }
 
                 // build the next block
-                this.pending_task = Some(this.spawn_execution_task());
+
+                let basefee = *self.basefee.borrow_and_update();
+                this.pending_task = Some(this.spawn_execution_task(basefee));
+                // don't break so pending task gets polled
             }
 
             // poll receiver that returns block build result
             if let Some(mut receiver) = this.pending_task.take() {
+                // poll here so waker gets called when block is ready
                 match receiver.poll_unpin(cx) {
                     Poll::Ready(res) => {
                         // TODO: best way to handle if pending txs in pool
