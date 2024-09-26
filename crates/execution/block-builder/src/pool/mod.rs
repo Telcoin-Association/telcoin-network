@@ -1,5 +1,7 @@
 //! The worker's approach to maintaining and updating transaction pool state.
 
 mod backup;
-pub mod maintain;
+mod maintain;
 mod metrics;
+
+pub use maintain::{maintain_transaction_pool_future, PoolMaintenanceConfig};

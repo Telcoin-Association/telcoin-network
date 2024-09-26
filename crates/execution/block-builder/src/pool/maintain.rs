@@ -23,7 +23,6 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
-use tn_types::WorkerBlockUpdate;
 use tokio::sync::oneshot;
 use tracing::{debug, trace};
 
@@ -72,7 +71,7 @@ impl Default for PoolMaintenanceConfig {
 //  TODO: either faucet subscribes to worker block updates OR keeps track of x amount of transactions it successfully submitted to keep track of own-nonce
 
 /// Long-running task that updates the transaction pool based on new worker block builds and engine execution.
-pub struct MaintainTxPool<Provider, Pool, C, W> {
+pub struct MaintainTxPool<Provider, Pool, C> {
     /// The configuration for pool maintenance.
     config: PoolMaintenanceConfig,
     /// The type used to query the database.
@@ -81,10 +80,6 @@ pub struct MaintainTxPool<Provider, Pool, C, W> {
     pool: Pool,
     /// The stream for canonical state updates.
     canonical_state_updates: C,
-    /// The stream for worker block updates.
-    ///
-    /// These are notifications for when the worker has successfully built a new block and guarantees to broadcast the block. The underlying promise is that this newly built block is stored in the database and the worker will continue to broadcast the block until it reaches a quorum of votes.
-    worker_events: W,
     /// Accounts that are out of sync with the pool.
     dirty_addresses: HashSet<Address>,
     /// The current state of maintenance.
@@ -103,9 +98,9 @@ pub struct MaintainTxPool<Provider, Pool, C, W> {
 type ReloadAccountsTask =
     oneshot::Receiver<Result<LoadedAccounts, Box<(HashSet<Address>, ProviderError)>>>;
 
-impl<Provider, Pool, C, W> MaintainTxPool<Provider, Pool, C, W>
+impl<Provider, Pool, C> MaintainTxPool<Provider, Pool, C>
 where
-    Pool: TransactionPoolExt,
+    Pool: TransactionPoolExt + Unpin,
 {
     /// Create a new instance of [Self].
     pub fn new(
@@ -113,7 +108,6 @@ where
         provider: Provider,
         pool: Pool,
         canonical_state_updates: C,
-        worker_events: W,
         basefee: Option<u64>,
     ) -> Self {
         let metrics = MaintainPoolMetrics::default();
@@ -135,7 +129,6 @@ where
             provider,
             pool,
             canonical_state_updates,
-            worker_events,
             dirty_addresses,
             maintenance_state,
             metrics,
@@ -184,7 +177,7 @@ where
     }
 }
 
-impl<Provider, Pool, C, W> Future for MaintainTxPool<Provider, Pool, C, W>
+impl<Provider, Pool, C> Future for MaintainTxPool<Provider, Pool, C>
 where
     Provider: StateProviderFactory
         + BlockReaderIdExt
@@ -195,7 +188,6 @@ where
         + 'static,
     Pool: TransactionPoolExt + Unpin + 'static,
     C: Stream<Item = CanonStateNotification> + Send + Unpin + 'static,
-    W: Stream<Item = WorkerBlockUpdate> + Send + Unpin + 'static,
 {
     type Output = ();
 
@@ -317,11 +309,10 @@ where
 }
 
 /// Returns a spawnable future for maintaining the state of the transaction pool.
-pub fn maintain_transaction_pool_future<Provider, P, C, W, Tasks>(
+pub fn maintain_transaction_pool_future<Provider, P, C, Tasks>(
     provider: Provider,
     pool: P,
     canon_events: C,
-    worker_events: W,
     task_spawner: Tasks,
     config: PoolMaintenanceConfig,
 ) -> BoxFuture<'static, ()>
@@ -331,17 +322,13 @@ where
         + ChainSpecProvider<ChainSpec = ChainSpec>
         + Clone
         + Send
+        + Unpin
         + 'static,
-    P: TransactionPoolExt + 'static,
+    P: TransactionPoolExt + Unpin + 'static,
     C: Stream<Item = CanonStateNotification> + Send + Unpin + 'static,
-    W: Stream<Item = WorkerBlockUpdate> + Send + Unpin + 'static,
     Tasks: TaskSpawner + 'static,
 {
-    async move {
-        MaintainTxPool::new(provider, pool, canon_events, worker_events, task_spawner, config)
-            .await;
-    }
-    .boxed()
+    async move { MaintainTxPool::new(config, provider, pool, canon_events, None).await }.boxed()
 }
 
 /// Keeps track of the pool's state, whether the accounts in the pool are in sync with the actual
