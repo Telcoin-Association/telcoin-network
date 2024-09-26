@@ -240,6 +240,92 @@ where
         rx
     }
 
+    /// Pull pending transactions from the pool and propose the next block.
+    fn build_block(&self) -> BlockBuilderResult<WorkerBlockUpdate> {
+        // This method needs:
+        // - block gas limit
+        // - basefee
+        // - block number
+        // - beneficiary
+
+        debug!(target: "block_builder", parent_hash = ?parent.hash(), parent_number = parent.number, "building new payload");
+        let block_gas_limit: u64 =
+            initialized_block_env.gas_limit.try_into().unwrap_or(chain_spec.max_gas_limit);
+
+        let base_fee = initialized_block_env.basefee.to::<u64>();
+        // NOTE: this holds a `read` lock on the tx pool
+        let mut best_txs = pool.best_transactions_with_attributes(BestTransactionsAttributes::new(
+            base_fee,
+            initialized_block_env.get_blob_gasprice().map(|gasprice| gasprice as u64),
+        ));
+
+        let block_number = initialized_block_env.number.to::<u64>();
+
+        // collect data for successful transactions
+        // let mut sum_blob_gas_used = 0;
+        let mut cumulative_gas_used = 0;
+        let mut receipts = Vec::new();
+        let mut senders = Vec::new();
+        let mut total_fees = U256::ZERO;
+        let mut executed_txs = Vec::new();
+
+        // begin loop through sorted "best" transactions in pending pool
+        // and execute them to build the block
+        while let Some(pool_tx) = best_txs.next() {
+            // ensure we still have capacity for this transaction
+            if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
+                // we can't fit this transaction into the block, so we need to mark it as invalid
+                // which also removes all dependent transaction from the iterator before we can
+                // continue
+                best_txs.mark_invalid(&pool_tx);
+                continue;
+            }
+
+            // convert tx to a signed transaction
+            let tx = pool_tx.to_recovered_transaction();
+            // append transaction to the list of executed transactions
+            senders.push(tx.signer());
+            executed_txs.push(tx.into_signed());
+        }
+
+        let transactions_root = proofs::calculate_transaction_root(&executed_txs);
+
+        // create header
+        let mut header = Header {
+            parent_hash: parent.hash(),
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            beneficiary,
+            state_root,
+            transactions_root,
+            receipts_root,
+            withdrawals_root: Some(EMPTY_WITHDRAWALS),
+            logs_bloom,
+            timestamp,
+            mix_hash: Default::default(),
+            nonce: 0,
+            base_fee_per_gas: Some(base_fee),
+            number: parent.number + 1,
+            gas_limit: block_gas_limit,
+            difficulty: U256::ZERO,
+            gas_used: cumulative_gas_used,
+            extra_data: Default::default(),
+            parent_beacon_block_root: None,
+            blob_gas_used,
+            excess_blob_gas,
+            requests_root: None,
+        };
+
+        // TODO: use ms for worker block and sec for final block?
+        //
+        // sometimes worker block are produced too quickly (<1s)
+        // resulting in batch timestamp == parent timestamp
+        if header.timestamp == parent.timestamp {
+            warn!(target: "execution::batch_maker", "header template timestamp same as parent");
+            header.timestamp = parent.timestamp + 1;
+        }
+        todo!()
+    }
+
     /// Returns the configured [`CfgEnvWithHandlerCfg`] and [`BlockEnv`] for the targeted payload
     /// (that has the `parent` as its parent).
     ///
