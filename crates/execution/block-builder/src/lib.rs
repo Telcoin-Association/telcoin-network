@@ -51,6 +51,8 @@ mod block_builder;
 mod error;
 mod pool;
 pub use pool::{maintain_transaction_pool_future, PoolMaintenanceConfig};
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
 
 // blockchain provider
 // tx pool
@@ -68,7 +70,7 @@ pub use pool::{maintain_transaction_pool_future, PoolMaintenanceConfig};
 // - impl Future for BlockProposer like Engine
 
 /// Type alias for the blocking task that locks the tx pool and builds the next worker block.
-type BlockBuildingTask = JoinHandle<WorkerBlock>;
+type BlockBuildingTask = oneshot::Receiver<B256>;
 // type BlockBuildingTask = oneshot::Receiver<BlockBuilderResult<WorkerBlockUpdate>>;
 
 /// The type that builds blocks for workers to propose.
@@ -110,18 +112,6 @@ pub struct BlockBuilder<BT, Pool, CE> {
     /// which guarantees the worker will attempt to broadcast the new block until
     /// quorum is reached.
     to_worker: Sender<NewWorkerBlock>,
-    /// Optional number of blocks to build before shutting down.
-    ///
-    /// Engine can produce multiple blocks per round of consensus, so this number may not
-    /// match the subdag index or block height. To control the number of outputs, consider
-    /// specifying a `max_round` for the execution engine.
-    ///
-    /// NOTE: this is primarily useful for debugging and testing
-    max_builds: Option<usize>,
-    /// The number of blocks this block builder has built.
-    ///
-    /// NOTE: this is only used when `max_blocks` is specified.
-    num_builds: Option<usize>,
     /// The address for worker block's beneficiary.
     address: Address,
     /// Receiver stream for pending transactions in the pool.
@@ -145,6 +135,15 @@ pub struct BlockBuilder<BT, Pool, CE> {
     gas_limit: u64,
     /// The maximum size of collected transactions, measured in bytes.
     max_size: usize,
+    /// Optional number of blocks to build before shutting down.
+    ///
+    /// Engine can produce multiple blocks per round of consensus, so this number may not
+    /// match the subdag index or block height. To control the number of outputs, consider
+    /// specifying a `max_round` for the execution engine.
+    ///
+    /// NOTE: this is primarily useful for debugging and testing
+    #[cfg(feature = "test-utils")]
+    max_builds: Option<test_utils::MaxBuilds>,
 }
 
 impl<BT, Pool, CE> BlockBuilder<BT, Pool, CE>
@@ -165,13 +164,14 @@ where
         pool: Pool,
         evm_config: CE,
         to_worker: Sender<NewWorkerBlock>,
-        max_builds: Option<usize>,
         address: Address,
         parent: SealedHeader,
         pending_tx_hashes_stream: ReceiverStream<TxHash>,
         basefee: watch::Receiver<u64>,
         gas_limit: u64,
         max_size: usize,
+        // #[cfg(feature = "test-utils")]
+        max_builds: Option<usize>,
     ) -> Self {
         // create broadcast channels
         // NOTE: it's important that worker updates are processed quickly
@@ -179,9 +179,6 @@ where
 
         // subscribe to canon state updates
         let canonical_state_updates = blockchain.canonical_state_stream();
-
-        // start at 0 if max_builds specified
-        let num_builds = max_builds.map(|_| 0);
 
         Self {
             pending_task: None,
@@ -191,14 +188,14 @@ where
             worker_block_updates,
             canonical_state_updates,
             to_worker,
-            max_builds,
-            num_builds,
             address,
             parent,
             pending_tx_hashes_stream,
             basefee,
             gas_limit,
             max_size,
+            #[cfg(feature = "test-utils")]
+            max_builds: max_builds.map(|max| test_utils::MaxBuilds::new(max)),
         }
     }
 
@@ -211,6 +208,7 @@ where
         let parent = self.parent.clone();
         let pool = self.pool.clone();
         let chain_spec = provider.chain_spec();
+        let to_worker = self.to_worker.clone();
 
         // TODO: use ms for worker block and sec for final block?
         //
@@ -257,33 +255,22 @@ where
             self.max_size,  // in bytes
         );
         let build_args = WorkerBlockBuilderArgs::new(provider, pool, config);
+        let (ack, rx) = oneshot::channel();
 
-        // spawn blocking task and return future
+        // spawn block building task and forward to worker
+        tokio::task::spawn(async move {
+            // this is safe to call without a semaphore bc it's held as a single `Option`
+            let block = build_worker_block(build_args);
+            if let Err(e) = to_worker.send(NewWorkerBlock { block, ack }).await {
+                error!(target: "worker::block_builder", ?e, "failed to send next block to worker");
+            }
+        });
+
+        // return oneshot channel for receiving ack
         //
-        // return JoinHandle instead of oneshot because build_worker_block does not return any
-        // errors
-        tokio::task::spawn_blocking(|| {
-            // this is safe to call on blocking thread without a semaphore bc
-            // it's held in Self::pending_task as a single `Option`
-            build_worker_block(build_args)
-        })
-    }
-
-    /// Check if the task has reached the maximum number of blocks to build as specified by
-    /// `max_builds`.
-    ///
-    /// Note: this is mainly for testing and debugging purposes.
-    fn has_reached_max_build(&self, progress: Option<usize>) -> bool {
-        let has_reached_max_build = progress >= self.max_builds;
-        if has_reached_max_build {
-            trace!(
-                target: "engine",
-                ?progress,
-                max_round = ?self.max_builds,
-                "Consensus engine reached max round for consensus"
-            );
-        }
-        has_reached_max_build
+        // reply acknowledges the block was received and stored in db
+        // see: worker::block_provider.rs
+        rx
     }
 }
 
@@ -350,6 +337,8 @@ where
                         // maintenance task will handle worker's pending block update
                         match canon_update {
                             CanonStateNotification::Commit { new } => {
+                                // NOTE: engine updates basefee watch channel before sending canon update
+
                                 // update parent information
                                 this.parent = new.tip().header.clone();
                             }
@@ -370,7 +359,7 @@ where
                 // only need pending pool stats
                 //
                 // create upstream PR for reth
-
+                //
                 // check for pending transactions
                 //
                 // considered using: pool.pool_size().pending
@@ -384,72 +373,30 @@ where
                 let basefee = *this.basefee.borrow_and_update();
                 this.pending_task = Some(this.spawn_execution_task(basefee));
 
-                // don't break so pending_task gets polled
+                // don't break so pending_task receiver gets polled
             }
 
-            // poll receiver that returns block build result
+            // poll receiver that returns worker's ack that block is proposed
             if let Some(mut receiver) = this.pending_task.take() {
-                // poll here so waker gets called when block is ready
+                // poll here so waker gets called when ack received
                 match receiver.poll_unpin(cx) {
                     Poll::Ready(res) => {
-                        // ensure no errors then store last executed header in memory
-                        let worker_block = res?;
-                        this.parent = worker_block.sealed_header().clone();
-
-                        // TODO: should this be background or directly call
-                        // pool.on_canonical_state_change()
-                        // - maintenance track is non blocking BUT
-                        // - maintenance task could be queued, canonical state updates, the
-                        //   maintenance task overwrites parent block
-                        //      - race condition
+                        // TODO: update tree's pending block?
                         //
-                        // Just call it here.
-                        //
-                        // apply worker update
-                        // NOTE: this is blocking
-                        // - better to have maintenance task that always checks canon and worker
-                        //   updates?
-                        // - need to ensure that worker update's parent block can't overwrite canon
-                        //   update tip
-                        // - also need to ensure pool isn't updated while building block
+                        // ensure no errors
+                        let _worker_block_hash = res?;
 
-                        // broadcast worker update
-                        //
-                        // the tx pool maintenance task should pick this up?
-                        // or is it better to just do it here?
-                        //
-
-                        // From parkinglot docs:
-                        //
-                        // read lock:
-                        // Locks this RwLock with shared read access, blocking the current thread
-                        // until it can be acquired. The calling thread will
-                        // be blocked until there are no more writers which hold the lock. There may
-                        // be other readers currently inside the lock when this method returns.
-                        // Note that attempts to recursively acquire a read lock on a RwLock when
-                        // the current thread already holds one may result in a deadlock.
-                        // Returns an RAII guard which will release this thread's shared access once
-                        // it is dropped.
-
-                        // write lock:
-                        // Locks this RwLock with exclusive write access, blocking the current
-                        // thread until it can be acquired. This function
-                        // will not return while other writers or other readers currently have
-                        // access to the lock. Returns an RAII guard which
-                        // will drop the write access of this RwLock when dropped
-
-                        // check max_builds
-                        if this.max_builds.is_some() {
-                            // increase num builds
-                            this.num_builds = this.num_builds.map(|n| n + 1);
-                            if this.has_reached_max_build(this.num_builds) {
-                                // immediately terminate if the specified max number of blocks were
-                                // built
+                        // check max_builds and possibly return early
+                        #[cfg(feature = "test-utils")]
+                        if let Some(max_builds) = this.max_builds.as_mut() {
+                            max_builds.num_builds += 1;
+                            if max_builds.has_reached_max() {
+                                debug!(target: "worker::block_builder", ?max_builds, "max builds reached");
                                 return Poll::Ready(Ok(()));
                             }
                         }
 
-                        // loop again to check for engine updates
+                        // loop again to check for engine updates and possibly start building the next block
                         continue;
                     }
                     Poll::Pending => {
@@ -464,5 +411,14 @@ where
 
         // all output executed, yield back to runtime
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_map_opt() {
+        let dis = Some(1);
+        assert_eq!(dis, Some(1));
     }
 }
