@@ -37,8 +37,8 @@ use std::{
     task::{Context, Poll, Waker},
 };
 use tn_types::{
-    now, NewWorkerBlock, PendingBlockConfig, WorkerBlockBuilderArgs, WorkerBlockUpdate,
-    WorkerBlockUpdateSender,
+    now, NewWorkerBlock, PendingBlockConfig, WorkerBlock, WorkerBlockBuilderArgs,
+    WorkerBlockUpdate, WorkerBlockUpdateSender,
 };
 use tokio::{
     sync::{broadcast, oneshot, watch},
@@ -68,7 +68,7 @@ pub use pool::{maintain_transaction_pool_future, PoolMaintenanceConfig};
 // - impl Future for BlockProposer like Engine
 
 /// Type alias for the blocking task that locks the tx pool and builds the next worker block.
-type BlockBuildingTask = JoinHandle<SealedHeader>;
+type BlockBuildingTask = JoinHandle<WorkerBlock>;
 // type BlockBuildingTask = oneshot::Receiver<BlockBuilderResult<WorkerBlockUpdate>>;
 
 /// The type that builds blocks for workers to propose.
@@ -260,8 +260,8 @@ where
 
         // spawn blocking task and return future
         //
-        // return JoinHandle instead of oneshot because
-        // build_worker_block does not return any errors
+        // return JoinHandle instead of oneshot because build_worker_block does not return any
+        // errors
         tokio::task::spawn_blocking(|| {
             // this is safe to call on blocking thread without a semaphore bc
             // it's held in Self::pending_task as a single `Option`
@@ -269,7 +269,8 @@ where
         })
     }
 
-    /// Check if the task has reached the maximum number of blocks to build as specified by `max_builds`.
+    /// Check if the task has reached the maximum number of blocks to build as specified by
+    /// `max_builds`.
     ///
     /// Note: this is mainly for testing and debugging purposes.
     fn has_reached_max_build(&self, progress: Option<usize>) -> bool {
@@ -324,12 +325,12 @@ where
         // TODO:
         // Should the pending transaction notification stream be used to signal wakeup?
         // pros:
-        //  - canon updates happen infrequently (~5s currently), so if no txs for a while,
-        //    then no pending task, so no wakeup
+        //  - canon updates happen infrequently (~5s currently), so if no txs for a while, then no
+        //    pending task, so no wakeup
         //
         // cons:
-        //  - could trigger this task to wake up frequently, but maybe that's a good thing
-        //    since this is one of the worker's primary responsibilities
+        //  - could trigger this task to wake up frequently, but maybe that's a good thing since
+        //    this is one of the worker's primary responsibilities
         //
         // also need to check basefee for changed? or should this not matter?
         // don't want a race condition where this task wakes up before canon update received...
@@ -392,7 +393,8 @@ where
                 match receiver.poll_unpin(cx) {
                     Poll::Ready(res) => {
                         // ensure no errors then store last executed header in memory
-                        this.parent = res?;
+                        let worker_block = res?;
+                        this.parent = worker_block.sealed_header().clone();
 
                         // TODO: should this be background or directly call
                         // pool.on_canonical_state_change()
