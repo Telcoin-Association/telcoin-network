@@ -126,8 +126,14 @@ pub struct BlockBuilder<BT, Pool, CE> {
     /// be uniform across all workers using building off the same parent. Worker uses the basefee
     /// from the latest round of consensus for proposing it's next blocks. The basefee included in
     /// the worker's block is used by the engine during final execution. Peers validate that the
-    /// worker's basefee is correct based on it's parent.
-    basefee: watch::Receiver<u64>,
+    /// worker block's basefee is correct based on it's parent.
+    basefee_watch: watch::Receiver<u64>,
+    /// The last basefee received from the engine.
+    ///
+    /// This value is tracked to ensure consistency. The only time this value is updated is when
+    /// a canon notification is received from the engine. The engine updates basefee watch channel
+    /// before broadcasting the canon notification, so this value is guaranteed to always be correct.
+    basefee: u64,
     /// The maximum amount of gas for a worker block.
     ///
     /// NOTE: transactions are not executed at this stage, so the worker measures the amount of gas
@@ -139,9 +145,9 @@ pub struct BlockBuilder<BT, Pool, CE> {
     ///
     /// Engine can produce multiple blocks per round of consensus, so this number may not
     /// match the subdag index or block height. To control the number of outputs, consider
-    /// specifying a `max_round` for the execution engine.
+    /// specifying a `max_round` for the execution engine as well.
     ///
-    /// NOTE: this is primarily useful for debugging and testing
+    /// NOTE: this is only used for debugging and testing
     #[cfg(feature = "test-utils")]
     max_builds: Option<test_utils::MaxBuilds>,
 }
@@ -167,11 +173,10 @@ where
         address: Address,
         parent: SealedHeader,
         pending_tx_hashes_stream: ReceiverStream<TxHash>,
-        basefee: watch::Receiver<u64>,
+        basefee_watch: watch::Receiver<u64>,
         gas_limit: u64,
         max_size: usize,
-        // #[cfg(feature = "test-utils")]
-        max_builds: Option<usize>,
+        #[cfg(feature = "test-utils")] max_builds: Option<usize>,
     ) -> Self {
         // create broadcast channels
         // NOTE: it's important that worker updates are processed quickly
@@ -179,6 +184,9 @@ where
 
         // subscribe to canon state updates
         let canonical_state_updates = blockchain.canonical_state_stream();
+
+        // start with current basefee in watch channel
+        let basefee = *basefee_watch.borrow();
 
         Self {
             pending_task: None,
@@ -191,6 +199,7 @@ where
             address,
             parent,
             pending_tx_hashes_stream,
+            basefee_watch,
             basefee,
             gas_limit,
             max_size,
@@ -203,12 +212,13 @@ where
     ///
     /// This approach allows the engine to yield back to the runtime while executing blocks.
     /// Executing blocks is cpu intensive, so a blocking task is used.
-    fn spawn_execution_task(&self, basefee: u64) -> BlockBuildingTask {
+    fn spawn_execution_task(&self) -> BlockBuildingTask {
         let provider = self.blockchain.clone();
         let parent = self.parent.clone();
         let pool = self.pool.clone();
         let chain_spec = provider.chain_spec();
         let to_worker = self.to_worker.clone();
+        let basefee = self.basefee;
 
         // TODO: use ms for worker block and sec for final block?
         //
@@ -310,6 +320,7 @@ where
 
         //
         // TODO:
+        //
         // Should the pending transaction notification stream be used to signal wakeup?
         // pros:
         //  - canon updates happen infrequently (~5s currently), so if no txs for a while, then no
@@ -319,10 +330,7 @@ where
         //  - could trigger this task to wake up frequently, but maybe that's a good thing since
         //    this is one of the worker's primary responsibilities
         //
-        // also need to check basefee for changed? or should this not matter?
-        // don't want a race condition where this task wakes up before canon update received...
-        //
-        // ideally they would be sent on the same channel, but working around reth right now
+        // other option is to set an interval as specified in the config?
 
         loop {
             // check for canon updates before mining the transaction pool
@@ -337,8 +345,13 @@ where
                         // maintenance task will handle worker's pending block update
                         match canon_update {
                             CanonStateNotification::Commit { new } => {
-                                // NOTE: engine updates basefee watch channel before sending canon update
-
+                                // NOTE: avoid polling watch channel for `change` to prevent race condition
+                                //
+                                // engine updates basefee watch channel before sending canon update
+                                //
+                                // tracking the basefee here ensures consistency and guarantees the basefee
+                                // is accurate based on the worker block builder's parent
+                                this.basefee = *this.basefee_watch.borrow_and_update();
                                 // update parent information
                                 this.parent = new.tip().header.clone();
                             }
@@ -355,30 +368,27 @@ where
             // note: it's important that the previous block build finishes before
             // inserting the next task to ensure updates are applied correctly
             if this.pending_task.is_none() {
-                // TODO: is there a more efficient approach?
-                // only need pending pool stats
-                //
-                // create upstream PR for reth
+                // TODO: is there a more efficient approach? only need pending pool stats
+                // create upstream PR for reth?
                 //
                 // check for pending transactions
                 //
                 // considered using: pool.pool_size().pending
-                // but this calculates size for all sub-pools
+                // but that calculates size for all sub-pools
                 if this.pool.pending_transactions().len() == 0 {
                     // nothing pending
                     break;
                 }
 
-                // build the next block
-                let basefee = *this.basefee.borrow_and_update();
-                this.pending_task = Some(this.spawn_execution_task(basefee));
+                // start building the next block
+                this.pending_task = Some(this.spawn_execution_task());
 
                 // don't break so pending_task receiver gets polled
             }
 
-            // poll receiver that returns worker's ack that block is proposed
+            // poll receiver that returns worker's ack once block is proposed
             if let Some(mut receiver) = this.pending_task.take() {
-                // poll here so waker gets called when ack received
+                // poll here so waker is notified when ack received
                 match receiver.poll_unpin(cx) {
                     Poll::Ready(res) => {
                         // TODO: update tree's pending block?
