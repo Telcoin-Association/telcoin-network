@@ -14,7 +14,7 @@
 
 pub use block_builder::build_worker_block;
 use consensus_metrics::metered_channel::Sender;
-use error::BlockBuilderResult;
+use error::{BlockBuilderError, BlockBuilderResult};
 use futures_util::{FutureExt, StreamExt};
 use reth_blockchain_tree::BlockchainTreeEngine;
 use reth_chainspec::ChainSpec;
@@ -40,7 +40,10 @@ use tn_types::{
     now, NewWorkerBlock, PendingBlockConfig, WorkerBlockBuilderArgs, WorkerBlockUpdate,
     WorkerBlockUpdateSender,
 };
-use tokio::sync::{broadcast, oneshot, watch};
+use tokio::{
+    sync::{broadcast, oneshot, watch},
+    task::JoinHandle,
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, trace, warn};
 
@@ -65,7 +68,8 @@ pub use pool::{maintain_transaction_pool_future, PoolMaintenanceConfig};
 // - impl Future for BlockProposer like Engine
 
 /// Type alias for the blocking task that locks the tx pool and builds the next worker block.
-type BlockBuildingTask = oneshot::Receiver<BlockBuilderResult<WorkerBlockUpdate>>;
+type BlockBuildingTask = JoinHandle<SealedHeader>;
+// type BlockBuildingTask = oneshot::Receiver<BlockBuilderResult<WorkerBlockUpdate>>;
 
 /// The type that builds blocks for workers to propose.
 ///
@@ -203,7 +207,6 @@ where
     /// This approach allows the engine to yield back to the runtime while executing blocks.
     /// Executing blocks is cpu intensive, so a blocking task is used.
     fn spawn_execution_task(&self, basefee: u64) -> BlockBuildingTask {
-        let evm_config = self.evm_config.clone();
         let provider = self.blockchain.clone();
         let parent = self.parent.clone();
         let pool = self.pool.clone();
@@ -254,27 +257,19 @@ where
             self.max_size,  // in bytes
         );
         let build_args = WorkerBlockBuilderArgs::new(provider, pool, config);
-        let (tx, rx) = oneshot::channel();
 
         // spawn blocking task and return future
+        //
+        // return JoinHandle instead of oneshot because
+        // build_worker_block does not return any errors
         tokio::task::spawn_blocking(|| {
-            // this is safe to call on blocking thread without a semaphore bc it's held in
-            // Self::pending_tesk as a single `Option`
-            let result = build_worker_block(build_args);
-            match tx.send(result) {
-                Ok(()) => (),
-                Err(e) => {
-                    error!(target: "engine", ?e, "error sending result from execute_consensus_output")
-                }
-            }
-        });
-
-        // oneshot receiver for execution result
-        rx
+            // this is safe to call on blocking thread without a semaphore bc
+            // it's held in Self::pending_task as a single `Option`
+            build_worker_block(build_args)
+        })
     }
 
-    /// Check if the task has reached the maximum number of blocks to build as specified by
-    /// `max_builds`.
+    /// Check if the task has reached the maximum number of blocks to build as specified by `max_builds`.
     ///
     /// Note: this is mainly for testing and debugging purposes.
     fn has_reached_max_build(&self, progress: Option<usize>) -> bool {
@@ -385,10 +380,10 @@ where
                 }
 
                 // build the next block
-
-                let basefee = *self.basefee.borrow_and_update();
+                let basefee = *this.basefee.borrow_and_update();
                 this.pending_task = Some(this.spawn_execution_task(basefee));
-                // don't break so pending task gets polled
+
+                // don't break so pending_task gets polled
             }
 
             // poll receiver that returns block build result
@@ -396,14 +391,8 @@ where
                 // poll here so waker gets called when block is ready
                 match receiver.poll_unpin(cx) {
                     Poll::Ready(res) => {
-                        // TODO: best way to handle if pending txs in pool
-                        // but execution fails? Although unlikely, this approach
-                        // would produce an empty worker block which should not happen.
-
-                        let worker_update = res.map_err(Into::into).and_then(|res| res)?;
-
                         // ensure no errors then store last executed header in memory
-                        this.parent_block = worker_update.parent().clone();
+                        this.parent = res?;
 
                         // TODO: should this be background or directly call
                         // pool.on_canonical_state_change()

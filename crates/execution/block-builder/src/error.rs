@@ -4,7 +4,7 @@ use reth_blockchain_tree::error::InsertBlockError;
 use reth_errors::{CanonicalError, ProviderError, RethError};
 use reth_revm::primitives::EVMError;
 use tn_types::WorkerBlockConversionError;
-use tokio::sync::oneshot;
+use tokio::{sync::oneshot, task::JoinError};
 
 /// Result alias for [`TNEngineError`].
 pub(crate) type BlockBuilderResult<T> = Result<T, BlockBuilderError>;
@@ -37,12 +37,6 @@ pub enum BlockBuilderError {
     #[error("Blockchain tree failed to make_canonical: {0}")]
     Canonical(#[from] CanonicalError),
     /// The oneshot channel that receives the result from executing output on a blocking thread.
-    #[error("The oneshot channel sender inside blocking task dropped during block building.")]
-    ChannelClosed,
-}
-
-impl From<oneshot::error::RecvError> for BlockBuilderError {
-    fn from(_: oneshot::error::RecvError) -> Self {
-        Self::ChannelClosed
-    }
+    #[error("Thread panicked while constructing the next worker block: {0}")]
+    ThreadPanicked(#[from] JoinError),
 }

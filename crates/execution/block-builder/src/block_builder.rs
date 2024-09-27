@@ -10,7 +10,7 @@ use reth_evm::ConfigureEvm;
 use reth_payload_builder::database::CachedReads;
 use reth_primitives::{
     constants::EMPTY_WITHDRAWALS, keccak256, proofs, Block, Header, IntoRecoveredTransaction,
-    Receipt, SealedBlockWithSenders, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256,
+    Receipt, SealedBlockWithSenders, SealedHeader, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256,
 };
 use reth_provider::{ChainSpecProvider, ExecutionOutcome, StateProviderFactory};
 use reth_revm::{
@@ -27,11 +27,11 @@ use tracing::{debug, warn};
 use crate::error::{BlockBuilderError, BlockBuilderResult};
 /// Construct an TN worker block using the best transactions from the pool.
 ///
-/// Returns a result indicating success with the payload or an error in case of failure.
+/// Returns the `SealedHeader` and cannot fail.
 #[inline]
 pub fn build_worker_block<Pool, Provider>(
     args: WorkerBlockBuilderArgs<Pool, Provider>,
-) -> BlockBuilderResult<WorkerBlockUpdate>
+) -> SealedHeader
 where
     Provider: StateProviderFactory,
     Pool: TransactionPool,
@@ -89,6 +89,9 @@ where
             continue;
         }
 
+        // txs are not executed, so use the gas_limit
+        cumulative_gas_used += tx.gas_limit();
+
         // append transaction to the list of executed transactions
         senders.push(tx.signer());
         executed_txs.push(tx.into_signed());
@@ -125,7 +128,9 @@ where
         excess_blob_gas: None,
         requests_root: None,
     };
-    todo!()
+
+    // seal header
+    header.seal_slow()
 }
 
 // /// Construct an TN worker block using the best transactions from the pool.
