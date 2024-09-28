@@ -96,9 +96,9 @@ where
     }
 
     /// Batch validator
-    pub async fn new_batch_validator(&self) -> BlockValidator<DB> {
+    pub async fn new_block_validator(&self) -> BlockValidator<DB> {
         let guard = self.internal.read().await;
-        guard.new_batch_validator()
+        guard.new_block_validator()
     }
 
     /// Retrieve the last executed block from the database to restore consensus.

@@ -328,12 +328,18 @@ impl BlockValidation for NoopBlockValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::validator::BlockValidator;
+    use narwhal_test_utils::default_test_execution_node;
+    use reth::tasks::{TaskExecutor, TaskManager};
     use reth_beacon_consensus::EthBeaconConsensus;
     use reth_blockchain_tree::{
         BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
     };
     use reth_chainspec::ChainSpec;
-    use reth_db::test_utils::{create_test_rw_db, tempdir_path};
+    use reth_db::{
+        test_utils::{create_test_rw_db, tempdir_path, TempDatabase},
+        DatabaseEnv,
+    };
     use reth_db_common::init::init_genesis;
     use reth_primitives::{
         constants::EMPTY_WITHDRAWALS, hex, Address, Bloom, Bytes, GenesisAccount, Header,
@@ -389,9 +395,23 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn test_valid_block() {
-        init_test_tracing();
+    /// Convenience type for creating test assets.
+    struct TestTypes {
+        /// Chain spec
+        chain: Arc<ChainSpec>,
+        /// The transaction factory to sign transactions.
+        tx_factory: TransactionFactory,
+        /// Task manager that owns the executor.
+        manager: TaskManager,
+        /// Task executor that owns the task.
+        executor: TaskExecutor,
+        /// The expected transactions for the valid sealed header.
+        valid_txs: Vec<TransactionSigned>,
+    }
+
+    /// Create an instance of block validator for tests.
+    async fn test_types() -> TestTypes {
+        // init_test_tracing();
         let genesis = adiri_genesis();
         let mut tx_factory = TransactionFactory::new();
         let factory_address = tx_factory.address();
@@ -409,49 +429,18 @@ mod tests {
         debug!("seeded genesis: {genesis:?}");
         let chain: Arc<ChainSpec> = Arc::new(genesis.into());
 
-        // init genesis
-        let db = create_test_rw_db();
-        let provider_factory = ProviderFactory::new(
-            Arc::clone(&db),
-            Arc::clone(&chain),
-            StaticFileProvider::read_write(tempdir_path())
-                .expect("static file provider read write created with tempdir path"),
-        );
-        let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
-        debug!("genesis hash: {genesis_hash:?}");
-
-        // configure blockchain tree
-        let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
-
-        let tree_externals = TreeExternals::new(
-            provider_factory.clone(),
-            Arc::clone(&consensus),
-            reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
-        );
-        let tree_config = BlockchainTreeConfig::default();
-        let tree = BlockchainTree::new(tree_externals, tree_config, PruneModes::none())
-            .expect("blockchain tree is valid");
-
-        let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
-
-        // provider
-        let blockchain_db =
-            BlockchainProvider::new(provider_factory.clone(), blockchain_tree.clone())
-                .expect("blockchain db valid");
-
-        // get gas price before passing db
-        let gas_price = get_gas_price(&blockchain_db);
-
-        // block validator
-        let block_validator = BlockValidator::new(blockchain_db, 1_000_000, 30_000_000);
-
-        let sealed_header = next_valid_sealed_header();
+        let manager = TaskManager::current();
+        let executor = manager.executor();
+        let execution_node =
+            default_test_execution_node(Some(chain.clone()), None, executor.clone())
+                .expect("block validator from execution node");
 
         // tx factory - [0; 32] seed address - nonce 0-2
         //
         // transactions are deterministic bc the factory is seeded with [0; 32]
 
         let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
+        let gas_price = 7;
 
         // create 3 transactions
         let transaction1 = tx_factory.create_eip1559(
@@ -481,12 +470,20 @@ mod tests {
         );
         debug!("transaction 3: {transaction3:?}");
 
-        let transactions = vec![transaction1, transaction2, transaction3];
-        let block = WorkerBlock::new(transactions, sealed_header.clone());
+        let valid_txs = vec![transaction1, transaction2, transaction3];
 
-        let result = block_validator.validate_block(&block).await;
+        // block validator
+        TestTypes { chain, tx_factory, manager, executor, valid_txs }
+    }
 
-        println!("result: {result:?}");
+    #[tokio::test]
+    async fn test_valid_block() {
+        let TestTypes { chain, tx_factory, valid_txs, executor, .. } = test_types().await;
+        let sealed_header = next_valid_sealed_header();
+        let block = WorkerBlock::new(valid_txs, sealed_header.clone());
+        let execution_node = default_test_execution_node(Some(chain), None, executor)?;
+        let validator = execution_node.new_block_validator().await;
+        let result = validator.validate_block(&block).await;
 
         assert!(result.is_ok())
     }

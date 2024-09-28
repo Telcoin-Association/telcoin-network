@@ -340,8 +340,8 @@ where
         Ok(())
     }
 
-    /// Create a new batch validator.
-    pub(super) fn new_batch_validator(&self) -> BlockValidator<DB> {
+    /// Create a new block validator.
+    pub(super) fn new_block_validator(&self) -> BlockValidator<DB> {
         // batch validator
         BlockValidator::<DB>::new(
             self.blockchain_db.clone(),

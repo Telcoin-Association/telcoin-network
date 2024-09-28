@@ -90,7 +90,7 @@ impl WorkerNodeInner {
             &channel_metrics.tx_block_maker_total,
         );
 
-        let batch_validator = execution_node.new_batch_validator().await;
+        let batch_validator = execution_node.new_block_validator().await;
 
         let handles = Worker::spawn(
             authority.clone(),
