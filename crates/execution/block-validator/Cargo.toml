@@ -36,7 +36,7 @@ reth-db = { workspace = true, features = ["test-utils"] }
 reth-beacon-consensus = { workspace = true }
 reth-primitives = { workspace = true, features = ["test-utils"] }
 reth-db-common = { workspace = true }
-narwhal-test-utils = { workspace = true }
+assert_matches = { workspace = true }
 
 [features]
 default = []

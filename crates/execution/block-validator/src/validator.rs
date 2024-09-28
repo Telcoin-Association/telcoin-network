@@ -53,6 +53,8 @@ where
     ///
     /// Workers do not execute full blocks. This method validates the required information.
     async fn validate_block(&self, block: &WorkerBlock) -> BlockValidationResult<()> {
+        // TODO: validate individual transactions against parent
+
         // obtain info for validation
         let transactions = block.transactions();
         let sealed_header = block.sealed_header();
@@ -328,8 +330,7 @@ impl BlockValidation for NoopBlockValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::validator::BlockValidator;
-    use narwhal_test_utils::default_test_execution_node;
+    use assert_matches::assert_matches;
     use reth::tasks::{TaskExecutor, TaskManager};
     use reth_beacon_consensus::EthBeaconConsensus;
     use reth_blockchain_tree::{
@@ -396,21 +397,17 @@ mod tests {
     }
 
     /// Convenience type for creating test assets.
-    struct TestTypes {
-        /// Chain spec
-        chain: Arc<ChainSpec>,
-        /// The transaction factory to sign transactions.
-        tx_factory: TransactionFactory,
-        /// Task manager that owns the executor.
-        manager: TaskManager,
-        /// Task executor that owns the task.
-        executor: TaskExecutor,
+    struct TestTools {
         /// The expected transactions for the valid sealed header.
         valid_txs: Vec<TransactionSigned>,
+        /// The expected sealed header.
+        valid_header: SealedHeader,
+        /// Validator
+        validator: BlockValidator<Arc<TempDatabase<DatabaseEnv>>>,
     }
 
     /// Create an instance of block validator for tests.
-    async fn test_types() -> TestTypes {
+    async fn test_types() -> TestTools {
         // init_test_tracing();
         let genesis = adiri_genesis();
         let mut tx_factory = TransactionFactory::new();
@@ -428,12 +425,6 @@ mod tests {
         let genesis = genesis.extend_accounts(account);
         debug!("seeded genesis: {genesis:?}");
         let chain: Arc<ChainSpec> = Arc::new(genesis.into());
-
-        let manager = TaskManager::current();
-        let executor = manager.executor();
-        let execution_node =
-            default_test_execution_node(Some(chain.clone()), None, executor.clone())
-                .expect("block validator from execution node");
 
         // tx factory - [0; 32] seed address - nonce 0-2
         //
@@ -472,528 +463,108 @@ mod tests {
 
         let valid_txs = vec![transaction1, transaction2, transaction3];
 
+        // init genesis
+        let db = create_test_rw_db();
+        let provider_factory = ProviderFactory::new(
+            Arc::clone(&db),
+            Arc::clone(&chain),
+            StaticFileProvider::read_write(tempdir_path())
+                .expect("static file provider read write created with tempdir path"),
+        );
+        let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
+        debug!("genesis hash: {genesis_hash:?}");
+
+        // configure blockchain tree
+        let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
+
+        let tree_externals = TreeExternals::new(
+            provider_factory.clone(),
+            Arc::clone(&consensus),
+            reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
+        );
+        let tree_config = BlockchainTreeConfig::default();
+        let tree = BlockchainTree::new(tree_externals, tree_config, PruneModes::none())
+            .expect("blockchain tree is valid");
+
+        let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
+
+        // provider
+        let blockchain_db =
+            BlockchainProvider::new(provider_factory.clone(), blockchain_tree.clone())
+                .expect("blockchain db valid");
+
+        let validator = BlockValidator::new(blockchain_db, 1_000_000, 30_000_000);
+        let valid_header = next_valid_sealed_header();
+
         // block validator
-        TestTypes { chain, tx_factory, manager, executor, valid_txs }
+        TestTools { valid_txs, valid_header, validator }
     }
 
     #[tokio::test]
     async fn test_valid_block() {
-        let TestTypes { chain, tx_factory, valid_txs, executor, .. } = test_types().await;
-        let sealed_header = next_valid_sealed_header();
-        let block = WorkerBlock::new(valid_txs, sealed_header.clone());
-        let execution_node = default_test_execution_node(Some(chain), None, executor)?;
-        let validator = execution_node.new_block_validator().await;
-        let result = validator.validate_block(&block).await;
+        let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        let valid_block = WorkerBlock::new(valid_txs, valid_header);
+        let result = validator.validate_block(&valid_block).await;
 
-        assert!(result.is_ok())
+        assert!(result.is_ok());
     }
 
-    // #[tokio::test]
-    // async fn test_invalid_block_wrong_parent_hash() {
-    //     init_test_tracing();
-    //     let genesis = adiri_genesis();
-    //     let mut tx_factory = TransactionFactory::new();
-    //     let factory_address = tx_factory.address();
-    //     debug!("seeding factory address: {factory_address:?}");
-
-    //     // fund factory with 99mil TEL
-    //     let account = vec![(
-    //         factory_address,
-    //         GenesisAccount::default().with_balance(
-    //             U256::from_str("0x51E410C0F93FE543000000").expect("account balance is parsed"),
-    //         ),
-    //     )];
-
-    //     let genesis = genesis.extend_accounts(account);
-    //     debug!("seeded genesis: {genesis:?}");
-    //     let chain: Arc<ChainSpec> = Arc::new(genesis.into());
-
-    //     // init genesis
-    //     let db = create_test_rw_db();
-    //     let provider_factory = ProviderFactory::new(
-    //         Arc::clone(&db),
-    //         Arc::clone(&chain),
-    //         StaticFileProvider::read_write(tempdir_path())
-    //             .expect("static file provider read write created with tempdir path"),
-    //     );
-    //     let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
-    //     debug!("genesis hash: {genesis_hash:?}");
-
-    //     // configure blockchain tree
-    //     let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
-
-    //     let tree_externals = TreeExternals::new(
-    //         provider_factory.clone(),
-    //         Arc::clone(&consensus),
-    //         reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
-    //     );
-    //     let tree_config = BlockchainTreeConfig::default();
-    //     let tree = BlockchainTree::new(tree_externals, tree_config, PruneModes::none())
-    //         .expect("blockchain tree is valid");
-
-    //     let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
-
-    //     // provider
-    //     let blockchain_db =
-    //         BlockchainProvider::new(provider_factory.clone(), blockchain_tree.clone())
-    //             .expect("blockchain db valid");
-
-    //     // block validator
-    //     let block_validator = BlockValidator::new(
-    //         Arc::clone(&consensus),
-    //         blockchain_db.clone(),
-    //         reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
-    //     );
-
-    //     // tx factory - [0; 32] seed address - nonce 0-2
-    //     //
-    //     // transactions are deterministic bc the factory is seeded with [0; 32]
-
-    //     let gas_price = get_gas_price(&blockchain_db);
-    //     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
-
-    //     // create 3 transactions
-    //     let transaction1 = tx_factory.create_eip1559(
-    //         chain.clone(),
-    //         gas_price,
-    //         Some(Address::ZERO),
-    //         value, // 1 TEL
-    //         Bytes::new(),
-    //     );
-    //     debug!("transaction 1: {transaction1:?}");
-
-    //     let transaction2 = tx_factory.create_eip1559(
-    //         chain.clone(),
-    //         gas_price,
-    //         Some(Address::ZERO),
-    //         value, // 1 TEL
-    //         Bytes::new(),
-    //     );
-    //     debug!("transaction 2: {transaction2:?}");
-
-    //     let transaction3 = tx_factory.create_eip1559(
-    //         chain.clone(),
-    //         gas_price,
-    //         Some(Address::ZERO),
-    //         value, // 1 TEL
-    //         Bytes::new(),
-    //     );
-    //     debug!("transaction 3: {transaction3:?}");
-
-    //     let wrong_parent_hash = B256::ZERO;
-
-    //     // sealed header
-    //     let mut sealed_header = next_valid_sealed_header();
-    //     sealed_header.set_parent_hash(wrong_parent_hash);
-
-    //     let transactions = vec![transaction1, transaction2, transaction3];
-    //     let block = WorkerBlock::new(transactions, sealed_header.clone());
-
-    //     let result = block_validator.validate_block(&block).await;
-
-    //     assert!(result.is_err())
-    // }
-
-    // #[tokio::test]
-    // async fn test_invalid_block_wrong_state_root() {
-    //     init_test_tracing();
-    //     let genesis = adiri_genesis();
-    //     let mut tx_factory = TransactionFactory::new();
-    //     let factory_address = tx_factory.address();
-    //     debug!("seeding factory address: {factory_address:?}");
-
-    //     // fund factory with 99mil TEL
-    //     let account = vec![(
-    //         factory_address,
-    //         GenesisAccount::default().with_balance(
-    //             U256::from_str("0x51E410C0F93FE543000000").expect("account balance is parsed"),
-    //         ),
-    //     )];
-
-    //     let genesis = genesis.extend_accounts(account);
-    //     debug!("seeded genesis: {genesis:?}");
-    //     let chain: Arc<ChainSpec> = Arc::new(genesis.into());
-
-    //     // init genesis
-    //     let db = create_test_rw_db();
-    //     let provider_factory = ProviderFactory::new(
-    //         Arc::clone(&db),
-    //         Arc::clone(&chain),
-    //         StaticFileProvider::read_write(tempdir_path())
-    //             .expect("static file provider read write created with tempdir path"),
-    //     );
-    //     let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
-    //     debug!("genesis hash: {genesis_hash:?}");
-
-    //     // configure blockchain tree
-    //     let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
-
-    //     let tree_externals = TreeExternals::new(
-    //         provider_factory.clone(),
-    //         Arc::clone(&consensus),
-    //         reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
-    //     );
-    //     let tree_config = BlockchainTreeConfig::default();
-    //     let tree = BlockchainTree::new(tree_externals, tree_config, PruneModes::none())
-    //         .expect("blockchain tree is valid");
-
-    //     let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
-
-    //     // provider
-    //     let blockchain_db =
-    //         BlockchainProvider::new(provider_factory.clone(), blockchain_tree.clone())
-    //             .expect("blockchain db valid");
-
-    //     // block validator
-    //     let block_validator = BlockValidator::new(
-    //         Arc::clone(&consensus),
-    //         blockchain_db.clone(),
-    //         reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
-    //     );
-
-    //     // tx factory - [0; 32] seed address - nonce 0-2
-    //     //
-    //     // transactions are deterministic bc the factory is seeded with [0; 32]
-
-    //     let gas_price = get_gas_price(&blockchain_db);
-    //     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
-
-    //     // create 3 transactions
-    //     let transaction1 = tx_factory.create_eip1559(
-    //         chain.clone(),
-    //         gas_price,
-    //         Some(Address::ZERO),
-    //         value, // 1 TEL
-    //         Bytes::new(),
-    //     );
-    //     debug!("transaction 1: {transaction1:?}");
-
-    //     let transaction2 = tx_factory.create_eip1559(
-    //         chain.clone(),
-    //         gas_price,
-    //         Some(Address::ZERO),
-    //         value, // 1 TEL
-    //         Bytes::new(),
-    //     );
-    //     debug!("transaction 2: {transaction2:?}");
-
-    //     let transaction3 = tx_factory.create_eip1559(
-    //         chain.clone(),
-    //         gas_price,
-    //         Some(Address::ZERO),
-    //         value, // 1 TEL
-    //         Bytes::new(),
-    //     );
-    //     debug!("transaction 3: {transaction3:?}");
-
-    //     let mut sealed_header = next_valid_sealed_header();
-    //     let wrong_state_root = hex!(
-    //         "0000000000000000af72d17a5ed533329c894c8e181fa1616428a1e9ae51bcf2" // wrong
-    //     )
-    //     .into();
-    //     sealed_header.set_state_root(wrong_state_root);
-
-    //     let transactions = vec![transaction1, transaction2, transaction3];
-    //     let block = WorkerBlock::new(transactions, sealed_header.clone());
-
-    //     let result = block_validator.validate_block(&block).await;
-
-    //     assert!(result.is_err())
-    // }
-
-    // #[tokio::test]
-    // async fn test_invalid_block_wrong_tx_root() {
-    //     init_test_tracing();
-    //     let genesis = adiri_genesis();
-    //     let mut tx_factory = TransactionFactory::new();
-    //     let factory_address = tx_factory.address();
-    //     debug!("seeding factory address: {factory_address:?}");
-
-    //     // fund factory with 99mil TEL
-    //     let account = vec![(
-    //         factory_address,
-    //         GenesisAccount::default().with_balance(
-    //             U256::from_str("0x51E410C0F93FE543000000").expect("account balance is parsed"),
-    //         ),
-    //     )];
-
-    //     let genesis = genesis.extend_accounts(account);
-    //     debug!("seeded genesis: {genesis:?}");
-    //     let chain: Arc<ChainSpec> = Arc::new(genesis.into());
-
-    //     // init genesis
-    //     let db = create_test_rw_db();
-    //     let provider_factory = ProviderFactory::new(
-    //         Arc::clone(&db),
-    //         Arc::clone(&chain),
-    //         StaticFileProvider::read_write(tempdir_path())
-    //             .expect("static file provider read write created with tempdir path"),
-    //     );
-    //     let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
-    //     debug!("genesis hash: {genesis_hash:?}");
-
-    //     // configure blockchain tree
-    //     let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
-
-    //     let tree_externals = TreeExternals::new(
-    //         provider_factory.clone(),
-    //         Arc::clone(&consensus),
-    //         reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
-    //     );
-    //     let tree_config = BlockchainTreeConfig::default();
-    //     let tree = BlockchainTree::new(tree_externals, tree_config, PruneModes::none())
-    //         .expect("blockchain tree is valid");
-
-    //     let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
-
-    //     // provider
-    //     let blockchain_db =
-    //         BlockchainProvider::new(provider_factory.clone(), blockchain_tree.clone())
-    //             .expect("blockchain db valid");
-
-    //     // block validator
-    //     let block_validator = BlockValidator::new(
-    //         Arc::clone(&consensus),
-    //         blockchain_db.clone(),
-    //         reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
-    //     );
-
-    //     // tx factory - [0; 32] seed address - nonce 0-2
-    //     //
-    //     // transactions are deterministic bc the factory is seeded with [0; 32]
-
-    //     let gas_price = get_gas_price(&blockchain_db);
-    //     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
-
-    //     // create 3 transactions
-    //     let transaction1 = tx_factory.create_eip1559(
-    //         chain.clone(),
-    //         gas_price,
-    //         Some(Address::ZERO),
-    //         value, // 1 TEL
-    //         Bytes::new(),
-    //     );
-    //     debug!("transaction 1: {transaction1:?}");
-
-    //     let transaction2 = tx_factory.create_eip1559(
-    //         chain.clone(),
-    //         gas_price,
-    //         Some(Address::ZERO),
-    //         value, // 1 TEL
-    //         Bytes::new(),
-    //     );
-    //     debug!("transaction 2: {transaction2:?}");
-
-    //     let transaction3 = tx_factory.create_eip1559(
-    //         chain.clone(),
-    //         gas_price,
-    //         Some(Address::ZERO),
-    //         value, // 1 TEL
-    //         Bytes::new(),
-    //     );
-    //     debug!("transaction 3: {transaction3:?}");
-
-    //     let sealed_header = next_valid_sealed_header();
-    //     // work around
-    //     let mut header = sealed_header.header().clone();
-    //     let hash = sealed_header.hash();
-
-    //     // update header with wrong tx root
-    //     let wrong_tx_root = hex!(
-    //         "00000000000000000000068270d6c1ce790c9a8d74835c315d5abecf851a8c74" // wrong
-    //     )
-    //     .into();
-    //     header.transactions_root = wrong_tx_root;
-    //     let sealed_header = SealedHeader::new(header, hash);
-
-    //     // sealed header
-    //     // let sealed_header = SealedHeader::new(
-    //     //     Header {
-    //     //         parent_hash: genesis_hash,
-    //     //         ommers_hash: EMPTY_OMMER_ROOT_HASH,
-    //     //         beneficiary: hex!("0000000000000000000000000000000000000000").into(),
-    //     //         state_root: hex!(
-    //     //             "c65c4aa390278016af72d17a5ed533329c894c8e181fa1616428a1e9ae51bcf2"
-    //     //         )
-    //     //         .into(),
-    //     //         transactions_root: hex!(
-    //     //             "00000000000000000000068270d6c1ce790c9a8d74835c315d5abecf851a8c74" // wrong
-    //     //         )
-    //     //         .into(),
-    //     //         receipts_root: hex!(
-    //     //             "25e6b7af647c519a27cc13276a1e6abc46154b51414d174b072698df1f6c19df"
-    //     //         )
-    //     //         .into(),
-    //     //         withdrawals_root: None,
-    //     //         logs_bloom: Bloom::default(),
-    //     //         difficulty: U256::ZERO,
-    //     //         number: 1,
-    //     //         gas_limit: 30000000,
-    //     //         gas_used: 63000,
-    //     //         timestamp: 1701790139,
-    //     //         mix_hash: B256::ZERO,
-    //     //         nonce: 0,
-    //     //         base_fee_per_gas: Some(875000000),
-    //     //         blob_gas_used: None,
-    //     //         excess_blob_gas: None,
-    //     //         parent_beacon_block_root: None,
-    //     //         extra_data: Bytes::default(),
-    //     //     },
-    //     //     hex!("ed9242a844ec144e25b58c085184c3c4ae8709226771659badf7e45cdd415c58").into(),
-    //     // );
-
-    //     let transactions = vec![transaction1, transaction2, transaction3];
-    //     let block = WorkerBlock::new(transactions, sealed_header.clone());
-
-    //     let result = block_validator.validate_block(&block).await;
-
-    //     assert!(result.is_err())
-    // }
-
-    // #[tokio::test]
-    // async fn test_invalid_block_wrong_receipts_root() {
-    //     init_test_tracing();
-    //     let genesis = adiri_genesis();
-    //     let mut tx_factory = TransactionFactory::new();
-    //     let factory_address = tx_factory.address();
-    //     debug!("seeding factory address: {factory_address:?}");
-
-    //     // fund factory with 99mil TEL
-    //     let account = vec![(
-    //         factory_address,
-    //         GenesisAccount::default().with_balance(
-    //             U256::from_str("0x51E410C0F93FE543000000").expect("account balance is parsed"),
-    //         ),
-    //     )];
-
-    //     let genesis = genesis.extend_accounts(account);
-    //     debug!("seeded genesis: {genesis:?}");
-    //     let chain: Arc<ChainSpec> = Arc::new(genesis.into());
-
-    //     // init genesis
-    //     let db = create_test_rw_db();
-    //     let provider_factory = ProviderFactory::new(
-    //         Arc::clone(&db),
-    //         Arc::clone(&chain),
-    //         StaticFileProvider::read_write(tempdir_path())
-    //             .expect("static file provider read write created with tempdir path"),
-    //     );
-    //     let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
-    //     debug!("genesis hash: {genesis_hash:?}");
-
-    //     // configure blockchain tree
-    //     let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
-
-    //     let tree_externals = TreeExternals::new(
-    //         provider_factory.clone(),
-    //         Arc::clone(&consensus),
-    //         reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
-    //     );
-    //     let tree_config = BlockchainTreeConfig::default();
-    //     let tree = BlockchainTree::new(tree_externals, tree_config, PruneModes::none())
-    //         .expect("blockchain tree is valid");
-
-    //     let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
-
-    //     // provider
-    //     let blockchain_db =
-    //         BlockchainProvider::new(provider_factory.clone(), blockchain_tree.clone())
-    //             .expect("blockchain db valid");
-
-    //     // block validator
-    //     let block_validator = BlockValidator::new(
-    //         Arc::clone(&consensus),
-    //         blockchain_db.clone(),
-    //         reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
-    //     );
-
-    //     // tx factory - [0; 32] seed address - nonce 0-2
-    //     //
-    //     // transactions are deterministic bc the factory is seeded with [0; 32]
-
-    //     let gas_price = get_gas_price(&blockchain_db);
-    //     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
-
-    //     // create 3 transactions
-    //     let transaction1 = tx_factory.create_eip1559(
-    //         chain.clone(),
-    //         gas_price,
-    //         Some(Address::ZERO),
-    //         value, // 1 TEL
-    //         Bytes::new(),
-    //     );
-    //     debug!("transaction 1: {transaction1:?}");
-
-    //     let transaction2 = tx_factory.create_eip1559(
-    //         chain.clone(),
-    //         gas_price,
-    //         Some(Address::ZERO),
-    //         value, // 1 TEL
-    //         Bytes::new(),
-    //     );
-    //     debug!("transaction 2: {transaction2:?}");
-
-    //     let transaction3 = tx_factory.create_eip1559(
-    //         chain.clone(),
-    //         gas_price,
-    //         Some(Address::ZERO),
-    //         value, // 1 TEL
-    //         Bytes::new(),
-    //     );
-    //     debug!("transaction 3: {transaction3:?}");
-
-    //     // sealed header
-    //     let sealed_header = next_valid_sealed_header();
-    //     let mut header = sealed_header.header().clone();
-    //     let hash = sealed_header.hash();
-    //     let wrong_receipts_root = hex!(
-    //         "0000000000000000000003276a1e6abc46154b51414d174b072698df1f6c19df" // wrong
-    //     )
-    //     .into();
-    //     header.receipts_root = wrong_receipts_root;
-    //     let sealed_header = SealedHeader::new(header, hash);
-    //     // let sealed_header = SealedHeader::new(
-    //     //     Header {
-    //     //         parent_hash: genesis_hash,
-    //     //         ommers_hash: EMPTY_OMMER_ROOT_HASH,
-    //     //         beneficiary: hex!("0000000000000000000000000000000000000000").into(),
-    //     //         state_root: hex!(
-    //     //             "c65c4aa390278016af72d17a5ed533329c894c8e181fa1616428a1e9ae51bcf2"
-    //     //         )
-    //     //         .into(),
-    //     //         transactions_root: hex!(
-    //     //             "73b96de5ae50ad0100ad668270d6c1ce790c9a8d74835c315d5abecf851a8c74"
-    //     //         )
-    //     //         .into(),
-    //     //         receipts_root: hex!(
-    //     //             "0000000000000000000003276a1e6abc46154b51414d174b072698df1f6c19df" // wrong
-    //     //         )
-    //     //         .into(),
-    //     //         withdrawals_root: None,
-    //     //         logs_bloom: Bloom::default(),
-    //     //         difficulty: U256::ZERO,
-    //     //         number: 1,
-    //     //         gas_limit: 30000000,
-    //     //         gas_used: 63000,
-    //     //         timestamp: 1701790139,
-    //     //         mix_hash: B256::ZERO,
-    //     //         nonce: 0,
-    //     //         base_fee_per_gas: Some(875000000),
-    //     //         blob_gas_used: None,
-    //     //         excess_blob_gas: None,
-    //     //         parent_beacon_block_root: None,
-    //     //         extra_data: Bytes::default(),
-    //     //     },
-    //     //     hex!("ed9242a844ec144e25b58c085184c3c4ae8709226771659badf7e45cdd415c58").into(),
-    //     // );
-
-    //     let transactions = vec![transaction1, transaction2, transaction3];
-    //     let block = WorkerBlock::new(transactions, sealed_header.clone());
-
-    //     let result = block_validator.validate_block(&block).await;
-
-    //     assert!(result.is_err())
-    // }
+    #[tokio::test]
+    async fn test_invalid_block_wrong_parent_hash() {
+        let TestTools { valid_txs, mut valid_header, validator } = test_types().await;
+        let wrong_parent_hash = B256::random();
+        valid_header.set_parent_hash(wrong_parent_hash);
+        // update hash since this is asserted first
+        let wrong_header = valid_header.unseal().seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::CanonicalChain { block_hash }) if block_hash == wrong_parent_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_block_wrong_parent_number() {
+        let TestTools { valid_txs, mut valid_header, validator } = test_types().await;
+        let wrong_block_number = 3;
+        valid_header.set_block_number(wrong_block_number);
+        // update hash since this is asserted first
+        let wrong_header = valid_header.unseal().seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::ParentBlockNumberMismatch{parent_block_number, block_number}) if parent_block_number == 0 && block_number == 3
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_block_wrong_state_root() {
+        let TestTools { valid_txs, mut valid_header, validator } = test_types().await;
+        let wrong_state_root = B256::random();
+        valid_header.set_state_root(wrong_state_root);
+        // update hash since this is asserted first
+        let wrong_header = valid_header.unseal().seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::NonEmptyStateRoot(wrong)) if wrong == wrong_state_root
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_block_wrong_transactions_root() {
+        let TestTools { valid_header, validator, valid_txs: mut wrong_txs } = test_types().await;
+        // remove tx
+        let _ = wrong_txs.pop();
+        let correct_root: B256 =
+            hex!("35cacf0a6e1826b718033b80345e39387f776a2eb3422b90d4265e113ae83c89").into();
+        let wrong_root = valid_header.transactions_root;
+        let wrong_block = WorkerBlock::new(wrong_txs, valid_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::TransactionRootMismatch { expected, peer_root }) if expected == correct_root && peer_root == wrong_root
+        );
+    }
 
     // // TODO:
     // // invalid block types for the rest of the sealed header:
