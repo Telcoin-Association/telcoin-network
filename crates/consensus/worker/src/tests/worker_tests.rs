@@ -45,7 +45,7 @@ impl BlockValidation for NilBatchValidator {
 //     let client = NetworkClient::new_from_keypair(&my_primary.network_keypair());
 
 //     let parameters = Parameters {
-//         batch_size: 200, // Two transactions.
+//         max_worker_tx_bytes_size: 200, // Two transactions.
 //         ..Parameters::default()
 //     };
 
@@ -118,7 +118,7 @@ impl BlockValidation for NilBatchValidator {
 //     let client = NetworkClient::new_from_keypair(&my_primary.network_keypair());
 
 //     let parameters = Parameters {
-//         batch_size: 200, // Two transactions.
+//         max_worker_tx_bytes_size: 200, // Two transactions.
 //         ..Parameters::default()
 //     };
 
@@ -226,7 +226,7 @@ impl BlockValidation for NilBatchValidator {
 //     let client = NetworkClient::new_from_keypair(&my_primary.network_keypair());
 
 //     let parameters = Parameters {
-//         batch_size: 200, // Two transactions.
+//         max_worker_tx_bytes_size: 200, // Two transactions.
 //         ..Parameters::default()
 //     };
 
@@ -327,7 +327,7 @@ impl BlockValidation for NilBatchValidator {
 async fn get_network_peers_from_admin_server() {
     // reth_tracing::init_test_tracing();
     let primary_1_parameters = Parameters {
-        batch_size: 200, // Two transactions.
+        max_worker_tx_bytes_size: 200, // Two transactions.
         ..Parameters::default()
     };
     let fixture = CommitteeFixture::builder().randomize_ports(true).build();
@@ -384,7 +384,7 @@ async fn get_network_peers_from_admin_server() {
     let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
 
     let worker_1_parameters = Parameters {
-        batch_size: 200, // Two transactions.
+        max_worker_tx_bytes_size: 200, // Two transactions.
         ..Parameters::default()
     };
 
@@ -458,7 +458,7 @@ async fn get_network_peers_from_admin_server() {
     let worker_2_keypair = authority_2.worker(worker_id).keypair().copy();
 
     let primary_2_parameters = Parameters {
-        batch_size: 200, // Two transactions.
+        max_worker_tx_bytes_size: 200, // Two transactions.
         ..Parameters::default()
     };
 
@@ -499,7 +499,7 @@ async fn get_network_peers_from_admin_server() {
     let metrics_2 = Metrics::new_with_registry(&registry_2);
 
     let worker_2_parameters = Parameters {
-        batch_size: 200, // Two transactions.
+        max_worker_tx_bytes_size: 200, // Two transactions.
         ..Parameters::default()
     };
 

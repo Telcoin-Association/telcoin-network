@@ -14,7 +14,6 @@ use reth::rpc::{
     eth::EthApi,
 };
 use reth_auto_seal_consensus::AutoSealConsensus;
-use reth_beacon_consensus::EthBeaconConsensus;
 use reth_blockchain_tree::{
     BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
 };

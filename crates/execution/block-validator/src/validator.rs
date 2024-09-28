@@ -2,16 +2,12 @@
 
 use crate::error::BlockValidationError;
 use reth_db::database::Database;
-use reth_evm::execute::BlockExecutorProvider;
 use reth_primitives::{
     constants::EMPTY_WITHDRAWALS, proofs, Bloom, Header, SealedHeader, B256, U256,
 };
 use reth_provider::{providers::BlockchainProvider, HeaderProvider};
-use std::{
-    fmt::{Debug, Display},
-    sync::Arc,
-};
-use tn_types::{Consensus, TransactionSigned, WorkerBlock};
+use std::fmt::{Debug, Display};
+use tn_types::{TransactionSigned, WorkerBlock};
 
 /// Type convenience for implementing block validation errors.
 type BlockValidationResult<T> = Result<T, BlockValidationError>;
@@ -346,10 +342,11 @@ mod tests {
     use reth_provider::{providers::StaticFileProvider, ProviderFactory};
     use reth_prune::PruneModes;
     use reth_tracing::init_test_tracing;
-    use std::str::FromStr;
+    use std::{str::FromStr, sync::Arc};
     use tn_types::{
         adiri_genesis,
         test_utils::{get_gas_price, TransactionFactory},
+        Consensus,
     };
     use tracing::debug;
 

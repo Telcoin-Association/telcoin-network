@@ -19,10 +19,7 @@ use futures_util::{FutureExt, StreamExt};
 use reth_blockchain_tree::BlockchainTreeEngine;
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
-use reth_primitives::{
-    Address, IntoRecoveredTransaction,
-    SealedHeader, TxHash, B256,
-};
+use reth_primitives::{Address, IntoRecoveredTransaction, SealedHeader, TxHash, B256};
 use reth_provider::{
     BlockReaderIdExt, CanonChainTracker, CanonStateNotification, CanonStateNotificationStream,
     CanonStateSubscriptions, ChainSpecProvider, StateProviderFactory,
@@ -159,6 +156,7 @@ where
     CE: ConfigureEvm + Clone,
 {
     /// Create a new instance of [Self].
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         blockchain: BT,
         pool: Pool,
@@ -418,23 +416,5 @@ where
 
         // all output executed, yield back to runtime
         Poll::Pending
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    struct Testing {
-        val: usize,
-    }
-
-    #[test]
-    fn test_map_opt() {
-        let mut test = Vec::new();
-        for val in 0..10 {
-            test.push(Testing { val })
-        }
-
-        let total = test.iter().map(|x| x.val).reduce(|t, v| t + v);
-        assert_eq!(total, 55);
     }
 }

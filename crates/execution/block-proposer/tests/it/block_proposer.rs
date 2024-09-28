@@ -9,7 +9,7 @@ use narwhal_network::client::NetworkClient;
 use narwhal_network_types::MockWorkerToPrimary;
 use narwhal_typed_store::{open_db, tables::WorkerBlocks, traits::Database};
 use narwhal_worker::{metrics::WorkerMetrics, BlockProvider, NUM_SHUTDOWN_RECEIVERS};
-use reth::{beacon_consensus::EthBeaconConsensus, tasks::TaskManager};
+use reth::tasks::TaskManager;
 use reth_blockchain_tree::noop::NoopBlockchainTree;
 use reth_chainspec::ChainSpec;
 use reth_db::test_utils::{create_test_rw_db, tempdir_path};
@@ -29,8 +29,7 @@ use tempfile::TempDir;
 use tn_block_proposer::{BlockProposerBuilder, MiningMode};
 use tn_block_validator::{BlockValidation, BlockValidator};
 use tn_types::{
-    test_utils::{get_gas_price, test_genesis, TransactionFactory},
-    Consensus, PendingWorkerBlock, PreSubscribedBroadcastSender, WorkerBlock,
+    test_utils::{get_gas_price, test_genesis, TransactionFactory}, PendingWorkerBlock, PreSubscribedBroadcastSender, WorkerBlock,
 };
 use tokio::{sync::watch, time::timeout};
 use tracing::debug;
@@ -200,8 +199,7 @@ async fn test_make_block_el_to_cl() {
         .expect("new block is Some()");
 
     // ensure block validator succeeds
-    let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
-    let block_validator = BlockValidator::new(consensus, blockchain_db.clone(), block_executor);
+    let block_validator = BlockValidator::new(blockchain_db.clone(), 1_000_000, 30_000_000);
 
     let valid_block_result = block_validator.validate_block(&block).await;
     assert!(valid_block_result.is_ok());

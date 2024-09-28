@@ -47,7 +47,7 @@ use tokio::{sync::watch, time::timeout};
 #[tokio::test]
 async fn test_get_network_peers_from_admin_server() {
     let primary_1_parameters = Parameters {
-        batch_size: 200, // Two transactions.
+        max_worker_tx_bytes_size: 200, // Two transactions.
         ..Parameters::default()
     };
     let fixture = CommitteeFixture::builder().randomize_ports(true).build();
@@ -117,7 +117,7 @@ async fn test_get_network_peers_from_admin_server() {
     let metrics_1 = Metrics::new_with_registry(&registry_1);
 
     let worker_1_parameters = Parameters {
-        batch_size: 200, // Two transactions.
+        max_worker_tx_bytes_size: 200, // Two transactions.
         ..Parameters::default()
     };
 
@@ -195,7 +195,7 @@ async fn test_get_network_peers_from_admin_server() {
     let client_2 = NetworkClient::new_from_keypair(&authority_2.network_keypair());
 
     let primary_2_parameters = Parameters {
-        batch_size: 200, // Two transactions.
+        max_worker_tx_bytes_size: 200, // Two transactions.
         ..Parameters::default()
     };
 
