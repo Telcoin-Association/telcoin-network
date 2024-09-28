@@ -96,6 +96,9 @@ pub enum BlockValidationError {
     #[error("Non-empty receipts root: {0:?}")]
     NonEmptyReceiptsRoot(B256),
     /// Non-empty value for peer's header.
+    #[error("Non-empty withdrawals root: {0:?}")]
+    NonEmptyWithdrawalsRoot(Option<B256>),
+    /// Non-empty value for peer's header.
     #[error("Non-empty logs bloom: {0:?}")]
     NonEmptyLogsBloom(Bloom),
     /// Non-empty value for peer's header.

@@ -96,7 +96,7 @@ where
     }
 
     /// Batch validator
-    pub async fn new_batch_validator(&self) -> BlockValidator<DB, Evm> {
+    pub async fn new_batch_validator(&self) -> BlockValidator<DB> {
         let guard = self.internal.read().await;
         guard.new_batch_validator()
     }

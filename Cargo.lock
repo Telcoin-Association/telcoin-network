@@ -10796,6 +10796,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-rlp",
  "async-trait",
+ "narwhal-test-utils",
  "reth",
  "reth-beacon-consensus",
  "reth-blockchain-tree",

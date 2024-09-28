@@ -342,17 +342,10 @@ where
     }
 
     /// Create a new batch validator.
-    pub(super) fn new_batch_validator(&self) -> BlockValidator<DB, Evm> {
-        // validate batches using beaacon consensus
-        // to ensure inner-chain compatibility
-        let consensus: Arc<dyn Consensus> =
-            Arc::new(EthBeaconConsensus::new(self.node_config.chain.clone()));
-
+    pub(super) fn new_batch_validator(&self) -> BlockValidator<DB> {
         // batch validator
-        BlockValidator::<DB, Evm>::new(
-            consensus,
+        BlockValidator::<DB>::new(
             self.blockchain_db.clone(),
-            self.evm_executor.clone(),
             self.tn_config.parameters.max_worker_tx_bytes_size,
             self.tn_config.parameters.max_worker_tx_gas,
         )
