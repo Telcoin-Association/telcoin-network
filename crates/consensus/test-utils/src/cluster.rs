@@ -252,7 +252,7 @@ impl Cluster {
     }
 
     fn parameters() -> Parameters {
-        Parameters { batch_size: 200, ..Parameters::default() }
+        Parameters { max_worker_tx_bytes_size: 200, ..Parameters::default() }
     }
 
     /// Subscribe to [ConsensusOutput] broadcast.

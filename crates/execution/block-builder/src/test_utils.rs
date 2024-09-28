@@ -18,7 +18,8 @@ impl MaxBuilds {
         Self { max_builds, num_builds: 0 }
     }
 
-    /// Check if the task has reached the maximum number of blocks to build as specified by `max_builds`.
+    /// Check if the task has reached the maximum number of blocks to build as specified by
+    /// `max_builds`.
     ///
     /// Note: this is only used for testing and debugging purposes.
     pub(crate) fn has_reached_max(&self) -> bool {

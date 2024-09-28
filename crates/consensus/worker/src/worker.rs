@@ -444,7 +444,7 @@ impl<DB: Database> Worker<DB> {
         // peers with the same `id` before passing off to the `QuorumWaiter`.
         let block_provider_handle = BlockProvider::spawn(
             self.id,
-            self.parameters.batch_size,
+            self.parameters.max_worker_tx_bytes_size,
             self.parameters.max_batch_delay,
             shutdown_receivers.pop().unwrap(),
             rx_batch_maker,

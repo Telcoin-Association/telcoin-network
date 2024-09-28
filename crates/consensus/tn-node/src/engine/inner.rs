@@ -40,7 +40,7 @@ use tn_block_proposer::{BlockProposerBuilder, MiningMode};
 use tn_block_validator::BlockValidator;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
-use tn_types::{Consensus, ConsensusOutput, NewWorkerBlock, PendingWorkerBlock, WorkerId};
+use tn_types::{Config, Consensus, ConsensusOutput, NewWorkerBlock, PendingWorkerBlock, WorkerId};
 use tokio::sync::{broadcast, mpsc::unbounded_channel, watch};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info};
@@ -57,6 +57,8 @@ where
     /// The address refers to the execution layer's address
     /// based on the authority's secp256k1 public key.
     address: Address,
+    /// The validator node config.
+    tn_config: Config,
     /// The type that holds all information needed to launch the node's engine.
     ///
     /// The [NodeConfig] is reth-specific and holds many helper functions that
@@ -161,6 +163,7 @@ where
             evm_executor,
             task_executor,
             opt_faucet_args,
+            tn_config,
             workers: HashMap::default(),
         })
     }
@@ -350,6 +353,8 @@ where
             consensus,
             self.blockchain_db.clone(),
             self.evm_executor.clone(),
+            self.tn_config.parameters.max_worker_tx_bytes_size,
+            self.tn_config.parameters.max_worker_tx_gas,
         )
     }
 

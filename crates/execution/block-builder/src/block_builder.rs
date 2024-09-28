@@ -9,8 +9,9 @@ use std::task::Waker;
 use reth_evm::ConfigureEvm;
 use reth_payload_builder::database::CachedReads;
 use reth_primitives::{
-    constants::EMPTY_WITHDRAWALS, keccak256, proofs, Block, Header, IntoRecoveredTransaction,
-    Receipt, SealedBlockWithSenders, SealedHeader, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256,
+    constants::EMPTY_WITHDRAWALS, keccak256, proofs, Block, Bloom, Bytes, Header,
+    IntoRecoveredTransaction, Receipt, SealedBlockWithSenders, SealedHeader, Withdrawals, B256,
+    EMPTY_OMMER_ROOT_HASH, U256,
 };
 use reth_provider::{ChainSpecProvider, ExecutionOutcome, StateProviderFactory};
 use reth_revm::{
@@ -125,7 +126,7 @@ where
         transactions_root,
         receipts_root: B256::ZERO,
         withdrawals_root: Some(EMPTY_WITHDRAWALS),
-        logs_bloom: Default::default(),
+        logs_bloom: Bloom::default(),
         timestamp,
         mix_hash: B256::ZERO,
         nonce: 0,
@@ -134,7 +135,7 @@ where
         gas_limit,
         difficulty: U256::ZERO,
         gas_used: total_possible_gas,
-        extra_data: Default::default(),
+        extra_data: Bytes::default(),
         parent_beacon_block_root: None,
         blob_gas_used: None,
         excess_blob_gas: None,

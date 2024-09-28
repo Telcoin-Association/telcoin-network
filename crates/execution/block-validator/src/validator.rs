@@ -9,7 +9,9 @@ use reth_evm::execute::{
     BlockExecutionOutput, BlockExecutorProvider, BlockValidationError as RethBlockValidationError,
     Executor,
 };
-use reth_primitives::{GotExpected, SealedBlockWithSenders, U256};
+use reth_primitives::{
+    proofs, Bloom, GotExpected, Header, SealedBlockWithSenders, SealedHeader, B256, U256,
+};
 use reth_provider::{
     providers::BlockchainProvider, ChainSpecProvider, DatabaseProviderFactory, HeaderProvider,
     StateRootProvider,
@@ -20,8 +22,11 @@ use std::{
     fmt::{Debug, Display},
     sync::Arc,
 };
-use tn_types::{Consensus, WorkerBlock};
+use tn_types::{BlockHash, Consensus, ConsensusError, TransactionSigned, WorkerBlock};
 use tracing::{debug, error};
+
+/// Type convenience for implementing block validation errors.
+type BlockValidationResult<T> = Result<T, BlockValidationError>;
 
 /// Block validator
 #[derive(Clone)]
@@ -38,6 +43,14 @@ where
     blockchain_db: BlockchainProvider<DB>,
     /// The executor factory to execute blocks with.
     executor_factory: Evm,
+    /// The maximum size (in bytes) for a peer's list of transactions.
+    ///
+    /// The peer-proposed block's transaction list must not exceed this value.
+    max_tx_bytes: usize,
+    /// The maximum size (in gas) for a peer's list of transactions.
+    ///
+    /// The peer-proposed block's transaction list must not exceed this value.
+    max_tx_gas: u64,
 }
 
 /// Defines the validation procedure for receiving either a new single transaction (from a client)
@@ -60,161 +73,53 @@ where
     /// Error type for block validation
     type Error = BlockValidationError;
 
-    /// Execute the transactions within the block
+    /// Validate a peer's worker block.
     ///
-    /// akin to `on_new_payload()` for `BeaconEngine`.
-    ///
-    /// BlockchainTree has several useful methods, but they are private. The publicly exposed
-    /// methods would result in canonicalizing blocks, which is undesireable. It is possible to
-    /// append then revert the block, but this is also very inefficient.
-    ///
-    /// The validator flow follows: `reth::blockchain_tree::blockchain_tree::validate_block` method.
-    async fn validate_block(&self, block: &WorkerBlock) -> Result<(), Self::Error> {
-        // check sui + reth
-        //
-        // ensure well-formed block
-        // verify receipts
-        // ensure timestamps are valid
-        // parent
-        // ensure
-
-        // try recover senders/txs
-        // create sealed block with senders
-        // BT: try_insert_validated_block
-        // beacon consensus checks - timestamps, forks, etc.
-        // ensure parent number +1 is block's sealed header number
-        // parent should be canonical - lookup in db
-
-        // try to recover signed transactions
-        let sealed_block: SealedBlockWithSenders = block.try_into()?;
-
-        // first, ensure valid block
-        // taken from blockchain_tree::validate_block
-        if let Err(e) =
-            self.consensus.validate_header_with_total_difficulty(&sealed_block, U256::MAX)
-        {
-            error!(
-                ?sealed_block,
-                "Failed to validate total difficulty for block {}: {e}",
-                sealed_block.header.hash()
-            );
-            return Err(e.into());
-        }
-
-        if let Err(e) = self.consensus.validate_header(&sealed_block) {
-            error!(?sealed_block, "Failed to validate header {}: {e}", sealed_block.header.hash());
-            return Err(e.into());
-        }
-
-        if let Err(e) = self.consensus.validate_block_pre_execution(&sealed_block) {
-            error!(?sealed_block, "Failed to validate block {}: {e}", sealed_block.header.hash());
-            return Err(e.into());
-        }
-
-        // the following is taken from BlockchainTree::try_append_canonical_chain()
-
-        // the main reason for porting this code is bc blocks may or may not
-        // extend the canonical tip, but state root still needs to be validated
-
-        // in reth, this is only done when canonical head is extended
-        // but blocks may be behind canonical tip, which should still
-        // be considered potentially valid
-
-        // moving this code here prevents having to revert the tree after
-        // validating the block because `on_new_payload` results in appending
-        // the execution payload to either a fork or the canonical tree
-
-        // all other methods are private
-
-        let parent = sealed_block.parent_num_hash();
-        let block_num_hash = sealed_block.num_hash();
-        debug!(target: "block_validator", head = ?block_num_hash.hash, ?parent, "Appending block to canonical chain");
-
-        // Validate that the block is post merge
-        let parent_td = self
-            .blockchain_db
-            .header_td(&parent.hash)?
-            .ok_or(BlockchainTreeError::CanonicalChain { block_hash: parent.hash })?;
-
-        // Pass the parent total difficulty to short-circuit unnecessary calculations.
-        if !self
-            .blockchain_db
-            .chain_spec()
-            .fork(EthereumHardfork::Paris)
-            .active_at_ttd(parent_td, U256::ZERO)
-        {
-            return Err(RethBlockValidationError::BlockPreMerge { hash: sealed_block.hash() })?;
-        }
+    /// Workers do not execute full blocks. This method validates the required information.
+    async fn validate_block(&self, block: &WorkerBlock) -> BlockValidationResult<()> {
+        // obtain info for validation
+        let transactions = block.transactions();
+        let sealed_header = block.sealed_header();
 
         // retrieve parent header from provider
-        let parent_header = self
+        //
+        // first step towards validating parent's header
+        let parent = self
             .blockchain_db
-            .header(&parent.hash)?
-            .ok_or(BlockchainTreeError::CanonicalChain { block_hash: parent.hash })?
-            .seal(parent.hash);
+            .header(&sealed_header.parent_hash)?
+            .ok_or(BlockValidationError::CanonicalChain { block_hash: sealed_header.parent_hash })?
+            .seal(sealed_header.parent_hash);
 
-        // from AppendableChain::validate_and_execute() - private method
+        // validate sealed header digest
+        self.validate_block_hash(sealed_header)?;
+
+        // validate transactions root
+        self.validate_transactions_root(transactions, sealed_header)?;
+
+        // validate parent hash/parent number
         //
-        // ported here to prevent redundant creation of bundle state provider
-        // just to check state root
+        // this validates the parent's hash by extension
+        self.validate_against_parent_hash_number(sealed_header.header(), &parent)?;
 
-        self.consensus.validate_header_against_parent(&sealed_block, &parent_header)?;
-        let block_with_senders = sealed_block.unseal();
+        // validate timestamp vs parent
+        self.validate_against_parent_timestamp(sealed_header.header(), parent.header())?;
 
-        // NOTE: this diverges from reth-beta approach
-        // but is still valid within the context of our consensus
-        // because of async network conditions, workers can suggest blocks
-        // behind the canonical tip
+        // validate gas limit
+        self.validate_block_gas(sealed_header.header(), transactions)?;
+
+        // validate block size (bytes)
+        self.validate_block_size_bytes(transactions)?;
+
+        // validate beneficiary?
+        // no - tips would go to someone else
+
+        // TODO: validate basefee doesn't actually do anything yet
+        self.validate_basefee()?;
+
+        // check empty roots to ensure malicious actor can't attack storage usage
         //
-        // TODO: validate base fee based on parent block
-
-        // // capture current state
-        // let provider = BundleStateProvider::new(state_provider, bundle_state_data_provider);
-        // let db = StateProviderDatabase::new(&provider);
-
-        // different approach for creating state provider than reth's `validate_and_execute`
-        // on `AppendableChain`
-        //
-        // reth uses `ConsistentDbView`, but this will throw an error if the current tip
-        // doesn't match the one recorded during the db view's initialization.
-        // TN expected to write several blocks at a time, so tip potentially always changing
-        //
-        // create state provider based on block's parent
-        let db = StateProviderDatabase::new(
-            self.blockchain_db
-                .database_provider_ro()?
-                .state_provider_by_block_number(parent.number)?,
-        );
-
-        // executor for single block
-        let executor = self.executor_factory.executor(db);
-        let state = executor.execute((&block_with_senders, U256::MAX).into())?;
-        let BlockExecutionOutput { state, receipts, requests, .. } = state;
-        self.consensus.validate_block_post_execution(
-            &block_with_senders,
-            PostExecutionInput::new(&receipts, &requests),
-        )?;
-
-        // TODO: enable ParallelStateRoot feature (or AsyncStateRoot)
-        // for better perfomance
-        // see reth::blockchain_tree::chain::AppendableChain::validate_and_execute()
-        //
-        // check state root
-        let db = StateProviderDatabase::new(
-            self.blockchain_db
-                .database_provider_ro()?
-                .state_provider_by_block_number(parent.number)?,
-        );
-        let hashed_state = HashedPostState::from_bundle_state(&state.state);
-        let state_root = db.state_root(hashed_state)?;
-        if block_with_senders.state_root != state_root {
-            return Err(BlockValidationError::BodyStateRootDiff(GotExpected {
-                got: state_root,
-                expected: block_with_senders.state_root,
-            }));
-        }
-
-        Ok(())
+        // NOTE: does not validate extra_data
+        self.validate_empty_values(sealed_header.header())
     }
 }
 
@@ -228,8 +133,202 @@ where
         consensus: Arc<dyn Consensus>,
         blockchain_db: BlockchainProvider<DB>,
         executor_factory: Evm,
+        max_tx_bytes: usize,
+        max_tx_gas: u64,
     ) -> Self {
-        Self { consensus, blockchain_db, executor_factory }
+        Self { consensus, blockchain_db, executor_factory, max_tx_bytes, max_tx_gas }
+    }
+
+    /// Validate header's hash.
+    #[inline]
+    fn validate_block_hash(&self, header: &SealedHeader) -> BlockValidationResult<()> {
+        let expected = header.header().hash_slow();
+        let peer_hash = header.hash();
+        if expected != peer_hash {
+            return Err(BlockValidationError::BlockHash { expected, peer_hash });
+        }
+        Ok(())
+    }
+
+    /// Validate transaction root.
+    #[inline]
+    fn validate_transactions_root(
+        &self,
+        transactions: &Vec<TransactionSigned>,
+        header: &SealedHeader,
+    ) -> BlockValidationResult<()> {
+        let expected = proofs::calculate_transaction_root(transactions);
+        let peer_root = header.transactions_root;
+        if expected != peer_root {
+            return Err(BlockValidationError::TransactionRootMismatch { expected, peer_root });
+        }
+        Ok(())
+    }
+
+    /// Validate against parent hash number.
+    #[inline]
+    fn validate_against_parent_hash_number(
+        &self,
+        header: &Header,
+        parent: &SealedHeader,
+    ) -> BlockValidationResult<()> {
+        // NOTE: parent hash is used to find the parent block.
+        // if the parent block is found by its hash and the number matches,
+        // then by extension, the parent's hash is verified
+        //
+        // ensure parent number is consistent.
+        if parent.number + 1 != header.number {
+            return Err(BlockValidationError::ParentBlockNumberMismatch {
+                parent_block_number: parent.number,
+                block_number: header.number,
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates the timestamp against the parent to make sure it is in the past.
+    #[inline]
+    fn validate_against_parent_timestamp(
+        &self,
+        header: &Header,
+        parent: &Header,
+    ) -> BlockValidationResult<()> {
+        if header.is_timestamp_in_past(parent.timestamp) {
+            return Err(BlockValidationError::TimestampIsInPast {
+                parent_timestamp: parent.timestamp,
+                timestamp: header.timestamp,
+            });
+        }
+        Ok(())
+    }
+
+    /// Possible gas used needs to be less than block's gas limit.
+    ///
+    /// Actual amount of gas used cannot be determined until execution.
+    #[inline]
+    fn validate_block_gas(
+        &self,
+        header: &Header,
+        transactions: &Vec<TransactionSigned>,
+    ) -> BlockValidationResult<()> {
+        // gas limit should be consistent amongst workers
+        if header.gas_limit != self.max_tx_gas {
+            return Err(BlockValidationError::InvalidGasLimit {
+                expected: self.max_tx_gas,
+                received: header.gas_limit,
+            });
+        }
+
+        // ensure total tx gas limit fits into block's gas limit
+        if header.gas_used >= header.gas_limit {
+            return Err(BlockValidationError::HeaderMaxGasExceedsGasLimit {
+                total_possible_gas: header.gas_used,
+                gas_limit: header.gas_limit,
+            });
+        }
+
+        // ensure accumulated max gas is correct
+        let max_possible_gas = transactions
+            .iter()
+            .map(|tx| tx.gas_limit())
+            .reduce(|total, gas| total + gas)
+            .ok_or(BlockValidationError::CalculateMaxPossibleGas)?;
+
+        if header.gas_used != max_possible_gas {
+            return Err(BlockValidationError::HeaderGasUsedMismatch {
+                expected: max_possible_gas,
+                received: header.gas_used,
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate the size of transactions (in bytes).
+    fn validate_block_size_bytes(
+        &self,
+        transactions: &Vec<TransactionSigned>,
+    ) -> BlockValidationResult<()> {
+        // calculate size (in bytes) of included transactions
+        let total_bytes = transactions
+            .iter()
+            .map(|tx| tx.size())
+            .reduce(|total, size| total + size)
+            .ok_or(BlockValidationError::CalculateTransactionByteSize)?;
+
+        if total_bytes > self.max_tx_bytes {
+            return Err(BlockValidationError::HeaderTransactionBytesExceedsMax(total_bytes));
+        }
+
+        Ok(())
+    }
+
+    /// TODO: Validate the block's basefee
+    fn validate_basefee(&self) -> BlockValidationResult<()> {
+        // TODO: validate basefee by consensus round
+        Ok(())
+    }
+
+    /// Validate expected empty values for the header.
+    ///
+    /// This is important to prevent a storage attack where malicious actor proposes lots of extra
+    /// data. NOTE: extra data is ignored
+    fn validate_empty_values(&self, header: &Header) -> BlockValidationResult<()> {
+        // ommers hash
+        if !header.ommers_hash_is_empty() {
+            return Err(BlockValidationError::NonEmptyOmmersHash(header.ommers_hash));
+        }
+
+        // state root
+        if header.state_root != B256::ZERO {
+            return Err(BlockValidationError::NonEmptyStateRoot(header.state_root));
+        }
+
+        // receipts root
+        if header.receipts_root != B256::ZERO {
+            return Err(BlockValidationError::NonEmptyReceiptsRoot(header.receipts_root));
+        }
+
+        // logs bloom
+        if header.logs_bloom != Bloom::default() {
+            return Err(BlockValidationError::NonEmptyLogsBloom(header.logs_bloom));
+        }
+
+        // mix hash
+        if header.mix_hash != B256::ZERO {
+            return Err(BlockValidationError::NonEmptyMixHash(header.mix_hash));
+        }
+
+        // nonce
+        if header.nonce != 0 {
+            return Err(BlockValidationError::NonZeroNonce(header.nonce));
+        }
+
+        // difficulty
+        if header.difficulty != U256::ZERO {
+            return Err(BlockValidationError::NonZeroDifficulty(header.difficulty));
+        }
+
+        // parent beacon block root
+        if header.parent_beacon_block_root.is_some() {
+            return Err(BlockValidationError::NonEmptyBeaconRoot(header.parent_beacon_block_root));
+        }
+
+        // blob gas used
+        if header.blob_gas_used.is_some() {
+            return Err(BlockValidationError::NonEmptyBlobGas(header.blob_gas_used));
+        }
+
+        // excess blob gas used
+        if header.excess_blob_gas.is_some() {
+            return Err(BlockValidationError::NonEmptyExcessBlobGas(header.excess_blob_gas));
+        }
+
+        // requests root
+        if header.requests_root.is_some() {
+            return Err(BlockValidationError::NonEmptyRequestsRoot(header.requests_root));
+        }
+
+        Ok(())
     }
 }
 

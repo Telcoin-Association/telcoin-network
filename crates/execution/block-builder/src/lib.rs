@@ -132,7 +132,8 @@ pub struct BlockBuilder<BT, Pool, CE> {
     ///
     /// This value is tracked to ensure consistency. The only time this value is updated is when
     /// a canon notification is received from the engine. The engine updates basefee watch channel
-    /// before broadcasting the canon notification, so this value is guaranteed to always be correct.
+    /// before broadcasting the canon notification, so this value is guaranteed to always be
+    /// correct.
     basefee: u64,
     /// The maximum amount of gas for a worker block.
     ///
@@ -345,12 +346,14 @@ where
                         // maintenance task will handle worker's pending block update
                         match canon_update {
                             CanonStateNotification::Commit { new } => {
-                                // NOTE: avoid polling watch channel for `change` to prevent race condition
+                                // NOTE: avoid polling watch channel for `change` to prevent race
+                                // condition
                                 //
                                 // engine updates basefee watch channel before sending canon update
                                 //
-                                // tracking the basefee here ensures consistency and guarantees the basefee
-                                // is accurate based on the worker block builder's parent
+                                // tracking the basefee here ensures consistency and guarantees the
+                                // basefee is accurate based on the
+                                // worker block builder's parent
                                 this.basefee = *this.basefee_watch.borrow_and_update();
                                 // update parent information
                                 this.parent = new.tip().header.clone();
@@ -406,7 +409,8 @@ where
                             }
                         }
 
-                        // loop again to check for engine updates and possibly start building the next block
+                        // loop again to check for engine updates and possibly start building the
+                        // next block
                         continue;
                     }
                     Poll::Pending => {
@@ -426,9 +430,18 @@ where
 
 #[cfg(test)]
 mod tests {
+    struct Testing {
+        val: usize,
+    }
+
     #[test]
     fn test_map_opt() {
-        let dis = Some(1);
-        assert_eq!(dis, Some(1));
+        let mut test = Vec::new();
+        for val in 0..10 {
+            test.push(Testing { val })
+        }
+
+        let total = test.iter().map(|x| x.val).reduce(|t, v| t + v);
+        assert_eq!(total, 55);
     }
 }
