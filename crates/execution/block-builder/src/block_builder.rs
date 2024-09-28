@@ -4,28 +4,17 @@
 //!
 //! The
 
-use std::task::Waker;
 
-use reth_evm::ConfigureEvm;
-use reth_payload_builder::database::CachedReads;
 use reth_primitives::{
-    constants::EMPTY_WITHDRAWALS, keccak256, proofs, Block, Bloom, Bytes, Header,
-    IntoRecoveredTransaction, Receipt, SealedBlockWithSenders, SealedHeader, Withdrawals, B256,
+    constants::EMPTY_WITHDRAWALS, proofs, Bloom, Bytes, Header,
+    IntoRecoveredTransaction, B256,
     EMPTY_OMMER_ROOT_HASH, U256,
 };
-use reth_provider::{ChainSpecProvider, ExecutionOutcome, StateProviderFactory};
-use reth_revm::{
-    database::StateProviderDatabase,
-    db::states::bundle_state::BundleRetention,
-    primitives::{EVMError, EnvWithHandlerCfg, InvalidTransaction, ResultAndState},
-    DatabaseCommit, State,
-};
+use reth_provider::StateProviderFactory;
 use reth_transaction_pool::{BestTransactionsAttributes, TransactionPool};
-use reth_trie::HashedPostState;
-use tn_types::{PendingBlockConfig, WorkerBlock, WorkerBlockBuilderArgs, WorkerBlockUpdate};
-use tracing::{debug, warn};
+use tn_types::{PendingBlockConfig, WorkerBlock, WorkerBlockBuilderArgs};
+use tracing::debug;
 
-use crate::error::{BlockBuilderError, BlockBuilderResult};
 /// Construct an TN worker block using the best transactions from the pool.
 ///
 /// Returns the `WorkerBlock` and cannot fail. The worker block continues to add
@@ -68,7 +57,7 @@ where
     let mut total_bytes_size = 0;
     let mut total_possible_gas = 0;
     let mut senders = Vec::new();
-    let mut total_fees = U256::ZERO;
+    let total_fees = U256::ZERO;
     let mut transactions = Vec::new();
 
     // begin loop through sorted "best" transactions in pending pool

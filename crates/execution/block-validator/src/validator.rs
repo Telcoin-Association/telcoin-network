@@ -1,29 +1,15 @@
 //! Block validator
 
 use crate::error::BlockValidationError;
-use reth_blockchain_tree::error::BlockchainTreeError;
-use reth_chainspec::EthereumHardfork;
-use reth_consensus::PostExecutionInput;
 use reth_db::database::Database;
-use reth_evm::execute::{
-    BlockExecutionOutput, BlockExecutorProvider, BlockValidationError as RethBlockValidationError,
-    Executor,
-};
-use reth_primitives::{
-    proofs, Bloom, GotExpected, Header, SealedBlockWithSenders, SealedHeader, B256, U256,
-};
-use reth_provider::{
-    providers::BlockchainProvider, ChainSpecProvider, DatabaseProviderFactory, HeaderProvider,
-    StateRootProvider,
-};
-use reth_revm::database::StateProviderDatabase;
-use reth_trie::HashedPostState;
+use reth_evm::execute::BlockExecutorProvider;
+use reth_primitives::{proofs, Bloom, Header, SealedHeader, B256, U256};
+use reth_provider::{providers::BlockchainProvider, HeaderProvider, StateRootProvider};
 use std::{
     fmt::{Debug, Display},
     sync::Arc,
 };
-use tn_types::{BlockHash, Consensus, ConsensusError, TransactionSigned, WorkerBlock};
-use tracing::{debug, error};
+use tn_types::{Consensus, TransactionSigned, WorkerBlock};
 
 /// Type convenience for implementing block validation errors.
 type BlockValidationResult<T> = Result<T, BlockValidationError>;
@@ -350,7 +336,6 @@ impl BlockValidation for NoopBlockValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use reth_beacon_consensus::EthBeaconConsensus;
     use reth_blockchain_tree::{
         BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
@@ -370,6 +355,7 @@ mod tests {
         adiri_genesis,
         test_utils::{get_gas_price, TransactionFactory},
     };
+    use tracing::debug;
 
     /// Return the next valid block
     fn next_valid_sealed_header() -> SealedHeader {

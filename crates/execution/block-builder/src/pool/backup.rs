@@ -18,14 +18,14 @@ use tracing::{debug, error, info, trace, warn};
 
 /// Settings for local transaction backup task
 #[derive(Debug, Clone, Default)]
-pub struct LocalTransactionBackupConfig {
+pub(crate) struct LocalTransactionBackupConfig {
     /// Path to transactions backup file
     pub transactions_path: Option<PathBuf>,
 }
 
 impl LocalTransactionBackupConfig {
     /// Receive path to transactions backup and return initialized config
-    pub const fn with_local_txs_backup(transactions_path: PathBuf) -> Self {
+    pub(crate) const fn with_local_txs_backup(transactions_path: PathBuf) -> Self {
         Self { transactions_path: Some(transactions_path) }
     }
 }
@@ -177,7 +177,7 @@ where
 
 /// Errors possible during txs backup load and decode
 #[derive(thiserror::Error, Debug)]
-pub enum TransactionsBackupError {
+pub(crate) enum TransactionsBackupError {
     /// Error during RLP decoding of transactions
     #[error("failed to apply transactions backup. Encountered RLP decode error: {0}")]
     Decode(#[from] alloy_rlp::Error),
@@ -191,7 +191,7 @@ pub enum TransactionsBackupError {
 
 /// Task which manages saving local transactions to the persistent file in case of shutdown.
 /// Reloads the transactions from the file on the boot up and inserts them into the pool.
-pub async fn backup_local_transactions_task<P>(
+pub(crate) async fn backup_local_transactions_task<P>(
     shutdown: reth_tasks::shutdown::GracefulShutdown,
     pool: P,
     config: LocalTransactionBackupConfig,

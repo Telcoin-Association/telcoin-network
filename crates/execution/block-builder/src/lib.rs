@@ -14,38 +14,31 @@
 
 pub use block_builder::build_worker_block;
 use consensus_metrics::metered_channel::Sender;
-use error::{BlockBuilderError, BlockBuilderResult};
+use error::BlockBuilderResult;
 use futures_util::{FutureExt, StreamExt};
 use reth_blockchain_tree::BlockchainTreeEngine;
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
-use reth_evm_ethereum::revm_spec_by_timestamp_after_merge;
 use reth_primitives::{
-    constants::EMPTY_WITHDRAWALS, proofs, Address, Header, IntoRecoveredTransaction, SealedBlock,
-    SealedHeader, TxHash, B256, EMPTY_OMMER_ROOT_HASH, U256,
+    Address, IntoRecoveredTransaction,
+    SealedHeader, TxHash, B256,
 };
 use reth_provider::{
     BlockReaderIdExt, CanonChainTracker, CanonStateNotification, CanonStateNotificationStream,
     CanonStateSubscriptions, ChainSpecProvider, StateProviderFactory,
 };
-use reth_revm::primitives::{BlockEnv, CfgEnv, CfgEnvWithHandlerCfg};
 use reth_transaction_pool::{TransactionPool, TransactionPoolExt};
 use std::{
     future::Future,
     pin::Pin,
-    sync::mpsc::Receiver,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
 use tn_types::{
-    now, NewWorkerBlock, PendingBlockConfig, WorkerBlock, WorkerBlockBuilderArgs,
-    WorkerBlockUpdate, WorkerBlockUpdateSender,
+    now, NewWorkerBlock, PendingBlockConfig, WorkerBlockBuilderArgs, WorkerBlockUpdateSender,
 };
-use tokio::{
-    sync::{broadcast, oneshot, watch},
-    task::JoinHandle,
-};
+use tokio::sync::{broadcast, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, warn};
 
 mod block_builder;
 mod error;
@@ -205,7 +198,7 @@ where
             gas_limit,
             max_size,
             #[cfg(feature = "test-utils")]
-            max_builds: max_builds.map(|max| test_utils::MaxBuilds::new(max)),
+            max_builds: max_builds.map(test_utils::MaxBuilds::new),
         }
     }
 
@@ -378,7 +371,7 @@ where
                 //
                 // considered using: pool.pool_size().pending
                 // but that calculates size for all sub-pools
-                if this.pool.pending_transactions().len() == 0 {
+                if this.pool.pending_transactions().is_empty() {
                     // nothing pending
                     break;
                 }

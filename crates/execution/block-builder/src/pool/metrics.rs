@@ -8,7 +8,7 @@ use reth_metrics::{
 /// Transaction pool metrics
 #[derive(Metrics)]
 #[metrics(scope = "transaction_pool")]
-pub struct TxPoolMetrics {
+pub(crate) struct TxPoolMetrics {
     /// Number of transactions inserted in the pool
     pub(crate) inserted_transactions: Counter,
     /// Number of invalid transactions
@@ -46,7 +46,7 @@ pub struct TxPoolMetrics {
 /// Transaction pool blobstore metrics
 #[derive(Metrics)]
 #[metrics(scope = "transaction_pool")]
-pub struct BlobStoreMetrics {
+pub(crate) struct BlobStoreMetrics {
     /// Number of failed inserts into the blobstore
     pub(crate) blobstore_failed_inserts: Counter,
     /// Number of failed deletes into the blobstore
@@ -60,7 +60,7 @@ pub struct BlobStoreMetrics {
 /// Transaction pool maintenance metrics
 #[derive(Metrics)]
 #[metrics(scope = "transaction_pool")]
-pub struct MaintainPoolMetrics {
+pub(crate) struct MaintainPoolMetrics {
     /// Number of currently dirty addresses that need to be updated in the pool by fetching account
     /// info
     pub(crate) dirty_accounts: Gauge,
@@ -97,7 +97,7 @@ impl MaintainPoolMetrics {
 /// All Transactions metrics
 #[derive(Metrics)]
 #[metrics(scope = "transaction_pool")]
-pub struct AllTransactionsMetrics {
+pub(crate) struct AllTransactionsMetrics {
     /// Number of all transactions by hash in the pool
     pub(crate) all_transactions_by_hash: Gauge,
     /// Number of all transactions by id in the pool

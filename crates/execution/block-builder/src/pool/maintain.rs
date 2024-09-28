@@ -10,7 +10,7 @@ use crate::pool::backup::{changed_accounts_iter, load_accounts, LoadedAccounts};
 use super::metrics::MaintainPoolMetrics;
 use futures_util::{future::BoxFuture, FutureExt, Stream, StreamExt};
 use reth_chainspec::ChainSpec;
-use reth_primitives::{constants::MIN_PROTOCOL_BASE_FEE, Address, U256};
+use reth_primitives::{constants::MIN_PROTOCOL_BASE_FEE, Address};
 use reth_provider::{
     BlockReaderIdExt, CanonStateNotification, Chain, ChainSpecProvider, ProviderError,
     StateProviderFactory,
@@ -74,7 +74,7 @@ impl Default for PoolMaintenanceConfig {
 
 /// Long-running task that updates the transaction pool based on new worker block builds and engine
 /// execution.
-pub struct MaintainTxPool<Provider, Pool, C> {
+pub(crate) struct MaintainTxPool<Provider, Pool, C> {
     /// The configuration for pool maintenance.
     config: PoolMaintenanceConfig,
     /// The type used to query the database.
@@ -106,7 +106,7 @@ where
     Pool: TransactionPoolExt + Unpin,
 {
     /// Create a new instance of [Self].
-    pub fn new(
+    pub(crate) fn new(
         config: PoolMaintenanceConfig,
         provider: Provider,
         pool: Pool,
@@ -284,7 +284,7 @@ where
                         this.dirty_addresses.remove(acc);
                     }
                     async move {
-                        let res = load_accounts(c, at, accs_to_reload.into_iter());
+                        let res = load_accounts(c, at, accs_to_reload);
                         let _ = tx.send(res);
                     }
                     .boxed()
@@ -292,7 +292,7 @@ where
                     // can fetch all dirty accounts at once
                     let accs_to_reload = std::mem::take(&mut this.dirty_addresses);
                     async move {
-                        let res = load_accounts(c, at, accs_to_reload.into_iter());
+                        let res = load_accounts(c, at, accs_to_reload);
                         let _ = tx.send(res);
                     }
                     .boxed()

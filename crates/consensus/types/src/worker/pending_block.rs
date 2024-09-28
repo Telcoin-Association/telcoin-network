@@ -5,7 +5,6 @@
 use reth_chainspec::ChainSpec;
 use reth_primitives::{Address, SealedBlock, SealedBlockWithSenders, SealedHeader};
 use reth_provider::ExecutionOutcome;
-use reth_revm::primitives::{BlockEnv, CfgEnvWithHandlerCfg};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
