@@ -76,7 +76,7 @@ where
 
         // validate parent hash/parent number
         //
-        // this validates the parent's hash by extension
+        // use the parent's number to validate the hash by extension
         self.validate_against_parent_hash_number(sealed_header.header(), &parent)?;
 
         // validate timestamp vs parent
@@ -343,7 +343,7 @@ mod tests {
     };
     use reth_db_common::init::init_genesis;
     use reth_primitives::{
-        constants::EMPTY_WITHDRAWALS, hex, Address, Bloom, Bytes, GenesisAccount, Header,
+        bloom, constants::EMPTY_WITHDRAWALS, hex, Address, Bloom, Bytes, GenesisAccount, Header,
         SealedHeader, B256, EMPTY_OMMER_ROOT_HASH,
     };
     use reth_provider::{providers::StaticFileProvider, ProviderFactory};
@@ -510,6 +510,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_invalid_block_wrong_transactions_root() {
+        let TestTools { valid_header, validator, valid_txs: mut wrong_txs } = test_types().await;
+        // remove tx
+        let _ = wrong_txs.pop();
+        let correct_root: B256 =
+            hex!("35cacf0a6e1826b718033b80345e39387f776a2eb3422b90d4265e113ae83c89").into();
+        let wrong_root = valid_header.transactions_root;
+        let wrong_block = WorkerBlock::new(wrong_txs, valid_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::TransactionRootMismatch { expected, peer_root }) if expected == correct_root && peer_root == wrong_root
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_block_wrong_block_hash() {
+        let TestTools { valid_header, validator, valid_txs } = test_types().await;
+        let correct_hash = valid_header.hash();
+        let wrong_hash = B256::ZERO;
+        let wrong_header = valid_header.unseal().seal(wrong_hash);
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::BlockHash { expected, peer_hash }) if expected == correct_hash && peer_hash == wrong_hash
+        );
+    }
+
+    #[tokio::test]
     async fn test_invalid_block_wrong_parent_hash() {
         let TestTools { valid_txs, mut valid_header, validator } = test_types().await;
         let wrong_parent_hash = B256::random();
@@ -538,6 +566,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_invalid_block_wrong_timestamp() {
+        let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        let (mut header, _hash) = valid_header.split();
+
+        // test header timestamp same as parent
+        let wrong_timestamp = adiri_genesis().timestamp;
+        header.timestamp = wrong_timestamp;
+
+        // update hash since this is asserted first
+        let wrong_header = header.clone().seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::TimestampIsInPast{parent_timestamp, timestamp}) if parent_timestamp == wrong_timestamp && timestamp == wrong_timestamp
+        );
+
+        // test header timestamp before parent
+        header.timestamp = wrong_timestamp - 1;
+
+        // update hash since this is asserted first
+        let wrong_header = header.seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::TimestampIsInPast{parent_timestamp, timestamp}) if parent_timestamp == wrong_timestamp && timestamp == wrong_timestamp - 1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_block_wrong_gas_limit() {
+        let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        let (mut header, _hash) = valid_header.split();
+
+        // specify gas limit more than 30mil limit set in validator
+        let wrong_gas_limit = 35_000_000;
+        header.gas_limit = wrong_gas_limit;
+
+        // update hash since this is asserted first
+        let wrong_header = header.seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::InvalidGasLimit{expected, received}) if expected == 30_000_000 && received == wrong_gas_limit
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_block_excess_gas_used() {
+        let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        let (mut header, _hash) = valid_header.split();
+
+        // specify gas limit more than 30mil limit set in validator
+        let excess_gas_used = 35_000_000;
+        header.gas_used = excess_gas_used;
+
+        // update hash since this is asserted first
+        let wrong_header = header.seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::HeaderMaxGasExceedsGasLimit{total_possible_gas, gas_limit}) if total_possible_gas == excess_gas_used && gas_limit == 30_000_000
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_block_wrong_gas_used() {
+        let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        let (mut header, _hash) = valid_header.split();
+
+        // gas used 1 wei BELOW actual
+        let wrong_gas_used = header.gas_used - 1;
+        header.gas_used = wrong_gas_used;
+
+        // update hash since this is asserted first
+        let wrong_header = header.clone().seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::HeaderGasUsedMismatch{expected, received}) if expected == 3_000_000 && received == wrong_gas_used
+        );
+
+        // gas used 1 wei ABOVE actual
+        let wrong_gas_used = header.gas_used + 2;
+        header.gas_used = wrong_gas_used;
+
+        // update hash since this is asserted first
+        let wrong_header = header.seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::HeaderGasUsedMismatch{expected, received}) if expected == 3_000_000 && received == wrong_gas_used
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_block_wrong_ommers_hash() {
+        let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        let (mut header, _hash) = valid_header.split();
+
+        let wrong_ommers_hash = B256::random();
+        header.ommers_hash = wrong_ommers_hash;
+        let wrong_header = header.seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::NonEmptyOmmersHash(wrong)) if wrong == wrong_ommers_hash
+        );
+    }
+
+    #[tokio::test]
     async fn test_invalid_block_wrong_state_root() {
         let TestTools { valid_txs, mut valid_header, validator } = test_types().await;
         let wrong_state_root = B256::random();
@@ -552,24 +690,202 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_invalid_block_wrong_transactions_root() {
-        let TestTools { valid_header, validator, valid_txs: mut wrong_txs } = test_types().await;
-        // remove tx
-        let _ = wrong_txs.pop();
-        let correct_root: B256 =
-            hex!("35cacf0a6e1826b718033b80345e39387f776a2eb3422b90d4265e113ae83c89").into();
-        let wrong_root = valid_header.transactions_root;
-        let wrong_block = WorkerBlock::new(wrong_txs, valid_header);
+    async fn test_invalid_block_wrong_receipt_root() {
+        let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        let (mut header, _hash) = valid_header.split();
+
+        let wrong_receipt_root = B256::random();
+        header.receipts_root = wrong_receipt_root;
+        let wrong_header = header.seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
         assert_matches::assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::TransactionRootMismatch { expected, peer_root }) if expected == correct_root && peer_root == wrong_root
+            Err(BlockValidationError::NonEmptyReceiptsRoot(wrong)) if wrong == wrong_receipt_root
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_block_wrong_withdrawals_root() {
+        let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        let (mut header, _hash) = valid_header.split();
+
+        let wrong_withdrawals_root = Some(B256::random());
+        header.withdrawals_root = wrong_withdrawals_root;
+        let wrong_header = header.seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::NonEmptyWithdrawalsRoot(wrong)) if wrong == wrong_withdrawals_root
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_block_wrong_logs_bloom() {
+        let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        let (mut header, _hash) = valid_header.split();
+
+        let wrong_logs_bloom = bloom!(
+            "00000000000000000000000000000000
+             00000000100000000000000000000000
+             00000000000000000000000000000000
+             00000000000000000000000000000000
+             00000000000000000000000000000000
+             00000000000000000000000000000000
+             00000002020000000000000000000000
+             00000000000000000000000800000000
+             10000000000000000000000000000000
+             00000000000000000000001000000000
+             00000000000000000000000000000000
+             00000000000000000000000000000000
+             00000000000000000000000000000000
+             00000000000000000000000000000000
+             00000000000000000000000000000000
+             00000000000000000000000000000000"
+        );
+
+        header.logs_bloom = wrong_logs_bloom;
+        let wrong_header = header.seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::NonEmptyLogsBloom(wrong)) if wrong == wrong_logs_bloom
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_block_wrong_mix_hash() {
+        let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        let (mut header, _hash) = valid_header.split();
+
+        let wrong_mix_hash = B256::random();
+        header.mix_hash = wrong_mix_hash;
+        let wrong_header = header.seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::NonEmptyMixHash(wrong)) if wrong == wrong_mix_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_block_wrong_difficulty() {
+        let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        let (mut header, _hash) = valid_header.split();
+
+        let wrong_difficulty = U256::from(7);
+        header.difficulty = wrong_difficulty;
+        let wrong_header = header.seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::NonZeroDifficulty(wrong)) if wrong == wrong_difficulty
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_block_wrong_parent_beacon_block_root() {
+        let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        let (mut header, _hash) = valid_header.split();
+
+        // random hash
+        let wrong_beacon_block = Some(B256::random());
+        header.parent_beacon_block_root = wrong_beacon_block;
+        let wrong_header = header.clone().seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::NonEmptyBeaconRoot(wrong)) if wrong == wrong_beacon_block
+        );
+
+        // ensure zero is invalid too
+        let wrong_beacon_block = Some(B256::ZERO);
+        header.parent_beacon_block_root = wrong_beacon_block;
+        let wrong_header = header.seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::NonEmptyBeaconRoot(wrong)) if wrong == wrong_beacon_block
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_block_wrong_blob_gas_used() {
+        let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        let (mut header, _hash) = valid_header.split();
+
+        let wrong_blob_gas_used = Some(0);
+        header.blob_gas_used = wrong_blob_gas_used;
+        let wrong_header = header.clone().seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::NonEmptyBlobGas(wrong)) if wrong == wrong_blob_gas_used
+        );
+
+        // other than zero
+        let wrong_blob_gas_used = Some(1_000_000);
+        header.blob_gas_used = wrong_blob_gas_used;
+        let wrong_header = header.seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::NonEmptyBlobGas(wrong)) if wrong == wrong_blob_gas_used
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_block_wrong_excess_blob_gas_used() {
+        let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        let (mut header, _hash) = valid_header.split();
+
+        let wrong_excess_blob_gas = Some(0);
+        header.excess_blob_gas = wrong_excess_blob_gas;
+        let wrong_header = header.clone().seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::NonEmptyExcessBlobGas(wrong)) if wrong == wrong_excess_blob_gas
+        );
+
+        // other than zero
+        let wrong_excess_blob_gas = Some(1_000_000);
+        header.excess_blob_gas = wrong_excess_blob_gas;
+        let wrong_header = header.seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::NonEmptyExcessBlobGas(wrong)) if wrong == wrong_excess_blob_gas
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_block_wrong_requests_root() {
+        let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        let (mut header, _hash) = valid_header.split();
+
+        // random hash
+        let wrong_requests_root = Some(B256::random());
+        header.requests_root = wrong_requests_root;
+        let wrong_header = header.clone().seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::NonEmptyRequestsRoot(wrong)) if wrong == wrong_requests_root
+        );
+
+        // ensure zero is invalid too
+        let wrong_requests_root = Some(B256::ZERO);
+        header.requests_root = wrong_requests_root;
+        let wrong_header = header.seal_slow();
+        let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        assert_matches::assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::NonEmptyRequestsRoot(wrong)) if wrong == wrong_requests_root
         );
     }
 
     // // TODO:
     // // invalid block types for the rest of the sealed header:
-    // // - logs bloom
-    // // - sealed block number
-    // // - BlockGasUsed
-    // // etc.
+    // // - block size bytes
+    // // - basefee
 }
