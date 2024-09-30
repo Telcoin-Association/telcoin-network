@@ -195,7 +195,7 @@ where
         }
 
         // ensure total tx gas limit fits into block's gas limit
-        if header.gas_used >= header.gas_limit {
+        if header.gas_used > header.gas_limit {
             return Err(BlockValidationError::HeaderMaxGasExceedsGasLimit {
                 total_possible_gas: header.gas_used,
                 gas_limit: header.gas_limit,
@@ -230,6 +230,7 @@ where
             .reduce(|total, size| total + size)
             .ok_or(BlockValidationError::CalculateTransactionByteSize)?;
 
+        // allow txs that equal max tx bytes
         if total_bytes > self.max_tx_bytes {
             return Err(BlockValidationError::HeaderTransactionBytesExceedsMax(total_bytes));
         }
@@ -331,7 +332,6 @@ impl BlockValidation for NoopBlockValidator {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
-    use reth::tasks::{TaskExecutor, TaskManager};
     use reth_beacon_consensus::EthBeaconConsensus;
     use reth_blockchain_tree::{
         BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
@@ -348,13 +348,8 @@ mod tests {
     };
     use reth_provider::{providers::StaticFileProvider, ProviderFactory};
     use reth_prune::PruneModes;
-    use reth_tracing::init_test_tracing;
     use std::{str::FromStr, sync::Arc};
-    use tn_types::{
-        adiri_genesis,
-        test_utils::{get_gas_price, TransactionFactory},
-        Consensus,
-    };
+    use tn_types::{adiri_genesis, test_utils::TransactionFactory, Consensus};
     use tracing::debug;
 
     /// Return the next valid block
@@ -518,7 +513,7 @@ mod tests {
             hex!("35cacf0a6e1826b718033b80345e39387f776a2eb3422b90d4265e113ae83c89").into();
         let wrong_root = valid_header.transactions_root;
         let wrong_block = WorkerBlock::new(wrong_txs, valid_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::TransactionRootMismatch { expected, peer_root }) if expected == correct_root && peer_root == wrong_root
         );
@@ -531,7 +526,7 @@ mod tests {
         let wrong_hash = B256::ZERO;
         let wrong_header = valid_header.unseal().seal(wrong_hash);
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::BlockHash { expected, peer_hash }) if expected == correct_hash && peer_hash == wrong_hash
         );
@@ -545,7 +540,7 @@ mod tests {
         // update hash since this is asserted first
         let wrong_header = valid_header.unseal().seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::CanonicalChain { block_hash }) if block_hash == wrong_parent_hash
         );
@@ -559,7 +554,7 @@ mod tests {
         // update hash since this is asserted first
         let wrong_header = valid_header.unseal().seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::ParentBlockNumberMismatch{parent_block_number, block_number}) if parent_block_number == 0 && block_number == 3
         );
@@ -577,7 +572,7 @@ mod tests {
         // update hash since this is asserted first
         let wrong_header = header.clone().seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::TimestampIsInPast{parent_timestamp, timestamp}) if parent_timestamp == wrong_timestamp && timestamp == wrong_timestamp
         );
@@ -588,7 +583,7 @@ mod tests {
         // update hash since this is asserted first
         let wrong_header = header.seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::TimestampIsInPast{parent_timestamp, timestamp}) if parent_timestamp == wrong_timestamp && timestamp == wrong_timestamp - 1
         );
@@ -606,7 +601,7 @@ mod tests {
         // update hash since this is asserted first
         let wrong_header = header.seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::InvalidGasLimit{expected, received}) if expected == 30_000_000 && received == wrong_gas_limit
         );
@@ -624,7 +619,7 @@ mod tests {
         // update hash since this is asserted first
         let wrong_header = header.seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::HeaderMaxGasExceedsGasLimit{total_possible_gas, gas_limit}) if total_possible_gas == excess_gas_used && gas_limit == 30_000_000
         );
@@ -642,7 +637,7 @@ mod tests {
         // update hash since this is asserted first
         let wrong_header = header.clone().seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::HeaderGasUsedMismatch{expected, received}) if expected == 3_000_000 && received == wrong_gas_used
         );
@@ -654,7 +649,7 @@ mod tests {
         // update hash since this is asserted first
         let wrong_header = header.seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::HeaderGasUsedMismatch{expected, received}) if expected == 3_000_000 && received == wrong_gas_used
         );
@@ -669,7 +664,7 @@ mod tests {
         header.ommers_hash = wrong_ommers_hash;
         let wrong_header = header.seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::NonEmptyOmmersHash(wrong)) if wrong == wrong_ommers_hash
         );
@@ -683,7 +678,7 @@ mod tests {
         // update hash since this is asserted first
         let wrong_header = valid_header.unseal().seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::NonEmptyStateRoot(wrong)) if wrong == wrong_state_root
         );
@@ -698,7 +693,7 @@ mod tests {
         header.receipts_root = wrong_receipt_root;
         let wrong_header = header.seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::NonEmptyReceiptsRoot(wrong)) if wrong == wrong_receipt_root
         );
@@ -713,7 +708,7 @@ mod tests {
         header.withdrawals_root = wrong_withdrawals_root;
         let wrong_header = header.seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::NonEmptyWithdrawalsRoot(wrong)) if wrong == wrong_withdrawals_root
         );
@@ -746,7 +741,7 @@ mod tests {
         header.logs_bloom = wrong_logs_bloom;
         let wrong_header = header.seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::NonEmptyLogsBloom(wrong)) if wrong == wrong_logs_bloom
         );
@@ -761,7 +756,7 @@ mod tests {
         header.mix_hash = wrong_mix_hash;
         let wrong_header = header.seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::NonEmptyMixHash(wrong)) if wrong == wrong_mix_hash
         );
@@ -776,7 +771,7 @@ mod tests {
         header.difficulty = wrong_difficulty;
         let wrong_header = header.seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::NonZeroDifficulty(wrong)) if wrong == wrong_difficulty
         );
@@ -792,7 +787,7 @@ mod tests {
         header.parent_beacon_block_root = wrong_beacon_block;
         let wrong_header = header.clone().seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::NonEmptyBeaconRoot(wrong)) if wrong == wrong_beacon_block
         );
@@ -802,7 +797,7 @@ mod tests {
         header.parent_beacon_block_root = wrong_beacon_block;
         let wrong_header = header.seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::NonEmptyBeaconRoot(wrong)) if wrong == wrong_beacon_block
         );
@@ -817,7 +812,7 @@ mod tests {
         header.blob_gas_used = wrong_blob_gas_used;
         let wrong_header = header.clone().seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::NonEmptyBlobGas(wrong)) if wrong == wrong_blob_gas_used
         );
@@ -827,7 +822,7 @@ mod tests {
         header.blob_gas_used = wrong_blob_gas_used;
         let wrong_header = header.seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::NonEmptyBlobGas(wrong)) if wrong == wrong_blob_gas_used
         );
@@ -842,7 +837,7 @@ mod tests {
         header.excess_blob_gas = wrong_excess_blob_gas;
         let wrong_header = header.clone().seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::NonEmptyExcessBlobGas(wrong)) if wrong == wrong_excess_blob_gas
         );
@@ -852,7 +847,7 @@ mod tests {
         header.excess_blob_gas = wrong_excess_blob_gas;
         let wrong_header = header.seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::NonEmptyExcessBlobGas(wrong)) if wrong == wrong_excess_blob_gas
         );
@@ -868,7 +863,7 @@ mod tests {
         header.requests_root = wrong_requests_root;
         let wrong_header = header.clone().seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::NonEmptyRequestsRoot(wrong)) if wrong == wrong_requests_root
         );
@@ -878,7 +873,7 @@ mod tests {
         header.requests_root = wrong_requests_root;
         let wrong_header = header.seal_slow();
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        assert_matches::assert_matches!(
+        assert_matches!(
             validator.validate_block(&wrong_block).await,
             Err(BlockValidationError::NonEmptyRequestsRoot(wrong)) if wrong == wrong_requests_root
         );
@@ -886,15 +881,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_block_wrong_size_in_bytes() {
-        let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        let TestTools { valid_header, validator, .. } = test_types().await;
         // create enough transactions to exceed 1MB
         // TODO: clean this up - taken from `test_types` fn
         // because validator uses provided with same genesis
         // and tx_factory needs funds
         let genesis = adiri_genesis();
+
+        // use new tx factory to ensure correct nonces are tracked
         let mut tx_factory = TransactionFactory::new();
         let factory_address = tx_factory.address();
-        debug!("seeding factory address: {factory_address:?}");
 
         // fund factory with 99mil TEL
         let account = vec![(
@@ -906,43 +902,83 @@ mod tests {
 
         let genesis = genesis.extend_accounts(account);
         let chain: Arc<ChainSpec> = Arc::new(genesis.into());
-        // currently 4695 txs
+
+        // currently: 4695 txs at 1000035 bytes
         let mut too_many_txs = Vec::new();
         let mut total_bytes = 0;
-        while total_bytes <= 1_000_000 {
-            let tx = tx_factory.create_eip1559(
-                chain.clone(),
-                7,
-                Some(Address::random()),
-                U256::from(100),
-                Bytes::default(),
+        let mut total_gas = 0;
+        while total_bytes < 1_000_000 {
+            let tx = tx_factory.create_explicit_eip1559(
+                Some(chain.chain.id()),
+                None,                    // default nonce
+                None,                    // no tip
+                Some(7),                 // min basefee for block 1
+                Some(1),                 // low gas limit to prevent excess gas used error
+                Some(Address::random()), // send to random address
+                Some(U256::from(100)),   // send low amount
+                None,                    // no input
+                None,                    // no access list
             );
+
+            // track totals
+            total_gas += tx.gas_limit();
             total_bytes += tx.size();
             too_many_txs.push(tx);
         }
 
-        println!("created too many txs: {:?}", too_many_txs.len());
-        // let wrong_requests_root = Some(B256::random());
-        // header.requests_root = wrong_requests_root;
-        // let wrong_header = header.clone().seal_slow();
-        // let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
-        // assert_matches::assert_matches!(
-        //     validator.validate_block(&wrong_block).await,
-        //     Err(BlockValidationError::NonEmptyRequestsRoot(wrong)) if wrong == wrong_requests_root
-        // );
+        // update header so tx root is correct
+        let (mut header, _hash) = valid_header.split();
+        header.gas_used = total_gas;
+        header.transactions_root = proofs::calculate_transaction_root(&too_many_txs);
+        let bad_header = header.clone().seal_slow();
 
-        // // ensure zero is invalid too
-        // let wrong_requests_root = Some(B256::ZERO);
-        // header.requests_root = wrong_requests_root;
-        // let wrong_header = header.seal_slow();
-        // let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
-        // assert_matches::assert_matches!(
-        //     validator.validate_block(&wrong_block).await,
-        //     Err(BlockValidationError::NonEmptyRequestsRoot(wrong)) if wrong == wrong_requests_root
-        // );
+        // NOTE: these assertions aren't important but want to know if tx size changes
+        assert_eq!(total_bytes, 1_000_035);
+        assert_eq!(too_many_txs.len(), 4695);
+
+        let wrong_block = WorkerBlock::new(too_many_txs, bad_header);
+        assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == total_bytes
+        );
+
+        // Generate 1MB vec of 1s - total bytes are: 1_000_213
+        let big_input = vec![1u8; 1_000_000];
+
+        // create giant tx
+        let max_gas = 30_000_000;
+        let giant_tx = tx_factory.create_explicit_eip1559(
+            Some(chain.chain.id()),
+            Some(0),                      // make this first tx in block 1
+            None,                         // no tip
+            Some(7),                      // min basefee for block 1
+            Some(max_gas),                // high gas limit bc this is a lot of data
+            None,                         // create tx
+            Some(U256::ZERO),             // no transfer
+            Some(Bytes::from(big_input)), // no input
+            None,                         // no access list
+        );
+
+        // NOTE: the actual size just needs to be above 1MB but want to know if tx size ever changes
+        let too_big = giant_tx.size();
+        assert_eq!(too_big, 1_000_213);
+
+        let txs = vec![giant_tx];
+        header.gas_used = max_gas;
+
+        // use expected value to reduce test time
+        // to recalculate: proofs::calculate_transaction_root(&txs)
+        let tx_root =
+            hex!("00e105ab5023ebb359f3770834cad7cc32e1495c79a9cdd803ed2c0eba7cb385").into();
+        header.transactions_root = tx_root;
+        let bad_header = header.seal_slow();
+        let wrong_block = WorkerBlock::new(txs, bad_header);
+        assert_matches!(
+            validator.validate_block(&wrong_block).await,
+            Err(BlockValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == too_big
+        );
     }
 
     // // TODO:
-    // // - block size bytes
     // // - basefee
 }

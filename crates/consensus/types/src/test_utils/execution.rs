@@ -3,20 +3,22 @@
 
 //! Specific test utils for execution layer
 use crate::{adiri_genesis, now, ExecutionKeypair, TimestampSec, WorkerBlock};
-use alloy::signers::{k256::FieldBytes, local::PrivateKeySigner};
+use alloy::{
+    eips::eip1559::MIN_PROTOCOL_BASE_FEE,
+    signers::{k256::FieldBytes, local::PrivateKeySigner},
+};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use reth_chainspec::{BaseFeeParams, ChainSpec};
 use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, Executor as _};
 use reth_primitives::{
-    constants::{
-        EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE,
-    },
+    constants::{EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT},
     proofs, public_key_to_address, sign_message, Address, Block, Bytes, Genesis, GenesisAccount,
     Header, PooledTransactionsElement, SealedHeader, Signature, Transaction, TransactionSigned,
     TxEip1559, TxHash, TxKind, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256,
 };
 use reth_provider::{BlockReaderIdExt, ExecutionOutcome, StateProviderFactory};
 use reth_revm::database::StateProviderDatabase;
+use reth_rpc_types::AccessList;
 use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool};
 use reth_trie::HashedPostState;
 use secp256k1::Secp256k1;
@@ -391,6 +393,61 @@ impl TransactionFactory {
         let signature = self.sign_hash(tx_signature_hash);
 
         // increase nonce for next tx
+        self.inc_nonce();
+
+        TransactionSigned::from_transaction_and_signature(transaction, signature)
+    }
+
+    /// Create and sign an EIP1559 transaction with all possible parameters passed.
+    ///
+    /// All arguments are optional and default to:
+    /// - chain_id: 2017 (adiri testnet)
+    /// - nonce: `Self::nonce` (correctly incremented)
+    /// - max_priority_fee_per_gas: 0 (no tip)
+    /// - max_fee_per_gas: basefee minimum (7 wei)
+    /// - gas_limit: 1_000_000 wei
+    /// - to: None (results in `TxKind::Create`)
+    /// - value: 1TEL (1^10*18 wei)
+    /// - input: empty bytes (`Bytes::default()`)
+    /// - access_list: None
+    ///
+    /// NOTE: the nonce is still incremented to track the number of signed transactions for `Self`.
+    pub fn create_explicit_eip1559(
+        &mut self,
+        chain_id: Option<u64>,
+        nonce: Option<u64>,
+        max_priority_fee_per_gas: Option<u128>,
+        max_fee_per_gas: Option<u128>,
+        gas_limit: Option<u64>,
+        to: Option<Address>,
+        value: Option<U256>,
+        input: Option<Bytes>,
+        access_list: Option<AccessList>,
+    ) -> TransactionSigned {
+        let tx_kind = match to {
+            Some(address) => TxKind::Call(address),
+            None => TxKind::Create,
+        };
+
+        // Eip1559
+        let transaction = Transaction::Eip1559(TxEip1559 {
+            chain_id: chain_id.unwrap_or(2017),
+            nonce: nonce.unwrap_or(self.nonce),
+            max_priority_fee_per_gas: max_priority_fee_per_gas.unwrap_or(0),
+            max_fee_per_gas: max_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE.into()),
+            gas_limit: gas_limit.unwrap_or(1_000_000),
+            to: tx_kind,
+            value: value.unwrap_or_else(|| {
+                U256::from(10).checked_pow(U256::from(18)).expect("1x10^18 does not overflow")
+            }),
+            input: input.unwrap_or_else(|| Bytes::default()),
+            access_list: access_list.unwrap_or_else(|| AccessList::default()),
+        });
+
+        let tx_signature_hash = transaction.signature_hash();
+        let signature = self.sign_hash(tx_signature_hash);
+
+        // increase nonce for self
         self.inc_nonce();
 
         TransactionSigned::from_transaction_and_signature(transaction, signature)
