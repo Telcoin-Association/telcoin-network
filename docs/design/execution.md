@@ -129,3 +129,10 @@ TN does not anticipate a need for supporting this EIP at this time.
 > The proliferation of smart contract controlled validators has caused there to be a demand for additional EL triggered behaviors. By allowing these systems to delegate administrative operations to their governing smart contracts, they can avoid intermediaries needing to step in and ensure certain operations occur. This creates a safer system for end users.
 
 TN validators may decide to manage themselves on chain through smart contracts, at which point a TIP will be introduced to support this EIP.
+
+### [EIP-2930](https://eips.ethereum.org/EIPS/eip-2930): Access List for transactions
+> Adds a transaction type which contains an access list, a list of addresses and storage keys that the transaction plans to access. Accesses outside the list are possible, but become more expensive.
+
+TN workers could execute blocks they propose to create this list per-block which could better support optimistic parallel execution in the engine.
+
+TN could also consider custom wallets that support this.
