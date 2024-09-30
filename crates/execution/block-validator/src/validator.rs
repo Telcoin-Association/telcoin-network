@@ -884,8 +884,65 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_invalid_block_wrong_size_in_bytes() {
+        let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        // create enough transactions to exceed 1MB
+        // TODO: clean this up - taken from `test_types` fn
+        // because validator uses provided with same genesis
+        // and tx_factory needs funds
+        let genesis = adiri_genesis();
+        let mut tx_factory = TransactionFactory::new();
+        let factory_address = tx_factory.address();
+        debug!("seeding factory address: {factory_address:?}");
+
+        // fund factory with 99mil TEL
+        let account = vec![(
+            factory_address,
+            GenesisAccount::default().with_balance(
+                U256::from_str("0x51E410C0F93FE543000000").expect("account balance is parsed"),
+            ),
+        )];
+
+        let genesis = genesis.extend_accounts(account);
+        let chain: Arc<ChainSpec> = Arc::new(genesis.into());
+        // currently 4695 txs
+        let mut too_many_txs = Vec::new();
+        let mut total_bytes = 0;
+        while total_bytes <= 1_000_000 {
+            let tx = tx_factory.create_eip1559(
+                chain.clone(),
+                7,
+                Some(Address::random()),
+                U256::from(100),
+                Bytes::default(),
+            );
+            total_bytes += tx.size();
+            too_many_txs.push(tx);
+        }
+
+        println!("created too many txs: {:?}", too_many_txs.len());
+        // let wrong_requests_root = Some(B256::random());
+        // header.requests_root = wrong_requests_root;
+        // let wrong_header = header.clone().seal_slow();
+        // let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
+        // assert_matches::assert_matches!(
+        //     validator.validate_block(&wrong_block).await,
+        //     Err(BlockValidationError::NonEmptyRequestsRoot(wrong)) if wrong == wrong_requests_root
+        // );
+
+        // // ensure zero is invalid too
+        // let wrong_requests_root = Some(B256::ZERO);
+        // header.requests_root = wrong_requests_root;
+        // let wrong_header = header.seal_slow();
+        // let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
+        // assert_matches::assert_matches!(
+        //     validator.validate_block(&wrong_block).await,
+        //     Err(BlockValidationError::NonEmptyRequestsRoot(wrong)) if wrong == wrong_requests_root
+        // );
+    }
+
     // // TODO:
-    // // invalid block types for the rest of the sealed header:
     // // - block size bytes
     // // - basefee
 }
