@@ -17,18 +17,22 @@ use block_builder::BlockBuilderOutput;
 use consensus_metrics::metered_channel::Sender;
 use error::BlockBuilderResult;
 use futures_util::{FutureExt, StreamExt};
-use reth_blockchain_tree::BlockchainTreeEngine;
+use pool::LastCanonicalUpdate;
+use reth_blockchain_tree::{BlockchainTreeEngine, BlockchainTreeViewer};
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
-use reth_primitives::{Address, IntoRecoveredTransaction, SealedHeader, TxHash, B256};
+use reth_primitives::{
+    Address, BlockNumHash, IntoRecoveredTransaction, SealedHeader, TxHash, B256,
+};
 use reth_provider::{
     BlockReaderIdExt, CanonChainTracker, CanonStateNotification, CanonStateNotificationStream,
-    CanonStateSubscriptions, ChainSpecProvider, StateProviderFactory,
+    CanonStateSubscriptions, Chain, ChainSpecProvider, FinalizedBlockReader, StateProviderFactory,
 };
-use reth_transaction_pool::{TransactionPool, TransactionPoolExt};
+use reth_transaction_pool::{BlockInfo, CanonicalStateUpdate, TransactionPool, TransactionPoolExt};
 use std::{
     future::Future,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 use tn_types::{
@@ -36,7 +40,7 @@ use tn_types::{
 };
 use tokio::sync::{broadcast, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
 mod block_builder;
 mod error;
@@ -62,7 +66,8 @@ pub mod test_utils;
 
 /// Type alias for the blocking task that locks the tx pool and builds the next worker block.
 type BlockBuildingTask = oneshot::Receiver<B256>;
-// type BlockBuildingTask = oneshot::Receiver<BlockBuilderResult<WorkerBlockUpdate>>;
+/// Type alias for the blocking task that locks the tx pool and updates account state.
+type PoolMaintenanceTask = oneshot::Receiver<B256>;
 
 /// The type that builds blocks for workers to propose.
 ///
@@ -92,9 +97,6 @@ pub struct BlockBuilder<BT, Pool, CE> {
     ///
     /// The RPC and transaction pool subsribe to these updates.
     worker_block_updates: WorkerBlockUpdateSender,
-    /// Receiving end from the engine's progress. Canonical state updates
-    /// are broadcast. These updates must take priority.
-    canonical_state_updates: CanonStateNotificationStream,
     /// The sending side to the worker's batch maker.
     ///
     /// Sending the new block through this channel triggers a broadcast to all peers.
@@ -107,25 +109,6 @@ pub struct BlockBuilder<BT, Pool, CE> {
     address: Address,
     /// Receiver stream for pending transactions in the pool.
     pending_tx_hashes_stream: ReceiverStream<TxHash>,
-    /// The [SealedHeader] of the last fully-executed block (see TN Engine).
-    ///
-    /// This information is from the current finalized block number and hash.
-    parent: SealedHeader,
-    /// The watch channel containing the latest base fee.
-    ///
-    /// Basefees are updated by the engine after a new round of consensus was executed and should
-    /// be uniform across all workers using building off the same parent. Worker uses the basefee
-    /// from the latest round of consensus for proposing it's next blocks. The basefee included in
-    /// the worker's block is used by the engine during final execution. Peers validate that the
-    /// worker block's basefee is correct based on it's parent.
-    basefee_watch: watch::Receiver<u64>,
-    /// The last basefee received from the engine.
-    ///
-    /// This value is tracked to ensure consistency. The only time this value is updated is when
-    /// a canon notification is received from the engine. The engine updates basefee watch channel
-    /// before broadcasting the canon notification, so this value is guaranteed to always be
-    /// correct.
-    basefee: u64,
     /// The maximum amount of gas for a worker block.
     ///
     /// NOTE: transactions are not executed at this stage, so the worker measures the amount of gas
@@ -133,6 +116,11 @@ pub struct BlockBuilder<BT, Pool, CE> {
     gas_limit: u64,
     /// The maximum size of collected transactions, measured in bytes.
     max_size: usize,
+    /// Watch channel to ensure consistency between pool maintenance tasks.
+    ///
+    /// Pool maintenance happens when the engine executes a round of consensus. The block builder
+    /// also applies pool updates when a worker block reaches quorum to remove mined transactions.
+    latest_update: watch::Receiver<LastCanonicalUpdate>,
     /// Optional number of blocks to build before shutting down.
     ///
     /// Engine can produce multiple blocks per round of consensus, so this number may not
@@ -150,6 +138,7 @@ where
         + ChainSpecProvider<ChainSpec = ChainSpec>
         + StateProviderFactory
         + BlockchainTreeEngine
+        + FinalizedBlockReader
         + CanonChainTracker
         + Clone
         + 'static,
@@ -164,22 +153,15 @@ where
         evm_config: CE,
         to_worker: Sender<NewWorkerBlock>,
         address: Address,
-        parent: SealedHeader,
         pending_tx_hashes_stream: ReceiverStream<TxHash>,
-        basefee_watch: watch::Receiver<u64>,
         gas_limit: u64,
         max_size: usize,
+        latest_update: watch::Receiver<LastCanonicalUpdate>,
         #[cfg(feature = "test-utils")] max_builds: Option<usize>,
     ) -> Self {
         // create broadcast channels
         // NOTE: it's important that worker updates are processed quickly
         let (worker_block_updates, _) = broadcast::channel(10);
-
-        // subscribe to canon state updates
-        let canonical_state_updates = blockchain.canonical_state_stream();
-
-        // start with current basefee in watch channel
-        let basefee = *basefee_watch.borrow();
 
         Self {
             pending_task: None,
@@ -187,15 +169,12 @@ where
             pool,
             evm_config,
             worker_block_updates,
-            canonical_state_updates,
             to_worker,
             address,
-            parent,
             pending_tx_hashes_stream,
-            basefee_watch,
-            basefee,
             gas_limit,
             max_size,
+            latest_update,
             #[cfg(feature = "test-utils")]
             max_builds: max_builds.map(test_utils::MaxBuilds::new),
         }
@@ -207,21 +186,10 @@ where
     /// Executing blocks is cpu intensive, so a blocking task is used.
     fn spawn_execution_task(&self) -> BlockBuildingTask {
         let provider = self.blockchain.clone();
-        let parent = self.parent.clone();
         let pool = self.pool.clone();
         let chain_spec = provider.chain_spec();
         let to_worker = self.to_worker.clone();
-        let basefee = self.basefee;
-
-        // TODO: use ms for worker block and sec for final block?
-        //
-        // sometimes worker block are produced too quickly in certain configs (<1s)
-        // resulting in batch timestamp == parent timestamp
-        let mut timestamp = now();
-        if timestamp == parent.timestamp {
-            warn!(target: "execution::block_builder", "new block timestamp same as parent - setting offset by 1sec");
-            timestamp = parent.timestamp + 1;
-        }
+        let latest_update = self.latest_update.clone();
 
         // TODO: this is needs further scrutiny
         //
@@ -248,45 +216,63 @@ where
         //     self.cfg_and_block_env(chain_spec.as_ref(), &parent, timestamp, prevrandao);
 
         let config = PendingBlockConfig::new(
-            parent,
             chain_spec,
-            timestamp,
             self.address,
-            basefee,
-            None,           // TODO: no support for blobs yet
             self.gas_limit, // in wei
             self.max_size,  // in bytes
         );
-        let build_args = WorkerBlockBuilderArgs::new(provider, pool, config);
+        let build_args = WorkerBlockBuilderArgs::new(provider, pool.clone(), config);
         let (ack, rx) = oneshot::channel();
 
         // spawn block building task and forward to worker
         tokio::task::spawn(async move {
             // this is safe to call without a semaphore bc it's held as a single `Option`
             let BlockBuilderOutput { worker_block: block, mined_transactions } =
-                build_worker_block(build_args);
+                build_worker_block(build_args, &latest_update);
+
+            // forward to worker and wait for ack that quorum was reached
             if let Err(e) = to_worker.send(NewWorkerBlock { block, ack }).await {
                 error!(target: "worker::block_builder", ?e, "failed to send next block to worker");
             }
 
             // wait for worker to ack quorum reached then update pool with mined transactions
             match rx.await {
-                Ok(hash) => {
-                    // remove minded transactions
+                Ok(_hash) => {
+                    // read from watch channel to ensure only mined transactions are updated
+                    let latest = latest_update.borrow();
+
+                    //
+                    // TODO: is this a race condition?
+                    // - watch channel updated by pool maintenance after calling `on_canonical_state_change`
+                    //
+                    // only maintenance task can guarantee correct order of applying updates, but
+                    // this task needs to ensure the mined transactions are removed before building the next block
+
+                    // create canonical state update
+                    // use latest values so only mined transactions are updated
+                    let update = CanonicalStateUpdate {
+                        new_tip: &latest.new_tip,
+                        pending_block_base_fee: latest.pending_block_base_fee,
+                        pending_block_blob_fee: latest.pending_block_blob_fee,
+                        changed_accounts: vec![], // only updated by engine updates
+                        mined_transactions,
+                    };
+
+                    // update pool to remove mined transactions
+                    pool.on_canonical_state_change(update);
                 }
                 Err(e) => {
                     error!(target: "worker::block_builder", ?e, "quorum waiter failed ack failed");
                 }
             }
-
-            //
         });
 
         // return oneshot channel for receiving ack
         //
         // reply acknowledges the block was received and stored in db
         // see: worker::block_provider.rs
-        rx
+        // rx
+        todo!()
     }
 }
 
@@ -342,45 +328,6 @@ where
         // TODO: apply mined transactions to tx pool
 
         loop {
-            // check for canon updates before mining the transaction pool
-            //
-            // this is critical to ensure worker's block is building off canonical tip
-            // block until canon updates are applied
-            while let Poll::Ready(update) = this.canonical_state_updates.poll_next_unpin(cx) {
-                match update {
-                    Some(canon_update) => {
-                        // poll canon updates stream and update pool `.on_canon_update`
-                        //
-                        // maintenance task will handle worker's pending block update
-                        match canon_update {
-                            CanonStateNotification::Commit { new } => {
-                                //
-                                // New approach:
-                                // - update pool here to prevent race conditions between next block and pool maintenance
-                                // - this also calculates next basefee
-                                // - store this `CanonicalStateUpdate` and reuse when applying mined blocks
-                                //
-                                //
-
-                                // NOTE: avoid polling watch channel for `change` to prevent race
-                                // condition
-                                //
-                                // engine updates basefee watch channel before sending canon update
-                                //
-                                // tracking the basefee here ensures consistency and guarantees the
-                                // basefee is accurate based on the worker block builder's parent
-                                this.basefee = *this.basefee_watch.borrow_and_update();
-                                // update parent information
-                                this.parent = new.tip().header.clone();
-                            }
-                            _ => unreachable!("TN reorgs are impossible"),
-                        }
-                    }
-                    // stream closed
-                    None => return Poll::Ready(Ok(())),
-                }
-            }
-
             // only insert task if there is none
             //
             // note: it's important that the previous block build finishes before

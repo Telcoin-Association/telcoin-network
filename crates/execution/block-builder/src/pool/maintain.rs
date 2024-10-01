@@ -10,7 +10,7 @@ use crate::pool::backup::{changed_accounts_iter, load_accounts, LoadedAccounts};
 use super::metrics::MaintainPoolMetrics;
 use futures_util::{future::BoxFuture, FutureExt, Stream, StreamExt};
 use reth_chainspec::ChainSpec;
-use reth_primitives::{constants::MIN_PROTOCOL_BASE_FEE, Address};
+use reth_primitives::{constants::MIN_PROTOCOL_BASE_FEE, Address, SealedBlock, TxHash};
 use reth_provider::{
     BlockReaderIdExt, CanonStateNotification, Chain, ChainSpecProvider, ProviderError,
     StateProviderFactory,
@@ -24,8 +24,8 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
-use tokio::sync::oneshot;
-use tracing::{debug, trace};
+use tokio::sync::{oneshot, watch};
+use tracing::{debug, error, trace};
 
 /// Additional settings for maintaining the transaction pool
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +90,19 @@ pub(crate) struct MaintainTxPool<Provider, Pool, C> {
     /// Metrics for maintenance.
     metrics: MaintainPoolMetrics,
 
+    /// Watch channel for consistency.
+    ///
+    /// The block builder needs this information to build the next block.
+    /// The complexity comes from obtaining locks on the pool. The watch channel
+    /// is used to prevent the following scenario:
+    /// - block builder obtains pool's read lock for latest block info
+    /// - releases lock to obtain write lock for pool's `best_transactions` iter
+    /// - maintenance task obtains write lock before block builder and updates tip
+    /// - block pulls best transactions from updated pool with wrong latest tip
+    ///
+    /// Ultimately, TN needs to vendor it's own transaction pool solution.
+    latest_update: watch::Sender<LastCanonicalUpdate>,
+
     /// The worker's current base fee.
     basefee: Option<u64>,
 
@@ -106,12 +119,13 @@ where
     Pool: TransactionPoolExt + Unpin,
 {
     /// Create a new instance of [Self].
-    pub(crate) fn new(
+    fn new(
         config: PoolMaintenanceConfig,
         provider: Provider,
         pool: Pool,
         canonical_state_updates: C,
         basefee: Option<u64>,
+        latest_update: watch::Sender<LastCanonicalUpdate>,
     ) -> Self {
         let metrics = MaintainPoolMetrics::default();
 
@@ -136,6 +150,7 @@ where
             maintenance_state,
             metrics,
             basefee,
+            latest_update,
             reload_accounts_task,
         }
     }
@@ -143,7 +158,7 @@ where
     /// This method is called when a canonical state update is received.
     ///
     /// Trigger the maintenance task to Update pool before building the next block.
-    fn process_canon_state_update(&self, update: Arc<Chain>) {
+    fn process_canon_state_update(&mut self, update: Arc<Chain>) {
         trace!(target: "worker::pool_maintenance", ?update, "canon state update from engine");
 
         // update pool based with canonical tip update
@@ -158,7 +173,7 @@ where
         // remove any transactions that were mined
         //
         // NOTE: this worker's txs should already be removed during the block building process
-        let mined_transactions = blocks.transaction_hashes().collect();
+        let mined_transactions: Vec<TxHash> = blocks.transaction_hashes().collect();
 
         // wrong approach:
         // TODO: basefee should come from engine's watch channel
@@ -178,8 +193,22 @@ where
             mined_transactions,           // entire round of consensus
         };
 
+        // update watch channel after pool's lock is released
+        let latest = LastCanonicalUpdate {
+            new_tip: tip.block.clone(),
+            pending_block_base_fee,
+            pending_block_blob_fee: None,
+        };
+
         // sync fn so self will block until all pool updates are complete
         self.pool.on_canonical_state_change(update);
+
+        // update watch channel so block builder has latest information
+        //
+        // NOTE: the block builder reads from this channel after it obtains the lock
+        if let Err(e) = self.latest_update.send(latest) {
+            error!(target: "worker::pool_maintenance", ?e, "failed to update watch channel with latest canon update");
+        }
     }
 }
 
@@ -198,17 +227,14 @@ where
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let PoolMaintenanceConfig { max_reload_accounts } = self.config;
-
         let this = self.get_mut();
 
         // update loop that drains all canon updates and worker updates
         // then updates the pool
         loop {
             trace!(target: "txpool", state=?this.maintenance_state, "awaiting new worker block or canonical udpate");
-
             this.metrics.set_dirty_accounts_len(this.dirty_addresses.len());
-            let pool_info = this.pool.block_info();
+
             // check for canon updates first
             //
             // this is critical to ensure worker's block is building off canonical tip
@@ -271,9 +297,10 @@ where
 
             // reload accounts that are out-of-sync in chunks
             if !this.dirty_addresses.is_empty() && this.reload_accounts_task.is_none() {
+                let PoolMaintenanceConfig { max_reload_accounts } = this.config;
                 let (tx, rx) = oneshot::channel();
                 let c = this.provider.clone();
-                let at = pool_info.last_seen_block_hash;
+                let at = this.pool.block_info().last_seen_block_hash;
                 let fut = if this.dirty_addresses.len() > max_reload_accounts {
                     // need to chunk accounts to reload
                     let accs_to_reload = this
@@ -322,6 +349,7 @@ pub fn maintain_transaction_pool_future<Provider, P, C, Tasks>(
     canon_events: C,
     task_spawner: Tasks,
     config: PoolMaintenanceConfig,
+    latest_update: watch::Sender<LastCanonicalUpdate>,
 ) -> BoxFuture<'static, ()>
 where
     Provider: StateProviderFactory
@@ -335,7 +363,7 @@ where
     C: Stream<Item = CanonStateNotification> + Send + Unpin + 'static,
     Tasks: TaskSpawner + 'static,
 {
-    async move { MaintainTxPool::new(config, provider, pool, canon_events, None).await }.boxed()
+    async move { MaintainTxPool::new(config, provider, pool, canon_events, None, latest_update).await }.boxed()
 }
 
 /// Keeps track of the pool's state, whether the accounts in the pool are in sync with the actual
@@ -354,4 +382,22 @@ impl MaintainedPoolState {
     const fn is_drifted(&self) -> bool {
         matches!(self, Self::Drifted)
     }
+}
+
+/// The struct that obtains latest update information.
+///
+/// Similar to `CanonicalStateUpdate` but without the lifetime headache.
+/// This type is used to apply mined transaction updates without any other side effects.
+#[derive(Debug)]
+pub struct LastCanonicalUpdate {
+    /// The finalized block from the latest round of consensus.
+    pub new_tip: SealedBlock,
+    /// EIP-1559 Base fee of the _next_ (pending) block
+    ///
+    /// The base fee of a block depends on the utilization of the last block and its base fee.
+    pub pending_block_base_fee: u64,
+    /// EIP-4844 blob fee of the _next_ (pending) block
+    ///
+    /// Only after Cancun
+    pub pending_block_blob_fee: Option<u128>,
 }

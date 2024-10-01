@@ -106,20 +106,10 @@ impl<Pool, Provider> WorkerBlockBuilderArgs<Pool, Provider> {
 /// The configuration to use for building the next worker block.
 #[derive(Debug)]
 pub struct PendingBlockConfig {
-    /// The parent to use for building the next block.
-    pub parent: SealedHeader,
     /// The chain spec.
     pub chain_spec: Arc<ChainSpec>,
-    /// The timestamp (sec) for when this block was built.
-    pub timestamp: u64,
     /// The worker primary's address.
     pub beneficiary: Address,
-    /// The basefee for transactions included in this worker block.
-    pub basefee: u64,
-    /// The blobfee for blobs included in this worker block.
-    ///
-    /// TODO: TN currently does not support blobs.
-    pub blobfee: Option<u64>,
     /// The maximum gas for a block.
     ///
     /// This value is only measured by a transaction's gas_limit,
@@ -132,15 +122,11 @@ pub struct PendingBlockConfig {
 impl PendingBlockConfig {
     /// Creates a new instance of [Self].
     pub fn new(
-        parent: SealedHeader,
         chain_spec: Arc<ChainSpec>,
-        timestamp: u64,
         beneficiary: Address,
-        basefee: u64,
-        blobfee: Option<u64>,
         gas_limit: u64,
         max_size: usize,
     ) -> Self {
-        Self { parent, chain_spec, timestamp, beneficiary, basefee, blobfee, gas_limit, max_size }
+        Self { chain_spec, beneficiary, gas_limit, max_size }
     }
 }

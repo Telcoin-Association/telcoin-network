@@ -9,9 +9,12 @@ use reth_primitives::{
     B256, EMPTY_OMMER_ROOT_HASH, U256,
 };
 use reth_provider::StateProviderFactory;
-use reth_transaction_pool::{BestTransactionsAttributes, TransactionPool};
-use tn_types::{PendingBlockConfig, WorkerBlock, WorkerBlockBuilderArgs};
-use tracing::debug;
+use reth_transaction_pool::{BestTransactionsAttributes, BlockInfo, TransactionPool};
+use tn_types::{now, PendingBlockConfig, WorkerBlock, WorkerBlockBuilderArgs};
+use tokio::sync::watch;
+use tracing::{debug, warn};
+
+use crate::pool::LastCanonicalUpdate;
 
 /// The output from building the next block.
 ///
@@ -44,29 +47,30 @@ pub(crate) struct BlockBuilderOutput {
 #[inline]
 pub fn build_worker_block<Pool, Provider>(
     args: WorkerBlockBuilderArgs<Pool, Provider>,
+    latest_update: &watch::Receiver<LastCanonicalUpdate>,
 ) -> BlockBuilderOutput
 where
     Provider: StateProviderFactory,
     Pool: TransactionPool,
 {
     let WorkerBlockBuilderArgs { provider, pool, block_config } = args;
-    let PendingBlockConfig {
-        parent,
-        chain_spec,
-        timestamp,
-        beneficiary,
-        basefee,
-        blobfee,
-        gas_limit,
-        max_size,
-    } = block_config;
+    let PendingBlockConfig { chain_spec, beneficiary, gas_limit, max_size } = block_config;
 
     // NOTE: this holds a `read` lock on the tx pool
-    let mut best_txs =
-        pool.best_transactions_with_attributes(BestTransactionsAttributes::new(basefee, blobfee));
+    // pull best transactions and rely on watch channel to ensure basefee is current
+    let mut best_txs = pool.best_transactions();
+
+    // now that pool is locked, read from watch channel for latest pool info
+    //
+    // this ensures that basefee is correct for the round because the pool
+    // maintenance task can't update pool while this task holds the lock
+    // let LastCanonicalUpdate { new_tip, pending_block_base_fee, pending_block_blob_fee } =
+    //     *latest_update.borrow();
+    let latest = latest_update.borrow();
 
     // NOTE: worker blocks always build off the latest finalized block
-    let block_number = parent.number + 1;
+    let block_number = latest.new_tip.number + 1;
+    let parent_hash = latest.new_tip.hash();
 
     // collect data for successful transactions
     // let mut sum_blob_gas_used = 0;
@@ -117,6 +121,18 @@ where
 
     let transactions_root = proofs::calculate_transaction_root(&transactions);
 
+    // TODO: use ms for worker block and sec for final block?
+    //
+    // sometimes worker block are produced too quickly in certain configs (<1s)
+    // resulting in batch timestamp == parent timestamp
+    //
+    // TODO: check for this error at the quorum waiter level?
+    let mut timestamp = now();
+    if timestamp == latest.new_tip.timestamp {
+        warn!(target: "worker::block_builder", "new block timestamp same as parent - setting offset by 1sec");
+        timestamp = latest.new_tip.timestamp + 1;
+    }
+
     // create header
     //
     // NOTE: workers do not execute transactions. Peers validate:
@@ -124,7 +140,7 @@ where
     // - all other roots are defaults
     // - use ZERO for hashes
     let header = Header {
-        parent_hash: parent.hash(),
+        parent_hash,
         ommers_hash: EMPTY_OMMER_ROOT_HASH,
         beneficiary,
         state_root: B256::ZERO,
@@ -135,8 +151,8 @@ where
         timestamp,
         mix_hash: B256::ZERO,
         nonce: 0,
-        base_fee_per_gas: Some(basefee),
-        number: parent.number + 1,
+        base_fee_per_gas: Some(latest.pending_block_base_fee),
+        number: block_number,
         gas_limit,
         difficulty: U256::ZERO,
         gas_used: total_possible_gas,
