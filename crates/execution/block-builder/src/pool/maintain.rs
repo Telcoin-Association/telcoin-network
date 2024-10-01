@@ -160,17 +160,20 @@ where
         // NOTE: this worker's txs should already be removed during the block building process
         let mined_transactions = blocks.transaction_hashes().collect();
 
+        // wrong approach:
         // TODO: basefee should come from engine's watch channel
         // and engine should update basefee then make round canonical
         //
         // the watch channel MUST be updated before the canon notification
+        //
+        // INSTEAD: calculate the next basefee HERE for the entire round
         let pending_block_base_fee = self.basefee.unwrap_or(MIN_PROTOCOL_BASE_FEE);
 
         // Canonical update
         let update = CanonicalStateUpdate {
             new_tip: &tip.block,          // finalized block
             pending_block_base_fee,       // current base fee for worker (network-wide)
-            pending_block_blob_fee: None, // current base fee for worker (network-wide)
+            pending_block_blob_fee: None, // current blob fee for worker (network-wide)
             changed_accounts,             // entire round of consensus
             mined_transactions,           // entire round of consensus
         };

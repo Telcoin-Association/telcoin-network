@@ -13,6 +13,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 pub use block_builder::build_worker_block;
+use block_builder::BlockBuilderOutput;
 use consensus_metrics::metered_channel::Sender;
 use error::BlockBuilderResult;
 use futures_util::{FutureExt, StreamExt};
@@ -262,10 +263,23 @@ where
         // spawn block building task and forward to worker
         tokio::task::spawn(async move {
             // this is safe to call without a semaphore bc it's held as a single `Option`
-            let block = build_worker_block(build_args);
+            let BlockBuilderOutput { worker_block: block, mined_transactions } =
+                build_worker_block(build_args);
             if let Err(e) = to_worker.send(NewWorkerBlock { block, ack }).await {
                 error!(target: "worker::block_builder", ?e, "failed to send next block to worker");
             }
+
+            // wait for worker to ack quorum reached then update pool with mined transactions
+            match rx.await {
+                Ok(hash) => {
+                    // remove minded transactions
+                }
+                Err(e) => {
+                    error!(target: "worker::block_builder", ?e, "quorum waiter failed ack failed");
+                }
+            }
+
+            //
         });
 
         // return oneshot channel for receiving ack
@@ -324,6 +338,9 @@ where
         //
         // other option is to set an interval as specified in the config?
 
+        //
+        // TODO: apply mined transactions to tx pool
+
         loop {
             // check for canon updates before mining the transaction pool
             //
@@ -337,14 +354,21 @@ where
                         // maintenance task will handle worker's pending block update
                         match canon_update {
                             CanonStateNotification::Commit { new } => {
+                                //
+                                // New approach:
+                                // - update pool here to prevent race conditions between next block and pool maintenance
+                                // - this also calculates next basefee
+                                // - store this `CanonicalStateUpdate` and reuse when applying mined blocks
+                                //
+                                //
+
                                 // NOTE: avoid polling watch channel for `change` to prevent race
                                 // condition
                                 //
                                 // engine updates basefee watch channel before sending canon update
                                 //
                                 // tracking the basefee here ensures consistency and guarantees the
-                                // basefee is accurate based on the
-                                // worker block builder's parent
+                                // basefee is accurate based on the worker block builder's parent
                                 this.basefee = *this.basefee_watch.borrow_and_update();
                                 // update parent information
                                 this.parent = new.tip().header.clone();

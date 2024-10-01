@@ -4,20 +4,36 @@
 //!
 //! The
 
-
 use reth_primitives::{
-    constants::EMPTY_WITHDRAWALS, proofs, Bloom, Bytes, Header,
-    IntoRecoveredTransaction, B256,
-    EMPTY_OMMER_ROOT_HASH, U256,
+    constants::EMPTY_WITHDRAWALS, proofs, Bloom, Bytes, Header, IntoRecoveredTransaction, TxHash,
+    B256, EMPTY_OMMER_ROOT_HASH, U256,
 };
 use reth_provider::StateProviderFactory;
 use reth_transaction_pool::{BestTransactionsAttributes, TransactionPool};
 use tn_types::{PendingBlockConfig, WorkerBlock, WorkerBlockBuilderArgs};
 use tracing::debug;
 
+/// The output from building the next block.
+///
+/// Contains information needed to update the transaction pool.
+pub(crate) struct BlockBuilderOutput {
+    /// The block info for the worker to propose.
+    pub(crate) worker_block: WorkerBlock,
+    /// The transaction hashes mined in this worker's block.
+    ///
+    /// NOTE: canonical changes update `ChangedAccount` and changed senders.
+    /// Only the mined transactions are removed from the pool. Account nonce and state
+    /// should only be updated on canonical changes so workers can validate
+    /// each other's blocks off the canonical tip.
+    ///
+    /// This is less efficient when accounts have lots of transactions in the pending
+    /// pool, but this approach is easier to implement in the short term.
+    pub(crate) mined_transactions: Vec<TxHash>,
+}
+
 /// Construct an TN worker block using the best transactions from the pool.
 ///
-/// Returns the `WorkerBlock` and cannot fail. The worker block continues to add
+/// Returns the [`BlockBuilderOutput`] and cannot fail. The worker block continues to add
 /// transactions to the proposed block until either:
 /// - accumulated transaction gas limit reached (measured by tx.gas_limit())
 /// - max byte size of transactions (measured by tx.size())
@@ -28,7 +44,7 @@ use tracing::debug;
 #[inline]
 pub fn build_worker_block<Pool, Provider>(
     args: WorkerBlockBuilderArgs<Pool, Provider>,
-) -> WorkerBlock
+) -> BlockBuilderOutput
 where
     Provider: StateProviderFactory,
     Pool: TransactionPool,
@@ -56,9 +72,9 @@ where
     // let mut sum_blob_gas_used = 0;
     let mut total_bytes_size = 0;
     let mut total_possible_gas = 0;
-    let mut senders = Vec::new();
     let total_fees = U256::ZERO;
     let mut transactions = Vec::new();
+    let mut mined_transactions = Vec::new();
 
     // begin loop through sorted "best" transactions in pending pool
     // and execute them to build the block
@@ -95,7 +111,7 @@ where
         total_bytes_size += tx.size();
 
         // append transaction to the list of executed transactions
-        senders.push(tx.signer());
+        mined_transactions.push(tx.hash());
         transactions.push(tx.into_signed());
     }
 
@@ -131,6 +147,10 @@ where
         requests_root: None,
     };
 
-    // return worker block
-    WorkerBlock { transactions, sealed_header: header.seal_slow(), received_at: None }
+    // worker block
+    let worker_block =
+        WorkerBlock { transactions, sealed_header: header.seal_slow(), received_at: None };
+
+    // return output
+    BlockBuilderOutput { worker_block, mined_transactions }
 }
