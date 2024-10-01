@@ -137,8 +137,6 @@ where
     BT: CanonStateSubscriptions
         + ChainSpecProvider<ChainSpec = ChainSpec>
         + StateProviderFactory
-        + BlockchainTreeEngine
-        + FinalizedBlockReader
         + CanonChainTracker
         + Clone
         + 'static,
@@ -184,6 +182,14 @@ where
     ///
     /// This approach allows the engine to yield back to the runtime while executing blocks.
     /// Executing blocks is cpu intensive, so a blocking task is used.
+    ///
+    /// The task performs the following actions:
+    /// - create a block
+    /// - send the block to worker's block proposer
+    /// - wait for ack that quorum reached
+    /// - send mined transactions to maintenance task
+    /// - wait for ack that maintenance task is complete
+    /// - return result
     fn spawn_execution_task(&self) -> BlockBuildingTask {
         let provider = self.blockchain.clone();
         let pool = self.pool.clone();
@@ -222,10 +228,13 @@ where
             self.max_size,  // in bytes
         );
         let build_args = WorkerBlockBuilderArgs::new(provider, pool.clone(), config);
-        let (ack, rx) = oneshot::channel();
+        let (result, done) = oneshot::channel();
 
         // spawn block building task and forward to worker
         tokio::task::spawn(async move {
+            // ack once worker reaches quorum
+            let (ack, rx) = oneshot::channel();
+
             // this is safe to call without a semaphore bc it's held as a single `Option`
             let BlockBuilderOutput { worker_block: block, mined_transactions } =
                 build_worker_block(build_args, &latest_update);
@@ -237,7 +246,7 @@ where
 
             // wait for worker to ack quorum reached then update pool with mined transactions
             match rx.await {
-                Ok(_hash) => {
+                Ok(hash) => {
                     // read from watch channel to ensure only mined transactions are updated
                     let latest = latest_update.borrow();
 
@@ -247,6 +256,22 @@ where
                     //
                     // only maintenance task can guarantee correct order of applying updates, but
                     // this task needs to ensure the mined transactions are removed before building the next block
+                    //
+                    // is pool.block_info() a better bet?
+
+                    // what is the worst thing that could happen?
+                    // - maintenance task updates pool with round 2, but before updating watch channel this thread reads from watch channel and tries to obtain lock
+                    // - this task obtains pool lock and misses the update
+                    // - this task updates pool using info for round 1 (after pool was just updated for round 2)
+                    // - next loop, this task reads correct info from watch channel and updates for round 2
+                    //
+
+                    // TODO: the only way to guarantee correct order is to send mined txs to maintenance pool
+                    // to apply update correctly
+                    //
+                    // this task can wait for a oneshot channel again
+                    //
+                    // not thrilled about the complexity, but it's the best we can do until we create our own tx pool
 
                     // create canonical state update
                     // use latest values so only mined transactions are updated
@@ -260,6 +285,11 @@ where
 
                     // update pool to remove mined transactions
                     pool.on_canonical_state_change(update);
+
+                    // signal to Self that this task is complete
+                    if let Err(e) = result.send(hash) {
+                        error!(target: "worker::block_builder", ?e, "failed to send block builder result to block builder task");
+                    }
                 }
                 Err(e) => {
                     error!(target: "worker::block_builder", ?e, "quorum waiter failed ack failed");
@@ -267,12 +297,8 @@ where
             }
         });
 
-        // return oneshot channel for receiving ack
-        //
-        // reply acknowledges the block was received and stored in db
-        // see: worker::block_provider.rs
-        // rx
-        todo!()
+        // return oneshot channel for receiving completion status
+        done
     }
 }
 
@@ -297,7 +323,6 @@ where
         + CanonStateSubscriptions
         + ChainSpecProvider<ChainSpec = ChainSpec>
         + BlockReaderIdExt
-        + BlockchainTreeEngine
         + Clone
         + Unpin
         + 'static,
