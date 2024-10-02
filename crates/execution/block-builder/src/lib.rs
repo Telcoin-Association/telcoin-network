@@ -17,7 +17,6 @@ use block_builder::BlockBuilderOutput;
 use consensus_metrics::metered_channel::Sender;
 use error::BlockBuilderResult;
 use futures_util::{FutureExt, StreamExt};
-use pool::LastCanonicalUpdate;
 use reth_blockchain_tree::{BlockchainTreeEngine, BlockchainTreeViewer};
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
@@ -45,7 +44,7 @@ use tracing::{debug, error, trace, warn};
 mod block_builder;
 mod error;
 mod pool;
-pub use pool::{maintain_transaction_pool_future, PoolMaintenanceConfig};
+pub use pool::{maintain_transaction_pool_future, LastCanonicalUpdate, PoolMaintenanceConfig};
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 

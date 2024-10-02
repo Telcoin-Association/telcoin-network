@@ -203,9 +203,9 @@ where
         // sync fn so self will block until all pool updates are complete
         self.pool.on_canonical_state_change(update);
 
-        // update watch channel so block builder has latest information
+        // update watch channel so block builder has latest information after updates applied
         //
-        // NOTE: the block builder reads from this channel after it obtains the lock
+        // NOTE: the block builder reads from this channel before reading best txs
         if let Err(e) = self.latest_update.send(latest) {
             error!(target: "worker::pool_maintenance", ?e, "failed to update watch channel with latest canon update");
         }
