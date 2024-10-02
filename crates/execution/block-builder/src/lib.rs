@@ -66,7 +66,8 @@ pub mod test_utils;
 // - impl Future for BlockProposer like Engine
 
 /// Type alias for the blocking task that locks the tx pool and builds the next worker block.
-type BlockBuildingTask = oneshot::Receiver<B256>;
+type BlockBuildingTask = oneshot::Receiver<(B256, Vec<TxHash>)>;
+
 /// Type alias for the blocking task that locks the tx pool and updates account state.
 type PoolMaintenanceTask = oneshot::Receiver<B256>;
 
@@ -320,47 +321,8 @@ where
             // wait for worker to ack quorum reached then update pool with mined transactions
             match rx.await {
                 Ok(hash) => {
-                    // read from watch channel to ensure only mined transactions are updated
-                    let latest = latest_update.borrow();
-
-                    //
-                    // TODO: is this a race condition?
-                    // - watch channel updated by pool maintenance after calling `on_canonical_state_change`
-                    //
-                    // only maintenance task can guarantee correct order of applying updates, but
-                    // this task needs to ensure the mined transactions are removed before building the next block
-                    //
-                    // is pool.block_info() a better bet?
-
-                    // what is the worst thing that could happen?
-                    // - maintenance task updates pool with round 2, but before updating watch channel this thread reads from watch channel and tries to obtain lock
-                    // - this task obtains pool lock and misses the update
-                    // - this task updates pool using info for round 1 (after pool was just updated for round 2)
-                    // - next loop, this task reads correct info from watch channel and updates for round 2
-                    //
-
-                    // TODO: the only way to guarantee correct order is to send mined txs to maintenance pool
-                    // to apply update correctly
-                    //
-                    // this task can wait for a oneshot channel again
-                    //
-                    // not thrilled about the complexity, but it's the best we can do until we create our own tx pool
-
-                    // create canonical state update
-                    // use latest values so only mined transactions are updated
-                    let update = CanonicalStateUpdate {
-                        new_tip: &latest.new_tip,
-                        pending_block_base_fee: latest.pending_block_base_fee,
-                        pending_block_blob_fee: latest.pending_block_blob_fee,
-                        changed_accounts: vec![], // only updated by engine updates
-                        mined_transactions,
-                    };
-
-                    // update pool to remove mined transactions
-                    pool.on_canonical_state_change(update);
-
                     // signal to Self that this task is complete
-                    if let Err(e) = result.send(hash) {
+                    if let Err(e) = result.send((hash, mined_transactions)) {
                         error!(target: "worker::block_builder", ?e, "failed to send block builder result to block builder task");
                     }
                 }
@@ -475,7 +437,22 @@ where
                         // TODO: update tree's pending block?
                         //
                         // ensure no errors
-                        let _worker_block_hash = res?;
+                        let (_worker_block_hash, mined_transactions) = res?;
+
+                        // create canonical state update
+                        // use latest values so only mined transactions are updated
+                        let update = CanonicalStateUpdate {
+                            new_tip: &this.latest_canon_state.new_tip,
+                            pending_block_base_fee: this.latest_canon_state.pending_block_base_fee,
+                            pending_block_blob_fee: this.latest_canon_state.pending_block_blob_fee,
+                            changed_accounts: vec![], // only updated by engine updates
+                            mined_transactions,
+                        };
+
+                        // TODO: should this be a spawned blocking task?
+                        //
+                        // update pool to remove mined transactions
+                        this.pool.on_canonical_state_change(update);
 
                         // check max_builds and possibly return early
                         #[cfg(feature = "test-utils")]
@@ -491,6 +468,7 @@ where
                         // next block
                         continue;
                     }
+
                     Poll::Pending => {
                         this.pending_task = Some(receiver);
 
