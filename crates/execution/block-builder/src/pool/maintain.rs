@@ -24,6 +24,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
+use tn_types::LastCanonicalUpdate;
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, trace};
 
@@ -195,7 +196,7 @@ where
 
         // update watch channel after pool's lock is released
         let latest = LastCanonicalUpdate {
-            new_tip: tip.block.clone(),
+            tip: tip.block.clone(),
             pending_block_base_fee,
             pending_block_blob_fee: None,
         };
@@ -382,22 +383,4 @@ impl MaintainedPoolState {
     const fn is_drifted(&self) -> bool {
         matches!(self, Self::Drifted)
     }
-}
-
-/// The struct that obtains latest update information.
-///
-/// Similar to `CanonicalStateUpdate` but without the lifetime headache.
-/// This type is used to apply mined transaction updates without any other side effects.
-#[derive(Debug)]
-pub struct LastCanonicalUpdate {
-    /// The finalized block from the latest round of consensus.
-    pub new_tip: SealedBlock,
-    /// EIP-1559 Base fee of the _next_ (pending) block
-    ///
-    /// The base fee of a block depends on the utilization of the last block and its base fee.
-    pub pending_block_base_fee: u64,
-    /// EIP-4844 blob fee of the _next_ (pending) block
-    ///
-    /// Only after Cancun
-    pub pending_block_blob_fee: Option<u128>,
 }

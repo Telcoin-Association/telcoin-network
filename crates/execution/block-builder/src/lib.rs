@@ -31,13 +31,15 @@ use reth_provider::{
 };
 use reth_transaction_pool::{BlockInfo, CanonicalStateUpdate, TransactionPool, TransactionPoolExt};
 use std::{
+    any::Any,
     future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
 use tn_types::{
-    now, NewWorkerBlock, PendingBlockConfig, WorkerBlockBuilderArgs, WorkerBlockUpdateSender,
+    now, LastCanonicalUpdate, NewWorkerBlock, PendingBlockConfig, WorkerBlockBuilderArgs,
+    WorkerBlockUpdateSender,
 };
 use tokio::sync::{broadcast, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -46,7 +48,7 @@ use tracing::{debug, error, trace, warn};
 mod block_builder;
 mod error;
 mod pool;
-pub use pool::{maintain_transaction_pool_future, LastCanonicalUpdate, PoolMaintenanceConfig};
+pub use pool::{maintain_transaction_pool_future, PoolMaintenanceConfig};
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
@@ -79,7 +81,7 @@ type PoolMaintenanceTask = oneshot::Receiver<B256>;
 ///     - tries to build the next worker block when there transactions are available
 /// -
 #[derive(Debug)]
-pub struct BlockBuilder<BT, Pool, CE> {
+pub struct BlockBuilder<BT, Pool> {
     /// Single active future that executes consensus output on a blocking thread and then returns
     /// the result through a oneshot channel.
     pending_task: Option<BlockBuildingTask>,
@@ -101,8 +103,6 @@ pub struct BlockBuilder<BT, Pool, CE> {
     ///
     /// This is a solution until TN has it's own transaction pool implementation.
     latest_canon_state: LastCanonicalUpdate,
-    /// EVM configuration for executing transactions and building blocks.
-    evm_config: CE,
     // /// Optional round of consensus to finish executing before then returning. The value is used
     // to /// track the subdag index from consensus output. The index is also considered the
     // "round" of /// consensus and is included in executed blocks as  the block's `nonce`
@@ -132,11 +132,6 @@ pub struct BlockBuilder<BT, Pool, CE> {
     gas_limit: u64,
     /// The maximum size of collected transactions, measured in bytes.
     max_size: usize,
-    /// Watch channel to ensure consistency between pool maintenance tasks.
-    ///
-    /// Pool maintenance happens when the engine executes a round of consensus. The block builder
-    /// also applies pool updates when a worker block reaches quorum to remove mined transactions.
-    latest_update: watch::Receiver<LastCanonicalUpdate>,
     /// Optional number of blocks to build before shutting down.
     ///
     /// Engine can produce multiple blocks per round of consensus, so this number may not
@@ -148,7 +143,7 @@ pub struct BlockBuilder<BT, Pool, CE> {
     max_builds: Option<test_utils::MaxBuilds>,
 }
 
-impl<BT, Pool, CE> BlockBuilder<BT, Pool, CE>
+impl<BT, Pool> BlockBuilder<BT, Pool>
 where
     BT: CanonStateSubscriptions
         + ChainSpecProvider<ChainSpec = ChainSpec>
@@ -157,7 +152,6 @@ where
         + Clone
         + 'static,
     Pool: TransactionPoolExt + 'static,
-    CE: ConfigureEvm + Clone,
 {
     /// Create a new instance of [Self].
     #[allow(clippy::too_many_arguments)]
@@ -166,13 +160,11 @@ where
         pool: Pool,
         canonical_state_stream: CanonStateNotificationStream,
         latest_canon_state: LastCanonicalUpdate,
-        evm_config: CE,
         to_worker: Sender<NewWorkerBlock>,
         address: Address,
         pending_tx_hashes_stream: ReceiverStream<TxHash>,
         gas_limit: u64,
         max_size: usize,
-        latest_update: watch::Receiver<LastCanonicalUpdate>,
         #[cfg(feature = "test-utils")] max_builds: Option<usize>,
     ) -> Self {
         // create broadcast channels
@@ -185,14 +177,12 @@ where
             pool,
             canonical_state_stream,
             latest_canon_state,
-            evm_config,
             worker_block_updates,
             to_worker,
             address,
             pending_tx_hashes_stream,
             gas_limit,
             max_size,
-            latest_update,
             #[cfg(feature = "test-utils")]
             max_builds: max_builds.map(test_utils::MaxBuilds::new),
         }
@@ -200,7 +190,7 @@ where
 
     /// This method is called when a canonical state update is received.
     ///
-    /// Trigger the maintenance task to Update pool before building the next block.
+    /// Trigger the maintenance task to update pool before building the next block.
     fn process_canon_state_update(&mut self, update: Arc<Chain>) {
         trace!(target: "worker::pool_maintenance", ?update, "canon state update from engine");
 
@@ -238,7 +228,7 @@ where
 
         // update watch channel after pool's lock is released
         let latest = LastCanonicalUpdate {
-            new_tip: tip.block.clone(),
+            tip: tip.block.clone(),
             pending_block_base_fee,
             pending_block_blob_fee: None,
         };
@@ -265,7 +255,6 @@ where
         let pool = self.pool.clone();
         let chain_spec = provider.chain_spec();
         let to_worker = self.to_worker.clone();
-        let latest_update = self.latest_update.clone();
 
         // TODO: this is needs further scrutiny
         //
@@ -294,6 +283,7 @@ where
         let config = PendingBlockConfig::new(
             chain_spec,
             self.address,
+            self.latest_canon_state.clone(),
             self.gas_limit, // in wei
             self.max_size,  // in bytes
         );
@@ -311,7 +301,7 @@ where
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
             let BlockBuilderOutput { worker_block: block, mined_transactions } =
-                build_worker_block(build_args, &latest_update);
+                build_worker_block(build_args);
 
             // forward to worker and wait for ack that quorum was reached
             if let Err(e) = to_worker.send(NewWorkerBlock { block, ack }).await {
@@ -351,7 +341,7 @@ where
 ///
 /// If the broadcast stream is closed, the engine will attempt to execute all remaining tasks and
 /// any output that is queued.
-impl<BT, Pool, CE> Future for BlockBuilder<BT, Pool, CE>
+impl<BT, Pool> Future for BlockBuilder<BT, Pool>
 where
     BT: StateProviderFactory
         + CanonChainTracker
@@ -361,7 +351,6 @@ where
         + Clone
         + Unpin
         + 'static,
-    CE: ConfigureEvm,
     Pool: TransactionPool + TransactionPoolExt + Unpin + 'static,
     <Pool as TransactionPool>::Transaction: IntoRecoveredTransaction,
 {
@@ -442,7 +431,7 @@ where
                         // create canonical state update
                         // use latest values so only mined transactions are updated
                         let update = CanonicalStateUpdate {
-                            new_tip: &this.latest_canon_state.new_tip,
+                            new_tip: &this.latest_canon_state.tip,
                             pending_block_base_fee: this.latest_canon_state.pending_block_base_fee,
                             pending_block_blob_fee: this.latest_canon_state.pending_block_blob_fee,
                             changed_accounts: vec![], // only updated by engine updates

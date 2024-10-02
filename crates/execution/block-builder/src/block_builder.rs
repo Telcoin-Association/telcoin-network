@@ -14,8 +14,6 @@ use tn_types::{now, PendingBlockConfig, WorkerBlock, WorkerBlockBuilderArgs};
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
-use crate::pool::LastCanonicalUpdate;
-
 /// The output from building the next block.
 ///
 /// Contains information needed to update the transaction pool.
@@ -47,30 +45,22 @@ pub(crate) struct BlockBuilderOutput {
 #[inline]
 pub fn build_worker_block<Pool, Provider>(
     args: WorkerBlockBuilderArgs<Pool, Provider>,
-    latest_update: &watch::Receiver<LastCanonicalUpdate>,
 ) -> BlockBuilderOutput
 where
     Provider: StateProviderFactory,
     Pool: TransactionPool,
 {
     let WorkerBlockBuilderArgs { provider, pool, block_config } = args;
-    let PendingBlockConfig { chain_spec, beneficiary, gas_limit, max_size } = block_config;
+    let PendingBlockConfig { chain_spec, beneficiary, parent_info, gas_limit, max_size } =
+        block_config;
 
-    // now that pool is locked, read from watch channel for latest pool info
-    //
-    // this ensures that basefee is correct for the round because the pool
-    // maintenance task can't update pool while this task holds the lock
-    // let LastCanonicalUpdate { new_tip, pending_block_base_fee, pending_block_blob_fee } =
-    //     *latest_update.borrow();
-    let latest = latest_update.borrow();
-
-    // NOTE: this holds a `read` lock on the tx pool
+    // NOTE: this obtains a `read` lock on the tx pool
     // pull best transactions and rely on watch channel to ensure basefee is current
     let mut best_txs = pool.best_transactions();
 
     // NOTE: worker blocks always build off the latest finalized block
-    let block_number = latest.new_tip.number + 1;
-    let parent_hash = latest.new_tip.hash();
+    let block_number = parent_info.tip.number + 1;
+    let parent_hash = parent_info.tip.hash();
 
     // collect data for successful transactions
     // let mut sum_blob_gas_used = 0;
@@ -130,9 +120,9 @@ where
     //
     // TODO: check for this error at the quorum waiter level?
     let mut timestamp = now();
-    if timestamp == latest.new_tip.timestamp {
+    if timestamp == parent_info.tip.timestamp {
         warn!(target: "worker::block_builder", "new block timestamp same as parent - setting offset by 1sec");
-        timestamp = latest.new_tip.timestamp + 1;
+        timestamp = parent_info.tip.timestamp + 1;
     }
 
     // create header
@@ -153,7 +143,7 @@ where
         timestamp,
         mix_hash: B256::ZERO,
         nonce: 0,
-        base_fee_per_gas: Some(latest.pending_block_base_fee),
+        base_fee_per_gas: Some(parent_info.pending_block_base_fee),
         number: block_number,
         gas_limit,
         difficulty: U256::ZERO,

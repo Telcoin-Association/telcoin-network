@@ -4,4 +4,4 @@ mod backup;
 mod maintain;
 mod metrics;
 
-pub use maintain::{maintain_transaction_pool_future, LastCanonicalUpdate, PoolMaintenanceConfig};
+pub use maintain::{maintain_transaction_pool_future, PoolMaintenanceConfig};
