@@ -20,8 +20,10 @@ use futures_util::{FutureExt, StreamExt};
 use reth_blockchain_tree::{BlockchainTreeEngine, BlockchainTreeViewer};
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
+use reth_execution_types::ChangedAccount;
 use reth_primitives::{
-    Address, BlockNumHash, IntoRecoveredTransaction, SealedHeader, TxHash, B256,
+    constants::MIN_PROTOCOL_BASE_FEE, Address, BlockNumHash, IntoRecoveredTransaction,
+    SealedHeader, TxHash, B256,
 };
 use reth_provider::{
     BlockReaderIdExt, CanonChainTracker, CanonStateNotification, CanonStateNotificationStream,
@@ -84,6 +86,20 @@ pub struct BlockBuilder<BT, Pool, CE> {
     blockchain: BT,
     /// The transaction pool with pending transactions.
     pool: Pool,
+    /// Canonical state changes from the engine.
+    ///
+    /// Notifications are sent on this stream after each round of consensus
+    /// is executed. These updates are used to apply changes to the transaction pool.
+    canonical_state_stream: CanonStateNotificationStream,
+    /// Type to track the last canonical state update.
+    ///
+    /// The worker applies updates to the pool when it mines new transactions, but
+    /// the canonical tip and basefee only change through engine updates. This type
+    /// allows the worker to apply mined transactions updates without affecting the
+    /// tip or basefee between rounds of consensus.
+    ///
+    /// This is a solution until TN has it's own transaction pool implementation.
+    latest_canon_state: LastCanonicalUpdate,
     /// EVM configuration for executing transactions and building blocks.
     evm_config: CE,
     // /// Optional round of consensus to finish executing before then returning. The value is used
@@ -147,6 +163,8 @@ where
     pub fn new(
         blockchain: BT,
         pool: Pool,
+        canonical_state_stream: CanonStateNotificationStream,
+        latest_canon_state: LastCanonicalUpdate,
         evm_config: CE,
         to_worker: Sender<NewWorkerBlock>,
         address: Address,
@@ -164,6 +182,8 @@ where
             pending_task: None,
             blockchain,
             pool,
+            canonical_state_stream,
+            latest_canon_state,
             evm_config,
             worker_block_updates,
             to_worker,
@@ -175,6 +195,56 @@ where
             #[cfg(feature = "test-utils")]
             max_builds: max_builds.map(test_utils::MaxBuilds::new),
         }
+    }
+
+    /// This method is called when a canonical state update is received.
+    ///
+    /// Trigger the maintenance task to Update pool before building the next block.
+    fn process_canon_state_update(&mut self, update: Arc<Chain>) {
+        trace!(target: "worker::pool_maintenance", ?update, "canon state update from engine");
+
+        // update pool based with canonical tip update
+        let (blocks, state) = update.inner();
+        let tip = blocks.tip();
+
+        // collect all accounts that changed in last round of consensus
+        let changed_accounts: Vec<ChangedAccount> = state
+            .accounts_iter()
+            .filter_map(|(addr, acc)| acc.map(|acc| (addr, acc)))
+            .map(|(address, acc)| ChangedAccount {
+                address,
+                nonce: acc.nonce,
+                balance: acc.balance,
+            })
+            .collect();
+
+        // remove any transactions that were mined
+        //
+        // NOTE: this worker's txs should already be removed during the block building process
+        let mined_transactions: Vec<TxHash> = blocks.transaction_hashes().collect();
+
+        // TODO: calculate the next basefee HERE for the entire round
+        let pending_block_base_fee = MIN_PROTOCOL_BASE_FEE;
+
+        // Canonical update
+        let update = CanonicalStateUpdate {
+            new_tip: &tip.block,          // finalized block
+            pending_block_base_fee,       // current base fee for worker (network-wide)
+            pending_block_blob_fee: None, // current blob fee for worker (network-wide)
+            changed_accounts,             // entire round of consensus
+            mined_transactions,           // entire round of consensus
+        };
+
+        // update watch channel after pool's lock is released
+        let latest = LastCanonicalUpdate {
+            new_tip: tip.block.clone(),
+            pending_block_base_fee,
+            pending_block_blob_fee: None,
+        };
+
+        // sync fn so self will block until all pool updates are complete
+        self.pool.on_canonical_state_change(update);
+        self.latest_canon_state = latest;
     }
 
     /// Spawns a blocking task to execute consensus output.
@@ -356,6 +426,24 @@ where
         // TODO: apply mined transactions to tx pool
 
         loop {
+            // check for canon updates before mining the transaction pool
+            //
+            // this is critical to ensure worker's block is building off canonical tip
+            // block until canon updates are applied
+            while let Poll::Ready(Some(canon_update)) =
+                this.canonical_state_stream.poll_next_unpin(cx)
+            {
+                // poll canon updates stream and update pool `.on_canon_update`
+                //
+                // maintenance task will handle worker's pending block update
+                match canon_update {
+                    CanonStateNotification::Commit { new } => {
+                        this.process_canon_state_update(new);
+                    }
+                    _ => unreachable!("TN reorgs are impossible"),
+                }
+            }
+
             // only insert task if there is none
             //
             // note: it's important that the previous block build finishes before
