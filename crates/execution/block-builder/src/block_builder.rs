@@ -56,10 +56,6 @@ where
     let WorkerBlockBuilderArgs { provider, pool, block_config } = args;
     let PendingBlockConfig { chain_spec, beneficiary, gas_limit, max_size } = block_config;
 
-    // NOTE: this holds a `read` lock on the tx pool
-    // pull best transactions and rely on watch channel to ensure basefee is current
-    let mut best_txs = pool.best_transactions();
-
     // now that pool is locked, read from watch channel for latest pool info
     //
     // this ensures that basefee is correct for the round because the pool
@@ -67,6 +63,10 @@ where
     // let LastCanonicalUpdate { new_tip, pending_block_base_fee, pending_block_blob_fee } =
     //     *latest_update.borrow();
     let latest = latest_update.borrow();
+
+    // NOTE: this holds a `read` lock on the tx pool
+    // pull best transactions and rely on watch channel to ensure basefee is current
+    let mut best_txs = pool.best_transactions();
 
     // NOTE: worker blocks always build off the latest finalized block
     let block_number = latest.new_tip.number + 1;
@@ -83,6 +83,8 @@ where
     // begin loop through sorted "best" transactions in pending pool
     // and execute them to build the block
     while let Some(pool_tx) = best_txs.next() {
+        // filter best transactions against Arc<hashset<TxHash>>
+
         // ensure block has capacity (in gas) for this transaction
         if total_possible_gas + pool_tx.gas_limit() > gas_limit {
             // the tx could exceed max gas limit for the block
