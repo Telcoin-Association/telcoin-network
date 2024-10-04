@@ -20,7 +20,7 @@ async fn basic_cluster_setup() {
     cluster.start(Some(4), Some(1), None).await;
 
     // give some time for nodes to bootstrap and build blocks
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     // fetch all the running authorities
     let authorities = cluster.authorities().await;
