@@ -53,19 +53,11 @@ Because blocks contain these fields, they are accessible to be re-purposed for T
 ##### Mixed Hash
 *Ethereum*: A 256-bit hash which, combined with the nonce, proves that a sufficient amount of computation has been carried out on this block (formally Hm). Post-merge, execution clients (reth and geth) use it to hold the prev randao value used to select the next quorum of validators by beacon chain. The block has `mixed_hash` and the beacon block has `prev_randao`. These values are converted when the execution payload is constructed from the built block and used by Beacon chain for validator shuffling.
 
-*TN*: WIP. Validators are shuffled with a separate mechanism, however sufficient randomness is passed to the execution layer through this value. The mix hash is used as a source of randomness on-chain.
+*TN*: Validators are shuffled with a separate mechanism, however sufficient randomness is passed to the execution layer through this value. The mix hash is used as a source of randomness on-chain.
 
-Simply using the digest from consensus output is an insufficient source of randomness because batches can be built off historic parents. An attacker could theoretically know the next digest and anticipate the mix hash in the upcoming batch. The ability to predict upcoming mix hashes would undermine the security of on-chain programs that rely on PREVRANDAO as a source of randomness in the EVM.
+The mix hash for a worker's block must be random, providing security for smart contracts relying on it. It also must be verifiable and impossible to manipulate. The consensus output is a hash of data, including aggregate BLS signatures, which is a good source of randomness. The mix hash is generated from the worker block's hash and the consensus output using XOR bitwise operation to ensure mix hashes are unique within a round.
 
-Instead, the digest of consensus output should be mixed with another value that the worker knows at the time of block construction (ie - number of transactions in the batch? timestamp? some value that can be used to reproduce the mix hash with extreme difficulty in predicting).
-
-Using values from the worker's own block requires trust in the node operator. Malicious operators could intentionally withhold transactions or force block production at a convenient time to ensure favorable execution environment. Using values such as timestamp or number of transactions provides an opportunity for manipulating the mix hash value.
-
-Is there a value peers can use? Might need to be signature-based. What is a value that node operators cannot manipulate without peers witnessing?
-
-The mix hash for a worker's block must be random, providing security for smart contracts relying on it. It also must be verifiable and impossible to manipulate. After consensus, the mix hash value is reused to ensure consistent execution results. During re-execution for finality, the mix hash can be known because no other transactions are possibly included. The only possibility is for them to be removed.
-
-*Logic*:  On-chain programs might rely on this value for randomness, and it must be consistent when the batch is made and the final block is executed. It's also important that the random value is verifiable yet unpredictable and difficult to manipulate. Further consideration is needed to guarantee this value.
+*Logic*: Ensure back-to-back blocks are executed within the same round to prevent attacks on-chain that might take advantage of knowing the mix hash during execution.
 
 ##### Extra Data
 *Ethereum*: Anything a validator wants to use - 32 bytes.
