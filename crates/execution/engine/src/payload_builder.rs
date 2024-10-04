@@ -49,7 +49,7 @@ where
     // create ommers while converting Batch to SealedBlockWithSenders
 
     // capture values from consensus output for full execution
-    let output_digest = output.digest();
+    let output_digest: B256 = output.digest().into();
     let sealed_blocks_with_senders = output.sealed_blocks_from_blocks()?;
     let ommers = output.ommers();
 
@@ -79,20 +79,6 @@ where
         let base_fee_per_gas = canonical_header.base_fee_per_gas.unwrap_or_default();
         let gas_limit = canonical_header.gas_limit;
 
-        // mix hash is the parent's consensus output digest
-        // TODO: this needs to stay consistent with initial block construction but is easy to
-        // manipulate for workers. For now, this should provide sufficient randomness for on-chain
-        // security in the next round.
-        //
-        // calculate mix hash as a source of randomness
-        // - consensus output digest from parent (beacon block root)
-        // - timestamp
-        //
-        // see https://eips.ethereum.org/EIPS/eip-4399
-        let mix_hash = output.mix_hash_for_empty_payload(
-            &canonical_header.parent_beacon_block_root.unwrap_or_default(),
-        );
-
         // empty withdrawals
         let withdrawals = Withdrawals::new(vec![]);
         let payload_attributes = TNPayloadAttributes::new(
@@ -102,10 +88,10 @@ where
             0,
             B256::ZERO, // no batch to digest
             &output,
-            output_digest.into(),
+            output_digest,
             base_fee_per_gas,
             gas_limit,
-            mix_hash,
+            output_digest, // use output digest for mix hash
             withdrawals,
         );
         let payload = TNPayload::new(payload_attributes);
@@ -132,7 +118,9 @@ where
             // use batch's base fee, gas limit, and withdrawals
             let base_fee_per_gas = block.base_fee_per_gas.unwrap_or_default();
             let gas_limit = block.gas_limit;
-            let mix_hash = block.mix_hash;
+
+            // apply XOR bitwise operator with worker's digest to ensure unique mixed hash per block for round
+            let mix_hash = output_digest ^ block.hash();
             let withdrawals = block.withdrawals.clone().unwrap_or_else(|| Withdrawals::new(vec![]));
             let payload_attributes = TNPayloadAttributes::new(
                 canonical_header,
