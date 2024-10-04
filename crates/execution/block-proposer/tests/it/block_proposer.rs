@@ -29,7 +29,8 @@ use tempfile::TempDir;
 use tn_block_proposer::{BlockProposerBuilder, MiningMode};
 use tn_block_validator::{BlockValidation, BlockValidator};
 use tn_types::{
-    test_utils::{get_gas_price, test_genesis, TransactionFactory}, PendingWorkerBlock, PreSubscribedBroadcastSender, WorkerBlock,
+    test_utils::{get_gas_price, test_genesis, TransactionFactory},
+    PendingWorkerBlock, PreSubscribedBroadcastSender, WorkerBlock,
 };
 use tokio::{sync::watch, time::timeout};
 use tracing::debug;

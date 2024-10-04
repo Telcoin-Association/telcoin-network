@@ -376,7 +376,8 @@ mod tests {
                 difficulty: U256::ZERO,
                 number: 1,
                 gas_limit: 30_000_000,
-                gas_used: 3_000_000, // TxFactory sets limit to 1_000_000 * 3txs                timestamp: 1701790139,
+                gas_used: 3_000_000, /* TxFactory sets limit to 1_000_000 * 3txs
+                                      * timestamp: 1701790139, */
                 timestamp: 1701790139,
                 mix_hash: B256::ZERO,
                 nonce: 0,

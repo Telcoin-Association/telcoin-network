@@ -119,7 +119,8 @@ where
             let base_fee_per_gas = block.base_fee_per_gas.unwrap_or_default();
             let gas_limit = block.gas_limit;
 
-            // apply XOR bitwise operator with worker's digest to ensure unique mixed hash per block for round
+            // apply XOR bitwise operator with worker's digest to ensure unique mixed hash per block
+            // for round
             let mix_hash = output_digest ^ block.hash();
             let withdrawals = block.withdrawals.clone().unwrap_or_else(|| Withdrawals::new(vec![]));
             let payload_attributes = TNPayloadAttributes::new(
