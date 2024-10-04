@@ -2,6 +2,7 @@
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+
 use crate::{aggregators::VotesAggregator, synchronizer::Synchronizer};
 
 use consensus_metrics::{metered_channel::Receiver, monitored_future, spawn_logged_monitored_task};
@@ -11,8 +12,7 @@ use narwhal_network::anemo_ext::NetworkExt;
 use narwhal_primary_metrics::PrimaryMetrics;
 use narwhal_storage::CertificateStore;
 use narwhal_typed_store::traits::Database;
-use std::{sync::Arc, time::Duration};
-use telcoin_macros::fail_point_async;
+use std::{future::Future, pin::pin, sync::Arc, task::Poll, time::Duration};
 use tn_types::{AuthorityIdentifier, Committee};
 
 use narwhal_network_types::{PrimaryToPrimaryClient, RequestVoteRequest};
@@ -82,6 +82,7 @@ impl<DB: Database> Certifier<DB> {
     ) -> JoinHandle<()> {
         spawn_logged_monitored_task!(
             async move {
+                info!(target: "primary::certifier", "Certifier on node {} has started successfully.", authority_id);
                 Self {
                     authority_id,
                     committee,
@@ -95,29 +96,11 @@ impl<DB: Database> Certifier<DB> {
                     network: primary_network,
                     metrics,
                 }
-                .run_inner()
-                .await
+                .await;
+                info!(target: "primary::certifier", "Certifier on node {} has shutdown.", authority_id);
             },
             "CertifierTask"
         )
-    }
-
-    #[instrument(level = "info", skip_all)]
-    async fn run_inner(self) {
-        // copy authority id for errors
-        let authority = self.authority_id;
-        let core = async move { self.run().await };
-
-        match core.await {
-            Err(err @ DagError::ShuttingDown) => {
-                error!(target: "primary::certifier", ?authority, ?err, "core error")
-            }
-            Err(err) => {
-                error!(target: "primary::certifier", ?authority, ?err, "PANIC");
-                panic!("{:?} - {:?}", authority, err)
-            }
-            Ok(_) => info!(target: "primary::certifier", ?authority, "run_inner complete"),
-        }
     }
 
     /// Requests a vote for a Header from the given peer. Retries indefinitely until either a
@@ -340,95 +323,84 @@ impl<DB: Database> Certifier<DB> {
 
         Ok(certificate)
     }
+}
 
-    /// Logs Certifier errors as appropriate.
-    fn process_result(&self, result: &DagResult<()>) {
-        match result {
-            Ok(()) => (),
-            Err(DagError::StoreError(e)) => {
-                error!(target: "primary::certifier", authority=?self.authority_id, "PANIC - {e}");
-                panic!("Storage failure: killing node.");
-            }
-            Err(
-                e @ DagError::TooOld(..)
-                | e @ DagError::VoteTooOld(..)
-                | e @ DagError::InvalidEpoch { .. },
-            ) => debug!(target: "primary::certifier", authority=?self.authority_id, "{e}"),
-            Err(e) => {
-                warn!(target: "primary::certifier", "processing result: {:?} - {e}", self.authority_id)
-            }
+impl<DB: Database> Future for Certifier<DB> {
+    // Errors are either loggable events or show stoppers so we don't return an error type.
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+
+        // Are we done?
+        if pin!(this.rx_shutdown.receiver.recv()).poll(cx).is_ready() {
+            return Poll::Ready(());
         }
-    }
 
-    /// Main loop listening to incoming messages.
-    pub async fn run(mut self) -> DagResult<Self> {
-        info!(target: "primary::certifier", "Certifier on node {} has started successfully.", self.authority_id);
-        loop {
-            let result = tokio::select! {
-                // We also receive here our new headers created by the `Proposer`.
-                // TODO: move logic into Proposer.
-                Some(header) = self.rx_headers.recv() => {
-                    debug!(target: "primary::certifier", authority=?self.authority_id, ?header, "header received!");
-                    let (tx_cancel, rx_cancel) = oneshot::channel();
-                    if let Some(cancel) = self.cancel_proposed_header {
-                        let _ = cancel.send(());
-                    }
-                    self.cancel_proposed_header = Some(tx_cancel);
+        // We also receive here our new headers created by the `Proposer`.
+        while let Poll::Ready(Some(header)) = this.rx_headers.poll_recv(cx) {
+            debug!(target: "primary::certifier", authority=?this.authority_id, ?header, "header received!");
+            let (tx_cancel, rx_cancel) = oneshot::channel();
+            if let Some(cancel) = this.cancel_proposed_header.take() {
+                let _ = cancel.send(());
+            }
+            this.cancel_proposed_header = Some(tx_cancel);
 
-                    let name = self.authority_id;
-                    let committee = self.committee.clone();
-                    let certificate_store = self.certificate_store.clone();
-                    let signature_service = self.signature_service.clone();
-                    let metrics = self.metrics.clone();
-                    let network = self.network.clone();
-                    fail_point_async!("narwhal-delay");
-                    debug!(target: "primary::certifier", authority=?self.authority_id, "spawning proposer header task...");
-                    self.propose_header_tasks.spawn(monitored_future!(Self::propose_header(
-                        name,
-                        committee,
-                        certificate_store,
-                        signature_service,
-                        metrics,
-                        network,
-                        header,
-                        rx_cancel,
-                    )));
-                    Ok(())
-                },
+            let name = this.authority_id;
+            let committee = this.committee.clone();
+            let certificate_store = this.certificate_store.clone();
+            let signature_service = this.signature_service.clone();
+            let metrics = this.metrics.clone();
+            let network = this.network.clone();
+            debug!(target: "primary::certifier", authority=?this.authority_id, "spawning proposer header task...");
+            this.propose_header_tasks.spawn(monitored_future!(Self::propose_header(
+                name,
+                committee,
+                certificate_store,
+                signature_service,
+                metrics,
+                network,
+                header,
+                rx_cancel,
+            )));
+        }
 
-                // Process certificates formed after receiving enough votes.
-                // TODO: move logic into Proposer.
-                Some(result) = self.propose_header_tasks.join_next() => {
-                    debug!(target: "primary::certifier", authority=?self.authority_id, ?result, "joining next propose_header_task");
-                    match result {
-                        Ok(Ok(certificate)) => {
-                            fail_point_async!("narwhal-delay");
-                            self.synchronizer.accept_own_certificate(certificate).await
-                        },
-                        Ok(Err(e)) => Err(e),
-                        Err(e) => {
-                            if e.is_cancelled() {
-                                error!(target: "primary::certifier", authority=?self.authority_id, "Certifier error: task cancelled! Shutting down...");
-                                // Ungraceful shutdown.
-                                Err(DagError::ShuttingDown)
-                            } else if e.is_panic() {
-                                error!(target: "primary::certifier", authority=?self.authority_id, "PANIC");
-                                // propagate panics.
-                                std::panic::resume_unwind(e.into_panic());
-                            } else {
-                                error!(target: "primary::certifier", authority=?self.authority_id, "PANIC");
-                                panic!("propose header task failed: {:?} - {e}", self.authority_id);
-                            }
-                        },
-                    }
-                },
-
-                _ = self.rx_shutdown.receiver.recv() => {
-                    return Ok(self);
+        // Process certificates formed after receiving enough votes.
+        let join_next = this.propose_header_tasks.join_next();
+        if let Poll::Ready(Some(result)) = pin!(join_next).poll(cx) {
+            debug!(target: "primary::certifier", authority=?this.authority_id, ?result, "joining next propose_header_task");
+            match result {
+                Ok(Ok(certificate)) => {
+                    let synchronizer = this.synchronizer.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = synchronizer.accept_own_certificate(certificate).await {
+                            error!("error accepting own certificate: {e}");
+                        }
+                    });
                 }
-            };
-
-            self.process_result(&result);
+                Ok(Err(e)) => {
+                    error!(target: "primary::certifier", authority=?this.authority_id, "Certifier error on proposed header task: {e}");
+                }
+                Err(e) => {
+                    if e.is_cancelled() {
+                        // Ungraceful task shutdown.
+                        error!(target: "primary::certifier", authority=?this.authority_id, "Certifier error: task cancelled! Shutting down...");
+                        //Err(DagError::ShuttingDown);
+                    } else if e.is_panic() {
+                        error!(target: "primary::certifier", authority=?this.authority_id, "PANIC");
+                        // propagate panics.
+                        std::panic::resume_unwind(e.into_panic());
+                    } else {
+                        error!(target: "primary::certifier", authority=?this.authority_id, "PANIC");
+                        panic!("propose header task failed: {:?} - {e}", this.authority_id);
+                    }
+                }
+            }
         }
+
+        Poll::Pending
     }
 }

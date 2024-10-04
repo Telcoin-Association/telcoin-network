@@ -7,7 +7,7 @@
 //! signature to be EVM compatible. The faucet service does all of this and
 //! then submits the transaction to the RPC Transaction Pool for the next batch.
 
-use crate::util::create_validator_info;
+use crate::util::{create_validator_info, IT_TEST_MUTEX};
 use alloy::{network::EthereumWallet, providers::ProviderBuilder, sol, sol_types::SolValue};
 use clap::Parser;
 use gcloud_sdk::{
@@ -53,6 +53,7 @@ use tracing::{debug, error, info};
 
 #[tokio::test]
 async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
     init_test_tracing();
 
     // create google env and temp chain spec for state initialization

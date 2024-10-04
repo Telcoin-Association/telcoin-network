@@ -1,4 +1,4 @@
-use crate::util::config_local_testnet;
+use crate::util::{config_local_testnet, IT_TEST_MUTEX};
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
 use rand::{rngs::StdRng, SeedableRng};
@@ -126,6 +126,7 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
 
 #[test]
 fn test_restarts() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
     init_test_tracing();
     // the tmp dir should be removed once tmp_quard is dropped
     let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");

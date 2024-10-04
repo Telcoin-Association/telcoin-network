@@ -15,11 +15,13 @@ impl<K: KeyT> Key for KeyWrap<K> {
 }
 
 impl<K: KeyT> Value for KeyWrap<K> {
-    type SelfType<'a> = K
+    type SelfType<'a>
+        = K
     where
         Self: 'a;
 
-    type AsBytes<'a> = Vec<u8>
+    type AsBytes<'a>
+        = Vec<u8>
     where
         Self: 'a;
 
@@ -51,11 +53,13 @@ impl<K: KeyT> Value for KeyWrap<K> {
 #[derive(Debug)]
 pub struct ValWrap<V: ValueT>(PhantomData<V>);
 impl<V: ValueT> Value for ValWrap<V> {
-    type SelfType<'a> = V
+    type SelfType<'a>
+        = V
     where
         Self: 'a;
 
-    type AsBytes<'a> = Vec<u8>
+    type AsBytes<'a>
+        = Vec<u8>
     where
         Self: 'a;
 
