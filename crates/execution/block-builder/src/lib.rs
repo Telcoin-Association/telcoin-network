@@ -17,31 +17,24 @@ use block_builder::BlockBuilderOutput;
 use consensus_metrics::metered_channel::Sender;
 use error::BlockBuilderResult;
 use futures_util::{FutureExt, StreamExt};
-use reth_blockchain_tree::{BlockchainTreeEngine, BlockchainTreeViewer};
 use reth_chainspec::ChainSpec;
-use reth_evm::ConfigureEvm;
 use reth_execution_types::ChangedAccount;
 use reth_primitives::{
-    constants::MIN_PROTOCOL_BASE_FEE, Address, BlockNumHash, IntoRecoveredTransaction,
-    SealedHeader, TxHash, B256,
+    constants::MIN_PROTOCOL_BASE_FEE, Address, IntoRecoveredTransaction, TxHash, B256,
 };
 use reth_provider::{
     BlockReaderIdExt, CanonChainTracker, CanonStateNotification, CanonStateNotificationStream,
-    CanonStateSubscriptions, Chain, ChainSpecProvider, FinalizedBlockReader, StateProviderFactory,
+    CanonStateSubscriptions, Chain, ChainSpecProvider, StateProviderFactory,
 };
-use reth_transaction_pool::{BlockInfo, CanonicalStateUpdate, TransactionPool, TransactionPoolExt};
+use reth_transaction_pool::{CanonicalStateUpdate, TransactionPool, TransactionPoolExt};
 use std::{
-    any::Any,
     future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
-use tn_types::{
-    now, LastCanonicalUpdate, NewWorkerBlock, PendingBlockConfig, WorkerBlockBuilderArgs,
-    WorkerBlockUpdateSender,
-};
-use tokio::sync::{broadcast, oneshot, watch};
+use tn_types::{LastCanonicalUpdate, NewWorkerBlock, PendingBlockConfig, WorkerBlockBuilderArgs};
+use tokio::sync::{oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, trace, warn};
 
@@ -109,10 +102,6 @@ pub struct BlockBuilder<BT, Pool> {
     // value. ///
     // /// NOTE: this is primarily useful for debugging and testing
     // max_round: Option<u64>,
-    /// The sending side of broadcast channel when a worker has successfully proposed a new block.
-    ///
-    /// The RPC and transaction pool subsribe to these updates.
-    worker_block_updates: WorkerBlockUpdateSender,
     /// The sending side to the worker's batch maker.
     ///
     /// Sending the new block through this channel triggers a broadcast to all peers.
@@ -167,17 +156,12 @@ where
         max_size: usize,
         #[cfg(feature = "test-utils")] max_builds: Option<usize>,
     ) -> Self {
-        // create broadcast channels
-        // NOTE: it's important that worker updates are processed quickly
-        let (worker_block_updates, _) = broadcast::channel(10);
-
         Self {
             pending_task: None,
             blockchain,
             pool,
             canonical_state_stream,
             latest_canon_state,
-            worker_block_updates,
             to_worker,
             address,
             pending_tx_hashes_stream,
@@ -427,6 +411,10 @@ where
                         //
                         // ensure no errors
                         let (_worker_block_hash, mined_transactions) = res?;
+
+                        // TODO: ensure this triggers faucet to track mined event
+                        // - faucet to keep track of nonce state?
+                        // - txhash mined event, keep track of highest nonce?
 
                         // create canonical state update
                         // use latest values so only mined transactions are updated

@@ -3,16 +3,9 @@
 //! This is an experimental approach to supporting pending blocks for workers.
 
 use reth_chainspec::ChainSpec;
-use reth_primitives::{Address, SealedBlock, SealedBlockWithSenders, SealedHeader};
+use reth_primitives::{Address, SealedBlock};
 use reth_provider::ExecutionOutcome;
 use std::sync::Arc;
-use tokio::sync::broadcast;
-
-/// Type alias for a sender that sends [`WorkerBlockUpdates`]
-pub type WorkerBlockUpdateSender = broadcast::Sender<WorkerBlockUpdate>;
-
-/// Type alias for a receiver that receives [`CanonStateNotification`]
-pub type WorkerBlockUpdates = broadcast::Receiver<WorkerBlockUpdate>;
 
 /// The type that holds the worker's pending block.
 ///
@@ -20,10 +13,6 @@ pub type WorkerBlockUpdates = broadcast::Receiver<WorkerBlockUpdate>;
 /// batch.
 #[derive(Debug, Default)]
 pub struct PendingWorkerBlock {
-    /// The finalized, canonical tip used to propose this block.
-    pub parent: SealedBlock,
-    /// The sealed block the worker is proposing.
-    pub pending: SealedBlockWithSenders,
     /// The state from execution outcome.
     state: Option<ExecutionOutcome>,
 }
@@ -31,8 +20,7 @@ pub struct PendingWorkerBlock {
 impl PendingWorkerBlock {
     /// Create a new instance of [Self].
     pub fn new(state: Option<ExecutionOutcome>) -> Self {
-        todo!()
-        // Self { state }
+        Self { state }
     }
 
     /// Return data for worker's current pending block.
@@ -51,34 +39,6 @@ impl PendingWorkerBlock {
             .unwrap_or_default()
             .unwrap_or_default()
             .map(|a| a.nonce)
-    }
-}
-
-/// The information from a worker's pending block proposal that is streamed to the transaction
-/// pool's maintenance task for updating transaction status.
-#[derive(Clone, Debug)]
-pub struct WorkerBlockUpdate {
-    /// The finalized, canonical tip used to propose this block.
-    pub parent: SealedBlock,
-    /// The sealed block the worker is proposing.
-    pub pending: SealedBlockWithSenders,
-    /// The state from execution outcome.
-    pub state: ExecutionOutcome,
-}
-
-impl WorkerBlockUpdate {
-    /// Create new instance of [Self].
-    pub fn new(
-        parent: SealedBlock,
-        pending: SealedBlockWithSenders,
-        state: ExecutionOutcome,
-    ) -> Self {
-        Self { parent, pending, state }
-    }
-
-    /// Return a reference to the worker block's parent.
-    pub fn parent(&self) -> &SealedBlock {
-        &self.parent
     }
 }
 

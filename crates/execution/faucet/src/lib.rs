@@ -134,6 +134,7 @@ impl Faucet {
             add_to_cache_tx,
             update_cache_rx,
             watch_rx,
+            highest_mined_tx_nonce: 0, // start at 0 and update with db read later
         };
         let faucet = Self { to_service };
         (faucet, service)
