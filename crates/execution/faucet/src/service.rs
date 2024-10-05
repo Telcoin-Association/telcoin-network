@@ -49,7 +49,8 @@ use tracing::{debug, error, warn};
 
 /// The mined transaction information for the faucet to track.
 ///
-/// This struct is used when a subscribed event is received for a transaction that is mined from the transaction pool. The information is used to track faucet state.
+/// This struct is used when a subscribed event is received for a transaction that is mined from the
+/// transaction pool. The information is used to track faucet state.
 pub(crate) struct MinedTxInfo {
     /// The address that received the faucet's drip.
     user: Address,
@@ -119,7 +120,10 @@ pub(crate) struct FaucetService<Provider, Pool, Tasks> {
     /// The pending block is updated right before transactions are removed from the tx pool.
     pub(crate) watch_rx: watch::Receiver<PendingWorkerBlock>,
     /// The nonce for this faucet as tracked through the highest mined transaction nonce.
-    /// The faucet service checks for the highest nonce in the transaction pool and if needd, in the database. However, the faucet also needs to nonce state for transactions that are pending in worker blocks. There isn't a great way to do this yet, so the faucet tracks it's own nonce to compare this way.
+    /// The faucet service checks for the highest nonce in the transaction pool and if needd, in
+    /// the database. However, the faucet also needs to nonce state for transactions that are
+    /// pending in worker blocks. There isn't a great way to do this yet, so the faucet tracks it's
+    /// own nonce to compare this way.
     pub(crate) highest_mined_tx_nonce: u64,
 }
 
@@ -471,7 +475,8 @@ where
 
 /// Recover the signed transaction and submit to the pool.
 ///
-/// The transaction is submitted to the pool and the service subscribes to events. When the transaction is `Mined`, the
+/// The transaction is submitted to the pool and the service subscribes to events. When the
+/// transaction is `Mined`, the
 async fn submit_transaction<Pool>(
     pool: Pool,
     tx: TransactionSigned,

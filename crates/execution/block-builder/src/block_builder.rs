@@ -9,9 +9,8 @@ use reth_primitives::{
     B256, EMPTY_OMMER_ROOT_HASH, U256,
 };
 use reth_provider::StateProviderFactory;
-use reth_transaction_pool::{BestTransactionsAttributes, BlockInfo, TransactionPool};
+use reth_transaction_pool::TransactionPool;
 use tn_types::{now, PendingBlockConfig, WorkerBlock, WorkerBlockBuilderArgs};
-use tokio::sync::watch;
 use tracing::{debug, warn};
 
 /// The output from building the next block.

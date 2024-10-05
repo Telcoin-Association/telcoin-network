@@ -440,8 +440,8 @@ impl TransactionFactory {
             value: value.unwrap_or_else(|| {
                 U256::from(10).checked_pow(U256::from(18)).expect("1x10^18 does not overflow")
             }),
-            input: input.unwrap_or_else(Bytes::default),
-            access_list: access_list.unwrap_or_else(AccessList::default),
+            input: input.unwrap_or_default(),
+            access_list: access_list.unwrap_or_default(),
         });
 
         let tx_signature_hash = transaction.signature_hash();

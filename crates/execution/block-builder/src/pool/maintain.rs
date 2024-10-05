@@ -10,7 +10,7 @@ use crate::pool::backup::{changed_accounts_iter, load_accounts, LoadedAccounts};
 use super::metrics::MaintainPoolMetrics;
 use futures_util::{future::BoxFuture, FutureExt, Stream, StreamExt};
 use reth_chainspec::ChainSpec;
-use reth_primitives::{constants::MIN_PROTOCOL_BASE_FEE, Address, SealedBlock, TxHash};
+use reth_primitives::{constants::MIN_PROTOCOL_BASE_FEE, Address, TxHash};
 use reth_provider::{
     BlockReaderIdExt, CanonStateNotification, Chain, ChainSpecProvider, ProviderError,
     StateProviderFactory,

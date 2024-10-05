@@ -130,7 +130,7 @@ where
                 block_index as u64,
                 batch_digest,
                 &output,
-                output_digest.into(),
+                output_digest,
                 base_fee_per_gas,
                 gas_limit,
                 mix_hash,

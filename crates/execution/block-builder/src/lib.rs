@@ -34,7 +34,7 @@ use std::{
     task::{Context, Poll},
 };
 use tn_types::{LastCanonicalUpdate, NewWorkerBlock, PendingBlockConfig, WorkerBlockBuilderArgs};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, trace, warn};
 
@@ -210,7 +210,7 @@ where
             mined_transactions,           // entire round of consensus
         };
 
-        // update watch channel after pool's lock is released
+        // track latest update to apply worker blocks
         let latest = LastCanonicalUpdate {
             tip: tip.block.clone(),
             pending_block_base_fee,
