@@ -42,7 +42,7 @@ pub(crate) struct BlockBuilderOutput {
 /// with very high gas limits. It's impossible to know the amount of gas a transaction
 /// will use without executing it, and the worker does not execute transactions.
 #[inline]
-pub fn build_worker_block<Pool, Provider>(
+pub(crate) fn build_worker_block<Pool, Provider>(
     args: WorkerBlockBuilderArgs<Pool, Provider>,
 ) -> BlockBuilderOutput
 where
@@ -114,7 +114,7 @@ where
 
     // TODO: use ms for worker block and sec for final block?
     //
-    // sometimes worker block are produced too quickly in certain configs (<1s)
+    // sometimes worker block are produced too quickly in certain configs (<1s diff)
     // resulting in batch timestamp == parent timestamp
     //
     // TODO: check for this error at the quorum waiter level?

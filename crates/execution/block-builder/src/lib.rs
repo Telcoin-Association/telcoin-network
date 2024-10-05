@@ -12,7 +12,7 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-pub use block_builder::build_worker_block;
+use block_builder::build_worker_block;
 use block_builder::BlockBuilderOutput;
 use consensus_metrics::metered_channel::Sender;
 use error::BlockBuilderResult;
@@ -45,26 +45,8 @@ pub use pool::{maintain_transaction_pool_future, PoolMaintenanceConfig};
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
-// blockchain provider
-// tx pool
-// consensus
-// max round
-// broadcast channel for sending WorkerBlocks after they're sealed
-// canon state updates subscriber channel to receive
-// basefee
-
-// initial approach:
-// - mine block when txpool pending tx notification received
-//      - try to fill up entire block
-//      - early network could be small blocks but faster than timer approach
-//
-// - impl Future for BlockProposer like Engine
-
 /// Type alias for the blocking task that locks the tx pool and builds the next worker block.
-type BlockBuildingTask = oneshot::Receiver<(B256, Vec<TxHash>)>;
-
-/// Type alias for the blocking task that locks the tx pool and updates account state.
-type PoolMaintenanceTask = oneshot::Receiver<B256>;
+type BlockBuildingTask = oneshot::Receiver<BlockBuilderResult<(B256, Vec<TxHash>)>>;
 
 /// The type that builds blocks for workers to propose.
 ///
@@ -193,12 +175,12 @@ where
             })
             .collect();
 
-        // remove any transactions that were mined
-        //
-        // NOTE: this worker's txs should already be removed during the block building process
+        // collect tx hashes to remove any transactions from this pool that were mined
         let mined_transactions: Vec<TxHash> = blocks.transaction_hashes().collect();
 
         // TODO: calculate the next basefee HERE for the entire round
+        //
+        // for now, always use lowest base fee possible
         let pending_block_base_fee = MIN_PROTOCOL_BASE_FEE;
 
         // Canonical update
@@ -217,53 +199,31 @@ where
             pending_block_blob_fee: None,
         };
 
+        // track canon update so worker updates don't overwrite the tip or base fees
+        self.latest_canon_state = latest;
+
         // sync fn so self will block until all pool updates are complete
         self.pool.on_canonical_state_change(update);
-        self.latest_canon_state = latest;
     }
 
-    /// Spawns a blocking task to execute consensus output.
+    /// Spawns a task to build the worker block and proposer to peers.
     ///
-    /// This approach allows the engine to yield back to the runtime while executing blocks.
-    /// Executing blocks is cpu intensive, so a blocking task is used.
+    /// This approach allows the block builder to yield back to the runtime while mining blocks.
     ///
     /// The task performs the following actions:
     /// - create a block
     /// - send the block to worker's block proposer
-    /// - wait for ack that quorum reached
-    /// - send mined transactions to maintenance task
-    /// - wait for ack that maintenance task is complete
+    /// - wait for ack that quorum was reached
     /// - return result
+    ///
+    /// Workers only propose one block at a time.
     fn spawn_execution_task(&self) -> BlockBuildingTask {
         let provider = self.blockchain.clone();
         let pool = self.pool.clone();
         let chain_spec = provider.chain_spec();
         let to_worker = self.to_worker.clone();
 
-        // TODO: this is needs further scrutiny
-        //
-        // see https://eips.ethereum.org/EIPS/eip-4399
-        //
-        // The right way is to provide the prevrandao from CL,
-        // then peers ensure this block is less than 2 rounds behind.
-        // logic:
-        // - 1 round of consensus -> worker updates
-        // - this block produced
-        // - this block sent to peers (async)
-        // - peer updates with 2 roud of consensus
-        // - peer receives this block
-        // - this block is valid because it was built off round 1
-        //      - if this block was built off round 0, then it's invalid
-        //      - ensure parent timestamp and this timestamp is (2 * max block duration)
-        //
-        // For now: this provides sufficent randomness for on-chain security,
-        // but requires an unacceptable amount of trust in the node operator
-        //
-        // TODO: move final execution to ENGINE - do not rely on mix hash at worker level
-        // let prevrandao = parent.parent_beacon_block_root.unwrap_or_else(|| B256::random());
-        // let (cfg, block_env) =
-        //     self.cfg_and_block_env(chain_spec.as_ref(), &parent, timestamp, prevrandao);
-
+        // configure params for next block to build
         let config = PendingBlockConfig::new(
             chain_spec,
             self.address,
@@ -290,13 +250,16 @@ where
             // forward to worker and wait for ack that quorum was reached
             if let Err(e) = to_worker.send(NewWorkerBlock { block, ack }).await {
                 error!(target: "worker::block_builder", ?e, "failed to send next block to worker");
+                // try to return error if worker channel closed
+                let _ = result.send(Err(e.into()));
+                return;
             }
 
             // wait for worker to ack quorum reached then update pool with mined transactions
             match rx.await {
                 Ok(hash) => {
                     // signal to Self that this task is complete
-                    if let Err(e) = result.send((hash, mined_transactions)) {
+                    if let Err(e) = result.send(Ok((hash, mined_transactions))) {
                         error!(target: "worker::block_builder", ?e, "failed to send block builder result to block builder task");
                     }
                 }
@@ -313,12 +276,8 @@ where
 
 /// The [BlockBuilder] is a future that loops through the following:
 /// - check/apply canonical state changes that affect the next build
-/// - check the block builder is idle
-/// - check if there are transactions in pending pool
-/// - build next block if pending transactions are available
-/// - poll any pending tasks
-/// - broadcast the newly proposed block once ack received
-///     - update base fee for RPC and transaction pool
+/// - poll any pending block building tasks
+/// - otherwise, build next block if pending transactions are available
 ///
 /// If a task completes, the loop continues to poll for any new output from consensus then begins
 /// executing the next task.
@@ -379,6 +338,17 @@ where
                 }
             }
 
+            // TODO: would time interval be better? (min block timer in config)
+            // this could wake task frequently under high network demand
+            //
+            // drain pending pool updates and pass waker so this gets awoken when txs are available
+            while let Poll::Ready(msg) = this.pending_tx_hashes_stream.poll_next_unpin(cx) {
+                match msg {
+                    Some(_tx) => (/* drain nofications now that pool is empty */),
+                    None => return Poll::Ready(Ok(())), // shutdown
+                }
+            }
+
             // only insert task if there is none
             //
             // note: it's important that the previous block build finishes before
@@ -410,7 +380,7 @@ where
                         // TODO: update tree's pending block?
                         //
                         // ensure no errors
-                        let (_worker_block_hash, mined_transactions) = res?;
+                        let (_worker_block_hash, mined_transactions) = res??;
 
                         // TODO: ensure this triggers faucet to track mined event
                         // - faucet to keep track of nonce state?

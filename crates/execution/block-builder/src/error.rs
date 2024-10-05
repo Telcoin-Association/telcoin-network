@@ -1,8 +1,10 @@
 //! Error types for Telcoin Network Block Builder.
 
+use std::sync::mpsc::SendError;
+
 use reth_errors::{CanonicalError, ProviderError, RethError};
 use tn_types::WorkerBlockConversionError;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 /// Result alias for [`TNEngineError`].
 pub(crate) type BlockBuilderResult<T> = Result<T, BlockBuilderError>;
@@ -30,11 +32,20 @@ pub enum BlockBuilderError {
     Canonical(#[from] CanonicalError),
     /// The oneshot channel that receives the ack that the block was persisted and being proposed.
     #[error("Fatal error: failed to receive ack reply that new block was built. Shutting down...")]
-    ChannelClosed,
+    AckChannelClosed,
+    /// Failed to send to the worker.
+    #[error("Fatal error: failed to send built block to worker.")]
+    WorkerChannelClosed,
 }
 
 impl From<oneshot::error::RecvError> for BlockBuilderError {
     fn from(_: oneshot::error::RecvError) -> Self {
-        Self::ChannelClosed
+        Self::AckChannelClosed
+    }
+}
+
+impl<T> From<mpsc::error::SendError<T>> for BlockBuilderError {
+    fn from(_: mpsc::error::SendError<T>) -> Self {
+        Self::WorkerChannelClosed
     }
 }
