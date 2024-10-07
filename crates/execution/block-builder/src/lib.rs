@@ -33,7 +33,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
-use tn_types::{LastCanonicalUpdate, NewWorkerBlock, PendingBlockConfig, WorkerBlockBuilderArgs};
+use tn_types::{LastCanonicalUpdate, PendingBlockConfig, WorkerBlockBuilderArgs};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, trace, warn};

@@ -45,11 +45,12 @@ use narwhal_typed_store::traits::Database;
 use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, thread::sleep, time::Duration};
 use tn_types::{
     traits::EncodeDecodeBase64, Authority, BlsKeypair, ChainIdentifier, Committee, Multiaddr,
-    NetworkKeypair, NetworkPublicKey, Parameters, Protocol, RandomnessPrivateKey, WorkerCache,
+    NetworkKeypair, NetworkPublicKey, Notifier, Parameters, Protocol, RandomnessPrivateKey,
+    WorkerCache,
 };
 
 use narwhal_network_types::{PrimaryToPrimaryServer, WorkerToPrimaryServer};
-use tn_types::{Certificate, PreSubscribedBroadcastSender, Round};
+use tn_types::{Certificate, Round};
 use tokio::{sync::watch, task::JoinHandle};
 use tower::ServiceBuilder;
 use tracing::{error, info};
@@ -60,9 +61,6 @@ pub mod primary_tests;
 
 /// The default channel capacity for each channel of the primary.
 pub const CHANNEL_CAPACITY: usize = 10_000;
-
-/// The number of shutdown receivers to create on startup. We need one per component loop.
-pub const NUM_SHUTDOWN_RECEIVERS: u64 = 27;
 
 pub struct Primary;
 
@@ -86,7 +84,7 @@ impl Primary {
         tx_new_certificates: Sender<Certificate>,
         rx_committed_certificates: Receiver<(Round, Vec<Certificate>)>,
         rx_consensus_round_updates: watch::Receiver<ConsensusRound>,
-        tx_shutdown: &mut PreSubscribedBroadcastSender,
+        tx_shutdown: &mut Notifier,
         leader_schedule: LeaderSchedule,
         metrics: &Metrics,
     ) -> Vec<JoinHandle<()>> {
@@ -357,7 +355,7 @@ impl Primary {
                 network.downgrade(),
                 metrics.network_connection_metrics.clone(),
                 peer_types,
-                Some(tx_shutdown.subscribe()),
+                tx_shutdown.subscribe(),
             );
 
         info!(

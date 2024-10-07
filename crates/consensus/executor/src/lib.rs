@@ -21,8 +21,8 @@ use narwhal_network::client::NetworkClient;
 use narwhal_storage::{CertificateStore, ConsensusStore};
 use std::sync::Arc;
 use tn_types::{
-    AuthorityIdentifier, CertificateDigest, CommittedSubDag, Committee,
-    ConditionalBroadcastReceiver, ConsensusOutput, WorkerCache,
+    AuthorityIdentifier, CertificateDigest, CommittedSubDag, Committee, ConsensusOutput, Noticer,
+    WorkerCache,
 };
 use tokio::{sync::broadcast, task::JoinHandle};
 use tracing::info;
@@ -54,8 +54,7 @@ impl Executor {
         worker_cache: WorkerCache,
         committee: Committee,
         client: NetworkClient,
-        // execution_state: State,
-        shutdown_receivers: ConditionalBroadcastReceiver,
+        rx_shutdown: Noticer,
         rx_sequence: metered_channel::Receiver<CommittedSubDag>,
         restored_consensus_output: Vec<CommittedSubDag>,
         consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
@@ -79,7 +78,7 @@ impl Executor {
             worker_cache,
             committee,
             client,
-            shutdown_receivers,
+            rx_shutdown,
             rx_sequence,
             arc_metrics,
             restored_consensus_output,

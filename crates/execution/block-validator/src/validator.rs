@@ -353,6 +353,10 @@ mod tests {
     use tracing::debug;
 
     /// Return the next valid block
+    ///
+    /// Note that SealedHeader's `parent_hash`, `state_root`, and `extra_data` must be updated when
+    /// updating accounts to fund in `adiri_genesis_raw` These new values can be obtained using
+    /// `tn-block-proposer::tests::test_make_block`
     fn next_valid_sealed_header() -> SealedHeader {
         // sealed header
         //
@@ -360,7 +364,7 @@ mod tests {
         SealedHeader::new(
             Header {
                 parent_hash: hex!(
-                    "0a908204acf0691cb8924082269df1c40deea2d7f2201e82a28cf07bd2a3d4ce"
+                    "bf0f2065b35a695aa0d47e9633d6cc78f6e012b988f774ff7e4c8467ea7f4126"
                 )
                 .into(),
                 ommers_hash: EMPTY_OMMER_ROOT_HASH,

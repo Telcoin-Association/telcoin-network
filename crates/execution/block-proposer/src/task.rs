@@ -1,11 +1,9 @@
 use crate::{mode::MiningMode, Storage};
-use consensus_metrics::metered_channel::Sender;
 use futures_util::{future::BoxFuture, FutureExt};
 use reth_chainspec::ChainSpec;
 use reth_evm::execute::BlockExecutorProvider;
 use reth_primitives::{IntoRecoveredTransaction, Withdrawals};
 use reth_provider::{BlockReaderIdExt, CanonChainTracker, StateProviderFactory};
-use reth_stages::PipelineEvent;
 use reth_transaction_pool::{TransactionPool, ValidPoolTransaction};
 use std::{
     collections::VecDeque,
@@ -13,14 +11,20 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
-use tn_types::{NewWorkerBlock, PendingWorkerBlock, WorkerBlock};
-use tokio::sync::{oneshot, watch};
-use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, warn};
+use tn_types::{error::BlockSealError, PendingWorkerBlock, WorkerBlock};
+use tokio::sync::{mpsc::Sender, oneshot, watch};
+use tracing::{debug, warn};
+
+pub(super) type BlockSender =
+    Sender<(WorkerBlock, Duration, oneshot::Sender<Result<(), BlockSealError>>)>;
 
 /// A Future that listens for new ready transactions and puts new blocks into storage
-pub struct MiningTask<Client, Pool: TransactionPool, BlockExecutor> {
+pub struct MiningTask<Client, Pool, BlockExecutor>
+where
+    Pool: TransactionPool,
+{
     /// The configured chain spec
     chain_spec: Arc<ChainSpec>,
     /// The client used to interact with the state
@@ -28,44 +32,38 @@ pub struct MiningTask<Client, Pool: TransactionPool, BlockExecutor> {
     /// The active miner
     miner: MiningMode,
     /// Single active future that inserts a new block into `storage`
-    insert_task: Option<BoxFuture<'static, Option<UnboundedReceiverStream<PipelineEvent>>>>,
+    insert_task: Option<BoxFuture<'static, Result<(), BlockSealError>>>,
     /// Shared storage to insert new blocks
     storage: Storage,
     /// Pool where transactions are stored
     pool: Pool,
     /// backlog of sets of transactions ready to be mined
     queued: VecDeque<Vec<Arc<ValidPoolTransaction<<Pool as TransactionPool>::Transaction>>>>,
-    /// Sending half of channel to worker.
-    ///
-    /// Worker recieves block and forwards to `quorum_waiter`.
-    to_worker: Sender<NewWorkerBlock>,
-    // /// Used to notify consumers of new blocks
-    // ///
-    // /// TODO: can this be used anywhere else?
-    // canon_state_notification: CanonStateNotificationSender,
-    /// The pipeline events to listen on
-    pipe_line_events: Option<UnboundedReceiverStream<PipelineEvent>>,
     /// The type used for block execution
     block_executor: BlockExecutor,
     /// The watch channel that shares the current pending worker block.
     watch_tx: watch::Sender<PendingWorkerBlock>,
+    /// Channel for sealing blocks.
+    block_provider_sender: BlockSender,
 }
 
 // === impl MiningTask ===
 
-impl<Client, Pool: TransactionPool, BlockExecutor> MiningTask<Client, Pool, BlockExecutor> {
+impl<Client, Pool, BlockExecutor> MiningTask<Client, Pool, BlockExecutor>
+where
+    Pool: TransactionPool,
+{
     /// Creates a new instance of the task
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         chain_spec: Arc<ChainSpec>,
         miner: MiningMode,
-        to_worker: Sender<NewWorkerBlock>,
-        // canon_state_notification: CanonStateNotificationSender,
         storage: Storage,
         client: Client,
         pool: Pool,
         block_executor: BlockExecutor,
         watch_tx: watch::Sender<PendingWorkerBlock>,
+        block_provider_sender: BlockSender,
     ) -> Self {
         Self {
             chain_spec,
@@ -74,18 +72,26 @@ impl<Client, Pool: TransactionPool, BlockExecutor> MiningTask<Client, Pool, Bloc
             insert_task: None,
             storage,
             pool,
-            to_worker,
-            // canon_state_notification,
             queued: Default::default(),
-            pipe_line_events: None,
             block_executor,
             watch_tx,
+            block_provider_sender,
         }
     }
 
-    /// Sets the pipeline events to listen on.
-    pub fn set_pipeline_events(&mut self, events: UnboundedReceiverStream<PipelineEvent>) {
-        self.pipe_line_events = Some(events);
+    async fn seal(
+        block_provider_sender: BlockSender,
+        block: WorkerBlock,
+        timeout: Duration,
+    ) -> Result<(), BlockSealError> {
+        let (tx, rx) = oneshot::channel();
+        match block_provider_sender.send((block, timeout, tx)).await {
+            Ok(_) => match rx.await {
+                Ok(res) => res,
+                Err(_) => Err(BlockSealError::FailedQuorum),
+            },
+            Err(_) => Err(BlockSealError::FailedQuorum),
+        }
     }
 }
 
@@ -117,11 +123,10 @@ where
                 let storage = this.storage.clone();
                 let transactions = this.queued.pop_front().expect("not empty");
 
-                let to_worker = this.to_worker.clone();
+                let block_provider_sender = this.block_provider_sender.clone();
                 let client = this.client.clone();
                 let chain_spec = Arc::clone(&this.chain_spec);
                 let pool = this.pool.clone();
-                let events = this.pipe_line_events.take();
                 let block_executor = this.block_executor.clone();
                 let worker_update = this.watch_tx.clone();
 
@@ -145,94 +150,65 @@ where
                         &block_executor,
                     ) {
                         Ok((new_header, state)) => {
-                            // TODO: make this a future
-                            //
-                            // send the new update to the engine, this will trigger the engine
-                            // to download and execute the block we just inserted
-                            let (ack, rx) = oneshot::channel();
-                            let _ = to_worker
-                                .send(NewWorkerBlock {
-                                    block: WorkerBlock::new(
-                                        // TODO: make block `TransactionSigned` then convert to
-                                        // bytes in `.digest` impl
-                                        // NOTE: a `WorkerBlock` is a `SealedBlock`
-                                        // convert txs to bytes
-                                        txns,
-                                        // versioned metadata for peer validation
-                                        new_header,
-                                    ),
-                                    ack,
-                                })
-                                .await;
+                            let block = WorkerBlock::new(
+                                // TODO: make block `TransactionSigned` then convert to
+                                // bytes in `.digest` impl
+                                // NOTE: a `WorkerBlock` is a `SealedBlock`
+                                // convert txs to bytes
+                                txns, // versioned metadata for peer validation
+                                new_header,
+                            );
+                            let digest = block.digest();
 
-                            match rx.await {
-                                Ok(digest) => {
+                            // Abstract this so this can be broken into a seperate proc eventually.
+                            match Self::seal(block_provider_sender, block, Duration::from_secs(10))
+                                .await
+                            {
+                                Ok(()) => {
                                     debug!(target: "execution::block_provider", ?digest, "Block sealed:");
+                                    // update execution state on watch channel
+                                    let _ =
+                                        worker_update.send(PendingWorkerBlock::new(Some(state)));
+                                    // TODO: this comment says dependent txs are also removed?
+                                    // might need to extend the trait onto another pool impl
+                                    //
+                                    // clear all transactions from pool once block is sealed
+                                    pool.remove_transactions(
+                                        transactions.iter().map(|tx| *(tx.hash())).collect(),
+                                    );
                                 }
-                                Err(err) => {
-                                    error!(target: "execution::block_provider", ?err, "Execution's BlockProvider Ack Failed:");
-                                    return None;
+                                Err(e) => {
+                                    return Err(e);
                                 }
                             }
-
-                            // TODO: leaving this here in case `WorkerBlock` -> `SealedBlock`
-
-                            // // seal the block
-                            // let block = Block {
-                            //     header: new_header.clone().unseal(),
-                            //     body: transactions,
-                            //     ommers: vec![],
-                            //     withdrawals: None,
-                            // };
-                            // let sealed_block = block.seal_slow();
-
-                            // let sealed_block_with_senders =
-                            //     SealedBlockWithSenders::new(sealed_block, senders)
-                            //         .expect("senders are valid");
-
-                            // debug!(target: "execution::block_provider",
-                            // header=?sealed_block_with_senders.hash(), "sending block
-                            // notification");
-
-                            // let chain =
-                            //     Arc::new(Chain::new(vec![sealed_block_with_senders],
-                            // bundle_state));
-
-                            // // send block notification
-                            // let _ = canon_state_notification
-                            //     .send(reth_provider::CanonStateNotification::Commit { new: chain
-                            // });
-
-                            // update execution state on watch channel
-                            let _ = worker_update.send(PendingWorkerBlock::new(Some(state)));
-
-                            // TODO: is this the best place to remove transactions?
-                            // should the miner poll this like payload builder?
-
-                            // TODO: this comment says dependent txs are also removed?
-                            // might need to extend the trait onto another pool impl
-                            //
-                            // clear all transactions from pool once block is sealed
-                            pool.remove_transactions(
-                                transactions.iter().map(|tx| *(tx.hash())).collect(),
-                            );
-
-                            drop(storage);
                         }
                         Err(err) => {
-                            warn!(target: "execution::block_provider", ?err, "failed to execute block")
+                            warn!(target: "execution::block_provider", ?err, "failed to execute block");
+                            return Err(BlockSealError::FailedQuorum);
                         }
                     }
 
-                    events
+                    Ok(())
                 }));
             }
 
             if let Some(mut fut) = this.insert_task.take() {
                 match fut.poll_unpin(cx) {
-                    Poll::Ready(events) => {
-                        this.pipe_line_events = events;
-                    }
+                    Poll::Ready(res) => match res {
+                        Ok(()) => {} // Block accepted!
+                        Err(e) => match e {
+                            BlockSealError::QuorumRejected => {} // Block has been rejected
+                            // by peers don't try it
+                            // again...
+                            BlockSealError::AntiQuorum => {} // Rejected but may work later (?)
+                            BlockSealError::Timeout => {}    // Timeout, maybe not enough */
+                            // peers up?
+                            BlockSealError::FailedQuorum => {} /* General failure (probably */
+                            // network)
+                            BlockSealError::FatalDBFailure => {} /* DB access failed, probably
+                                                                  * should panic/shutdown */
+                        },
+                    },
                     Poll::Pending => {
                         this.insert_task = Some(fut);
                         break;

@@ -201,11 +201,13 @@ impl MdbxDatabase {
 }
 
 impl Database for MdbxDatabase {
-    type TX<'txn> = MdbxTx
+    type TX<'txn>
+        = MdbxTx
     where
         Self: 'txn;
 
-    type TXMut<'txn> = MdbxTxMut
+    type TXMut<'txn>
+        = MdbxTxMut
     where
         Self: 'txn;
 

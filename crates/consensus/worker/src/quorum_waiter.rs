@@ -1,26 +1,53 @@
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
 // Copyright (c) Telcoin, LLC
+// Copyright (c) 2021, Facebook, Inc. and its affiliates
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{block_provider::MAX_PARALLEL_BLOCK, metrics::WorkerMetrics};
-use consensus_metrics::{metered_channel::Receiver, monitored_future, spawn_logged_monitored_task};
+use crate::metrics::WorkerMetrics;
+use anemo::types::response::StatusCode;
+use consensus_metrics::monitored_future;
 use futures::stream::{futures_unordered::FuturesUnordered, StreamExt as _};
 use narwhal_network::{CancelOnDropHandler, ReliableNetwork};
 use narwhal_network_types::WorkerBlockMessage;
-use std::{sync::Arc, time::Duration};
-use tn_types::{
-    Authority, Committee, ConditionalBroadcastReceiver, Stake, WorkerBlock, WorkerCache, WorkerId,
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
 };
-use tokio::{task::JoinHandle, time::timeout};
-use tracing::{trace, warn};
+use thiserror::Error;
+use tn_types::{Authority, Committee, Stake, WorkerBlock, WorkerCache, WorkerId};
+use tokio::task::JoinHandle;
 
 #[cfg(test)]
 #[path = "tests/quorum_waiter_tests.rs"]
 pub mod quorum_waiter_tests;
 
-/// The QuorumWaiter waits for 2f authorities to acknowledge reception of a batch.
-pub struct QuorumWaiter {
+/// Interface to QuorumWaiter, exists primarily for tests.
+pub trait QuorumWaiterTrait: Send + Sync + Clone + Unpin + 'static {
+    /// Send a block to committee peers in an attempt to get quorum on it's validity.
+    ///
+    /// Returns a JoinHandle to a future that will timeout.  Each peer attempt can:
+    /// - Accept the block and it's stake to quorum
+    /// - Reject the block explicitly in which case it's stake will never be added to quorum (can
+    ///   cause total block rejection)
+    /// - Have an error of some type stopping it's stake from adding to quorum but possibly not
+    ///   forever
+    ///
+    /// If the future resolves to Ok then the block has reached quorum other wise examine the error.
+    /// An error of QuorumWaiterError::QuorumRejected indicates the block will never be accepted
+    /// otherwise it might be possible if the network improves.
+    fn verify_block(
+        &self,
+        block: WorkerBlock,
+        timeout: Duration,
+    ) -> JoinHandle<Result<(), QuorumWaiterError>>;
+}
+
+/// Basically BoxFuture but without the unneeded lifetime.
+type QMBoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+struct QuorumWaiterInner {
     /// This authority.
     authority: Authority,
     /// The id of this worker.
@@ -29,160 +56,195 @@ pub struct QuorumWaiter {
     committee: Committee,
     /// The worker information cache.
     worker_cache: WorkerCache,
-    /// Receiver for shutdown.
-    rx_shutdown: ConditionalBroadcastReceiver,
-    /// Input Channel to receive commands.
-    rx_quorum_waiter: Receiver<(WorkerBlock, tokio::sync::oneshot::Sender<()>)>,
     /// A network sender to broadcast the batches to the other workers.
     network: anemo::Network,
     /// Record metrics for quorum waiter.
     metrics: Arc<WorkerMetrics>,
 }
 
+/// The QuorumWaiter waits for 2f authorities to acknowledge reception of a batch.
+#[derive(Clone)]
+pub struct QuorumWaiter {
+    inner: Arc<QuorumWaiterInner>,
+}
+
 impl QuorumWaiter {
-    /// Spawn a new QuorumWaiter.
-    #[allow(clippy::too_many_arguments)]
-    #[must_use]
-    pub fn spawn(
+    /// Create a new QuorumWaiter.
+    pub fn new(
         authority: Authority,
         id: WorkerId,
         committee: Committee,
         worker_cache: WorkerCache,
-        rx_shutdown: ConditionalBroadcastReceiver,
-        rx_quorum_waiter: Receiver<(WorkerBlock, tokio::sync::oneshot::Sender<()>)>,
         network: anemo::Network,
         metrics: Arc<WorkerMetrics>,
-    ) -> JoinHandle<()> {
-        spawn_logged_monitored_task!(
-            async move {
-                Self {
-                    authority,
-                    id,
-                    committee,
-                    worker_cache,
-                    rx_shutdown,
-                    rx_quorum_waiter,
-                    network,
-                    metrics,
-                }
-                .run()
-                .await;
-            },
-            "QuorumWaiterTask"
-        )
+    ) -> Self {
+        Self {
+            inner: Arc::new(QuorumWaiterInner {
+                authority,
+                id,
+                committee,
+                worker_cache,
+                network,
+                metrics,
+            }),
+        }
     }
 
     /// Helper function. It waits for a future to complete and then delivers a value.
     async fn waiter(
         wait_for: CancelOnDropHandler<eyre::Result<anemo::Response<()>>>,
         deliver: Stake,
-    ) -> Stake {
-        let _ = wait_for.await;
-        deliver
-    }
-
-    /// Main loop.
-    async fn run(&mut self) {
-        let mut pipeline = FuturesUnordered::new();
-        let mut best_effort_with_timeout = FuturesUnordered::new();
-
-        loop {
-            tokio::select! {
-
-                // When a new batch is available, and the pipeline is not full, add a new
-                // task to the pipeline to send this batch to workers.
-                //
-                // TODO: make the constant a config parameter.
-                Some((batch, channel)) = self.rx_quorum_waiter.recv(), if pipeline.len() < MAX_PARALLEL_BLOCK => {
-                    // Broadcast the batch to the other workers.
-                    let workers: Vec<_> = self
-                        .worker_cache
-                        .others_workers_by_id(self.authority.protocol_key(), &self.id)
-                        .into_iter()
-                        .map(|(name, info)| (name, info.name))
-                        .collect();
-                    let (primary_names, worker_names): (Vec<_>, _) = workers.into_iter().unzip();
-                    let message  = WorkerBlockMessage{worker_block: batch.clone()};
-                    let handlers = self.network.broadcast(worker_names, &message);
-                    let timer = self.metrics.block_broadcast_quorum_latency.start_timer();
-
-                    // Collect all the handlers to receive acknowledgements.
-                    let mut wait_for_quorum: FuturesUnordered<_> = primary_names
-                        .into_iter()
-                        .zip(handlers.into_iter())
-                        .map(|(name, handler)| {
-                            let stake = self.committee.stake(&name);
-                            monitored_future!(Self::waiter(handler, stake))
-                        })
-                        .collect();
-
-                    // Wait for the first 2f nodes to send back an Ack. Then we consider the batch
-                    // delivered and we send its digest to the primary (that will include it into
-                    // the dag). This should reduce the amount of syncing.
-                    let threshold = self.committee.quorum_threshold();
-                    let mut total_stake = self.authority.stake();
-
-                    pipeline.push(async move {
-                        // Keep the timer until a quorum is reached.
-                        let _timer = timer;
-                        // A future that sends to 2/3 stake then returns. Also prints a warning
-                        // if we terminate before we have managed to get to the full 2/3 stake.
-                        let mut opt_channel = Some(channel);
-                        loop{
-                            if let Some(stake) = wait_for_quorum.next().await {
-                                total_stake += stake;
-                                if total_stake >= threshold {
-                                    // Notify anyone waiting for this.
-                                    let channel = opt_channel.take().unwrap();
-                                    if let Err(e) = channel.send(()) {
-                                        warn!("Channel waiting for quorum response dropped: {:?}", e);
-                                    }
-                                    break
-                                }
-                            } else {
-                                // This should not happen unless shutting down, because
-                                // `broadcast()` uses `send()` which keeps retrying on
-                                // failed responses.
-                                warn!("Batch dissemination ended without a quorum. Shutting down.");
-                                break;
-                            }
-                        }
-                        (batch, opt_channel, wait_for_quorum)
-                    });
-                },
-
-                // Process futures in the pipeline. They complete when we have sent to >2/3
-                // of other worker by stake, but after that we still try to send to the remaining
-                // on a best effort basis.
-                Some((batch, opt_channel, mut remaining)) = pipeline.next() => {
-                    // opt_channel is not consumed only when the worker is shutting down and
-                    // broadcast fails. TODO: switch to returning a status from pipeline.
-                    if opt_channel.is_some() {
-                        return;
-                    }
-                    // Attempt to send messages to the remaining workers
-                    if !remaining.is_empty() {
-                        trace!("Best effort dissemination for batch {} for remaining {}", batch.digest(), remaining.len());
-                        best_effort_with_timeout.push(async move {
-                           // Bound the attempt to a few seconds to tolerate nodes that are
-                           // offline and will never succeed.
-                           //
-                           // TODO: make the constant a config parameter.
-                           timeout(Duration::from_secs(5), async move{
-                               while remaining.next().await.is_some() { }
-                           }).await
-                       });
-                    }
-                },
-
-                // Drive the best effort send efforts which may update remaining workers
-                // or timeout.
-                Some(_) = best_effort_with_timeout.next() => {}
-
-                _ = self.rx_shutdown.receiver.recv() => {
-                    return
+    ) -> Result<Stake, WaiterError> {
+        match wait_for.await {
+            Ok(r) => {
+                let status = r.status();
+                match status {
+                    StatusCode::Success => Ok(deliver),
+                    StatusCode::BadRequest => Err(WaiterError::Rejected(deliver)),
+                    // Non-exhaustive enum...
+                    _ => Err(WaiterError::Rpc(status, deliver)),
                 }
             }
+            Err(_) => Err(WaiterError::Network(deliver)),
         }
     }
+}
+
+impl QuorumWaiterTrait for QuorumWaiter {
+    fn verify_block(
+        &self,
+        block: WorkerBlock,
+        timeout: Duration,
+    ) -> JoinHandle<Result<(), QuorumWaiterError>> {
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            let timeout_res = tokio::time::timeout(timeout, async move {
+                let start_time = Instant::now();
+                // Broadcast the batch to the other workers.
+                let workers: Vec<_> = inner
+                    .worker_cache
+                    .others_workers_by_id(inner.authority.protocol_key(), &inner.id)
+                    .into_iter()
+                    .map(|(name, info)| (name, info.name))
+                    .collect();
+                let (primary_names, worker_names): (Vec<_>, _) = workers.into_iter().unzip();
+                let message = WorkerBlockMessage { worker_block: block.clone() };
+                let handlers = inner.network.broadcast(worker_names, &message);
+                let _timer = inner.metrics.block_broadcast_quorum_latency.start_timer();
+
+                // Collect all the handlers to receive acknowledgements.
+                let mut wait_for_quorum: FuturesUnordered<QMBoxFuture<Result<Stake, WaiterError>>> =
+                    FuturesUnordered::new();
+                // Total stake available for the entire committee.
+                // Can use this to determine anti-quorum more quickly.
+                let mut available_stake = 0;
+                // Stake from a committee member that has rejected this block.
+                let mut rejected_stake = 0;
+                primary_names
+                    .into_iter()
+                    .zip(handlers.into_iter())
+                    .map(|(name, handler)| {
+                        let stake = inner.committee.stake(&name);
+                        available_stake += stake;
+                        Box::pin(monitored_future!(Self::waiter(handler, stake)))
+                    })
+                    .for_each(|f| wait_for_quorum.push(f));
+
+                // Wait for the first 2f nodes to send back an Ack. Then we consider the block
+                // delivered and we send its digest to the primary (that will include it into
+                // the dag). This should reduce the amount of syncing.
+                let threshold = inner.committee.quorum_threshold();
+                let mut total_stake = inner.authority.stake();
+                // If more stake than this is rejected then the block will never be accepted.
+                let max_rejected_stake = available_stake - threshold;
+
+                // Wait on the peer responses and produce an Ok(()) for quorum (2/3 stake confirmed
+                // block) or Error if quorum not reached.
+                loop {
+                    if let Some(res) = wait_for_quorum.next().await {
+                        match res {
+                            Ok(stake) => {
+                                total_stake += stake;
+                                if total_stake >= threshold {
+                                    let remaining_time =
+                                        start_time.elapsed().saturating_sub(timeout);
+                                    if !wait_for_quorum.is_empty() && !remaining_time.is_zero() {
+                                        // Let the remaining waiters have a chance for the remaining
+                                        // time.
+                                        // These are fire and forget, they will timeout soon so no
+                                        // big deal.
+                                        tokio::spawn(async move {
+                                            let _ =
+                                                tokio::time::timeout(remaining_time, async move {
+                                                    while (wait_for_quorum.next().await).is_some() {
+                                                        // do nothing
+                                                    }
+                                                })
+                                                .await;
+                                        });
+                                    }
+                                    break Ok(());
+                                }
+                            }
+                            Err(WaiterError::Rejected(stake)) => {
+                                rejected_stake -= stake;
+                                available_stake -= stake;
+                            }
+                            Err(WaiterError::Network(stake)) => {
+                                available_stake -= stake;
+                            }
+                            Err(WaiterError::Rpc(_, stake)) => {
+                                available_stake -= stake;
+                            }
+                        }
+                    } else {
+                        // Ran out of Peers and did not reach quorum...
+                        break Err(QuorumWaiterError::AntiQuorum);
+                    }
+                    if rejected_stake > max_rejected_stake {
+                        // Can no longer reach quorum because our block was explicitly rejected by
+                        // to much stack.
+                        break Err(QuorumWaiterError::QuorumRejected);
+                    }
+                    if total_stake + available_stake < threshold {
+                        // It is no longer possible to reach quorum...
+                        // This is likely because of network/rpc errors and may not be permanent.
+                        break Err(QuorumWaiterError::AntiQuorum);
+                    }
+                }
+            })
+            .await;
+            match timeout_res {
+                Ok(res) => match res {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(e),
+                },
+                Err(_elapsed) => Err(QuorumWaiterError::Timeout),
+            }
+        })
+    }
+}
+
+#[derive(Clone, Debug, Error)]
+pub enum QuorumWaiterError {
+    #[error("Block was rejected by enough peers to never reach quorum")]
+    QuorumRejected,
+    #[error("Anti quorum reached for block (note this may not be permanent)")]
+    AntiQuorum,
+    #[error("Timed out waiting for quorum")]
+    Timeout,
+    #[error("Network Error")]
+    Network,
+    #[error("RPC Status Error {0}")]
+    Rpc(StatusCode),
+}
+
+#[derive(Clone, Debug, Error)]
+enum WaiterError {
+    #[error("Block was rejected by peer")]
+    Rejected(Stake),
+    #[error("Network Error")]
+    Network(Stake),
+    #[error("RPC Status Error {0}")]
+    Rpc(StatusCode, Stake),
 }

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use fastcrypto::encoding::{Encoding, Hex};
 use narwhal_primary::{
     consensus::{ConsensusRound, LeaderSchedule, LeaderSwapTable},
-    Primary, CHANNEL_CAPACITY, NUM_SHUTDOWN_RECEIVERS,
+    Primary, CHANNEL_CAPACITY,
 };
 use narwhal_storage::NodeStorage;
 
@@ -352,7 +352,7 @@ async fn get_network_peers_from_admin_server() {
     let (_tx_feedback, rx_feedback) = tn_types::test_channel!(CHANNEL_CAPACITY);
     let (_tx_consensus_round_updates, rx_consensus_round_updates) =
         watch::channel(ConsensusRound::default());
-    let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+    let mut tx_shutdown = Notifier::new();
 
     // Spawn Primary 1
     Primary::spawn(
@@ -381,37 +381,24 @@ async fn get_network_peers_from_admin_server() {
 
     let registry_1 = Registry::new();
     let metrics_1 = Metrics::new_with_registry(&registry_1);
-    let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+    let mut tx_shutdown = Notifier::new();
 
     let worker_1_parameters = Parameters {
         max_worker_tx_bytes_size: 200, // Two transactions.
         ..Parameters::default()
     };
 
-    // For EL batch maker
-    let channel_metrics: Arc<WorkerChannelMetrics> = metrics_1.channel_metrics.clone();
-    let (_tx_batch_maker, rx_batch_maker) = channel_with_total(
-        CHANNEL_CAPACITY,
-        &channel_metrics.tx_block_maker,
-        &channel_metrics.tx_block_maker_total,
-    );
-
     // Spawn a `Worker` instance for primary 1.
-    Worker::spawn(
+    let worker = Worker::new(
         authority_1.authority().clone(),
         worker_1_keypair.copy(),
         worker_id,
         committee.clone(),
         worker_cache.clone(),
         worker_1_parameters.clone(),
-        NoopBlockValidator,
-        client_1.clone(),
         store.batch_store.clone(),
-        metrics_1.clone(),
-        &mut tx_shutdown,
-        channel_metrics,
-        rx_batch_maker,
     );
+    worker.spawn(NoopBlockValidator, client_1.clone(), metrics_1.clone(), &mut tx_shutdown);
 
     let primary_1_peer_id = Hex::encode(authority_1.network_keypair().copy().public().0.as_bytes());
     let worker_1_peer_id = Hex::encode(worker_1_keypair.copy().public().0.as_bytes());
@@ -468,7 +455,7 @@ async fn get_network_peers_from_admin_server() {
     let (_tx_consensus_round_updates, rx_consensus_round_updates) =
         watch::channel(ConsensusRound::default());
 
-    let mut tx_shutdown_2 = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+    let mut tx_shutdown_2 = Notifier::new();
 
     // Spawn Primary 2
     Primary::spawn(
@@ -503,32 +490,19 @@ async fn get_network_peers_from_admin_server() {
         ..Parameters::default()
     };
 
-    let mut tx_shutdown_worker = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
-
-    // For EL batch maker
-    let channel_metrics: Arc<WorkerChannelMetrics> = metrics_2.channel_metrics.clone();
-    let (_tx_batch_maker, rx_batch_maker) = channel_with_total(
-        CHANNEL_CAPACITY,
-        &channel_metrics.tx_block_maker,
-        &channel_metrics.tx_block_maker_total,
-    );
+    let mut tx_shutdown_worker = Notifier::new();
 
     // Spawn a `Worker` instance for primary 2.
-    Worker::spawn(
+    let worker = Worker::new(
         authority_2.authority().clone(),
         worker_2_keypair.copy(),
         worker_id,
         committee.clone(),
         worker_cache.clone(),
         worker_2_parameters.clone(),
-        NoopBlockValidator,
-        client_2,
         store.batch_store,
-        metrics_2.clone(),
-        &mut tx_shutdown_worker,
-        channel_metrics,
-        rx_batch_maker,
     );
+    worker.spawn(NoopBlockValidator, client_2, metrics_2.clone(), &mut tx_shutdown_worker);
 
     // Wait for tasks to start. Sleeping longer here to ensure all primaries and workers
     // have  a chance to connect to each other.

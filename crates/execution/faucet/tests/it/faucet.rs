@@ -19,7 +19,14 @@ use gcloud_sdk::{
 };
 use jsonrpsee::{core::client::ClientT, rpc_params};
 use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicKey as PubKey};
+use narwhal_network::client::NetworkClient;
 use narwhal_test_utils::{default_test_execution_node, faucet_test_execution_node};
+use narwhal_typed_store::open_db;
+use narwhal_worker::{
+    metrics::WorkerMetrics,
+    quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
+    BlockProvider,
+};
 use reth_chainspec::ChainSpec;
 use reth_primitives::{
     alloy_primitives::U160, public_key_to_address, Address, GenesisAccount, SealedHeader, B256,
@@ -31,9 +38,10 @@ use reth_tracing::init_test_tracing;
 use reth_transaction_pool::TransactionPool;
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
+use tempfile::TempDir;
 use tn_faucet::Drip;
 use tn_types::{
-    adiri_genesis, test_channel,
+    adiri_genesis,
     test_utils::{
         contract_artifacts::{
             ERC1967PROXY_INITCODE, ERC1967PROXY_RUNTIMECODE, STABLECOINMANAGER_RUNTIMECODE,
@@ -41,10 +49,26 @@ use tn_types::{
         },
         execution_outcome_from_test_batch_, TransactionFactory,
     },
-    NewWorkerBlock, TransactionSigned, WorkerBlock,
+    TransactionSigned, WorkerBlock,
 };
-use tokio::time::timeout;
+use tokio::{sync::mpsc::Sender, time::timeout};
 use tracing::debug;
+
+#[derive(Clone, Debug)]
+struct TestChanQuorumWaiter(Sender<WorkerBlock>);
+impl QuorumWaiterTrait for TestChanQuorumWaiter {
+    fn verify_block(
+        &self,
+        block: WorkerBlock,
+        _timeout: Duration,
+    ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
+        let chan = self.0.clone();
+        tokio::spawn(async move {
+            chan.send(block).await.unwrap();
+            Ok(())
+        })
+    }
+}
 
 #[tokio::test]
 async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
@@ -228,10 +252,17 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     )?;
 
     let worker_id = 0;
-    let (to_worker, mut next_batch) = test_channel!(1);
+    let (to_worker, mut next_batch) = tokio::sync::mpsc::channel(1);
+    let client = NetworkClient::new_with_empty_id();
+    let temp_dir = TempDir::new().unwrap();
+    let store = open_db(temp_dir.path());
+    let qw = TestChanQuorumWaiter(to_worker);
+    let node_metrics = WorkerMetrics::default();
+    let block_provider =
+        BlockProvider::new(0, qw.clone(), Arc::new(node_metrics), client, store.clone());
 
     // start batch maker
-    execution_node.start_batch_maker(to_worker, worker_id).await?;
+    execution_node.start_batch_maker(worker_id, block_provider.blocks_rx()).await?;
 
     // create client
     let client = execution_node.worker_http_client(&worker_id).await?.expect("worker rpc client");
@@ -249,14 +280,10 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     let duration = Duration::from_secs(15);
 
     // wait for canon event or timeout
-    let new_batch: NewWorkerBlock =
+    let new_block: WorkerBlock =
         timeout(duration, next_batch.recv()).await?.expect("batch received");
-    let digest = new_batch.block.digest();
 
-    // send ack to worker
-    let _ = new_batch.ack.send(digest);
-
-    let batch_txs = new_batch.block.transactions();
+    let batch_txs = new_block.transactions();
     let tx = batch_txs.first().expect("first batch tx from faucet");
 
     // assert recovered transaction
@@ -517,10 +544,16 @@ async fn test_faucet_transfers_stablecoin_with_google_kms() -> eyre::Result<()> 
 
     println!("starting batch maker...");
     let worker_id = 0;
-    let (to_worker, mut next_batch) = test_channel!(2);
-
+    let (to_worker, mut next_batch) = tokio::sync::mpsc::channel(2);
+    let client = NetworkClient::new_with_empty_id();
+    let temp_dir = TempDir::new().unwrap();
+    let store = open_db(temp_dir.path());
+    let qw = TestChanQuorumWaiter(to_worker);
+    let node_metrics = WorkerMetrics::default();
+    let block_provider =
+        BlockProvider::new(0, qw.clone(), Arc::new(node_metrics), client, store.clone());
     // start batch maker
-    execution_node.start_batch_maker(to_worker, worker_id).await?;
+    execution_node.start_batch_maker(worker_id, block_provider.blocks_rx()).await?;
 
     let user_address = Address::random();
     let client = execution_node.worker_http_client(&worker_id).await?.expect("worker rpc client");
@@ -540,10 +573,10 @@ async fn test_faucet_transfers_stablecoin_with_google_kms() -> eyre::Result<()> 
     let duration = Duration::from_secs(15);
 
     // wait for canon event or timeout
-    let new_batch: NewWorkerBlock =
+    let new_block: WorkerBlock =
         timeout(duration, next_batch.recv()).await?.expect("batch received");
 
-    let batch_txs = new_batch.block.transactions();
+    let batch_txs = new_block.transactions();
     let tx = batch_txs.first().expect("first batch tx from faucet");
 
     let contract_params: Vec<u8> = Drip::abi_encode_params(&(&contract_address, &user_address));

@@ -18,7 +18,7 @@ use std::{
 };
 use tn_types::{
     AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Committee,
-    ConditionalBroadcastReceiver, ConsensusCommit, Round, SequenceNumber, Timestamp,
+    ConsensusCommit, Noticer, Round, SequenceNumber, Timestamp,
 };
 use tokio::{sync::watch, task::JoinHandle};
 use tracing::{debug, info, instrument};
@@ -273,7 +273,7 @@ pub struct Consensus<DB> {
     committee: Committee,
 
     /// Receiver for shutdown.
-    rx_shutdown: ConditionalBroadcastReceiver,
+    rx_shutdown: Noticer,
     /// Receives new certificates from the primary. The primary should send us new certificates
     /// only if it already sent us its whole history.
     rx_new_certificates: metered_channel::Receiver<Certificate>,
@@ -302,7 +302,7 @@ impl<DB: Database> Consensus<DB> {
         gc_depth: Round,
         store: Arc<ConsensusStore<DB>>,
         cert_store: CertificateStore<DB>,
-        rx_shutdown: ConditionalBroadcastReceiver,
+        rx_shutdown: Noticer,
         rx_new_certificates: metered_channel::Receiver<Certificate>,
         tx_committed_certificates: metered_channel::Sender<(Round, Vec<Certificate>)>,
         tx_consensus_round_updates: watch::Sender<ConsensusRound>,
@@ -371,7 +371,7 @@ impl<DB: Database> Consensus<DB> {
         'main: loop {
             tokio::select! {
 
-                _ = self.rx_shutdown.receiver.recv() => {
+                _ = &self.rx_shutdown => {
                     return Ok(())
                 }
 

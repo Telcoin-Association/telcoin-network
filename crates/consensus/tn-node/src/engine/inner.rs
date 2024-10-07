@@ -7,7 +7,6 @@ use crate::{
     engine::{WorkerNetwork, WorkerNode},
     error::ExecutionError,
 };
-use consensus_metrics::metered_channel::Sender;
 use jsonrpsee::http_client::HttpClient;
 use reth::rpc::{
     builder::{config::RethRpcServerConfig, RpcModuleBuilder, RpcServerHandle},
@@ -227,8 +226,8 @@ where
     /// The worker's RPC, TX pool, and block builder
     pub(super) async fn start_batch_maker(
         &mut self,
-        to_worker: Sender<NewWorkerBlock>,
         worker_id: WorkerId,
+        block_provider_sender: WorkerBlockSender,
     ) -> eyre::Result<()> {
         // TODO: both start_engine and start_batch_maker lookup head
         let head = self.node_config.lookup_head(self.provider_factory.clone())?;
@@ -262,11 +261,11 @@ where
             Arc::clone(&self.node_config.chain),
             self.blockchain_db.clone(),
             transaction_pool.clone(),
-            to_worker,
             mining_mode,
             self.address,
             self.evm_executor.clone(),
             watch_tx.clone(),
+            block_provider_sender,
         )
         .build();
 

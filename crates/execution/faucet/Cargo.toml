@@ -49,3 +49,8 @@ fastcrypto = { workspace = true }
 tn-types = { workspace = true, features = ["test-utils"] }
 consensus-metrics = { workspace = true }
 narwhal-test-utils = { workspace = true }
+narwhal-network = { workspace = true }
+narwhal-network-types = { workspace = true }
+narwhal-worker = { workspace = true }
+narwhal-typed-store = { workspace = true }
+tempfile = { workspace = true }

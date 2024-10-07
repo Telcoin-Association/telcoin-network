@@ -194,11 +194,13 @@ impl<DB: Database> LayeredDatabase<DB> {
 }
 
 impl<DB: Database> Database for LayeredDatabase<DB> {
-    type TX<'txn> = LayeredDbTx
+    type TX<'txn>
+        = LayeredDbTx
     where
         Self: 'txn;
 
-    type TXMut<'txn> = LayeredDbTxMut<DB>
+    type TXMut<'txn>
+        = LayeredDbTxMut<DB>
     where
         Self: 'txn;
 

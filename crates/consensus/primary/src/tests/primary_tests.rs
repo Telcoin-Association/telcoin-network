@@ -6,9 +6,7 @@ use crate::{
     common::create_db_stores,
     consensus::{ConsensusRound, LeaderSchedule, LeaderSwapTable},
     synchronizer::Synchronizer,
-    NUM_SHUTDOWN_RECEIVERS,
 };
-use consensus_metrics::metered_channel::channel_with_total;
 use fastcrypto::{
     encoding::{Encoding, Hex},
     hash::Hash,
@@ -23,10 +21,7 @@ use narwhal_network_types::{
 use narwhal_primary_metrics::{PrimaryChannelMetrics, PrimaryMetrics};
 use narwhal_storage::{CertificateStore, NodeStorage, PayloadStore, VoteDigestStore};
 use narwhal_typed_store::open_db;
-use narwhal_worker::{
-    metrics::{Metrics, WorkerChannelMetrics},
-    Worker,
-};
+use narwhal_worker::{metrics::Metrics, Worker};
 use prometheus::Registry;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -39,8 +34,8 @@ use tn_block_validator::NoopBlockValidator;
 use tn_types::{
     now,
     test_utils::{make_optimal_signed_certificates, CommitteeFixture},
-    AuthorityIdentifier, Certificate, ChainIdentifier, Committee, Parameters,
-    PreSubscribedBroadcastSender, SignatureVerificationState,
+    AuthorityIdentifier, Certificate, ChainIdentifier, Committee, Notifier, Parameters,
+    SignatureVerificationState,
 };
 use tokio::{sync::watch, time::timeout};
 
@@ -86,7 +81,7 @@ async fn test_get_network_peers_from_admin_server() {
     let (_tx_consensus_round_updates, rx_consensus_round_updates) =
         watch::channel(ConsensusRound::default());
 
-    let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+    let mut tx_shutdown = Notifier::new();
 
     // Spawn Primary 1
     Primary::spawn(
@@ -121,32 +116,19 @@ async fn test_get_network_peers_from_admin_server() {
         ..Parameters::default()
     };
 
-    let mut tx_shutdown_worker = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
-
-    // For EL batch maker
-    let channel_metrics: Arc<WorkerChannelMetrics> = metrics_1.channel_metrics.clone();
-    let (_tx_batch_maker, rx_batch_maker) = channel_with_total(
-        CHANNEL_CAPACITY,
-        &channel_metrics.tx_block_maker,
-        &channel_metrics.tx_block_maker_total,
-    );
+    let mut tx_shutdown_worker = Notifier::new();
 
     // Spawn a `Worker` instance for primary 1.
-    Worker::spawn(
+    let worker = Worker::new(
         authority_1.authority().clone(),
         worker_1_keypair.copy(),
         worker_id,
         committee.clone(),
         worker_cache.clone(),
         worker_1_parameters.clone(),
-        NoopBlockValidator,
-        client_1,
         store.batch_store,
-        metrics_1,
-        &mut tx_shutdown_worker,
-        channel_metrics,
-        rx_batch_maker,
     );
+    worker.spawn(NoopBlockValidator, client_1, metrics_1, &mut tx_shutdown_worker);
 
     // Test getting all known peers for primary 1
     let resp = reqwest::get(format!(
@@ -219,7 +201,7 @@ async fn test_get_network_peers_from_admin_server() {
     );
     let (_tx_consensus_round_updates, rx_consensus_round_updates) =
         watch::channel(ConsensusRound::default());
-    let mut tx_shutdown_2 = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+    let mut tx_shutdown_2 = Notifier::new();
 
     // Spawn Primary 2
     Primary::spawn(

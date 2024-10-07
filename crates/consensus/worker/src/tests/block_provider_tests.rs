@@ -1,24 +1,45 @@
+use std::sync::Mutex;
+
+use crate::quorum_waiter::QuorumWaiterError;
+
 // Copyright (c) 2021, Facebook, Inc. and its affiliates
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 use super::*;
 
-use crate::NUM_SHUTDOWN_RECEIVERS;
 use narwhal_network_types::MockWorkerToPrimary;
 use narwhal_typed_store::open_db;
 use reth_primitives::SealedHeader;
 use tempfile::TempDir;
-use tn_types::{test_utils::transaction, PreSubscribedBroadcastSender};
+use tn_types::test_utils::transaction;
+
+#[derive(Clone, Debug)]
+struct TestMakeBlockQuorumWaiter(Arc<Mutex<Option<WorkerBlock>>>);
+impl TestMakeBlockQuorumWaiter {
+    fn new_test() -> Self {
+        Self(Arc::new(Mutex::new(None)))
+    }
+}
+impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
+    fn verify_block(
+        &self,
+        block: WorkerBlock,
+        _timeout: Duration,
+    ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
+        let data = self.0.clone();
+        tokio::spawn(async move {
+            *data.lock().unwrap() = Some(block);
+            Ok(())
+        })
+    }
+}
 
 #[tokio::test]
 async fn make_block() {
     let client = NetworkClient::new_with_empty_id();
     let temp_dir = TempDir::new().unwrap();
     let store = open_db(temp_dir.path());
-    let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
-    let (tx_block_maker, rx_block_maker) = tn_types::test_channel!(1);
-    let (tx_quorum_waiter, mut rx_quorum_waiter) = tn_types::test_channel!(1);
     let node_metrics = WorkerMetrics::default();
 
     // Mock the primary client to always succeed.
@@ -28,40 +49,27 @@ async fn make_block() {
 
     // Spawn a `BlockProvider` instance.
     let id = 0;
-    let _block_maker_handle = BlockProvider::spawn(
-        id,
-        /* max_block_size */ 200,
-        /* max_block_delay */
-        Duration::from_millis(1_000_000), // Ensure the timer is not triggered.
-        tx_shutdown.subscribe(),
-        rx_block_maker,
-        tx_quorum_waiter,
-        Arc::new(node_metrics),
-        client,
-        store.clone(),
-    );
+    let qw = TestMakeBlockQuorumWaiter::new_test();
+    let block_provider =
+        BlockProvider::new(id, qw.clone(), Arc::new(node_metrics), client, store.clone());
 
     // Send enough transactions to seal a block.
     let tx = transaction();
-    let (ack, block1_rx) = tokio::sync::oneshot::channel();
-    let new_block_1 = NewWorkerBlock {
-        block: WorkerBlock::new(vec![tx.clone(), tx.clone()], SealedHeader::default()),
-        ack,
-    };
+    let new_block = WorkerBlock::new(vec![tx.clone(), tx.clone()], SealedHeader::default());
 
-    tx_block_maker.send(new_block_1).await.unwrap();
+    block_provider.seal(new_block.clone(), Duration::from_secs(10)).await.unwrap();
 
     // Ensure the block is as expected.
     let expected_block = WorkerBlock::new(vec![tx.clone(), tx.clone()], SealedHeader::default());
-    let (block, resp) = rx_quorum_waiter.recv().await.unwrap();
 
-    assert_eq!(block.transactions(), expected_block.transactions());
-
-    // Eventually deliver message
-    assert!(resp.send(()).is_ok());
-
-    // Block provider should finish creating the block.
-    assert!(block1_rx.await.is_ok());
+    assert_eq!(
+        new_block.transactions(),
+        qw.0.lock()
+            .unwrap()
+            .as_ref()
+            .expect("Worker block not sent to Quorum Waiter!")
+            .transactions()
+    );
 
     // Ensure the block is stored
     assert!(store.get::<WorkerBlocks>(&expected_block.digest()).unwrap().is_some());

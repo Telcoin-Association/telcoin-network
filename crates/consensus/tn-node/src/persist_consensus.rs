@@ -31,10 +31,11 @@ impl PersistConsensus {
     /// Spawns an async task that will pull from rx and save each ConsensusOutput to the DB.
     pub async fn start(&self, mut rx: broadcast::Receiver<ConsensusOutput>) {
         let db = self.db.clone();
-        // Async spawn for simplicity but if the DB writes are slow this could bog down tokio.  Will
-        // only try to do one write at a time though.
-        tokio::spawn(async move {
-            while let Ok(consensus_output) = rx.recv().await {
+        // Normal thread here so we don't bog down the runtime with DB writes.
+        std::thread::spawn(move || {
+            tracing::info!(target: "engine", "starting persistant consensus writer");
+            // When rx errors (closed sender) thread should end.
+            while let Ok(consensus_output) = rx.blocking_recv() {
                 match db.write_txn() {
                     Ok(mut txn) => {
                         if let Err(e) = txn.insert::<SubDags>(
@@ -57,6 +58,7 @@ impl PersistConsensus {
                     }
                 }
             }
+            tracing::info!(target: "engine", "stopping persistant consensus writer");
         });
     }
 }

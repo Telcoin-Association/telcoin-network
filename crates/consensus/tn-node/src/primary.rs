@@ -15,7 +15,7 @@ use narwhal_primary::{
     consensus::{
         Bullshark, ChannelMetrics, Consensus, ConsensusMetrics, ConsensusRound, LeaderSchedule,
     },
-    Primary, CHANNEL_CAPACITY, NUM_SHUTDOWN_RECEIVERS,
+    Primary, CHANNEL_CAPACITY,
 };
 use narwhal_primary_metrics::Metrics;
 use narwhal_storage::NodeStorage;
@@ -28,8 +28,8 @@ use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use std::{sync::Arc, time::Instant};
 use tn_types::{
     AuthorityIdentifier, BlsKeypair, BlsPublicKey, Certificate, ChainIdentifier, Committee,
-    ConditionalBroadcastReceiver, ConsensusOutput, NetworkKeypair, Parameters,
-    PreSubscribedBroadcastSender, Round, WorkerCache, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    ConsensusOutput, NetworkKeypair, Notifier, Parameters, Round, WorkerCache,
+    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::{
     sync::{broadcast, watch, RwLock},
@@ -45,7 +45,7 @@ struct PrimaryNodeInner {
     /// Keeping NetworkClient here for quicker shutdown.
     client: Option<NetworkClient>,
     /// The shutdown signal channel
-    tx_shutdown: Option<PreSubscribedBroadcastSender>,
+    tx_shutdown: Option<Notifier>,
     /// Peer ID used for local connections.
     own_peer_id: Option<PeerId>,
     /// Consensus broadcast channel.
@@ -103,7 +103,7 @@ impl PrimaryNodeInner {
         self.own_peer_id = Some(PeerId(network_keypair.public().0.to_bytes()));
 
         // create the channel to send the shutdown signal
-        let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+        let mut tx_shutdown = Notifier::new();
 
         let executor_metrics = ExecutorMetrics::default();
 
@@ -157,9 +157,8 @@ impl PrimaryNodeInner {
             c.shutdown();
         }
 
-        if let Some(tx_shutdown) = self.tx_shutdown.as_ref() {
-            tx_shutdown.send().expect("Couldn't send the shutdown signal to downstream components");
-            self.tx_shutdown = None
+        if let Some(mut tx_shutdown) = self.tx_shutdown.take() {
+            tx_shutdown.notify();
         }
 
         // Now wait until handles have been completed
@@ -203,7 +202,7 @@ impl PrimaryNodeInner {
         // // The state used by the client to execute transactions.
         // execution_state: State,
         // The channel to send the shutdown signal
-        tx_shutdown: &mut PreSubscribedBroadcastSender,
+        tx_shutdown: &mut Notifier,
         // The metrics for executor
         // Passing here bc the tx notifier is needed to create the metrics.
         executor_metrics: ExecutorMetrics,
@@ -242,7 +241,7 @@ where
                 committee.clone(),
                 client.clone(),
                 store,
-                tx_shutdown.subscribe_n(3),
+                tx_shutdown,
                 rx_new_certificates,
                 tx_committed_certificates.clone(),
                 tx_consensus_round_updates,
@@ -296,7 +295,7 @@ where
         committee: Committee,
         client: NetworkClient,
         store: &NodeStorage<CDB>,
-        mut shutdown_receivers: Vec<ConditionalBroadcastReceiver>,
+        tx_shutdown: &mut Notifier,
         rx_new_certificates: metered_channel::Receiver<Certificate>,
         tx_committed_certificates: metered_channel::Sender<(Round, Vec<Certificate>)>,
         tx_consensus_round_updates: watch::Sender<ConsensusRound>,
@@ -370,7 +369,7 @@ where
             self.parameters.gc_depth,
             store.consensus_store.clone(),
             store.certificate_store.clone(),
-            shutdown_receivers.pop().unwrap(),
+            tx_shutdown.subscribe(),
             rx_new_certificates,
             tx_committed_certificates,
             tx_consensus_round_updates,
@@ -386,7 +385,7 @@ where
             worker_cache,
             committee.clone(),
             client,
-            shutdown_receivers.pop().unwrap(),
+            tx_shutdown.subscribe(),
             rx_sequence,
             restored_consensus_output,
             self.consensus_output_notification_sender.clone(),

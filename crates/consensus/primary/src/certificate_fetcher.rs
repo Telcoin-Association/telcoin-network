@@ -18,12 +18,12 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tn_types::{AuthorityIdentifier, Committee, NetworkPublicKey};
+use tn_types::{AuthorityIdentifier, Committee, NetworkPublicKey, Noticer};
 
 use narwhal_network_types::{FetchCertificatesRequest, FetchCertificatesResponse};
 use tn_types::{
     error::{DagError, DagResult},
-    validate_received_certificate_version, Certificate, ConditionalBroadcastReceiver, Round,
+    validate_received_certificate_version, Certificate, Round,
 };
 use tokio::{
     sync::watch,
@@ -70,7 +70,7 @@ pub(crate) struct CertificateFetcher<DB> {
     /// Receiver for signal of round changes.
     rx_consensus_round_updates: watch::Receiver<ConsensusRound>,
     /// Receiver for shutdown.
-    rx_shutdown: ConditionalBroadcastReceiver,
+    rx_shutdown: Noticer,
     /// Receives certificates with missing parents from the `Synchronizer`.
     rx_certificate_fetcher: Receiver<CertificateFetcherCommand>,
     /// Map of validator to target rounds that local store must catch up to.
@@ -105,7 +105,7 @@ impl<DB: Database> CertificateFetcher<DB> {
         network: anemo::Network,
         certificate_store: CertificateStore<DB>,
         rx_consensus_round_updates: watch::Receiver<ConsensusRound>,
-        rx_shutdown: ConditionalBroadcastReceiver,
+        rx_shutdown: Noticer,
         rx_certificate_fetcher: Receiver<CertificateFetcherCommand>,
         synchronizer: Arc<Synchronizer<DB>>,
         metrics: Arc<PrimaryMetrics>,
@@ -214,7 +214,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                         self.kickstart();
                     }
                 },
-                _ = self.rx_shutdown.receiver.recv() => {
+                _ = &self.rx_shutdown => {
                     return
                 }
             }

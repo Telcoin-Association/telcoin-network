@@ -3,22 +3,19 @@
 // SPDX-License-Identifier: Apache-2.0
 use fastcrypto::hash::Hash;
 use narwhal_executor::get_restored_consensus_output;
-use narwhal_primary::{
-    consensus::{
-        Bullshark, Consensus, ConsensusMetrics, ConsensusRound, LeaderSchedule, LeaderSwapTable,
-    },
-    NUM_SHUTDOWN_RECEIVERS,
+use narwhal_primary::consensus::{
+    Bullshark, Consensus, ConsensusMetrics, ConsensusRound, LeaderSchedule, LeaderSwapTable,
 };
 use narwhal_storage::NodeStorage;
 
 use narwhal_typed_store::open_db;
 use tempfile::TempDir;
-use tn_types::{test_utils::CommitteeFixture, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
+use tn_types::{test_utils::CommitteeFixture, Notifier, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
 
 use std::{collections::BTreeSet, sync::Arc};
 use tokio::sync::watch;
 
-use tn_types::{Certificate, PreSubscribedBroadcastSender, Round};
+use tn_types::{Certificate, Round};
 
 #[tokio::test]
 async fn test_recovery() {
@@ -58,7 +55,7 @@ async fn test_recovery() {
     let (tx_consensus_round_updates, _rx_consensus_round_updates) =
         watch::channel(ConsensusRound::default());
 
-    let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+    let mut tx_shutdown = Notifier::new();
 
     const GC_DEPTH: Round = 50;
     const NUM_SUB_DAGS_PER_SCHEDULE: u64 = 100;

@@ -6,12 +6,21 @@
 #![allow(clippy::mutable_key_type)]
 
 mod reputation;
+use std::time::Duration;
+
 pub use reputation::*;
 mod output;
 pub use output::*;
 mod execution;
 pub use execution::*;
 pub use reth_consensus::{Consensus, ConsensusError};
+use tokio::sync::{mpsc::Sender, oneshot};
+
+use crate::{error::BlockSealError, WorkerBlock};
 
 /// A global sequence number assigned to every CommittedSubDag.
 pub type SequenceNumber = u64;
+
+/// Type for the channel sender to submit worker block to the block provider.
+pub type WorkerBlockSender =
+    Sender<(WorkerBlock, Duration, oneshot::Sender<Result<(), BlockSealError>>)>;

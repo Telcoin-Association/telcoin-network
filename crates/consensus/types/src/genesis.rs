@@ -117,6 +117,9 @@ fn adiri_genesis_raw() -> &'static str {
         },
         "0x8903d35F5F941bc0C6977DBf40d0cB067473e8f2": {
             "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
+        },
+        "0x0e26AdE1F5A99Bd6B5D40f870a87bFE143Db68B6": {
+            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
         }
     },
     "number": "0x0",

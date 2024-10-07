@@ -165,11 +165,13 @@ impl Default for MemDatabase {
 }
 
 impl Database for MemDatabase {
-    type TX<'txn> = MemDbTx
+    type TX<'txn>
+        = MemDbTx
     where
         Self: 'txn;
 
-    type TXMut<'txn> = MemDbTxMut
+    type TXMut<'txn>
+        = MemDbTxMut
     where
         Self: 'txn;
 

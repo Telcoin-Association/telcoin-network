@@ -5,7 +5,7 @@
 
 use narwhal_network::client::NetworkClient;
 use narwhal_storage::NodeStorage;
-use narwhal_typed_store::open_db;
+use narwhal_typed_store::{open_db, DatabaseType};
 use std::path::PathBuf;
 use tn_node::worker::WorkerNode;
 use tn_types::{
@@ -22,7 +22,8 @@ pub struct WorkerNodeDetails {
     pub transactions_address: Multiaddr,
     name: AuthorityIdentifier,
     primary_key: BlsPublicKey,
-    node: WorkerNode,
+    // Need to assign a type to WorkerNode generic since we create it in this struct.
+    node: WorkerNode<DatabaseType>,
     committee: Committee,
     worker_cache: WorkerCache,
     store_path: PathBuf,
@@ -59,8 +60,7 @@ impl WorkerNodeDetails {
         client: NetworkClient,
         preserve_store: bool,
         execution_node: &TestExecutionNode,
-    ) -> eyre::Result<()>
-where {
+    ) -> eyre::Result<()> {
         if self.is_running().await {
             panic!("Worker with id {} is already running, can't start again", self.id);
         }

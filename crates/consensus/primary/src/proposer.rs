@@ -26,7 +26,7 @@ use crate::{
 };
 use consensus_metrics::metered_channel::{Receiver, Sender};
 use fastcrypto::hash::Hash as _;
-use futures::{FutureExt, StreamExt};
+use futures::FutureExt;
 use narwhal_primary_metrics::PrimaryMetrics;
 use narwhal_storage::ProposerStore;
 use narwhal_typed_store::traits::Database;
@@ -34,13 +34,13 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
     future::Future,
-    pin::Pin,
+    pin::{pin, Pin},
     sync::Arc,
     task::{Context, Poll},
 };
 use tn_types::{
-    now, AuthorityIdentifier, BlockHash, Certificate, Committee, ConditionalBroadcastReceiver,
-    Epoch, Header, Round, SystemMessage, TimestampSec, WorkerId,
+    now, AuthorityIdentifier, BlockHash, Certificate, Committee, Epoch, Header, Noticer, Round,
+    SystemMessage, TimestampSec, WorkerId,
 };
 use tokio::{
     sync::{
@@ -49,7 +49,6 @@ use tokio::{
     },
     time::{sleep, Duration, Interval},
 };
-use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, enabled, error, trace, warn};
 
 /// Type alias for the async task that creates, stores, and sends the proposer's new header.
@@ -130,7 +129,7 @@ pub struct Proposer<DB: Database> {
     /// Receiver for shutdown.
     ///
     /// Also used to signal committee change.
-    rx_shutdown_stream: BroadcastStream<()>,
+    rx_shutdown: Noticer,
     /// Receives the parents to include in the next header (along with their round number) from
     /// `Synchronizer`.
     rx_parents: Receiver<(Vec<Certificate>, Round)>,
@@ -195,7 +194,7 @@ impl<DB: Database + 'static> Proposer<DB> {
         max_header_delay: Duration,
         min_header_delay: Duration,
         fatal_header_timeout: Option<Duration>,
-        rx_shutdown: ConditionalBroadcastReceiver,
+        rx_shutdown: Noticer,
         rx_parents: Receiver<(Vec<Certificate>, Round)>,
         rx_our_digests: Receiver<OurDigestMessage>,
         rx_system_messages: Receiver<SystemMessage>,
@@ -213,7 +212,6 @@ impl<DB: Database + 'static> Proposer<DB> {
         let mut fatal_header_timeout = tokio::time::interval(fatal_header_timeout);
         // reset interval because first tick completes immediately
         fatal_header_timeout.reset();
-        let rx_shutdown_stream = BroadcastStream::new(rx_shutdown.receiver);
 
         Self {
             authority_id,
@@ -226,7 +224,7 @@ impl<DB: Database + 'static> Proposer<DB> {
             max_delay_interval,
             fatal_header_timeout,
             opt_latest_header: None,
-            rx_shutdown_stream,
+            rx_shutdown,
             rx_parents,
             rx_our_digests,
             rx_system_messages,
@@ -865,7 +863,7 @@ where
             //
             // okay to shutdown here because other primary tasks are expected to shutdown too
             // ie) no point completing the proposal if certifier is down
-            if let Poll::Ready(Some(_shutdown)) = this.rx_shutdown_stream.poll_next_unpin(cx) {
+            if pin!(&this.rx_shutdown).poll(cx).is_ready() {
                 warn!(target: "primary::proposer", authority=?this.authority_id, round=this.round, "received shutdown signal...");
                 return Poll::Ready(Ok(()));
             }
