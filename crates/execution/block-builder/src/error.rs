@@ -1,7 +1,5 @@
 //! Error types for Telcoin Network Block Builder.
 
-use std::sync::mpsc::SendError;
-
 use reth_errors::{CanonicalError, ProviderError, RethError};
 use tn_types::WorkerBlockConversionError;
 use tokio::sync::{mpsc, oneshot};
@@ -36,6 +34,9 @@ pub enum BlockBuilderError {
     /// Failed to send to the worker.
     #[error("Fatal error: failed to send built block to worker.")]
     WorkerChannelClosed,
+    /// Fatal db error with worker while trying to reach quorum.
+    #[error("Fatal error: worker block provider db error")]
+    FatalDBFailure,
 }
 
 impl From<oneshot::error::RecvError> for BlockBuilderError {

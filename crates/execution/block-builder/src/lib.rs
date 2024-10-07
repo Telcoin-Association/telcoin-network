@@ -15,6 +15,7 @@
 use block_builder::build_worker_block;
 use block_builder::BlockBuilderOutput;
 use consensus_metrics::metered_channel::Sender;
+use error::BlockBuilderError;
 use error::BlockBuilderResult;
 use futures_util::{FutureExt, StreamExt};
 use reth_chainspec::ChainSpec;
@@ -33,6 +34,9 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
+use tn_types::error::BlockSealError;
+use tn_types::WorkerBlock;
+use tn_types::WorkerBlockSender;
 use tn_types::{LastCanonicalUpdate, PendingBlockConfig, WorkerBlockBuilderArgs};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
@@ -44,7 +48,7 @@ mod error;
 pub mod test_utils;
 
 /// Type alias for the blocking task that locks the tx pool and builds the next worker block.
-type BlockBuildingTask = oneshot::Receiver<BlockBuilderResult<(B256, Vec<TxHash>)>>;
+type BlockBuildingTask = oneshot::Receiver<BlockBuilderResult<Vec<TxHash>>>;
 
 /// The type that builds blocks for workers to propose.
 ///
@@ -89,7 +93,7 @@ pub struct BlockBuilder<BT, Pool> {
     /// The worker's block maker sends an ack once the block has been stored in db
     /// which guarantees the worker will attempt to broadcast the new block until
     /// quorum is reached.
-    to_worker: Sender<NewWorkerBlock>,
+    to_worker: WorkerBlockSender,
     /// The address for worker block's beneficiary.
     address: Address,
     /// Receiver stream for pending transactions in the pool.
@@ -129,7 +133,7 @@ where
         pool: Pool,
         canonical_state_stream: CanonStateNotificationStream,
         latest_canon_state: LastCanonicalUpdate,
-        to_worker: Sender<NewWorkerBlock>,
+        to_worker: WorkerBlockSender,
         address: Address,
         pending_tx_hashes_stream: ReceiverStream<TxHash>,
         gas_limit: u64,
@@ -242,11 +246,11 @@ where
             let (ack, rx) = oneshot::channel();
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
-            let BlockBuilderOutput { worker_block: block, mined_transactions } =
+            let BlockBuilderOutput { worker_block, mined_transactions } =
                 build_worker_block(build_args);
 
             // forward to worker and wait for ack that quorum was reached
-            if let Err(e) = to_worker.send(NewWorkerBlock { block, ack }).await {
+            if let Err(e) = to_worker.send((worker_block, ack)).await {
                 error!(target: "worker::block_builder", ?e, "failed to send next block to worker");
                 // try to return error if worker channel closed
                 let _ = result.send(Err(e.into()));
@@ -255,10 +259,37 @@ where
 
             // wait for worker to ack quorum reached then update pool with mined transactions
             match rx.await {
-                Ok(hash) => {
-                    // signal to Self that this task is complete
-                    if let Err(e) = result.send(Ok((hash, mined_transactions))) {
-                        error!(target: "worker::block_builder", ?e, "failed to send block builder result to block builder task");
+                Ok(res) => {
+                    match res {
+                        Ok(_) => {
+                            // signal to Self that this task is complete
+                            if let Err(e) = result.send(Ok(mined_transactions)) {
+                                error!(target: "worker::block_builder", ?e, "failed to send block builder result to block builder task");
+                            }
+                        }
+                        Err(error) => {
+                            error!(target: "worker::block_builder", ?error, "error while sealing block");
+                            let converted = match error {
+                                BlockSealError::FatalDBFailure => {
+                                    // fatal - return error
+                                    Err(BlockBuilderError::FatalDBFailure)
+                                }
+                                BlockSealError::QuorumRejected
+                                | BlockSealError::AntiQuorum
+                                | BlockSealError::Timeout
+                                | BlockSealError::FailedQuorum => {
+                                    // potentially non-fatal error
+                                    //
+                                    // return empty vec to indicate no transactions mined
+                                    // NOTE: this will apply no changes to transaction pool
+                                    Ok(vec![])
+                                }
+                            };
+
+                            if let Err(e) = result.send(converted) {
+                                error!(target: "worker::block_builder", ?e, "failed to send block builder result to block builder task");
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -342,15 +373,12 @@ where
             // drain pending pool updates and pass waker so this gets awoken when txs are available
             while let Poll::Ready(msg) = this.pending_tx_hashes_stream.poll_next_unpin(cx) {
                 match msg {
-                    Some(_tx) => (/* drain nofications now that pool is empty */),
+                    Some(_tx) => (/* drain nofications */),
                     None => return Poll::Ready(Ok(())), // shutdown
                 }
             }
 
-            // only insert task if there is none
-            //
-            // note: it's important that the previous block build finishes before
-            // inserting the next task to ensure updates are applied correctly
+            // only propose one block at a time
             if this.pending_task.is_none() {
                 // TODO: is there a more efficient approach? only need pending pool stats
                 // create upstream PR for reth?
@@ -370,26 +398,34 @@ where
                 // don't break so pending_task receiver gets polled
             }
 
-            // poll receiver that returns worker's ack once block is proposed
+            // poll receiver that returns mined transactions once the worker block reaches quorum
             if let Some(mut receiver) = this.pending_task.take() {
                 // poll here so waker is notified when ack received
                 match receiver.poll_unpin(cx) {
                     Poll::Ready(res) => {
                         // TODO: update tree's pending block?
-                        //
-                        // ensure no errors
-                        let (_worker_block_hash, mined_transactions) = res??;
 
-                        // TODO: ensure this triggers faucet to track mined event
-                        // - faucet to keep track of nonce state?
-                        // - txhash mined event, keep track of highest nonce?
+                        // ensure no fatal errors
+                        let mined_transactions = res??;
+
+                        // NOTE: empty vec returned for non-fatal error during block proposal
+                        if mined_transactions.is_empty() {
+                            // return pending until next canon update because the last block failed to reach quorum
+                            //
+                            // task should wait until next canonical update applied to pool
+                            break;
+                        }
+
+                        // use latest values so only mined transactions are updated
+                        let new_tip = &this.latest_canon_state.tip;
+                        let pending_block_base_fee = this.latest_canon_state.pending_block_base_fee;
+                        let pending_block_blob_fee = this.latest_canon_state.pending_block_blob_fee;
 
                         // create canonical state update
-                        // use latest values so only mined transactions are updated
                         let update = CanonicalStateUpdate {
-                            new_tip: &this.latest_canon_state.tip,
-                            pending_block_base_fee: this.latest_canon_state.pending_block_base_fee,
-                            pending_block_blob_fee: this.latest_canon_state.pending_block_blob_fee,
+                            new_tip,
+                            pending_block_base_fee,
+                            pending_block_blob_fee,
                             changed_accounts: vec![], // only updated by engine updates
                             mined_transactions,
                         };
