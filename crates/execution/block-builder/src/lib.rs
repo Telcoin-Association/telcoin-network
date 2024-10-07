@@ -40,8 +40,6 @@ use tracing::{debug, error, trace, warn};
 
 mod block_builder;
 mod error;
-mod pool;
-pub use pool::{maintain_transaction_pool_future, PoolMaintenanceConfig};
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
