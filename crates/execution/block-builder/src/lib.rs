@@ -12,21 +12,16 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-use block_builder::build_worker_block;
-use block_builder::BlockBuilderOutput;
-use consensus_metrics::metered_channel::Sender;
+pub use block_builder::build_worker_block;
+pub use block_builder::BlockBuilderOutput;
 use error::BlockBuilderError;
 use error::BlockBuilderResult;
 use futures_util::{FutureExt, StreamExt};
-use reth_chainspec::ChainSpec;
 use reth_execution_types::ChangedAccount;
 use reth_primitives::{
-    constants::MIN_PROTOCOL_BASE_FEE, Address, IntoRecoveredTransaction, TxHash, B256,
+    constants::MIN_PROTOCOL_BASE_FEE, Address, IntoRecoveredTransaction, TxHash,
 };
-use reth_provider::{
-    BlockReaderIdExt, CanonChainTracker, CanonStateNotification, CanonStateNotificationStream,
-    CanonStateSubscriptions, Chain, ChainSpecProvider, StateProviderFactory,
-};
+use reth_provider::{CanonStateNotification, CanonStateNotificationStream, Chain};
 use reth_transaction_pool::{CanonicalStateUpdate, TransactionPool, TransactionPoolExt};
 use std::{
     future::Future,
@@ -35,7 +30,6 @@ use std::{
     task::{Context, Poll},
 };
 use tn_types::error::BlockSealError;
-use tn_types::WorkerBlock;
 use tn_types::WorkerBlockSender;
 use tn_types::{LastCanonicalUpdate, PendingBlockConfig, WorkerBlockBuilderArgs};
 use tokio::sync::oneshot;
@@ -63,7 +57,9 @@ pub struct BlockBuilder<BT, Pool> {
     /// the result through a oneshot channel.
     pending_task: Option<BlockBuildingTask>,
     /// The type used to query both the database and the blockchain tree.
-    blockchain: BT,
+    ///
+    /// TODO: leaving this for now to prevent generics refactor
+    _blockchain: BT,
     /// The transaction pool with pending transactions.
     pool: Pool,
     /// Canonical state changes from the engine.
@@ -118,18 +114,12 @@ pub struct BlockBuilder<BT, Pool> {
 
 impl<BT, Pool> BlockBuilder<BT, Pool>
 where
-    BT: CanonStateSubscriptions
-        + ChainSpecProvider<ChainSpec = ChainSpec>
-        + StateProviderFactory
-        + CanonChainTracker
-        + Clone
-        + 'static,
     Pool: TransactionPoolExt + 'static,
 {
     /// Create a new instance of [Self].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        blockchain: BT,
+        _blockchain: BT,
         pool: Pool,
         canonical_state_stream: CanonStateNotificationStream,
         latest_canon_state: LastCanonicalUpdate,
@@ -142,7 +132,7 @@ where
     ) -> Self {
         Self {
             pending_task: None,
-            blockchain,
+            _blockchain,
             pool,
             canonical_state_stream,
             latest_canon_state,
@@ -221,20 +211,17 @@ where
     ///
     /// Workers only propose one block at a time.
     fn spawn_execution_task(&self) -> BlockBuildingTask {
-        let provider = self.blockchain.clone();
         let pool = self.pool.clone();
-        let chain_spec = provider.chain_spec();
         let to_worker = self.to_worker.clone();
 
         // configure params for next block to build
         let config = PendingBlockConfig::new(
-            chain_spec,
             self.address,
             self.latest_canon_state.clone(),
             self.gas_limit, // in wei
             self.max_size,  // in bytes
         );
-        let build_args = WorkerBlockBuilderArgs::new(provider, pool.clone(), config);
+        let build_args = WorkerBlockBuilderArgs::new(pool.clone(), config);
         let (result, done) = oneshot::channel();
 
         // spawn block building task and forward to worker
@@ -316,14 +303,7 @@ where
 /// any output that is queued.
 impl<BT, Pool> Future for BlockBuilder<BT, Pool>
 where
-    BT: StateProviderFactory
-        + CanonChainTracker
-        + CanonStateSubscriptions
-        + ChainSpecProvider<ChainSpec = ChainSpec>
-        + BlockReaderIdExt
-        + Clone
-        + Unpin
-        + 'static,
+    BT: Unpin,
     Pool: TransactionPool + TransactionPoolExt + Unpin + 'static,
     <Pool as TransactionPool>::Transaction: IntoRecoveredTransaction,
 {

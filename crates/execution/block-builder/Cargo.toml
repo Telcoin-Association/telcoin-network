@@ -15,7 +15,6 @@ tokio-stream = { workspace = true }
 tracing = { workspace = true }
 
 reth-primitives = { workspace = true }
-reth-chainspec = { workspace = true }
 reth-errors = { workspace = true }
 reth-stages = { workspace = true }
 reth-provider = { workspace = true }
@@ -27,8 +26,6 @@ reth-metrics = { workspace = true }
 metrics = { workspace = true }
 thiserror = { workspace = true }
 alloy-rlp = { workspace = true }
-
-consensus-metrics = { workspace = true }
 
 [dev-dependencies]
 # unit tests

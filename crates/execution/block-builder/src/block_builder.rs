@@ -8,7 +8,6 @@ use reth_primitives::{
     constants::EMPTY_WITHDRAWALS, proofs, Bloom, Bytes, Header, IntoRecoveredTransaction, TxHash,
     B256, EMPTY_OMMER_ROOT_HASH, U256,
 };
-use reth_provider::StateProviderFactory;
 use reth_transaction_pool::TransactionPool;
 use tn_types::{now, PendingBlockConfig, WorkerBlock, WorkerBlockBuilderArgs};
 use tracing::{debug, warn};
@@ -16,6 +15,7 @@ use tracing::{debug, warn};
 /// The output from building the next block.
 ///
 /// Contains information needed to update the transaction pool.
+#[derive(Debug)]
 pub struct BlockBuilderOutput {
     /// The block info for the worker to propose.
     pub(crate) worker_block: WorkerBlock,
@@ -42,16 +42,12 @@ pub struct BlockBuilderOutput {
 /// with very high gas limits. It's impossible to know the amount of gas a transaction
 /// will use without executing it, and the worker does not execute transactions.
 #[inline]
-pub fn build_worker_block<Pool, Provider>(
-    args: WorkerBlockBuilderArgs<Pool, Provider>,
-) -> BlockBuilderOutput
+pub fn build_worker_block<P>(args: WorkerBlockBuilderArgs<P>) -> BlockBuilderOutput
 where
-    Provider: StateProviderFactory,
-    Pool: TransactionPool,
+    P: TransactionPool,
 {
-    let WorkerBlockBuilderArgs { provider, pool, block_config } = args;
-    let PendingBlockConfig { chain_spec, beneficiary, parent_info, gas_limit, max_size } =
-        block_config;
+    let WorkerBlockBuilderArgs { pool, block_config } = args;
+    let PendingBlockConfig { beneficiary, parent_info, gas_limit, max_size } = block_config;
 
     // NOTE: this obtains a `read` lock on the tx pool
     // pull best transactions and rely on watch channel to ensure basefee is current

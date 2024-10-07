@@ -2,10 +2,8 @@
 //!
 //! This is an experimental approach to supporting pending blocks for workers.
 
-use reth_chainspec::ChainSpec;
 use reth_primitives::{Address, SealedBlock};
 use reth_provider::ExecutionOutcome;
-use std::sync::Arc;
 
 /// The type that holds the worker's pending block.
 ///
@@ -44,9 +42,7 @@ impl PendingWorkerBlock {
 
 /// The arguments passed to the worker's block builder.
 #[derive(Debug)]
-pub struct WorkerBlockBuilderArgs<Pool, Provider> {
-    /// The state provider.
-    pub provider: Provider,
+pub struct WorkerBlockBuilderArgs<Pool> {
     /// The transaction pool.
     pub pool: Pool,
     /// The attributes for the next block.
@@ -56,18 +52,16 @@ pub struct WorkerBlockBuilderArgs<Pool, Provider> {
     pub block_config: PendingBlockConfig,
 }
 
-impl<Pool, Provider> WorkerBlockBuilderArgs<Pool, Provider> {
+impl<Pool> WorkerBlockBuilderArgs<Pool> {
     /// Create a new instance of [Self].
-    pub fn new(provider: Provider, pool: Pool, block_config: PendingBlockConfig) -> Self {
-        Self { provider, pool, block_config }
+    pub fn new(pool: Pool, block_config: PendingBlockConfig) -> Self {
+        Self { pool, block_config }
     }
 }
 
 /// The configuration to use for building the next worker block.
 #[derive(Debug)]
 pub struct PendingBlockConfig {
-    /// The chain spec.
-    pub chain_spec: Arc<ChainSpec>,
     /// The worker primary's address.
     pub beneficiary: Address,
     /// The current information from canonical tip and finalized block.
@@ -88,13 +82,12 @@ pub struct PendingBlockConfig {
 impl PendingBlockConfig {
     /// Creates a new instance of [Self].
     pub fn new(
-        chain_spec: Arc<ChainSpec>,
         beneficiary: Address,
         parent_info: LastCanonicalUpdate,
         gas_limit: u64,
         max_size: usize,
     ) -> Self {
-        Self { chain_spec, beneficiary, parent_info, gas_limit, max_size }
+        Self { beneficiary, parent_info, gas_limit, max_size }
     }
 }
 
