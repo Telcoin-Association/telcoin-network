@@ -50,14 +50,15 @@ async fn make_block() {
     // Spawn a `BlockProvider` instance.
     let id = 0;
     let qw = TestMakeBlockQuorumWaiter::new_test();
+    let timeout = Duration::from_secs(5);
     let block_provider =
-        BlockProvider::new(id, qw.clone(), Arc::new(node_metrics), client, store.clone());
+        BlockProvider::new(id, qw.clone(), Arc::new(node_metrics), client, store.clone(), timeout);
 
     // Send enough transactions to seal a block.
     let tx = transaction();
     let new_block = WorkerBlock::new(vec![tx.clone(), tx.clone()], SealedHeader::default());
 
-    block_provider.seal(new_block.clone(), Duration::from_secs(10)).await.unwrap();
+    block_provider.seal(new_block.clone()).await.unwrap();
 
     // Ensure the block is as expected.
     let expected_block = WorkerBlock::new(vec![tx.clone(), tx.clone()], SealedHeader::default());

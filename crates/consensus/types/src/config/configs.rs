@@ -4,6 +4,7 @@ use crate::{
     adiri_genesis, utils::get_available_tcp_port, BlsPublicKey, BlsSignature, Multiaddr,
     NetworkPublicKey, ValidatorInfo, WorkerIndex,
 };
+use alloy::dyn_abi::parser::ParameterSpecifier;
 use fastcrypto::traits::KeyPair as KeyPairTrait;
 use reth_chainspec::ChainSpec;
 use reth_primitives::{Address, Genesis};
@@ -181,6 +182,9 @@ pub struct Parameters {
     /// Anemo network settings.
     #[serde(default = "AnemoParameters::default")]
     pub anemo: AnemoParameters,
+    /// Worker timeout when request vote from peers.
+    #[serde(default = "Parameters::default_worker_block_vote_timeout")]
+    pub worker_block_vote_timeout: Duration,
 }
 
 impl Parameters {
@@ -228,6 +232,10 @@ impl Parameters {
 
     fn default_max_concurrent_requests() -> usize {
         500_000
+    }
+
+    fn default_worker_block_vote_timeout() -> Duration {
+        Duration::from_secs(10)
     }
 }
 
@@ -365,6 +373,7 @@ impl Default for Parameters {
             prometheus_metrics: PrometheusMetricsParameters::default(),
             network_admin_server: NetworkAdminServerParameters::default(),
             anemo: AnemoParameters::default(),
+            worker_block_vote_timeout: Parameters::default_worker_block_vote_timeout(),
         }
     }
 }

@@ -38,7 +38,9 @@ use tn_block_proposer::{BlockProposerBuilder, MiningMode};
 use tn_block_validator::BlockValidator;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
-use tn_types::{Config, Consensus, ConsensusOutput, NewWorkerBlock, PendingWorkerBlock, WorkerId};
+use tn_types::{
+    Config, Consensus, ConsensusOutput, PendingWorkerBlock, WorkerBlockSender, WorkerId,
+};
 use tokio::sync::{broadcast, mpsc::unbounded_channel, watch};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info};

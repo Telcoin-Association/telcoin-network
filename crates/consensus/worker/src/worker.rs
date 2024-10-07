@@ -424,6 +424,13 @@ impl<DB: Database> Worker<DB> {
             node_metrics.clone(),
         );
 
-        BlockProvider::new(self.id, quorum_waiter, node_metrics, client, self.store.clone())
+        BlockProvider::new(
+            self.id,
+            quorum_waiter,
+            node_metrics,
+            client,
+            self.store.clone(),
+            self.parameters.worker_block_vote_timeout,
+        )
     }
 }

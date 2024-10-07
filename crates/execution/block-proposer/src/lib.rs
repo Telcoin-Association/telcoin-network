@@ -505,8 +505,9 @@ mod tests {
         let store = open_db(temp_dir.path());
         let qw = TestMakeBlockQuorumWaiter();
         let node_metrics = WorkerMetrics::default();
+        let timeout = Duration::from_secs(5);
         let block_provider =
-            BlockProvider::new(0, qw, Arc::new(node_metrics), client, store.clone());
+            BlockProvider::new(0, qw, Arc::new(node_metrics), client, store.clone(), timeout);
         // build block proposer
         let task = BlockProposerBuilder::new(
             Arc::clone(&chain),

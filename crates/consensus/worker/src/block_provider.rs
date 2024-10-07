@@ -36,6 +36,8 @@ pub struct BlockProvider<DB, QW> {
     store: DB,
     /// Channel sender for alternate block submision if not calling seal directly.
     tx_blocks: WorkerBlockSender,
+    /// The amount of time to wait on a reply from peer before timing out.
+    timeout: Duration,
 }
 
 impl<DB, QW> std::fmt::Debug for BlockProvider<DB, QW> {
@@ -51,15 +53,16 @@ impl<DB: Database, QW: QuorumWaiterTrait> BlockProvider<DB, QW> {
         node_metrics: Arc<WorkerMetrics>,
         client: NetworkClient,
         store: DB,
+        timeout: Duration,
     ) -> Self {
         let (tx_blocks, mut rx_blocks) = tokio::sync::mpsc::channel(1000);
-        let this = Self { id, quorum_waiter, node_metrics, client, store, tx_blocks };
+        let this = Self { id, quorum_waiter, node_metrics, client, store, tx_blocks, timeout };
         let this_clone = this.clone();
         // Spawn a little task to accept blocks from a channel and seal them that way.
         // Allows the engine to remain removed from the worker.
         tokio::spawn(async move {
-            while let Some((block, timeout, tx)) = rx_blocks.recv().await {
-                let res = this_clone.seal(block, timeout).await;
+            while let Some((block, tx)) = rx_blocks.recv().await {
+                let res = this_clone.seal(block).await;
                 if tx.send(res).is_err() {
                     error!(target: "worker::block_provider", "Error sending result to channel caller!  Channel closed.");
                 }
@@ -73,7 +76,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> BlockProvider<DB, QW> {
     }
 
     /// Seal and broadcast the current block.
-    pub async fn seal(&self, block: WorkerBlock, timeout: Duration) -> Result<(), BlockSealError> {
+    pub async fn seal(&self, block: WorkerBlock) -> Result<(), BlockSealError> {
         let size = block.size();
 
         self.node_metrics
@@ -81,7 +84,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> BlockProvider<DB, QW> {
             .with_label_values(&["latest block size"])
             .observe(size as f64);
 
-        let block_attest_handle = self.quorum_waiter.verify_block(block.clone(), timeout);
+        let block_attest_handle = self.quorum_waiter.verify_block(block.clone(), self.timeout);
 
         // Wait for our block to reach quorum or fail to do so.
         match block_attest_handle.await {

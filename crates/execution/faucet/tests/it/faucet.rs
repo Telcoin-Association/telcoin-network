@@ -258,8 +258,9 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     let store = open_db(temp_dir.path());
     let qw = TestChanQuorumWaiter(to_worker);
     let node_metrics = WorkerMetrics::default();
+    let timeout = Duration::from_secs(5);
     let block_provider =
-        BlockProvider::new(0, qw.clone(), Arc::new(node_metrics), client, store.clone());
+        BlockProvider::new(0, qw.clone(), Arc::new(node_metrics), client, store.clone(), timeout);
 
     // start batch maker
     execution_node.start_batch_maker(worker_id, block_provider.blocks_rx()).await?;
@@ -550,8 +551,9 @@ async fn test_faucet_transfers_stablecoin_with_google_kms() -> eyre::Result<()> 
     let store = open_db(temp_dir.path());
     let qw = TestChanQuorumWaiter(to_worker);
     let node_metrics = WorkerMetrics::default();
+    let timeout = Duration::from_secs(5);
     let block_provider =
-        BlockProvider::new(0, qw.clone(), Arc::new(node_metrics), client, store.clone());
+        BlockProvider::new(0, qw.clone(), Arc::new(node_metrics), client, store.clone(), timeout);
     // start batch maker
     execution_node.start_batch_maker(worker_id, block_provider.blocks_rx()).await?;
 

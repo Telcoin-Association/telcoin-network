@@ -33,11 +33,7 @@ use tn_block_proposer::{BlockProposerBuilder, MiningMode};
 use tn_block_validator::{BlockValidation, BlockValidator};
 use tn_types::{
     test_utils::{get_gas_price, test_genesis, TransactionFactory},
-<<<<<<< HEAD
-    PendingWorkerBlock, PreSubscribedBroadcastSender, WorkerBlock,
-=======
     Consensus, PendingWorkerBlock, WorkerBlock,
->>>>>>> main
 };
 use tokio::sync::watch;
 use tracing::debug;
@@ -73,8 +69,15 @@ async fn test_make_block_el_to_cl() {
     network_client.set_worker_to_primary_local_handler(Arc::new(mock_server));
 
     let qw = TestMakeBlockQuorumWaiter();
-    let block_provider =
-        BlockProvider::new(0, qw.clone(), Arc::new(node_metrics), network_client, store.clone());
+    let timeout = Duration::from_secs(5);
+    let block_provider = BlockProvider::new(
+        0,
+        qw.clone(),
+        Arc::new(node_metrics),
+        network_client,
+        store.clone(),
+        timeout,
+    );
 
     //
     //=== Execution Layer

@@ -6,8 +6,6 @@
 #![allow(clippy::mutable_key_type)]
 
 mod reputation;
-use std::time::Duration;
-
 pub use reputation::*;
 mod output;
 pub use output::*;
@@ -22,5 +20,4 @@ use crate::{error::BlockSealError, WorkerBlock};
 pub type SequenceNumber = u64;
 
 /// Type for the channel sender to submit worker block to the block provider.
-pub type WorkerBlockSender =
-    Sender<(WorkerBlock, Duration, oneshot::Sender<Result<(), BlockSealError>>)>;
+pub type WorkerBlockSender = Sender<(WorkerBlock, oneshot::Sender<Result<(), BlockSealError>>)>;
