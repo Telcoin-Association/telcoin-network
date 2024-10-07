@@ -91,23 +91,6 @@ impl ConsensusOutput {
             })
             .collect()
     }
-    /// Calculate the mix hash for a round with no blocks.
-    ///
-    /// Calculates mix hash as a source of randomness on-chain.
-    /// - keccak256
-    /// - consensus output digest from parent (beacon block root)
-    /// - timestamp from consensus
-    ///
-    /// TODO: this should be consistent-ish with how workers calculate their
-    /// mix hashes for proposed blocks. However, this approach is easy to manipulate.
-    /// Need to figure out a better approach for workers, then replicate similar approach here.
-    ///
-    /// See https://eips.ethereum.org/EIPS/eip-4399
-    pub fn mix_hash_for_empty_payload(&self, parent_mix_hash: &B256) -> B256 {
-        keccak256(
-            [parent_mix_hash.as_slice(), self.committed_at().to_le_bytes().as_slice()].concat(),
-        )
-    }
 }
 
 impl Hash<{ crypto::DIGEST_LENGTH }> for ConsensusOutput {

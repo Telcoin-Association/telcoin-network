@@ -449,8 +449,7 @@ mod tests {
         assert_eq!(expected_block.number, expected_block_height);
 
         // mix hash is calculated from parent blocks parent_beacon_block_root and output's timestamp
-        let expected_mix_hash =
-            consensus_output.mix_hash_for_empty_payload(&genesis_header.mix_hash);
+        let expected_mix_hash = consensus_output.digest().into();
         assert_eq!(expected_block.mix_hash, expected_mix_hash);
         let manual_mix_hash = keccak256(
             [

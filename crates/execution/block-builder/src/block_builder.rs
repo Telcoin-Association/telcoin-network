@@ -16,7 +16,7 @@ use tracing::{debug, warn};
 /// The output from building the next block.
 ///
 /// Contains information needed to update the transaction pool.
-pub(crate) struct BlockBuilderOutput {
+pub struct BlockBuilderOutput {
     /// The block info for the worker to propose.
     pub(crate) worker_block: WorkerBlock,
     /// The transaction hashes mined in this worker's block.
@@ -42,7 +42,7 @@ pub(crate) struct BlockBuilderOutput {
 /// with very high gas limits. It's impossible to know the amount of gas a transaction
 /// will use without executing it, and the worker does not execute transactions.
 #[inline]
-pub(crate) fn build_worker_block<Pool, Provider>(
+pub fn build_worker_block<Pool, Provider>(
     args: WorkerBlockBuilderArgs<Pool, Provider>,
 ) -> BlockBuilderOutput
 where
