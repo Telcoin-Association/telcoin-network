@@ -25,7 +25,7 @@ use reth_provider::{providers::BlockchainProvider, ExecutionOutcome};
 use reth_tasks::TaskExecutor;
 use tn_block_validator::BlockValidator;
 use tn_faucet::FaucetArgs;
-use tn_types::{Config, ConsensusOutput, PendingWorkerBlock, WorkerBlockSender, WorkerId};
+use tn_types::{Config, ConsensusOutput, WorkerBlockSender, WorkerId};
 use tokio::sync::{broadcast, watch, RwLock};
 pub use worker::*;
 

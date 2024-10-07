@@ -21,10 +21,9 @@ use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use reth_transaction_pool::TransactionPool;
 use secp256k1::constants::PUBLIC_KEY_SIZE;
 use std::time::Duration;
-use tn_types::PendingWorkerBlock;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedSender},
-    oneshot, watch,
+    oneshot,
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 mod cli_ext;

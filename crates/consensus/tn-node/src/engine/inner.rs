@@ -2,7 +2,7 @@
 //!
 //! This module contains the logic for execution.
 
-use super::{PendingBlockWatchChannels, TnBuilder, WorkerComponents, WorkerTxPool};
+use super::{TnBuilder, WorkerComponents, WorkerTxPool};
 use crate::{
     engine::{WorkerNetwork, WorkerNode},
     error::ExecutionError,
@@ -38,10 +38,8 @@ use tn_block_builder::BlockBuilder;
 use tn_block_validator::BlockValidator;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
-use tn_types::{
-    Config, Consensus, ConsensusOutput, PendingWorkerBlock, WorkerBlockSender, WorkerId,
-};
-use tokio::sync::{broadcast, mpsc::unbounded_channel, watch};
+use tn_types::{Config, Consensus, ConsensusOutput, WorkerBlockSender, WorkerId};
+use tokio::sync::{broadcast, mpsc::unbounded_channel};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info};
 

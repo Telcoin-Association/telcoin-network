@@ -14,8 +14,6 @@ use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_transaction_pool::TransactionPool;
 use secp256k1::PublicKey;
 use std::{str::FromStr, time::Duration};
-use tn_types::PendingWorkerBlock;
-use tokio::sync::watch;
 use tracing::{info, warn};
 
 /// Args for running the faucet.

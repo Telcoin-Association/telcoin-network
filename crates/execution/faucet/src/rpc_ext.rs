@@ -7,8 +7,6 @@ use reth::rpc::server_types::eth::EthResult;
 use reth_primitives::{Address, TxHash};
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_transaction_pool::TransactionPool;
-use tn_types::PendingWorkerBlock;
-use tokio::sync::watch;
 
 /// Faucet that disperses 1 TEL every 24hours per requesting address.
 #[rpc(server, namespace = "faucet")]

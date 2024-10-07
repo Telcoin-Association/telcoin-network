@@ -39,10 +39,9 @@ use std::{
     task::{ready, Context, Poll},
     time::{Duration, SystemTime},
 };
-use tn_types::PendingWorkerBlock;
 use tokio::sync::{
     mpsc::{UnboundedReceiver, UnboundedSender},
-    oneshot, watch,
+    oneshot,
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
