@@ -42,53 +42,18 @@ use tokio::sync::watch;
 /// The explicit type for the worker's transaction pool.
 pub type WorkerTxPool<DB> = EthTransactionPool<BlockchainProvider<DB>, DiskFileBlobStore>;
 
-/// Convenience type for managing worker watch channels for pending block.
-#[derive(Clone, Debug)]
-pub(super) struct PendingBlockWatchChannels {
-    /// The sending half of the watch channel.
-    sender: watch::Sender<PendingWorkerBlock>,
-    /// The receiving half of the watch channel.
-    receiver: watch::Receiver<PendingWorkerBlock>,
-}
-
-impl PendingBlockWatchChannels {
-    /// Create a new instance of [Self].
-    pub fn new(
-        sender: watch::Sender<PendingWorkerBlock>,
-        receiver: watch::Receiver<PendingWorkerBlock>,
-    ) -> Self {
-        Self { sender, receiver }
-    }
-
-    /// Return an owned sender channel.
-    pub fn sender(&self) -> watch::Sender<PendingWorkerBlock> {
-        self.sender.clone()
-    }
-
-    /// Return an owned receiver channel.
-    pub fn receiver(&self) -> watch::Receiver<PendingWorkerBlock> {
-        self.receiver.clone()
-    }
-}
-
 /// Execution components on a per-worker basis.
 pub(super) struct WorkerComponents<DB> {
     /// The RPC handle.
     rpc_handle: RpcServerHandle,
-    /// The current pending block watch channel.
-    pending_channels: PendingBlockWatchChannels,
     /// The worker's transaction pool.
     pool: WorkerTxPool<DB>,
 }
 
 impl<DB> WorkerComponents<DB> {
     /// Create a new instance of [Self].
-    pub fn new(
-        rpc_handle: RpcServerHandle,
-        pending_channels: PendingBlockWatchChannels,
-        pool: WorkerTxPool<DB>,
-    ) -> Self {
-        Self { rpc_handle, pending_channels, pool }
+    pub fn new(rpc_handle: RpcServerHandle, pool: WorkerTxPool<DB>) -> Self {
+        Self { rpc_handle, pool }
     }
 
     /// Return a reference to the rpc handle
@@ -99,16 +64,6 @@ impl<DB> WorkerComponents<DB> {
     /// Return a reference to the worker's transaction pool.
     pub fn pool(&self) -> WorkerTxPool<DB> {
         self.pool.clone()
-    }
-
-    /// Return a receiver for pending block watch channel.
-    pub fn pending_block_receiver(&self) -> watch::Receiver<PendingWorkerBlock> {
-        self.pending_channels.receiver()
-    }
-
-    /// Return a sender for pending block watch channel.
-    pub fn pending_block_sender(&self) -> watch::Sender<PendingWorkerBlock> {
-        self.pending_channels.sender()
     }
 }
 

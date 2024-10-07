@@ -115,10 +115,6 @@ pub(crate) struct FaucetService<Provider, Pool, Tasks> {
     ///
     /// Addresses received on this channel are added to the LRU cache.
     pub(crate) update_cache_rx: UnboundedReceiver<MinedTxInfo>,
-    /// The watch channel for tracking the worker's latest pending block.
-    ///
-    /// The pending block is updated right before transactions are removed from the tx pool.
-    pub(crate) watch_rx: watch::Receiver<PendingWorkerBlock>,
     /// The nonce for this faucet as tracked through the highest mined transaction nonce.
     /// The faucet service checks for the highest nonce in the transaction pool and if needd, in
     /// the database. However, the faucet also needs to nonce state for transactions that are

@@ -101,7 +101,6 @@ impl FaucetArgs {
         &self,
         provider: Provider,
         pool: Pool,
-        watch_rx: watch::Receiver<PendingWorkerBlock>,
     ) -> eyre::Result<FaucetRpcExt>
     where
         Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
@@ -145,7 +144,7 @@ impl FaucetArgs {
                 contract_address: self.contract_address,
             };
 
-            let ext = FaucetRpcExt::new(provider, pool, config, watch_rx);
+            let ext = FaucetRpcExt::new(provider, pool, config);
 
             info!(target: "faucet", "Google KMS active - merging faucet extension.");
             return Ok(ext);

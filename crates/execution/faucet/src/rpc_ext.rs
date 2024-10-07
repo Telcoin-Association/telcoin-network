@@ -40,17 +40,12 @@ impl FaucetRpcExtApiServer for FaucetRpcExt {
 
 impl FaucetRpcExt {
     /// Create new instance
-    pub fn new<Provider, Pool>(
-        provider: Provider,
-        pool: Pool,
-        config: FaucetConfig,
-        watch_rx: watch::Receiver<PendingWorkerBlock>,
-    ) -> Self
+    pub fn new<Provider, Pool>(provider: Provider, pool: Pool, config: FaucetConfig) -> Self
     where
         Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
         Pool: TransactionPool + Unpin + Clone + 'static,
     {
-        let faucet = Faucet::spawn(provider, pool, config, watch_rx);
+        let faucet = Faucet::spawn(provider, pool, config);
 
         Self { faucet }
     }

@@ -252,8 +252,6 @@ where
         // TODO: this is basically noop and missing some functionality
         let network = WorkerNetwork::default();
 
-        // watch channel for new batches
-        let (watch_tx, watch_rx) = watch::channel(PendingWorkerBlock::default());
         todo!();
 
         // let block_builder = BlockBuilder::new(
@@ -305,11 +303,9 @@ where
 
         if let Some(faucet_args) = self.opt_faucet_args.take() {
             // create extension from CLI args
-            match faucet_args.create_rpc_extension(
-                self.blockchain_db.clone(),
-                transaction_pool.clone(),
-                watch_rx.clone(),
-            ) {
+            match faucet_args
+                .create_rpc_extension(self.blockchain_db.clone(), transaction_pool.clone())
+            {
                 Ok(faucet_ext) => {
                     // add faucet module
                     if let Err(e) = server.merge_configured(faucet_ext.into_rpc()) {
@@ -328,11 +324,7 @@ where
         let server_config = self.node_config.rpc.rpc_server_config();
         let rpc_handle = server_config.start(&server).await?;
 
-        let components = WorkerComponents::new(
-            rpc_handle,
-            PendingBlockWatchChannels::new(watch_tx, watch_rx),
-            transaction_pool,
-        );
+        let components = WorkerComponents::new(rpc_handle, transaction_pool);
 
         self.workers.insert(worker_id, components);
         Ok(())
@@ -424,36 +416,6 @@ where
             .pool();
 
         Ok(tx_pool)
-    }
-
-    /// Return a worker's pending block state if it exists.
-    pub(super) fn worker_pending_block(
-        &self,
-        worker_id: &WorkerId,
-    ) -> eyre::Result<Option<ExecutionOutcome>> {
-        let state = self
-            .workers
-            .get(worker_id)
-            .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
-            .pending_block_receiver()
-            .borrow()
-            .latest();
-
-        Ok(state)
-    }
-
-    /// Return a worker's sending channel for pending block updates.
-    pub(super) fn worker_pending_block_sender(
-        &self,
-        worker_id: &WorkerId,
-    ) -> eyre::Result<watch::Sender<PendingWorkerBlock>> {
-        let sender = self
-            .workers
-            .get(worker_id)
-            .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
-            .pending_block_sender();
-
-        Ok(sender)
     }
 
     /// Return a worker's local Http address if the RpcServer exists.

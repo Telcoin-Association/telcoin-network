@@ -142,24 +142,6 @@ where
         guard.get_worker_transaction_pool(worker_id)
     }
 
-    /// Return the worker's current pending block state.
-    pub async fn worker_pending_block(
-        &self,
-        worker_id: &WorkerId,
-    ) -> eyre::Result<Option<ExecutionOutcome>> {
-        let guard = self.internal.read().await;
-        guard.worker_pending_block(worker_id)
-    }
-
-    /// Return a worker's sending channel for pending block updates.
-    pub async fn worker_pending_block_sender(
-        &self,
-        worker_id: &WorkerId,
-    ) -> eyre::Result<watch::Sender<PendingWorkerBlock>> {
-        let guard = self.internal.read().await;
-        guard.worker_pending_block_sender(worker_id)
-    }
-
     /// Return an HTTP local address for submitting transactions to the RPC.
     pub async fn worker_http_local_address(
         &self,

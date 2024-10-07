@@ -112,7 +112,6 @@ impl Faucet {
         pool: Pool,
         executor: Tasks,
         config: FaucetConfig,
-        watch_rx: watch::Receiver<PendingWorkerBlock>,
     ) -> (Self, FaucetService<Provider, Pool, Tasks>) {
         let (to_service, rx) = unbounded_channel();
         let FaucetConfig { wait_period, chain_id, wallet, contract_address } = config;
@@ -133,7 +132,6 @@ impl Faucet {
             wallet,
             add_to_cache_tx,
             update_cache_rx,
-            watch_rx,
             highest_mined_tx_nonce: 0, // start at 0 and update with db read later
         };
         let faucet = Self { to_service };
@@ -148,13 +146,12 @@ impl Faucet {
         provider: Provider,
         pool: Pool,
         config: FaucetConfig,
-        watch_rx: watch::Receiver<PendingWorkerBlock>,
     ) -> Self
     where
         Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
         Pool: TransactionPool + Unpin + Clone + 'static,
     {
-        Self::spawn_with(provider, pool, config, TokioTaskExecutor::default(), watch_rx)
+        Self::spawn_with(provider, pool, config, TokioTaskExecutor::default())
     }
 
     /// Creates a new async LRU backed cache service task and spawns it to a new task via
@@ -166,14 +163,13 @@ impl Faucet {
         pool: Pool,
         config: FaucetConfig,
         executor: Tasks,
-        watch_rx: watch::Receiver<PendingWorkerBlock>,
     ) -> Self
     where
         Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
         Pool: TransactionPool + Unpin + Clone + 'static,
         Tasks: TaskSpawner + Clone + 'static,
     {
-        let (this, service) = Self::create(provider, pool, executor.clone(), config, watch_rx);
+        let (this, service) = Self::create(provider, pool, executor.clone(), config);
 
         executor.spawn_critical("faucet cache", Box::pin(service));
         this
