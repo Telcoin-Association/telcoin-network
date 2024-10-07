@@ -85,13 +85,13 @@ where
     }
 
     /// Batch maker
-    pub async fn start_batch_maker(
+    pub async fn start_block_builder(
         &self,
         worker_id: WorkerId,
         block_provider_sender: WorkerBlockSender,
     ) -> eyre::Result<()> {
         let mut guard = self.internal.write().await;
-        guard.start_batch_maker(worker_id, block_provider_sender).await
+        guard.start_block_builder(worker_id, block_provider_sender).await
     }
 
     /// Batch validator

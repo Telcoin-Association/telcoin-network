@@ -5322,7 +5322,7 @@ dependencies = [
  "reth-transaction-pool",
  "telcoin-network",
  "tempfile",
- "tn-block-proposer",
+ "tn-block-builder",
  "tn-block-validator",
  "tn-engine",
  "tn-faucet",
@@ -10745,45 +10745,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tn-block-proposer"
-version = "0.1.0"
-dependencies = [
- "anemo",
- "assert_matches",
- "consensus-metrics",
- "fastcrypto",
- "futures-util",
- "narwhal-network",
- "narwhal-network-types",
- "narwhal-typed-store",
- "narwhal-worker",
- "prometheus",
- "reth",
- "reth-blockchain-tree",
- "reth-chainspec",
- "reth-db",
- "reth-db-common",
- "reth-evm",
- "reth-execution-errors",
- "reth-node-core",
- "reth-node-ethereum",
- "reth-payload-builder",
- "reth-primitives",
- "reth-provider",
- "reth-revm",
- "reth-stages",
- "reth-tracing",
- "reth-transaction-pool",
- "reth-trie",
- "tempfile",
- "tn-block-validator",
- "tn-types",
- "tokio",
- "tokio-stream",
- "tracing",
-]
-
-[[package]]
 name = "tn-block-validator"
 version = "0.1.0"
 dependencies = [
@@ -10948,7 +10909,7 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "thiserror",
- "tn-block-proposer",
+ "tn-block-builder",
  "tn-block-validator",
  "tn-engine",
  "tn-faucet",

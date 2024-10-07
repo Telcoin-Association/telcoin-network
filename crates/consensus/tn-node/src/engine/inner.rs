@@ -34,7 +34,7 @@ use reth_prune::PruneModes;
 use reth_tasks::TaskExecutor;
 use reth_transaction_pool::TransactionPool;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
-use tn_block_proposer::{BlockProposerBuilder, MiningMode};
+use tn_block_builder::BlockBuilder;
 use tn_block_validator::BlockValidator;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
@@ -226,12 +226,12 @@ where
     }
 
     /// The worker's RPC, TX pool, and block builder
-    pub(super) async fn start_batch_maker(
+    pub(super) async fn start_block_builder(
         &mut self,
         worker_id: WorkerId,
         block_provider_sender: WorkerBlockSender,
     ) -> eyre::Result<()> {
-        // TODO: both start_engine and start_batch_maker lookup head
+        // TODO: both start_engine and start_block_builder lookup head
         let head = self.node_config.lookup_head(self.provider_factory.clone())?;
 
         let ctx = BuilderContext::<WorkerNode<DB, Evm>>::new(
@@ -254,25 +254,22 @@ where
 
         // watch channel for new batches
         let (watch_tx, watch_rx) = watch::channel(PendingWorkerBlock::default());
+        todo!();
 
-        // build batch maker
-        let max_transactions = 10;
-        let mining_mode =
-            MiningMode::instant(max_transactions, transaction_pool.pending_transactions_listener());
-        let task = BlockProposerBuilder::new(
-            Arc::clone(&self.node_config.chain),
-            self.blockchain_db.clone(),
-            transaction_pool.clone(),
-            mining_mode,
-            self.address,
-            self.evm_executor.clone(),
-            watch_tx.clone(),
-            block_provider_sender,
-        )
-        .build();
+        // let block_builder = BlockBuilder::new(
+        //     blockchain,
+        //     pool,
+        //     canonical_state_stream,
+        //     latest_canon_state,
+        //     to_worker,
+        //     address,
+        //     pending_tx_hashes_stream,
+        //     gas_limit,
+        //     max_size,
+        // );
 
         // spawn batch maker mining task
-        self.task_executor.spawn_critical("batch maker", task);
+        // self.task_executor.spawn_critical("batch maker", task);
 
         // let mut hooks = EngineHooks::new();
 

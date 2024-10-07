@@ -216,6 +216,7 @@ where
     /// - create a block
     /// - send the block to worker's block proposer
     /// - wait for ack that quorum was reached
+    /// - convert result to fatal/non-fatal
     /// - return result
     ///
     /// Workers only propose one block at a time.

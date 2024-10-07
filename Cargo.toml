@@ -22,7 +22,6 @@ members = [
 
     # execution
     "crates/execution/block-builder",
-    "crates/execution/block-proposer",
     "crates/execution/block-validator",
     "crates/execution/faucet",
     "crates/execution/engine",
@@ -189,7 +188,7 @@ tn-block-validator = { path = "crates/execution/block-validator" }
 tn-engine = { path = "crates/execution/engine" }
 
 # block maker
-tn-block-proposer = { path = "crates/execution/block-proposer" }
+tn-block-builder = { path = "crates/execution/block-builder" }
 futures-util = "0.3.25"
 jsonrpsee = { version = "0.24" }
 assert_matches = { version = "1.5.0" }

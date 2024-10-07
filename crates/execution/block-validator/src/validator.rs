@@ -356,7 +356,7 @@ mod tests {
     ///
     /// Note that SealedHeader's `parent_hash`, `state_root`, and `extra_data` must be updated when
     /// updating accounts to fund in `adiri_genesis_raw` These new values can be obtained using
-    /// `tn-block-proposer::tests::test_make_block`
+    /// `tn-block-builder::tests::test_make_block`
     fn next_valid_sealed_header() -> SealedHeader {
         // sealed header
         //
