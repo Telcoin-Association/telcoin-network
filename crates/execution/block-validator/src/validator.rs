@@ -392,7 +392,7 @@ mod tests {
                 extra_data: Bytes::default(),
                 requests_root: None,
             },
-            hex!("d962e1964e4351dbbe6095d22caee7199e4e4c0c0947d56ff23ea28ec821ebf5").into(),
+            hex!("abc832c52b74957b7ef596e35022068ba9a8ab222ed4dbbe42b3eb07d17a42ef").into(),
         )
     }
 
@@ -408,7 +408,7 @@ mod tests {
 
     /// Create an instance of block validator for tests.
     async fn test_types() -> TestTools {
-        // init_test_tracing();
+        // reth_tracing::init_test_tracing();
         let genesis = adiri_genesis();
         let mut tx_factory = TransactionFactory::new();
         let factory_address = tx_factory.address();
@@ -503,6 +503,7 @@ mod tests {
     #[tokio::test]
     async fn test_valid_block() {
         let TestTools { valid_txs, valid_header, validator } = test_types().await;
+        let new_hash = valid_header.clone().unseal().seal_slow();
         let valid_block = WorkerBlock::new(valid_txs, valid_header);
         let result = validator.validate_block(&valid_block).await;
 
