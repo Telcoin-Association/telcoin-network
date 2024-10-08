@@ -18,9 +18,7 @@ use error::BlockBuilderError;
 use error::BlockBuilderResult;
 use futures_util::{FutureExt, StreamExt};
 use reth_execution_types::ChangedAccount;
-use reth_primitives::{
-    constants::MIN_PROTOCOL_BASE_FEE, Address, IntoRecoveredTransaction, TxHash,
-};
+use reth_primitives::{constants::MIN_PROTOCOL_BASE_FEE, Address, TxHash};
 use reth_provider::{CanonStateNotification, CanonStateNotificationStream, Chain};
 use reth_transaction_pool::{CanonicalStateUpdate, TransactionPool, TransactionPoolExt};
 use std::{
@@ -32,7 +30,7 @@ use std::{
 use tn_types::error::BlockSealError;
 use tn_types::WorkerBlockSender;
 use tn_types::{LastCanonicalUpdate, PendingBlockConfig, WorkerBlockBuilderArgs};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc::Receiver, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, trace, warn};
 
@@ -125,11 +123,12 @@ where
         latest_canon_state: LastCanonicalUpdate,
         to_worker: WorkerBlockSender,
         address: Address,
-        pending_tx_hashes_stream: ReceiverStream<TxHash>,
+        pending_tx_hashes_receiver: Receiver<TxHash>,
         gas_limit: u64,
         max_size: usize,
         #[cfg(feature = "test-utils")] max_builds: Option<usize>,
     ) -> Self {
+        let pending_tx_hashes_stream = ReceiverStream::new(pending_tx_hashes_receiver);
         Self {
             pending_task: None,
             _blockchain,
@@ -305,7 +304,6 @@ impl<BT, Pool> Future for BlockBuilder<BT, Pool>
 where
     BT: Unpin,
     Pool: TransactionPool + TransactionPoolExt + Unpin + 'static,
-    <Pool as TransactionPool>::Transaction: IntoRecoveredTransaction,
 {
     type Output = BlockBuilderResult<()>;
 

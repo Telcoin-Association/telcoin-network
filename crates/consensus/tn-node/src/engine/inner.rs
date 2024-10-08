@@ -7,6 +7,7 @@ use crate::{
     engine::{WorkerNetwork, WorkerNode},
     error::ExecutionError,
 };
+use eyre::eyre;
 use jsonrpsee::http_client::HttpClient;
 use reth::rpc::{
     builder::{config::RethRpcServerConfig, RpcModuleBuilder, RpcServerHandle},
@@ -27,18 +28,22 @@ use reth_node_ethereum::{node::EthereumPoolBuilder, EthEvmConfig};
 use reth_primitives::Address;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
-    DatabaseProviderFactory, ExecutionOutcome, FinalizedBlockReader, HeaderProvider,
-    ProviderFactory,
+    BlockReader, CanonStateSubscriptions as _, DatabaseProviderFactory, ExecutionOutcome,
+    FinalizedBlockReader, HeaderProvider, ProviderFactory, TransactionVariant,
 };
 use reth_prune::PruneModes;
 use reth_tasks::TaskExecutor;
-use reth_transaction_pool::TransactionPool;
+use reth_transaction_pool::{
+    blobstore::DiskFileBlobStore, TransactionPool, TransactionValidationTaskExecutor,
+};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tn_block_builder::BlockBuilder;
 use tn_block_validator::BlockValidator;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
-use tn_types::{Config, Consensus, ConsensusOutput, WorkerBlockSender, WorkerId};
+use tn_types::{
+    Config, Consensus, ConsensusOutput, LastCanonicalUpdate, WorkerBlockSender, WorkerId,
+};
 use tokio::sync::{broadcast, mpsc::unbounded_channel};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info};
@@ -229,7 +234,6 @@ where
         worker_id: WorkerId,
         block_provider_sender: WorkerBlockSender,
     ) -> eyre::Result<()> {
-        // TODO: both start_engine and start_block_builder lookup head
         let head = self.node_config.lookup_head(self.provider_factory.clone())?;
 
         let ctx = BuilderContext::<WorkerNode<DB, Evm>>::new(
@@ -238,34 +242,94 @@ where
             self.task_executor.clone(),
             WithConfigs {
                 config: self.node_config.clone(),
-                toml_config: reth_config::Config::default(), /* mostly peer / staging configs */
+                toml_config: reth_config::Config::default(), /* mostly unused peer and staging configs */
             },
         );
 
-        // default tx pool
-        let pool_builder = EthereumPoolBuilder::default();
+        // inspired by reth's default eth tx pool:
+        // - `EthereumPoolBuilder::default()`
+        // - `components_builder.build_components()`
+        // - `pool_builder.build_pool(&ctx)`
+        let transaction_pool = {
+            let data_dir = ctx.config().datadir();
+            let pool_config = ctx.pool_config();
+            let blob_store = DiskFileBlobStore::open(data_dir.blobstore(), Default::default())?;
+            let validator = TransactionValidationTaskExecutor::eth_builder(ctx.chain_spec())
+                .with_head_timestamp(ctx.head().timestamp)
+                .kzg_settings(ctx.kzg_settings()?)
+                .with_local_transactions_config(pool_config.local_transactions_config.clone())
+                .with_additional_tasks(ctx.config().txpool.additional_validation_tasks)
+                .build_with_tasks(
+                    ctx.provider().clone(),
+                    ctx.task_executor().clone(),
+                    blob_store.clone(),
+                );
 
-        // taken from components_builder.build_components();
-        let transaction_pool = pool_builder.build_pool(&ctx).await?;
+            let transaction_pool =
+                reth_transaction_pool::Pool::eth_pool(validator, blob_store, pool_config);
+
+            info!(target: "tn::execution", "Transaction pool initialized");
+
+            let transactions_path = data_dir.txpool_transactions();
+            let transactions_backup_config =
+                reth_transaction_pool::maintain::LocalTransactionBackupConfig::with_local_txs_backup(transactions_path);
+
+            // spawn task to backup local transaction pool in case of restarts
+            ctx.task_executor().spawn_critical_with_graceful_shutdown_signal(
+                "local transactions backup task",
+                |shutdown| {
+                    reth_transaction_pool::maintain::backup_local_transactions_task(
+                        shutdown,
+                        transaction_pool.clone(),
+                        transactions_backup_config,
+                    )
+                },
+            );
+
+            transaction_pool
+        };
+
         // TODO: this is basically noop and missing some functionality
         let network = WorkerNetwork::default();
 
-        todo!();
+        let tx_pool_latest = transaction_pool.block_info();
+        let tip = self
+            .blockchain_db
+            .sealed_block_with_senders(
+                tx_pool_latest.last_seen_block_hash.into(),
+                TransactionVariant::NoHash,
+            )?
+            .ok_or_else(|| {
+                eyre!(
+                    "Failed to find sealed block during block builder startup! ({} - {:?}) ",
+                    tx_pool_latest.last_seen_block_number,
+                    tx_pool_latest.last_seen_block_hash,
+                )
+            })?;
 
-        // let block_builder = BlockBuilder::new(
-        //     blockchain,
-        //     pool,
-        //     canonical_state_stream,
-        //     latest_canon_state,
-        //     to_worker,
-        //     address,
-        //     pending_tx_hashes_stream,
-        //     gas_limit,
-        //     max_size,
-        // );
+        let latest_canon_state = LastCanonicalUpdate {
+            tip: tip.block,
+            pending_block_base_fee: tx_pool_latest.pending_basefee,
+            pending_block_blob_fee: tx_pool_latest.pending_blob_fee,
+        };
 
-        // spawn batch maker mining task
-        // self.task_executor.spawn_critical("batch maker", task);
+        let block_builder = BlockBuilder::new(
+            self.blockchain_db.clone(),
+            transaction_pool.clone(),
+            self.blockchain_db.canonical_state_stream(),
+            latest_canon_state,
+            block_provider_sender,
+            self.address,
+            transaction_pool.pending_transactions_listener(),
+            self.tn_config.parameters.max_worker_tx_gas,
+            self.tn_config.parameters.max_worker_tx_bytes_size,
+        );
+
+        // spawn block builder task
+        self.task_executor.spawn_critical("batch builder", async move {
+            let res = block_builder.await;
+            info!(target: "tn::execution", ?res, "block builder task exited");
+        });
 
         // let mut hooks = EngineHooks::new();
 
@@ -318,13 +382,14 @@ where
             }
         }
 
-        // start the server
+        // start the RPC server
         let server_config = self.node_config.rpc.rpc_server_config();
         let rpc_handle = server_config.start(&server).await?;
 
+        // take ownership of worker components
         let components = WorkerComponents::new(rpc_handle, transaction_pool);
-
         self.workers.insert(worker_id, components);
+
         Ok(())
     }
 
