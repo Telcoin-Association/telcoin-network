@@ -212,8 +212,10 @@ pub fn execute_test_batch<P, E>(
 
 /// Test utility to execute batch and return execution outcome.
 ///
-/// NOTE: this is loosely based on reth's auto-seal consensus
-pub fn execution_outcome_from_test_batch_<P, E>(
+/// This is useful for simulating execution results for account state changes.
+/// Currently only used by faucet tests to obtain faucet contract account info
+/// by simulating deploying proxy contract. The results are then put into genesis.
+pub fn execution_outcome_for_tests<P, E>(
     worker_block: &WorkerBlock,
     parent: &SealedHeader,
     optional_params: OptionalTestBatchParams,

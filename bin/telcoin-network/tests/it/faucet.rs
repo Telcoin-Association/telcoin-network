@@ -44,7 +44,7 @@ use tn_types::{
             ERC1967PROXY_INITCODE, ERC1967PROXY_RUNTIMECODE, STABLECOINMANAGER_RUNTIMECODE,
             STABLECOIN_RUNTIMECODE,
         },
-        execution_outcome_from_test_batch_, TransactionFactory,
+        execution_outcome_for_tests, TransactionFactory,
     },
     TransactionSigned, WorkerBlock,
 };
@@ -715,7 +715,7 @@ async fn get_contract_state_for_genesis(
     // execute batch
     let batch = WorkerBlock::new(raw_txs_to_execute, SealedHeader::default());
     let parent = chain.sealed_genesis_header();
-    let execution_outcome = execution_outcome_from_test_batch_(
+    let execution_outcome = execution_outcome_for_tests(
         &batch,
         &parent,
         Default::default(),

@@ -503,7 +503,6 @@ mod tests {
     #[tokio::test]
     async fn test_valid_block() {
         let TestTools { valid_txs, valid_header, validator } = test_types().await;
-        let new_hash = valid_header.clone().unseal().seal_slow();
         let valid_block = WorkerBlock::new(valid_txs, valid_header);
         let result = validator.validate_block(&valid_block).await;
 
