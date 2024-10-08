@@ -242,7 +242,8 @@ where
             self.task_executor.clone(),
             WithConfigs {
                 config: self.node_config.clone(),
-                toml_config: reth_config::Config::default(), /* mostly unused peer and staging configs */
+                toml_config: reth_config::Config::default(), /* mostly unused peer and staging
+                                                              * configs */
             },
         );
 

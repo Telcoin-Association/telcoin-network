@@ -12,10 +12,8 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-pub use block_builder::build_worker_block;
-pub use block_builder::BlockBuilderOutput;
-use error::BlockBuilderError;
-use error::BlockBuilderResult;
+pub use block_builder::{build_worker_block, BlockBuilderOutput};
+use error::{BlockBuilderError, BlockBuilderResult};
 use futures_util::{FutureExt, StreamExt};
 use reth_execution_types::ChangedAccount;
 use reth_primitives::{constants::MIN_PROTOCOL_BASE_FEE, Address, TxHash};
@@ -27,9 +25,10 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
-use tn_types::error::BlockSealError;
-use tn_types::WorkerBlockSender;
-use tn_types::{LastCanonicalUpdate, PendingBlockConfig, WorkerBlockBuilderArgs};
+use tn_types::{
+    error::BlockSealError, LastCanonicalUpdate, PendingBlockConfig, WorkerBlockBuilderArgs,
+    WorkerBlockSender,
+};
 use tokio::sync::{mpsc::Receiver, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, trace, warn};
@@ -389,7 +388,8 @@ where
 
                         // NOTE: empty vec returned for non-fatal error during block proposal
                         if mined_transactions.is_empty() {
-                            // return pending until next canon update because the last block failed to reach quorum
+                            // return pending until next canon update because the last block failed
+                            // to reach quorum
                             //
                             // task should wait until next canonical update applied to pool
                             break;
