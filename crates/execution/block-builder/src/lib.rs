@@ -419,7 +419,7 @@ where
                         if let Some(max_builds) = this.max_builds.as_mut() {
                             max_builds.num_builds += 1;
                             if max_builds.has_reached_max() {
-                                debug!(target: "worker::block_builder", ?max_builds, "max builds reached");
+                                tracing::debug!(target: "worker::block_builder", ?max_builds, "max builds reached");
                                 return Poll::Ready(Ok(()));
                             }
                         }

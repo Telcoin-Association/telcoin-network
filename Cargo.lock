@@ -10794,6 +10794,7 @@ dependencies = [
  "reth-tracing",
  "reth-trie",
  "thiserror",
+ "tn-block-builder",
  "tn-types",
  "tokio",
  "tokio-stream",

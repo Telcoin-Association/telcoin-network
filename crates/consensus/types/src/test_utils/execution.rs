@@ -106,111 +106,7 @@ pub struct OptionalTestBatchParams {
     pub base_fee_per_gas_opt: Option<u64>,
 }
 
-/// Attempt to update batch with accurate header information.
-///
-/// NOTE: this is loosely based on reth's auto-seal consensus
-pub fn execute_test_batch<P, E>(
-    worker_block: &mut WorkerBlock,
-    parent: &SealedHeader,
-    optional_params: OptionalTestBatchParams,
-    provider: &P,
-    executor: &E,
-) where
-    P: StateProviderFactory + BlockReaderIdExt,
-    E: BlockExecutorProvider,
-{
-    // deconstruct optional parameters for header
-    let OptionalTestBatchParams {
-        beneficiary_opt,
-        withdrawals_opt,
-        timestamp_opt,
-        mix_hash_opt,
-        base_fee_per_gas_opt,
-    } = optional_params;
-
-    // create "empty" header with default values
-    let mut header = Header {
-        parent_hash: parent.hash(),
-        ommers_hash: EMPTY_OMMER_ROOT_HASH,
-        beneficiary: beneficiary_opt.unwrap_or_else(|| Address::random()),
-        state_root: Default::default(),
-        transactions_root: Default::default(),
-        receipts_root: Default::default(),
-        withdrawals_root: Some(
-            withdrawals_opt
-                .clone()
-                .map_or(EMPTY_WITHDRAWALS, |w| proofs::calculate_withdrawals_root(&w)),
-        ),
-        logs_bloom: Default::default(),
-        difficulty: U256::ZERO,
-        number: parent.number + 1,
-        gas_limit: ETHEREUM_BLOCK_GAS_LIMIT,
-        gas_used: 0,
-        timestamp: timestamp_opt.unwrap_or_else(now),
-        mix_hash: mix_hash_opt.unwrap_or_else(|| B256::random()),
-        nonce: 0,
-        base_fee_per_gas: base_fee_per_gas_opt.or(Some(MIN_PROTOCOL_BASE_FEE)),
-        blob_gas_used: None,
-        excess_blob_gas: None,
-        extra_data: Default::default(),
-        parent_beacon_block_root: None,
-        requests_root: None,
-    };
-
-    // update header's transactions root
-    header.transactions_root = if worker_block.transactions().is_empty() {
-        EMPTY_TRANSACTIONS
-    } else {
-        proofs::calculate_transaction_root(worker_block.transactions())
-    };
-
-    // recover senders from block
-    let block = Block {
-        header,
-        body: worker_block.transactions().clone(),
-        ommers: vec![],
-        withdrawals: withdrawals_opt.clone(),
-        requests: None,
-    }
-    .with_recovered_senders()
-    .expect("unable to recover senders while executing test batch");
-
-    // create execution db
-    let mut db = StateProviderDatabase::new(
-        provider.latest().expect("provider retrieves latest during test batch execution"),
-    );
-
-    // convenience
-    let block_number = block.number;
-
-    // execute the block
-    let BlockExecutionOutput { state, receipts, gas_used, .. } = executor
-        .executor(&mut db)
-        .execute((&block, U256::ZERO).into())
-        .expect("executor can execute test batch transactions");
-    let execution_outcome = ExecutionOutcome::new(state, receipts.into(), block_number, vec![]);
-    let hashed_state = HashedPostState::from_bundle_state(&execution_outcome.state().state);
-
-    // retrieve header to update values post-execution
-    let Block { mut header, .. } = block.block;
-
-    // update header
-    header.gas_used = gas_used;
-    header.state_root =
-        db.state_root(hashed_state).expect("state root calculation during test batch execution");
-    header.receipts_root = execution_outcome
-        .receipts_root_slow(block_number)
-        .expect("receipts root calculation during test batch execution");
-    header.logs_bloom = execution_outcome
-        .block_logs_bloom(block_number)
-        .expect("logs bloom calculation during test batch execution");
-
-    // seal header and update batch's metadata
-    let sealed_header = header.seal_slow();
-    worker_block.update_header(sealed_header);
-}
-
-/// Test utility to execute batch and return execution outcome.
+/// Test utility to execute worker block and return execution outcome.
 ///
 /// This is useful for simulating execution results for account state changes.
 /// Currently only used by faucet tests to obtain faucet contract account info
@@ -218,7 +114,6 @@ pub fn execute_test_batch<P, E>(
 pub fn execution_outcome_for_tests<P, E>(
     worker_block: &WorkerBlock,
     parent: &SealedHeader,
-    optional_params: OptionalTestBatchParams,
     provider: &P,
     executor: &E,
 ) -> ExecutionOutcome
@@ -226,37 +121,24 @@ where
     P: StateProviderFactory + BlockReaderIdExt,
     E: BlockExecutorProvider,
 {
-    // deconstruct optional parameters for header
-    let OptionalTestBatchParams {
-        beneficiary_opt,
-        withdrawals_opt,
-        timestamp_opt,
-        mix_hash_opt,
-        base_fee_per_gas_opt,
-    } = optional_params;
-
     // create "empty" header with default values
     let mut header = Header {
         parent_hash: parent.hash(),
         ommers_hash: EMPTY_OMMER_ROOT_HASH,
-        beneficiary: beneficiary_opt.unwrap_or_else(|| Address::random()),
+        beneficiary: Address::ZERO,
         state_root: Default::default(),
         transactions_root: Default::default(),
         receipts_root: Default::default(),
-        withdrawals_root: Some(
-            withdrawals_opt
-                .clone()
-                .map_or(EMPTY_WITHDRAWALS, |w| proofs::calculate_withdrawals_root(&w)),
-        ),
+        withdrawals_root: Some(EMPTY_WITHDRAWALS),
         logs_bloom: Default::default(),
         difficulty: U256::ZERO,
         number: parent.number + 1,
         gas_limit: ETHEREUM_BLOCK_GAS_LIMIT,
         gas_used: 0,
-        timestamp: timestamp_opt.unwrap_or_else(now),
-        mix_hash: mix_hash_opt.unwrap_or_else(|| B256::random()),
+        timestamp: now(),
+        mix_hash: B256::random(),
         nonce: 0,
-        base_fee_per_gas: base_fee_per_gas_opt.or(Some(MIN_PROTOCOL_BASE_FEE)),
+        base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
         blob_gas_used: None,
         excess_blob_gas: None,
         extra_data: Default::default(),
@@ -283,7 +165,7 @@ where
         header,
         body: txs,
         ommers: vec![],
-        withdrawals: withdrawals_opt.clone(),
+        withdrawals: Some(Default::default()),
         requests: None,
     }
     .with_recovered_senders()

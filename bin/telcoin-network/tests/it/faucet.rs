@@ -715,13 +715,8 @@ async fn get_contract_state_for_genesis(
     // execute batch
     let batch = WorkerBlock::new(raw_txs_to_execute, SealedHeader::default());
     let parent = chain.sealed_genesis_header();
-    let execution_outcome = execution_outcome_for_tests(
-        &batch,
-        &parent,
-        Default::default(),
-        &provider,
-        &block_executor,
-    );
+    let execution_outcome =
+        execution_outcome_for_tests(&batch, &parent, &provider, &block_executor);
 
     Ok(execution_outcome)
 }

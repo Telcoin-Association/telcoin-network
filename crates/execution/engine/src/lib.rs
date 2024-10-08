@@ -776,8 +776,9 @@ mod tests {
                 assert_ne!(block.number, expected_header.number);
             }
 
-            // mix hash should always come from batch
-            assert_eq!(block.mix_hash, expected_header.mix_hash);
+            // mix hash is xor worker block's hash and consensus output digest
+            let expected_mix_hash = expected_header.mix_hash ^ *expected_parent_beacon_block_root;
+            assert_eq!(block.mix_hash, expected_mix_hash);
             // bloom expected to be the same bc all proposed transactions should be good
             // ie) no duplicates, etc.
             //
@@ -1147,8 +1148,9 @@ mod tests {
                 assert_ne!(block.number, expected_header.number);
             }
 
-            // mix hash should always come from batch
-            assert_eq!(block.mix_hash, expected_header.mix_hash);
+            // mix hash is xor worker block's hash and consensus output digest
+            let expected_mix_hash = expected_header.mix_hash ^ *expected_parent_beacon_block_root;
+            assert_eq!(block.mix_hash, expected_mix_hash);
             // bloom expected to be the same bc all proposed transactions should be good
             // ie) no duplicates, etc.
             //
