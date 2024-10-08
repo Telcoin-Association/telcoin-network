@@ -12,7 +12,7 @@ use reth_transaction_pool::{
     TransactionListenerKind, TransactionOrigin, TransactionPool, ValidPoolTransaction,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     future::Future,
     sync::Arc,
     time::Instant,
@@ -54,7 +54,7 @@ impl MaxBuilds {
 /// Attempt to update batch with accurate header information.
 ///
 /// NOTE: this is loosely based on reth's auto-seal consensus
-pub fn execute_test_batch(block: &mut WorkerBlock, parent: &SealedHeader) {
+pub fn execute_test_worker_block(block: &mut WorkerBlock, parent: &SealedHeader) {
     let pool = TestPool::new(block.transactions.clone());
 
     let parent_info = LastCanonicalUpdate {
@@ -238,7 +238,7 @@ impl TransactionPool for TestPool {
     fn best_transactions(
         &self,
     ) -> Box<dyn BestTransactions<Item = Arc<ValidPoolTransaction<Self::Transaction>>>> {
-        let mut independent = Vec::new();
+        let mut independent = VecDeque::new();
 
         // see reth::transaction-pool::pool::pending::update_independents_and_highest_nonces()
         //
@@ -246,7 +246,7 @@ impl TransactionPool for TestPool {
         // guaranteed because the pool is gapless
         for tx in self.transactions.iter() {
             if tx.transaction_id.unchecked_ancestor().and_then(|id| self.by_id.get(&id)).is_none() {
-                independent.push(tx.clone())
+                independent.push_back(tx.clone())
             }
         }
 
@@ -379,7 +379,7 @@ struct BestTestTransactions {
     ///
     /// Once an `independent` transaction with the nonce `N` is returned, it unlocks `N+1`, which
     /// then can be moved from the `all` set to the `independent` set.
-    independent: Vec<Arc<ValidPoolTransaction<EthPooledTransaction>>>,
+    independent: VecDeque<Arc<ValidPoolTransaction<EthPooledTransaction>>>,
     /// There might be the case where a yielded transactions is invalid, this will track it.
     invalid: HashSet<TxHash>,
     /// Flag to control whether to skip blob transactions (EIP4844).
@@ -433,8 +433,8 @@ impl Iterator for BestTestTransactions {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // Remove the next independent tx with the highest priority
-            let best = self.independent.first()?.clone();
+            // remove the next independent tx (created with `push_back`)
+            let best = self.independent.pop_front()?.clone();
             let hash = best.transaction.transaction().hash();
 
             // skip transactions that were marked as invalid
@@ -449,7 +449,7 @@ impl Iterator for BestTestTransactions {
 
             // Insert transactions that just got unlocked.
             if let Some(unlocked) = self.all.get(&best.transaction_id.descendant()) {
-                self.independent.push(unlocked.clone());
+                self.independent.push_back(unlocked.clone());
             }
 
             if self.skip_blobs && best.is_eip4844() {

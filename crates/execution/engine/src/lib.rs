@@ -290,7 +290,6 @@ impl<BT, CE> std::fmt::Debug for ExecutorEngine<BT, CE> {
 #[cfg(test)]
 mod tests {
     use crate::ExecutorEngine;
-
     use fastcrypto::hash::Hash as _;
     use narwhal_test_utils::default_test_execution_node;
     use reth_blockchain_tree::BlockchainTreeViewer;
@@ -303,11 +302,10 @@ mod tests {
     use reth_tasks::TaskManager;
     use reth_tracing::init_test_tracing;
     use std::{collections::VecDeque, str::FromStr as _, sync::Arc, time::Duration};
+    use tn_block_builder::test_utils::execute_test_worker_block;
     use tn_types::{
         adiri_chain_spec_arc, adiri_genesis, now,
-        test_utils::{
-            execute_test_batch, seeded_genesis_from_random_batches, OptionalTestBatchParams,
-        },
+        test_utils::{seeded_genesis_from_random_batches, OptionalTestBatchParams},
         BlockHash, Certificate, CommittedSubDag, ConsensusOutput, ReputationScores,
     };
     use tokio::{sync::oneshot, time::timeout};
@@ -443,7 +441,7 @@ mod tests {
         assert_eq!(expected_block.parent_beacon_block_root, Some(output_digest));
         // first block's parent is expected to be genesis
         assert_eq!(expected_block.parent_hash, chain.genesis_hash());
-        // expect state roots to be the same as genesis bc no txs
+        // expect state roots to be same because empty output has no state change
         assert_eq!(expected_block.state_root, genesis_header.state_root);
         // expect header number genesis + 1
         assert_eq!(expected_block.number, expected_block_height);
@@ -528,14 +526,19 @@ mod tests {
             // increase basefee
             inc_base_fee += idx as u64;
 
-            let optional_params = OptionalTestBatchParams {
-                beneficiary_opt: None, // ensure random for assertions
-                withdrawals_opt: None,
-                timestamp_opt: None,
-                mix_hash_opt: None,
-                base_fee_per_gas_opt: Some(inc_base_fee),
-            };
-            execute_test_batch(batch, &parent, optional_params, &provider, &block_executor);
+            // this is the only way to do this right now
+            let mut header = batch.sealed_header().clone().unseal();
+
+            // update basefee and set beneficiary
+            header.beneficiary = Address::random();
+            header.base_fee_per_gas = Some(inc_base_fee);
+
+            // okay to use bad hash bc execution executing block will seal slowly
+            let updated = header.seal(B256::ZERO);
+            batch.update_header(updated);
+
+            // actually execute the block now
+            execute_test_worker_block(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
 
             // store values for assertions later
@@ -550,14 +553,19 @@ mod tests {
             // this makes assertions easier at the end
             inc_base_fee += 4 + idx as u64;
 
-            let optional_params = OptionalTestBatchParams {
-                beneficiary_opt: None, // ensure random for assertions
-                withdrawals_opt: None,
-                timestamp_opt: None,
-                mix_hash_opt: None,
-                base_fee_per_gas_opt: Some(inc_base_fee),
-            };
-            execute_test_batch(batch, &parent, optional_params, &provider, &block_executor);
+            // this is the only way to do this right now
+            let mut header = batch.sealed_header().clone().unseal();
+
+            // update basefee and set beneficiary
+            header.beneficiary = Address::random();
+            header.base_fee_per_gas = Some(inc_base_fee);
+
+            // okay to use bad hash bc execution executing block will seal slowly
+            let updated = header.seal(B256::ZERO);
+            batch.update_header(updated);
+
+            // actually execute the block now
+            execute_test_worker_block(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
 
             // store values for assertions later
@@ -698,8 +706,8 @@ mod tests {
         //     – Withdrawals
         //     – Requests
         //     – Senders
-        let expected_blocks = provider.block_with_senders_range(1..=expected_block_height)?;
-        assert_eq!(expected_block_height, expected_blocks.len() as u64);
+        let executed_blocks = provider.block_with_senders_range(1..=expected_block_height)?;
+        assert_eq!(expected_block_height, executed_blocks.len() as u64);
 
         // basefee intentionally increased with loop
         let mut expected_base_fee = MIN_PROTOCOL_BASE_FEE;
@@ -708,7 +716,7 @@ mod tests {
 
         // assert blocks are executed as expected
         for (idx, txs) in txs_by_block.iter().enumerate() {
-            let block = &expected_blocks[idx];
+            let block = &executed_blocks[idx];
             let signers = &signers_by_block[idx];
             assert_eq!(&block.senders, signers);
             assert_eq!(&block.body, txs);
@@ -753,43 +761,39 @@ mod tests {
             assert_eq!(block.parent_beacon_block_root, Some(*expected_parent_beacon_block_root));
 
             // assert information from batch headers
-            let expected_header = &batch_headers[idx];
+            let proposed_header = &batch_headers[idx];
 
             if idx == 0 {
                 // first block's parent is expected to be genesis
                 assert_eq!(block.parent_hash, chain.genesis_hash());
-                // expect state roots to be the same as batch's bc of genesis
-                assert_eq!(block.state_root, expected_header.state_root);
                 // expect header number +1 for batch bc of genesis
-                assert_eq!(block.number, expected_header.number);
+                assert_eq!(block.number, proposed_header.number);
             } else {
-                assert_ne!(block.parent_hash, expected_header.parent_hash);
+                assert_ne!(block.parent_hash, proposed_header.parent_hash);
                 // TODO: this is inefficient
                 //
                 // assert parents executed in order (sanity check)
-                let expected_parent = expected_blocks[idx - 1].header.hash_slow();
+                let expected_parent = executed_blocks[idx - 1].header.hash_slow();
                 assert_eq!(block.parent_hash, expected_parent);
-                // expect state roots NOT to be the same as batch's since genesis is parent for all
-                // batches
-                assert_ne!(block.state_root, expected_header.state_root);
                 // expect block numbers NOT the same as batch's headers
-                assert_ne!(block.number, expected_header.number);
+                assert_ne!(block.number, proposed_header.number);
             }
 
+            // expect state roots to be different bc worker uses ZERO
+            assert_ne!(block.state_root, proposed_header.state_root);
+
             // mix hash is xor worker block's hash and consensus output digest
-            let expected_mix_hash = expected_header.mix_hash ^ *expected_parent_beacon_block_root;
+            let expected_mix_hash = proposed_header.hash() ^ *expected_parent_beacon_block_root;
             assert_eq!(block.mix_hash, expected_mix_hash);
             // bloom expected to be the same bc all proposed transactions should be good
             // ie) no duplicates, etc.
             //
             // TODO: randomly generate contract transactions as well!!!
-            assert_eq!(block.logs_bloom, expected_header.logs_bloom);
+            assert_eq!(block.logs_bloom, proposed_header.logs_bloom);
             // gas limit should come from batch
             //
             // TODO: ensure batch validation prevents peer workers from changing this value
-            assert_eq!(block.gas_limit, expected_header.gas_limit);
-            // gas used should be the same bc every transaction is expected to pass
-            assert_eq!(block.gas_used, expected_header.gas_used);
+            assert_eq!(block.gas_limit, proposed_header.gas_limit);
             // difficulty should match the batch's index within consensus output
             assert_eq!(block.difficulty, U256::from(expected_batch_index));
             // assert batch digest match extra data
@@ -797,7 +801,7 @@ mod tests {
             // assert batch's withdrawals match
             //
             // TODO: this is currently always empty
-            assert_eq!(block.withdrawals_root, expected_header.withdrawals_root);
+            assert_eq!(block.withdrawals_root, proposed_header.withdrawals_root);
         }
 
         Ok(())
@@ -860,14 +864,19 @@ mod tests {
             // increase basefee
             inc_base_fee += idx as u64;
 
-            let optional_params = OptionalTestBatchParams {
-                beneficiary_opt: None, // ensure random for assertions
-                withdrawals_opt: None,
-                timestamp_opt: None,
-                mix_hash_opt: None,
-                base_fee_per_gas_opt: Some(inc_base_fee),
-            };
-            execute_test_batch(batch, &parent, optional_params, &provider, &block_executor);
+            // this is the only way to do this right now
+            let mut header = batch.sealed_header().clone().unseal();
+
+            // update basefee and set beneficiary
+            header.beneficiary = Address::random();
+            header.base_fee_per_gas = Some(inc_base_fee);
+
+            // okay to use bad hash bc execution executing block will seal slowly
+            let updated = header.seal(B256::ZERO);
+            batch.update_header(updated);
+
+            // actually execute the block now
+            execute_test_worker_block(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
 
             // store values for assertions later
@@ -882,14 +891,19 @@ mod tests {
             // this makes assertions easier at the end
             inc_base_fee += 4 + idx as u64;
 
-            let optional_params = OptionalTestBatchParams {
-                beneficiary_opt: None, // ensure random for assertions
-                withdrawals_opt: None,
-                timestamp_opt: None,
-                mix_hash_opt: None,
-                base_fee_per_gas_opt: Some(inc_base_fee),
-            };
-            execute_test_batch(batch, &parent, optional_params, &provider, &block_executor);
+            // this is the only way to do this right now
+            let mut header = batch.sealed_header().clone().unseal();
+
+            // update basefee and set beneficiary
+            header.beneficiary = Address::random();
+            header.base_fee_per_gas = Some(inc_base_fee);
+
+            // okay to use bad hash bc execution executing block will seal slowly
+            let updated = header.seal(B256::ZERO);
+            batch.update_header(updated);
+
+            // actually execute the block now
+            execute_test_worker_block(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
 
             // store values for assertions later
@@ -1055,20 +1069,20 @@ mod tests {
         //     – Withdrawals
         //     – Requests
         //     – Senders
-        let expected_blocks = provider.block_with_senders_range(1..=expected_block_height)?;
-        assert_eq!(expected_block_height, expected_blocks.len() as u64);
+        let executed_blocks = provider.block_with_senders_range(1..=expected_block_height)?;
+        assert_eq!(expected_block_height, executed_blocks.len() as u64);
 
         // basefee intentionally increased with loop
         let mut expected_base_fee = MIN_PROTOCOL_BASE_FEE;
         let output_digest_1: B256 = consensus_output_1.digest().into();
         let output_digest_2: B256 = consensus_output_2.digest().into();
 
-        // assert blocks are executed as expected
+        // assert blocks are execute as expected
         for (idx, txs) in txs_by_block.iter().enumerate() {
-            let block = &expected_blocks[idx];
+            let block = &executed_blocks[idx];
             let signers = &signers_by_block[idx];
             // assert information from batch headers
-            let expected_header = &batch_headers[idx];
+            let proposed_header = &batch_headers[idx];
 
             // expect blocks 4 and 8 to be empty (no txs bc they are duplicates)
             // sub 1 to account for loop idx starting at 0
@@ -1078,14 +1092,12 @@ mod tests {
                 assert!(block.senders.is_empty());
                 assert!(block.body.is_empty());
                 // gas used should NOT be the same as bc duplicate transaction are ignored
-                assert_ne!(block.gas_used, expected_header.gas_used);
+                assert_ne!(block.gas_used, proposed_header.gas_used);
                 // gas used should be zero bc all transactions were duplicates
                 assert_eq!(block.gas_used, 0);
             } else {
                 assert_eq!(&block.senders, signers);
                 assert_eq!(&block.body, txs);
-                // gas used should be the same as bc every transaction is expected to pass
-                assert_eq!(block.gas_used, expected_header.gas_used);
             }
 
             // basefee was increased for each batch
@@ -1130,36 +1142,34 @@ mod tests {
             if idx == 0 {
                 // first block's parent is expected to be genesis
                 assert_eq!(block.parent_hash, chain.genesis_hash());
-                // expect state roots to be the same as batch's bc of genesis
-                assert_eq!(block.state_root, expected_header.state_root);
                 // expect header number +1 for batch bc of genesis
-                assert_eq!(block.number, expected_header.number);
+                assert_eq!(block.number, proposed_header.number);
             } else {
-                assert_ne!(block.parent_hash, expected_header.parent_hash);
+                assert_ne!(block.parent_hash, proposed_header.parent_hash);
                 // TODO: this is inefficient
                 //
                 // assert parents executed in order (sanity check)
-                let expected_parent = expected_blocks[idx - 1].header.hash_slow();
+                let expected_parent = executed_blocks[idx - 1].header.hash_slow();
                 assert_eq!(block.parent_hash, expected_parent);
-                // expect state roots NOT to be the same as batch's since genesis is parent for all
-                // batches
-                assert_ne!(block.state_root, expected_header.state_root);
                 // expect block numbers NOT the same as batch's headers
-                assert_ne!(block.number, expected_header.number);
+                assert_ne!(block.number, proposed_header.number);
             }
 
+            // expect state roots to be different bc worker uses ZERO
+            assert_ne!(block.state_root, proposed_header.state_root);
+
             // mix hash is xor worker block's hash and consensus output digest
-            let expected_mix_hash = expected_header.mix_hash ^ *expected_parent_beacon_block_root;
+            let expected_mix_hash = proposed_header.hash() ^ *expected_parent_beacon_block_root;
             assert_eq!(block.mix_hash, expected_mix_hash);
             // bloom expected to be the same bc all proposed transactions should be good
             // ie) no duplicates, etc.
             //
-            // TODO: randomly generate contract transactions as well!!!
-            assert_eq!(block.logs_bloom, expected_header.logs_bloom);
+            // TODO: this doesn't actually test anything bc there are no contract txs
+            assert_eq!(block.logs_bloom, proposed_header.logs_bloom);
             // gas limit should come from batch
             //
             // TODO: ensure batch validation prevents peer workers from changing this value
-            assert_eq!(block.gas_limit, expected_header.gas_limit);
+            assert_eq!(block.gas_limit, proposed_header.gas_limit);
             // difficulty should match the batch's index within consensus output
             assert_eq!(block.difficulty, U256::from(expected_batch_index));
             // assert batch digest match extra data
@@ -1167,7 +1177,7 @@ mod tests {
             // assert batch's withdrawals match
             //
             // TODO: this is currently always empty
-            assert_eq!(block.withdrawals_root, expected_header.withdrawals_root);
+            assert_eq!(block.withdrawals_root, proposed_header.withdrawals_root);
         }
 
         Ok(())
@@ -1213,14 +1223,19 @@ mod tests {
             // increase basefee
             inc_base_fee += idx as u64;
 
-            let optional_params = OptionalTestBatchParams {
-                beneficiary_opt: None, // ensure random for assertions
-                withdrawals_opt: None,
-                timestamp_opt: None,
-                mix_hash_opt: None,
-                base_fee_per_gas_opt: Some(inc_base_fee),
-            };
-            execute_test_batch(batch, &parent, optional_params, &provider, &block_executor);
+            // this is the only way to do this right now
+            let mut header = batch.sealed_header().clone().unseal();
+
+            // update basefee and set beneficiary
+            header.beneficiary = Address::random();
+            header.base_fee_per_gas = Some(inc_base_fee);
+
+            // okay to use bad hash bc execution executing block will seal slowly
+            let updated = header.seal(B256::ZERO);
+            batch.update_header(updated);
+
+            // actually execute the block now
+            execute_test_worker_block(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
 
             // store values for assertions later
@@ -1235,14 +1250,19 @@ mod tests {
             // this makes assertions easier at the end
             inc_base_fee += 4 + idx as u64;
 
-            let optional_params = OptionalTestBatchParams {
-                beneficiary_opt: None, // ensure random for assertions
-                withdrawals_opt: None,
-                timestamp_opt: None,
-                mix_hash_opt: None,
-                base_fee_per_gas_opt: Some(inc_base_fee),
-            };
-            execute_test_batch(batch, &parent, optional_params, &provider, &block_executor);
+            // this is the only way to do this right now
+            let mut header = batch.sealed_header().clone().unseal();
+
+            // update basefee and set beneficiary
+            header.beneficiary = Address::random();
+            header.base_fee_per_gas = Some(inc_base_fee);
+
+            // okay to use bad hash bc execution executing block will seal slowly
+            let updated = header.seal(B256::ZERO);
+            batch.update_header(updated);
+
+            // actually execute the block now
+            execute_test_worker_block(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
 
             // store values for assertions later

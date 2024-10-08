@@ -233,6 +233,7 @@ where
         &mut self,
         worker_id: WorkerId,
         block_provider_sender: WorkerBlockSender,
+        // #[cfg(test)] max_builds: Option<usize>,
     ) -> eyre::Result<()> {
         let head = self.node_config.lookup_head(self.provider_factory.clone())?;
 
@@ -328,6 +329,8 @@ where
             transaction_pool.pending_transactions_listener(),
             self.tn_config.parameters.max_worker_tx_gas,
             self.tn_config.parameters.max_worker_tx_bytes_size,
+            // #[cfg(test)]
+            // max_builds,
         );
 
         // spawn block builder task
