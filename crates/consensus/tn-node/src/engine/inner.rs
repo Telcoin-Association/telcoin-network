@@ -25,11 +25,11 @@ use reth_db_common::init::init_genesis;
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use reth_node_builder::{common::WithConfigs, BuilderContext, NodeConfig};
 use reth_node_ethereum::EthEvmConfig;
-use reth_primitives::Address;
+use reth_primitives::{Address, SealedBlockWithSenders, B256};
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
-    BlockReader, CanonStateSubscriptions as _, DatabaseProviderFactory,
-    FinalizedBlockReader, HeaderProvider, ProviderFactory, TransactionVariant,
+    BlockReader, CanonStateSubscriptions as _, DatabaseProviderFactory, FinalizedBlockReader,
+    HeaderProvider, ProviderFactory, TransactionVariant,
 };
 use reth_prune::PruneModes;
 use reth_tasks::TaskExecutor;
@@ -294,19 +294,23 @@ where
         let network = WorkerNetwork::default();
 
         let tx_pool_latest = transaction_pool.block_info();
-        let tip = self
-            .blockchain_db
-            .sealed_block_with_senders(
-                tx_pool_latest.last_seen_block_hash.into(),
-                TransactionVariant::NoHash,
-            )?
-            .ok_or_else(|| {
-                eyre!(
-                    "Failed to find sealed block during block builder startup! ({} - {:?}) ",
-                    tx_pool_latest.last_seen_block_number,
-                    tx_pool_latest.last_seen_block_hash,
-                )
-            })?;
+
+        let tip = match tx_pool_latest.last_seen_block_hash {
+            B256::ZERO => SealedBlockWithSenders::default(),
+            _ => self
+                .blockchain_db
+                .sealed_block_with_senders(
+                    tx_pool_latest.last_seen_block_hash.into(),
+                    TransactionVariant::NoHash,
+                )?
+                .ok_or_else(|| {
+                    eyre!(
+                        "Failed to find sealed block during block builder startup! ({} - {:?}) ",
+                        tx_pool_latest.last_seen_block_number,
+                        tx_pool_latest.last_seen_block_hash,
+                    )
+                })?,
+        };
 
         let latest_canon_state = LastCanonicalUpdate {
             tip: tip.block,
