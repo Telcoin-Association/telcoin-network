@@ -296,7 +296,7 @@ mod tests {
     use reth_blockchain_tree::BlockchainTreeViewer;
     use reth_chainspec::ChainSpec;
     use reth_primitives::{
-        constants::MIN_PROTOCOL_BASE_FEE, keccak256, proofs, Address, BlockHashOrNumber, B256,
+        constants::MIN_PROTOCOL_BASE_FEE, proofs, Address, BlockHashOrNumber, B256,
         EMPTY_OMMER_ROOT_HASH, U256,
     };
     use reth_provider::{BlockIdReader, BlockNumReader, BlockReader, TransactionVariant};
@@ -448,17 +448,10 @@ mod tests {
         // expect header number genesis + 1
         assert_eq!(expected_block.number, expected_block_height);
 
-        // mix hash is calculated from parent blocks parent_beacon_block_root and output's timestamp
-        let expected_mix_hash = consensus_output.digest().into();
-        assert_eq!(expected_block.mix_hash, expected_mix_hash);
-        let manual_mix_hash = keccak256(
-            [
-                genesis_header.mix_hash.as_slice(),
-                consensus_output.committed_at().to_le_bytes().as_slice(),
-            ]
-            .concat(),
-        );
-        assert_eq!(expected_block.mix_hash, manual_mix_hash);
+        // mix hash is xor bitwise with worker sealed block's hash and consensus output
+        // just use consensus output hash if no worker blocks in the round
+        let consensus_output_hash = B256::from(consensus_output.digest());
+        assert_eq!(expected_block.mix_hash, consensus_output_hash);
         // bloom expected to be the same bc all proposed transactions should be good
         // ie) no duplicates, etc.
         //

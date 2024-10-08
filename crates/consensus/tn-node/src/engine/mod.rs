@@ -21,12 +21,12 @@ mod inner;
 mod worker;
 
 use self::inner::ExecutionNodeInner;
-use reth_provider::{providers::BlockchainProvider, ExecutionOutcome};
+use reth_provider::providers::BlockchainProvider;
 use reth_tasks::TaskExecutor;
 use tn_block_validator::BlockValidator;
 use tn_faucet::FaucetArgs;
 use tn_types::{Config, ConsensusOutput, WorkerBlockSender, WorkerId};
-use tokio::sync::{broadcast, watch, RwLock};
+use tokio::sync::{broadcast, RwLock};
 pub use worker::*;
 
 /// The struct used to build the execution nodes.

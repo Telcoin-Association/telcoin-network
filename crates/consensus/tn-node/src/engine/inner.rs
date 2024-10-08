@@ -23,12 +23,12 @@ use reth_db::{
 };
 use reth_db_common::init::init_genesis;
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
-use reth_node_builder::{common::WithConfigs, components::PoolBuilder, BuilderContext, NodeConfig};
-use reth_node_ethereum::{node::EthereumPoolBuilder, EthEvmConfig};
+use reth_node_builder::{common::WithConfigs, BuilderContext, NodeConfig};
+use reth_node_ethereum::EthEvmConfig;
 use reth_primitives::Address;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
-    BlockReader, CanonStateSubscriptions as _, DatabaseProviderFactory, ExecutionOutcome,
+    BlockReader, CanonStateSubscriptions as _, DatabaseProviderFactory,
     FinalizedBlockReader, HeaderProvider, ProviderFactory, TransactionVariant,
 };
 use reth_prune::PruneModes;

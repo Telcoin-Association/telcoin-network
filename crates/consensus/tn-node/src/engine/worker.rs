@@ -37,7 +37,6 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 use tn_types::adiri_chain_spec;
-use tokio::sync::watch;
 
 /// The explicit type for the worker's transaction pool.
 pub type WorkerTxPool<DB> = EthTransactionPool<BlockchainProvider<DB>, DiskFileBlobStore>;

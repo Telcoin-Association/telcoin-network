@@ -31,7 +31,7 @@ use tn_types::{
 };
 use tokio::sync::{mpsc::Receiver, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, trace, warn};
+use tracing::{error, trace, warn};
 
 mod block_builder;
 mod error;

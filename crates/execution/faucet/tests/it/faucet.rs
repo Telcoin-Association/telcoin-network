@@ -51,7 +51,7 @@ use tn_types::{
     },
     TransactionSigned, WorkerBlock,
 };
-use tokio::{sync::mpsc::Sender, time::timeout};
+use tokio::{sync::mpsc::Sender, time};
 use tracing::debug;
 
 #[derive(Clone, Debug)]
@@ -282,7 +282,7 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
 
     // wait for canon event or timeout
     let new_block: WorkerBlock =
-        timeout(duration, next_batch.recv()).await?.expect("batch received");
+        time::timeout(duration, next_batch.recv()).await?.expect("batch received");
 
     let batch_txs = new_block.transactions();
     let tx = batch_txs.first().expect("first batch tx from faucet");
@@ -576,7 +576,7 @@ async fn test_faucet_transfers_stablecoin_with_google_kms() -> eyre::Result<()> 
 
     // wait for canon event or timeout
     let new_block: WorkerBlock =
-        timeout(duration, next_batch.recv()).await?.expect("batch received");
+        time::timeout(duration, next_batch.recv()).await?.expect("batch received");
 
     let batch_txs = new_block.transactions();
     let tx = batch_txs.first().expect("first batch tx from faucet");

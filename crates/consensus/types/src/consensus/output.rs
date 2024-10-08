@@ -5,7 +5,7 @@ use crate::{
     TimestampSec, WorkerBlock, WorkerBlockConversionError,
 };
 use fastcrypto::hash::{Digest, Hash, HashFunction};
-use reth_primitives::{keccak256, Address, BlockHash, Header, SealedBlockWithSenders, B256};
+use reth_primitives::{Address, BlockHash, Header, SealedBlockWithSenders, B256};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,

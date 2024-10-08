@@ -4,7 +4,6 @@ use crate::{
     adiri_genesis, utils::get_available_tcp_port, BlsPublicKey, BlsSignature, Multiaddr,
     NetworkPublicKey, ValidatorInfo, WorkerIndex,
 };
-use alloy::dyn_abi::parser::ParameterSpecifier;
 use fastcrypto::traits::KeyPair as KeyPairTrait;
 use reth_chainspec::ChainSpec;
 use reth_primitives::{Address, Genesis};
