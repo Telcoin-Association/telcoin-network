@@ -234,7 +234,8 @@ async fn test_make_block_el_to_cl() {
     let sealed_header_from_batch_store = batch_from_store.sealed_header();
     assert_eq!(sealed_header_from_batch_store.beneficiary, address);
 
-    // txpool size after mining
+    // txpool should be empty after mining
+    // test_make_block_no_ack_txs_in_pool_still tests for txs in pool without mining event
     let pending_pool_len = txpool.pool_size().pending;
     debug!("pool_size(): {:?}", txpool.pool_size());
     assert_eq!(pending_pool_len, 0);

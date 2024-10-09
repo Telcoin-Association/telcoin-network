@@ -443,3 +443,396 @@ where
         Poll::Pending
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert_matches::assert_matches;
+    use narwhal_network::client::NetworkClient;
+    use narwhal_typed_store::{open_db, tables::WorkerBlocks, traits::Database};
+    use narwhal_worker::{
+        metrics::WorkerMetrics,
+        quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
+        BlockProvider,
+    };
+    use reth::tasks::TaskManager;
+    use reth_blockchain_tree::noop::NoopBlockchainTree;
+    use reth_chainspec::ChainSpec;
+    use reth_db::{
+        test_utils::{create_test_rw_db, tempdir_path, TempDatabase},
+        DatabaseEnv,
+    };
+    use reth_db_common::init::init_genesis;
+    use reth_primitives::{
+        alloy_primitives::U160, BlockBody, Bytes, GenesisAccount, SealedBlock, U256,
+    };
+    use reth_provider::{
+        providers::{BlockchainProvider, StaticFileProvider},
+        CanonStateSubscriptions as _, ProviderFactory,
+    };
+    use reth_transaction_pool::{
+        blobstore::InMemoryBlobStore, CoinbaseTipOrdering, EthPooledTransaction,
+        EthTransactionValidator, Pool, PoolConfig, TransactionValidationTaskExecutor,
+    };
+    use std::{str::FromStr, time::Duration};
+    use tempfile::TempDir;
+    use tn_types::{
+        adiri_chain_spec_arc, adiri_genesis,
+        test_utils::{adiri_genesis_seeded, get_gas_price, TransactionFactory},
+        WorkerBlock,
+    };
+    use tokio::sync::watch;
+    use tracing::debug;
+
+    #[derive(Clone, Debug)]
+    struct TestMakeBlockQuorumWaiter();
+    impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
+        fn verify_block(
+            &self,
+            _block: WorkerBlock,
+            _timeout: Duration,
+        ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
+            tokio::spawn(async move { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_make_block_no_ack_txs_in_pool_still() {
+        // reth_tracing::init_test_tracing();
+        let genesis = adiri_genesis();
+        let mut tx_factory = TransactionFactory::new();
+        let factory_address = tx_factory.address();
+
+        // fund factory with 99mil TEL
+        let account = vec![(
+            factory_address,
+            GenesisAccount::default().with_balance(
+                U256::from_str("0x51E410C0F93FE543000000").expect("account balance is parsed"),
+            ),
+        )];
+
+        let genesis = genesis.extend_accounts(account);
+        let head_timestamp = genesis.timestamp;
+        let chain: Arc<ChainSpec> = Arc::new(genesis.into());
+
+        // init genesis
+        let db = create_test_rw_db();
+        // provider
+        let provider_factory = ProviderFactory::new(
+            Arc::clone(&db),
+            Arc::clone(&chain),
+            StaticFileProvider::read_write(tempdir_path())
+                .expect("static file provider read write created with tempdir path"),
+        );
+        let _genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
+
+        let blockchain_db =
+            BlockchainProvider::new(provider_factory, Arc::new(NoopBlockchainTree::default()))
+                .expect("test blockchain provider");
+
+        // task manger
+        let manager = TaskManager::current();
+        let executor = manager.executor();
+
+        // txpool
+        let blob_store = InMemoryBlobStore::default();
+        let validator = TransactionValidationTaskExecutor::eth_builder(Arc::clone(&chain))
+            .with_head_timestamp(head_timestamp)
+            .with_additional_tasks(1)
+            .build_with_tasks(blockchain_db.clone(), executor, blob_store.clone());
+
+        let txpool =
+            reth_transaction_pool::Pool::eth_pool(validator, blob_store, PoolConfig::default());
+        let address = Address::from(U160::from(33));
+        let client = NetworkClient::new_with_empty_id();
+        let temp_dir = TempDir::new().unwrap();
+        let store = open_db(temp_dir.path());
+        let qw = TestMakeBlockQuorumWaiter();
+        let node_metrics = WorkerMetrics::default();
+        let timeout = Duration::from_secs(5);
+        let block_provider =
+            BlockProvider::new(0, qw, Arc::new(node_metrics), client, store.clone(), timeout);
+
+        let tx_pool_latest = txpool.block_info();
+        let tip = SealedBlock::new(chain.sealed_genesis_header(), BlockBody::default());
+
+        let latest_canon_state = LastCanonicalUpdate {
+            tip, // genesis
+            pending_block_base_fee: tx_pool_latest.pending_basefee,
+            pending_block_blob_fee: tx_pool_latest.pending_blob_fee,
+        };
+
+        // build execution block proposer
+        let block_builder = BlockBuilder::new(
+            blockchain_db.clone(),
+            txpool.clone(),
+            blockchain_db.canonical_state_stream(),
+            latest_canon_state,
+            block_provider.blocks_rx(),
+            address,
+            txpool.pending_transactions_listener(),
+            30_000_000, // 30mil gas limit
+            1_000_000,  // 1MB size
+        );
+
+        let gas_price = get_gas_price(&blockchain_db);
+        let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
+
+        // create 3 transactions
+        let transaction1 = tx_factory.create_eip1559(
+            chain.clone(),
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let transaction2 = tx_factory.create_eip1559(
+            chain.clone(),
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let transaction3 = tx_factory.create_eip1559(
+            chain.clone(),
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let added_result = tx_factory.submit_tx_to_pool(transaction1.clone(), txpool.clone()).await;
+        assert_matches!(added_result, hash if hash == transaction1.hash());
+
+        let added_result = tx_factory.submit_tx_to_pool(transaction2.clone(), txpool.clone()).await;
+        assert_matches!(added_result, hash if hash == transaction2.hash());
+
+        let added_result = tx_factory.submit_tx_to_pool(transaction3.clone(), txpool.clone()).await;
+        assert_matches!(added_result, hash if hash == transaction3.hash());
+
+        // txpool size
+        let pending_pool_len = txpool.pool_size().pending;
+        assert_eq!(pending_pool_len, 3);
+
+        // spawn block_builder once worker is ready
+        let _block_builder = tokio::spawn(Box::pin(block_builder));
+
+        // wait for new block
+        let mut new_block = None;
+        for _ in 0..5 {
+            let _ = tokio::time::sleep(Duration::from_secs(1)).await;
+            // Ensure the block is stored
+            if let Some((_, wb)) = store.iter::<WorkerBlocks>().next() {
+                new_block = Some(wb);
+                break;
+            }
+        }
+        let new_block = new_block.unwrap();
+
+        // number of transactions in the block
+        let block_txs = new_block.transactions();
+
+        // check max tx for task matches num of transactions in block
+        let num_block_txs = block_txs.len();
+        assert_eq!(3, num_block_txs);
+
+        // ensure decoded block transaction is transaction1
+        let block_tx = block_txs.first().cloned().expect("one tx in block");
+        assert_eq!(block_tx, transaction1);
+
+        // yield to try and give pool a chance to update
+        tokio::task::yield_now().await;
+
+        // transactions should be in pool still since ack wasn't received
+        // IT test ensures these transactions are cleared
+        let pending_pool_len = txpool.pool_size().pending;
+        assert_eq!(pending_pool_len, 3);
+    }
+
+    /// Convenience struct for creating test assets.
+    struct TestTools {
+        /// Factory for creating and signing valid transactions.
+        tx_factory: TransactionFactory,
+        /// Last canonical update - expected to be genesis in these tests.
+        last_canonical_update: LastCanonicalUpdate,
+        /// Execution components:
+        /// - BlockchainProvider (db)
+        /// - TransactionPool
+        /// - ChainSpec
+        /// - TaskManager (so executor tasks don't drop)
+        execution_components: TestExecutionComponents,
+    }
+
+    /// Convenience type for holding execution components.
+    struct TestExecutionComponents {
+        blockchain_db: BlockchainProvider<Arc<TempDatabase<DatabaseEnv>>>,
+        txpool: Pool<
+            TransactionValidationTaskExecutor<
+                EthTransactionValidator<
+                    BlockchainProvider<Arc<TempDatabase<DatabaseEnv>>>,
+                    EthPooledTransaction,
+                >,
+            >,
+            CoinbaseTipOrdering<EthPooledTransaction>,
+            InMemoryBlobStore,
+        >,
+        chain: Arc<ChainSpec>,
+        manager: TaskManager,
+    }
+
+    /// Helper function to create common testing infrastructure.
+    fn get_test_tools() -> TestTools {
+        let mut tx_factory = TransactionFactory::new();
+        let factory_address = tx_factory.address();
+        let genesis = adiri_genesis_seeded(vec![factory_address]);
+        let head_timestamp = genesis.timestamp;
+        let chain: Arc<ChainSpec> = Arc::new(genesis.into());
+
+        // init genesis
+        let db = create_test_rw_db();
+        // provider
+        let provider_factory = ProviderFactory::new(
+            Arc::clone(&db),
+            Arc::clone(&chain),
+            StaticFileProvider::read_write(tempdir_path())
+                .expect("static file provider read write created with tempdir path"),
+        );
+        let _genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
+
+        let blockchain_db =
+            BlockchainProvider::new(provider_factory, Arc::new(NoopBlockchainTree::default()))
+                .expect("test blockchain provider");
+
+        // task manger
+        let manager = TaskManager::current();
+        let executor = manager.executor();
+
+        // txpool
+        let blob_store = InMemoryBlobStore::default();
+        let validator = TransactionValidationTaskExecutor::eth_builder(Arc::clone(&chain))
+            .with_head_timestamp(head_timestamp)
+            .with_additional_tasks(1)
+            .build_with_tasks(blockchain_db.clone(), executor, blob_store.clone());
+
+        let txpool =
+            reth_transaction_pool::Pool::eth_pool(validator, blob_store, PoolConfig::default());
+        let tx_pool_latest = txpool.block_info();
+        let tip = SealedBlock::new(chain.sealed_genesis_header(), BlockBody::default());
+
+        let last_canonical_update = LastCanonicalUpdate {
+            tip, // genesis
+            pending_block_base_fee: tx_pool_latest.pending_basefee,
+            pending_block_blob_fee: tx_pool_latest.pending_blob_fee,
+        };
+
+        let execution_components =
+            TestExecutionComponents { blockchain_db, txpool, chain, manager };
+        TestTools { tx_factory, last_canonical_update, execution_components }
+    }
+
+    #[tokio::test]
+    async fn test_() {
+        // reth_tracing::init_test_tracing();
+        let TestTools { mut tx_factory, last_canonical_update, execution_components } =
+            get_test_tools();
+        let TestExecutionComponents { blockchain_db, txpool, chain, manager } =
+            execution_components;
+        let address = Address::from(U160::from(33));
+
+        // let (to_worker, )
+
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        // build execution block proposer
+        let block_builder = BlockBuilder::new(
+            blockchain_db.clone(),
+            txpool.clone(),
+            blockchain_db.canonical_state_stream(),
+            last_canonical_update,
+            tx,
+            address,
+            txpool.pending_transactions_listener(),
+            30_000_000, // 30mil gas limit
+            1_000_000,  // 1MB size
+        );
+
+        let gas_price = get_gas_price(&blockchain_db);
+        println!("gas!! - {gas_price:?}");
+        let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
+
+        // create 3 transactions
+        let transaction1 = tx_factory.create_eip1559(
+            chain.clone(),
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let transaction2 = tx_factory.create_eip1559(
+            chain.clone(),
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let transaction3 = tx_factory.create_eip1559(
+            chain.clone(),
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let added_result = tx_factory.submit_tx_to_pool(transaction1.clone(), txpool.clone()).await;
+        assert_matches!(added_result, hash if hash == transaction1.hash());
+
+        let added_result = tx_factory.submit_tx_to_pool(transaction2.clone(), txpool.clone()).await;
+        assert_matches!(added_result, hash if hash == transaction2.hash());
+
+        let added_result = tx_factory.submit_tx_to_pool(transaction3.clone(), txpool.clone()).await;
+        assert_matches!(added_result, hash if hash == transaction3.hash());
+
+        // txpool size
+        let pending_pool_len = txpool.pool_size().pending;
+        assert_eq!(pending_pool_len, 3);
+
+        // spawn block_builder once worker is ready
+        let _block_builder = tokio::spawn(Box::pin(block_builder));
+
+        // // wait for new block
+        // let mut new_block = None;
+        // for _ in 0..5 {
+        //     let _ = tokio::time::sleep(Duration::from_secs(1)).await;
+        //     // Ensure the block is stored
+        //     if let Some((_, wb)) = store.iter::<WorkerBlocks>().next() {
+        //         new_block = Some(wb);
+        //         break;
+        //     }
+        // }
+        // let new_block = new_block.unwrap();
+
+        // // number of transactions in the block
+        // let block_txs = new_block.transactions();
+
+        // // check max tx for task matches num of transactions in block
+        // let num_block_txs = block_txs.len();
+        // assert_eq!(3, num_block_txs);
+
+        // // ensure decoded block transaction is transaction1
+        // let block_tx = block_txs.first().cloned().expect("one tx in block");
+        // assert_eq!(block_tx, transaction1);
+
+        // yield to try and give pool a chance to update
+        tokio::task::yield_now().await;
+
+        // transactions should be in pool still since ack wasn't received
+        let pending_pool_len = txpool.pool_size().pending;
+        assert_eq!(pending_pool_len, 3);
+    }
+
+    // test canonical changes update pool
+    // test errors from worker
+}

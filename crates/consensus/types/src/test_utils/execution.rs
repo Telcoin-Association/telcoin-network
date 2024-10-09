@@ -20,7 +20,6 @@ use reth_provider::{BlockReaderIdExt, ExecutionOutcome, StateProviderFactory};
 use reth_revm::database::StateProviderDatabase;
 use reth_rpc_types::AccessList;
 use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool};
-use reth_trie::HashedPostState;
 use secp256k1::Secp256k1;
 use std::{str::FromStr as _, sync::Arc};
 use tracing::debug;
@@ -32,6 +31,21 @@ pub fn test_genesis() -> Genesis {
     let default_factory_account =
         vec![(default_address, GenesisAccount::default().with_balance(U256::MAX))];
     genesis.extend_accounts(default_factory_account)
+}
+
+/// Helper function to seed addresses within adiri genesis.
+///
+/// Each address is funded with 99_000_000 TEL at genesis.
+pub fn adiri_genesis_seeded(accounts: Vec<Address>) -> Genesis {
+    let accounts = accounts.into_iter().map(|acc| {
+        (
+            acc,
+            GenesisAccount::default().with_balance(
+                U256::from_str("0x51E410C0F93FE543000000").expect("account balance is parsed"),
+            ),
+        )
+    });
+    adiri_genesis().extend_accounts(accounts)
 }
 
 /// Helper function to seed an instance of Genesis with accounts from a random batch.
