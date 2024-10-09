@@ -10,7 +10,6 @@ use consensus_metrics::spawn_logged_monitored_task;
 use indexmap::IndexMap;
 use narwhal_typed_store::open_db;
 use reth_primitives::B256;
-use reth_tracing::init_test_tracing;
 use tempfile::TempDir;
 use tn_types::{
     test_utils::{fixture_payload, CommitteeFixture},
@@ -19,7 +18,7 @@ use tn_types::{
 
 #[tokio::test]
 async fn test_empty_proposal() {
-    init_test_tracing();
+    // reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder().build();
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();
@@ -73,7 +72,7 @@ async fn test_empty_proposal() {
 
 #[tokio::test]
 async fn test_propose_payload_fatal_timer() {
-    init_test_tracing();
+    // reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder().build();
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();
@@ -220,7 +219,7 @@ async fn test_propose_payload_fatal_timer() {
 
 #[tokio::test]
 async fn test_equivocation_protection_after_restart() {
-    init_test_tracing();
+    // reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder().build();
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();

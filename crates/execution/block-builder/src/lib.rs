@@ -482,7 +482,6 @@ mod tests {
         WorkerBlock,
     };
     use tokio::time::timeout;
-    
 
     #[derive(Clone, Debug)]
     struct TestMakeBlockQuorumWaiter();
@@ -667,7 +666,9 @@ mod tests {
 
     /// Convenience type for holding execution components.
     struct TestExecutionComponents {
+        /// The database client.
         blockchain_db: BlockchainProvider<Arc<TempDatabase<DatabaseEnv>>>,
+        /// The transaction pool for the block builder.
         txpool: Pool<
             TransactionValidationTaskExecutor<
                 EthTransactionValidator<
@@ -678,7 +679,9 @@ mod tests {
             CoinbaseTipOrdering<EthPooledTransaction>,
             InMemoryBlobStore,
         >,
+        /// The chainspec with seeded genesis.
         chain: Arc<ChainSpec>,
+        /// Own manager so executor's tasks don't drop (reth).
         _manager: TaskManager,
     }
 
@@ -869,5 +872,137 @@ mod tests {
         assert_eq!(pending_pool_len, 7);
     }
 
-    // test canonical changes update pool
+    /// Test canonical changes update pool
+    #[tokio::test]
+    async fn test_pool_updates_after_canonical_update() {
+        // reth_tracing::init_test_tracing();
+        let TestTools { mut tx_factory, last_canonical_update, execution_components } =
+            get_test_tools();
+        let TestExecutionComponents { blockchain_db, txpool, chain, .. } = execution_components;
+        let address = Address::from(U160::from(33));
+        let (to_worker, mut from_block_builder) = tokio::sync::mpsc::channel(2);
+        // build execution block proposer
+        let block_builder = BlockBuilder::new(
+            blockchain_db.clone(),
+            txpool.clone(),
+            blockchain_db.canonical_state_stream(),
+            last_canonical_update,
+            to_worker,
+            address,
+            txpool.pending_transactions_listener(),
+            30_000_000, // 30mil gas limit
+            1_000_000,  // 1MB size
+        );
+
+        // expected to be 7 wei for first block
+        let gas_price = get_gas_price(&blockchain_db);
+        let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
+
+        // create 3 transactions
+        let transaction1 = tx_factory.create_eip1559(
+            chain.clone(),
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let transaction2 = tx_factory.create_eip1559(
+            chain.clone(),
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let transaction3 = tx_factory.create_eip1559(
+            chain.clone(),
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let added_result = tx_factory.submit_tx_to_pool(transaction1.clone(), txpool.clone()).await;
+        assert_matches!(added_result, hash if hash == transaction1.hash());
+
+        let added_result = tx_factory.submit_tx_to_pool(transaction2.clone(), txpool.clone()).await;
+        assert_matches!(added_result, hash if hash == transaction2.hash());
+
+        let added_result = tx_factory.submit_tx_to_pool(transaction3.clone(), txpool.clone()).await;
+        assert_matches!(added_result, hash if hash == transaction3.hash());
+
+        // txpool size
+        let pending_pool_len = txpool.pool_size().pending;
+        assert_eq!(pending_pool_len, 3);
+
+        // spawn block_builder once worker is ready
+        let block_builder_task = tokio::spawn(Box::pin(block_builder));
+
+        // plenty of time for block production
+        let duration = std::time::Duration::from_secs(5);
+
+        // BlockSealError::QuorumRejected
+        // | BlockSealError::AntiQuorum
+        // | BlockSealError::Timeout
+        // | BlockSealError::FailedQuorum => {
+
+        let non_fatal_errors = vec![
+            BlockSealError::QuorumRejected,
+            BlockSealError::AntiQuorum,
+            BlockSealError::Timeout,
+            BlockSealError::FailedQuorum,
+        ];
+
+        // receive new blocks and return non-fatal errors
+        // non-fatal errors cause the loop to break and wait for txpool updates
+        // submitting a new pending transaction is one of the ways this task wakes up
+        for (idx, error) in non_fatal_errors.into_iter().enumerate() {
+            let (block, ack) = timeout(duration, from_block_builder.recv())
+                .await
+                .expect("block builder's sender didn't drop")
+                .expect("worker block was built");
+
+            // all 3 transactions present
+            assert_eq!(block.transactions().len(), 3 + idx);
+
+            // send non-fatal error
+            let _ = ack.send(Err(error));
+
+            // submit another tx to pool to wake up task
+            tx_factory
+                .create_and_submit_eip1559_pool_tx(
+                    chain.clone(),
+                    gas_price,
+                    Address::ZERO,
+                    value, // 1 TEL
+                    &txpool,
+                )
+                .await;
+        }
+
+        // wait for next block
+        let (block, ack) = timeout(duration, from_block_builder.recv())
+            .await
+            .expect("block builder's sender didn't drop")
+            .expect("worker block was built");
+
+        // expect 7 transactions after loop added 4 more
+        assert_eq!(block.transactions().len(), 7);
+
+        // now send fatal error
+        let _ = ack.send(Err(BlockSealError::FatalDBFailure));
+
+        // ensure block builder shuts down from fatal error
+        let result = block_builder_task.await.expect("ack channel delivered result");
+        println!("result: {result:?}");
+        assert!(result.is_err());
+
+        // yield to try and give pool a chance to update
+        tokio::task::yield_now().await;
+
+        // transactions should be in pool still since ack was error
+        let pending_pool_len = txpool.pool_size().pending;
+        assert_eq!(pending_pool_len, 7);
+    }
 }

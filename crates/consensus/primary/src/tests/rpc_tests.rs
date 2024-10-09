@@ -9,12 +9,11 @@ use narwhal_network::{PrimaryToPrimaryRpc, WorkerRpc};
 use narwhal_network_types::{FetchCertificatesRequest, RequestBlocksRequest};
 use narwhal_test_utils::cluster::Cluster;
 use reth::tasks::TaskManager;
-use reth_tracing::init_test_tracing;
 use tn_types::AuthorityIdentifier;
 
 #[tokio::test]
 async fn test_server_authorizations() {
-    init_test_tracing();
+    // reth_tracing::init_test_tracing();
     // Set up primaries and workers with a committee.
     let manager = TaskManager::current();
     let executor = manager.executor();

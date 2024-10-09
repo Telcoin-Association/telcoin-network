@@ -14,8 +14,7 @@ use tn_block_validator::NoopBlockValidator;
 
 #[tokio::test]
 async fn synchronize() {
-    reth_tracing::init_test_tracing();
-
+    // reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder().randomize_ports(true).build();
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();

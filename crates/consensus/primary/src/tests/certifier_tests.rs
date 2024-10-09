@@ -21,7 +21,7 @@ use tokio::sync::watch;
 // #[tokio::test(flavor = "current_thread", start_paused = true)]
 // async fn propose_header_and_form_certificate_v1() {
 //     let cert_v1_protocol_config = get_protocol_config(28);
-//     reth_tracing::init_test_tracing();
+//     // reth_tracing::init_test_tracing();
 //     let fixture = CommitteeFixture::builder().randomize_ports(true).build();
 //     let committee = fixture.committee();
 //     let worker_cache = fixture.worker_cache();
@@ -140,7 +140,7 @@ use tokio::sync::watch;
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn propose_header_and_form_certificate_v2() {
     let temp_dir = TempDir::new().unwrap();
-    reth_tracing::init_test_tracing();
+    // reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder().randomize_ports(true).build();
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();
@@ -248,7 +248,7 @@ async fn propose_header_and_form_certificate_v2() {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn propose_header_failure() {
     let temp_dir = TempDir::new().unwrap();
-    reth_tracing::init_test_tracing();
+    // reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder().randomize_ports(true).build();
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();
@@ -339,7 +339,7 @@ async fn propose_header_failure() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn propose_header_scenario_with_bad_sigs() {
-    reth_tracing::init_test_tracing();
+    // reth_tracing::init_test_tracing();
     // expect cert if less than 2 byzantines, otherwise no cert
     run_vote_aggregator_with_param(6, 0, true).await;
     run_vote_aggregator_with_param(6, 1, true).await;
