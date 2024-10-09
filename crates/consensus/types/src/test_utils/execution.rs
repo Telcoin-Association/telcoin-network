@@ -202,6 +202,7 @@ where
 }
 
 /// Transaction factory
+#[derive(Clone, Copy, Debug)]
 pub struct TransactionFactory {
     /// Keypair for signing transactions
     keypair: ExecutionKeypair,

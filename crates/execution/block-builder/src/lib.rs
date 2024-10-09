@@ -481,7 +481,7 @@ mod tests {
         test_utils::{adiri_genesis_seeded, get_gas_price, TransactionFactory},
         WorkerBlock,
     };
-    use tokio::sync::watch;
+    use tokio::{sync::watch, time::timeout};
     use tracing::debug;
 
     #[derive(Clone, Debug)]
@@ -679,12 +679,12 @@ mod tests {
             InMemoryBlobStore,
         >,
         chain: Arc<ChainSpec>,
-        manager: TaskManager,
+        _manager: TaskManager,
     }
 
     /// Helper function to create common testing infrastructure.
     fn get_test_tools() -> TestTools {
-        let mut tx_factory = TransactionFactory::new();
+        let tx_factory = TransactionFactory::new();
         let factory_address = tx_factory.address();
         let genesis = adiri_genesis_seeded(vec![factory_address]);
         let head_timestamp = genesis.timestamp;
@@ -706,8 +706,8 @@ mod tests {
                 .expect("test blockchain provider");
 
         // task manger
-        let manager = TaskManager::current();
-        let executor = manager.executor();
+        let _manager = TaskManager::current();
+        let executor = _manager.executor();
 
         // txpool
         let blob_store = InMemoryBlobStore::default();
@@ -728,37 +728,37 @@ mod tests {
         };
 
         let execution_components =
-            TestExecutionComponents { blockchain_db, txpool, chain, manager };
+            TestExecutionComponents { blockchain_db, txpool, chain, _manager };
         TestTools { tx_factory, last_canonical_update, execution_components }
     }
 
+    /// Test all possible errors from the worker while trying to reach quorum from peers.
+    ///
+    /// Non-fatal errors return empty vecs of mined transactions.
+    /// Fatal error causes shutdown.
     #[tokio::test]
-    async fn test_() {
+    async fn test_all_possible_error_outcomes() {
         // reth_tracing::init_test_tracing();
         let TestTools { mut tx_factory, last_canonical_update, execution_components } =
             get_test_tools();
-        let TestExecutionComponents { blockchain_db, txpool, chain, manager } =
-            execution_components;
+        let TestExecutionComponents { blockchain_db, txpool, chain, .. } = execution_components;
         let address = Address::from(U160::from(33));
-
-        // let (to_worker, )
-
-        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let (to_worker, mut from_block_builder) = tokio::sync::mpsc::channel(2);
         // build execution block proposer
         let block_builder = BlockBuilder::new(
             blockchain_db.clone(),
             txpool.clone(),
             blockchain_db.canonical_state_stream(),
             last_canonical_update,
-            tx,
+            to_worker,
             address,
             txpool.pending_transactions_listener(),
             30_000_000, // 30mil gas limit
             1_000_000,  // 1MB size
         );
 
+        // expected to be 7 wei for first block
         let gas_price = get_gas_price(&blockchain_db);
-        println!("gas!! - {gas_price:?}");
         let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
 
         // create 3 transactions
@@ -800,39 +800,74 @@ mod tests {
         assert_eq!(pending_pool_len, 3);
 
         // spawn block_builder once worker is ready
-        let _block_builder = tokio::spawn(Box::pin(block_builder));
+        let block_builder_task = tokio::spawn(Box::pin(block_builder));
 
-        // // wait for new block
-        // let mut new_block = None;
-        // for _ in 0..5 {
-        //     let _ = tokio::time::sleep(Duration::from_secs(1)).await;
-        //     // Ensure the block is stored
-        //     if let Some((_, wb)) = store.iter::<WorkerBlocks>().next() {
-        //         new_block = Some(wb);
-        //         break;
-        //     }
-        // }
-        // let new_block = new_block.unwrap();
+        // plenty of time for block production
+        let duration = std::time::Duration::from_secs(5);
 
-        // // number of transactions in the block
-        // let block_txs = new_block.transactions();
+        // BlockSealError::QuorumRejected
+        // | BlockSealError::AntiQuorum
+        // | BlockSealError::Timeout
+        // | BlockSealError::FailedQuorum => {
 
-        // // check max tx for task matches num of transactions in block
-        // let num_block_txs = block_txs.len();
-        // assert_eq!(3, num_block_txs);
+        let non_fatal_errors = vec![
+            BlockSealError::QuorumRejected,
+            BlockSealError::AntiQuorum,
+            BlockSealError::Timeout,
+            BlockSealError::FailedQuorum,
+        ];
 
-        // // ensure decoded block transaction is transaction1
-        // let block_tx = block_txs.first().cloned().expect("one tx in block");
-        // assert_eq!(block_tx, transaction1);
+        // receive new blocks and return non-fatal errors
+        // non-fatal errors cause the loop to break and wait for txpool updates
+        // submitting a new pending transaction is one of the ways this task wakes up
+        for (idx, error) in non_fatal_errors.into_iter().enumerate() {
+            let (block, ack) = timeout(duration, from_block_builder.recv())
+                .await
+                .expect("block builder's sender didn't drop")
+                .expect("worker block was built");
+
+            // all 3 transactions present
+            assert_eq!(block.transactions().len(), 3 + idx);
+
+            // send non-fatal error
+            let _ = ack.send(Err(error));
+
+            // submit another tx to pool to wake up task
+            tx_factory
+                .create_and_submit_eip1559_pool_tx(
+                    chain.clone(),
+                    gas_price,
+                    Address::ZERO,
+                    value, // 1 TEL
+                    &txpool,
+                )
+                .await;
+        }
+
+        // wait for next block
+        let (block, ack) = timeout(duration, from_block_builder.recv())
+            .await
+            .expect("block builder's sender didn't drop")
+            .expect("worker block was built");
+
+        // expect 7 transactions after loop added 4 more
+        assert_eq!(block.transactions().len(), 7);
+
+        // now send fatal error
+        let _ = ack.send(Err(BlockSealError::FatalDBFailure));
+
+        // ensure block builder shuts down from fatal error
+        let result = block_builder_task.await.expect("ack channel delivered result");
+        println!("result: {result:?}");
+        assert!(result.is_err());
 
         // yield to try and give pool a chance to update
         tokio::task::yield_now().await;
 
-        // transactions should be in pool still since ack wasn't received
+        // transactions should be in pool still since ack was error
         let pending_pool_len = txpool.pool_size().pending;
-        assert_eq!(pending_pool_len, 3);
+        assert_eq!(pending_pool_len, 7);
     }
 
     // test canonical changes update pool
-    // test errors from worker
 }
