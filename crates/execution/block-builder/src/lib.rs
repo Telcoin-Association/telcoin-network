@@ -98,15 +98,6 @@ pub struct BlockBuilder<BT, Pool> {
     gas_limit: u64,
     /// The maximum size of collected transactions, measured in bytes.
     max_size: usize,
-    // /// Optional number of blocks to build before shutting down.
-    // ///
-    // /// Engine can produce multiple blocks per round of consensus, so this number may not
-    // /// match the subdag index or block height. To control the number of outputs, consider
-    // /// specifying a `max_round` for the execution engine as well.
-    // ///
-    // /// NOTE: this is only used for debugging and testing
-    // #[cfg(feature = "test-utils")]
-    // max_builds: Option<test_utils::MaxBuilds>,
 }
 
 impl<BT, Pool> BlockBuilder<BT, Pool>
@@ -125,7 +116,6 @@ where
         pending_tx_hashes_receiver: Receiver<TxHash>,
         gas_limit: u64,
         max_size: usize,
-        // #[cfg(feature = "test-utils")] max_builds: Option<usize>,
     ) -> Self {
         let pending_tx_hashes_stream = ReceiverStream::new(pending_tx_hashes_receiver);
         Self {
@@ -139,8 +129,6 @@ where
             pending_tx_hashes_stream,
             gas_limit,
             max_size,
-            // #[cfg(feature = "test-utils")]
-            // max_builds: max_builds.map(test_utils::MaxBuilds::new),
         }
     }
 
@@ -388,10 +376,7 @@ where
 
                         // NOTE: empty vec returned for non-fatal error during block proposal
                         if mined_transactions.is_empty() {
-                            // return pending until next canon update because the last block failed
-                            // to reach quorum
-                            //
-                            // task should wait until next canonical update applied to pool
+                            // return pending and hopefully next attempt will work
                             break;
                         }
 
@@ -413,16 +398,6 @@ where
                         //
                         // update pool to remove mined transactions
                         this.pool.on_canonical_state_change(update);
-
-                        // // check max_builds and possibly return early
-                        // #[cfg(feature = "test-utils")]
-                        // if let Some(max_builds) = this.max_builds.as_mut() {
-                        //     max_builds.num_builds += 1;
-                        //     if max_builds.has_reached_max() {
-                        //         tracing::debug!(target: "worker::block_builder", ?max_builds,
-                        // "max builds reached");         return
-                        // Poll::Ready(Ok(()));     }
-                        // }
 
                         // loop again to check for any other pending transactions
                         // and possibly start building the next block
