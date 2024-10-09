@@ -39,6 +39,9 @@ pub enum TnEngineError {
     /// The oneshot channel that receives the result from executing output on a blocking thread.
     #[error("The oneshot channel sender inside blocking task dropped during output execution.")]
     ChannelClosed,
+    /// The queued output that triggered the engine build was not found.
+    #[error("Engine trying to build from empty queue.")]
+    EmptyQueue,
 }
 
 impl From<oneshot::error::RecvError> for TnEngineError {
