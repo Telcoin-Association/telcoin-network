@@ -296,22 +296,19 @@ where
 
         let tx_pool_latest = transaction_pool.block_info();
 
-        let tip = match tx_pool_latest.last_seen_block_hash {
-            B256::ZERO => SealedBlockWithSenders::default(),
-            _ => self
-                .blockchain_db
-                .sealed_block_with_senders(
-                    tx_pool_latest.last_seen_block_hash.into(),
-                    TransactionVariant::NoHash,
-                )?
-                .ok_or_else(|| {
-                    eyre!(
-                        "Failed to find sealed block during block builder startup! ({} - {:?}) ",
-                        tx_pool_latest.last_seen_block_number,
-                        tx_pool_latest.last_seen_block_hash,
-                    )
-                })?,
-        };
+        let tip = self
+            .blockchain_db
+            .sealed_block_with_senders(
+                tx_pool_latest.last_seen_block_hash.into(),
+                TransactionVariant::NoHash,
+            )?
+            .ok_or_else(|| {
+                eyre!(
+                    "Failed to find sealed block during block builder startup! ({} - {:?}) ",
+                    tx_pool_latest.last_seen_block_number,
+                    tx_pool_latest.last_seen_block_hash,
+                )
+            })?;
 
         let latest_canon_state = LastCanonicalUpdate {
             tip: tip.block,

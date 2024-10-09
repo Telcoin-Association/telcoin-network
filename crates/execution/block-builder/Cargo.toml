@@ -48,6 +48,9 @@ narwhal-network = { workspace = true }
 narwhal-network-types = { workspace = true }
 narwhal-typed-store = { workspace = true }
 tn-block-validator = { workspace = true }
+reth-chainspec = { workspace = true }
+reth-db = { workspace = true }
+reth-db-common = { workspace = true }
 
 [features]
 default = []
