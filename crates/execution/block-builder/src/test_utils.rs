@@ -12,8 +12,7 @@ use reth_transaction_pool::{
     TransactionListenerKind, TransactionOrigin, TransactionPool, ValidPoolTransaction,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
-    future::Future,
+    collections::{BTreeMap, HashSet, VecDeque},
     sync::Arc,
     time::Instant,
 };

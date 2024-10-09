@@ -419,9 +419,9 @@ where
                         // if let Some(max_builds) = this.max_builds.as_mut() {
                         //     max_builds.num_builds += 1;
                         //     if max_builds.has_reached_max() {
-                        //         tracing::debug!(target: "worker::block_builder", ?max_builds, "max builds reached");
-                        //         return Poll::Ready(Ok(()));
-                        //     }
+                        //         tracing::debug!(target: "worker::block_builder", ?max_builds,
+                        // "max builds reached");         return
+                        // Poll::Ready(Ok(()));     }
                         // }
 
                         // loop again to check for engine updates and possibly start building the
@@ -477,12 +477,12 @@ mod tests {
     use std::{str::FromStr, time::Duration};
     use tempfile::TempDir;
     use tn_types::{
-        adiri_chain_spec_arc, adiri_genesis,
+        adiri_genesis,
         test_utils::{adiri_genesis_seeded, get_gas_price, TransactionFactory},
         WorkerBlock,
     };
-    use tokio::{sync::watch, time::timeout};
-    use tracing::debug;
+    use tokio::time::timeout;
+    
 
     #[derive(Clone, Debug)]
     struct TestMakeBlockQuorumWaiter();

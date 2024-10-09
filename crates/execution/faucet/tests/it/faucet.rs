@@ -548,7 +548,7 @@ async fn test_faucet_transfers_stablecoin_with_google_kms() -> eyre::Result<()> 
         faucet_test_execution_node(true, Some(chain), None, executor, faucet_proxy_address)?;
 
     let worker_id = 0;
-    let (to_worker, mut next_batch) = tokio::sync::mpsc::channel(2);
+    let (to_worker, next_batch) = tokio::sync::mpsc::channel(2);
     let client = NetworkClient::new_with_empty_id();
     let temp_dir = TempDir::new().unwrap();
     let store = open_db(temp_dir.path());

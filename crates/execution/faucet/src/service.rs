@@ -100,7 +100,8 @@ pub(crate) struct FaucetService<Provider, Pool, Tasks> {
     pub(crate) success_cache: LruCache<(Address, Address), SystemTime>,
     /// Short-lived pending cache.
     ///
-    /// This cache is to prevent quick calls before a request has had time to reach consensus. The cache is much shorter so a user can re-request if a faucet transaction failed.
+    /// This cache is to prevent quick calls before a request has had time to reach consensus. The
+    /// cache is much shorter so a user can re-request if a faucet transaction failed.
     pub(crate) pending_cache: LruCache<(Address, Address), SystemTime>,
     /// The chain id for constructing transactions.
     pub(crate) chain_id: u64,

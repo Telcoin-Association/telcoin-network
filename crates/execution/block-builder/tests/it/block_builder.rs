@@ -1,6 +1,7 @@
 //! Block builder (EL) collects transactions and creates blocks.
 //!
-//! Block builder (CL) receives the block from EL and forwards it to the Quorum Waiter for votes from peers.
+//! Block builder (CL) receives the block from EL and forwards it to the Quorum Waiter for votes
+//! from peers.
 
 use assert_matches::assert_matches;
 use narwhal_network::client::NetworkClient;
