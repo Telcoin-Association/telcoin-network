@@ -116,21 +116,27 @@ impl Faucet {
         let FaucetConfig { wait_period, chain_id, wallet, contract_address } = config;
 
         // Construct an `LruCache` of `<String, SystemTime>`s, limited by 24hr expiry time
-        let lru_cache = LruCache::with_expiry_duration(wait_period);
-        let (add_to_cache_tx, update_cache_rx) = tokio::sync::mpsc::unbounded_channel();
+        let success_cache = LruCache::with_expiry_duration(wait_period);
+
+        // short time-based LRU cache to stop duplicate requests while consensus is being reached
+        // NOTE: 10s chosen bc defaults primary header delay - this should be configurable
+        let pending_cache = LruCache::with_expiry_duration(Duration::from_secs(10));
+        let (add_to_success_cache_tx, update_success_cache_rx) =
+            tokio::sync::mpsc::unbounded_channel();
 
         let service = FaucetService {
             faucet_contract: contract_address,
             request_rx: UnboundedReceiverStream::new(rx),
             provider,
             pool,
-            lru_cache,
+            success_cache,
+            pending_cache,
             chain_id,
             wait_period,
             executor,
             wallet,
-            add_to_cache_tx,
-            update_cache_rx,
+            add_to_success_cache_tx,
+            update_success_cache_rx,
             highest_mined_tx_nonce: 0, // start at 0 and update with db read later
         };
         let faucet = Self { to_service };

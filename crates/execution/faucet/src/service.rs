@@ -96,7 +96,12 @@ pub(crate) struct FaucetService<Provider, Pool, Tasks> {
     ///
     /// Users request faucet transfers for native tokens (zero address) and
     /// stablecoin tokens (contract address) at specific times.
-    pub(crate) lru_cache: LruCache<(Address, Address), SystemTime>,
+    /// NOTE: only transactions that were successfully mined are included in this 24-hr cache.
+    pub(crate) success_cache: LruCache<(Address, Address), SystemTime>,
+    /// Short-lived pending cache.
+    ///
+    /// This cache is to prevent quick calls before a request has had time to reach consensus. The cache is much shorter so a user can re-request if a faucet transaction failed.
+    pub(crate) pending_cache: LruCache<(Address, Address), SystemTime>,
     /// The chain id for constructing transactions.
     pub(crate) chain_id: u64,
     /// The amount of time the LRU cache retains an address (specified in `FaucetConfig`).
@@ -109,11 +114,11 @@ pub(crate) struct FaucetService<Provider, Pool, Tasks> {
     ///
     /// The user's address and contract address are sent through this channel
     /// then added to the LRU cache.
-    pub(crate) add_to_cache_tx: UnboundedSender<MinedTxInfo>,
+    pub(crate) add_to_success_cache_tx: UnboundedSender<MinedTxInfo>,
     /// Receiving half of the cache channel.
     ///
     /// Addresses received on this channel are added to the LRU cache.
-    pub(crate) update_cache_rx: UnboundedReceiver<MinedTxInfo>,
+    pub(crate) update_success_cache_rx: UnboundedReceiver<MinedTxInfo>,
     /// The nonce for this faucet as tracked through the highest mined transaction nonce.
     /// The faucet service checks for the highest nonce in the transaction pool and if needd, in
     /// the database. However, the faucet also needs to nonce state for transactions that are
@@ -155,7 +160,7 @@ where
         let public_key = self.wallet.kms_public_key();
         let chain_id = self.chain_id;
         let pool = self.pool.clone();
-        let add_to_cache = self.add_to_cache_tx.clone();
+        let add_to_success_cache = self.add_to_success_cache_tx.clone();
 
         // request signature and submit to txpool
         self.executor.spawn(Box::pin(async move {
@@ -169,7 +174,8 @@ where
                     let tx_for_pool =
                         TransactionSigned::from_transaction_and_signature(transaction, signature);
                     let res =
-                        submit_transaction(pool, tx_for_pool, add_to_cache, user, contract).await;
+                        submit_transaction(pool, tx_for_pool, add_to_success_cache, user, contract)
+                            .await;
                     // reply to rpc
                     let _ = reply.send(res);
                 }
@@ -410,7 +416,7 @@ where
         loop {
             // listen for cache updates
             while let Poll::Ready(Some(MinedTxInfo { user, contract, nonce })) =
-                this.update_cache_rx.poll_recv(cx)
+                this.update_success_cache_rx.poll_recv(cx)
             {
                 // sanity check
                 // NOTE: this should never be possible bc transaction pool mines by inc nonce
@@ -419,14 +425,14 @@ where
                 }
 
                 // insert user's address and contract address into LRU cache
-                this.lru_cache.insert((user, contract), SystemTime::now());
+                this.success_cache.insert((user, contract), SystemTime::now());
             }
 
             match ready!(this.request_rx.poll_next_unpin(cx)) {
                 None => {
                     unreachable!("faucet request_rx can't close - always listening for addresses from the rpc")
                 }
-                Some((address, contract, reply)) => {
+                Some((user_address, contract, reply)) => {
                     // assign token address for checking LRU cache
                     let contract_address = if let Some(address) = contract {
                         // stablecoin transfer
@@ -436,9 +442,34 @@ where
                         Address::ZERO
                     };
 
-                    // check the cache for user's address
+                    // check the pending cache for user's address
+                    //
                     // use `::peek` so cache timer doesn't reset
-                    if let Some(time) = this.lru_cache.peek(&(address, contract_address)) {
+                    if let Some(time) = this.pending_cache.peek(&(user_address, contract_address)) {
+                        // return remaining time if address combo is still cached
+                        let wait_period_over = this.calc_wait_period(time);
+                        let error = match wait_period_over {
+                            Ok(time) => {
+                                // trim off ms, us, and ns
+                                let human_readable =
+                                    format_duration(Duration::new(time.as_secs(), 0));
+                                let msg = format!("Wait period over at: {}", human_readable);
+                                Err(EthApiError::InvalidParams(msg))
+                            }
+                            Err(e) => Err(e),
+                        };
+
+                        // return the error and check the next request
+                        let _ = reply.send(error);
+                        continue;
+                    }
+
+                    // add request to short-lived pending cache
+                    this.pending_cache.insert((user_address, contract_address), SystemTime::now());
+
+                    // check the longer-lived success cache for user's address
+                    // use `::peek` so cache timer doesn't reset
+                    if let Some(time) = this.success_cache.peek(&(user_address, contract_address)) {
                         // return remaining time if address combo is still cached
                         let wait_period_over = this.calc_wait_period(time);
                         let error = match wait_period_over {
@@ -458,7 +489,8 @@ where
                     }
 
                     // user's request not in cache - process request
-                    if let Err(e) = this.process_transfer_request(address, contract_address, reply)
+                    if let Err(e) =
+                        this.process_transfer_request(user_address, contract_address, reply)
                     {
                         error!(target: "faucet", ?e, "Error creating faucet transaction")
                     }
@@ -475,7 +507,7 @@ where
 async fn submit_transaction<Pool>(
     pool: Pool,
     tx: TransactionSigned,
-    add_to_cache: UnboundedSender<MinedTxInfo>,
+    add_to_success_cache: UnboundedSender<MinedTxInfo>,
     user: Address,
     contract: Address,
 ) -> EthResult<TxHash>
@@ -505,7 +537,7 @@ where
             debug!(target: "faucet", ?event, "tx event received:");
             match event {
                 TransactionEvent::Mined(_block_hash) => {
-                    let _ = add_to_cache.send(mined_tx_info);
+                    let _ = add_to_success_cache.send(mined_tx_info);
                     // end loop
                     break;
                 }
