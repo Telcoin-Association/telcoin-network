@@ -311,8 +311,7 @@ mod tests {
     use std::{collections::VecDeque, str::FromStr as _, sync::Arc, time::Duration};
     use tn_block_builder::test_utils::execute_test_worker_block;
     use tn_types::{
-        adiri_chain_spec_arc, adiri_genesis, now,
-        test_utils::seeded_genesis_from_random_batches,
+        adiri_chain_spec_arc, adiri_genesis, now, test_utils::seeded_genesis_from_random_batches,
         BlockHash, Certificate, CommittedSubDag, ConsensusOutput, ReputationScores,
     };
     use tokio::{sync::oneshot, time::timeout};

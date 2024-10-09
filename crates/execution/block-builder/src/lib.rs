@@ -424,8 +424,15 @@ where
                         // Poll::Ready(Ok(()));     }
                         // }
 
-                        // loop again to check for engine updates and possibly start building the
-                        // next block
+                        // loop again to check for any other pending transactions
+                        // and possibly start building the next block
+                        //
+                        // NOTE: continuing here is important.
+                        // To prevent the following scenario, do not wait for task's waker:
+                        // - there were more transactions in the pool than could fit in the first
+                        //   block
+                        // - pending transaction notifications already drained
+                        // - have to wait for engine's next canonical update or another pending tx
                         continue;
                     }
 
