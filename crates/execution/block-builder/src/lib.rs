@@ -459,7 +459,7 @@ mod tests {
     };
     use reth_provider::{
         providers::{BlockchainProvider, StaticFileProvider},
-        CanonStateSubscriptions as _, ProviderFactory,
+        CanonStateNotifications, CanonStateSubscriptions as _, ProviderFactory,
     };
     use reth_transaction_pool::{
         blobstore::InMemoryBlobStore, CoinbaseTipOrdering, EthPooledTransaction,
@@ -473,6 +473,7 @@ mod tests {
         WorkerBlock,
     };
     use tokio::time::timeout;
+    use tokio_stream::wrappers::BroadcastStream;
 
     #[derive(Clone, Debug)]
     struct TestMakeBlockQuorumWaiter();
@@ -799,11 +800,6 @@ mod tests {
         // plenty of time for block production
         let duration = std::time::Duration::from_secs(5);
 
-        // BlockSealError::QuorumRejected
-        // | BlockSealError::AntiQuorum
-        // | BlockSealError::Timeout
-        // | BlockSealError::FailedQuorum => {
-
         let non_fatal_errors = vec![
             BlockSealError::QuorumRejected,
             BlockSealError::AntiQuorum,
@@ -852,7 +848,6 @@ mod tests {
 
         // ensure block builder shuts down from fatal error
         let result = block_builder_task.await.expect("ack channel delivered result");
-        println!("result: {result:?}");
         assert!(result.is_err());
 
         // yield to try and give pool a chance to update
@@ -863,15 +858,16 @@ mod tests {
         assert_eq!(pending_pool_len, 7);
     }
 
-    /// Test canonical changes update pool
+    /// Test transactions are mined from the pool.
     #[tokio::test]
-    async fn test_pool_updates_after_canonical_update() {
+    async fn test_pool_updates_after_txs_mined() {
         // reth_tracing::init_test_tracing();
         let TestTools { mut tx_factory, last_canonical_update, execution_components } =
             get_test_tools();
         let TestExecutionComponents { blockchain_db, txpool, chain, .. } = execution_components;
         let address = Address::from(U160::from(33));
         let (to_worker, mut from_block_builder) = tokio::sync::mpsc::channel(2);
+
         // build execution block proposer
         let block_builder = BlockBuilder::new(
             blockchain_db.clone(),
@@ -928,72 +924,59 @@ mod tests {
         assert_eq!(pending_pool_len, 3);
 
         // spawn block_builder once worker is ready
-        let block_builder_task = tokio::spawn(Box::pin(block_builder));
+        let _block_builder_task = tokio::spawn(Box::pin(block_builder));
 
         // plenty of time for block production
         let duration = std::time::Duration::from_secs(5);
 
-        // BlockSealError::QuorumRejected
-        // | BlockSealError::AntiQuorum
-        // | BlockSealError::Timeout
-        // | BlockSealError::FailedQuorum => {
-
-        let non_fatal_errors = vec![
-            BlockSealError::QuorumRejected,
-            BlockSealError::AntiQuorum,
-            BlockSealError::Timeout,
-            BlockSealError::FailedQuorum,
-        ];
-
-        // receive new blocks and return non-fatal errors
-        // non-fatal errors cause the loop to break and wait for txpool updates
-        // submitting a new pending transaction is one of the ways this task wakes up
-        for (idx, error) in non_fatal_errors.into_iter().enumerate() {
-            let (block, ack) = timeout(duration, from_block_builder.recv())
-                .await
-                .expect("block builder's sender didn't drop")
-                .expect("worker block was built");
-
-            // all 3 transactions present
-            assert_eq!(block.transactions().len(), 3 + idx);
-
-            // send non-fatal error
-            let _ = ack.send(Err(error));
-
-            // submit another tx to pool to wake up task
-            tx_factory
-                .create_and_submit_eip1559_pool_tx(
-                    chain.clone(),
-                    gas_price,
-                    Address::ZERO,
-                    value, // 1 TEL
-                    &txpool,
-                )
-                .await;
-        }
-
-        // wait for next block
+        // receive proposed block with 3 transactions
         let (block, ack) = timeout(duration, from_block_builder.recv())
             .await
             .expect("block builder's sender didn't drop")
             .expect("worker block was built");
 
-        // expect 7 transactions after loop added 4 more
-        assert_eq!(block.transactions().len(), 7);
+        // submit new transaction before sending ack
+        let expected_tx_hash = tx_factory
+            .create_and_submit_eip1559_pool_tx(
+                chain.clone(),
+                gas_price,
+                Address::ZERO,
+                value, // 1 TEL
+                &txpool,
+            )
+            .await;
 
-        // now send fatal error
-        let _ = ack.send(Err(BlockSealError::FatalDBFailure));
+        // assert first 3 txs in block
+        assert_eq!(block.transactions().len(), 3);
 
-        // ensure block builder shuts down from fatal error
-        let result = block_builder_task.await.expect("ack channel delivered result");
-        println!("result: {result:?}");
-        assert!(result.is_err());
+        // assert all 4 txs in pending pool
+        let pending_pool_len = txpool.pool_size().pending;
+        assert_eq!(pending_pool_len, 4);
+
+        // send ack to mine first 3 transactions
+        let _ = ack.send(Ok(()));
+
+        // receive next block
+        let (block, ack) = timeout(duration, from_block_builder.recv())
+            .await
+            .expect("block builder's sender didn't drop")
+            .expect("worker block was built");
+        // send ack to mine block
+        let _ = ack.send(Ok(()));
+
+        // assert only transaction in block
+        assert_eq!(block.transactions().len(), 1);
+
+        // confirm 4th transaction hash matches one submitted
+        let tx = block.transactions().first().expect("block transactions length is one");
+        assert_eq!(tx.hash(), expected_tx_hash);
 
         // yield to try and give pool a chance to update
         tokio::task::yield_now().await;
 
-        // transactions should be in pool still since ack was error
+        // assert all transactions mined
         let pending_pool_len = txpool.pool_size().pending;
-        assert_eq!(pending_pool_len, 7);
+        assert_eq!(pending_pool_len, 0);
     }
+    // TODO: test canonical update affects pool
 }
