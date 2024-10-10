@@ -51,6 +51,12 @@ tn-block-validator = { workspace = true }
 reth-chainspec = { workspace = true }
 reth-db = { workspace = true }
 reth-db-common = { workspace = true }
+tn-engine = { workspace = true }
+tn-block-builder = { workspace = true, features = ["test-utils"] }
+
+# TODO: only used for canon it test
+reth-prune = { workspace = true }
+reth-node-ethereum = { workspace = true }
 
 [features]
 default = []

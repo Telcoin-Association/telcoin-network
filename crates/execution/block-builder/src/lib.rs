@@ -40,7 +40,7 @@ use tn_types::{
 };
 use tokio::sync::{mpsc::Receiver, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 mod block_builder;
 mod error;
@@ -145,7 +145,7 @@ where
     ///
     /// Trigger the maintenance task to update pool before building the next block.
     fn process_canon_state_update(&mut self, update: Arc<Chain>) {
-        trace!(target: "worker::pool_maintenance", ?update, "canon state update from engine");
+        trace!(target: "worker::block-builder", ?update, "canon state update from engine");
 
         // update pool based with canonical tip update
         let (blocks, state) = update.inner();
@@ -162,8 +162,12 @@ where
             })
             .collect();
 
+        debug!(target: "block-builder", ?changed_accounts);
+
         // collect tx hashes to remove any transactions from this pool that were mined
         let mined_transactions: Vec<TxHash> = blocks.transaction_hashes().collect();
+
+        debug!(target: "block-builder", ?mined_transactions);
 
         // TODO: calculate the next basefee HERE for the entire round
         //
@@ -185,6 +189,8 @@ where
             pending_block_base_fee,
             pending_block_blob_fee: None,
         };
+
+        debug!(target: "block-builder", ?update, ?latest, "applying update to txpool");
 
         // track canon update so worker updates don't overwrite the tip or base fees
         self.latest_canon_state = latest;
@@ -219,6 +225,7 @@ where
         let build_args = WorkerBlockBuilderArgs::new(pool.clone(), config);
         let (result, done) = oneshot::channel();
 
+        warn!(target: "block-builder", "spawning pending task");
         // spawn block building task and forward to worker
         tokio::task::spawn(async move {
             // arc dashmap/hashset rwlock for txhashes for this worker by round
@@ -245,6 +252,7 @@ where
                 Ok(res) => {
                     match res {
                         Ok(_) => {
+                            debug!(target: "block-builder", ?res, "received ack");
                             // signal to Self that this task is complete
                             if let Err(e) = result.send(Ok(mined_transactions)) {
                                 error!(target: "worker::block_builder", ?e, "failed to send block builder result to block builder task");
@@ -331,6 +339,7 @@ where
             while let Poll::Ready(Some(canon_update)) =
                 this.canonical_state_stream.poll_next_unpin(cx)
             {
+                debug!(target: "block-builder", ?canon_update, "received canonical update");
                 // poll canon updates stream and update pool `.on_canon_update`
                 //
                 // maintenance task will handle worker's pending block update
@@ -347,6 +356,7 @@ where
             //
             // drain pending pool updates and pass waker so this gets awoken when txs are available
             while let Poll::Ready(msg) = this.pending_tx_hashes_stream.poll_next_unpin(cx) {
+                debug!(target: "block-builder", ?msg, "draining pending tx hashes stream");
                 match msg {
                     Some(_tx) => (/* drain nofications */),
                     None => return Poll::Ready(Ok(())), // shutdown
@@ -378,6 +388,7 @@ where
                 // poll here so waker is notified when ack received
                 match receiver.poll_unpin(cx) {
                     Poll::Ready(res) => {
+                        debug!(target: "block-builder", ?res, "pending task complete");
                         // TODO: update tree's pending block?
 
                         // ensure no fatal errors
@@ -402,6 +413,8 @@ where
                             changed_accounts: vec![], // only updated by engine updates
                             mined_transactions,
                         };
+
+                        debug!(target: "block-builder", ?update, "applying block builder's update");
 
                         // TODO: should this be a spawned blocking task?
                         //

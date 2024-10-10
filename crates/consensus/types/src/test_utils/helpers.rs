@@ -201,7 +201,7 @@ pub fn transaction() -> TransactionSigned {
     // TODO: use [0; 32] seed account instead?
     let mut tx_factory = TransactionFactory::new_random();
     let chain = adiri_chain_spec_arc();
-    let gas_price = 875000000;
+    let gas_price = 100_000;
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
 
     // random transaction
