@@ -1,7 +1,16 @@
-//! The worker's block maker monitors a transaction pool populated by incoming transactions through
-//! the worker's RPC.
+//! The block builder maintains the transaction pool and builds the next block.
 //!
-//! The block maker is a future that
+//! The block builder listens for canonical state changes from the engine and updates the
+//! transaction pool. These updates move transactions to the correct sub-pools. Only transactions in
+//! the pending pool are considered for the next block.
+//!
+//! Upon successfully building the next block, the block builder forwards to the worker's block
+//! provider. The worker's block provider reliably broadcasts the block and tries to reach quorum
+//! within a time limit. If quorum fails, the block builder receives the error and does not mine the
+//! transactions. If quorum is reached, the transactions are mined and removed from the pending
+//! pool. When this task removes transactions from the pending pool, it uses the current canonical
+//! tip and basefee calculated for the round. Only the engine's canonical updates affect the pool's
+//! tracked `tip`, basefee, and blob fees sorting transactions into sub-pools.
 
 #![doc(
     html_logo_url = "https://www.telco.in/logos/TEL.svg",

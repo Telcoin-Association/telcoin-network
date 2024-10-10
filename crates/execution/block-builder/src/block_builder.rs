@@ -1,8 +1,10 @@
 //! The logic for building worker blocks.
 //!
-//! This is called by the block_builder once pending transactions are picked up.
+//! Transactions are pulled from the worker's pending pool and added to the block without being
+//! executed. Block size is measured in bytes and a transaction's max gas limit. The block is sealed
+//! when the pending pool devoid of transactions or the max block size is reached (wei or bytes).
 //!
-//! The
+//! The mined transactions are returned with the built block so the worker can update the pool.
 
 use reth_primitives::{
     constants::EMPTY_WITHDRAWALS, proofs, Bloom, Bytes, Header, IntoRecoveredTransaction, TxHash,
