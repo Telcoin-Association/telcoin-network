@@ -61,7 +61,6 @@ where
     // let mut sum_blob_gas_used = 0;
     let mut total_bytes_size = 0;
     let mut total_possible_gas = 0;
-    let total_fees = U256::ZERO;
     let mut transactions = Vec::new();
     let mut mined_transactions = Vec::new();
 

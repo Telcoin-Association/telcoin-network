@@ -311,6 +311,7 @@ impl TransactionFactory {
     /// - access_list: None
     ///
     /// NOTE: the nonce is still incremented to track the number of signed transactions for `Self`.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_explicit_eip1559(
         &mut self,
         chain_id: Option<u64>,

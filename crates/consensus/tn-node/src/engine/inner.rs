@@ -25,7 +25,7 @@ use reth_db_common::init::init_genesis;
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use reth_node_builder::{common::WithConfigs, BuilderContext, NodeConfig};
 use reth_node_ethereum::EthEvmConfig;
-use reth_primitives::{Address, SealedBlockWithSenders, B256};
+use reth_primitives::{Address, BlockBody, SealedBlock, SealedBlockWithSenders, B256};
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     BlockReader, CanonStateSubscriptions as _, DatabaseProviderFactory, FinalizedBlockReader,
@@ -297,7 +297,16 @@ where
         let tx_pool_latest = transaction_pool.block_info();
 
         let tip = match tx_pool_latest.last_seen_block_hash {
-            B256::ZERO => SealedBlockWithSenders::default(),
+            // use genesis on startup
+            B256::ZERO => SealedBlockWithSenders::new(
+                SealedBlock::new(
+                    self.tn_config.chain_spec().sealed_genesis_header(),
+                    BlockBody::default(),
+                ),
+                vec![],
+            )
+            .ok_or_else(|| eyre!("Failed to create genesis block for starting tx pool"))?,
+            // retrieve from database
             _ => self
                 .blockchain_db
                 .sealed_block_with_senders(
