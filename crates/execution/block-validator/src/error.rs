@@ -1,6 +1,6 @@
 //! Error types for building and executing output from consensus.
 
-use reth_primitives::{BlockNumber, Bloom, B256, U256};
+use reth_primitives::{BlockNumber, B256};
 use reth_provider::ProviderError;
 use thiserror::Error;
 use tn_types::BlockHash;
@@ -12,9 +12,9 @@ pub enum BlockValidationError {
     #[error("Invalid digest for worker block's sealed header: expected {expected:?} - received {peer_hash:?}")]
     BlockHash {
         /// The block hash computed from the payload.
-        expected: B256,
+        expected: Box<B256>,
         /// The block hash provided with the payload.
-        peer_hash: B256,
+        peer_hash: Box<B256>,
     },
     /// Error when the block number does not match the parent block number.
     #[error(
@@ -41,9 +41,9 @@ pub enum BlockValidationError {
     #[error("Peer's transaction root mismatch: expected {expected:?} - received {peer_root:?}")]
     TransactionRootMismatch {
         /// The transaction root computed from the peer's transactions.
-        expected: B256,
+        expected: Box<B256>,
         /// The transaction root provided with the peer's block.
-        peer_root: B256,
+        peer_root: Box<B256>,
     },
     /// Canonical chain header cannot be found.
     #[error("Canonical chain header {block_hash} can't be found for peer block's parent")]
@@ -87,39 +87,39 @@ pub enum BlockValidationError {
     #[error("Peer's transactions exceed max byte size: {0}")]
     HeaderTransactionBytesExceedsMax(usize),
     /// Non-empty value for peer's header.
-    #[error("Non-empty ommers hash: {0:?}")]
-    NonEmptyOmmersHash(B256),
+    #[error("Non-empty ommers hash")]
+    NonEmptyOmmersHash,
     /// Non-empty value for peer's header.
-    #[error("Non-empty state root: {0:?}")]
-    NonEmptyStateRoot(B256),
+    #[error("Non-empty state root")]
+    NonEmptyStateRoot,
     /// Non-empty value for peer's header.
-    #[error("Non-empty receipts root: {0:?}")]
-    NonEmptyReceiptsRoot(B256),
+    #[error("Non-empty receipts root")]
+    NonEmptyReceiptsRoot,
     /// Non-empty value for peer's header.
-    #[error("Non-empty withdrawals root: {0:?}")]
-    NonEmptyWithdrawalsRoot(Option<B256>),
+    #[error("Non-empty withdrawals root")]
+    NonEmptyWithdrawalsRoot,
     /// Non-empty value for peer's header.
-    #[error("Non-empty logs bloom: {0:?}")]
-    NonEmptyLogsBloom(Bloom),
+    #[error("Non-empty logs bloom")]
+    NonEmptyLogsBloom,
     /// Non-empty value for peer's header.
-    #[error("Non-empty mix hash: {0:?}")]
-    NonEmptyMixHash(B256),
+    #[error("Non-empty mix hash")]
+    NonEmptyMixHash,
     /// Non-empty value for peer's header.
-    #[error("Non-zero nonce: {0}")]
-    NonZeroNonce(u64),
+    #[error("Non-zero nonce")]
+    NonZeroNonce,
     /// Non-empty value for peer's header.
-    #[error("Non-zero difficulty: {0}")]
-    NonZeroDifficulty(U256),
+    #[error("Non-zero difficulty")]
+    NonZeroDifficulty,
     /// Non-empty value for peer's header.
-    #[error("Non-empty parent beacon block root: {0:?}")]
-    NonEmptyBeaconRoot(Option<B256>),
+    #[error("Non-empty parent beacon block root")]
+    NonEmptyBeaconRoot,
     /// Non-empty value for peer's header.
-    #[error("Non-empty blob gas: {0:?}")]
-    NonEmptyBlobGas(Option<u64>),
+    #[error("Non-empty blob gas")]
+    NonEmptyBlobGas,
     /// Non-empty value for peer's header.
-    #[error("Non-empty excess blob gas: {0:?}")]
-    NonEmptyExcessBlobGas(Option<u64>),
+    #[error("Non-empty excess blob gas")]
+    NonEmptyExcessBlobGas,
     /// Non-empty value for peer's header.
-    #[error("Non-empty requests root: {0:?}")]
-    NonEmptyRequestsRoot(Option<B256>),
+    #[error("Non-empty requests root")]
+    NonEmptyRequestsRoot,
 }

@@ -117,8 +117,8 @@ where
     /// Validate header's hash.
     #[inline]
     fn validate_block_hash(&self, header: &SealedHeader) -> BlockValidationResult<()> {
-        let expected = header.header().hash_slow();
-        let peer_hash = header.hash();
+        let expected = Box::new(header.header().hash_slow());
+        let peer_hash = Box::new(header.hash());
         if expected != peer_hash {
             return Err(BlockValidationError::BlockHash { expected, peer_hash });
         }
@@ -129,11 +129,11 @@ where
     #[inline]
     fn validate_transactions_root(
         &self,
-        transactions: &Vec<TransactionSigned>,
+        transactions: &[TransactionSigned],
         header: &SealedHeader,
     ) -> BlockValidationResult<()> {
-        let expected = proofs::calculate_transaction_root(transactions);
-        let peer_root = header.transactions_root;
+        let expected = Box::new(proofs::calculate_transaction_root(transactions));
+        let peer_root = Box::new(header.transactions_root);
         if expected != peer_root {
             return Err(BlockValidationError::TransactionRootMismatch { expected, peer_root });
         }
@@ -184,7 +184,7 @@ where
     fn validate_block_gas(
         &self,
         header: &Header,
-        transactions: &Vec<TransactionSigned>,
+        transactions: &[TransactionSigned],
     ) -> BlockValidationResult<()> {
         // gas limit should be consistent amongst workers
         if header.gas_limit != self.max_tx_gas {
@@ -221,7 +221,7 @@ where
     /// Validate the size of transactions (in bytes).
     fn validate_block_size_bytes(
         &self,
-        transactions: &Vec<TransactionSigned>,
+        transactions: &[TransactionSigned],
     ) -> BlockValidationResult<()> {
         // calculate size (in bytes) of included transactions
         let total_bytes = transactions
@@ -251,62 +251,62 @@ where
     fn validate_empty_values(&self, header: &Header) -> BlockValidationResult<()> {
         // ommers hash
         if !header.ommers_hash_is_empty() {
-            return Err(BlockValidationError::NonEmptyOmmersHash(header.ommers_hash));
+            return Err(BlockValidationError::NonEmptyOmmersHash);
         }
 
         // state root
         if header.state_root != B256::ZERO {
-            return Err(BlockValidationError::NonEmptyStateRoot(header.state_root));
+            return Err(BlockValidationError::NonEmptyStateRoot);
         }
 
         // receipts root
         if header.receipts_root != B256::ZERO {
-            return Err(BlockValidationError::NonEmptyReceiptsRoot(header.receipts_root));
+            return Err(BlockValidationError::NonEmptyReceiptsRoot);
         }
 
         // withdrawals root
         if header.withdrawals_root != Some(EMPTY_WITHDRAWALS) {
-            return Err(BlockValidationError::NonEmptyWithdrawalsRoot(header.withdrawals_root));
+            return Err(BlockValidationError::NonEmptyWithdrawalsRoot);
         }
 
         // logs bloom
         if header.logs_bloom != Bloom::default() {
-            return Err(BlockValidationError::NonEmptyLogsBloom(header.logs_bloom));
+            return Err(BlockValidationError::NonEmptyLogsBloom);
         }
 
         // mix hash
         if header.mix_hash != B256::ZERO {
-            return Err(BlockValidationError::NonEmptyMixHash(header.mix_hash));
+            return Err(BlockValidationError::NonEmptyMixHash);
         }
 
         // nonce
         if header.nonce != 0 {
-            return Err(BlockValidationError::NonZeroNonce(header.nonce));
+            return Err(BlockValidationError::NonZeroNonce);
         }
 
         // difficulty
         if header.difficulty != U256::ZERO {
-            return Err(BlockValidationError::NonZeroDifficulty(header.difficulty));
+            return Err(BlockValidationError::NonZeroDifficulty);
         }
 
         // parent beacon block root
         if header.parent_beacon_block_root.is_some() {
-            return Err(BlockValidationError::NonEmptyBeaconRoot(header.parent_beacon_block_root));
+            return Err(BlockValidationError::NonEmptyBeaconRoot);
         }
 
         // blob gas used
         if header.blob_gas_used.is_some() {
-            return Err(BlockValidationError::NonEmptyBlobGas(header.blob_gas_used));
+            return Err(BlockValidationError::NonEmptyBlobGas);
         }
 
         // excess blob gas used
         if header.excess_blob_gas.is_some() {
-            return Err(BlockValidationError::NonEmptyExcessBlobGas(header.excess_blob_gas));
+            return Err(BlockValidationError::NonEmptyExcessBlobGas);
         }
 
         // requests root
         if header.requests_root.is_some() {
-            return Err(BlockValidationError::NonEmptyRequestsRoot(header.requests_root));
+            return Err(BlockValidationError::NonEmptyRequestsRoot);
         }
 
         Ok(())
@@ -514,9 +514,10 @@ mod tests {
         let TestTools { valid_header, validator, valid_txs: mut wrong_txs } = test_types().await;
         // remove tx
         let _ = wrong_txs.pop();
-        let correct_root: B256 =
-            hex!("35cacf0a6e1826b718033b80345e39387f776a2eb3422b90d4265e113ae83c89").into();
-        let wrong_root = valid_header.transactions_root;
+        let correct_root: Box<B256> = Box::new(
+            hex!("35cacf0a6e1826b718033b80345e39387f776a2eb3422b90d4265e113ae83c89").into(),
+        );
+        let wrong_root = Box::new(valid_header.transactions_root);
         let wrong_block = WorkerBlock::new(wrong_txs, valid_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
@@ -533,7 +534,7 @@ mod tests {
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::BlockHash { expected, peer_hash }) if expected == correct_hash && peer_hash == wrong_hash
+            Err(BlockValidationError::BlockHash { expected, peer_hash }) if expected == Box::new(correct_hash) && peer_hash == Box::new(wrong_hash)
         );
     }
 
@@ -671,7 +672,7 @@ mod tests {
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::NonEmptyOmmersHash(wrong)) if wrong == wrong_ommers_hash
+            Err(BlockValidationError::NonEmptyOmmersHash)
         );
     }
 
@@ -685,7 +686,7 @@ mod tests {
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::NonEmptyStateRoot(wrong)) if wrong == wrong_state_root
+            Err(BlockValidationError::NonEmptyStateRoot)
         );
     }
 
@@ -700,7 +701,7 @@ mod tests {
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::NonEmptyReceiptsRoot(wrong)) if wrong == wrong_receipt_root
+            Err(BlockValidationError::NonEmptyReceiptsRoot)
         );
     }
 
@@ -715,7 +716,7 @@ mod tests {
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::NonEmptyWithdrawalsRoot(wrong)) if wrong == wrong_withdrawals_root
+            Err(BlockValidationError::NonEmptyWithdrawalsRoot)
         );
     }
 
@@ -748,7 +749,7 @@ mod tests {
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::NonEmptyLogsBloom(wrong)) if wrong == wrong_logs_bloom
+            Err(BlockValidationError::NonEmptyLogsBloom)
         );
     }
 
@@ -763,7 +764,7 @@ mod tests {
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::NonEmptyMixHash(wrong)) if wrong == wrong_mix_hash
+            Err(BlockValidationError::NonEmptyMixHash)
         );
     }
 
@@ -778,7 +779,7 @@ mod tests {
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::NonZeroDifficulty(wrong)) if wrong == wrong_difficulty
+            Err(BlockValidationError::NonZeroDifficulty)
         );
     }
 
@@ -794,7 +795,7 @@ mod tests {
         let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::NonEmptyBeaconRoot(wrong)) if wrong == wrong_beacon_block
+            Err(BlockValidationError::NonEmptyBeaconRoot)
         );
 
         // ensure zero is invalid too
@@ -804,7 +805,7 @@ mod tests {
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::NonEmptyBeaconRoot(wrong)) if wrong == wrong_beacon_block
+            Err(BlockValidationError::NonEmptyBeaconRoot)
         );
     }
 
@@ -819,7 +820,7 @@ mod tests {
         let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::NonEmptyBlobGas(wrong)) if wrong == wrong_blob_gas_used
+            Err(BlockValidationError::NonEmptyBlobGas)
         );
 
         // other than zero
@@ -829,7 +830,7 @@ mod tests {
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::NonEmptyBlobGas(wrong)) if wrong == wrong_blob_gas_used
+            Err(BlockValidationError::NonEmptyBlobGas)
         );
     }
 
@@ -844,7 +845,7 @@ mod tests {
         let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::NonEmptyExcessBlobGas(wrong)) if wrong == wrong_excess_blob_gas
+            Err(BlockValidationError::NonEmptyExcessBlobGas)
         );
 
         // other than zero
@@ -854,7 +855,7 @@ mod tests {
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::NonEmptyExcessBlobGas(wrong)) if wrong == wrong_excess_blob_gas
+            Err(BlockValidationError::NonEmptyExcessBlobGas)
         );
     }
 
@@ -870,7 +871,7 @@ mod tests {
         let wrong_block = WorkerBlock::new(valid_txs.clone(), wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::NonEmptyRequestsRoot(wrong)) if wrong == wrong_requests_root
+            Err(BlockValidationError::NonEmptyRequestsRoot)
         );
 
         // ensure zero is invalid too
@@ -880,7 +881,7 @@ mod tests {
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::NonEmptyRequestsRoot(wrong)) if wrong == wrong_requests_root
+            Err(BlockValidationError::NonEmptyRequestsRoot)
         );
     }
 
