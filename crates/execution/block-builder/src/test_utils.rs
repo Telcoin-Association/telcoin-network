@@ -147,7 +147,7 @@ impl TransactionPool for TestPool {
     async fn add_transaction(
         &self,
         _origin: TransactionOrigin,
-        transaction: Self::Transaction,
+        _transaction: Self::Transaction,
     ) -> PoolResult<TxHash> {
         // let hash = *transaction.hash();
         // Err(PoolError::other(hash, Box::new(NoopInsertError::new(transaction))))
@@ -157,7 +157,7 @@ impl TransactionPool for TestPool {
     async fn add_transactions(
         &self,
         _origin: TransactionOrigin,
-        transactions: Vec<Self::Transaction>,
+        _transactions: Vec<Self::Transaction>,
     ) -> Vec<PoolResult<TxHash>> {
         // transactions
         //     .into_iter()
@@ -390,23 +390,6 @@ impl BestTestTransactions {
     fn mark_invalid(&mut self, tx: &Arc<ValidPoolTransaction<EthPooledTransaction>>) {
         self.invalid.insert(*tx.hash());
     }
-
-    /// Returns the ancestor the given transaction, the transaction with `nonce - 1`.
-    ///
-    /// Note: for a transaction with nonce higher than the current on chain nonce this will always
-    /// return an ancestor since all transaction in this pool are gapless.
-    fn ancestor(
-        &self,
-        id: &TransactionId,
-    ) -> Option<&Arc<ValidPoolTransaction<EthPooledTransaction>>> {
-        self.all.get(&id.unchecked_ancestor()?)
-    }
-
-    /// Checks for new transactions that have come into the `PendingPool` after this iterator was
-    /// created and inserts them
-    fn add_new_transactions(&mut self) {
-        unimplemented!()
-    }
 }
 
 impl BestTransactions for BestTestTransactions {
@@ -459,13 +442,5 @@ impl Iterator for BestTestTransactions {
                 return Some(best);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[tokio::test]
-    async fn test_utils_execute_same() {
-        todo!()
     }
 }

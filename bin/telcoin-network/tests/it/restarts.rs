@@ -280,7 +280,7 @@ fn get_balance_above_with_retry(node: &str, address: &str, above: u128) -> eyre:
     let mut bal = get_balance(node, address, 5).unwrap_or(0);
     let mut i = 0;
     while i < 30 && bal <= above {
-        std::thread::sleep(Duration::from_millis(1000));
+        std::thread::sleep(Duration::from_millis(1200));
         i += 1;
         bal = get_balance(node, address, 5).unwrap_or(0);
     }
