@@ -137,7 +137,7 @@ impl Faucet {
             wallet,
             add_to_success_cache_tx,
             update_success_cache_rx,
-            highest_mined_tx_nonce: 0, // start at 0 and update with db read later
+            next_nonce: 0, // start at 0 - service checks db
         };
         let faucet = Self { to_service };
         (faucet, service)

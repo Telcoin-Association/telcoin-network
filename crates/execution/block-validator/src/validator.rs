@@ -534,7 +534,7 @@ mod tests {
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,
-            Err(BlockValidationError::BlockHash { expected, peer_hash }) if expected == Box::new(correct_hash) && peer_hash == Box::new(wrong_hash)
+            Err(BlockValidationError::BlockHash { expected, peer_hash }) if expected == correct_hash && peer_hash == wrong_hash
         );
     }
 

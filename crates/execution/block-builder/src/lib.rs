@@ -225,7 +225,6 @@ where
         let build_args = WorkerBlockBuilderArgs::new(pool.clone(), config);
         let (result, done) = oneshot::channel();
 
-        warn!(target: "block-builder", "spawning pending task");
         // spawn block building task and forward to worker
         tokio::task::spawn(async move {
             // arc dashmap/hashset rwlock for txhashes for this worker by round

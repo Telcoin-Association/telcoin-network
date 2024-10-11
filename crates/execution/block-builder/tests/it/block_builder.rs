@@ -640,8 +640,8 @@ async fn test_canonical_notification_updates_pool() {
     // let ommers_root = proofs::calculate_ommers_root(&ommers);
     // let mix_hash = output_digest ^ sealed_block_with_senders.hash();
     // let withdrawals =
-    //     sealed_block_with_senders.withdrawals.clone().unwrap_or_else(|| Withdrawals::new(vec![]));
-    // let payload_attributes = TNPayloadAttributes::new(
+    //     sealed_block_with_senders.withdrawals.clone().unwrap_or_else(||
+    // Withdrawals::new(vec![])); let payload_attributes = TNPayloadAttributes::new(
     //     chain.sealed_genesis_header(),
     //     ommers,
     //     ommers_root,

@@ -79,7 +79,7 @@ pub fn execute_test_worker_block(block: &mut WorkerBlock, parent: &SealedHeader)
 /// A test pool that ensures every transaction is in the pending pool
 #[derive(Default, Clone, Debug)]
 struct TestPool {
-    sender_ids: Arc<SenderIdentifiers>,
+    _sender_ids: Arc<SenderIdentifiers>,
     transactions: Vec<Arc<ValidPoolTransaction<EthPooledTransaction>>>,
     by_id: BTreeMap<TransactionId, Arc<ValidPoolTransaction<EthPooledTransaction>>>,
 }
@@ -113,8 +113,8 @@ impl TestPool {
                 valid_tx
             })
             .collect();
-        let sender_ids = Arc::new(sender_ids);
-        Self { sender_ids, transactions, by_id: by_id.into_iter().collect() }
+        let _sender_ids = Arc::new(sender_ids);
+        Self { _sender_ids, transactions, by_id: by_id.into_iter().collect() }
     }
 }
 

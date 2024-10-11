@@ -10,6 +10,7 @@
 use crate::util::{create_validator_info, IT_TEST_MUTEX};
 use alloy::{network::EthereumWallet, providers::ProviderBuilder, sol, sol_types::SolValue};
 use clap::Parser;
+use futures::{stream::FuturesUnordered, StreamExt};
 use gcloud_sdk::{
     google::cloud::kms::v1::{
         key_management_service_client::KeyManagementServiceClient, GetPublicKeyRequest,
@@ -478,6 +479,70 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
         .await
         .is_err());
 
+    // submit 100 txs
+    let random_addresses: Vec<Address> = (0..50).map(|_| Address::random()).collect();
+    let mut requests: FuturesUnordered<JoinHandle<String>> = random_addresses
+        .clone()
+        .into_iter()
+        .map(|address| {
+            tokio::spawn({
+                let client = client.clone();
+                async move {
+                    client
+                        .clone()
+                        .request::<String, _>("faucet_transfer", rpc_params![address])
+                        .await
+                        .expect("request successful")
+                }
+            })
+        })
+        .collect();
+
+    // let mut results = Vec::new();
+    while let Some(res) = requests.next().await {
+        // results.push(res?);
+        assert!(res.is_ok());
+    }
+
+    // wait for all account balances to update
+    let mut check_account_balances: FuturesUnordered<JoinHandle<()>> = random_addresses
+        .into_iter()
+        .map(|address| {
+            tokio::spawn({
+                let client = client.clone();
+                async move {
+                    // client
+                    //     .clone()
+                    //     .request::<String, _>("faucet_transfer", rpc_params![address])
+                    //     .await
+                    //     .expect("request successful")
+
+                    // ensure account balance increased
+                    //
+                    // account balance is only updates on final execution
+                    // finding the expected balance in time means the faucet successfully used the
+                    // correct nonce
+                    let _ = timeout(
+                        duration,
+                        ensure_account_balance_infinite_loop(
+                            &client,
+                            address,
+                            expected_tel_balance,
+                        ),
+                    )
+                    .await
+                    .expect("inside check account balances for {address:?}")
+                    .expect("expected balance random account timeout");
+                }
+            })
+        })
+        .collect();
+
+    while let Some(res) = check_account_balances.next().await {
+        // results.push(res?);
+        assert!(res.is_ok());
+    }
+
     Ok(())
 }
 
@@ -684,7 +749,7 @@ async fn ensure_account_balance_infinite_loop(
     expected_bal: U256,
 ) -> eyre::Result<U256> {
     while let Ok(bal) = client.request::<String, _>("eth_getBalance", rpc_params!(address)).await {
-        debug!(target: "faucet-test", "bal: {bal:?}");
+        debug!(target: "faucet-test", "{address} bal: {bal:?}");
         let balance = U256::from_str(&bal)?;
 
         // return Ok if expected bal
@@ -698,9 +763,7 @@ async fn ensure_account_balance_infinite_loop(
     Ok(U256::ZERO)
 }
 
-/// Test utility to get desired state changes from a temporary genesis for a subsequent one
-///
-/// NOTE: makes use of `execution_outcome_from_test_batch` below
+/// Test utility to get desired state changes from a temporary genesis for a subsequent one.
 async fn get_contract_state_for_genesis(
     chain: Arc<ChainSpec>,
     raw_txs_to_execute: Vec<TransactionSigned>,
