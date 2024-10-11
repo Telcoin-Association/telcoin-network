@@ -515,7 +515,6 @@ mod tests {
         let execution_node =
             default_test_execution_node(Some(chain.clone()), None, executor.clone())?;
         let provider = execution_node.get_provider().await;
-        let block_executor = execution_node.get_block_executor().await;
         let parent = chain.sealed_genesis_header();
 
         // execute batches to update headers with valid data
@@ -853,7 +852,6 @@ mod tests {
         let execution_node =
             default_test_execution_node(Some(chain.clone()), None, executor.clone())?;
         let provider = execution_node.get_provider().await;
-        let block_executor = execution_node.get_block_executor().await;
         let parent = chain.sealed_genesis_header();
 
         // execute batches to update headers with valid data
@@ -1211,8 +1209,6 @@ mod tests {
         let executor = manager.executor();
         let execution_node =
             default_test_execution_node(Some(chain.clone()), None, executor.clone())?;
-        let provider = execution_node.get_provider().await;
-        let block_executor = execution_node.get_block_executor().await;
         let parent = chain.sealed_genesis_header();
 
         // execute batches to update headers with valid data

@@ -547,21 +547,10 @@ async fn test_faucet_transfers_stablecoin_with_google_kms() -> eyre::Result<()> 
     let execution_node =
         faucet_test_execution_node(true, Some(chain), None, executor, faucet_proxy_address)?;
 
-    let worker_id = 0;
-    let (to_worker, next_batch) = tokio::sync::mpsc::channel(2);
-    let client = NetworkClient::new_with_empty_id();
-    let temp_dir = TempDir::new().unwrap();
-    let store = open_db(temp_dir.path());
-    let qw = TestChanQuorumWaiter(to_worker);
-    let node_metrics = WorkerMetrics::default();
-    let timeout = Duration::from_secs(5);
-    let block_provider =
-        BlockProvider::new(0, qw.clone(), Arc::new(node_metrics), client, store.clone(), timeout);
-
     // start batch maker
+    let worker_id = 0;
     let (to_worker, mut next_batch) = tokio::sync::mpsc::channel(2);
     execution_node.start_block_builder(worker_id, to_worker).await?;
-    // execution_node.start_block_builder(worker_id, block_provider.blocks_rx()).await?;
 
     let user_address = Address::random();
     let client = execution_node.worker_http_client(&worker_id).await?.expect("worker rpc client");

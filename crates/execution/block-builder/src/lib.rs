@@ -471,7 +471,7 @@ mod tests {
     };
     use reth_provider::{
         providers::{BlockchainProvider, StaticFileProvider},
-        CanonStateNotifications, CanonStateSubscriptions as _, ProviderFactory,
+        CanonStateSubscriptions as _, ProviderFactory,
     };
     use reth_transaction_pool::{
         blobstore::InMemoryBlobStore, CoinbaseTipOrdering, EthPooledTransaction,
@@ -485,7 +485,6 @@ mod tests {
         WorkerBlock,
     };
     use tokio::time::timeout;
-    use tokio_stream::wrappers::BroadcastStream;
 
     #[derive(Clone, Debug)]
     struct TestMakeBlockQuorumWaiter();
@@ -668,21 +667,23 @@ mod tests {
         execution_components: TestExecutionComponents,
     }
 
+    type TestPool = Pool<
+        TransactionValidationTaskExecutor<
+            EthTransactionValidator<
+                BlockchainProvider<Arc<TempDatabase<DatabaseEnv>>>,
+                EthPooledTransaction,
+            >,
+        >,
+        CoinbaseTipOrdering<EthPooledTransaction>,
+        InMemoryBlobStore,
+    >;
+
     /// Convenience type for holding execution components.
     struct TestExecutionComponents {
         /// The database client.
         blockchain_db: BlockchainProvider<Arc<TempDatabase<DatabaseEnv>>>,
         /// The transaction pool for the block builder.
-        txpool: Pool<
-            TransactionValidationTaskExecutor<
-                EthTransactionValidator<
-                    BlockchainProvider<Arc<TempDatabase<DatabaseEnv>>>,
-                    EthPooledTransaction,
-                >,
-            >,
-            CoinbaseTipOrdering<EthPooledTransaction>,
-            InMemoryBlobStore,
-        >,
+        txpool: TestPool,
         /// The chainspec with seeded genesis.
         chain: Arc<ChainSpec>,
         /// Own manager so executor's tasks don't drop (reth).

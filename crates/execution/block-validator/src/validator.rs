@@ -528,9 +528,9 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_block_wrong_block_hash() {
         let TestTools { valid_header, validator, valid_txs } = test_types().await;
-        let correct_hash = valid_header.hash();
-        let wrong_hash = B256::ZERO;
-        let wrong_header = valid_header.unseal().seal(wrong_hash);
+        let correct_hash = Box::new(valid_header.hash());
+        let wrong_hash = Box::new(B256::ZERO);
+        let wrong_header = valid_header.unseal().seal(*wrong_hash);
         let wrong_block = WorkerBlock::new(valid_txs, wrong_header);
         assert_matches!(
             validator.validate_block(&wrong_block).await,

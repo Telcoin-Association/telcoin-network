@@ -4,7 +4,6 @@
 //! from peers.
 
 use assert_matches::assert_matches;
-use fastcrypto::hash::Hash as _;
 use narwhal_network::client::NetworkClient;
 use narwhal_network_types::MockWorkerToPrimary;
 use narwhal_typed_store::{open_db, tables::WorkerBlocks, traits::Database};
@@ -14,16 +13,15 @@ use narwhal_worker::{
     BlockProvider,
 };
 use reth_blockchain_tree::{
-    noop::NoopBlockchainTree, BlockValidationKind, BlockchainTree, BlockchainTreeConfig,
-    BlockchainTreeEngine, ShareableBlockchainTree, TreeExternals,
+    noop::NoopBlockchainTree, BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree,
+    TreeExternals,
 };
 use reth_chainspec::ChainSpec;
 use reth_db::test_utils::{create_test_rw_db, tempdir_path};
 use reth_db_common::init::init_genesis;
 use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
 use reth_primitives::{
-    alloy_primitives::U160, constants::MIN_PROTOCOL_BASE_FEE, proofs, Address, BlockBody, Bytes,
-    SealedBlock, SealedBlockWithSenders, SealedHeader, Withdrawals, B256, U256,
+    alloy_primitives::U160, Address, BlockBody, Bytes, SealedBlock, SealedHeader, U256,
 };
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
@@ -40,12 +38,9 @@ use tn_block_builder::{test_utils::execute_test_worker_block, BlockBuilder};
 use tn_block_validator::{BlockValidation, BlockValidator};
 use tn_engine::execute_consensus_output;
 use tn_types::{
-    test_utils::{
-        get_gas_price, seeded_genesis_from_random_batch, seeded_genesis_from_random_batches,
-        test_genesis, TransactionFactory,
-    },
+    test_utils::{get_gas_price, test_genesis, TransactionFactory},
     AutoSealConsensus, BuildArguments, Certificate, CommittedSubDag, Consensus, ConsensusOutput,
-    LastCanonicalUpdate, ReputationScores, TNPayload, TNPayloadAttributes, WorkerBlock,
+    LastCanonicalUpdate, ReputationScores, WorkerBlock,
 };
 use tokio::time::timeout;
 use tracing::debug;
@@ -485,7 +480,7 @@ async fn test_canonical_notification_updates_pool() {
 
     // TODO: figure out a better way to ensure this matches engine::inner::new
     let evm_config = EthEvmConfig::default();
-    let executor = EthExecutorProvider::new(Arc::clone(&chain), evm_config.clone());
+    let executor = EthExecutorProvider::new(Arc::clone(&chain), evm_config);
     let auto_consensus: Arc<dyn Consensus> = Arc::new(AutoSealConsensus::new(Arc::clone(&chain)));
     let tree_config = BlockchainTreeConfig::default();
     let tree_externals =
@@ -673,11 +668,8 @@ async fn test_canonical_notification_updates_pool() {
     // // this sends update and apply canonical changes to pool
     // blockchain_db.make_canonical(next_canonical_hash).expect("worker block is canonical");
 
-    // yield to try and give pool a chance to update
-    tokio::task::yield_now().await;
-
     // sleep to ensure canonical update received before ack
-    let _ = tokio::time::sleep(Duration::from_secs(1));
+    let _ = tokio::time::sleep(Duration::from_secs(1)).await;
 
     // assert 4th transaction demoted to queued pool
     let pool_size = txpool.pool_size();
