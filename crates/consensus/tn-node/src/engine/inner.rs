@@ -25,7 +25,9 @@ use reth_db_common::init::init_genesis;
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use reth_node_builder::{common::WithConfigs, BuilderContext, NodeConfig};
 use reth_node_ethereum::EthEvmConfig;
-use reth_primitives::{Address, BlockBody, SealedBlock, SealedBlockWithSenders, B256};
+use reth_primitives::{
+    constants::MIN_PROTOCOL_BASE_FEE, Address, BlockBody, SealedBlock, SealedBlockWithSenders, B256,
+};
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     BlockReader, CanonStateSubscriptions as _, DatabaseProviderFactory, FinalizedBlockReader,
@@ -294,7 +296,29 @@ where
         // TODO: this is basically noop and missing some functionality
         let network = WorkerNetwork::default();
 
-        let tx_pool_latest = transaction_pool.block_info();
+        // TODO: update the tx pool with correct block info
+        // Need to create the LastCanonicalUpdate and apply to transaction pool so the block info is
+        // correct
+
+        // let finalized_block_num =
+        //     self.blockchain_db.database_provider_ro()?.last_finalized_block_number()?.
+        // unwrap_or(0);
+
+        use reth_transaction_pool::TransactionPoolExt as _;
+        let mut tx_pool_latest = transaction_pool.block_info();
+        tx_pool_latest.pending_basefee = MIN_PROTOCOL_BASE_FEE;
+        transaction_pool.set_block_info(tx_pool_latest);
+
+        // TODO: ensure basefee is pulled from the db
+        //
+        // this should likely come from another call that pulls all blocks from final round and
+        // calculates basefee once this is implemented for the block builder
+        //
+        // ensure basefee starts at minimum
+        // NOTE: the default for pool.block_info() is `0`
+        if tx_pool_latest.pending_basefee == 0 {
+            tx_pool_latest.pending_basefee = MIN_PROTOCOL_BASE_FEE;
+        }
 
         let tip = match tx_pool_latest.last_seen_block_hash {
             // use genesis on startup

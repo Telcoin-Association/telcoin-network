@@ -278,7 +278,7 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     let starting_balance: String = client.request("eth_getBalance", rpc_params!(address)).await?;
     assert_eq!(U256::from_str(&starting_balance)?, U256::ZERO);
 
-    // // note: response is different each time bc KMS
+    // note: response is different each time bc KMS
     let tx_hash: String = client.request("faucet_transfer", rpc_params![address]).await?;
 
     // more than enough time for the next block
@@ -662,7 +662,7 @@ async fn test_faucet_transfers_stablecoin_with_google_kms() -> eyre::Result<()> 
 /// ```
 
 #[test]
-#[ignore = "this is only useful for debugging purposes"]
+#[ignore = "only useful for debugging purposes"]
 fn test_print_kms_wallets() -> eyre::Result<()> {
     let keys = [
         "-----BEGIN PUBLIC KEY-----\nMFYwEAYHKoZIzj0CAQYFK4EEAAoDQgAEqzv8pSIJXo3PJZsGv+feaCZJFQoG3ed5\ngl0o/dpBKtwT+yajMYTCravDiqW/g62W+PNVzLoCbaot1WdlwXcp4Q==\n-----END PUBLIC KEY-----\n",
