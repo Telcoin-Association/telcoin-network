@@ -344,7 +344,7 @@ where
             latest_canon_state,
             block_provider_sender,
             self.address,
-            transaction_pool.pending_transactions_listener(),
+            self.tn_config.parameters.max_worker_block_delay,
             self.tn_config.parameters.max_worker_tx_gas,
             self.tn_config.parameters.max_worker_tx_bytes_size,
         );

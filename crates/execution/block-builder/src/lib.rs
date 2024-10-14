@@ -33,13 +33,13 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 use tn_types::{
     error::BlockSealError, LastCanonicalUpdate, PendingBlockConfig, WorkerBlockBuilderArgs,
     WorkerBlockSender,
 };
-use tokio::sync::{mpsc::Receiver, oneshot};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::{sync::oneshot, time::Interval};
 use tracing::{debug, error, trace, warn};
 
 mod block;
@@ -92,8 +92,11 @@ pub struct BlockBuilder<BT, Pool> {
     to_worker: WorkerBlockSender,
     /// The address for worker block's beneficiary.
     address: Address,
-    /// Receiver stream for pending transactions in the pool.
-    pending_tx_hashes_stream: ReceiverStream<TxHash>,
+    /// Maximum amount of time to wait before querying block builds.
+    ///
+    /// This interval wakes the task periodically to check on the progress of the latest built
+    /// block and the pending transaction pool.
+    max_delay_interval: Interval,
     /// The maximum amount of gas for a worker block.
     ///
     /// NOTE: transactions are not executed at this stage, so the worker measures the amount of gas
@@ -116,11 +119,11 @@ where
         latest_canon_state: LastCanonicalUpdate,
         to_worker: WorkerBlockSender,
         address: Address,
-        pending_tx_hashes_receiver: Receiver<TxHash>,
+        max_delay: Duration,
         gas_limit: u64,
         max_size: usize,
     ) -> Self {
-        let pending_tx_hashes_stream = ReceiverStream::new(pending_tx_hashes_receiver);
+        let max_delay_interval = tokio::time::interval(max_delay);
         Self {
             pending_task: None,
             _blockchain,
@@ -129,7 +132,7 @@ where
             latest_canon_state,
             to_worker,
             address,
-            pending_tx_hashes_stream,
+            max_delay_interval,
             gas_limit,
             max_size,
         }
@@ -220,7 +223,7 @@ where
         let (result, done) = oneshot::channel();
 
         // spawn block building task and forward to worker
-        tokio::task::spawn(async move {
+        tokio::spawn(async move {
             // arc dashmap/hashset rwlock for txhashes for this worker by round
             // canon updates clear set
             // successful proposals add mined txs to set
@@ -278,6 +281,9 @@ where
                 }
                 Err(e) => {
                     error!(target: "worker::block_builder", ?e, "quorum waiter failed ack failed");
+                    if let Err(e) = result.send(Err(e.into())) {
+                        error!(target: "worker::block_builder", ?e, "failed to send block builder result to block builder task");
+                    }
                 }
             }
         });
@@ -307,23 +313,7 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        //
-        // TODO:
-        //
-        // Should the pending transaction notification stream be used to signal wakeup?
-        // pros:
-        //  - canon updates happen infrequently (~5s currently), so if no txs for a while, then no
-        //    pending task, so no wakeup
-        //
-        // cons:
-        //  - could trigger this task to wake up frequently, but maybe that's a good thing since
-        //    this is one of the worker's primary responsibilities
-        //
-        // other option is to set an interval as specified in the config?
-
-        //
-        // TODO: apply mined transactions to tx pool
-
+        // loop when a successful block is built
         loop {
             // check for canon updates before mining the transaction pool
             //
@@ -344,18 +334,6 @@ where
                 }
             }
 
-            // TODO: would time interval be better? (min block timer in config)
-            // this could wake task frequently under high network demand
-            //
-            // drain pending pool updates and pass waker so this gets awoken when txs are available
-            while let Poll::Ready(msg) = this.pending_tx_hashes_stream.poll_next_unpin(cx) {
-                debug!(target: "block-builder", ?msg, "draining pending tx hashes stream");
-                match msg {
-                    Some(_tx) => (/* drain nofications */),
-                    None => return Poll::Ready(Ok(())), // shutdown
-                }
-            }
-
             // only propose one block at a time
             if this.pending_task.is_none() {
                 // TODO: is there a more efficient approach? only need pending pool stats
@@ -366,6 +344,14 @@ where
                 // considered using: pool.pool_size().pending
                 // but that calculates size for all sub-pools
                 if this.pool.pending_transactions().is_empty() {
+                    // reset interval to wake up after some time
+                    //
+                    // only need to reset here if there is no pending block being built
+                    this.max_delay_interval.reset();
+
+                    // tick interval to ensure it advances
+                    let _ = this.max_delay_interval.poll_tick(cx);
+
                     // nothing pending
                     break;
                 }
@@ -422,7 +408,7 @@ where
                         // - there were more transactions in the pool than could fit in the first
                         //   block
                         // - pending transaction notifications already drained
-                        // - have to wait for engine's next canonical update or another pending tx
+                        // - have to wait for engine's next canonical update to wake up
                         continue;
                     }
 
@@ -566,7 +552,7 @@ mod tests {
             latest_canon_state,
             block_provider.blocks_rx(),
             address,
-            txpool.pending_transactions_listener(),
+            Duration::from_secs(1),
             30_000_000, // 30mil gas limit
             1_000_000,  // 1MB size
         );
@@ -754,7 +740,7 @@ mod tests {
             last_canonical_update,
             to_worker,
             address,
-            txpool.pending_transactions_listener(),
+            Duration::from_secs(1),
             30_000_000, // 30mil gas limit
             1_000_000,  // 1MB size
         );
@@ -883,7 +869,7 @@ mod tests {
             last_canonical_update,
             to_worker,
             address,
-            txpool.pending_transactions_listener(),
+            Duration::from_secs(1),
             30_000_000, // 30mil gas limit
             1_000_000,  // 1MB size
         );

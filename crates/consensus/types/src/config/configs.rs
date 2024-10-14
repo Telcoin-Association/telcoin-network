@@ -167,8 +167,8 @@ pub struct Parameters {
     pub max_worker_tx_gas: u64,
     /// The delay after which the workers seal a batch of transactions, even if `max_batch_size`
     /// is not reached.
-    #[serde(with = "humantime_serde", default = "Parameters::default_max_batch_delay")]
-    pub max_batch_delay: Duration,
+    #[serde(with = "humantime_serde", default = "Parameters::default_max_worker_block_delay")]
+    pub max_worker_block_delay: Duration,
     /// The maximum number of concurrent requests for messages accepted from an un-trusted entity
     #[serde(default = "Parameters::default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
@@ -225,7 +225,7 @@ impl Parameters {
         30_000_000
     }
 
-    fn default_max_batch_delay() -> Duration {
+    fn default_max_worker_block_delay() -> Duration {
         Duration::from_secs(1)
     }
 
@@ -367,7 +367,7 @@ impl Default for Parameters {
             sync_retry_nodes: Parameters::default_sync_retry_nodes(),
             max_worker_tx_bytes_size: Parameters::default_max_worker_block_size(),
             max_worker_tx_gas: Parameters::default_max_worker_block_gas(),
-            max_batch_delay: Parameters::default_max_batch_delay(),
+            max_worker_block_delay: Parameters::default_max_worker_block_delay(),
             max_concurrent_requests: Parameters::default_max_concurrent_requests(),
             prometheus_metrics: PrometheusMetricsParameters::default(),
             network_admin_server: NetworkAdminServerParameters::default(),
@@ -398,7 +398,7 @@ impl Parameters {
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
         info!("Worker block size set to {} B", self.max_worker_tx_bytes_size);
         info!("Worker block gas set to {} wei", self.max_worker_tx_gas);
-        info!("Max batch delay set to {} ms", self.max_batch_delay.as_millis());
+        info!("Max batch delay set to {} ms", self.max_worker_block_delay.as_millis());
         info!("Max concurrent requests set to {}", self.max_concurrent_requests);
         info!("Prometheus metrics server will run on {}", self.prometheus_metrics.socket_addr);
         info!(

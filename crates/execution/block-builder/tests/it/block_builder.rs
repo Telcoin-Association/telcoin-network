@@ -147,7 +147,7 @@ async fn test_make_block_el_to_cl() {
         latest_canon_state,
         block_provider.blocks_rx(),
         address,
-        txpool.pending_transactions_listener(),
+        Duration::from_secs(1),
         30_000_000, // 30mil gas limit
         1_000_000,  // 1MB size
     );
@@ -322,7 +322,7 @@ async fn test_block_builder_produces_valid_blocks() {
         latest_canon_state,
         to_worker,
         address,
-        txpool.pending_transactions_listener(),
+        Duration::from_secs(1),
         max_block_gas_limit,  // 30mil gas limit
         max_block_bytes_size, // 1MB size
     );
@@ -532,7 +532,7 @@ async fn test_canonical_notification_updates_pool() {
         latest_canon_state,
         to_worker,
         address,
-        txpool.pending_transactions_listener(),
+        Duration::from_secs(1),
         max_block_gas_limit,  // 30mil gas limit
         max_block_bytes_size, // 1MB size
     );
