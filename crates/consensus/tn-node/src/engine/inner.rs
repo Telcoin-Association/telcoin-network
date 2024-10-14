@@ -30,8 +30,8 @@ use reth_primitives::{
 };
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
-    BlockReader, CanonStateSubscriptions as _, DatabaseProviderFactory, FinalizedBlockReader,
-    HeaderProvider, ProviderFactory, TransactionVariant,
+    BlockIdReader, BlockReader, CanonStateSubscriptions as _, DatabaseProviderFactory,
+    FinalizedBlockReader, HeaderProvider, ProviderFactory, TransactionVariant,
 };
 use reth_prune::PruneModes;
 use reth_tasks::TaskExecutor;
@@ -293,36 +293,22 @@ where
             transaction_pool
         };
 
-        // TODO: this is basically noop and missing some functionality
+        // TODO: WorkerNetwork is basically noop and missing some functionality
         let network = WorkerNetwork::default();
-
-        // TODO: update the tx pool with correct block info
-        // Need to create the LastCanonicalUpdate and apply to transaction pool so the block info is
-        // correct
-
-        // let finalized_block_num =
-        //     self.blockchain_db.database_provider_ro()?.last_finalized_block_number()?.
-        // unwrap_or(0);
-
         use reth_transaction_pool::TransactionPoolExt as _;
         let mut tx_pool_latest = transaction_pool.block_info();
         tx_pool_latest.pending_basefee = MIN_PROTOCOL_BASE_FEE;
+        tx_pool_latest.last_seen_block_hash = ctx
+            .provider()
+            .finalized_block_hash()?
+            .unwrap_or_else(|| self.tn_config.chain_spec().sealed_genesis_header().hash());
+        tx_pool_latest.last_seen_block_number =
+            ctx.provider().finalized_block_number()?.unwrap_or_default();
         transaction_pool.set_block_info(tx_pool_latest);
 
-        // TODO: ensure basefee is pulled from the db
-        //
-        // this should likely come from another call that pulls all blocks from final round and
-        // calculates basefee once this is implemented for the block builder
-        //
-        // ensure basefee starts at minimum
-        // NOTE: the default for pool.block_info() is `0`
-        if tx_pool_latest.pending_basefee == 0 {
-            tx_pool_latest.pending_basefee = MIN_PROTOCOL_BASE_FEE;
-        }
-
-        let tip = match tx_pool_latest.last_seen_block_hash {
+        let tip = match tx_pool_latest.last_seen_block_number {
             // use genesis on startup
-            B256::ZERO => SealedBlockWithSenders::new(
+            0 => SealedBlockWithSenders::new(
                 SealedBlock::new(
                     self.tn_config.chain_spec().sealed_genesis_header(),
                     BlockBody::default(),
