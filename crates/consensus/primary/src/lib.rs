@@ -31,4 +31,4 @@ mod rpc_tests;
 #[path = "tests/certificate_order_test.rs"]
 mod certificate_order_test;
 
-pub use crate::primary::{Primary, CHANNEL_CAPACITY, NUM_SHUTDOWN_RECEIVERS};
+pub use crate::primary::{Primary, CHANNEL_CAPACITY};

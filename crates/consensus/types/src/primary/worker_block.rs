@@ -27,17 +27,6 @@ pub enum WorkerBlockConversionError {
     DecodeTransaction(#[from] alloy_rlp::Error),
 }
 
-/// The message type for EL to CL when a new worker block is made.
-#[derive(Debug)]
-pub struct NewWorkerBlock {
-    /// A block that was constructed by the EL.
-    pub block: WorkerBlock,
-    /// Reply to the EL once the block is stored.
-    pub ack: WorkerBlockResponse,
-    // TODO: add reason for sealing block here
-    // for metrics: `timeout`, 'gas', or 'bytes/size'
-}
-
 /// The block for workers to communicate for consensus.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct WorkerBlock {

@@ -1,6 +1,7 @@
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+
 use crate::cluster::Cluster;
 use reth::{providers::BlockReader, tasks::TaskManager};
 use std::time::Duration;

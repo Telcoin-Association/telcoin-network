@@ -15,9 +15,8 @@ use std::{
     vec,
 };
 use tn_types::{
-    AuthorityIdentifier, BlockHash, Certificate, CommittedSubDag, Committee,
-    ConditionalBroadcastReceiver, ConsensusOutput, NetworkPublicKey, Timestamp, WorkerBlock,
-    WorkerCache, WorkerId,
+    AuthorityIdentifier, BlockHash, Certificate, CommittedSubDag, Committee, ConsensusOutput,
+    NetworkPublicKey, Noticer, Timestamp, WorkerBlock, WorkerCache, WorkerId,
 };
 use tokio::{sync::broadcast, task::JoinHandle};
 use tracing::{debug, error, info, warn};
@@ -27,7 +26,7 @@ use tracing::{debug, error, info, warn};
 /// forward the certificates to the Executor.
 pub struct Subscriber {
     /// Receiver for shutdown
-    rx_shutdown: ConditionalBroadcastReceiver,
+    rx_shutdown: Noticer,
     /// A channel to receive sequenced consensus messages.
     rx_sequence: metered_channel::Receiver<CommittedSubDag>,
     /// Inner state.
@@ -48,7 +47,7 @@ pub fn spawn_subscriber(
     worker_cache: WorkerCache,
     committee: Committee,
     client: NetworkClient,
-    shutdown_subscriber: ConditionalBroadcastReceiver,
+    rx_shutdown: Noticer,
     rx_sequence: metered_channel::Receiver<CommittedSubDag>,
     metrics: Arc<ExecutorMetrics>,
     restored_consensus_output: Vec<CommittedSubDag>,
@@ -76,7 +75,7 @@ pub fn spawn_subscriber(
             authority_id,
             worker_cache,
             committee,
-            shutdown_subscriber,
+            rx_shutdown,
             rx_sequence,
             client,
             metrics,
@@ -113,7 +112,7 @@ async fn create_and_run_subscriber(
     authority_id: AuthorityIdentifier,
     worker_cache: WorkerCache,
     committee: Committee,
-    rx_shutdown: ConditionalBroadcastReceiver,
+    rx_shutdown: Noticer,
     rx_sequence: metered_channel::Receiver<CommittedSubDag>,
     client: NetworkClient,
     metrics: Arc<ExecutorMetrics>,
@@ -182,7 +181,7 @@ impl Subscriber {
                     }
                 },
 
-                _ = self.rx_shutdown.receiver.recv() => {
+                _ = &self.rx_shutdown => {
                     return Ok(())
                 }
 

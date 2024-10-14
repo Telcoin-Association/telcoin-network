@@ -18,7 +18,8 @@ impl WorkerToWorkerMockServer {
         address: Multiaddr,
     ) -> (Receiver<WorkerBlockMessage>, anemo::Network) {
         let addr = address.to_anemo_address().unwrap();
-        let (batch_sender, batch_receiver) = channel(1);
+        // Channel size 1000, should be big enough for testing even if ignoring the receiver..
+        let (batch_sender, batch_receiver) = channel(1000);
         let service = WorkerToWorkerServer::new(Self { batch_sender });
 
         let routes = anemo::Router::new().add_rpc_service(service);

@@ -8,7 +8,7 @@ use super::*;
 
 use crate::consensus::{
     make_certificate_store, make_consensus_store, Consensus, ConsensusRound,
-    NUM_SHUTDOWN_RECEIVERS, NUM_SUB_DAGS_PER_SCHEDULE,
+    NUM_SUB_DAGS_PER_SCHEDULE,
 };
 #[allow(unused_imports)]
 use fastcrypto::traits::KeyPair;
@@ -17,8 +17,7 @@ use narwhal_typed_store::open_db;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use tn_types::{
-    test_utils::CommitteeFixture, AuthorityIdentifier, PreSubscribedBroadcastSender,
-    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    test_utils::CommitteeFixture, AuthorityIdentifier, Notifier, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 #[allow(unused_imports)]
 use tokio::sync::mpsc::channel;
@@ -445,7 +444,7 @@ async fn commit_one() {
     let (tx_consensus_round_updates, _rx_consensus_round_updates) =
         watch::channel(ConsensusRound::new(0, 0));
 
-    let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+    let mut tx_shutdown = Notifier::new();
 
     let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
     let cert_store = make_certificate_store(open_db(tn_types::test_utils::temp_dir()));
@@ -524,7 +523,7 @@ async fn dead_node() {
     let (tx_consensus_round_updates, _rx_consensus_round_updates) =
         watch::channel(ConsensusRound::new(0, 0));
 
-    let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+    let mut tx_shutdown = Notifier::new();
 
     let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
     let cert_store = make_certificate_store(open_db(tn_types::test_utils::temp_dir()));
@@ -678,7 +677,7 @@ async fn not_enough_support() {
     let (tx_consensus_round_updates, _rx_consensus_round_updates) =
         watch::channel(ConsensusRound::new(0, 0));
 
-    let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+    let mut tx_shutdown = Notifier::new();
 
     let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
     let cert_store = make_certificate_store(open_db(tn_types::test_utils::temp_dir()));
@@ -796,7 +795,7 @@ async fn missing_leader() {
     let (tx_consensus_round_updates, _rx_consensus_round_updates) =
         watch::channel(ConsensusRound::new(0, 0));
 
-    let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+    let mut tx_shutdown = Notifier::new();
 
     let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
     let cert_store = make_certificate_store(open_db(tn_types::test_utils::temp_dir()));
@@ -885,7 +884,7 @@ async fn committed_round_after_restart() {
         let (tx_consensus_round_updates, rx_consensus_round_updates) =
             watch::channel(ConsensusRound::new(0, 0));
 
-        let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+        let mut tx_shutdown = Notifier::new();
         let gc_depth = 50;
         let metrics = Arc::new(ConsensusMetrics::default());
 
@@ -946,7 +945,7 @@ async fn committed_round_after_restart() {
         info!("Committed round adanced to {}", input_round.saturating_sub(1));
 
         // Shutdown consensus and wait for it to stop.
-        tx_shutdown.send().unwrap();
+        tx_shutdown.notify();
         handle.await.unwrap();
     }
 }
@@ -1158,7 +1157,7 @@ async fn restart_with_new_committee() {
         let (tx_consensus_round_updates, _rx_consensus_round_updates) =
             watch::channel(ConsensusRound::new(0, 0));
 
-        let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+        let mut tx_shutdown = Notifier::new();
         let store = make_consensus_store(open_db(tn_types::test_utils::temp_dir()));
         let cert_store = make_certificate_store(open_db(tn_types::test_utils::temp_dir()));
         let gc_depth = 50;
@@ -1237,7 +1236,7 @@ async fn restart_with_new_committee() {
 
         // Move to the next epoch.
         committee = committee.advance_epoch(epoch + 1);
-        tx_shutdown.send().unwrap();
+        tx_shutdown.notify();
 
         // Ensure consensus stopped.
         handle.await.unwrap();

@@ -8,14 +8,14 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     time::Duration,
 };
-use tn_types::ConditionalBroadcastReceiver;
+use tn_types::Noticer;
 use tokio::{task::JoinHandle, time::sleep};
 use tracing::{error, info};
 
 pub fn start_admin_server(
     port: u16,
     network: anemo::Network,
-    mut tr_shutdown: ConditionalBroadcastReceiver,
+    rx_shutdown: Noticer,
 ) -> Vec<JoinHandle<()>> {
     let mut router =
         Router::new().route("/peers", get(get_peers)).route("/known_peers", get(get_known_peers));
@@ -34,7 +34,7 @@ pub fn start_admin_server(
     let mut handles = Vec::new();
     // Spawn a task to shutdown server.
     handles.push(spawn_monitored_task!(async move {
-        _ = tr_shutdown.receiver.recv().await;
+        _ = rx_shutdown.await;
         handle.clone().shutdown();
     }));
 

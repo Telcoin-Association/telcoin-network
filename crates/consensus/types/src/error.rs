@@ -153,3 +153,18 @@ impl<T> From<tokio::sync::mpsc::error::TrySendError<T>> for DagError {
         }
     }
 }
+
+/// Errors that can be reported while seal a block.
+#[derive(Clone, Debug, Error)]
+pub enum BlockSealError {
+    #[error("Block was rejected by enough peers to never reach quorum")]
+    QuorumRejected,
+    #[error("Anti quorum reached for block (note this may not be permanent)")]
+    AntiQuorum,
+    #[error("Timed out waiting for quorum")]
+    Timeout,
+    #[error("Failed to get enough responses to reach quorum")]
+    FailedQuorum,
+    #[error("Failed to access consensus DB, this is fatal")]
+    FatalDBFailure,
+}

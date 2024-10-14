@@ -273,6 +273,10 @@ mod tests {
     };
 
     /// Return the next valid block
+    ///
+    /// Note that SealedHeader's `parent_hash`, `state_root`, and `extra_data` must be updated when
+    /// updating accounts to fund in `adiri_genesis_raw` These new values can be obtained using
+    /// `tn-block-proposer::tests::test_make_block`
     fn next_valid_sealed_header() -> SealedHeader {
         // sealed header
         //
@@ -280,13 +284,13 @@ mod tests {
         SealedHeader::new(
             Header {
                 parent_hash: hex!(
-                    "0a908204acf0691cb8924082269df1c40deea2d7f2201e82a28cf07bd2a3d4ce"
+                    "bf0f2065b35a695aa0d47e9633d6cc78f6e012b988f774ff7e4c8467ea7f4126"
                 )
                 .into(),
                 ommers_hash: EMPTY_OMMER_ROOT_HASH,
                 beneficiary: hex!("0000000000000000000000000000000000000000").into(),
                 state_root: hex!(
-                    "82d9a09efc5f9f408c45a1a0e205d8a09ee156781a0d7221ee913a8130d95cd0"
+                    "f18a009363b7d8b75b10ac5deac750d03689addb15b59c317a96a74a9b478ec8"
                 )
                 .into(),
                 transactions_root: hex!(
@@ -313,7 +317,7 @@ mod tests {
                 extra_data: Bytes::default(),
                 requests_root: None,
             },
-            hex!("ed9242a844ec144e25b58c085184c3c4ae8709226771659badf7e45cdd415c58").into(),
+            hex!("fc6d1ae1e7eb746bde848361e399a76fc66a28076a9e279422bbec6120b27991").into(),
         )
     }
 

@@ -91,8 +91,6 @@ pub struct WorkerMetrics {
     pub created_block_size: HistogramVec,
     /// Time taken to create a block
     pub created_block_latency: HistogramVec,
-    /// The number of parallel worker blocks currently processed by the worker
-    pub parallel_worker_blocks: IntGauge,
     /// Latency of broadcasting blocks to a quorum in seconds.
     pub block_broadcast_quorum_latency: Histogram,
     /// Counter of remote/local block fetch statuses.
@@ -134,11 +132,6 @@ impl WorkerMetrics {
                 &["reason"],
                 // buckets in seconds
                 LATENCY_SEC_BUCKETS.to_vec(),
-                registry
-            )?,
-            parallel_worker_blocks: register_int_gauge_with_registry!(
-                "parallel_worker_blocks",
-                "The number of parallel worker blocks currently processed by the worker",
                 registry
             )?,
             block_broadcast_quorum_latency: register_histogram_with_registry!(

@@ -8,7 +8,7 @@
 mod block_fetcher;
 mod block_provider;
 mod network;
-mod quorum_waiter;
+pub mod quorum_waiter;
 mod worker;
 
 pub mod metrics;

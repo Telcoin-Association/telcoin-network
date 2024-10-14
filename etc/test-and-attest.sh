@@ -21,7 +21,7 @@ if [ -z "$GITHUB_ATTESTATION_PRIVATE_KEY" ]; then
 fi
 
 # NOTE: this contract must match CI
-CONTRACT_ADDRESS="0x1f2f25561a11762bdffd91014c6d0e49af334447"
+CONTRACT_ADDRESS="0xba26a2c8e1c54d5bbb96e891fd4a9d853f438eb9"
 RPC_ENDPOINT="https://rpc.adiri.tel"
 ATTEST_CALL="attestGitCommitHash(bytes20,bool)"
 VERIFY_CALL="gitCommitHashAttested(bytes20)"
@@ -87,7 +87,7 @@ echo "clippy for workspace: default and all features passed"
 # default features
 cargo test --workspace --no-fail-fast -- --show-output
 # faucet it test
-cargo test -p telcoin-network --test it --features faucet --no-fail-fast -- --show-output
+cargo test -p telcoin-network --test it --features faucet --no-fail-fast -- faucet --show-output
 
 echo "default tests and specific faucet it test passing"
 

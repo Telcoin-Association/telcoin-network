@@ -5,7 +5,7 @@
 use super::*;
 use crate::common::create_db_stores;
 
-use crate::{consensus::ConsensusRound, NUM_SHUTDOWN_RECEIVERS};
+use crate::consensus::ConsensusRound;
 use fastcrypto::traits::KeyPair;
 use narwhal_network::client::NetworkClient;
 use narwhal_network_types::{MockPrimaryToPrimary, PrimaryToPrimaryServer, RequestVoteResponse};
@@ -14,10 +14,7 @@ use narwhal_typed_store::open_db;
 use rand::{rngs::StdRng, SeedableRng};
 use std::num::NonZeroUsize;
 use tempfile::TempDir;
-use tn_types::{
-    test_utils::CommitteeFixture, BlsKeypair, PreSubscribedBroadcastSender,
-    SignatureVerificationState,
-};
+use tn_types::{test_utils::CommitteeFixture, BlsKeypair, Notifier, SignatureVerificationState};
 use tokio::sync::watch;
 
 // // TODO: Remove after network has moved to CertificateV2
@@ -154,7 +151,7 @@ async fn propose_header_and_form_certificate_v2() {
     let signature_service = SignatureService::new(primary.keypair().copy());
     let metrics = Arc::new(PrimaryMetrics::default());
     let primary_channel_metrics = PrimaryChannelMetrics::default();
-    let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+    let mut tx_shutdown = Notifier::new();
     let (tx_certificate_fetcher, _rx_certificate_fetcher) = tn_types::test_channel!(1);
     let (tx_headers, rx_headers) = tn_types::test_channel!(1);
     let (tx_new_certificates, mut rx_new_certificates) = tn_types::test_channel!(3);
@@ -262,7 +259,7 @@ async fn propose_header_failure() {
     let signature_service = SignatureService::new(primary.keypair().copy());
     let metrics = Arc::new(PrimaryMetrics::default());
     let primary_channel_metrics = PrimaryChannelMetrics::default();
-    let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+    let mut tx_shutdown = Notifier::new();
     let (tx_certificate_fetcher, _rx_certificate_fetcher) = tn_types::test_channel!(1);
     let (tx_headers, rx_headers) = tn_types::test_channel!(1);
     let (tx_new_certificates, mut rx_new_certificates) = tn_types::test_channel!(3);
@@ -373,7 +370,7 @@ async fn run_vote_aggregator_with_param(
     let signature_service = SignatureService::new(primary.keypair().copy());
     let metrics = Arc::new(PrimaryMetrics::default());
     let primary_channel_metrics = PrimaryChannelMetrics::default();
-    let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+    let mut tx_shutdown = Notifier::new();
     let (tx_certificate_fetcher, _rx_certificate_fetcher) = tn_types::test_channel!(1);
     let (tx_headers, rx_headers) = tn_types::test_channel!(1);
     let (tx_new_certificates, mut rx_new_certificates) = tn_types::test_channel!(3);
@@ -483,7 +480,7 @@ async fn test_shutdown_core() {
     let metrics = Arc::new(PrimaryMetrics::default());
     let primary_channel_metrics = PrimaryChannelMetrics::default();
 
-    let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+    let mut tx_shutdown = Notifier::new();
     let (tx_certificate_fetcher, _rx_certificate_fetcher) = tn_types::test_channel!(1);
     let (_tx_headers, rx_headers) = tn_types::test_channel!(1);
     let (tx_new_certificates, _rx_new_certificates) = tn_types::test_channel!(1);
@@ -536,6 +533,6 @@ async fn test_shutdown_core() {
     );
 
     // Shutdown the core.
-    _ = tx_shutdown.send().unwrap();
+    tx_shutdown.notify();
     assert!(handle.await.is_ok());
 }

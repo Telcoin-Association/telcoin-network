@@ -8,7 +8,11 @@ use assert_matches::assert_matches;
 use narwhal_network::client::NetworkClient;
 use narwhal_network_types::MockWorkerToPrimary;
 use narwhal_typed_store::{open_db, tables::WorkerBlocks, traits::Database};
-use narwhal_worker::{metrics::WorkerMetrics, BlockProvider, NUM_SHUTDOWN_RECEIVERS};
+use narwhal_worker::{
+    metrics::WorkerMetrics,
+    quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
+    BlockProvider,
+};
 use reth::{beacon_consensus::EthBeaconConsensus, tasks::TaskManager};
 use reth_blockchain_tree::noop::NoopBlockchainTree;
 use reth_chainspec::ChainSpec;
@@ -30,17 +34,26 @@ use tn_block_proposer::{BlockProposerBuilder, MiningMode};
 use tn_block_validator::{BlockValidation, BlockValidator};
 use tn_types::{
     test_utils::{get_gas_price, test_genesis, TransactionFactory},
-    Consensus, PendingWorkerBlock, PreSubscribedBroadcastSender, WorkerBlock,
+    Consensus, PendingWorkerBlock, WorkerBlock,
 };
-use tokio::{sync::watch, time::timeout};
+use tokio::sync::watch;
 use tracing::debug;
+
+#[derive(Clone, Debug)]
+struct TestMakeBlockQuorumWaiter();
+impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
+    fn verify_block(
+        &self,
+        _block: WorkerBlock,
+        _timeout: Duration,
+    ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
+        tokio::spawn(async move { Ok(()) })
+    }
+}
 
 #[tokio::test]
 async fn test_make_block_el_to_cl() {
     init_test_tracing();
-
-    // worker channel
-    let (to_worker, rx_block_maker) = tn_types::test_channel!(1);
 
     //
     //=== Consensus Layer
@@ -49,8 +62,6 @@ async fn test_make_block_el_to_cl() {
     let network_client = NetworkClient::new_with_empty_id();
     let temp_dir = TempDir::new().unwrap();
     let store = open_db(temp_dir.path());
-    let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
-    let (tx_quorum_waiter, mut rx_quorum_waiter) = tn_types::test_channel!(1);
     let node_metrics = WorkerMetrics::default();
 
     // Mock the primary client to always succeed.
@@ -58,23 +69,9 @@ async fn test_make_block_el_to_cl() {
     mock_server.expect_report_own_block().returning(|_| Ok(anemo::Response::new(())));
     network_client.set_worker_to_primary_local_handler(Arc::new(mock_server));
 
-    // Spawn a `BatchMaker` instance.
-    let id = 0;
-    let _block_provider_handle = BlockProvider::spawn(
-        id,
-        /* max_block_size */ 200,
-        /* max_block_delay */
-        Duration::from_millis(1_000_000), // Ensure the timer is not triggered.
-        tx_shutdown.subscribe(),
-        rx_block_maker,
-        tx_quorum_waiter,
-        Arc::new(node_metrics),
-        network_client,
-        store.clone(),
-    );
-
-    // worker's block provider takes a long time to start
-    tokio::task::yield_now().await;
+    let qw = TestMakeBlockQuorumWaiter();
+    let block_provider =
+        BlockProvider::new(0, qw.clone(), Arc::new(node_metrics), network_client, store.clone());
 
     //
     //=== Execution Layer
@@ -130,11 +127,11 @@ async fn test_make_block_el_to_cl() {
         Arc::clone(&chain),
         blockchain_db.clone(),
         txpool.clone(),
-        to_worker,
         mining_mode,
         address,
         block_executor.clone(),
         tx,
+        block_provider.blocks_rx(),
     )
     .build();
 
@@ -192,12 +189,17 @@ async fn test_make_block_el_to_cl() {
     //=== Test block flow
     //
 
-    // wait for quorum waiter's channel to recv block
-    let too_long = Duration::from_secs(5);
-    let (block, resp) = timeout(too_long, rx_quorum_waiter.recv())
-        .await
-        .expect("new block created within time")
-        .expect("new block is Some()");
+    // wait for new block
+    let mut block = None;
+    for _ in 0..5 {
+        let _ = tokio::time::sleep(Duration::from_secs(1)).await;
+        // Ensure the block is stored
+        if let Some((_, wb)) = store.iter::<WorkerBlocks>().next() {
+            block = Some(wb);
+            break;
+        }
+    }
+    let block = block.unwrap();
 
     // ensure block validator succeeds
     let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
@@ -211,9 +213,6 @@ async fn test_make_block_el_to_cl() {
         WorkerBlock::new(vec![transaction1.clone()], block.sealed_header().clone());
     let block_txs = block.transactions();
     assert_eq!(block_txs, expected_block.transactions());
-
-    // ack to CL block provider
-    assert!(resp.send(()).is_ok());
 
     // ensure enough time passes for store to pass
     let _ = tokio::time::sleep(std::time::Duration::from_secs(1)).await;

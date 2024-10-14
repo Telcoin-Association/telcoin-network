@@ -45,6 +45,7 @@ match_opt = { workspace = true }
 multiaddr = { workspace = true }
 telcoin-sync = { workspace = true }
 alloy-rlp = { workspace = true }
+parking_lot = { workspace = true }
 
 schemars = { version = "0.8.16" }
 serde_yaml = { workspace = true }

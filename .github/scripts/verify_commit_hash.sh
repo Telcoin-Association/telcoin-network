@@ -8,7 +8,7 @@ set -e  # Exit immediately if a command exits with a non-zero status
 # adiri contract details
 #
 # NOTE: this contract must match local test-and-attest.sh
-CONTRACT_ADDRESS="0x1f2f25561a11762bdffd91014c6d0e49af334447"
+CONTRACT_ADDRESS="0xba26a2c8e1c54d5bbb96e891fd4a9d853f438eb9"
 RPC_ENDPOINT="https://rpc.adiri.tel"
 
 # Function call

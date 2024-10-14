@@ -17,9 +17,6 @@ pub use metrics::*;
 
 mod serde;
 
-mod pre_subscribed_broadcast;
-pub use pre_subscribed_broadcast::*;
-
 mod crypto;
 pub use crypto::*;
 mod config;
@@ -39,3 +36,6 @@ pub mod test_utils;
 
 mod codec;
 pub use codec::*;
+
+mod notifier;
+pub use notifier::*;

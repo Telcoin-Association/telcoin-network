@@ -4,6 +4,8 @@ use clap::Parser;
 use narwhal_test_utils::CommandParser;
 use telcoin_network::{genesis::GenesisArgs, keytool::KeyArgs};
 
+pub static IT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Execute genesis ceremony inside tempdir
 pub async fn create_validator_info(datadir: &str, address: &str) -> eyre::Result<()> {
     // init genesis

@@ -8,10 +8,10 @@ use consensus_metrics::{
 };
 use fastcrypto::groups;
 use fastcrypto_tbls::{dkg, nodes};
-use tn_types::{AuthorityIdentifier, ChainIdentifier, Committee, RandomnessPrivateKey};
+use tn_types::{AuthorityIdentifier, ChainIdentifier, Committee, Noticer, RandomnessPrivateKey};
 
 use tap::TapFallible;
-use tn_types::{Certificate, ConditionalBroadcastReceiver, Round, SystemMessage};
+use tn_types::{Certificate, Round, SystemMessage};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -29,7 +29,7 @@ pub struct StateHandler {
     /// Receives the ordered certificates from consensus.
     rx_committed_certificates: Receiver<(Round, Vec<Certificate>)>,
     /// Channel to signal committee changes.
-    rx_shutdown: ConditionalBroadcastReceiver,
+    rx_shutdown: Noticer,
     /// A channel to update the committed rounds
     tx_committed_own_headers: Option<Sender<(Round, Vec<Round>)>>,
     /// A channel to send system messages to the proposer.
@@ -208,7 +208,7 @@ impl StateHandler {
         authority_id: AuthorityIdentifier,
         committee: Committee,
         rx_committed_certificates: Receiver<(Round, Vec<Certificate>)>,
-        rx_shutdown: ConditionalBroadcastReceiver,
+        rx_shutdown: Noticer,
         tx_committed_own_headers: Option<Sender<(Round, Vec<Round>)>>,
         tx_system_messages: Sender<SystemMessage>,
         randomness_private_key: RandomnessPrivateKey,
@@ -290,7 +290,7 @@ impl StateHandler {
                     self.handle_sequenced(commit_round, certificates).await;
                 },
 
-                _ = self.rx_shutdown.receiver.recv() => {
+                _ = &self.rx_shutdown => {
                     // shutdown network
                     let _ = self.network.shutdown().await.tap_err(|err|{
                         error!("Error while shutting down network: {err}")

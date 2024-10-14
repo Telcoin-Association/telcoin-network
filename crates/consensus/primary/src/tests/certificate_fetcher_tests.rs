@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    certificate_fetcher::CertificateFetcher, consensus::ConsensusRound,
-    primary::NUM_SHUTDOWN_RECEIVERS, synchronizer::Synchronizer,
+    certificate_fetcher::CertificateFetcher, consensus::ConsensusRound, synchronizer::Synchronizer,
 };
 use anemo::async_trait;
 use eyre::Result;
@@ -25,8 +24,8 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tn_types::{
     test_utils::CommitteeFixture, AuthorityIdentifier, BlockHash, BlsAggregateSignatureBytes,
-    Certificate, CertificateDigest, Epoch, Header, HeaderDigest, PreSubscribedBroadcastSender,
-    Round, SignatureVerificationState, SystemMessage, TimestampSec, WorkerId,
+    Certificate, CertificateDigest, Epoch, Header, HeaderDigest, Notifier, Round,
+    SignatureVerificationState, SystemMessage, TimestampSec, WorkerId,
 };
 use tokio::{
     sync::{
@@ -170,7 +169,7 @@ async fn fetch_certificates_v1_basic() {
     let gc_depth: Round = 50;
 
     // kept empty
-    let mut tx_shutdown = PreSubscribedBroadcastSender::new(NUM_SHUTDOWN_RECEIVERS);
+    let mut tx_shutdown = Notifier::new();
     // synchronizer to certificate fetcher
     let (tx_certificate_fetcher, rx_certificate_fetcher) = tn_types::test_channel!(1000);
     let (tx_new_certificates, _rx_new_certificates) = tn_types::test_channel!(1000);
