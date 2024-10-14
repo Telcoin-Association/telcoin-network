@@ -375,7 +375,7 @@ where
 
                         // NOTE: empty vec returned for non-fatal error during block proposal
                         if mined_transactions.is_empty() {
-                            // return pending and hopefully next attempt will work
+                            // return pending and wait for canonical update to wake up again
                             break;
                         }
 
@@ -439,13 +439,17 @@ mod tests {
         BlockProvider,
     };
     use reth::tasks::TaskManager;
-    use reth_blockchain_tree::noop::NoopBlockchainTree;
+    use reth_blockchain_tree::{
+        noop::NoopBlockchainTree, BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree,
+        TreeExternals,
+    };
     use reth_chainspec::ChainSpec;
     use reth_db::{
         test_utils::{create_test_rw_db, tempdir_path, TempDatabase},
         DatabaseEnv,
     };
     use reth_db_common::init::init_genesis;
+    use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
     use reth_primitives::{
         alloy_primitives::U160, BlockBody, Bytes, GenesisAccount, SealedBlock, U256,
     };
@@ -453,15 +457,18 @@ mod tests {
         providers::{BlockchainProvider, StaticFileProvider},
         CanonStateSubscriptions as _, ProviderFactory,
     };
+    use reth_prune::PruneModes;
     use reth_transaction_pool::{
         blobstore::InMemoryBlobStore, CoinbaseTipOrdering, EthPooledTransaction,
         EthTransactionValidator, Pool, PoolConfig, TransactionValidationTaskExecutor,
     };
     use std::{str::FromStr, time::Duration};
     use tempfile::TempDir;
+    use tn_engine::execute_consensus_output;
     use tn_types::{
         adiri_genesis,
         test_utils::{adiri_genesis_seeded, get_gas_price, TransactionFactory},
+        AutoSealConsensus, BuildArguments, CommittedSubDag, Consensus, ConsensusOutput,
         WorkerBlock,
     };
     use tokio::time::timeout;
@@ -689,9 +696,21 @@ mod tests {
         );
         let _genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
 
-        let blockchain_db =
-            BlockchainProvider::new(provider_factory, Arc::new(NoopBlockchainTree::default()))
-                .expect("test blockchain provider");
+        // TODO: figure out a better way to ensure this matches engine::inner::new
+        let evm_config = EthEvmConfig::default();
+        let executor = EthExecutorProvider::new(Arc::clone(&chain), evm_config);
+        let auto_consensus: Arc<dyn Consensus> =
+            Arc::new(AutoSealConsensus::new(Arc::clone(&chain)));
+        let tree_config = BlockchainTreeConfig::default();
+        let tree_externals =
+            TreeExternals::new(provider_factory.clone(), auto_consensus.clone(), executor.clone());
+        let tree = BlockchainTree::new(tree_externals, tree_config, PruneModes::none())
+            .expect("new blockchain tree");
+
+        let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
+
+        let blockchain_db = BlockchainProvider::new(provider_factory, blockchain_tree)
+            .expect("test blockchain provider");
 
         // task manger
         let _manager = TaskManager::current();
@@ -740,7 +759,7 @@ mod tests {
             last_canonical_update,
             to_worker,
             address,
-            Duration::from_secs(1),
+            Duration::from_millis(1),
             30_000_000, // 30mil gas limit
             1_000_000,  // 1MB size
         );
@@ -793,6 +812,11 @@ mod tests {
         // plenty of time for block production
         let duration = std::time::Duration::from_secs(5);
 
+        // simulate engine to create canonical blocks from empty rounds
+        let evm_config = EthEvmConfig::default();
+        let mut subdag_index = 0;
+        let mut parent = chain.sealed_genesis_header();
+
         let non_fatal_errors = vec![
             BlockSealError::QuorumRejected,
             BlockSealError::AntiQuorum,
@@ -806,7 +830,7 @@ mod tests {
         for (idx, error) in non_fatal_errors.into_iter().enumerate() {
             let (block, ack) = timeout(duration, from_block_builder.recv())
                 .await
-                .expect("block builder's sender didn't drop")
+                .expect("block builder built another block after canonical update")
                 .expect("worker block was built");
 
             // all 3 transactions present
@@ -815,7 +839,7 @@ mod tests {
             // send non-fatal error
             let _ = ack.send(Err(error));
 
-            // submit another tx to pool to wake up task
+            // submit another tx to pool
             tx_factory
                 .create_and_submit_eip1559_pool_tx(
                     chain.clone(),
@@ -825,6 +849,31 @@ mod tests {
                     &txpool,
                 )
                 .await;
+
+            // canonical update to wake up task
+            let output = ConsensusOutput {
+                sub_dag: CommittedSubDag::new(
+                    vec![Default::default()],
+                    Default::default(),
+                    subdag_index,
+                    Default::default(),
+                    None,
+                )
+                .into(),
+                blocks: vec![vec![]],
+                beneficiary: address,
+                block_digests: Default::default(),
+            };
+            // execute output to trigger canonical update
+            let args = BuildArguments::new(blockchain_db.clone(), output, parent);
+            let final_header = execute_consensus_output(evm_config, args).expect("output executed");
+
+            // update values for next loop
+            parent = final_header;
+            subdag_index += 1;
+
+            // sleep to ensure canonical update received before ack
+            let _ = tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
         // wait for next block
@@ -971,5 +1020,4 @@ mod tests {
         let pending_pool_len = txpool.pool_size().pending;
         assert_eq!(pending_pool_len, 0);
     }
-    // TODO: test canonical update affects pool
 }

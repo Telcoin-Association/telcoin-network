@@ -630,44 +630,6 @@ async fn test_canonical_notification_updates_pool() {
     let args = BuildArguments::new(blockchain_db.clone(), output, chain.sealed_genesis_header());
     let _final_header = execute_consensus_output(evm_config, args).expect("output executed");
 
-    // let output_digest: B256 = output.digest().into();
-    // let ommers = output.ommers();
-    // let ommers_root = proofs::calculate_ommers_root(&ommers);
-    // let mix_hash = output_digest ^ sealed_block_with_senders.hash();
-    // let withdrawals =
-    //     sealed_block_with_senders.withdrawals.clone().unwrap_or_else(||
-    // Withdrawals::new(vec![])); let payload_attributes = TNPayloadAttributes::new(
-    //     chain.sealed_genesis_header(),
-    //     ommers,
-    //     ommers_root,
-    //     0, // index
-    //     sealed_block_with_senders.hash(),
-    //     &output,
-    //     output_digest,
-    //     sealed_block_with_senders.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE),
-    //     sealed_block_with_senders.gas_limit,
-    //     mix_hash,
-    //     withdrawals,
-    // );
-    // let payload = TNPayload::new(payload_attributes);
-    // let executed_block = build_block_from_batch_payload(
-    //     &evm_config,
-    //     payload,
-    //     &blockchain_db,
-    //     chain,
-    //     sealed_block_with_senders,
-    // )
-    // .expect("engine block from worker block");
-
-    // let next_canonical_hash = executed_block.block.hash();
-    // // apply canonical tip update
-    // blockchain_db
-    //     .insert_block(executed_block, BlockValidationKind::SkipStateRootValidation)
-    //     .expect("worker block made canonical");
-
-    // // this sends update and apply canonical changes to pool
-    // blockchain_db.make_canonical(next_canonical_hash).expect("worker block is canonical");
-
     // sleep to ensure canonical update received before ack
     let _ = tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -676,13 +638,6 @@ async fn test_canonical_notification_updates_pool() {
     println!("poolsize: {pool_size:?}");
     assert_eq!(pool_size.queued, 0);
     assert_eq!(pool_size.pending, 1);
-
-    // UPdate comment for test:
-    //
-    // - add 4th transaction to pool so it's queued
-    // - execute a canonical block that unlocks queued transaction
-    // - assert the queued tx is now pending
-    //
 
     // plenty of time for block production
     let duration = std::time::Duration::from_secs(5);
