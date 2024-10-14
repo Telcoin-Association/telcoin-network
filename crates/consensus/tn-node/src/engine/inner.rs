@@ -26,7 +26,7 @@ use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use reth_node_builder::{common::WithConfigs, BuilderContext, NodeConfig};
 use reth_node_ethereum::EthEvmConfig;
 use reth_primitives::{
-    constants::MIN_PROTOCOL_BASE_FEE, Address, BlockBody, SealedBlock, SealedBlockWithSenders, B256,
+    constants::MIN_PROTOCOL_BASE_FEE, Address, BlockBody, SealedBlock, SealedBlockWithSenders,
 };
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
@@ -235,7 +235,6 @@ where
         &mut self,
         worker_id: WorkerId,
         block_provider_sender: WorkerBlockSender,
-        // #[cfg(test)] max_builds: Option<usize>,
     ) -> eyre::Result<()> {
         let head = self.node_config.lookup_head(self.provider_factory.clone())?;
 
@@ -348,12 +347,10 @@ where
             transaction_pool.pending_transactions_listener(),
             self.tn_config.parameters.max_worker_tx_gas,
             self.tn_config.parameters.max_worker_tx_bytes_size,
-            // #[cfg(test)]
-            // max_builds,
         );
 
         // spawn block builder task
-        self.task_executor.spawn_critical("batch builder", async move {
+        tokio::spawn(async move {
             let res = block_builder.await;
             info!(target: "tn::execution", ?res, "block builder task exited");
         });

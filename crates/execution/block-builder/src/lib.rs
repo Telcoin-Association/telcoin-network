@@ -21,7 +21,7 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-pub use block_builder::{build_worker_block, BlockBuilderOutput};
+pub use block::{build_worker_block, BlockBuilderOutput};
 use error::{BlockBuilderError, BlockBuilderResult};
 use futures_util::{FutureExt, StreamExt};
 use reth_execution_types::ChangedAccount;
@@ -42,13 +42,13 @@ use tokio::sync::{mpsc::Receiver, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, trace, warn};
 
-mod block_builder;
+mod block;
 mod error;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
 /// Type alias for the blocking task that locks the tx pool and builds the next worker block.
-type BlockBuildingTask = oneshot::Receiver<BlockBuilderResult<Vec<TxHash>>>;
+type BuildResult = oneshot::Receiver<BlockBuilderResult<Vec<TxHash>>>;
 
 /// The type that builds blocks for workers to propose.
 ///
@@ -61,7 +61,7 @@ type BlockBuildingTask = oneshot::Receiver<BlockBuilderResult<Vec<TxHash>>>;
 pub struct BlockBuilder<BT, Pool> {
     /// Single active future that executes consensus output on a blocking thread and then returns
     /// the result through a oneshot channel.
-    pending_task: Option<BlockBuildingTask>,
+    pending_task: Option<BuildResult>,
     /// The type used to query both the database and the blockchain tree.
     ///
     /// TODO: leaving this for now to prevent generics refactor
@@ -82,12 +82,6 @@ pub struct BlockBuilder<BT, Pool> {
     ///
     /// This is a solution until TN has it's own transaction pool implementation.
     latest_canon_state: LastCanonicalUpdate,
-    // /// Optional round of consensus to finish executing before then returning. The value is used
-    // to /// track the subdag index from consensus output. The index is also considered the
-    // "round" of /// consensus and is included in executed blocks as  the block's `nonce`
-    // value. ///
-    // /// NOTE: this is primarily useful for debugging and testing
-    // max_round: Option<u64>,
     /// The sending side to the worker's batch maker.
     ///
     /// Sending the new block through this channel triggers a broadcast to all peers.
@@ -211,7 +205,7 @@ where
     /// - return result
     ///
     /// Workers only propose one block at a time.
-    fn spawn_execution_task(&self) -> BlockBuildingTask {
+    fn spawn_execution_task(&self) -> BuildResult {
         let pool = self.pool.clone();
         let to_worker = self.to_worker.clone();
 
