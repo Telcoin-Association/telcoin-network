@@ -155,21 +155,16 @@ where
         let transaction = self.create_transaction_to_sign(user, contract)?;
         // request signature from kms
         let kms_name = self.wallet.name();
-        // let kms_client = self.kms_client();
         let public_key = self.wallet.kms_public_key();
         let chain_id = self.chain_id;
         let pool = self.pool.clone();
         let add_to_success_cache = self.add_to_success_cache_tx.clone();
 
-        let nonce = transaction.nonce();
         debug!(target: "faucet", ?transaction, "processing transfer request");
-        // sanity check - this should never be possible
-        // if nonce > self.next_nonce {
-        debug!(target: "faucet", ?nonce, highest=?self.next_nonce, "processing transfer request - updating tracked nonce");
+
+        // update tracked nonce
+        let nonce = transaction.nonce();
         self.next_nonce = nonce + 1;
-        // } else {
-        //     debug!(target: "faucet", ?nonce, highest=?self.next_nonce, "SKIPPED UPDATE");
-        // }
 
         // request signature and submit to txpool
         self.executor.spawn(Box::pin(async move {
