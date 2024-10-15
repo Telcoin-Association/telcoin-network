@@ -56,7 +56,7 @@ impl<V: BlockValidation, DB: Database> WorkerToWorker for WorkerReceiverHandler<
             return Err(anemo::rpc::Status::new_with_message(
                 StatusCode::BadRequest,
                 format!(
-                    "Invalid batch from peer {:?}: {err}\n\nbad worker block:\n{:?}",
+                    "Invalid block from peer {:?}: {err}\n\nbad worker block:\n{:?}",
                     peer_id,
                     &message.worker_block.sealed_header(),
                 ),

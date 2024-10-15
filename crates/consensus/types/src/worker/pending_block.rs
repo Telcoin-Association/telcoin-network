@@ -10,9 +10,6 @@ pub struct WorkerBlockBuilderArgs<Pool> {
     /// The transaction pool.
     pub pool: Pool,
     /// The attributes for the next block.
-    // ConfigPendingBlock
-    // PendingBlockConfig
-    // NextBlockConfig
     pub block_config: PendingBlockConfig,
 }
 

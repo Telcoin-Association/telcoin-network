@@ -570,7 +570,6 @@ async fn test_faucet_transfers_stablecoin_with_google_kms() -> eyre::Result<()> 
     let duration = Duration::from_secs(15);
 
     // wait for canon event or timeout
-    // let new_block: WorkerBlock =
     let (new_block, ack): (WorkerBlock, oneshot::Sender<Result<(), BlockSealError>>) =
         time::timeout(duration, next_batch.recv()).await?.expect("batch received");
 
