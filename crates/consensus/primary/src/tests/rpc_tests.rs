@@ -13,7 +13,7 @@ use tn_types::AuthorityIdentifier;
 
 #[tokio::test]
 async fn test_server_authorizations() {
-    // reth_tracing::init_test_tracing();
+    reth_tracing::init_test_tracing();
     // Set up primaries and workers with a committee.
     let manager = TaskManager::current();
     let executor = manager.executor();

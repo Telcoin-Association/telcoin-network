@@ -156,7 +156,7 @@ struct BadHeader {
 /// v2 for sui -> is v1 TN
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn fetch_certificates_v1_basic() {
-    // reth_tracing::init_test_tracing();
+    reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder().randomize_ports(true).build();
     let worker_cache = fixture.worker_cache();
     let primary = fixture.authorities().next().unwrap();

@@ -18,7 +18,7 @@ use tn_types::{
 
 #[tokio::test]
 async fn test_empty_proposal() {
-    // reth_tracing::init_test_tracing();
+    reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder().build();
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();
@@ -72,7 +72,7 @@ async fn test_empty_proposal() {
 
 #[tokio::test]
 async fn test_propose_payload_fatal_timer() {
-    // reth_tracing::init_test_tracing();
+    reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder().build();
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();
@@ -219,7 +219,7 @@ async fn test_propose_payload_fatal_timer() {
 
 #[tokio::test]
 async fn test_equivocation_protection_after_restart() {
-    // reth_tracing::init_test_tracing();
+    reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder().build();
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();
