@@ -63,7 +63,7 @@ mockall = { workspace = true }
 tn-node = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
-narwhal-test-utils = { workspace = true }
+tn-test-utils = { workspace = true }
 tracing = { workspace = true }
 narwhal-worker = { workspace = true }
 tn-storage = { workspace = true }

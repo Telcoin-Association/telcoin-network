@@ -189,9 +189,9 @@ pub fn parse_pubkey(value: &str) -> eyre::Result<PublicKey> {
 mod tests {
     use crate::FaucetArgs;
     use clap::Parser;
-    use narwhal_test_utils::CommandParser;
     use secp256k1::PublicKey;
     use std::str::FromStr;
+    use tn_test_utils::CommandParser;
 
     #[test]
     fn test_pem_pubkey_parses() {

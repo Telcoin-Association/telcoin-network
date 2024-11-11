@@ -1,5 +1,5 @@
 [package]
-name = "narwhal-test-utils"
+name = "tn-test-utils"
 version.workspace = true
 edition = "2021"
 license = "Apache-2.0"
@@ -55,7 +55,7 @@ reth-transaction-pool = { workspace = true }
 jsonrpsee = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 tn-storage = { workspace = true }
-telcoin-network = { path = "../../../bin/telcoin-network" }
+telcoin-network = { path = "../../bin/telcoin-network" }
 reth-evm = { workspace = true }
 alloy = { workspace = true, features = [
     "contract",

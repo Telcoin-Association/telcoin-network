@@ -9,10 +9,10 @@ use crate::quorum_waiter::QuorumWaiterError;
 use super::*;
 
 use narwhal_network_types::MockWorkerToPrimary;
-use narwhal_test_utils::transaction;
 use reth_primitives::SealedHeader;
 use tempfile::TempDir;
 use tn_storage::open_db;
+use tn_test_utils::transaction;
 
 #[derive(Clone, Debug)]
 struct TestMakeBlockQuorumWaiter(Arc<Mutex<Option<WorkerBlock>>>);

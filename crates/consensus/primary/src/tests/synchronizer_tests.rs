@@ -12,10 +12,6 @@ use fastcrypto::{hash::Hash, traits::KeyPair};
 use futures::{stream::FuturesUnordered, StreamExt};
 use itertools::Itertools;
 use narwhal_network::client::NetworkClient;
-use narwhal_test_utils::{
-    fixture_batch_with_transactions, make_optimal_signed_certificates, mock_signed_certificate,
-    CommitteeFixture,
-};
 use std::{
     collections::{BTreeSet, HashMap},
     num::NonZeroUsize,
@@ -23,6 +19,10 @@ use std::{
     time::Duration,
 };
 use tn_storage::mem_db::MemDatabase;
+use tn_test_utils::{
+    fixture_batch_with_transactions, make_optimal_signed_certificates, mock_signed_certificate,
+    CommitteeFixture,
+};
 use tn_types::{
     error::DagError, BlsAggregateSignatureBytes, Certificate, Committee, Round,
     SignatureVerificationState, TnReceiver, TnSender,

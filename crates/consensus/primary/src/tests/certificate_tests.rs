@@ -5,13 +5,13 @@
 // This test file tests the validity of the 'certificates' implementation.
 
 use fastcrypto::traits::KeyPair as _;
-use tn_storage::mem_db::MemDatabase;
-use narwhal_test_utils::CommitteeFixture;
 use rand::{
     rngs::{OsRng, StdRng},
     SeedableRng,
 };
 use std::num::NonZeroUsize;
+use tn_storage::mem_db::MemDatabase;
+use tn_test_utils::CommitteeFixture;
 use tn_types::{AuthorityIdentifier, BlsKeypair, Certificate, SignatureVerificationState, Vote};
 
 #[test]

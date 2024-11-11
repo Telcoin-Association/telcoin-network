@@ -11,7 +11,6 @@ mod tests {
     };
     use fastcrypto::traits::{KeyPair, ToFromBytes};
     use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
-    use narwhal_test_utils::TransactionFactory;
     use rand::{rngs::StdRng, SeedableRng};
     use reth::{
         primitives::{Address, Bytes, GenesisAccount, U256},
@@ -20,6 +19,7 @@ mod tests {
     use reth_chainspec::ChainSpec;
     use std::{sync::Arc, time::Duration};
     use tn_config::{fetch_file_content, ContractStandardJson};
+    use tn_test_utils::TransactionFactory;
     use tn_types::{adiri_genesis, BlsKeypair, NetworkKeypair};
     use tokio::runtime::Handle;
 

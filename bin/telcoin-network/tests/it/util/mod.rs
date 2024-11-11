@@ -1,5 +1,4 @@
 use clap::Parser;
-use narwhal_test_utils::{default_test_execution_node, execution_outcome_for_tests, CommandParser};
 use reth::{
     providers::ExecutionOutcome,
     tasks::{TaskExecutor, TaskManager},
@@ -11,6 +10,7 @@ use reth_primitives::SealedHeader;
 use std::{path::PathBuf, sync::Arc};
 use telcoin_network::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
 use tn_node::launch_node;
+use tn_test_utils::{default_test_execution_node, execution_outcome_for_tests, CommandParser};
 use tn_types::{TransactionSigned, WorkerBlock};
 use tokio::task::JoinHandle;
 use tracing::error;

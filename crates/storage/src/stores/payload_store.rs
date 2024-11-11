@@ -126,7 +126,7 @@ mod tests {
         let store = PayloadStore::new(db);
 
         // run the tests a few times
-        let batch: WorkerBlock = narwhal_test_utils::fixture_batch_with_transactions(10);
+        let batch: WorkerBlock = tn_test_utils::fixture_batch_with_transactions(10);
         let id = batch.digest();
         let worker_id = 0;
 

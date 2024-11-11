@@ -37,7 +37,7 @@ reth-trie = { workspace = true }
 [dev-dependencies]
 # unit tests
 eyre = { workspace = true }
-narwhal-test-utils = { workspace = true }
+tn-test-utils = { workspace = true }
 reth-tracing = { workspace = true }
 reth-tasks = { workspace = true }
 tn-block-builder = { workspace = true, features = ["test-utils"] }

@@ -37,7 +37,7 @@ eyre = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-narwhal-test-utils = { workspace = true }
+tn-test-utils = { workspace = true }
 
 [features]
 test-utils = []

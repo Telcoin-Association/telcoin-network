@@ -11,11 +11,11 @@ use narwhal_primary::{
     Primary,
 };
 
-use narwhal_test_utils::CommitteeFixture;
 use prometheus::Registry;
 use tempfile::TempDir;
 use tn_block_validator::NoopBlockValidator;
 use tn_storage::mem_db::MemDatabase;
+use tn_test_utils::CommitteeFixture;
 use tn_types::WorkerBlock;
 
 // A test validator that rejects every batch

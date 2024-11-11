@@ -7,10 +7,10 @@ use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
 };
 use fastcrypto::{hash::Hash, traits::KeyPair};
-use narwhal_test_utils::make_optimal_signed_certificates;
 use rand::rngs::ThreadRng;
 use reth_primitives::Address;
 use std::collections::{BTreeMap, BTreeSet};
+use tn_test_utils::make_optimal_signed_certificates;
 use tn_types::{
     encode, BlsKeypair, Certificate, CommitteeBuilder, Multiaddr, NetworkKeypair, WorkerCache,
     WorkerIndex,

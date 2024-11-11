@@ -32,7 +32,7 @@ alloy-rlp = { workspace = true }
 
 [dev-dependencies]
 # unit tests
-narwhal-test-utils = { workspace = true }
+tn-test-utils = { workspace = true }
 reth = { workspace = true }
 assert_matches = { workspace = true }
 reth-blockchain-tree = { workspace = true }

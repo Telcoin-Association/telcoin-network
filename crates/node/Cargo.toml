@@ -91,7 +91,7 @@ tn-faucet = { workspace = true }
 [dev-dependencies]
 serde-reflection = { workspace = true }
 serde_yaml = { workspace = true }
-narwhal-test-utils = { workspace = true }
+tn-test-utils = { workspace = true }
 reth-tracing = { workspace = true }
 narwhal-network = { workspace = true, features = ["test-utils"] }
 narwhal-primary = { workspace = true }

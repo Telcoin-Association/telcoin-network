@@ -21,7 +21,6 @@ use gcloud_sdk::{
 };
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
 use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicKey as PubKey};
-use narwhal_test_utils::TransactionFactory;
 use reth::tasks::TaskManager;
 use reth_chainspec::ChainSpec;
 use reth_primitives::{public_key_to_address, Address, GenesisAccount, B256, U256};
@@ -29,6 +28,7 @@ use reth_tracing::init_test_tracing;
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
 use tn_config::{fetch_file_content, ContractStandardJson};
+use tn_test_utils::TransactionFactory;
 use tn_types::adiri_genesis;
 use tokio::{runtime::Handle, task::JoinHandle, time::timeout};
 use tracing::{debug, info};

@@ -52,7 +52,7 @@ reth-tracing = { workspace = true }
 prometheus = { workspace = true }
 fastcrypto = { workspace = true }
 consensus-metrics = { workspace = true }
-narwhal-test-utils = { workspace = true }
+tn-test-utils = { workspace = true }
 narwhal-network = { workspace = true }
 narwhal-network-types = { workspace = true }
 narwhal-worker = { workspace = true }

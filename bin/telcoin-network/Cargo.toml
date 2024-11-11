@@ -83,7 +83,7 @@ gcloud-sdk = { version = "=0.24.6", default-features = false, features = [
 ] }
 jsonrpsee = { workspace = true }
 k256 = "0.13.3"
-narwhal-test-utils = { workspace = true }
+tn-test-utils = { workspace = true }
 tonic = { workspace = true }
 
 [features]

@@ -20,10 +20,6 @@ use gcloud_sdk::{
 use jsonrpsee::{core::client::ClientT, rpc_params};
 use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicKey as PubKey};
 use narwhal_network::client::NetworkClient;
-use narwhal_test_utils::{
-    default_test_execution_node, execution_outcome_for_tests, faucet_test_execution_node,
-    TransactionFactory,
-};
 use narwhal_worker::{
     metrics::WorkerMetrics,
     quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
@@ -44,6 +40,10 @@ use tempfile::TempDir;
 use tn_config::{fetch_file_content, ContractStandardJson};
 use tn_faucet::Drip;
 use tn_storage::open_db;
+use tn_test_utils::{
+    default_test_execution_node, execution_outcome_for_tests, faucet_test_execution_node,
+    TransactionFactory,
+};
 use tn_types::{adiri_genesis, error::BlockSealError, TransactionSigned, WorkerBlock};
 use tokio::{
     sync::{mpsc::Sender, oneshot},

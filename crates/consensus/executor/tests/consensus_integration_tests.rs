@@ -8,8 +8,8 @@ use narwhal_primary::{
     ConsensusBus,
 };
 
-use narwhal_test_utils::CommitteeFixture;
 use tn_storage::mem_db::MemDatabase;
+use tn_test_utils::CommitteeFixture;
 use tn_types::DEFAULT_BAD_NODES_STAKE_THRESHOLD;
 
 use std::{collections::BTreeSet, sync::Arc};
@@ -30,14 +30,13 @@ async fn test_recovery() {
     let genesis =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
     let (mut certificates, next_parents) =
-        narwhal_test_utils::make_optimal_certificates(&committee, 1..=4, &genesis, &ids);
+        tn_test_utils::make_optimal_certificates(&committee, 1..=4, &genesis, &ids);
 
     // Make two certificate (f+1) with round 5 to trigger the commits.
     let (_, certificate) =
-        narwhal_test_utils::mock_certificate(&committee, ids[0], 5, next_parents.clone());
+        tn_test_utils::mock_certificate(&committee, ids[0], 5, next_parents.clone());
     certificates.push_back(certificate);
-    let (_, certificate) =
-        narwhal_test_utils::mock_certificate(&committee, ids[1], 5, next_parents);
+    let (_, certificate) = tn_test_utils::mock_certificate(&committee, ids[1], 5, next_parents);
     certificates.push_back(certificate);
 
     const NUM_SUB_DAGS_PER_SCHEDULE: u64 = 100;

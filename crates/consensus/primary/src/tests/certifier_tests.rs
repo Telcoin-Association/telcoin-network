@@ -7,10 +7,10 @@ use super::*;
 use crate::ConsensusBus;
 use fastcrypto::traits::KeyPair;
 use narwhal_network_types::{MockPrimaryToPrimary, PrimaryToPrimaryServer, RequestVoteResponse};
-use narwhal_test_utils::CommitteeFixture;
 use rand::{rngs::StdRng, SeedableRng};
 use std::num::NonZeroUsize;
 use tn_storage::mem_db::MemDatabase;
+use tn_test_utils::CommitteeFixture;
 use tn_types::{BlsKeypair, SignatureVerificationState, TnSender};
 
 // // TODO: Remove after network has moved to CertificateV2

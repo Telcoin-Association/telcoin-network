@@ -1572,9 +1572,9 @@ mod tests {
     use crate::synchronizer::State;
     use fastcrypto::{hash::Hash, traits::KeyPair};
     use itertools::Itertools;
-    use narwhal_test_utils::{make_optimal_signed_certificates, CommitteeFixture};
     use std::{collections::BTreeSet, num::NonZeroUsize};
     use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils::{make_optimal_signed_certificates, CommitteeFixture};
     use tn_types::{Certificate, Committee, Round};
 
     // Tests that gc_once is reporting back missing certificates up to gc_round and no further.

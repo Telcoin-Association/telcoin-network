@@ -45,7 +45,7 @@ tn-block-validator = { workspace = true }
 [dev-dependencies]
 rand = { workspace = true }
 tempfile = { workspace = true }
-narwhal-test-utils = { workspace = true }
+tn-test-utils = { workspace = true }
 reqwest = { workspace = true }
 tn-node = { workspace = true }
 narwhal-primary = { workspace = true }

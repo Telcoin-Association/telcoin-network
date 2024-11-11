@@ -14,7 +14,7 @@ use tn_storage::ConsensusStore;
 use tn_storage::{mem_db::MemDatabase, open_db};
 use tn_types::AuthorityIdentifier;
 
-use narwhal_test_utils::{mock_certificate, CommitteeFixture};
+use tn_test_utils::{mock_certificate, CommitteeFixture};
 use tn_types::{Certificate, CommittedSubDag, ReputationScores, Round};
 
 use crate::consensus::{Dag, LeaderSchedule, LeaderSwapTable};

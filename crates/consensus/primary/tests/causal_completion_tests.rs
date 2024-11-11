@@ -1,13 +1,13 @@
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
-use narwhal_test_utils::cluster::Cluster;
 use prometheus::core::Metric;
 use reth::tasks::TaskManager;
 use tn_storage::mem_db::MemDatabase;
+use tn_test_utils::cluster::Cluster;
 
-use narwhal_test_utils::setup_test_tracing;
 use std::time::Duration;
+use tn_test_utils::setup_test_tracing;
 use tracing::info;
 
 #[ignore]
