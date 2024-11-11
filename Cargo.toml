@@ -2,17 +2,17 @@
 members = [
     # common
     "bin/telcoin-network",
+    "crates/config",
+    "crates/storage",
     "crates/tn-types",
+    "crates/tn-node",
 
     # consensus
-    "crates/config",
     "crates/consensus/consensus-metrics",
     "crates/consensus/executor",
     "crates/consensus/network",
     "crates/consensus/network-types",
-    "crates/consensus/tn-node",
     "crates/consensus/primary",
-    "crates/storage",
     "crates/consensus/telcoin-macros",
     "crates/consensus/telcoin-sync",
     "crates/consensus/test-utils",
@@ -194,7 +194,7 @@ assert_matches = { version = "1.5.0" }
 
 # common
 tn-types = { path = "./crates/tn-types" }
-tn-node = { path = "./crates/consensus/tn-node" }
+tn-node = { path = "./crates/tn-node" }
 tn-config = { path = "./crates/config" }
 
 # optional
