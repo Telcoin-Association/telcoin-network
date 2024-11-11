@@ -8,10 +8,10 @@ use std::{
     sync::Arc,
 };
 
-use narwhal_storage::ConsensusStore;
-use narwhal_typed_store::{mem_db::MemDatabase, open_db};
 use reth_tracing::init_test_tracing;
 use tempfile::TempDir;
+use tn_storage::ConsensusStore;
+use tn_storage::{mem_db::MemDatabase, open_db};
 use tn_types::AuthorityIdentifier;
 
 use narwhal_test_utils::{mock_certificate, CommitteeFixture};

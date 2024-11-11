@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 use indexmap::IndexMap;
 use narwhal_test_utils::{AuthorityFixture, CommitteeFixture};
-use narwhal_typed_store::mem_db::MemDatabase;
 use rand::{rngs::OsRng, seq::SliceRandom};
 use std::{collections::BTreeSet, num::NonZeroUsize};
+use tn_storage::mem_db::MemDatabase;
 use tn_types::{
     AuthorityIdentifier, BlsPublicKey, BlsSignature, Certificate, Committee, Header, Stake, Vote,
 };

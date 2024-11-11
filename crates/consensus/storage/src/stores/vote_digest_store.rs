@@ -2,7 +2,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use narwhal_typed_store::{tables::Votes, traits::Database};
+use crate::{tables::Votes, traits::Database};
 use telcoin_macros::fail_point;
 use tn_types::{AuthorityIdentifier, Vote, VoteInfo};
 

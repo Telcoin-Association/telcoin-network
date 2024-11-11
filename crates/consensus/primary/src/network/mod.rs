@@ -11,8 +11,6 @@ use crate::{synchronizer::Synchronizer, ConsensusBus};
 use fastcrypto::hash::Hash;
 use narwhal_network_types::{RequestVoteRequest, RequestVoteResponse};
 use narwhal_primary_metrics::PrimaryMetrics;
-use narwhal_storage::PayloadStore;
-use narwhal_typed_store::traits::Database;
 use parking_lot::Mutex;
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
@@ -20,6 +18,8 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
+use tn_storage::traits::Database;
+use tn_storage::PayloadStore;
 use tn_types::{
     ensure,
     error::{DagError, DagResult},

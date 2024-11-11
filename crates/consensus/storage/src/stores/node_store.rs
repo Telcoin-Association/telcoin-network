@@ -2,16 +2,9 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    payload_store::PayloadStore, vote_digest_store::VoteDigestStore, CertificateStore,
-    ConsensusStore, ProposerStore,
-};
-use narwhal_typed_store::traits::Database;
+use crate::traits::Database;
+use crate::{CertificateStore, ConsensusStore, PayloadStore, ProposerStore, VoteDigestStore};
 use std::sync::Arc;
-
-// A type alias marking the "payload" tokens sent by workers to their primary as batch
-// acknowledgements
-pub use narwhal_typed_store::PayloadToken;
 
 /// All the data stores of the node.
 #[derive(Clone)]

@@ -16,7 +16,7 @@ use narwhal_network_types::{
     RequestBlocksResponse, WorkerBlockMessage, WorkerOthersBlockMessage, WorkerSynchronizeMessage,
     WorkerToWorker, WorkerToWorkerClient,
 };
-use narwhal_typed_store::{
+use tn_storage::{
     tables::WorkerBlocks,
     traits::{Database, DbTxMut},
 };

@@ -28,8 +28,6 @@ use crate::{
 use fastcrypto::hash::Hash as _;
 use futures::FutureExt;
 use narwhal_primary_metrics::PrimaryMetrics;
-use narwhal_storage::ProposerStore;
-use narwhal_typed_store::traits::Database;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
@@ -39,6 +37,8 @@ use std::{
     task::{Context, Poll},
 };
 use tn_config::ConsensusConfig;
+use tn_storage::traits::Database;
+use tn_storage::ProposerStore;
 use tn_types::{
     now, AuthorityIdentifier, BlockHash, Certificate, Committee, Epoch, Header, Noticer, Round,
     SystemMessage, TimestampSec, TnReceiver, TnSender, WorkerId,

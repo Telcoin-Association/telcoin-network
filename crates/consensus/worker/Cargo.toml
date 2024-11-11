@@ -26,13 +26,13 @@ tower = { workspace = true }
 tracing = { workspace = true }
 itertools = { workspace = true }
 
+tn-storage = { workspace = true }
 fastcrypto = { workspace = true, features = ["copy_key"] }
 narwhal-network = { workspace = true }
 narwhal-network-types = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
 prometheus = { workspace = true }
-narwhal-typed-store = { workspace = true }
 consensus-metrics = { workspace = true }
 narwhal-primary-metrics = { workspace = true }
 
@@ -49,7 +49,6 @@ narwhal-test-utils = { workspace = true }
 reqwest = { workspace = true }
 tn-node = { workspace = true }
 narwhal-primary = { workspace = true }
-narwhal-storage = { workspace = true }
 reth-tracing = { workspace = true }
 narwhal-network = { workspace = true, features = ["test-utils"] }
 bytes = { workspace = true }

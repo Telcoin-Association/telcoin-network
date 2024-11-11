@@ -41,8 +41,7 @@ narwhal-network = { workspace = true }
 narwhal-network-types = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
-narwhal-storage = { workspace = true }
-narwhal-typed-store = { workspace = true }
+tn-storage = { workspace = true }
 telcoin-macros = { workspace = true }
 
 telcoin-sync = { workspace = true }
@@ -67,7 +66,7 @@ tempfile = { workspace = true }
 narwhal-test-utils = { workspace = true }
 tracing = { workspace = true }
 narwhal-worker = { workspace = true }
-narwhal-storage = { workspace = true }
+tn-storage = { workspace = true }
 reqwest = { workspace = true }
 bytes = { workspace = true }
 reth-tracing = { workspace = true }

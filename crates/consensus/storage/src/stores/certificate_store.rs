@@ -12,11 +12,11 @@ use std::{
 };
 use telcoin_macros::fail_point;
 
-use crate::{StoreResult, ROUNDS_TO_KEEP};
-use narwhal_typed_store::{
+use crate::{
     tables::{CertificateDigestByOrigin, CertificateDigestByRound, Certificates},
     traits::{Database, DbTx, DbTxMut},
 };
+use crate::{StoreResult, ROUNDS_TO_KEEP};
 use telcoin_sync::sync::notify_read::NotifyRead;
 use tn_types::{AuthorityIdentifier, Certificate, CertificateDigest, Round};
 

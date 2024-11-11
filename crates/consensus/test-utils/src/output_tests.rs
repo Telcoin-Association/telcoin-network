@@ -1,6 +1,6 @@
 use indexmap::IndexMap;
-use narwhal_typed_store::mem_db::MemDatabase;
 use std::{collections::BTreeSet, num::NonZeroUsize};
+use tn_storage::mem_db::MemDatabase;
 use tn_types::{
     AuthorityIdentifier, Certificate, CommittedSubDag, HeaderBuilder, ReputationScores,
 };

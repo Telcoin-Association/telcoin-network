@@ -24,7 +24,6 @@ use narwhal_test_utils::{
     default_test_execution_node, execution_outcome_for_tests, faucet_test_execution_node,
     TransactionFactory,
 };
-use narwhal_typed_store::open_db;
 use narwhal_worker::{
     metrics::WorkerMetrics,
     quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
@@ -44,6 +43,7 @@ use std::{str::FromStr, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tn_config::{fetch_file_content, ContractStandardJson};
 use tn_faucet::Drip;
+use tn_storage::open_db;
 use tn_types::{adiri_genesis, error::BlockSealError, TransactionSigned, WorkerBlock};
 use tokio::{
     sync::{mpsc::Sender, oneshot},

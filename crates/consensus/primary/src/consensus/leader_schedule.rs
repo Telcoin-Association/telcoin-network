@@ -2,8 +2,6 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use narwhal_storage::ConsensusStore;
-use narwhal_typed_store::traits::Database;
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 use std::{
@@ -11,6 +9,8 @@ use std::{
     fmt::{Debug, Formatter},
     sync::Arc,
 };
+use tn_storage::traits::Database;
+use tn_storage::ConsensusStore;
 use tn_types::{Authority, AuthorityIdentifier, Committee, Stake};
 
 use tn_types::{Certificate, ReputationScores, Round};

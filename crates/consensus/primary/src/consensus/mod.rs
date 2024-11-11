@@ -23,8 +23,8 @@ pub use crate::consensus::{
 
 pub use narwhal_primary_metrics::consensus::{ChannelMetrics, ConsensusMetrics};
 
-use narwhal_typed_store::StoreError;
 use thiserror::Error;
+use tn_storage::StoreError;
 
 use tn_types::Certificate;
 

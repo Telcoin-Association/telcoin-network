@@ -433,7 +433,6 @@ mod tests {
     use assert_matches::assert_matches;
     use narwhal_network::client::NetworkClient;
     use narwhal_test_utils::{adiri_genesis_seeded, get_gas_price, TransactionFactory};
-    use narwhal_typed_store::{open_db, tables::WorkerBlocks, traits::Database};
     use narwhal_worker::{
         metrics::WorkerMetrics,
         quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
@@ -466,6 +465,7 @@ mod tests {
     use std::{str::FromStr, time::Duration};
     use tempfile::TempDir;
     use tn_engine::execute_consensus_output;
+    use tn_storage::{open_db, tables::WorkerBlocks, traits::Database};
     use tn_types::{
         adiri_genesis, AutoSealConsensus, BuildArguments, CommittedSubDag, Consensus,
         ConsensusOutput, WorkerBlock,

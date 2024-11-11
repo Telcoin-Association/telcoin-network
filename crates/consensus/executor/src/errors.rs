@@ -1,9 +1,9 @@
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
-use narwhal_typed_store::StoreError;
 use std::fmt::Debug;
 use thiserror::Error;
+use tn_storage::StoreError;
 use tn_types::{CertificateDigest, WorkerId};
 
 /// Return an error if the condition is false.

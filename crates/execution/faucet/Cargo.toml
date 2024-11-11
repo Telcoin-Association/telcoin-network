@@ -56,7 +56,7 @@ narwhal-test-utils = { workspace = true }
 narwhal-network = { workspace = true }
 narwhal-network-types = { workspace = true }
 narwhal-worker = { workspace = true }
-narwhal-typed-store = { workspace = true }
+tn-storage = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 tn-config = { workspace = true }

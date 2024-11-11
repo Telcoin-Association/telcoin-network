@@ -3,7 +3,7 @@
 
 //! Responsible for persisting all consensus output to a persistant store for later retrieval.
 
-use narwhal_typed_store::{
+use tn_storage::{
     tables::{SubDags, WorkerBlocks},
     traits::{Database, DbTxMut},
     ReDB,

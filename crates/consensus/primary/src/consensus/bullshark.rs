@@ -7,9 +7,9 @@ use crate::consensus::{
     Outcome,
 };
 use fastcrypto::hash::Hash;
-use narwhal_storage::ConsensusStore;
-use narwhal_typed_store::traits::Database;
 use std::{collections::VecDeque, sync::Arc};
+use tn_storage::traits::Database;
+use tn_storage::ConsensusStore;
 use tn_types::{Committee, Stake};
 
 use tn_types::{Certificate, CommittedSubDag, ReputationScores, Round};

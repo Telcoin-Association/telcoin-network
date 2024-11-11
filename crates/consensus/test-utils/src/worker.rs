@@ -5,7 +5,7 @@
 
 use crate::temp_dir;
 use fastcrypto::traits::KeyPair as _;
-use narwhal_typed_store::traits::Database;
+use tn_storage::traits::Database;
 use std::path::PathBuf;
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_node::worker::WorkerNode;

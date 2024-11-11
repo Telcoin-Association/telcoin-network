@@ -48,7 +48,7 @@ prometheus = { workspace = true }
 narwhal-worker = { workspace = true }
 narwhal-network = { workspace = true }
 narwhal-network-types = { workspace = true }
-narwhal-typed-store = { workspace = true }
+tn-storage = { workspace = true }
 tn-block-validator = { workspace = true }
 reth-chainspec = { workspace = true }
 reth-db = { workspace = true }

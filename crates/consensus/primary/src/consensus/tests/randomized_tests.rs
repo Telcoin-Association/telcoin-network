@@ -8,8 +8,6 @@ use crate::consensus::{
 };
 use fastcrypto::hash::{Hash, HashFunction};
 use futures::{stream::FuturesUnordered, StreamExt};
-use narwhal_storage::ConsensusStore;
-use narwhal_typed_store::{mem_db::MemDatabase, open_db, traits::Database};
 use rand::{
     distributions::{Bernoulli, Distribution},
     prelude::SliceRandom,
@@ -22,6 +20,8 @@ use std::{
     ops::RangeInclusive,
     sync::Arc,
 };
+use tn_storage::ConsensusStore;
+use tn_storage::{mem_db::MemDatabase, open_db, traits::Database};
 use tn_types::{Authority, AuthorityIdentifier, Committee, Stake};
 
 use narwhal_test_utils::{mock_certificate_with_rand, CommitteeFixture};

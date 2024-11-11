@@ -30,10 +30,10 @@ use narwhal_network::{
     metrics::MetricsMakeCallbackHandler,
 };
 use narwhal_network_types::{PrimaryToWorkerServer, WorkerToWorkerServer};
-use narwhal_typed_store::traits::Database;
 use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, thread::sleep, time::Duration};
 use tn_block_validator::BlockValidation;
 use tn_config::ConsensusConfig;
+use tn_storage::traits::Database;
 use tn_types::{
     traits::KeyPair as _, AuthorityIdentifier, Multiaddr, NetworkPublicKey, Noticer, Protocol,
     WorkerId,

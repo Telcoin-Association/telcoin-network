@@ -4,8 +4,6 @@
 use crate::{primary::PrimaryNode, worker::WorkerNode};
 use engine::{ExecutionNode, TnBuilder};
 use futures::{future::try_join_all, stream::FuturesUnordered};
-pub use narwhal_storage::NodeStorage;
-use narwhal_typed_store::open_db;
 use persist_consensus::PersistConsensus;
 use reth_db::{
     database::Database,
@@ -13,6 +11,8 @@ use reth_db::{
 };
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use tn_config::{ConsensusConfig, KeyConfig, TelcoinDirs};
+use tn_storage::open_db;
+pub use tn_storage::NodeStorage;
 use tracing::{info, instrument};
 
 pub mod dirs;

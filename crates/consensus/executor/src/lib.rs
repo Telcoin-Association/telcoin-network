@@ -9,17 +9,17 @@ mod metrics;
 
 pub use errors::{SubscriberError, SubscriberResult};
 use narwhal_primary::ConsensusBus;
-use narwhal_typed_store::traits::Database;
 pub use state::ExecutionIndices;
+use tn_storage::traits::Database;
 
 pub use crate::metrics::ExecutorMetrics;
 use crate::subscriber::spawn_subscriber;
 
 use async_trait::async_trait;
 use mockall::automock;
-use narwhal_storage::{CertificateStore, ConsensusStore};
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
+use tn_storage::{CertificateStore, ConsensusStore};
 use tn_types::{CertificateDigest, CommittedSubDag, ConsensusOutput, Noticer};
 use tokio::{sync::broadcast, task::JoinHandle};
 use tracing::info;

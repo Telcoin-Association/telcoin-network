@@ -10,8 +10,8 @@
 
 use crate::{metrics::WorkerMetrics, quorum_waiter::QuorumWaiterTrait};
 use narwhal_network::{client::NetworkClient, WorkerToPrimaryClient};
-use narwhal_typed_store::{tables::WorkerBlocks, traits::Database};
 use std::{sync::Arc, time::Duration};
+use tn_storage::{tables::WorkerBlocks, traits::Database};
 use tn_types::{error::BlockSealError, WorkerBlock, WorkerBlockSender, WorkerId};
 
 use narwhal_network_types::WorkerOwnBlockMessage;

@@ -7,8 +7,8 @@ use std::time::Duration;
 use anemo::PeerId;
 use narwhal_network::{PrimaryToPrimaryRpc, WorkerRpc};
 use narwhal_network_types::{FetchCertificatesRequest, RequestBlocksRequest};
+use tn_storage::mem_db::MemDatabase;
 use narwhal_test_utils::cluster::Cluster;
-use narwhal_typed_store::mem_db::MemDatabase;
 use reth::tasks::TaskManager;
 use tn_types::AuthorityIdentifier;
 

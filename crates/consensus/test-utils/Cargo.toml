@@ -33,7 +33,6 @@ tn-config = { workspace = true }
 narwhal-worker = { workspace = true }
 consensus-metrics = { workspace = true }
 narwhal-primary-metrics = { workspace = true }
-narwhal-typed-store = { workspace = true }
 reth-tracing = { workspace = true }
 reth-chainspec = { workspace = true }
 reth-cli-commands = { workspace = true }
@@ -55,11 +54,9 @@ reth-db = { workspace = true, features = ["test-utils"] }
 reth-transaction-pool = { workspace = true }
 jsonrpsee = { workspace = true }
 clap = { workspace = true, features = ["env"] }
-
+tn-storage = { workspace = true }
 telcoin-network = { path = "../../../bin/telcoin-network" }
-
 reth-evm = { workspace = true }
-
 alloy = { workspace = true, features = [
     "contract",
     "signers",
@@ -68,7 +65,6 @@ alloy = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-narwhal-storage = { workspace = true }
 criterion = { workspace = true }
 futures.workspace = true
 

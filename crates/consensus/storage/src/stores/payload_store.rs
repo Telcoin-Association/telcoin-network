@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::PayloadToken;
-use narwhal_typed_store::{
+use crate::{
     tables::Payload,
     traits::{Database, DbTx, DbTxMut},
 };
@@ -113,9 +113,9 @@ impl<DB: Database> PayloadStore<DB> {
 
 #[cfg(test)]
 mod tests {
+    use crate::open_db;
     use crate::PayloadStore;
     use futures::future::join_all;
-    use narwhal_typed_store::open_db;
     use tempfile::TempDir;
     use tn_types::WorkerBlock;
 

@@ -21,7 +21,7 @@ tokio = { workspace = true, features = ["sync"] }
 tonic.workspace = true
 tracing.workspace = true
 prometheus.workspace = true
-narwhal-storage = { workspace = true }
+tn-storage = { workspace = true }
 narwhal-network-types = { workspace = true }
 
 tn-types = { workspace = true }
@@ -30,7 +30,6 @@ narwhal-network = { workspace = true }
 mockall.workspace = true
 
 consensus-metrics.workspace = true
-narwhal-typed-store = { workspace = true }
 narwhal-primary = { workspace = true }
 
 [dev-dependencies]

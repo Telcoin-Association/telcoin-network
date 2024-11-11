@@ -17,8 +17,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 fastcrypto = { workspace = true }
 narwhal-network = { workspace = true }
-narwhal-typed-store = { workspace = true }
-narwhal-storage = { workspace = true }
+tn-storage = { workspace = true }
 tn-types = { workspace = true }
 eyre = { workspace = true }
 rand = { workspace = true }

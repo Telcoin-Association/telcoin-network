@@ -11,8 +11,6 @@ use crate::{
 };
 use consensus_metrics::spawn_logged_monitored_task;
 use fastcrypto::hash::Hash;
-use narwhal_storage::CertificateStore;
-use narwhal_typed_store::traits::Database;
 use std::{
     cmp::{max, Ordering},
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -20,6 +18,8 @@ use std::{
     sync::Arc,
 };
 use tn_config::ConsensusConfig;
+use tn_storage::traits::Database;
+use tn_storage::CertificateStore;
 use tn_types::{
     AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Committee,
     ConsensusCommit, Noticer, Round, SequenceNumber, Timestamp, TnReceiver, TnSender,

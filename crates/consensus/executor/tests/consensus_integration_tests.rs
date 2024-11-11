@@ -9,7 +9,7 @@ use narwhal_primary::{
 };
 
 use narwhal_test_utils::CommitteeFixture;
-use narwhal_typed_store::mem_db::MemDatabase;
+use tn_storage::mem_db::MemDatabase;
 use tn_types::DEFAULT_BAD_NODES_STAKE_THRESHOLD;
 
 use std::{collections::BTreeSet, sync::Arc};

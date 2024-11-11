@@ -12,8 +12,8 @@ use crate::{
 };
 #[allow(unused_imports)]
 use fastcrypto::traits::KeyPair;
+use tn_storage::{mem_db::MemDatabase, open_db};
 use narwhal_test_utils::{CommitteeFixture, TelcoinTempDirs};
-use narwhal_typed_store::{mem_db::MemDatabase, open_db};
 #[cfg(test)]
 use std::collections::BTreeSet;
 use std::collections::HashMap;

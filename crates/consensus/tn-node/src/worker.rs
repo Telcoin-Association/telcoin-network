@@ -5,7 +5,6 @@
 //! Hierarchical type to hold tasks spawned for a worker in the network.
 use crate::{engine::ExecutionNode, error::NodeError, try_join_all, FuturesUnordered};
 use anemo::PeerId;
-use narwhal_typed_store::traits::Database as ConsensusDatabase;
 use narwhal_worker::{metrics::Metrics, Worker};
 use reth_db::{
     database::Database,
@@ -14,6 +13,7 @@ use reth_db::{
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use std::{sync::Arc, time::Instant};
 use tn_config::ConsensusConfig;
+use tn_storage::traits::Database as ConsensusDatabase;
 use tn_types::WorkerId;
 use tokio::{sync::RwLock, task::JoinHandle};
 use tracing::{info, instrument};

@@ -8,14 +8,14 @@ use consensus_metrics::{monitored_future, monitored_scope, spawn_logged_monitore
 use futures::{stream::FuturesUnordered, StreamExt};
 use narwhal_network::PrimaryToPrimaryRpc;
 use narwhal_primary_metrics::PrimaryMetrics;
-use narwhal_storage::CertificateStore;
-use narwhal_typed_store::traits::Database;
 use rand::{rngs::ThreadRng, seq::SliceRandom};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
     time::Duration,
 };
+use tn_storage::traits::Database;
+use tn_storage::CertificateStore;
 use tn_types::{AuthorityIdentifier, Committee, NetworkPublicKey, Noticer, TnReceiver, TnSender};
 
 use narwhal_network_types::{FetchCertificatesRequest, FetchCertificatesResponse};

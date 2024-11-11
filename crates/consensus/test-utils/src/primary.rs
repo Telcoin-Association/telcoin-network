@@ -3,10 +3,10 @@
 
 //! Primary fixture for the cluster
 use narwhal_primary::consensus::ConsensusMetrics;
-use narwhal_typed_store::traits::Database;
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 use tn_config::ConsensusConfig;
 use tn_node::primary::PrimaryNode;
+use tn_storage::traits::Database;
 use tn_types::{AuthorityIdentifier, ConsensusOutput};
 use tokio::{
     sync::broadcast::{self},

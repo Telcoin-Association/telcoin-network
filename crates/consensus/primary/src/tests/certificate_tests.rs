@@ -5,8 +5,8 @@
 // This test file tests the validity of the 'certificates' implementation.
 
 use fastcrypto::traits::KeyPair as _;
+use tn_storage::mem_db::MemDatabase;
 use narwhal_test_utils::CommitteeFixture;
-use narwhal_typed_store::mem_db::MemDatabase;
 use rand::{
     rngs::{OsRng, StdRng},
     SeedableRng,

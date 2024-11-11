@@ -16,8 +16,8 @@ use narwhal_network::{
     client::NetworkClient,
     PrimaryToWorkerClient, RetryConfig,
 };
-use narwhal_storage::{CertificateStore, PayloadStore};
-use narwhal_typed_store::traits::Database;
+use tn_storage::{CertificateStore, PayloadStore};
+use tn_storage::traits::Database;
 use parking_lot::Mutex;
 use std::{
     cmp::min,
@@ -1573,7 +1573,7 @@ mod tests {
     use fastcrypto::{hash::Hash, traits::KeyPair};
     use itertools::Itertools;
     use narwhal_test_utils::{make_optimal_signed_certificates, CommitteeFixture};
-    use narwhal_typed_store::mem_db::MemDatabase;
+    use tn_storage::mem_db::MemDatabase;
     use std::{collections::BTreeSet, num::NonZeroUsize};
     use tn_types::{Certificate, Committee, Round};
 

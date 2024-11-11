@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{cluster::Cluster, ensure_test_environment};
-use narwhal_typed_store::mem_db::MemDatabase;
 use reth::{providers::BlockReader, tasks::TaskManager};
 use std::time::Duration;
+use tn_storage::mem_db::MemDatabase;
 
 #[tokio::test]
 async fn basic_cluster_setup() {

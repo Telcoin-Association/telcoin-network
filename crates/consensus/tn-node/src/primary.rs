@@ -12,7 +12,7 @@ use narwhal_primary::{
     ConsensusBus, Primary, CHANNEL_CAPACITY,
 };
 use narwhal_primary_metrics::Metrics;
-use narwhal_typed_store::traits::Database as ConsensusDatabase;
+use tn_storage::traits::Database as ConsensusDatabase;
 use reth_db::{
     database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},

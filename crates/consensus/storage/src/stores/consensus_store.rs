@@ -4,11 +4,11 @@
 
 //! NOTE: tests for this module are in test-utils storage_tests.rs to avoid circular dependancies.
 
-use crate::{StoreResult, ROUNDS_TO_KEEP};
-use narwhal_typed_store::{
+use crate::{
     tables::{CommittedSubDag as CommittedSubDagTable, LastCommitted},
     traits::{Database, DbTxMut},
 };
+use crate::{StoreResult, ROUNDS_TO_KEEP};
 use std::collections::HashMap;
 use tn_types::{AuthorityIdentifier, CommittedSubDag, ConsensusCommit, Round, SequenceNumber};
 use tracing::debug;

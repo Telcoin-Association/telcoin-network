@@ -5,8 +5,8 @@
 
 use super::*;
 use narwhal_network::test_utils::WorkerToWorkerMockServer;
+use tn_storage::mem_db::MemDatabase;
 use narwhal_test_utils::{batch, test_network, CommitteeFixture};
-use narwhal_typed_store::mem_db::MemDatabase;
 
 #[tokio::test]
 async fn wait_for_quorum() {

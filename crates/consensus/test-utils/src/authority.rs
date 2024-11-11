@@ -10,10 +10,10 @@ use crate::{
 use fastcrypto::{hash::Hash, traits::KeyPair as _};
 use jsonrpsee::http_client::HttpClient;
 use narwhal_network::client::NetworkClient;
-use narwhal_typed_store::traits::Database;
 use reth::primitives::Address;
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use tn_config::{Config, ConsensusConfig, KeyConfig};
+use tn_storage::traits::Database;
 use tn_types::{
     Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, Certificate, Committee,
     ConsensusOutput, Header, HeaderBuilder, Multiaddr, NetworkKeypair, NetworkPublicKey, Round,

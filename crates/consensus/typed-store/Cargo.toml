@@ -13,11 +13,11 @@ publish = false
 
 [dependencies]
 eyre = { workspace = true }
+tracing = { workspace = true }
+tn-types = { workspace = true }
 prometheus = { workspace = true }
 serde = { workspace = true }
-tracing = { workspace = true }
 ouroboros = { workspace = true }
-tn-types = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 
@@ -47,9 +47,3 @@ page_size = { version = "0.6.0", optional = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 uint = { workspace = true }     # For rocks tests.
-
-[features]
-redb = []
-rocksdb = ["dep:rocksdb", "dep:thiserror", "dep:fdlimit", "dep:telcoin-macros"]
-reth-libmdbx = ["dep:reth-libmdbx", "dep:page_size"]
-default = ["reth-libmdbx"]

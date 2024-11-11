@@ -5096,9 +5096,7 @@ dependencies = [
  "narwhal-network",
  "narwhal-network-types",
  "narwhal-primary",
- "narwhal-storage",
  "narwhal-test-utils",
- "narwhal-typed-store",
  "prometheus",
  "reth-primitives",
  "serde",
@@ -5106,6 +5104,7 @@ dependencies = [
  "thiserror",
  "tn-config",
  "tn-node",
+ "tn-storage",
  "tn-types",
  "tokio",
  "tonic 0.10.2",
@@ -5186,9 +5185,7 @@ dependencies = [
  "narwhal-network",
  "narwhal-network-types",
  "narwhal-primary-metrics",
- "narwhal-storage",
  "narwhal-test-utils",
- "narwhal-typed-store",
  "narwhal-worker",
  "once_cell",
  "parking_lot 0.12.3",
@@ -5207,6 +5204,7 @@ dependencies = [
  "tn-block-validator",
  "tn-config",
  "tn-node",
+ "tn-storage",
  "tn-types",
  "tokio",
  "tokio-stream",
@@ -5221,23 +5219,6 @@ dependencies = [
  "consensus-metrics",
  "narwhal-network",
  "prometheus",
- "tracing",
-]
-
-[[package]]
-name = "narwhal-storage"
-version = "0.1.0"
-dependencies = [
- "eyre",
- "fastcrypto",
- "futures",
- "narwhal-test-utils",
- "narwhal-typed-store",
- "telcoin-macros",
- "telcoin-sync",
- "tempfile",
- "tn-types",
- "tokio",
  "tracing",
 ]
 
@@ -5261,8 +5242,6 @@ dependencies = [
  "narwhal-network-types",
  "narwhal-primary",
  "narwhal-primary-metrics",
- "narwhal-storage",
- "narwhal-typed-store",
  "narwhal-worker",
  "once_cell",
  "prometheus",
@@ -5287,33 +5266,11 @@ dependencies = [
  "tn-engine",
  "tn-faucet",
  "tn-node",
+ "tn-storage",
  "tn-types",
  "tokio",
  "tonic 0.10.2",
  "tracing",
-]
-
-[[package]]
-name = "narwhal-typed-store"
-version = "0.1.0"
-dependencies = [
- "dashmap 6.1.0",
- "eyre",
- "fdlimit",
- "ouroboros",
- "page_size",
- "parking_lot 0.12.3",
- "prometheus",
- "redb",
- "reth-libmdbx",
- "rocksdb",
- "serde",
- "telcoin-macros",
- "tempfile",
- "thiserror",
- "tn-types",
- "tracing",
- "uint",
 ]
 
 [[package]]
@@ -5337,9 +5294,7 @@ dependencies = [
  "narwhal-network-types",
  "narwhal-primary",
  "narwhal-primary-metrics",
- "narwhal-storage",
  "narwhal-test-utils",
- "narwhal-typed-store",
  "prometheus",
  "rand 0.8.5",
  "reqwest 0.12.7",
@@ -5351,6 +5306,7 @@ dependencies = [
  "tn-block-validator",
  "tn-config",
  "tn-node",
+ "tn-storage",
  "tn-types",
  "tokio",
  "tonic 0.10.2",
@@ -10669,7 +10625,6 @@ dependencies = [
  "narwhal-network",
  "narwhal-network-types",
  "narwhal-test-utils",
- "narwhal-typed-store",
  "narwhal-worker",
  "prometheus",
  "reth",
@@ -10694,6 +10649,7 @@ dependencies = [
  "tn-block-builder",
  "tn-block-validator",
  "tn-engine",
+ "tn-storage",
  "tn-types",
  "tokio",
  "tracing",
@@ -10738,8 +10694,6 @@ dependencies = [
  "fastcrypto",
  "humantime-serde",
  "narwhal-network",
- "narwhal-storage",
- "narwhal-typed-store",
  "parking_lot 0.12.3",
  "rand 0.8.5",
  "reth-chainspec",
@@ -10749,6 +10703,7 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "thiserror",
+ "tn-storage",
  "tn-types",
  "tracing",
 ]
@@ -10804,7 +10759,6 @@ dependencies = [
  "narwhal-network",
  "narwhal-network-types",
  "narwhal-test-utils",
- "narwhal-typed-store",
  "narwhal-worker",
  "prometheus",
  "reth",
@@ -10821,6 +10775,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tn-config",
+ "tn-storage",
  "tn-types",
  "tokio",
  "tokio-stream",
@@ -10851,9 +10806,7 @@ dependencies = [
  "narwhal-network-types",
  "narwhal-primary",
  "narwhal-primary-metrics",
- "narwhal-storage",
  "narwhal-test-utils",
- "narwhal-typed-store",
  "narwhal-worker",
  "prometheus",
  "rand 0.8.5",
@@ -10897,11 +10850,40 @@ dependencies = [
  "tn-config",
  "tn-engine",
  "tn-faucet",
+ "tn-storage",
  "tn-types",
  "tokio",
  "tokio-stream",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "tn-storage"
+version = "0.1.0"
+dependencies = [
+ "dashmap 6.1.0",
+ "eyre",
+ "fastcrypto",
+ "fdlimit",
+ "futures",
+ "narwhal-test-utils",
+ "ouroboros",
+ "page_size",
+ "parking_lot 0.12.3",
+ "prometheus",
+ "redb",
+ "reth-libmdbx",
+ "rocksdb",
+ "serde",
+ "telcoin-macros",
+ "telcoin-sync",
+ "tempfile",
+ "thiserror",
+ "tn-types",
+ "tokio",
+ "tracing",
+ "uint",
 ]
 
 [[package]]

@@ -3,7 +3,6 @@
 
 //! The builder responsible for creating all aspects of the committee fixture.
 use super::{AuthorityFixture, CommitteeFixture};
-use narwhal_typed_store::traits::Database;
 use rand::{
     rngs::{OsRng, StdRng},
     SeedableRng,
@@ -15,6 +14,7 @@ use std::{
     num::NonZeroUsize,
 };
 use tn_config::KeyConfig;
+use tn_storage::traits::Database;
 use tn_types::{
     get_available_tcp_port, traits::KeyPair, Authority, BlsKeypair, Committee, Epoch, Multiaddr,
     Stake, WorkerCache, WorkerIndex,

@@ -9,8 +9,8 @@ use crate::consensus::LeaderSwapTable;
 use consensus_metrics::spawn_logged_monitored_task;
 use indexmap::IndexMap;
 use narwhal_test_utils::{fixture_payload, CommitteeFixture};
-use narwhal_typed_store::mem_db::MemDatabase;
 use reth_primitives::B256;
+use tn_storage::mem_db::MemDatabase;
 use tn_types::{BlockHash, CHANNEL_CAPACITY};
 
 #[tokio::test]

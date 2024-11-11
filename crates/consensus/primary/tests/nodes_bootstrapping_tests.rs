@@ -2,8 +2,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 use narwhal_test_utils::cluster::Cluster;
-use narwhal_typed_store::mem_db::MemDatabase;
 use reth::tasks::TaskManager;
+use tn_storage::mem_db::MemDatabase;
 
 use narwhal_test_utils::setup_test_tracing;
 use std::time::Duration;

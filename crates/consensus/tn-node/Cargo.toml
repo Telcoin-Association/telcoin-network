@@ -34,9 +34,8 @@ fastcrypto = { workspace = true }
 narwhal-executor = { workspace = true }
 narwhal-network = { workspace = true }
 narwhal-primary = { workspace = true, features = ["test-utils"] }
-narwhal-typed-store = { workspace = true }
 prometheus = { workspace = true }
-narwhal-storage = { workspace = true }
+tn-storage = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
 narwhal-network-types = { workspace = true }

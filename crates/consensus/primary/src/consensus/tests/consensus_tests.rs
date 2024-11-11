@@ -7,7 +7,7 @@ use std::{collections::BTreeSet, sync::Arc};
 use fastcrypto::hash::Hash;
 
 use narwhal_test_utils::CommitteeFixture;
-use narwhal_typed_store::mem_db::MemDatabase;
+use tn_storage::mem_db::MemDatabase;
 use tn_types::{
     Certificate, ReputationScores, TnReceiver, TnSender, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };

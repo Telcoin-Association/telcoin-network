@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use narwhal_network::client::NetworkClient;
-use narwhal_storage::NodeStorage;
-use narwhal_typed_store::traits::Database;
 use parking_lot::Mutex;
+use tn_storage::traits::Database;
+use tn_storage::NodeStorage;
 use tn_types::{Authority, Committee, Noticer, Notifier, WorkerCache};
 
 use crate::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, Parameters, TelcoinDirs};
