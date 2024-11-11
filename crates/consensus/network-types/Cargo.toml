@@ -8,6 +8,7 @@ homepage.workspace = true
 repository.workspace = true
 authors = [
     "Grant Kee <grant@telcoin.org>",
+    "Steven Stanfield <steve@telcoin.org>",
     "Mysten Labs <build@mystenlabs.com>",
 ]
 description = "Commonly used types in telcoin network's internal network communication."

@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
+authors = [
+    "Grant Kee <grant@telcoin.org>",
+    "Steven Stanfield <steve@telcoin.org>",
+    "Markus Osterlund <markus@telcoin.org>",
+]
 
 [dependencies]
 tracing = { workspace = true }

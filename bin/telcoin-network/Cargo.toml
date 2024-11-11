@@ -5,6 +5,11 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/telcoin/telcoin-network"
 readme = "README.md"
+authors = [
+    "Grant Kee <grant@telcoin.org>",
+    "Steven Stanfield <steve@telcoin.org>",
+    "Markus Osterlund <markus@telcoin.org>",
+]
 
 [dependencies]
 clap = { workspace = true, features = ["derive", "env"] }

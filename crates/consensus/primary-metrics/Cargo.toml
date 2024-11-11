@@ -3,8 +3,8 @@ name = "narwhal-primary-metrics"
 version.workspace = true
 authors = [
     "Grant Kee <grant@telcoin.org>",
-    "Mysten Labs <build@mystenlabs.com>",
     "Steven Stanfield <steve@telcoin.org>",
+    "Mysten Labs <build@mystenlabs.com>",
 ]
 license = "Apache-2.0"
 publish = false

@@ -4,8 +4,8 @@ version.workspace = true
 license = "Apache-2.0"
 authors = [
     "Grant Kee <grant@telcoin.org>",
-    "Francois Garillot <francois@mystenlabs.com>",
     "Steven Stanfield <steve@telcoin.org>",
+    "Francois Garillot <francois@mystenlabs.com>",
 ]
 description = "a typed database interface"
 edition = "2021"

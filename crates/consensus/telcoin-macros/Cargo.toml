@@ -2,6 +2,7 @@
 name = "telcoin-macros"
 authors = [
     "Grant Kee <grant@telcoin.org>",
+    "Steven Stanfield <steve@telcoin.org>",
     "Mysten Labs <build@mystenlabs.com>",
 ]
 version.workspace = true

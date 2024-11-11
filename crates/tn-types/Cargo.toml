@@ -5,8 +5,9 @@ edition = "2021"
 license = "Apache-2.0"
 authors = [
     "Grant Kee <grant@telcoin.org>",
-    "Mysten Labs <build@mystenlabs.com>",
     "Steven Stanfield <steve@telcoin.org>",
+    "Markus Osterlund <markus@telcoin.org>",
+    "Mysten Labs <build@mystenlabs.com>",
 ]
 publish = false
 

@@ -4,6 +4,7 @@ version.workspace = true
 license = "Apache-2.0"
 authors = [
     "Grant Kee <grant@telcoin.org>",
+    "Steven Stanfield <steve@telcoin.org>",
     "Mysten Labs <build@mystenlabs.com>",
 ]
 publish = false
