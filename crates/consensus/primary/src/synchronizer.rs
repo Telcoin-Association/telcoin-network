@@ -16,8 +16,6 @@ use narwhal_network::{
     client::NetworkClient,
     PrimaryToWorkerClient, RetryConfig,
 };
-use tn_storage::{CertificateStore, PayloadStore};
-use tn_storage::traits::Database;
 use parking_lot::Mutex;
 use std::{
     cmp::min,
@@ -28,8 +26,10 @@ use std::{
     },
     time::Duration,
 };
-use telcoin_sync::sync::notify_once::NotifyOnce;
 use tn_config::ConsensusConfig;
+use tn_storage::traits::Database;
+use tn_storage::{CertificateStore, PayloadStore};
+use tn_sync::sync::notify_once::NotifyOnce;
 use tn_types::{
     AuthorityIdentifier, Committee, NetworkPublicKey, TnReceiver, TnSender, WorkerCache,
 };
@@ -1573,8 +1573,8 @@ mod tests {
     use fastcrypto::{hash::Hash, traits::KeyPair};
     use itertools::Itertools;
     use narwhal_test_utils::{make_optimal_signed_certificates, CommitteeFixture};
-    use tn_storage::mem_db::MemDatabase;
     use std::{collections::BTreeSet, num::NonZeroUsize};
+    use tn_storage::mem_db::MemDatabase;
     use tn_types::{Certificate, Committee, Round};
 
     // Tests that gc_once is reporting back missing certificates up to gc_round and no further.

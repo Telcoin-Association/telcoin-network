@@ -42,7 +42,7 @@ anemo = { workspace = true }
 once_cell = { workspace = true }
 match_opt = { workspace = true }
 multiaddr = { workspace = true }
-telcoin-sync = { workspace = true }
+tn-sync = { workspace = true }
 alloy-rlp = { workspace = true }
 parking_lot = { workspace = true }
 serde_yaml = { workspace = true }

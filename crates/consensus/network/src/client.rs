@@ -13,7 +13,7 @@ use narwhal_network_types::{
 };
 use parking_lot::RwLock;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use telcoin_sync::sync::notify_once::NotifyOnce;
+use tn_sync::sync::notify_once::NotifyOnce;
 use tn_types::{traits::KeyPair, NetworkKeypair, NetworkPublicKey};
 use tokio::{select, time::sleep};
 use tracing::error;

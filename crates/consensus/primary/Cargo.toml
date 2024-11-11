@@ -42,9 +42,9 @@ narwhal-network-types = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
 tn-storage = { workspace = true }
-telcoin-macros = { workspace = true }
+tn-macros = { workspace = true }
 
-telcoin-sync = { workspace = true }
+tn-sync = { workspace = true }
 consensus-metrics = { workspace = true }
 narwhal-primary-metrics = { workspace = true }
 

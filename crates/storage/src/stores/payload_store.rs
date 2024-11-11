@@ -8,8 +8,8 @@ use crate::{
     traits::{Database, DbTx, DbTxMut},
 };
 use std::sync::Arc;
-use telcoin_macros::fail_point;
-use telcoin_sync::sync::notify_read::NotifyRead;
+use tn_macros::fail_point;
+use tn_sync::sync::notify_read::NotifyRead;
 use tn_types::{BlockHash, WorkerId};
 
 /// Store of the batch digests for the primary node for the own created batches.

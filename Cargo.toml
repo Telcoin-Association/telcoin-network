@@ -3,9 +3,12 @@ members = [
     # common
     "bin/telcoin-network",
     "crates/config",
+    "crates/engine",
+    "crates/node",
     "crates/storage",
-    "crates/tn-types",
-    "crates/tn-node",
+    "crates/types",
+    "crates/tn-macros",
+    "crates/tn-sync",
 
     # consensus
     "crates/consensus/consensus-metrics",
@@ -13,8 +16,6 @@ members = [
     "crates/consensus/network",
     "crates/consensus/network-types",
     "crates/consensus/primary",
-    "crates/consensus/telcoin-macros",
-    "crates/consensus/telcoin-sync",
     "crates/consensus/test-utils",
     "crates/consensus/worker",
     "crates/consensus/primary-metrics",
@@ -23,7 +24,6 @@ members = [
     "crates/execution/block-builder",
     "crates/execution/block-validator",
     "crates/execution/faucet",
-    "crates/execution/engine",
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
@@ -184,7 +184,7 @@ alloy = { version = "0.3.6", features = ["full"] }
 alloy-rlp = "0.3.4"
 
 tn-block-validator = { path = "crates/execution/block-validator" }
-tn-engine = { path = "crates/execution/engine" }
+tn-engine = { path = "crates/engine" }
 
 # block maker
 tn-block-builder = { path = "crates/execution/block-builder" }
@@ -193,8 +193,8 @@ jsonrpsee = { version = "0.24" }
 assert_matches = { version = "1.5.0" }
 
 # common
-tn-types = { path = "./crates/tn-types" }
-tn-node = { path = "./crates/tn-node" }
+tn-types = { path = "./crates/types" }
+tn-node = { path = "./crates/node" }
 tn-config = { path = "./crates/config" }
 
 # optional
@@ -210,8 +210,8 @@ narwhal-test-utils = { path = "./crates/consensus/test-utils" }
 narwhal-network-types = { path = "./crates/consensus/network-types" }
 consensus-metrics = { path = "./crates/consensus/consensus-metrics" }
 narwhal-primary-metrics = { path = "./crates/consensus/primary-metrics" }
-telcoin-sync = { path = "./crates/consensus/telcoin-sync" }
-telcoin-macros = { path = "./crates/consensus/telcoin-macros" }
+tn-sync = { path = "./crates/tn-sync" }
+tn-macros = { path = "./crates/tn-macros" }
 
 # misc
 fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "802c1ac98061687d6ce024849c747a250dbeea52" }

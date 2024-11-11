@@ -5132,9 +5132,9 @@ dependencies = [
  "prometheus",
  "quinn-proto",
  "rand 0.8.5",
- "telcoin-macros",
- "telcoin-sync",
  "thiserror",
+ "tn-macros",
+ "tn-sync",
  "tn-types",
  "tokio",
  "tower",
@@ -5197,14 +5197,14 @@ dependencies = [
  "reth-primitives",
  "reth-tracing",
  "tap",
- "telcoin-macros",
- "telcoin-sync",
  "tempfile",
  "thiserror",
  "tn-block-validator",
  "tn-config",
+ "tn-macros",
  "tn-node",
  "tn-storage",
+ "tn-sync",
  "tn-types",
  "tokio",
  "tokio-stream",
@@ -10360,15 +10360,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
-name = "telcoin-macros"
-version = "0.1.0"
-dependencies = [
- "futures",
- "once_cell",
- "tracing",
-]
-
-[[package]]
 name = "telcoin-network"
 version = "0.1.0"
 dependencies = [
@@ -10425,15 +10416,6 @@ dependencies = [
  "tonic 0.10.2",
  "tracing",
  "vergen",
-]
-
-[[package]]
-name = "telcoin-sync"
-version = "0.1.0"
-dependencies = [
- "futures",
- "parking_lot 0.12.3",
- "tokio",
 ]
 
 [[package]]
@@ -10784,6 +10766,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tn-macros"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "once_cell",
+ "tracing",
+]
+
+[[package]]
 name = "tn-node"
 version = "0.1.0"
 dependencies = [
@@ -10876,14 +10867,23 @@ dependencies = [
  "reth-libmdbx",
  "rocksdb",
  "serde",
- "telcoin-macros",
- "telcoin-sync",
  "tempfile",
  "thiserror",
+ "tn-macros",
+ "tn-sync",
  "tn-types",
  "tokio",
  "tracing",
  "uint",
+]
+
+[[package]]
+name = "tn-sync"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "parking_lot 0.12.3",
+ "tokio",
 ]
 
 [[package]]
@@ -10922,9 +10922,9 @@ dependencies = [
  "serde_repr",
  "serde_with 2.3.3",
  "serde_yaml",
- "telcoin-sync",
  "tempfile",
  "thiserror",
+ "tn-sync",
  "tokio",
  "tracing",
 ]

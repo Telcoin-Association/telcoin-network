@@ -18,11 +18,11 @@ parking_lot = { workspace = true }
 quinn-proto = { workspace = true }
 prometheus = { workspace = true }
 rand = { workspace = true, features = ["small_rng"] }
-telcoin-macros = { workspace = true }
+tn-macros = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "sync", "macros", "time"] }
 tracing = { workspace = true }
 tn-types = { workspace = true }
-telcoin-sync = { workspace = true }
+tn-sync = { workspace = true }
 consensus-metrics = { workspace = true }
 narwhal-network-types = { workspace = true }
 

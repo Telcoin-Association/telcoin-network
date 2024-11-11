@@ -6,7 +6,7 @@
 
 use crate::{tables::LastProposed, traits::Database};
 use crate::{ProposerKey, StoreResult};
-use telcoin_macros::fail_point;
+use tn_macros::fail_point;
 use tn_types::Header;
 
 pub const LAST_PROPOSAL_KEY: ProposerKey = 0;

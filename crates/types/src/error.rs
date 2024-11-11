@@ -7,8 +7,8 @@ use crate::{
 };
 use fastcrypto::hash::Digest;
 use std::sync::Arc;
-use telcoin_sync::sync::notify_once::NotifyOnce;
 use thiserror::Error;
+use tn_sync::sync::notify_once::NotifyOnce;
 
 /// Return an error if the condition is false.
 #[macro_export(local_inner_macros)]
