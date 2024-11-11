@@ -3,7 +3,7 @@ name = "narwhal-network"
 version.workspace = true
 license = "Apache-2.0"
 authors = [
-    "Grant Kee <grant.kee@telco.in>",
+    "Grant Kee <grant@telcoin.org>",
     "Mysten Labs <build@mystenlabs.com>",
 ]
 edition = "2021"

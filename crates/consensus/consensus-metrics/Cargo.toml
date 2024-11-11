@@ -2,7 +2,7 @@
 name = "consensus-metrics"
 version.workspace = true
 authors = [
-    "Grant Kee <grant.kee@telco.in>",
+    "Grant Kee <grant@telcoin.org>",
     "Mysten Labs <build@mystenlabs.com>",
 ]
 license = "Apache-2.0"

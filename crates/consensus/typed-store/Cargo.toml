@@ -3,7 +3,7 @@ name = "narwhal-typed-store"
 version.workspace = true
 license = "Apache-2.0"
 authors = [
-    "Grant Kee <grant.kee@telco.in>",
+    "Grant Kee <grant@telcoin.org>",
     "Francois Garillot <francois@mystenlabs.com>",
     "Steven Stanfield <steve@telcoin.org>",
 ]

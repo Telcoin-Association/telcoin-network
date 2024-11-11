@@ -7,7 +7,7 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 authors = [
-    "Grant Kee <grant.kee@telco.in>",
+    "Grant Kee <grant@telcoin.org>",
     "Mysten Labs <build@mystenlabs.com>",
 ]
 description = "Commonly used types in telcoin network's internal network communication."
