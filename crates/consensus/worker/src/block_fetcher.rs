@@ -269,7 +269,7 @@ impl<'a> PendingGuard<'a> {
     }
 }
 
-impl<'a> Drop for PendingGuard<'a> {
+impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
         self.metric.dec()
     }

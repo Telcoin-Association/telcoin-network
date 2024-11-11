@@ -7,9 +7,11 @@
 //! signature to be EVM compatible. The faucet service does all of this and
 //! then submits the transaction to the RPC Transaction Pool for the next batch.
 
-use crate::util::{create_validator_info, IT_TEST_MUTEX};
-use alloy::{network::EthereumWallet, providers::ProviderBuilder, sol, sol_types::SolValue};
-use clap::Parser;
+use crate::util::{
+    ensure_account_balance_infinite_loop, get_contract_state_for_genesis, spawn_local_testnet,
+    IT_TEST_MUTEX,
+};
+use alloy::{hex, network::EthereumWallet, providers::ProviderBuilder, sol, sol_types::SolValue};
 use futures::{stream::FuturesUnordered, StreamExt};
 use gcloud_sdk::{
     google::cloud::kms::v1::{
@@ -17,36 +19,18 @@ use gcloud_sdk::{
     },
     GoogleApi, GoogleAuthMiddleware, GoogleEnvironment,
 };
-use jsonrpsee::{
-    core::client::ClientT,
-    http_client::{HttpClient, HttpClientBuilder},
-    rpc_params,
-};
+use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
 use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicKey as PubKey};
-use narwhal_test_utils::{
-    contract_artifacts::{
-        ERC1967PROXY_INITCODE, ERC1967PROXY_RUNTIMECODE, STABLECOINMANAGER_RUNTIMECODE,
-        STABLECOIN_RUNTIMECODE,
-    },
-    default_test_execution_node, execution_outcome_for_tests, CommandParser, TransactionFactory,
-};
-use reth::{
-    providers::ExecutionOutcome,
-    tasks::{TaskExecutor, TaskManager},
-    CliContext,
-};
+use narwhal_test_utils::TransactionFactory;
+use reth::tasks::TaskManager;
 use reth_chainspec::ChainSpec;
-use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
-use reth_primitives::{public_key_to_address, Address, GenesisAccount, SealedHeader, B256, U256};
+use reth_primitives::{public_key_to_address, Address, GenesisAccount, B256, U256};
 use reth_tracing::init_test_tracing;
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
-use telcoin_network::{genesis::GenesisArgs, node::NodeCommand};
-use tn_faucet::FaucetArgs;
-use tn_node::launch_node;
-use tn_types::{adiri_genesis, TransactionSigned, WorkerBlock};
+use tn_types::{adiri_genesis, fetch_file_content, ContractStandardJson};
 use tokio::{runtime::Handle, task::JoinHandle, time::timeout};
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 #[tokio::test]
 async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result<()> {
@@ -102,12 +86,25 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
         }
     );
 
-    // extend genesis accounts to fund factory_address, etch bytecodes, and construct proxy creation
-    // txs
+    // set random addresses on which to etch contract bytecodes
     let faucet_impl_address = Address::random();
     let stablecoin_impl_address = Address::random();
-    let faucet_bytecode = *STABLECOINMANAGER_RUNTIMECODE;
-    let stablecoin_impl_bytecode = STABLECOIN_RUNTIMECODE.as_slice();
+    // fetch bytecode attributes from compiled jsons in tn-contracts repo
+    let faucet_standard_json = fetch_file_content(
+        "../../tn-contracts/out/StablecoinManager.sol/StablecoinManager.json".into(),
+    );
+    let faucet_contract: ContractStandardJson =
+        serde_json::from_str(&faucet_standard_json).expect("json parsing failure");
+    let faucet_bytecode =
+        hex::decode(faucet_contract.deployed_bytecode.object).expect("invalid bytecode hexstring");
+    let stablecoin_json =
+        fetch_file_content("../../tn-contracts/out/Stablecoin.sol/Stablecoin.json".into());
+    let stablecoin_contract: ContractStandardJson =
+        serde_json::from_str(&stablecoin_json).expect("json parsing failure");
+    let stablecoin_impl_bytecode = hex::decode(stablecoin_contract.deployed_bytecode.object)
+        .expect("invalid bytecode hexstring");
+
+    // extend genesis accounts to fund factory_address, etch bytecodes, construct proxy creation txs
     let mut tx_factory = TransactionFactory::new();
     let factory_address = tx_factory.address();
     let tmp_genesis = tmp_chain.genesis.clone().extend_accounts(
@@ -115,11 +112,11 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
             (factory_address, GenesisAccount::default().with_balance(U256::MAX)),
             (
                 faucet_impl_address,
-                GenesisAccount::default().with_code(Some(faucet_bytecode.into())),
+                GenesisAccount::default().with_code(Some(faucet_bytecode.clone().into())),
             ),
             (
                 stablecoin_impl_address,
-                GenesisAccount::default().with_code(Some(stablecoin_impl_bytecode.into())),
+                GenesisAccount::default().with_code(Some(stablecoin_impl_bytecode.clone().into())),
             ),
         ]
         .into_iter(),
@@ -160,8 +157,15 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
     // construct create data for faucet proxy address
     let init_call = [&faucet_init_selector, &init_params[..]].concat();
     let constructor_params = (faucet_impl_address, init_call.clone()).abi_encode_params();
-    let faucet_init_code = ERC1967PROXY_INITCODE.as_slice();
-    let faucet_create_data = [faucet_init_code, &constructor_params[..]].concat();
+    let proxy_json =
+        fetch_file_content("../../tn-contracts/out/ERC1967Proxy.sol/ERC1967Proxy.json".into());
+    let proxy_contract: ContractStandardJson =
+        serde_json::from_str(&proxy_json).expect("json parsing failure");
+    let proxy_initcode =
+        hex::decode(proxy_contract.bytecode.object).expect("invalid bytecode hexstring");
+    let proxy_bytecode =
+        hex::decode(proxy_contract.deployed_bytecode.object).expect("invalid bytecode hexstring");
+    let faucet_create_data = [proxy_initcode.clone().as_slice(), &constructor_params[..]].concat();
 
     // construct `grantRole(faucet)` data
     let grant_role_selector = [47, 47, 241, 93];
@@ -180,7 +184,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
     let stablecoin_constructor_params =
         (stablecoin_impl_address, stablecoin_init_call.clone()).abi_encode_params();
     let stablecoin_create_data =
-        [ERC1967PROXY_INITCODE.as_slice(), &stablecoin_constructor_params[..]].concat();
+        [proxy_initcode.as_slice(), &stablecoin_constructor_params[..]].concat();
 
     // faucet deployment will be `factory_address`'s first tx, stablecoin will be second tx
     let faucet_proxy_address = factory_address.create(0);
@@ -204,6 +208,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
     let gas_price = 100;
     let faucet_tx_raw = tx_factory.create_eip1559(
         pre_genesis_chain.clone(),
+        None,
         gas_price,
         None,
         U256::ZERO,
@@ -212,6 +217,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
 
     let stablecoin_tx_raw = tx_factory.create_eip1559(
         pre_genesis_chain.clone(),
+        None,
         gas_price,
         None,
         U256::ZERO,
@@ -220,6 +226,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
 
     let role_tx_raw = tx_factory.create_eip1559(
         pre_genesis_chain.clone(),
+        None,
         gas_price,
         Some(faucet_proxy_address),
         U256::ZERO,
@@ -228,6 +235,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
 
     let updatexyz_tx_raw = tx_factory.create_eip1559(
         pre_genesis_chain.clone(),
+        None,
         gas_price,
         Some(faucet_proxy_address),
         U256::ZERO,
@@ -236,6 +244,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
 
     let minter_tx_raw = tx_factory.create_eip1559(
         pre_genesis_chain.clone(),
+        None,
         gas_price,
         Some(stablecoin_address),
         U256::ZERO,
@@ -260,8 +269,6 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
         .expect("stablecoin address missing from bundle state")
         .storage;
 
-    let faucet_proxy_bytecode = *ERC1967PROXY_RUNTIMECODE;
-
     // real genesis: configure genesis accounts for proxy deployment & faucet_role
     let genesis_accounts = vec![
         (factory_address, GenesisAccount::default().with_balance(U256::MAX)),
@@ -272,21 +279,21 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
         ),
         (
             stablecoin_address,
-            GenesisAccount::default()
-                .with_code(Some(ERC1967PROXY_RUNTIMECODE.into()))
-                .with_storage(Some(
+            GenesisAccount::default().with_code(Some(proxy_bytecode.clone().into())).with_storage(
+                Some(
                     execution_storage_stablecoin
                         .iter()
                         .map(|(k, v)| ((*k).into(), v.present_value.into()))
                         .collect(),
-                )),
+                ),
+            ),
         ),
         (faucet_impl_address, GenesisAccount::default().with_code(Some(faucet_bytecode.into()))),
         // convert U256 HashMap to B256 for BTreeMap
         (
             faucet_proxy_address,
             GenesisAccount::default()
-                .with_code(Some(faucet_proxy_bytecode.into()))
+                .with_code(Some(proxy_bytecode.into()))
                 .with_balance(U256::MAX)
                 .with_storage(Some(
                     execution_storage_faucet
@@ -365,6 +372,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
     // this creates scenario for faucet to rely on provider.latest() for accuracy
     let tx = random_tx_factory.create_eip1559(
         chain,
+        None,
         1_000_000_000,
         Some(Address::random()),
         U256::from_str("0xaffffffffffffff").expect("U256 from str for tx factory"),
@@ -625,157 +633,4 @@ async fn prepare_google_kms_env() -> eyre::Result<(Arc<ChainSpec>, Address)> {
     let genesis = genesis.extend_accounts(accounts_to_fund);
 
     Ok((Arc::new(genesis.into()), kms_address))
-}
-
-/// Create validator info, genesis ceremony, and spawn node command with faucet active.
-async fn spawn_local_testnet(
-    task_executor: &TaskExecutor,
-    chain: Arc<ChainSpec>,
-    contract_address: &str,
-) -> eyre::Result<Vec<JoinHandle<()>>> {
-    // create temp path for test
-    let temp_path = tempfile::TempDir::new().expect("tempdir is okay").into_path();
-
-    let validators = ["validator-1", "validator-2", "validator-3", "validator-4"];
-
-    // create shared genesis dir
-    let shared_genesis_dir = temp_path.join("shared-genesis");
-    let copy_path = shared_genesis_dir.join("genesis/validators");
-    std::fs::create_dir_all(&copy_path)?;
-
-    // create validator info and copy to shared genesis dir
-    for v in validators.into_iter() {
-        let dir = temp_path.join(v);
-        let datadir = dir.to_str().expect("validator temp dir");
-        // init genesis ceremony to create committee / worker_cache files
-        create_validator_info(datadir, "0").await?;
-
-        // copy to shared genesis dir
-        let copy = dir.join("genesis/validators");
-        for config in std::fs::read_dir(copy)? {
-            let entry = config?;
-            std::fs::copy(entry.path(), copy_path.join(entry.file_name()))?;
-        }
-    }
-
-    // create committee from shared genesis dir
-    let create_committee_command = CommandParser::<GenesisArgs>::parse_from([
-        "tn",
-        "create-committee",
-        "--datadir",
-        shared_genesis_dir.to_str().expect("shared genesis dir"),
-    ]);
-    create_committee_command.args.execute().await?;
-
-    let mut node_handles = Vec::with_capacity(validators.len());
-    for v in validators.into_iter() {
-        let dir = temp_path.join(v);
-        let datadir = dir.to_str().expect("validator temp dir");
-
-        // copy genesis files back to validator dirs
-        std::fs::copy(
-            shared_genesis_dir.join("genesis/committee.yaml"),
-            dir.join("genesis/committee.yaml"),
-        )?;
-        std::fs::copy(
-            shared_genesis_dir.join("genesis/worker_cache.yaml"),
-            dir.join("genesis/worker_cache.yaml"),
-        )?;
-
-        let instance = v.chars().last().expect("validator instance").to_string();
-
-        let mut command = NodeCommand::<FaucetArgs>::parse_from([
-            "tn",
-            "--dev",
-            "--datadir",
-            datadir,
-            //
-            // TODO: debug max-block doesn't work
-            //
-            // "--debug.max-block",
-            // "5",
-            // "--debug.terminate",
-            "--chain",
-            "adiri",
-            "--instance",
-            &instance,
-            "--google-kms",
-            "--contract-address",
-            contract_address,
-        ]);
-
-        let cli_ctx = CliContext { task_executor: task_executor.clone() };
-
-        // update genesis with seeded accounts
-        command.chain = chain.clone();
-
-        // collect join handles
-        node_handles.push(task_executor.spawn_critical(
-            v,
-            Box::pin(async move {
-                let err = command
-                    .execute(
-                        cli_ctx,
-                        false, // don't overwrite chain with the default
-                        |mut builder, faucet_args, tn_datadir| async move {
-                            builder.opt_faucet_args = Some(faucet_args);
-                            let evm_config = EthEvmConfig::default();
-                            let executor = EthExecutorProvider::new(
-                                std::sync::Arc::clone(&builder.node_config.chain),
-                                evm_config,
-                            );
-                            launch_node(builder, executor, evm_config, tn_datadir).await
-                        },
-                    )
-                    .await;
-                error!("{:?}", err);
-            }),
-        ));
-    }
-
-    Ok(node_handles)
-}
-
-/// RPC request to continually check until an account balance is above 0.
-///
-/// Warning: this should only be called with a timeout - could result in infinite loop otherwise.
-async fn ensure_account_balance_infinite_loop(
-    client: &HttpClient,
-    address: Address,
-    expected_bal: U256,
-) -> eyre::Result<U256> {
-    while let Ok(bal) = client.request::<String, _>("eth_getBalance", rpc_params!(address)).await {
-        debug!(target: "faucet-test", "{address} bal: {bal:?}");
-        let balance = U256::from_str(&bal)?;
-
-        // return Ok if expected bal
-        if balance == expected_bal {
-            return Ok(balance);
-        }
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-
-    Ok(U256::ZERO)
-}
-
-/// Test utility to get desired state changes from a temporary genesis for a subsequent one.
-async fn get_contract_state_for_genesis(
-    chain: Arc<ChainSpec>,
-    raw_txs_to_execute: Vec<TransactionSigned>,
-) -> eyre::Result<ExecutionOutcome> {
-    // create execution components
-    let manager = TaskManager::current();
-    let executor = manager.executor();
-    let execution_node = default_test_execution_node(Some(chain.clone()), None, executor)?;
-    let provider = execution_node.get_provider().await;
-    let block_executor = execution_node.get_block_executor().await;
-
-    // execute batch
-    let batch = WorkerBlock::new(raw_txs_to_execute, SealedHeader::default());
-    let parent = chain.sealed_genesis_header();
-    let execution_outcome =
-        execution_outcome_for_tests(&batch, &parent, &provider, &block_executor);
-
-    Ok(execution_outcome)
 }

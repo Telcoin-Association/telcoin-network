@@ -37,6 +37,10 @@ impl TelcoinDirs for TelcoinTempDirs {
         self.genesis_path().join("worker_cache.yaml")
     }
 
+    fn genesis_file_path(&self) -> PathBuf {
+        self.genesis_path().join("genesis.json")
+    }
+
     fn narwhal_db_path(&self) -> PathBuf {
         self.0.path().join("narwhal-db")
     }

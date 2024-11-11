@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 use tn_node::dirs::{default_datadir_args, DataDirChainPath, DataDirPath};
-use tn_types::{Config, ConfigTrait, TelcoinDirs as _};
+use tn_types::{Config, ConfigFmt, ConfigTrait, TelcoinDirs as _};
 use tracing::{debug, info, warn};
 
 /// Generate keypairs and save them to a file.
@@ -108,7 +108,7 @@ impl KeyArgs {
                         config.keypath = authority_key_path;
 
                         debug!("{config:?}");
-                        Config::store_path(self.config_path(), config)?;
+                        Config::store_path(self.config_path(), config, ConfigFmt::YAML)?;
                     }
                 }
             }
@@ -186,7 +186,8 @@ impl KeyArgs {
         debug!("loading config...");
         let config_path = self.config_path();
         debug!(?config_path);
-        let config = Config::load_from_path::<Config>(&config_path).unwrap_or_default();
+        let config =
+            Config::load_from_path::<Config>(&config_path, ConfigFmt::YAML).unwrap_or_default();
         debug!("{:?}", config);
 
         info!(target: "tn::cli", path = ?config_path, "Configuration loaded");
@@ -201,7 +202,7 @@ mod tests {
     use clap::Parser;
     use reth_cli_commands::node::NoArgs;
     use tempfile::tempdir;
-    use tn_types::{Config, ConfigTrait};
+    use tn_types::{Config, ConfigFmt, ConfigTrait};
 
     /// Test that generate keys command works.
     /// This test also ensures that confy is able to
@@ -229,7 +230,10 @@ mod tests {
 
         tn.run(|_, _, _| async move { Ok(()) }).expect("generate keys command");
 
-        Config::load_from_path::<Config>(tempdir.join("telcoin-network.yaml").as_path())
-            .expect("config loaded yaml okay");
+        Config::load_from_path::<Config>(
+            tempdir.join("telcoin-network.yaml").as_path(),
+            ConfigFmt::YAML,
+        )
+        .expect("config loaded yaml okay");
     }
 }

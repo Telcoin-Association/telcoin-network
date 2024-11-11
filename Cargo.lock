@@ -5275,6 +5275,7 @@ dependencies = [
  "reth-node-ethereum",
  "reth-primitives",
  "reth-stages",
+ "reth-tasks",
  "reth-tracing",
  "reth-transaction-pool",
  "secp256k1 0.29.0",
@@ -10808,6 +10809,7 @@ dependencies = [
  "reth-transaction-pool",
  "secp256k1 0.29.0",
  "serde",
+ "serde_json",
  "tempfile",
  "tn-types",
  "tokio",
@@ -10896,6 +10898,7 @@ dependencies = [
 name = "tn-types"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "alloy-rlp",
  "anemo",
  "base64 0.21.7",

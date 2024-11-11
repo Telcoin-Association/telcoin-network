@@ -7,20 +7,26 @@
 
 use crate::{
     verify_proof_of_possession, BlsPublicKey, BlsSignature, Committee, CommitteeBuilder, Config,
-    ConfigTrait, Epoch, Intent, IntentMessage, Multiaddr, NetworkPublicKey, PrimaryInfo,
+    ConfigFmt, ConfigTrait, Epoch, Intent, IntentMessage, Multiaddr, NetworkPublicKey, PrimaryInfo,
     TelcoinDirs, ValidatorSignature, WorkerCache, WorkerIndex,
 };
+use alloy::{
+    hex::{self, FromHex},
+    primitives::FixedBytes,
+};
 use eyre::Context;
-use fastcrypto::traits::{InsecureDefault, Signer};
+use fastcrypto::traits::{InsecureDefault, Signer, ToFromBytes};
 use reth_chainspec::ChainSpec;
-use reth_primitives::{constants::MIN_PROTOCOL_BASE_FEE, keccak256, Address, Genesis};
+use reth_primitives::{
+    constants::MIN_PROTOCOL_BASE_FEE, keccak256, Address, Genesis, GenesisAccount,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     ffi::OsStr,
     fmt::{Display, Formatter},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use tracing::{info, warn};
@@ -181,6 +187,60 @@ impl NetworkGenesis {
         self.validators.insert(validator.public_key().clone(), validator);
     }
 
+    /// Read output file from Solidity GenerateConsensusRegistryStorage utility
+    /// to fetch storage configuration for ConsensusRegistry at genesis
+    pub fn construct_registry_genesis_accounts(&mut self, registry_cfg_path: Option<PathBuf>) {
+        let path = match registry_cfg_path {
+            Some(path) => path,
+            None => "../../tn-contracts/deployments/consensus-registry-storage.yaml".into(),
+        };
+        let registry_storage_yaml = fetch_file_content(path);
+        let registry_storage_cfg: BTreeMap<String, String> =
+            serde_yaml::from_str(&registry_storage_yaml).expect("yaml parsing failure");
+        let mut registry_storage_cfg: BTreeMap<FixedBytes<32>, FixedBytes<32>> =
+            registry_storage_cfg
+                .into_iter()
+                .map(|(k, v)| (k.parse().expect("Invalid key"), v.parse().expect("Invalid val")))
+                .collect();
+
+        let pubkey_flags = PubkeyFlags::new(self.validators.len());
+        // iterate over BTreeMap to conditionally overwrite flagged values with pubkeys that are now
+        // known
+        let validator_info: Vec<_> = self.validators.values().cloned().collect();
+        for val in registry_storage_cfg.values_mut() {
+            PubkeyFlags::overwrite_if_flag(val, &pubkey_flags, &validator_info);
+        }
+
+        let registry_impl = Address::random();
+        let registry_standard_json = fetch_file_content(
+            "../../tn-contracts/out/ConsensusRegistry.sol/ConsensusRegistry.json".into(),
+        );
+        let registry_contract: ContractStandardJson =
+            serde_json::from_str(&registry_standard_json).expect("json parsing failure");
+        let registry_bytecode = hex::decode(registry_contract.deployed_bytecode.object)
+            .expect("invalid bytecode hexstring");
+        let registry_proxy = Address::from_hex("0x07e17e17e17e17e17e17e17e17e17e17e17e17e1")
+            .expect("invalid hex address");
+        let proxy_standard_json =
+            fetch_file_content("../../tn-contracts/out/ERC1967Proxy.sol/ERC1967Proxy.json".into());
+        let proxy_contract: ContractStandardJson =
+            serde_json::from_str(&proxy_standard_json).expect("json parsing failure");
+        let proxy_bytecode = hex::decode(proxy_contract.deployed_bytecode.object)
+            .expect("invalid bytecode hexstring");
+        let registry_genesis_accounts = vec![
+            (registry_impl, GenesisAccount::default().with_code(Some(registry_bytecode.into()))),
+            (
+                registry_proxy,
+                GenesisAccount::default()
+                    .with_code(Some(proxy_bytecode.into()))
+                    .with_storage(Some(registry_storage_cfg)),
+            ),
+        ];
+
+        // update chain with new genesis
+        self.chain = self.chain.genesis.clone().extend_accounts(registry_genesis_accounts).into();
+    }
+
     /// Generate a [NetworkGenesis] by reading files in a directory.
     pub fn load_from_path<P>(telcoin_paths: &P) -> eyre::Result<Self>
     where
@@ -221,7 +281,8 @@ impl NetworkGenesis {
         #[allow(clippy::mutable_key_type)]
         let validators = BTreeMap::from_iter(validators);
 
-        let tn_config: Config = Config::load_from_path(telcoin_paths.node_config_path())?;
+        let tn_config: Config =
+            Config::load_from_path(telcoin_paths.node_config_path(), ConfigFmt::YAML)?;
 
         let network_genesis = Self {
             chain: tn_config.chain_spec(),
@@ -325,6 +386,11 @@ impl NetworkGenesis {
         // }
 
         Ok(())
+    }
+
+    /// Return a reference to `Self::chain`.
+    pub fn chain_info(&self) -> &ChainSpec {
+        &self.chain
     }
 
     /// Validate each validator:
@@ -500,13 +566,93 @@ impl PartialEq for ValidatorSignatureInfo {
     }
 }
 
+struct PubkeyFlags {
+    bls_a: FixedBytes<32>,
+    bls_b: FixedBytes<32>,
+    bls_c: FixedBytes<32>,
+    ed25519: FixedBytes<32>,
+    ecdsa: FixedBytes<32>,
+}
+
+impl PubkeyFlags {
+    /// Calculate flags used by Foundry util to label storage values for overwriting
+    fn new(num_validators: usize) -> Vec<PubkeyFlags> {
+        (1..=num_validators)
+            .map(|i| PubkeyFlags {
+                bls_a: keccak256(format!("VALIDATOR_{}_BLS_A", i)),
+                bls_b: keccak256(format!("VALIDATOR_{}_BLS_B", i)),
+                bls_c: keccak256(format!("VALIDATOR_{}_BLS_C", i)),
+                ed25519: keccak256(format!("VALIDATOR_{}_ED25519", i)),
+                ecdsa: keccak256(format!("VALIDATOR_{}_ECDSA", i)),
+            })
+            .collect()
+    }
+
+    /// Conditionally overwrites flagged placeholder values with the intended pubkey within
+    /// `validator_infos` This only occurs if `val` is found to match a collision-resistant hash
+    /// within `flags`
+    fn overwrite_if_flag(
+        val: &mut FixedBytes<32>,
+        flags: &[PubkeyFlags],
+        validator_infos: &[ValidatorInfo],
+    ) {
+        for (i, flag) in flags.iter().enumerate() {
+            if *val == flag.bls_a {
+                // overwrite using first 32 bytes of bls pubkey
+                let bls_first_word = &validator_infos[i].bls_public_key.as_bytes()[0..32];
+                val.copy_from_slice(bls_first_word);
+                return;
+            } else if *val == flag.bls_b {
+                // overwrite using middle 32 bytes of bls pubkey
+                let bls_middle_word = &validator_infos[i].bls_public_key.as_bytes()[32..64];
+                val.copy_from_slice(bls_middle_word);
+                return;
+            } else if *val == flag.bls_c {
+                // overwrite using last 32 bytes of bls pubkey
+                let bls_last_word = &validator_infos[i].bls_public_key.as_bytes()[64..96];
+                val.copy_from_slice(bls_last_word);
+                return;
+            } else if *val == flag.ecdsa {
+                *val = validator_infos[i].execution_address.into_word();
+                return;
+            } else if *val == flag.ed25519 {
+                *val = FixedBytes::from_slice(validator_infos[i].primary_network_key().as_bytes());
+                return;
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct BytecodeObject {
+    pub object: String,
+}
+
+#[derive(Deserialize)]
+pub struct ContractStandardJson {
+    pub bytecode: BytecodeObject,
+    #[serde(rename = "deployedBytecode")]
+    pub deployed_bytecode: BytecodeObject,
+}
+
+pub fn fetch_file_content(relative_path: PathBuf) -> String {
+    let mut file_path = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("Missing CARGO_MANIFEST_DIR!"),
+    );
+    file_path.push(relative_path);
+
+    fs::read_to_string(file_path).expect("unable to read file")
+}
+
 #[cfg(test)]
 mod tests {
     use super::NetworkGenesis;
     use crate::{
-        adiri_chain_spec, generate_proof_of_possession, BlsKeypair, Multiaddr, NetworkKeypair,
-        PrimaryInfo, TelcoinDirs, ValidatorInfo, WorkerIndex, WorkerInfo,
+        adiri_chain_spec, fetch_file_content, generate_proof_of_possession,
+        genesis::ContractStandardJson, BlsKeypair, Multiaddr, NetworkKeypair, PrimaryInfo,
+        TelcoinDirs, ValidatorInfo, WorkerIndex, WorkerInfo,
     };
+    use alloy::hex::{self, FromHex};
     use fastcrypto::traits::KeyPair;
     use rand::{rngs::StdRng, SeedableRng};
     use reth_primitives::Address;
@@ -548,11 +694,44 @@ mod tests {
         // save to file
         network_genesis.write_to_path(paths.genesis_path()).unwrap();
         // load network genesis
-        let loaded_network_genesis =
+        let mut loaded_network_genesis =
             NetworkGenesis::load_from_path(&paths).expect("unable to load network genesis");
+
+        loaded_network_genesis.construct_registry_genesis_accounts(Some(
+            "../../../tn-contracts/deployments/consensus-registry-storage.yaml".into(),
+        ));
+
         let loaded_validator =
             loaded_network_genesis.validators.get(validator.public_key()).unwrap();
         assert_eq!(&validator, loaded_validator);
+
+        let expected_registry_addr =
+            Address::from_hex("0x07e17e17e17e17e17e17e17e17e17e17e17e17e1")
+                .expect("failed to parse address");
+        let proxy_standard_json =
+            fetch_file_content("../../tn-contracts/out/ERC1967Proxy.sol/ERC1967Proxy.json".into());
+        let proxy_contract: ContractStandardJson =
+            serde_json::from_str(&proxy_standard_json).expect("failed to parse json");
+        let proxy_bytecode = hex::decode(proxy_contract.deployed_bytecode.object)
+            .expect("invalid bytecode hexstring");
+        match loaded_network_genesis.chain.genesis.alloc.get(&expected_registry_addr) {
+            Some(account) => {
+                // check registry bytecode matches expected value
+                match &account.code {
+                    Some(code) => {
+                        assert_eq!(***code, *proxy_bytecode, "wrong registry bytecode")
+                    }
+                    None => panic!("registry code not set"),
+                }
+
+                // check registry storage was set and is not `None`
+                match &account.storage {
+                    Some(storage) => assert!(!storage.is_empty()),
+                    None => panic!("registry storage not set"),
+                }
+            }
+            None => panic!("expected registry address not found in genesis"),
+        }
     }
 
     #[test]

@@ -34,13 +34,13 @@ pub struct RocksDbTxMut<'txn> {
     txn: Transaction<'txn, rocksdb::OptimisticTransactionDB>,
 }
 
-impl<'txn> Debug for RocksDbTxMut<'txn> {
+impl Debug for RocksDbTxMut<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "RocksDbTxMut")
     }
 }
 
-impl<'txn> DbTx for RocksDbTxMut<'txn> {
+impl DbTx for RocksDbTxMut<'_> {
     fn get<T: crate::traits::Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
         let cf = self
             .db
@@ -52,7 +52,7 @@ impl<'txn> DbTx for RocksDbTxMut<'txn> {
     }
 }
 
-impl<'txn> DbTxMut for RocksDbTxMut<'txn> {
+impl DbTxMut for RocksDbTxMut<'_> {
     fn insert<T: crate::traits::Table>(
         &mut self,
         key: &T::Key,

@@ -5,7 +5,7 @@ use reth::dirs::MaybePlatformPath;
 use reth_chainspec::ChainSpec;
 use std::{path::PathBuf, sync::Arc};
 use tn_node::dirs::{default_datadir_args, DataDirChainPath, DataDirPath};
-use tn_types::{Config, ConfigTrait, NetworkGenesis, TelcoinDirs as _};
+use tn_types::{Config, ConfigFmt, ConfigTrait, NetworkGenesis, TelcoinDirs as _};
 
 use crate::args::clap_genesis_parser;
 use tracing::info;
@@ -53,6 +53,10 @@ pub struct CreateCommitteeArgs {
         required = false,
     )]
     pub chain: Arc<ChainSpec>,
+
+    /// The path to the consensus registry storage yaml file.
+    #[arg(long, value_name = "CONSENSUS_REGISTRY_PATH", verbatim_doc_comment)]
+    pub consensus_registry: Option<PathBuf>,
 }
 
 impl CreateCommitteeArgs {
@@ -71,17 +75,33 @@ impl CreateCommitteeArgs {
         // load network genesis
         let data_dir: DataDirChainPath =
             self.datadir.unwrap_or_chain_default(self.chain.chain, default_datadir_args()).into();
-        let network_genesis = NetworkGenesis::load_from_path(&data_dir)?;
+        let mut network_genesis = NetworkGenesis::load_from_path(&data_dir)?;
 
         // validate only checks proof of possession for now
+        //
+        // the signatures must match the expected genesis file before consensus registry is added
         network_genesis.validate()?;
+
+        // updated genesis with registry information
+        network_genesis.construct_registry_genesis_accounts(self.consensus_registry.clone());
+
+        // update the config with new genesis information
+        let config_path = self.config.clone().unwrap_or(data_dir.node_config_path());
+        let mut tn_config: Config = Config::load_from_path(&config_path, ConfigFmt::YAML)?;
+        tn_config.genesis = network_genesis.chain_info().genesis().clone();
+
+        // write genesis and config to file
+        //
+        // NOTE: CLI parser only supports JSON format for genesis
+        Config::store_path(data_dir.genesis_file_path(), tn_config.genesis(), ConfigFmt::JSON)?;
+        Config::store_path(config_path, tn_config, ConfigFmt::YAML)?;
 
         // generate committee and worker cache
         let committee = network_genesis.create_committee()?;
         let worker_cache = network_genesis.create_worker_cache()?;
 
         // write to file
-        Config::store_path(data_dir.committee_path(), committee)?;
-        Config::store_path(data_dir.worker_cache_path(), worker_cache)
+        Config::store_path(data_dir.committee_path(), committee, ConfigFmt::YAML)?;
+        Config::store_path(data_dir.worker_cache_path(), worker_cache, ConfigFmt::YAML)
     }
 }

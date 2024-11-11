@@ -119,3 +119,11 @@ down:
 # alternative approach to run 4 local validator nodes outside of docker on local machine
 validators:
 	./etc/local-testnet.sh ;
+
+# init submodules
+init-submodules:
+	git submodule update --init --recursive
+
+# update tn-contracts submodule
+update-tn-contracts:
+	cd tn-contracts && git pull && cd ..

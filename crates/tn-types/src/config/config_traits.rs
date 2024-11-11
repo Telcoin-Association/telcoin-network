@@ -9,6 +9,22 @@ use std::{
 };
 use tracing::info;
 
+/// The serialization format for the config.
+#[derive(PartialEq, Debug)]
+pub enum ConfigFmt {
+    /// Serialize using YAML.
+    YAML,
+    /// Serialize using JSON.
+    JSON,
+}
+
+impl ConfigFmt {
+    /// Helper method to identify type.
+    pub fn is_json(&self) -> bool {
+        *self == Self::JSON
+    }
+}
+
 /// Based on `confy` crate.
 /// Problem: reth uses TOML and TN uses yaml, so must replicate the necessary code as a trait.
 /// Can't use confy crate with two different `cfg`s.
@@ -19,6 +35,7 @@ pub trait ConfigTrait {
     /// exists.
     fn load_from_path<T: Serialize + DeserializeOwned + Default>(
         path: impl AsRef<Path>,
+        fmt: ConfigFmt,
     ) -> eyre::Result<T> {
         info!(target: "tn::config", path = ?path.as_ref(), "Loading configuration");
         match File::open(&path) {
@@ -26,15 +43,19 @@ pub trait ConfigTrait {
                 let mut cfg_string = String::new();
                 file.read_to_string(&mut cfg_string)?;
 
-                let cfg_data = serde_yaml::from_str(&cfg_string);
-                cfg_data.with_context(|| "bad yaml data")
+                // return deserialized data in specified format
+                if fmt.is_json() {
+                    serde_json::from_str(&cfg_string).with_context(|| "bad json data")
+                } else {
+                    serde_yaml::from_str(&cfg_string).with_context(|| "bad yaml data")
+                }
             }
             Err(ref e) if e.kind() == NotFound => {
                 if let Some(parent) = path.as_ref().parent() {
                     fs::create_dir_all(parent).with_context(|| "Directory creation failed")?;
                 }
                 let cfg = T::default();
-                Self::store_path(path, &cfg)?;
+                Self::store_path(path, &cfg, fmt)?;
                 Ok(cfg)
             }
             Err(e) => eyre::bail!("Failed to open file: {e}"),
@@ -48,15 +69,23 @@ pub trait ConfigTrait {
     /// and behavior, see [`store`]'s documentation.
     ///
     /// [`store`]: fn.store.html
-    fn store_path<T: Serialize>(path: impl AsRef<Path>, cfg: T) -> eyre::Result<()> {
+    fn store_path<T: Serialize>(
+        path: impl AsRef<Path>,
+        cfg: T,
+        fmt: ConfigFmt,
+    ) -> eyre::Result<()> {
         let path = path.as_ref();
         let config_dir =
             path.parent().with_context(|| format!("{:?} is a root or prefix", path))?;
         fs::create_dir_all(config_dir)
             .with_context(|| "directory creation failed while storing")?;
 
-        let s =
-            serde_yaml::to_string(&cfg).with_context(|| "Failed to serialize config to yaml")?;
+        // serialize in specified fmt
+        let s = if fmt.is_json() {
+            serde_json::to_string(&cfg).with_context(|| "Failed to serialize config to json")?
+        } else {
+            serde_yaml::to_string(&cfg).with_context(|| "Failed to serialize config to yaml")?
+        };
 
         let mut f = OpenOptions::new()
             .write(true)
@@ -86,6 +115,8 @@ pub trait TelcoinDirs: std::fmt::Debug + Send + Sync + 'static {
     fn committee_path(&self) -> PathBuf;
     /// Return the path to the worker cache file.
     fn worker_cache_path(&self) -> PathBuf;
+    /// Return the path to the chain spec file.
+    fn genesis_file_path(&self) -> PathBuf;
     /// Return the path to narwhal's node storage.
     fn narwhal_db_path(&self) -> PathBuf;
 }
@@ -113,6 +144,10 @@ impl TelcoinDirs for PathBuf {
 
     fn worker_cache_path(&self) -> PathBuf {
         self.genesis_path().join("worker_cache.yaml")
+    }
+
+    fn genesis_file_path(&self) -> PathBuf {
+        self.genesis_path().join("genesis.json")
     }
 
     fn narwhal_db_path(&self) -> PathBuf {
@@ -145,6 +180,10 @@ impl TelcoinDirs for Path {
         self.genesis_path().join("worker_cache.yaml")
     }
 
+    fn genesis_file_path(&self) -> PathBuf {
+        self.genesis_path().join("genesis.json")
+    }
+
     fn narwhal_db_path(&self) -> PathBuf {
         self.join("narwhal-db")
     }
@@ -173,6 +212,10 @@ impl TelcoinDirs for &'static Path {
 
     fn worker_cache_path(&self) -> PathBuf {
         self.genesis_path().join("worker_cache.yaml")
+    }
+
+    fn genesis_file_path(&self) -> PathBuf {
+        self.genesis_path().join("genesis.json")
     }
 
     fn narwhal_db_path(&self) -> PathBuf {

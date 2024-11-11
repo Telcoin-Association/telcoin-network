@@ -26,7 +26,7 @@ use tn_node::{
     dirs::{default_datadir_args, DataDirChainPath, DataDirPath},
     engine::TnBuilder,
 };
-use tn_types::{Config, ConfigTrait, TelcoinDirs as _};
+use tn_types::{Config, ConfigFmt, ConfigTrait, TelcoinDirs as _};
 use tracing::*;
 
 /// Start the node
@@ -163,7 +163,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // TODO: use config or CLI chain spec?
         let config_path = self.config.clone().unwrap_or(tn_datadir.node_config_path());
 
-        let tn_config: Config = Config::load_from_path(&config_path)?;
+        let tn_config: Config = Config::load_from_path(&config_path, ConfigFmt::YAML)?;
         if load_config {
             // Make sure we are using the chain from config not just the default.
             self.chain = Arc::new(tn_config.chain_spec());

@@ -26,9 +26,6 @@ pub use execution::{
 pub mod helpers;
 pub use helpers::*;
 
-mod artifacts;
-pub use artifacts::*;
-
 mod telcoin_temp_dirs;
 pub use telcoin_temp_dirs::*;
 

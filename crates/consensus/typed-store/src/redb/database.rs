@@ -349,7 +349,7 @@ where
     iter: Box<dyn Iterator<Item = (K, V)> + 'this>,
 }
 
-impl<'a, K, V> Iterator for ReDBIter<'a, K, V>
+impl<K, V> Iterator for ReDBIter<'_, K, V>
 where
     K: KeyT,
     V: ValueT,

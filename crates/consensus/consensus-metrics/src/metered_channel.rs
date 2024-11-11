@@ -42,7 +42,7 @@ pub struct BorrowedReceiver<'a, T> {
     guard: MutexGuard<'a, Option<Receiver<T>>>,
 }
 
-impl<'a, T: Send> TnReceiver<T> for BorrowedReceiver<'a, T> {
+impl<T: Send> TnReceiver<T> for BorrowedReceiver<'_, T> {
     async fn recv(&mut self) -> Option<T> {
         self.guard.as_mut().expect("receiver has been taken!").recv().await
     }
@@ -165,7 +165,7 @@ impl<T: Send> TnSender<T> for MeteredMpscChannel<T> {
 }
 
 ////////////////////////////////
-/// Stream API Wrappers!
+// Stream API Wrappers!
 ////////////////////////////////
 
 /// A wrapper around [`crate::metered_channel::Receiver`] that implements [`Stream`].
@@ -221,7 +221,7 @@ impl<T> From<Receiver<T>> for ReceiverStream<T> {
 }
 
 ////////////////////////////////////////////////////////////////
-/// Constructor
+// Constructor
 ////////////////////////////////////////////////////////////////
 
 /// Similar to `mpsc::channel`, `channel` creates a pair of `Sender` and `Receiver`

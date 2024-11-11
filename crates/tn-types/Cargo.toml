@@ -47,6 +47,7 @@ alloy-rlp = { workspace = true }
 parking_lot = { workspace = true }
 serde_yaml = { workspace = true }
 secp256k1 = { workspace = true }
+alloy = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -18,7 +18,7 @@ use reth_primitives::{keccak256, Address, GenesisAccount, U256};
 use secp256k1::Secp256k1;
 use std::{path::PathBuf, sync::Arc};
 use tn_node::dirs::{default_datadir_args, DataDirChainPath, DataDirPath};
-use tn_types::{Config, ConfigTrait, NetworkGenesis, TelcoinDirs as _};
+use tn_types::{Config, ConfigFmt, ConfigTrait, NetworkGenesis, TelcoinDirs as _};
 
 /// Generate keypairs and save them to a file.
 #[derive(Debug, Args)]
@@ -126,14 +126,14 @@ impl GenesisArgs {
                 // TODO: use config or CLI chain spec?
                 let config_path = self.config.clone().unwrap_or(datadir.node_config_path());
 
-                let mut tn_config: Config = Config::load_from_path(&config_path)?;
+                let mut tn_config: Config = Config::load_from_path(&config_path, ConfigFmt::YAML)?;
                 if let Some(acct_str) = &init.dev_funded_account {
                     let addr = account_from_word(acct_str);
                     tn_config.genesis.alloc.insert(
                         addr,
                         GenesisAccount::default().with_balance(U256::from(10).pow(U256::from(27))), // One Billion TEL
                     );
-                    Config::store_path(config_path, tn_config.clone())?;
+                    Config::store_path(config_path, tn_config.clone(), ConfigFmt::YAML)?;
                 }
 
                 let network_genesis = NetworkGenesis::with_chain_spec(tn_config.chain_spec());

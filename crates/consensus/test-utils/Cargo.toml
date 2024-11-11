@@ -37,7 +37,7 @@ reth-tracing = { workspace = true }
 reth-chainspec = { workspace = true }
 reth-cli-commands = { workspace = true }
 secp256k1 = { workspace = true }
-
+reth-tasks = { workspace = true }
 
 anemo = { workspace = true }
 
