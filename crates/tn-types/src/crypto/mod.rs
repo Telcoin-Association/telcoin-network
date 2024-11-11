@@ -12,8 +12,6 @@
 //! - use generic schemes (avoid using the algo's `Struct`` impl functions)
 //! - change type aliases to update codebase with new crypto
 
-use std::future::Future;
-
 use eyre::Context;
 use fastcrypto::{
     bls12381, ed25519,
@@ -21,14 +19,14 @@ use fastcrypto::{
     hash::{Blake2b256, HashFunction},
     traits::{AggregateAuthenticator, KeyPair, Signer, ToFromBytes, VerifyingKey},
 };
+use std::future::Future;
 // This re-export allows using the trait-defined APIs
 pub use fastcrypto::traits;
 use reth_chainspec::ChainSpec;
 use serde::Serialize;
 mod intent;
-pub use intent::*;
-
 use crate::encode;
+pub use intent::*;
 
 //
 // CONSENSUS
