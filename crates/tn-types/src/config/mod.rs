@@ -22,9 +22,6 @@ use std::{
 };
 use thiserror::Error;
 
-pub mod committee;
-pub use committee::*;
-
 use self::utils::get_available_tcp_port;
 pub mod utils;
 

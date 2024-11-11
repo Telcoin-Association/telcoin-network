@@ -8,11 +8,10 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use crate::{
-    config::{AuthorityIdentifier, Epoch},
     crypto::{
         self, to_intent_message, BlsPublicKey, BlsSignature, IntentMessage, ValidatorSignature,
     },
-    encode, BlsSigner, Header, HeaderDigest, Round,
+    encode, AuthorityIdentifier, BlsSigner, Epoch, Header, HeaderDigest, Round,
 };
 
 /// A Vote on a Header is a claim by the voting authority that all payloads and the full history

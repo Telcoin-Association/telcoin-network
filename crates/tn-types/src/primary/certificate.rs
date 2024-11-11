@@ -8,7 +8,7 @@ use serde_with::serde_as;
 use std::{collections::VecDeque, fmt};
 
 use crate::{
-    config::{AuthorityIdentifier, Committee, Epoch, Stake, WorkerCache},
+    config::{Epoch, Stake, WorkerCache},
     crypto::{
         self, to_intent_message, BlsAggregateSignature, BlsAggregateSignatureBytes, BlsPublicKey,
         BlsSignature, ValidatorAggregateSignature,
@@ -17,7 +17,7 @@ use crate::{
     error::{DagError, DagResult},
     now,
     serde::NarwhalBitmap,
-    Header, Round, TimestampSec,
+    AuthorityIdentifier, Committee, Header, Round, TimestampSec,
 };
 
 /// Certificates are the output of consensus.

@@ -1,5 +1,5 @@
 //! Reputation scores for validation nodes participating in consensus.
-use crate::{config::AuthorityIdentifier, Committee};
+use crate::{AuthorityIdentifier, Committee};
 use serde::{Deserialize, Serialize};
 use std::{cmp::Ordering, collections::HashMap};
 

@@ -38,3 +38,6 @@ mod notifier;
 pub use notifier::*;
 
 pub use reth_primitives::{BlockHash, TransactionSigned};
+
+mod committee;
+pub use committee::*;
