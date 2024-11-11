@@ -1,43 +1,29 @@
 // Copyright (c) Telcoin, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-pub mod worker;
-pub use worker::*;
-
-pub mod primary;
-pub use primary::*;
-
+mod codec;
+mod committee;
 mod crypto;
-pub use crypto::*;
-
-// Error types
+mod engine;
+mod genesis;
+mod helpers;
+mod multiaddr;
+mod notifier;
+mod primary;
+mod serde;
+mod sync;
+mod worker;
 #[macro_use]
 pub mod error;
-
-pub mod serde;
-
-pub mod codec;
 pub use codec::*;
-
-pub mod multiaddr;
-pub use multiaddr::*;
-
-pub mod genesis;
-pub use genesis::*;
-
-mod consensus;
-pub use consensus::*;
-
-mod sync;
-pub use sync::*;
-
-mod notifier;
-pub use notifier::*;
-
-pub use reth_primitives::{BlockHash, TransactionSigned};
-
-mod committee;
 pub use committee::*;
-
-mod helpers;
+pub use crypto::*;
+pub use engine::*;
+pub use genesis::*;
 pub use helpers::*;
+pub use multiaddr::*;
+pub use notifier::*;
+pub use primary::*;
+pub use reth_primitives::{BlockHash, TransactionSigned};
+pub use sync::*;
+pub use worker::*;

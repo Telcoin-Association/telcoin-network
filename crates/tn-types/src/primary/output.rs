@@ -5,8 +5,8 @@
 //! See test_utils output_tests.rs for this modules tests.
 
 use crate::{
-    crypto, encode, Certificate, CertificateDigest, ReputationScores, Round, SequenceNumber,
-    TimestampSec, WorkerBlock, WorkerBlockConversionError,
+    crypto, encode, Certificate, CertificateDigest, ReputationScores, Round, TimestampSec,
+    WorkerBlock, WorkerBlockConversionError,
 };
 use fastcrypto::hash::{Digest, Hash, HashFunction};
 use reth_primitives::{Address, BlockHash, Header, SealedBlockWithSenders, B256};
@@ -18,6 +18,9 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tracing::warn;
+
+/// A global sequence number assigned to every CommittedSubDag.
+pub type SequenceNumber = u64;
 
 #[derive(Clone, Debug)]
 /// The output of Consensus, which includes all the blocks for each certificate in the sub dag

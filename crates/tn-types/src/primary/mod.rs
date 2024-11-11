@@ -4,12 +4,16 @@ use std::time::{Duration, SystemTime};
 mod certificate;
 mod header;
 mod info;
+mod output;
+mod reputation;
 mod vote;
 mod worker_block;
 
 pub use certificate::*;
 pub use header::*;
 pub use info::*;
+pub use output::*;
+pub use reputation::*;
 pub use vote::*;
 pub use worker_block::*;
 

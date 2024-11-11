@@ -1,9 +1,9 @@
 //! Recreated `AutoSealConsensus` to reduce the amount of imports from reth.
 
-use super::{Consensus, ConsensusError};
 use crate::ConsensusOutput;
 use reth_chainspec::ChainSpec;
 use reth_consensus::PostExecutionInput;
+pub use reth_consensus::{Consensus, ConsensusError};
 use reth_evm_ethereum::revm_spec_by_timestamp_after_merge;
 use reth_payload_primitives::PayloadBuilderAttributes;
 use reth_primitives::{
