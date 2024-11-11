@@ -1,13 +1,14 @@
 // Copyright (c) Telcoin, LLC
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::{
+    read_validator_keypair_from_file, TelcoinDirs, BLS_KEYFILE, PRIMARY_NETWORK_KEYFILE,
+    WORKER_NETWORK_KEYFILE,
+};
 use std::sync::Arc;
-
 use tn_types::{
-    read_validator_keypair_from_file,
     traits::{AllowedRng, KeyPair, Signer},
     BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner, NetworkKeypair, NetworkPublicKey,
-    TelcoinDirs, BLS_KEYFILE, PRIMARY_NETWORK_KEYFILE, WORKER_NETWORK_KEYFILE,
 };
 
 #[derive(Debug)]

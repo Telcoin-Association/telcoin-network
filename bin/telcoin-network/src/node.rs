@@ -22,11 +22,11 @@ use reth_cli_commands::node::NoArgs;
 use reth_cli_util::parse_socket_address;
 use reth_db::{init_db, DatabaseEnv};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use tn_config::{Config, ConfigFmt, ConfigTrait, TelcoinDirs as _};
 use tn_node::{
     dirs::{default_datadir_args, DataDirChainPath, DataDirPath},
     engine::TnBuilder,
 };
-use tn_types::{Config, ConfigFmt, ConfigTrait, TelcoinDirs as _};
 use tracing::*;
 
 /// Start the node

@@ -42,11 +42,9 @@ use reth_transaction_pool::TransactionPool;
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
 use tempfile::TempDir;
+use tn_config::{fetch_file_content, ContractStandardJson};
 use tn_faucet::Drip;
-use tn_types::{
-    adiri_genesis, error::BlockSealError, fetch_file_content, ContractStandardJson,
-    TransactionSigned, WorkerBlock,
-};
+use tn_types::{adiri_genesis, error::BlockSealError, TransactionSigned, WorkerBlock};
 use tokio::{
     sync::{mpsc::Sender, oneshot},
     time,

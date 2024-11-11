@@ -1,13 +1,12 @@
 //! Create a committee from the validators in genesis.
 
+use crate::args::clap_genesis_parser;
 use clap::Args;
 use reth::dirs::MaybePlatformPath;
 use reth_chainspec::ChainSpec;
 use std::{path::PathBuf, sync::Arc};
+use tn_config::{Config, ConfigFmt, ConfigTrait, NetworkGenesis, TelcoinDirs as _};
 use tn_node::dirs::{default_datadir_args, DataDirChainPath, DataDirPath};
-use tn_types::{Config, ConfigFmt, ConfigTrait, NetworkGenesis, TelcoinDirs as _};
-
-use crate::args::clap_genesis_parser;
 use tracing::info;
 
 /// Add the validator to the node

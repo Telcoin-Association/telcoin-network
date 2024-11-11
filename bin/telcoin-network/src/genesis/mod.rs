@@ -17,8 +17,8 @@ use reth_chainspec::ChainSpec;
 use reth_primitives::{keccak256, Address, GenesisAccount, U256};
 use secp256k1::Secp256k1;
 use std::{path::PathBuf, sync::Arc};
+use tn_config::{Config, ConfigFmt, ConfigTrait, NetworkGenesis, TelcoinDirs as _};
 use tn_node::dirs::{default_datadir_args, DataDirChainPath, DataDirPath};
-use tn_types::{Config, ConfigFmt, ConfigTrait, NetworkGenesis, TelcoinDirs as _};
 
 /// Generate keypairs and save them to a file.
 #[derive(Debug, Args)]

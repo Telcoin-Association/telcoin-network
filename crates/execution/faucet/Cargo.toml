@@ -59,3 +59,4 @@ narwhal-worker = { workspace = true }
 narwhal-typed-store = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+tn-config = { workspace = true }

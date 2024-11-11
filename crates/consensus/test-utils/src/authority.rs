@@ -13,9 +13,9 @@ use narwhal_network::client::NetworkClient;
 use narwhal_typed_store::traits::Database;
 use reth::primitives::Address;
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
-use tn_config::{ConsensusConfig, KeyConfig};
+use tn_config::{Config, ConsensusConfig, KeyConfig};
 use tn_types::{
-    Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, Certificate, Committee, Config,
+    Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, Certificate, Committee,
     ConsensusOutput, Header, HeaderBuilder, Multiaddr, NetworkKeypair, NetworkPublicKey, Round,
     Vote, WorkerCache, WorkerId,
 };

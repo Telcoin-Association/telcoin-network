@@ -12,8 +12,7 @@ use reth_db::{
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
 };
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
-use tn_config::{ConsensusConfig, KeyConfig};
-use tn_types::TelcoinDirs;
+use tn_config::{ConsensusConfig, KeyConfig, TelcoinDirs};
 use tracing::{info, instrument};
 
 pub mod dirs;

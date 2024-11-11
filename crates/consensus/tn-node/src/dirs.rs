@@ -5,7 +5,7 @@ use reth::{
 };
 use reth_chainspec::Chain;
 use std::{fmt::Debug, ops::Deref, path::PathBuf, str::FromStr as _};
-use tn_types::{TelcoinDirs, GENESIS_VALIDATORS_DIR};
+use tn_config::{TelcoinDirs, GENESIS_VALIDATORS_DIR};
 
 /// The path to join for the directory that stores validator keys.
 pub const VALIDATOR_KEYS_DIR: &str = "validator-keys";

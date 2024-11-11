@@ -49,8 +49,8 @@ tn-faucet = { workspace = true, optional = true }
 alloy = { workspace = true }
 
 # config
+tn-config = { workspace = true }
 serde_yaml = { workspace = true }
-
 reth = { workspace = true }
 reth-config = { workspace = true }
 reth-primitives = { workspace = true }

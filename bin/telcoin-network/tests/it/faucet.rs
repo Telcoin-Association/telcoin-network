@@ -28,7 +28,8 @@ use reth_primitives::{public_key_to_address, Address, GenesisAccount, B256, U256
 use reth_tracing::init_test_tracing;
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
-use tn_types::{adiri_genesis, fetch_file_content, ContractStandardJson};
+use tn_config::{fetch_file_content, ContractStandardJson};
+use tn_types::adiri_genesis;
 use tokio::{runtime::Handle, task::JoinHandle, time::timeout};
 use tracing::{debug, info};
 

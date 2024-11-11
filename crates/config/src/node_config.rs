@@ -1,9 +1,5 @@
 //! Configurations for the Telcoin Network.
 
-use crate::{
-    adiri_genesis, utils::get_available_tcp_port, BlsPublicKey, BlsSignature, Multiaddr,
-    NetworkPublicKey, ValidatorInfo, WorkerIndex,
-};
 use fastcrypto::traits::KeyPair as KeyPairTrait;
 use reth_chainspec::ChainSpec;
 use reth_primitives::{Address, Genesis};
@@ -13,9 +9,13 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use tn_types::{
+    adiri_genesis, utils::get_available_tcp_port, BlsPublicKey, BlsSignature, Multiaddr,
+    NetworkPublicKey, WorkerIndex,
+};
 use tracing::info;
 
-use crate::ConfigTrait;
+use crate::{ConfigTrait, ValidatorInfo};
 
 /// The filename to use when reading/writing the validator's BlsKey.
 pub const BLS_KEYFILE: &str = "bls.key";

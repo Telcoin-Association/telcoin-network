@@ -17,6 +17,7 @@ use reth_db::{
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use reth_node_builder::NodeConfig;
 use std::{net::SocketAddr, sync::Arc};
+use tn_config::Config;
 mod inner;
 mod worker;
 
@@ -25,7 +26,7 @@ use reth_provider::providers::BlockchainProvider;
 use reth_tasks::TaskExecutor;
 use tn_block_validator::BlockValidator;
 use tn_faucet::FaucetArgs;
-use tn_types::{Config, ConsensusOutput, WorkerBlockSender, WorkerId};
+use tn_types::{ConsensusOutput, WorkerBlockSender, WorkerId};
 use tokio::sync::{broadcast, RwLock};
 pub use worker::*;
 

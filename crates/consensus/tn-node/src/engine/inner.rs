@@ -41,11 +41,10 @@ use reth_transaction_pool::{
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tn_block_builder::BlockBuilder;
 use tn_block_validator::BlockValidator;
+use tn_config::Config;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
-use tn_types::{
-    Config, Consensus, ConsensusOutput, LastCanonicalUpdate, WorkerBlockSender, WorkerId,
-};
+use tn_types::{Consensus, ConsensusOutput, LastCanonicalUpdate, WorkerBlockSender, WorkerId};
 use tokio::sync::{broadcast, mpsc::unbounded_channel};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info};

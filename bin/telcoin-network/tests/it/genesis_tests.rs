@@ -19,9 +19,8 @@ mod tests {
     };
     use reth_chainspec::ChainSpec;
     use std::{sync::Arc, time::Duration};
-    use tn_types::{
-        adiri_genesis, fetch_file_content, BlsKeypair, ContractStandardJson, NetworkKeypair,
-    };
+    use tn_config::{fetch_file_content, ContractStandardJson};
+    use tn_types::{adiri_genesis, BlsKeypair, NetworkKeypair};
     use tokio::runtime::Handle;
 
     #[tokio::test]

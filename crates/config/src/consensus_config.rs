@@ -4,12 +4,9 @@ use narwhal_network::client::NetworkClient;
 use narwhal_storage::NodeStorage;
 use narwhal_typed_store::traits::Database;
 use parking_lot::Mutex;
-use tn_types::{
-    Authority, Committee, Config, ConfigFmt, ConfigTrait, Noticer, Notifier, Parameters,
-    TelcoinDirs, WorkerCache,
-};
+use tn_types::{Authority, Committee, Noticer, Notifier, WorkerCache};
 
-use crate::KeyConfig;
+use crate::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, Parameters, TelcoinDirs};
 
 #[derive(Debug)]
 struct ConsensusConfigInner<DB> {
