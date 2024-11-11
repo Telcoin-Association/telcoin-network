@@ -12,7 +12,7 @@ members = [
     "crates/consensus/network-types",
     "crates/consensus/tn-node",
     "crates/consensus/primary",
-    "crates/consensus/storage",
+    "crates/storage",
     "crates/consensus/telcoin-macros",
     "crates/consensus/telcoin-sync",
     "crates/consensus/test-utils",
@@ -204,7 +204,7 @@ tn-faucet = { path = "./crates/execution/faucet" }
 narwhal-executor = { path = "./crates/consensus/executor" }
 narwhal-network = { path = "./crates/consensus/network" }
 narwhal-worker = { path = "./crates/consensus/worker" }
-tn-storage = { path = "./crates/consensus/storage" }
+tn-storage = { path = "./crates/storage" }
 narwhal-primary = { path = "./crates/consensus/primary" }
 narwhal-test-utils = { path = "./crates/consensus/test-utils" }
 narwhal-network-types = { path = "./crates/consensus/network-types" }
