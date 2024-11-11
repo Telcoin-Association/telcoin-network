@@ -53,21 +53,4 @@ pub use narwhal::{
     worker_to_primary_server::{MockWorkerToPrimary, WorkerToPrimary, WorkerToPrimaryServer},
     worker_to_worker_client::WorkerToWorkerClient,
     worker_to_worker_server::{MockWorkerToWorker, WorkerToWorker, WorkerToWorkerServer},
-    // Empty, Transaction as TransactionProto, ValidatorData,
-    // transactions_client::TransactionsClient,
-    // transactions_server::{Transactions, TransactionsServer},
 };
-
-// impl From<Transaction> for TransactionProto {
-//     fn from(transaction: Transaction) -> Self {
-//         TransactionProto {
-//             transaction: Bytes::from(transaction),
-//         }
-//     }
-// }
-
-// impl From<TransactionProto> for Transaction {
-//     fn from(transaction: TransactionProto) -> Self {
-//         transaction.transaction.to_vec()
-//     }
-// }

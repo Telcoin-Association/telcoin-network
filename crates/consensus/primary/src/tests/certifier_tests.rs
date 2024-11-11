@@ -5,8 +5,8 @@
 use super::*;
 
 use crate::ConsensusBus;
+use consensus_network_types::{MockPrimaryToPrimary, PrimaryToPrimaryServer, RequestVoteResponse};
 use fastcrypto::traits::KeyPair;
-use narwhal_network_types::{MockPrimaryToPrimary, PrimaryToPrimaryServer, RequestVoteResponse};
 use rand::{rngs::StdRng, SeedableRng};
 use std::num::NonZeroUsize;
 use tn_storage::mem_db::MemDatabase;

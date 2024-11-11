@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use narwhal_network::client::NetworkClient;
+use consensus_network::client::NetworkClient;
 use parking_lot::Mutex;
 use tn_storage::traits::Database;
 use tn_storage::NodeStorage;

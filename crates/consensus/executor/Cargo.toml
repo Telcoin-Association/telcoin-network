@@ -22,11 +22,11 @@ tonic.workspace = true
 tracing.workspace = true
 prometheus.workspace = true
 tn-storage = { workspace = true }
-narwhal-network-types = { workspace = true }
+consensus-network-types = { workspace = true }
 
 tn-types = { workspace = true }
 tn-config = { workspace = true }
-narwhal-network = { workspace = true }
+consensus-network = { workspace = true }
 mockall.workspace = true
 
 consensus-metrics.workspace = true

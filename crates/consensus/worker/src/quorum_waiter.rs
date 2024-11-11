@@ -6,9 +6,9 @@
 use crate::metrics::WorkerMetrics;
 use anemo::types::response::StatusCode;
 use consensus_metrics::monitored_future;
+use consensus_network::{CancelOnDropHandler, ReliableNetwork};
+use consensus_network_types::WorkerBlockMessage;
 use futures::stream::{futures_unordered::FuturesUnordered, StreamExt as _};
-use narwhal_network::{CancelOnDropHandler, ReliableNetwork};
-use narwhal_network_types::WorkerBlockMessage;
 use std::{
     future::Future,
     pin::Pin,

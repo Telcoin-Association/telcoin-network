@@ -7,9 +7,9 @@ use crate::{
     primary::PrimaryNodeDetails, worker::WorkerNodeDetails, TelcoinTempDirs, TestExecutionNode,
     WorkerFixture,
 };
+use consensus_network::client::NetworkClient;
 use fastcrypto::{hash::Hash, traits::KeyPair as _};
 use jsonrpsee::http_client::HttpClient;
-use narwhal_network::client::NetworkClient;
 use reth::primitives::Address;
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use tn_config::{Config, ConsensusConfig, KeyConfig};

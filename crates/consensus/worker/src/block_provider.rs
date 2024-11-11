@@ -9,12 +9,12 @@
 //! and sends it to the quorum waiter for broadcasting to peers.
 
 use crate::{metrics::WorkerMetrics, quorum_waiter::QuorumWaiterTrait};
-use narwhal_network::{client::NetworkClient, WorkerToPrimaryClient};
+use consensus_network::{client::NetworkClient, WorkerToPrimaryClient};
 use std::{sync::Arc, time::Duration};
 use tn_storage::{tables::WorkerBlocks, traits::Database};
 use tn_types::{error::BlockSealError, WorkerBlock, WorkerBlockSender, WorkerId};
 
-use narwhal_network_types::WorkerOwnBlockMessage;
+use consensus_network_types::WorkerOwnBlockMessage;
 use tracing::error;
 
 #[cfg(test)]

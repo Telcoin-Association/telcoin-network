@@ -28,8 +28,8 @@ itertools = { workspace = true }
 
 tn-storage = { workspace = true }
 fastcrypto = { workspace = true, features = ["copy_key"] }
-narwhal-network = { workspace = true }
-narwhal-network-types = { workspace = true }
+consensus-network = { workspace = true }
+consensus-network-types = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
 prometheus = { workspace = true }
@@ -50,7 +50,7 @@ reqwest = { workspace = true }
 tn-node = { workspace = true }
 narwhal-primary = { workspace = true }
 reth-tracing = { workspace = true }
-narwhal-network = { workspace = true, features = ["test-utils"] }
+consensus-network = { workspace = true, features = ["test-utils"] }
 bytes = { workspace = true }
 
 [features]

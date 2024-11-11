@@ -7,11 +7,11 @@ use crate::{
     CancelOnDropHandler, RetryConfig,
 };
 use anemo::PeerId;
-use eyre::{format_err, Result};
-use narwhal_network_types::{
+use consensus_network_types::{
     FetchCertificatesRequest, FetchCertificatesResponse, PrimaryToPrimaryClient,
     RequestBlocksRequest, RequestBlocksResponse, WorkerBlockMessage, WorkerToWorkerClient,
 };
+use eyre::{format_err, Result};
 use std::time::Duration;
 use tn_types::NetworkPublicKey;
 

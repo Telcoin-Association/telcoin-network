@@ -9,23 +9,7 @@ use std::{
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn main() -> Result<()> {
-    // #[cfg(not(target_env = "msvc"))]
-    // std::env::set_var("PROTOC", protobuf_src::protoc());
-
-    // let out_dir = if env::var("DUMP_GENERATED_GRPC").is_ok() {
-    //     PathBuf::from("")
-    // } else {
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
-    // };
-
-    // let proto_files = &["proto/narwhal.proto"];
-    // let dirs = &["proto"];
-
-    // // Use `Bytes` instead of `Vec<u8>` for bytes fields
-    // let mut config = prost_build::Config::new();
-    // config.bytes(["."]);
-
-    // tonic_build::configure().out_dir(&out_dir).compile_with_config(config, proto_files, dirs)?;
 
     build_anemo_services(&out_dir);
 

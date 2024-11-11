@@ -4,8 +4,8 @@
 //! from peers.
 
 use assert_matches::assert_matches;
-use narwhal_network::client::NetworkClient;
-use narwhal_network_types::MockWorkerToPrimary;
+use consensus_network::client::NetworkClient;
+use consensus_network_types::MockWorkerToPrimary;
 use narwhal_worker::{
     metrics::WorkerMetrics,
     quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},

@@ -1,6 +1,6 @@
 //! Mock implementations for Primary to Primary/Worker.
 use anemo::async_trait;
-use narwhal_network_types::{
+use consensus_network_types::{
     FetchBlocksRequest, FetchBlocksResponse, FetchCertificatesRequest, FetchCertificatesResponse,
     PrimaryToPrimary, PrimaryToPrimaryServer, PrimaryToWorker, PrimaryToWorkerServer,
     RequestVoteRequest, RequestVoteResponse, SendCertificateRequest, SendCertificateResponse,

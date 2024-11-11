@@ -8,7 +8,7 @@ use crate::quorum_waiter::QuorumWaiterError;
 // SPDX-License-Identifier: Apache-2.0
 use super::*;
 
-use narwhal_network_types::MockWorkerToPrimary;
+use consensus_network_types::MockWorkerToPrimary;
 use reth_primitives::SealedHeader;
 use tempfile::TempDir;
 use tn_storage::open_db;

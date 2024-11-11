@@ -46,8 +46,8 @@ reth-provider = { workspace = true, features = ["test-utils"] }
 anemo = { workspace = true }
 prometheus = { workspace = true }
 narwhal-worker = { workspace = true }
-narwhal-network = { workspace = true }
-narwhal-network-types = { workspace = true }
+consensus-network = { workspace = true }
+consensus-network-types = { workspace = true }
 tn-storage = { workspace = true }
 tn-block-validator = { workspace = true }
 reth-chainspec = { workspace = true }

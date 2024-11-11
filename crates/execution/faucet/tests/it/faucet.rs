@@ -11,6 +11,7 @@ use alloy::{
     hex, sol,
     sol_types::{SolType, SolValue},
 };
+use consensus_network::client::NetworkClient;
 use gcloud_sdk::{
     google::cloud::kms::v1::{
         key_management_service_client::KeyManagementServiceClient, GetPublicKeyRequest,
@@ -19,7 +20,6 @@ use gcloud_sdk::{
 };
 use jsonrpsee::{core::client::ClientT, rpc_params};
 use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicKey as PubKey};
-use narwhal_network::client::NetworkClient;
 use narwhal_worker::{
     metrics::WorkerMetrics,
     quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},

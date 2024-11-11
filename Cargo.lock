@@ -2060,6 +2060,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "consensus-network"
+version = "0.1.0"
+dependencies = [
+ "anemo",
+ "anemo-tower",
+ "anyhow",
+ "axum",
+ "axum-server",
+ "backoff",
+ "bytes",
+ "consensus-metrics",
+ "consensus-network-types",
+ "dashmap 6.1.0",
+ "eyre",
+ "futures",
+ "parking_lot 0.12.3",
+ "prometheus",
+ "quinn-proto",
+ "rand 0.8.5",
+ "thiserror",
+ "tn-macros",
+ "tn-sync",
+ "tn-test-utils",
+ "tn-types",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "consensus-network-types"
+version = "0.1.0"
+dependencies = [
+ "anemo",
+ "anemo-build",
+ "bcs",
+ "bytes",
+ "indexmap 1.9.3",
+ "mockall",
+ "roaring",
+ "rustversion",
+ "serde",
+ "snap",
+ "tn-types",
+ "tonic 0.8.3",
+ "tracing",
+]
+
+[[package]]
 name = "console"
 version = "0.15.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5089,12 +5138,12 @@ dependencies = [
  "async-trait",
  "bytes",
  "consensus-metrics",
+ "consensus-network",
+ "consensus-network-types",
  "fastcrypto",
  "futures",
  "indexmap 2.5.0",
  "mockall",
- "narwhal-network",
- "narwhal-network-types",
  "narwhal-primary",
  "prometheus",
  "reth-primitives",
@@ -5112,55 +5161,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "narwhal-network"
-version = "0.1.0"
-dependencies = [
- "anemo",
- "anemo-tower",
- "anyhow",
- "axum",
- "axum-server",
- "backoff",
- "bytes",
- "consensus-metrics",
- "dashmap 6.1.0",
- "eyre",
- "futures",
- "narwhal-network-types",
- "parking_lot 0.12.3",
- "prometheus",
- "quinn-proto",
- "rand 0.8.5",
- "thiserror",
- "tn-macros",
- "tn-sync",
- "tn-test-utils",
- "tn-types",
- "tokio",
- "tower",
- "tracing",
-]
-
-[[package]]
-name = "narwhal-network-types"
-version = "0.1.0"
-dependencies = [
- "anemo",
- "anemo-build",
- "bcs",
- "bytes",
- "indexmap 1.9.3",
- "mockall",
- "roaring",
- "rustversion",
- "serde",
- "snap",
- "tn-types",
- "tonic 0.8.3",
- "tracing",
-]
-
-[[package]]
 name = "narwhal-primary"
 version = "0.1.0"
 dependencies = [
@@ -5171,6 +5171,8 @@ dependencies = [
  "bytes",
  "cfg-if",
  "consensus-metrics",
+ "consensus-network",
+ "consensus-network-types",
  "criterion",
  "dashmap 6.1.0",
  "eyre",
@@ -5182,8 +5184,6 @@ dependencies = [
  "itertools 0.10.5",
  "mockall",
  "narwhal-executor",
- "narwhal-network",
- "narwhal-network-types",
  "narwhal-primary-metrics",
  "narwhal-worker",
  "once_cell",
@@ -5217,7 +5217,7 @@ name = "narwhal-primary-metrics"
 version = "0.1.0"
 dependencies = [
  "consensus-metrics",
- "narwhal-network",
+ "consensus-network",
  "prometheus",
  "tracing",
 ]
@@ -5234,13 +5234,13 @@ dependencies = [
  "byteorder",
  "bytes",
  "consensus-metrics",
+ "consensus-network",
+ "consensus-network-types",
  "eyre",
  "fastcrypto",
  "futures",
  "governor",
  "itertools 0.10.5",
- "narwhal-network",
- "narwhal-network-types",
  "narwhal-primary",
  "narwhal-primary-metrics",
  "prometheus",
@@ -10315,6 +10315,7 @@ dependencies = [
  "alloy",
  "clap",
  "consensus-metrics",
+ "consensus-network",
  "const-hex",
  "const-str",
  "ethereum-tx-sign",
@@ -10332,7 +10333,6 @@ dependencies = [
  "metrics-exporter-prometheus 0.12.2",
  "metrics-process 1.2.1",
  "metrics-util 0.15.0",
- "narwhal-network",
  "pin-project 1.1.5",
  "prometheus",
  "rand 0.8.5",
@@ -10550,11 +10550,11 @@ dependencies = [
  "alloy-rlp",
  "anemo",
  "assert_matches",
+ "consensus-network",
+ "consensus-network-types",
  "fastcrypto",
  "futures-util",
  "metrics 0.23.0",
- "narwhal-network",
- "narwhal-network-types",
  "narwhal-worker",
  "prometheus",
  "reth",
@@ -10621,10 +10621,10 @@ name = "tn-config"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "consensus-network",
  "eyre",
  "fastcrypto",
  "humantime-serde",
- "narwhal-network",
  "parking_lot 0.12.3",
  "rand 0.8.5",
  "reth-chainspec",
@@ -10678,6 +10678,8 @@ dependencies = [
  "cfg-if",
  "clap",
  "consensus-metrics",
+ "consensus-network",
+ "consensus-network-types",
  "ecdsa",
  "eyre",
  "fastcrypto",
@@ -10687,8 +10689,6 @@ dependencies = [
  "jsonrpsee",
  "k256",
  "lru_time_cache",
- "narwhal-network",
- "narwhal-network-types",
  "narwhal-worker",
  "prometheus",
  "reth",
@@ -10734,6 +10734,8 @@ dependencies = [
  "cfg-if",
  "clap",
  "consensus-metrics",
+ "consensus-network",
+ "consensus-network-types",
  "dirs-next",
  "enr",
  "eyre",
@@ -10742,8 +10744,6 @@ dependencies = [
  "futures",
  "jsonrpsee",
  "narwhal-executor",
- "narwhal-network",
- "narwhal-network-types",
  "narwhal-primary",
  "narwhal-primary-metrics",
  "narwhal-worker",
@@ -10843,6 +10843,8 @@ dependencies = [
  "anemo",
  "clap",
  "consensus-metrics",
+ "consensus-network",
+ "consensus-network-types",
  "criterion",
  "eyre",
  "fastcrypto",
@@ -10851,8 +10853,6 @@ dependencies = [
  "indexmap 2.5.0",
  "itertools 0.10.5",
  "jsonrpsee",
- "narwhal-network",
- "narwhal-network-types",
  "narwhal-primary",
  "narwhal-primary-metrics",
  "narwhal-worker",

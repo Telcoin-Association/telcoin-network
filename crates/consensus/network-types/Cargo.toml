@@ -1,5 +1,5 @@
 [package]
-name = "narwhal-network-types"
+name = "consensus-network-types"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

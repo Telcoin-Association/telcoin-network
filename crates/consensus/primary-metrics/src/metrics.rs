@@ -4,7 +4,7 @@ use std::sync::Arc;
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use narwhal_network::metrics::{NetworkConnectionMetrics, NetworkMetrics};
+use consensus_network::metrics::{NetworkConnectionMetrics, NetworkMetrics};
 use prometheus::{
     default_registry, linear_buckets, register_histogram_vec_with_registry,
     register_histogram_with_registry, register_int_counter_vec_with_registry,

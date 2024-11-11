@@ -26,18 +26,18 @@ use anemo_tower::{
     trace::{DefaultMakeSpan, DefaultOnFailure, TraceLayer},
 };
 use consensus_metrics::spawn_logged_monitored_task;
-use fastcrypto::traits::KeyPair as _;
-use narwhal_network::{
+use consensus_network::{
     epoch_filter::{AllowedEpoch, EPOCH_HEADER_KEY},
     failpoints::FailpointsMakeCallbackHandler,
     metrics::MetricsMakeCallbackHandler,
 };
+use fastcrypto::traits::KeyPair as _;
 use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, thread::sleep, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_storage::traits::Database;
 use tn_types::{traits::EncodeDecodeBase64, Multiaddr, NetworkPublicKey, Protocol};
 
-use narwhal_network_types::{PrimaryToPrimaryServer, WorkerToPrimaryServer};
+use consensus_network_types::{PrimaryToPrimaryServer, WorkerToPrimaryServer};
 use tokio::task::JoinHandle;
 use tower::ServiceBuilder;
 use tracing::{error, info};
@@ -274,7 +274,7 @@ impl Primary {
         }
 
         let (connection_monitor_handle, _) =
-            narwhal_network::connectivity::ConnectionMonitor::spawn(
+            consensus_network::connectivity::ConnectionMonitor::spawn(
                 network.downgrade(),
                 consensus_bus.primary_metrics().network_connection_metrics.clone(),
                 peer_types,
@@ -287,7 +287,7 @@ impl Primary {
             config.parameters().network_admin_server.primary_network_admin_server_port
         );
 
-        let admin_handles = narwhal_network::admin::start_admin_server(
+        let admin_handles = consensus_network::admin::start_admin_server(
             config.parameters().network_admin_server.primary_network_admin_server_port,
             network.clone(),
             config.subscribe_shutdown(),

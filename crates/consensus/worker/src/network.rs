@@ -8,20 +8,20 @@
 use crate::block_fetcher::WorkerBlockFetcher;
 use anemo::{types::response::StatusCode, Network};
 use async_trait::async_trait;
-use eyre::Result;
-use itertools::Itertools;
-use narwhal_network::{client::NetworkClient, WorkerToPrimaryClient};
-use narwhal_network_types::{
+use consensus_network::{client::NetworkClient, WorkerToPrimaryClient};
+use consensus_network_types::{
     FetchBlocksRequest, FetchBlocksResponse, PrimaryToWorker, RequestBlocksRequest,
     RequestBlocksResponse, WorkerBlockMessage, WorkerOthersBlockMessage, WorkerSynchronizeMessage,
     WorkerToWorker, WorkerToWorkerClient,
 };
+use eyre::Result;
+use itertools::Itertools;
+use std::{collections::HashSet, time::Duration};
+use tn_block_validator::BlockValidation;
 use tn_storage::{
     tables::WorkerBlocks,
     traits::{Database, DbTxMut},
 };
-use std::{collections::HashSet, time::Duration};
-use tn_block_validator::BlockValidation;
 use tn_types::{now, Committee, WorkerCache, WorkerId};
 use tracing::{debug, trace};
 

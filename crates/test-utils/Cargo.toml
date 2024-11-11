@@ -23,8 +23,8 @@ tracing = { workspace = true }
 once_cell = { workspace = true }
 
 fastcrypto = { workspace = true }
-narwhal-network = { workspace = true }
-narwhal-network-types = { workspace = true }
+consensus-network = { workspace = true }
+consensus-network-types = { workspace = true }
 tn-node = { workspace = true }
 narwhal-primary = { workspace = true }
 tn-types = { workspace = true }

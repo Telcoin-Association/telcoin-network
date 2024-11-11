@@ -1,5 +1,5 @@
 [package]
-name = "narwhal-network"
+name = "consensus-network"
 version.workspace = true
 license = "Apache-2.0"
 authors = [
@@ -24,7 +24,7 @@ tracing = { workspace = true }
 tn-types = { workspace = true }
 tn-sync = { workspace = true }
 consensus-metrics = { workspace = true }
-narwhal-network-types = { workspace = true }
+consensus-network-types = { workspace = true }
 
 anemo = { workspace = true }
 anemo-tower = { workspace = true }

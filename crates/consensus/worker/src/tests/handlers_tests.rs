@@ -3,7 +3,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use narwhal_network_types::{MockWorkerToWorker, WorkerToWorkerServer};
+use consensus_network_types::{MockWorkerToWorker, WorkerToWorkerServer};
 use std::vec;
 use tempfile::TempDir;
 use tn_storage::{mem_db::MemDatabase, open_db};

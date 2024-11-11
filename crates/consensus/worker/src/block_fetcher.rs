@@ -10,9 +10,9 @@ use std::{
 
 use anemo::Network;
 use async_trait::async_trait;
+use consensus_network::WorkerRpc;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use itertools::Itertools;
-use narwhal_network::WorkerRpc;
 use prometheus::IntGauge;
 use rand::{rngs::ThreadRng, seq::SliceRandom};
 use tn_storage::{
@@ -21,7 +21,7 @@ use tn_storage::{
 };
 use tn_types::NetworkPublicKey;
 
-use narwhal_network_types::{RequestBlocksRequest, RequestBlocksResponse};
+use consensus_network_types::{RequestBlocksRequest, RequestBlocksResponse};
 use tn_types::{now, BlockHash, WorkerBlock};
 use tokio::{
     select,

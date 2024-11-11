@@ -8,14 +8,14 @@ use consensus_metrics::{
     metered_channel::{channel_with_total, MeteredMpscChannel},
     monitored_scope, spawn_logged_monitored_task,
 };
-use fastcrypto::hash::Hash as _;
-use futures::{stream::FuturesOrdered, StreamExt};
-use itertools::Itertools;
-use narwhal_network::{
+use consensus_network::{
     anemo_ext::{NetworkExt, WaitingPeer},
     client::NetworkClient,
     PrimaryToWorkerClient, RetryConfig,
 };
+use fastcrypto::hash::Hash as _;
+use futures::{stream::FuturesOrdered, StreamExt};
+use itertools::Itertools;
 use parking_lot::Mutex;
 use std::{
     cmp::min,
@@ -34,7 +34,7 @@ use tn_types::{
     AuthorityIdentifier, Committee, NetworkPublicKey, TnReceiver, TnSender, WorkerCache,
 };
 
-use narwhal_network_types::{
+use consensus_network_types::{
     PrimaryToPrimaryClient, SendCertificateRequest, SendCertificateResponse,
     WorkerSynchronizeMessage,
 };

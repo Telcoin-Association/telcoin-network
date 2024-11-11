@@ -8,8 +8,8 @@
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
 use crate::{synchronizer::Synchronizer, ConsensusBus};
+use consensus_network_types::{RequestVoteRequest, RequestVoteResponse};
 use fastcrypto::hash::Hash;
-use narwhal_network_types::{RequestVoteRequest, RequestVoteResponse};
 use narwhal_primary_metrics::PrimaryMetrics;
 use parking_lot::Mutex;
 use std::{

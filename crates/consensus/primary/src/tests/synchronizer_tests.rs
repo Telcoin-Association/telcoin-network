@@ -8,10 +8,10 @@ use crate::{
     synchronizer::Synchronizer,
     ConsensusBus,
 };
+use consensus_network::client::NetworkClient;
 use fastcrypto::{hash::Hash, traits::KeyPair};
 use futures::{stream::FuturesUnordered, StreamExt};
 use itertools::Itertools;
-use narwhal_network::client::NetworkClient;
 use std::{
     collections::{BTreeSet, HashMap},
     num::NonZeroUsize,

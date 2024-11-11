@@ -53,8 +53,8 @@ prometheus = { workspace = true }
 fastcrypto = { workspace = true }
 consensus-metrics = { workspace = true }
 tn-test-utils = { workspace = true }
-narwhal-network = { workspace = true }
-narwhal-network-types = { workspace = true }
+consensus-network = { workspace = true }
+consensus-network-types = { workspace = true }
 narwhal-worker = { workspace = true }
 tn-storage = { workspace = true }
 tempfile = { workspace = true }

@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use anemo::PeerId;
-use narwhal_network::{PrimaryToPrimaryRpc, WorkerRpc};
-use narwhal_network_types::{FetchCertificatesRequest, RequestBlocksRequest};
+use consensus_network::{PrimaryToPrimaryRpc, WorkerRpc};
+use consensus_network_types::{FetchCertificatesRequest, RequestBlocksRequest};
 use reth::tasks::TaskManager;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::cluster::Cluster;

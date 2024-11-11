@@ -7,7 +7,7 @@ use crate::{
     traits::{PrimaryToWorkerClient, WorkerToPrimaryClient},
 };
 use anemo::{Network, PeerId, Request};
-use narwhal_network_types::{
+use consensus_network_types::{
     FetchBlocksRequest, FetchBlocksResponse, PrimaryToWorker, WorkerOthersBlockMessage,
     WorkerOwnBlockMessage, WorkerSynchronizeMessage, WorkerToPrimary,
 };

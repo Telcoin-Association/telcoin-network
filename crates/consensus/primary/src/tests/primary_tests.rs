@@ -7,15 +7,15 @@ use crate::{
     synchronizer::Synchronizer,
     ConsensusBus,
 };
+use consensus_network_types::{
+    FetchCertificatesRequest, MockPrimaryToWorker, PrimaryToPrimary, RequestVoteRequest,
+};
 use fastcrypto::{
     encoding::{Encoding, Hex},
     hash::Hash,
     traits::KeyPair as _,
 };
 use itertools::Itertools;
-use narwhal_network_types::{
-    FetchCertificatesRequest, MockPrimaryToWorker, PrimaryToPrimary, RequestVoteRequest,
-};
 use narwhal_worker::{metrics::Metrics, Worker};
 use prometheus::Registry;
 use std::{

@@ -23,13 +23,13 @@ use anemo_tower::{
     trace::{DefaultMakeSpan, DefaultOnFailure, TraceLayer},
 };
 use consensus_metrics::spawn_logged_monitored_task;
-use narwhal_network::{
+use consensus_network::{
     client::NetworkClient,
     epoch_filter::{AllowedEpoch, EPOCH_HEADER_KEY},
     failpoints::FailpointsMakeCallbackHandler,
     metrics::MetricsMakeCallbackHandler,
 };
-use narwhal_network_types::{PrimaryToWorkerServer, WorkerToWorkerServer};
+use consensus_network_types::{PrimaryToWorkerServer, WorkerToWorkerServer};
 use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, thread::sleep, time::Duration};
 use tn_block_validator::BlockValidation;
 use tn_config::ConsensusConfig;
@@ -324,7 +324,7 @@ impl<DB: Database> Worker<DB> {
         }
 
         let (connection_monitor_handle, _) =
-            narwhal_network::connectivity::ConnectionMonitor::spawn(
+            consensus_network::connectivity::ConnectionMonitor::spawn(
                 network.downgrade(),
                 metrics.network_connection_metrics.clone(),
                 peer_types,
@@ -343,7 +343,7 @@ impl<DB: Database> Worker<DB> {
             self.id, network_admin_server_base_port
         );
 
-        let admin_handles = narwhal_network::admin::start_admin_server(
+        let admin_handles = consensus_network::admin::start_admin_server(
             network_admin_server_base_port,
             network.clone(),
             config.subscribe_shutdown(),

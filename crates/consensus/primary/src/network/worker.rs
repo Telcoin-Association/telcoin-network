@@ -9,7 +9,7 @@
 //! requests from it's own workers and other primaries.
 
 use anemo::async_trait;
-use narwhal_network_types::{WorkerOthersBlockMessage, WorkerOwnBlockMessage, WorkerToPrimary};
+use consensus_network_types::{WorkerOthersBlockMessage, WorkerOwnBlockMessage, WorkerToPrimary};
 use tn_storage::traits::Database;
 use tn_types::TnSender;
 use tokio::sync::oneshot;
