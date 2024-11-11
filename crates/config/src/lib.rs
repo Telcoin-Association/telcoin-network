@@ -1,13 +1,13 @@
 //! Crate for configuring a node.
 //!
 //! Node-specific and network-wide configurations.
-pub mod consensus_config;
-pub use consensus_config::*;
-pub mod key_config;
-pub use key_config::*;
+mod consensus;
+pub use consensus::*;
+mod keys;
+pub use keys::*;
 mod genesis;
 pub use genesis::*;
-mod node_config;
-pub use node_config::*;
+mod node;
+pub use node::*;
 mod traits;
 pub use traits::*;
