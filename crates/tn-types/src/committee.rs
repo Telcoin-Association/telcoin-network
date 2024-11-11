@@ -3,9 +3,9 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{CommitteeUpdateError, ConfigError, Epoch, Stake};
 use crate::{
     crypto::{BlsPublicKey, BlsPublicKeyBytes, NetworkPublicKey},
+    error::{CommitteeUpdateError, ConfigError},
     Multiaddr,
 };
 use fastcrypto::{
@@ -20,6 +20,14 @@ use std::{
     fmt::{Display, Formatter},
     num::NonZeroU64,
 };
+
+/// The epoch number.
+pub type Epoch = u64;
+
+// TODO: This actually represents voting power (out of 10,000) and not amount staked.
+// Consider renaming to `VotingPower`.
+/// The voting power an authority has within the committee.
+pub type Stake = u64;
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct Authority {

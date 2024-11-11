@@ -12,7 +12,7 @@ use std::{
     process::{Child, Command},
     time::Duration,
 };
-use tn_types::utils::get_available_tcp_port;
+use tn_types::get_available_tcp_port;
 use tokio::runtime::Runtime;
 use tracing::{debug, error};
 

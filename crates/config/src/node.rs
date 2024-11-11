@@ -10,8 +10,8 @@ use std::{
     time::Duration,
 };
 use tn_types::{
-    adiri_genesis, utils::get_available_tcp_port, BlsPublicKey, BlsSignature, Multiaddr,
-    NetworkPublicKey, WorkerIndex,
+    adiri_genesis, get_available_tcp_port, BlsPublicKey, BlsSignature, Multiaddr, NetworkPublicKey,
+    WorkerIndex,
 };
 use tracing::info;
 

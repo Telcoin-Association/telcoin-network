@@ -16,8 +16,8 @@ use std::{
 };
 use tn_config::KeyConfig;
 use tn_types::{
-    traits::KeyPair, utils::get_available_tcp_port, Authority, BlsKeypair, Committee, Epoch,
-    Multiaddr, Stake, WorkerCache, WorkerIndex,
+    get_available_tcp_port, traits::KeyPair, Authority, BlsKeypair, Committee, Epoch, Multiaddr,
+    Stake, WorkerCache, WorkerIndex,
 };
 
 pub struct Builder<DB, F, R = OsRng> {

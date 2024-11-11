@@ -7,10 +7,7 @@ pub use worker::*;
 pub mod primary;
 pub use primary::*;
 
-pub mod config;
-pub use config::*;
-
-pub mod crypto;
+mod crypto;
 pub use crypto::*;
 
 // Error types
@@ -41,3 +38,6 @@ pub use reth_primitives::{BlockHash, TransactionSigned};
 
 mod committee;
 pub use committee::*;
+
+mod helpers;
+pub use helpers::*;

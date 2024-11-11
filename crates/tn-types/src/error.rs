@@ -3,7 +3,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
-    config::Epoch, crypto, CertificateDigest, HeaderDigest, Round, TimestampSec, VoteDigest,
+    crypto, CertificateDigest, Epoch, HeaderDigest, Round, TimestampSec, VoteDigest, WorkerId,
 };
 use fastcrypto::hash::Digest;
 use std::sync::Arc;
@@ -163,4 +163,31 @@ pub enum BlockSealError {
     FailedQuorum,
     #[error("Failed to access consensus DB, this is fatal")]
     FatalDBFailure,
+}
+
+#[derive(Error, Debug)]
+pub enum ConfigError {
+    #[error("Node {0} is not in the committee")]
+    NotInCommittee(String),
+
+    #[error("Node {0} is not in the worker cache")]
+    NotInWorkerCache(String),
+
+    #[error("Unknown worker id {0}")]
+    UnknownWorker(WorkerId),
+
+    #[error("Failed to read config file '{file}': {message}")]
+    ImportError { file: String, message: String },
+}
+
+#[derive(Error, Debug)]
+pub enum CommitteeUpdateError {
+    #[error("Node {0} is not in the committee")]
+    NotInCommittee(String),
+
+    #[error("Node {0} was not in the update")]
+    MissingFromUpdate(String),
+
+    #[error("Node {0} has a different stake than expected")]
+    DifferentStake(String),
 }

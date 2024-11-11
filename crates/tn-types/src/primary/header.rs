@@ -10,11 +10,10 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt};
 
 use crate::{
-    config::{Epoch, WorkerCache, WorkerId},
     crypto, encode,
     error::{DagError, DagResult},
-    now, AuthorityIdentifier, CertificateDigest, Committee, Round, TimestampSec, VoteDigest,
-    WorkerBlock,
+    now, AuthorityIdentifier, CertificateDigest, Committee, Epoch, Round, TimestampSec, VoteDigest,
+    WorkerBlock, WorkerCache, WorkerId,
 };
 
 /// Messages generated internally by Narwhal that are included in headers for sequencing.

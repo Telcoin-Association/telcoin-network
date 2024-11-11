@@ -1,12 +1,8 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-#![allow(clippy::mutable_key_type)]
-
+//! Worker peer information.
 use crate::{
     crypto::{BlsPublicKey, NetworkPublicKey},
-    Multiaddr,
+    error::ConfigError,
+    get_available_tcp_port, Epoch, Multiaddr,
 };
 use eyre::ContextCompat;
 use fastcrypto::traits::{EncodeDecodeBase64, InsecureDefault};
@@ -20,120 +16,6 @@ use std::{
     fmt,
     str::FromStr,
 };
-use thiserror::Error;
-
-use self::utils::get_available_tcp_port;
-pub mod utils;
-
-/// The epoch number.
-pub type Epoch = u64;
-
-/// Opaque bytes uniquely identifying the current chain. Analogue of the
-/// type in `sui-types` crate.
-///
-/// TODO: this should be replaced with chainspec.
-#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
-pub struct ChainIdentifier([u8; 32]);
-
-impl ChainIdentifier {
-    pub fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    pub fn unknown() -> Self {
-        Self([0; 32])
-    }
-
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-#[derive(Error, Debug)]
-pub enum ConfigError {
-    #[error("Node {0} is not in the committee")]
-    NotInCommittee(String),
-
-    #[error("Node {0} is not in the worker cache")]
-    NotInWorkerCache(String),
-
-    #[error("Unknown worker id {0}")]
-    UnknownWorker(WorkerId),
-
-    #[error("Failed to read config file '{file}': {message}")]
-    ImportError { file: String, message: String },
-}
-
-#[derive(Error, Debug)]
-pub enum CommitteeUpdateError {
-    #[error("Node {0} is not in the committee")]
-    NotInCommittee(String),
-
-    #[error("Node {0} was not in the update")]
-    MissingFromUpdate(String),
-
-    #[error("Node {0} has a different stake than expected")]
-    DifferentStake(String),
-}
-
-/// Information for the Primary.
-///
-/// TODO: update AuthorityFixture, etc. to use this instead.
-/// Currently, Primary details are fanned out in authority details.
-#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
-pub struct PrimaryInfo {
-    /// The primary's public network key. Used to sign messages (ie - headers, certs, votes)
-    pub network_key: NetworkPublicKey,
-    /// The WAN address for the primary.
-    /// This is where peers should send consensus messages for this primary to process.
-    pub network_address: Multiaddr,
-    /// The worker public network key.
-    ///
-    /// TODO: should each worker have their own key?
-    /// Adding this for CLI - expects only 1 worker for now.
-    pub worker_network_key: NetworkPublicKey,
-    /// The workers for this primary.
-    pub worker_index: WorkerIndex,
-}
-
-impl PrimaryInfo {
-    /// Create a new instance of [PrimaryInfo].
-    pub fn new(
-        network_key: NetworkPublicKey,
-        network_address: Multiaddr,
-        worker_network_key: NetworkPublicKey,
-        worker_index: WorkerIndex,
-    ) -> Self {
-        Self { network_key, network_address, worker_network_key, worker_index }
-    }
-
-    /// Return a reference to the primary's [WorkerIndex].
-    pub fn worker_index(&self) -> &WorkerIndex {
-        &self.worker_index
-    }
-}
-
-impl Default for PrimaryInfo {
-    fn default() -> Self {
-        let host = std::env::var("NARWHAL_HOST").unwrap_or("127.0.0.1".to_string());
-        let primary_udp_port = get_available_tcp_port(&host).unwrap_or(49590).to_string();
-        // let primary_udp_port = std::env::var("PRIMARY_UDP_PORT").unwrap_or("49590".to_string());
-
-        Self {
-            network_key: NetworkPublicKey::insecure_default(),
-            network_address: format!("/ip4/{}/udp/{}", &host, primary_udp_port)
-                .parse()
-                .expect("multiaddr parsed for primary"),
-            worker_network_key: NetworkPublicKey::insecure_default(),
-            worker_index: Default::default(),
-        }
-    }
-}
-
-// TODO: This actually represents voting power (out of 10,000) and not amount staked.
-// Consider renaming to `VotingPower`.
-/// The voting power an authority has within the committee.
-pub type Stake = u64;
 
 /// The unique identifier for a worker (per primary).
 ///
