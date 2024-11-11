@@ -201,7 +201,7 @@ tn-config = { path = "./crates/config" }
 tn-faucet = { path = "./crates/execution/faucet" }
 
 # consensus
-narwhal-executor = { path = "./crates/consensus/executor" }
+tn-executor = { path = "./crates/consensus/executor" }
 consensus-network = { path = "./crates/consensus/network" }
 narwhal-worker = { path = "./crates/consensus/worker" }
 tn-storage = { path = "./crates/storage" }

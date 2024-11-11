@@ -6,13 +6,11 @@
 use crate::{engine::ExecutionNode, error::NodeError, try_join_all, FuturesUnordered};
 use anemo::PeerId;
 use fastcrypto::traits::VerifyingKey;
-use narwhal_executor::{get_restored_consensus_output, Executor, SubscriberResult};
 use narwhal_primary::{
     consensus::{Bullshark, Consensus, ConsensusMetrics, LeaderSchedule},
     ConsensusBus, Primary, CHANNEL_CAPACITY,
 };
 use narwhal_primary_metrics::Metrics;
-use tn_storage::traits::Database as ConsensusDatabase;
 use reth_db::{
     database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
@@ -20,6 +18,8 @@ use reth_db::{
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use std::{sync::Arc, time::Instant};
 use tn_config::ConsensusConfig;
+use tn_executor::{get_restored_consensus_output, Executor, SubscriberResult};
+use tn_storage::traits::Database as ConsensusDatabase;
 use tn_types::{BlsPublicKey, ConsensusOutput, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
 use tokio::{
     sync::{broadcast, RwLock},

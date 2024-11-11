@@ -5132,7 +5132,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "narwhal-executor"
+name = "tn-executor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -5183,7 +5183,7 @@ dependencies = [
  "indexmap 2.5.0",
  "itertools 0.10.5",
  "mockall",
- "narwhal-executor",
+ "tn-executor",
  "narwhal-primary-metrics",
  "narwhal-worker",
  "once_cell",
@@ -10743,7 +10743,7 @@ dependencies = [
  "fdlimit",
  "futures",
  "jsonrpsee",
- "narwhal-executor",
+ "tn-executor",
  "narwhal-primary",
  "narwhal-primary-metrics",
  "narwhal-worker",

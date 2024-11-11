@@ -2,11 +2,11 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 use fastcrypto::hash::Hash;
-use narwhal_executor::get_restored_consensus_output;
 use narwhal_primary::{
     consensus::{Bullshark, Consensus, ConsensusMetrics, LeaderSchedule, LeaderSwapTable},
     ConsensusBus,
 };
+use tn_executor::get_restored_consensus_output;
 
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;

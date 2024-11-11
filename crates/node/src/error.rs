@@ -1,11 +1,11 @@
 //! Error types for spawning a full node
 
 use eyre::ErrReport;
-use narwhal_executor::SubscriberError;
 use reth_beacon_consensus::BeaconForkChoiceUpdateError;
 use reth_db_common::init::InitDatabaseError;
 use reth_provider::ProviderError;
 use thiserror::Error;
+use tn_executor::SubscriberError;
 use tn_types::WorkerId;
 
 #[derive(Debug, Error)]

@@ -31,7 +31,7 @@ enr = { workspace = true, default-features = false, features = [
 ] }
 
 fastcrypto = { workspace = true }
-narwhal-executor = { workspace = true }
+tn-executor = { workspace = true }
 consensus-network = { workspace = true }
 narwhal-primary = { workspace = true, features = ["test-utils"] }
 prometheus = { workspace = true }

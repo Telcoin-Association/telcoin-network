@@ -56,7 +56,7 @@ dashmap = { workspace = true }
 async-trait = { workspace = true }
 criterion = { workspace = true }
 futures = { workspace = true }
-narwhal-executor = { workspace = true }
+tn-executor = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
 mockall = { workspace = true }
