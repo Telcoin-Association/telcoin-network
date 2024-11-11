@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod codec;
+#[allow(clippy::mutable_key_type)]
 mod committee;
 mod crypto;
 mod engine;

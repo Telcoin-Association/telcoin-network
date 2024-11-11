@@ -14,8 +14,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tn_storage::traits::Database;
-use tn_storage::CertificateStore;
+use tn_storage::{traits::Database, CertificateStore};
 use tn_types::{AuthorityIdentifier, Committee, NetworkPublicKey, Noticer, TnReceiver, TnSender};
 
 use consensus_network_types::{FetchCertificatesRequest, FetchCertificatesResponse};

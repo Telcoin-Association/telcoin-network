@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
-use tn_storage::traits::Database;
-use tn_storage::{CertificateStore, ConsensusStore};
+use tn_storage::{traits::Database, CertificateStore, ConsensusStore};
 
 pub const NUM_SUB_DAGS_PER_SCHEDULE: u64 = 100;
 

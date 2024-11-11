@@ -1,5 +1,5 @@
 [package]
-name = "consensus-executor"
+name = "tn-executor"
 version.workspace = true
 edition = "2021"
 license = "Apache-2.0"

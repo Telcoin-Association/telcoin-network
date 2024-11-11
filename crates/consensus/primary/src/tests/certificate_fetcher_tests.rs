@@ -14,8 +14,7 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 use once_cell::sync::OnceCell;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
-use tn_storage::CertificateStore;
-use tn_storage::{mem_db::MemDatabase, traits::Database};
+use tn_storage::{mem_db::MemDatabase, traits::Database, CertificateStore};
 use tn_test_utils::{test_network, CommitteeFixture};
 use tn_types::{
     AuthorityIdentifier, BlockHash, BlsAggregateSignatureBytes, Certificate, CertificateDigest,

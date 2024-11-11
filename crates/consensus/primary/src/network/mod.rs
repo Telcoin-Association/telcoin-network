@@ -18,8 +18,7 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
-use tn_storage::traits::Database;
-use tn_storage::PayloadStore;
+use tn_storage::{traits::Database, PayloadStore};
 use tn_types::{
     ensure,
     error::{DagError, DagResult},

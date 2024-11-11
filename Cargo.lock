@@ -5132,35 +5132,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tn-executor"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "consensus-metrics",
- "consensus-network",
- "consensus-network-types",
- "fastcrypto",
- "futures",
- "indexmap 2.5.0",
- "mockall",
- "narwhal-primary",
- "prometheus",
- "reth-primitives",
- "serde",
- "tempfile",
- "thiserror",
- "tn-config",
- "tn-node",
- "tn-storage",
- "tn-test-utils",
- "tn-types",
- "tokio",
- "tonic 0.10.2",
- "tracing",
-]
-
-[[package]]
 name = "narwhal-primary"
 version = "0.1.0"
 dependencies = [
@@ -5183,7 +5154,6 @@ dependencies = [
  "indexmap 2.5.0",
  "itertools 0.10.5",
  "mockall",
- "tn-executor",
  "narwhal-primary-metrics",
  "narwhal-worker",
  "once_cell",
@@ -5200,6 +5170,7 @@ dependencies = [
  "thiserror",
  "tn-block-validator",
  "tn-config",
+ "tn-executor",
  "tn-macros",
  "tn-node",
  "tn-storage",
@@ -10670,6 +10641,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "tn-executor"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "consensus-metrics",
+ "consensus-network",
+ "consensus-network-types",
+ "fastcrypto",
+ "futures",
+ "indexmap 2.5.0",
+ "mockall",
+ "narwhal-primary",
+ "prometheus",
+ "reth-primitives",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tn-config",
+ "tn-node",
+ "tn-storage",
+ "tn-test-utils",
+ "tn-types",
+ "tokio",
+ "tonic 0.10.2",
+ "tracing",
+]
+
+[[package]]
 name = "tn-faucet"
 version = "0.1.0"
 dependencies = [
@@ -10743,7 +10743,6 @@ dependencies = [
  "fdlimit",
  "futures",
  "jsonrpsee",
- "tn-executor",
  "narwhal-primary",
  "narwhal-primary-metrics",
  "narwhal-worker",
@@ -10788,6 +10787,7 @@ dependencies = [
  "tn-block-validator",
  "tn-config",
  "tn-engine",
+ "tn-executor",
  "tn-faucet",
  "tn-storage",
  "tn-test-utils",

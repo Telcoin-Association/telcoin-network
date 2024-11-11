@@ -20,8 +20,7 @@ use std::{
     ops::RangeInclusive,
     sync::Arc,
 };
-use tn_storage::ConsensusStore;
-use tn_storage::{mem_db::MemDatabase, open_db, traits::Database};
+use tn_storage::{mem_db::MemDatabase, open_db, traits::Database, ConsensusStore};
 use tn_types::{Authority, AuthorityIdentifier, Committee, Stake};
 
 use tn_test_utils::{mock_certificate_with_rand, CommitteeFixture};

@@ -18,8 +18,7 @@ use std::{
     sync::Arc,
 };
 use tn_config::ConsensusConfig;
-use tn_storage::traits::Database;
-use tn_storage::CertificateStore;
+use tn_storage::{traits::Database, CertificateStore};
 use tn_types::{
     AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Committee,
     ConsensusCommit, Noticer, Round, SequenceNumber, Timestamp, TnReceiver, TnSender,

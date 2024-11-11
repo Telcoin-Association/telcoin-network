@@ -2,10 +2,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::PayloadToken;
 use crate::{
     tables::Payload,
     traits::{Database, DbTx, DbTxMut},
+    PayloadToken,
 };
 use std::sync::Arc;
 use tn_macros::fail_point;
@@ -113,8 +113,7 @@ impl<DB: Database> PayloadStore<DB> {
 
 #[cfg(test)]
 mod tests {
-    use crate::open_db;
-    use crate::PayloadStore;
+    use crate::{open_db, PayloadStore};
     use futures::future::join_all;
     use tempfile::TempDir;
     use tn_types::WorkerBlock;

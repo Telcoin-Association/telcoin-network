@@ -37,8 +37,7 @@ use std::{
     task::{Context, Poll},
 };
 use tn_config::ConsensusConfig;
-use tn_storage::traits::Database;
-use tn_storage::ProposerStore;
+use tn_storage::{traits::Database, ProposerStore};
 use tn_types::{
     now, AuthorityIdentifier, BlockHash, Certificate, Committee, Epoch, Header, Noticer, Round,
     SystemMessage, TimestampSec, TnReceiver, TnSender, WorkerId,

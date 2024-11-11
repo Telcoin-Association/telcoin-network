@@ -15,8 +15,8 @@ use tn_macros::fail_point;
 use crate::{
     tables::{CertificateDigestByOrigin, CertificateDigestByRound, Certificates},
     traits::{Database, DbTx, DbTxMut},
+    StoreResult, ROUNDS_TO_KEEP,
 };
-use crate::{StoreResult, ROUNDS_TO_KEEP};
 use tn_sync::sync::notify_read::NotifyRead;
 use tn_types::{AuthorityIdentifier, Certificate, CertificateDigest, Round};
 

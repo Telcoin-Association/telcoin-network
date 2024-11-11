@@ -27,8 +27,7 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
-use tn_storage::traits::Database;
-use tn_storage::{CertificateStore, PayloadStore};
+use tn_storage::{traits::Database, CertificateStore, PayloadStore};
 use tn_sync::sync::notify_once::NotifyOnce;
 use tn_types::{
     AuthorityIdentifier, Committee, NetworkPublicKey, TnReceiver, TnSender, WorkerCache,

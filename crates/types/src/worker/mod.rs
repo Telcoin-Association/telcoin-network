@@ -1,6 +1,7 @@
 //! Worker types.
 
 use tokio::sync::{mpsc::Sender, oneshot};
+#[allow(clippy::mutable_key_type)]
 mod info;
 pub use info::*;
 mod pending_block;

@@ -11,8 +11,7 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use narwhal_primary_metrics::PrimaryMetrics;
 use std::{future::Future, pin::pin, sync::Arc, task::Poll, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig};
-use tn_storage::traits::Database;
-use tn_storage::CertificateStore;
+use tn_storage::{traits::Database, CertificateStore};
 use tn_types::{AuthorityIdentifier, BlsSigner, Committee, Noticer, TnSender};
 
 use consensus_network_types::{PrimaryToPrimaryClient, RequestVoteRequest};

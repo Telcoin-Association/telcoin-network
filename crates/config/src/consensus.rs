@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use consensus_network::client::NetworkClient;
 use parking_lot::Mutex;
-use tn_storage::traits::Database;
-use tn_storage::NodeStorage;
+use tn_storage::{traits::Database, NodeStorage};
 use tn_types::{Authority, Committee, Noticer, Notifier, WorkerCache};
 
 use crate::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, Parameters, TelcoinDirs};

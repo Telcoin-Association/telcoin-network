@@ -7,8 +7,8 @@
 use crate::{
     tables::{CommittedSubDag as CommittedSubDagTable, LastCommitted},
     traits::{Database, DbTxMut},
+    StoreResult, ROUNDS_TO_KEEP,
 };
-use crate::{StoreResult, ROUNDS_TO_KEEP};
 use std::collections::HashMap;
 use tn_types::{AuthorityIdentifier, CommittedSubDag, ConsensusCommit, Round, SequenceNumber};
 use tracing::debug;

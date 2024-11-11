@@ -10,8 +10,7 @@ use narwhal_primary::consensus::{
     Bullshark, ConsensusMetrics, ConsensusState, LeaderSchedule, LeaderSwapTable,
 };
 use std::{collections::BTreeSet, sync::Arc};
-use tn_storage::NodeStorage;
-use tn_storage::{mem_db::MemDatabase, open_db};
+use tn_storage::{mem_db::MemDatabase, open_db, NodeStorage};
 use tn_test_utils::{make_optimal_certificates, temp_dir, CommitteeFixture};
 use tn_types::{encode, Certificate, Round, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
 use tokio::time::Instant;

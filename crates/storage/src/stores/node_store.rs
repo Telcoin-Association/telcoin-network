@@ -2,8 +2,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::traits::Database;
-use crate::{CertificateStore, ConsensusStore, PayloadStore, ProposerStore, VoteDigestStore};
+use crate::{
+    traits::Database, CertificateStore, ConsensusStore, PayloadStore, ProposerStore,
+    VoteDigestStore,
+};
 use std::sync::Arc;
 
 /// All the data stores of the node.

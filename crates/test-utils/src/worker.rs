@@ -5,10 +5,10 @@
 
 use crate::temp_dir;
 use fastcrypto::traits::KeyPair as _;
-use tn_storage::traits::Database;
 use std::path::PathBuf;
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_node::worker::WorkerNode;
+use tn_storage::traits::Database;
 use tn_types::{AuthorityIdentifier, Multiaddr, NetworkKeypair, WorkerId, WorkerInfo};
 use tracing::info;
 
