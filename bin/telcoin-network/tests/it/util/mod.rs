@@ -282,7 +282,7 @@ pub async fn get_contract_state_for_genesis(
     let block_executor = execution_node.get_block_executor().await;
 
     // execute batch
-    let batch = WorkerBlock::new(raw_txs_to_execute, SealedHeader::default());
+    let batch = WorkerBlock::new_for_test(raw_txs_to_execute, SealedHeader::default());
     let parent = chain.sealed_genesis_header();
     let execution_outcome =
         execution_outcome_for_tests(&batch, &parent, &provider, &block_executor);

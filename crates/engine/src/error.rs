@@ -42,6 +42,9 @@ pub enum TnEngineError {
     /// The queued output that triggered the engine build was not found.
     #[error("Engine trying to build from empty queue.")]
     EmptyQueue,
+    // Failed to recover the signer for a transaction.
+    #[error("Could not recover signer for transaction")]
+    MissingSigner,
 }
 
 impl From<oneshot::error::RecvError> for TnEngineError {

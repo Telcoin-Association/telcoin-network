@@ -6,10 +6,7 @@
 //!
 //! The mined transactions are returned with the built block so the worker can update the pool.
 
-use reth_primitives::{
-    constants::EMPTY_WITHDRAWALS, proofs, Bloom, Bytes, Header, IntoRecoveredTransaction, TxHash,
-    B256, EMPTY_OMMER_ROOT_HASH, U256,
-};
+use reth_primitives::{IntoRecoveredTransaction, TxHash};
 use reth_transaction_pool::TransactionPool;
 use tn_types::{now, PendingBlockConfig, WorkerBlock, WorkerBlockBuilderArgs};
 use tracing::{debug, warn};
@@ -56,7 +53,6 @@ where
     let mut best_txs = pool.best_transactions();
 
     // NOTE: worker blocks always build off the latest finalized block
-    let block_number = parent_info.tip.number + 1;
     let parent_hash = parent_info.tip.hash();
 
     // collect data for successful transactions
@@ -107,8 +103,6 @@ where
         transactions.push(tx.into_signed());
     }
 
-    let transactions_root = proofs::calculate_transaction_root(&transactions);
-
     // TODO: use ms for worker block and sec for final block?
     //
     // sometimes worker block are produced too quickly in certain configs (<1s diff)
@@ -121,39 +115,15 @@ where
         timestamp = parent_info.tip.timestamp + 1;
     }
 
-    // create header
-    //
-    // NOTE: workers do not execute transactions. Peers validate:
-    // - calculated transaction root
-    // - all other roots are defaults
-    // - use ZERO for hashes
-    let header = Header {
-        parent_hash,
-        ommers_hash: EMPTY_OMMER_ROOT_HASH,
-        beneficiary,
-        state_root: B256::ZERO,
-        transactions_root,
-        receipts_root: B256::ZERO,
-        withdrawals_root: Some(EMPTY_WITHDRAWALS),
-        logs_bloom: Bloom::default(),
-        timestamp,
-        mix_hash: B256::ZERO,
-        nonce: 0,
-        base_fee_per_gas: Some(parent_info.pending_block_base_fee),
-        number: block_number,
-        gas_limit,
-        difficulty: U256::ZERO,
-        gas_used: total_possible_gas,
-        extra_data: Bytes::default(),
-        parent_beacon_block_root: None,
-        blob_gas_used: None,
-        excess_blob_gas: None,
-        requests_root: None,
-    };
-
     // worker block
-    let worker_block =
-        WorkerBlock { transactions, sealed_header: header.seal_slow(), received_at: None };
+    let worker_block = WorkerBlock {
+        transactions,
+        parent_hash,
+        beneficiary,
+        timestamp,
+        base_fee_per_gas: Some(parent_info.pending_block_base_fee),
+        received_at: None,
+    };
 
     // return output
     BlockBuilderOutput { worker_block, mined_transactions }

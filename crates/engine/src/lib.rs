@@ -531,16 +531,9 @@ mod tests {
             // increase basefee
             inc_base_fee += idx as u64;
 
-            // this is the only way to do this right now
-            let mut header = batch.sealed_header().clone().unseal();
-
             // update basefee and set beneficiary
-            header.beneficiary = Address::random();
-            header.base_fee_per_gas = Some(inc_base_fee);
-
-            // okay to use bad hash bc execution executing block will seal slowly
-            let updated = header.seal(B256::ZERO);
-            batch.update_header(updated);
+            batch.beneficiary = Address::random();
+            batch.base_fee_per_gas = Some(inc_base_fee);
 
             // actually execute the block now
             execute_test_worker_block(batch, &parent);
@@ -558,16 +551,9 @@ mod tests {
             // this makes assertions easier at the end
             inc_base_fee += 4 + idx as u64;
 
-            // this is the only way to do this right now
-            let mut header = batch.sealed_header().clone().unseal();
-
             // update basefee and set beneficiary
-            header.beneficiary = Address::random();
-            header.base_fee_per_gas = Some(inc_base_fee);
-
-            // okay to use bad hash bc execution executing block will seal slowly
-            let updated = header.seal(B256::ZERO);
-            batch.update_header(updated);
+            batch.beneficiary = Address::random();
+            batch.base_fee_per_gas = Some(inc_base_fee);
 
             // actually execute the block now
             execute_test_worker_block(batch, &parent);
@@ -577,6 +563,8 @@ mod tests {
             let header = batch.sealed_header().clone();
             batch_headers.push(header);
         }
+        // Reload all_batches so we can calculate mix_hash properly later.
+        let all_batches = [batches_1.clone(), batches_2.clone()].concat();
 
         //=== Consensus
         //
@@ -788,7 +776,7 @@ mod tests {
             assert_ne!(block.state_root, proposed_header.state_root);
 
             // mix hash is xor worker block's hash and consensus output digest
-            let expected_mix_hash = proposed_header.hash() ^ *expected_parent_beacon_block_root;
+            let expected_mix_hash = all_batches[idx].digest() ^ *expected_parent_beacon_block_root;
             assert_eq!(block.mix_hash, expected_mix_hash);
             // bloom expected to be the same bc all proposed transactions should be good
             // ie) no duplicates, etc.
@@ -868,16 +856,9 @@ mod tests {
             // increase basefee
             inc_base_fee += idx as u64;
 
-            // this is the only way to do this right now
-            let mut header = batch.sealed_header().clone().unseal();
-
             // update basefee and set beneficiary
-            header.beneficiary = Address::random();
-            header.base_fee_per_gas = Some(inc_base_fee);
-
-            // okay to use bad hash bc execution executing block will seal slowly
-            let updated = header.seal(B256::ZERO);
-            batch.update_header(updated);
+            batch.beneficiary = Address::random();
+            batch.base_fee_per_gas = Some(inc_base_fee);
 
             // actually execute the block now
             execute_test_worker_block(batch, &parent);
@@ -895,16 +876,9 @@ mod tests {
             // this makes assertions easier at the end
             inc_base_fee += 4 + idx as u64;
 
-            // this is the only way to do this right now
-            let mut header = batch.sealed_header().clone().unseal();
-
             // update basefee and set beneficiary
-            header.beneficiary = Address::random();
-            header.base_fee_per_gas = Some(inc_base_fee);
-
-            // okay to use bad hash bc execution executing block will seal slowly
-            let updated = header.seal(B256::ZERO);
-            batch.update_header(updated);
+            batch.beneficiary = Address::random();
+            batch.base_fee_per_gas = Some(inc_base_fee);
 
             // actually execute the block now
             execute_test_worker_block(batch, &parent);
@@ -914,6 +888,8 @@ mod tests {
             let header = batch.sealed_header().clone();
             batch_headers.push(header);
         }
+        // Reload all_batches so we can calculate mix_hash properly later.
+        let all_batches = [batches_1.clone(), batches_2.clone()].concat();
 
         // store ref as variable for clarity
         let duplicated_batch_for_round_1 = &batches_1[0];
@@ -1146,8 +1122,6 @@ mod tests {
             if idx == 0 {
                 // first block's parent is expected to be genesis
                 assert_eq!(block.parent_hash, chain.genesis_hash());
-                // expect header number +1 for batch bc of genesis
-                assert_eq!(block.number, proposed_header.number);
             } else {
                 assert_ne!(block.parent_hash, proposed_header.parent_hash);
                 // TODO: this is inefficient
@@ -1155,15 +1129,10 @@ mod tests {
                 // assert parents executed in order (sanity check)
                 let expected_parent = executed_blocks[idx - 1].header.hash_slow();
                 assert_eq!(block.parent_hash, expected_parent);
-                // expect block numbers NOT the same as batch's headers
-                assert_ne!(block.number, proposed_header.number);
             }
 
-            // expect state roots to be different bc worker uses ZERO
-            assert_ne!(block.state_root, proposed_header.state_root);
-
             // mix hash is xor worker block's hash and consensus output digest
-            let expected_mix_hash = proposed_header.hash() ^ *expected_parent_beacon_block_root;
+            let expected_mix_hash = all_batches[idx].digest() ^ *expected_parent_beacon_block_root;
             assert_eq!(block.mix_hash, expected_mix_hash);
             // bloom expected to be the same bc all proposed transactions should be good
             // ie) no duplicates, etc.
@@ -1225,16 +1194,9 @@ mod tests {
             // increase basefee
             inc_base_fee += idx as u64;
 
-            // this is the only way to do this right now
-            let mut header = batch.sealed_header().clone().unseal();
-
             // update basefee and set beneficiary
-            header.beneficiary = Address::random();
-            header.base_fee_per_gas = Some(inc_base_fee);
-
-            // okay to use bad hash bc execution executing block will seal slowly
-            let updated = header.seal(B256::ZERO);
-            batch.update_header(updated);
+            batch.beneficiary = Address::random();
+            batch.base_fee_per_gas = Some(inc_base_fee);
 
             // actually execute the block now
             execute_test_worker_block(batch, &parent);
@@ -1252,16 +1214,9 @@ mod tests {
             // this makes assertions easier at the end
             inc_base_fee += 4 + idx as u64;
 
-            // this is the only way to do this right now
-            let mut header = batch.sealed_header().clone().unseal();
-
             // update basefee and set beneficiary
-            header.beneficiary = Address::random();
-            header.base_fee_per_gas = Some(inc_base_fee);
-
-            // okay to use bad hash bc execution executing block will seal slowly
-            let updated = header.seal(B256::ZERO);
-            batch.update_header(updated);
+            batch.beneficiary = Address::random();
+            batch.base_fee_per_gas = Some(inc_base_fee);
 
             // actually execute the block now
             execute_test_worker_block(batch, &parent);

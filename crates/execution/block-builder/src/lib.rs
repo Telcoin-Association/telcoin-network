@@ -467,8 +467,8 @@ mod tests {
     use tn_storage::{open_db, tables::WorkerBlocks, traits::Database};
     use tn_test_utils::{adiri_genesis_seeded, get_gas_price, TransactionFactory};
     use tn_types::{
-        adiri_genesis, AutoSealConsensus, BuildArguments, CommittedSubDag, Consensus,
-        ConsensusOutput, WorkerBlock,
+        adiri_genesis, max_worker_block_gas, AutoSealConsensus, BuildArguments, CommittedSubDag,
+        Consensus, ConsensusOutput, WorkerBlock,
     };
     use tokio::time::timeout;
 
@@ -559,8 +559,8 @@ mod tests {
             block_provider.blocks_rx(),
             address,
             Duration::from_secs(1),
-            30_000_000, // 30mil gas limit
-            1_000_000,  // 1MB size
+            max_worker_block_gas(0), // 30mil gas limit
+            1_000_000,               // 1MB size
         );
 
         let gas_price = get_gas_price(&blockchain_db);
@@ -762,8 +762,8 @@ mod tests {
             to_worker,
             address,
             Duration::from_millis(1),
-            30_000_000, // 30mil gas limit
-            1_000_000,  // 1MB size
+            max_worker_block_gas(0), // 30mil gas limit
+            1_000_000,               // 1MB size
         );
 
         // expected to be 7 wei for first block
@@ -922,8 +922,8 @@ mod tests {
             to_worker,
             address,
             Duration::from_secs(1),
-            30_000_000, // 30mil gas limit
-            1_000_000,  // 1MB size
+            max_worker_block_gas(0), // 30mil gas limit
+            1_000_000,               // 1MB size
         );
 
         // expected to be 7 wei for first block

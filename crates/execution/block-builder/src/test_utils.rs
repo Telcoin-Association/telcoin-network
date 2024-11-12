@@ -18,7 +18,8 @@ use std::{
     time::Instant,
 };
 use tn_types::{
-    LastCanonicalUpdate, PendingBlockConfig, TransactionSigned, WorkerBlock, WorkerBlockBuilderArgs,
+    max_worker_block_gas, LastCanonicalUpdate, PendingBlockConfig, TransactionSigned, WorkerBlock,
+    WorkerBlockBuilderArgs,
 };
 use tokio::sync::mpsc::{self, Receiver};
 
@@ -30,22 +31,22 @@ pub fn execute_test_worker_block(block: &mut WorkerBlock, parent: &SealedHeader)
 
     let parent_info = LastCanonicalUpdate {
         tip: SealedBlock::new(parent.clone(), BlockBody::default()),
-        pending_block_base_fee: block
-            .sealed_header()
-            .base_fee_per_gas
-            .unwrap_or(MIN_PROTOCOL_BASE_FEE),
+        pending_block_base_fee: block.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE),
         pending_block_blob_fee: None,
     };
 
     let block_config = PendingBlockConfig::new(
-        block.sealed_header().beneficiary,
+        block.beneficiary,
         parent_info,
-        30_000_000, // gas limit in wei
-        1_000_000,  // maxsize in bytes
+        max_worker_block_gas(block.timestamp),
+        1_000_000, // maxsize in bytes
     );
     let args = WorkerBlockBuilderArgs { pool, block_config };
     let BlockBuilderOutput { worker_block, .. } = build_worker_block(args);
-    block.update_header(worker_block.sealed_header);
+    block.parent_hash = worker_block.parent_hash;
+    block.beneficiary = worker_block.beneficiary;
+    block.timestamp = worker_block.timestamp;
+    block.base_fee_per_gas = worker_block.base_fee_per_gas;
 }
 
 /// A test pool that ensures every transaction is in the pending pool

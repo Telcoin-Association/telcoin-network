@@ -57,8 +57,7 @@ impl<V: BlockValidation, DB: Database> WorkerToWorker for WorkerReceiverHandler<
                 StatusCode::BadRequest,
                 format!(
                     "Invalid block from peer {:?}: {err}\n\nbad worker block:\n{:?}",
-                    peer_id,
-                    &message.worker_block.sealed_header(),
+                    peer_id, message.worker_block,
                 ),
             ));
         }

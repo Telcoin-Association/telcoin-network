@@ -24,7 +24,7 @@ use reth_revm::{
 };
 use reth_trie::HashedPostState;
 use std::sync::Arc;
-use tn_types::{BuildArguments, TNPayload, TNPayloadAttributes};
+use tn_types::{max_worker_block_gas, BuildArguments, TNPayload, TNPayloadAttributes, WorkerBlock};
 use tracing::{debug, error, info, warn};
 
 /// Execute output from consensus to extend the canonical chain.
@@ -50,7 +50,7 @@ where
 
     // capture values from consensus output for full execution
     let output_digest: B256 = output.digest().into();
-    let sealed_blocks_with_senders = output.sealed_blocks_from_blocks()?;
+    let worker_blocks = output.flatten_worker_blocks();
     let ommers = output.ommers();
 
     // calculate ommers hash or use default if empty
@@ -62,7 +62,7 @@ where
 
     // assert vecs match
     debug_assert_eq!(
-        sealed_blocks_with_senders.len(),
+        worker_blocks.len(),
         output.block_digests.len(),
         "uneven number of sealed blocks from batches and batch digests"
     );
@@ -72,7 +72,7 @@ where
 
     // extend canonical tip if output contains batches with transactions
     // otherwise execute an empty block to extend canonical tip
-    if sealed_blocks_with_senders.is_empty() {
+    if worker_blocks.is_empty() {
         // execute single block with no transactions
         //
         // use parent values for next block (these values would come from the worker's block)
@@ -112,17 +112,17 @@ where
             })?;
     } else {
         // loop and construct blocks with transactions
-        for (block_index, block) in sealed_blocks_with_senders.into_iter().enumerate() {
+        for (block_index, block) in worker_blocks.into_iter().enumerate() {
             let batch_digest =
                 output.next_block_digest().ok_or(TnEngineError::NextBlockDigestMissing)?;
             // use batch's base fee, gas limit, and withdrawals
             let base_fee_per_gas = block.base_fee_per_gas.unwrap_or_default();
-            let gas_limit = block.gas_limit;
+            let gas_limit = max_worker_block_gas(block.timestamp);
 
             // apply XOR bitwise operator with worker's digest to ensure unique mixed hash per block
             // for round
-            let mix_hash = output_digest ^ block.hash();
-            let withdrawals = block.withdrawals.clone().unwrap_or_else(|| Withdrawals::new(vec![]));
+            let mix_hash = output_digest ^ block.digest();
+            let withdrawals = Withdrawals::new(vec![]);
             let payload_attributes = TNPayloadAttributes::new(
                 canonical_header,
                 ommers.clone(),
@@ -205,7 +205,7 @@ fn build_block_from_batch_payload<EvmConfig, Provider>(
     payload: TNPayload,
     provider: &Provider,
     chain_spec: Arc<ChainSpec>,
-    batch_block: SealedBlockWithSenders,
+    batch_block: WorkerBlock,
 ) -> EngineResult<SealedBlockWithSenders>
 where
     EvmConfig: ConfigureEvm,
@@ -235,7 +235,9 @@ where
     // initialize values for execution from block env
     //
     // note: uses the worker's sealed header for "parent" values
-    let (cfg, block_env) = payload.cfg_and_block_env(chain_spec.as_ref(), batch_block.header());
+    // note the sealed header below is more or less junk but payload trait requires it.
+    let (cfg, block_env) =
+        payload.cfg_and_block_env(chain_spec.as_ref(), batch_block.sealed_header().header());
 
     // TODO: better to get these from payload attributes?
     // - more efficient, but harder to maintain?
@@ -266,9 +268,8 @@ where
 
     // TODO: parallelize tx recovery when it's worth it (see TransactionSigned::recover_signers())
 
-    let txs = batch_block.into_transactions_ecrecovered();
-
-    for tx in txs {
+    for tx in batch_block.transactions {
+        //txs {
         // // TODO: support blob gas with cancun genesis hardfork
         // //
         // // There's only limited amount of blob space available per block, so we need to check if
@@ -286,6 +287,12 @@ where
         //     }
         // }
 
+        let tx = if let Some(signer) = tx.recover_signer() {
+            tx.with_signer(signer)
+        } else {
+            error!(target: "engine", "Could not recover signer for {tx:?}");
+            return Err(TnEngineError::MissingSigner);
+        };
         let env = EnvWithHandlerCfg::new_with_cfg_env(
             cfg.clone(),
             block_env.clone(),

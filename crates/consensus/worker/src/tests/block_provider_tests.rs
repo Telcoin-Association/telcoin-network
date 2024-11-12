@@ -56,12 +56,14 @@ async fn make_block() {
 
     // Send enough transactions to seal a block.
     let tx = transaction();
-    let new_block = WorkerBlock::new(vec![tx.clone(), tx.clone()], SealedHeader::default());
+    let new_block =
+        WorkerBlock::new_for_test(vec![tx.clone(), tx.clone()], SealedHeader::default());
 
     block_provider.seal(new_block.clone()).await.unwrap();
 
     // Ensure the block is as expected.
-    let expected_block = WorkerBlock::new(vec![tx.clone(), tx.clone()], SealedHeader::default());
+    let expected_block =
+        WorkerBlock::new_for_test(vec![tx.clone(), tx.clone()], SealedHeader::default());
 
     assert_eq!(
         new_block.transactions(),

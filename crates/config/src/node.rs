@@ -10,8 +10,8 @@ use std::{
     time::Duration,
 };
 use tn_types::{
-    adiri_genesis, get_available_tcp_port, BlsPublicKey, BlsSignature, Multiaddr, NetworkPublicKey,
-    WorkerIndex,
+    adiri_genesis, get_available_tcp_port, max_worker_block_gas, BlsPublicKey, BlsSignature,
+    Multiaddr, NetworkPublicKey, WorkerIndex,
 };
 use tracing::info;
 
@@ -222,7 +222,7 @@ impl Parameters {
 
     /// Measured in wei - 30mil
     fn default_max_worker_block_gas() -> u64 {
-        30_000_000
+        max_worker_block_gas(0)
     }
 
     fn default_max_worker_block_delay() -> Duration {

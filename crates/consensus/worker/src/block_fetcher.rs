@@ -322,9 +322,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let block_store = open_db(temp_dir.path());
         let header = Header { nonce: 1, ..Default::default() };
-        let block1 = WorkerBlock::new(vec![transaction()], header.seal_slow());
+        let block1 = WorkerBlock::new_for_test(vec![transaction()], header.seal_slow());
         let header = Header { nonce: 2, ..Default::default() };
-        let block2 = WorkerBlock::new(vec![transaction()], header.seal_slow());
+        let block2 = WorkerBlock::new_for_test(vec![transaction()], header.seal_slow());
         let (digests, known_workers) = (
             HashSet::from_iter(vec![block1.digest(), block2.digest()]),
             HashSet::from_iter(test_pks(&[1, 2])),
@@ -369,9 +369,9 @@ mod tests {
         let mut network = TestRequestBlocksNetwork::new();
         let temp_dir = TempDir::new().unwrap();
         let block_store = open_db(temp_dir.path());
-        let block1 = WorkerBlock::new(vec![transaction()], SealedHeader::default());
-        let block2 = WorkerBlock::new(vec![transaction()], SealedHeader::default());
-        let block3 = WorkerBlock::new(vec![transaction()], SealedHeader::default());
+        let block1 = WorkerBlock::new_for_test(vec![transaction()], SealedHeader::default());
+        let block2 = WorkerBlock::new_for_test(vec![transaction()], SealedHeader::default());
+        let block3 = WorkerBlock::new_for_test(vec![transaction()], SealedHeader::default());
         let (digests, known_workers) = (
             HashSet::from_iter(vec![block1.digest(), block2.digest(), block3.digest()]),
             HashSet::from_iter(test_pks(&[1, 2, 3])),
@@ -404,9 +404,9 @@ mod tests {
         let mut network = TestRequestBlocksNetwork::new();
         let temp_dir = TempDir::new().unwrap();
         let block_store = open_db(temp_dir.path());
-        let block1 = WorkerBlock::new(vec![transaction()], SealedHeader::default());
-        let block2 = WorkerBlock::new(vec![transaction()], SealedHeader::default());
-        let block3 = WorkerBlock::new(vec![transaction()], SealedHeader::default());
+        let block1 = WorkerBlock::new_for_test(vec![transaction()], SealedHeader::default());
+        let block2 = WorkerBlock::new_for_test(vec![transaction()], SealedHeader::default());
+        let block3 = WorkerBlock::new_for_test(vec![transaction()], SealedHeader::default());
         let (digests, known_workers) = (
             HashSet::from_iter(vec![block1.digest(), block2.digest(), block3.digest()]),
             HashSet::from_iter(test_pks(&[2, 3, 4])),
@@ -446,11 +446,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let block_store = open_db(temp_dir.path());
         let header = Header { nonce: 1, ..Default::default() };
-        let block1 = WorkerBlock::new(vec![transaction()], header.seal_slow());
+        let block1 = WorkerBlock::new_for_test(vec![transaction()], header.seal_slow());
         let header = Header { nonce: 2, ..Default::default() };
-        let block2 = WorkerBlock::new(vec![transaction()], header.seal_slow());
+        let block2 = WorkerBlock::new_for_test(vec![transaction()], header.seal_slow());
         let header = Header { nonce: 3, ..Default::default() };
-        let block3 = WorkerBlock::new(vec![transaction()], header.seal_slow());
+        let block3 = WorkerBlock::new_for_test(vec![transaction()], header.seal_slow());
         let (digests, known_workers) = (
             HashSet::from_iter(vec![block1.digest(), block2.digest(), block3.digest()]),
             HashSet::from_iter(test_pks(&[1, 2, 3, 4])),
@@ -502,7 +502,7 @@ mod tests {
         for _i in 0..num_digests / 2 {
             let header = Header { nonce, ..Default::default() };
             nonce += 1;
-            let block = WorkerBlock::new(vec![transaction()], header.seal_slow());
+            let block = WorkerBlock::new_for_test(vec![transaction()], header.seal_slow());
             local_digests.push(block.digest());
             block_store.insert::<WorkerBlocks>(&block.digest(), &block).unwrap();
             network.put(&[1, 2, 3], block.clone());
@@ -512,7 +512,7 @@ mod tests {
         for _i in (num_digests / 2)..num_digests {
             let header = Header { nonce, ..Default::default() };
             nonce += 1;
-            let block = WorkerBlock::new(vec![transaction()], header.seal_slow());
+            let block = WorkerBlock::new_for_test(vec![transaction()], header.seal_slow());
             network.put(&[1, 2, 3], block.clone());
             expected_blocks.push(block);
         }

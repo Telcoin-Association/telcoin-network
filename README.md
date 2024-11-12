@@ -109,4 +109,14 @@ To install `tn-contracts` dependencies, simply run the following NPM command:
 npm install
 ```
 
-Now `tn-contracts` is fully initialized; to compile run `forge build` and to run the fuzz tests run `forge test`. Contract information is best viewed in each contract's interface where its API is defined and documented in NatSpec format.
+### Build the contracts using Foundry
+
+Now that `tn-contracts` is initialized, compile the contracts to populate the required `out` dir by running
+
+```bash
+forge build
+```
+
+### Optional: Foundry tests
+
+To run the fuzz tests run `forge test`. Note that contract information is best viewed in each contract's interface where its API is defined and documented in NatSpec format.

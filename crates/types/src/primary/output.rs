@@ -6,10 +6,10 @@
 
 use crate::{
     crypto, encode, Certificate, CertificateDigest, ReputationScores, Round, TimestampSec,
-    WorkerBlock, WorkerBlockConversionError,
+    WorkerBlock,
 };
 use fastcrypto::hash::{Digest, Hash, HashFunction};
-use reth_primitives::{Address, BlockHash, Header, SealedBlockWithSenders, B256};
+use reth_primitives::{Address, BlockHash, Header, B256};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -81,22 +81,9 @@ impl ConsensusOutput {
             .flat_map(|blocks| blocks.iter().map(|block| block.sealed_header().header().clone()))
             .collect()
     }
-    /// Recover the sealed blocks with senders for all blocks in output.
-    ///
-    /// TODO: parallelize this when output contains enough blocks.
-    pub fn sealed_blocks_from_blocks(
-        &self,
-    ) -> Result<Vec<SealedBlockWithSenders>, WorkerBlockConversionError> {
-        self.blocks
-            .iter()
-            .flat_map(|blocks| {
-                blocks.iter().map(|block| {
-                    // create sealed block from block for execution this should never fail since
-                    // blocks are validated
-                    SealedBlockWithSenders::try_from(block)
-                })
-            })
-            .collect()
+
+    pub fn flatten_worker_blocks(&self) -> Vec<WorkerBlock> {
+        self.blocks.iter().flat_map(|blocks| blocks.iter().cloned()).collect()
     }
 }
 

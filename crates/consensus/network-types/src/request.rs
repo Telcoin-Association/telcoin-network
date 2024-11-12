@@ -167,6 +167,13 @@ pub struct ValidateBlockRequest {
 
 impl From<SealBlockRequest> for WorkerBlock {
     fn from(value: SealBlockRequest) -> Self {
-        WorkerBlock::new(value.payload, value.worker_block.sealed_header.clone())
+        Self {
+            transactions: value.payload,
+            parent_hash: value.worker_block.parent_hash,
+            beneficiary: value.worker_block.beneficiary,
+            timestamp: value.worker_block.timestamp,
+            base_fee_per_gas: value.worker_block.base_fee_per_gas,
+            received_at: None,
+        }
     }
 }

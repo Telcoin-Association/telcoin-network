@@ -150,7 +150,7 @@ pub fn fixture_batch_with_transactions(number_of_transactions: u32) -> WorkerBlo
         extra_data: r.into(),
         ..Default::default()
     };
-    WorkerBlock::new(transactions, header.seal_slow())
+    WorkerBlock::new_for_test(transactions, header.seal_slow())
 }
 
 pub fn fixture_payload_with_rand<R: Rng + ?Sized>(
@@ -181,7 +181,7 @@ pub fn transaction_with_rand<R: Rng + ?Sized>(rand: &mut R) -> TransactionSigned
 }
 
 pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R) -> WorkerBlock {
-    WorkerBlock::new(
+    WorkerBlock::new_for_test(
         vec![transaction_with_rand(rand), transaction_with_rand(rand)],
         SealedHeader::default(),
     )
@@ -225,7 +225,7 @@ pub fn batch() -> WorkerBlock {
         extra_data: r.into(),
         ..Default::default()
     };
-    WorkerBlock::new(transactions, header.seal_slow())
+    WorkerBlock::new_for_test(transactions, header.seal_slow())
 }
 
 /// generate multiple fixture batches. The number of generated batches
@@ -247,7 +247,7 @@ pub fn batch_with_transactions(num_of_transactions: usize) -> WorkerBlock {
         transactions.push(transaction());
     }
 
-    WorkerBlock::new(transactions, SealedHeader::default())
+    WorkerBlock::new_for_test(transactions, SealedHeader::default())
 }
 
 /// Creates one certificate per authority starting and finishing at the specified rounds
