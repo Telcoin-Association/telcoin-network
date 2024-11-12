@@ -7,8 +7,7 @@ members = [
     "crates/node",
     "crates/storage",
     "crates/test-utils",
-    "crates/tn-macros",
-    "crates/tn-sync",
+    "crates/tn-utils",
     "crates/types",
 
     # consensus
@@ -210,8 +209,7 @@ tn-test-utils = { path = "./crates/test-utils" }
 consensus-network-types = { path = "./crates/consensus/network-types" }
 consensus-metrics = { path = "./crates/consensus/consensus-metrics" }
 narwhal-primary-metrics = { path = "./crates/consensus/primary-metrics" }
-tn-sync = { path = "./crates/tn-sync" }
-tn-macros = { path = "./crates/tn-macros" }
+tn-utils = { path = "./crates/tn-utils" }
 
 # misc
 fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "802c1ac98061687d6ce024849c747a250dbeea52" }

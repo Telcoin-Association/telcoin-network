@@ -42,9 +42,7 @@ consensus-network-types = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
 tn-storage = { workspace = true }
-tn-macros = { workspace = true }
-
-tn-sync = { workspace = true }
+tn-utils = { workspace = true }
 consensus-metrics = { workspace = true }
 narwhal-primary-metrics = { workspace = true }
 

@@ -25,7 +25,7 @@ use std::{
 use tracing::{info, instrument, warn};
 
 pub use errors::TypedStoreError;
-use tn_macros::{fail_point, nondeterministic};
+use tn_utils::{fail_point, nondeterministic};
 
 // Write buffer size per RocksDB instance can be set via the env var below.
 // If the env var is not set, use the default value in MiB.

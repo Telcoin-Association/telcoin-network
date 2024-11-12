@@ -13,8 +13,8 @@ use consensus_network_types::{
 };
 use parking_lot::RwLock;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use tn_sync::sync::notify_once::NotifyOnce;
 use tn_types::{traits::KeyPair, NetworkKeypair, NetworkPublicKey};
+use tn_utils::sync::notify_once::NotifyOnce;
 use tokio::{select, time::sleep};
 use tracing::error;
 

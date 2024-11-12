@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{tables::Votes, traits::Database};
-use tn_macros::fail_point;
 use tn_types::{AuthorityIdentifier, Vote, VoteInfo};
+use tn_utils::fail_point;
 
 /// The storage for the last votes digests per authority
 #[derive(Clone)]

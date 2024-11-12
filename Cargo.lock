@@ -2080,10 +2080,9 @@ dependencies = [
  "quinn-proto",
  "rand 0.8.5",
  "thiserror",
- "tn-macros",
- "tn-sync",
  "tn-test-utils",
  "tn-types",
+ "tn-utils",
  "tokio",
  "tower",
  "tracing",
@@ -5171,12 +5170,11 @@ dependencies = [
  "tn-block-validator",
  "tn-config",
  "tn-executor",
- "tn-macros",
  "tn-node",
  "tn-storage",
- "tn-sync",
  "tn-test-utils",
  "tn-types",
+ "tn-utils",
  "tokio",
  "tokio-stream",
  "tower",
@@ -10715,15 +10713,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tn-macros"
-version = "0.1.0"
-dependencies = [
- "futures",
- "once_cell",
- "tracing",
-]
-
-[[package]]
 name = "tn-node"
 version = "0.1.0"
 dependencies = [
@@ -10817,22 +10806,12 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror",
- "tn-macros",
- "tn-sync",
  "tn-test-utils",
  "tn-types",
+ "tn-utils",
  "tokio",
  "tracing",
  "uint",
-]
-
-[[package]]
-name = "tn-sync"
-version = "0.1.0"
-dependencies = [
- "futures",
- "parking_lot 0.12.3",
- "tokio",
 ]
 
 [[package]]
@@ -10924,7 +10903,18 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "thiserror",
- "tn-sync",
+ "tn-utils",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "tn-utils"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "once_cell",
+ "parking_lot 0.12.3",
  "tokio",
  "tracing",
 ]

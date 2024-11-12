@@ -10,15 +10,15 @@ use std::{
     collections::BTreeMap,
     sync::Arc,
 };
-use tn_macros::fail_point;
+use tn_utils::fail_point;
 
 use crate::{
     tables::{CertificateDigestByOrigin, CertificateDigestByRound, Certificates},
     traits::{Database, DbTx, DbTxMut},
     StoreResult, ROUNDS_TO_KEEP,
 };
-use tn_sync::sync::notify_read::NotifyRead;
 use tn_types::{AuthorityIdentifier, Certificate, CertificateDigest, Round};
+use tn_utils::sync::notify_read::NotifyRead;
 
 /// The main storage when we have to deal with certificates.
 ///

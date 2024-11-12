@@ -12,10 +12,9 @@ publish = false
 
 [dependencies]
 fastcrypto.workspace = true
-tn-sync.workspace = true
+tn-utils.workspace = true
 tracing.workspace = true
 tn-types = { workspace = true }
-tn-macros = { workspace = true }
 eyre = { workspace = true }
 prometheus = { workspace = true }
 serde = { workspace = true }

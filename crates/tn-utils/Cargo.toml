@@ -1,22 +1,21 @@
 [package]
-name = "tn-macros"
+name = "tn-utils"
 authors = [
     "Grant Kee <grant@telcoin.org>",
     "Steven Stanfield <steve@telcoin.org>",
     "Mysten Labs <build@mystenlabs.com>",
 ]
-version.workspace = true
 license = "Apache-2.0"
-publish = false
+version.workspace = true
 edition = "2021"
+publish = false
 
 [dependencies]
+tokio = { workspace = true, features = ["sync"] }
+parking_lot = { workspace = true }
 once_cell = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(msim)',
-    'cfg(fail_points)',
-] }
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "test-util"] }
