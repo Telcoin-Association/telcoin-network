@@ -572,7 +572,7 @@ mod tests {
             NetworkGenesis::load_from_path(&paths).expect("unable to load network genesis");
 
         loaded_network_genesis.construct_registry_genesis_accounts(Some(
-            "../../../tn-contracts/deployments/consensus-registry-storage.yaml".into(),
+            "../../tn-contracts/deployments/consensus-registry-storage.yaml".into(),
         ));
 
         let loaded_validator =

@@ -122,8 +122,8 @@ validators:
 
 # init submodules
 init-submodules:
-	git submodule update --init --recursive
+	git submodule update --init --recursive ;
 
 # update tn-contracts submodule
 update-tn-contracts:
-	git submodule update foreach get
+	git submodule update --remote ;
