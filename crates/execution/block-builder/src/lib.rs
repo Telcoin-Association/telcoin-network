@@ -432,11 +432,6 @@ mod tests {
     use super::*;
     use assert_matches::assert_matches;
     use consensus_network::client::NetworkClient;
-    use narwhal_worker::{
-        metrics::WorkerMetrics,
-        quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
-        BlockProvider,
-    };
     use reth::tasks::TaskManager;
     use reth_blockchain_tree::{
         noop::NoopBlockchainTree, BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree,
@@ -469,6 +464,11 @@ mod tests {
     use tn_types::{
         adiri_genesis, max_worker_block_gas, AutoSealConsensus, BuildArguments, CommittedSubDag,
         Consensus, ConsensusOutput, WorkerBlock,
+    };
+    use tn_worker::{
+        metrics::WorkerMetrics,
+        quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
+        BlockProvider,
     };
     use tokio::time::timeout;
 

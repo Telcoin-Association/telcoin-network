@@ -26,13 +26,13 @@ fastcrypto = { workspace = true }
 consensus-network = { workspace = true }
 consensus-network-types = { workspace = true }
 tn-node = { workspace = true }
-narwhal-primary = { workspace = true }
+tn-primary = { workspace = true }
 tn-types = { workspace = true }
 tn-faucet = { workspace = true }
 tn-config = { workspace = true }
-narwhal-worker = { workspace = true }
+tn-worker = { workspace = true }
 consensus-metrics = { workspace = true }
-narwhal-primary-metrics = { workspace = true }
+tn-primary-metrics = { workspace = true }
 reth-tracing = { workspace = true }
 reth-chainspec = { workspace = true }
 reth-cli-commands = { workspace = true }

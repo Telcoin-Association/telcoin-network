@@ -30,12 +30,12 @@ consensus-network = { workspace = true }
 mockall.workspace = true
 
 consensus-metrics.workspace = true
-narwhal-primary = { workspace = true }
+tn-primary = { workspace = true }
 
 [dev-dependencies]
 indexmap.workspace = true
 tempfile.workspace = true
-narwhal-primary = { workspace = true }
+tn-primary = { workspace = true }
 tn-node = { workspace = true }
 tn-test-utils = { workspace = true }
 bytes = { workspace = true }

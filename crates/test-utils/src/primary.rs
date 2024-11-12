@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Primary fixture for the cluster
-use narwhal_primary::consensus::ConsensusMetrics;
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 use tn_config::ConsensusConfig;
 use tn_node::primary::PrimaryNode;
+use tn_primary::consensus::ConsensusMetrics;
 use tn_storage::traits::Database;
 use tn_types::{AuthorityIdentifier, ConsensusOutput};
 use tokio::{
@@ -41,7 +41,7 @@ impl<DB: Database> PrimaryNodeDetails<DB> {
     }
 
     /// Retrieve the consensus metrics in use for this primary node.
-    pub async fn primary_metrics(&self) -> Arc<narwhal_primary_metrics::Metrics> {
+    pub async fn primary_metrics(&self) -> Arc<tn_primary_metrics::Metrics> {
         self.node.primary_metrics().await
     }
 

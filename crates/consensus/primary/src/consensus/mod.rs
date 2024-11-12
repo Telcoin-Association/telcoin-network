@@ -21,7 +21,7 @@ pub use crate::consensus::{
     utils::gc_round,
 };
 
-pub use narwhal_primary_metrics::consensus::{ChannelMetrics, ConsensusMetrics};
+pub use tn_primary_metrics::consensus::{ChannelMetrics, ConsensusMetrics};
 
 use thiserror::Error;
 use tn_storage::StoreError;

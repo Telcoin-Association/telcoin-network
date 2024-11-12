@@ -236,7 +236,7 @@ where
 
             authorities_latest_commit.insert(primary.id, value);
 
-            info!("[Node {}] Metric narwhal_primary_last_committed_round -> {value}", primary.id);
+            info!("[Node {}] Metric tn_primary_last_committed_round -> {value}", primary.id);
         }
 
         authorities_latest_commit

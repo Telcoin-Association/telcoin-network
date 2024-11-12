@@ -1,5 +1,5 @@
 [package]
-name = "narwhal-worker"
+name = "tn-worker"
 version.workspace = true
 license = "Apache-2.0"
 authors = [
@@ -34,7 +34,7 @@ tn-types = { workspace = true }
 tn-config = { workspace = true }
 prometheus = { workspace = true }
 consensus-metrics = { workspace = true }
-narwhal-primary-metrics = { workspace = true }
+tn-primary-metrics = { workspace = true }
 
 anemo = { workspace = true }
 anemo-tower = { workspace = true }
@@ -48,7 +48,7 @@ tempfile = { workspace = true }
 tn-test-utils = { workspace = true }
 reqwest = { workspace = true }
 tn-node = { workspace = true }
-narwhal-primary = { workspace = true }
+tn-primary = { workspace = true }
 reth-tracing = { workspace = true }
 consensus-network = { workspace = true, features = ["test-utils"] }
 bytes = { workspace = true }

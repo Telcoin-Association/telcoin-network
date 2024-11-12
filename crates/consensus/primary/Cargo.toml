@@ -1,5 +1,5 @@
 [package]
-name = "narwhal-primary"
+name = "tn-primary"
 version.workspace = true
 license = "Apache-2.0"
 authors = [
@@ -44,7 +44,7 @@ tn-config = { workspace = true }
 tn-storage = { workspace = true }
 tn-utils = { workspace = true }
 consensus-metrics = { workspace = true }
-narwhal-primary-metrics = { workspace = true }
+tn-primary-metrics = { workspace = true }
 
 anemo = { workspace = true }
 anemo-tower = { workspace = true }
@@ -63,7 +63,7 @@ proptest = { workspace = true }
 tempfile = { workspace = true }
 tn-test-utils = { workspace = true }
 tracing = { workspace = true }
-narwhal-worker = { workspace = true }
+tn-worker = { workspace = true }
 tn-storage = { workspace = true }
 reqwest = { workspace = true }
 bytes = { workspace = true }

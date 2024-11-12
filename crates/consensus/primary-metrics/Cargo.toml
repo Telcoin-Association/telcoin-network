@@ -1,5 +1,5 @@
 [package]
-name = "narwhal-primary-metrics"
+name = "tn-primary-metrics"
 version.workspace = true
 authors = [
     "Grant Kee <grant@telcoin.org>",

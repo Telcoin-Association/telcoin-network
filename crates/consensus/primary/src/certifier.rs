@@ -8,9 +8,9 @@ use crate::{aggregators::VotesAggregator, synchronizer::Synchronizer, ConsensusB
 use consensus_metrics::{monitored_future, spawn_logged_monitored_task};
 use consensus_network::anemo_ext::NetworkExt;
 use futures::{stream::FuturesUnordered, StreamExt};
-use narwhal_primary_metrics::PrimaryMetrics;
 use std::{future::Future, pin::pin, sync::Arc, task::Poll, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig};
+use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::{traits::Database, CertificateStore};
 use tn_types::{AuthorityIdentifier, BlsSigner, Committee, Noticer, TnSender};
 

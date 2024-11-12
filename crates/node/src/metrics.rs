@@ -9,8 +9,8 @@ use tn_types::{AuthorityIdentifier, Multiaddr};
 use tokio::task::JoinHandle;
 
 const METRICS_ROUTE: &str = "/metrics";
-const PRIMARY_METRICS_PREFIX: &str = "narwhal_primary";
-const _WORKER_METRICS_PREFIX: &str = "narwhal_worker";
+const PRIMARY_METRICS_PREFIX: &str = "tn_primary";
+const _WORKER_METRICS_PREFIX: &str = "tn_worker";
 
 pub fn new_registry() -> Result<Registry, PrometheusError> {
     Registry::new_custom(None, None)

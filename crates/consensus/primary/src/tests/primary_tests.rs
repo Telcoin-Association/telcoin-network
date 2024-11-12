@@ -16,7 +16,6 @@ use fastcrypto::{
     traits::KeyPair as _,
 };
 use itertools::Itertools;
-use narwhal_worker::{metrics::Metrics, Worker};
 use prometheus::Registry;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -31,6 +30,7 @@ use tn_test_utils::{
     CommitteeFixture,
 };
 use tn_types::{now, AuthorityIdentifier, Certificate, Committee, SignatureVerificationState};
+use tn_worker::{metrics::Metrics, Worker};
 use tokio::time::timeout;
 
 #[tokio::test]

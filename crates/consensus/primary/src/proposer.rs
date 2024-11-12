@@ -27,7 +27,6 @@ use crate::{
 };
 use fastcrypto::hash::Hash as _;
 use futures::FutureExt;
-use narwhal_primary_metrics::PrimaryMetrics;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
@@ -37,6 +36,7 @@ use std::{
     task::{Context, Poll},
 };
 use tn_config::ConsensusConfig;
+use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::{traits::Database, ProposerStore};
 use tn_types::{
     now, AuthorityIdentifier, BlockHash, Certificate, Committee, Epoch, Header, Noticer, Round,

@@ -8,8 +8,8 @@ mod subscriber;
 mod metrics;
 
 pub use errors::{SubscriberError, SubscriberResult};
-use narwhal_primary::ConsensusBus;
 pub use state::ExecutionIndices;
+use tn_primary::ConsensusBus;
 use tn_storage::traits::Database;
 
 pub use crate::metrics::ExecutorMetrics;

@@ -10,7 +10,6 @@
 use crate::{synchronizer::Synchronizer, ConsensusBus};
 use consensus_network_types::{RequestVoteRequest, RequestVoteResponse};
 use fastcrypto::hash::Hash;
-use narwhal_primary_metrics::PrimaryMetrics;
 use parking_lot::Mutex;
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
@@ -18,6 +17,7 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
+use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::{traits::Database, PayloadStore};
 use tn_types::{
     ensure,

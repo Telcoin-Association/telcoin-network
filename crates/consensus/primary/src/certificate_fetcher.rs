@@ -7,13 +7,13 @@ use anemo::Request;
 use consensus_metrics::{monitored_future, monitored_scope, spawn_logged_monitored_task};
 use consensus_network::PrimaryToPrimaryRpc;
 use futures::{stream::FuturesUnordered, StreamExt};
-use narwhal_primary_metrics::PrimaryMetrics;
 use rand::{rngs::ThreadRng, seq::SliceRandom};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
     time::Duration,
 };
+use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::{traits::Database, CertificateStore};
 use tn_types::{AuthorityIdentifier, Committee, NetworkPublicKey, Noticer, TnReceiver, TnSender};
 

@@ -6,7 +6,7 @@
 use super::*;
 use async_trait::async_trait;
 use fastcrypto::encoding::{Encoding, Hex};
-use narwhal_primary::{
+use tn_primary::{
     consensus::{LeaderSchedule, LeaderSwapTable},
     Primary,
 };
@@ -338,7 +338,7 @@ async fn get_network_peers_from_admin_server() {
     let temp_dir = TempDir::new().unwrap();
     let _ = std::fs::create_dir_all(temp_dir.path());
 
-    let cb_1 = narwhal_primary::ConsensusBus::new();
+    let cb_1 = tn_primary::ConsensusBus::new();
     // Spawn Primary 1
     Primary::spawn(
         config_1.clone(),
@@ -402,7 +402,7 @@ async fn get_network_peers_from_admin_server() {
 
     let worker_2_keypair = authority_2.worker().keypair().copy();
 
-    let cb_2 = narwhal_primary::ConsensusBus::new();
+    let cb_2 = tn_primary::ConsensusBus::new();
     // Spawn Primary 2
     Primary::spawn(
         config_2.clone(),

@@ -202,13 +202,13 @@ tn-faucet = { path = "./crates/execution/faucet" }
 # consensus
 tn-executor = { path = "./crates/consensus/executor" }
 consensus-network = { path = "./crates/consensus/network" }
-narwhal-worker = { path = "./crates/consensus/worker" }
+tn-worker = { path = "./crates/consensus/worker" }
 tn-storage = { path = "./crates/storage" }
-narwhal-primary = { path = "./crates/consensus/primary" }
+tn-primary = { path = "./crates/consensus/primary" }
 tn-test-utils = { path = "./crates/test-utils" }
 consensus-network-types = { path = "./crates/consensus/network-types" }
 consensus-metrics = { path = "./crates/consensus/consensus-metrics" }
-narwhal-primary-metrics = { path = "./crates/consensus/primary-metrics" }
+tn-primary-metrics = { path = "./crates/consensus/primary-metrics" }
 tn-utils = { path = "./crates/tn-utils" }
 
 # misc

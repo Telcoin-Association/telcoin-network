@@ -45,7 +45,7 @@ reth-provider = { workspace = true, features = ["test-utils"] }
 # integration tests
 anemo = { workspace = true }
 prometheus = { workspace = true }
-narwhal-worker = { workspace = true }
+tn-worker = { workspace = true }
 consensus-network = { workspace = true }
 consensus-network-types = { workspace = true }
 tn-storage = { workspace = true }

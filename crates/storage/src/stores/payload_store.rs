@@ -9,8 +9,7 @@ use crate::{
 };
 use std::sync::Arc;
 use tn_types::{BlockHash, WorkerId};
-use tn_utils::fail_point;
-use tn_utils::sync::notify_read::NotifyRead;
+use tn_utils::{fail_point, sync::notify_read::NotifyRead};
 
 /// Store of the batch digests for the primary node for the own created batches.
 #[derive(Clone)]

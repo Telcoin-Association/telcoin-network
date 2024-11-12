@@ -55,7 +55,7 @@ consensus-metrics = { workspace = true }
 tn-test-utils = { workspace = true }
 consensus-network = { workspace = true }
 consensus-network-types = { workspace = true }
-narwhal-worker = { workspace = true }
+tn-worker = { workspace = true }
 tn-storage = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }

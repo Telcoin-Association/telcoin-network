@@ -66,10 +66,10 @@ macro_rules! test_committed_certificates_channel {
 }
 
 /// See (not imported to avoid a circular dependancy):
-/// narwhal_primary_metrics::PrimaryChannelMetrics::NAME_NEW_CERTS,
+/// tn_primary_metrics::PrimaryChannelMetrics::NAME_NEW_CERTS,
 pub const NAME_NEW_CERTS: &str = "tx_new_certificates";
 /// See (not imported to avoid a circular dependancy):
-/// narwhal_primary_metrics::PrimaryChannelMetrics::DESC_NEW_CERTS,
+/// tn_primary_metrics::PrimaryChannelMetrics::DESC_NEW_CERTS,
 pub const DESC_NEW_CERTS: &str =
     "occupancy of the channel from the `Consensus` to the `primary::StateHandler`";
 

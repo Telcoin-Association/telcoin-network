@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
-use narwhal_primary_metrics::{ChannelMetrics, ConsensusMetrics, Metrics};
+use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, Metrics};
 use tn_types::{Certificate, CommittedSubDag, Header, Round, TnSender, CHANNEL_CAPACITY};
 use tokio::sync::watch;
 

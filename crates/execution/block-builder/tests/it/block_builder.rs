@@ -6,11 +6,6 @@
 use assert_matches::assert_matches;
 use consensus_network::client::NetworkClient;
 use consensus_network_types::MockWorkerToPrimary;
-use narwhal_worker::{
-    metrics::WorkerMetrics,
-    quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
-    BlockProvider,
-};
 use reth_blockchain_tree::{
     noop::NoopBlockchainTree, BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree,
     TreeExternals,
@@ -41,6 +36,11 @@ use tn_test_utils::{get_gas_price, test_genesis, TransactionFactory};
 use tn_types::{
     max_worker_block_gas, AutoSealConsensus, BuildArguments, Certificate, CommittedSubDag,
     Consensus, ConsensusOutput, LastCanonicalUpdate, ReputationScores, WorkerBlock,
+};
+use tn_worker::{
+    metrics::WorkerMetrics,
+    quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
+    BlockProvider,
 };
 use tokio::time::timeout;
 use tracing::debug;

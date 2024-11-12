@@ -5,8 +5,8 @@
 
 //! Aggregate votes after proposing a header.
 use fastcrypto::hash::{Digest, Hash};
-use narwhal_primary_metrics::PrimaryMetrics;
 use std::{collections::HashSet, sync::Arc};
+use tn_primary_metrics::PrimaryMetrics;
 use tn_types::{AuthorityIdentifier, Committee, Stake};
 
 use tn_types::{
