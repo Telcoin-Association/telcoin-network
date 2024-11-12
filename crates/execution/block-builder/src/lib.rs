@@ -97,13 +97,6 @@ pub struct BlockBuilder<BT, Pool> {
     /// This interval wakes the task periodically to check on the progress of the latest built
     /// block and the pending transaction pool.
     max_delay_interval: Interval,
-    /// The maximum amount of gas for a worker block.
-    ///
-    /// NOTE: transactions are not executed at this stage, so the worker measures the amount of gas
-    /// specified by a transaction's gas limit.
-    gas_limit: u64,
-    /// The maximum size of collected transactions, measured in bytes.
-    max_size: usize,
 }
 
 impl<BT, Pool> BlockBuilder<BT, Pool>
@@ -120,8 +113,6 @@ where
         to_worker: WorkerBlockSender,
         address: Address,
         max_delay: Duration,
-        gas_limit: u64,
-        max_size: usize,
     ) -> Self {
         let max_delay_interval = tokio::time::interval(max_delay);
         Self {
@@ -133,8 +124,6 @@ where
             to_worker,
             address,
             max_delay_interval,
-            gas_limit,
-            max_size,
         }
     }
 
@@ -213,12 +202,7 @@ where
         let to_worker = self.to_worker.clone();
 
         // configure params for next block to build
-        let config = PendingBlockConfig::new(
-            self.address,
-            self.latest_canon_state.clone(),
-            self.gas_limit, // in wei
-            self.max_size,  // in bytes
-        );
+        let config = PendingBlockConfig::new(self.address, self.latest_canon_state.clone());
         let build_args = WorkerBlockBuilderArgs::new(pool.clone(), config);
         let (result, done) = oneshot::channel();
 
@@ -462,8 +446,8 @@ mod tests {
     use tn_storage::{open_db, tables::WorkerBlocks, traits::Database};
     use tn_test_utils::{adiri_genesis_seeded, get_gas_price, TransactionFactory};
     use tn_types::{
-        adiri_genesis, max_worker_block_gas, AutoSealConsensus, BuildArguments, CommittedSubDag,
-        Consensus, ConsensusOutput, WorkerBlock,
+        adiri_genesis, AutoSealConsensus, BuildArguments, CommittedSubDag, Consensus,
+        ConsensusOutput, WorkerBlock,
     };
     use tn_worker::{
         metrics::WorkerMetrics,
@@ -559,8 +543,6 @@ mod tests {
             block_provider.blocks_rx(),
             address,
             Duration::from_secs(1),
-            max_worker_block_gas(0), // 30mil gas limit
-            1_000_000,               // 1MB size
         );
 
         let gas_price = get_gas_price(&blockchain_db);
@@ -762,8 +744,6 @@ mod tests {
             to_worker,
             address,
             Duration::from_millis(1),
-            max_worker_block_gas(0), // 30mil gas limit
-            1_000_000,               // 1MB size
         );
 
         // expected to be 7 wei for first block
@@ -922,8 +902,6 @@ mod tests {
             to_worker,
             address,
             Duration::from_secs(1),
-            max_worker_block_gas(0), // 30mil gas limit
-            1_000_000,               // 1MB size
         );
 
         // expected to be 7 wei for first block

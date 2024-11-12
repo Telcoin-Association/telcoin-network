@@ -6,10 +6,7 @@
 
 use crate::{crypto, encode, TimestampSec};
 use fastcrypto::hash::HashFunction;
-use reth_primitives::{
-    constants::EMPTY_WITHDRAWALS, proofs, Address, BlockHash, Bloom, Bytes, Header, SealedBlock,
-    SealedHeader, TransactionSigned, B256, EMPTY_OMMER_ROOT_HASH, U256,
-};
+use reth_primitives::{Address, BlockHash, SealedBlock, SealedHeader, TransactionSigned, B256};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -115,46 +112,6 @@ impl WorkerBlock {
         total_possible_gas
     }
 
-    /// Returns a sealed header.
-    /// This is a synthetic sealed header with a lot of default values.
-    /// It is NOT an actual block on the chain and has limited utility.
-    pub fn sealed_header(&self) -> SealedHeader {
-        let transactions_root = proofs::calculate_transaction_root(&self.transactions);
-
-        let total_possible_gas = self.total_possible_gas();
-
-        // create header
-        //
-        // NOTE: workers do not execute transactions. Peers validate:
-        // - calculated transaction root
-        // - all other roots are defaults
-        // - use ZERO for hashes
-        let header = Header {
-            parent_hash: self.parent_hash,
-            ommers_hash: EMPTY_OMMER_ROOT_HASH,
-            beneficiary: self.beneficiary,
-            state_root: B256::ZERO,
-            transactions_root,
-            receipts_root: B256::ZERO,
-            withdrawals_root: Some(EMPTY_WITHDRAWALS),
-            logs_bloom: Bloom::default(),
-            timestamp: self.timestamp,
-            mix_hash: B256::ZERO,
-            nonce: 0,
-            base_fee_per_gas: self.base_fee_per_gas,
-            number: 1,
-            gas_limit: max_worker_block_gas(self.timestamp), // gas limit in wei - just a default
-            difficulty: U256::ZERO,
-            gas_used: total_possible_gas,
-            extra_data: Bytes::default(),
-            parent_beacon_block_root: None,
-            blob_gas_used: None,
-            excess_blob_gas: None,
-            requests_root: None,
-        };
-        header.seal_slow()
-    }
-
     /// Returns the received at time if available.
     pub fn received_at(&self) -> Option<TimestampSec> {
         self.received_at
@@ -170,4 +127,10 @@ impl WorkerBlock {
 /// Currently allways 30,000,000 but can change in the future at a fork.
 pub fn max_worker_block_gas(_timestamp: u64) -> u64 {
     30_000_000
+}
+
+/// Max worker block size in effect at a timestamp.  Measured in bytes.
+/// Currently allways 1,000,000 but can change in the future at a fork.
+pub fn max_worker_block_size(_timestamp: u64) -> usize {
+    1_000_000
 }

@@ -31,24 +31,12 @@ pub struct PendingBlockConfig {
     /// is updated with rounds of consensus and used by the worker to
     /// build the next block.
     pub parent_info: LastCanonicalUpdate,
-    /// The maximum gas for a block.
-    ///
-    /// This value is only measured by a transaction's gas_limit,
-    /// not the actual amount of gas used during a transaction's execution.
-    pub gas_limit: u64,
-    /// The maximum size of the worker's block measured in bytes.
-    pub max_size: usize,
 }
 
 impl PendingBlockConfig {
     /// Creates a new instance of [Self].
-    pub fn new(
-        beneficiary: Address,
-        parent_info: LastCanonicalUpdate,
-        gas_limit: u64,
-        max_size: usize,
-    ) -> Self {
-        Self { beneficiary, parent_info, gas_limit, max_size }
+    pub fn new(beneficiary: Address, parent_info: LastCanonicalUpdate) -> Self {
+        Self { beneficiary, parent_info }
     }
 }
 

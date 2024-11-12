@@ -8,7 +8,10 @@
 
 use reth_primitives::{IntoRecoveredTransaction, TxHash};
 use reth_transaction_pool::TransactionPool;
-use tn_types::{now, PendingBlockConfig, WorkerBlock, WorkerBlockBuilderArgs};
+use tn_types::{
+    max_worker_block_gas, max_worker_block_size, now, PendingBlockConfig, WorkerBlock,
+    WorkerBlockBuilderArgs,
+};
 use tracing::{debug, warn};
 
 /// The output from building the next block.
@@ -46,7 +49,9 @@ where
     P: TransactionPool,
 {
     let WorkerBlockBuilderArgs { pool, block_config } = args;
-    let PendingBlockConfig { beneficiary, parent_info, gas_limit, max_size } = block_config;
+    let gas_limit = max_worker_block_gas(block_config.parent_info.tip.timestamp);
+    let max_size = max_worker_block_size(block_config.parent_info.tip.timestamp);
+    let PendingBlockConfig { beneficiary, parent_info } = block_config;
 
     // NOTE: this obtains a `read` lock on the tx pool
     // pull best transactions and rely on watch channel to ensure basefee is current

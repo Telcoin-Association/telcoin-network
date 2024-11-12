@@ -5,7 +5,7 @@ use reth_db::database::Database;
 use reth_primitives::Header;
 use reth_provider::{providers::BlockchainProvider, HeaderProvider};
 use std::fmt::{Debug, Display};
-use tn_types::{TransactionSigned, WorkerBlock};
+use tn_types::{max_worker_block_gas, max_worker_block_size, TransactionSigned, WorkerBlock};
 
 /// Type convenience for implementing block validation errors.
 type BlockValidationResult<T> = Result<T, BlockValidationError>;
@@ -18,14 +18,6 @@ where
 {
     /// Database provider to encompass tree and provider factory.
     blockchain_db: BlockchainProvider<DB>,
-    /// The maximum size (in bytes) for a peer's list of transactions.
-    ///
-    /// The peer-proposed block's transaction list must not exceed this value.
-    max_tx_bytes: usize,
-    /// The maximum size (in gas) for a peer's list of transactions.
-    ///
-    /// The peer-proposed block's transaction list must not exceed this value.
-    max_tx_gas: u64,
 }
 
 /// Defines the validation procedure for receiving either a new single transaction (from a client)
@@ -69,10 +61,10 @@ where
         self.validate_against_parent_timestamp(block.timestamp, parent.header())?;
 
         // validate gas limit
-        self.validate_block_gas(block.total_possible_gas())?;
+        self.validate_block_gas(block.total_possible_gas(), block.timestamp)?;
 
         // validate block size (bytes)
-        self.validate_block_size_bytes(transactions)?;
+        self.validate_block_size_bytes(transactions, block.timestamp)?;
 
         // validate beneficiary?
         // no - tips would go to someone else
@@ -88,12 +80,8 @@ where
     DB: Database + Clone,
 {
     /// Create a new instance of [Self]
-    pub fn new(
-        blockchain_db: BlockchainProvider<DB>,
-        max_tx_bytes: usize,
-        max_tx_gas: u64,
-    ) -> Self {
-        Self { blockchain_db, max_tx_bytes, max_tx_gas }
+    pub fn new(blockchain_db: BlockchainProvider<DB>) -> Self {
+        Self { blockchain_db }
     }
 
     /// Validates the timestamp against the parent to make sure it is in the past.
@@ -116,12 +104,17 @@ where
     ///
     /// Actual amount of gas used cannot be determined until execution.
     #[inline]
-    fn validate_block_gas(&self, total_possible_gas: u64) -> BlockValidationResult<()> {
+    fn validate_block_gas(
+        &self,
+        total_possible_gas: u64,
+        timestamp: u64,
+    ) -> BlockValidationResult<()> {
         // ensure total tx gas limit fits into block's gas limit
-        if total_possible_gas > self.max_tx_gas {
+        let max_tx_gas = max_worker_block_gas(timestamp);
+        if total_possible_gas > max_tx_gas {
             return Err(BlockValidationError::HeaderMaxGasExceedsGasLimit {
                 total_possible_gas,
-                gas_limit: self.max_tx_gas,
+                gas_limit: max_tx_gas,
             });
         }
         Ok(())
@@ -131,6 +124,7 @@ where
     fn validate_block_size_bytes(
         &self,
         transactions: &[TransactionSigned],
+        timestamp: u64,
     ) -> BlockValidationResult<()> {
         // calculate size (in bytes) of included transactions
         let total_bytes = transactions
@@ -138,9 +132,10 @@ where
             .map(|tx| tx.size())
             .reduce(|total, size| total + size)
             .ok_or(BlockValidationError::CalculateTransactionByteSize)?;
+        let max_tx_bytes = max_worker_block_size(timestamp);
 
         // allow txs that equal max tx bytes
-        if total_bytes > self.max_tx_bytes {
+        if total_bytes > max_tx_bytes {
             return Err(BlockValidationError::HeaderTransactionBytesExceedsMax(total_bytes));
         }
 
@@ -247,11 +242,11 @@ mod tests {
 
     /// Create an instance of block validator for tests.
     async fn test_types() -> TestTools {
-        test_types_int(1_000_000, max_worker_block_gas(0)).await
+        test_types_int(false).await
     }
 
     /// Create an instance of block validator for tests.
-    async fn test_types_int(max_tx_bytes: usize, max_tx_gas: u64) -> TestTools {
+    async fn test_types_int(to_much_gas: bool) -> TestTools {
         // reth_tracing::init_test_tracing();
         let genesis = adiri_genesis();
         let mut tx_factory = TransactionFactory::new();
@@ -276,11 +271,12 @@ mod tests {
 
         let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
         let gas_price = 7;
+        let gas_limit = if to_much_gas { Some(max_worker_block_gas(0)) } else { None };
 
         // create 3 transactions
         let transaction1 = tx_factory.create_eip1559(
             chain.clone(),
-            None,
+            gas_limit,
             gas_price,
             Some(Address::ZERO),
             value, // 1 TEL
@@ -340,7 +336,7 @@ mod tests {
             BlockchainProvider::new(provider_factory.clone(), blockchain_tree.clone())
                 .expect("blockchain db valid");
 
-        let validator = BlockValidator::new(blockchain_db, max_tx_bytes, max_tx_gas);
+        let validator = BlockValidator::new(blockchain_db);
         let valid_header = next_valid_sealed_header();
 
         // block validator
@@ -402,11 +398,11 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_block_excess_gas_used() {
         // Set super low gas limit.
-        let TestTools { valid_txs, valid_header, validator } = test_types_int(1_000_000, 10).await;
+        let TestTools { valid_txs, valid_header, validator } = test_types_int(true).await;
 
         let wrong_block = WorkerBlock::new_for_test(valid_txs, valid_header);
         assert_matches!(
-            validator.validate_block_gas(wrong_block.total_possible_gas()),
+            validator.validate_block_gas(wrong_block.total_possible_gas(), wrong_block.timestamp),
             Err(BlockValidationError::HeaderMaxGasExceedsGasLimit {
                 total_possible_gas: _,
                 gas_limit: _
@@ -442,7 +438,7 @@ mod tests {
         let mut too_many_txs = Vec::new();
         let mut total_bytes = 0;
         let mut total_gas = 0;
-        while total_bytes < 1_000_000 {
+        while total_bytes < max_worker_block_size(0) {
             let tx = tx_factory.create_explicit_eip1559(
                 Some(chain.chain.id()),
                 None,                    // default nonce

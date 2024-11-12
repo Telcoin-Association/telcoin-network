@@ -1,5 +1,6 @@
 //! Configurations for the Telcoin Network.
 
+use crate::{ConfigTrait, ValidatorInfo};
 use fastcrypto::traits::KeyPair as KeyPairTrait;
 use reth_chainspec::ChainSpec;
 use reth_primitives::{Address, Genesis};
@@ -10,12 +11,10 @@ use std::{
     time::Duration,
 };
 use tn_types::{
-    adiri_genesis, get_available_tcp_port, max_worker_block_gas, BlsPublicKey, BlsSignature,
-    Multiaddr, NetworkPublicKey, WorkerIndex,
+    adiri_genesis, get_available_tcp_port, BlsPublicKey, BlsSignature, Multiaddr, NetworkPublicKey,
+    WorkerIndex,
 };
 use tracing::info;
-
-use crate::{ConfigTrait, ValidatorInfo};
 
 /// The filename to use when reading/writing the validator's BlsKey.
 pub const BLS_KEYFILE: &str = "bls.key";
@@ -155,16 +154,6 @@ pub struct Parameters {
     /// are picked at random from the committee.
     #[serde(default = "Parameters::default_sync_retry_nodes")]
     pub sync_retry_nodes: usize,
-    /// The maximum size (in bytes) for the proposed collection of transactions.
-    ///
-    /// The worker's collection of transactions must not exceed this value.
-    #[serde(default = "Parameters::default_max_worker_block_size")]
-    pub max_worker_tx_bytes_size: usize,
-    /// The maximum size (in gas) for the proposed collection of transactions.
-    ///
-    /// The worker's collection of transactions must not exceed this value.
-    #[serde(default = "Parameters::default_max_worker_block_gas")]
-    pub max_worker_tx_gas: u64,
     /// The delay after which the workers seal a batch of transactions, even if `max_batch_size`
     /// is not reached.
     #[serde(with = "humantime_serde", default = "Parameters::default_max_worker_block_delay")]
@@ -213,16 +202,6 @@ impl Parameters {
 
     fn default_sync_retry_nodes() -> usize {
         3
-    }
-
-    /// Measured in bytes - 1MB
-    fn default_max_worker_block_size() -> usize {
-        1_000_000
-    }
-
-    /// Measured in wei - 30mil
-    fn default_max_worker_block_gas() -> u64 {
-        max_worker_block_gas(0)
     }
 
     fn default_max_worker_block_delay() -> Duration {
@@ -365,8 +344,6 @@ impl Default for Parameters {
             gc_depth: Parameters::default_gc_depth(),
             sync_retry_delay: Parameters::default_sync_retry_delay(),
             sync_retry_nodes: Parameters::default_sync_retry_nodes(),
-            max_worker_tx_bytes_size: Parameters::default_max_worker_block_size(),
-            max_worker_tx_gas: Parameters::default_max_worker_block_gas(),
             max_worker_block_delay: Parameters::default_max_worker_block_delay(),
             max_concurrent_requests: Parameters::default_max_concurrent_requests(),
             prometheus_metrics: PrometheusMetricsParameters::default(),
@@ -396,8 +373,6 @@ impl Parameters {
         info!("Garbage collection depth set to {} rounds", self.gc_depth);
         info!("Sync retry delay set to {} ms", self.sync_retry_delay.as_millis());
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
-        info!("Worker block size set to {} B", self.max_worker_tx_bytes_size);
-        info!("Worker block gas set to {} wei", self.max_worker_tx_gas);
         info!("Max batch delay set to {} ms", self.max_worker_block_delay.as_millis());
         info!("Max concurrent requests set to {}", self.max_concurrent_requests);
         info!("Prometheus metrics server will run on {}", self.prometheus_metrics.socket_addr);

@@ -301,8 +301,8 @@ mod tests {
     use reth_blockchain_tree::BlockchainTreeViewer;
     use reth_chainspec::ChainSpec;
     use reth_primitives::{
-        constants::MIN_PROTOCOL_BASE_FEE, proofs, Address, BlockHashOrNumber, B256,
-        EMPTY_OMMER_ROOT_HASH, U256,
+        constants::{EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE},
+        Address, BlockHashOrNumber, Bloom, B256, EMPTY_OMMER_ROOT_HASH, U256,
     };
     use reth_provider::{BlockIdReader, BlockNumReader, BlockReader, TransactionVariant};
     use reth_tasks::TaskManager;
@@ -311,8 +311,8 @@ mod tests {
     use tn_block_builder::test_utils::execute_test_worker_block;
     use tn_test_utils::{default_test_execution_node, seeded_genesis_from_random_batches};
     use tn_types::{
-        adiri_chain_spec_arc, adiri_genesis, now, BlockHash, Certificate, CommittedSubDag,
-        ConsensusOutput, ReputationScores,
+        adiri_chain_spec_arc, adiri_genesis, max_worker_block_gas, now, BlockHash, Certificate,
+        CommittedSubDag, ConsensusOutput, ReputationScores,
     };
     use tokio::{sync::oneshot, time::timeout};
     use tokio_stream::wrappers::BroadcastStream;
@@ -436,9 +436,6 @@ mod tests {
         assert_eq!(expected_block.nonce, sub_dag_index);
         assert_eq!(expected_block.nonce, consensus_output.nonce());
 
-        // ommers contains headers from all batches from consensus output
-        let expected_ommers = consensus_output.ommers();
-        assert_eq!(expected_block.ommers, expected_ommers);
         // ommers root
         assert_eq!(expected_block.header.ommers_hash, EMPTY_OMMER_ROOT_HASH,);
         // timestamp
@@ -520,9 +517,6 @@ mod tests {
         // execute batches to update headers with valid data
         let mut inc_base_fee = MIN_PROTOCOL_BASE_FEE;
 
-        // capture values from updated batches for assertions later
-        let mut batch_headers = vec![];
-
         // updated batches separately because they are mutated in-place
         // and need to be passed to different outputs
         //
@@ -538,10 +532,6 @@ mod tests {
             // actually execute the block now
             execute_test_worker_block(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
-
-            // store values for assertions later
-            let header = batch.sealed_header().clone();
-            batch_headers.push(header);
         }
 
         // update second round
@@ -558,10 +548,6 @@ mod tests {
             // actually execute the block now
             execute_test_worker_block(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
-
-            // store values for assertions later
-            let header = batch.sealed_header().clone();
-            batch_headers.push(header);
         }
         // Reload all_batches so we can calculate mix_hash properly later.
         let all_batches = [batches_1.clone(), batches_2.clone()].concat();
@@ -743,37 +729,25 @@ mod tests {
             assert_eq!(&block.nonce, expected_subdag_index);
             assert_eq!(block.nonce, expected_output.nonce());
 
-            // ommers root
-            assert_eq!(
-                block.header.ommers_hash,
-                proofs::calculate_ommers_root(&expected_output.ommers())
-            );
             // timestamp
             assert_eq!(block.timestamp, expected_output.committed_at());
             // parent beacon block root is output digest
             assert_eq!(block.parent_beacon_block_root, Some(*expected_parent_beacon_block_root));
 
-            // assert information from batch headers
-            let proposed_header = &batch_headers[idx];
-
             if idx == 0 {
                 // first block's parent is expected to be genesis
                 assert_eq!(block.parent_hash, chain.genesis_hash());
-                // expect header number +1 for batch bc of genesis
-                assert_eq!(block.number, proposed_header.number);
+                // expect header number 1 for batch bc of genesis
+                assert_eq!(block.number, 1);
             } else {
-                assert_ne!(block.parent_hash, proposed_header.parent_hash);
                 // TODO: this is inefficient
                 //
                 // assert parents executed in order (sanity check)
                 let expected_parent = executed_blocks[idx - 1].header.hash_slow();
                 assert_eq!(block.parent_hash, expected_parent);
                 // expect block numbers NOT the same as batch's headers
-                assert_ne!(block.number, proposed_header.number);
+                assert_ne!(block.number, 1);
             }
-
-            // expect state roots to be different bc worker uses ZERO
-            assert_ne!(block.state_root, proposed_header.state_root);
 
             // mix hash is xor worker block's hash and consensus output digest
             let expected_mix_hash = all_batches[idx].digest() ^ *expected_parent_beacon_block_root;
@@ -782,11 +756,11 @@ mod tests {
             // ie) no duplicates, etc.
             //
             // TODO: randomly generate contract transactions as well!!!
-            assert_eq!(block.logs_bloom, proposed_header.logs_bloom);
+            assert_eq!(block.logs_bloom, Bloom::default());
             // gas limit should come from batch
             //
             // TODO: ensure batch validation prevents peer workers from changing this value
-            assert_eq!(block.gas_limit, proposed_header.gas_limit);
+            assert_eq!(block.gas_limit, max_worker_block_gas(block.number));
             // difficulty should match the batch's index within consensus output
             assert_eq!(block.difficulty, U256::from(expected_batch_index));
             // assert batch digest match extra data
@@ -794,7 +768,7 @@ mod tests {
             // assert batch's withdrawals match
             //
             // TODO: this is currently always empty
-            assert_eq!(block.withdrawals_root, proposed_header.withdrawals_root);
+            assert_eq!(block.withdrawals_root, Some(EMPTY_WITHDRAWALS));
         }
 
         Ok(())
@@ -845,9 +819,6 @@ mod tests {
         // execute batches to update headers with valid data
         let mut inc_base_fee = MIN_PROTOCOL_BASE_FEE;
 
-        // capture values from updated batches for assertions later
-        let mut batch_headers = vec![];
-
         // updated batches separately because they are mutated in-place
         // and need to be passed to different outputs
         //
@@ -863,10 +834,6 @@ mod tests {
             // actually execute the block now
             execute_test_worker_block(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
-
-            // store values for assertions later
-            let header = batch.sealed_header().clone();
-            batch_headers.push(header);
         }
 
         // update second round
@@ -883,10 +850,6 @@ mod tests {
             // actually execute the block now
             execute_test_worker_block(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
-
-            // store values for assertions later
-            let header = batch.sealed_header().clone();
-            batch_headers.push(header);
         }
         // Reload all_batches so we can calculate mix_hash properly later.
         let all_batches = [batches_1.clone(), batches_2.clone()].concat();
@@ -1061,8 +1024,6 @@ mod tests {
         for (idx, txs) in txs_by_block.iter().enumerate() {
             let block = &executed_blocks[idx];
             let signers = &signers_by_block[idx];
-            // assert information from batch headers
-            let proposed_header = &batch_headers[idx];
 
             // expect blocks 4 and 8 to be empty (no txs bc they are duplicates)
             // sub 1 to account for loop idx starting at 0
@@ -1072,7 +1033,7 @@ mod tests {
                 assert!(block.senders.is_empty());
                 assert!(block.body.is_empty());
                 // gas used should NOT be the same as bc duplicate transaction are ignored
-                assert_ne!(block.gas_used, proposed_header.gas_used);
+                assert_ne!(block.gas_used, max_worker_block_gas(block.number));
                 // gas used should be zero bc all transactions were duplicates
                 assert_eq!(block.gas_used, 0);
             } else {
@@ -1109,11 +1070,6 @@ mod tests {
             assert_eq!(&block.nonce, expected_subdag_index);
             assert_eq!(block.nonce, expected_output.nonce());
 
-            // ommers root
-            assert_eq!(
-                block.header.ommers_hash,
-                proofs::calculate_ommers_root(&expected_output.ommers())
-            );
             // timestamp
             assert_eq!(block.timestamp, expected_output.committed_at());
             // parent beacon block root is output digest
@@ -1123,7 +1079,6 @@ mod tests {
                 // first block's parent is expected to be genesis
                 assert_eq!(block.parent_hash, chain.genesis_hash());
             } else {
-                assert_ne!(block.parent_hash, proposed_header.parent_hash);
                 // TODO: this is inefficient
                 //
                 // assert parents executed in order (sanity check)
@@ -1138,11 +1093,11 @@ mod tests {
             // ie) no duplicates, etc.
             //
             // TODO: this doesn't actually test anything bc there are no contract txs
-            assert_eq!(block.logs_bloom, proposed_header.logs_bloom);
+            assert_eq!(block.logs_bloom, Bloom::default());
             // gas limit should come from batch
             //
             // TODO: ensure batch validation prevents peer workers from changing this value
-            assert_eq!(block.gas_limit, proposed_header.gas_limit);
+            assert_eq!(block.gas_limit, max_worker_block_gas(block.number));
             // difficulty should match the batch's index within consensus output
             assert_eq!(block.difficulty, U256::from(expected_batch_index));
             // assert batch digest match extra data
@@ -1150,7 +1105,7 @@ mod tests {
             // assert batch's withdrawals match
             //
             // TODO: this is currently always empty
-            assert_eq!(block.withdrawals_root, proposed_header.withdrawals_root);
+            assert_eq!(block.withdrawals_root, Some(EMPTY_WITHDRAWALS));
         }
 
         Ok(())
@@ -1183,9 +1138,6 @@ mod tests {
         // execute batches to update headers with valid data
         let mut inc_base_fee = MIN_PROTOCOL_BASE_FEE;
 
-        // capture values from updated batches for assertions later
-        let mut batch_headers = vec![];
-
         // updated batches separately because they are mutated in-place
         // and need to be passed to different outputs
         //
@@ -1201,10 +1153,6 @@ mod tests {
             // actually execute the block now
             execute_test_worker_block(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
-
-            // store values for assertions later
-            let header = batch.sealed_header().clone();
-            batch_headers.push(header);
         }
 
         // update second round
@@ -1221,10 +1169,6 @@ mod tests {
             // actually execute the block now
             execute_test_worker_block(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
-
-            // store values for assertions later
-            let header = batch.sealed_header().clone();
-            batch_headers.push(header);
         }
 
         //=== Consensus

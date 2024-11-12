@@ -34,8 +34,8 @@ use tn_engine::execute_consensus_output;
 use tn_storage::{open_db, tables::WorkerBlocks, traits::Database};
 use tn_test_utils::{get_gas_price, test_genesis, TransactionFactory};
 use tn_types::{
-    max_worker_block_gas, AutoSealConsensus, BuildArguments, Certificate, CommittedSubDag,
-    Consensus, ConsensusOutput, LastCanonicalUpdate, ReputationScores, WorkerBlock,
+    AutoSealConsensus, BuildArguments, Certificate, CommittedSubDag, Consensus, ConsensusOutput,
+    LastCanonicalUpdate, ReputationScores, WorkerBlock,
 };
 use tn_worker::{
     metrics::WorkerMetrics,
@@ -148,8 +148,6 @@ async fn test_make_block_el_to_cl() {
         block_provider.blocks_rx(),
         address,
         Duration::from_secs(1),
-        max_worker_block_gas(0), // 30mil gas limit
-        1_000_000,               // 1MB size
     );
 
     let gas_price = get_gas_price(&blockchain_db);
@@ -221,11 +219,7 @@ async fn test_make_block_el_to_cl() {
     let block = block.unwrap();
 
     // ensure block validator succeeds
-    let block_validator = BlockValidator::new(
-        blockchain_db.clone(),
-        1_000_000,
-        max_worker_block_gas(block.timestamp),
-    );
+    let block_validator = BlockValidator::new(blockchain_db.clone());
 
     let valid_block_result = block_validator.validate_block(&block).await;
     assert!(valid_block_result.is_ok());
@@ -318,8 +312,6 @@ async fn test_block_builder_produces_valid_blocks() {
     };
 
     let (to_worker, mut from_block_builder) = tokio::sync::mpsc::channel(2);
-    let max_block_gas_limit = max_worker_block_gas(0);
-    let max_block_bytes_size = 1_000_000;
 
     // build execution block proposer
     let block_builder = BlockBuilder::new(
@@ -330,8 +322,6 @@ async fn test_block_builder_produces_valid_blocks() {
         to_worker,
         address,
         Duration::from_secs(1),
-        max_block_gas_limit,  // 30mil gas limit
-        max_block_bytes_size, // 1MB size
     );
 
     let gas_price = get_gas_price(&blockchain_db);
@@ -415,8 +405,7 @@ async fn test_block_builder_produces_valid_blocks() {
     let _ = ack.send(Ok(()));
 
     // validate first block
-    let block_validator =
-        BlockValidator::new(blockchain_db.clone(), max_block_bytes_size, max_block_gas_limit);
+    let block_validator = BlockValidator::new(blockchain_db.clone());
 
     let valid_block_result = block_validator.validate_block(&first_block).await;
     assert!(valid_block_result.is_ok());
@@ -532,8 +521,6 @@ async fn test_canonical_notification_updates_pool() {
     };
 
     let (to_worker, mut from_block_builder) = tokio::sync::mpsc::channel(2);
-    let max_block_gas_limit = max_worker_block_gas(0);
-    let max_block_bytes_size = 1_000_000;
 
     // build execution block proposer
     let block_builder = BlockBuilder::new(
@@ -544,8 +531,6 @@ async fn test_canonical_notification_updates_pool() {
         to_worker,
         address,
         Duration::from_secs(1),
-        max_block_gas_limit,  // 30mil gas limit
-        max_block_bytes_size, // 1MB size
     );
 
     let gas_price = get_gas_price(&blockchain_db);
@@ -666,8 +651,7 @@ async fn test_canonical_notification_updates_pool() {
     let _ = ack.send(Ok(()));
 
     // validate block
-    let block_validator =
-        BlockValidator::new(blockchain_db, max_block_bytes_size, max_block_gas_limit);
+    let block_validator = BlockValidator::new(blockchain_db);
 
     let valid_block_result = block_validator.validate_block(&first_block).await;
     assert!(valid_block_result.is_ok());

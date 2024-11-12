@@ -5,13 +5,11 @@ use reth_chainspec::ChainSpec;
 use reth_consensus::PostExecutionInput;
 pub use reth_consensus::{Consensus, ConsensusError};
 use reth_evm_ethereum::revm_spec_by_timestamp_after_merge;
-use reth_payload_primitives::PayloadBuilderAttributes;
 use reth_primitives::{
     Address, BlockWithSenders, Header, SealedBlock, SealedHeader, Withdrawals, B256, U256,
 };
 use reth_revm::primitives::{BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg};
-use reth_rpc_types::engine::PayloadId;
-use std::{convert::Infallible, sync::Arc};
+use std::sync::Arc;
 
 /// A consensus implementation that validates everything.
 ///
@@ -102,6 +100,71 @@ impl TNPayload {
     pub fn new(attributes: TNPayloadAttributes) -> Self {
         Self { attributes }
     }
+
+    pub fn cfg_and_block_env(&self, chain_spec: &ChainSpec) -> (CfgEnvWithHandlerCfg, BlockEnv) {
+        // configure evm env based on parent block
+        let cfg = CfgEnv::default().with_chain_id(chain_spec.chain().id());
+
+        // ensure we're not missing any timestamp based hardforks
+        let spec_id = revm_spec_by_timestamp_after_merge(chain_spec, self.timestamp());
+
+        // use the blob excess gas and price set by the worker during batch creation
+        let blob_excess_gas_and_price = Some(BlobExcessGasAndPrice::new(0));
+
+        // use the basefee set by the worker during batch creation
+        let basefee = U256::from(self.attributes.base_fee_per_gas);
+
+        // ensure gas_limit enforced during block validation
+        let gas_limit = U256::from(self.attributes.gas_limit);
+
+        // create block environment to re-execute worker's block
+        let block_env = BlockEnv {
+            // the block's number should come from the canonical tip, NOT the worker block's number
+            number: U256::from(self.attributes.parent_header.number + 1),
+            coinbase: self.suggested_fee_recipient(),
+            timestamp: U256::from(self.timestamp()),
+            // leave difficulty zero
+            // this value is useful for post-execution, but worker's block is created with this
+            // value
+            difficulty: U256::ZERO,
+            prevrandao: Some(self.prev_randao()),
+            gas_limit,
+            basefee,
+            // calculate excess gas based on parent block's blob gas usage
+            blob_excess_gas_and_price,
+        };
+
+        (CfgEnvWithHandlerCfg::new_with_spec_id(cfg, spec_id), block_env)
+    }
+
+    pub fn timestamp(&self) -> u64 {
+        self.attributes.timestamp
+    }
+
+    pub fn suggested_fee_recipient(&self) -> Address {
+        self.attributes.beneficiary
+    }
+
+    /// PrevRandao is used by TN to provide a source for randomness on-chain.
+    ///
+    /// This is used as the executed block's "mix_hash".
+    /// [EIP-4399]: https://eips.ethereum.org/EIPS/eip-4399
+    pub fn prev_randao(&self) -> B256 {
+        self.attributes.mix_hash
+    }
+
+    pub fn parent(&self) -> B256 {
+        self.attributes.parent_header.hash()
+    }
+
+    pub fn parent_beacon_block_root(&self) -> Option<B256> {
+        Some(self.attributes.consensus_output_digest)
+    }
+
+    /// Taken from worker's block, but currently always empty.
+    pub fn withdrawals(&self) -> &Withdrawals {
+        &self.attributes.withdrawals
+    }
 }
 
 /// The type used to construct a [TNPayload].
@@ -113,10 +176,6 @@ impl TNPayload {
 pub struct TNPayloadAttributes {
     /// The previous canonical block's number and hash.
     pub parent_header: SealedHeader,
-    /// Ommers on TN are all the hashes of batches.
-    pub ommers: Vec<Header>,
-    /// Hash of all ommers in this output from consensus.
-    pub ommers_root: B256,
     /// The beneficiary from the round of consensus.
     pub beneficiary: Address,
     /// The index of the subdag, which equates to the round of consensus.
@@ -156,8 +215,6 @@ impl TNPayloadAttributes {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         parent_header: SealedHeader,
-        ommers: Vec<Header>,
-        ommers_root: B256,
         batch_index: u64,
         batch_digest: B256,
         output: &ConsensusOutput,
@@ -169,8 +226,6 @@ impl TNPayloadAttributes {
     ) -> Self {
         Self {
             parent_header,
-            ommers,
-            ommers_root,
             beneficiary: output.beneficiary(),
             nonce: output.nonce(),
             batch_index,
@@ -182,93 +237,5 @@ impl TNPayloadAttributes {
             mix_hash,
             withdrawals,
         }
-    }
-}
-
-/// Implement [PayloadBuilderAttributes] for extending the canonical tip after consensus is reached.
-impl PayloadBuilderAttributes for TNPayload {
-    type RpcPayloadAttributes = TNPayloadAttributes;
-
-    // try_new cannot fail because Self::new() cannot fail
-    type Error = Infallible;
-
-    /// This is bypassed in the current implementation.
-    fn try_new(_parent: B256, attributes: Self::RpcPayloadAttributes) -> Result<Self, Self::Error> {
-        Ok(Self::new(attributes))
-    }
-
-    fn payload_id(&self) -> PayloadId {
-        // construct the payload id from the block's index
-        // guaranteed to always be unique within each output
-        PayloadId::new(self.attributes.batch_index.to_le_bytes())
-    }
-
-    fn parent(&self) -> B256 {
-        self.attributes.parent_header.hash()
-    }
-
-    fn timestamp(&self) -> u64 {
-        self.attributes.timestamp
-    }
-
-    fn parent_beacon_block_root(&self) -> Option<B256> {
-        Some(self.attributes.consensus_output_digest)
-    }
-
-    fn suggested_fee_recipient(&self) -> Address {
-        self.attributes.beneficiary
-    }
-
-    /// PrevRandao is used by TN to provide a source for randomness on-chain.
-    ///
-    /// This is used as the executed block's "mix_hash".
-    /// [EIP-4399]: https://eips.ethereum.org/EIPS/eip-4399
-    fn prev_randao(&self) -> B256 {
-        self.attributes.mix_hash
-    }
-
-    /// Taken from worker's block, but currently always empty.
-    fn withdrawals(&self) -> &Withdrawals {
-        &self.attributes.withdrawals
-    }
-
-    fn cfg_and_block_env(
-        &self,
-        chain_spec: &ChainSpec,
-        _worker: &Header, // use `self`
-    ) -> (CfgEnvWithHandlerCfg, BlockEnv) {
-        // configure evm env based on parent block
-        let cfg = CfgEnv::default().with_chain_id(chain_spec.chain().id());
-
-        // ensure we're not missing any timestamp based hardforks
-        let spec_id = revm_spec_by_timestamp_after_merge(chain_spec, self.timestamp());
-
-        // use the blob excess gas and price set by the worker during batch creation
-        let blob_excess_gas_and_price = Some(BlobExcessGasAndPrice::new(0));
-
-        // use the basefee set by the worker during batch creation
-        let basefee = U256::from(self.attributes.base_fee_per_gas);
-
-        // ensure gas_limit enforced during block validation
-        let gas_limit = U256::from(self.attributes.gas_limit);
-
-        // create block environment to re-execute worker's block
-        let block_env = BlockEnv {
-            // the block's number should come from the canonical tip, NOT the worker block's number
-            number: U256::from(self.attributes.parent_header.number + 1),
-            coinbase: self.suggested_fee_recipient(),
-            timestamp: U256::from(self.timestamp()),
-            // leave difficulty zero
-            // this value is useful for post-execution, but worker's block is created with this
-            // value
-            difficulty: U256::ZERO,
-            prevrandao: Some(self.prev_randao()),
-            gas_limit,
-            basefee,
-            // calculate excess gas based on parent block's blob gas usage
-            blob_excess_gas_and_price,
-        };
-
-        (CfgEnvWithHandlerCfg::new_with_spec_id(cfg, spec_id), block_env)
     }
 }

@@ -322,8 +322,6 @@ where
             block_provider_sender,
             self.address,
             self.tn_config.parameters.max_worker_block_delay,
-            self.tn_config.parameters.max_worker_tx_gas,
-            self.tn_config.parameters.max_worker_tx_bytes_size,
         );
 
         // spawn block builder task
@@ -397,11 +395,7 @@ where
     /// Create a new block validator.
     pub(super) fn new_block_validator(&self) -> BlockValidator<DB> {
         // batch validator
-        BlockValidator::<DB>::new(
-            self.blockchain_db.clone(),
-            self.tn_config.parameters.max_worker_tx_bytes_size,
-            self.tn_config.parameters.max_worker_tx_gas,
-        )
+        BlockValidator::<DB>::new(self.blockchain_db.clone())
     }
 
     /// Fetch the last executed state from the database.
