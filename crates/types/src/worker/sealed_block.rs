@@ -1,10 +1,10 @@
 //! Block implementation for consensus.
 //!
-//! Blocks hold transactions and other data.
+//! Blocks hold transactions and other data. This type is used to represent worker proposals that
+//! have reached quorum.
 // Copyright (c) Telcoin, LLC
 
-use super::TimestampSec;
-use crate::{crypto, encode};
+use crate::{crypto, encode, TimestampSec};
 use fastcrypto::hash::HashFunction;
 use reth_primitives::{
     constants::EMPTY_WITHDRAWALS, proofs, Address, BlockHash, Bloom, Bytes, Header, SealedBlock,

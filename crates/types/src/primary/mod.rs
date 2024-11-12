@@ -7,7 +7,6 @@ mod info;
 mod output;
 mod reputation;
 mod vote;
-mod worker_block;
 
 pub use certificate::*;
 pub use header::*;
@@ -15,7 +14,6 @@ pub use info::*;
 pub use output::*;
 pub use reputation::*;
 pub use vote::*;
-pub use worker_block::*;
 
 /// For now, use 0 to prevent any removal of bad nodes since validator sets
 /// are static.
