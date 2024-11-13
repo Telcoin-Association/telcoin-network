@@ -4,8 +4,8 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use tn_types::{
-    AuthorityIdentifier, BlockHash, Certificate, Header, NetworkPublicKey, Round,
-    TransactionSigned, WorkerBlock, WorkerId,
+    AuthorityIdentifier, BlockHash, Certificate, Header, NetworkPublicKey, Round, WorkerBlock,
+    WorkerId,
 };
 use tracing::warn;
 
