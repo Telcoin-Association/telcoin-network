@@ -13,9 +13,9 @@ pub struct WorkerSynchronizeMessage {
     pub digests: Vec<BlockHash>,
     /// The peer worker's authority.
     pub target: AuthorityIdentifier,
-    // Used to indicate to the worker that it does not need to fully validate
-    // the batch it receives because it is part of a certificate. Only digest
-    // verification is required.
+    /// Used to indicate to the worker that it does not need to fully validate
+    /// the batch it receives because it is part of a certificate. Only digest
+    /// verification is required.
     pub is_certified: bool,
 }
 

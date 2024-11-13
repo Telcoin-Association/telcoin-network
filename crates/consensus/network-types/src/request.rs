@@ -22,8 +22,8 @@ pub struct RequestVoteRequest {
     /// This primary's header for round.
     pub header: Header,
 
-    // Parent certificates provided by the requester, in case the primary's peer doesn't yet
-    // have them. The peer requires parent certs in order to offer a vote.
+    /// Parent certificates provided by the requester, in case the primary's peer doesn't yet
+    /// have them. The peer requires parent certs in order to offer a vote.
     pub parents: Vec<Certificate>,
 }
 

@@ -59,7 +59,7 @@ pub struct RequestBlocksResponse {
 /// Verification result for peer's latest execution result.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VerifyExecutionResponse {
-    /// The verification result.
+    /// Boolean if the execution header was considered valid by engine.
     ///
     /// Engine verifies the integrity of the data and if the block num hash matches.
     ///

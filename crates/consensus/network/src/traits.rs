@@ -1,5 +1,3 @@
-use std::future::Future;
-
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
@@ -10,6 +8,7 @@ use consensus_network_types::{
     WorkerSynchronizeMessage,
 };
 use eyre::Result;
+use std::future::Future;
 use tn_types::NetworkPublicKey;
 
 pub trait ReliableNetwork<Request: Clone + Send + Sync> {

@@ -23,9 +23,9 @@
 /// - what are inbound request layers? `add_layer_for...`
 ///     - see crates/consensus/primary/src/primary.rs:L248
 /// - is there more to Routes than just keeping wires from crossing?
-/// - probably want to change codec to be consistent (rlp), but I think this can wait for post
+/// - probably want to change codec to be consistent (rlp/ssz), but I think this can wait for post
 ///   testnet
-mod narwhal {
+mod consensus_network {
     // output from build
     include!(concat!(env!("OUT_DIR"), "/tn.PrimaryToPrimary.rs"));
     include!(concat!(env!("OUT_DIR"), "/tn.PrimaryToWorker.rs"));
@@ -36,7 +36,7 @@ mod narwhal {
 }
 
 // exports from build
-pub use narwhal::{
+pub use consensus_network::{
     // engine
     engine_to_primary_client::EngineToPrimaryClient,
     engine_to_primary_server::{EngineToPrimary, EngineToPrimaryServer, MockEngineToPrimary},

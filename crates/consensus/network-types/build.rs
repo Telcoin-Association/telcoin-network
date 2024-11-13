@@ -14,7 +14,6 @@ fn main() -> Result<()> {
     build_anemo_services(&out_dir);
 
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=proto");
     println!("cargo:rerun-if-env-changed=DUMP_GENERATED_GRPC");
 
     nightly();
