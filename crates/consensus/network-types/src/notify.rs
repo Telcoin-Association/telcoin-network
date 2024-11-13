@@ -2,6 +2,7 @@
 //!
 //! These messages are passed as unreliable send and
 //! don't expect a response.
+use reth_primitives::SealedHeader;
 use serde::{Deserialize, Serialize};
 use tn_types::{AuthorityIdentifier, BlockHash, WorkerBlock, WorkerId};
 
@@ -43,4 +44,11 @@ pub struct WorkerOthersBlockMessage {
 pub struct WorkerBlockMessage {
     /// The sending worker's batch.
     pub worker_block: WorkerBlock,
+}
+
+/// Engine to primary when canonical tip is updated.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CanonicalUpdateMessage {
+    /// The latest execution result.
+    pub tip: SealedHeader,
 }

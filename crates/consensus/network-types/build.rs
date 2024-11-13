@@ -32,7 +32,7 @@ fn build_anemo_services(out_dir: &Path) {
 
     let primary_to_primary = anemo_build::manual::Service::builder()
         .name("PrimaryToPrimary")
-        .package("narwhal")
+        .package("tn")
         .attributes(automock_attribute.clone())
         .method(
             anemo_build::manual::Method::builder()
@@ -65,7 +65,7 @@ fn build_anemo_services(out_dir: &Path) {
 
     let primary_to_worker = anemo_build::manual::Service::builder()
         .name("PrimaryToWorker")
-        .package("narwhal")
+        .package("tn")
         .attributes(automock_attribute.clone())
         .method(
             anemo_build::manual::Method::builder()
@@ -87,57 +87,48 @@ fn build_anemo_services(out_dir: &Path) {
         )
         .build();
 
-    let worker_to_engine = anemo_build::manual::Service::builder()
-        .name("WorkerToEngine")
-        .package("narwhal")
+    let primary_to_engine = anemo_build::manual::Service::builder()
+        .name("PrimaryToEngine")
+        .package("tn")
         .attributes(automock_attribute.clone())
         .method(
             anemo_build::manual::Method::builder()
-                .name("build_block")
-                .route_name("BuildBlock")
-                .request_type("crate::BuildBlockRequest")
-                .response_type("()")
-                .codec_path(codec_path)
-                .build(),
-        )
-        .method(
-            anemo_build::manual::Method::builder()
-                .name("validate_block")
-                .route_name("ValidateBlock")
-                .request_type("crate::ValidateBlockRequest")
-                .response_type("()")
+                .name("verify_execution")
+                .route_name("VerifyExecution")
+                .request_type("crate::VerifyExecutionRequest")
+                .response_type("crate::VerifyExecutionResponse")
                 .codec_path(codec_path)
                 .build(),
         )
         .build();
 
-    let engine_to_worker = anemo_build::manual::Service::builder()
-        .name("EngineToWorker")
-        .package("narwhal")
+    let engine_to_primary = anemo_build::manual::Service::builder()
+        .name("EngineToPrimary")
+        .package("tn")
         .attributes(automock_attribute.clone())
         .method(
             anemo_build::manual::Method::builder()
-                .name("seal_block")
-                .route_name("SealBlock")
-                .request_type("crate::SealBlockRequest")
-                .response_type("crate::SealedBlockResponse")
+                .name("canonical_update")
+                .route_name("CanonicalUpdate")
+                .request_type("crate::CanonicalUpdateMessage")
+                .response_type("()")
                 .codec_path(codec_path)
                 .build(),
         )
-        .method(
-            anemo_build::manual::Method::builder()
-                .name("missing_blocks")
-                .route_name("MissingBlocks")
-                .request_type("crate::MissingBlocksRequest")
-                .response_type("crate::FetchBlocksResponse")
-                .codec_path(codec_path)
-                .build(),
-        )
+        // .method(
+        //     anemo_build::manual::Method::builder()
+        //         .name("sync_state")
+        //         .route_name("SyncState")
+        //         .request_type("crate::SyncStateRequest")
+        //         .response_type("crate::SyncStateResponse")
+        //         .codec_path(codec_path)
+        //         .build(),
+        // )
         .build();
 
     let worker_to_primary = anemo_build::manual::Service::builder()
         .name("WorkerToPrimary")
-        .package("narwhal")
+        .package("tn")
         .attributes(automock_attribute.clone())
         .method(
             anemo_build::manual::Method::builder()
@@ -161,7 +152,7 @@ fn build_anemo_services(out_dir: &Path) {
 
     let worker_to_worker = anemo_build::manual::Service::builder()
         .name("WorkerToWorker")
-        .package("narwhal")
+        .package("tn")
         .attributes(automock_attribute)
         .method(
             anemo_build::manual::Method::builder()
@@ -188,8 +179,8 @@ fn build_anemo_services(out_dir: &Path) {
         primary_to_worker,
         worker_to_primary,
         worker_to_worker,
-        engine_to_worker,
-        worker_to_engine,
+        engine_to_primary,
+        primary_to_engine,
     ]);
 }
 
