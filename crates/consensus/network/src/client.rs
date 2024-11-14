@@ -1,3 +1,10 @@
+//! Client implementations for local network messages.
+//!
+//! The clients are written from the perspective of the server.
+//!
+//! A "WorkerClient" is a client that talks to workers. The primary uses a worker client.
+//!
+//! A "PrimaryClient" is a client that talks to primary. Workers use a primary client.
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
@@ -17,6 +24,58 @@ use tn_types::{traits::KeyPair, NetworkKeypair, NetworkPublicKey};
 use tn_utils::sync::notify_once::NotifyOnce;
 use tokio::{select, time::sleep};
 use tracing::error;
+
+/// The worker's client to send messages to the primary.
+#[derive(Debug, Clone)]
+pub struct WorkerClient {
+    inner: Arc<RwLock<WorkerClientInner>>,
+    shutdown_notify: Arc<NotifyOnce>,
+}
+
+/// The inner type for [WorkerClient].
+struct WorkerClientInner {
+    primary_peer_id: PeerId,
+    worker_network: BTreeMap<u16, Network>,
+    worker_to_primary_handler: Option<Arc<dyn WorkerToPrimary>>,
+    shutdown: bool,
+}
+
+impl std::fmt::Debug for WorkerClientInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NetworkClient::Inner for {}", self.primary_peer_id)?;
+        write!(f, "\t{} nodes in worker network", self.worker_network.len())
+    }
+}
+
+/// The worker's client to send messages to the primary.
+#[derive(Debug, Clone)]
+pub struct PrimaryClient {
+    inner: Arc<RwLock<PrimaryClientInner>>,
+    shutdown_notify: Arc<NotifyOnce>,
+}
+
+/// The inner type for [WorkerClient].
+struct PrimaryClientInner {
+    primary_peer_id: PeerId,
+    primary_network: Option<Network>,
+    primary_to_worker_handler: BTreeMap<PeerId, Arc<dyn PrimaryToWorker>>,
+    shutdown: bool,
+}
+
+impl std::fmt::Debug for PrimaryClientInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NetworkClient::Inner for {}", self.primary_peer_id)
+    }
+}
+
+// // //
+//
+// TODO: replace the `NetworkClient` with worker/primary implementations and add engine.
+// and get rid of this stupid loop crap with retry attempts. the only reason this is here
+// is because NetworkClient does too much. code doesn't know if/when primary/worker start
+// so there's options and confusing logic. Just create the clients with the config on node startup.
+//
+// // //
 
 /// NetworkClient provides the interface to send requests to other nodes, and call other components
 /// directly if they live in the same process. It is used by both primary and worker(s).

@@ -12,7 +12,9 @@ struct ConsensusConfigInner<DB> {
     config: Config,
     committee: Committee,
     tn_datadir: Arc<dyn TelcoinDirs>,
-    network_client: NetworkClient,
+    // network_client: NetworkClient,
+    worker_to_primary_client: WorkerClient,
+    primary_to_worker_client: PrimaryClient,
     node_storage: NodeStorage<DB>,
     key_config: KeyConfig,
     authority: Authority,
@@ -72,7 +74,9 @@ where
     }
 
     /// Create a new config with a committe.
-    /// Exposed for testing ONLY.
+    ///
+    /// This should only be called by `Self::new`.
+    /// The method is exposed publicly for testing ONLY.
     pub fn new_with_committee<TND: TelcoinDirs + 'static>(
         config: Config,
         tn_datadir: TND,
@@ -143,6 +147,16 @@ where
 
     pub fn network_client(&self) -> &NetworkClient {
         &self.inner.network_client
+    }
+
+    /// Local interface for worker to primary communication.
+    pub fn worker_to_primary_client(&self) -> &NetworkClient {
+        &self.inner.worker_to_primary_client
+    }
+
+    /// Local interface for primary to worker communication.
+    pub fn primary_to_worker_client(&self) -> &NetworkClient {
+        &self.inner.primary_to_worker_client
     }
 
     pub fn node_storage(&self) -> &NodeStorage<DB> {
