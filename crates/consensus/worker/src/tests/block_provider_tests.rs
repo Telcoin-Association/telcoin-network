@@ -37,7 +37,7 @@ impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
 
 #[tokio::test]
 async fn make_block() {
-    let client = NetworkClient::new_with_empty_id();
+    let client = PrimaryClient::new_with_empty_id();
     let temp_dir = TempDir::new().unwrap();
     let store = open_db(temp_dir.path());
     let node_metrics = WorkerMetrics::default();

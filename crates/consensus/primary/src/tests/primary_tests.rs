@@ -468,7 +468,7 @@ async fn test_request_vote_already_voted() {
     let id = primary.id();
     let author = fixture.authorities().nth(2).unwrap();
     let network = test_network(primary.primary_network_keypair(), primary.network_address());
-    let client = primary.consensus_config().network_client().clone(); // NetworkClient::new_from_keypair(&primary.primary_primary_primary_network_keypair());
+    let client = primary.consensus_config().network_client().clone(); // PrimaryClient::new_from_keypair(&primary.primary_primary_primary_network_keypair());
 
     let certificate_store = primary.consensus_config().node_storage().certificate_store.clone();
     let payload_store = primary.consensus_config().node_storage().payload_store.clone();

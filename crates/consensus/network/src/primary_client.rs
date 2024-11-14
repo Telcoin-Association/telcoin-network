@@ -1,10 +1,10 @@
 //! Client implementations for local network messages.
 //!
-//! The clients are written from the perspective of the server.
+//! The clients are written from the perspective of the client.
 //!
-//! A "WorkerClient" is a client that talks to workers. The primary uses a worker client.
+//! A "PrimaryClient" is a client for primaries.
 //!
-//! A "PrimaryClient" is a client that talks to primary. Workers use a primary client.
+//! A "WorkerClient" is a client for workers.
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
@@ -34,6 +34,7 @@ pub struct WorkerClient {
 
 /// The inner type for [WorkerClient].
 struct WorkerClientInner {
+    // TODO: is this needed for worker client?
     primary_peer_id: PeerId,
     worker_network: BTreeMap<u16, Network>,
     worker_to_primary_handler: Option<Arc<dyn WorkerToPrimary>>,
@@ -42,42 +43,21 @@ struct WorkerClientInner {
 
 impl std::fmt::Debug for WorkerClientInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "NetworkClient::Inner for {}", self.primary_peer_id)?;
+        // write!(f, "PrimaryClient::Inner for {}", self.primary_peer_id)?;
         write!(f, "\t{} nodes in worker network", self.worker_network.len())
     }
 }
 
-/// The worker's client to send messages to the primary.
-#[derive(Debug, Clone)]
-pub struct PrimaryClient {
-    inner: Arc<RwLock<PrimaryClientInner>>,
-    shutdown_notify: Arc<NotifyOnce>,
-}
-
-/// The inner type for [WorkerClient].
-struct PrimaryClientInner {
-    primary_peer_id: PeerId,
-    primary_network: Option<Network>,
-    primary_to_worker_handler: BTreeMap<PeerId, Arc<dyn PrimaryToWorker>>,
-    shutdown: bool,
-}
-
-impl std::fmt::Debug for PrimaryClientInner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "NetworkClient::Inner for {}", self.primary_peer_id)
-    }
-}
-
 // // //
 //
-// TODO: replace the `NetworkClient` with worker/primary implementations and add engine.
+// TODO: replace the `PrimaryClient` with worker/primary implementations and add engine.
 // and get rid of this stupid loop crap with retry attempts. the only reason this is here
-// is because NetworkClient does too much. code doesn't know if/when primary/worker start
+// is because PrimaryClient does too much. code doesn't know if/when primary/worker start
 // so there's options and confusing logic. Just create the clients with the config on node startup.
 //
 // // //
 
-/// NetworkClient provides the interface to send requests to other nodes, and call other components
+/// PrimaryClient provides the interface to send requests to other nodes, and call other components
 /// directly if they live in the same process. It is used by both primary and worker(s).
 ///
 /// Currently this only supports local direct calls, and it will be extended to support remote
@@ -85,7 +65,7 @@ impl std::fmt::Debug for PrimaryClientInner {
 ///
 /// TODO: investigate splitting this into Primary and Worker specific clients.
 #[derive(Debug, Clone)]
-pub struct NetworkClient {
+pub struct PrimaryClient {
     inner: Arc<RwLock<Inner>>,
     shutdown_notify: Arc<NotifyOnce>,
 }
@@ -101,12 +81,12 @@ struct Inner {
 
 impl std::fmt::Debug for Inner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "NetworkClient::Inner for {}", self.primary_peer_id)?;
+        write!(f, "PrimaryClient::Inner for {}", self.primary_peer_id)?;
         write!(f, "\t{} nodes in worker network", self.worker_network.len())
     }
 }
 
-impl NetworkClient {
+impl PrimaryClient {
     const GET_CLIENT_RETRIES: usize = 50;
     const GET_CLIENT_INTERVAL: Duration = Duration::from_millis(300);
 
@@ -124,11 +104,7 @@ impl NetworkClient {
         }
     }
 
-    pub fn new_from_keypair(primary_network_keypair: &NetworkKeypair) -> Self {
-        Self::new(PeerId(primary_network_keypair.public().0.into()))
-    }
-
-    /// Create a new [NetworkClient] from the primary's network key.
+    /// Create a new [PrimaryClient] from the primary's network key.
     pub fn new_from_public_key(primary_network_public_key: &NetworkPublicKey) -> Self {
         Self::new(PeerId(primary_network_public_key.0.into()))
     }
@@ -250,7 +226,7 @@ impl NetworkClient {
 
 // TODO: extract common logic for cancelling on shutdown.
 
-impl PrimaryToWorkerClient for NetworkClient {
+impl PrimaryToWorkerClient for PrimaryClient {
     async fn synchronize(
         &self,
         worker_name: NetworkPublicKey,
@@ -285,7 +261,7 @@ impl PrimaryToWorkerClient for NetworkClient {
     }
 }
 
-impl WorkerToPrimaryClient for NetworkClient {
+impl WorkerToPrimaryClient for PrimaryClient {
     async fn report_own_block(
         &self,
         request: WorkerOwnBlockMessage,

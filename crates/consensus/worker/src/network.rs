@@ -8,7 +8,7 @@
 use crate::block_fetcher::WorkerBlockFetcher;
 use anemo::{types::response::StatusCode, Network};
 use async_trait::async_trait;
-use consensus_network::{client::NetworkClient, WorkerToPrimaryClient};
+use consensus_network::{client::PrimaryClient, WorkerToPrimaryClient};
 use consensus_network_types::{
     FetchBlocksRequest, FetchBlocksResponse, PrimaryToWorker, RequestBlocksRequest,
     RequestBlocksResponse, WorkerBlockMessage, WorkerOthersBlockMessage, WorkerSynchronizeMessage,
@@ -35,7 +35,7 @@ pub struct WorkerReceiverHandler<V, DB> {
     /// This worker's id.
     pub id: WorkerId,
     /// The interface for communicating with this worker's primary.
-    pub client: NetworkClient,
+    pub client: PrimaryClient,
     /// Database for storing worker blocks received from peers.
     pub store: DB,
     /// The type that validates worker blocks received from peers.

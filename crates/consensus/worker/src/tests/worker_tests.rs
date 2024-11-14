@@ -41,7 +41,7 @@ impl BlockValidation for NilBatchValidator {
 //     let my_primary = fixture.authorities().next().unwrap();
 //     let myself = my_primary.worker(worker_id);
 //     let public_key = my_primary.public_key();
-//     let client = NetworkClient::new_from_keypair(&my_primary.primary_network_keypair());
+//     let client = PrimaryClient::new_from_keypair(&my_primary.primary_network_keypair());
 
 //     let parameters = Parameters {
 //         max_worker_tx_bytes_size: 200, // Two transactions.
@@ -114,7 +114,7 @@ impl BlockValidation for NilBatchValidator {
 //     let my_primary = fixture.authorities().next().unwrap();
 //     let myself = my_primary.worker(worker_id);
 //     let authority_public_key = my_primary.public_key();
-//     let client = NetworkClient::new_from_keypair(&my_primary.primary_network_keypair());
+//     let client = PrimaryClient::new_from_keypair(&my_primary.primary_network_keypair());
 
 //     let parameters = Parameters {
 //         max_worker_tx_bytes_size: 200, // Two transactions.
@@ -222,7 +222,7 @@ impl BlockValidation for NilBatchValidator {
 //     let my_primary = fixture.authorities().next().unwrap();
 //     let myself = my_primary.worker(worker_id);
 //     let authority_public_key = my_primary.public_key();
-//     let client = NetworkClient::new_from_keypair(&my_primary.primary_network_keypair());
+//     let client = PrimaryClient::new_from_keypair(&my_primary.primary_network_keypair());
 
 //     let parameters = Parameters {
 //         max_worker_tx_bytes_size: 200, // Two transactions.

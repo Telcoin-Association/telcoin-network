@@ -8,7 +8,7 @@ use crate::{
     synchronizer::Synchronizer,
     ConsensusBus,
 };
-use consensus_network::client::NetworkClient;
+use consensus_network::client::PrimaryClient;
 use fastcrypto::{hash::Hash, traits::KeyPair};
 use futures::{stream::FuturesUnordered, StreamExt};
 use itertools::Itertools;
@@ -35,7 +35,7 @@ async fn accept_certificates() {
     let primary = fixture.authorities().last().unwrap();
     let network_key = primary.primary_network_keypair().copy().private().0.to_bytes();
     let authority_id = primary.id();
-    let client = NetworkClient::new_from_keypair(&primary.primary_network_keypair());
+    let client = PrimaryClient::new_from_keypair(&primary.primary_network_keypair());
 
     let certificate_store = primary.consensus_config().node_storage().certificate_store.clone();
 
@@ -168,7 +168,7 @@ async fn synchronizer_recover_basic() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let committee = fixture.committee();
     let primary = fixture.authorities().last().unwrap();
-    let client = NetworkClient::new_from_keypair(&primary.primary_network_keypair());
+    let client = PrimaryClient::new_from_keypair(&primary.primary_network_keypair());
     let network_key = primary.primary_network_keypair().copy().private().0.to_bytes();
     let name = primary.id();
 
@@ -239,7 +239,7 @@ async fn synchronizer_recover_partial_certs() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let committee = fixture.committee();
     let primary = fixture.authorities().last().unwrap();
-    let client = NetworkClient::new_from_keypair(&primary.primary_network_keypair());
+    let client = PrimaryClient::new_from_keypair(&primary.primary_network_keypair());
     let network_key = primary.primary_network_keypair().copy().private().0.to_bytes();
     let name = primary.id();
 
@@ -297,7 +297,7 @@ async fn synchronizer_recover_previous_round() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let committee = fixture.committee();
     let primary = fixture.authorities().last().unwrap();
-    let client = NetworkClient::new_from_keypair(&primary.primary_network_keypair());
+    let client = PrimaryClient::new_from_keypair(&primary.primary_network_keypair());
     let network_key = primary.primary_network_keypair().copy().private().0.to_bytes();
     let name = primary.id();
 

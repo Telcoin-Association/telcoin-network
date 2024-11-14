@@ -24,7 +24,7 @@ use anemo_tower::{
 };
 use consensus_metrics::spawn_logged_monitored_task;
 use consensus_network::{
-    client::NetworkClient,
+    client::PrimaryClient,
     epoch_filter::{AllowedEpoch, EPOCH_HEADER_KEY},
     failpoints::FailpointsMakeCallbackHandler,
     metrics::MetricsMakeCallbackHandler,
@@ -410,7 +410,7 @@ impl<DB: Database> Worker<DB> {
     fn new_block_provider(
         &self,
         node_metrics: Arc<WorkerMetrics>,
-        client: NetworkClient,
+        client: PrimaryClient,
         network: anemo::Network,
     ) -> BlockProvider<DB, QuorumWaiter> {
         info!(target: "worker::worker", "Starting handler for transactions");

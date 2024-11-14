@@ -7,17 +7,18 @@
 
 pub mod admin;
 pub mod anemo_ext;
-pub mod client;
 pub mod connectivity;
 pub mod epoch_filter;
 mod error;
 pub mod failpoints;
 pub mod metrics;
 mod p2p;
+pub mod primary_client;
 mod retry;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 mod traits;
+pub mod worker_client;
 
 pub use crate::{
     retry::RetryConfig,

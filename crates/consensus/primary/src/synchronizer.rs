@@ -10,7 +10,7 @@ use consensus_metrics::{
 };
 use consensus_network::{
     anemo_ext::{NetworkExt, WaitingPeer},
-    client::NetworkClient,
+    client::PrimaryClient,
     PrimaryToWorkerClient, RetryConfig,
 };
 use fastcrypto::hash::Hash as _;
@@ -80,7 +80,7 @@ struct Inner<DB> {
     // Highest round of verfied certificate that has been received.
     highest_received_round: AtomicU64,
     // Client for fetching payloads.
-    client: NetworkClient,
+    client: PrimaryClient,
     // The persistent storage tables.
     certificate_store: CertificateStore<DB>,
     // The persistent store of the available batch digests produced either via our own workers
