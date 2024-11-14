@@ -2,34 +2,31 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::metrics::WorkerMetrics;
+use anemo::Network;
+use async_trait::async_trait;
+use consensus_network::WorkerRpc;
+use consensus_network_types::{RequestBlocksRequest, RequestBlocksResponse};
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
+use itertools::Itertools;
+use prometheus::IntGauge;
+use rand::{rngs::ThreadRng, seq::SliceRandom};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
-
-use anemo::Network;
-use async_trait::async_trait;
-use consensus_network::WorkerRpc;
-use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
-use itertools::Itertools;
-use prometheus::IntGauge;
-use rand::{rngs::ThreadRng, seq::SliceRandom};
 use tn_storage::{
     tables::WorkerBlocks,
     traits::{Database, DbTxMut},
 };
 use tn_types::NetworkPublicKey;
-
-use consensus_network_types::{RequestBlocksRequest, RequestBlocksResponse};
 use tn_types::{now, BlockHash, WorkerBlock};
 use tokio::{
     select,
     time::{sleep, sleep_until, Instant},
 };
 use tracing::debug;
-
-use crate::metrics::WorkerMetrics;
 
 const REMOTE_PARALLEL_FETCH_INTERVAL: Duration = Duration::from_secs(2);
 const WORKER_RETRY_INTERVAL: Duration = Duration::from_secs(1);

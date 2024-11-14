@@ -9,12 +9,11 @@
 //! and sends it to the quorum waiter for broadcasting to peers.
 
 use crate::{metrics::WorkerMetrics, quorum_waiter::QuorumWaiterTrait};
-use consensus_network::{client::WorkerClient, WorkerToPrimaryClient};
+use consensus_network::WorkersLocalClient;
+use consensus_network_types::WorkerOwnBlockMessage;
 use std::{sync::Arc, time::Duration};
 use tn_storage::{tables::WorkerBlocks, traits::Database};
 use tn_types::{error::BlockSealError, WorkerBlock, WorkerBlockSender, WorkerId};
-
-use consensus_network_types::WorkerOwnBlockMessage;
 use tracing::error;
 
 #[cfg(test)]
@@ -31,7 +30,7 @@ pub struct BlockProvider<DB, QW> {
     /// Metrics handler
     node_metrics: Arc<WorkerMetrics>,
     /// The network client to send our blocks to the primary.
-    client: WorkerClient,
+    client: WorkersLocalClient,
     /// The block store to store our own blocks.
     store: DB,
     /// Channel sender for alternate block submision if not calling seal directly.
@@ -51,7 +50,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> BlockProvider<DB, QW> {
         id: WorkerId,
         quorum_waiter: QW,
         node_metrics: Arc<WorkerMetrics>,
-        client: WorkerClient,
+        client: WorkersLocalClient,
         store: DB,
         timeout: Duration,
     ) -> Self {

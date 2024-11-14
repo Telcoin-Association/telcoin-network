@@ -1,18 +1,15 @@
 //! Client implementations for local network messages.
 //!
-//! The clients are written from the perspective of the client.
+//! The clients are written from the perspective of the server.
 //!
-//! A "PrimaryClient" is a client for primaries.
+//! A "WorkerClient" is a client that talks to workers. The primary uses a worker client.
 //!
-//! A "WorkerClient" is a client for workers.
+//! A "PrimaryClient" is a client that talks to primary. Workers use a primary client.
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    error::LocalClientError,
-    traits::{PrimaryToWorkerClient, WorkerToPrimaryClient},
-};
+use crate::{error::LocalClientError, traits::PrimaryToWorkerClient};
 use anemo::{Network, PeerId, Request};
 use consensus_network_types::{
     FetchBlocksRequest, FetchBlocksResponse, PrimaryToWorker, WorkerOthersBlockMessage,
@@ -25,39 +22,16 @@ use tn_utils::sync::notify_once::NotifyOnce;
 use tokio::{select, time::sleep};
 use tracing::error;
 
-/// The worker's client to send messages to the primary.
-#[derive(Debug, Clone)]
-pub struct WorkerClient {
-    inner: Arc<RwLock<WorkerClientInner>>,
-    shutdown_notify: Arc<NotifyOnce>,
-}
-
-/// The inner type for [WorkerClient].
-struct WorkerClientInner {
-    // TODO: is this needed for worker client?
-    primary_peer_id: PeerId,
-    worker_network: BTreeMap<u16, Network>,
-    worker_to_primary_handler: Option<Arc<dyn WorkerToPrimary>>,
-    shutdown: bool,
-}
-
-impl std::fmt::Debug for WorkerClientInner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // write!(f, "PrimaryClient::Inner for {}", self.primary_peer_id)?;
-        write!(f, "\t{} nodes in worker network", self.worker_network.len())
-    }
-}
-
 // // //
 //
-// TODO: replace the `PrimaryClient` with worker/primary implementations and add engine.
+// TODO: replace the `NetworkClient` with worker/primary implementations and add engine.
 // and get rid of this stupid loop crap with retry attempts. the only reason this is here
-// is because PrimaryClient does too much. code doesn't know if/when primary/worker start
+// is because NetworkClient does too much. code doesn't know if/when primary/worker start
 // so there's options and confusing logic. Just create the clients with the config on node startup.
 //
 // // //
 
-/// PrimaryClient provides the interface to send requests to other nodes, and call other components
+/// NetworkClient provides the interface to send requests to other nodes, and call other components
 /// directly if they live in the same process. It is used by both primary and worker(s).
 ///
 /// Currently this only supports local direct calls, and it will be extended to support remote
@@ -65,7 +39,7 @@ impl std::fmt::Debug for WorkerClientInner {
 ///
 /// TODO: investigate splitting this into Primary and Worker specific clients.
 #[derive(Debug, Clone)]
-pub struct PrimaryClient {
+pub struct NetworkClient {
     inner: Arc<RwLock<Inner>>,
     shutdown_notify: Arc<NotifyOnce>,
 }
@@ -81,12 +55,12 @@ struct Inner {
 
 impl std::fmt::Debug for Inner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "PrimaryClient::Inner for {}", self.primary_peer_id)?;
+        write!(f, "NetworkClient::Inner for {}", self.primary_peer_id)?;
         write!(f, "\t{} nodes in worker network", self.worker_network.len())
     }
 }
 
-impl PrimaryClient {
+impl NetworkClient {
     const GET_CLIENT_RETRIES: usize = 50;
     const GET_CLIENT_INTERVAL: Duration = Duration::from_millis(300);
 
@@ -104,7 +78,11 @@ impl PrimaryClient {
         }
     }
 
-    /// Create a new [PrimaryClient] from the primary's network key.
+    pub fn new_from_keypair(primary_network_keypair: &NetworkKeypair) -> Self {
+        Self::new(PeerId(primary_network_keypair.public().0.into()))
+    }
+
+    /// Create a new [NetworkClient] from the primary's network key.
     pub fn new_from_public_key(primary_network_public_key: &NetworkPublicKey) -> Self {
         Self::new(PeerId(primary_network_public_key.0.into()))
     }
@@ -226,7 +204,7 @@ impl PrimaryClient {
 
 // TODO: extract common logic for cancelling on shutdown.
 
-impl PrimaryToWorkerClient for PrimaryClient {
+impl PrimaryToWorkerClient for NetworkClient {
     async fn synchronize(
         &self,
         worker_name: NetworkPublicKey,
@@ -261,36 +239,36 @@ impl PrimaryToWorkerClient for PrimaryClient {
     }
 }
 
-impl WorkerToPrimaryClient for PrimaryClient {
-    async fn report_own_block(
-        &self,
-        request: WorkerOwnBlockMessage,
-    ) -> Result<(), LocalClientError> {
-        let c = self.get_worker_to_primary_handler().await?;
-        select! {
-            resp = c.report_own_block(Request::new(request)) => {
-                resp.map_err(|e| LocalClientError::Internal(format!("{e:?}")))?;
-                Ok(())
-            },
-            () = self.shutdown_notify.wait() => {
-                Err(LocalClientError::ShuttingDown)
-            },
-        }
-    }
+// impl WorkerToPrimaryClient for NetworkClient {
+//     async fn report_own_block(
+//         &self,
+//         request: WorkerOwnBlockMessage,
+//     ) -> Result<(), LocalClientError> {
+//         let c = self.get_worker_to_primary_handler().await?;
+//         select! {
+//             resp = c.report_own_block(Request::new(request)) => {
+//                 resp.map_err(|e| LocalClientError::Internal(format!("{e:?}")))?;
+//                 Ok(())
+//             },
+//             () = self.shutdown_notify.wait() => {
+//                 Err(LocalClientError::ShuttingDown)
+//             },
+//         }
+//     }
 
-    async fn report_others_block(
-        &self,
-        request: WorkerOthersBlockMessage,
-    ) -> Result<(), LocalClientError> {
-        let c = self.get_worker_to_primary_handler().await?;
-        select! {
-            resp = c.report_others_block(Request::new(request)) => {
-                resp.map_err(|e| LocalClientError::Internal(format!("{e:?}")))?;
-                Ok(())
-            },
-            () = self.shutdown_notify.wait() => {
-                Err(LocalClientError::ShuttingDown)
-            },
-        }
-    }
-}
+//     async fn report_others_block(
+//         &self,
+//         request: WorkerOthersBlockMessage,
+//     ) -> Result<(), LocalClientError> {
+//         let c = self.get_worker_to_primary_handler().await?;
+//         select! {
+//             resp = c.report_others_block(Request::new(request)) => {
+//                 resp.map_err(|e| LocalClientError::Internal(format!("{e:?}")))?;
+//                 Ok(())
+//             },
+//             () = self.shutdown_notify.wait() => {
+//                 Err(LocalClientError::ShuttingDown)
+//             },
+//         }
+//     }
+// }

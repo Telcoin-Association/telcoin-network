@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use consensus_network::client::{PrimaryClient, WorkerClient};
+use consensus_network::client::NetworkClient;
 use parking_lot::Mutex;
 use tn_storage::{traits::Database, NodeStorage};
 use tn_types::{Authority, Committee, NetworkPublicKey, Noticer, Notifier, WorkerCache};
@@ -159,9 +159,5 @@ where
 
     pub fn database(&self) -> &DB {
         &self.inner.node_storage.batch_store
-    }
-
-    pub fn primary_network_key(&self) -> &NetworkPublicKey {
-        &self.inner.config.primary_public_key()
     }
 }
