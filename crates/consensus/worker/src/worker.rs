@@ -13,7 +13,7 @@ use crate::{
 use anemo::{
     codegen::InboundRequestLayer,
     types::{Address, PeerInfo},
-    Config, Network, PeerId,
+    Config as AnemoConfig, Network, PeerId,
 };
 use anemo_tower::{
     auth::{AllowedPeers, RequireAuthorizationLayer},
@@ -28,6 +28,7 @@ use consensus_network::{
     epoch_filter::{AllowedEpoch, EPOCH_HEADER_KEY},
     failpoints::FailpointsMakeCallbackHandler,
     metrics::MetricsMakeCallbackHandler,
+    primary_client::WorkerClient,
 };
 use consensus_network_types::{PrimaryToWorkerServer, WorkerToWorkerServer};
 use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, thread::sleep, time::Duration};
@@ -66,7 +67,8 @@ impl<DB: Database> Worker<DB> {
         Self { id, consensus_config }
     }
 
-    fn anemo_config() -> Config {
+    /// Return the default anemo configuration.
+    fn anemo_config() -> AnemoConfig {
         let mut quic_config = anemo::QuicConfig::default();
         // Allow more concurrent streams for burst activity.
         quic_config.max_concurrent_bidi_streams = Some(10_000);
@@ -126,9 +128,89 @@ impl<DB: Database> Worker<DB> {
 
         let node_metrics = metrics.worker_metrics.clone();
 
+        // start local network between worker <-> primary
+        // TODO: should this be worker's pub key?
+        let peer_id = WorkerClient::new_from_public_key(config.primary_network_key());
+        let block_fetcher = WorkerBlockFetcher::new(
+            worker_name,
+            network.clone(),
+            self.consensus_config.node_storage().batch_store.clone(),
+            node_metrics.clone(),
+        );
+
+        let anemo_config = Self::anemo_config();
+        let epoch_string: String = self.consensus_config.committee().epoch().to_string();
+
+        // TODO: this is lazy
+        //
+        // trying to create network then local network to pass to `new_from_public_key`
+        // network client needs handler, wan to create new
+        let network;
+        let mut retries_left = 90;
+        loop {
+            let network_result = anemo::Network::bind(addr.clone())
+                .server_name("telcoin-network")
+                .private_key(
+                    self.consensus_config
+                        .key_config()
+                        .worker_network_keypair()
+                        .copy()
+                        .private()
+                        .0
+                        .to_bytes(),
+                )
+                .config(anemo_config)
+                .outbound_request_layer(outbound_layer.clone())
+                .start(service.clone());
+            match network_result {
+                Ok(n) => {
+                    network = n;
+                    break;
+                }
+                Err(_) => {
+                    retries_left -= 1;
+
+                    if retries_left <= 0 {
+                        panic!();
+                    }
+                    error!(target: "worker::worker",
+                        "Address {} should be available for the primary Narwhal service, retrying in one second",
+                        addr
+                    );
+                    sleep(Duration::from_secs(1));
+                }
+            }
+        }
+
+        let handler = Arc::new(PrimaryReceiverHandler {
+            id: self.id,
+            committee: self.consensus_config.committee().clone(),
+            worker_cache: self.consensus_config.worker_cache().clone(),
+            store: self.consensus_config.database().clone(),
+            request_batches_timeout: self.consensus_config.parameters().sync_retry_delay,
+            network: Some(network.clone()),
+            batch_fetcher: Some(block_fetcher),
+            validator: validator.clone(),
+        });
+
+        let local_network = WorkerClient::new();
+        // local_network.set_primary_to_worker_local_handler(
+        //     worker_peer_id,
+        //     Arc::new(PrimaryReceiverHandler {
+        //         id: self.id,
+        //         committee: self.consensus_config.committee().clone(),
+        //         worker_cache: self.consensus_config.worker_cache().clone(),
+        //         store: self.consensus_config.database().clone(),
+        //         request_batches_timeout: self.consensus_config.parameters().sync_retry_delay,
+        //         network: Some(network.clone()),
+        //         batch_fetcher: Some(block_fetcher),
+        //         validator: validator.clone(),
+        //     }),
+        // );
+
         let mut worker_service = WorkerToWorkerServer::new(WorkerReceiverHandler {
             id: self.id,
-            client: self.consensus_config.network_client().clone(),
+            client: local_network.clone(),
             store: self.consensus_config.node_storage().batch_store.clone(),
             validator: validator.clone(),
         });
@@ -168,8 +250,6 @@ impl<DB: Database> Worker<DB> {
         // Receive incoming messages from other workers.
         let address = self.my_address();
         let addr = address.to_anemo_address().unwrap();
-
-        let epoch_string: String = self.consensus_config.committee().epoch().to_string();
 
         // Set up anemo Network.
         let our_primary_peer_id =
@@ -225,68 +305,9 @@ impl<DB: Database> Worker<DB> {
                 epoch_string,
             ))
             .into_inner();
-
-        let anemo_config = Self::anemo_config();
-
-        let network;
-        let mut retries_left = 90;
-        loop {
-            let network_result = anemo::Network::bind(addr.clone())
-                .server_name("narwhal")
-                .private_key(
-                    self.consensus_config
-                        .key_config()
-                        .worker_network_keypair()
-                        .copy()
-                        .private()
-                        .0
-                        .to_bytes(),
-                )
-                .config(anemo_config.clone())
-                .outbound_request_layer(outbound_layer.clone())
-                .start(service.clone());
-            match network_result {
-                Ok(n) => {
-                    network = n;
-                    break;
-                }
-                Err(_) => {
-                    retries_left -= 1;
-
-                    if retries_left <= 0 {
-                        panic!();
-                    }
-                    error!(target: "worker::worker",
-                        "Address {} should be available for the primary Narwhal service, retrying in one second",
-                        addr
-                    );
-                    sleep(Duration::from_secs(1));
-                }
-            }
-        }
-        self.consensus_config.network_client().set_worker_network(self.id, network.clone());
+        // local_network.set_worker_wan(self.id, network.clone());
 
         info!(target: "worker::worker", "Worker {} listening to worker messages on {}", self.id, address);
-
-        let block_fetcher = WorkerBlockFetcher::new(
-            worker_name,
-            network.clone(),
-            self.consensus_config.node_storage().batch_store.clone(),
-            node_metrics.clone(),
-        );
-        self.consensus_config.network_client().set_primary_to_worker_local_handler(
-            worker_peer_id,
-            Arc::new(PrimaryReceiverHandler {
-                id: self.id,
-                committee: self.consensus_config.committee().clone(),
-                worker_cache: self.consensus_config.worker_cache().clone(),
-                store: self.consensus_config.database().clone(),
-                request_batches_timeout: self.consensus_config.parameters().sync_retry_delay,
-                network: Some(network.clone()),
-                batch_fetcher: Some(block_fetcher),
-                validator: validator.clone(),
-            }),
-        );
 
         let mut peer_types = HashMap::new();
 
@@ -349,11 +370,8 @@ impl<DB: Database> Worker<DB> {
             config.subscribe_shutdown(),
         );
 
-        let block_provider = self.new_block_provider(
-            node_metrics,
-            self.consensus_config.network_client().clone(),
-            network.clone(),
-        );
+        let block_provider =
+            self.new_block_provider(node_metrics, local_network.clone(), network.clone());
 
         let network_shutdown_handle =
             Self::shutdown_network_listener(config.subscribe_shutdown(), network);

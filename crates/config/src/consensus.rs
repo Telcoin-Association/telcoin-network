@@ -3,7 +3,7 @@ use std::sync::Arc;
 use consensus_network::client::{PrimaryClient, WorkerClient};
 use parking_lot::Mutex;
 use tn_storage::{traits::Database, NodeStorage};
-use tn_types::{Authority, Committee, Noticer, Notifier, WorkerCache};
+use tn_types::{Authority, Committee, NetworkPublicKey, Noticer, Notifier, WorkerCache};
 
 use crate::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, Parameters, TelcoinDirs};
 
@@ -12,9 +12,6 @@ struct ConsensusConfigInner<DB> {
     config: Config,
     committee: Committee,
     tn_datadir: Arc<dyn TelcoinDirs>,
-    network_client: PrimaryClient,
-    worker_to_primary_client: WorkerClient,
-    // primary_to_worker_client: PrimaryClient,
     node_storage: NodeStorage<DB>,
     key_config: KeyConfig,
     authority: Authority,
@@ -85,8 +82,8 @@ where
         committee: Committee,
         mut worker_cache: Option<WorkerCache>,
     ) -> eyre::Result<Self> {
-        let network_client =
-            PrimaryClient::new_from_public_key(config.validator_info.primary_network_key());
+        // let network_client =
+        //     PrimaryClient::new_from_public_key(config.validator_info.primary_network_key());
 
         let primary_public_key = key_config.primary_public_key();
         let authority = committee
@@ -104,7 +101,6 @@ where
                 config,
                 committee,
                 tn_datadir,
-                network_client,
                 node_storage,
                 key_config,
                 authority,
@@ -145,20 +141,6 @@ where
         self.inner.tn_datadir.clone()
     }
 
-    pub fn network_client(&self) -> &PrimaryClient {
-        &self.inner.network_client
-    }
-
-    /// Local interface for worker to primary communication.
-    pub fn worker_to_primary_client(&self) -> &PrimaryClient {
-        &self.inner.worker_to_primary_client
-    }
-
-    /// Local interface for primary to worker communication.
-    pub fn primary_to_worker_client(&self) -> &PrimaryClient {
-        &self.inner.primary_to_worker_client
-    }
-
     pub fn node_storage(&self) -> &NodeStorage<DB> {
         &self.inner.node_storage
     }
@@ -177,5 +159,9 @@ where
 
     pub fn database(&self) -> &DB {
         &self.inner.node_storage.batch_store
+    }
+
+    pub fn primary_network_key(&self) -> &NetworkPublicKey {
+        &self.inner.config.primary_public_key()
     }
 }

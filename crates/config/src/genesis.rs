@@ -365,7 +365,7 @@ impl ValidatorInfo {
         &self.bls_public_key
     }
 
-    /// Return the primary's network address.
+    /// Return the primary's public network key.
     pub fn primary_network_key(&self) -> &NetworkPublicKey {
         &self.primary_info.network_key
     }

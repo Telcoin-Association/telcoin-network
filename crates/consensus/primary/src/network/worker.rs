@@ -8,15 +8,13 @@
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
 
+use super::WorkerReceiverHandler;
+use crate::proposer::OurDigestMessage;
 use anemo::async_trait;
 use consensus_network_types::{WorkerOthersBlockMessage, WorkerOwnBlockMessage, WorkerToPrimary};
 use tn_storage::traits::Database;
 use tn_types::TnSender;
 use tokio::sync::oneshot;
-
-use crate::proposer::OurDigestMessage;
-
-use super::WorkerReceiverHandler;
 
 // TODO: anemo still uses async_trait
 #[async_trait]

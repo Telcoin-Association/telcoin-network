@@ -43,7 +43,7 @@ async fn test_server_authorizations() {
             .with_timeout(Duration::from_secs(5));
         primary_network.fetch_certificates(&primary_target_name, request).await.unwrap();
 
-        let worker_network = test_client.get_worker_network(0).await.unwrap();
+        let worker_network = test_client.wan_client().await.unwrap();
         let worker_target_name = test_worker_cache
             .workers
             .get(target_authority.protocol_key())
@@ -85,7 +85,7 @@ async fn test_server_authorizations() {
         // Removing the AllowedPeers RequireAuthorizationLayer for primary should make this succeed.
         assert!(primary_network.fetch_certificates(&primary_target_name, request).await.is_err());
 
-        let worker_network = test_client.get_worker_network(0).await.unwrap();
+        let worker_network = test_client.wan_client().await.unwrap();
         let worker_target_name = unreachable_worker_cache
             .workers
             .get(unreachable_authority.protocol_key())

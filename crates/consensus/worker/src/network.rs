@@ -35,7 +35,7 @@ pub struct WorkerReceiverHandler<V, DB> {
     /// This worker's id.
     pub id: WorkerId,
     /// The interface for communicating with this worker's primary.
-    pub client: PrimaryClient,
+    pub client: WorkerClient,
     /// Database for storing worker blocks received from peers.
     pub store: DB,
     /// The type that validates worker blocks received from peers.

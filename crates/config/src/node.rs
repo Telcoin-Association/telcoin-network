@@ -105,9 +105,14 @@ impl Config {
         &self.validator_info.execution_address
     }
 
-    /// Return a reference to the primary's public key.
-    pub fn primary_public_key(&self) -> eyre::Result<&BlsPublicKey> {
-        Ok(self.validator_info.public_key())
+    /// Return a reference to the primary's public BLS key.
+    pub fn primary_bls_key(&self) -> &BlsPublicKey {
+        self.validator_info.public_key()
+    }
+
+    /// Return a reference to the primary's public BLS key.
+    pub fn primary_network_key(&self) -> &NetworkPublicKey {
+        self.validator_info.primary_network_key()
     }
 
     /// Return a reference to the primary's [WorkerIndex].

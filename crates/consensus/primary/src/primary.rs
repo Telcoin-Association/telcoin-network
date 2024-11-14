@@ -31,13 +31,12 @@ use consensus_network::{
     failpoints::FailpointsMakeCallbackHandler,
     metrics::MetricsMakeCallbackHandler,
 };
+use consensus_network_types::{PrimaryToPrimaryServer, WorkerToPrimaryServer};
 use fastcrypto::traits::KeyPair as _;
 use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, thread::sleep, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_storage::traits::Database;
 use tn_types::{traits::EncodeDecodeBase64, Multiaddr, NetworkPublicKey, Protocol};
-
-use consensus_network_types::{PrimaryToPrimaryServer, WorkerToPrimaryServer};
 use tokio::task::JoinHandle;
 use tower::ServiceBuilder;
 use tracing::{error, info};
