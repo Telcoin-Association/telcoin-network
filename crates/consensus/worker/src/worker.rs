@@ -94,33 +94,6 @@ impl<DB: Database> Worker<DB> {
 
         let node_metrics = metrics.worker_metrics.clone();
 
-        let mut worker_service = WorkerToWorkerServer::new(WorkerReceiverHandler {
-            id: self.id,
-            client: self.consensus_config.local_network().clone(),
-            store: self.consensus_config.node_storage().batch_store.clone(),
-            validator: validator.clone(),
-        });
-        // Apply rate limits from configuration as needed.
-        if let Some(limit) = self.consensus_config.config().parameters.anemo.report_batch_rate_limit
-        {
-            worker_service = worker_service.add_layer_for_report_block(InboundRequestLayer::new(
-                rate_limit::RateLimitLayer::new(
-                    governor::Quota::per_second(limit),
-                    rate_limit::WaitMode::Block,
-                ),
-            ));
-        }
-        if let Some(limit) =
-            self.consensus_config.config().parameters.anemo.request_batches_rate_limit
-        {
-            worker_service = worker_service.add_layer_for_request_blocks(InboundRequestLayer::new(
-                rate_limit::RateLimitLayer::new(
-                    governor::Quota::per_second(limit),
-                    rate_limit::WaitMode::Block,
-                ),
-            ));
-        }
-
         // // Legacy RPC interface, only used by delete_batches() for external consensus.
         // let primary_service = PrimaryToWorkerServer::new(PrimaryReceiverHandler {
         //     id: self.id,
@@ -134,107 +107,18 @@ impl<DB: Database> Worker<DB> {
         // });
 
         // Receive incoming messages from other workers.
-        let address = self.my_address();
-        let addr = address.to_anemo_address().unwrap();
-
-        let epoch_string: String = self.consensus_config.committee().epoch().to_string();
+        let network = self.start_network(validator.clone(), &metrics);
 
         // Set up anemo Network.
-        let our_primary_peer_id =
-            PeerId(self.consensus_config.authority().network_key().0.to_bytes());
+        // let our_primary_peer_id =
+        //     PeerId(self.consensus_config.authority().network_key().0.to_bytes());
         // let primary_to_worker_router = anemo::Router::new()
         //     .add_rpc_service(primary_service)
         //     // Add an Authorization Layer to ensure that we only service requests from our primary
         //     .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new([our_primary_peer_id])))
         //     .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())));
 
-        let worker_peer_ids = self
-            .consensus_config
-            .worker_cache()
-            .all_workers()
-            .into_iter()
-            .map(|(worker_name, _)| PeerId(worker_name.0.to_bytes()));
-        let routes = anemo::Router::new()
-            .add_rpc_service(worker_service)
-            .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new(worker_peer_ids)))
-            .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())));
-        // .merge(primary_to_worker_router);
-
-        let service = ServiceBuilder::new()
-            .layer(
-                TraceLayer::new_for_server_errors()
-                    .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
-                    .on_failure(DefaultOnFailure::new().level(tracing::Level::WARN)),
-            )
-            .layer(CallbackLayer::new(MetricsMakeCallbackHandler::new(
-                metrics.inbound_network_metrics.clone(),
-                self.consensus_config.config().parameters.anemo.excessive_message_size(),
-            )))
-            .layer(CallbackLayer::new(FailpointsMakeCallbackHandler::new()))
-            .layer(SetResponseHeaderLayer::overriding(
-                EPOCH_HEADER_KEY.parse().unwrap(),
-                epoch_string.clone(),
-            ))
-            .service(routes);
-
-        let outbound_layer = ServiceBuilder::new()
-            .layer(
-                TraceLayer::new_for_client_and_server_errors()
-                    .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
-                    .on_failure(DefaultOnFailure::new().level(tracing::Level::WARN)),
-            )
-            .layer(CallbackLayer::new(MetricsMakeCallbackHandler::new(
-                metrics.outbound_network_metrics.clone(),
-                self.consensus_config.config().parameters.anemo.excessive_message_size(),
-            )))
-            .layer(CallbackLayer::new(FailpointsMakeCallbackHandler::new()))
-            .layer(SetRequestHeaderLayer::overriding(
-                EPOCH_HEADER_KEY.parse().unwrap(),
-                epoch_string,
-            ))
-            .into_inner();
-
-        let anemo_config = self.consensus_config.anemo_config();
-
-        let network;
-        let mut retries_left = 90;
-        loop {
-            let network_result = anemo::Network::bind(addr.clone())
-                .server_name("telcoin-network")
-                .private_key(
-                    self.consensus_config
-                        .key_config()
-                        .worker_network_keypair()
-                        .copy()
-                        .private()
-                        .0
-                        .to_bytes(),
-                )
-                .config(anemo_config.clone())
-                .outbound_request_layer(outbound_layer.clone())
-                .start(service.clone());
-            match network_result {
-                Ok(n) => {
-                    network = n;
-                    break;
-                }
-                Err(_) => {
-                    retries_left -= 1;
-
-                    if retries_left <= 0 {
-                        panic!();
-                    }
-                    error!(target: "worker::worker",
-                        "Address {} should be available for the primary Narwhal service, retrying in one second",
-                        addr
-                    );
-                    sleep(Duration::from_secs(1));
-                }
-            }
-        }
         self.consensus_config.local_network().set_worker_network(self.id, network.clone());
-
-        info!(target: "worker::worker", "Worker {} listening to worker messages on {}", self.id, address);
 
         let block_fetcher = WorkerBlockFetcher::new(
             worker_name,
@@ -252,7 +136,7 @@ impl<DB: Database> Worker<DB> {
                 request_batches_timeout: self.consensus_config.parameters().sync_retry_delay,
                 network: Some(network.clone()),
                 batch_fetcher: Some(block_fetcher),
-                validator: validator.clone(),
+                validator,
             }),
         );
 
@@ -342,8 +226,130 @@ impl<DB: Database> Worker<DB> {
         (handles, block_provider)
     }
 
-    // Spawns a task responsible for explicitly shutting down the network
-    // when a shutdown signal has been sent to the node.
+    /// Start the anemo network for the primary.
+    fn start_network(&self, validator: impl BlockValidation, metrics: &Metrics) -> Network {
+        let mut worker_service = WorkerToWorkerServer::new(WorkerReceiverHandler {
+            id: self.id,
+            client: self.consensus_config.local_network().clone(),
+            store: self.consensus_config.node_storage().batch_store.clone(),
+            validator,
+        });
+
+        // Apply rate limits from configuration as needed.
+        if let Some(limit) = self.consensus_config.config().parameters.anemo.report_batch_rate_limit
+        {
+            worker_service = worker_service.add_layer_for_report_block(InboundRequestLayer::new(
+                rate_limit::RateLimitLayer::new(
+                    governor::Quota::per_second(limit),
+                    rate_limit::WaitMode::Block,
+                ),
+            ));
+        }
+        if let Some(limit) =
+            self.consensus_config.config().parameters.anemo.request_batches_rate_limit
+        {
+            worker_service = worker_service.add_layer_for_request_blocks(InboundRequestLayer::new(
+                rate_limit::RateLimitLayer::new(
+                    governor::Quota::per_second(limit),
+                    rate_limit::WaitMode::Block,
+                ),
+            ));
+        }
+
+        let address = self.my_address();
+        let addr = address.to_anemo_address().unwrap();
+        let epoch_string: String = self.consensus_config.committee().epoch().to_string();
+        let worker_peer_ids = self
+            .consensus_config
+            .worker_cache()
+            .all_workers()
+            .into_iter()
+            .map(|(worker_name, _)| PeerId(worker_name.0.to_bytes()));
+        let routes = anemo::Router::new()
+            .add_rpc_service(worker_service)
+            .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new(worker_peer_ids)))
+            .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())));
+        // .merge(primary_to_worker_router);
+
+        let service = ServiceBuilder::new()
+            .layer(
+                TraceLayer::new_for_server_errors()
+                    .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
+                    .on_failure(DefaultOnFailure::new().level(tracing::Level::WARN)),
+            )
+            .layer(CallbackLayer::new(MetricsMakeCallbackHandler::new(
+                metrics.inbound_network_metrics.clone(),
+                self.consensus_config.config().parameters.anemo.excessive_message_size(),
+            )))
+            .layer(CallbackLayer::new(FailpointsMakeCallbackHandler::new()))
+            .layer(SetResponseHeaderLayer::overriding(
+                EPOCH_HEADER_KEY.parse().unwrap(),
+                epoch_string.clone(),
+            ))
+            .service(routes);
+
+        let outbound_layer = ServiceBuilder::new()
+            .layer(
+                TraceLayer::new_for_client_and_server_errors()
+                    .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
+                    .on_failure(DefaultOnFailure::new().level(tracing::Level::WARN)),
+            )
+            .layer(CallbackLayer::new(MetricsMakeCallbackHandler::new(
+                metrics.outbound_network_metrics.clone(),
+                self.consensus_config.config().parameters.anemo.excessive_message_size(),
+            )))
+            .layer(CallbackLayer::new(FailpointsMakeCallbackHandler::new()))
+            .layer(SetRequestHeaderLayer::overriding(
+                EPOCH_HEADER_KEY.parse().unwrap(),
+                epoch_string,
+            ))
+            .into_inner();
+
+        let anemo_config = self.consensus_config.anemo_config();
+
+        let network;
+        let mut retries_left = 90;
+        loop {
+            let network_result = anemo::Network::bind(addr.clone())
+                .server_name("telcoin-network")
+                .private_key(
+                    self.consensus_config
+                        .key_config()
+                        .worker_network_keypair()
+                        .copy()
+                        .private()
+                        .0
+                        .to_bytes(),
+                )
+                .config(anemo_config.clone())
+                .outbound_request_layer(outbound_layer.clone())
+                .start(service.clone());
+            match network_result {
+                Ok(n) => {
+                    network = n;
+                    break;
+                }
+                Err(_) => {
+                    retries_left -= 1;
+
+                    if retries_left <= 0 {
+                        panic!();
+                    }
+                    error!(target: "worker::worker",
+                        "Address {} should be available for the primary Narwhal service, retrying in one second",
+                        addr
+                    );
+                    sleep(Duration::from_secs(1));
+                }
+            }
+        }
+
+        info!(target: "worker::worker", "Worker {} listening to worker messages on {}", self.id, address);
+        network
+    }
+
+    /// Spawns a task responsible for explicitly shutting down the network
+    /// when a shutdown signal has been sent to the node.
     fn shutdown_network_listener(rx_shutdown: Noticer, network: Network) -> JoinHandle<()> {
         spawn_logged_monitored_task!(
             async move {

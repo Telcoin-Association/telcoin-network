@@ -3,6 +3,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::{
+    aggregators::CertificatesAggregator, certificate_fetcher::CertificateFetcherCommand,
+    ConsensusBus, CHANNEL_CAPACITY,
+};
 use anemo::{rpc::Status, Network, Request, Response};
 use consensus_metrics::{
     metered_channel::{channel_with_total, MeteredMpscChannel},
@@ -12,6 +16,10 @@ use consensus_network::{
     anemo_ext::{NetworkExt, WaitingPeer},
     local::LocalNetwork,
     PrimaryToWorkerClient, RetryConfig,
+};
+use consensus_network_types::{
+    PrimaryToPrimaryClient, SendCertificateRequest, SendCertificateResponse,
+    WorkerSynchronizeMessage,
 };
 use fastcrypto::hash::Hash as _;
 use futures::{stream::FuturesOrdered, StreamExt};
@@ -29,30 +37,20 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_storage::{traits::Database, CertificateStore, PayloadStore};
 use tn_types::{
-    AuthorityIdentifier, Committee, NetworkPublicKey, TnReceiver, TnSender, WorkerCache,
-};
-use tn_utils::sync::notify_once::NotifyOnce;
-
-use consensus_network_types::{
-    PrimaryToPrimaryClient, SendCertificateRequest, SendCertificateResponse,
-    WorkerSynchronizeMessage,
-};
-use tn_types::{
     ensure,
     error::{AcceptNotification, DagError, DagResult},
     Certificate, CertificateDigest, Header, Round, SignatureVerificationState,
 };
+use tn_types::{
+    AuthorityIdentifier, Committee, NetworkPublicKey, TnReceiver, TnSender, WorkerCache,
+};
+use tn_utils::sync::notify_once::NotifyOnce;
 use tokio::{
     sync::{broadcast, oneshot, MutexGuard},
     task::{spawn_blocking, JoinSet},
     time::{sleep, timeout, Instant},
 };
 use tracing::{debug, error, instrument, trace, warn};
-
-use crate::{
-    aggregators::CertificatesAggregator, certificate_fetcher::CertificateFetcherCommand,
-    ConsensusBus, CHANNEL_CAPACITY,
-};
 
 #[cfg(test)]
 #[path = "tests/synchronizer_tests.rs"]
