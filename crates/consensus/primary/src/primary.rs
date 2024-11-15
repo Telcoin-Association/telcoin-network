@@ -110,9 +110,9 @@ impl Primary {
         // TODO: remove this
         config
             .local_network()
-            .set_worker_to_primary_local_handler(Arc::new(worker_receiver_handler.clone()));
+            .set_worker_to_primary_local_handler(Arc::new(worker_receiver_handler));
 
-        let worker_service = WorkerToPrimaryServer::new(worker_receiver_handler);
+        // let worker_service = WorkerToPrimaryServer::new(worker_receiver_handler);
 
         let addr = address.to_anemo_address().unwrap();
 
@@ -124,11 +124,11 @@ impl Primary {
             .unwrap()
             .into_iter()
             .map(|worker_info| PeerId(worker_info.name.0.to_bytes()));
-        let worker_to_primary_router = anemo::Router::new()
-            .add_rpc_service(worker_service)
-            // Add an Authorization Layer to ensure that we only service requests from our workers
-            .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new(our_worker_peer_ids)))
-            .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())));
+        // let worker_to_primary_router = anemo::Router::new()
+        //     .add_rpc_service(worker_service)
+        //     // Add an Authorization Layer to ensure that we only service requests from our workers
+        //     .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new(our_worker_peer_ids)))
+        //     .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())));
 
         let primary_peer_ids = config
             .committee()
@@ -137,8 +137,8 @@ impl Primary {
         let routes = anemo::Router::new()
             .add_rpc_service(primary_service)
             .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new(primary_peer_ids)))
-            .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())))
-            .merge(worker_to_primary_router);
+            .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())));
+        // .merge(worker_to_primary_router);
 
         let service = ServiceBuilder::new()
             .layer(
