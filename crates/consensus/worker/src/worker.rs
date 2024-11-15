@@ -153,17 +153,17 @@ impl<DB: Database> Worker<DB> {
             ));
         }
 
-        // Legacy RPC interface, only used by delete_batches() for external consensus.
-        let primary_service = PrimaryToWorkerServer::new(PrimaryReceiverHandler {
-            id: self.id,
-            committee: self.consensus_config.committee().clone(),
-            worker_cache: self.consensus_config.worker_cache().clone(),
-            store: self.consensus_config.node_storage().batch_store.clone(),
-            request_batches_timeout: self.consensus_config.config().parameters.sync_retry_delay,
-            network: None,
-            batch_fetcher: None,
-            validator: validator.clone(),
-        });
+        // // Legacy RPC interface, only used by delete_batches() for external consensus.
+        // let primary_service = PrimaryToWorkerServer::new(PrimaryReceiverHandler {
+        //     id: self.id,
+        //     committee: self.consensus_config.committee().clone(),
+        //     worker_cache: self.consensus_config.worker_cache().clone(),
+        //     store: self.consensus_config.node_storage().batch_store.clone(),
+        //     request_batches_timeout: self.consensus_config.config().parameters.sync_retry_delay,
+        //     network: None,
+        //     batch_fetcher: None,
+        //     validator: validator.clone(),
+        // });
 
         // Receive incoming messages from other workers.
         let address = self.my_address();
@@ -174,11 +174,11 @@ impl<DB: Database> Worker<DB> {
         // Set up anemo Network.
         let our_primary_peer_id =
             PeerId(self.consensus_config.authority().network_key().0.to_bytes());
-        let primary_to_worker_router = anemo::Router::new()
-            .add_rpc_service(primary_service)
-            // Add an Authorization Layer to ensure that we only service requests from our primary
-            .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new([our_primary_peer_id])))
-            .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())));
+        // let primary_to_worker_router = anemo::Router::new()
+        //     .add_rpc_service(primary_service)
+        //     // Add an Authorization Layer to ensure that we only service requests from our primary
+        //     .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new([our_primary_peer_id])))
+        //     .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())));
 
         let worker_peer_ids = self
             .consensus_config
@@ -189,8 +189,8 @@ impl<DB: Database> Worker<DB> {
         let routes = anemo::Router::new()
             .add_rpc_service(worker_service)
             .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new(worker_peer_ids)))
-            .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())))
-            .merge(primary_to_worker_router);
+            .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())));
+        // .merge(primary_to_worker_router);
 
         let service = ServiceBuilder::new()
             .layer(
@@ -242,7 +242,7 @@ impl<DB: Database> Worker<DB> {
                         .0
                         .to_bytes(),
                 )
-                .config(anemo_config.clone())
+                .config(anemo_config)
                 .outbound_request_layer(outbound_layer.clone())
                 .start(service.clone());
             match network_result {

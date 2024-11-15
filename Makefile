@@ -73,7 +73,7 @@ check:
 
 # run workspace unit tests
 test:
-	cargo test --workspace --features faucet --no-fail-fast ;
+	cargo test --workspace --no-fail-fast -- --show-output ;
 
 # run faucet integration test
 test-faucet:
