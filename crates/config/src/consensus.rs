@@ -1,4 +1,5 @@
 //! Configuration for consensus network (primary and worker).
+use anemo::Config as AnemoConfig;
 use consensus_network::local::LocalNetwork;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ struct ConsensusConfigInner<DB> {
     key_config: KeyConfig,
     authority: Authority,
     local_network: LocalNetwork,
+    anemo_config: AnemoConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +99,7 @@ where
         let tn_datadir = Arc::new(tn_datadir);
         let worker_cache = worker_cache.take().map(Arc::new);
         let shutdown = Arc::new(Mutex::new(Notifier::new()));
+        let anemo_config = Self::create_anemo_config();
         Ok(Self {
             inner: Arc::new(ConsensusConfigInner {
                 config,
@@ -106,10 +109,46 @@ where
                 key_config,
                 authority,
                 local_network,
+                anemo_config,
             }),
             worker_cache,
             shutdown,
         })
+    }
+
+    /// The configurable variables for anemo p2p network.
+    ///
+    /// Used for cosensus by both the primary and workers.
+    fn create_anemo_config() -> AnemoConfig {
+        let mut quic_config = anemo::QuicConfig::default();
+        // Allow more concurrent streams for burst activity.
+        quic_config.max_concurrent_bidi_streams = Some(10_000);
+        // Increase send and receive buffer sizes on the worker, since the worker is
+        // responsible for broadcasting and fetching payloads.
+        // With 200MiB buffer size and ~500ms RTT, the max throughput ~400MiB.
+        quic_config.stream_receive_window = Some(100 << 20);
+        quic_config.receive_window = Some(200 << 20);
+        quic_config.send_window = Some(200 << 20);
+        quic_config.crypto_buffer_size = Some(1 << 20);
+        quic_config.socket_receive_buffer_size = Some(20 << 20);
+        quic_config.socket_send_buffer_size = Some(20 << 20);
+        quic_config.allow_failed_socket_buffer_size_setting = true;
+        quic_config.max_idle_timeout_ms = Some(30_000);
+        // Enable keep alives every 5s
+        quic_config.keep_alive_interval_ms = Some(5_000);
+        let mut config = anemo::Config::default();
+        config.quic = Some(quic_config);
+        // Set the max_frame_size to be 1 GB to work around the issue of there being too many
+        // delegation events in the epoch change txn.
+        config.max_frame_size = Some(1 << 30);
+        // Set a default timeout of 300s for all RPC requests
+        config.inbound_request_timeout_ms = Some(300_000);
+        config.outbound_request_timeout_ms = Some(300_000);
+        config.shutdown_idle_timeout_ms = Some(1_000);
+        config.connectivity_check_interval_ms = Some(2_000);
+        config.connection_backoff_ms = Some(1_000);
+        config.max_connection_backoff_ms = Some(20_000);
+        config
     }
 
     /// Return a Noticer that will signal when shutdown has occurred.
@@ -165,5 +204,9 @@ where
 
     pub fn local_network(&self) -> &LocalNetwork {
         &self.inner.local_network
+    }
+
+    pub fn anemo_config(&self) -> &AnemoConfig {
+        &self.inner.anemo_config
     }
 }

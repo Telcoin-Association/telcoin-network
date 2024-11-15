@@ -29,6 +29,7 @@ alloy = { workspace = true }
 reth-chainspec = { workspace = true }
 reth-primitives = { workspace = true }
 humantime-serde = { workspace = true }
+anemo = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

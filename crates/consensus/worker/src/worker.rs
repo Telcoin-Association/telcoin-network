@@ -13,7 +13,7 @@ use crate::{
 use anemo::{
     codegen::InboundRequestLayer,
     types::{Address, PeerInfo},
-    Config, Network, PeerId,
+    Network, PeerId,
 };
 use anemo_tower::{
     auth::{AllowedPeers, RequireAuthorizationLayer},
@@ -64,38 +64,6 @@ impl<DB: Database> Worker<DB> {
 
         // Define a worker instance.
         Self { id, consensus_config }
-    }
-
-    fn anemo_config() -> Config {
-        let mut quic_config = anemo::QuicConfig::default();
-        // Allow more concurrent streams for burst activity.
-        quic_config.max_concurrent_bidi_streams = Some(10_000);
-        // Increase send and receive buffer sizes on the worker, since the worker is
-        // responsible for broadcasting and fetching payloads.
-        // With 200MiB buffer size and ~500ms RTT, the max throughput ~400MiB.
-        quic_config.stream_receive_window = Some(100 << 20);
-        quic_config.receive_window = Some(200 << 20);
-        quic_config.send_window = Some(200 << 20);
-        quic_config.crypto_buffer_size = Some(1 << 20);
-        quic_config.socket_receive_buffer_size = Some(20 << 20);
-        quic_config.socket_send_buffer_size = Some(20 << 20);
-        quic_config.allow_failed_socket_buffer_size_setting = true;
-        quic_config.max_idle_timeout_ms = Some(30_000);
-        // Enable keep alives every 5s
-        quic_config.keep_alive_interval_ms = Some(5_000);
-        let mut config = anemo::Config::default();
-        config.quic = Some(quic_config);
-        // Set the max_frame_size to be 1 GB to work around the issue of there being too many
-        // delegation events in the epoch change txn.
-        config.max_frame_size = Some(1 << 30);
-        // Set a default timeout of 300s for all RPC requests
-        config.inbound_request_timeout_ms = Some(300_000);
-        config.outbound_request_timeout_ms = Some(300_000);
-        config.shutdown_idle_timeout_ms = Some(1_000);
-        config.connectivity_check_interval_ms = Some(2_000);
-        config.connection_backoff_ms = Some(1_000);
-        config.max_connection_backoff_ms = Some(20_000);
-        config
     }
 
     fn my_address(&self) -> Multiaddr {
@@ -226,7 +194,7 @@ impl<DB: Database> Worker<DB> {
             ))
             .into_inner();
 
-        let anemo_config = Self::anemo_config();
+        let anemo_config = self.consensus_config.anemo_config();
 
         let network;
         let mut retries_left = 90;
