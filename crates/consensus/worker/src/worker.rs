@@ -307,42 +307,44 @@ impl<DB: Database> Worker<DB> {
 
         let anemo_config = self.consensus_config.anemo_config();
 
-        let network;
-        let mut retries_left = 90;
-        loop {
-            let network_result = anemo::Network::bind(addr.clone())
-                .server_name("telcoin-network")
-                .private_key(
-                    self.consensus_config
-                        .key_config()
-                        .worker_network_keypair()
-                        .copy()
-                        .private()
-                        .0
-                        .to_bytes(),
-                )
-                .config(anemo_config.clone())
-                .outbound_request_layer(outbound_layer.clone())
-                .start(service.clone());
-            match network_result {
-                Ok(n) => {
-                    network = n;
-                    break;
-                }
-                Err(_) => {
-                    retries_left -= 1;
+        // let network;
+        // let mut retries_left = 90;
+        // loop {
+        // let network_result = anemo::Network::bind(addr.clone())
+        let network = anemo::Network::bind(addr.clone())
+            .server_name("telcoin-network")
+            .private_key(
+                self.consensus_config
+                    .key_config()
+                    .worker_network_keypair()
+                    .copy()
+                    .private()
+                    .0
+                    .to_bytes(),
+            )
+            .config(anemo_config.clone())
+            .outbound_request_layer(outbound_layer.clone())
+            .start(service.clone())
+            .expect("worker network bind");
+        // match network_result {
+        //     Ok(n) => {
+        //         network = n;
+        //         break;
+        //     }
+        //     Err(_) => {
+        //         retries_left -= 1;
 
-                    if retries_left <= 0 {
-                        panic!();
-                    }
-                    error!(target: "worker::worker",
-                        "Address {} should be available for the primary Narwhal service, retrying in one second",
-                        addr
-                    );
-                    sleep(Duration::from_secs(1));
-                }
-            }
-        }
+        //         if retries_left <= 0 {
+        //             panic!();
+        //         }
+        //         error!(target: "worker::worker",
+        //             "Address {} should be available for the primary Narwhal service, retrying in one second",
+        //             addr
+        //         );
+        //         sleep(Duration::from_secs(1));
+        //     }
+        // }
+        // }
 
         info!(target: "worker::worker", "Worker {} listening to worker messages on {}", self.id, address);
         network

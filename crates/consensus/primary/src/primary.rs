@@ -107,9 +107,10 @@ impl Primary {
             config.node_storage().payload_store.clone(),
         );
 
-        // config
-        //     .local_network()
-        //     .set_worker_to_primary_local_handler(Arc::new(worker_receiver_handler.clone()));
+        // TODO: remove this
+        config
+            .local_network()
+            .set_worker_to_primary_local_handler(Arc::new(worker_receiver_handler.clone()));
 
         let worker_service = WorkerToPrimaryServer::new(worker_receiver_handler);
 
@@ -204,7 +205,9 @@ impl Primary {
                 }
             }
         }
-        // config.local_network().set_primary_network(network.clone());
+
+        // TODO: remove this
+        config.local_network().set_primary_network(network.clone());
 
         info!("Primary {} listening on {}", config.authority().id(), address);
 
