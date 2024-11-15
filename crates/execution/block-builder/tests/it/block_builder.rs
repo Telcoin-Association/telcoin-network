@@ -4,7 +4,7 @@
 //! from peers.
 
 use assert_matches::assert_matches;
-use consensus_network::client::PrimaryClient;
+use consensus_network::local::LocalNetwork;
 use consensus_network_types::MockWorkerToPrimary;
 use reth_blockchain_tree::{
     noop::NoopBlockchainTree, BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree,
@@ -65,7 +65,7 @@ async fn test_make_block_el_to_cl() {
     //=== Consensus Layer
     //
 
-    let network_client = PrimaryClient::new_with_empty_id();
+    let network_client = LocalNetwork::new_with_empty_id();
     let temp_dir = TempDir::new().unwrap();
     let store = open_db(temp_dir.path());
     let node_metrics = WorkerMetrics::default();

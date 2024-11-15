@@ -9,8 +9,8 @@
 //! and sends it to the quorum waiter for broadcasting to peers.
 
 use crate::{metrics::WorkerMetrics, quorum_waiter::QuorumWaiterTrait};
-use consensus_network::WorkersLocalClient;
-use consensus_network_types::WorkerOwnBlockMessage;
+use consensus_network::{local::LocalNetwork, WorkerToPrimaryClient as _};
+use consensus_network_types::{WorkerOwnBlockMessage, WorkerToPrimary};
 use std::{sync::Arc, time::Duration};
 use tn_storage::{tables::WorkerBlocks, traits::Database};
 use tn_types::{error::BlockSealError, WorkerBlock, WorkerBlockSender, WorkerId};
@@ -30,7 +30,7 @@ pub struct BlockProvider<DB, QW> {
     /// Metrics handler
     node_metrics: Arc<WorkerMetrics>,
     /// The network client to send our blocks to the primary.
-    client: WorkersLocalClient,
+    client: LocalNetwork,
     /// The block store to store our own blocks.
     store: DB,
     /// Channel sender for alternate block submision if not calling seal directly.
@@ -50,7 +50,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> BlockProvider<DB, QW> {
         id: WorkerId,
         quorum_waiter: QW,
         node_metrics: Arc<WorkerMetrics>,
-        client: WorkersLocalClient,
+        client: LocalNetwork,
         store: DB,
         timeout: Duration,
     ) -> Self {
@@ -127,9 +127,9 @@ impl<DB: Database, QW: QuorumWaiterTrait> BlockProvider<DB, QW> {
         let message =
             WorkerOwnBlockMessage { digest, worker_id: self.id, worker_block: block.clone() };
         if let Err(err) = self.client.report_own_block(message).await {
-            error!(target: "worker::block_provider", "Failed to report our block: {err}");
+            error!(target: "worker::block_provider", "Failed to report our block: {err:?}");
             // Should we return an error here?  Doing so complicates some tests but also the block
-            // is sealed, etc. Also, if we can not report our own block is this a
+            // is sealed, etc. If we can not report our own block is this a
             // showstopper?
         }
         Ok(())

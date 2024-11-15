@@ -11,7 +11,7 @@ use alloy::{
     hex, sol,
     sol_types::{SolType, SolValue},
 };
-use consensus_network::client::PrimaryClient;
+use consensus_network::local::LocalNetwork;
 use gcloud_sdk::{
     google::cloud::kms::v1::{
         key_management_service_client::KeyManagementServiceClient, GetPublicKeyRequest,
@@ -261,7 +261,7 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
 
     let worker_id = 0;
     let (to_worker, mut next_batch) = tokio::sync::mpsc::channel(1);
-    let client = PrimaryClient::new_with_empty_id();
+    let client = LocalNetwork::new_with_empty_id();
     let temp_dir = TempDir::new().unwrap();
     let store = open_db(temp_dir.path());
     let qw = TestChanQuorumWaiter(to_worker);

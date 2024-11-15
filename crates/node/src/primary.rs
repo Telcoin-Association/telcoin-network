@@ -101,7 +101,7 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         // send the shutdown signal to the node
         let now = Instant::now();
 
-        self.consensus_config.network_client().shutdown();
+        self.consensus_config.local_network().shutdown();
         self.consensus_config.shutdown();
 
         // Now wait until handles have been completed

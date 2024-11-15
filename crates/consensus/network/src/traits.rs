@@ -56,17 +56,17 @@ pub trait PrimaryToWorkerClient {
     ) -> impl Future<Output = Result<FetchBlocksResponse, LocalClientError>>;
 }
 
-// pub trait WorkerToPrimaryClient {
-//     fn report_own_block(
-//         &self,
-//         request: WorkerOwnBlockMessage,
-//     ) -> impl Future<Output = Result<(), LocalClientError>>;
+pub trait WorkerToPrimaryClient {
+    fn report_own_block(
+        &self,
+        request: WorkerOwnBlockMessage,
+    ) -> impl Future<Output = Result<(), LocalClientError>>;
 
-//     fn report_others_block(
-//         &self,
-//         request: WorkerOthersBlockMessage,
-//     ) -> impl Future<Output = Result<(), LocalClientError>>;
-// }
+    fn report_others_block(
+        &self,
+        request: WorkerOthersBlockMessage,
+    ) -> impl Future<Output = Result<(), LocalClientError>>;
+}
 
 pub trait WorkerRpc {
     fn request_blocks(

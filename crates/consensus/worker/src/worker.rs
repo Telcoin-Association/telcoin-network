@@ -24,9 +24,9 @@ use anemo_tower::{
 };
 use consensus_metrics::spawn_logged_monitored_task;
 use consensus_network::{
-    client::NetworkClient,
     epoch_filter::{AllowedEpoch, EPOCH_HEADER_KEY},
     failpoints::FailpointsMakeCallbackHandler,
+    local::LocalNetwork,
     metrics::MetricsMakeCallbackHandler,
 };
 use consensus_network_types::{PrimaryToWorkerServer, WorkerToWorkerServer};
@@ -128,7 +128,7 @@ impl<DB: Database> Worker<DB> {
 
         let mut worker_service = WorkerToWorkerServer::new(WorkerReceiverHandler {
             id: self.id,
-            client: self.consensus_config.network_client().clone(),
+            client: self.consensus_config.local_network().clone(),
             store: self.consensus_config.node_storage().batch_store.clone(),
             validator: validator.clone(),
         });
@@ -232,7 +232,7 @@ impl<DB: Database> Worker<DB> {
         let mut retries_left = 90;
         loop {
             let network_result = anemo::Network::bind(addr.clone())
-                .server_name("narwhal")
+                .server_name("telcoin-network")
                 .private_key(
                     self.consensus_config
                         .key_config()
@@ -242,7 +242,7 @@ impl<DB: Database> Worker<DB> {
                         .0
                         .to_bytes(),
                 )
-                .config(anemo_config)
+                .config(anemo_config.clone())
                 .outbound_request_layer(outbound_layer.clone())
                 .start(service.clone());
             match network_result {
@@ -264,7 +264,7 @@ impl<DB: Database> Worker<DB> {
                 }
             }
         }
-        self.consensus_config.network_client().set_worker_network(self.id, network.clone());
+        self.consensus_config.local_network().set_worker_network(self.id, network.clone());
 
         info!(target: "worker::worker", "Worker {} listening to worker messages on {}", self.id, address);
 
@@ -274,7 +274,7 @@ impl<DB: Database> Worker<DB> {
             self.consensus_config.node_storage().batch_store.clone(),
             node_metrics.clone(),
         );
-        self.consensus_config.network_client().set_primary_to_worker_local_handler(
+        self.consensus_config.local_network().set_primary_to_worker_local_handler(
             worker_peer_id,
             Arc::new(PrimaryReceiverHandler {
                 id: self.id,
@@ -351,7 +351,7 @@ impl<DB: Database> Worker<DB> {
 
         let block_provider = self.new_block_provider(
             node_metrics,
-            self.consensus_config.network_client().clone(),
+            self.consensus_config.local_network().clone(),
             network.clone(),
         );
 
@@ -410,7 +410,7 @@ impl<DB: Database> Worker<DB> {
     fn new_block_provider(
         &self,
         node_metrics: Arc<WorkerMetrics>,
-        client: NetworkClient,
+        client: LocalNetwork,
         network: anemo::Network,
     ) -> BlockProvider<DB, QuorumWaiter> {
         info!(target: "worker::worker", "Starting handler for transactions");

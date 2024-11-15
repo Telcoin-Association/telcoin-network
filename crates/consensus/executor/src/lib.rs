@@ -57,7 +57,7 @@ impl Executor {
             config.authority().id(),
             config.worker_cache().clone(),
             config.committee().clone(),
-            config.network_client().clone(),
+            config.local_network().clone(),
             rx_shutdown,
             consensus_bus,
             restored_consensus_output,

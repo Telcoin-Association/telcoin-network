@@ -7,7 +7,7 @@ use crate::{
     primary::PrimaryNodeDetails, worker::WorkerNodeDetails, TelcoinTempDirs, TestExecutionNode,
     WorkerFixture,
 };
-use consensus_network::client::PrimaryClient;
+use consensus_network::local::LocalNetwork;
 use fastcrypto::{hash::Hash, traits::KeyPair as _};
 use jsonrpsee::http_client::HttpClient;
 use reth::primitives::Address;
@@ -41,7 +41,7 @@ pub struct AuthorityDetails<DB> {
 
 /// Inner type for authority's details.
 struct AuthorityDetailsInternal<DB> {
-    client: Option<PrimaryClient>,
+    client: Option<LocalNetwork>,
     primary: PrimaryNodeDetails<DB>,
     workers: HashMap<WorkerId, WorkerNodeDetails<DB>>,
     execution: TestExecutionNode,
@@ -81,7 +81,7 @@ impl<DB: Database> AuthorityDetails<DB> {
         Self { id, public_key, name, internal: Arc::new(RwLock::new(internal)) }
     }
 
-    pub async fn client(&self) -> PrimaryClient {
+    pub async fn client(&self) -> LocalNetwork {
         let internal = self.internal.read().await;
         internal
             .client

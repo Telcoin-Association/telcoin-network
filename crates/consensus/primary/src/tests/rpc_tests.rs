@@ -2,12 +2,11 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::time::Duration;
-
 use anemo::PeerId;
 use consensus_network::{PrimaryToPrimaryRpc, WorkerRpc};
 use consensus_network_types::{FetchCertificatesRequest, RequestBlocksRequest};
 use reth::tasks::TaskManager;
+use std::time::Duration;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::cluster::Cluster;
 use tn_types::AuthorityIdentifier;
@@ -28,7 +27,7 @@ async fn test_server_authorizations() {
         .next()
         .unwrap()
         .consensus_config()
-        .network_client()
+        .local_network()
         .clone();
     let test_committee = test_cluster.committee.clone();
     let test_worker_cache = test_cluster.fixture().worker_cache().clone();
@@ -43,7 +42,7 @@ async fn test_server_authorizations() {
             .with_timeout(Duration::from_secs(5));
         primary_network.fetch_certificates(&primary_target_name, request).await.unwrap();
 
-        let worker_network = test_client.wan_client().await.unwrap();
+        let worker_network = test_client.get_worker_network(0).await.unwrap();
         let worker_target_name = test_worker_cache
             .workers
             .get(target_authority.protocol_key())
@@ -85,7 +84,7 @@ async fn test_server_authorizations() {
         // Removing the AllowedPeers RequireAuthorizationLayer for primary should make this succeed.
         assert!(primary_network.fetch_certificates(&primary_target_name, request).await.is_err());
 
-        let worker_network = test_client.wan_client().await.unwrap();
+        let worker_network = test_client.get_worker_network(0).await.unwrap();
         let worker_target_name = unreachable_worker_cache
             .workers
             .get(unreachable_authority.protocol_key())

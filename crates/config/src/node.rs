@@ -110,7 +110,7 @@ impl Config {
         self.validator_info.public_key()
     }
 
-    /// Return a reference to the primary's public BLS key.
+    /// Return a reference to the primary's public network key.
     pub fn primary_network_key(&self) -> &NetworkPublicKey {
         self.validator_info.primary_network_key()
     }

@@ -7,24 +7,24 @@
 
 pub mod admin;
 pub mod anemo_ext;
-pub mod client;
 pub mod connectivity;
 pub mod epoch_filter;
 mod error;
 pub mod failpoints;
+pub mod local;
 pub mod metrics;
 mod p2p;
-mod primarys_local_client;
 mod retry;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 mod traits;
-mod workers_local_client;
-pub use workers_local_client::WorkersLocalClient;
 
 pub use crate::{
     retry::RetryConfig,
-    traits::{PrimaryToPrimaryRpc, PrimaryToWorkerClient, ReliableNetwork, WorkerRpc},
+    traits::{
+        PrimaryToPrimaryRpc, PrimaryToWorkerClient, ReliableNetwork, WorkerRpc,
+        WorkerToPrimaryClient,
+    },
 };
 
 /// This adapter will make a [`tokio::task::JoinHandle`] abort its handled task when the handle is

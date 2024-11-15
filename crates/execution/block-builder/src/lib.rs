@@ -415,7 +415,7 @@ where
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
-    use consensus_network::client::PrimaryClient;
+    use consensus_network::local::LocalNetwork;
     use reth::tasks::TaskManager;
     use reth_blockchain_tree::{
         noop::NoopBlockchainTree, BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree,
@@ -516,7 +516,7 @@ mod tests {
         let txpool =
             reth_transaction_pool::Pool::eth_pool(validator, blob_store, PoolConfig::default());
         let address = Address::from(U160::from(33));
-        let client = PrimaryClient::new_with_empty_id();
+        let client = LocalNetwork::new_with_empty_id();
         let temp_dir = TempDir::new().unwrap();
         let store = open_db(temp_dir.path());
         let qw = TestMakeBlockQuorumWaiter();

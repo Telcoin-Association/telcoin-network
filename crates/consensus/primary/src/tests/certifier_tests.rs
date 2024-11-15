@@ -22,7 +22,7 @@ use tn_types::{BlsKeypair, SignatureVerificationState, TnSender};
 //     let committee = fixture.committee();
 //     let worker_cache = fixture.worker_cache();
 //     let primary = fixture.authorities().last().unwrap();
-//     let client = PrimaryClient::new_from_keypair(&primary.primary_network_keypair());
+//     let client = LocalNetwork::new_from_keypair(&primary.primary_network_keypair());
 //     let network_key = primary.primary_network_keypair().copy().private().0.to_bytes();
 //     let id = primary.id();
 //     let signature_service = SignatureService::new(primary.keypair().copy());

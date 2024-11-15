@@ -1,7 +1,7 @@
-use std::sync::Arc;
-
-use consensus_network::client::NetworkClient;
+//! Configuration for consensus network (primary and worker).
+use consensus_network::local::LocalNetwork;
 use parking_lot::Mutex;
+use std::sync::Arc;
 use tn_storage::{traits::Database, NodeStorage};
 use tn_types::{Authority, Committee, NetworkPublicKey, Noticer, Notifier, WorkerCache};
 
@@ -15,6 +15,7 @@ struct ConsensusConfigInner<DB> {
     node_storage: NodeStorage<DB>,
     key_config: KeyConfig,
     authority: Authority,
+    local_network: LocalNetwork,
 }
 
 #[derive(Debug, Clone)]
@@ -82,8 +83,8 @@ where
         committee: Committee,
         mut worker_cache: Option<WorkerCache>,
     ) -> eyre::Result<Self> {
-        // let network_client =
-        //     PrimaryClient::new_from_public_key(config.validator_info.primary_network_key());
+        let local_network =
+            LocalNetwork::new_from_public_key(config.validator_info.primary_network_key());
 
         let primary_public_key = key_config.primary_public_key();
         let authority = committee
@@ -104,6 +105,7 @@ where
                 node_storage,
                 key_config,
                 authority,
+                local_network,
             }),
             worker_cache,
             shutdown,
@@ -159,5 +161,9 @@ where
 
     pub fn database(&self) -> &DB {
         &self.inner.node_storage.batch_store
+    }
+
+    pub fn local_network(&self) -> &LocalNetwork {
+        &self.inner.local_network
     }
 }

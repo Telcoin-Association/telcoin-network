@@ -1,15 +1,12 @@
-//! Client implementations for local network messages.
-//!
-//! The clients are written from the perspective of the server.
-//!
-//! A "WorkerClient" is a client that talks to workers. The primary uses a worker client.
-//!
-//! A "PrimaryClient" is a client that talks to primary. Workers use a primary client.
+//! Client implementation for local network messages between primary and worker.
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{error::LocalClientError, traits::PrimaryToWorkerClient};
+use crate::{
+    error::LocalClientError,
+    traits::{PrimaryToWorkerClient, WorkerToPrimaryClient},
+};
 use anemo::{Network, PeerId, Request};
 use consensus_network_types::{
     FetchBlocksRequest, FetchBlocksResponse, PrimaryToWorker, WorkerOthersBlockMessage,
@@ -24,14 +21,16 @@ use tracing::error;
 
 // // //
 //
-// TODO: replace the `NetworkClient` with worker/primary implementations and add engine.
+// TODO: replace the `LocalNetwork` with worker/primary implementations and add engine.
 // and get rid of this stupid loop crap with retry attempts. the only reason this is here
-// is because NetworkClient does too much. code doesn't know if/when primary/worker start
+// is because LocalNetwork does too much. code doesn't know if/when primary/worker start
 // so there's options and confusing logic. Just create the clients with the config on node startup.
+//
+// This is not so simple.
 //
 // // //
 
-/// NetworkClient provides the interface to send requests to other nodes, and call other components
+/// LocalNetwork provides the interface to send requests to other nodes, and call other components
 /// directly if they live in the same process. It is used by both primary and worker(s).
 ///
 /// Currently this only supports local direct calls, and it will be extended to support remote
@@ -39,13 +38,17 @@ use tracing::error;
 ///
 /// TODO: investigate splitting this into Primary and Worker specific clients.
 #[derive(Debug, Clone)]
-pub struct NetworkClient {
+pub struct LocalNetwork {
     inner: Arc<RwLock<Inner>>,
     shutdown_notify: Arc<NotifyOnce>,
 }
 
 struct Inner {
+    /// The primary's peer id.
     primary_peer_id: PeerId,
+    /// Primary's wide-area network.
+    ///
+    /// Peer to peer communication.
     primary_network: Option<Network>,
     worker_network: BTreeMap<u16, Network>,
     worker_to_primary_handler: Option<Arc<dyn WorkerToPrimary>>,
@@ -55,12 +58,12 @@ struct Inner {
 
 impl std::fmt::Debug for Inner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "NetworkClient::Inner for {}", self.primary_peer_id)?;
+        write!(f, "LocalNetwork::Inner for {}", self.primary_peer_id)?;
         write!(f, "\t{} nodes in worker network", self.worker_network.len())
     }
 }
 
-impl NetworkClient {
+impl LocalNetwork {
     const GET_CLIENT_RETRIES: usize = 50;
     const GET_CLIENT_INTERVAL: Duration = Duration::from_millis(300);
 
@@ -82,7 +85,7 @@ impl NetworkClient {
         Self::new(PeerId(primary_network_keypair.public().0.into()))
     }
 
-    /// Create a new [NetworkClient] from the primary's network key.
+    /// Create a new [LocalNetwork] from the primary's network key.
     pub fn new_from_public_key(primary_network_public_key: &NetworkPublicKey) -> Self {
         Self::new(PeerId(primary_network_public_key.0.into()))
     }
@@ -204,7 +207,7 @@ impl NetworkClient {
 
 // TODO: extract common logic for cancelling on shutdown.
 
-impl PrimaryToWorkerClient for NetworkClient {
+impl PrimaryToWorkerClient for LocalNetwork {
     async fn synchronize(
         &self,
         worker_name: NetworkPublicKey,
@@ -239,36 +242,36 @@ impl PrimaryToWorkerClient for NetworkClient {
     }
 }
 
-// impl WorkerToPrimaryClient for NetworkClient {
-//     async fn report_own_block(
-//         &self,
-//         request: WorkerOwnBlockMessage,
-//     ) -> Result<(), LocalClientError> {
-//         let c = self.get_worker_to_primary_handler().await?;
-//         select! {
-//             resp = c.report_own_block(Request::new(request)) => {
-//                 resp.map_err(|e| LocalClientError::Internal(format!("{e:?}")))?;
-//                 Ok(())
-//             },
-//             () = self.shutdown_notify.wait() => {
-//                 Err(LocalClientError::ShuttingDown)
-//             },
-//         }
-//     }
+impl WorkerToPrimaryClient for LocalNetwork {
+    async fn report_own_block(
+        &self,
+        request: WorkerOwnBlockMessage,
+    ) -> Result<(), LocalClientError> {
+        let c = self.get_worker_to_primary_handler().await?;
+        select! {
+            resp = c.report_own_block(Request::new(request)) => {
+                resp.map_err(|e| LocalClientError::Internal(format!("{e:?}")))?;
+                Ok(())
+            },
+            () = self.shutdown_notify.wait() => {
+                Err(LocalClientError::ShuttingDown)
+            },
+        }
+    }
 
-//     async fn report_others_block(
-//         &self,
-//         request: WorkerOthersBlockMessage,
-//     ) -> Result<(), LocalClientError> {
-//         let c = self.get_worker_to_primary_handler().await?;
-//         select! {
-//             resp = c.report_others_block(Request::new(request)) => {
-//                 resp.map_err(|e| LocalClientError::Internal(format!("{e:?}")))?;
-//                 Ok(())
-//             },
-//             () = self.shutdown_notify.wait() => {
-//                 Err(LocalClientError::ShuttingDown)
-//             },
-//         }
-//     }
-// }
+    async fn report_others_block(
+        &self,
+        request: WorkerOthersBlockMessage,
+    ) -> Result<(), LocalClientError> {
+        let c = self.get_worker_to_primary_handler().await?;
+        select! {
+            resp = c.report_others_block(Request::new(request)) => {
+                resp.map_err(|e| LocalClientError::Internal(format!("{e:?}")))?;
+                Ok(())
+            },
+            () = self.shutdown_notify.wait() => {
+                Err(LocalClientError::ShuttingDown)
+            },
+        }
+    }
+}

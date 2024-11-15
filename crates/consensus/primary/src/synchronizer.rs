@@ -10,7 +10,7 @@ use consensus_metrics::{
 };
 use consensus_network::{
     anemo_ext::{NetworkExt, WaitingPeer},
-    client::PrimaryClient,
+    local::LocalNetwork,
     PrimaryToWorkerClient, RetryConfig,
 };
 use fastcrypto::hash::Hash as _;
@@ -80,7 +80,7 @@ struct Inner<DB> {
     // Highest round of verfied certificate that has been received.
     highest_received_round: AtomicU64,
     // Client for fetching payloads.
-    client: PrimaryClient,
+    client: LocalNetwork,
     // The persistent storage tables.
     certificate_store: CertificateStore<DB>,
     // The persistent store of the available batch digests produced either via our own workers
@@ -365,7 +365,7 @@ impl<DB: Database> Synchronizer<DB> {
             gc_round: AtomicU64::new(gc_round),
             highest_processed_round: AtomicU64::new(highest_processed_round),
             highest_received_round: AtomicU64::new(0),
-            client: consensus_config.network_client().clone(),
+            client: consensus_config.local_network().clone(),
             certificate_store: consensus_config.node_storage().certificate_store.clone(),
             payload_store: consensus_config.node_storage().payload_store.clone(),
             tx_certificate_acceptor,
@@ -539,7 +539,7 @@ impl<DB: Database> Synchronizer<DB> {
 
         // Start tasks to broadcast created certificates.
         let inner_senders = inner.clone();
-        let client = consensus_config.network_client().clone();
+        let client = consensus_config.local_network().clone();
         spawn_logged_monitored_task!(
             async move {
                 let network = match client.get_primary_network().await {
