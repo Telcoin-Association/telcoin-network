@@ -34,8 +34,8 @@ use tn_engine::execute_consensus_output;
 use tn_storage::{open_db, tables::WorkerBlocks, traits::Database};
 use tn_test_utils::{get_gas_price, test_genesis, TransactionFactory};
 use tn_types::{
-    AutoSealConsensus, BuildArguments, Certificate, CommittedSubDag, Consensus, ConsensusOutput,
-    LastCanonicalUpdate, ReputationScores, WorkerBlock,
+    AutoSealConsensus, BuildArguments, Certificate, CommittedSubDag, Consensus, ConsensusHeader,
+    ConsensusOutput, LastCanonicalUpdate, ReputationScores, WorkerBlock,
 };
 use tn_worker::{
     metrics::WorkerMetrics,
@@ -623,6 +623,8 @@ async fn test_canonical_notification_updates_pool() {
         blocks: vec![vec![first_block]],
         beneficiary: address,
         block_digests,
+        parent_hash: ConsensusHeader::default().digest(),
+        number: 0,
     };
 
     // execute output to trigger canonical update

@@ -104,7 +104,6 @@ where
     Pool: TransactionPoolExt + 'static,
 {
     /// Create a new instance of [Self].
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         _blockchain: BT,
         pool: Pool,
@@ -447,7 +446,7 @@ mod tests {
     use tn_test_utils::{adiri_genesis_seeded, get_gas_price, TransactionFactory};
     use tn_types::{
         adiri_genesis, AutoSealConsensus, BuildArguments, CommittedSubDag, Consensus,
-        ConsensusOutput, WorkerBlock,
+        ConsensusHeader, ConsensusOutput, WorkerBlock,
     };
     use tn_worker::{
         metrics::WorkerMetrics,
@@ -847,6 +846,8 @@ mod tests {
                 blocks: vec![vec![]],
                 beneficiary: address,
                 block_digests: Default::default(),
+                parent_hash: ConsensusHeader::default().digest(),
+                number: 0,
             };
             // execute output to trigger canonical update
             let args = BuildArguments::new(blockchain_db.clone(), output, parent);

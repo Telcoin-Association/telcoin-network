@@ -5,7 +5,8 @@ use fastcrypto::hash::{Digest, Hash, HashFunction};
 use fastcrypto_tbls::{tbls::ThresholdBls, types::ThresholdBls12381MinSig};
 use indexmap::IndexMap;
 use once_cell::sync::OnceCell;
-use reth_primitives::BlockHash;
+use reth_primitives::{BlockHash, BlockNumber};
+use reth_rpc_types::BlockNumHash;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt};
 
@@ -55,6 +56,13 @@ pub struct Header {
     pub system_messages: Vec<SystemMessage>,
     /// Parent certificates for this Header.
     pub parents: BTreeSet<CertificateDigest>,
+    /// Hash of the latest known execution block when this Header was build.
+    /// This may be our parent block or may not but it does include our latest
+    /// execution result in a signed and validates structure which validates
+    /// this execution block as well.
+    pub latest_execution_block: BlockHash,
+    /// Number of the latest known execution block when this Header was build.
+    pub latest_execution_block_num: BlockNumber,
     /// The [HeaderDigest].
     #[serde(skip)]
     pub digest: OnceCell<HeaderDigest>,
@@ -69,6 +77,7 @@ impl Header {
         payload: IndexMap<BlockHash, (WorkerId, TimestampSec)>,
         system_messages: Vec<SystemMessage>,
         parents: BTreeSet<CertificateDigest>,
+        latest_execution_block: BlockNumHash,
     ) -> Self {
         let header = Self {
             author,
@@ -79,6 +88,8 @@ impl Header {
             system_messages,
             parents,
             digest: OnceCell::default(),
+            latest_execution_block: latest_execution_block.hash,
+            latest_execution_block_num: latest_execution_block.number,
         };
         let digest = Hash::digest(&header);
         header.digest.set(digest).unwrap();
@@ -203,6 +214,11 @@ impl Header {
     pub fn clear_parents_for_test(&mut self) {
         self.parents.clear();
     }
+
+    /// Return the latest known block number/hash this header was built from.
+    pub fn latest_execution_block_num_hash(&self) -> BlockNumHash {
+        BlockNumHash { hash: self.latest_execution_block, number: self.latest_execution_block_num }
+    }
 }
 
 impl From<Header> for CertificateDigest {
@@ -213,6 +229,8 @@ impl From<Header> for CertificateDigest {
 
 impl HeaderBuilder {
     /// "Build" the header by taking all fields and calculating the hash.
+    /// This is used for tests, if used for "real" code then at least latest_execution_block will
+    /// need to be visited.
     pub fn build(self) -> Result<Header, fastcrypto::error::FastCryptoError> {
         let h = Header {
             author: self.author.unwrap(),
@@ -223,6 +241,9 @@ impl HeaderBuilder {
             system_messages: self.system_messages.unwrap_or_default(),
             parents: self.parents.unwrap(),
             digest: OnceCell::default(),
+            // Fake data for tests.  This is used by tests...
+            latest_execution_block: BlockHash::default(),
+            latest_execution_block_num: 0,
         };
 
         // TODO: return error here

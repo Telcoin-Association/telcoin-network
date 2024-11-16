@@ -312,7 +312,7 @@ mod tests {
     use tn_test_utils::{default_test_execution_node, seeded_genesis_from_random_batches};
     use tn_types::{
         adiri_chain_spec_arc, adiri_genesis, max_worker_block_gas, now, BlockHash, Certificate,
-        CommittedSubDag, ConsensusOutput, ReputationScores,
+        CommittedSubDag, ConsensusHeader, ConsensusOutput, ReputationScores,
     };
     use tokio::{sync::oneshot, time::timeout};
     use tokio_stream::wrappers::BroadcastStream;
@@ -351,7 +351,10 @@ mod tests {
             blocks: Default::default(), // empty
             beneficiary,
             block_digests: Default::default(), // empty
+            parent_hash: ConsensusHeader::default().digest(),
+            number: 0,
         };
+        let consensus_output_hash = consensus_output.consensus_header_hash();
 
         let chain = adiri_chain_spec_arc();
 
@@ -408,7 +411,7 @@ mod tests {
         assert_eq!(canonical_tip, final_block);
         // assert last executed output is correct and finalized
         let last_output = execution_node.last_executed_output().await?;
-        assert_eq!(last_output, sub_dag_index); // round of consensus
+        assert_eq!(last_output, consensus_output_hash);
 
         // pull newly executed block from database (skip genesis)
         let expected_block = provider
@@ -418,7 +421,6 @@ mod tests {
 
         // min basefee in genesis
         let expected_base_fee = MIN_PROTOCOL_BASE_FEE;
-        let output_digest: B256 = consensus_output.digest().into();
         // assert expected basefee
         assert_eq!(genesis_header.base_fee_per_gas, Some(expected_base_fee));
         // basefee comes from workers - if no batches, then use parent's basefee
@@ -441,7 +443,10 @@ mod tests {
         // timestamp
         assert_eq!(expected_block.timestamp, consensus_output.committed_at());
         // parent beacon block root is output digest
-        assert_eq!(expected_block.parent_beacon_block_root, Some(output_digest));
+        assert_eq!(
+            expected_block.parent_beacon_block_root,
+            Some(consensus_output.consensus_header_hash())
+        );
         // first block's parent is expected to be genesis
         assert_eq!(expected_block.parent_hash, chain.genesis_hash());
         // expect state roots to be same because empty output has no state change
@@ -583,6 +588,8 @@ mod tests {
             blocks: vec![batches_1],
             beneficiary: beneficiary_1,
             block_digests: batch_digests_1.clone(),
+            parent_hash: ConsensusHeader::default().digest(),
+            number: 0,
         };
 
         // create second output
@@ -608,7 +615,10 @@ mod tests {
             blocks: vec![batches_2],
             beneficiary: beneficiary_2,
             block_digests: batch_digests_2.clone(),
+            parent_hash: consensus_output_1.consensus_header_hash(),
+            number: 1,
         };
+        let consensus_output_2_hash = consensus_output_2.consensus_header_hash();
 
         // combine VecDeque and convert to Vec for assertions later
         batch_digests_1.extend(batch_digests_2);
@@ -673,7 +683,7 @@ mod tests {
         assert_eq!(canonical_tip, final_block);
         // assert last executed output is correct and finalized
         let last_output = execution_node.last_executed_output().await?;
-        assert_eq!(last_output, sub_dag_index_2); // round of consensus
+        assert_eq!(last_output, consensus_output_2_hash); // round of consensus
 
         // pull newly executed blocks from database (skip genesis)
         //
@@ -709,7 +719,8 @@ mod tests {
             let mut expected_output = &consensus_output_1;
             let mut expected_beneficiary = &beneficiary_1;
             let mut expected_subdag_index = &sub_dag_index_1;
-            let mut expected_parent_beacon_block_root = &output_digest_1;
+            let mut output_digest = output_digest_1;
+            let mut expected_parent_beacon_block_root = consensus_output_1.consensus_header_hash();
             let mut expected_batch_index = idx;
 
             // update values based on index for all assertions below
@@ -718,7 +729,8 @@ mod tests {
                 expected_output = &consensus_output_2;
                 expected_beneficiary = &beneficiary_2;
                 expected_subdag_index = &sub_dag_index_2;
-                expected_parent_beacon_block_root = &output_digest_2;
+                output_digest = output_digest_2;
+                expected_parent_beacon_block_root = consensus_output_2.consensus_header_hash();
                 // takeaway 4 to compensate for independent loops for executing batches
                 expected_batch_index = idx - 4;
             }
@@ -732,7 +744,7 @@ mod tests {
             // timestamp
             assert_eq!(block.timestamp, expected_output.committed_at());
             // parent beacon block root is output digest
-            assert_eq!(block.parent_beacon_block_root, Some(*expected_parent_beacon_block_root));
+            assert_eq!(block.parent_beacon_block_root, Some(expected_parent_beacon_block_root));
 
             if idx == 0 {
                 // first block's parent is expected to be genesis
@@ -750,7 +762,7 @@ mod tests {
             }
 
             // mix hash is xor worker block's hash and consensus output digest
-            let expected_mix_hash = all_batches[idx].digest() ^ *expected_parent_beacon_block_root;
+            let expected_mix_hash = all_batches[idx].digest() ^ output_digest;
             assert_eq!(block.mix_hash, expected_mix_hash);
             // bloom expected to be the same bc all proposed transactions should be good
             // ie) no duplicates, etc.
@@ -906,6 +918,8 @@ mod tests {
             blocks: vec![batches_1],
             beneficiary: beneficiary_1,
             block_digests: batch_digests_1.clone(),
+            parent_hash: ConsensusHeader::default().digest(),
+            number: 0,
         };
 
         // create second output
@@ -931,7 +945,10 @@ mod tests {
             blocks: vec![batches_2],
             beneficiary: beneficiary_2,
             block_digests: batch_digests_2.clone(),
+            parent_hash: consensus_output_1.consensus_header_hash(),
+            number: 1,
         };
+        let consensus_output_2_hash = consensus_output_2.consensus_header_hash();
 
         // combine VecDeque and convert to Vec for assertions later
         batch_digests_1.extend(batch_digests_2);
@@ -1000,7 +1017,7 @@ mod tests {
         assert_eq!(canonical_tip, final_block);
         // assert last executed output is correct and finalized
         let last_output = execution_node.last_executed_output().await?;
-        assert_eq!(last_output, sub_dag_index_2); // round of consensus
+        assert_eq!(last_output, consensus_output_2_hash); // round of consensus
 
         // pull newly executed blocks from database (skip genesis)
         //
@@ -1050,7 +1067,9 @@ mod tests {
             let mut expected_output = &consensus_output_1;
             let mut expected_beneficiary = &beneficiary_1;
             let mut expected_subdag_index = &sub_dag_index_1;
-            let mut expected_parent_beacon_block_root = &output_digest_1;
+            let mut output_digest = output_digest_1;
+            // We just set this to default in the test...
+            let mut expected_parent_beacon_block_root = consensus_output_1.consensus_header_hash();
             let mut expected_batch_index = idx;
 
             // update values based on index for all assertions below
@@ -1059,7 +1078,8 @@ mod tests {
                 expected_output = &consensus_output_2;
                 expected_beneficiary = &beneficiary_2;
                 expected_subdag_index = &sub_dag_index_2;
-                expected_parent_beacon_block_root = &output_digest_2;
+                output_digest = output_digest_2;
+                expected_parent_beacon_block_root = consensus_output_2.consensus_header_hash();
                 // takeaway 4 to compensate for independent loops for executing batches
                 expected_batch_index = idx - 4;
             }
@@ -1073,7 +1093,7 @@ mod tests {
             // timestamp
             assert_eq!(block.timestamp, expected_output.committed_at());
             // parent beacon block root is output digest
-            assert_eq!(block.parent_beacon_block_root, Some(*expected_parent_beacon_block_root));
+            assert_eq!(block.parent_beacon_block_root, Some(expected_parent_beacon_block_root));
 
             if idx == 0 {
                 // first block's parent is expected to be genesis
@@ -1087,7 +1107,7 @@ mod tests {
             }
 
             // mix hash is xor worker block's hash and consensus output digest
-            let expected_mix_hash = all_batches[idx].digest() ^ *expected_parent_beacon_block_root;
+            let expected_mix_hash = all_batches[idx].digest() ^ output_digest;
             assert_eq!(block.mix_hash, expected_mix_hash);
             // bloom expected to be the same bc all proposed transactions should be good
             // ie) no duplicates, etc.
@@ -1201,7 +1221,10 @@ mod tests {
             blocks: vec![batches_1],
             beneficiary: beneficiary_1,
             block_digests: batch_digests_1,
+            parent_hash: ConsensusHeader::default().digest(),
+            number: 0,
         };
+        let consensus_output_1_hash = consensus_output_1.consensus_header_hash();
 
         // create second output
         let mut leader_2 = Certificate::default();
@@ -1226,6 +1249,8 @@ mod tests {
             blocks: vec![batches_2],
             beneficiary: beneficiary_2,
             block_digests: batch_digests_2,
+            parent_hash: consensus_output_1.consensus_header_hash(),
+            number: 1,
         };
 
         //=== Execution
@@ -1285,7 +1310,7 @@ mod tests {
         assert_eq!(canonical_tip, final_block);
         // assert last executed output is correct and finalized
         let last_output = execution_node.last_executed_output().await?;
-        assert_eq!(last_output, 1);
+        assert_eq!(last_output, consensus_output_1_hash);
 
         Ok(())
     }

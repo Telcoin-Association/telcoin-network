@@ -11,20 +11,18 @@ use reth_db::{
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
 };
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
+use reth_primitives::B256;
 use std::{sync::Arc, time::Instant};
 use tn_config::ConsensusConfig;
-use tn_executor::{get_restored_consensus_output, Executor, SubscriberResult};
+use tn_executor::{Executor, SubscriberResult};
 use tn_primary::{
     consensus::{Bullshark, Consensus, ConsensusMetrics, LeaderSchedule},
-    ConsensusBus, Primary, CHANNEL_CAPACITY,
+    ConsensusBus, Primary,
 };
 use tn_primary_metrics::Metrics;
 use tn_storage::traits::Database as ConsensusDatabase;
-use tn_types::{BlsPublicKey, ConsensusOutput, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
-use tokio::{
-    sync::{broadcast, RwLock},
-    task::JoinHandle,
-};
+use tn_types::{BlsPublicKey, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
+use tokio::{sync::RwLock, task::JoinHandle};
 use tracing::{info, instrument};
 
 struct PrimaryNodeInner<CDB> {
@@ -36,10 +34,6 @@ struct PrimaryNodeInner<CDB> {
     handles: FuturesUnordered<JoinHandle<()>>,
     /// Peer ID used for local connections.
     own_peer_id: Option<PeerId>,
-    /// Consensus broadcast channel.
-    ///
-    /// NOTE: this broadcasts to all subscribers, but lagging receivers will lose messages
-    consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
 }
 
 impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
@@ -70,14 +64,14 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         ));
 
         // used to retrieve the last executed certificate in case of restarts
-        let last_executed_sub_dag_index =
+        let last_executed_consensus_hash =
             execution_components.last_executed_output().await.expect("execution found HEAD");
 
         // create receiving channel before spawning primary to ensure messages are not lost
-        let consensus_output_rx = self.subscribe_consensus_output();
+        let consensus_output_rx = self.consensus_bus.subscribe_consensus_output();
 
         // spawn primary if not already running
-        let primary_handles = self.spawn_primary(last_executed_sub_dag_index).await?;
+        let primary_handles = self.spawn_primary(last_executed_consensus_hash).await?;
 
         // start engine
         execution_components.start_engine(consensus_output_rx).await?;
@@ -129,12 +123,12 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
     pub async fn spawn_primary(
         &self,
         // Used for recovering after crashes/restarts
-        last_executed_sub_dag_index: u64,
+        last_executed_consensus_hash: B256,
     ) -> SubscriberResult<Vec<JoinHandle<()>>> {
         let mut handles = Vec::new();
 
         let (consensus_handles, leader_schedule) =
-            self.spawn_consensus(&self.consensus_bus, last_executed_sub_dag_index).await?;
+            self.spawn_consensus(&self.consensus_bus, last_executed_consensus_hash).await?;
         handles.extend(consensus_handles);
 
         // Spawn the primary.
@@ -151,7 +145,7 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
     async fn spawn_consensus(
         &self,
         consensus_bus: &ConsensusBus,
-        last_executed_sub_dag_index: u64,
+        last_executed_consensus_hash: B256,
     ) -> SubscriberResult<(Vec<JoinHandle<()>>, LeaderSchedule)>
     where
         BlsPublicKey: VerifyingKey,
@@ -174,23 +168,6 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         // for now, all batches are contained within a single block, (ie 1 consensus output = 1
         // executed block) so use block number for restored consensus output
         // since block number == last_executed_sub_dag_index
-
-        // Check for any sub-dags that have been sent by consensus but were not processed by the
-        // executor.
-        let restored_consensus_output = get_restored_consensus_output(
-            self.consensus_config.node_storage().consensus_store.clone(),
-            self.consensus_config.node_storage().certificate_store.clone(),
-            last_executed_sub_dag_index,
-        )
-        .await?;
-
-        let num_sub_dags = restored_consensus_output.len() as u64;
-        if num_sub_dags > 0 {
-            info!(
-                "Consensus output on its way to the executor was restored for {num_sub_dags} sub-dags",
-            );
-        }
-        self.consensus_bus.consensus_metrics().recovered_consensus_output.inc_by(num_sub_dags);
 
         let leader_schedule = LeaderSchedule::from_store(
             self.consensus_config.committee().clone(),
@@ -216,20 +193,12 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
             self.consensus_config.clone(),
             self.consensus_config.subscribe_shutdown(),
             consensus_bus.clone(),
-            restored_consensus_output,
-            self.consensus_output_notification_sender.clone(),
+            last_executed_consensus_hash,
         )?;
 
         let handles = vec![executor_handle, consensus_handle];
 
         Ok((handles, leader_schedule))
-    }
-
-    /// Subscribe to [ConsensusOutput] broadcast.
-    ///
-    /// NOTE: this broadcasts to all subscribers, but lagging receivers will lose messages
-    pub fn subscribe_consensus_output(&self) -> broadcast::Receiver<ConsensusOutput> {
-        self.consensus_output_notification_sender.subscribe()
     }
 }
 
@@ -240,18 +209,12 @@ pub struct PrimaryNode<CDB> {
 
 impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
     pub fn new(consensus_config: ConsensusConfig<CDB>) -> PrimaryNode<CDB> {
-        // TODO: what is an appropriate channel capacity? CHANNEL_CAPACITY currently set to 10k
-        // which seems really high but is consistent for now
-        let (consensus_output_notification_sender, _receiver) =
-            tokio::sync::broadcast::channel(CHANNEL_CAPACITY);
-
         let consensus_bus = ConsensusBus::new();
         let inner = PrimaryNodeInner {
             consensus_config,
             consensus_bus,
             handles: FuturesUnordered::new(),
             own_peer_id: None,
-            consensus_output_notification_sender,
         };
 
         Self { internal: Arc::new(RwLock::new(inner)) }
@@ -287,11 +250,6 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
         guard.wait().await
     }
 
-    pub async fn subscribe_consensus_output(&self) -> broadcast::Receiver<ConsensusOutput> {
-        let guard = self.internal.read().await;
-        guard.consensus_output_notification_sender.subscribe()
-    }
-
     /// Return the consensus metrics.
     pub async fn consensus_metrics(&self) -> Arc<ConsensusMetrics> {
         self.internal.read().await.consensus_bus.consensus_metrics()
@@ -300,5 +258,10 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
     /// Return the primary metrics.
     pub async fn primary_metrics(&self) -> Arc<Metrics> {
         self.internal.read().await.consensus_bus.primary_metrics()
+    }
+
+    /// Return a copy of the primaries consensus bus.
+    pub async fn consensus_bus(&self) -> ConsensusBus {
+        self.internal.read().await.consensus_bus.clone()
     }
 }

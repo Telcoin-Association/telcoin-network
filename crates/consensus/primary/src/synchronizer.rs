@@ -5,7 +5,7 @@
 
 use crate::{
     aggregators::CertificatesAggregator, certificate_fetcher::CertificateFetcherCommand,
-    ConsensusBus, CHANNEL_CAPACITY,
+    ConsensusBus,
 };
 use anemo::{rpc::Status, Network, Request, Response};
 use consensus_metrics::{
@@ -39,10 +39,8 @@ use tn_storage::{traits::Database, CertificateStore, PayloadStore};
 use tn_types::{
     ensure,
     error::{AcceptNotification, DagError, DagResult},
-    Certificate, CertificateDigest, Header, Round, SignatureVerificationState,
-};
-use tn_types::{
-    AuthorityIdentifier, Committee, NetworkPublicKey, TnReceiver, TnSender, WorkerCache,
+    AuthorityIdentifier, Certificate, CertificateDigest, Committee, Header, NetworkPublicKey,
+    Round, SignatureVerificationState, TnReceiver, TnSender, WorkerCache, CHANNEL_CAPACITY,
 };
 use tn_utils::sync::notify_once::NotifyOnce;
 use tokio::{

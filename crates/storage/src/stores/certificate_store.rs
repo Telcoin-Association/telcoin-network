@@ -142,27 +142,6 @@ impl<DB: Database> CertificateStore<DB> {
         digests: impl Iterator<Item = &'a CertificateDigest>,
     ) -> StoreResult<Vec<bool>> {
         digests.map(|digest| self.db.contains_key::<Certificates>(digest)).collect()
-        /*
-        // TODO- clean up and reduce allocations.
-        // Batch checks into the cache and the certificate store.
-        let digests = digests.enumerate().collect::<Vec<_>>();
-        let mut found = self.cache.multi_contains(digests.iter().map(|(_, d)| *d));
-        let store_lookups = digests
-            .iter()
-            .zip(found.iter())
-            .filter_map(|((i, d), hit)| if *hit { None } else { Some((*i, *d)) })
-            .collect::<Vec<_>>();
-        for ((i, _d), hit) in store_lookups
-            .into_iter()
-            .map(|(i, d)| ((i, d), self.db.contains_key::<Certificates>(d).unwrap_or_default()))
-        {
-            debug_assert!(!found[i]);
-            if hit {
-                found[i] = true;
-            }
-        }
-        Ok(found)
-        */
     }
 
     /// Retrieves multiple certificates by their provided ids. The results
@@ -172,31 +151,6 @@ impl<DB: Database> CertificateStore<DB> {
         ids: impl IntoIterator<Item = CertificateDigest>,
     ) -> StoreResult<Vec<Option<Certificate>>> {
         ids.into_iter().map(|digest| self.db.get::<Certificates>(&digest)).collect()
-        /*
-        // TODO- clean up and reduce allocations.
-        let mut found = HashMap::new();
-        let mut missing = Vec::new();
-
-        // first find whatever we can from our local cache
-        let ids: Vec<CertificateDigest> = ids.into_iter().collect();
-        for (id, certificate) in self.cache.read_all(ids.clone()) {
-            if let Some(certificate) = certificate {
-                found.insert(id, certificate.clone());
-            } else {
-                missing.push(id);
-            }
-        }
-
-        // then fallback for all the misses on the storage
-        let from_store = self.db.multi_get::<Certificates>(&missing)?;
-        from_store.iter().zip(missing).for_each(|(certificate, id)| {
-            if let Some(certificate) = certificate {
-                found.insert(id, certificate.clone());
-            }
-        });
-
-        Ok(ids.into_iter().map(|id| found.get(&id).cloned()).collect())
-        */
     }
 
     /// Waits to get notified until the requested certificate becomes available

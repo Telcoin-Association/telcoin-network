@@ -45,9 +45,6 @@ use tracing::{error, info};
 #[path = "tests/primary_tests.rs"]
 pub mod primary_tests;
 
-/// The default channel capacity for each channel of the primary.
-pub const CHANNEL_CAPACITY: usize = 10_000;
-
 pub struct Primary;
 
 impl Primary {

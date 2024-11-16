@@ -86,8 +86,12 @@ where
         let payload = TNPayload::new(payload_attributes);
 
         // execute
-        let next_canonical_block =
-            build_block_from_empty_payload(payload, &provider, provider.chain_spec())?;
+        let next_canonical_block = build_block_from_empty_payload(
+            payload,
+            &provider,
+            provider.chain_spec(),
+            output.consensus_header_hash(),
+        )?;
 
         debug!(target: "engine", ?next_canonical_block, "empty block");
 
@@ -132,6 +136,7 @@ where
                 &provider,
                 provider.chain_spec(),
                 block,
+                output.consensus_header_hash(),
             )?;
 
             debug!(target: "engine", ?next_canonical_block, "worker's block executed");
@@ -193,6 +198,7 @@ fn build_block_from_batch_payload<EvmConfig, Provider>(
     provider: &Provider,
     chain_spec: Arc<ChainSpec>,
     batch_block: WorkerBlock,
+    consensus_header_hash: B256,
 ) -> EngineResult<SealedBlockWithSenders>
 where
     EvmConfig: ConfigureEvm,
@@ -426,7 +432,7 @@ where
         difficulty: U256::from(payload.attributes.batch_index),
         gas_used: cumulative_gas_used,
         extra_data: payload.attributes.batch_digest.into(),
-        parent_beacon_block_root: payload.parent_beacon_block_root(),
+        parent_beacon_block_root: Some(consensus_header_hash),
         blob_gas_used: None,   // TODO: support blobs
         excess_blob_gas: None, // TODO: support blobs
         requests_root: None,
@@ -450,6 +456,7 @@ fn build_block_from_empty_payload<Provider>(
     payload: TNPayload,
     provider: &Provider,
     chain_spec: Arc<ChainSpec>,
+    consensus_header_digest: B256,
 ) -> EngineResult<SealedBlockWithSenders>
 where
     Provider: StateProviderFactory,
@@ -508,7 +515,7 @@ where
         difficulty: U256::ZERO, // batch index
         gas_used: 0,
         extra_data: payload.attributes.batch_digest.into(),
-        parent_beacon_block_root: payload.parent_beacon_block_root(),
+        parent_beacon_block_root: Some(consensus_header_digest),
         blob_gas_used: None,   // TODO: support blobs
         excess_blob_gas: None, // TODO: support blobs
         requests_root: None,

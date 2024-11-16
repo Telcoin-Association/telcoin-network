@@ -7,11 +7,8 @@ use tn_config::ConsensusConfig;
 use tn_node::primary::PrimaryNode;
 use tn_primary::consensus::ConsensusMetrics;
 use tn_storage::traits::Database;
-use tn_types::{AuthorityIdentifier, ConsensusOutput};
-use tokio::{
-    sync::broadcast::{self},
-    task::JoinHandle,
-};
+use tn_types::AuthorityIdentifier;
+use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::TestExecutionNode;
@@ -72,13 +69,6 @@ impl<DB: Database> PrimaryNodeDetails<DB> {
     /// node as still running.
     pub async fn is_running(&self) -> bool {
         self.node.is_running().await
-    }
-
-    /// Subscribe to [ConsensusOutput] broadcast.
-    ///
-    /// NOTE: this broadcasts to all subscribers, but lagging receivers will lose messages
-    pub async fn subscribe_consensus_output(&self) -> broadcast::Receiver<ConsensusOutput> {
-        self.node.subscribe_consensus_output().await
     }
 
     pub fn node(&self) -> &PrimaryNode<DB> {

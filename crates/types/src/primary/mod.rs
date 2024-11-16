@@ -1,6 +1,7 @@
 //! Primary types used for consensus.
 
 use std::time::{Duration, SystemTime};
+mod block;
 mod certificate;
 mod header;
 mod info;
@@ -8,6 +9,7 @@ mod output;
 mod reputation;
 mod vote;
 
+pub use block::*;
 pub use certificate::*;
 pub use header::*;
 pub use info::*;

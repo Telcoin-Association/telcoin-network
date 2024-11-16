@@ -16,6 +16,7 @@ use reth_db::{
 };
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use reth_node_builder::NodeConfig;
+use reth_primitives::B256;
 use std::{net::SocketAddr, sync::Arc};
 use tn_config::Config;
 mod inner;
@@ -102,7 +103,7 @@ where
     }
 
     /// Retrieve the last executed block from the database to restore consensus.
-    pub async fn last_executed_output(&self) -> eyre::Result<u64> {
+    pub async fn last_executed_output(&self) -> eyre::Result<B256> {
         let guard = self.internal.read().await;
         guard.last_executed_output()
     }

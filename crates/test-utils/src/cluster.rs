@@ -8,8 +8,7 @@ use itertools::Itertools;
 use reth::tasks::TaskExecutor;
 use std::{collections::HashMap, time::Duration};
 use tn_storage::traits::Database;
-use tn_types::{Committee, ConsensusOutput, WorkerId};
-use tokio::sync::broadcast;
+use tn_types::{Committee, WorkerId};
 use tracing::info;
 
 #[cfg(test)]
@@ -240,17 +239,6 @@ where
         }
 
         authorities_latest_commit
-    }
-
-    /// Subscribe to [ConsensusOutput] broadcast.
-    ///
-    /// NOTE: this broadcasts to all subscribers, but lagging receivers will lose messages
-    pub async fn subscribe_consensus_output_by_authority(
-        &self,
-        id: usize,
-    ) -> broadcast::Receiver<ConsensusOutput> {
-        let authority = self.authority(id);
-        authority.subscribe_consensus_output().await
     }
 
     pub fn fixture(&self) -> &CommitteeFixture<DB> {

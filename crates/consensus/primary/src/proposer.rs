@@ -255,6 +255,7 @@ impl<DB: Database + 'static> Proposer<DB> {
             digests.iter().map(|m| (m.digest, (m.worker_id, m.timestamp))).collect(),
             system_messages.clone(),
             parents.iter().map(|x| x.digest()).collect(),
+            consensus_bus.recent_blocks().borrow().latest_block(),
         );
 
         // update metrics before sending/storing header

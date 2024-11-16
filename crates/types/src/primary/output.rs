@@ -19,6 +19,8 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::warn;
 
+use super::ConsensusHeader;
+
 /// A global sequence number assigned to every CommittedSubDag.
 pub type SequenceNumber = u64;
 
@@ -38,6 +40,14 @@ pub struct ConsensusOutput {
     ///
     /// This value is included in [Self] digest.
     pub block_digests: VecDeque<BlockHash>,
+
+    // These fields are used to construct the ConsensusHeader.
+    /// The hash of the previous ConsesusHeader in the chain.
+    pub parent_hash: B256,
+
+    /// A scalar value equal to the number of ancestor blocks. The genesis block has a number of
+    /// zero.
+    pub number: u64,
 }
 
 impl ConsensusOutput {
@@ -75,6 +85,20 @@ impl ConsensusOutput {
 
     pub fn flatten_worker_blocks(&self) -> Vec<WorkerBlock> {
         self.blocks.iter().flat_map(|blocks| blocks.iter().cloned()).collect()
+    }
+
+    /// Build a new ConsensusHeader frome this output.
+    pub fn consensus_header(&self) -> ConsensusHeader {
+        ConsensusHeader {
+            parent_hash: self.parent_hash,
+            sub_dag: (*self.sub_dag).clone(),
+            number: self.number,
+        }
+    }
+
+    /// Return the hash of the consensus header that matches this output.
+    pub fn consensus_header_hash(&self) -> B256 {
+        ConsensusHeader::digest_from_parts(self.parent_hash, &self.sub_dag, self.number)
     }
 }
 
@@ -206,7 +230,7 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for CommittedSubDag {
         }
         hasher.update(self.leader.digest());
         hasher.update(encode(&self.sub_dag_index));
-        hasher.update(encode(&self.reputation_score));
+        // skip reputation for stable hashes
         hasher.update(encode(&self.commit_timestamp));
         ConsensusOutputDigest(hasher.finalize().into())
     }

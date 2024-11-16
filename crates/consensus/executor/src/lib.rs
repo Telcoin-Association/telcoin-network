@@ -8,6 +8,7 @@ mod subscriber;
 mod metrics;
 
 pub use errors::{SubscriberError, SubscriberResult};
+use reth_primitives::B256;
 pub use state::ExecutionIndices;
 use tn_primary::ConsensusBus;
 use tn_storage::traits::Database;
@@ -21,7 +22,7 @@ use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_storage::{CertificateStore, ConsensusStore};
 use tn_types::{CertificateDigest, CommittedSubDag, ConsensusOutput, Noticer};
-use tokio::{sync::broadcast, task::JoinHandle};
+use tokio::task::JoinHandle;
 use tracing::info;
 
 /// Convenience type representing a serialized transaction.
@@ -49,20 +50,11 @@ impl Executor {
         config: ConsensusConfig<DB>,
         rx_shutdown: Noticer,
         consensus_bus: ConsensusBus,
-        restored_consensus_output: Vec<CommittedSubDag>,
-        consensus_output_notification_sender: broadcast::Sender<ConsensusOutput>,
+        last_executed_consensus_hash: B256,
     ) -> SubscriberResult<JoinHandle<()>> {
         // Spawn the subscriber.
-        let subscriber_handle = spawn_subscriber(
-            config.authority().id(),
-            config.worker_cache().clone(),
-            config.committee().clone(),
-            config.local_network().clone(),
-            rx_shutdown,
-            consensus_bus,
-            restored_consensus_output,
-            consensus_output_notification_sender,
-        );
+        let subscriber_handle =
+            spawn_subscriber(config, rx_shutdown, consensus_bus, last_executed_consensus_hash);
 
         // Return the handle.
         info!("Consensus subscriber successfully started");

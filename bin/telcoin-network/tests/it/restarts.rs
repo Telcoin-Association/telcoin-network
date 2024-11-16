@@ -105,6 +105,7 @@ fn run_restart_tests1(
         kill_child(&mut child2);
         return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 20 * WEI_PER_TEL)));
     }
+
     Ok(child2)
 }
 

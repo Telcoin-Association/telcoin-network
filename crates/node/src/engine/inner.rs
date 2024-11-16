@@ -26,7 +26,7 @@ use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use reth_node_builder::{common::WithConfigs, BuilderContext, NodeConfig};
 use reth_node_ethereum::EthEvmConfig;
 use reth_primitives::{
-    constants::MIN_PROTOCOL_BASE_FEE, Address, BlockBody, SealedBlock, SealedBlockWithSenders,
+    constants::MIN_PROTOCOL_BASE_FEE, Address, BlockBody, SealedBlock, SealedBlockWithSenders, B256,
 };
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
@@ -404,9 +404,9 @@ where
     /// the last committed sub dag from it's database in the case
     /// of the node restarting.
     ///
-    /// The primary adds +1 to this value for recovering output
+    /// This returns the hash of the last executed ConsensusHeader on the consensus chain.
     /// since the execution layer is confirming the last executing block.
-    pub(super) fn last_executed_output(&self) -> eyre::Result<u64> {
+    pub(super) fn last_executed_output(&self) -> eyre::Result<B256> {
         // NOTE: The payload_builder only extends canonical tip and sets finalized after
         // entire output is successfully executed. This ensures consistent recovery state.
         //
@@ -422,8 +422,8 @@ where
             .blockchain_db
             .database_provider_ro()?
             .header_by_number(finalized_block_num)?
-            .map(|opt| opt.nonce)
-            .unwrap_or(0);
+            .map(|opt| opt.parent_beacon_block_root.unwrap_or_default())
+            .unwrap_or_else(Default::default);
 
         Ok(last_round_of_consensus)
     }
