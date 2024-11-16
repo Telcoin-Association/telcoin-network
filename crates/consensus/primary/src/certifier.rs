@@ -1,30 +1,36 @@
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
+//! Certifier broadcasts headers and certificates for this primary.
+
 // Copyright (c) Telcoin, LLC
+// Copyright (c) 2021, Facebook, Inc. and its affiliates
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{aggregators::VotesAggregator, synchronizer::Synchronizer, ConsensusBus};
-
+use anemo::{rpc::Status, Request, Response};
 use consensus_metrics::{monitored_future, spawn_logged_monitored_task};
-use consensus_network::anemo_ext::NetworkExt;
-use futures::{stream::FuturesUnordered, StreamExt};
-use std::{future::Future, pin::pin, sync::Arc, task::Poll, time::Duration};
+use consensus_network::anemo_ext::{NetworkExt, WaitingPeer};
+use consensus_network_types::{
+    PrimaryToPrimaryClient, RequestVoteRequest, SendCertificateRequest, SendCertificateResponse,
+};
+use futures::{
+    stream::{FuturesOrdered, FuturesUnordered},
+    StreamExt,
+};
+use std::{cmp::min, future::Future, pin::pin, sync::Arc, task::Poll, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::{traits::Database, CertificateStore};
-use tn_types::{AuthorityIdentifier, BlsSigner, Committee, Noticer, TnSender};
-
-use consensus_network_types::{PrimaryToPrimaryClient, RequestVoteRequest};
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
     Certificate, CertificateDigest, Header, NetworkPublicKey, TnReceiver, Vote,
 };
+use tn_types::{AuthorityIdentifier, BlsSigner, Committee, Noticer, TnSender, CHANNEL_CAPACITY};
 use tokio::{
-    sync::oneshot,
+    sync::{broadcast, oneshot},
     task::{JoinHandle, JoinSet},
 };
-use tracing::{debug, enabled, error, info, instrument, warn};
+use tracing::{debug, enabled, error, info, instrument, trace, warn};
 
 #[cfg(test)]
 #[path = "tests/certifier_tests.rs"]
@@ -62,6 +68,12 @@ pub struct Certifier<DB> {
     network: anemo::Network,
     /// Metrics handler
     metrics: Arc<PrimaryMetrics>,
+    /// Send own certificates to be broadcasted to all other peers.
+    tx_own_certificate_broadcast: broadcast::Sender<Certificate>,
+    /// Background tasks broadcasting newly formed certificates.
+    ///
+    /// The set must be "owned" as it runs in the background.
+    _certificate_senders: JoinSet<()>,
 }
 
 impl<DB: Database> Certifier<DB> {
@@ -74,6 +86,72 @@ impl<DB: Database> Certifier<DB> {
     ) -> JoinHandle<()> {
         let rx_shutdown = config.subscribe_shutdown();
         let metrics = consensus_bus.primary_metrics().node_metrics.clone();
+        // These channels are used internally to this module (file) and don't need to go in the
+        // consensus bus. If this changes they can move.  Note there can be issues receiving
+        // certs over the broadcast if not subscribed early.
+        let (tx_own_certificate_broadcast, _rx_own_certificate_broadcast) =
+            broadcast::channel(CHANNEL_CAPACITY);
+
+        // prevents race condition during startup when first proposed header fails during
+        // tx_own_certificate_broadcast.send()
+        let broadcast_targets: Vec<(_, _, _)> = config
+            .committee()
+            .others_primaries_by_id(config.authority().id())
+            .into_iter()
+            .map(|(name, _addr, network_key)| {
+                (name, tx_own_certificate_broadcast.subscribe(), network_key)
+            })
+            .collect();
+
+        let highest_created_certificate = config
+            .node_storage()
+            .certificate_store
+            .last_round(config.authority().id())
+            .expect("certificate store available");
+
+        let mut _certificate_senders = JoinSet::new();
+        for (name, rx_own_certificate_broadcast, network_key) in broadcast_targets.into_iter() {
+            trace!(target:"primary::synchronizer::broadcast_certificates", ?name, "spawning sender for peer");
+            _certificate_senders.spawn(Self::push_certificates(
+                primary_network.clone(),
+                name,
+                network_key,
+                rx_own_certificate_broadcast,
+            ));
+        }
+        if let Some(cert) = highest_created_certificate {
+            // Error can be ignored.
+            if let Err(e) = tx_own_certificate_broadcast.send(cert) {
+                error!(target: "primary::certifier", ?e, "failed to broadcast highest created certificate during startup");
+            }
+        }
+
+        // spawn_logged_monitored_task!(
+        //     async move {
+        //         trace!(target:"primary::synchronizer::broadcast_certificates", "awaiting lock for certificate senders...");
+        //         let mut senders = inner_senders.certificate_senders.lock();
+        //         trace!(target:"primary::synchronizer::broadcast_certificates", "certificate senders mutex lock obtained");
+        //         for (name, rx_own_certificate_broadcast, network_key) in
+        //             broadcast_targets.into_iter()
+        //         {
+        //             trace!(target:"primary::synchronizer::broadcast_certificates", ?name, "spawning sender for peer");
+        //             senders.spawn(Self::push_certificates(
+        //                 inner_senders.network.clone(),
+        //                 name,
+        //                 network_key,
+        //                 rx_own_certificate_broadcast,
+        //             ));
+        //         }
+        //         if let Some(cert) = highest_created_certificate {
+        //             // Error can be ignored.
+        //             if let Err(e) = tx_own_certificate_broadcast.send(cert) {
+        //                 error!(target: "primary::synchronizer::broadcast_certificates", ?e, "failed to broadcast certificate inside broadcast task");
+        //             }
+        //         }
+        //     },
+        //     "Synchronizer::BroadcastCertificates"
+        // );
+
         spawn_logged_monitored_task!(
             async move {
                 info!(target: "primary::certifier", "Certifier on node {} has started successfully.", config.authority().id());
@@ -89,6 +167,8 @@ impl<DB: Database> Certifier<DB> {
                     propose_header_tasks: JoinSet::new(),
                     network: primary_network,
                     metrics,
+                    tx_own_certificate_broadcast: tx_own_certificate_broadcast.clone(),
+                    _certificate_senders,
                 }
                 .await;
                 info!(target: "primary::certifier", "Certifier on node {} has shutdown.", config.authority().id());
@@ -319,6 +399,83 @@ impl<DB: Database> Certifier<DB> {
 
         Ok(certificate)
     }
+
+    /// Pushes new certificates received from the rx_own_certificate_broadcast channel
+    /// to the target peer continuously. Only exits when the primary is shutting down.
+    async fn push_certificates(
+        network: anemo::Network,
+        authority_id: AuthorityIdentifier,
+        network_key: NetworkPublicKey,
+        mut rx_own_certificate_broadcast: broadcast::Receiver<Certificate>,
+    ) {
+        const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
+        let peer_id = anemo::PeerId(network_key.0.to_bytes());
+        let peer = network.waiting_peer(peer_id);
+        let client = PrimaryToPrimaryClient::new(peer);
+        // Older broadcasts return early, so the last broadcast must be the latest certificate.
+        // This will contain at most certificates created within the last PUSH_TIMEOUT.
+        let mut requests = FuturesOrdered::new();
+        // Back off and retry only happen when there is only one certificate to be broadcasted.
+        // Otherwise no retry happens.
+        const BACKOFF_INTERVAL: Duration = Duration::from_millis(100);
+        const MAX_BACKOFF_MULTIPLIER: u32 = 100;
+        let mut backoff_multiplier: u32 = 0;
+
+        async fn send_certificate(
+            mut client: PrimaryToPrimaryClient<WaitingPeer>,
+            request: Request<SendCertificateRequest>,
+            cert: Certificate,
+        ) -> (Certificate, Result<Response<SendCertificateResponse>, Status>) {
+            let resp = client.send_certificate(request).await;
+            (cert, resp)
+        }
+
+        loop {
+            trace!(target: "primary::synchronizer", authority=?authority_id, "start loop for push certificate");
+            tokio::select! {
+                result = rx_own_certificate_broadcast.recv() => {
+                    trace!(target: "primary::synchronizer", authority=?authority_id, "rx_own_certificate_broadcast received");
+                    let cert = match result {
+                        Ok(cert) => cert,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            trace!(target: "primary::synchronizer", "Certificate sender {authority_id} is shutting down!");
+                            return;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(e)) => {
+                            warn!(target: "primary::synchronizer", "Certificate broadcaster {authority_id} lagging! {e}");
+                            // Re-run the loop to receive again.
+                            continue;
+                        }
+                    };
+                    trace!(target: "primary::synchronizer", authority=?authority_id, ?cert, "successfully received own cert broadcast");
+                    let request = Request::new(SendCertificateRequest { certificate: cert.clone() }).with_timeout(PUSH_TIMEOUT);
+                    requests.push_back(send_certificate(client.clone(),request, cert));
+                }
+                Some((cert, resp)) = requests.next() => {
+                    trace!(target: "primary::synchronizer", authority=?authority_id, ?resp, ?cert, "next cert request");
+                    backoff_multiplier = match resp {
+                        Ok(_) => {
+                            0
+                        },
+                        Err(_) => {
+                            if requests.is_empty() {
+                                // Retry broadcasting the latest certificate, to help the network stay alive.
+                                let request = Request::new(SendCertificateRequest { certificate: cert.clone() }).with_timeout(PUSH_TIMEOUT);
+                                requests.push_back(send_certificate(client.clone(), request, cert));
+                                min(backoff_multiplier * 2 + 1, MAX_BACKOFF_MULTIPLIER)
+                            } else {
+                                // TODO: add backoff and retries for transient & retriable errors.
+                                0
+                            }
+                        },
+                    };
+                    if backoff_multiplier > 0 {
+                        tokio::time::sleep(BACKOFF_INTERVAL * backoff_multiplier).await;
+                    }
+                }
+            };
+        }
+    }
 }
 
 impl<DB: Database> Future for Certifier<DB> {
@@ -374,9 +531,19 @@ impl<DB: Database> Future for Certifier<DB> {
             match result {
                 Ok(Ok(certificate)) => {
                     let synchronizer = this.synchronizer.clone();
+                    let tx_own_certificate_broadcast = this.tx_own_certificate_broadcast.clone();
+                    // TODO: both of these should be fatal and cause shutdown
                     tokio::spawn(async move {
-                        if let Err(e) = synchronizer.accept_own_certificate(certificate).await {
-                            error!("error accepting own certificate: {e}");
+                        // pass to synchronizer for internal processing
+                        if let Err(e) =
+                            synchronizer.accept_own_certificate(certificate.clone()).await
+                        {
+                            error!(target: "primary::certifier", "error accepting own certificate: {e}");
+                        }
+
+                        // Broadcast the certificate once the synchronizer is ok
+                        if let Err(e) = tx_own_certificate_broadcast.send(certificate.clone()) {
+                            error!(target: "primary::certifier", ?certificate, ?e, "failed to broadcast certificate to self!");
                         }
                     });
                 }

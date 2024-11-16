@@ -7,26 +7,17 @@ use crate::{
     aggregators::CertificatesAggregator, certificate_fetcher::CertificateFetcherCommand,
     ConsensusBus,
 };
-use anemo::{rpc::Status, Network, Request, Response};
 use consensus_metrics::{
     metered_channel::{channel_with_total, MeteredMpscChannel},
     monitored_scope, spawn_logged_monitored_task,
 };
-use consensus_network::{
-    anemo_ext::{NetworkExt, WaitingPeer},
-    local::LocalNetwork,
-    PrimaryToWorkerClient, RetryConfig,
-};
-use consensus_network_types::{
-    PrimaryToPrimaryClient, SendCertificateRequest, SendCertificateResponse,
-    WorkerSynchronizeMessage,
-};
+use consensus_network::{local::LocalNetwork, PrimaryToWorkerClient, RetryConfig};
+use consensus_network_types::WorkerSynchronizeMessage;
 use fastcrypto::hash::Hash as _;
 use futures::{stream::FuturesOrdered, StreamExt};
 use itertools::Itertools;
 use parking_lot::Mutex;
 use std::{
-    cmp::min,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -44,9 +35,9 @@ use tn_types::{
 };
 use tn_utils::sync::notify_once::NotifyOnce;
 use tokio::{
-    sync::{broadcast, oneshot, MutexGuard},
+    sync::{oneshot, MutexGuard},
     task::{spawn_blocking, JoinSet},
-    time::{sleep, timeout, Instant},
+    time::{timeout, Instant},
 };
 use tracing::{debug, error, instrument, trace, warn};
 
@@ -88,12 +79,8 @@ struct Inner<DB> {
     tx_certificate_acceptor:
         MeteredMpscChannel<(Vec<Certificate>, oneshot::Sender<DagResult<()>>, bool)>,
     consensus_bus: ConsensusBus,
-    // Send own certificates to be broadcasted to all other peers.
-    tx_own_certificate_broadcast: broadcast::Sender<Certificate>,
     // Genesis digests and contents.
     genesis: HashMap<CertificateDigest, Certificate>,
-    // Background tasks broadcasting newly formed certificates.
-    certificate_senders: Mutex<JoinSet<()>>,
     // A background task that synchronizes batches. A tuple of a header and the maximum accepted
     // age is sent over.
     tx_batch_tasks: MeteredMpscChannel<(Header, u64)>,
@@ -333,14 +320,7 @@ impl<DB: Database> Synchronizer<DB> {
         let genesis = Self::make_genesis(committee);
         let node_store = consensus_config.node_storage();
         let highest_processed_round = node_store.certificate_store.highest_round_number();
-        let highest_created_certificate =
-            node_store.certificate_store.last_round(consensus_config.authority().id()).unwrap();
         let gc_round = consensus_bus.consensus_round_updates().borrow().gc_round;
-        // These channels are used internally to this module (file) and don't need to go in the
-        // consensus bus. If this changes they can move.  Note there can be issues receiving
-        // certs over the broadcast if not subscribed early.
-        let (tx_own_certificate_broadcast, _rx_own_certificate_broadcast) =
-            broadcast::channel(CHANNEL_CAPACITY);
         let (tx_certificate_acceptor, mut rx_certificate_acceptor) = channel_with_total(
             CHANNEL_CAPACITY,
             &primary_channel_metrics.tx_certificate_acceptor,
@@ -366,24 +346,11 @@ impl<DB: Database> Synchronizer<DB> {
             payload_store: consensus_config.node_storage().payload_store.clone(),
             tx_certificate_acceptor,
             consensus_bus: consensus_bus.clone(),
-            tx_own_certificate_broadcast: tx_own_certificate_broadcast.clone(),
             genesis,
             tx_batch_tasks,
-            certificate_senders: Mutex::new(JoinSet::new()),
             certificates_aggregators: Mutex::new(BTreeMap::new()),
             state: tokio::sync::Mutex::new(State::default()),
         });
-
-        // prevents race condition during startup when first proposed header fails during
-        // tx_own_certificate_broadcast.send()
-        let broadcast_targets: Vec<(_, _, _)> = inner
-            .committee
-            .others_primaries_by_id(consensus_config.authority().id())
-            .into_iter()
-            .map(|(name, _addr, network_key)| {
-                (name, tx_own_certificate_broadcast.subscribe(), network_key)
-            })
-            .collect();
 
         // Start a task to recover parent certificates for proposer.
         let inner_proposer = inner.clone();
@@ -533,42 +500,8 @@ impl<DB: Database> Synchronizer<DB> {
             "Synchronizer::AcceptCertificates"
         );
 
-        // Start tasks to broadcast created certificates.
-        let inner_senders = inner.clone();
-        let client = consensus_config.local_network().clone();
-        spawn_logged_monitored_task!(
-            async move {
-                let network = match client.get_primary_network().await {
-                    Ok(network) => network,
-                    Err(e) => {
-                        error!(target:"primary::synchronizer::broadcast_certificates", ?e, "failed to get primary network!");
-                        return;
-                    }
-                };
-
-                trace!(target:"primary::synchronizer::broadcast_certificates", "awaiting lock for certificate senders...");
-                let mut senders = inner_senders.certificate_senders.lock();
-                trace!(target:"primary::synchronizer::broadcast_certificates", "certificate senders mutex lock obtained");
-                for (name, rx_own_certificate_broadcast, network_key) in
-                    broadcast_targets.into_iter()
-                {
-                    trace!(target:"primary::synchronizer::broadcast_certificates", ?name, "spawning sender for peer");
-                    senders.spawn(Self::push_certificates(
-                        network.clone(),
-                        name,
-                        network_key,
-                        rx_own_certificate_broadcast,
-                    ));
-                }
-                if let Some(cert) = highest_created_certificate {
-                    // Error can be ignored.
-                    if let Err(e) = tx_own_certificate_broadcast.send(cert) {
-                        error!(target: "primary::synchronizer::broadcast_certificates", ?e, "failed to broadcast certificate inside broadcast task");
-                    }
-                }
-            },
-            "Synchronizer::BroadcastCertificates"
-        );
+        // // Start tasks to broadcast created certificates.
+        // let inner_senders = inner.clone();
 
         // Start a task to async download batches if needed
         let weak_inner = Arc::downgrade(&inner);
@@ -743,12 +676,6 @@ impl<DB: Database> Synchronizer<DB> {
                 panic!("Failed to process locally-created certificate: {e}")
             }
         };
-
-        // Broadcast the certificate.
-        if let Err(e) = self.inner.tx_own_certificate_broadcast.send(certificate.clone()) {
-            error!(target: "primary::synchronizer", authority=?self.inner.authority_id, ?certificate, ?e, "failed to broadcast certificate!");
-            return Err(DagError::ShuttingDown);
-        }
 
         // Update metrics.
         let round = certificate.round();
@@ -1123,84 +1050,6 @@ impl<DB: Database> Synchronizer<DB> {
             .set(state.num_suspended() as i64);
 
         result
-    }
-
-    /// Pushes new certificates received from the rx_own_certificate_broadcast channel
-    /// to the target peer continuously. Only exits when the primary is shutting down.
-    // TODO: move this to proposer, since this naturally follows after a certificate is created.
-    async fn push_certificates(
-        network: Network,
-        authority_id: AuthorityIdentifier,
-        network_key: NetworkPublicKey,
-        mut rx_own_certificate_broadcast: broadcast::Receiver<Certificate>,
-    ) {
-        const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
-        let peer_id = anemo::PeerId(network_key.0.to_bytes());
-        let peer = network.waiting_peer(peer_id);
-        let client = PrimaryToPrimaryClient::new(peer);
-        // Older broadcasts return early, so the last broadcast must be the latest certificate.
-        // This will contain at most certificates created within the last PUSH_TIMEOUT.
-        let mut requests = FuturesOrdered::new();
-        // Back off and retry only happen when there is only one certificate to be broadcasted.
-        // Otherwise no retry happens.
-        const BACKOFF_INTERVAL: Duration = Duration::from_millis(100);
-        const MAX_BACKOFF_MULTIPLIER: u32 = 100;
-        let mut backoff_multiplier: u32 = 0;
-
-        async fn send_certificate(
-            mut client: PrimaryToPrimaryClient<WaitingPeer>,
-            request: Request<SendCertificateRequest>,
-            cert: Certificate,
-        ) -> (Certificate, Result<Response<SendCertificateResponse>, Status>) {
-            let resp = client.send_certificate(request).await;
-            (cert, resp)
-        }
-
-        loop {
-            trace!(target: "primary::synchronizer", authority=?authority_id, "start loop for push certificate");
-            tokio::select! {
-                result = rx_own_certificate_broadcast.recv() => {
-                    trace!(target: "primary::synchronizer", authority=?authority_id, "rx_own_certificate_broadcast received");
-                    let cert = match result {
-                        Ok(cert) => cert,
-                        Err(broadcast::error::RecvError::Closed) => {
-                            trace!(target: "primary::synchronizer", "Certificate sender {authority_id} is shutting down!");
-                            return;
-                        }
-                        Err(broadcast::error::RecvError::Lagged(e)) => {
-                            warn!(target: "primary::synchronizer", "Certificate broadcaster {authority_id} lagging! {e}");
-                            // Re-run the loop to receive again.
-                            continue;
-                        }
-                    };
-                    trace!(target: "primary::synchronizer", authority=?authority_id, ?cert, "successfully received own cert broadcast");
-                    let request = Request::new(SendCertificateRequest { certificate: cert.clone() }).with_timeout(PUSH_TIMEOUT);
-                    requests.push_back(send_certificate(client.clone(),request, cert));
-                }
-                Some((cert, resp)) = requests.next() => {
-                    trace!(target: "primary::synchronizer", authority=?authority_id, ?resp, ?cert, "next cert request");
-                    backoff_multiplier = match resp {
-                        Ok(_) => {
-                            0
-                        },
-                        Err(_) => {
-                            if requests.is_empty() {
-                                // Retry broadcasting the latest certificate, to help the network stay alive.
-                                let request = Request::new(SendCertificateRequest { certificate: cert.clone() }).with_timeout(PUSH_TIMEOUT);
-                                requests.push_back(send_certificate(client.clone(), request, cert));
-                                min(backoff_multiplier * 2 + 1, MAX_BACKOFF_MULTIPLIER)
-                            } else {
-                                // TODO: add backoff and retries for transient & retriable errors.
-                                0
-                            }
-                        },
-                    };
-                    if backoff_multiplier > 0 {
-                        sleep(BACKOFF_INTERVAL * backoff_multiplier).await;
-                    }
-                }
-            };
-        }
     }
 
     /// Synchronizes batches in the given header with other nodes (through our workers).

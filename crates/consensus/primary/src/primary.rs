@@ -66,8 +66,6 @@ impl Primary {
             config.authority().protocol_key().encode_base64(),
         );
 
-        let synchronizer = Arc::new(Synchronizer::new(config.clone(), consensus_bus));
-
         let worker_receiver_handler = WorkerReceiverHandler::new(
             consensus_bus.clone(),
             config.node_storage().payload_store.clone(),
@@ -80,6 +78,8 @@ impl Primary {
 
         // let worker_service = WorkerToPrimaryServer::new(worker_receiver_handler);
         //
+
+        let synchronizer = Arc::new(Synchronizer::new(config.clone(), consensus_bus));
         let network = Self::start_network(&config, synchronizer.clone(), consensus_bus);
 
         let mut peer_types = HashMap::new();
