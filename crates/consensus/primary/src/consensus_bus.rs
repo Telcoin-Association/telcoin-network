@@ -19,6 +19,7 @@ use crate::{
     proposer::OurDigestMessage, RecentBlocks,
 };
 
+/// The bus for inner-process communication.
 #[derive(Debug)]
 struct ConsensusBusInner {
     /// New certificates from the primary. The primary should send us new certificates
@@ -73,6 +74,11 @@ struct ConsensusBusInner {
     _rx_consensus_output: broadcast::Receiver<ConsensusOutput>,
 }
 
+/// This contains the shared consensus channels and the prometheus metrics
+/// containers (used mostly to track consensus messages).
+/// A new bus can be created with new() but there should only ever be one created (except for
+/// tests). This allows us to not create and pass channels all over the place add-hoc.
+/// It also allows makes it much easier to find where channels are fed and consumed.
 #[derive(Clone, Debug)]
 pub struct ConsensusBus {
     inner: Arc<ConsensusBusInner>,
@@ -84,11 +90,6 @@ impl Default for ConsensusBus {
     }
 }
 
-/// This contains the shared consensus channels and the prometheus metrics
-/// containers (used mostly to track consensus messages).
-/// A new bus can be created with new() but there should only ever be one created (except for
-/// tests). This allows us to not create and pass channels all over the place add-hoc.
-/// It also allows makes it much easier to find where channels are fed and consumed.
 impl ConsensusBus {
     pub fn new() -> Self {
         let consensus_metrics = Arc::new(ConsensusMetrics::default());

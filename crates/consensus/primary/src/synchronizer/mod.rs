@@ -3,6 +3,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::{
+    aggregators::CertificatesAggregator, certificate_fetcher::CertificateFetcherCommand,
+    ConsensusBus,
+};
 use anemo::{rpc::Status, Network, Request, Response};
 use consensus_metrics::{
     metered_channel::{channel_with_total, MeteredMpscChannel},
@@ -12,6 +16,10 @@ use consensus_network::{
     anemo_ext::{NetworkExt, WaitingPeer},
     client::NetworkClient,
     PrimaryToWorkerClient, RetryConfig,
+};
+use consensus_network_types::{
+    PrimaryToPrimaryClient, SendCertificateRequest, SendCertificateResponse,
+    WorkerSynchronizeMessage,
 };
 use fastcrypto::hash::Hash as _;
 use futures::{stream::FuturesOrdered, StreamExt};
@@ -29,20 +37,12 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_storage::{traits::Database, CertificateStore, PayloadStore};
 use tn_types::{
-    AuthorityIdentifier, Committee, NetworkPublicKey, TnReceiver, TnSender, WorkerCache,
-    CHANNEL_CAPACITY,
-};
-use tn_utils::sync::notify_once::NotifyOnce;
-
-use consensus_network_types::{
-    PrimaryToPrimaryClient, SendCertificateRequest, SendCertificateResponse,
-    WorkerSynchronizeMessage,
-};
-use tn_types::{
     ensure,
     error::{AcceptNotification, DagError, DagResult},
-    Certificate, CertificateDigest, Header, Round, SignatureVerificationState,
+    AuthorityIdentifier, Certificate, CertificateDigest, Committee, Header, NetworkPublicKey,
+    Round, SignatureVerificationState, TnReceiver, TnSender, WorkerCache, CHANNEL_CAPACITY,
 };
+use tn_utils::sync::notify_once::NotifyOnce;
 use tokio::{
     sync::{broadcast, oneshot, MutexGuard},
     task::{spawn_blocking, JoinSet},
@@ -50,13 +50,13 @@ use tokio::{
 };
 use tracing::{debug, error, instrument, trace, warn};
 
-use crate::{
-    aggregators::CertificatesAggregator, certificate_fetcher::CertificateFetcherCommand,
-    ConsensusBus,
-};
+mod gc;
+mod recover_parents;
+
+pub(crate) type Parents = Mutex<BTreeMap<Round, Box<CertificatesAggregator>>>;
 
 #[cfg(test)]
-#[path = "tests/synchronizer_tests.rs"]
+#[path = "../tests/synchronizer_tests.rs"]
 pub mod synchronizer_tests;
 
 /// Only try to accept or suspend a certificate, if it is within this limit above the
@@ -390,6 +390,7 @@ impl<DB: Database> Synchronizer<DB> {
             })
             .collect();
 
+        // TODO: this just runs once at startup
         // Start a task to recover parent certificates for proposer.
         let inner_proposer = inner.clone();
         spawn_logged_monitored_task!(
@@ -418,86 +419,86 @@ impl<DB: Database> Synchronizer<DB> {
         // if no gc / consensus commit happened for 30s.
         let weak_inner = Arc::downgrade(&inner);
         let mut rx_consensus_round_updates = consensus_bus.consensus_round_updates().subscribe();
-        spawn_logged_monitored_task!(
-            async move {
-                const FETCH_TRIGGER_TIMEOUT: Duration = Duration::from_secs(30);
-                //let mut rx_consensus_round_updates = rx_consensus_round_updates.clone();
-                loop {
-                    let Ok(result) =
-                        timeout(FETCH_TRIGGER_TIMEOUT, rx_consensus_round_updates.changed()).await
-                    else {
-                        // When consensus commit has not happened for 30s, it is possible that no
-                        // new certificate is received by this primary or
-                        // created in the network, so fetching should
-                        // definitely be started. For other reasons of
-                        // timing out, there is no harm to start fetching either.
-                        let Some(inner) = weak_inner.upgrade() else {
-                            error!(target: "primary::synchronizer::gc", "failed to upgrade weak pointer while re-fetching rx_consensus_round_updates - shutting down");
-                            return;
-                        };
-                        if let Err(e) = inner
-                            .consensus_bus
-                            .certificate_fetcher()
-                            .send(CertificateFetcherCommand::Kick)
-                            .await
-                        {
-                            error!(target: "primary::synchronizer::gc", ?e, "failed to send on tx_certificate_fetcher");
-                            return;
-                        }
-                        inner
-                            .consensus_bus
-                            .primary_metrics()
-                            .node_metrics
-                            .synchronizer_gc_timeout
-                            .inc();
-                        warn!(target: "primary::synchronizer::gc", "No consensus commit happened for {:?}, triggering certificate fetching.", FETCH_TRIGGER_TIMEOUT);
-                        continue;
-                    };
+        // spawn_logged_monitored_task!(
+        //     async move {
+        //         const FETCH_TRIGGER_TIMEOUT: Duration = Duration::from_secs(30);
+        //         //let mut rx_consensus_round_updates = rx_consensus_round_updates.clone();
+        //         loop {
+        //             let Ok(result) =
+        //                 timeout(FETCH_TRIGGER_TIMEOUT, rx_consensus_round_updates.changed()).await
+        //             else {
+        //                 // When consensus commit has not happened for 30s, it is possible that no
+        //                 // new certificate is received by this primary or
+        //                 // created in the network, so fetching should
+        //                 // definitely be started. For other reasons of
+        //                 // timing out, there is no harm to start fetching either.
+        //                 let Some(inner) = weak_inner.upgrade() else {
+        //                     error!(target: "primary::synchronizer::gc", "failed to upgrade weak pointer while re-fetching rx_consensus_round_updates - shutting down");
+        //                     return;
+        //                 };
+        //                 if let Err(e) = inner
+        //                     .consensus_bus
+        //                     .certificate_fetcher()
+        //                     .send(CertificateFetcherCommand::Kick)
+        //                     .await
+        //                 {
+        //                     error!(target: "primary::synchronizer::gc", ?e, "failed to send on tx_certificate_fetcher");
+        //                     return;
+        //                 }
+        //                 inner
+        //                     .consensus_bus
+        //                     .primary_metrics()
+        //                     .node_metrics
+        //                     .synchronizer_gc_timeout
+        //                     .inc();
+        //                 warn!(target: "primary::synchronizer::gc", "No consensus commit happened for {:?}, triggering certificate fetching.", FETCH_TRIGGER_TIMEOUT);
+        //                 continue;
+        //             };
 
-                    if let Err(e) = result {
-                        error!(target: "primary::synchronizer::gc", ?e, "failed to received rx_consensus_round_updates - shutting down...");
-                        return;
-                    }
+        //             if let Err(e) = result {
+        //                 error!(target: "primary::synchronizer::gc", ?e, "failed to received rx_consensus_round_updates - shutting down...");
+        //                 return;
+        //             }
 
-                    let _scope = monitored_scope("Synchronizer::gc_iteration");
-                    let gc_round = rx_consensus_round_updates.borrow().gc_round;
-                    let Some(inner) = weak_inner.upgrade() else {
-                        error!(target: "primary::synchronizer::gc", "failed to upgrade weak pointer - shutting down");
-                        return;
-                    };
-                    // this is the only task updating gc_round
-                    inner.gc_round.store(gc_round, Ordering::Release);
-                    inner.certificates_aggregators.lock().retain(|k, _| k > &gc_round);
-                    // Accept certificates at and below gc round, if there is any.
-                    let mut state = inner.state.lock().await;
-                    while let Some(((round, digest), suspended_cert)) = state.run_gc_once(gc_round)
-                    {
-                        assert!(round <= gc_round, "Never gc certificates above gc_round as this can lead to missing causal history in DAG");
+        //             let _scope = monitored_scope("Synchronizer::gc_iteration");
+        //             let gc_round = rx_consensus_round_updates.borrow().gc_round;
+        //             let Some(inner) = weak_inner.upgrade() else {
+        //                 error!(target: "primary::synchronizer::gc", "failed to upgrade weak pointer - shutting down");
+        //                 return;
+        //             };
+        //             // this is the only task updating gc_round
+        //             inner.gc_round.store(gc_round, Ordering::Release);
+        //             inner.certificates_aggregators.lock().retain(|k, _| k > &gc_round);
+        //             // Accept certificates at and below gc round, if there is any.
+        //             let mut state = inner.state.lock().await;
+        //             while let Some(((round, digest), suspended_cert)) = state.run_gc_once(gc_round)
+        //             {
+        //                 assert!(round <= gc_round, "Never gc certificates above gc_round as this can lead to missing causal history in DAG");
 
-                        let suspended_children_certs = state.accept_children(round, digest);
-                        // Acceptance must be in causal order.
-                        for suspended in
-                            suspended_cert.into_iter().chain(suspended_children_certs.into_iter())
-                        {
-                            match inner.accept_suspended_certificate(&state, suspended).await {
-                                Ok(()) => {
-                                    trace!(target: "primary::synchronizer::gc", "accepted suspended cert")
-                                }
-                                Err(DagError::ShuttingDown) => {
-                                    error!(target: "primary::synchronizer::gc", "error accepting suspended cert - shutting down...");
-                                    return;
-                                }
-                                Err(e) => {
-                                    error!(target: "primary::synchronizer::gc", ?e, "error accepting suspended cert - PANIC");
-                                    panic!("Unexpected error accepting certificate during GC! {e}")
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "Synchronizer::GarbageCollection"
-        );
+        //                 let suspended_children_certs = state.accept_children(round, digest);
+        //                 // Acceptance must be in causal order.
+        //                 for suspended in
+        //                     suspended_cert.into_iter().chain(suspended_children_certs.into_iter())
+        //                 {
+        //                     match inner.accept_suspended_certificate(&state, suspended).await {
+        //                         Ok(()) => {
+        //                             trace!(target: "primary::synchronizer::gc", "accepted suspended cert")
+        //                         }
+        //                         Err(DagError::ShuttingDown) => {
+        //                             error!(target: "primary::synchronizer::gc", "error accepting suspended cert - shutting down...");
+        //                             return;
+        //                         }
+        //                         Err(e) => {
+        //                             error!(target: "primary::synchronizer::gc", ?e, "error accepting suspended cert - PANIC");
+        //                             panic!("Unexpected error accepting certificate during GC! {e}")
+        //                         }
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //     },
+        //     "Synchronizer::GarbageCollection"
+        // );
 
         // Start a task to accept certificates. See comment above `process_certificates_with_lock()`
         // for why this task is needed.
