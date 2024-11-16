@@ -71,37 +71,6 @@ impl Primary {
 
         let synchronizer = Arc::new(Synchronizer::new(config.clone(), consensus_bus));
 
-        // Spawn the network receiver listening to messages from the other primaries.
-        let address = config.authority().primary_network_address();
-        let address =
-            address.replace(0, |_protocol| Some(Protocol::Ip4(Ipv4Addr::UNSPECIFIED))).unwrap();
-        let mut primary_service = PrimaryToPrimaryServer::new(PrimaryReceiverHandler::new(
-            config.clone(),
-            synchronizer.clone(),
-            consensus_bus.clone(),
-            Default::default(),
-        ))
-        // Allow only one inflight RequestVote RPC at a time per peer.
-        // This is required for correctness.
-        .add_layer_for_request_vote(InboundRequestLayer::new(
-            inflight_limit::InflightLimitLayer::new(1, inflight_limit::WaitMode::ReturnError),
-        ))
-        // Allow only one inflight FetchCertificates RPC at a time per peer.
-        // These are already a block request; an individual peer should never need more than one.
-        .add_layer_for_fetch_certificates(InboundRequestLayer::new(
-            inflight_limit::InflightLimitLayer::new(1, inflight_limit::WaitMode::ReturnError),
-        ));
-
-        // Apply other rate limits from configuration as needed.
-        if let Some(limit) = config.parameters().anemo.send_certificate_rate_limit {
-            primary_service = primary_service.add_layer_for_send_certificate(
-                InboundRequestLayer::new(rate_limit::RateLimitLayer::new(
-                    governor::Quota::per_second(limit),
-                    rate_limit::WaitMode::Block,
-                )),
-            );
-        }
-
         let worker_receiver_handler = WorkerReceiverHandler::new(
             consensus_bus.clone(),
             config.node_storage().payload_store.clone(),
@@ -113,106 +82,17 @@ impl Primary {
             .set_worker_to_primary_local_handler(Arc::new(worker_receiver_handler));
 
         // let worker_service = WorkerToPrimaryServer::new(worker_receiver_handler);
-
-        let addr = address.to_anemo_address().unwrap();
-
-        let epoch_string: String = config.committee().epoch().to_string();
-
-        let our_worker_peer_ids = config
-            .worker_cache()
-            .our_workers(config.authority().protocol_key())
-            .unwrap()
-            .into_iter()
-            .map(|worker_info| PeerId(worker_info.name.0.to_bytes()));
-        // let worker_to_primary_router = anemo::Router::new()
-        //     .add_rpc_service(worker_service)
-        //     // Add an Authorization Layer to ensure that we only service requests from our workers
-        //     .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new(our_worker_peer_ids)))
-        //     .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())));
-
-        let primary_peer_ids = config
-            .committee()
-            .authorities()
-            .map(|authority| PeerId(authority.network_key().0.to_bytes()));
-        let routes = anemo::Router::new()
-            .add_rpc_service(primary_service)
-            .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new(primary_peer_ids)))
-            .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())));
-        // .merge(worker_to_primary_router);
-
-        let service = ServiceBuilder::new()
-            .layer(
-                TraceLayer::new_for_server_errors()
-                    .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
-                    .on_failure(DefaultOnFailure::new().level(tracing::Level::WARN)),
-            )
-            .layer(CallbackLayer::new(MetricsMakeCallbackHandler::new(
-                consensus_bus.primary_metrics().inbound_network_metrics.clone(),
-                config.parameters().anemo.excessive_message_size(),
-            )))
-            .layer(CallbackLayer::new(FailpointsMakeCallbackHandler::new()))
-            .layer(SetResponseHeaderLayer::overriding(
-                EPOCH_HEADER_KEY.parse().unwrap(),
-                epoch_string.clone(),
-            ))
-            .service(routes);
-
-        let outbound_layer = ServiceBuilder::new()
-            .layer(
-                TraceLayer::new_for_client_and_server_errors()
-                    .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
-                    .on_failure(DefaultOnFailure::new().level(tracing::Level::WARN)),
-            )
-            .layer(CallbackLayer::new(MetricsMakeCallbackHandler::new(
-                consensus_bus.primary_metrics().outbound_network_metrics.clone(),
-                config.parameters().anemo.excessive_message_size(),
-            )))
-            .layer(CallbackLayer::new(FailpointsMakeCallbackHandler::new()))
-            .layer(SetRequestHeaderLayer::overriding(
-                EPOCH_HEADER_KEY.parse().unwrap(),
-                epoch_string,
-            ))
-            .into_inner();
-
-        let anemo_config = config.anemo_config();
-        let network;
-        let mut retries_left = 90;
-        loop {
-            let network_result = anemo::Network::bind(addr.clone())
-                .server_name("telcoin-network")
-                .private_key(
-                    config.key_config().primary_network_keypair().copy().private().0.to_bytes(),
-                )
-                .config(anemo_config.clone())
-                .outbound_request_layer(outbound_layer.clone())
-                .start(service.clone());
-            match network_result {
-                Ok(n) => {
-                    network = n;
-                    break;
-                }
-                Err(_) => {
-                    retries_left -= 1;
-
-                    if retries_left <= 0 {
-                        panic!("Failed to initialize Network!");
-                    }
-                    error!(
-                        "Address {} should be available for the primary Narwhal service, retrying in one second",
-                        addr
-                    );
-                    sleep(Duration::from_secs(1));
-                }
-            }
-        }
-
-        // TODO: remove this
-        config.local_network().set_primary_network(network.clone());
-
-        info!("Primary {} listening on {}", config.authority().id(), address);
+        //
+        let network = Self::start_network(&config, synchronizer.clone(), consensus_bus);
 
         let mut peer_types = HashMap::new();
 
+        // TODO: this is only needed to accurately return peer count from admin server and should
+        // probably be removed - two tests fail - 1 primary and 1 worker
+        // (peer count from admin server)
+        //
+        // DO NOT MERGE UNTIL THIS IS ADDRESSED
+        //
         // Add my workers
         for worker in config.worker_cache().our_workers(config.authority().protocol_key()).unwrap()
         {
@@ -318,6 +198,142 @@ impl Primary {
         );
 
         handles
+    }
+
+    /// Start the anema network for the primary.
+    fn start_network<DB: Database>(
+        config: &ConsensusConfig<DB>,
+        synchronizer: Arc<Synchronizer<DB>>,
+        consensus_bus: &ConsensusBus,
+    ) -> Network {
+        // Spawn the network receiver listening to messages from the other primaries.
+        let address = config.authority().primary_network_address();
+        let address =
+            address.replace(0, |_protocol| Some(Protocol::Ip4(Ipv4Addr::UNSPECIFIED))).unwrap();
+        let mut primary_service = PrimaryToPrimaryServer::new(PrimaryReceiverHandler::new(
+            config.clone(),
+            synchronizer,
+            consensus_bus.clone(),
+            Default::default(),
+        ))
+        // Allow only one inflight RequestVote RPC at a time per peer.
+        // This is required for correctness.
+        .add_layer_for_request_vote(InboundRequestLayer::new(
+            inflight_limit::InflightLimitLayer::new(1, inflight_limit::WaitMode::ReturnError),
+        ))
+        // Allow only one inflight FetchCertificates RPC at a time per peer.
+        // These are already a block request; an individual peer should never need more than one.
+        .add_layer_for_fetch_certificates(InboundRequestLayer::new(
+            inflight_limit::InflightLimitLayer::new(1, inflight_limit::WaitMode::ReturnError),
+        ));
+
+        // Apply other rate limits from configuration as needed.
+        if let Some(limit) = config.parameters().anemo.send_certificate_rate_limit {
+            primary_service = primary_service.add_layer_for_send_certificate(
+                InboundRequestLayer::new(rate_limit::RateLimitLayer::new(
+                    governor::Quota::per_second(limit),
+                    rate_limit::WaitMode::Block,
+                )),
+            );
+        }
+
+        let addr = address.to_anemo_address().unwrap();
+
+        let epoch_string: String = config.committee().epoch().to_string();
+
+        // let our_worker_peer_ids = config
+        //     .worker_cache()
+        //     .our_workers(config.authority().protocol_key())
+        //     .unwrap()
+        //     .into_iter()
+        //     .map(|worker_info| PeerId(worker_info.name.0.to_bytes()));
+        // let worker_to_primary_router = anemo::Router::new()
+        //     .add_rpc_service(worker_service)
+        //     // Add an Authorization Layer to ensure that we only service requests from our workers
+        //     .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new(our_worker_peer_ids)))
+        //     .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())));
+
+        let primary_peer_ids = config
+            .committee()
+            .authorities()
+            .map(|authority| PeerId(authority.network_key().0.to_bytes()));
+        let routes = anemo::Router::new()
+            .add_rpc_service(primary_service)
+            .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new(primary_peer_ids)))
+            .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())));
+        // .merge(worker_to_primary_router);
+
+        let service = ServiceBuilder::new()
+            .layer(
+                TraceLayer::new_for_server_errors()
+                    .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
+                    .on_failure(DefaultOnFailure::new().level(tracing::Level::WARN)),
+            )
+            .layer(CallbackLayer::new(MetricsMakeCallbackHandler::new(
+                consensus_bus.primary_metrics().inbound_network_metrics.clone(),
+                config.parameters().anemo.excessive_message_size(),
+            )))
+            .layer(CallbackLayer::new(FailpointsMakeCallbackHandler::new()))
+            .layer(SetResponseHeaderLayer::overriding(
+                EPOCH_HEADER_KEY.parse().unwrap(),
+                epoch_string.clone(),
+            ))
+            .service(routes);
+
+        let outbound_layer = ServiceBuilder::new()
+            .layer(
+                TraceLayer::new_for_client_and_server_errors()
+                    .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
+                    .on_failure(DefaultOnFailure::new().level(tracing::Level::WARN)),
+            )
+            .layer(CallbackLayer::new(MetricsMakeCallbackHandler::new(
+                consensus_bus.primary_metrics().outbound_network_metrics.clone(),
+                config.parameters().anemo.excessive_message_size(),
+            )))
+            .layer(CallbackLayer::new(FailpointsMakeCallbackHandler::new()))
+            .layer(SetRequestHeaderLayer::overriding(
+                EPOCH_HEADER_KEY.parse().unwrap(),
+                epoch_string,
+            ))
+            .into_inner();
+
+        let anemo_config = config.anemo_config();
+        let network;
+        let mut retries_left = 90;
+        loop {
+            let network_result = anemo::Network::bind(addr.clone())
+                .server_name("telcoin-network")
+                .private_key(
+                    config.key_config().primary_network_keypair().copy().private().0.to_bytes(),
+                )
+                .config(anemo_config.clone())
+                .outbound_request_layer(outbound_layer.clone())
+                .start(service.clone());
+            match network_result {
+                Ok(n) => {
+                    network = n;
+                    break;
+                }
+                Err(_) => {
+                    retries_left -= 1;
+
+                    if retries_left <= 0 {
+                        panic!("Failed to initialize Network!");
+                    }
+                    error!(
+                        "Address {} should be available for the primary Narwhal service, retrying in one second",
+                        addr
+                    );
+                    sleep(Duration::from_secs(1));
+                }
+            }
+        }
+
+        // TODO: remove this
+        config.local_network().set_primary_network(network.clone());
+
+        info!("Primary {} listening on {}", config.authority().id(), address);
+        network
     }
 
     fn add_peer_in_network(
