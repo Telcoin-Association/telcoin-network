@@ -298,38 +298,39 @@ impl Primary {
             .into_inner();
 
         let anemo_config = config.anemo_config();
-        let network;
-        let mut retries_left = 90;
-        loop {
-            let network_result = anemo::Network::bind(addr.clone())
-                .server_name("telcoin-network")
-                .private_key(
-                    config.key_config().primary_network_keypair().copy().private().0.to_bytes(),
-                )
-                .config(anemo_config.clone())
-                .outbound_request_layer(outbound_layer.clone())
-                .start(service.clone());
-            match network_result {
-                Ok(n) => {
-                    network = n;
-                    break;
-                }
-                Err(_) => {
-                    retries_left -= 1;
+        // let network;
+        // let mut retries_left = 90;
+        // loop {
+        let network = anemo::Network::bind(addr.clone())
+            .server_name("telcoin-network")
+            .private_key(
+                config.key_config().primary_network_keypair().copy().private().0.to_bytes(),
+            )
+            .config(anemo_config.clone())
+            .outbound_request_layer(outbound_layer.clone())
+            .start(service.clone())
+            .expect("primary network bind");
+        // match network_result {
+        //     Ok(n) => {
+        //         network = n;
+        //         break;
+        //     }
+        //     Err(_) => {
+        //         retries_left -= 1;
 
-                    if retries_left <= 0 {
-                        panic!("Failed to initialize Network!");
-                    }
-                    error!(
-                        "Address {} should be available for the primary Narwhal service, retrying in one second",
-                        addr
-                    );
-                    sleep(Duration::from_secs(1));
-                }
-            }
-        }
+        //         if retries_left <= 0 {
+        //             panic!("Failed to initialize Network!");
+        //         }
+        //         error!(
+        //             "Address {} should be available for the primary Narwhal service, retrying in one second",
+        //             addr
+        //         );
+        //         sleep(Duration::from_secs(1));
+        //     }
+        // }
+        // }
 
-        // TODO: remove this
+        // TODO: remove this - only used in tests for convenience
         config.local_network().set_primary_network(network.clone());
 
         info!("Primary {} listening on {}", config.authority().id(), address);
