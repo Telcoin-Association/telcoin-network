@@ -29,8 +29,8 @@ use consensus_network::{
     local::LocalNetwork,
     metrics::MetricsMakeCallbackHandler,
 };
-use consensus_network_types::{PrimaryToWorkerServer, WorkerToWorkerServer};
-use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, thread::sleep, time::Duration};
+use consensus_network_types::WorkerToWorkerServer;
+use std::{collections::HashMap, net::Ipv4Addr, sync::Arc};
 use tn_block_validator::BlockValidation;
 use tn_config::ConsensusConfig;
 use tn_storage::traits::Database;
@@ -52,27 +52,19 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 /// The main worker struct that holds all information needed for worker.
 pub struct Worker<DB> {
     /// The id of this worker used for index-based lookup by other NW nodes.
-    id: WorkerId,
+    _id: WorkerId,
     /// Configuration for the worker.
-    consensus_config: ConsensusConfig<DB>,
+    _consensus_config: ConsensusConfig<DB>,
     /// The worker's WAN.
     network: Network,
 }
 
 impl<DB: Database> Worker<DB> {
-    // pub fn new(id: WorkerId, consensus_config: ConsensusConfig<DB>) -> Self {
-    //     let worker_name = consensus_config.key_config().worker_network_public_key();
-    //     let worker_peer_id = PeerId(worker_name.0.to_bytes());
-
-    //     // Define a worker instance.
-    //     Self { id, consensus_config }
-    // }
-
     /// Retrieve the worker's network address by id.
     fn worker_address(id: &WorkerId, consensus_config: &ConsensusConfig<DB>) -> Multiaddr {
         let address = consensus_config
             .worker_cache()
-            .worker(consensus_config.authority().protocol_key(), &id)
+            .worker(consensus_config.authority().protocol_key(), id)
             .expect("Our public key or worker id is not in the worker cache")
             .worker_address;
         if let Some(addr) =
@@ -119,9 +111,11 @@ impl<DB: Database> Worker<DB> {
         //     PeerId(consensus_config.authority().network_key().0.to_bytes());
         // let primary_to_worker_router = anemo::Router::new()
         //     .add_rpc_service(primary_service)
-        //     // Add an Authorization Layer to ensure that we only service requests from our primary
+        //     // Add an Authorization Layer to ensure that we only service requests from our
+        // primary
         //     .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new([our_primary_peer_id])))
-        //     .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())));
+        //     .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.
+        // clone())));
 
         // consensus_config.local_network().set_worker_network(id, network.clone());
 
@@ -227,7 +221,7 @@ impl<DB: Database> Worker<DB> {
 
         let mut handles = vec![connection_monitor_handle, network_shutdown_handle];
         handles.extend(admin_handles);
-        (Self { id, consensus_config, network }, handles, block_provider)
+        (Self { _id: id, _consensus_config: consensus_config, network }, handles, block_provider)
     }
 
     /// Start the anemo network for the primary.
@@ -262,7 +256,7 @@ impl<DB: Database> Worker<DB> {
             ));
         }
 
-        let address = Self::worker_address(&id, &consensus_config);
+        let address = Self::worker_address(&id, consensus_config);
         let addr = address.to_anemo_address().unwrap();
         let epoch_string: String = consensus_config.committee().epoch().to_string();
         let worker_peer_ids = consensus_config
@@ -343,8 +337,8 @@ impl<DB: Database> Worker<DB> {
         //             panic!();
         //         }
         //         error!(target: "worker::worker",
-        //             "Address {} should be available for the primary Narwhal service, retrying in one second",
-        //             addr
+        //             "Address {} should be available for the primary Narwhal service, retrying in
+        // one second",             addr
         //         );
         //         sleep(Duration::from_secs(1));
         //     }

@@ -12,7 +12,7 @@ use consensus_network::{local::LocalNetwork, WorkerToPrimaryClient as _};
 use consensus_network_types::{
     FetchBlocksRequest, FetchBlocksResponse, PrimaryToWorker, RequestBlocksRequest,
     RequestBlocksResponse, WorkerBlockMessage, WorkerOthersBlockMessage, WorkerSynchronizeMessage,
-    WorkerToPrimary, WorkerToWorker, WorkerToWorkerClient,
+    WorkerToWorker, WorkerToWorkerClient,
 };
 use eyre::Result;
 use itertools::Itertools;

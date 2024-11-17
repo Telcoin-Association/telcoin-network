@@ -4,7 +4,7 @@ use consensus_network::local::LocalNetwork;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use tn_storage::{traits::Database, NodeStorage};
-use tn_types::{Authority, Committee, NetworkPublicKey, Noticer, Notifier, WorkerCache};
+use tn_types::{Authority, Committee, Noticer, Notifier, WorkerCache};
 
 use crate::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, Parameters, TelcoinDirs};
 

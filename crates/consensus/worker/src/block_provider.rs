@@ -10,7 +10,7 @@
 
 use crate::{metrics::WorkerMetrics, quorum_waiter::QuorumWaiterTrait};
 use consensus_network::{local::LocalNetwork, WorkerToPrimaryClient as _};
-use consensus_network_types::{WorkerOwnBlockMessage, WorkerToPrimary};
+use consensus_network_types::WorkerOwnBlockMessage;
 use std::{sync::Arc, time::Duration};
 use tn_storage::{tables::WorkerBlocks, traits::Database};
 use tn_types::{error::BlockSealError, WorkerBlock, WorkerBlockSender, WorkerId};

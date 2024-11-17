@@ -31,15 +31,15 @@ use consensus_network::{
     failpoints::FailpointsMakeCallbackHandler,
     metrics::MetricsMakeCallbackHandler,
 };
-use consensus_network_types::{PrimaryToPrimaryServer, WorkerToPrimaryServer};
+use consensus_network_types::PrimaryToPrimaryServer;
 use fastcrypto::traits::KeyPair as _;
-use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, thread::sleep, time::Duration};
+use std::{collections::HashMap, net::Ipv4Addr, sync::Arc};
 use tn_config::ConsensusConfig;
 use tn_storage::traits::Database;
 use tn_types::{traits::EncodeDecodeBase64, Multiaddr, NetworkPublicKey, Protocol};
 use tokio::task::JoinHandle;
 use tower::ServiceBuilder;
-use tracing::{error, info};
+use tracing::info;
 
 #[cfg(test)]
 #[path = "tests/primary_tests.rs"]
@@ -250,9 +250,11 @@ impl Primary {
         //     .map(|worker_info| PeerId(worker_info.name.0.to_bytes()));
         // let worker_to_primary_router = anemo::Router::new()
         //     .add_rpc_service(worker_service)
-        //     // Add an Authorization Layer to ensure that we only service requests from our workers
+        //     // Add an Authorization Layer to ensure that we only service requests from our
+        // workers
         //     .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new(our_worker_peer_ids)))
-        //     .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())));
+        //     .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.
+        // clone())));
 
         let primary_peer_ids = config
             .committee()
@@ -323,8 +325,8 @@ impl Primary {
         //             panic!("Failed to initialize Network!");
         //         }
         //         error!(
-        //             "Address {} should be available for the primary Narwhal service, retrying in one second",
-        //             addr
+        //             "Address {} should be available for the primary Narwhal service, retrying in
+        // one second",             addr
         //         );
         //         sleep(Duration::from_secs(1));
         //     }

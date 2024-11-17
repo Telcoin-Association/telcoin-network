@@ -6,14 +6,14 @@
 use super::*;
 use async_trait::async_trait;
 use fastcrypto::encoding::{Encoding, Hex};
+use prometheus::Registry;
+use std::time::Duration;
+use tempfile::TempDir;
+use tn_block_validator::NoopBlockValidator;
 use tn_primary::{
     consensus::{LeaderSchedule, LeaderSwapTable},
     Primary,
 };
-
-use prometheus::Registry;
-use tempfile::TempDir;
-use tn_block_validator::NoopBlockValidator;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
 use tn_types::WorkerBlock;

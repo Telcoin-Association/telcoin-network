@@ -23,9 +23,9 @@ use tn_storage::{traits::Database, CertificateStore};
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
-    Certificate, CertificateDigest, Header, NetworkPublicKey, TnReceiver, Vote,
+    AuthorityIdentifier, BlsSigner, Certificate, CertificateDigest, Committee, Header,
+    NetworkPublicKey, Noticer, TnReceiver, TnSender, Vote, CHANNEL_CAPACITY,
 };
-use tn_types::{AuthorityIdentifier, BlsSigner, Committee, Noticer, TnSender, CHANNEL_CAPACITY};
 use tokio::{
     sync::{broadcast, oneshot},
     task::{JoinHandle, JoinSet},
@@ -128,14 +128,15 @@ impl<DB: Database> Certifier<DB> {
 
         // spawn_logged_monitored_task!(
         //     async move {
-        //         trace!(target:"primary::synchronizer::broadcast_certificates", "awaiting lock for certificate senders...");
-        //         let mut senders = inner_senders.certificate_senders.lock();
-        //         trace!(target:"primary::synchronizer::broadcast_certificates", "certificate senders mutex lock obtained");
-        //         for (name, rx_own_certificate_broadcast, network_key) in
+        //         trace!(target:"primary::synchronizer::broadcast_certificates", "awaiting lock for
+        // certificate senders...");         let mut senders =
+        // inner_senders.certificate_senders.lock();         trace!(target:"
+        // primary::synchronizer::broadcast_certificates", "certificate senders mutex lock
+        // obtained");         for (name, rx_own_certificate_broadcast, network_key) in
         //             broadcast_targets.into_iter()
         //         {
-        //             trace!(target:"primary::synchronizer::broadcast_certificates", ?name, "spawning sender for peer");
-        //             senders.spawn(Self::push_certificates(
+        //             trace!(target:"primary::synchronizer::broadcast_certificates", ?name,
+        // "spawning sender for peer");             senders.spawn(Self::push_certificates(
         //                 inner_senders.network.clone(),
         //                 name,
         //                 network_key,
@@ -145,8 +146,8 @@ impl<DB: Database> Certifier<DB> {
         //         if let Some(cert) = highest_created_certificate {
         //             // Error can be ignored.
         //             if let Err(e) = tx_own_certificate_broadcast.send(cert) {
-        //                 error!(target: "primary::synchronizer::broadcast_certificates", ?e, "failed to broadcast certificate inside broadcast task");
-        //             }
+        //                 error!(target: "primary::synchronizer::broadcast_certificates", ?e,
+        // "failed to broadcast certificate inside broadcast task");             }
         //         }
         //     },
         //     "Synchronizer::BroadcastCertificates"

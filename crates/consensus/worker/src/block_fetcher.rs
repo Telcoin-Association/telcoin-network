@@ -20,8 +20,7 @@ use tn_storage::{
     tables::WorkerBlocks,
     traits::{Database, DbTxMut},
 };
-use tn_types::NetworkPublicKey;
-use tn_types::{now, BlockHash, WorkerBlock};
+use tn_types::{now, BlockHash, NetworkPublicKey, WorkerBlock};
 use tokio::{
     select,
     time::{sleep, sleep_until, Instant},

@@ -7,7 +7,7 @@ use crate::{
     error::LocalClientError,
     traits::{PrimaryToWorkerClient, WorkerToPrimaryClient},
 };
-use anemo::{Network, PeerId, Request};
+use anemo::{PeerId, Request};
 use consensus_network_types::{
     FetchBlocksRequest, FetchBlocksResponse, PrimaryToWorker, WorkerOthersBlockMessage,
     WorkerOwnBlockMessage, WorkerSynchronizeMessage, WorkerToPrimary,
@@ -17,7 +17,6 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tn_types::{traits::KeyPair, NetworkKeypair, NetworkPublicKey};
 use tn_utils::sync::notify_once::NotifyOnce;
 use tokio::{select, time::sleep};
-use tracing::error;
 
 // // //
 //

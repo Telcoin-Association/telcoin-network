@@ -1,14 +1,10 @@
 //! The handler for receiving requests from the Primary.
 
-use anemo::{async_trait, types::response::StatusCode};
+use anemo::async_trait;
 use consensus_network_types::{PrimaryToEngine, VerifyExecutionRequest, VerifyExecutionResponse};
-use std::time::Duration;
-
-/// Maximum duration to fetch certificates from local storage.
-const FETCH_CERTIFICATES_MAX_HANDLER_TIME: Duration = Duration::from_secs(10);
 
 pub struct PrimaryReceiverHandler<DB> {
-    db: DB,
+    _db: DB,
 }
 
 // TODO: anemo still uses async_trait
@@ -16,7 +12,7 @@ pub struct PrimaryReceiverHandler<DB> {
 impl<DB: Send + Sync + 'static> PrimaryToEngine for PrimaryReceiverHandler<DB> {
     async fn verify_execution(
         &self,
-        request: anemo::Request<VerifyExecutionRequest>,
+        _request: anemo::Request<VerifyExecutionRequest>,
     ) -> Result<anemo::Response<VerifyExecutionResponse>, anemo::rpc::Status> {
         // validate execution block for primary
         //
