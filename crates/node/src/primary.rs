@@ -4,7 +4,7 @@
 
 //! Hierarchical type to hold tasks spawned for a worker in the network.
 use crate::{engine::ExecutionNode, error::NodeError, try_join_all, FuturesUnordered};
-use anemo::PeerId;
+use anemo::{Network, PeerId};
 use fastcrypto::traits::VerifyingKey;
 use reth_db::{
     database::Database,
@@ -30,10 +30,14 @@ struct PrimaryNodeInner<CDB> {
     consensus_config: ConsensusConfig<CDB>,
     /// Container for consensus channels.
     consensus_bus: ConsensusBus,
-    /// The task handles created from primary
-    handles: FuturesUnordered<JoinHandle<()>>,
     /// Peer ID used for local connections.
     own_peer_id: Option<PeerId>,
+    /// The primary struct that holds handles and network.
+    ///
+    /// Option is some after the primary has started.
+    primary: Option<Primary>,
+    /// The handles for consensus.
+    handles: FuturesUnordered<JoinHandle<()>>,
 }
 
 impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
@@ -70,15 +74,11 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         // create receiving channel before spawning primary to ensure messages are not lost
         let consensus_output_rx = self.consensus_bus.subscribe_consensus_output();
 
-        // spawn primary if not already running
-        let primary_handles = self.spawn_primary(last_executed_consensus_hash).await?;
+        // spawn primary and update `self`
+        self.spawn_primary(last_executed_consensus_hash).await?;
 
         // start engine
         execution_components.start_engine(consensus_output_rx).await?;
-
-        // now keep the handlers
-        self.handles.clear();
-        self.handles.extend(primary_handles);
 
         Ok(())
     }
@@ -112,8 +112,7 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         try_join_all(&mut self.handles).await.unwrap();
     }
 
-    // If any of the underlying handles haven't still finished, then this method will return
-    // true, otherwise false will returned instead.
+    /// Boolean if any of the join handles are not "finished".
     async fn is_running(&self) -> bool {
         self.handles.iter().any(|h| !h.is_finished())
     }
@@ -121,22 +120,25 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
     /// Spawn a new primary. Optionally also spawn the consensus and a client executing
     /// transactions.
     pub async fn spawn_primary(
-        &self,
+        &mut self,
         // Used for recovering after crashes/restarts
         last_executed_consensus_hash: B256,
-    ) -> SubscriberResult<Vec<JoinHandle<()>>> {
-        let mut handles = Vec::new();
-
+    ) -> SubscriberResult<()> {
         let (consensus_handles, leader_schedule) =
             self.spawn_consensus(&self.consensus_bus, last_executed_consensus_hash).await?;
-        handles.extend(consensus_handles);
+
+        // already ensures node was NOT running, but clear to be sure
+        self.handles.clear();
+        self.handles.extend(consensus_handles);
+
+        // start primary add extend handles
+        let (primary, handles) =
+            Primary::spawn(self.consensus_config.clone(), &self.consensus_bus, leader_schedule);
+        self.handles.extend(handles);
 
         // Spawn the primary.
-        let primary_handles =
-            Primary::spawn(self.consensus_config.clone(), &self.consensus_bus, leader_schedule);
-        handles.extend(primary_handles);
-
-        Ok(handles)
+        self.primary = Some(primary);
+        Ok(())
     }
 
     /// Spawn the consensus core and the client executing transactions.
@@ -213,8 +215,9 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
         let inner = PrimaryNodeInner {
             consensus_config,
             consensus_bus,
-            handles: FuturesUnordered::new(),
             own_peer_id: None,
+            primary: None,
+            handles: FuturesUnordered::new(),
         };
 
         Self { internal: Arc::new(RwLock::new(inner)) }
@@ -263,5 +266,10 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
     /// Return a copy of the primaries consensus bus.
     pub async fn consensus_bus(&self) -> ConsensusBus {
         self.internal.read().await.consensus_bus.clone()
+    }
+
+    /// Return the WAN if the primary is runnig.
+    pub async fn network(&self) -> Option<Network> {
+        self.internal.read().await.primary.as_ref().map(|p| p.network().clone())
     }
 }

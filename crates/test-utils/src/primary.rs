@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Primary fixture for the cluster
+use anemo::Network;
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 use tn_config::ConsensusConfig;
 use tn_node::primary::PrimaryNode;
@@ -73,5 +74,10 @@ impl<DB: Database> PrimaryNodeDetails<DB> {
 
     pub fn node(&self) -> &PrimaryNode<DB> {
         &self.node
+    }
+
+    /// Return an owned wide-area [Network] if it is running.
+    pub async fn network(&self) -> Option<Network> {
+        self.node.network().await
     }
 }

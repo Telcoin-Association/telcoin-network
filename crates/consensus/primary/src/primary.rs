@@ -45,7 +45,10 @@ use tracing::{error, info};
 #[path = "tests/primary_tests.rs"]
 pub mod primary_tests;
 
-pub struct Primary;
+pub struct Primary {
+    /// The Primary's network.
+    network: Network,
+}
 
 impl Primary {
     /// Spawns the primary and returns the JoinHandles of its tasks, as well as a metered receiver
@@ -54,7 +57,8 @@ impl Primary {
         config: ConsensusConfig<DB>,
         consensus_bus: &ConsensusBus,
         leader_schedule: LeaderSchedule,
-    ) -> Vec<JoinHandle<()>> {
+        // TODO: don't return handles here - need to refactor tn_node::PrimaryNode
+    ) -> (Self, Vec<JoinHandle<()>>) {
         // Write the parameters to the logs.
         config.parameters().tracing();
 
@@ -183,7 +187,7 @@ impl Primary {
             config.authority().id(),
             consensus_bus,
             config.subscribe_shutdown(),
-            network,
+            network.clone(),
         );
         handles.push(state_handler_handle);
 
@@ -194,7 +198,7 @@ impl Primary {
             config.authority().primary_network_address()
         );
 
-        handles
+        (Self { network }, handles)
     }
 
     /// Start the anema network for the primary.
@@ -349,5 +353,10 @@ impl Primary {
         network.known_peers().insert(peer_info);
 
         (peer_id, address)
+    }
+
+    /// Return a reference to the Primary's network.
+    pub fn network(&self) -> &Network {
+        &self.network
     }
 }
