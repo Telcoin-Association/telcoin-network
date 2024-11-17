@@ -318,9 +318,14 @@ impl<DB: Database> AuthorityDetails<DB> {
         false
     }
 
-    /// Returns an owned WAN if it exists.
+    /// Returns an owned primary WAN if it exists.
     pub async fn primary_network(&self) -> Option<Network> {
         self.primary().await.network().await
+    }
+
+    /// Returns an owned worker WAN if it exists.
+    pub async fn worker_network(&self, worker_id: WorkerId) -> Option<Network> {
+        self.worker(worker_id).await.network().await
     }
 }
 

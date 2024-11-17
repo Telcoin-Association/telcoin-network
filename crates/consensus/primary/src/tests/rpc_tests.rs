@@ -22,16 +22,10 @@ async fn test_server_authorizations() {
     // allow enough time for peers to establish connections
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    let test_client = test_cluster
-        .fixture()
-        .authorities()
-        .next()
-        .unwrap()
-        .consensus_config()
-        .local_network()
-        .clone();
     let primary_network =
         test_cluster.authorities().await.first().unwrap().primary_network().await.unwrap();
+    let worker_network =
+        test_cluster.authorities().await.first().unwrap().worker_network(0).await.unwrap();
     let test_committee = test_cluster.committee.clone();
     let test_worker_cache = test_cluster.fixture().worker_cache().clone();
 
@@ -47,7 +41,6 @@ async fn test_server_authorizations() {
             .await
             .expect("fetch certs from target primary");
 
-        let worker_network = test_client.get_worker_network(0).await.unwrap();
         let worker_target_name = test_worker_cache
             .workers
             .get(target_authority.protocol_key())
@@ -89,7 +82,6 @@ async fn test_server_authorizations() {
         // Removing the AllowedPeers RequireAuthorizationLayer for primary should make this succeed.
         assert!(primary_network.fetch_certificates(&primary_target_name, request).await.is_err());
 
-        let worker_network = test_client.get_worker_network(0).await.unwrap();
         let worker_target_name = unreachable_worker_cache
             .workers
             .get(unreachable_authority.protocol_key())

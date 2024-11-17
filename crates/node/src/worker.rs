@@ -4,7 +4,7 @@
 
 //! Hierarchical type to hold tasks spawned for a worker in the network.
 use crate::{engine::ExecutionNode, error::NodeError, try_join_all, FuturesUnordered};
-use anemo::PeerId;
+use anemo::{Network, PeerId};
 use reth_db::{
     database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
@@ -19,15 +19,15 @@ use tokio::{sync::RwLock, task::JoinHandle};
 use tracing::{info, instrument};
 
 pub struct WorkerNodeInner<CDB> {
-    // The worker's id
+    /// The worker's id
     id: WorkerId,
-    // The consensus configuration.
+    /// The consensus configuration.
     consensus_config: ConsensusConfig<CDB>,
-    // The task handles created from primary
+    /// The task handles created from primary
     handles: FuturesUnordered<JoinHandle<()>>,
-    // Peer ID used for local connections.
+    /// Peer ID used for local connections.
     own_peer_id: Option<PeerId>,
-    // Keep the worker around.
+    /// Keep the worker around.
     worker: Option<Worker<CDB>>,
 }
 
@@ -58,15 +58,15 @@ impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
 
         let batch_validator = execution_node.new_block_validator().await;
 
-        let worker = Worker::new(self.id, self.consensus_config.clone());
+        let (worker, handles, block_provider) =
+            Worker::spawn(self.id, batch_validator, metrics, self.consensus_config.clone());
 
-        let (handles, block_provider) =
-            worker.spawn(batch_validator, metrics, self.consensus_config.clone());
+        // worker.spawn(batch_validator, metrics, self.consensus_config.clone());
 
         // spawn batch maker for worker
         execution_node.start_block_builder(self.id, block_provider.blocks_rx()).await?;
 
-        // now keep the handlers
+        // now keep the handles
         self.handles.clear();
         self.handles.extend(handles);
         self.worker = Some(worker);
@@ -153,5 +153,10 @@ impl<CDB: ConsensusDatabase> WorkerNode<CDB> {
     pub async fn wait(&self) {
         let mut guard = self.internal.write().await;
         guard.wait().await
+    }
+
+    /// Return the WAN if the worker is runnig.
+    pub async fn network(&self) -> Option<Network> {
+        self.internal.read().await.worker.as_ref().map(|w| w.network().clone())
     }
 }

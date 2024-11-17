@@ -53,24 +53,26 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 pub struct Worker<DB> {
     /// The id of this worker used for index-based lookup by other NW nodes.
     id: WorkerId,
+    /// Configuration for the worker.
     consensus_config: ConsensusConfig<DB>,
+    /// The worker's WAN.
+    network: Network,
 }
 
 impl<DB: Database> Worker<DB> {
-    pub fn new(id: WorkerId, consensus_config: ConsensusConfig<DB>) -> Self {
-        let worker_name = consensus_config.key_config().worker_network_public_key();
-        let worker_peer_id = PeerId(worker_name.0.to_bytes());
-        info!("Boot worker node with id {} peer id {}", id, worker_peer_id,);
+    // pub fn new(id: WorkerId, consensus_config: ConsensusConfig<DB>) -> Self {
+    //     let worker_name = consensus_config.key_config().worker_network_public_key();
+    //     let worker_peer_id = PeerId(worker_name.0.to_bytes());
 
-        // Define a worker instance.
-        Self { id, consensus_config }
-    }
+    //     // Define a worker instance.
+    //     Self { id, consensus_config }
+    // }
 
-    fn my_address(&self) -> Multiaddr {
-        let address = self
-            .consensus_config
+    /// Retrieve the worker's network address by id.
+    fn worker_address(id: &WorkerId, consensus_config: &ConsensusConfig<DB>) -> Multiaddr {
+        let address = consensus_config
             .worker_cache()
-            .worker(self.consensus_config.authority().protocol_key(), &self.id)
+            .worker(consensus_config.authority().protocol_key(), &id)
             .expect("Our public key or worker id is not in the worker cache")
             .worker_address;
         if let Some(addr) =
@@ -82,58 +84,61 @@ impl<DB: Database> Worker<DB> {
         }
     }
 
+    /// Spawn the worker.
+    ///
+    /// Create an instance of `Self` and start all tasks to participate in consensus.
     pub fn spawn(
-        &self,
+        id: WorkerId,
         validator: impl BlockValidation,
         metrics: Metrics,
-        config: ConsensusConfig<DB>,
-    ) -> (Vec<JoinHandle<()>>, BlockProvider<DB, QuorumWaiter>) {
-        let worker_name = self.consensus_config.key_config().worker_network_public_key();
+        consensus_config: ConsensusConfig<DB>,
+    ) -> (Self, Vec<JoinHandle<()>>, BlockProvider<DB, QuorumWaiter>) {
+        let worker_name = consensus_config.key_config().worker_network_public_key();
         let worker_peer_id = PeerId(worker_name.0.to_bytes());
-        info!("Boot worker node with id {} peer id {}", self.id, worker_peer_id,);
+        info!("Boot worker node with id {} peer id {}", id, worker_peer_id,);
 
         let node_metrics = metrics.worker_metrics.clone();
 
         // // Legacy RPC interface, only used by delete_batches() for external consensus.
         // let primary_service = PrimaryToWorkerServer::new(PrimaryReceiverHandler {
-        //     id: self.id,
-        //     committee: self.consensus_config.committee().clone(),
-        //     worker_cache: self.consensus_config.worker_cache().clone(),
-        //     store: self.consensus_config.node_storage().batch_store.clone(),
-        //     request_batches_timeout: self.consensus_config.config().parameters.sync_retry_delay,
+        //     id: id,
+        //     committee: consensus_config.committee().clone(),
+        //     worker_cache: consensus_config.worker_cache().clone(),
+        //     store: consensus_config.node_storage().batch_store.clone(),
+        //     request_batches_timeout: consensus_config.config().parameters.sync_retry_delay,
         //     network: None,
         //     batch_fetcher: None,
         //     validator: validator.clone(),
         // });
 
         // Receive incoming messages from other workers.
-        let network = self.start_network(validator.clone(), &metrics);
+        let network = Self::start_network(id, &consensus_config, validator.clone(), &metrics);
 
         // Set up anemo Network.
         // let our_primary_peer_id =
-        //     PeerId(self.consensus_config.authority().network_key().0.to_bytes());
+        //     PeerId(consensus_config.authority().network_key().0.to_bytes());
         // let primary_to_worker_router = anemo::Router::new()
         //     .add_rpc_service(primary_service)
         //     // Add an Authorization Layer to ensure that we only service requests from our primary
         //     .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new([our_primary_peer_id])))
         //     .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())));
 
-        self.consensus_config.local_network().set_worker_network(self.id, network.clone());
+        // consensus_config.local_network().set_worker_network(id, network.clone());
 
         let block_fetcher = WorkerBlockFetcher::new(
             worker_name,
             network.clone(),
-            self.consensus_config.node_storage().batch_store.clone(),
+            consensus_config.node_storage().batch_store.clone(),
             node_metrics.clone(),
         );
-        self.consensus_config.local_network().set_primary_to_worker_local_handler(
+        consensus_config.local_network().set_primary_to_worker_local_handler(
             worker_peer_id,
             Arc::new(PrimaryReceiverHandler {
-                id: self.id,
-                committee: self.consensus_config.committee().clone(),
-                worker_cache: self.consensus_config.worker_cache().clone(),
-                store: self.consensus_config.database().clone(),
-                request_batches_timeout: self.consensus_config.parameters().sync_retry_delay,
+                id,
+                committee: consensus_config.committee().clone(),
+                worker_cache: consensus_config.worker_cache().clone(),
+                store: consensus_config.database().clone(),
+                request_batches_timeout: consensus_config.parameters().sync_retry_delay,
                 network: Some(network.clone()),
                 batch_fetcher: Some(block_fetcher),
                 validator,
@@ -142,10 +147,9 @@ impl<DB: Database> Worker<DB> {
 
         let mut peer_types = HashMap::new();
 
-        let other_workers = self
-            .consensus_config
+        let other_workers = consensus_config
             .worker_cache()
-            .others_workers_by_id(self.consensus_config.authority().protocol_key(), &self.id)
+            .others_workers_by_id(consensus_config.authority().protocol_key(), &id)
             .into_iter()
             .map(|(_, info)| (info.name, info.worker_address));
 
@@ -159,18 +163,16 @@ impl<DB: Database> Worker<DB> {
         // Connect worker to its corresponding primary.
         let (peer_id, address) = Self::add_peer_in_network(
             &network,
-            self.consensus_config.authority().network_key(),
-            self.consensus_config.authority().primary_network_address(),
+            consensus_config.authority().network_key(),
+            consensus_config.authority().primary_network_address(),
         );
         peer_types.insert(peer_id, "our_primary".to_string());
         info!(target: "worker::worker", "Adding our primary with peer id {} and address {}", peer_id, address);
 
         // update the peer_types with the "other_primary". We do not add them in the Network
         // struct, otherwise the networking library will try to connect to it
-        let other_primaries: Vec<(AuthorityIdentifier, Multiaddr, NetworkPublicKey)> = self
-            .consensus_config
-            .committee()
-            .others_primaries_by_id(self.consensus_config.authority().id());
+        let other_primaries: Vec<(AuthorityIdentifier, Multiaddr, NetworkPublicKey)> =
+            consensus_config.committee().others_primaries_by_id(consensus_config.authority().id());
         for (_, _, network_key) in other_primaries {
             peer_types.insert(PeerId(network_key.0.to_bytes()), "other_primary".to_string());
         }
@@ -180,64 +182,70 @@ impl<DB: Database> Worker<DB> {
                 network.downgrade(),
                 metrics.network_connection_metrics.clone(),
                 peer_types,
-                config.subscribe_shutdown(),
+                consensus_config.subscribe_shutdown(),
             );
 
-        let network_admin_server_base_port = self
-            .consensus_config
+        // TODO: revisit this soon
+        let network_admin_server_base_port = consensus_config
             .parameters()
             .network_admin_server
             .worker_network_admin_server_base_port
-            .checked_add(self.id)
+            .checked_add(id)
             .unwrap();
         info!(target: "worker::worker",
             "Worker {} listening to network admin messages on 127.0.0.1:{}",
-            self.id, network_admin_server_base_port
+            id, network_admin_server_base_port
         );
 
         let admin_handles = consensus_network::admin::start_admin_server(
             network_admin_server_base_port,
             network.clone(),
-            config.subscribe_shutdown(),
+            consensus_config.subscribe_shutdown(),
         );
 
-        let block_provider = self.new_block_provider(
+        let block_provider = Self::new_block_provider(
+            id,
+            &consensus_config,
             node_metrics,
-            self.consensus_config.local_network().clone(),
+            consensus_config.local_network().clone(),
             network.clone(),
         );
 
         let network_shutdown_handle =
-            Self::shutdown_network_listener(config.subscribe_shutdown(), network);
+            Self::shutdown_network_listener(consensus_config.subscribe_shutdown(), network.clone());
 
         // NOTE: This log entry is used to compute performance.
         info!(target: "worker::worker",
             "Worker {} successfully booted on {}",
-            self.id,
-            self.consensus_config
+            id,
+            consensus_config
                 .worker_cache()
-                .worker(self.consensus_config.authority().protocol_key(), &self.id)
+                .worker(consensus_config.authority().protocol_key(), &id)
                 .expect("Our public key or worker id is not in the worker cache")
                 .transactions
         );
 
         let mut handles = vec![connection_monitor_handle, network_shutdown_handle];
         handles.extend(admin_handles);
-        (handles, block_provider)
+        (Self { id, consensus_config, network }, handles, block_provider)
     }
 
     /// Start the anemo network for the primary.
-    fn start_network(&self, validator: impl BlockValidation, metrics: &Metrics) -> Network {
+    fn start_network(
+        id: WorkerId,
+        consensus_config: &ConsensusConfig<DB>,
+        validator: impl BlockValidation,
+        metrics: &Metrics,
+    ) -> Network {
         let mut worker_service = WorkerToWorkerServer::new(WorkerReceiverHandler {
-            id: self.id,
-            client: self.consensus_config.local_network().clone(),
-            store: self.consensus_config.node_storage().batch_store.clone(),
+            id,
+            client: consensus_config.local_network().clone(),
+            store: consensus_config.node_storage().batch_store.clone(),
             validator,
         });
 
         // Apply rate limits from configuration as needed.
-        if let Some(limit) = self.consensus_config.config().parameters.anemo.report_batch_rate_limit
-        {
+        if let Some(limit) = consensus_config.config().parameters.anemo.report_batch_rate_limit {
             worker_service = worker_service.add_layer_for_report_block(InboundRequestLayer::new(
                 rate_limit::RateLimitLayer::new(
                     governor::Quota::per_second(limit),
@@ -245,9 +253,7 @@ impl<DB: Database> Worker<DB> {
                 ),
             ));
         }
-        if let Some(limit) =
-            self.consensus_config.config().parameters.anemo.request_batches_rate_limit
-        {
+        if let Some(limit) = consensus_config.config().parameters.anemo.request_batches_rate_limit {
             worker_service = worker_service.add_layer_for_request_blocks(InboundRequestLayer::new(
                 rate_limit::RateLimitLayer::new(
                     governor::Quota::per_second(limit),
@@ -256,11 +262,10 @@ impl<DB: Database> Worker<DB> {
             ));
         }
 
-        let address = self.my_address();
+        let address = Self::worker_address(&id, &consensus_config);
         let addr = address.to_anemo_address().unwrap();
-        let epoch_string: String = self.consensus_config.committee().epoch().to_string();
-        let worker_peer_ids = self
-            .consensus_config
+        let epoch_string: String = consensus_config.committee().epoch().to_string();
+        let worker_peer_ids = consensus_config
             .worker_cache()
             .all_workers()
             .into_iter()
@@ -279,7 +284,7 @@ impl<DB: Database> Worker<DB> {
             )
             .layer(CallbackLayer::new(MetricsMakeCallbackHandler::new(
                 metrics.inbound_network_metrics.clone(),
-                self.consensus_config.config().parameters.anemo.excessive_message_size(),
+                consensus_config.config().parameters.anemo.excessive_message_size(),
             )))
             .layer(CallbackLayer::new(FailpointsMakeCallbackHandler::new()))
             .layer(SetResponseHeaderLayer::overriding(
@@ -296,7 +301,7 @@ impl<DB: Database> Worker<DB> {
             )
             .layer(CallbackLayer::new(MetricsMakeCallbackHandler::new(
                 metrics.outbound_network_metrics.clone(),
-                self.consensus_config.config().parameters.anemo.excessive_message_size(),
+                consensus_config.config().parameters.anemo.excessive_message_size(),
             )))
             .layer(CallbackLayer::new(FailpointsMakeCallbackHandler::new()))
             .layer(SetRequestHeaderLayer::overriding(
@@ -305,7 +310,7 @@ impl<DB: Database> Worker<DB> {
             ))
             .into_inner();
 
-        let anemo_config = self.consensus_config.anemo_config();
+        let anemo_config = consensus_config.anemo_config();
 
         // let network;
         // let mut retries_left = 90;
@@ -314,7 +319,7 @@ impl<DB: Database> Worker<DB> {
         let network = anemo::Network::bind(addr.clone())
             .server_name("telcoin-network")
             .private_key(
-                self.consensus_config
+                consensus_config
                     .key_config()
                     .worker_network_keypair()
                     .copy()
@@ -346,7 +351,7 @@ impl<DB: Database> Worker<DB> {
         // }
         // }
 
-        info!(target: "worker::worker", "Worker {} listening to worker messages on {}", self.id, address);
+        info!(target: "worker::worker", "Worker {} listening to worker messages on {}", id, address);
         network
     }
 
@@ -384,7 +389,8 @@ impl<DB: Database> Worker<DB> {
 
     /// Builds a new block provider responsible for handling client transactions.
     fn new_block_provider(
-        &self,
+        id: WorkerId,
+        consensus_config: &ConsensusConfig<DB>,
         node_metrics: Arc<WorkerMetrics>,
         client: LocalNetwork,
         network: anemo::Network,
@@ -394,21 +400,26 @@ impl<DB: Database> Worker<DB> {
         // The `QuorumWaiter` waits for 2f authorities to acknowledge receiving the block
         // before forwarding the block to the `Processor`
         let quorum_waiter = QuorumWaiter::new(
-            self.consensus_config.authority().clone(),
-            self.id,
-            self.consensus_config.committee().clone(),
-            self.consensus_config.worker_cache().clone(),
+            consensus_config.authority().clone(),
+            id,
+            consensus_config.committee().clone(),
+            consensus_config.worker_cache().clone(),
             network,
             node_metrics.clone(),
         );
 
         BlockProvider::new(
-            self.id,
+            id,
             quorum_waiter,
             node_metrics,
             client,
-            self.consensus_config.database().clone(),
-            self.consensus_config.parameters().worker_block_vote_timeout,
+            consensus_config.database().clone(),
+            consensus_config.parameters().worker_block_vote_timeout,
         )
+    }
+
+    /// Return an owned copy of the WAN.
+    pub fn network(&self) -> Network {
+        self.network.clone()
     }
 }

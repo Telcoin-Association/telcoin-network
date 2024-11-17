@@ -4,6 +4,7 @@
 //! Worker fixture for the cluster
 
 use crate::temp_dir;
+use anemo::Network;
 use fastcrypto::traits::KeyPair as _;
 use std::path::PathBuf;
 use tn_config::{ConsensusConfig, KeyConfig};
@@ -69,6 +70,11 @@ impl<DB: Database> WorkerNodeDetails<DB> {
     /// node as still running.
     pub async fn is_running(&self) -> bool {
         self.node.is_running().await
+    }
+
+    /// Return an owned wide-area [Network] if it is running.
+    pub async fn network(&self) -> Option<Network> {
+        self.node.network().await
     }
 }
 

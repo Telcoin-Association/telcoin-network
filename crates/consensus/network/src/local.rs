@@ -46,20 +46,17 @@ pub struct LocalNetwork {
 struct Inner {
     /// The primary's peer id.
     primary_peer_id: PeerId,
-    /// Primary's wide-area network.
-    ///
-    /// Peer to peer communication.
-    primary_network: Option<Network>,
-    worker_network: BTreeMap<u16, Network>,
+    /// The type that holds logic for worker to primary requests.
     worker_to_primary_handler: Option<Arc<dyn WorkerToPrimary>>,
+    /// The type that holds logic for primary to worker requests.
     primary_to_worker_handler: BTreeMap<PeerId, Arc<dyn PrimaryToWorker>>,
+    /// Shutdown status.
     shutdown: bool,
 }
 
 impl std::fmt::Debug for Inner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LocalNetwork::Inner for {}", self.primary_peer_id)?;
-        write!(f, "\t{} nodes in worker network", self.worker_network.len())
+        write!(f, "LocalNetwork::Inner for {}", self.primary_peer_id)
     }
 }
 
@@ -71,8 +68,6 @@ impl LocalNetwork {
         Self {
             inner: Arc::new(RwLock::new(Inner {
                 primary_peer_id,
-                primary_network: None,
-                worker_network: BTreeMap::new(),
                 worker_to_primary_handler: None,
                 primary_to_worker_handler: BTreeMap::new(),
                 shutdown: false,
@@ -93,29 +88,6 @@ impl LocalNetwork {
     pub fn new_with_empty_id() -> Self {
         // ED25519_PUBLIC_KEY_LENGTH is 32 bytes.
         Self::new(PeerId([0u8; 32]))
-    }
-
-    pub fn set_worker_network(&self, worker_id: u16, network: Network) {
-        let mut inner = self.inner.write();
-        if inner.worker_network.insert(worker_id, network).is_some() {
-            error!("Worker {} network is already set", worker_id);
-        }
-    }
-
-    pub async fn get_worker_network(&self, worker_id: u16) -> Result<Network, anemo::rpc::Status> {
-        for _ in 0..Self::GET_CLIENT_RETRIES {
-            {
-                let inner = self.inner.read();
-                if inner.shutdown {
-                    return Err(anemo::rpc::Status::internal("This node has shutdown"));
-                }
-                if let Some(network) = inner.worker_network.get(&worker_id) {
-                    return Ok(network.clone());
-                }
-            }
-            sleep(Self::GET_CLIENT_INTERVAL).await;
-        }
-        Err(anemo::rpc::Status::internal(format!("The worker {} has not started", worker_id)))
     }
 
     pub fn set_worker_to_primary_local_handler(&self, handler: Arc<dyn WorkerToPrimary>) {
