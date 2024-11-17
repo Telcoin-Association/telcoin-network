@@ -95,35 +95,11 @@ impl LocalNetwork {
         Self::new(PeerId([0u8; 32]))
     }
 
-    pub fn set_primary_network(&self, network: Network) {
-        let mut inner = self.inner.write();
-        if inner.primary_network.is_some() {
-            error!("Primary network is already set");
-        }
-        inner.primary_network = Some(network);
-    }
-
     pub fn set_worker_network(&self, worker_id: u16, network: Network) {
         let mut inner = self.inner.write();
         if inner.worker_network.insert(worker_id, network).is_some() {
             error!("Worker {} network is already set", worker_id);
         }
-    }
-
-    pub async fn get_primary_network(&self) -> Result<Network, anemo::rpc::Status> {
-        for _ in 0..Self::GET_CLIENT_RETRIES {
-            {
-                let inner = self.inner.read();
-                if inner.shutdown {
-                    return Err(anemo::rpc::Status::internal("This node has shutdown"));
-                }
-                if let Some(network) = &inner.primary_network {
-                    return Ok(network.clone());
-                }
-            }
-            sleep(Self::GET_CLIENT_INTERVAL).await;
-        }
-        Err(anemo::rpc::Status::internal("Primary has not started"))
     }
 
     pub async fn get_worker_network(&self, worker_id: u16) -> Result<Network, anemo::rpc::Status> {

@@ -7,6 +7,7 @@ use crate::{
     primary::PrimaryNodeDetails, worker::WorkerNodeDetails, TelcoinTempDirs, TestExecutionNode,
     WorkerFixture,
 };
+use anemo::Network;
 use consensus_network::local::LocalNetwork;
 use fastcrypto::{hash::Hash, traits::KeyPair as _};
 use jsonrpsee::http_client::HttpClient;
@@ -315,6 +316,11 @@ impl<DB: Database> AuthorityDetails<DB> {
         }
 
         false
+    }
+
+    /// Returns an owned WAN if it exists.
+    pub async fn primary_network(&self) -> Option<Network> {
+        self.primary().await.network().await
     }
 }
 

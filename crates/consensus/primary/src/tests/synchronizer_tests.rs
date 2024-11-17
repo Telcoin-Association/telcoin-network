@@ -8,7 +8,6 @@ use crate::{
     synchronizer::Synchronizer,
     ConsensusBus,
 };
-use consensus_network::local::LocalNetwork;
 use fastcrypto::{hash::Hash, traits::KeyPair};
 use futures::{stream::FuturesUnordered, StreamExt};
 use itertools::Itertools;
@@ -31,12 +30,7 @@ use tn_types::{
 #[tokio::test]
 async fn accept_certificates() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
-    let committee = fixture.committee();
     let primary = fixture.authorities().last().unwrap();
-    let network_key = primary.primary_network_keypair().copy().private().0.to_bytes();
-    let authority_id = primary.id();
-    let client = LocalNetwork::new_from_keypair(&primary.primary_network_keypair());
-
     let certificate_store = primary.consensus_config().node_storage().certificate_store.clone();
 
     let cb = ConsensusBus::new();
@@ -44,14 +38,6 @@ async fn accept_certificates() {
     let mut rx_parents = cb.parents().subscribe();
     // Make a synchronizer.
     let synchronizer = Arc::new(Synchronizer::new(primary.consensus_config(), &cb));
-
-    let own_address = committee.primary_by_id(&authority_id).unwrap().to_anemo_address().unwrap();
-    let network = anemo::Network::bind(own_address)
-        .server_name("narwhal")
-        .private_key(network_key)
-        .start(anemo::Router::new())
-        .unwrap();
-    client.set_primary_network(network.clone());
 
     // Send 3 certificates to the Synchronizer.
     let certificates: Vec<_> =
@@ -166,25 +152,12 @@ async fn accept_suspended_certificates() {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn synchronizer_recover_basic() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
-    let committee = fixture.committee();
     let primary = fixture.authorities().last().unwrap();
-    let client = LocalNetwork::new_from_keypair(&primary.primary_network_keypair());
-    let network_key = primary.primary_network_keypair().copy().private().0.to_bytes();
-    let name = primary.id();
-
     let certificate_store = primary.consensus_config().node_storage().certificate_store.clone();
 
     let cb = ConsensusBus::new();
     // Make Synchronizer.
     let synchronizer = Arc::new(Synchronizer::new(primary.consensus_config(), &cb));
-
-    let own_address = committee.primary_by_id(&name).unwrap().to_anemo_address().unwrap();
-    let network = anemo::Network::bind(own_address)
-        .server_name("narwhal")
-        .private_key(network_key)
-        .start(anemo::Router::new())
-        .unwrap();
-    client.set_primary_network(network.clone());
 
     // Send 3 certificates to Synchronizer.
     let certificates: Vec<_> =
@@ -209,7 +182,6 @@ async fn synchronizer_recover_basic() {
     let cb = ConsensusBus::new();
     let mut rx_parents = cb.parents().subscribe();
     let _synchronizer = Arc::new(Synchronizer::new(primary.consensus_config(), &cb));
-    client.set_primary_network(network.clone());
 
     // Ensure the Synchronizer sends the parent certificates to the proposer.
 
@@ -237,23 +209,10 @@ async fn synchronizer_recover_basic() {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn synchronizer_recover_partial_certs() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
-    let committee = fixture.committee();
     let primary = fixture.authorities().last().unwrap();
-    let client = LocalNetwork::new_from_keypair(&primary.primary_network_keypair());
-    let network_key = primary.primary_network_keypair().copy().private().0.to_bytes();
-    let name = primary.id();
-
     let cb = ConsensusBus::new();
     // Make a synchronizer.
     let synchronizer = Arc::new(Synchronizer::new(primary.consensus_config(), &cb));
-
-    let own_address = committee.primary_by_id(&name).unwrap().to_anemo_address().unwrap();
-    let network = anemo::Network::bind(own_address)
-        .server_name("narwhal")
-        .private_key(network_key)
-        .start(anemo::Router::new())
-        .unwrap();
-    client.set_primary_network(network.clone());
 
     // Send 1 certificate.
     let certificates: Vec<Certificate> =
@@ -270,7 +229,6 @@ async fn synchronizer_recover_partial_certs() {
     let cb = ConsensusBus::new();
     let mut rx_parents = cb.parents().subscribe();
     let synchronizer = Arc::new(Synchronizer::new(primary.consensus_config(), &cb));
-    client.set_primary_network(network.clone());
 
     // Send remaining 2f certs.
     for cert in certificates.clone().into_iter().take(2) {
@@ -297,21 +255,9 @@ async fn synchronizer_recover_previous_round() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let committee = fixture.committee();
     let primary = fixture.authorities().last().unwrap();
-    let client = LocalNetwork::new_from_keypair(&primary.primary_network_keypair());
-    let network_key = primary.primary_network_keypair().copy().private().0.to_bytes();
-    let name = primary.id();
-
     let cb = ConsensusBus::new();
     // Make a synchronizer.
     let synchronizer = Arc::new(Synchronizer::new(primary.consensus_config(), &cb));
-
-    let own_address = committee.primary_by_id(&name).unwrap().to_anemo_address().unwrap();
-    let network = anemo::Network::bind(own_address)
-        .server_name("narwhal")
-        .private_key(network_key)
-        .start(anemo::Router::new())
-        .unwrap();
-    client.set_primary_network(network.clone());
 
     // Send 3 certificates from round 1, and 2 certificates from round 2 to Synchronizer.
     let genesis_certs = Certificate::genesis(&committee);
@@ -337,7 +283,6 @@ async fn synchronizer_recover_previous_round() {
     let cb = ConsensusBus::new();
     let mut rx_parents = cb.parents().subscribe();
     let _synchronizer = Arc::new(Synchronizer::new(primary.consensus_config(), &cb));
-    client.set_primary_network(network.clone());
 
     // the recovery flow sends message that contains the parents for the last round for which we
     // have a quorum of certificates, in this case is round 1.

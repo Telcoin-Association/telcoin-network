@@ -19,7 +19,8 @@ async fn test_server_authorizations() {
     let executor = manager.executor();
     let mut test_cluster = Cluster::new(executor, MemDatabase::default);
     test_cluster.start(Some(4), Some(1), None).await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // allow enough time for peers to establish connections
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     let test_client = test_cluster
         .fixture()
@@ -29,6 +30,8 @@ async fn test_server_authorizations() {
         .consensus_config()
         .local_network()
         .clone();
+    let primary_network =
+        test_cluster.authorities().await.first().unwrap().primary_network().await.unwrap();
     let test_committee = test_cluster.committee.clone();
     let test_worker_cache = test_cluster.fixture().worker_cache().clone();
 
@@ -36,11 +39,13 @@ async fn test_server_authorizations() {
     {
         let target_authority = test_committee.authority(&AuthorityIdentifier(1)).unwrap();
 
-        let primary_network = test_client.get_primary_network().await.unwrap();
         let primary_target_name = target_authority.network_key();
         let request = anemo::Request::new(FetchCertificatesRequest::default())
             .with_timeout(Duration::from_secs(5));
-        primary_network.fetch_certificates(&primary_target_name, request).await.unwrap();
+        primary_network
+            .fetch_certificates(&primary_target_name, request)
+            .await
+            .expect("fetch certs from target primary");
 
         let worker_network = test_client.get_worker_network(0).await.unwrap();
         let worker_target_name = test_worker_cache
@@ -74,7 +79,7 @@ async fn test_server_authorizations() {
         let primary_target_name = unreachable_authority.network_key();
         let primary_peer_id: PeerId = PeerId(primary_target_name.0.to_bytes());
         let primary_address = unreachable_authority.primary_network_address();
-        let primary_network = test_client.get_primary_network().await.unwrap();
+
         primary_network
             .connect_with_peer_id(primary_address.to_anemo_address().unwrap(), primary_peer_id)
             .await

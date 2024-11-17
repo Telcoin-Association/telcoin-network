@@ -88,6 +88,19 @@ impl Primary {
 
         let mut peer_types = HashMap::new();
 
+        // Add other primaries
+        let primaries = config
+            .committee()
+            .others_primaries_by_id(config.authority().id())
+            .into_iter()
+            .map(|(_, address, network_key)| (network_key, address));
+
+        for (public_key, address) in primaries {
+            let (peer_id, address) = Self::add_peer_in_network(&network, public_key, &address);
+            peer_types.insert(peer_id, "other_primary".to_string());
+            info!("Adding others primaries with peer id {} and address {}", peer_id, address);
+        }
+
         // TODO: this is only needed to accurately return peer count from admin server and should
         // probably be removed - two tests fail - 1 primary and 1 worker
         // (peer count from admin server)
@@ -109,19 +122,6 @@ impl Primary {
                 Self::add_peer_in_network(&network, worker.name, &worker.worker_address);
             peer_types.insert(peer_id, "other_worker".to_string());
             info!("Adding others worker with peer id {} and address {}", peer_id, address);
-        }
-
-        // Add other primaries
-        let primaries = config
-            .committee()
-            .others_primaries_by_id(config.authority().id())
-            .into_iter()
-            .map(|(_, address, network_key)| (network_key, address));
-
-        for (public_key, address) in primaries {
-            let (peer_id, address) = Self::add_peer_in_network(&network, public_key, &address);
-            peer_types.insert(peer_id, "other_primary".to_string());
-            info!("Adding others primaries with peer id {} and address {}", peer_id, address);
         }
 
         let (connection_monitor_handle, _) =
@@ -330,9 +330,9 @@ impl Primary {
         //     }
         // }
         // }
-
-        // TODO: remove this - only used in tests for convenience
-        config.local_network().set_primary_network(network.clone());
+        //
+        // // TODO: remove this - only used in tests for convenience
+        // config.local_network().set_primary_network(network.clone());
 
         info!("Primary {} listening on {}", config.authority().id(), address);
         network
