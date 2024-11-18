@@ -114,15 +114,6 @@ fn build_anemo_services(out_dir: &Path) {
                 .codec_path(codec_path)
                 .build(),
         )
-        // .method(
-        //     anemo_build::manual::Method::builder()
-        //         .name("sync_state")
-        //         .route_name("SyncState")
-        //         .request_type("crate::SyncStateRequest")
-        //         .response_type("crate::SyncStateResponse")
-        //         .codec_path(codec_path)
-        //         .build(),
-        // )
         .build();
 
     let worker_to_primary = anemo_build::manual::Service::builder()
