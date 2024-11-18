@@ -1,0 +1,18 @@
+[package]
+name = "tn-rpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[dependencies]
+jsonrpsee = { workspace = true }
+jsonrpsee-types = { workspace = true }
+thiserror = { workspace = true }
+reth-primitives = { workspace = true }
+
+[lints]
+workspace = true

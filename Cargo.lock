@@ -10747,6 +10747,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tn-rpc"
+version = "0.1.0"
+dependencies = [
+ "jsonrpsee",
+ "jsonrpsee-types",
+ "reth-primitives",
+ "thiserror",
+]
+
+[[package]]
 name = "tn-storage"
 version = "0.1.0"
 dependencies = [
