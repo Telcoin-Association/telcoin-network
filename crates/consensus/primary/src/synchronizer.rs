@@ -30,8 +30,8 @@ use tn_storage::{traits::Database, CertificateStore, PayloadStore};
 use tn_types::{
     ensure,
     error::{AcceptNotification, DagError, DagResult},
-    AuthorityIdentifier, Certificate, CertificateDigest, Committee, Header,
-    Round, SignatureVerificationState, TnReceiver, TnSender, WorkerCache, CHANNEL_CAPACITY,
+    AuthorityIdentifier, Certificate, CertificateDigest, Committee, Header, Round,
+    SignatureVerificationState, TnReceiver, TnSender, WorkerCache, CHANNEL_CAPACITY,
 };
 use tn_utils::sync::notify_once::NotifyOnce;
 use tokio::{
@@ -499,9 +499,6 @@ impl<DB: Database> Synchronizer<DB> {
             },
             "Synchronizer::AcceptCertificates"
         );
-
-        // // Start tasks to broadcast created certificates.
-        // let inner_senders = inner.clone();
 
         // Start a task to async download batches if needed
         let weak_inner = Arc::downgrade(&inner);
