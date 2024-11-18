@@ -91,33 +91,8 @@ impl<DB: Database> Worker<DB> {
 
         let node_metrics = metrics.worker_metrics.clone();
 
-        // // Legacy RPC interface, only used by delete_batches() for external consensus.
-        // let primary_service = PrimaryToWorkerServer::new(PrimaryReceiverHandler {
-        //     id: id,
-        //     committee: consensus_config.committee().clone(),
-        //     worker_cache: consensus_config.worker_cache().clone(),
-        //     store: consensus_config.node_storage().batch_store.clone(),
-        //     request_batches_timeout: consensus_config.config().parameters.sync_retry_delay,
-        //     network: None,
-        //     batch_fetcher: None,
-        //     validator: validator.clone(),
-        // });
-
         // Receive incoming messages from other workers.
         let network = Self::start_network(id, &consensus_config, validator.clone(), &metrics);
-
-        // Set up anemo Network.
-        // let our_primary_peer_id =
-        //     PeerId(consensus_config.authority().network_key().0.to_bytes());
-        // let primary_to_worker_router = anemo::Router::new()
-        //     .add_rpc_service(primary_service)
-        //     // Add an Authorization Layer to ensure that we only service requests from our
-        // primary
-        //     .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new([our_primary_peer_id])))
-        //     .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.
-        // clone())));
-
-        // consensus_config.local_network().set_worker_network(id, network.clone());
 
         let block_fetcher = WorkerBlockFetcher::new(
             worker_name,
@@ -306,10 +281,6 @@ impl<DB: Database> Worker<DB> {
 
         let anemo_config = consensus_config.anemo_config();
 
-        // let network;
-        // let mut retries_left = 90;
-        // loop {
-        // let network_result = anemo::Network::bind(addr.clone())
         let network = anemo::Network::bind(addr.clone())
             .server_name("telcoin-network")
             .private_key(
@@ -325,25 +296,6 @@ impl<DB: Database> Worker<DB> {
             .outbound_request_layer(outbound_layer.clone())
             .start(service.clone())
             .expect("worker network bind");
-        // match network_result {
-        //     Ok(n) => {
-        //         network = n;
-        //         break;
-        //     }
-        //     Err(_) => {
-        //         retries_left -= 1;
-
-        //         if retries_left <= 0 {
-        //             panic!();
-        //         }
-        //         error!(target: "worker::worker",
-        //             "Address {} should be available for the primary Narwhal service, retrying in
-        // one second",             addr
-        //         );
-        //         sleep(Duration::from_secs(1));
-        //     }
-        // }
-        // }
 
         info!(target: "worker::worker", "Worker {} listening to worker messages on {}", id, address);
         network

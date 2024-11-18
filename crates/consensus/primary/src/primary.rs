@@ -80,9 +80,6 @@ impl Primary {
             .local_network()
             .set_worker_to_primary_local_handler(Arc::new(worker_receiver_handler));
 
-        // let worker_service = WorkerToPrimaryServer::new(worker_receiver_handler);
-        //
-
         let synchronizer = Arc::new(Synchronizer::new(config.clone(), consensus_bus));
         let network = Self::start_network(&config, synchronizer.clone(), consensus_bus);
 
@@ -104,8 +101,6 @@ impl Primary {
         // TODO: this is only needed to accurately return peer count from admin server and should
         // probably be removed - two tests fail - 1 primary and 1 worker
         // (peer count from admin server)
-        //
-        // DO NOT MERGE UNTIL THIS IS ADDRESSED
         //
         // Add my workers
         for worker in config.worker_cache().our_workers(config.authority().protocol_key()).unwrap()
@@ -242,20 +237,6 @@ impl Primary {
 
         let epoch_string: String = config.committee().epoch().to_string();
 
-        // let our_worker_peer_ids = config
-        //     .worker_cache()
-        //     .our_workers(config.authority().protocol_key())
-        //     .unwrap()
-        //     .into_iter()
-        //     .map(|worker_info| PeerId(worker_info.name.0.to_bytes()));
-        // let worker_to_primary_router = anemo::Router::new()
-        //     .add_rpc_service(worker_service)
-        //     // Add an Authorization Layer to ensure that we only service requests from our
-        // workers
-        //     .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new(our_worker_peer_ids)))
-        //     .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.
-        // clone())));
-
         let primary_peer_ids = config
             .committee()
             .authorities()
@@ -264,7 +245,6 @@ impl Primary {
             .add_rpc_service(primary_service)
             .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new(primary_peer_ids)))
             .route_layer(RequireAuthorizationLayer::new(AllowedEpoch::new(epoch_string.clone())));
-        // .merge(worker_to_primary_router);
 
         let service = ServiceBuilder::new()
             .layer(
@@ -301,9 +281,6 @@ impl Primary {
             .into_inner();
 
         let anemo_config = config.anemo_config();
-        // let network;
-        // let mut retries_left = 90;
-        // loop {
         let network = anemo::Network::bind(addr.clone())
             .server_name("telcoin-network")
             .private_key(
@@ -313,28 +290,6 @@ impl Primary {
             .outbound_request_layer(outbound_layer.clone())
             .start(service.clone())
             .expect("primary network bind");
-        // match network_result {
-        //     Ok(n) => {
-        //         network = n;
-        //         break;
-        //     }
-        //     Err(_) => {
-        //         retries_left -= 1;
-
-        //         if retries_left <= 0 {
-        //             panic!("Failed to initialize Network!");
-        //         }
-        //         error!(
-        //             "Address {} should be available for the primary Narwhal service, retrying in
-        // one second",             addr
-        //         );
-        //         sleep(Duration::from_secs(1));
-        //     }
-        // }
-        // }
-        //
-        // // TODO: remove this - only used in tests for convenience
-        // config.local_network().set_primary_network(network.clone());
 
         info!("Primary {} listening on {}", config.authority().id(), address);
         network

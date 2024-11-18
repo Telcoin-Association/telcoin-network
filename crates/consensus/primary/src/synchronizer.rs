@@ -500,9 +500,6 @@ impl<DB: Database> Synchronizer<DB> {
             "Synchronizer::AcceptCertificates"
         );
 
-        // // Start tasks to broadcast created certificates.
-        // let inner_senders = inner.clone();
-
         // Start a task to async download batches if needed
         let weak_inner = Arc::downgrade(&inner);
         spawn_logged_monitored_task!(
