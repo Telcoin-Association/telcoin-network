@@ -1,26 +1,35 @@
-//! Engine communication
+//! Engine communication.
+//!
+//! Implementation logic for processing inner-node messages from this primary's engine.
 // Copyright (c) Telcoin, LLC
 // SPDX-License-Identifier: Apache-2.0
 
 use anemo::async_trait;
 use consensus_network_types::{CanonicalUpdateMessage, EngineToPrimary};
-use tn_storage::traits::Database;
+use reth_primitives::SealedHeader;
+use tokio::sync::watch;
 
 #[allow(dead_code)]
-struct EngineReceiverHandler<DB> {
-    _db: DB,
+struct EngineReceiverHandler {
+    /// Watch channel with latest canonical header for proposer.
+    latest: watch::Sender<SealedHeader>,
 }
 
 // TODO: anemo still uses async_trait
 #[async_trait]
-impl<DB: Database> EngineToPrimary for EngineReceiverHandler<DB> {
+impl EngineToPrimary for EngineReceiverHandler {
     async fn canonical_update(
         &self,
-        _request: anemo::Request<CanonicalUpdateMessage>,
+        request: anemo::Request<CanonicalUpdateMessage>,
     ) -> Result<anemo::Response<()>, anemo::rpc::Status> {
-        // update watch channel so proposer has the latest tip
-        todo!()
+        let canon_update = request.into_body();
+
+        // update watch channel
+        self.latest
+            .send(canon_update.tip)
+            .map(|_| anemo::Response::new(()))
+            .map_err(|e| anemo::rpc::Status::internal(e.to_string()))
     }
 
-    // TODO: add method to update peers for sync
+    // TODO: add method to update peers for handshake
 }

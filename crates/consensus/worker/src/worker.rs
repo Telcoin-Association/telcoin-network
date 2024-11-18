@@ -91,6 +91,7 @@ impl<DB: Database> Worker<DB> {
 
         let node_metrics = metrics.worker_metrics.clone();
 
+        // Receive incoming messages from other workers.
         let network = Self::start_network(id, &consensus_config, validator.clone(), &metrics);
 
         let block_fetcher = WorkerBlockFetcher::new(
