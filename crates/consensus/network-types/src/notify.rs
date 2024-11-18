@@ -2,7 +2,6 @@
 //!
 //! These messages are passed as unreliable send and
 //! don't expect a response.
-use reth_primitives::SealedHeader;
 use serde::{Deserialize, Serialize};
 use tn_types::{AuthorityIdentifier, BlockHash, WorkerBlock, WorkerId};
 
@@ -13,9 +12,9 @@ pub struct WorkerSynchronizeMessage {
     pub digests: Vec<BlockHash>,
     /// The peer worker's authority.
     pub target: AuthorityIdentifier,
-    /// Used to indicate to the worker that it does not need to fully validate
-    /// the batch it receives because it is part of a certificate. Only digest
-    /// verification is required.
+    // Used to indicate to the worker that it does not need to fully validate
+    // the batch it receives because it is part of a certificate. Only digest
+    // verification is required.
     pub is_certified: bool,
 }
 
@@ -44,11 +43,4 @@ pub struct WorkerOthersBlockMessage {
 pub struct WorkerBlockMessage {
     /// The sending worker's batch.
     pub worker_block: WorkerBlock,
-}
-
-/// Engine to primary when canonical tip is updated.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CanonicalUpdateMessage {
-    /// The latest execution result.
-    pub tip: SealedHeader,
 }

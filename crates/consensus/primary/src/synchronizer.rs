@@ -30,8 +30,8 @@ use tn_storage::{traits::Database, CertificateStore, PayloadStore};
 use tn_types::{
     ensure,
     error::{AcceptNotification, DagError, DagResult},
-    AuthorityIdentifier, Certificate, CertificateDigest, Committee, Header,
-    Round, SignatureVerificationState, TnReceiver, TnSender, WorkerCache, CHANNEL_CAPACITY,
+    AuthorityIdentifier, Certificate, CertificateDigest, Committee, Header, Round,
+    SignatureVerificationState, TnReceiver, TnSender, WorkerCache, CHANNEL_CAPACITY,
 };
 use tn_utils::sync::notify_once::NotifyOnce;
 use tokio::{

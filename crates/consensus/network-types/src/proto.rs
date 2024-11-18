@@ -23,31 +23,32 @@
 /// - what are inbound request layers? `add_layer_for...`
 ///     - see crates/consensus/primary/src/primary.rs:L248
 /// - is there more to Routes than just keeping wires from crossing?
-/// - probably want to change codec to be consistent (rlp/ssz), but I think this can wait for post
+/// - probably want to change codec to be consistent (rlp), but I think this can wait for post
 ///   testnet
-mod consensus_network {
+mod narwhal {
+
     // output from build
-    include!(concat!(env!("OUT_DIR"), "/tn.PrimaryToPrimary.rs"));
-    include!(concat!(env!("OUT_DIR"), "/tn.PrimaryToWorker.rs"));
-    include!(concat!(env!("OUT_DIR"), "/tn.WorkerToPrimary.rs"));
-    include!(concat!(env!("OUT_DIR"), "/tn.WorkerToWorker.rs"));
-    include!(concat!(env!("OUT_DIR"), "/tn.EngineToPrimary.rs"));
-    include!(concat!(env!("OUT_DIR"), "/tn.PrimaryToEngine.rs"));
+    include!(concat!(env!("OUT_DIR"), "/narwhal.PrimaryToPrimary.rs"));
+    include!(concat!(env!("OUT_DIR"), "/narwhal.PrimaryToWorker.rs"));
+    include!(concat!(env!("OUT_DIR"), "/narwhal.WorkerToPrimary.rs"));
+    include!(concat!(env!("OUT_DIR"), "/narwhal.WorkerToWorker.rs"));
+    include!(concat!(env!("OUT_DIR"), "/narwhal.EngineToWorker.rs"));
+    include!(concat!(env!("OUT_DIR"), "/narwhal.WorkerToEngine.rs"));
 }
 
 // exports from build
-pub use consensus_network::{
+pub use narwhal::{
     // engine
-    engine_to_primary_client::EngineToPrimaryClient,
-    engine_to_primary_server::{EngineToPrimary, EngineToPrimaryServer, MockEngineToPrimary},
-    primary_to_engine_client::PrimaryToEngineClient,
-    primary_to_engine_server::{MockPrimaryToEngine, PrimaryToEngine, PrimaryToEngineServer},
+    engine_to_worker_client::EngineToWorkerClient,
+    engine_to_worker_server::{EngineToWorker, EngineToWorkerServer, MockEngineToWorker},
     // primary
     primary_to_primary_client::PrimaryToPrimaryClient,
     primary_to_primary_server::{MockPrimaryToPrimary, PrimaryToPrimary, PrimaryToPrimaryServer},
     primary_to_worker_client::PrimaryToWorkerClient,
     primary_to_worker_server::{MockPrimaryToWorker, PrimaryToWorker, PrimaryToWorkerServer},
     // worker
+    worker_to_engine_client::WorkerToEngineClient,
+    worker_to_engine_server::{MockWorkerToEngine, WorkerToEngine, WorkerToEngineServer},
     worker_to_primary_client::WorkerToPrimaryClient,
     worker_to_primary_server::{MockWorkerToPrimary, WorkerToPrimary, WorkerToPrimaryServer},
     worker_to_worker_client::WorkerToWorkerClient,

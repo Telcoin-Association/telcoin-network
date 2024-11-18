@@ -1,11 +1,10 @@
 //! Request message types
-use reth_primitives::SealedHeader;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use tn_types::{
-    AuthorityIdentifier, BlockHash, Certificate, Header, NetworkPublicKey, Round, WorkerBlock,
-    WorkerId,
+    AuthorityIdentifier, BlockHash, Certificate, Header, NetworkPublicKey, Round,
+    TransactionSigned, WorkerBlock, WorkerId,
 };
 use tracing::warn;
 
@@ -22,8 +21,8 @@ pub struct RequestVoteRequest {
     /// This primary's header for round.
     pub header: Header,
 
-    /// Parent certificates provided by the requester, in case the primary's peer doesn't yet
-    /// have them. The peer requires parent certs in order to offer a vote.
+    // Parent certificates provided by the requester, in case the primary's peer doesn't yet
+    // have them. The peer requires parent certs in order to offer a vote.
     pub parents: Vec<Certificate>,
 }
 
@@ -107,6 +106,21 @@ pub struct FetchBlocksRequest {
     pub known_workers: HashSet<NetworkPublicKey>,
 }
 
+/// TODO: probably delete this
+///
+/// Used by the Engine to request missing blocks from the worker's store
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MissingBlocksRequest {
+    /// Missing blocks
+    pub digests: HashSet<BlockHash>,
+}
+
+impl From<HashSet<BlockHash>> for MissingBlocksRequest {
+    fn from(digests: HashSet<BlockHash>) -> Self {
+        Self { digests }
+    }
+}
+
 //=== Workers
 
 /// Used by primary to bulk request blocks from workers local store.
@@ -114,6 +128,28 @@ pub struct FetchBlocksRequest {
 pub struct RequestBlocksRequest {
     /// Vec of requested blocks' digests
     pub block_digests: Vec<BlockHash>,
+}
+
+/// Worker's block provider request to EL after timer goes off.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuildBlockRequest {
+    /// The worker_id for the block.
+    pub worker_id: WorkerId,
+}
+
+impl From<WorkerId> for BuildBlockRequest {
+    fn from(worker_id: WorkerId) -> Self {
+        Self { worker_id }
+    }
+}
+
+/// Engine to worker after a block is built.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SealBlockRequest {
+    /// Collection of transactions encoded as bytes.
+    pub payload: Vec<TransactionSigned>,
+    /// Execution data for validation.
+    pub worker_block: WorkerBlock,
 }
 
 /// Used by workers to validate a peer's block using EL.
@@ -129,31 +165,15 @@ pub struct ValidateBlockRequest {
     pub worker_id: WorkerId,
 }
 
-/// Primary to engine request to verify a peer's latest execution result.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct VerifyExecutionRequest {
-    /// Execution data to verify.
-    ///
-    /// The peer sends their latest sealed header of the finalized canonical tip.
-    pub latest: SealedHeader,
-}
-
-/// Used by the Engine to forward requests from peers trying to sync.
-///
-/// TODO: this should probably be a peer request.
-/// The primary would add this peer and then the peer
-/// can request through another request/response method
-/// on PrimaryToPrimary or something similar to indicate
-/// non-consensus related requests. Maybe use "SyncState"
-/// namespace.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SyncStateRequest {
-    /// Missing blocks
-    pub digests: HashSet<BlockHash>,
-}
-
-impl From<HashSet<BlockHash>> for SyncStateRequest {
-    fn from(digests: HashSet<BlockHash>) -> Self {
-        Self { digests }
+impl From<SealBlockRequest> for WorkerBlock {
+    fn from(value: SealBlockRequest) -> Self {
+        Self {
+            transactions: value.payload,
+            parent_hash: value.worker_block.parent_hash,
+            beneficiary: value.worker_block.beneficiary,
+            timestamp: value.worker_block.timestamp,
+            base_fee_per_gas: value.worker_block.base_fee_per_gas,
+            received_at: None,
+        }
     }
 }
