@@ -23,7 +23,6 @@ members = [
     "crates/execution/block-builder",
     "crates/execution/block-validator",
     "crates/execution/faucet",
-    "crates/execution/state-sync",
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
