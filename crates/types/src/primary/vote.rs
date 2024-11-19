@@ -9,7 +9,7 @@ use std::fmt;
 
 use crate::{
     crypto::{
-        self, to_intent_message, BlsPublicKey, BlsSignature, IntentMessage, ValidatorSignature,
+        self, to_intent_message, BlsPublicKey, BlsSignature, IntentMessage, ProtocolSignature,
     },
     encode, AuthorityIdentifier, BlsSigner, Epoch, Header, HeaderDigest, Round,
 };

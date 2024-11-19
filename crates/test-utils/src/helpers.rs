@@ -19,7 +19,7 @@ use std::{
 use tn_types::{
     adiri_chain_spec_arc, to_intent_message, AuthorityIdentifier, BlsKeypair, BlsSignature,
     Certificate, CertificateDigest, Committee, Epoch, HeaderBuilder, Multiaddr, NetworkKeypair,
-    Round, Stake, TimestampSec, ValidatorSignature, WorkerBlock, WorkerId,
+    ProtocolSignature, Round, Stake, TimestampSec, WorkerBlock, WorkerId,
 };
 
 use crate::execution::TransactionFactory;
