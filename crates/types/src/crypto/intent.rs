@@ -3,7 +3,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Intent message types. This module may not be needed.
+//! Intent message types to protect replay attacks on signatures.
 use crate::try_decode;
 use eyre::eyre;
 use fastcrypto::encoding::decode_bytes_hex;
@@ -67,9 +67,9 @@ impl Default for AppId {
 #[repr(u8)]
 pub enum IntentScope {
     ProofOfPossession = 0, // Used for authority's proof of possession for protocol keys.
-    EpochBoundary = 1,     // Used for an authority signature on a checkpoint at epochs boundaries.
-    ConsensusDigest = 2,   // Used for narwhal authority signature on header digest.
-    PersonalMessage = 3,   // Used for a user signature on a personal message.
+    EpochBoundary = 1,     // Used for authority signature on a checkpoint at epochs boundaries.
+    ConsensusDigest = 2,   // Used for authority signature on consensus digests.
+    SystemMessage = 3,     // Used for signing system messages.
 }
 
 impl TryFrom<u8> for IntentScope {
@@ -89,8 +89,11 @@ impl TryFrom<u8> for IntentScope {
 /// The serialization of an Intent is a 3-byte array where each field is represented by a byte.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone, Hash)]
 pub struct Intent {
+    /// The scope of the intent within the system.
     pub scope: IntentScope,
+    /// The version of intent.
     pub version: IntentVersion,
+    /// The application id.
     pub app_id: AppId,
 }
 
@@ -115,18 +118,20 @@ impl Intent {
     }
 }
 
-/// Intent Message is a wrapper around a message with its intent.
+/// Intent Message is a wrapper around a message specifying its intent.
 ///
-/// The message can be any type that implements [trait Serialize]. *ALL* signatures in Sui must
-/// commits to the intent message, not the message itself. This guarantees any intent
-/// message signed in the system cannot collide with another since they are domain
-/// separated by intent.
+/// The message can be any type that implements [trait Serialize]. *ALL* signatures must
+/// sign the intent message, not the data itself. This guarantees any intent
+/// message signed in the system cannot collide with another since the domains
+/// are separated by intent.
 ///
 /// The serialization of an IntentMessage is compact: it only appends three bytes
 /// to the message itself.
 #[derive(Debug, PartialEq, Eq, Serialize, Clone, Hash, Deserialize)]
 pub struct IntentMessage<T> {
+    /// The data specifying the signature's intent.
     pub intent: Intent,
+    /// The underlying data of the message to include.
     pub value: T,
 }
 
@@ -134,10 +139,4 @@ impl<T> IntentMessage<T> {
     pub fn new(intent: Intent, value: T) -> Self {
         Self { intent, value }
     }
-}
-
-/// A person message that wraps around a byte array.
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
-pub struct PersonalMessage {
-    pub message: Vec<u8>,
 }
