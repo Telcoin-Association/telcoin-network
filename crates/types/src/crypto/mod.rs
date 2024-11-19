@@ -25,6 +25,7 @@ pub use fastcrypto::traits;
 use reth_chainspec::ChainSpec;
 use serde::Serialize;
 mod intent;
+mod network;
 use crate::encode;
 pub use intent::*;
 
@@ -52,6 +53,8 @@ pub type BlsKeypair = bls12381::min_sig::BLS12381KeyPair;
 pub type NetworkPublicKey = ed25519::Ed25519PublicKey;
 /// Keypair used to sign network messages between peers during consensus.
 pub type NetworkKeypair = ed25519::Ed25519KeyPair;
+/// Signature using network key.
+pub type NetworkSignature = ed25519::Ed25519Signature;
 //
 // EXECUTION
 //
@@ -102,7 +105,7 @@ pub fn generate_proof_of_possession(
     let genesis_bytes = encode(&chain_spec.genesis);
     msg.extend_from_slice(genesis_bytes.as_slice());
     let sig = BlsSignature::new_secure(
-        &IntentMessage::new(Intent::telcoin_app(IntentScope::ProofOfPossession), msg),
+        &IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg),
         keypair,
     );
     Ok(sig)
@@ -122,7 +125,7 @@ pub fn verify_proof_of_possession(
     let genesis_bytes = encode(&chain_spec.genesis);
     msg.extend_from_slice(genesis_bytes.as_slice());
     let result = proof.verify_secure(
-        &IntentMessage::new(Intent::telcoin_app(IntentScope::ProofOfPossession), msg),
+        &IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg),
         public_key,
     );
 
@@ -131,7 +134,10 @@ pub fn verify_proof_of_possession(
 
 /// A trait for sign and verify over an intent message, instead of the message itself. See more at
 /// [struct IntentMessage].
-pub trait ValidatorSignature {
+pub trait ProtocolSignature {
+    /// The type used to verify the signature.
+    type Pubkey: VerifyingKey;
+
     /// Create a new signature over an intent message.
     fn new_secure<T>(value: &IntentMessage<T>, secret: &dyn Signer<Self>) -> Self
     where
@@ -141,13 +147,15 @@ pub trait ValidatorSignature {
     fn verify_secure<T>(
         &self,
         value: &IntentMessage<T>,
-        author: &BlsPublicKey,
+        public_key: &Self::Pubkey,
     ) -> Result<(), FastCryptoError>
     where
         T: Serialize;
 }
 
-impl ValidatorSignature for BlsSignature {
+impl ProtocolSignature for BlsSignature {
+    type Pubkey = BlsPublicKey;
+
     fn new_secure<T>(value: &IntentMessage<T>, secret: &dyn Signer<Self>) -> Self
     where
         T: Serialize,
@@ -193,10 +201,10 @@ impl ValidatorAggregateSignature for BlsAggregateSignature {
     }
 }
 
-/// Wrap a message in an intent message. Currently in Narwhal, the scope is always
-/// IntentScope::HeaderDigest and the app id is AppId::Narwhal.
+/// Wrap a message in an intent message. Currently in Consensus, the scope is always
+/// IntentScope::ConsensusDigest and the app id is AppId::Consensus.
 pub fn to_intent_message<T>(value: T) -> IntentMessage<T> {
-    IntentMessage::new(Intent::narwhal_app(IntentScope::HeaderDigest), value)
+    IntentMessage::new(Intent::consensus(IntentScope::ConsensusDigest), value)
 }
 
 #[cfg(test)]

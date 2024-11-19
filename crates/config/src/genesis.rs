@@ -19,7 +19,7 @@ use std::{
 use tn_types::{
     adiri_genesis, verify_proof_of_possession, BlsPublicKey, BlsSignature, Committee,
     CommitteeBuilder, Epoch, Intent, IntentMessage, Multiaddr, NetworkPublicKey, PrimaryInfo,
-    ValidatorSignature, WorkerCache, WorkerIndex,
+    ProtocolSignature, WorkerCache, WorkerIndex,
 };
 use tracing::{info, warn};
 /// The validators directory used to create genesis.

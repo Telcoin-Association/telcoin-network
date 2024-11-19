@@ -3,15 +3,15 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Intent message types. This module may not be needed.
+//! Intent message types to protect replay attacks on signatures.
+use crate::try_decode;
 use eyre::eyre;
 use fastcrypto::encoding::decode_bytes_hex;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::str::FromStr;
 
-use crate::try_decode;
-
+/// The prefix length for intent messages.
 pub const INTENT_PREFIX_LENGTH: usize = 3;
 
 /// The version here is to distinguish between signing different versions of the struct
@@ -35,17 +35,16 @@ impl TryFrom<u8> for IntentVersion {
 /// This enums specifies the application ID.
 ///
 /// Two intents in two different applications
-/// (i.e., Narwhal, Telcoin, Ethereum, Polygon etc) should never collide, so that even when a
-/// signing key is reused, nobody can take a signature designated for app_1 and present it as a
+/// (ie. Telcoin, Ethereum, Polygon, etc) should never collide, so that even when a
+/// signing key is reused, the signature designated for app_1 cannot be used as a
 /// valid signature for any intent in app_2.
 #[derive(Serialize_repr, Deserialize_repr, Copy, Clone, PartialEq, Eq, Debug, Hash)]
 #[repr(u8)]
 pub enum AppId {
     Telcoin = 0,
-    Narwhal = 1,
+    Consensus = 1,
 }
 
-// TODO(joyqvq): Use num_derive
 impl TryFrom<u8> for AppId {
     type Error = eyre::Report;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
@@ -67,14 +66,10 @@ impl Default for AppId {
 #[derive(Serialize_repr, Deserialize_repr, Copy, Clone, PartialEq, Eq, Debug, Hash)]
 #[repr(u8)]
 pub enum IntentScope {
-    TransactionData = 0,         // Used for a user signature on a transaction data.
-    TransactionEffects = 1,      // Used for an authority signature on transaction effects.
-    CheckpointSummary = 2,       // Used for an authority signature on a checkpoint summary.
-    PersonalMessage = 3,         // Used for a user signature on a personal message.
-    SenderSignedTransaction = 4, // Used for an authority signature on a user signed transaction.
-    ProofOfPossession = 5,       /* Used as a signature representing an authority's proof of
-                                  * possession of its authority protocol key. */
-    HeaderDigest = 6, // Used for narwhal authority signature on header digest.
+    ProofOfPossession = 0, // Used for authority's proof of possession for protocol keys.
+    EpochBoundary = 1,     // Used for authority signature on a checkpoint at epochs boundaries.
+    ConsensusDigest = 2,   // Used for authority signature on consensus digests.
+    SystemMessage = 3,     // Used for signing system messages.
 }
 
 impl TryFrom<u8> for IntentScope {
@@ -94,8 +89,11 @@ impl TryFrom<u8> for IntentScope {
 /// The serialization of an Intent is a 3-byte array where each field is represented by a byte.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone, Hash)]
 pub struct Intent {
+    /// The scope of the intent within the system.
     pub scope: IntentScope,
+    /// The version of intent.
     pub version: IntentVersion,
+    /// The application id.
     pub app_id: AppId,
 }
 
@@ -111,27 +109,29 @@ impl FromStr for Intent {
 }
 
 impl Intent {
-    pub fn telcoin_app(scope: IntentScope) -> Self {
+    pub fn telcoin(scope: IntentScope) -> Self {
         Self { version: IntentVersion::V0, scope, app_id: AppId::Telcoin }
     }
 
-    pub fn narwhal_app(scope: IntentScope) -> Self {
-        Self { scope, version: IntentVersion::V0, app_id: AppId::Narwhal }
+    pub fn consensus(scope: IntentScope) -> Self {
+        Self { scope, version: IntentVersion::V0, app_id: AppId::Consensus }
     }
 }
 
-/// Intent Message is a wrapper around a message with its intent.
+/// Intent Message is a wrapper around a message specifying its intent.
 ///
-/// The message can be any type that implements [trait Serialize]. *ALL* signatures in Sui must
-/// commits to the intent message, not the message itself. This guarantees any intent
-/// message signed in the system cannot collide with another since they are domain
-/// separated by intent.
+/// The message can be any type that implements [trait Serialize]. *ALL* signatures must
+/// sign the intent message, not the data itself. This guarantees any intent
+/// message signed in the system cannot collide with another since the domains
+/// are separated by intent.
 ///
 /// The serialization of an IntentMessage is compact: it only appends three bytes
 /// to the message itself.
 #[derive(Debug, PartialEq, Eq, Serialize, Clone, Hash, Deserialize)]
 pub struct IntentMessage<T> {
+    /// The data specifying the signature's intent.
     pub intent: Intent,
+    /// The underlying data of the message to include.
     pub value: T,
 }
 
@@ -139,10 +139,4 @@ impl<T> IntentMessage<T> {
     pub fn new(intent: Intent, value: T) -> Self {
         Self { intent, value }
     }
-}
-
-/// A person message that wraps around a byte array.
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
-pub struct PersonalMessage {
-    pub message: Vec<u8>,
 }
