@@ -24,8 +24,8 @@ use std::future::Future;
 pub use fastcrypto::traits;
 use reth_chainspec::ChainSpec;
 use serde::Serialize;
-mod handshake;
 mod intent;
+mod network;
 use crate::encode;
 pub use intent::*;
 
