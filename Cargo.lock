@@ -10730,8 +10730,11 @@ version = "0.1.0"
 dependencies = [
  "jsonrpsee",
  "jsonrpsee-types",
+ "reth-chainspec",
  "reth-primitives",
+ "serde",
  "thiserror",
+ "tn-types",
 ]
 
 [[package]]

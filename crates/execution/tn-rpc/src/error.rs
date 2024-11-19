@@ -2,7 +2,7 @@
 //!
 //! These errors are returned by the RPC for public requests to the `tn` namespace.
 
-use reth_primitives::hex::encode_prefixed;
+use reth_primitives::{hex::encode_prefixed, ChainId};
 use thiserror::Error;
 
 /// The result type for TN RPC namespace.
@@ -11,8 +11,11 @@ pub type TelcoinNetworkRpcResult<T> = Result<T, TNRpcError>;
 /// Error type for public RPC endpoints in the `tn` namespace.
 #[derive(Debug, Error)]
 pub enum TNRpcError {
-    #[error("Failure while booting node")]
-    NodeBootstrapError,
+    /// Handshake client is trying to join the wrong network.
+    ///
+    /// Return this node's chain id.
+    #[error("Incompatible chain id for chain: {0}")]
+    InvalidChainId(ChainId),
 }
 
 impl From<TNRpcError> for jsonrpsee_types::ErrorObject<'static> {

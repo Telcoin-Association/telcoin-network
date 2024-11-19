@@ -9,9 +9,12 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
+tn-types = { workspace = true }
 jsonrpsee = { workspace = true }
 jsonrpsee-types = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
+reth-chainspec = { workspace = true }
 reth-primitives = { workspace = true }
 
 [lints]

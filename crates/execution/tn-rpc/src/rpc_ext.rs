@@ -1,7 +1,12 @@
 //! RPC extension that supports state sync through NVV peer request.
 
-use crate::error::TelcoinNetworkRpcResult;
+use crate::{
+    error::{TNRpcError, TelcoinNetworkRpcResult},
+    Handshake,
+};
 use jsonrpsee::{core::async_trait, proc_macros::rpc};
+use reth_chainspec::ChainSpec;
+use std::sync::Arc;
 
 /// Telcoin Network RPC namespace.
 ///
@@ -10,29 +15,41 @@ use jsonrpsee::{core::async_trait, proc_macros::rpc};
 pub trait TelcoinNetworkRpcExtApi {
     /// Transfer TEL to an address
     #[method(name = "validatorHandshake")]
-    async fn handshake(&self) -> TelcoinNetworkRpcResult<()>;
+    async fn handshake(&self, handshake: Handshake) -> TelcoinNetworkRpcResult<()>;
 }
 
 /// The type that implements `tn` namespace trait.
-pub struct TelcoinNetworkRpcExt<N, P> {
+pub struct TelcoinNetworkRpcExt<N> {
+    /// The chain id for this node.
+    chain: Arc<ChainSpec>,
     /// The inner-node network.
     ///
     /// The interface that handles primary <-> engine network communication.
     inner_node_network: N,
-    /// The database provider.
-    provider: P,
 }
 
 #[async_trait]
-impl<N, P> TelcoinNetworkRpcExtApiServer for TelcoinNetworkRpcExt<N, P>
+impl<N> TelcoinNetworkRpcExtApiServer for TelcoinNetworkRpcExt<N>
 where
     N: Send + Sync + 'static,
-    P: Send + Sync + 'static,
 {
     /// Handshake method.
     ///
     /// The handshake forwards peer requests to the Primary.
-    async fn handshake(&self) -> TelcoinNetworkRpcResult<()> {
+    async fn handshake(&self, handshake: Handshake) -> TelcoinNetworkRpcResult<()> {
+        // deconstruct handshake
+        let Handshake { chain_id, network_key, proof, address } = handshake;
+
+        let this_chain_id = self.chain.chain.id();
+
+        // ensure chain id matches
+        if chain_id != this_chain_id {
+            return Err(TNRpcError::InvalidChainId(this_chain_id));
+        }
+
+        // verify proof of possession
+        //
+
         // basic verify then forward to primary
         // - chain id
         // - read from staking contract to indicate with message to primary
@@ -41,9 +58,9 @@ where
     }
 }
 
-impl<N, P> TelcoinNetworkRpcExt<N, P> {
+impl<N> TelcoinNetworkRpcExt<N> {
     /// Create new instance of the Telcoin Network RPC extension.
-    pub fn new(inner_node_network: N, provider: P) -> Self {
-        Self { inner_node_network, provider }
+    pub fn new(chain: Arc<ChainSpec>, inner_node_network: N) -> Self {
+        Self { chain, inner_node_network }
     }
 }
