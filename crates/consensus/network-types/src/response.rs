@@ -54,12 +54,15 @@ pub struct RequestBlocksResponse {
     pub is_size_limit_reached: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SealedBlockResponse {
-    /// The block.
-    pub block: WorkerBlock,
-    /// The digest of the sealed block.
-    pub digest: BlockHash,
-    /// Worker id who broadcast the block
-    pub worker_id: WorkerId,
+//=== Engine
+
+/// Verification result for peer's latest execution result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VerifyExecutionResponse {
+    /// Boolean if the execution header was considered valid by engine.
+    ///
+    /// Engine verifies the integrity of the data and if the block num hash matches.
+    ///
+    /// TODO: should this return anything else?
+    pub valid: bool,
 }

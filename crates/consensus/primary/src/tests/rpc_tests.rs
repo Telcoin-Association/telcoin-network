@@ -13,15 +13,15 @@ use tn_types::AuthorityIdentifier;
 
 #[tokio::test]
 async fn test_server_authorizations() {
-    reth_tracing::init_test_tracing();
     // Set up primaries and workers with a committee.
     let manager = TaskManager::current();
     let executor = manager.executor();
     let mut test_cluster = Cluster::new(executor, MemDatabase::default);
     test_cluster.start(Some(4), Some(1), None).await;
     // allow enough time for peers to establish connections
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
+    let this_authority_id = test_cluster.authorities().await.first().unwrap().name;
     let primary_network =
         test_cluster.authorities().await.first().unwrap().primary_network().await.unwrap();
     let worker_network =
@@ -31,8 +31,14 @@ async fn test_server_authorizations() {
 
     // Reachable to primaries in the same committee.
     {
-        let target_authority = test_committee.authority(&AuthorityIdentifier(1)).unwrap();
+        // ensures this authority isn't `1`
+        //
+        // this test occasionally failed because this primary was assigned id `1`
+        let target = AuthorityIdentifier(1);
+        let target_id = if this_authority_id == target { AuthorityIdentifier(2) } else { target };
 
+        // retrieve peer's network key
+        let target_authority = test_committee.authority(&target_id).unwrap();
         let primary_target_name = target_authority.network_key();
         let request = anemo::Request::new(FetchCertificatesRequest::default())
             .with_timeout(Duration::from_secs(5));
