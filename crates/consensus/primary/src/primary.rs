@@ -102,8 +102,6 @@ impl Primary {
         // probably be removed - two tests fail - 1 primary and 1 worker
         // (peer count from admin server)
         //
-        // DO NOT MERGE UNTIL THIS IS ADDRESSED
-        //
         // Add my workers
         for worker in config.worker_cache().our_workers(config.authority().protocol_key()).unwrap()
         {
