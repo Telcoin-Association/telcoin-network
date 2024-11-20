@@ -4,7 +4,8 @@ use crate::{
     error::{TNRpcError, TelcoinNetworkRpcResult},
     Handshake,
 };
-use jsonrpsee::{core::async_trait, proc_macros::rpc};
+use async_trait::async_trait;
+use jsonrpsee::proc_macros::rpc;
 use reth_chainspec::ChainSpec;
 use std::sync::Arc;
 
@@ -37,18 +38,16 @@ where
     ///
     /// The handshake forwards peer requests to the Primary.
     async fn handshake(&self, handshake: Handshake) -> TelcoinNetworkRpcResult<()> {
-        // deconstruct handshake
-        let Handshake { chain_id, network_key, proof, address } = handshake;
-
-        let this_chain_id = self.chain.chain.id();
-
         // ensure chain id matches
-        if chain_id != this_chain_id {
+        let this_chain_id = self.chain.chain().id();
+        if !handshake.verify_chain_id(this_chain_id) {
             return Err(TNRpcError::InvalidChainId(this_chain_id));
         }
 
         // verify proof of possession
-        //
+        if !handshake.verify_proof(self.chain.genesis()) {
+            return Err(TNRpcError::InvalidProofOfPossession);
+        }
 
         // basic verify then forward to primary
         // - chain id

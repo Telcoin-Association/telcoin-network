@@ -16,6 +16,9 @@ pub enum TNRpcError {
     /// Return this node's chain id.
     #[error("Incompatible chain id for chain: {0}")]
     InvalidChainId(ChainId),
+    /// Handshake client provided an invalid signature for network key.
+    #[error("Invalid proof of possession for provided network key.")]
+    InvalidProofOfPossession,
 }
 
 impl From<TNRpcError> for jsonrpsee_types::ErrorObject<'static> {
@@ -37,8 +40,9 @@ pub fn rpc_err(
         code,
         msg.into(),
         data.map(|data| {
-            jsonrpsee::core::to_json_raw_value(&encode_prefixed(data))
-                .expect("string is serializable")
+            // jsonrpsee::core::to_json_raw_value(&encode_prefixed(data))
+            //     .expect("string is serializable")
+            encode_prefixed(data)
         }),
     )
 }

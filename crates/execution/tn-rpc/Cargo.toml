@@ -10,12 +10,16 @@ exclude.workspace = true
 
 [dependencies]
 tn-types = { workspace = true }
-jsonrpsee = { workspace = true }
+jsonrpsee = { workspace = true, features = ["server", "macros"] }
 jsonrpsee-types = { workspace = true }
+async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 reth-chainspec = { workspace = true }
 reth-primitives = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
 
 [lints]
 workspace = true

@@ -10728,8 +10728,10 @@ dependencies = [
 name = "tn-rpc"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "jsonrpsee",
  "jsonrpsee-types",
+ "rand 0.8.5",
  "reth-chainspec",
  "reth-primitives",
  "serde",

@@ -60,19 +60,18 @@ pub fn generate_proof_of_possession_network(
 ///
 /// The intent message is expected to contain the validator's public key
 /// and the [Genesis] for the network.
-pub fn verify_proof_of_possession_bls(
-    proof: &BlsSignature,
-    public_key: &BlsPublicKey,
-    chain_spec: &ChainSpec,
-) -> eyre::Result<()> {
-    public_key.validate().with_context(|| "Provided public key invalid")?;
+pub fn verify_proof_of_possession_network(
+    proof: &NetworkSignature,
+    public_key: &NetworkPublicKey,
+    genesis: &Genesis,
+) -> bool {
     let mut msg = public_key.as_bytes().to_vec();
-    let genesis_bytes = encode(&chain_spec.genesis);
+    let genesis_bytes = encode(genesis);
     msg.extend_from_slice(genesis_bytes.as_slice());
-    let result = proof.verify_secure(
-        &IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg),
-        public_key,
-    );
-
-    Ok(result?)
+    proof
+        .verify_secure(
+            &IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg),
+            public_key,
+        )
+        .is_ok()
 }
