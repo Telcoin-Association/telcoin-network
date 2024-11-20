@@ -23,16 +23,16 @@ use anemo_tower::{
     trace::{DefaultMakeSpan, DefaultOnFailure, TraceLayer},
 };
 use consensus_metrics::spawn_logged_monitored_task;
-use consensus_network::{
+use std::{collections::HashMap, net::Ipv4Addr, sync::Arc};
+use tn_block_validator::BlockValidation;
+use tn_config::ConsensusConfig;
+use tn_network::{
     epoch_filter::{AllowedEpoch, EPOCH_HEADER_KEY},
     failpoints::FailpointsMakeCallbackHandler,
     local::LocalNetwork,
     metrics::MetricsMakeCallbackHandler,
 };
-use consensus_network_types::WorkerToWorkerServer;
-use std::{collections::HashMap, net::Ipv4Addr, sync::Arc};
-use tn_block_validator::BlockValidation;
-use tn_config::ConsensusConfig;
+use tn_network_types::WorkerToWorkerServer;
 use tn_storage::traits::Database;
 use tn_types::{
     traits::KeyPair as _, AuthorityIdentifier, Multiaddr, NetworkPublicKey, Noticer, Protocol,
@@ -146,13 +146,12 @@ impl<DB: Database> Worker<DB> {
             peer_types.insert(PeerId(network_key.0.to_bytes()), "other_primary".to_string());
         }
 
-        let (connection_monitor_handle, _) =
-            consensus_network::connectivity::ConnectionMonitor::spawn(
-                network.downgrade(),
-                metrics.network_connection_metrics.clone(),
-                peer_types,
-                consensus_config.subscribe_shutdown(),
-            );
+        let (connection_monitor_handle, _) = tn_network::connectivity::ConnectionMonitor::spawn(
+            network.downgrade(),
+            metrics.network_connection_metrics.clone(),
+            peer_types,
+            consensus_config.subscribe_shutdown(),
+        );
 
         // TODO: revisit this soon
         let network_admin_server_base_port = consensus_config
@@ -166,7 +165,7 @@ impl<DB: Database> Worker<DB> {
             id, network_admin_server_base_port
         );
 
-        let admin_handles = consensus_network::admin::start_admin_server(
+        let admin_handles = tn_network::admin::start_admin_server(
             network_admin_server_base_port,
             network.clone(),
             consensus_config.subscribe_shutdown(),

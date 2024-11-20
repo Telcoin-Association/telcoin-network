@@ -8,16 +8,16 @@
 use crate::{aggregators::VotesAggregator, synchronizer::Synchronizer, ConsensusBus};
 use anemo::{rpc::Status, Request, Response};
 use consensus_metrics::{monitored_future, spawn_logged_monitored_task};
-use consensus_network::anemo_ext::{NetworkExt, WaitingPeer};
-use consensus_network_types::{
-    PrimaryToPrimaryClient, RequestVoteRequest, SendCertificateRequest, SendCertificateResponse,
-};
 use futures::{
     stream::{FuturesOrdered, FuturesUnordered},
     StreamExt,
 };
 use std::{cmp::min, future::Future, pin::pin, sync::Arc, task::Poll, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig};
+use tn_network::anemo_ext::{NetworkExt, WaitingPeer};
+use tn_network_types::{
+    PrimaryToPrimaryClient, RequestVoteRequest, SendCertificateRequest, SendCertificateResponse,
+};
 use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::{traits::Database, CertificateStore};
 use tn_types::{

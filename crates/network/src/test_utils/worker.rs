@@ -1,6 +1,6 @@
 //! Mock implementations for Worker to Primary/Worker.
 use anemo::async_trait;
-use consensus_network_types::{
+use tn_network_types::{
     RequestBlocksRequest, RequestBlocksResponse, WorkerBlockMessage, WorkerToWorker,
     WorkerToWorkerServer,
 };

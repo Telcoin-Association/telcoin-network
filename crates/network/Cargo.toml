@@ -1,5 +1,5 @@
 [package]
-name = "consensus-network"
+name = "tn-network"
 version.workspace = true
 license = "Apache-2.0"
 authors = [
@@ -23,7 +23,7 @@ tracing = { workspace = true }
 tn-types = { workspace = true }
 tn-utils = { workspace = true }
 consensus-metrics = { workspace = true }
-consensus-network-types = { workspace = true }
+tn-network-types = { workspace = true }
 
 anemo = { workspace = true }
 anemo-tower = { workspace = true }

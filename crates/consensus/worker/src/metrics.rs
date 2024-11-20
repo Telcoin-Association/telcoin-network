@@ -2,7 +2,6 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use consensus_network::metrics::{NetworkConnectionMetrics, NetworkMetrics};
 use prometheus::{
     default_registry, register_histogram_vec_with_registry, register_histogram_with_registry,
     register_int_counter_vec_with_registry, register_int_counter_with_registry,
@@ -10,6 +9,7 @@ use prometheus::{
     Registry,
 };
 use std::sync::Arc;
+use tn_network::metrics::{NetworkConnectionMetrics, NetworkMetrics};
 
 const LATENCY_SEC_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4,

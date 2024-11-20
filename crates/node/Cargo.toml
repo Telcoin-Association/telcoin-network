@@ -32,13 +32,13 @@ enr = { workspace = true, default-features = false, features = [
 
 fastcrypto = { workspace = true }
 tn-executor = { workspace = true }
-consensus-network = { workspace = true }
+tn-network = { workspace = true }
 tn-primary = { workspace = true, features = ["test-utils"] }
 prometheus = { workspace = true }
 tn-storage = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
-consensus-network-types = { workspace = true }
+tn-network-types = { workspace = true }
 tn-worker = { workspace = true }
 eyre = { workspace = true }
 
@@ -93,7 +93,7 @@ serde-reflection = { workspace = true }
 serde_yaml = { workspace = true }
 tn-test-utils = { workspace = true }
 reth-tracing = { workspace = true }
-consensus-network = { workspace = true, features = ["test-utils"] }
+tn-network = { workspace = true, features = ["test-utils"] }
 tn-primary = { workspace = true }
 assert_matches = { workspace = true }
 tempfile = { workspace = true }

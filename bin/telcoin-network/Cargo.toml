@@ -43,7 +43,7 @@ rand_chacha = { workspace = true }
 prometheus = { workspace = true }
 tn-types = { workspace = true }
 tn-node = { workspace = true }
-consensus-network = { workspace = true }
+tn-network = { workspace = true }
 consensus-metrics = { workspace = true }
 tn-faucet = { workspace = true, optional = true }
 alloy = { workspace = true }

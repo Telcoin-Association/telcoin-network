@@ -7,7 +7,7 @@ use crate::{
     CancelOnDropHandler, RetryConfig,
 };
 use anemo::PeerId;
-use consensus_network_types::{
+use tn_network_types::{
     FetchCertificatesRequest, FetchCertificatesResponse, PrimaryToPrimaryClient,
     RequestBlocksRequest, RequestBlocksResponse, WorkerBlockMessage, WorkerToWorkerClient,
 };

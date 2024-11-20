@@ -5,8 +5,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anemo::async_trait;
-use consensus_network_types::{CanonicalUpdateMessage, EngineToPrimary};
 use reth_primitives::SealedHeader;
+use tn_network_types::{CanonicalUpdateMessage, EngineToPrimary};
 use tokio::sync::watch;
 
 #[allow(dead_code)]

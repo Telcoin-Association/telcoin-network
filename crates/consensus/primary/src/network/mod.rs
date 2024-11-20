@@ -8,7 +8,6 @@
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
 use crate::{synchronizer::Synchronizer, ConsensusBus};
-use consensus_network_types::{RequestVoteRequest, RequestVoteResponse};
 use fastcrypto::hash::Hash;
 use parking_lot::Mutex;
 use std::{
@@ -17,6 +16,7 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
+use tn_network_types::{RequestVoteRequest, RequestVoteResponse};
 use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::{traits::Database, PayloadStore};
 use tn_types::{

@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::{errors::SubscriberResult, metrics::ExecutorMetrics};
 use consensus_metrics::spawn_logged_monitored_task;
-use consensus_network::{local::LocalNetwork, PrimaryToWorkerClient};
-use consensus_network_types::FetchBlocksRequest;
 use fastcrypto::hash::Hash;
 use futures::{stream::FuturesOrdered, StreamExt};
 use reth_primitives::{Address, B256};
@@ -15,6 +13,8 @@ use std::{
     vec,
 };
 use tn_config::ConsensusConfig;
+use tn_network::{local::LocalNetwork, PrimaryToWorkerClient};
+use tn_network_types::FetchBlocksRequest;
 use tn_primary::ConsensusBus;
 use tn_storage::{
     tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},

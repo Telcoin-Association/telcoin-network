@@ -1,8 +1,8 @@
 //! Configuration for consensus network (primary and worker).
 use anemo::Config as AnemoConfig;
-use consensus_network::local::LocalNetwork;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use tn_network::local::LocalNetwork;
 use tn_storage::{traits::Database, NodeStorage};
 use tn_types::{Authority, Committee, Noticer, Notifier, WorkerCache};
 

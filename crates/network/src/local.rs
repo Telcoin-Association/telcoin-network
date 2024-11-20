@@ -8,7 +8,7 @@ use crate::{
     traits::{PrimaryToWorkerClient, WorkerToPrimaryClient},
 };
 use anemo::{PeerId, Request};
-use consensus_network_types::{
+use tn_network_types::{
     FetchBlocksRequest, FetchBlocksResponse, PrimaryToWorker, WorkerOthersBlockMessage,
     WorkerOwnBlockMessage, WorkerSynchronizeMessage, WorkerToPrimary,
 };

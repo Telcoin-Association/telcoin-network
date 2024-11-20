@@ -5,8 +5,6 @@
 use crate::metrics::WorkerMetrics;
 use anemo::Network;
 use async_trait::async_trait;
-use consensus_network::WorkerRpc;
-use consensus_network_types::{RequestBlocksRequest, RequestBlocksResponse};
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use itertools::Itertools;
 use prometheus::IntGauge;
@@ -16,6 +14,8 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tn_network::WorkerRpc;
+use tn_network_types::{RequestBlocksRequest, RequestBlocksResponse};
 use tn_storage::{
     tables::WorkerBlocks,
     traits::{Database, DbTxMut},

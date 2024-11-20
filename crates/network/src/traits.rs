@@ -2,13 +2,13 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 use crate::{error::LocalClientError, CancelOnDropHandler};
-use consensus_network_types::{
+use eyre::Result;
+use std::future::Future;
+use tn_network_types::{
     FetchBlocksRequest, FetchBlocksResponse, FetchCertificatesRequest, FetchCertificatesResponse,
     RequestBlocksRequest, RequestBlocksResponse, WorkerOthersBlockMessage, WorkerOwnBlockMessage,
     WorkerSynchronizeMessage,
 };
-use eyre::Result;
-use std::future::Future;
 use tn_types::NetworkPublicKey;
 
 pub trait ReliableNetwork<Request: Clone + Send + Sync> {

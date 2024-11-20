@@ -414,7 +414,6 @@ where
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
-    use consensus_network::local::LocalNetwork;
     use reth::tasks::TaskManager;
     use reth_blockchain_tree::{
         noop::NoopBlockchainTree, BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree,
@@ -442,6 +441,7 @@ mod tests {
     use std::{str::FromStr, time::Duration};
     use tempfile::TempDir;
     use tn_engine::execute_consensus_output;
+    use tn_network::local::LocalNetwork;
     use tn_storage::{open_db, tables::WorkerBlocks, traits::Database};
     use tn_test_utils::{adiri_genesis_seeded, get_gas_price, TransactionFactory};
     use tn_types::{

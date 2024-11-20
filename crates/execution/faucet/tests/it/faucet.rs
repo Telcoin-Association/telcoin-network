@@ -11,7 +11,6 @@ use alloy::{
     hex, sol,
     sol_types::{SolType, SolValue},
 };
-use consensus_network::local::LocalNetwork;
 use gcloud_sdk::{
     google::cloud::kms::v1::{
         key_management_service_client::KeyManagementServiceClient, GetPublicKeyRequest,
@@ -34,6 +33,7 @@ use std::{str::FromStr, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tn_config::{fetch_file_content, ContractStandardJson};
 use tn_faucet::Drip;
+use tn_network::local::LocalNetwork;
 use tn_storage::open_db;
 use tn_test_utils::{
     default_test_execution_node, execution_outcome_for_tests, faucet_test_execution_node,

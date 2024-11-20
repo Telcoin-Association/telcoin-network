@@ -5,7 +5,6 @@
 use crate::{synchronizer::Synchronizer, ConsensusBus};
 use anemo::Request;
 use consensus_metrics::{monitored_future, monitored_scope, spawn_logged_monitored_task};
-use consensus_network::PrimaryToPrimaryRpc;
 use futures::{stream::FuturesUnordered, StreamExt};
 use rand::{rngs::ThreadRng, seq::SliceRandom};
 use std::{
@@ -13,11 +12,12 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tn_network::PrimaryToPrimaryRpc;
 use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::{traits::Database, CertificateStore};
 use tn_types::{AuthorityIdentifier, Committee, NetworkPublicKey, Noticer, TnReceiver, TnSender};
 
-use consensus_network_types::{FetchCertificatesRequest, FetchCertificatesResponse};
+use tn_network_types::{FetchCertificatesRequest, FetchCertificatesResponse};
 use tn_types::{
     error::{DagError, DagResult},
     validate_received_certificate_version, Certificate, Round,

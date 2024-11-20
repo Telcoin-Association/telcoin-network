@@ -5,10 +5,10 @@
 use super::*;
 
 use crate::ConsensusBus;
-use consensus_network_types::{MockPrimaryToPrimary, PrimaryToPrimaryServer, RequestVoteResponse};
 use fastcrypto::traits::KeyPair;
 use rand::{rngs::StdRng, SeedableRng};
 use std::num::NonZeroUsize;
+use tn_network_types::{MockPrimaryToPrimary, PrimaryToPrimaryServer, RequestVoteResponse};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
 use tn_types::{BlsKeypair, SignatureVerificationState, TnSender};

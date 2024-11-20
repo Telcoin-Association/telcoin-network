@@ -37,8 +37,8 @@ tap = { workspace = true }
 
 fastcrypto = { workspace = true }
 fastcrypto-tbls = { workspace = true }
-consensus-network = { workspace = true }
-consensus-network-types = { workspace = true }
+tn-network = { workspace = true }
+tn-network-types = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
 tn-storage = { workspace = true }
