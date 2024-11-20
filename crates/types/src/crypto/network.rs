@@ -1,11 +1,15 @@
 //! Crypto functions to help with new node handshake using network keys.
 
-use super::{IntentMessage, NetworkPublicKey, NetworkSignature, ProtocolSignature};
+use super::{
+    Intent, IntentMessage, IntentScope, NetworkKeypair, NetworkPublicKey, NetworkSignature,
+    ProtocolSignature,
+};
 use crate::encode;
 use fastcrypto::{
     error::FastCryptoError,
-    traits::{Signer, VerifyingKey as _},
+    traits::{KeyPair as _, Signer, ToFromBytes as _, VerifyingKey as _},
 };
+use reth_primitives::Genesis;
 use serde::Serialize;
 
 impl ProtocolSignature for NetworkSignature {
@@ -30,4 +34,45 @@ impl ProtocolSignature for NetworkSignature {
         let message = encode(&value);
         public_key.verify(&message, self)
     }
+}
+
+/// Generate a proof for handshake.
+///
+/// This is used to verify network signatures for newly discovered peers.
+///
+/// The proof of possession is a [NetworkSignature] committed over the intent message
+/// `intent || message` (See more at [IntentMessage] and [Intent]).
+/// The message is constructed as: [NetworkPublicKey] || [Genesis].
+pub fn generate_proof_of_possession_network(
+    keypair: &NetworkKeypair,
+    genesis: &Genesis,
+) -> NetworkSignature {
+    let mut msg = keypair.public().as_bytes().to_vec();
+    let genesis_bytes = encode(&genesis);
+    msg.extend_from_slice(genesis_bytes.as_slice());
+    NetworkSignature::new_secure(
+        &IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg),
+        keypair,
+    )
+}
+
+/// Verify proof of possession against the expected intent message.
+///
+/// The intent message is expected to contain the validator's public key
+/// and the [Genesis] for the network.
+pub fn verify_proof_of_possession_bls(
+    proof: &BlsSignature,
+    public_key: &BlsPublicKey,
+    chain_spec: &ChainSpec,
+) -> eyre::Result<()> {
+    public_key.validate().with_context(|| "Provided public key invalid")?;
+    let mut msg = public_key.as_bytes().to_vec();
+    let genesis_bytes = encode(&chain_spec.genesis);
+    msg.extend_from_slice(genesis_bytes.as_slice());
+    let result = proof.verify_secure(
+        &IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg),
+        public_key,
+    );
+
+    Ok(result?)
 }

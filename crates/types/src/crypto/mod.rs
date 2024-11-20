@@ -28,6 +28,7 @@ mod intent;
 mod network;
 use crate::encode;
 pub use intent::*;
+pub use network::*;
 
 //
 // CONSENSUS
@@ -96,8 +97,8 @@ pub trait BlsSigner: Clone + Send + Sync + Unpin + 'static {
 ///
 /// The proof of possession is a [BlsSignature] committed over the intent message
 /// `intent || message` (See more at [IntentMessage] and [Intent]).
-/// The message is constructed as: [BlsPublicKey] || [ChainSpec].
-pub fn generate_proof_of_possession(
+/// The message is constructed as: [BlsPublicKey] || [Genesis].
+pub fn generate_proof_of_possession_bls(
     keypair: &BlsKeypair,
     chain_spec: &ChainSpec,
 ) -> eyre::Result<BlsSignature> {
@@ -114,8 +115,8 @@ pub fn generate_proof_of_possession(
 /// Verify proof of possession against the expected intent message,
 ///
 /// The intent message is expected to contain the validator's public key
-/// and the [ChainSpec] for the network.
-pub fn verify_proof_of_possession(
+/// and the [Genesis] for the network.
+pub fn verify_proof_of_possession_bls(
     proof: &BlsSignature,
     public_key: &BlsPublicKey,
     chain_spec: &ChainSpec,
@@ -209,7 +210,7 @@ pub fn to_intent_message<T>(value: T) -> IntentMessage<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_proof_of_possession, verify_proof_of_possession};
+    use super::{generate_proof_of_possession_bls, verify_proof_of_possession_bls};
     use crate::{adiri_chain_spec_arc, adiri_genesis, BlsKeypair};
     use fastcrypto::traits::KeyPair;
     use rand::{
@@ -221,8 +222,8 @@ mod tests {
     fn test_proof_of_possession_success() {
         let keypair = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
         let chain_spec = adiri_chain_spec_arc();
-        let proof = generate_proof_of_possession(&keypair, &chain_spec).unwrap();
-        assert!(verify_proof_of_possession(&proof, keypair.public(), &chain_spec).is_ok())
+        let proof = generate_proof_of_possession_bls(&keypair, &chain_spec).unwrap();
+        assert!(verify_proof_of_possession_bls(&proof, keypair.public(), &chain_spec).is_ok())
     }
 
     #[test]
@@ -230,8 +231,8 @@ mod tests {
         let keypair = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
         let malicious_key = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
         let chain_spec = adiri_chain_spec_arc();
-        let proof = generate_proof_of_possession(&malicious_key, &chain_spec).unwrap();
-        assert!(verify_proof_of_possession(&proof, keypair.public(), &chain_spec).is_err())
+        let proof = generate_proof_of_possession_bls(&malicious_key, &chain_spec).unwrap();
+        assert!(verify_proof_of_possession_bls(&proof, keypair.public(), &chain_spec).is_err())
     }
 
     #[test]
@@ -239,8 +240,8 @@ mod tests {
         let keypair = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
         let malicious_key = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
         let chain_spec = adiri_chain_spec_arc();
-        let proof = generate_proof_of_possession(&keypair, &chain_spec).unwrap();
-        assert!(verify_proof_of_possession(&proof, malicious_key.public(), &chain_spec).is_err())
+        let proof = generate_proof_of_possession_bls(&keypair, &chain_spec).unwrap();
+        assert!(verify_proof_of_possession_bls(&proof, malicious_key.public(), &chain_spec).is_err())
     }
 
     #[test]
@@ -249,7 +250,7 @@ mod tests {
         let chain_spec = adiri_chain_spec_arc();
         let mut wrong = adiri_genesis();
         wrong.timestamp = 0;
-        let proof = generate_proof_of_possession(&keypair, &wrong.into()).unwrap();
-        assert!(verify_proof_of_possession(&proof, keypair.public(), &chain_spec).is_err())
+        let proof = generate_proof_of_possession_bls(&keypair, &wrong.into()).unwrap();
+        assert!(verify_proof_of_possession_bls(&proof, keypair.public(), &chain_spec).is_err())
     }
 }
