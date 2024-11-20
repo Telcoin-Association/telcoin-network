@@ -40,9 +40,8 @@ pub fn rpc_err(
         code,
         msg.into(),
         data.map(|data| {
-            // jsonrpsee::core::to_json_raw_value(&encode_prefixed(data))
-            //     .expect("string is serializable")
-            encode_prefixed(data)
+            jsonrpsee::core::to_json_raw_value(&encode_prefixed(data))
+                .expect("string is serializable")
         }),
     )
 }

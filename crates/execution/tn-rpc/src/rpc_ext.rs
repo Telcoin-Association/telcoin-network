@@ -49,11 +49,9 @@ where
             return Err(TNRpcError::InvalidProofOfPossession);
         }
 
-        // basic verify then forward to primary
-        // - chain id
-        // - read from staking contract to indicate with message to primary
-        //   that peer is NVV or OV for peer-type
-        todo!()
+        // TODO: forward to primary
+        // self.inner_node_network.new_peer
+        Ok(())
     }
 }
 
