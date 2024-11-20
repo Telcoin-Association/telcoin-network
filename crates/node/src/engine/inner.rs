@@ -367,8 +367,10 @@ where
         let engine_to_primary = (); // TODO: pass client/server here
         let tn_ext = TelcoinNetworkRpcExt::new(ctx.chain_spec(), engine_to_primary);
         if let Err(e) = server.merge_configured(tn_ext.into_rpc()) {
-            error!(target: "faucet", "Error merging TN rpc module: {e:?}");
+            error!(target: "tn::execution", "Error merging TN rpc module: {e:?}");
         }
+
+        info!(target: "tn::execution", "tn rpc extension successfully merged");
 
         // extend faucet namespace if included
         if let Some(faucet_args) = self.opt_faucet_args.take() {
