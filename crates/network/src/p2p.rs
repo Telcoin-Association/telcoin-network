@@ -7,12 +7,12 @@ use crate::{
     CancelOnDropHandler, RetryConfig,
 };
 use anemo::PeerId;
+use eyre::{format_err, Result};
+use std::time::Duration;
 use tn_network_types::{
     FetchCertificatesRequest, FetchCertificatesResponse, PrimaryToPrimaryClient,
     RequestBlocksRequest, RequestBlocksResponse, WorkerBlockMessage, WorkerToWorkerClient,
 };
-use eyre::{format_err, Result};
-use std::time::Duration;
 use tn_types::NetworkPublicKey;
 
 fn send<F, R, Fut>(

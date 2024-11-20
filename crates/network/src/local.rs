@@ -8,12 +8,12 @@ use crate::{
     traits::{PrimaryToWorkerClient, WorkerToPrimaryClient},
 };
 use anemo::{PeerId, Request};
+use parking_lot::RwLock;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tn_network_types::{
     FetchBlocksRequest, FetchBlocksResponse, PrimaryToWorker, WorkerOthersBlockMessage,
     WorkerOwnBlockMessage, WorkerSynchronizeMessage, WorkerToPrimary,
 };
-use parking_lot::RwLock;
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tn_types::{traits::KeyPair, NetworkKeypair, NetworkPublicKey};
 use tn_utils::sync::notify_once::NotifyOnce;
 use tokio::{select, time::sleep};
