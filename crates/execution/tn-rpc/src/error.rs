@@ -17,7 +17,7 @@ pub enum TNRpcError {
     #[error("Incompatible chain id for chain: {0}")]
     InvalidChainId(ChainId),
     /// Handshake client provided an invalid signature for network key.
-    #[error("Invalid proof of possession for provided network key.")]
+    #[error("Invalid proof of possession for provided network key or genesis.")]
     InvalidProofOfPossession,
 }
 

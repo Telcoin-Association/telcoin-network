@@ -46,7 +46,8 @@ impl Handshake {
 
     /// Verify the peer's proof of possession.
     ///
-    /// The expected signature should contain the peer's network public key and the genesis for the same chain as this node.
+    /// The expected signature should contain the peer's network public key and the genesis for the
+    /// same chain as this node.
     ///
     /// The method returns bool indicating if the signature is valid (true) or invalid (false).
     pub fn verify_proof(&self, genesis: &Genesis) -> bool {
@@ -79,7 +80,8 @@ impl HandshakeBuilder {
 
     /// Build the [Handshake] using the builder's values.
     ///
-    /// This method calls another function to generate the proof of possession for the provided network keys.
+    /// This method calls another function to generate the proof of possession for the provided
+    /// network keys.
     pub fn build(self) -> Handshake {
         // deconstruct builder
         let Self { chain_id, network_keypair, address, genesis } = self;
