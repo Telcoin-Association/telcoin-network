@@ -40,6 +40,7 @@ tn-types = { workspace = true }
 tn-config = { workspace = true }
 consensus-network-types = { workspace = true }
 tn-worker = { workspace = true }
+tn-rpc = { workspace = true }
 eyre = { workspace = true }
 
 consensus-metrics = { workspace = true }

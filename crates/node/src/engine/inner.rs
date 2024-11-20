@@ -44,6 +44,7 @@ use tn_block_validator::BlockValidator;
 use tn_config::Config;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
+use tn_rpc::{TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{Consensus, ConsensusOutput, LastCanonicalUpdate, WorkerBlockSender, WorkerId};
 use tokio::sync::{broadcast, mpsc::unbounded_channel};
 use tokio_stream::wrappers::BroadcastStream;
@@ -362,6 +363,14 @@ where
         // TODO: rpc hook here
         // server.merge.node_configured(rpc_ext)?;
 
+        // extend TN namespace
+        let engine_to_primary = (); // TODO: pass client/server here
+        let tn_ext = TelcoinNetworkRpcExt::new(ctx.chain_spec(), engine_to_primary);
+        if let Err(e) = server.merge_configured(tn_ext.into_rpc()) {
+            error!(target: "faucet", "Error merging TN rpc module: {e:?}");
+        }
+
+        // extend faucet namespace if included
         if let Some(faucet_args) = self.opt_faucet_args.take() {
             // create extension from CLI args
             match faucet_args

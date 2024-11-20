@@ -25,13 +25,15 @@ impl From<TNRpcError> for jsonrpsee_types::ErrorObject<'static> {
     fn from(error: TNRpcError) -> Self {
         // TODO: update this when adding errors
         match error {
-            _ => rpc_err(500, error.to_string(), None),
+            TNRpcError::InvalidProofOfPossession => rpc_error(401, error.to_string(), None),
+            TNRpcError::InvalidChainId(_) => rpc_error(400, error.to_string(), None),
+            // _ => rpc_error(500, error.to_string(), None),
         }
     }
 }
 
 /// Constructs a JSON-RPC error for jsonrpsee compatibility.
-pub fn rpc_err(
+pub fn rpc_error(
     code: i32,
     msg: impl Into<String>,
     data: Option<&[u8]>,

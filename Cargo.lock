@@ -10653,6 +10653,7 @@ dependencies = [
  "tn-faucet",
  "tn-primary",
  "tn-primary-metrics",
+ "tn-rpc",
  "tn-storage",
  "tn-test-utils",
  "tn-types",

@@ -26,7 +26,7 @@ pub struct TelcoinNetworkRpcExt<N> {
     /// The inner-node network.
     ///
     /// The interface that handles primary <-> engine network communication.
-    inner_node_network: N,
+    _inner_node_network: N,
 }
 
 #[async_trait]
@@ -57,7 +57,7 @@ where
 
 impl<N> TelcoinNetworkRpcExt<N> {
     /// Create new instance of the Telcoin Network RPC extension.
-    pub fn new(chain: Arc<ChainSpec>, inner_node_network: N) -> Self {
-        Self { chain, inner_node_network }
+    pub fn new(chain: Arc<ChainSpec>, _inner_node_network: N) -> Self {
+        Self { chain, _inner_node_network }
     }
 }
