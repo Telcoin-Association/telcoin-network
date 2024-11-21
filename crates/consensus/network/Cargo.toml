@@ -35,6 +35,8 @@ anyhow = { workspace = true }
 eyre = { workspace = true }
 thiserror = { workspace = true }
 
+reth-primitives = { workspace = true }
+
 [dev-dependencies]
 tn-test-utils = { workspace = true }
 

@@ -2079,6 +2079,7 @@ dependencies = [
  "prometheus",
  "quinn-proto",
  "rand 0.8.5",
+ "reth-primitives",
  "thiserror",
  "tn-test-utils",
  "tn-types",

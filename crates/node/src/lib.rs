@@ -45,6 +45,9 @@ where
     // adjust rpc instance ports
     builder.node_config.adjust_instance_ports();
 
+    // TODO: impl trait for inner-node network to swap out later with WAN solution
+    // trait InnerNetwork
+    //
     // create the local network for engine <-> primary <-> worker
     let inner_network = InnerNodeNetwork::spawn();
     let (primary_handle, worker_handle, engine_handle) = inner_network.into_parts();

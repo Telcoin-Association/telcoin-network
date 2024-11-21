@@ -21,18 +21,6 @@ pub struct InnerNodeNetwork {
     engine_handle: EngineInnerNetworkHandle,
 }
 
-/// Message types for inner-node communication.
-pub enum InnerNetworkMessage {
-    /// From primary to the worker.
-    PrimaryToWorker,
-    /// From primary to the engine.
-    PrimaryToEngine,
-    /// From worker to the primary.
-    WorkerToPrimary,
-    /// From engine to the primary.
-    EngineToPrimary,
-}
-
 impl InnerNodeNetwork {
     /// Deconstruct self for separate nodes to take ownership of handles.
     pub fn into_parts(
@@ -107,9 +95,14 @@ impl InnerNodeNetwork {
         tokio::spawn(async move {
             while let Some(msg) = engine_router.recv().await {
                 match msg {
+                    EngineToPrimaryMessage::CanonicalUpdate(tip) => {
+                        if let Err(e) = inner_engine_to_primary.send(tip).await {
+                            error!(target: "inner-node-network", ?e, "engine to primary canonical update")
+                        }
+                    }
                     EngineToPrimaryMessage::Handshake => {
                         if let Err(e) = inner_engine_to_primary.send(()).await {
-                            error!(target: "inner-node-network", ?e, "engine to primary")
+                            error!(target: "inner-node-network", ?e, "engine to primary handshake/new peer")
                         }
                     }
                 }

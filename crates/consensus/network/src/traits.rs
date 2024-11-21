@@ -8,6 +8,7 @@ use consensus_network_types::{
     WorkerSynchronizeMessage,
 };
 use eyre::Result;
+use reth_primitives::SealedHeader;
 use std::future::Future;
 use tn_types::NetworkPublicKey;
 
@@ -74,4 +75,9 @@ pub trait WorkerRpc {
         peer: &NetworkPublicKey,
         request: impl anemo::types::request::IntoRequest<RequestBlocksRequest> + Send,
     ) -> impl Future<Output = Result<RequestBlocksResponse>>;
+}
+
+/// Trait to replace anemo.
+pub trait EngineToPrimary {
+    fn canonical_update(&self, new_tip: SealedHeader) -> impl Future<Output = Result<()>>;
 }
