@@ -78,6 +78,11 @@ pub trait WorkerRpc {
 }
 
 /// Trait to replace anemo.
-pub trait EngineToPrimary {
+pub trait EngineToPrimaryClient {
     fn canonical_update(&self, new_tip: SealedHeader) -> impl Future<Output = Result<()>>;
+}
+
+/// Trait to replace anemo.
+pub trait PrimaryToEngineClient {
+    fn verify_execution(&self, value: SealedHeader) -> impl Future<Output = Result<()>>;
 }

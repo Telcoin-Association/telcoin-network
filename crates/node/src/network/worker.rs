@@ -1,5 +1,6 @@
 //! Inner-node network impl for the worker.
 
+use super::PrimaryToWorkerMessage;
 use consensus_network_types::{WorkerOthersBlockMessage, WorkerOwnBlockMessage};
 use tokio::sync::mpsc;
 
@@ -16,5 +17,5 @@ pub struct WorkerInnerNetworkHandle {
     /// Sending half to the inner-node network for worker to primary messages.
     pub to_network: mpsc::Sender<WorkerToPrimaryMessage>,
     /// Receiver for inner-node network messages.
-    pub from_network: mpsc::Receiver<()>,
+    pub from_network: mpsc::Receiver<PrimaryToWorkerMessage>,
 }

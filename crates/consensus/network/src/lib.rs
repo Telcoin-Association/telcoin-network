@@ -22,8 +22,8 @@ mod traits;
 pub use crate::{
     retry::RetryConfig,
     traits::{
-        EngineToPrimary, PrimaryToPrimaryRpc, PrimaryToWorkerClient, ReliableNetwork, WorkerRpc,
-        WorkerToPrimaryClient,
+        EngineToPrimaryClient, PrimaryToPrimaryRpc, PrimaryToWorkerClient, ReliableNetwork,
+        WorkerRpc, WorkerToPrimaryClient,
     },
 };
 

@@ -4,8 +4,8 @@
 //! Channels are used instead of binding ports on the host.
 
 use super::{
-    EngineInnerNetworkHandle, EngineToPrimaryMessage, LocalPrimaryMessage,
-    PrimaryInnerNetworkHandle, WorkerInnerNetworkHandle, WorkerToPrimaryMessage,
+    EngineInnerNetworkHandle, FromPrimaryMessage, PrimaryInnerNetworkHandle, ToPrimaryMessage,
+    WorkerInnerNetworkHandle,
 };
 use tn_types::CHANNEL_CAPACITY;
 use tokio::sync::mpsc;
@@ -52,13 +52,13 @@ impl InnerNodeNetwork {
         tokio::spawn(async move {
             while let Some(msg) = primary_router.recv().await {
                 match msg {
-                    LocalPrimaryMessage::PrimaryToWorker(_) => {
-                        if let Err(e) = inner_primary_to_worker.send(()).await {
+                    FromPrimaryMessage::PrimaryToWorker(msg) => {
+                        if let Err(e) = inner_primary_to_worker.send(msg).await {
                             error!(target: "inner-node-network", ?e, "primary to worker:")
                         }
                     }
-                    LocalPrimaryMessage::PrimaryToEngine(_) => {
-                        if let Err(e) = inner_primary_to_engine.send(()).await {
+                    FromPrimaryMessage::PrimaryToEngine(msg) => {
+                        if let Err(e) = inner_primary_to_engine.send(msg).await {
                             error!(target: "inner-node-network", ?e, "primary to engine:")
                         }
                     }
@@ -74,18 +74,24 @@ impl InnerNodeNetwork {
         // process message FROM worker and forward to the primary
         tokio::spawn(async move {
             while let Some(msg) = worker_router.recv().await {
-                match msg {
-                    WorkerToPrimaryMessage::OwnBlock(_) => {
-                        if let Err(e) = inner_worker_to_primary.send(()).await {
-                            error!(target: "inner-node-network", ?e, "worker to primary")
-                        }
-                    }
-                    WorkerToPrimaryMessage::OtherBlock(_) => {
-                        if let Err(e) = inner_worker_to_primary.send(()).await {
-                            error!(target: "inner-node-network", ?e, "worker to primary")
-                        }
-                    }
+                // wrap worker message for primary receiver
+                let msg = ToPrimaryMessage::WorkerToPrimary(msg);
+                if let Err(e) = inner_worker_to_primary.send(msg).await {
+                    error!(target: "inner-node-network", ?e, "worker to primary")
                 }
+
+                // match msg {
+                //     WorkerToPrimaryMessage::OwnBlock(_) => {
+                //         if let Err(e) = inner_worker_to_primary.send(()).await {
+                //             error!(target: "inner-node-network", ?e, "worker to primary")
+                //         }
+                //     }
+                //     WorkerToPrimaryMessage::OtherBlock(_) => {
+                //         if let Err(e) = inner_worker_to_primary.send(()).await {
+                //             error!(target: "inner-node-network", ?e, "worker to primary")
+                //         }
+                //     }
+                // }
             }
         });
 
@@ -94,18 +100,24 @@ impl InnerNodeNetwork {
         // process message FROM engine and forward to the primary
         tokio::spawn(async move {
             while let Some(msg) = engine_router.recv().await {
-                match msg {
-                    EngineToPrimaryMessage::CanonicalUpdate(tip) => {
-                        if let Err(e) = inner_engine_to_primary.send(tip).await {
-                            error!(target: "inner-node-network", ?e, "engine to primary canonical update")
-                        }
-                    }
-                    EngineToPrimaryMessage::Handshake => {
-                        if let Err(e) = inner_engine_to_primary.send(()).await {
-                            error!(target: "inner-node-network", ?e, "engine to primary handshake/new peer")
-                        }
-                    }
+                // wrap engine message for primary receiver
+                let msg = ToPrimaryMessage::EngineToPrimary(msg);
+                if let Err(e) = inner_engine_to_primary.send(msg).await {
+                    error!(target: "inner-node-network", ?e, "engine to primary canonical update")
                 }
+
+                // match msg {
+                //     EngineToPrimaryMessage::CanonicalUpdate(tip) => {
+                //         if let Err(e) = inner_engine_to_primary.send(msg).await {
+                //             error!(target: "inner-node-network", ?e, "engine to primary canonical update")
+                //         }
+                //     }
+                //     EngineToPrimaryMessage::Handshake => {
+                //         if let Err(e) = inner_engine_to_primary.send(()).await {
+                //             error!(target: "inner-node-network", ?e, "engine to primary handshake/new peer")
+                //         }
+                //     }
+                // }
             }
         });
 
