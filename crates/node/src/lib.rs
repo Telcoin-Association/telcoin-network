@@ -19,6 +19,7 @@ pub mod dirs;
 pub mod engine;
 mod error;
 pub mod metrics;
+mod network;
 pub mod primary;
 pub mod worker;
 
