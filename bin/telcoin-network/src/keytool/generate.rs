@@ -11,7 +11,7 @@ use reth_primitives::Address;
 use std::{path::Path, sync::Arc};
 use tn_config::{Config, BLS_KEYFILE, PRIMARY_NETWORK_KEYFILE, WORKER_NETWORK_KEYFILE};
 use tn_node::dirs::DataDirPath;
-use tn_types::{generate_proof_of_possession, BlsKeypair, NetworkKeypair};
+use tn_types::{generate_proof_of_possession_bls, BlsKeypair, NetworkKeypair};
 use tracing::info;
 
 /// Generate keypairs and save them to a file.
@@ -102,7 +102,7 @@ impl ValidatorArgs {
         // bls keypair for consensus - drop after write to zeroize memory
         let bls_keypair = self.generate_keypair_from_rng::<BlsKeypair>()?;
         self.write_keypair_to_file(&bls_keypair, authority_key_path.join(BLS_KEYFILE))?;
-        let proof = generate_proof_of_possession(&bls_keypair, &self.chain)?;
+        let proof = generate_proof_of_possession_bls(&bls_keypair, &self.chain)?;
         config.update_protocol_key(bls_keypair.public().clone())?;
         config.update_proof_of_possession(proof)?;
         drop(bls_keypair); // calls zeroize() for OnceCell containing private key

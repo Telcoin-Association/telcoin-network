@@ -23,6 +23,7 @@ members = [
     "crates/execution/block-builder",
     "crates/execution/block-validator",
     "crates/execution/faucet",
+    "crates/execution/tn-rpc",
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
@@ -189,6 +190,7 @@ tn-engine = { path = "crates/engine" }
 tn-block-builder = { path = "crates/execution/block-builder" }
 futures-util = "0.3.25"
 jsonrpsee = { version = "0.24" }
+jsonrpsee-types = { version = "0.24" }
 assert_matches = { version = "1.5.0" }
 
 # common
@@ -197,6 +199,7 @@ tn-node = { path = "./crates/node" }
 tn-config = { path = "./crates/config" }
 tn-network = { path = "./crates/network" }
 tn-network-types = { path = "./crates/network-types" }
+tn-rpc = { path = "./crates/execution/tn-rpc" }
 
 # optional
 tn-faucet = { path = "./crates/execution/faucet" }

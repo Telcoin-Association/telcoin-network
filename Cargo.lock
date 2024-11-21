@@ -10653,6 +10653,7 @@ dependencies = [
  "tn-network-types",
  "tn-primary",
  "tn-primary-metrics",
+ "tn-rpc",
  "tn-storage",
  "tn-test-utils",
  "tn-types",
@@ -10722,6 +10723,21 @@ dependencies = [
  "prometheus",
  "tn-network",
  "tracing",
+]
+
+[[package]]
+name = "tn-rpc"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "jsonrpsee",
+ "jsonrpsee-types",
+ "rand 0.8.5",
+ "reth-chainspec",
+ "reth-primitives",
+ "serde",
+ "thiserror",
+ "tn-types",
 ]
 
 [[package]]

@@ -195,7 +195,7 @@ impl Primary {
         (Self { network }, handles)
     }
 
-    /// Start the anema network for the primary.
+    /// Start the anemo network for the primary.
     fn start_network<DB: Database>(
         config: &ConsensusConfig<DB>,
         synchronizer: Arc<Synchronizer<DB>>,
