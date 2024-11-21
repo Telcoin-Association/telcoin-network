@@ -37,7 +37,10 @@ use telcoin_network::node::NodeCommand;
 use tempfile::tempdir;
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
-use tn_node::engine::{ExecutionNode, TnBuilder};
+use tn_node::{
+    engine::{ExecutionNode, TnBuilder},
+    network::EngineInnerNetworkHandle,
+};
 use tn_types::{adiri_genesis, now, ExecutionKeypair, TimestampSec, WorkerBlock};
 use tracing::debug;
 
@@ -61,6 +64,7 @@ pub fn default_test_execution_node(
     opt_chain: Option<Arc<ChainSpec>>,
     opt_address: Option<Address>,
     executor: TaskExecutor,
+    network_handle: EngineInnerNetworkHandle,
 ) -> eyre::Result<TestExecutionNode> {
     let (builder, _) = execution_builder::<NoArgs>(
         opt_chain,
@@ -75,7 +79,7 @@ pub fn default_test_execution_node(
         EthExecutorProvider::new(Arc::clone(&builder.node_config.chain), evm_config);
 
     // create engine node
-    let engine = ExecutionNode::new(builder, block_executor, evm_config)?;
+    let engine = ExecutionNode::new(builder, block_executor, evm_config, network_handle)?;
 
     Ok(engine)
 }
@@ -173,6 +177,7 @@ pub fn faucet_test_execution_node(
     opt_address: Option<Address>,
     executor: TaskExecutor,
     faucet_proxy_address: Address,
+    network_handle: EngineInnerNetworkHandle,
 ) -> eyre::Result<TestExecutionNode> {
     let faucet_args = ["--google-kms"];
 
@@ -203,7 +208,7 @@ pub fn faucet_test_execution_node(
         EthExecutorProvider::new(Arc::clone(&builder.node_config.chain), evm_config);
 
     // create engine node
-    let engine = ExecutionNode::new(builder, block_executor, evm_config)?;
+    let engine = ExecutionNode::new(builder, block_executor, evm_config, network_handle)?;
 
     Ok(engine)
 }

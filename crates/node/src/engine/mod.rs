@@ -22,6 +22,8 @@ use tn_config::Config;
 mod inner;
 mod worker;
 
+use crate::network::EngineInnerNetworkHandle;
+
 use self::inner::ExecutionNodeInner;
 use reth_provider::providers::BlockchainProvider;
 use reth_tasks::TaskExecutor;
@@ -71,8 +73,13 @@ where
     CE: ConfigureEvm,
 {
     /// Create a new instance of `Self`.
-    pub fn new(tn_builder: TnBuilder<DB>, evm: Evm, evm_config: CE) -> eyre::Result<Self> {
-        let inner = ExecutionNodeInner::new(tn_builder, evm, evm_config)?;
+    pub fn new(
+        tn_builder: TnBuilder<DB>,
+        evm: Evm,
+        evm_config: CE,
+        inner_network: EngineInnerNetworkHandle,
+    ) -> eyre::Result<Self> {
+        let inner = ExecutionNodeInner::new(tn_builder, evm, evm_config, inner_network)?;
 
         Ok(ExecutionNode { internal: Arc::new(RwLock::new(inner)) })
     }

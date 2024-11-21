@@ -7,6 +7,7 @@ use crate::{authority::AuthorityDetails, default_test_execution_node, CommitteeF
 use itertools::Itertools;
 use reth::tasks::TaskExecutor;
 use std::{collections::HashMap, time::Duration};
+use tn_node::network::InnerNodeNetwork;
 use tn_storage::traits::Database;
 use tn_types::{Committee, WorkerId};
 use tracing::info;
@@ -49,10 +50,15 @@ where
             let authority_id = authority_fixture.id();
             let authority_execution_address = authority_fixture.execution_address();
 
+            // create the local network for engine <-> primary <-> worker
+            let inner_network = InnerNodeNetwork::spawn();
+            let (primary_handle, worker_handle, engine_handle) = inner_network.into_parts();
+
             let engine = default_test_execution_node(
                 None, // default: adiri chain
                 Some(authority_execution_address),
                 executor.clone(),
+                engine_handle,
             )
             .expect("default test execution node");
 

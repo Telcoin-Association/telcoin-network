@@ -20,7 +20,7 @@ pub mod dirs;
 pub mod engine;
 mod error;
 pub mod metrics;
-mod network;
+pub mod network;
 pub mod primary;
 pub mod worker;
 
@@ -52,7 +52,7 @@ where
     let inner_network = InnerNodeNetwork::spawn();
     let (primary_handle, worker_handle, engine_handle) = inner_network.into_parts();
 
-    let engine = ExecutionNode::new(builder, executor, evm_config)?;
+    let engine = ExecutionNode::new(builder, executor, evm_config, engine_handle)?;
 
     info!(target: "telcoin::node", "execution engine created");
 

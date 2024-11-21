@@ -24,6 +24,17 @@ pub struct EngineInnerNetworkHandle {
     pub from_network: mpsc::Receiver<PrimaryToEngineMessage>,
 }
 
+impl EngineInnerNetworkHandle {
+    /// Create a noop network handle for testing.
+    ///
+    /// This is purely convenience.
+    pub fn new_noop() -> Self {
+        let (to_network, _) = mpsc::channel(1);
+        let (_, from_network) = mpsc::channel(1);
+        Self { to_network, from_network }
+    }
+}
+
 impl EngineToPrimaryClient for EngineInnerNetworkHandle {
     async fn canonical_update(&self, tip: SealedHeader) -> eyre::Result<()> {
         let msg = EngineToPrimaryMessage::CanonicalUpdate(CanonicalUpdateMessage { tip });

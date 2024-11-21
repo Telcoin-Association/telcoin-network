@@ -9,7 +9,7 @@ use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
 use reth_primitives::SealedHeader;
 use std::{path::PathBuf, sync::Arc};
 use telcoin_network::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
-use tn_node::launch_node;
+use tn_node::{launch_node, network::EngineInnerNetworkHandle};
 use tn_test_utils::{default_test_execution_node, execution_outcome_for_tests, CommandParser};
 use tn_types::{TransactionSigned, WorkerBlock};
 use tokio::task::JoinHandle;
@@ -277,7 +277,9 @@ pub async fn get_contract_state_for_genesis(
     // create execution components
     let manager = TaskManager::current();
     let executor = manager.executor();
-    let execution_node = default_test_execution_node(Some(chain.clone()), None, executor)?;
+    let noop_network_handle = EngineInnerNetworkHandle::new_noop();
+    let execution_node =
+        default_test_execution_node(Some(chain.clone()), None, executor, noop_network_handle)?;
     let provider = execution_node.get_provider().await;
     let block_executor = execution_node.get_block_executor().await;
 

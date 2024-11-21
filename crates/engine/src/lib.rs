@@ -361,8 +361,13 @@ mod tests {
         // execution node components
         let manager = TaskManager::current();
         let executor = manager.executor();
-        let execution_node =
-            default_test_execution_node(Some(chain.clone()), None, executor.clone())?;
+        let noop_network_handle = EngineInnerNetworkHandle::new_noop();
+        let execution_node = default_test_execution_node(
+            Some(chain.clone()),
+            None,
+            executor.clone(),
+            noop_network_handle,
+        )?;
 
         let (to_engine, from_consensus) = tokio::sync::broadcast::channel(1);
         let consensus_output_stream = BroadcastStream::from(from_consensus);
@@ -514,8 +519,13 @@ mod tests {
         // create execution node components
         let manager = TaskManager::current();
         let executor = manager.executor();
-        let execution_node =
-            default_test_execution_node(Some(chain.clone()), None, executor.clone())?;
+        let noop_network_handle = EngineInnerNetworkHandle::new_noop();
+        let execution_node = default_test_execution_node(
+            Some(chain.clone()),
+            None,
+            executor.clone(),
+            noop_network_handle,
+        )?;
         let provider = execution_node.get_provider().await;
         let parent = chain.sealed_genesis_header();
 
@@ -823,8 +833,13 @@ mod tests {
         // create execution node components
         let manager = TaskManager::current();
         let executor = manager.executor();
-        let execution_node =
-            default_test_execution_node(Some(chain.clone()), None, executor.clone())?;
+        let noop_network_handle = EngineInnerNetworkHandle::new_noop();
+        let execution_node = default_test_execution_node(
+            Some(chain.clone()),
+            None,
+            executor.clone(),
+            noop_network_handle,
+        )?;
         let provider = execution_node.get_provider().await;
         let parent = chain.sealed_genesis_header();
 
@@ -1151,8 +1166,13 @@ mod tests {
         // create execution node components
         let manager = TaskManager::current();
         let executor = manager.executor();
-        let execution_node =
-            default_test_execution_node(Some(chain.clone()), None, executor.clone())?;
+        let noop_network_handle = EngineInnerNetworkHandle::new_noop();
+        let execution_node = default_test_execution_node(
+            Some(chain.clone()),
+            None,
+            executor.clone(),
+            noop_network_handle,
+        )?;
         let parent = chain.sealed_genesis_header();
 
         // execute batches to update headers with valid data

@@ -6,7 +6,9 @@ use super::{TnBuilder, WorkerComponents, WorkerTxPool};
 use crate::{
     engine::{WorkerNetwork, WorkerNode},
     error::ExecutionError,
+    network::{EngineInnerNetworkHandle, EngineToPrimaryMessage},
 };
+use consensus_network_types::PrimaryToEngine;
 use eyre::eyre;
 use jsonrpsee::http_client::HttpClient;
 use reth::rpc::{
@@ -45,7 +47,10 @@ use tn_config::Config;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
 use tn_types::{Consensus, ConsensusOutput, LastCanonicalUpdate, WorkerBlockSender, WorkerId};
-use tokio::sync::{broadcast, mpsc::unbounded_channel};
+use tokio::sync::{
+    broadcast,
+    mpsc::{self, unbounded_channel},
+};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info};
 
@@ -88,7 +93,10 @@ where
     opt_faucet_args: Option<FaucetArgs>,
     /// Collection of execution components by worker.
     workers: HashMap<WorkerId, WorkerComponents<DB>>,
-    // TODO: add Pool to self.workers for direct access (tests)
+    /// The inner-node network handle.
+    ///
+    /// Used to send canonical state updates to the primary.
+    to_network: mpsc::Sender<EngineToPrimaryMessage>,
 }
 
 impl<DB, Evm, CE> ExecutionNodeInner<DB, Evm, CE>
@@ -102,6 +110,7 @@ where
         tn_builder: TnBuilder<DB>,
         evm_executor: Evm,
         evm_config: CE,
+        inner_network: EngineInnerNetworkHandle,
     ) -> eyre::Result<Self> {
         // deconstruct the builder
         let TnBuilder { database, node_config, task_executor, tn_config, opt_faucet_args } =
@@ -158,6 +167,9 @@ where
         let blockchain_db = BlockchainProvider::new(provider_factory.clone(), blockchain_tree)?;
         let address = *tn_config.execution_address();
 
+        // spawn inner-network
+        let EngineInnerNetworkHandle { to_network, from_network } = inner_network;
+
         Ok(Self {
             address,
             node_config,
@@ -169,6 +181,7 @@ where
             opt_faucet_args,
             tn_config,
             workers: HashMap::default(),
+            to_network,
         })
     }
 
