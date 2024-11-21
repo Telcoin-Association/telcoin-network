@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{primary::PrimaryNode, worker::WorkerNode};
-use consensus_network::inner_node::InnerNodeNetwork;
 use engine::{ExecutionNode, TnBuilder};
 use futures::{future::try_join_all, stream::FuturesUnordered, StreamExt};
 use reth_db::{
@@ -12,6 +11,7 @@ use reth_db::{
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use reth_provider::CanonStateSubscriptions;
 use tn_config::{ConsensusConfig, KeyConfig, TelcoinDirs};
+use tn_network::inner_node::InnerNodeNetwork;
 use tn_storage::open_db;
 pub use tn_storage::NodeStorage;
 use tracing::{info, instrument};

@@ -26,15 +26,15 @@ use anemo_tower::{
     trace::{DefaultMakeSpan, DefaultOnFailure, TraceLayer},
 };
 use consensus_metrics::spawn_logged_monitored_task;
-use consensus_network::{
+use fastcrypto::traits::KeyPair as _;
+use std::{collections::HashMap, net::Ipv4Addr, sync::Arc};
+use tn_config::ConsensusConfig;
+use tn_network::{
     epoch_filter::{AllowedEpoch, EPOCH_HEADER_KEY},
     failpoints::FailpointsMakeCallbackHandler,
     metrics::MetricsMakeCallbackHandler,
 };
-use consensus_network_types::PrimaryToPrimaryServer;
-use fastcrypto::traits::KeyPair as _;
-use std::{collections::HashMap, net::Ipv4Addr, sync::Arc};
-use tn_config::ConsensusConfig;
+use tn_network_types::PrimaryToPrimaryServer;
 use tn_storage::traits::Database;
 use tn_types::{traits::EncodeDecodeBase64, Multiaddr, NetworkPublicKey, Protocol};
 use tokio::task::JoinHandle;
@@ -119,13 +119,12 @@ impl Primary {
             info!("Adding others worker with peer id {} and address {}", peer_id, address);
         }
 
-        let (connection_monitor_handle, _) =
-            consensus_network::connectivity::ConnectionMonitor::spawn(
-                network.downgrade(),
-                consensus_bus.primary_metrics().network_connection_metrics.clone(),
-                peer_types,
-                config.subscribe_shutdown(),
-            );
+        let (connection_monitor_handle, _) = tn_network::connectivity::ConnectionMonitor::spawn(
+            network.downgrade(),
+            consensus_bus.primary_metrics().network_connection_metrics.clone(),
+            peer_types,
+            config.subscribe_shutdown(),
+        );
 
         info!(
             "Primary {} listening to network admin messages on 127.0.0.1:{}",
@@ -133,7 +132,7 @@ impl Primary {
             config.parameters().network_admin_server.primary_network_admin_server_port
         );
 
-        let admin_handles = consensus_network::admin::start_admin_server(
+        let admin_handles = tn_network::admin::start_admin_server(
             config.parameters().network_admin_server.primary_network_admin_server_port,
             network.clone(),
             config.subscribe_shutdown(),
@@ -196,7 +195,7 @@ impl Primary {
         (Self { network }, handles)
     }
 
-    /// Start the anema network for the primary.
+    /// Start the anemo network for the primary.
     fn start_network<DB: Database>(
         config: &ConsensusConfig<DB>,
         synchronizer: Arc<Synchronizer<DB>>,

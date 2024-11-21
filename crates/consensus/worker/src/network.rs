@@ -8,16 +8,16 @@
 use crate::block_fetcher::WorkerBlockFetcher;
 use anemo::{types::response::StatusCode, Network};
 use async_trait::async_trait;
-use consensus_network::{local::LocalNetwork, WorkerToPrimaryClient as _};
-use consensus_network_types::{
-    FetchBlocksRequest, FetchBlocksResponse, PrimaryToWorker, RequestBlocksRequest,
-    RequestBlocksResponse, WorkerBlockMessage, WorkerOthersBlockMessage, WorkerSynchronizeMessage,
-    WorkerToWorker, WorkerToWorkerClient,
-};
 use eyre::Result;
 use itertools::Itertools;
 use std::{collections::HashSet, time::Duration};
 use tn_block_validator::BlockValidation;
+use tn_network::{local::LocalNetwork, WorkerToPrimaryClient as _};
+use tn_network_types::{
+    FetchBlocksRequest, FetchBlocksResponse, PrimaryToWorker, RequestBlocksRequest,
+    RequestBlocksResponse, WorkerBlockMessage, WorkerOthersBlockMessage, WorkerSynchronizeMessage,
+    WorkerToWorker, WorkerToWorkerClient,
+};
 use tn_storage::{
     tables::WorkerBlocks,
     traits::{Database, DbTxMut},

@@ -9,9 +9,9 @@
 //! and sends it to the quorum waiter for broadcasting to peers.
 
 use crate::{metrics::WorkerMetrics, quorum_waiter::QuorumWaiterTrait};
-use consensus_network::{local::LocalNetwork, WorkerToPrimaryClient as _};
-use consensus_network_types::WorkerOwnBlockMessage;
 use std::{sync::Arc, time::Duration};
+use tn_network::{local::LocalNetwork, WorkerToPrimaryClient as _};
+use tn_network_types::WorkerOwnBlockMessage;
 use tn_storage::{tables::WorkerBlocks, traits::Database};
 use tn_types::{error::BlockSealError, WorkerBlock, WorkerBlockSender, WorkerId};
 use tracing::error;

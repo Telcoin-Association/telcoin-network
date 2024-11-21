@@ -25,7 +25,7 @@
 /// - is there more to Routes than just keeping wires from crossing?
 /// - probably want to change codec to be consistent (rlp/ssz), but I think this can wait for post
 ///   testnet
-mod consensus_network {
+mod anemo_build {
     // output from build
     include!(concat!(env!("OUT_DIR"), "/tn.PrimaryToPrimary.rs"));
     include!(concat!(env!("OUT_DIR"), "/tn.PrimaryToWorker.rs"));
@@ -35,8 +35,8 @@ mod consensus_network {
     include!(concat!(env!("OUT_DIR"), "/tn.PrimaryToEngine.rs"));
 }
 
-// exports from build
-pub use consensus_network::{
+// exports from build.rs
+pub use anemo_build::{
     // engine
     engine_to_primary_client::EngineToPrimaryClient,
     engine_to_primary_server::{EngineToPrimary, EngineToPrimaryServer, MockEngineToPrimary},

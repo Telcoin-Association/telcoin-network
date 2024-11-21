@@ -16,7 +16,7 @@ use std::{
 
 use anemo::{async_trait, types::response::StatusCode};
 use consensus_metrics::monitored_scope;
-use consensus_network_types::{
+use tn_network_types::{
     FetchCertificatesRequest, FetchCertificatesResponse, PrimaryToPrimary, RequestVoteRequest,
     RequestVoteResponse, SendCertificateRequest, SendCertificateResponse,
 };

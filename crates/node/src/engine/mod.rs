@@ -11,7 +11,6 @@
 //! The methods in this module are thread-safe wrappers for the inner type that contains logic.
 
 use self::inner::ExecutionNodeInner;
-use consensus_network::inner_node::EngineInnerNetworkHandle;
 use reth_db::{
     database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
@@ -25,6 +24,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tn_block_validator::BlockValidator;
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
+use tn_network::inner_node::EngineInnerNetworkHandle;
 use tn_types::{ConsensusOutput, WorkerBlockSender, WorkerId};
 use tokio::sync::{broadcast, RwLock};
 pub use worker::*;

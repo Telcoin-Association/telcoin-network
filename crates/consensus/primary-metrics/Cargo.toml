@@ -12,6 +12,6 @@ edition = "2021"
 
 [dependencies]
 prometheus = { workspace = true }
-consensus-network = { workspace = true }
+tn-network = { workspace = true }
 tracing = { workspace = true }
 consensus-metrics = { workspace = true }

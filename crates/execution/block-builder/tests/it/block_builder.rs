@@ -4,8 +4,6 @@
 //! from peers.
 
 use assert_matches::assert_matches;
-use consensus_network::local::LocalNetwork;
-use consensus_network_types::MockWorkerToPrimary;
 use reth_blockchain_tree::{
     noop::NoopBlockchainTree, BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree,
     TreeExternals,
@@ -31,6 +29,8 @@ use tempfile::TempDir;
 use tn_block_builder::{test_utils::execute_test_worker_block, BlockBuilder};
 use tn_block_validator::{BlockValidation, BlockValidator};
 use tn_engine::execute_consensus_output;
+use tn_network::local::LocalNetwork;
+use tn_network_types::MockWorkerToPrimary;
 use tn_storage::{open_db, tables::WorkerBlocks, traits::Database};
 use tn_test_utils::{get_gas_price, test_genesis, TransactionFactory};
 use tn_types::{

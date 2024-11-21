@@ -1,5 +1,5 @@
 [package]
-name = "consensus-network-types"
+name = "tn-network-types"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

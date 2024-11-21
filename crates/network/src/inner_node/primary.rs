@@ -1,6 +1,6 @@
 //! Inner-node network impl for the primary.
 
-use consensus_network_types::{FetchBlocksRequest, WorkerSynchronizeMessage};
+use tn_network_types::{FetchBlocksRequest, WorkerSynchronizeMessage};
 use tokio::sync::mpsc;
 
 use super::{EngineToPrimaryMessage, WorkerToPrimaryMessage};

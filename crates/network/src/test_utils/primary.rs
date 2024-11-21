@@ -1,12 +1,12 @@
 //! Mock implementations for Primary to Primary/Worker.
 use anemo::async_trait;
-use consensus_network_types::{
+use std::collections::HashMap;
+use tn_network_types::{
     FetchBlocksRequest, FetchBlocksResponse, FetchCertificatesRequest, FetchCertificatesResponse,
     PrimaryToPrimary, PrimaryToPrimaryServer, PrimaryToWorker, PrimaryToWorkerServer,
     RequestVoteRequest, RequestVoteResponse, SendCertificateRequest, SendCertificateResponse,
     WorkerSynchronizeMessage,
 };
-use std::collections::HashMap;
 use tn_types::{traits::KeyPair as _, Multiaddr, NetworkKeypair};
 
 use tokio::sync::mpsc::{channel, Receiver, Sender};

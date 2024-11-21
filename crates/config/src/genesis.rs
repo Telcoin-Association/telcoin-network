@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use tn_types::{
-    adiri_genesis, verify_proof_of_possession, BlsPublicKey, BlsSignature, Committee,
+    adiri_genesis, verify_proof_of_possession_bls, BlsPublicKey, BlsSignature, Committee,
     CommitteeBuilder, Epoch, Intent, IntentMessage, Multiaddr, NetworkPublicKey, PrimaryInfo,
     ProtocolSignature, WorkerCache, WorkerIndex,
 };
@@ -276,7 +276,7 @@ impl NetworkGenesis {
     pub fn validate(&self) -> eyre::Result<()> {
         for (pubkey, validator) in self.validators.iter() {
             info!(target: "genesis::validate", "verifying validator: {}", pubkey);
-            verify_proof_of_possession(&validator.proof_of_possession, pubkey, &self.chain)?;
+            verify_proof_of_possession_bls(&validator.proof_of_possession, pubkey, &self.chain)?;
         }
         info!(target: "genesis::validate", "all validators valid for genesis");
         Ok(())
@@ -529,7 +529,7 @@ mod tests {
     use std::collections::BTreeMap;
     use tempfile::tempdir;
     use tn_types::{
-        adiri_chain_spec, generate_proof_of_possession, BlsKeypair, Multiaddr, NetworkKeypair,
+        adiri_chain_spec, generate_proof_of_possession_bls, BlsKeypair, Multiaddr, NetworkKeypair,
         PrimaryInfo, WorkerIndex, WorkerInfo,
     };
 
@@ -544,7 +544,7 @@ mod tests {
         let network_keypair = NetworkKeypair::generate(&mut StdRng::from_seed([0; 32]));
         let address = Address::from_raw_public_key(&[0; 64]);
         let proof_of_possession =
-            generate_proof_of_possession(&bls_keypair, &adiri_chain_spec()).unwrap();
+            generate_proof_of_possession_bls(&bls_keypair, &adiri_chain_spec()).unwrap();
         let primary_network_address = Multiaddr::empty();
         let worker_info = WorkerInfo::default();
         let worker_index = WorkerIndex(BTreeMap::from([(0, worker_info)]));
@@ -617,7 +617,7 @@ mod tests {
             let network_keypair = NetworkKeypair::generate(&mut StdRng::from_seed([0; 32]));
             let address = Address::from_raw_public_key(&[0; 64]);
             let proof_of_possession =
-                generate_proof_of_possession(&bls_keypair, &adiri_chain_spec()).unwrap();
+                generate_proof_of_possession_bls(&bls_keypair, &adiri_chain_spec()).unwrap();
             let primary_network_address = Multiaddr::empty();
             let worker_info = WorkerInfo::default();
             let worker_index = WorkerIndex(BTreeMap::from([(0, worker_info)]));
@@ -659,7 +659,7 @@ mod tests {
 
             // generate proof with wrong chain spec
             let proof_of_possession =
-                generate_proof_of_possession(&bls_keypair, &wrong_chain).unwrap();
+                generate_proof_of_possession_bls(&bls_keypair, &wrong_chain).unwrap();
             let primary_network_address = Multiaddr::empty();
             let worker_info = WorkerInfo::default();
             let worker_index = WorkerIndex(BTreeMap::from([(0, worker_info)]));

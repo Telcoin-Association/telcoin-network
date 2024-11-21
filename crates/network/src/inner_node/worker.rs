@@ -1,7 +1,7 @@
 //! Inner-node network impl for the worker.
 
 use super::PrimaryToWorkerMessage;
-use consensus_network_types::{WorkerOthersBlockMessage, WorkerOwnBlockMessage};
+use tn_network_types::{WorkerOthersBlockMessage, WorkerOwnBlockMessage};
 use tokio::sync::mpsc;
 
 /// Worker to Primary message types.

@@ -297,7 +297,6 @@ impl<BT, CE> std::fmt::Debug for ExecutorEngine<BT, CE> {
 #[cfg(test)]
 mod tests {
     use crate::ExecutorEngine;
-    use consensus_network::inner_node::EngineInnerNetworkHandle;
     use fastcrypto::hash::Hash as _;
     use reth_blockchain_tree::BlockchainTreeViewer;
     use reth_chainspec::ChainSpec;
@@ -310,6 +309,7 @@ mod tests {
     use reth_tracing::init_test_tracing;
     use std::{collections::VecDeque, str::FromStr as _, sync::Arc, time::Duration};
     use tn_block_builder::test_utils::execute_test_worker_block;
+    use tn_network::inner_node::EngineInnerNetworkHandle;
     use tn_test_utils::{default_test_execution_node, seeded_genesis_from_random_batches};
     use tn_types::{
         adiri_chain_spec_arc, adiri_genesis, max_worker_block_gas, now, BlockHash, Certificate,

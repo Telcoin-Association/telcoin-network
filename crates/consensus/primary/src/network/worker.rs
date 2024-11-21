@@ -11,7 +11,7 @@
 use super::WorkerReceiverHandler;
 use crate::proposer::OurDigestMessage;
 use anemo::async_trait;
-use consensus_network_types::{WorkerOthersBlockMessage, WorkerOwnBlockMessage, WorkerToPrimary};
+use tn_network_types::{WorkerOthersBlockMessage, WorkerOwnBlockMessage, WorkerToPrimary};
 use tn_storage::traits::Database;
 use tn_types::TnSender;
 use tokio::sync::oneshot;

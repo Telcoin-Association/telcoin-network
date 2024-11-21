@@ -2060,56 +2060,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "consensus-network"
-version = "0.1.0"
-dependencies = [
- "anemo",
- "anemo-tower",
- "anyhow",
- "axum",
- "axum-server",
- "backoff",
- "bytes",
- "consensus-metrics",
- "consensus-network-types",
- "dashmap 6.1.0",
- "eyre",
- "futures",
- "parking_lot 0.12.3",
- "prometheus",
- "quinn-proto",
- "rand 0.8.5",
- "reth-primitives",
- "thiserror",
- "tn-test-utils",
- "tn-types",
- "tn-utils",
- "tokio",
- "tower",
- "tracing",
-]
-
-[[package]]
-name = "consensus-network-types"
-version = "0.1.0"
-dependencies = [
- "anemo",
- "anemo-build",
- "bcs",
- "bytes",
- "indexmap 2.5.0",
- "mockall",
- "reth-primitives",
- "roaring",
- "rustversion",
- "serde",
- "snap",
- "tn-types",
- "tonic 0.10.2",
- "tracing",
-]
-
-[[package]]
 name = "console"
 version = "0.15.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10161,7 +10111,6 @@ dependencies = [
  "alloy",
  "clap",
  "consensus-metrics",
- "consensus-network",
  "const-hex",
  "const-str",
  "ethereum-tx-sign",
@@ -10204,6 +10153,7 @@ dependencies = [
  "tikv-jemallocator",
  "tn-config",
  "tn-faucet",
+ "tn-network",
  "tn-node",
  "tn-test-utils",
  "tn-types",
@@ -10396,8 +10346,6 @@ dependencies = [
  "alloy-rlp",
  "anemo",
  "assert_matches",
- "consensus-network",
- "consensus-network-types",
  "fastcrypto",
  "futures-util",
  "metrics 0.23.0",
@@ -10424,6 +10372,8 @@ dependencies = [
  "tn-block-builder",
  "tn-block-validator",
  "tn-engine",
+ "tn-network",
+ "tn-network-types",
  "tn-storage",
  "tn-test-utils",
  "tn-types",
@@ -10468,7 +10418,6 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "anemo",
- "consensus-network",
  "eyre",
  "fastcrypto",
  "humantime-serde",
@@ -10481,6 +10430,7 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "thiserror",
+ "tn-network",
  "tn-storage",
  "tn-types",
  "tracing",
@@ -10490,7 +10440,6 @@ dependencies = [
 name = "tn-engine"
 version = "0.1.0"
 dependencies = [
- "consensus-network",
  "eyre",
  "fastcrypto",
  "futures",
@@ -10509,6 +10458,7 @@ dependencies = [
  "reth-trie",
  "thiserror",
  "tn-block-builder",
+ "tn-network",
  "tn-test-utils",
  "tn-types",
  "tokio",
@@ -10523,8 +10473,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "consensus-metrics",
- "consensus-network",
- "consensus-network-types",
  "fastcrypto",
  "futures",
  "indexmap 2.5.0",
@@ -10535,6 +10483,8 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tn-config",
+ "tn-network",
+ "tn-network-types",
  "tn-node",
  "tn-primary",
  "tn-storage",
@@ -10554,8 +10504,6 @@ dependencies = [
  "cfg-if",
  "clap",
  "consensus-metrics",
- "consensus-network",
- "consensus-network-types",
  "ecdsa",
  "eyre",
  "fastcrypto",
@@ -10580,12 +10528,64 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tn-config",
+ "tn-network",
+ "tn-network-types",
  "tn-storage",
  "tn-test-utils",
  "tn-types",
  "tn-worker",
  "tokio",
  "tokio-stream",
+ "tonic 0.10.2",
+ "tracing",
+]
+
+[[package]]
+name = "tn-network"
+version = "0.1.0"
+dependencies = [
+ "anemo",
+ "anemo-tower",
+ "anyhow",
+ "axum",
+ "axum-server",
+ "backoff",
+ "bytes",
+ "consensus-metrics",
+ "dashmap 6.1.0",
+ "eyre",
+ "futures",
+ "parking_lot 0.12.3",
+ "prometheus",
+ "quinn-proto",
+ "rand 0.8.5",
+ "reth-primitives",
+ "thiserror",
+ "tn-network-types",
+ "tn-test-utils",
+ "tn-types",
+ "tn-utils",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "tn-network-types"
+version = "0.1.0"
+dependencies = [
+ "anemo",
+ "anemo-build",
+ "bcs",
+ "bytes",
+ "indexmap 2.5.0",
+ "mockall",
+ "reth-primitives",
+ "roaring",
+ "rustversion",
+ "serde",
+ "snap",
+ "tn-types",
  "tonic 0.10.2",
  "tracing",
 ]
@@ -10601,8 +10601,6 @@ dependencies = [
  "cfg-if",
  "clap",
  "consensus-metrics",
- "consensus-network",
- "consensus-network-types",
  "dirs-next",
  "enr",
  "eyre",
@@ -10653,8 +10651,11 @@ dependencies = [
  "tn-engine",
  "tn-executor",
  "tn-faucet",
+ "tn-network",
+ "tn-network-types",
  "tn-primary",
  "tn-primary-metrics",
+ "tn-rpc",
  "tn-storage",
  "tn-test-utils",
  "tn-types",
@@ -10676,8 +10677,6 @@ dependencies = [
  "bytes",
  "cfg-if",
  "consensus-metrics",
- "consensus-network",
- "consensus-network-types",
  "criterion",
  "dashmap 6.1.0",
  "eyre",
@@ -10703,6 +10702,8 @@ dependencies = [
  "tn-block-validator",
  "tn-config",
  "tn-executor",
+ "tn-network",
+ "tn-network-types",
  "tn-node",
  "tn-primary-metrics",
  "tn-storage",
@@ -10721,9 +10722,24 @@ name = "tn-primary-metrics"
 version = "0.1.0"
 dependencies = [
  "consensus-metrics",
- "consensus-network",
  "prometheus",
+ "tn-network",
  "tracing",
+]
+
+[[package]]
+name = "tn-rpc"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "jsonrpsee",
+ "jsonrpsee-types",
+ "rand 0.8.5",
+ "reth-chainspec",
+ "reth-primitives",
+ "serde",
+ "thiserror",
+ "tn-types",
 ]
 
 [[package]]
@@ -10761,8 +10777,6 @@ dependencies = [
  "anemo",
  "clap",
  "consensus-metrics",
- "consensus-network",
- "consensus-network-types",
  "criterion",
  "eyre",
  "fastcrypto",
@@ -10793,6 +10807,8 @@ dependencies = [
  "tn-config",
  "tn-engine",
  "tn-faucet",
+ "tn-network",
+ "tn-network-types",
  "tn-node",
  "tn-primary",
  "tn-primary-metrics",
@@ -10870,8 +10886,6 @@ dependencies = [
  "byteorder",
  "bytes",
  "consensus-metrics",
- "consensus-network",
- "consensus-network-types",
  "eyre",
  "fastcrypto",
  "futures",
@@ -10887,6 +10901,8 @@ dependencies = [
  "thiserror",
  "tn-block-validator",
  "tn-config",
+ "tn-network",
+ "tn-network-types",
  "tn-node",
  "tn-primary",
  "tn-primary-metrics",

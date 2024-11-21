@@ -7,9 +7,6 @@ use crate::{
     synchronizer::Synchronizer,
     ConsensusBus,
 };
-use consensus_network_types::{
-    FetchCertificatesRequest, MockPrimaryToWorker, PrimaryToPrimary, RequestVoteRequest,
-};
 use fastcrypto::{
     encoding::{Encoding, Hex},
     hash::Hash,
@@ -24,6 +21,9 @@ use std::{
     time::Duration,
 };
 use tn_block_validator::NoopBlockValidator;
+use tn_network_types::{
+    FetchCertificatesRequest, MockPrimaryToWorker, PrimaryToPrimary, RequestVoteRequest,
+};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{
     fixture_batch_with_transactions, make_optimal_signed_certificates, test_network,

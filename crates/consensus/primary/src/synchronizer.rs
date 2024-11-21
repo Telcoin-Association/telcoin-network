@@ -11,8 +11,6 @@ use consensus_metrics::{
     metered_channel::{channel_with_total, MeteredMpscChannel},
     monitored_scope, spawn_logged_monitored_task,
 };
-use consensus_network::{local::LocalNetwork, PrimaryToWorkerClient, RetryConfig};
-use consensus_network_types::WorkerSynchronizeMessage;
 use fastcrypto::hash::Hash as _;
 use futures::{stream::FuturesOrdered, StreamExt};
 use itertools::Itertools;
@@ -26,6 +24,8 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
+use tn_network::{local::LocalNetwork, PrimaryToWorkerClient, RetryConfig};
+use tn_network_types::WorkerSynchronizeMessage;
 use tn_storage::{traits::Database, CertificateStore, PayloadStore};
 use tn_types::{
     ensure,

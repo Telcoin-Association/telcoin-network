@@ -6,8 +6,6 @@
 use crate::metrics::WorkerMetrics;
 use anemo::types::response::StatusCode;
 use consensus_metrics::monitored_future;
-use consensus_network::{CancelOnDropHandler, ReliableNetwork};
-use consensus_network_types::WorkerBlockMessage;
 use futures::stream::{futures_unordered::FuturesUnordered, StreamExt as _};
 use std::{
     future::Future,
@@ -16,6 +14,8 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
+use tn_network::{CancelOnDropHandler, ReliableNetwork};
+use tn_network_types::WorkerBlockMessage;
 use tn_types::{Authority, Committee, Stake, WorkerBlock, WorkerCache, WorkerId};
 use tokio::task::JoinHandle;
 

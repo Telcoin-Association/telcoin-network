@@ -2,7 +2,7 @@
 
 use super::PrimaryToEngineMessage;
 use crate::EngineToPrimaryClient;
-use consensus_network_types::CanonicalUpdateMessage;
+use tn_network_types::CanonicalUpdateMessage;
 use reth_primitives::SealedHeader;
 use tokio::sync::mpsc;
 
