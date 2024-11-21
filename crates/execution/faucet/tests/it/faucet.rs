@@ -33,7 +33,7 @@ use std::{str::FromStr, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tn_config::{fetch_file_content, ContractStandardJson};
 use tn_faucet::Drip;
-use tn_network::local::LocalNetwork;
+use tn_network::{inner_node::EngineInnerNetworkHandle, local::LocalNetwork};
 use tn_storage::open_db;
 use tn_test_utils::{
     default_test_execution_node, execution_outcome_for_tests, faucet_test_execution_node,
@@ -250,6 +250,11 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     let manager = TaskManager::current();
     let executor = manager.executor();
 
+    // TODO: the inner-node network should support engine <-> worker
+    //
+    // create noop inner-node network for simple execution
+    let noop_network_handle = EngineInnerNetworkHandle::new_noop();
+
     // create engine node
     let execution_node = faucet_test_execution_node(
         true,
@@ -257,6 +262,7 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
         None,
         executor,
         faucet_proxy_address,
+        noop_network_handle,
     )?;
 
     let worker_id = 0;
@@ -567,9 +573,18 @@ async fn test_faucet_transfers_stablecoin_with_google_kms() -> eyre::Result<()> 
     let manager = TaskManager::current();
     let executor = manager.executor();
 
+    // create noop inner-node network for simple execution
+    let noop_network_handle = EngineInnerNetworkHandle::new_noop();
+
     // create engine node
-    let execution_node =
-        faucet_test_execution_node(true, Some(chain), None, executor, faucet_proxy_address)?;
+    let execution_node = faucet_test_execution_node(
+        true,
+        Some(chain),
+        None,
+        executor,
+        faucet_proxy_address,
+        noop_network_handle,
+    )?;
 
     // start batch maker
     let worker_id = 0;
@@ -767,7 +782,10 @@ async fn get_contract_state_for_genesis(
     // create execution components
     let manager = TaskManager::current();
     let executor = manager.executor();
-    let execution_node = default_test_execution_node(Some(chain.clone()), None, executor)?;
+    // create noop inner-node network for simple execution
+    let noop_network_handle = EngineInnerNetworkHandle::new_noop();
+    let execution_node =
+        default_test_execution_node(Some(chain.clone()), None, executor, noop_network_handle)?;
     let provider = execution_node.get_provider().await;
     let block_executor = execution_node.get_block_executor().await;
 
