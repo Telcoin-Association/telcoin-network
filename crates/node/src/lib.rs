@@ -4,6 +4,7 @@
 use crate::{primary::PrimaryNode, worker::WorkerNode};
 use engine::{ExecutionNode, TnBuilder};
 use futures::{future::try_join_all, stream::FuturesUnordered, StreamExt};
+use network::InnerNodeNetwork;
 use reth_db::{
     database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
@@ -43,6 +44,11 @@ where
     let config = builder.tn_config.clone();
     // adjust rpc instance ports
     builder.node_config.adjust_instance_ports();
+
+    // create the local network for engine <-> primary <-> worker
+    let inner_network = InnerNodeNetwork::spawn();
+    let (primary_handle, worker_handle, engine_handle) = inner_network.into_parts();
+
     let engine = ExecutionNode::new(builder, executor, evm_config)?;
 
     info!(target: "telcoin::node", "execution engine created");
@@ -63,9 +69,9 @@ where
     let (worker_id, _worker_info) = consensus_config.config().workers().first_worker()?;
     let worker = WorkerNode::new(*worker_id, consensus_config.clone());
     let primary = PrimaryNode::new(consensus_config.clone());
-
     let mut engine_state = engine.get_provider().await.canonical_state_stream();
     let eng_bus = primary.consensus_bus().await;
+
     // Spawn a task to update the consensus bus with new execution blocks as they are produced.
     tokio::spawn(async move {
         while let Some(latest) = engine_state.next().await {
