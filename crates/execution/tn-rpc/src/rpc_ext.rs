@@ -38,12 +38,6 @@ where
     ///
     /// The handshake forwards peer requests to the Primary.
     async fn handshake(&self, handshake: Handshake) -> TelcoinNetworkRpcResult<()> {
-        // ensure chain id matches
-        let this_chain_id = self.chain.chain().id();
-        if !handshake.verify_chain_id(this_chain_id) {
-            return Err(TNRpcError::InvalidChainId(this_chain_id));
-        }
-
         // verify proof of possession
         if !handshake.verify_proof(self.chain.genesis()) {
             return Err(TNRpcError::InvalidProofOfPossession);

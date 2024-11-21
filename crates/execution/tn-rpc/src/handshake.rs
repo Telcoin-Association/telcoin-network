@@ -1,6 +1,6 @@
 //! RPC types for handshake.
 
-use reth_primitives::{ChainId, Genesis};
+use reth_primitives::Genesis;
 use serde::{Deserialize, Serialize};
 use tn_types::{
     generate_proof_of_possession_network, traits::KeyPair, verify_proof_of_possession_network,
@@ -12,10 +12,6 @@ use tn_types::{
 /// TODO: consider including client version.
 #[derive(Serialize, Deserialize)]
 pub struct Handshake {
-    /// The chain id for the client.
-    ///
-    /// This must match the node's chain id.
-    chain_id: ChainId,
     /// The node's network key for signing.
     network_key: NetworkPublicKey,
     /// The signature to prove possession of the network key.
@@ -26,22 +22,8 @@ pub struct Handshake {
 
 impl Handshake {
     /// Create a new instance of Self.
-    pub fn new(
-        chain_id: ChainId,
-        network_key: NetworkPublicKey,
-        proof: NetworkSignature,
-        address: Multiaddr,
-    ) -> Self {
-        Self { chain_id, network_key, proof, address }
-    }
-
-    /// Verify the handshake's intended chain id.
-    ///
-    /// The expected chain id should match the same chain id as this node.
-    ///
-    /// The method returns bool indicating if the chain id matches (true) or is different (false).
-    pub fn verify_chain_id(&self, chain_id: ChainId) -> bool {
-        self.chain_id == chain_id
+    pub fn new(network_key: NetworkPublicKey, proof: NetworkSignature, address: Multiaddr) -> Self {
+        Self { network_key, proof, address }
     }
 
     /// Verify the peer's proof of possession.
@@ -57,8 +39,6 @@ impl Handshake {
 
 /// Type to facilitate building the handshake.
 pub struct HandshakeBuilder {
-    /// This node's chain id for the client.
-    chain_id: ChainId,
     /// This node's network keys for generating proof of possession.
     network_keypair: NetworkKeypair,
     /// This node's network multiaddress for peers to use.
@@ -69,13 +49,8 @@ pub struct HandshakeBuilder {
 
 impl HandshakeBuilder {
     /// Create a new instance of Self, uninitialized.
-    pub fn new(
-        chain_id: ChainId,
-        network_keypair: NetworkKeypair,
-        address: Multiaddr,
-        genesis: Genesis,
-    ) -> Self {
-        Self { chain_id, network_keypair, address, genesis }
+    pub fn new(network_keypair: NetworkKeypair, address: Multiaddr, genesis: Genesis) -> Self {
+        Self { network_keypair, address, genesis }
     }
 
     /// Build the [Handshake] using the builder's values.
@@ -84,12 +59,12 @@ impl HandshakeBuilder {
     /// network keys.
     pub fn build(self) -> Handshake {
         // deconstruct builder
-        let Self { chain_id, network_keypair, address, genesis } = self;
+        let Self { network_keypair, address, genesis } = self;
 
         // generate proof of possession using network keys
         let proof = generate_proof_of_possession_network(&network_keypair, &genesis);
 
-        Handshake { chain_id, network_key: network_keypair.public().clone(), proof, address }
+        Handshake { network_key: network_keypair.public().clone(), proof, address }
     }
 }
 
@@ -101,14 +76,13 @@ mod tests {
 
     #[test]
     fn test_handshake_proof() {
-        let chain_id = 1111;
         let multiaddr: Multiaddr =
             Multiaddr::new("/ip4/10.10.10.33/udp/49590".parse().expect("valid multiaddr"));
         let network_keypair = NetworkKeypair::generate(&mut StdRng::from_seed([0; 32]));
         let genesis = adiri_genesis();
 
         let mut handshake =
-            HandshakeBuilder::new(chain_id, network_keypair, multiaddr, genesis.clone()).build();
+            HandshakeBuilder::new(network_keypair, multiaddr, genesis.clone()).build();
         assert!(handshake.verify_proof(&genesis));
 
         // use wrong key
