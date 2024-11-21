@@ -6,9 +6,8 @@ use super::{TnBuilder, WorkerComponents, WorkerTxPool};
 use crate::{
     engine::{WorkerNetwork, WorkerNode},
     error::ExecutionError,
-    network::{EngineInnerNetworkHandle, EngineToPrimaryMessage},
 };
-use consensus_network_types::PrimaryToEngine;
+use consensus_network::inner_node::{EngineInnerNetworkHandle, EngineToPrimaryMessage};
 use eyre::eyre;
 use jsonrpsee::http_client::HttpClient;
 use reth::rpc::{

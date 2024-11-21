@@ -1,7 +1,7 @@
 //! Inner-node network impl for the engine.
 
 use super::PrimaryToEngineMessage;
-use consensus_network::EngineToPrimaryClient;
+use crate::EngineToPrimaryClient;
 use consensus_network_types::CanonicalUpdateMessage;
 use reth_primitives::SealedHeader;
 use tokio::sync::mpsc;

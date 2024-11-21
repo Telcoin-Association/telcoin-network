@@ -5,6 +5,7 @@ use alloy::{
     signers::{k256::FieldBytes, local::PrivateKeySigner},
 };
 use clap::{Args, Parser};
+use consensus_network::inner_node::EngineInnerNetworkHandle;
 use core::fmt;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use reth::{
@@ -37,10 +38,7 @@ use telcoin_network::node::NodeCommand;
 use tempfile::tempdir;
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
-use tn_node::{
-    engine::{ExecutionNode, TnBuilder},
-    network::EngineInnerNetworkHandle,
-};
+use tn_node::engine::{ExecutionNode, TnBuilder};
 use tn_types::{adiri_genesis, now, ExecutionKeypair, TimestampSec, WorkerBlock};
 use tracing::debug;
 

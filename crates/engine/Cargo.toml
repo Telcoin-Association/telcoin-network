@@ -40,3 +40,4 @@ tn-test-utils = { workspace = true }
 reth-tracing = { workspace = true }
 reth-tasks = { workspace = true }
 tn-block-builder = { workspace = true, features = ["test-utils"] }
+consensus-network = { workspace = true }

@@ -297,6 +297,7 @@ impl<BT, CE> std::fmt::Debug for ExecutorEngine<BT, CE> {
 #[cfg(test)]
 mod tests {
     use crate::ExecutorEngine;
+    use consensus_network::inner_node::EngineInnerNetworkHandle;
     use fastcrypto::hash::Hash as _;
     use reth_blockchain_tree::BlockchainTreeViewer;
     use reth_chainspec::ChainSpec;

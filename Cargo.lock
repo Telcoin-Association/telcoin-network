@@ -10490,6 +10490,7 @@ dependencies = [
 name = "tn-engine"
 version = "0.1.0"
 dependencies = [
+ "consensus-network",
  "eyre",
  "fastcrypto",
  "futures",

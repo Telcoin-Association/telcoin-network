@@ -11,6 +11,7 @@ pub mod connectivity;
 pub mod epoch_filter;
 mod error;
 pub mod failpoints;
+pub mod inner_node;
 pub mod local;
 pub mod metrics;
 mod p2p;

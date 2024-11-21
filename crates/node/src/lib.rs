@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{primary::PrimaryNode, worker::WorkerNode};
+use consensus_network::inner_node::InnerNodeNetwork;
 use engine::{ExecutionNode, TnBuilder};
 use futures::{future::try_join_all, stream::FuturesUnordered, StreamExt};
-use network::InnerNodeNetwork;
 use reth_db::{
     database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
@@ -20,7 +20,6 @@ pub mod dirs;
 pub mod engine;
 mod error;
 pub mod metrics;
-pub mod network;
 pub mod primary;
 pub mod worker;
 

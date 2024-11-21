@@ -4,10 +4,10 @@
 
 //! Cluster fixture to represent a local network.
 use crate::{authority::AuthorityDetails, default_test_execution_node, CommitteeFixture};
+use consensus_network::inner_node::InnerNodeNetwork;
 use itertools::Itertools;
 use reth::tasks::TaskExecutor;
 use std::{collections::HashMap, time::Duration};
-use tn_node::network::InnerNodeNetwork;
 use tn_storage::traits::Database;
 use tn_types::{Committee, WorkerId};
 use tracing::info;

@@ -10,6 +10,8 @@
 //!
 //! The methods in this module are thread-safe wrappers for the inner type that contains logic.
 
+use self::inner::ExecutionNodeInner;
+use consensus_network::inner_node::EngineInnerNetworkHandle;
 use reth_db::{
     database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
@@ -17,21 +19,17 @@ use reth_db::{
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use reth_node_builder::NodeConfig;
 use reth_primitives::B256;
-use std::{net::SocketAddr, sync::Arc};
-use tn_config::Config;
-mod inner;
-mod worker;
-
-use crate::network::EngineInnerNetworkHandle;
-
-use self::inner::ExecutionNodeInner;
 use reth_provider::providers::BlockchainProvider;
 use reth_tasks::TaskExecutor;
+use std::{net::SocketAddr, sync::Arc};
 use tn_block_validator::BlockValidator;
+use tn_config::Config;
 use tn_faucet::FaucetArgs;
 use tn_types::{ConsensusOutput, WorkerBlockSender, WorkerId};
 use tokio::sync::{broadcast, RwLock};
 pub use worker::*;
+mod inner;
+mod worker;
 
 /// The struct used to build the execution nodes.
 ///
