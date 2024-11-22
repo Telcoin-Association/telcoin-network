@@ -4,7 +4,7 @@
 
 use super::{TnBuilder, WorkerComponents, WorkerTxPool};
 use crate::{
-    engine::{WorkerNetwork, WorkerNode},
+    engine::{network::PrimaryToEngineReceiver, WorkerNetwork, WorkerNode},
     error::ExecutionError,
 };
 use eyre::eyre;
@@ -169,6 +169,12 @@ where
 
         // spawn inner-node network
         let EngineInnerNetworkHandle { to_network, from_network } = inner_network;
+
+        let network_db = blockchain_db.clone();
+        // spawn engine's network listener
+        tokio::spawn(async move {
+            let _ = PrimaryToEngineReceiver::new(from_network, network_db).await;
+        });
 
         Ok(Self {
             address,
