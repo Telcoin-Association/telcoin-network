@@ -40,19 +40,21 @@ impl<DB> Future for PrimaryToEngineReceiver<DB> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        match this.network_stream.poll_next_unpin(cx) {
-            // request to verify execution result from peer
-            Poll::Ready(Some(PrimaryToEngineMessage::VerifyExecution)) => {
-                // TODO:
-                // - check block numhash
-                // - verify header too?
-                //
-                // if number not found, get height
-                // need to wait until canonical update
-                ()
+        loop {
+            match this.network_stream.poll_next_unpin(cx) {
+                // request to verify execution result from peer
+                Poll::Ready(Some(PrimaryToEngineMessage::VerifyExecution)) => {
+                    // TODO:
+                    // - check block numhash
+                    // - verify header too?
+                    //
+                    // if number not found, get height
+                    // need to wait until canonical update
+                    ()
+                }
+                Poll::Ready(None) => return Poll::Ready(()),
+                Poll::Pending => break,
             }
-            Poll::Ready(None) => (),
-            Poll::Pending => (),
         }
 
         Poll::Pending
