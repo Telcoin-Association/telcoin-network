@@ -167,7 +167,7 @@ where
         let blockchain_db = BlockchainProvider::new(provider_factory.clone(), blockchain_tree)?;
         let address = *tn_config.execution_address();
 
-        // spawn inner-network
+        // spawn inner-node network
         let EngineInnerNetworkHandle { to_network, from_network } = inner_network;
 
         Ok(Self {

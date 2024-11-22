@@ -29,6 +29,7 @@ use tn_types::{ConsensusOutput, WorkerBlockSender, WorkerId};
 use tokio::sync::{broadcast, RwLock};
 pub use worker::*;
 mod inner;
+mod network;
 mod worker;
 
 /// The struct used to build the execution nodes.
