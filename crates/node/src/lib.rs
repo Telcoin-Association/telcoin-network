@@ -86,7 +86,7 @@ where
     primary.start(&engine).await?;
 
     // start the worker
-    worker.start(&engine).await?;
+    worker.start(&engine, worker_handle).await?;
 
     // TODO: use value from CLI
     let terminate_early = false;

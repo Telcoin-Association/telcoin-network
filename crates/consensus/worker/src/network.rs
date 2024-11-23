@@ -8,11 +8,22 @@
 use crate::block_fetcher::WorkerBlockFetcher;
 use anemo::{types::response::StatusCode, Network};
 use async_trait::async_trait;
+use consensus_metrics::metered_channel::ReceiverStream;
 use eyre::Result;
+use futures::StreamExt as _;
 use itertools::Itertools;
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::HashSet,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 use tn_block_validator::BlockValidation;
-use tn_network::{local::LocalNetwork, WorkerToPrimaryClient as _};
+use tn_network::{
+    inner_node::PrimaryToWorkerMessage, local::LocalNetwork, WorkerToPrimaryClient as _,
+};
 use tn_network_types::{
     FetchBlocksRequest, FetchBlocksResponse, PrimaryToWorker, RequestBlocksRequest,
     RequestBlocksResponse, WorkerBlockMessage, WorkerOthersBlockMessage, WorkerSynchronizeMessage,
@@ -116,6 +127,7 @@ impl<V: BlockValidation, DB: Database> WorkerToWorker for WorkerReceiverHandler<
 }
 
 /// Defines how the network receiver handles incoming primary messages.
+#[derive(Clone)]
 pub struct PrimaryReceiverHandler<V, DB> {
     /// The id of this worker.
     pub id: WorkerId,
@@ -130,7 +142,7 @@ pub struct PrimaryReceiverHandler<V, DB> {
     /// Synchronize header payloads from other workers.
     pub network: Option<Network>,
     /// Fetch certificate payloads from other workers.
-    pub batch_fetcher: Option<WorkerBlockFetcher<DB>>,
+    pub batch_fetcher: WorkerBlockFetcher<DB>,
     /// Validate incoming batches
     pub validator: V,
 }
@@ -239,14 +251,82 @@ impl<V: BlockValidation, DB: Database> PrimaryToWorker for PrimaryReceiverHandle
         &self,
         request: anemo::Request<FetchBlocksRequest>,
     ) -> Result<anemo::Response<FetchBlocksResponse>, anemo::rpc::Status> {
-        let Some(batch_fetcher) = self.batch_fetcher.as_ref() else {
-            return Err(anemo::rpc::Status::new_with_message(
-                StatusCode::BadRequest,
-                "fetch_batches() is unsupported via RPC interface, please call via local worker handler instead",
-            ));
-        };
+        // let Some(batch_fetcher) = self.batch_fetcher.as_ref() else {
+        //     return Err(anemo::rpc::Status::new_with_message(
+        //         StatusCode::BadRequest,
+        //         "fetch_batches() is unsupported via RPC interface, please call via local worker handler instead",
+        //     ));
+        // };
         let request = request.into_body();
-        let blocks = batch_fetcher.fetch(request.digests, request.known_workers).await;
+        let blocks = self.batch_fetcher.fetch(request.digests, request.known_workers).await;
         Ok(anemo::Response::new(FetchBlocksResponse { blocks }))
     }
 }
+
+/// Worker's network handle for inner-node communication.
+pub struct WorkerInnerNetwork<P> {
+    /// Receiving channel from inner-node network.
+    ///
+    /// The primary sends messages to the engine through the inner-node network.
+    /// The messages are forwarded to the engine and processed here.
+    network_stream: ReceiverStream<PrimaryToWorkerMessage>,
+    /// The type to handle requests from the Primary.
+    primary_receiver: Arc<P>,
+}
+
+impl<P> WorkerInnerNetwork<P> {
+    /// Create a new instance of Self.
+    pub fn new(
+        network_stream: ReceiverStream<PrimaryToWorkerMessage>,
+        primary_receiver: Arc<P>,
+    ) -> Self {
+        Self { network_stream, primary_receiver }
+    }
+
+    /// Spawn a long-running task to listen and process network messages.
+    pub async fn listen(mut self)
+    where
+        P: PrimaryToWorker + 'static,
+    {
+        match self.network_stream.next().await {
+            // request to verify execution result from peer
+            Some(PrimaryToWorkerMessage::FetchBlocks(req)) => {
+                self.primary_receiver.fetch_blocks(anemo::Request::new(req)).await;
+            }
+
+            Some(PrimaryToWorkerMessage::Synchronize(req)) => {
+                unimplemented!()
+            }
+            None => (),
+        }
+    }
+}
+
+// impl<P> Future for WorkerInnerNetwork<P>
+// where
+//     P: PrimaryToWorker,
+// {
+//     type Output = ();
+
+//     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+//         let this = self.as_mut().get_mut();
+
+//         loop {
+//             match this.network_stream.poll_next_unpin(cx) {
+//                 // request to verify execution result from peer
+//                 Poll::Ready(Some(PrimaryToWorkerMessage::FetchBlocks(req))) => {
+//                     let handler = self.primary_receiver.clone();
+//                     let _ = tokio::spawn(handler.fetch_blocks(anemo::Request::new(req)));
+//                 }
+
+//                 Poll::Ready(Some(PrimaryToWorkerMessage::Synchronize(req))) => {
+//                     unimplemented!()
+//                 }
+//                 Poll::Ready(None) => return Poll::Ready(()),
+//                 Poll::Pending => break,
+//             }
+//         }
+
+//         Poll::Pending
+//     }
+// }

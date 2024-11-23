@@ -121,6 +121,7 @@ impl InnerNodeNetwork {
             }
         });
 
+        // handles for each node subcomponent
         let primary_handle =
             PrimaryInnerNetworkHandle { to_network: for_primary_tx, from_network: for_primary_rx };
         let worker_handle =

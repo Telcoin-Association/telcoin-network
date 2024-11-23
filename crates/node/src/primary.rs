@@ -15,6 +15,7 @@ use reth_primitives::B256;
 use std::{sync::Arc, time::Instant};
 use tn_config::ConsensusConfig;
 use tn_executor::{Executor, SubscriberResult};
+use tn_network::inner_node::PrimaryInnerNetworkHandle;
 use tn_primary::{
     consensus::{Bullshark, Consensus, ConsensusMetrics, LeaderSchedule},
     ConsensusBus, Primary,

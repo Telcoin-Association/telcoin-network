@@ -8,6 +8,7 @@ use anemo::Network;
 use fastcrypto::traits::KeyPair as _;
 use std::path::PathBuf;
 use tn_config::{ConsensusConfig, KeyConfig};
+use tn_network::inner_node::WorkerInnerNetworkHandle;
 use tn_node::worker::WorkerNode;
 use tn_storage::traits::Database;
 use tn_types::{AuthorityIdentifier, Multiaddr, NetworkKeypair, WorkerId, WorkerInfo};
@@ -42,6 +43,7 @@ impl<DB: Database> WorkerNodeDetails<DB> {
         &mut self,
         preserve_store: bool,
         execution_node: &TestExecutionNode,
+        inner_network_handle: WorkerInnerNetworkHandle,
     ) -> eyre::Result<()> {
         if self.is_running().await {
             panic!("Worker with id {} is already running, can't start again", self.id);
@@ -52,7 +54,7 @@ impl<DB: Database> WorkerNodeDetails<DB> {
 
         info!(target: "cluster::worker", "starting worker-{} for authority {}", self.id, self.name);
 
-        self.node.start(execution_node).await?;
+        self.node.start(execution_node, inner_network_handle).await?;
 
         self.store_path = store_path;
 

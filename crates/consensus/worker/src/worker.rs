@@ -29,6 +29,7 @@ use tn_config::ConsensusConfig;
 use tn_network::{
     epoch_filter::{AllowedEpoch, EPOCH_HEADER_KEY},
     failpoints::FailpointsMakeCallbackHandler,
+    inner_node::WorkerInnerNetworkHandle,
     local::LocalNetwork,
     metrics::MetricsMakeCallbackHandler,
 };
@@ -84,12 +85,15 @@ impl<DB: Database> Worker<DB> {
         validator: impl BlockValidation,
         metrics: Metrics,
         consensus_config: ConsensusConfig<DB>,
+        inner_network_handle: WorkerInnerNetworkHandle,
     ) -> (Self, Vec<JoinHandle<()>>, BlockProvider<DB, QuorumWaiter>) {
         let worker_name = consensus_config.key_config().worker_network_public_key();
         let worker_peer_id = PeerId(worker_name.0.to_bytes());
         info!("Boot worker node with id {} peer id {}", id, worker_peer_id,);
 
         let node_metrics = metrics.worker_metrics.clone();
+
+        // spawn inner-node network receiver
 
         // Receive incoming messages from other workers.
         let network = Self::start_network(id, &consensus_config, validator.clone(), &metrics);
@@ -109,7 +113,7 @@ impl<DB: Database> Worker<DB> {
                 store: consensus_config.database().clone(),
                 request_batches_timeout: consensus_config.parameters().sync_retry_delay,
                 network: Some(network.clone()),
-                batch_fetcher: Some(block_fetcher),
+                batch_fetcher: block_fetcher,
                 validator,
             }),
         );

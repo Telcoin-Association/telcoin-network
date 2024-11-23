@@ -12,6 +12,7 @@ use reth_db::{
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use std::{sync::Arc, time::Instant};
 use tn_config::ConsensusConfig;
+use tn_network::inner_node::WorkerInnerNetworkHandle;
 use tn_storage::traits::Database as ConsensusDatabase;
 use tn_types::WorkerId;
 use tn_worker::{metrics::Metrics, Worker};
@@ -39,6 +40,7 @@ impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
         &mut self,
         // used to create the batch maker process
         execution_node: &ExecutionNode<DB, Evm, CE>,
+        inner_network_handle: WorkerInnerNetworkHandle,
     ) -> eyre::Result<()>
     where
         DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
@@ -58,8 +60,13 @@ impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
 
         let batch_validator = execution_node.new_block_validator().await;
 
-        let (worker, handles, block_provider) =
-            Worker::spawn(self.id, batch_validator, metrics, self.consensus_config.clone());
+        let (worker, handles, block_provider) = Worker::spawn(
+            self.id,
+            batch_validator,
+            metrics,
+            self.consensus_config.clone(),
+            inner_network_handle,
+        );
 
         // spawn batch maker for worker
         execution_node.start_block_builder(self.id, block_provider.blocks_rx()).await?;
@@ -128,6 +135,7 @@ impl<CDB: ConsensusDatabase> WorkerNode<CDB> {
         &self,
         // used to create the batch maker process
         execution_node: &ExecutionNode<DB, Evm, CE>,
+        inner_network_handle: WorkerInnerNetworkHandle,
     ) -> eyre::Result<()>
     where
         DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
@@ -135,7 +143,7 @@ impl<CDB: ConsensusDatabase> WorkerNode<CDB> {
         CE: ConfigureEvm,
     {
         let mut guard = self.internal.write().await;
-        guard.start(execution_node).await
+        guard.start(execution_node, inner_network_handle).await
     }
 
     pub async fn shutdown(&self) {

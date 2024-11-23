@@ -30,6 +30,7 @@ use tracing::debug;
 const REMOTE_PARALLEL_FETCH_INTERVAL: Duration = Duration::from_secs(2);
 const WORKER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
+#[derive(Clone)]
 pub struct WorkerBlockFetcher<DB> {
     name: NetworkPublicKey,
     network: Arc<dyn RequestBlocksNetwork>,

@@ -13,7 +13,7 @@ use jsonrpsee::http_client::HttpClient;
 use reth::primitives::Address;
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use tn_config::{Config, ConsensusConfig, KeyConfig};
-use tn_network::local::LocalNetwork;
+use tn_network::{inner_node::WorkerInnerNetworkHandle, local::LocalNetwork};
 use tn_storage::traits::Database;
 use tn_types::{
     Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, Certificate, Committee, Header,
@@ -54,6 +54,7 @@ impl<DB: Database> AuthorityDetails<DB> {
         name: AuthorityIdentifier,
         consensus_config: ConsensusConfig<DB>,
         execution: TestExecutionNode,
+        inner_network_handle: WorkerInnerNetworkHandle,
     ) -> Self {
         // Create all the nodes we have in the committee
         let public_key = consensus_config.key_config().primary_public_key();

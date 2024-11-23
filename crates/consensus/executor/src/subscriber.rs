@@ -206,7 +206,8 @@ impl<DB: Database> Subscriber<DB> {
         }
     }
 
-    /// Returns ordered vector of futures for downloading blocks for certificates
+    /// Returns ordered vector of futures for downloading blocks for committed certificates.
+    ///
     /// Order of futures returned follows order of blocks in the certificates.
     /// See BlockFetcher for more details.
     async fn fetch_blocks(
