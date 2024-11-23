@@ -39,7 +39,7 @@ impl InnerNodeNetwork {
         // channels for primary
         let (for_primary_tx, mut primary_router) = mpsc::channel(CHANNEL_CAPACITY);
         let (inner_worker_to_primary, for_primary_rx) = mpsc::channel(CHANNEL_CAPACITY);
-        // channels for worker
+        // channels for worker hub
         let (for_worker_tx, mut worker_router) = mpsc::channel(CHANNEL_CAPACITY);
         let (inner_primary_to_worker, for_worker_rx) = mpsc::channel(CHANNEL_CAPACITY);
         // channels for engine

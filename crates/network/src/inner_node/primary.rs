@@ -23,21 +23,10 @@ pub enum ToPrimaryMessage {
 
 /// Primary message to the worker.
 ///
-/// TODO: can these be consolidated?
-///
-/// DO NOT MERGE UNTIL ADDRESSED
-/// @@@@@
-///
-/// !!!!!!----------
-///
-/// ???
-///
-///
-/// asdf
 pub enum PrimaryToWorkerMessage {
-    /// Synchronize with other workers to retrieve missing batches.
+    /// Synchronize with other workers to retrieve missing batches during rounds.
     Synchronize(WorkerSynchronizeMessage),
-    /// Fetch blocks missing in certificates.
+    /// Fetch blocks missing in certificates that reached consensus and were committed.
     FetchBlocks(FetchBlocksRequest),
 }
 
