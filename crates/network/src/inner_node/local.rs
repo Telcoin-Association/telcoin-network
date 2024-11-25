@@ -35,7 +35,7 @@ impl InnerNodeNetwork {
     /// Returns local network handles for worker, primary, and engine.
     ///
     /// TODO: this only supports one local worker.
-    pub fn spawn() -> Self {
+    pub fn spawn(num_worker: usize) -> Self {
         // channels for primary
         let (for_primary_tx, mut primary_router) = mpsc::channel(CHANNEL_CAPACITY);
         let (inner_worker_to_primary, for_primary_rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -68,6 +68,11 @@ impl InnerNodeNetwork {
 
         // obtain copy of "to primary" for engine before passing to worker inner router
         let inner_engine_to_primary = inner_worker_to_primary.clone();
+
+        let mut workers_by_id = HashMap::with_capacity(num_workers);
+        for worker_id in 0..num_worker {
+            let (worker_tx, mut worker_router) = mpsc::channel(CHANNEL_CAPACITY);
+        }
 
         // spawn worker router
         //
