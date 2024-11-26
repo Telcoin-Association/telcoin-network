@@ -11335,7 +11335,6 @@ dependencies = [
  "dashmap 6.1.0",
  "eyre",
  "futures",
- "libp2p",
  "parking_lot 0.12.3",
  "prometheus",
  "quinn-proto",
@@ -11348,6 +11347,19 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tower",
+ "tracing",
+]
+
+[[package]]
+name = "tn-network-libp2p"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "futures",
+ "libp2p",
+ "tn-types",
+ "tokio",
+ "tokio-stream",
  "tracing",
 ]
 

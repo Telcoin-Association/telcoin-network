@@ -1,0 +1,26 @@
+[package]
+name = "tn-network-libp2p"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[dependencies]
+libp2p = { workspace = true, features = [
+    "gossipsub",
+    "tokio",
+    "quic",
+    "macros",
+] }
+tokio = { workspace = true, features = ["rt", "net", "sync", "macros", "time"] }
+tokio-stream = { workspace = true }
+tn-types = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+eyre = { workspace = true }
+
+[lints]
+workspace = true

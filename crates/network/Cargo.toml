@@ -36,13 +36,6 @@ anyhow = { workspace = true }
 eyre = { workspace = true }
 thiserror = { workspace = true }
 
-libp2p = { workspace = true, features = [
-    "gossipsub",
-    "tokio",
-    "quic",
-    "macros",
-] }
-
 [dev-dependencies]
 tn-test-utils = { workspace = true }
 
