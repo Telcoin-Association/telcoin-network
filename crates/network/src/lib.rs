@@ -11,6 +11,7 @@ pub mod connectivity;
 pub mod epoch_filter;
 mod error;
 pub mod failpoints;
+mod gossip;
 pub mod local;
 pub mod metrics;
 mod p2p;
@@ -20,6 +21,7 @@ pub mod test_utils;
 mod traits;
 
 pub use crate::{
+    gossip::*,
     retry::RetryConfig,
     traits::{
         PrimaryToPrimaryRpc, PrimaryToWorkerClient, ReliableNetwork, WorkerRpc,
