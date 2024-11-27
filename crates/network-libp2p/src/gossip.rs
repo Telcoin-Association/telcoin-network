@@ -16,7 +16,7 @@ use tracing::{error, info};
 
 /// Network behavior for p2p gossip.
 #[derive(NetworkBehaviour)]
-struct GossipBehavior {
+struct TelcoinGossip {
     /// Gossipsub
     gossipsub: gossipsub::Behaviour,
 }
@@ -59,7 +59,7 @@ pub fn start_gossip_publish_network(
                 gossipsub_config,
             )?;
 
-            Ok(GossipBehavior { gossipsub })
+            Ok(TelcoinGossip { gossipsub })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
