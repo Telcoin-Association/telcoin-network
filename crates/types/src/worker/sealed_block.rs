@@ -184,7 +184,8 @@ impl WorkerBlock {
     ///
     /// Calculate the hash and seal the worker block so it can't be changed.
     ///
-    /// NOTE: `WorkerBlock::received_at` is skipped during serialization and is excluded from the digest.
+    /// NOTE: `WorkerBlock::received_at` is skipped during serialization and is excluded from the
+    /// digest.
     pub fn seal_slow(self) -> SealedWorkerBlock {
         let digest = self.digest();
         self.seal(digest)
