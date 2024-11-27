@@ -1,8 +1,9 @@
+// Copyright (c) Telcoin, LLC
+
 //! Block implementation for consensus.
 //!
 //! Blocks hold transactions and other data. This type is used to represent worker proposals that
 //! have reached quorum.
-// Copyright (c) Telcoin, LLC
 
 use crate::{adiri_chain_spec, crypto, encode, now, TimestampSec};
 use fastcrypto::hash::HashFunction;

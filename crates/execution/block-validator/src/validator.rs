@@ -156,8 +156,8 @@ where
     }
 }
 
-#[cfg(any(test, feature = "test-utils"))]
 /// Noop validation struct that validates any block.
+#[cfg(any(test, feature = "test-utils"))]
 #[derive(Default, Clone)]
 pub struct NoopBlockValidator;
 
@@ -186,104 +186,28 @@ mod tests {
     };
     use reth_db_common::init::init_genesis;
     use reth_primitives::{
-        constants::EMPTY_WITHDRAWALS, hex, proofs, Address, Bloom, Bytes, GenesisAccount, Header,
-        SealedHeader, B256, EMPTY_OMMER_ROOT_HASH, U256,
+        constants::MIN_PROTOCOL_BASE_FEE, hex, Address, Bytes, GenesisAccount, B256, U256,
     };
     use reth_provider::{providers::StaticFileProvider, ProviderFactory};
     use reth_prune::PruneModes;
     use std::{str::FromStr, sync::Arc};
-    use tn_test_utils::TransactionFactory;
+    use tn_test_utils::{test_genesis, TransactionFactory};
     use tn_types::{adiri_genesis, max_worker_block_gas, Consensus, WorkerBlock};
     use tracing::debug;
 
-    /// Return the next valid block
-    fn next_valid_sealed_header() -> SealedHeader {
+    /// Return the next valid sealed worker block
+    fn next_valid_sealed_worker_block() -> SealedWorkerBlock {
         let timestamp = 1701790139;
-        // sealed header
-        //
-        // intentionally used hard-coded values
-        SealedHeader::new(
-            Header {
-                parent_hash: hex!(
-                    "bf0f2065b35a695aa0d47e9633d6cc78f6e012b988f774ff7e4c8467ea7f4126"
-                )
-                .into(),
-                ommers_hash: EMPTY_OMMER_ROOT_HASH,
-                beneficiary: hex!("0000000000000000000000000000000000000000").into(),
-                state_root: B256::ZERO,
-                transactions_root: hex!(
-                    "3facac570ec391ef164bce1757035e1a8f03d5731640879b17b7da24a027c718"
-                )
-                .into(),
-                receipts_root: B256::ZERO,
-                withdrawals_root: Some(EMPTY_WITHDRAWALS),
-                logs_bloom: Bloom::default(),
-                difficulty: U256::ZERO,
-                number: 1,
-                gas_limit: max_worker_block_gas(timestamp),
-                gas_used: 3_000_000, /* TxFactory sets limit to 1_000_000 * 3txs
-                                      * timestamp: 1701790139, */
-                timestamp,
-                mix_hash: B256::ZERO,
-                nonce: 0,
-                base_fee_per_gas: Some(7),
-                blob_gas_used: None,
-                excess_blob_gas: None,
-                parent_beacon_block_root: None,
-                extra_data: Bytes::default(),
-                requests_root: None,
-            },
-            hex!("abc832c52b74957b7ef596e35022068ba9a8ab222ed4dbbe42b3eb07d17a42ef").into(),
-        )
-    }
-
-    /// Convenience type for creating test assets.
-    struct TestTools {
-        /// The expected transactions for the valid sealed header.
-        valid_txs: Vec<TransactionSigned>,
-        /// The expected sealed header.
-        valid_header: SealedHeader,
-        /// Validator
-        validator: BlockValidator<Arc<TempDatabase<DatabaseEnv>>>,
-    }
-
-    /// Create an instance of block validator for tests.
-    async fn test_types() -> TestTools {
-        test_types_int(false).await
-    }
-
-    /// Create an instance of block validator for tests.
-    async fn test_types_int(to_much_gas: bool) -> TestTools {
-        // reth_tracing::init_test_tracing();
-        let genesis = adiri_genesis();
+        // create valid transactions
         let mut tx_factory = TransactionFactory::new();
-        let factory_address = tx_factory.address();
-        debug!("seeding factory address: {factory_address:?}");
-
-        // fund factory with 99mil TEL
-        let account = vec![(
-            factory_address,
-            GenesisAccount::default().with_balance(
-                U256::from_str("0x51E410C0F93FE543000000").expect("account balance is parsed"),
-            ),
-        )];
-
-        let genesis = genesis.extend_accounts(account);
-        debug!("seeded genesis: {genesis:?}");
-        let chain: Arc<ChainSpec> = Arc::new(genesis.into());
-
-        // tx factory - [0; 32] seed address - nonce 0-2
-        //
-        // transactions are deterministic bc the factory is seeded with [0; 32]
-
         let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
         let gas_price = 7;
-        let gas_limit = if to_much_gas { Some(max_worker_block_gas(0)) } else { None };
+        let chain: Arc<ChainSpec> = Arc::new(test_genesis().into());
 
         // create 3 transactions
         let transaction1 = tx_factory.create_eip1559(
             chain.clone(),
-            gas_limit,
+            None,
             gas_price,
             Some(Address::ZERO),
             value, // 1 TEL
@@ -302,7 +226,7 @@ mod tests {
         debug!("transaction 2: {transaction2:?}");
 
         let transaction3 = tx_factory.create_eip1559(
-            chain.clone(),
+            chain,
             None,
             gas_price,
             Some(Address::ZERO),
@@ -312,6 +236,38 @@ mod tests {
         debug!("transaction 3: {transaction3:?}");
 
         let valid_txs = vec![transaction1, transaction2, transaction3];
+        // sealed header
+        //
+        // intentionally used hard-coded values
+        SealedWorkerBlock::new(
+            WorkerBlock {
+                transactions: valid_txs,
+                parent_hash: hex!(
+                    "bf0f2065b35a695aa0d47e9633d6cc78f6e012b988f774ff7e4c8467ea7f4126"
+                )
+                .into(),
+                beneficiary: Address::ZERO,
+                timestamp,
+                base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
+                received_at: None,
+            },
+            hex!("abc832c52b74957b7ef596e35022068ba9a8ab222ed4dbbe42b3eb07d17a42ef").into(),
+        )
+    }
+
+    /// Convenience type for creating test assets.
+    struct TestTools {
+        /// The expected sealed worker block.
+        valid_block: SealedWorkerBlock,
+        /// Validator
+        validator: BlockValidator<Arc<TempDatabase<DatabaseEnv>>>,
+    }
+
+    /// Create an instance of block validator for tests.
+    async fn test_tools() -> TestTools {
+        // reth_tracing::init_test_tracing();
+
+        let chain: Arc<ChainSpec> = Arc::new(test_genesis().into());
 
         // init genesis
         let db = create_test_rw_db();
@@ -344,16 +300,15 @@ mod tests {
                 .expect("blockchain db valid");
 
         let validator = BlockValidator::new(blockchain_db);
-        let valid_header = next_valid_sealed_header();
+        let valid_block = next_valid_sealed_worker_block();
 
         // block validator
-        TestTools { valid_txs, valid_header, validator }
+        TestTools { valid_block, validator }
     }
 
     #[tokio::test]
     async fn test_valid_block() {
-        let TestTools { valid_txs, valid_header, validator } = test_types().await;
-        let valid_block = WorkerBlock::new_for_test(valid_txs, valid_header).seal_slow();
+        let TestTools { valid_block, validator } = test_tools().await;
         let result = validator.validate_block(valid_block).await;
 
         assert!(result.is_ok());
@@ -361,55 +316,86 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_block_wrong_parent_hash() {
-        let TestTools { valid_txs, mut valid_header, validator } = test_types().await;
+        let TestTools { valid_block, validator } = test_tools().await;
+        let (worker_block, _) = valid_block.split();
+        let WorkerBlock {
+            transactions, beneficiary, timestamp, base_fee_per_gas, received_at, ..
+        } = worker_block;
         let wrong_parent_hash = B256::random();
-        valid_header.set_parent_hash(wrong_parent_hash);
-        // update hash since this is asserted first
-        let wrong_header = valid_header.unseal().seal_slow();
-        let wrong_block = WorkerBlock::new_for_test(valid_txs, wrong_header);
+        let invalid_block = WorkerBlock {
+            transactions,
+            parent_hash: wrong_parent_hash,
+            beneficiary,
+            timestamp,
+            base_fee_per_gas,
+            received_at,
+        };
         assert_matches!(
-            validator.validate_block(&wrong_block).await,
+            validator.validate_block(invalid_block.seal_slow()).await,
             Err(BlockValidationError::CanonicalChain { block_hash }) if block_hash == wrong_parent_hash
         );
     }
 
     #[tokio::test]
     async fn test_invalid_block_wrong_timestamp() {
-        let TestTools { valid_txs, valid_header, validator } = test_types().await;
-        let (mut header, _hash) = valid_header.split();
+        let TestTools { valid_block, validator } = test_tools().await;
+        let (mut worker_block, _) = valid_block.split();
 
-        // test header timestamp same as parent
+        // test worker_block timestamp same as parent
         let wrong_timestamp = adiri_genesis().timestamp;
-        header.timestamp = wrong_timestamp;
+        worker_block.timestamp = wrong_timestamp;
 
-        // update hash since this is asserted first
-        let wrong_header = header.clone().seal_slow();
-        let wrong_block = WorkerBlock::new_for_test(valid_txs.clone(), wrong_header);
         assert_matches!(
-            validator.validate_block(&wrong_block).await,
+            validator.validate_block(worker_block.clone().seal_slow()).await,
             Err(BlockValidationError::TimestampIsInPast{parent_timestamp, timestamp}) if parent_timestamp == wrong_timestamp && timestamp == wrong_timestamp
         );
 
         // test header timestamp before parent
-        header.timestamp = wrong_timestamp - 1;
+        worker_block.timestamp = wrong_timestamp - 1;
 
-        // update hash since this is asserted first
-        let wrong_header = header.seal_slow();
-        let wrong_block = WorkerBlock::new_for_test(valid_txs, wrong_header);
         assert_matches!(
-            validator.validate_block(&wrong_block).await,
+            validator.validate_block(worker_block.seal_slow()).await,
             Err(BlockValidationError::TimestampIsInPast{parent_timestamp, timestamp}) if parent_timestamp == wrong_timestamp && timestamp == wrong_timestamp - 1
         );
     }
 
     #[tokio::test]
     async fn test_invalid_block_excess_gas_used() {
-        // Set super low gas limit.
-        let TestTools { valid_txs, valid_header, validator } = test_types_int(true).await;
+        // Set excessive gas limit.
+        let TestTools { valid_block, validator } = test_tools().await;
+        let (worker_block, _) = valid_block.split();
 
-        let wrong_block = WorkerBlock::new_for_test(valid_txs, valid_header);
+        // sign excessive transaction
+        let mut tx_factory = TransactionFactory::new();
+        let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
+        let gas_price = 7;
+        let chain: Arc<ChainSpec> = Arc::new(test_genesis().into());
+
+        // create transaction with max gas limit above the max allowed
+        let invalid_transaction = tx_factory.create_eip1559(
+            chain.clone(),
+            Some(max_worker_block_gas(worker_block.timestamp) + 1),
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let WorkerBlock {
+            beneficiary, timestamp, base_fee_per_gas, received_at, parent_hash, ..
+        } = worker_block;
+        let invalid_block = WorkerBlock {
+            transactions: vec![invalid_transaction],
+            parent_hash,
+            beneficiary,
+            timestamp,
+            base_fee_per_gas,
+            received_at,
+        };
+
         assert_matches!(
-            validator.validate_block_gas(wrong_block.total_possible_gas(), wrong_block.timestamp),
+            validator
+                .validate_block_gas(invalid_block.total_possible_gas(), invalid_block.timestamp),
             Err(BlockValidationError::HeaderMaxGasExceedsGasLimit {
                 total_possible_gas: _,
                 gas_limit: _
@@ -419,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_block_wrong_size_in_bytes() {
-        let TestTools { valid_header, validator, .. } = test_types().await;
+        let TestTools { valid_block, validator } = test_tools().await;
         // create enough transactions to exceed 1MB
         // TODO: clean this up - taken from `test_types` fn
         // because validator uses provided with same genesis
@@ -464,19 +450,17 @@ mod tests {
             too_many_txs.push(tx);
         }
 
-        // update header so tx root is correct
-        let (mut header, _hash) = valid_header.split();
-        header.gas_used = total_gas;
-        header.transactions_root = proofs::calculate_transaction_root(&too_many_txs);
-        let bad_header = header.clone().seal_slow();
-
         // NOTE: these assertions aren't important but want to know if tx size changes
         assert_eq!(total_bytes, 1_000_035);
         assert_eq!(too_many_txs.len(), 4695);
 
-        let wrong_block = WorkerBlock::new_for_test(too_many_txs, bad_header);
+        // update header so tx root is correct
+        let (mut block, _hash) = valid_block.split();
+        block.transactions = too_many_txs;
+        let invalid_block = block.clone().seal_slow();
+
         assert_matches!(
-            validator.validate_block(&wrong_block).await,
+            validator.validate_block(invalid_block).await,
             Err(BlockValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == total_bytes
         );
 
@@ -501,18 +485,11 @@ mod tests {
         let too_big = giant_tx.size();
         assert_eq!(too_big, 1_000_213);
 
-        let txs = vec![giant_tx];
-        header.gas_used = max_gas;
-
-        // use expected value to reduce test time
-        // to recalculate: proofs::calculate_transaction_root(&txs)
-        let tx_root =
-            hex!("00e105ab5023ebb359f3770834cad7cc32e1495c79a9cdd803ed2c0eba7cb385").into();
-        header.transactions_root = tx_root;
-        let bad_header = header.seal_slow();
-        let wrong_block = WorkerBlock::new_for_test(txs, bad_header);
+        let invalid_txs = vec![giant_tx];
+        block.transactions = invalid_txs;
+        let invalid_block = block.seal_slow();
         assert_matches!(
-            validator.validate_block(&wrong_block).await,
+            validator.validate_block(invalid_block).await,
             Err(BlockValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == too_big
         );
     }

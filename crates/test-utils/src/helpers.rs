@@ -212,19 +212,7 @@ pub fn transaction() -> TransactionSigned {
 // Fixture
 pub fn batch() -> WorkerBlock {
     let transactions = vec![transaction(), transaction()];
-    // Put some random bytes in the header so that tests will have unique headers.
-    let r: Vec<u8> = (0..32).map(|_v| rand::random::<u8>()).collect();
-    // let header =
-    //     Header { nonce: rand::random::<u64>(), extra_data: r.into(), ..Default::default() };
-    // WorkerBlock::new_for_test(transactions, header)
-    WorkerBlock {
-        transactions,
-        received_at: None,
-        parent_hash: todo!(),
-        beneficiary: todo!(),
-        timestamp: todo!(),
-        base_fee_per_gas: todo!(),
-    }
+    WorkerBlock { transactions, ..Default::default() }
 }
 
 /// generate multiple fixture batches. The number of generated batches
