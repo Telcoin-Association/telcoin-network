@@ -4,7 +4,7 @@
 //! don't expect a response.
 use reth_primitives::SealedHeader;
 use serde::{Deserialize, Serialize};
-use tn_types::{AuthorityIdentifier, BlockHash, WorkerBlock, WorkerId};
+use tn_types::{AuthorityIdentifier, BlockHash, SealedWorkerBlock, TimestampSec, WorkerId};
 
 /// Used by the primary to request that the worker sync the target missing batches.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -22,12 +22,12 @@ pub struct WorkerSynchronizeMessage {
 /// Used by worker to inform primary it sealed a new batch.
 #[derive(Clone, Serialize, Deserialize, Eq, PartialEq, Debug)]
 pub struct WorkerOwnBlockMessage {
-    /// The worker's batch digest.
-    pub digest: BlockHash,
     /// The worker's id.
     pub worker_id: WorkerId,
-    /// The metadata for the sealed batch.
-    pub worker_block: WorkerBlock,
+    /// The digest for the worker block that reached quorum.
+    pub digest: BlockHash,
+    /// The timestamp for the worker block.
+    pub timestamp: TimestampSec,
 }
 
 /// Used by worker to inform primary it received a batch from another authority.
@@ -43,7 +43,7 @@ pub struct WorkerOthersBlockMessage {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerBlockMessage {
     /// The sending worker's batch.
-    pub worker_block: WorkerBlock,
+    pub sealed_worker_block: SealedWorkerBlock,
 }
 
 /// Engine to primary when canonical tip is updated.

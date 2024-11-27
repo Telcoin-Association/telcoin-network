@@ -4,9 +4,8 @@
 use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
 };
-
 use rand::rngs::ThreadRng;
-use reth_primitives::{SealedHeader, TransactionSigned};
+use reth_primitives::TransactionSigned;
 use tn_test_utils::transaction_with_rand;
 use tn_types::WorkerBlock;
 
@@ -22,10 +21,10 @@ pub fn batch_digest(c: &mut Criterion) {
         let tx_gen = |rand: &mut ThreadRng| {
             (0..512).map(move |_| transaction_with_rand(rand)).collect::<Vec<TransactionSigned>>()
         };
-        let batch = WorkerBlock::new_for_test(
-            (0..size).flat_map(move |_| tx_gen(prand)).collect::<Vec<_>>(),
-            SealedHeader::default(),
-        );
+        let batch = WorkerBlock {
+            transactions: (0..size).flat_map(move |_| tx_gen(prand)).collect::<Vec<_>>(),
+            ..Default::default()
+        };
         digest_group.throughput(Throughput::Bytes(512 * size as u64));
         digest_group.bench_with_input(BenchmarkId::new("batch digest", size), &batch, |b, i| {
             b.iter(|| i.digest())

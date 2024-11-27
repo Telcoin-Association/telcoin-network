@@ -12,9 +12,7 @@ use reth_chainspec::ChainSpec;
 use reth_db::test_utils::{create_test_rw_db, tempdir_path};
 use reth_db_common::init::init_genesis;
 use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
-use reth_primitives::{
-    alloy_primitives::U160, Address, BlockBody, Bytes, SealedBlock, SealedHeader, U256,
-};
+use reth_primitives::{alloy_primitives::U160, Address, BlockBody, Bytes, SealedBlock, U256};
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     CanonStateSubscriptions, ProviderFactory,
@@ -35,7 +33,7 @@ use tn_storage::{open_db, tables::WorkerBlocks, traits::Database};
 use tn_test_utils::{get_gas_price, test_genesis, TransactionFactory};
 use tn_types::{
     AutoSealConsensus, BuildArguments, Certificate, CommittedSubDag, Consensus, ConsensusHeader,
-    ConsensusOutput, LastCanonicalUpdate, ReputationScores, WorkerBlock,
+    ConsensusOutput, LastCanonicalUpdate, ReputationScores, SealedWorkerBlock, WorkerBlock,
 };
 use tn_worker::{
     metrics::WorkerMetrics,
@@ -50,7 +48,7 @@ struct TestMakeBlockQuorumWaiter();
 impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
     fn verify_block(
         &self,
-        _block: WorkerBlock,
+        _block: SealedWorkerBlock,
         _timeout: Duration,
     ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
         tokio::spawn(async move { Ok(()) })
@@ -145,7 +143,7 @@ async fn test_make_block_el_to_cl() {
         txpool.clone(),
         blockchain_db.canonical_state_stream(),
         latest_canon_state,
-        block_provider.blocks_rx(),
+        block_provider.blocks_tx(),
         address,
         Duration::from_secs(1),
     );
@@ -207,31 +205,33 @@ async fn test_make_block_el_to_cl() {
     //
 
     // wait for new block
-    let mut block = None;
+    let mut sealed_block = None;
     for _ in 0..5 {
         let _ = tokio::time::sleep(Duration::from_secs(1)).await;
         // Ensure the block is stored
-        if let Some((_, wb)) = store.iter::<WorkerBlocks>().next() {
-            block = Some(wb);
+        if let Some((digest, wb)) = store.iter::<WorkerBlocks>().next() {
+            sealed_block = Some(SealedWorkerBlock::new(wb, digest));
             break;
         }
     }
-    let block = block.unwrap();
+    let sealed_block = sealed_block.unwrap();
 
     // ensure block validator succeeds
     let block_validator = BlockValidator::new(blockchain_db.clone());
 
-    let valid_block_result = block_validator.validate_block(&block).await;
+    let valid_block_result = block_validator.validate_block(sealed_block.clone()).await;
     assert!(valid_block_result.is_ok());
 
     // ensure expected transaction is in block
     let expected_block = WorkerBlock {
         transactions: vec![transaction1.clone(), transaction2.clone(), transaction3.clone()],
         received_at: None,
-        ..block
-    };
-    let block_txs = block.transactions();
-    assert_eq!(block_txs, expected_block.transactions());
+        ..*sealed_block.block()
+    }
+    .seal_slow();
+
+    let block_txs = sealed_block.block().transactions();
+    assert_eq!(block_txs, expected_block.block().transactions());
 
     // ensure enough time passes for store to pass
     let _ = tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -407,20 +407,20 @@ async fn test_block_builder_produces_valid_blocks() {
     // validate first block
     let block_validator = BlockValidator::new(blockchain_db.clone());
 
-    let valid_block_result = block_validator.validate_block(&first_block).await;
+    let valid_block_result = block_validator.validate_block(first_block.clone()).await;
     assert!(valid_block_result.is_ok());
 
     // ensure expected transaction is in block
     let expected_block = WorkerBlock {
         transactions: vec![transaction1.clone(), transaction2.clone(), transaction3.clone()],
         received_at: None,
-        ..first_block
+        ..*first_block.block()
     };
-    let block_txs = first_block.transactions();
+    let block_txs = first_block.block().transactions();
     assert_eq!(block_txs, expected_block.transactions());
 
     // receive next block
-    let (block, ack) = timeout(duration, from_block_builder.recv())
+    let (next_block, ack) = timeout(duration, from_block_builder.recv())
         .await
         .expect("block builder's sender didn't drop")
         .expect("worker block was built");
@@ -428,14 +428,14 @@ async fn test_block_builder_produces_valid_blocks() {
     let _ = ack.send(Ok(()));
 
     // validate second block
-    let valid_block_result = block_validator.validate_block(&block).await;
+    let valid_block_result = block_validator.validate_block(next_block.clone()).await;
     assert!(valid_block_result.is_ok());
 
     // assert only transaction in block
-    assert_eq!(block.transactions().len(), 1);
+    assert_eq!(next_block.block().transactions().len(), 1);
 
     // confirm 4th transaction hash matches one submitted
-    let tx = block.transactions().first().expect("block transactions length is one");
+    let tx = next_block.block().transactions().first().expect("block transactions length is one");
     assert_eq!(tx.hash(), expected_tx_hash);
 
     // yield to try and give pool a chance to update
@@ -602,10 +602,10 @@ async fn test_canonical_notification_updates_pool() {
     assert_eq!(queued_pool_len, 1);
 
     // ensure expected transaction is in block
-    let mut first_block = WorkerBlock::new_for_test(
-        vec![transaction1.clone(), transaction2.clone(), transaction3.clone()],
-        SealedHeader::default(),
-    );
+    let mut first_block = WorkerBlock {
+        transactions: vec![transaction1.clone(), transaction2.clone(), transaction3.clone()],
+        ..Default::default()
+    };
 
     execute_test_worker_block(&mut first_block, &chain.sealed_genesis_header());
 
@@ -655,7 +655,7 @@ async fn test_canonical_notification_updates_pool() {
     // validate block
     let block_validator = BlockValidator::new(blockchain_db);
 
-    let valid_block_result = block_validator.validate_block(&first_block).await;
+    let valid_block_result = block_validator.validate_block(first_block.clone()).await;
     assert!(valid_block_result.is_ok());
 
     // yield to try and give pool a chance to update

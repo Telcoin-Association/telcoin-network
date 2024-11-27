@@ -21,8 +21,7 @@ use jsonrpsee::{core::client::ClientT, rpc_params};
 use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicKey as PubKey};
 use reth_chainspec::ChainSpec;
 use reth_primitives::{
-    alloy_primitives::U160, public_key_to_address, Address, GenesisAccount, SealedHeader, B256,
-    U256,
+    alloy_primitives::U160, public_key_to_address, Address, GenesisAccount, B256, U256,
 };
 use reth_provider::ExecutionOutcome;
 use reth_tasks::TaskManager;
@@ -39,7 +38,9 @@ use tn_test_utils::{
     default_test_execution_node, execution_outcome_for_tests, faucet_test_execution_node,
     TransactionFactory,
 };
-use tn_types::{adiri_genesis, error::BlockSealError, TransactionSigned, WorkerBlock};
+use tn_types::{
+    adiri_genesis, error::BlockSealError, SealedWorkerBlock, TransactionSigned, WorkerBlock,
+};
 use tn_worker::{
     metrics::WorkerMetrics,
     quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
@@ -52,11 +53,11 @@ use tokio::{
 use tracing::debug;
 
 #[derive(Clone, Debug)]
-struct TestChanQuorumWaiter(Sender<WorkerBlock>);
+struct TestChanQuorumWaiter(Sender<SealedWorkerBlock>);
 impl QuorumWaiterTrait for TestChanQuorumWaiter {
     fn verify_block(
         &self,
-        block: WorkerBlock,
+        block: SealedWorkerBlock,
         _timeout: Duration,
     ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
         let chan = self.0.clone();
@@ -271,7 +272,7 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
         BlockProvider::new(0, qw.clone(), Arc::new(node_metrics), client, store.clone(), timeout);
 
     // start batch maker
-    execution_node.start_block_builder(worker_id, block_provider.blocks_rx()).await?;
+    execution_node.start_block_builder(worker_id, block_provider.blocks_tx()).await?;
 
     // create client
     let client = execution_node.worker_http_client(&worker_id).await?.expect("worker rpc client");
@@ -289,10 +290,10 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     let duration = Duration::from_secs(15);
 
     // wait for canon event or timeout
-    let new_block: WorkerBlock =
+    let new_block: SealedWorkerBlock =
         time::timeout(duration, next_batch.recv()).await?.expect("batch received");
 
-    let batch_txs = new_block.transactions();
+    let batch_txs = new_block.block().transactions();
     let tx = batch_txs.first().expect("first batch tx from faucet");
 
     // assert recovered transaction
@@ -594,12 +595,12 @@ async fn test_faucet_transfers_stablecoin_with_google_kms() -> eyre::Result<()> 
     let duration = Duration::from_secs(15);
 
     // wait for canon event or timeout
-    let (new_block, ack): (WorkerBlock, oneshot::Sender<Result<(), BlockSealError>>) =
+    let (new_block, ack): (SealedWorkerBlock, oneshot::Sender<Result<(), BlockSealError>>) =
         time::timeout(duration, next_batch.recv()).await?.expect("batch received");
 
     // send ack
     let _ = ack.send(Ok(()));
-    let batch_txs = new_block.transactions();
+    let batch_txs = new_block.block().transactions();
     let tx = batch_txs.first().expect("first batch tx from faucet");
 
     let contract_params: Vec<u8> = Drip::abi_encode_params(&(&contract_address, &user_address));
@@ -772,8 +773,12 @@ async fn get_contract_state_for_genesis(
     let block_executor = execution_node.get_block_executor().await;
 
     // execute batch
-    let batch = WorkerBlock::new_for_test(raw_txs_to_execute, SealedHeader::default());
     let parent = chain.sealed_genesis_header();
+    let batch = WorkerBlock {
+        transactions: raw_txs_to_execute,
+        parent_hash: parent.hash(),
+        ..Default::default()
+    };
     let execution_outcome =
         execution_outcome_for_tests(&batch, &parent, &provider, &block_executor);
 

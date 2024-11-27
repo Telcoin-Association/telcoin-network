@@ -3,10 +3,7 @@ use reth_primitives::SealedHeader;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use tn_types::{
-    AuthorityIdentifier, BlockHash, Certificate, Header, NetworkPublicKey, Round, WorkerBlock,
-    WorkerId,
-};
+use tn_types::{AuthorityIdentifier, BlockHash, Certificate, Header, NetworkPublicKey, Round};
 use tracing::warn;
 
 /// Request for broadcasting certificates to peers.
@@ -114,19 +111,6 @@ pub struct FetchBlocksRequest {
 pub struct RequestBlocksRequest {
     /// Vec of requested blocks' digests
     pub block_digests: Vec<BlockHash>,
-}
-
-/// Used by workers to validate a peer's block using EL.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ValidateBlockRequest {
-    /// The peer's block to validate.
-    pub block: WorkerBlock,
-    /// The worker's id.
-    ///
-    /// TODO: this is redundant because
-    /// there is a method on anemo requests, but it returns
-    /// an option which makes me wonder if it's reliably present.
-    pub worker_id: WorkerId,
 }
 
 /// Primary to engine request to verify a peer's latest execution result.

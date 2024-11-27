@@ -32,7 +32,7 @@ impl<DB: Database> WorkerToPrimary for WorkerReceiverHandler<DB> {
             .send(OurDigestMessage {
                 digest: message.digest,
                 worker_id: message.worker_id,
-                timestamp: message.worker_block.created_at(),
+                timestamp: message.timestamp,
                 ack_channel: tx_ack,
             })
             .await

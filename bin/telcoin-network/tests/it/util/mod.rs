@@ -6,7 +6,6 @@ use reth::{
 };
 use reth_chainspec::ChainSpec;
 use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
-use reth_primitives::SealedHeader;
 use std::{path::PathBuf, sync::Arc};
 use telcoin_network::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
 use tn_node::launch_node;
@@ -282,8 +281,12 @@ pub async fn get_contract_state_for_genesis(
     let block_executor = execution_node.get_block_executor().await;
 
     // execute batch
-    let batch = WorkerBlock::new_for_test(raw_txs_to_execute, SealedHeader::default());
     let parent = chain.sealed_genesis_header();
+    let batch = WorkerBlock {
+        transactions: raw_txs_to_execute,
+        parent_hash: parent.hash(),
+        ..Default::default()
+    };
     let execution_outcome =
         execution_outcome_for_tests(&batch, &parent, &provider, &block_executor);
 

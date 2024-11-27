@@ -219,7 +219,7 @@ where
                 build_worker_block(build_args);
 
             // forward to worker and wait for ack that quorum was reached
-            if let Err(e) = to_worker.send((worker_block, ack)).await {
+            if let Err(e) = to_worker.send((worker_block.seal_slow(), ack)).await {
                 error!(target: "worker::block_builder", ?e, "failed to send next block to worker");
                 // try to return error if worker channel closed
                 let _ = result.send(Err(e.into()));
@@ -446,7 +446,7 @@ mod tests {
     use tn_test_utils::{adiri_genesis_seeded, get_gas_price, TransactionFactory};
     use tn_types::{
         adiri_genesis, AutoSealConsensus, BuildArguments, CommittedSubDag, Consensus,
-        ConsensusHeader, ConsensusOutput, WorkerBlock,
+        ConsensusHeader, ConsensusOutput, SealedWorkerBlock,
     };
     use tn_worker::{
         metrics::WorkerMetrics,
@@ -460,7 +460,7 @@ mod tests {
     impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
         fn verify_block(
             &self,
-            _block: WorkerBlock,
+            _block: SealedWorkerBlock,
             _timeout: Duration,
         ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
             tokio::spawn(async move { Ok(()) })
@@ -539,7 +539,7 @@ mod tests {
             txpool.clone(),
             blockchain_db.canonical_state_stream(),
             latest_canon_state,
-            block_provider.blocks_rx(),
+            block_provider.blocks_tx(),
             address,
             Duration::from_secs(1),
         );
@@ -811,13 +811,13 @@ mod tests {
         // non-fatal errors cause the loop to break and wait for txpool updates
         // submitting a new pending transaction is one of the ways this task wakes up
         for (subdag_index, error) in non_fatal_errors.into_iter().enumerate() {
-            let (block, ack) = timeout(duration, from_block_builder.recv())
+            let (sealed_block, ack) = timeout(duration, from_block_builder.recv())
                 .await
                 .expect("block builder built another block after canonical update")
                 .expect("worker block was built");
 
             // all 3 transactions present
-            assert_eq!(block.transactions().len(), 3 + subdag_index);
+            assert_eq!(sealed_block.block().transactions().len(), 3 + subdag_index);
 
             // send non-fatal error
             let _ = ack.send(Err(error));
@@ -861,13 +861,13 @@ mod tests {
         }
 
         // wait for next block
-        let (block, ack) = timeout(duration, from_block_builder.recv())
+        let (sealed_block, ack) = timeout(duration, from_block_builder.recv())
             .await
             .expect("block builder's sender didn't drop")
             .expect("worker block was built");
 
         // expect 7 transactions after loop added 4 more
-        assert_eq!(block.transactions().len(), 7);
+        assert_eq!(sealed_block.block().transactions().len(), 7);
 
         // now send fatal error
         let _ = ack.send(Err(BlockSealError::FatalDBFailure));
@@ -957,7 +957,7 @@ mod tests {
         let duration = std::time::Duration::from_secs(5);
 
         // receive proposed block with 3 transactions
-        let (block, ack) = timeout(duration, from_block_builder.recv())
+        let (sealed_block, ack) = timeout(duration, from_block_builder.recv())
             .await
             .expect("block builder's sender didn't drop")
             .expect("worker block was built");
@@ -974,7 +974,7 @@ mod tests {
             .await;
 
         // assert first 3 txs in block
-        assert_eq!(block.transactions().len(), 3);
+        assert_eq!(sealed_block.block().transactions().len(), 3);
 
         // assert all 4 txs in pending pool
         let pending_pool_len = txpool.pool_size().pending;
@@ -984,7 +984,7 @@ mod tests {
         let _ = ack.send(Ok(()));
 
         // receive next block
-        let (block, ack) = timeout(duration, from_block_builder.recv())
+        let (sealed_block, ack) = timeout(duration, from_block_builder.recv())
             .await
             .expect("block builder's sender didn't drop")
             .expect("worker block was built");
@@ -992,10 +992,11 @@ mod tests {
         let _ = ack.send(Ok(()));
 
         // assert only transaction in block
-        assert_eq!(block.transactions().len(), 1);
+        assert_eq!(sealed_block.block().transactions().len(), 1);
 
         // confirm 4th transaction hash matches one submitted
-        let tx = block.transactions().first().expect("block transactions length is one");
+        let tx =
+            sealed_block.block().transactions().first().expect("block transactions length is one");
         assert_eq!(tx.hash(), expected_tx_hash);
 
         // yield to try and give pool a chance to update

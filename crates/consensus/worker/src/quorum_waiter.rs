@@ -16,7 +16,7 @@ use std::{
 use thiserror::Error;
 use tn_network::{CancelOnDropHandler, ReliableNetwork};
 use tn_network_types::WorkerBlockMessage;
-use tn_types::{Authority, Committee, Stake, WorkerBlock, WorkerCache, WorkerId};
+use tn_types::{Authority, Committee, SealedWorkerBlock, Stake, WorkerCache, WorkerId};
 use tokio::task::JoinHandle;
 
 #[cfg(test)]
@@ -39,7 +39,7 @@ pub trait QuorumWaiterTrait: Send + Sync + Clone + Unpin + 'static {
     /// otherwise it might be possible if the network improves.
     fn verify_block(
         &self,
-        block: WorkerBlock,
+        block: SealedWorkerBlock,
         timeout: Duration,
     ) -> JoinHandle<Result<(), QuorumWaiterError>>;
 }
@@ -113,7 +113,7 @@ impl QuorumWaiter {
 impl QuorumWaiterTrait for QuorumWaiter {
     fn verify_block(
         &self,
-        block: WorkerBlock,
+        sealed_worker_block: SealedWorkerBlock,
         timeout: Duration,
     ) -> JoinHandle<Result<(), QuorumWaiterError>> {
         let inner = self.inner.clone();
@@ -128,7 +128,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                     .map(|(name, info)| (name, info.name))
                     .collect();
                 let (primary_names, worker_names): (Vec<_>, _) = workers.into_iter().unzip();
-                let message = WorkerBlockMessage { worker_block: block.clone() };
+                let message = WorkerBlockMessage { sealed_worker_block };
                 let handlers = inner.network.broadcast(worker_names, &message);
                 let _timer = inner.metrics.block_broadcast_quorum_latency.start_timer();
 
