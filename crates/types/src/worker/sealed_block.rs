@@ -6,7 +6,7 @@
 
 use crate::{crypto, encode, TimestampSec};
 use fastcrypto::hash::HashFunction;
-use reth_primitives::{Address, BlockHash, SealedBlock, SealedHeader, TransactionSigned, B256};
+use reth_primitives::{Address, BlockHash, SealedBlock, SealedHeader, TransactionSigned};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -28,6 +28,39 @@ pub enum WorkerBlockConversionError {
 
 /// The block for workers to communicate for consensus.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct SealedWorkerBlock {
+    /// The immutable worker block fields.
+    pub block: WorkerBlock,
+    /// The immutable digest of the block.
+    pub digest: BlockHash,
+}
+
+impl SealedWorkerBlock {
+    /// Create a new instance of Self.
+    ///
+    /// WARNING: this does not verify the provided digest matches the provided block.
+    pub fn new(block: WorkerBlock, digest: BlockHash) -> Self {
+        Self { block, digest }
+    }
+
+    /// Consume self to extract the worker block so it can be modified.
+    pub fn unseal(self) -> WorkerBlock {
+        self.block
+    }
+
+    /// Return the sealed worker block fields.
+    pub fn block(&self) -> &WorkerBlock {
+        &self.block
+    }
+
+    /// Return the digest of the sealed worker block.
+    pub fn digest(&self) -> BlockHash {
+        self.digest
+    }
+}
+
+/// The block for workers to communicate for consensus.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct WorkerBlock {
     /// The collection of transactions executed in this block.
     pub transactions: Vec<TransactionSigned>,
@@ -39,7 +72,7 @@ pub struct WorkerBlock {
     pub received_at: Option<TimestampSec>,
     /// The Keccak 256-bit hash of the parent
     /// block’s header, in its entirety; formally Hp.
-    pub parent_hash: B256,
+    pub parent_hash: BlockHash,
     /// The 160-bit address to which all fees collected from the successful mining of this block
     /// be transferred; formally Hc.
     pub beneficiary: Address,
@@ -120,6 +153,21 @@ impl WorkerBlock {
     /// Sets the recieved at field.
     pub fn set_received_at(&mut self, time: TimestampSec) {
         self.received_at = Some(time)
+    }
+
+    /// Seal the header with a known hash.
+    ///
+    /// WARNING: This method does not verify whether the hash is correct.
+    pub fn seal(self, digest: BlockHash) -> SealedWorkerBlock {
+        SealedWorkerBlock::new(self, digest)
+    }
+
+    /// Seal the worker block.
+    ///
+    /// Calculate the hash and seal the worker block so it can't be changed.
+    pub fn seal_slow(self) -> SealedWorkerBlock {
+        let digest = self.digest();
+        self.seal(digest)
     }
 }
 
