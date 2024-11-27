@@ -13,7 +13,7 @@ use std::{sync::Arc, time::Duration};
 use tn_network::{local::LocalNetwork, WorkerToPrimaryClient as _};
 use tn_network_types::WorkerOwnBlockMessage;
 use tn_storage::{tables::WorkerBlocks, traits::Database};
-use tn_types::{error::BlockSealError, WorkerBlock, WorkerBlockSender, WorkerId};
+use tn_types::{error::BlockSealError, SealedWorkerBlock, WorkerBlockSender, WorkerId};
 use tracing::error;
 
 #[cfg(test)]
@@ -70,20 +70,21 @@ impl<DB: Database, QW: QuorumWaiterTrait> BlockProvider<DB, QW> {
         this
     }
 
-    pub fn blocks_rx(&self) -> WorkerBlockSender {
+    pub fn blocks_tx(&self) -> WorkerBlockSender {
         self.tx_blocks.clone()
     }
 
     /// Seal and broadcast the current block.
-    pub async fn seal(&self, block: WorkerBlock) -> Result<(), BlockSealError> {
-        let size = block.size();
+    pub async fn seal(&self, sealed_block: SealedWorkerBlock) -> Result<(), BlockSealError> {
+        let size = sealed_block.size();
 
         self.node_metrics
             .created_block_size
             .with_label_values(&["latest block size"])
             .observe(size as f64);
 
-        let block_attest_handle = self.quorum_waiter.verify_block(block.clone(), self.timeout);
+        let block_attest_handle =
+            self.quorum_waiter.verify_block(sealed_block.clone(), self.timeout);
 
         // Wait for our block to reach quorum or fail to do so.
         match block_attest_handle.await {
@@ -116,7 +117,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> BlockProvider<DB, QW> {
         }
 
         // Now save it to disk
-        let digest = block.digest();
+        let (block, digest) = sealed_block.split();
 
         if let Err(e) = self.store.insert::<WorkerBlocks>(&digest, &block) {
             error!(target: "worker::block_provider", "Store failed with error: {:?}", e);
@@ -125,13 +126,14 @@ impl<DB: Database, QW: QuorumWaiterTrait> BlockProvider<DB, QW> {
 
         // Send the block to the primary.
         let message =
-            WorkerOwnBlockMessage { digest, worker_id: self.id, worker_block: block.clone() };
+            WorkerOwnBlockMessage { worker_id: self.id, digest, timestamp: block.created_at() };
         if let Err(err) = self.client.report_own_block(message).await {
             error!(target: "worker::block_provider", "Failed to report our block: {err:?}");
             // Should we return an error here?  Doing so complicates some tests but also the block
             // is sealed, etc. If we can not report our own block is this a
             // showstopper?
         }
+
         Ok(())
     }
 }

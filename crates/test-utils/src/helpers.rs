@@ -10,7 +10,7 @@ use rand::{
     rngs::{OsRng, StdRng},
     thread_rng, Rng, RngCore, SeedableRng,
 };
-use reth_primitives::{Address, BlockHash, Bytes, SealedHeader, TransactionSigned, U256};
+use reth_primitives::{Address, BlockHash, Bytes, Header, TransactionSigned, U256};
 use reth_tracing::tracing_subscriber::EnvFilter;
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
@@ -144,13 +144,7 @@ pub fn fixture_batch_with_transactions(number_of_transactions: u32) -> WorkerBlo
     let transactions = (0..number_of_transactions).map(|_v| transaction()).collect();
 
     // Put some random bytes in the header so that tests will have unique headers.
-    let r: Vec<u8> = (0..32).map(|_v| rand::random::<u8>()).collect();
-    let header = reth_primitives::Header {
-        nonce: rand::random::<u64>(),
-        extra_data: r.into(),
-        ..Default::default()
-    };
-    WorkerBlock::new_for_test(transactions, header.seal_slow())
+    WorkerBlock { transactions, beneficiary: Address::random(), ..Default::default() }
 }
 
 pub fn fixture_payload_with_rand<R: Rng + ?Sized>(
@@ -183,7 +177,7 @@ pub fn transaction_with_rand<R: Rng + ?Sized>(rand: &mut R) -> TransactionSigned
 pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R) -> WorkerBlock {
     WorkerBlock::new_for_test(
         vec![transaction_with_rand(rand), transaction_with_rand(rand)],
-        SealedHeader::default(),
+        Header::default(),
     )
 }
 
@@ -220,12 +214,17 @@ pub fn batch() -> WorkerBlock {
     let transactions = vec![transaction(), transaction()];
     // Put some random bytes in the header so that tests will have unique headers.
     let r: Vec<u8> = (0..32).map(|_v| rand::random::<u8>()).collect();
-    let header = reth_primitives::Header {
-        nonce: rand::random::<u64>(),
-        extra_data: r.into(),
-        ..Default::default()
-    };
-    WorkerBlock::new_for_test(transactions, header.seal_slow())
+    // let header =
+    //     Header { nonce: rand::random::<u64>(), extra_data: r.into(), ..Default::default() };
+    // WorkerBlock::new_for_test(transactions, header)
+    WorkerBlock {
+        transactions,
+        received_at: None,
+        parent_hash: todo!(),
+        beneficiary: todo!(),
+        timestamp: todo!(),
+        base_fee_per_gas: todo!(),
+    }
 }
 
 /// generate multiple fixture batches. The number of generated batches
@@ -247,7 +246,7 @@ pub fn batch_with_transactions(num_of_transactions: usize) -> WorkerBlock {
         transactions.push(transaction());
     }
 
-    WorkerBlock::new_for_test(transactions, SealedHeader::default())
+    WorkerBlock::new_for_test(transactions, Header::default())
 }
 
 /// Creates one certificate per authority starting and finishing at the specified rounds

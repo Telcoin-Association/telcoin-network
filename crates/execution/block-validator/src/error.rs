@@ -7,6 +7,9 @@ use tn_types::BlockHash;
 /// Block validation error types
 #[derive(Error, Debug)]
 pub enum BlockValidationError {
+    /// The sealed worker block hash does not match this worker's calculated digest.
+    #[error("Invalid digest for sealed worker block.")]
+    InvalidDigest,
     /// Attempt to retrieve the block's header from this worker's database.
     #[error("Error retrieving header from database provider: {0}")]
     Provider(#[from] ProviderError),

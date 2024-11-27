@@ -22,7 +22,7 @@ use tn_storage::{
     tables::WorkerBlocks,
     traits::{Database, DbTxMut},
 };
-use tn_types::{now, Committee, WorkerCache, WorkerId};
+use tn_types::{now, Committee, SealedWorkerBlock, WorkerCache, WorkerId};
 use tracing::{debug, trace};
 
 #[cfg(test)]
@@ -51,29 +51,32 @@ impl<V: BlockValidation, DB: Database> WorkerToWorker for WorkerReceiverHandler<
         // own peer id for error handling
         let peer_id = request.peer_id().copied();
         let message = request.into_body();
+        let WorkerBlockMessage { sealed_worker_block } = message;
         // validate batch - log error if invalid
-        if let Err(err) = self.validator.validate_block(&message.worker_block).await {
+        if let Err(err) = self.validator.validate_block(sealed_worker_block.clone()).await {
             return Err(anemo::rpc::Status::new_with_message(
                 StatusCode::BadRequest,
                 format!(
-                    "Invalid block from peer {:?}: {err}\n\nbad worker block:\n{:?}",
-                    peer_id, message.worker_block,
+                    "Invalid block from peer {:?}: {err}\nsealed_\nbad worker block:\n{:?}",
+                    peer_id, sealed_worker_block,
                 ),
             ));
         }
-        let digest = message.worker_block.digest();
 
-        let mut batch = message.worker_block;
+        let (mut worker_block, digest) = sealed_worker_block.split();
 
         // Set received_at timestamp for remote batch.
-        batch.set_received_at(now());
-        self.store.insert::<WorkerBlocks>(&digest, &batch).map_err(|e| {
+        worker_block.set_received_at(now());
+        self.store.insert::<WorkerBlocks>(&digest, &worker_block).map_err(|e| {
             anemo::rpc::Status::internal(format!("failed to write to batch store: {e:?}"))
         })?;
+
+        // notify primary for payload store
         self.client
             .report_others_block(WorkerOthersBlockMessage { digest, worker_id: self.id })
             .await
             .map_err(|e| anemo::rpc::Status::internal(e.to_string()))?;
+
         Ok(anemo::Response::new(()))
     }
 
@@ -193,32 +196,39 @@ impl<V: BlockValidation, DB: Database> PrimaryToWorker for PrimaryReceiverHandle
         let request = RequestBlocksRequest { block_digests: missing.iter().cloned().collect() };
         debug!("Sending RequestBatchesRequest to {worker_name}: {request:?}");
 
-        let mut response = client
+        let response = client
             .request_blocks(anemo::Request::new(request).with_timeout(self.request_batches_timeout))
             .await?
             .into_inner();
 
-        for batch in response.blocks.iter_mut() {
+        let sealed_blocks_from_response: Vec<SealedWorkerBlock> = missing
+            .iter()
+            .cloned()
+            .zip(response.blocks)
+            .map(|(digest, block)| SealedWorkerBlock::new(block, digest))
+            .collect();
+
+        for sealed_block in sealed_blocks_from_response.into_iter() {
             if !message.is_certified {
-                // This batch is not part of a certificate, so we need to validate it.
-                if let Err(err) = self.validator.validate_block(batch).await {
+                // This block is not part of a certificate, so we need to validate it.
+                if let Err(err) = self.validator.validate_block(sealed_block.clone()).await {
                     return Err(anemo::rpc::Status::new_with_message(
                         StatusCode::BadRequest,
-                        format!("Invalid batch: {err}"),
+                        format!("Invalid worker block: {err}"),
                     ));
                 }
             }
 
-            let digest = batch.digest();
+            let (mut block, digest) = sealed_block.split();
             if missing.remove(&digest) {
-                // Set received_at timestamp for remote batch.
-                batch.set_received_at(now());
+                // Set received_at timestamp for remote block.
+                block.set_received_at(now());
                 let mut tx = self.store.write_txn().map_err(|e| {
                     anemo::rpc::Status::internal(format!(
-                        "failed to create batch transaction to commit: {e:?}"
+                        "failed to create block transaction to commit: {e:?}"
                     ))
                 })?;
-                tx.insert::<WorkerBlocks>(&digest, batch).map_err(|e| {
+                tx.insert::<WorkerBlocks>(&digest, &block).map_err(|e| {
                     anemo::rpc::Status::internal(format!(
                         "failed to batch transaction to commit: {e:?}"
                     ))

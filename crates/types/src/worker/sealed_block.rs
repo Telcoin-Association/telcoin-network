@@ -4,9 +4,11 @@
 //! have reached quorum.
 // Copyright (c) Telcoin, LLC
 
-use crate::{crypto, encode, TimestampSec};
+use crate::{adiri_chain_spec, crypto, encode, now, TimestampSec};
 use fastcrypto::hash::HashFunction;
-use reth_primitives::{Address, BlockHash, SealedBlock, SealedHeader, TransactionSigned};
+use reth_primitives::{
+    constants::MIN_PROTOCOL_BASE_FEE, Address, BlockHash, Header, SealedBlock, TransactionSigned,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -57,6 +59,18 @@ impl SealedWorkerBlock {
     pub fn digest(&self) -> BlockHash {
         self.digest
     }
+
+    /// Split Self into separate parts.
+    ///
+    /// This is the inverse of [`WorkerBlock::seal_slow`].
+    pub fn split(self) -> (WorkerBlock, BlockHash) {
+        (self.block, self.digest)
+    }
+
+    /// Size of the sealed block.
+    pub fn size(&self) -> usize {
+        self.block.size() + size_of::<BlockHash>()
+    }
 }
 
 /// The block for workers to communicate for consensus.
@@ -64,12 +78,6 @@ impl SealedWorkerBlock {
 pub struct WorkerBlock {
     /// The collection of transactions executed in this block.
     pub transactions: Vec<TransactionSigned>,
-    /// Timestamp of when the entity was received by another node. This will help
-    /// calculate latencies that are not affected by clock drift or network
-    /// delays. This field is not set for own blocks.
-    #[serde(skip)]
-    // This field changes often so don't serialize (i.e. don't use it in the digest)
-    pub received_at: Option<TimestampSec>,
     /// The Keccak 256-bit hash of the parent
     /// block’s header, in its entirety; formally Hp.
     pub parent_hash: BlockHash,
@@ -86,19 +94,25 @@ pub struct WorkerBlock {
     /// above the gas target, and decreasing when blocks are below the gas target. The base fee per
     /// gas is burned.
     pub base_fee_per_gas: Option<u64>,
+    /// Timestamp of when the entity was received by another node. This will help
+    /// calculate latencies that are not affected by clock drift or network
+    /// delays. This field is not set for own blocks.
+    #[serde(skip)]
+    // This field changes often so don't serialize (i.e. don't use it in the digest)
+    pub received_at: Option<TimestampSec>,
 }
 
 impl WorkerBlock {
     /// Create a new block for testing only!
     ///
     /// This is NOT a valid block for consensus.
-    pub fn new_for_test(transactions: Vec<TransactionSigned>, sealed_header: SealedHeader) -> Self {
+    pub fn new_for_test(transactions: Vec<TransactionSigned>, header: Header) -> Self {
         Self {
             transactions,
-            parent_hash: sealed_header.parent_hash,
-            beneficiary: sealed_header.beneficiary,
-            timestamp: sealed_header.timestamp,
-            base_fee_per_gas: sealed_header.base_fee_per_gas,
+            parent_hash: header.parent_hash,
+            beneficiary: header.beneficiary,
+            timestamp: header.timestamp,
+            base_fee_per_gas: header.base_fee_per_gas,
             received_at: None,
         }
     }
@@ -109,6 +123,8 @@ impl WorkerBlock {
     }
 
     /// Digest for this block (the hash of the sealed header).
+    ///
+    /// NOTE: `Self::received_at` is skipped during serialization and is excluded from the digest.
     pub fn digest(&self) -> BlockHash {
         let mut hasher = crypto::DefaultHashFunction::new();
         hasher.update(encode(self));
@@ -142,6 +158,7 @@ impl WorkerBlock {
             // txs are not executed, so use the gas_limit
             total_possible_gas += tx.gas_limit();
         }
+
         total_possible_gas
     }
 
@@ -165,9 +182,24 @@ impl WorkerBlock {
     /// Seal the worker block.
     ///
     /// Calculate the hash and seal the worker block so it can't be changed.
+    ///
+    /// NOTE: `WorkerBlock::received_at` is skipped during serialization and is excluded from the digest.
     pub fn seal_slow(self) -> SealedWorkerBlock {
         let digest = self.digest();
         self.seal(digest)
+    }
+}
+
+impl Default for WorkerBlock {
+    fn default() -> Self {
+        Self {
+            transactions: vec![],
+            received_at: None,
+            parent_hash: adiri_chain_spec().genesis_hash(),
+            beneficiary: Address::ZERO,
+            timestamp: now(),
+            base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
+        }
     }
 }
 

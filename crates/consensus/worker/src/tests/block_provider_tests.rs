@@ -1,21 +1,20 @@
-use std::sync::Mutex;
-
-use crate::quorum_waiter::QuorumWaiterError;
-
 // Copyright (c) 2021, Facebook, Inc. and its affiliates
 // Copyright (c) Telcoin, LLC
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
-use super::*;
 
-use reth_primitives::SealedHeader;
+//! Unit tests for the worker's block provider.
+use super::*;
+use crate::quorum_waiter::QuorumWaiterError;
+use std::sync::Mutex;
 use tempfile::TempDir;
 use tn_network_types::MockWorkerToPrimary;
 use tn_storage::open_db;
 use tn_test_utils::transaction;
+use tn_types::WorkerBlock;
 
 #[derive(Clone, Debug)]
-struct TestMakeBlockQuorumWaiter(Arc<Mutex<Option<WorkerBlock>>>);
+struct TestMakeBlockQuorumWaiter(Arc<Mutex<Option<SealedWorkerBlock>>>);
 impl TestMakeBlockQuorumWaiter {
     fn new_test() -> Self {
         Self(Arc::new(Mutex::new(None)))
@@ -24,7 +23,7 @@ impl TestMakeBlockQuorumWaiter {
 impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
     fn verify_block(
         &self,
-        block: WorkerBlock,
+        block: SealedWorkerBlock,
         _timeout: Duration,
     ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
         let data = self.0.clone();
@@ -57,13 +56,13 @@ async fn make_block() {
     // Send enough transactions to seal a block.
     let tx = transaction();
     let new_block =
-        WorkerBlock::new_for_test(vec![tx.clone(), tx.clone()], SealedHeader::default());
+        WorkerBlock { transactions: vec![tx.clone(), tx.clone()], ..Default::default() };
 
-    block_provider.seal(new_block.clone()).await.unwrap();
+    block_provider.seal(new_block.clone().seal_slow()).await.unwrap();
 
     // Ensure the block is as expected.
     let expected_block =
-        WorkerBlock::new_for_test(vec![tx.clone(), tx.clone()], SealedHeader::default());
+        WorkerBlock { transactions: vec![tx.clone(), tx.clone()], ..Default::default() };
 
     assert_eq!(
         new_block.transactions(),
@@ -71,6 +70,7 @@ async fn make_block() {
             .unwrap()
             .as_ref()
             .expect("Worker block not sent to Quorum Waiter!")
+            .block()
             .transactions()
     );
 

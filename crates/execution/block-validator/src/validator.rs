@@ -5,7 +5,7 @@ use reth_db::database::Database;
 use reth_primitives::Header;
 use reth_provider::{providers::BlockchainProvider, HeaderProvider};
 use std::fmt::{Debug, Display};
-use tn_types::{max_worker_block_gas, max_worker_block_size, TransactionSigned, WorkerBlock};
+use tn_types::{max_worker_block_gas, max_worker_block_size, SealedWorkerBlock, TransactionSigned};
 
 /// Type convenience for implementing block validation errors.
 type BlockValidationResult<T> = Result<T, BlockValidationError>;
@@ -28,7 +28,7 @@ where
 pub trait BlockValidation: Clone + Send + Sync + 'static {
     type Error: Display + Debug + Send + Sync + 'static;
     /// Determines if this block can be voted on
-    async fn validate_block(&self, b: &WorkerBlock) -> Result<(), Self::Error>;
+    async fn validate_block(&self, b: SealedWorkerBlock) -> Result<(), Self::Error>;
 }
 
 #[async_trait::async_trait]
@@ -42,7 +42,14 @@ where
     /// Validate a peer's worker block.
     ///
     /// Workers do not execute full blocks. This method validates the required information.
-    async fn validate_block(&self, block: &WorkerBlock) -> BlockValidationResult<()> {
+    async fn validate_block(&self, sealed_block: SealedWorkerBlock) -> BlockValidationResult<()> {
+        // ensure digest matches worker block
+        let (block, digest) = sealed_block.split();
+        let verified_hash = block.clone().seal_slow().digest();
+        if digest != verified_hash {
+            return Err(BlockValidationError::InvalidDigest);
+        }
+
         // TODO: validate individual transactions against parent
 
         // obtain info for validation
@@ -159,7 +166,7 @@ pub struct NoopBlockValidator;
 impl BlockValidation for NoopBlockValidator {
     type Error = BlockValidationError;
 
-    async fn validate_block(&self, _block: &WorkerBlock) -> Result<(), Self::Error> {
+    async fn validate_block(&self, _block: SealedWorkerBlock) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -186,7 +193,7 @@ mod tests {
     use reth_prune::PruneModes;
     use std::{str::FromStr, sync::Arc};
     use tn_test_utils::TransactionFactory;
-    use tn_types::{adiri_genesis, max_worker_block_gas, Consensus};
+    use tn_types::{adiri_genesis, max_worker_block_gas, Consensus, WorkerBlock};
     use tracing::debug;
 
     /// Return the next valid block
@@ -346,8 +353,8 @@ mod tests {
     #[tokio::test]
     async fn test_valid_block() {
         let TestTools { valid_txs, valid_header, validator } = test_types().await;
-        let valid_block = WorkerBlock::new_for_test(valid_txs, valid_header);
-        let result = validator.validate_block(&valid_block).await;
+        let valid_block = WorkerBlock::new_for_test(valid_txs, valid_header).seal_slow();
+        let result = validator.validate_block(valid_block).await;
 
         assert!(result.is_ok());
     }

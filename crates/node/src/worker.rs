@@ -62,7 +62,7 @@ impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
             Worker::spawn(self.id, batch_validator, metrics, self.consensus_config.clone());
 
         // spawn batch maker for worker
-        execution_node.start_block_builder(self.id, block_provider.blocks_rx()).await?;
+        execution_node.start_block_builder(self.id, block_provider.blocks_tx()).await?;
 
         // now keep the handles
         self.handles.clear();
