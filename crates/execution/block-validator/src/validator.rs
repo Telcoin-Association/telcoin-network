@@ -213,7 +213,6 @@ mod tests {
             value, // 1 TEL
             Bytes::new(),
         );
-        debug!("transaction 1: {transaction1:?}");
 
         let transaction2 = tx_factory.create_eip1559(
             chain.clone(),
@@ -223,7 +222,6 @@ mod tests {
             value, // 1 TEL
             Bytes::new(),
         );
-        debug!("transaction 2: {transaction2:?}");
 
         let transaction3 = tx_factory.create_eip1559(
             chain,
@@ -233,17 +231,17 @@ mod tests {
             value, // 1 TEL
             Bytes::new(),
         );
-        debug!("transaction 3: {transaction3:?}");
 
         let valid_txs = vec![transaction1, transaction2, transaction3];
-        // sealed header
+
+        // sealed worker block
         //
         // intentionally used hard-coded values
         SealedWorkerBlock::new(
             WorkerBlock {
                 transactions: valid_txs,
                 parent_hash: hex!(
-                    "bf0f2065b35a695aa0d47e9633d6cc78f6e012b988f774ff7e4c8467ea7f4126"
+                    "a0673579c1a31037ee29a7e3cb7b1495a020bf21d958269ea8291a64326667c5"
                 )
                 .into(),
                 beneficiary: Address::ZERO,
@@ -251,7 +249,7 @@ mod tests {
                 base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
                 received_at: None,
             },
-            hex!("abc832c52b74957b7ef596e35022068ba9a8ab222ed4dbbe42b3eb07d17a42ef").into(),
+            hex!("3db9ad782b190874867d04f3c26a88546a06be445c9544697499659944210593").into(),
         )
     }
 
@@ -265,8 +263,7 @@ mod tests {
 
     /// Create an instance of block validator for tests.
     async fn test_tools() -> TestTools {
-        // reth_tracing::init_test_tracing();
-
+        // genesis with default TransactionFactory funded
         let chain: Arc<ChainSpec> = Arc::new(test_genesis().into());
 
         // init genesis
@@ -309,8 +306,14 @@ mod tests {
     #[tokio::test]
     async fn test_valid_block() {
         let TestTools { valid_block, validator } = test_tools().await;
-        let result = validator.validate_block(valid_block).await;
+        let result = validator.validate_block(valid_block.clone()).await;
+        assert!(result.is_ok());
 
+        // ensure non-serialized data does not affect validity
+        let (mut worker_block, _) = valid_block.split();
+        worker_block.received_at = Some(tn_types::now());
+        let different_block = worker_block.seal_slow();
+        let result = validator.validate_block(different_block).await;
         assert!(result.is_ok());
     }
 
@@ -430,7 +433,6 @@ mod tests {
         // currently: 4695 txs at 1000035 bytes
         let mut too_many_txs = Vec::new();
         let mut total_bytes = 0;
-        let mut total_gas = 0;
         while total_bytes < max_worker_block_size(0) {
             let tx = tx_factory.create_explicit_eip1559(
                 Some(chain.chain.id()),
@@ -445,7 +447,6 @@ mod tests {
             );
 
             // track totals
-            total_gas += tx.gas_limit();
             total_bytes += tx.size();
             too_many_txs.push(tx);
         }

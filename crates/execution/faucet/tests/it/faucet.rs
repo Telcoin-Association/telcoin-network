@@ -21,8 +21,7 @@ use jsonrpsee::{core::client::ClientT, rpc_params};
 use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicKey as PubKey};
 use reth_chainspec::ChainSpec;
 use reth_primitives::{
-    alloy_primitives::U160, public_key_to_address, Address, GenesisAccount, SealedHeader, B256,
-    U256,
+    alloy_primitives::U160, public_key_to_address, Address, GenesisAccount, B256, U256,
 };
 use reth_provider::ExecutionOutcome;
 use reth_tasks::TaskManager;
