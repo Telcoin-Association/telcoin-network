@@ -4,3 +4,5 @@ mod gossip;
 mod worker;
 pub use gossip::start_gossip_publish_network;
 pub use worker::*;
+mod generic;
+pub use generic::*;
