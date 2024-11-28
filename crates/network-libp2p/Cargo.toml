@@ -21,6 +21,7 @@ tn-types = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 eyre = { workspace = true }
+consensus-metrics = { workspace = true }
 
 [lints]
 workspace = true
