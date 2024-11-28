@@ -1,4 +1,4 @@
-//! Worker gossipsub network.
+//! Generic abstraction for publishing (flood) to the gossipsub network.
 
 use consensus_metrics::spawn_logged_monitored_task;
 use eyre::eyre;
@@ -34,7 +34,7 @@ pub struct PublishNetwork {
     /// The stream for receiving sealed worker blocks to publish.
     stream: ReceiverStream<Vec<u8>>,
     /// The [Multiaddr] for the swarm.
-    listen_on: Multiaddr,
+    multiaddr: Multiaddr,
 }
 
 /// Convenience trait to make publish network generic over message types.
@@ -44,12 +44,17 @@ pub struct PublishNetwork {
 /// gossip network because the message id is the same as the data type's digest used to reach
 /// consensus.
 pub trait PublishMessageId<'a>: From<&'a Vec<u8>> {
+    /// Create a message id for a published message to the gossip network.
+    ///
+    /// Lifetimes are preferred for easier maintainability.
     fn message_id(msg: &Message) -> BlockHash;
 }
 
 impl<'a> PublishMessageId<'a> for SealedWorkerBlock {
     fn message_id(msg: &Message) -> BlockHash {
-        // TODO: this approach doesn't require lifetimes, but is harder to maintain. The tradeoff is
+        // TODO: this approach doesn't require lifetimes, but is harder to maintain.
+        //
+        // The tradeoff is:
         // maintainability vs readability.
         //
         // tn_types::decode::<Self>(&msg.data).digest()
@@ -60,7 +65,7 @@ impl<'a> PublishMessageId<'a> for SealedWorkerBlock {
 
 impl PublishNetwork {
     /// Create a new instance of Self.
-    pub fn new<'a, M>(receiver: mpsc::Receiver<Vec<u8>>) -> Self
+    pub fn new<'a, M>(receiver: mpsc::Receiver<Vec<u8>>, multiaddr: Multiaddr) -> Self
     where
         M: PublishMessageId<'a>,
     {
@@ -104,18 +109,16 @@ impl PublishNetwork {
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
 
+        // convert receiver into stream for convenience in `Self::poll`
         let stream = ReceiverStream::new(receiver);
-        let listen_on = "/ip4/0.0.0.0/udp/0/quic-v1"
-            .parse()
-            .expect("multiaddr parsed for worker gossip publisher");
 
-        Self { topic, network: swarm, stream, listen_on }
+        Self { topic, network: swarm, stream, multiaddr }
     }
 
     pub async fn spawn(mut self) -> JoinHandle<()> {
         // connect to network using address
         self.network
-            .listen_on(self.listen_on.clone())
+            .listen_on(self.multiaddr.clone())
             .expect("port for worker gossip publisher available");
 
         // spawn future
@@ -157,7 +160,10 @@ mod tests {
     #[tokio::test]
     async fn test_generics_compile() -> eyre::Result<()> {
         let (tx, rx) = mpsc::channel(1);
-        let worker_publish_network = PublishNetwork::new::<SealedWorkerBlock>(rx);
+        let listen_on = "/ip4/0.0.0.0/udp/0/quic-v1"
+            .parse()
+            .expect("multiaddr parsed for worker gossip publisher");
+        let worker_publish_network = PublishNetwork::new::<SealedWorkerBlock>(rx, listen_on);
         let _ = worker_publish_network.spawn();
 
         Ok(())
