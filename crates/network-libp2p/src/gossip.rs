@@ -23,7 +23,8 @@ struct TelcoinGossip {
 
 /// Spawn a gossipsub network for consensus output.
 ///
-/// This network supports clients that follow consensus without participating as a voting committee member.
+/// This network supports clients that follow consensus without participating as a voting committee
+/// member.
 pub fn start_gossip_publish_network(
     new_output: broadcast::Receiver<ConsensusHeader>,
 ) -> eyre::Result<()> {

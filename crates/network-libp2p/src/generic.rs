@@ -33,20 +33,24 @@ pub struct PublishNetwork {
     network: Swarm<gossipsub::Behaviour>,
     /// The stream for receiving sealed worker blocks to publish.
     stream: ReceiverStream<Vec<u8>>,
-    /// The [multiaddr] for the swarm.
+    /// The [Multiaddr] for the swarm.
     listen_on: Multiaddr,
 }
 
 /// Convenience trait to make publish network generic over message types.
 ///
-/// The function decodes the `[libp2p::Message]` data field and returns the digest. Using the digest for published message topics makes it easier for peers to recover missing data through the gossip network because the message id is the same as the data type's digest used to reach consensus.
+/// The function decodes the `[libp2p::Message]` data field and returns the digest. Using the digest
+/// for published message topics makes it easier for peers to recover missing data through the
+/// gossip network because the message id is the same as the data type's digest used to reach
+/// consensus.
 pub trait PublishMessageId<'a>: From<&'a Vec<u8>> {
     fn message_id(msg: &Message) -> BlockHash;
 }
 
 impl<'a> PublishMessageId<'a> for SealedWorkerBlock {
     fn message_id(msg: &Message) -> BlockHash {
-        // TODO: this approach doesn't require lifetimes, but is harder to maintain. The tradeoff is maintainability vs readability.
+        // TODO: this approach doesn't require lifetimes, but is harder to maintain. The tradeoff is
+        // maintainability vs readability.
         //
         // tn_types::decode::<Self>(&msg.data).digest()
 
@@ -60,7 +64,6 @@ impl PublishNetwork {
     where
         M: PublishMessageId<'a>,
     {
-        // pub fn new<T: From<Vec<u8>>, M: PublishMessageId<T>>(receiver: mpsc::Receiver<Vec<u8>>) -> Self {
         let topic = gossipsub::IdentTopic::new(WORKER_BLOCK_TOPIC);
 
         // generate a random ed25519 key
@@ -81,7 +84,8 @@ impl PublishNetwork {
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
                     .heartbeat_interval(Duration::from_secs(10)) // This is set to aid debugging by not cluttering the log space
                     .validation_mode(gossipsub::ValidationMode::Strict) // this is default - enforce message signing
-                    .message_id_fn(message_id_fn) // content-address messages. No two messages of the same content will be propagated.
+                    .message_id_fn(message_id_fn) // content-address messages. No two messages of the same content will be
+                    // propagated.
                     .build()
                     .map_err(|e| {
                         error!(?e, "gossipsub publish network");

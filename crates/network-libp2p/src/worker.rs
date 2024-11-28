@@ -138,7 +138,8 @@ impl WorkerPublish {
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
                     .heartbeat_interval(Duration::from_secs(10)) // This is set to aid debugging by not cluttering the log space
                     .validation_mode(gossipsub::ValidationMode::Strict) // this is default - enforce message signing
-                    .message_id_fn(message_id_fn) // content-address messages. No two messages of the same content will be propagated.
+                    .message_id_fn(message_id_fn) // content-address messages. No two messages of the same content will be
+                    // propagated.
                     .build()
                     .map_err(|e| {
                         error!(?e, "gossipsub publish network");
