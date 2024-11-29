@@ -9,6 +9,7 @@ use libp2p::{
 };
 use std::{
     future::Future,
+    marker::PhantomData,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -124,6 +125,14 @@ impl PublishNetwork {
         // spawn future
         spawn_logged_monitored_task!(self)
     }
+
+    /// Create a new publish network for [SealedWorkerBlock].
+    ///
+    /// This type is used by worker to publish sealed blocks after they reach quorum.
+    pub fn new_for_worker(receiver: mpsc::Receiver<Vec<u8>>, multiaddr: Multiaddr) -> Self {
+        // TODO: pass worker topic here
+        Self::new::<SealedWorkerBlock>(receiver, multiaddr)
+    }
 }
 
 impl Future for PublishNetwork {
@@ -152,7 +161,6 @@ impl Future for PublishNetwork {
 
 #[cfg(test)]
 mod tests {
-    use tn_types::SealedWorkerBlock;
     use tokio::sync::mpsc;
 
     use super::PublishNetwork;
@@ -163,7 +171,9 @@ mod tests {
         let listen_on = "/ip4/0.0.0.0/udp/0/quic-v1"
             .parse()
             .expect("multiaddr parsed for worker gossip publisher");
-        let worker_publish_network = PublishNetwork::new::<SealedWorkerBlock>(rx, listen_on);
+        // let worker_publish_network = PublishNetwork::new::<SealedWorkerBlock>(rx, listen_on);
+
+        let worker_publish_network = PublishNetwork::new_for_worker(rx, listen_on);
         let _ = worker_publish_network.spawn();
 
         Ok(())
