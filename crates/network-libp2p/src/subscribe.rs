@@ -5,6 +5,7 @@ use eyre::eyre;
 use futures::{FutureExt, StreamExt as _};
 use libp2p::{
     gossipsub::{self, IdentTopic, Message},
+    swarm::SwarmEvent,
     Multiaddr, Swarm, SwarmBuilder,
 };
 use std::{
@@ -141,9 +142,63 @@ impl Future for SubscriberNetwork {
 
         loop {
             match this.network.poll_next_unpin(cx) {
-                Poll::Ready(Some(swarm_event)) => {
-                    todo!()
-                }
+                Poll::Ready(Some(swarm_event)) => match swarm_event {
+                    SwarmEvent::Behaviour(gossip) => match gossip {
+                        gossipsub::Event::Message { propagation_source, message_id, message } => {
+                            // - message_id is the digest of the worker block / certificate / consensus header
+                            // - message.data is the gossipped worker block / certificate / consensus header
+                            //
+                            // TODO: is propagation_source the publisher's public key?
+                            todo!()
+                        }
+                        gossipsub::Event::Subscribed { peer_id, topic } => todo!(),
+                        gossipsub::Event::Unsubscribed { peer_id, topic } => todo!(),
+                        gossipsub::Event::GossipsubNotSupported { peer_id } => todo!(),
+                    },
+                    SwarmEvent::ConnectionEstablished {
+                        peer_id,
+                        connection_id,
+                        endpoint,
+                        num_established,
+                        concurrent_dial_errors,
+                        established_in,
+                    } => todo!(),
+                    SwarmEvent::ConnectionClosed {
+                        peer_id,
+                        connection_id,
+                        endpoint,
+                        num_established,
+                        cause,
+                    } => todo!(),
+                    SwarmEvent::IncomingConnection {
+                        connection_id,
+                        local_addr,
+                        send_back_addr,
+                    } => todo!(),
+                    SwarmEvent::IncomingConnectionError {
+                        connection_id,
+                        local_addr,
+                        send_back_addr,
+                        error,
+                    } => todo!(),
+                    SwarmEvent::OutgoingConnectionError { connection_id, peer_id, error } => {
+                        todo!()
+                    }
+                    SwarmEvent::NewListenAddr { listener_id, address } => todo!(),
+                    SwarmEvent::ExpiredListenAddr { listener_id, address } => {
+                        todo!()
+                    }
+                    SwarmEvent::ListenerClosed { listener_id, addresses, reason } => todo!(),
+                    SwarmEvent::ListenerError { listener_id, error } => todo!(),
+                    SwarmEvent::Dialing { peer_id, connection_id } => todo!(),
+                    SwarmEvent::NewExternalAddrCandidate { address } => todo!(),
+                    SwarmEvent::ExternalAddrConfirmed { address } => todo!(),
+                    SwarmEvent::ExternalAddrExpired { address } => todo!(),
+                    SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => {
+                        todo!()
+                    }
+                    _ => todo!(),
+                },
                 Poll::Ready(None) => return Poll::Ready(()),
                 Poll::Pending => break,
             }
