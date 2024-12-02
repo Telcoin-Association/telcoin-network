@@ -216,7 +216,6 @@ impl Certificate {
         };
 
         // Verify the signatures
-        // let certificate_digest: Digest<{ crypto::DIGEST_LENGTH }> = Digest::from(self.digest());
         let certificate_digest = self.digest();
         BlsAggregateSignature::try_from(aggregrate_signature_bytes)
             .map_err(|_| DagError::InvalidSignature)?
