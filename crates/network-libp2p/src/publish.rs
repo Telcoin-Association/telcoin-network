@@ -2,19 +2,17 @@
 
 use crate::types::{build_swarm, PublishMessageId, PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC};
 use consensus_metrics::spawn_logged_monitored_task;
-use eyre::eyre;
 use futures::StreamExt as _;
 use libp2p::{
-    gossipsub::{self, IdentTopic, Message},
-    Multiaddr, Swarm, SwarmBuilder,
+    gossipsub::{self, IdentTopic},
+    Multiaddr, Swarm,
 };
 use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
-    time::Duration,
 };
-use tn_types::{BlockHash, Certificate, SealedWorkerBlock};
+use tn_types::{Certificate, SealedWorkerBlock};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::error;

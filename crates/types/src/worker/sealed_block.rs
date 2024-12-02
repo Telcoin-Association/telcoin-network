@@ -207,7 +207,7 @@ impl Default for WorkerBlock {
 
 impl From<&Vec<u8>> for SealedWorkerBlock {
     fn from(value: &Vec<u8>) -> Self {
-        crate::decode(&value)
+        crate::decode(value)
     }
 }
 

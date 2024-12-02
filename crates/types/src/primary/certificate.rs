@@ -312,7 +312,7 @@ impl Certificate {
 
 impl From<&Vec<u8>> for Certificate {
     fn from(value: &Vec<u8>) -> Self {
-        crate::decode(&value)
+        crate::decode(value)
     }
 }
 
