@@ -101,7 +101,8 @@ pub trait PublishMessageId<'a>: From<&'a Vec<u8>> {
 
 impl<'a> PublishMessageId<'a> for SealedWorkerBlock {
     fn message_id(msg: &Message) -> BlockHash {
-        // TODO: this approach doesn't require lifetimes, but is harder to maintain.
+        // TODO: this approach requires lifetimes, but is easier to maintain.
+        // ie) encoding/decoding logic is defined in impl of `From`
         //
         // The tradeoff is:
         // maintainability vs readability.
@@ -145,9 +146,12 @@ impl Future for SubscriberNetwork {
             match swarm_event {
                 SwarmEvent::Behaviour(gossip) => match gossip {
                     gossipsub::Event::Message { propagation_source, message_id, message } => {
-                        // - `propagation_source` is the PeerId created from the  publisher's public key
-                        // - message_id is the digest of the worker block / certificate / consensus header
-                        // - message.data is the gossipped worker block / certificate / consensus header
+                        // - `propagation_source` is the PeerId created from the  publisher's public
+                        //   key
+                        // - message_id is the digest of the worker block / certificate / consensus
+                        //   header
+                        // - message.data is the gossipped worker block / certificate / consensus
+                        //   header
                         if let Err(e) = this.sender.try_send(message.data) {
                             // fatal: receiver dropped or channel queue full
                             error!(target: "subscriber-network", topic=?this.topic, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
