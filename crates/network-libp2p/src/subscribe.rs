@@ -1,78 +1,25 @@
-//! Worker gossipsub network.
+//! Gossipsub network subscriber implementation.
+//!
+//! Subscribers receive gossipped output from committee-voting validators.
 
+use crate::types::{build_swarm, PublishMessageId, WORKER_BLOCK_TOPIC};
 use consensus_metrics::spawn_logged_monitored_task;
-use eyre::eyre;
-use futures::{ready, FutureExt, StreamExt as _};
+use futures::{ready, StreamExt as _};
 use libp2p::{
-    gossipsub::{self, IdentTopic, Message},
+    gossipsub::{self, IdentTopic},
     swarm::SwarmEvent,
-    Multiaddr, Swarm, SwarmBuilder,
+    Multiaddr, Swarm,
 };
 use std::{
     future::Future,
     pin::Pin,
-    sync::mpsc::TrySendError,
     task::{Context, Poll},
-    time::Duration,
 };
-use tn_types::{encode, BlockHash, SealedWorkerBlock, WorkerBlock};
 use tokio::{
     sync::mpsc::{self, Sender},
     task::JoinHandle,
 };
-use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info, trace};
-
-/// Generate a swarm type for use with gossip network.
-pub fn build_swarm<'a, M>() -> Swarm<gossipsub::Behaviour>
-where
-    M: PublishMessageId<'a>,
-{
-    // generate a random ed25519 key
-    SwarmBuilder::with_new_identity()
-        // tokio runtime
-        .with_tokio()
-        // quic protocol
-        .with_quic()
-        // custom behavior
-        .with_behaviour(|keypair| {
-            // To content-address message, we can take the hash of message and use it as an ID.
-            let message_id_fn = |message: &gossipsub::Message| {
-                let message_id = M::message_id(message);
-                gossipsub::MessageId::new(message_id.as_ref())
-            };
-
-            // Set a custom gossipsub configuration
-            let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_secs(10)) // This is set to aid debugging by not cluttering the log space
-                .validation_mode(gossipsub::ValidationMode::Strict) // this is default - enforce message signing
-                .message_id_fn(message_id_fn) // content-address messages. No two messages of the same content will be
-                // propagated.
-                .build()
-                .map_err(|e| {
-                    error!(?e, "gossipsub publish network");
-                    eyre!("failed to build gossipsub config for primary")
-                })?;
-
-            // build a gossipsub network behaviour
-            let network = gossipsub::Behaviour::new(
-                gossipsub::MessageAuthenticity::Signed(keypair.clone()),
-                gossipsub_config,
-            )?;
-
-            Ok(network)
-        })
-        .expect("worker publish swarm behavior valid")
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
-        .build()
-}
-
-/// The topic for NVVs to subscribe to for published worker blocks.
-pub const WORKER_BLOCK_TOPIC: &str = "tn_worker_blocks";
-/// The topic for NVVs to subscribe to for published primary certificates.
-pub const PRIMARY_CERT_TOPIC: &str = "tn_certificates";
-/// The topic for NVVs to subscribe to for published consensus chain.
-pub const CONSENSUS_HEADER_TOPIC: &str = "tn_consensus_headers";
+use tracing::{error, trace};
 
 /// The worker's network for publishing sealed worker blocks.
 pub struct SubscriberNetwork {
@@ -84,33 +31,6 @@ pub struct SubscriberNetwork {
     sender: Sender<Vec<u8>>,
     /// The [Multiaddr] for the swarm.
     multiaddr: Multiaddr,
-}
-
-/// Convenience trait to make publish network generic over message types.
-///
-/// The function decodes the `[libp2p::Message]` data field and returns the digest. Using the digest
-/// for published message topics makes it easier for peers to recover missing data through the
-/// gossip network because the message id is the same as the data type's digest used to reach
-/// consensus.
-pub trait PublishMessageId<'a>: From<&'a Vec<u8>> {
-    /// Create a message id for a published message to the gossip network.
-    ///
-    /// Lifetimes are preferred for easier maintainability.
-    fn message_id(msg: &Message) -> BlockHash;
-}
-
-impl<'a> PublishMessageId<'a> for SealedWorkerBlock {
-    fn message_id(msg: &Message) -> BlockHash {
-        // TODO: this approach requires lifetimes, but is easier to maintain.
-        // ie) encoding/decoding logic is defined in impl of `From`
-        //
-        // The tradeoff is:
-        // maintainability vs readability.
-        //
-        // tn_types::decode::<Self>(&msg.data).digest()
-
-        Self::from(&msg.data).digest()
-    }
 }
 
 impl SubscriberNetwork {

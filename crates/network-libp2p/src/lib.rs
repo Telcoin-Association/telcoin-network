@@ -3,8 +3,7 @@
 mod gossip;
 mod publish;
 mod subscribe;
-mod worker;
+pub mod types;
 pub use gossip::start_gossip_publish_network;
 pub use publish::*;
 pub use subscribe::*;
-pub use worker::*;

@@ -11356,6 +11356,7 @@ version = "0.1.0"
 dependencies = [
  "consensus-metrics",
  "eyre",
+ "fastcrypto",
  "futures",
  "libp2p",
  "serde",

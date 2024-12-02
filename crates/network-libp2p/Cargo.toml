@@ -23,6 +23,7 @@ tracing = { workspace = true }
 eyre = { workspace = true }
 consensus-metrics = { workspace = true }
 serde = { workspace = true }
+fastcrypto = { workspace = true }
 
 [lints]
 workspace = true
