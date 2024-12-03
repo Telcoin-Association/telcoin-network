@@ -21,9 +21,11 @@ tn-types = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 eyre = { workspace = true }
-consensus-metrics = { workspace = true }
 serde = { workspace = true }
 fastcrypto = { workspace = true }
+
+[dev-dependencies]
+reth-tracing = { workspace = true }
 
 [lints]
 workspace = true

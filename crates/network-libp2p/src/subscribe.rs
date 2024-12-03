@@ -5,7 +5,6 @@
 use crate::types::{
     build_swarm, PublishMessageId, CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
 };
-use consensus_metrics::spawn_logged_monitored_task;
 use futures::{ready, StreamExt as _};
 use libp2p::{
     gossipsub::{self, IdentTopic},
@@ -53,14 +52,12 @@ impl SubscriberNetwork {
     /// Spawn the network and start listening.
     ///
     /// Calls [`Swarm::listen_on`] and spawns `Self` as a future.
-    pub async fn spawn(mut self) -> JoinHandle<()> {
+    pub fn spawn(mut self) -> eyre::Result<JoinHandle<()>> {
         // connect to network using address
-        self.network
-            .listen_on(self.multiaddr.clone())
-            .expect("port for worker gossip publisher available");
+        self.network.listen_on(self.multiaddr.clone())?;
 
         // spawn future
-        spawn_logged_monitored_task!(self)
+        Ok(tokio::task::spawn(self))
     }
 
     /// Create a new subscribe network for [SealedWorkerBlock].
@@ -211,7 +208,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[tokio::test]
-    async fn test_generics_compile() -> eyre::Result<()> {
+    async fn todo_test() -> eyre::Result<()> {
         let (tx, _rx) = mpsc::channel(1);
         let listen_on = "/ip4/0.0.0.0/udp/0/quic-v1"
             .parse()

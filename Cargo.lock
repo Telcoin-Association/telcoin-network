@@ -11354,11 +11354,11 @@ dependencies = [
 name = "tn-network-libp2p"
 version = "0.1.0"
 dependencies = [
- "consensus-metrics",
  "eyre",
  "fastcrypto",
  "futures",
  "libp2p",
+ "reth-tracing",
  "serde",
  "tn-types",
  "tokio",

@@ -3,8 +3,7 @@
 use crate::types::{
     build_swarm, PublishMessageId, CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
 };
-use consensus_metrics::spawn_logged_monitored_task;
-use futures::StreamExt as _;
+use futures::{ready, StreamExt as _};
 use libp2p::{
     gossipsub::{self, IdentTopic},
     Multiaddr, Swarm,
@@ -17,7 +16,7 @@ use std::{
 use tn_types::{Certificate, ConsensusHeader, SealedWorkerBlock};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::error;
+use tracing::{error, info};
 
 /// The worker's network for publishing sealed worker blocks.
 pub struct PublishNetwork {
@@ -50,14 +49,12 @@ impl PublishNetwork {
     /// Spawn the network and start listening.
     ///
     /// Calls [`Swarm::listen_on`] and spawns `Self` as a future.
-    pub async fn spawn(mut self) -> JoinHandle<()> {
+    pub fn spawn(mut self) -> eyre::Result<JoinHandle<()>> {
         // connect to network using address
-        self.network
-            .listen_on(self.multiaddr.clone())
-            .expect("port for gossip publisher available");
+        self.network.listen_on(self.multiaddr.clone())?;
 
         // spawn future
-        spawn_logged_monitored_task!(self)
+        Ok(tokio::task::spawn(self))
     }
 
     /// Create a new publish network for [SealedWorkerBlock].
@@ -93,22 +90,17 @@ impl Future for PublishNetwork {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        info!(target: "publish-network", topic=?this.topic, "starting poll...");
 
-        loop {
-            match this.stream.poll_next_unpin(cx) {
-                Poll::Ready(Some(worker_block)) => {
-                    if let Err(e) =
-                        this.network.behaviour_mut().publish(this.topic.clone(), worker_block)
-                    {
-                        error!(target: "worker::gossip::publish", ?e);
-                    }
-                }
-                Poll::Ready(None) => return Poll::Ready(()),
-                Poll::Pending => break,
+        while let Some(msg) = ready!(this.stream.poll_next_unpin(cx)) {
+            if let Err(e) = this.network.behaviour_mut().publish(this.topic.clone(), msg) {
+                error!(target: "publish-network", ?e);
+                break;
             }
         }
 
-        Poll::Pending
+        info!(target: "publish-network", topic=?this.topic, "publisher shutting down...");
+        Poll::Ready(())
     }
 }
 
@@ -123,23 +115,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_generics_compile() -> eyre::Result<()> {
-        let (tx_pub, rx_pub) = mpsc::channel(1);
+        reth_tracing::init_test_tracing();
+
+        let (tx_pub, rx_pub) = mpsc::channel(100);
         let listen_on: Multiaddr = "/ip4/0.0.0.0/udp/0/quic-v1"
             .parse()
             .expect("multiaddr parsed for worker gossip publisher");
 
         let worker_publish_network = PublishNetwork::new_for_worker(rx_pub, listen_on.clone());
-        let _ = worker_publish_network.spawn();
+        worker_publish_network.spawn()?;
 
         let (tx_sub, mut rx_sub) = mpsc::channel(1);
         let worker_subscriber_network = SubscriberNetwork::new_for_worker(tx_sub, listen_on);
-        let _ = worker_subscriber_network.spawn();
+        worker_subscriber_network.spawn()?;
+
+        // try yielding?
+        tokio::task::yield_now().await;
+        // let _ = tokio::time::sleep(Duration::from_secs(5)).await;
 
         // publish random block
         let random_block = WorkerBlock::default();
         let sealed_block = random_block.seal_slow();
         let expected_result = Vec::from(&sealed_block);
-        let res = tx_pub.try_send(expected_result.clone());
+        let res = tx_pub.send(expected_result.clone()).await;
         assert!(res.is_ok());
 
         let gossip_block = timeout(Duration::from_secs(5), rx_sub.recv())
