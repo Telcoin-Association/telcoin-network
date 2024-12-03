@@ -1,12 +1,12 @@
 //! Generic abstraction for publishing (flood) to the gossipsub network.
 
 use crate::types::{
-    build_swarm, PublishMessageId, CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
+    start_swarm, PublishMessageId, CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
 };
 use futures::{ready, StreamExt as _};
 use libp2p::{
     gossipsub::{self, IdentTopic},
-    Multiaddr, Swarm,
+    Multiaddr, PeerId, Swarm,
 };
 use std::{
     future::Future,
@@ -26,8 +26,8 @@ pub struct PublishNetwork {
     network: Swarm<gossipsub::Behaviour>,
     /// The stream for receiving sealed worker blocks to publish.
     stream: ReceiverStream<Vec<u8>>,
-    /// The [Multiaddr] for the swarm.
-    multiaddr: Multiaddr,
+    // /// The [Multiaddr] for the swarm.
+    // multiaddr: Multiaddr,
 }
 
 impl PublishNetwork {
@@ -36,31 +36,47 @@ impl PublishNetwork {
         topic: IdentTopic,
         receiver: mpsc::Receiver<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> Self
+    ) -> eyre::Result<Self>
     where
         M: PublishMessageId<'a>,
     {
-        let swarm = build_swarm::<M>();
+        // create swarm and start listening
+        let swarm = start_swarm::<M>(multiaddr)?;
         // convert receiver into stream for convenience in `Self::poll`
         let stream = ReceiverStream::new(receiver);
-        Self { topic, network: swarm, stream, multiaddr }
+        Ok(Self { topic, network: swarm, stream })
+    }
+
+    /// Return this publisher's [PeerId].
+    pub fn local_peer_id(&self) -> &PeerId {
+        self.network.local_peer_id()
+    }
+
+    /// Return an iterator of addresses the network is listening on.
+    pub fn listeners(&self) -> Vec<Multiaddr> {
+        self.network.listeners().cloned().collect()
+    }
+
+    /// Add an explicit peer to support further discovery.
+    pub fn add_explicit_peer(&mut self, peer_id: PeerId, addr: Multiaddr) {
+        self.network.add_peer_address(peer_id, addr);
     }
 
     /// Spawn the network and start listening.
     ///
     /// Calls [`Swarm::listen_on`] and spawns `Self` as a future.
-    pub fn spawn(mut self) -> eyre::Result<JoinHandle<()>> {
-        // connect to network using address
-        self.network.listen_on(self.multiaddr.clone())?;
-
-        // spawn future
-        Ok(tokio::task::spawn(self))
+    pub fn spawn(self) -> JoinHandle<()> {
+        // spawn future to process requests
+        tokio::task::spawn(self)
     }
 
     /// Create a new publish network for [SealedWorkerBlock].
     ///
     /// This type is used by worker to publish sealed blocks after they reach quorum.
-    pub fn new_for_worker(receiver: mpsc::Receiver<Vec<u8>>, multiaddr: Multiaddr) -> Self {
+    pub fn new_for_worker(
+        receiver: mpsc::Receiver<Vec<u8>>,
+        multiaddr: Multiaddr,
+    ) -> eyre::Result<Self> {
         // worker's default topic
         let topic = gossipsub::IdentTopic::new(WORKER_BLOCK_TOPIC);
         Self::new::<SealedWorkerBlock>(topic, receiver, multiaddr)
@@ -69,7 +85,10 @@ impl PublishNetwork {
     /// Create a new publish network for [Certificate].
     ///
     /// This type is used by primary to publish certificates after headers reach quorum.
-    pub fn new_for_primary(receiver: mpsc::Receiver<Vec<u8>>, multiaddr: Multiaddr) -> Self {
+    pub fn new_for_primary(
+        receiver: mpsc::Receiver<Vec<u8>>,
+        multiaddr: Multiaddr,
+    ) -> eyre::Result<Self> {
         // primary's default topic
         let topic = gossipsub::IdentTopic::new(PRIMARY_CERT_TOPIC);
         Self::new::<Certificate>(topic, receiver, multiaddr)
@@ -78,7 +97,10 @@ impl PublishNetwork {
     /// Create a new publish network for [ConsensusHeader].
     ///
     /// This type is used by consensus to publish consensus block headers after the subdag commits the latest round (finality).
-    pub fn new_for_consensus(receiver: mpsc::Receiver<Vec<u8>>, multiaddr: Multiaddr) -> Self {
+    pub fn new_for_consensus(
+        receiver: mpsc::Receiver<Vec<u8>>,
+        multiaddr: Multiaddr,
+    ) -> eyre::Result<Self> {
         // consensus header's default topic
         let topic = gossipsub::IdentTopic::new(CONSENSUS_HEADER_TOPIC);
         Self::new::<ConsensusHeader>(topic, receiver, multiaddr)
@@ -117,21 +139,44 @@ mod tests {
     async fn test_generics_compile() -> eyre::Result<()> {
         reth_tracing::init_test_tracing();
 
-        let (tx_pub, rx_pub) = mpsc::channel(100);
-        let listen_on: Multiaddr = "/ip4/0.0.0.0/udp/0/quic-v1"
+        let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1"
             .parse()
             .expect("multiaddr parsed for worker gossip publisher");
 
-        let worker_publish_network = PublishNetwork::new_for_worker(rx_pub, listen_on.clone());
-        worker_publish_network.spawn()?;
-
+        // spawn subscriber network first
         let (tx_sub, mut rx_sub) = mpsc::channel(1);
-        let worker_subscriber_network = SubscriberNetwork::new_for_worker(tx_sub, listen_on);
-        worker_subscriber_network.spawn()?;
-
-        // try yielding?
+        let mut worker_subscriber_network =
+            SubscriberNetwork::new_for_worker(tx_sub, listen_on.clone())?;
+        // yield to find listener
         tokio::task::yield_now().await;
-        // let _ = tokio::time::sleep(Duration::from_secs(5)).await;
+        let sub = &worker_subscriber_network;
+
+        let _ = timeout(Duration::from_secs(10), async move {
+            while sub.listeners().is_empty() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("swarm event listener started");
+        let addresses = worker_subscriber_network.listeners();
+        let peer_id = worker_subscriber_network.local_peer_id();
+
+        println!("subscriber addresses: {addresses:?}");
+
+        // spawn publish network and add subscriber
+        let (tx_pub, rx_pub) = mpsc::channel(100);
+        let mut worker_publish_network = PublishNetwork::new_for_worker(rx_pub, listen_on)?;
+        let peer_id = worker_publish_network.local_peer_id();
+        println!("peer_id: {peer_id:?}");
+
+        // capture listeners for discovery in unit test
+        let listeners = worker_publish_network.listeners();
+        println!("publisher addresses: {addresses:?}");
+
+        // spawn subscriber network
+        worker_subscriber_network.spawn();
+        // spawn publish network
+        worker_publish_network.spawn();
 
         // publish random block
         let random_block = WorkerBlock::default();

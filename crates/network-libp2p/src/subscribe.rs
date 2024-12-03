@@ -3,13 +3,13 @@
 //! Subscribers receive gossipped output from committee-voting validators.
 
 use crate::types::{
-    build_swarm, PublishMessageId, CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
+    start_swarm, PublishMessageId, CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
 };
 use futures::{ready, StreamExt as _};
 use libp2p::{
     gossipsub::{self, IdentTopic},
     swarm::SwarmEvent,
-    Multiaddr, Swarm,
+    Multiaddr, PeerId, Swarm,
 };
 use std::{
     future::Future,
@@ -31,8 +31,8 @@ pub struct SubscriberNetwork {
     network: Swarm<gossipsub::Behaviour>,
     /// The stream for receiving sealed worker blocks to publish.
     sender: Sender<Vec<u8>>,
-    /// The [Multiaddr] for the swarm.
-    multiaddr: Multiaddr,
+    // /// The [Multiaddr] for the swarm.
+    // multiaddr: Multiaddr,
 }
 
 impl SubscriberNetwork {
@@ -41,29 +41,44 @@ impl SubscriberNetwork {
         topic: IdentTopic,
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> Self
+    ) -> eyre::Result<Self>
     where
         M: PublishMessageId<'a>,
     {
-        let swarm = build_swarm::<M>();
-        Self { topic, network: swarm, sender, multiaddr }
+        // create swarm and start listening
+        let swarm = start_swarm::<M>(multiaddr)?;
+        Ok(Self { topic, network: swarm, sender })
+    }
+
+    /// Return this publisher's [PeerId].
+    pub fn local_peer_id(&self) -> &PeerId {
+        self.network.local_peer_id()
+    }
+
+    /// Return an iterator of addresses the network is listening on.
+    pub fn listeners(&self) -> Vec<Multiaddr> {
+        self.network.listeners().cloned().collect()
+    }
+    /// Add an explicit peer to support further discovery.
+    pub fn add_explicit_peer(&mut self, peer_id: PeerId, addr: Multiaddr) {
+        self.network.add_peer_address(peer_id, addr);
     }
 
     /// Spawn the network and start listening.
     ///
     /// Calls [`Swarm::listen_on`] and spawns `Self` as a future.
-    pub fn spawn(mut self) -> eyre::Result<JoinHandle<()>> {
-        // connect to network using address
-        self.network.listen_on(self.multiaddr.clone())?;
-
+    pub fn spawn(self) -> JoinHandle<()> {
         // spawn future
-        Ok(tokio::task::spawn(self))
+        tokio::task::spawn(self)
     }
 
     /// Create a new subscribe network for [SealedWorkerBlock].
     ///
     /// This type is used by worker to subscribe sealed blocks after they reach quorum.
-    pub fn new_for_worker(sender: mpsc::Sender<Vec<u8>>, multiaddr: Multiaddr) -> Self {
+    pub fn new_for_worker(
+        sender: mpsc::Sender<Vec<u8>>,
+        multiaddr: Multiaddr,
+    ) -> eyre::Result<Self> {
         // worker's default topic
         let topic = gossipsub::IdentTopic::new(WORKER_BLOCK_TOPIC);
         Self::new::<SealedWorkerBlock>(topic, sender, multiaddr)
@@ -72,7 +87,10 @@ impl SubscriberNetwork {
     /// Create a new subscribe network for [Certificate].
     ///
     /// This type is used by primary to subscribe certificates after headers reach quorum.
-    pub fn new_for_primary(sender: mpsc::Sender<Vec<u8>>, multiaddr: Multiaddr) -> Self {
+    pub fn new_for_primary(
+        sender: mpsc::Sender<Vec<u8>>,
+        multiaddr: Multiaddr,
+    ) -> eyre::Result<Self> {
         // primary's default topic
         let topic = gossipsub::IdentTopic::new(PRIMARY_CERT_TOPIC);
         Self::new::<Certificate>(topic, sender, multiaddr)
@@ -81,7 +99,10 @@ impl SubscriberNetwork {
     /// Create a new subscribe network for [ConsensusHeader].
     ///
     /// This type is used by consensus to subscribe consensus block headers after the subdag commits the latest round (finality).
-    pub fn new_for_consensus(sender: mpsc::Sender<Vec<u8>>, multiaddr: Multiaddr) -> Self {
+    pub fn new_for_consensus(
+        sender: mpsc::Sender<Vec<u8>>,
+        multiaddr: Multiaddr,
+    ) -> eyre::Result<Self> {
         // consensus header's default topic
         let topic = gossipsub::IdentTopic::new(CONSENSUS_HEADER_TOPIC);
         Self::new::<ConsensusHeader>(topic, sender, multiaddr)
@@ -213,7 +234,7 @@ mod tests {
         let listen_on = "/ip4/0.0.0.0/udp/0/quic-v1"
             .parse()
             .expect("multiaddr parsed for worker gossip publisher");
-        let worker_publish_network = SubscriberNetwork::new_for_worker(tx, listen_on);
+        let worker_publish_network = SubscriberNetwork::new_for_worker(tx, listen_on)?;
         let _ = worker_publish_network.spawn();
 
         Ok(())

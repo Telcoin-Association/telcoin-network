@@ -2,7 +2,7 @@
 
 use eyre::eyre;
 use fastcrypto::hash::Hash as _;
-use libp2p::{gossipsub, Swarm, SwarmBuilder};
+use libp2p::{gossipsub, Multiaddr, Swarm, SwarmBuilder};
 use std::time::Duration;
 use tn_types::{BlockHash, Certificate, ConsensusHeader, SealedWorkerBlock};
 use tracing::error;
@@ -52,15 +52,17 @@ impl<'a> PublishMessageId<'a> for ConsensusHeader {
     }
 }
 
-/// Generate a swarm type for use with gossip network.
+/// Generate a swarm type for use with gossip network and start listening.
 ///
 /// This is a convenience function to keep publisher/subscriber network DRY.
-pub fn build_swarm<'a, M>() -> Swarm<gossipsub::Behaviour>
+///
+/// NOTE: the swarm tries to connect to the provided multiaddr.
+pub fn start_swarm<'a, M>(multiaddr: Multiaddr) -> eyre::Result<Swarm<gossipsub::Behaviour>>
 where
     M: PublishMessageId<'a>,
 {
     // generate a random ed25519 key
-    SwarmBuilder::with_new_identity()
+    let mut swarm = SwarmBuilder::with_new_identity()
         // tokio runtime
         .with_tokio()
         // quic protocol
@@ -95,5 +97,10 @@ where
         })
         .expect("worker publish swarm behavior valid")
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
-        .build()
+        .build();
+
+    // start listening
+    swarm.listen_on(multiaddr)?;
+
+    Ok(swarm)
 }
