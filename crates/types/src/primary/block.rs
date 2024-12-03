@@ -73,3 +73,9 @@ impl From<ConsensusOutput> for ConsensusHeader {
         }
     }
 }
+
+impl From<&Vec<u8>> for ConsensusHeader {
+    fn from(value: &Vec<u8>) -> Self {
+        crate::decode(value)
+    }
+}

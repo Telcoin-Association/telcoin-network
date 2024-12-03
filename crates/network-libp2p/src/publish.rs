@@ -1,6 +1,8 @@
 //! Generic abstraction for publishing (flood) to the gossipsub network.
 
-use crate::types::{build_swarm, PublishMessageId, PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC};
+use crate::types::{
+    build_swarm, PublishMessageId, CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
+};
 use consensus_metrics::spawn_logged_monitored_task;
 use futures::StreamExt as _;
 use libp2p::{
@@ -12,7 +14,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tn_types::{Certificate, SealedWorkerBlock};
+use tn_types::{Certificate, ConsensusHeader, SealedWorkerBlock};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::error;
@@ -40,10 +42,8 @@ impl PublishNetwork {
         M: PublishMessageId<'a>,
     {
         let swarm = build_swarm::<M>();
-
         // convert receiver into stream for convenience in `Self::poll`
         let stream = ReceiverStream::new(receiver);
-
         Self { topic, network: swarm, stream, multiaddr }
     }
 
@@ -77,6 +77,15 @@ impl PublishNetwork {
         let topic = gossipsub::IdentTopic::new(PRIMARY_CERT_TOPIC);
         Self::new::<Certificate>(topic, receiver, multiaddr)
     }
+
+    /// Create a new publish network for [ConsensusHeader].
+    ///
+    /// This type is used by consensus to publish consensus block headers after the subdag commits the latest round (finality).
+    pub fn new_for_consensus(receiver: mpsc::Receiver<Vec<u8>>, multiaddr: Multiaddr) -> Self {
+        // consensus header's default topic
+        let topic = gossipsub::IdentTopic::new(CONSENSUS_HEADER_TOPIC);
+        Self::new::<ConsensusHeader>(topic, receiver, multiaddr)
+    }
 }
 
 impl Future for PublishNetwork {
@@ -106,18 +115,39 @@ impl Future for PublishNetwork {
 #[cfg(test)]
 mod tests {
     use super::PublishNetwork;
-    use tokio::sync::mpsc;
+    use crate::SubscriberNetwork;
+    use libp2p::Multiaddr;
+    use std::time::Duration;
+    use tn_types::WorkerBlock;
+    use tokio::{sync::mpsc, time::timeout};
 
     #[tokio::test]
     async fn test_generics_compile() -> eyre::Result<()> {
-        let (tx, rx) = mpsc::channel(1);
-        let listen_on = "/ip4/0.0.0.0/udp/0/quic-v1"
+        let (tx_pub, rx_pub) = mpsc::channel(1);
+        let listen_on: Multiaddr = "/ip4/0.0.0.0/udp/0/quic-v1"
             .parse()
             .expect("multiaddr parsed for worker gossip publisher");
-        // let worker_publish_network = PublishNetwork::new::<SealedWorkerBlock>(rx, listen_on);
 
-        let worker_publish_network = PublishNetwork::new_for_worker(rx, listen_on);
+        let worker_publish_network = PublishNetwork::new_for_worker(rx_pub, listen_on.clone());
         let _ = worker_publish_network.spawn();
+
+        let (tx_sub, mut rx_sub) = mpsc::channel(1);
+        let worker_subscriber_network = SubscriberNetwork::new_for_worker(tx_sub, listen_on);
+        let _ = worker_subscriber_network.spawn();
+
+        // publish random block
+        let random_block = WorkerBlock::default();
+        let sealed_block = random_block.seal_slow();
+        let expected_result = Vec::from(&sealed_block);
+        let res = tx_pub.try_send(expected_result.clone());
+        assert!(res.is_ok());
+
+        let gossip_block = timeout(Duration::from_secs(5), rx_sub.recv())
+            .await
+            .expect("timeout waiting for gossiped worker block")
+            .expect("worker block received");
+
+        assert_eq!(gossip_block, expected_result);
 
         Ok(())
     }

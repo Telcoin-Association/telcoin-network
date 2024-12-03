@@ -4,7 +4,7 @@ use eyre::eyre;
 use fastcrypto::hash::Hash as _;
 use libp2p::{gossipsub, Swarm, SwarmBuilder};
 use std::time::Duration;
-use tn_types::{BlockHash, Certificate, SealedWorkerBlock};
+use tn_types::{BlockHash, Certificate, ConsensusHeader, SealedWorkerBlock};
 use tracing::error;
 
 /// The topic for NVVs to subscribe to for published worker blocks.
@@ -38,6 +38,14 @@ impl<'a> PublishMessageId<'a> for SealedWorkerBlock {
 
 // Implementation for primary gossip network.
 impl<'a> PublishMessageId<'a> for Certificate {
+    fn message_id(msg: &gossipsub::Message) -> BlockHash {
+        let certificate = Self::from(&msg.data);
+        certificate.digest().into()
+    }
+}
+
+// Implementation for primary gossip network.
+impl<'a> PublishMessageId<'a> for ConsensusHeader {
     fn message_id(msg: &gossipsub::Message) -> BlockHash {
         let certificate = Self::from(&msg.data);
         certificate.digest().into()

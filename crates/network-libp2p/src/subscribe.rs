@@ -2,7 +2,9 @@
 //!
 //! Subscribers receive gossipped output from committee-voting validators.
 
-use crate::types::{build_swarm, PublishMessageId, WORKER_BLOCK_TOPIC};
+use crate::types::{
+    build_swarm, PublishMessageId, CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
+};
 use consensus_metrics::spawn_logged_monitored_task;
 use futures::{ready, StreamExt as _};
 use libp2p::{
@@ -15,6 +17,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
+use tn_types::{Certificate, ConsensusHeader, SealedWorkerBlock};
 use tokio::{
     sync::mpsc::{self, Sender},
     task::JoinHandle,
@@ -35,16 +38,21 @@ pub struct SubscriberNetwork {
 
 impl SubscriberNetwork {
     /// Create a new instance of Self.
-    pub fn new<'a, M>(sender: mpsc::Sender<Vec<u8>>, multiaddr: Multiaddr) -> Self
+    pub fn new<'a, M>(
+        topic: IdentTopic,
+        sender: mpsc::Sender<Vec<u8>>,
+        multiaddr: Multiaddr,
+    ) -> Self
     where
         M: PublishMessageId<'a>,
     {
-        let topic = gossipsub::IdentTopic::new(WORKER_BLOCK_TOPIC);
         let swarm = build_swarm::<M>();
-
         Self { topic, network: swarm, sender, multiaddr }
     }
 
+    /// Spawn the network and start listening.
+    ///
+    /// Calls [`Swarm::listen_on`] and spawns `Self` as a future.
     pub async fn spawn(mut self) -> JoinHandle<()> {
         // connect to network using address
         self.network
@@ -53,6 +61,33 @@ impl SubscriberNetwork {
 
         // spawn future
         spawn_logged_monitored_task!(self)
+    }
+
+    /// Create a new subscribe network for [SealedWorkerBlock].
+    ///
+    /// This type is used by worker to subscribe sealed blocks after they reach quorum.
+    pub fn new_for_worker(sender: mpsc::Sender<Vec<u8>>, multiaddr: Multiaddr) -> Self {
+        // worker's default topic
+        let topic = gossipsub::IdentTopic::new(WORKER_BLOCK_TOPIC);
+        Self::new::<SealedWorkerBlock>(topic, sender, multiaddr)
+    }
+
+    /// Create a new subscribe network for [Certificate].
+    ///
+    /// This type is used by primary to subscribe certificates after headers reach quorum.
+    pub fn new_for_primary(sender: mpsc::Sender<Vec<u8>>, multiaddr: Multiaddr) -> Self {
+        // primary's default topic
+        let topic = gossipsub::IdentTopic::new(PRIMARY_CERT_TOPIC);
+        Self::new::<Certificate>(topic, sender, multiaddr)
+    }
+
+    /// Create a new subscribe network for [ConsensusHeader].
+    ///
+    /// This type is used by consensus to subscribe consensus block headers after the subdag commits the latest round (finality).
+    pub fn new_for_consensus(sender: mpsc::Sender<Vec<u8>>, multiaddr: Multiaddr) -> Self {
+        // consensus header's default topic
+        let topic = gossipsub::IdentTopic::new(CONSENSUS_HEADER_TOPIC);
+        Self::new::<ConsensusHeader>(topic, sender, multiaddr)
     }
 }
 
@@ -173,16 +208,15 @@ impl Future for SubscriberNetwork {
 #[cfg(test)]
 mod tests {
     use super::SubscriberNetwork;
-    use tn_types::SealedWorkerBlock;
     use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_generics_compile() -> eyre::Result<()> {
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, _rx) = mpsc::channel(1);
         let listen_on = "/ip4/0.0.0.0/udp/0/quic-v1"
             .parse()
             .expect("multiaddr parsed for worker gossip publisher");
-        let worker_publish_network = SubscriberNetwork::new::<SealedWorkerBlock>(tx, listen_on);
+        let worker_publish_network = SubscriberNetwork::new_for_worker(tx, listen_on);
         let _ = worker_publish_network.spawn();
 
         Ok(())
