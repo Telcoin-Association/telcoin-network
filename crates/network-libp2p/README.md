@@ -38,7 +38,8 @@ It's useful for informing the Swarm about how it can reach a specific peer.
 This method does not initiate a connection but merely adds the address to the list of known addresses for a peer.
 This is useful to ensure the Swarm has an address for a future connection associated with a peer's id through manual discovery.
 
-Add peer before dialing by peer id?
+Adding a peer's id and multiaddr, then dialing by peer id does not work in tests.
+Dialing the peer by multiaddr without adding the peer works.
 
 `Gossipsub::add_explicit_peer` directly influences how the Gossipsub protocol considers peers for message propagation.
 When a peer is explicitly added to Gossipsub, it's included in the Gossipsub internal list, which influences the mesh construction for topics and ensures that the peer is considered for message forwarding.

@@ -26,7 +26,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, trace};
+use tracing::{debug, error, trace};
 
 /// The worker's network for publishing sealed worker blocks.
 pub struct SubscriberNetwork {
@@ -145,6 +145,7 @@ impl Future for SubscriberNetwork {
         //
         // this allows handles to be dropped without causing problems
         if let Poll::Ready(Some(command)) = this.commands.poll_next_unpin(cx) {
+            trace!(target: "subscriber-network", ?command, "processing command...");
             process_network_command(command, &mut this.network);
         }
 
@@ -152,6 +153,7 @@ impl Future for SubscriberNetwork {
             match event {
                 SwarmEvent::Behaviour(gossip) => match gossip {
                     gossipsub::Event::Message { propagation_source, message_id, message } => {
+                        trace!(target: "subscriber-network", topic=?this.topic, ?propagation_source, ?message_id, ?message, "message received from publisher");
                         // - `propagation_source` is the PeerId created from the  publisher's public
                         //   key
                         // - message_id is the digest of the worker block / certificate / consensus
@@ -165,14 +167,14 @@ impl Future for SubscriberNetwork {
                         }
                     }
                     gossipsub::Event::Subscribed { peer_id, topic } => {
-                        trace!(target: "subscriber-network", topic=?this.topic, ?peer_id, ?topic)
+                        trace!(target: "subscriber-network", topic=?this.topic, ?peer_id, ?topic, "gossipsub event - subscribed")
                     }
                     gossipsub::Event::Unsubscribed { peer_id, topic } => {
-                        trace!(target: "subscriber-network", topic=?this.topic, ?peer_id, ?topic)
+                        trace!(target: "subscriber-network", topic=?this.topic, ?peer_id, ?topic, "gossipsub event - unsubscribed")
                     }
                     gossipsub::Event::GossipsubNotSupported { peer_id } => {
                         // TODO: remove peer at this point?
-                        trace!(target: "subscriber-network", topic=?this.topic, ?peer_id)
+                        trace!(target: "subscriber-network", topic=?this.topic, ?peer_id, "gossipsub event - not supported")
                     }
                 },
                 SwarmEvent::ConnectionEstablished {
@@ -183,7 +185,7 @@ impl Future for SubscriberNetwork {
                     concurrent_dial_errors,
                     established_in,
                 } => {
-                    trace!(target: "subscriber-network", topic=?this.topic, ?peer_id, ?connection_id, ?endpoint, ?num_established, ?concurrent_dial_errors, ?established_in)
+                    trace!(target: "subscriber-network", topic=?this.topic, ?peer_id, ?connection_id, ?endpoint, ?num_established, ?concurrent_dial_errors, ?established_in, "connection established")
                 }
                 SwarmEvent::ConnectionClosed {
                     peer_id,
@@ -199,9 +201,10 @@ impl Future for SubscriberNetwork {
                     ?endpoint,
                     ?num_established,
                     ?cause,
+                    "connection closed"
                 ),
                 SwarmEvent::IncomingConnection { connection_id, local_addr, send_back_addr } => {
-                    trace!(target: "subscriber-network", topic=?this.topic, ?connection_id, ?local_addr, ?send_back_addr)
+                    trace!(target: "subscriber-network", topic=?this.topic, ?connection_id, ?local_addr, ?send_back_addr, "incoming connection")
                 }
                 SwarmEvent::IncomingConnectionError {
                     connection_id,
@@ -215,36 +218,37 @@ impl Future for SubscriberNetwork {
                     ?local_addr,
                     ?send_back_addr,
                     ?error,
+                    "incoming connection error"
                 ),
                 SwarmEvent::OutgoingConnectionError { connection_id, peer_id, error } => {
-                    trace!(target: "subscriber-network", topic=?this.topic, ?connection_id, ?peer_id, ?error,)
+                    trace!(target: "subscriber-network", topic=?this.topic, ?connection_id, ?peer_id, ?error, "outgoing connection error")
                 }
                 SwarmEvent::NewListenAddr { listener_id, address } => {
-                    trace!(target: "subscriber-network", topic=?this.topic, ?listener_id, ?address)
+                    trace!(target: "subscriber-network", topic=?this.topic, ?listener_id, ?address, "new listener addr")
                 }
                 SwarmEvent::ExpiredListenAddr { listener_id, address } => {
-                    trace!(target: "subscriber-network", topic=?this.topic, ?listener_id, ?address)
+                    trace!(target: "subscriber-network", topic=?this.topic, ?listener_id, ?address, "expired listen addr")
                 }
                 SwarmEvent::ListenerClosed { listener_id, addresses, reason } => {
-                    trace!(target: "subscriber-network", topic=?this.topic, ?listener_id, ?addresses, ?reason)
+                    trace!(target: "subscriber-network", topic=?this.topic, ?listener_id, ?addresses, ?reason, "listener closed")
                 }
                 SwarmEvent::ListenerError { listener_id, error } => {
-                    trace!(target: "subscriber-network", topic=?this.topic, ?listener_id, ?error)
+                    trace!(target: "subscriber-network", topic=?this.topic, ?listener_id, ?error, "listener error")
                 }
                 SwarmEvent::Dialing { peer_id, connection_id } => {
-                    trace!(target: "subscriber-network", topic=?this.topic, ? peer_id, ?connection_id)
+                    trace!(target: "subscriber-network", topic=?this.topic, ? peer_id, ?connection_id, "dialing")
                 }
                 SwarmEvent::NewExternalAddrCandidate { address } => {
-                    trace!(target: "subscriber-network", topic=?this.topic, ?address)
+                    trace!(target: "subscriber-network", topic=?this.topic, ?address, "new external addr candidate")
                 }
                 SwarmEvent::ExternalAddrConfirmed { address } => {
-                    trace!(target: "subscriber-network", topic=?this.topic, ?address)
+                    trace!(target: "subscriber-network", topic=?this.topic, ?address, "external addr confirmed")
                 }
                 SwarmEvent::ExternalAddrExpired { address } => {
-                    trace!(target: "subscriber-network", topic=?this.topic, ?address)
+                    trace!(target: "subscriber-network", topic=?this.topic, ?address, "external addr expired")
                 }
                 SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => {
-                    trace!(target: "subscriber-network", topic=?this.topic, ?peer_id, ?address)
+                    trace!(target: "subscriber-network", topic=?this.topic, ?peer_id, ?address, "new external addr of peer")
                 }
                 _e => {
                     trace!(target: "subscriber-network", topic=?this.topic, ?_e, "non-exhaustive event match")

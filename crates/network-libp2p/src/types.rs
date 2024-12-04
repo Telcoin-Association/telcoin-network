@@ -3,7 +3,7 @@
 use eyre::eyre;
 use fastcrypto::hash::Hash as _;
 use libp2p::{
-    gossipsub,
+    gossipsub::{self, IdentTopic, MessageId, PublishError, SubscriptionError},
     swarm::{dial_opts::DialOpts, DialError},
     Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
@@ -110,10 +110,14 @@ where
     Ok(swarm)
 }
 
+/// Commands for the swarm.
+#[derive(Debug)]
 pub enum NetworkCommand {
     /// Listeners
     GetListener { reply: oneshot::Sender<Vec<Multiaddr>> },
-    /// Add explicit peer
+    /// Add explicit peer to add.
+    ///
+    /// This adds to the swarm's peers and the gossipsub's peers.
     AddExplicitPeer {
         /// The peer's id.
         peer_id: PeerId,
@@ -122,13 +126,26 @@ pub enum NetworkCommand {
     },
     /// Dial a peer to establish a connection.
     Dial {
-        /// The peer's address or peer id both impl Into<DialOpts>.
+        /// The peer's address and peer id both impl Into<DialOpts>.
+        ///
+        /// However, it seems best to use the peer's [Multiaddr].
         dial_opts: DialOpts,
         /// Oneshot for reply
         reply: oneshot::Sender<std::result::Result<(), DialError>>,
     },
     /// Return an owned copy of this node's [PeerId].
     LocalPeerId { reply: oneshot::Sender<PeerId> },
+    /// Subscribe to a topic.
+    Subscribe {
+        topic: IdentTopic,
+        reply: oneshot::Sender<std::result::Result<bool, SubscriptionError>>,
+    },
+    /// Publish a message to topic subscribers.
+    Publish {
+        topic: IdentTopic,
+        msg: Vec<u8>,
+        reply: oneshot::Sender<std::result::Result<MessageId, PublishError>>,
+    },
 }
 
 /// Network handle.
@@ -170,6 +187,22 @@ impl GossipNetworkHandle {
         self.sender.send(NetworkCommand::LocalPeerId { reply }).await?;
         Ok(peer_id.await?)
     }
+
+    /// Subscribe to a topic.
+    pub async fn subscribe(&self, topic: IdentTopic) -> eyre::Result<bool> {
+        let (reply, already_subscribed) = oneshot::channel();
+        self.sender.send(NetworkCommand::Subscribe { topic, reply }).await?;
+        let res = already_subscribed.await?;
+        Ok(res?)
+    }
+
+    /// Publish a message on a certain topic.
+    pub async fn publish(&self, topic: IdentTopic, msg: Vec<u8>) -> eyre::Result<MessageId> {
+        let (reply, published) = oneshot::channel();
+        self.sender.send(NetworkCommand::Publish { topic, msg, reply }).await?;
+        let res = published.await?;
+        Ok(res?)
+    }
 }
 
 /// Helper function for processing network commands.
@@ -183,26 +216,38 @@ pub(crate) fn process_network_command(
         NetworkCommand::GetListener { reply } => {
             let addrs = network.listeners().cloned().collect();
             if let Err(e) = reply.send(addrs) {
-                error!(target: "subsciber-network", ?e, "GetListeners command failed");
+                error!(target: "gossip-network", ?e, "GetListeners command failed");
             }
         }
         NetworkCommand::AddExplicitPeer { peer_id, addr } => {
             // TODO: need to understand what `add_explicit_peer` actually does
             //
             // DO NOT MERGE
-            network.behaviour_mut().add_explicit_peer(&peer_id);
             network.add_peer_address(peer_id, addr);
+            network.behaviour_mut().add_explicit_peer(&peer_id);
         }
         NetworkCommand::Dial { dial_opts, reply } => {
             let res = network.dial(dial_opts);
             if let Err(e) = reply.send(res) {
-                error!(target: "subsciber-network", ?e, "AddExplicitPeer command failed");
+                error!(target: "gossip-network", ?e, "AddExplicitPeer command failed");
             }
         }
         NetworkCommand::LocalPeerId { reply } => {
             let peer_id = network.local_peer_id().clone();
             if let Err(e) = reply.send(peer_id) {
-                error!(target: "subsciber-network", ?e, "LocalPeerId command failed");
+                error!(target: "gossip-network", ?e, "LocalPeerId command failed");
+            }
+        }
+        NetworkCommand::Publish { topic, msg, reply } => {
+            let res = network.behaviour_mut().publish(topic, msg);
+            if let Err(e) = reply.send(res) {
+                error!(target: "gossip-network", ?e, "Publish command failed");
+            }
+        }
+        NetworkCommand::Subscribe { topic, reply } => {
+            let res = network.behaviour_mut().subscribe(&topic);
+            if let Err(e) = reply.send(res) {
+                error!(target: "gossip-network", ?e, "Subscribe command failed");
             }
         }
     }
