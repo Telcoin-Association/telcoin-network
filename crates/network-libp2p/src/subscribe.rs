@@ -3,8 +3,8 @@
 //! Subscribers receive gossipped output from committee-voting validators.
 
 use crate::types::{
-    process_network_command, start_swarm, NetworkCommand, PublishMessageId, CONSENSUS_HEADER_TOPIC,
-    PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
+    process_network_command, start_swarm, GossipNetworkHandle, NetworkCommand, PublishMessageId,
+    CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
 };
 use futures::{ready, StreamExt as _};
 use libp2p::{
@@ -48,7 +48,7 @@ impl SubscriberNetwork {
         topic: IdentTopic,
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> eyre::Result<(Self, SubscriberNetworkHandle)>
+    ) -> eyre::Result<(Self, GossipNetworkHandle)>
     where
         M: PublishMessageId<'a>,
     {
@@ -60,7 +60,7 @@ impl SubscriberNetwork {
         // create channels and handle
         let (handle_tx, network_rx) = mpsc::channel(1);
         let commands = ReceiverStream::new(network_rx);
-        let handle = SubscriberNetworkHandle { sender: handle_tx };
+        let handle = GossipNetworkHandle::new(handle_tx);
         let network = Self { topic, network: swarm, sender, commands };
         Ok((network, handle))
     }
@@ -104,7 +104,7 @@ impl SubscriberNetwork {
     pub fn new_for_worker(
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> eyre::Result<(Self, SubscriberNetworkHandle)> {
+    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // worker's default topic
         let topic = gossipsub::IdentTopic::new(WORKER_BLOCK_TOPIC);
         Self::new::<SealedWorkerBlock>(topic, sender, multiaddr)
@@ -116,7 +116,7 @@ impl SubscriberNetwork {
     pub fn new_for_primary(
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> eyre::Result<(Self, SubscriberNetworkHandle)> {
+    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // primary's default topic
         let topic = gossipsub::IdentTopic::new(PRIMARY_CERT_TOPIC);
         Self::new::<Certificate>(topic, sender, multiaddr)
@@ -128,7 +128,7 @@ impl SubscriberNetwork {
     pub fn new_for_consensus(
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> eyre::Result<(Self, SubscriberNetworkHandle)> {
+    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // consensus header's default topic
         let topic = gossipsub::IdentTopic::new(CONSENSUS_HEADER_TOPIC);
         Self::new::<ConsensusHeader>(topic, sender, multiaddr)
@@ -145,7 +145,7 @@ impl Future for SubscriberNetwork {
         //
         // this allows handles to be dropped without causing problems
         if let Poll::Ready(Some(command)) = this.commands.poll_next_unpin(cx) {
-            process_network_command(command, &this.network);
+            process_network_command(command, &mut this.network);
         }
 
         while let Some(swarm_event) = ready!(this.network.poll_next_unpin(cx)) {
@@ -253,19 +253,6 @@ impl Future for SubscriberNetwork {
         }
 
         Poll::Ready(())
-    }
-}
-
-pub struct SubscriberNetworkHandle {
-    sender: mpsc::Sender<NetworkCommand>,
-}
-
-impl SubscriberNetworkHandle {
-    /// Request listeners from the swarm.
-    pub async fn listeners(&self) -> eyre::Result<Vec<Multiaddr>> {
-        let (reply, listeners) = oneshot::channel();
-        let _ = self.sender.send(NetworkCommand::GetListener { reply }).await;
-        Ok(listeners.await?)
     }
 }
 

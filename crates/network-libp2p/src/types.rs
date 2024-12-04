@@ -2,7 +2,11 @@
 
 use eyre::eyre;
 use fastcrypto::hash::Hash as _;
-use libp2p::{gossipsub, swarm::dial_opts::DialOpts, Multiaddr, PeerId, Swarm, SwarmBuilder};
+use libp2p::{
+    gossipsub,
+    swarm::{dial_opts::DialOpts, DialError},
+    Multiaddr, PeerId, Swarm, SwarmBuilder,
+};
 use std::time::Duration;
 use tn_types::{BlockHash, Certificate, ConsensusHeader, SealedWorkerBlock};
 use tokio::sync::{mpsc, oneshot};
@@ -115,8 +119,6 @@ pub enum NetworkCommand {
         peer_id: PeerId,
         /// The peer's address.
         addr: Multiaddr,
-        /// Oneshot for reply
-        reply: oneshot::Sender<()>,
     },
     /// Dial a peer to establish a connection.
     ///
@@ -125,7 +127,7 @@ pub enum NetworkCommand {
         /// The peer's address or peer id both impl Into<DialOpts>.
         dial_opts: DialOpts,
         /// Oneshot for reply
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<std::result::Result<(), DialError>>,
     },
 }
 
@@ -136,18 +138,39 @@ pub struct GossipNetworkHandle {
 }
 
 impl GossipNetworkHandle {
+    /// Create a new instance of Self.
+    pub fn new(sender: mpsc::Sender<NetworkCommand>) -> Self {
+        Self { sender }
+    }
+
     /// Request listeners from the swarm.
     pub async fn listeners(&self) -> eyre::Result<Vec<Multiaddr>> {
         let (reply, listeners) = oneshot::channel();
-        let _ = self.sender.send(NetworkCommand::GetListener { reply }).await;
+        self.sender.send(NetworkCommand::GetListener { reply }).await?;
         Ok(listeners.await?)
+    }
+
+    /// Add explicit peer.
+    pub async fn add_explicit_peer(&self, peer_id: PeerId, addr: Multiaddr) -> eyre::Result<()> {
+        self.sender.send(NetworkCommand::AddExplicitPeer { peer_id, addr }).await?;
+        Ok(())
+    }
+
+    /// Dial a peer.
+    pub async fn dial(&self, dial_opts: DialOpts) -> eyre::Result<()> {
+        let (reply, ack) = oneshot::channel();
+        self.sender.send(NetworkCommand::Dial { dial_opts, reply }).await?;
+        let res = ack.await?;
+        Ok(res?)
     }
 }
 
-/// Helper function for keeping code DRY.
+/// Helper function for processing network commands.
+///
+/// This function calls methods on the swarm.
 pub(crate) fn process_network_command(
     command: NetworkCommand,
-    network: &Swarm<gossipsub::Behaviour>,
+    network: &mut Swarm<gossipsub::Behaviour>,
 ) {
     match command {
         NetworkCommand::GetListener { reply } => {
@@ -156,7 +179,18 @@ pub(crate) fn process_network_command(
                 error!(target: "subsciber-network", ?e, "GetListeners command failed");
             }
         }
-        NetworkCommand::AddExplicitPeer { peer_id, addr, reply } => todo!(),
-        NetworkCommand::Dial { dial_opts, reply } => todo!(),
+        NetworkCommand::AddExplicitPeer { peer_id, addr } => {
+            // TODO: need to understand what `add_explicit_peer` actually does
+            //
+            // DO NOT MERGE
+            network.behaviour_mut().add_explicit_peer(&peer_id);
+            network.add_peer_address(peer_id, addr);
+        }
+        NetworkCommand::Dial { dial_opts, reply } => {
+            let res = network.dial(dial_opts);
+            if let Err(e) = reply.send(res) {
+                error!(target: "subsciber-network", ?e, "AddExplicitPeer command failed");
+            }
+        }
     }
 }

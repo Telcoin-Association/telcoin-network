@@ -152,7 +152,8 @@ mod tests {
 
         // spawn publish network first
         let (tx_pub, rx_pub) = mpsc::channel(1);
-        let mut worker_publish_network = PublishNetwork::new_for_worker(rx_pub, listen_on.clone())?;
+        let (mut worker_publish_network, worker_publish_network_handle) =
+            PublishNetwork::new_for_worker(rx_pub, listen_on.clone())?;
         let pub_peer_id = worker_publish_network.local_peer_id().clone();
 
         // sanity check - expect empty
@@ -195,7 +196,6 @@ mod tests {
 
         // by this point, the three events needed to process peer's subscription are complete
         let sub_addr = worker_subscriber_network_handle.listeners().await?;
-        println!("\n\n\nDid this work??? {sub_addr:?}\n\n\n");
         assert!(!sub_addr.is_empty());
 
         // let event = worker_publish_network.network.select_next_some().await;
