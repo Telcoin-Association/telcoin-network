@@ -18,7 +18,7 @@ use std::{
 use tn_types::{Certificate, ConsensusHeader, SealedWorkerBlock};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace, warn};
 
 /// The worker's network for publishing sealed worker blocks.
 pub struct PublishNetwork {
@@ -44,14 +44,20 @@ impl PublishNetwork {
     where
         M: PublishMessageId<'a>,
     {
-        // create swarm and start listening
-        let swarm = start_swarm::<M>(multiaddr)?;
-        // convert receiver into stream for convenience in `Self::poll`
-        let stream = ReceiverStream::new(receiver);
+        // create handle
         let (handle_tx, network_rx) = mpsc::channel(1);
         let commands = ReceiverStream::new(network_rx);
         let handle = GossipNetworkHandle::new(handle_tx);
+
+        // create swarm and start listening
+        let swarm = start_swarm::<M>(multiaddr)?;
+
+        // convert receiver into stream for convenience in `Self::poll`
+        let stream = ReceiverStream::new(receiver);
+
+        // create Self
         let network = Self { topic, network: swarm, stream, commands };
+
         Ok((network, handle))
     }
 
@@ -140,7 +146,25 @@ impl Future for PublishNetwork {
                     debug!(target: "publish-network", ?event, "Swarm event occurred");
                     // Process swarm events here, such as handling new connections or errors
                     match event {
-                        SwarmEvent::Behaviour(_) => todo!(),
+                        SwarmEvent::Behaviour(gossip) => match gossip {
+                            gossipsub::Event::Message {
+                                propagation_source,
+                                message_id,
+                                message,
+                            } => {
+                                warn!(target: "publish-network", topic=?this.topic, ?propagation_source, ?message_id, ?message, "unexpected gossip message received!")
+                            }
+                            gossipsub::Event::Subscribed { peer_id, topic } => {
+                                trace!(target: "publish-network", topic=?this.topic, ?peer_id, ?topic)
+                            }
+                            gossipsub::Event::Unsubscribed { peer_id, topic } => {
+                                trace!(target: "publish-network", topic=?this.topic, ?peer_id, ?topic)
+                            }
+                            gossipsub::Event::GossipsubNotSupported { peer_id } => {
+                                // TODO: remove peer at this point?
+                                trace!(target: "publish-network", topic=?this.topic, ?peer_id)
+                            }
+                        },
                         SwarmEvent::ConnectionEstablished {
                             peer_id,
                             connection_id,
@@ -148,38 +172,77 @@ impl Future for PublishNetwork {
                             num_established,
                             concurrent_dial_errors,
                             established_in,
-                        } => todo!(),
+                        } => {
+                            trace!(target: "publish-network", topic=?this.topic, ?peer_id, ?connection_id, ?endpoint, ?num_established, ?concurrent_dial_errors, ?established_in)
+                        }
                         SwarmEvent::ConnectionClosed {
                             peer_id,
                             connection_id,
                             endpoint,
                             num_established,
                             cause,
-                        } => todo!(),
+                        } => trace!(
+                            target: "publish-network",
+                            topic=?this.topic,
+                            ?peer_id,
+                            ?connection_id,
+                            ?endpoint,
+                            ?num_established,
+                            ?cause,
+                        ),
                         SwarmEvent::IncomingConnection {
                             connection_id,
                             local_addr,
                             send_back_addr,
-                        } => todo!(),
+                        } => {
+                            trace!(target: "publish-network", topic=?this.topic, ?connection_id, ?local_addr, ?send_back_addr)
+                        }
                         SwarmEvent::IncomingConnectionError {
                             connection_id,
                             local_addr,
                             send_back_addr,
                             error,
-                        } => todo!(),
+                        } => trace!(
+                            target: "publish-network",
+                            topic=?this.topic,
+                            ?connection_id,
+                            ?local_addr,
+                            ?send_back_addr,
+                            ?error,
+                        ),
                         SwarmEvent::OutgoingConnectionError { connection_id, peer_id, error } => {
-                            todo!()
+                            trace!(target: "publish-network", topic=?this.topic, ?connection_id, ?peer_id, ?error,)
                         }
-                        SwarmEvent::NewListenAddr { listener_id, address } => todo!(),
-                        SwarmEvent::ExpiredListenAddr { listener_id, address } => todo!(),
-                        SwarmEvent::ListenerClosed { listener_id, addresses, reason } => todo!(),
-                        SwarmEvent::ListenerError { listener_id, error } => todo!(),
-                        SwarmEvent::Dialing { peer_id, connection_id } => todo!(),
-                        SwarmEvent::NewExternalAddrCandidate { address } => todo!(),
-                        SwarmEvent::ExternalAddrConfirmed { address } => todo!(),
-                        SwarmEvent::ExternalAddrExpired { address } => todo!(),
-                        SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => todo!(),
-                        _ => todo!(),
+                        SwarmEvent::NewListenAddr { listener_id, address } => {
+                            trace!(target: "publish-network", topic=?this.topic, ?listener_id, ?address)
+                        }
+                        SwarmEvent::ExpiredListenAddr { listener_id, address } => {
+                            trace!(target: "publish-network", topic=?this.topic, ?listener_id, ?address)
+                        }
+                        SwarmEvent::ListenerClosed { listener_id, addresses, reason } => {
+                            trace!(target: "publish-network", topic=?this.topic, ?listener_id, ?addresses, ?reason)
+                        }
+                        SwarmEvent::ListenerError { listener_id, error } => {
+                            trace!(target: "publish-network", topic=?this.topic, ?listener_id, ?error)
+                        }
+                        SwarmEvent::Dialing { peer_id, connection_id } => {
+                            trace!(target: "publish-network", topic=?this.topic, ? peer_id, ?connection_id)
+                        }
+                        SwarmEvent::NewExternalAddrCandidate { address } => {
+                            trace!(target: "publish-network", topic=?this.topic, ?address)
+                        }
+                        SwarmEvent::ExternalAddrConfirmed { address } => {
+                            trace!(target: "publish-network", topic=?this.topic, ?address)
+                        }
+                        SwarmEvent::ExternalAddrExpired { address } => {
+                            trace!(target: "publish-network", topic=?this.topic, ?address)
+                        }
+                        SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => {
+                            trace!(target: "publish-network", topic=?this.topic, ?peer_id, ?address)
+                        }
+                        _e => {
+                            trace!(target: "publish-network", topic=?this.topic, ?_e, "non-exhaustive event match")
+                        }
                     }
                 }
                 Poll::Pending => break,
@@ -220,26 +283,12 @@ mod tests {
             .parse()
             .expect("multiaddr parsed for worker gossip publisher");
 
-        // spawn publish network first
+        // spawn publish
         let (tx_pub, rx_pub) = mpsc::channel(1);
         let (mut worker_publish_network, worker_publish_network_handle) =
             PublishNetwork::new_for_worker(rx_pub, listen_on.clone())?;
-        let pub_peer_id = worker_publish_network.local_peer_id().clone();
 
-        // sanity check - expect empty
-        let empty: Vec<Multiaddr> = vec![];
-        assert_eq!(empty, worker_publish_network.listeners());
-
-        // the new listener address is only populated after this is polled
-        let pub_addr = match worker_publish_network.network.select_next_some().await {
-            SwarmEvent::NewListenAddr { address, .. } => address,
-            _ => panic!("NewListenerAddr should always be the first event"),
-        };
-
-        // sanity check - pupulated now that event was polled
-        assert_eq!(vec![pub_addr.clone()], worker_publish_network.listeners());
-
-        // spawn subscriber and publishing add peer
+        // spawn subscriber
         let (tx_sub, mut rx_sub) = mpsc::channel(1);
         let (mut worker_subscriber_network, worker_subscriber_network_handle) =
             SubscriberNetwork::new_for_worker(tx_sub, listen_on)?;
@@ -249,30 +298,41 @@ mod tests {
         // NOTE: this doesn't work - add peer/addr and then dial by peer_id
         // worker_subscriber_network.add_explicit_peer(pub_peer_id, pub_addr.clone());
         // worker_subscriber_network.dial(pub_peer_id)?;
-        //
-        // however, this works
-        worker_subscriber_network.dial(pub_addr)?;
 
-        // spawn subscriber network to process dial event
+        // however, this works
+        // worker_subscriber_network.dial(pub_addr)?;
+
+        // spawn subscriber network
         worker_subscriber_network.spawn();
 
-        // process dial event for publisher
-        let event = worker_publish_network.network.select_next_some().await;
-        println!("publisher event :D\n{event:?}");
-        let event = worker_publish_network.network.select_next_some().await;
-        println!("publisher event :D\n{event:?}");
-        let event = worker_publish_network.network.select_next_some().await;
-        println!("publisher event :D\n{event:?}");
+        // spawn publish network
+        worker_publish_network.spawn();
+        let pub_id = worker_publish_network_handle.local_peer_id().await?;
+        let pub_listeners = worker_subscriber_network_handle.listeners().await?;
 
-        // by this point, the three events needed to process peer's subscription are complete
-        let sub_addr = worker_subscriber_network_handle.listeners().await?;
-        assert!(!sub_addr.is_empty());
+        worker_subscriber_network_handle
+            .add_explicit_peer(
+                pub_id.clone(),
+                pub_listeners.first().expect("pub network is listening").clone(),
+            )
+            .await?;
 
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // dial peer by id now
+        worker_subscriber_network_handle.dial(pub_id.into()).await?;
+
+        // // process dial event for publisher
+        // let event = worker_publish_network.network.select_next_some().await;
+        // println!("publisher event :D\n{event:?}");
+        // let event = worker_publish_network.network.select_next_some().await;
+        // println!("publisher event :D\n{event:?}");
         // let event = worker_publish_network.network.select_next_some().await;
         // println!("publisher event :D\n{event:?}");
 
-        // spawn publish network to begin publishing
-        worker_publish_network.spawn();
+        // by this point, the three events needed to process peer's subscription are complete
+        // let sub_addr = worker_subscriber_network_handle.listeners().await?;
+        // assert!(!sub_addr.is_empty());
 
         // publish random block
         let random_block = WorkerBlock::default();

@@ -121,14 +121,14 @@ pub enum NetworkCommand {
         addr: Multiaddr,
     },
     /// Dial a peer to establish a connection.
-    ///
-    /// TODO: only supports multiaddr?
     Dial {
         /// The peer's address or peer id both impl Into<DialOpts>.
         dial_opts: DialOpts,
         /// Oneshot for reply
         reply: oneshot::Sender<std::result::Result<(), DialError>>,
     },
+    /// Return an owned copy of this node's [PeerId].
+    LocalPeerId { reply: oneshot::Sender<PeerId> },
 }
 
 /// Network handle.
@@ -163,6 +163,13 @@ impl GossipNetworkHandle {
         let res = ack.await?;
         Ok(res?)
     }
+
+    /// Get local peer id.
+    pub async fn local_peer_id(&self) -> eyre::Result<PeerId> {
+        let (reply, peer_id) = oneshot::channel();
+        self.sender.send(NetworkCommand::LocalPeerId { reply }).await?;
+        Ok(peer_id.await?)
+    }
 }
 
 /// Helper function for processing network commands.
@@ -190,6 +197,12 @@ pub(crate) fn process_network_command(
             let res = network.dial(dial_opts);
             if let Err(e) = reply.send(res) {
                 error!(target: "subsciber-network", ?e, "AddExplicitPeer command failed");
+            }
+        }
+        NetworkCommand::LocalPeerId { reply } => {
+            let peer_id = network.local_peer_id().clone();
+            if let Err(e) = reply.send(peer_id) {
+                error!(target: "subsciber-network", ?e, "LocalPeerId command failed");
             }
         }
     }

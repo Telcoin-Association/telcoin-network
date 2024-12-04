@@ -148,8 +148,8 @@ impl Future for SubscriberNetwork {
             process_network_command(command, &mut this.network);
         }
 
-        while let Some(swarm_event) = ready!(this.network.poll_next_unpin(cx)) {
-            match swarm_event {
+        while let Some(event) = ready!(this.network.poll_next_unpin(cx)) {
+            match event {
                 SwarmEvent::Behaviour(gossip) => match gossip {
                     gossipsub::Event::Message { propagation_source, message_id, message } => {
                         // - `propagation_source` is the PeerId created from the  publisher's public
