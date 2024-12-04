@@ -46,7 +46,10 @@ impl SubscriberNetwork {
         M: PublishMessageId<'a>,
     {
         // create swarm and start listening
-        let swarm = start_swarm::<M>(multiaddr)?;
+        let mut swarm = start_swarm::<M>(multiaddr)?;
+        // subscribe to topic
+        swarm.behaviour_mut().subscribe(&topic)?;
+        // return Self
         Ok(Self { topic, network: swarm, sender })
     }
 
@@ -59,12 +62,14 @@ impl SubscriberNetwork {
     pub fn listeners(&self) -> Vec<Multiaddr> {
         self.network.listeners().cloned().collect()
     }
+
     /// Add an explicit peer to support further discovery.
     pub fn add_explicit_peer(&mut self, peer_id: PeerId, addr: Multiaddr) {
+        self.network.behaviour_mut().add_explicit_peer(&peer_id);
         self.network.add_peer_address(peer_id, addr);
     }
 
-    /// Spawn the network and start listening.
+    /// Spawn the network to process incoming gossip.
     ///
     /// Calls [`Swarm::listen_on`] and spawns `Self` as a future.
     pub fn spawn(self) -> JoinHandle<()> {

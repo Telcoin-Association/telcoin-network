@@ -44,7 +44,7 @@ impl<'a> PublishMessageId<'a> for Certificate {
     }
 }
 
-// Implementation for primary gossip network.
+// Implementation for consensus gossip network.
 impl<'a> PublishMessageId<'a> for ConsensusHeader {
     fn message_id(msg: &gossipsub::Message) -> BlockHash {
         let certificate = Self::from(&msg.data);

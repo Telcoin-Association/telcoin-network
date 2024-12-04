@@ -52,21 +52,25 @@ impl PublishNetwork {
         self.network.local_peer_id()
     }
 
-    /// Return an iterator of addresses the network is listening on.
+    /// Return an collection of addresses the network is listening on.
+    ///
+    /// NOTE: until the swarm events are polled, this will return empty.
+    /// See unit tests for implementation.
     pub fn listeners(&self) -> Vec<Multiaddr> {
         self.network.listeners().cloned().collect()
     }
 
     /// Add an explicit peer to support further discovery.
     pub fn add_explicit_peer(&mut self, peer_id: PeerId, addr: Multiaddr) {
+        self.network.behaviour_mut().add_explicit_peer(&peer_id);
         self.network.add_peer_address(peer_id, addr);
     }
 
-    /// Spawn the network and start listening.
+    /// Spawn the network to start publishing gossip.
     ///
     /// Calls [`Swarm::listen_on`] and spawns `Self` as a future.
     pub fn spawn(self) -> JoinHandle<()> {
-        // spawn future to process requests
+        // spawn future
         tokio::task::spawn(self)
     }
 
@@ -130,7 +134,8 @@ impl Future for PublishNetwork {
 mod tests {
     use super::PublishNetwork;
     use crate::SubscriberNetwork;
-    use libp2p::Multiaddr;
+    use futures::StreamExt as _;
+    use libp2p::{swarm::SwarmEvent, Multiaddr};
     use std::time::Duration;
     use tn_types::WorkerBlock;
     use tokio::{sync::mpsc, time::timeout};
@@ -139,39 +144,36 @@ mod tests {
     async fn test_generics_compile() -> eyre::Result<()> {
         reth_tracing::init_test_tracing();
 
+        // default any address
         let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1"
             .parse()
             .expect("multiaddr parsed for worker gossip publisher");
 
-        // spawn subscriber network first
+        // spawn publish network first
+        let (tx_pub, rx_pub) = mpsc::channel(1);
+        let mut worker_publish_network = PublishNetwork::new_for_worker(rx_pub, listen_on.clone())?;
+        let pub_peer_id = worker_publish_network.local_peer_id().clone();
+
+        // sanity check - expect empty
+        let empty: Vec<Multiaddr> = vec![];
+        assert_eq!(empty, worker_publish_network.listeners());
+
+        // the new listener address is only populated after this is polled
+        let pub_addr = match worker_publish_network.network.select_next_some().await {
+            SwarmEvent::NewListenAddr { address, .. } => address,
+            _ => panic!("NewListenerAddr should always be the first event"),
+        };
+
+        // sanity check - pupulated now that event was polled
+        assert_eq!(vec![pub_addr.clone()], worker_publish_network.listeners());
+
+        // spawn subscriber and publishing add peer
         let (tx_sub, mut rx_sub) = mpsc::channel(1);
-        let mut worker_subscriber_network =
-            SubscriberNetwork::new_for_worker(tx_sub, listen_on.clone())?;
-        // yield to find listener
-        tokio::task::yield_now().await;
-        let sub = &worker_subscriber_network;
+        let mut worker_subscriber_network = SubscriberNetwork::new_for_worker(tx_sub, listen_on)?;
+        worker_subscriber_network.add_explicit_peer(pub_peer_id, pub_addr.clone());
 
-        let _ = timeout(Duration::from_secs(10), async move {
-            while sub.listeners().is_empty() {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("swarm event listener started");
-        let addresses = worker_subscriber_network.listeners();
-        let peer_id = worker_subscriber_network.local_peer_id();
-
-        println!("subscriber addresses: {addresses:?}");
-
-        // spawn publish network and add subscriber
-        let (tx_pub, rx_pub) = mpsc::channel(100);
-        let mut worker_publish_network = PublishNetwork::new_for_worker(rx_pub, listen_on)?;
-        let peer_id = worker_publish_network.local_peer_id();
-        println!("peer_id: {peer_id:?}");
-
-        // capture listeners for discovery in unit test
-        let listeners = worker_publish_network.listeners();
-        println!("publisher addresses: {addresses:?}");
+        // dial subscriber
+        worker_publish_network.network.dial(pub_addr)?;
 
         // spawn subscriber network
         worker_subscriber_network.spawn();
