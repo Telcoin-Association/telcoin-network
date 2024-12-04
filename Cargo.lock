@@ -11360,6 +11360,7 @@ dependencies = [
  "libp2p",
  "reth-tracing",
  "serde",
+ "tn-test-utils",
  "tn-types",
  "tokio",
  "tokio-stream",
