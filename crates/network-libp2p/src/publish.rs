@@ -1,11 +1,13 @@
 //! Generic abstraction for publishing (flood) to the gossipsub network.
 
 use crate::types::{
-    start_swarm, PublishMessageId, CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
+    process_network_command, start_swarm, GossipNetworkHandle, NetworkCommand, PublishMessageId,
+    CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
 };
 use futures::{ready, StreamExt as _};
 use libp2p::{
     gossipsub::{self, IdentTopic},
+    swarm::SwarmEvent,
     Multiaddr, PeerId, Swarm,
 };
 use std::{
@@ -26,6 +28,8 @@ pub struct PublishNetwork {
     network: Swarm<gossipsub::Behaviour>,
     /// The stream for receiving sealed worker blocks to publish.
     stream: ReceiverStream<Vec<u8>>,
+    /// The receiver for processing network handle requests.
+    commands: ReceiverStream<NetworkCommand>,
     // /// The [Multiaddr] for the swarm.
     // multiaddr: Multiaddr,
 }
@@ -36,7 +40,7 @@ impl PublishNetwork {
         topic: IdentTopic,
         receiver: mpsc::Receiver<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> eyre::Result<Self>
+    ) -> eyre::Result<(Self, GossipNetworkHandle)>
     where
         M: PublishMessageId<'a>,
     {
@@ -44,7 +48,11 @@ impl PublishNetwork {
         let swarm = start_swarm::<M>(multiaddr)?;
         // convert receiver into stream for convenience in `Self::poll`
         let stream = ReceiverStream::new(receiver);
-        Ok(Self { topic, network: swarm, stream })
+        let (handle_tx, network_rx) = mpsc::channel(1);
+        let commands = ReceiverStream::new(network_rx);
+        let handle = GossipNetworkHandle::new(handle_tx);
+        let network = Self { topic, network: swarm, stream, commands };
+        Ok((network, handle))
     }
 
     /// Return this publisher's [PeerId].
@@ -80,7 +88,7 @@ impl PublishNetwork {
     pub fn new_for_worker(
         receiver: mpsc::Receiver<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> eyre::Result<Self> {
+    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // worker's default topic
         let topic = gossipsub::IdentTopic::new(WORKER_BLOCK_TOPIC);
         Self::new::<SealedWorkerBlock>(topic, receiver, multiaddr)
@@ -92,7 +100,7 @@ impl PublishNetwork {
     pub fn new_for_primary(
         receiver: mpsc::Receiver<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> eyre::Result<Self> {
+    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // primary's default topic
         let topic = gossipsub::IdentTopic::new(PRIMARY_CERT_TOPIC);
         Self::new::<Certificate>(topic, receiver, multiaddr)
@@ -104,7 +112,7 @@ impl PublishNetwork {
     pub fn new_for_consensus(
         receiver: mpsc::Receiver<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> eyre::Result<Self> {
+    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // consensus header's default topic
         let topic = gossipsub::IdentTopic::new(CONSENSUS_HEADER_TOPIC);
         Self::new::<ConsensusHeader>(topic, receiver, multiaddr)
@@ -118,6 +126,68 @@ impl Future for PublishNetwork {
         let this = self.get_mut();
         info!(target: "publish-network", topic=?this.topic, "starting poll...");
 
+        // handle network commands first
+        //
+        // this allows handles to be dropped without causing problems
+        if let Poll::Ready(Some(command)) = this.commands.poll_next_unpin(cx) {
+            process_network_command(command, &mut this.network);
+        }
+
+        // process swarm events
+        loop {
+            match this.network.poll_next_unpin(cx) {
+                Poll::Ready(Some(event)) => {
+                    debug!(target: "publish-network", ?event, "Swarm event occurred");
+                    // Process swarm events here, such as handling new connections or errors
+                    match event {
+                        SwarmEvent::Behaviour(_) => todo!(),
+                        SwarmEvent::ConnectionEstablished {
+                            peer_id,
+                            connection_id,
+                            endpoint,
+                            num_established,
+                            concurrent_dial_errors,
+                            established_in,
+                        } => todo!(),
+                        SwarmEvent::ConnectionClosed {
+                            peer_id,
+                            connection_id,
+                            endpoint,
+                            num_established,
+                            cause,
+                        } => todo!(),
+                        SwarmEvent::IncomingConnection {
+                            connection_id,
+                            local_addr,
+                            send_back_addr,
+                        } => todo!(),
+                        SwarmEvent::IncomingConnectionError {
+                            connection_id,
+                            local_addr,
+                            send_back_addr,
+                            error,
+                        } => todo!(),
+                        SwarmEvent::OutgoingConnectionError { connection_id, peer_id, error } => {
+                            todo!()
+                        }
+                        SwarmEvent::NewListenAddr { listener_id, address } => todo!(),
+                        SwarmEvent::ExpiredListenAddr { listener_id, address } => todo!(),
+                        SwarmEvent::ListenerClosed { listener_id, addresses, reason } => todo!(),
+                        SwarmEvent::ListenerError { listener_id, error } => todo!(),
+                        SwarmEvent::Dialing { peer_id, connection_id } => todo!(),
+                        SwarmEvent::NewExternalAddrCandidate { address } => todo!(),
+                        SwarmEvent::ExternalAddrConfirmed { address } => todo!(),
+                        SwarmEvent::ExternalAddrExpired { address } => todo!(),
+                        SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => todo!(),
+                        _ => todo!(),
+                    }
+                }
+                Poll::Pending => break,
+                Poll::Ready(None) => return Poll::Ready(()), // swarm closed
+            }
+        }
+
+        // publish messages to the network after swarm updates
         while let Some(msg) = ready!(this.stream.poll_next_unpin(cx)) {
             debug!(target: "publish-network", topic=?this.topic, "publishing msg :D");
             if let Err(e) = this.network.behaviour_mut().publish(this.topic.clone(), msg) {
@@ -176,7 +246,7 @@ mod tests {
 
         // dial publisher to establish connection
         //
-        // NOTE: this doesn't work - add peer/addr and then dial by peer
+        // NOTE: this doesn't work - add peer/addr and then dial by peer_id
         // worker_subscriber_network.add_explicit_peer(pub_peer_id, pub_addr.clone());
         // worker_subscriber_network.dial(pub_peer_id)?;
         //
