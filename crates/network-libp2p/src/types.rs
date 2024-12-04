@@ -1,16 +1,13 @@
 //! Constants and trait implementations for network compatibility.
 
-use eyre::eyre;
 use fastcrypto::hash::Hash as _;
 use libp2p::{
     gossipsub::{self, IdentTopic, MessageId, PublishError, SubscriptionError},
     swarm::{dial_opts::DialOpts, DialError},
-    Multiaddr, PeerId, Swarm, SwarmBuilder,
+    Multiaddr, PeerId,
 };
-use std::time::Duration;
 use tn_types::{BlockHash, Certificate, ConsensusHeader, SealedWorkerBlock};
 use tokio::sync::{mpsc, oneshot};
-use tracing::error;
 
 /// The topic for NVVs to subscribe to for published worker blocks.
 pub const WORKER_BLOCK_TOPIC: &str = "tn_worker_blocks";
@@ -53,7 +50,7 @@ impl<'a> PublishMessageId<'a> for Certificate {
 impl<'a> PublishMessageId<'a> for ConsensusHeader {
     fn message_id(msg: &gossipsub::Message) -> BlockHash {
         let certificate = Self::from(&msg.data);
-        certificate.digest().into()
+        certificate.digest()
     }
 }
 

@@ -1,6 +1,7 @@
 //! Certificates and their digests.
 //!
-//! Certificates are issued by Primaries once their proposed headers are verified by a quorum (2f+1) of peers.
+//! Certificates are issued by Primaries once their proposed headers are verified by a quorum (2f+1)
+//! of peers.
 use crate::{
     crypto::{
         self, to_intent_message, BlsAggregateSignature, BlsAggregateSignatureBytes, BlsPublicKey,

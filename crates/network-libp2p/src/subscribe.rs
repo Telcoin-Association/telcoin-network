@@ -22,14 +22,11 @@ use std::{
 };
 use tn_types::{Certificate, ConsensusHeader, SealedWorkerBlock};
 use tokio::{
-    sync::{
-        mpsc::{self, Sender},
-        oneshot,
-    },
+    sync::mpsc::{self, Sender},
     task::JoinHandle,
 };
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, trace};
+use tracing::{error, trace};
 
 /// The worker's network for publishing sealed worker blocks.
 pub struct SubscriberNetwork {
@@ -127,7 +124,8 @@ impl SubscriberNetwork {
 
     /// Create a new subscribe network for [ConsensusHeader].
     ///
-    /// This type is used by consensus to subscribe consensus block headers after the subdag commits the latest round (finality).
+    /// This type is used by consensus to subscribe consensus block headers after the subdag commits
+    /// the latest round (finality).
     pub fn new_for_consensus(
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,

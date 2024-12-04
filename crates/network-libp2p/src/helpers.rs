@@ -2,15 +2,11 @@
 
 use crate::types::{NetworkCommand, PublishMessageId};
 use eyre::eyre;
-use fastcrypto::hash::Hash as _;
 use libp2p::{
-    gossipsub::{self, IdentTopic, MessageId, PublishError, SubscriptionError},
-    swarm::{dial_opts::DialOpts, DialError},
-    Multiaddr, PeerId, Swarm, SwarmBuilder,
+    gossipsub::{self},
+    Multiaddr, Swarm, SwarmBuilder,
 };
 use std::time::Duration;
-use tn_types::{BlockHash, Certificate, ConsensusHeader, SealedWorkerBlock};
-use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
 /// Generate a swarm type for use with gossip network and start listening.
@@ -95,7 +91,7 @@ pub(crate) fn process_network_command(
             }
         }
         NetworkCommand::LocalPeerId { reply } => {
-            let peer_id = network.local_peer_id().clone();
+            let peer_id = *network.local_peer_id();
             if let Err(e) = reply.send(peer_id) {
                 error!(target: "gossip-network", ?e, "LocalPeerId command failed");
             }
