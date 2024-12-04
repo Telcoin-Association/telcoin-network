@@ -2,9 +2,12 @@
 //!
 //! Subscribers receive gossipped output from committee-voting validators.
 
-use crate::types::{
-    process_network_command, start_swarm, GossipNetworkHandle, NetworkCommand, PublishMessageId,
-    CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
+use crate::{
+    helpers::{process_network_command, start_swarm},
+    types::{
+        GossipNetworkHandle, NetworkCommand, PublishMessageId, CONSENSUS_HEADER_TOPIC,
+        PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
+    },
 };
 use futures::{ready, StreamExt as _};
 use libp2p::{
