@@ -3,7 +3,8 @@
 //! Subscribers receive gossipped output from committee-voting validators.
 
 use crate::types::{
-    start_swarm, PublishMessageId, CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
+    process_network_command, start_swarm, NetworkCommand, PublishMessageId, CONSENSUS_HEADER_TOPIC,
+    PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
 };
 use futures::{ready, StreamExt as _};
 use libp2p::{
@@ -18,9 +19,13 @@ use std::{
 };
 use tn_types::{Certificate, ConsensusHeader, SealedWorkerBlock};
 use tokio::{
-    sync::mpsc::{self, Sender},
+    sync::{
+        mpsc::{self, Sender},
+        oneshot,
+    },
     task::JoinHandle,
 };
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, trace};
 
 /// The worker's network for publishing sealed worker blocks.
@@ -31,6 +36,8 @@ pub struct SubscriberNetwork {
     network: Swarm<gossipsub::Behaviour>,
     /// The stream for receiving sealed worker blocks to publish.
     sender: Sender<Vec<u8>>,
+    /// The receiver for processing network handle requests.
+    commands: ReceiverStream<NetworkCommand>,
     // /// The [Multiaddr] for the swarm.
     // multiaddr: Multiaddr,
 }
@@ -41,7 +48,7 @@ impl SubscriberNetwork {
         topic: IdentTopic,
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> eyre::Result<Self>
+    ) -> eyre::Result<(Self, SubscriberNetworkHandle)>
     where
         M: PublishMessageId<'a>,
     {
@@ -49,8 +56,13 @@ impl SubscriberNetwork {
         let mut swarm = start_swarm::<M>(multiaddr)?;
         // subscribe to topic
         swarm.behaviour_mut().subscribe(&topic)?;
-        // return Self
-        Ok(Self { topic, network: swarm, sender })
+
+        // create channels and handle
+        let (handle_tx, network_rx) = mpsc::channel(1);
+        let commands = ReceiverStream::new(network_rx);
+        let handle = SubscriberNetworkHandle { sender: handle_tx };
+        let network = Self { topic, network: swarm, sender, commands };
+        Ok((network, handle))
     }
 
     /// Return this publisher's [PeerId].
@@ -92,7 +104,7 @@ impl SubscriberNetwork {
     pub fn new_for_worker(
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> eyre::Result<Self> {
+    ) -> eyre::Result<(Self, SubscriberNetworkHandle)> {
         // worker's default topic
         let topic = gossipsub::IdentTopic::new(WORKER_BLOCK_TOPIC);
         Self::new::<SealedWorkerBlock>(topic, sender, multiaddr)
@@ -104,7 +116,7 @@ impl SubscriberNetwork {
     pub fn new_for_primary(
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> eyre::Result<Self> {
+    ) -> eyre::Result<(Self, SubscriberNetworkHandle)> {
         // primary's default topic
         let topic = gossipsub::IdentTopic::new(PRIMARY_CERT_TOPIC);
         Self::new::<Certificate>(topic, sender, multiaddr)
@@ -116,7 +128,7 @@ impl SubscriberNetwork {
     pub fn new_for_consensus(
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> eyre::Result<Self> {
+    ) -> eyre::Result<(Self, SubscriberNetworkHandle)> {
         // consensus header's default topic
         let topic = gossipsub::IdentTopic::new(CONSENSUS_HEADER_TOPIC);
         Self::new::<ConsensusHeader>(topic, sender, multiaddr)
@@ -128,6 +140,13 @@ impl Future for SubscriberNetwork {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+
+        // handle network commands first
+        //
+        // this allows handles to be dropped without causing problems
+        if let Poll::Ready(Some(command)) = this.commands.poll_next_unpin(cx) {
+            process_network_command(command, &this.network);
+        }
 
         while let Some(swarm_event) = ready!(this.network.poll_next_unpin(cx)) {
             match swarm_event {
@@ -237,6 +256,19 @@ impl Future for SubscriberNetwork {
     }
 }
 
+pub struct SubscriberNetworkHandle {
+    sender: mpsc::Sender<NetworkCommand>,
+}
+
+impl SubscriberNetworkHandle {
+    /// Request listeners from the swarm.
+    pub async fn listeners(&self) -> eyre::Result<Vec<Multiaddr>> {
+        let (reply, listeners) = oneshot::channel();
+        let _ = self.sender.send(NetworkCommand::GetListener { reply }).await;
+        Ok(listeners.await?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::SubscriberNetwork;
@@ -249,7 +281,7 @@ mod tests {
             .parse()
             .expect("multiaddr parsed for worker gossip publisher");
         let worker_publish_network = SubscriberNetwork::new_for_worker(tx, listen_on)?;
-        let _ = worker_publish_network.spawn();
+        // let _ = worker_publish_network.spawn();
 
         Ok(())
     }

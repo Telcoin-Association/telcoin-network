@@ -170,7 +170,8 @@ mod tests {
 
         // spawn subscriber and publishing add peer
         let (tx_sub, mut rx_sub) = mpsc::channel(1);
-        let mut worker_subscriber_network = SubscriberNetwork::new_for_worker(tx_sub, listen_on)?;
+        let (mut worker_subscriber_network, worker_subscriber_network_handle) =
+            SubscriberNetwork::new_for_worker(tx_sub, listen_on)?;
 
         // dial publisher to establish connection
         //
@@ -193,6 +194,9 @@ mod tests {
         println!("publisher event :D\n{event:?}");
 
         // by this point, the three events needed to process peer's subscription are complete
+        let sub_addr = worker_subscriber_network_handle.listeners().await?;
+        println!("\n\n\nDid this work??? {sub_addr:?}\n\n\n");
+        assert!(!sub_addr.is_empty());
 
         // let event = worker_publish_network.network.select_next_some().await;
         // println!("publisher event :D\n{event:?}");

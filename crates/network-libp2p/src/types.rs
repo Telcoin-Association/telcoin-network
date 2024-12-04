@@ -2,9 +2,10 @@
 
 use eyre::eyre;
 use fastcrypto::hash::Hash as _;
-use libp2p::{gossipsub, Multiaddr, Swarm, SwarmBuilder};
+use libp2p::{gossipsub, swarm::dial_opts::DialOpts, Multiaddr, PeerId, Swarm, SwarmBuilder};
 use std::time::Duration;
 use tn_types::{BlockHash, Certificate, ConsensusHeader, SealedWorkerBlock};
+use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
 /// The topic for NVVs to subscribe to for published worker blocks.
@@ -103,4 +104,59 @@ where
     swarm.listen_on(multiaddr)?;
 
     Ok(swarm)
+}
+
+pub enum NetworkCommand {
+    /// Listeners
+    GetListener { reply: oneshot::Sender<Vec<Multiaddr>> },
+    /// Add explicit peer
+    AddExplicitPeer {
+        /// The peer's id.
+        peer_id: PeerId,
+        /// The peer's address.
+        addr: Multiaddr,
+        /// Oneshot for reply
+        reply: oneshot::Sender<()>,
+    },
+    /// Dial a peer to establish a connection.
+    ///
+    /// TODO: only supports multiaddr?
+    Dial {
+        /// The peer's address or peer id both impl Into<DialOpts>.
+        dial_opts: DialOpts,
+        /// Oneshot for reply
+        reply: oneshot::Sender<()>,
+    },
+}
+
+/// Network handle.
+pub struct GossipNetworkHandle {
+    /// Sending channel to the network to process commands.
+    sender: mpsc::Sender<NetworkCommand>,
+}
+
+impl GossipNetworkHandle {
+    /// Request listeners from the swarm.
+    pub async fn listeners(&self) -> eyre::Result<Vec<Multiaddr>> {
+        let (reply, listeners) = oneshot::channel();
+        let _ = self.sender.send(NetworkCommand::GetListener { reply }).await;
+        Ok(listeners.await?)
+    }
+}
+
+/// Helper function for keeping code DRY.
+pub(crate) fn process_network_command(
+    command: NetworkCommand,
+    network: &Swarm<gossipsub::Behaviour>,
+) {
+    match command {
+        NetworkCommand::GetListener { reply } => {
+            let addrs = network.listeners().cloned().collect();
+            if let Err(e) = reply.send(addrs) {
+                error!(target: "subsciber-network", ?e, "GetListeners command failed");
+            }
+        }
+        NetworkCommand::AddExplicitPeer { peer_id, addr, reply } => todo!(),
+        NetworkCommand::Dial { dial_opts, reply } => todo!(),
+    }
 }
