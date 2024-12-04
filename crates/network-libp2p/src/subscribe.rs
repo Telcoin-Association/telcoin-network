@@ -8,7 +8,7 @@ use crate::types::{
 use futures::{ready, StreamExt as _};
 use libp2p::{
     gossipsub::{self, IdentTopic},
-    swarm::SwarmEvent,
+    swarm::{dial_opts::DialOpts, SwarmEvent},
     Multiaddr, PeerId, Swarm,
 };
 use std::{
@@ -61,6 +61,15 @@ impl SubscriberNetwork {
     /// Return an iterator of addresses the network is listening on.
     pub fn listeners(&self) -> Vec<Multiaddr> {
         self.network.listeners().cloned().collect()
+    }
+
+    /// Dial a peer to establish connection.
+    ///
+    /// Examples that impl `Into<DialOpts>` are:
+    /// - [Multiaddr]
+    /// - [PeerId] for known peers
+    pub fn dial(&mut self, peer: impl Into<DialOpts>) -> eyre::Result<()> {
+        Ok(self.network.dial(peer)?)
     }
 
     /// Add an explicit peer to support further discovery.

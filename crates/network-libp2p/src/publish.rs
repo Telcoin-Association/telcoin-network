@@ -16,7 +16,7 @@ use std::{
 use tn_types::{Certificate, ConsensusHeader, SealedWorkerBlock};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// The worker's network for publishing sealed worker blocks.
 pub struct PublishNetwork {
@@ -119,6 +119,7 @@ impl Future for PublishNetwork {
         info!(target: "publish-network", topic=?this.topic, "starting poll...");
 
         while let Some(msg) = ready!(this.stream.poll_next_unpin(cx)) {
+            debug!(target: "publish-network", topic=?this.topic, "publishing msg :D");
             if let Err(e) = this.network.behaviour_mut().publish(this.topic.clone(), msg) {
                 error!(target: "publish-network", ?e);
                 break;
@@ -170,14 +171,33 @@ mod tests {
         // spawn subscriber and publishing add peer
         let (tx_sub, mut rx_sub) = mpsc::channel(1);
         let mut worker_subscriber_network = SubscriberNetwork::new_for_worker(tx_sub, listen_on)?;
-        worker_subscriber_network.add_explicit_peer(pub_peer_id, pub_addr.clone());
 
-        // dial subscriber
-        worker_publish_network.network.dial(pub_addr)?;
+        // dial publisher to establish connection
+        //
+        // NOTE: this doesn't work - add peer/addr and then dial by peer
+        // worker_subscriber_network.add_explicit_peer(pub_peer_id, pub_addr.clone());
+        // worker_subscriber_network.dial(pub_peer_id)?;
+        //
+        // however, this works
+        worker_subscriber_network.dial(pub_addr)?;
 
-        // spawn subscriber network
+        // spawn subscriber network to process dial event
         worker_subscriber_network.spawn();
-        // spawn publish network
+
+        // process dial event for publisher
+        let event = worker_publish_network.network.select_next_some().await;
+        println!("publisher event :D\n{event:?}");
+        let event = worker_publish_network.network.select_next_some().await;
+        println!("publisher event :D\n{event:?}");
+        let event = worker_publish_network.network.select_next_some().await;
+        println!("publisher event :D\n{event:?}");
+
+        // by this point, the three events needed to process peer's subscription are complete
+
+        // let event = worker_publish_network.network.select_next_some().await;
+        // println!("publisher event :D\n{event:?}");
+
+        // spawn publish network to begin publishing
         worker_publish_network.spawn();
 
         // publish random block
