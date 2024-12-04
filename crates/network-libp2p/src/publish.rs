@@ -306,82 +306,82 @@ mod tests {
         Ok(())
     }
 
-    /// DOESN'T WORK - trying to dial by peer id after adding explicitly
-    #[tokio::test]
-    async fn test_add_explicit_peer_and_dial_by_peer_id() -> eyre::Result<()> {
-        reth_tracing::init_test_tracing();
+    // /// DOESN'T WORK - trying to dial by peer id after adding explicitly
+    // #[tokio::test]
+    // async fn test_add_explicit_peer_and_dial_by_peer_id() -> eyre::Result<()> {
+    //     reth_tracing::init_test_tracing();
 
-        // default any address
-        let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1"
-            .parse()
-            .expect("multiaddr parsed for worker gossip publisher");
+    //     // default any address
+    //     let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1"
+    //         .parse()
+    //         .expect("multiaddr parsed for worker gossip publisher");
 
-        // spawn publish
-        let (worker_publish_network, worker_publish_network_handle) =
-            PublishNetwork::new_for_worker(listen_on.clone())?;
+    //     // spawn publish
+    //     let (worker_publish_network, worker_publish_network_handle) =
+    //         PublishNetwork::new_for_worker(listen_on.clone())?;
 
-        // spawn subscriber
-        let (tx_sub, _rx_sub) = mpsc::channel(1);
-        let (worker_subscriber_network, worker_subscriber_network_handle) =
-            SubscriberNetwork::new_for_worker(tx_sub, listen_on)?;
+    //     // spawn subscriber
+    //     let (tx_sub, _rx_sub) = mpsc::channel(1);
+    //     let (worker_subscriber_network, worker_subscriber_network_handle) =
+    //         SubscriberNetwork::new_for_worker(tx_sub, listen_on)?;
 
-        // dial publisher to establish connection
-        //
-        // NOTE: this doesn't work - add peer/addr and then dial by peer_id
-        // worker_subscriber_network.add_explicit_peer(pub_peer_id, pub_addr.clone());
-        // worker_subscriber_network.dial(pub_peer_id)?;
+    //     // dial publisher to establish connection
+    //     //
+    //     // NOTE: this doesn't work - add peer/addr and then dial by peer_id
+    //     // worker_subscriber_network.add_explicit_peer(pub_peer_id, pub_addr.clone());
+    //     // worker_subscriber_network.dial(pub_peer_id)?;
 
-        // however, this works
-        // worker_subscriber_network.dial(pub_addr)?;
+    //     // however, this works
+    //     // worker_subscriber_network.dial(pub_addr)?;
 
-        // spawn subscriber network
-        worker_subscriber_network.spawn();
+    //     // spawn subscriber network
+    //     worker_subscriber_network.spawn();
 
-        // spawn publish network
-        worker_publish_network.spawn();
-        let pub_id = worker_publish_network_handle.local_peer_id().await?;
-        let pub_listeners = worker_publish_network_handle.listeners().await?;
-        let pub_addr = pub_listeners.first().expect("pub network is listening").clone();
+    //     // spawn publish network
+    //     worker_publish_network.spawn();
+    //     let pub_id = worker_publish_network_handle.local_peer_id().await?;
+    //     let pub_listeners = worker_publish_network_handle.listeners().await?;
+    //     let pub_addr = pub_listeners.first().expect("pub network is listening").clone();
 
-        // TODO: this does not work
-        worker_subscriber_network_handle.add_explicit_peer(pub_id, pub_addr).await?;
+    //     // TODO: this does not work
+    //     worker_subscriber_network_handle.add_explicit_peer(pub_id, pub_addr).await?;
 
-        // dial publishing peer's addr
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        println!("\n\nDialing...\n\n");
-        worker_subscriber_network_handle.dial(pub_id.into()).await?;
+    //     // dial publishing peer's addr
+    //     tokio::task::yield_now().await;
+    //     tokio::time::sleep(Duration::from_secs(5)).await;
+    //     println!("\n\nDialing...\n\n");
+    //     worker_subscriber_network_handle.dial(pub_id.into()).await?;
 
-        // subscribe to topic
-        // worker_subscriber_network_handle.subscribe(IdentTopic::new(WORKER_BLOCK_TOPIC)).await?;
+    //     // subscribe to topic
+    //     // worker_subscriber_network_handle.subscribe(IdentTopic::new(WORKER_BLOCK_TOPIC)).await?;
 
-        // // process dial event for publisher
-        // let event = worker_publish_network.network.select_next_some().await;
-        // println!("publisher event :D\n{event:?}");
-        // let event = worker_publish_network.network.select_next_some().await;
-        // println!("publisher event :D\n{event:?}");
-        // let event = worker_publish_network.network.select_next_some().await;
-        // println!("publisher event :D\n{event:?}");
+    //     // // process dial event for publisher
+    //     // let event = worker_publish_network.network.select_next_some().await;
+    //     // println!("publisher event :D\n{event:?}");
+    //     // let event = worker_publish_network.network.select_next_some().await;
+    //     // println!("publisher event :D\n{event:?}");
+    //     // let event = worker_publish_network.network.select_next_some().await;
+    //     // println!("publisher event :D\n{event:?}");
 
-        // by this point, the three events needed to process peer's subscription are complete
-        // let sub_addr = worker_subscriber_network_handle.listeners().await?;
-        // assert!(!sub_addr.is_empty());
+    //     // by this point, the three events needed to process peer's subscription are complete
+    //     // let sub_addr = worker_subscriber_network_handle.listeners().await?;
+    //     // assert!(!sub_addr.is_empty());
 
-        // publish random block
-        // let random_block = WorkerBlock::default();
-        // let sealed_block = random_block.seal_slow();
-        // let expected_result = Vec::from(&sealed_block);
-        // let res = tx_pub.send(expected_result.clone()).await;
-        // assert!(res.is_ok());
+    //     // publish random block
+    //     // let random_block = WorkerBlock::default();
+    //     // let sealed_block = random_block.seal_slow();
+    //     // let expected_result = Vec::from(&sealed_block);
+    //     // let res = tx_pub.send(expected_result.clone()).await;
+    //     // assert!(res.is_ok());
 
-        // // wait for subscriber to forward
-        // let gossip_block = timeout(Duration::from_secs(5), rx_sub.recv())
-        //     .await
-        //     .expect("timeout waiting for gossiped worker block")
-        //     .expect("worker block received");
+    //     // // wait for subscriber to forward
+    //     // let gossip_block = timeout(Duration::from_secs(5), rx_sub.recv())
+    //     //     .await
+    //     //     .expect("timeout waiting for gossiped worker block")
+    //     //     .expect("worker block received");
 
-        // assert_eq!(gossip_block, expected_result);
+    //     // assert_eq!(gossip_block, expected_result);
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 }

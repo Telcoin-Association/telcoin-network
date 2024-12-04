@@ -263,18 +263,9 @@ impl Future for SubscriberNetwork {
 
 #[cfg(test)]
 mod tests {
-    use super::SubscriberNetwork;
-    use tokio::sync::mpsc;
 
     #[tokio::test]
-    async fn todo_test() -> eyre::Result<()> {
-        let (tx, _rx) = mpsc::channel(1);
-        let listen_on = "/ip4/0.0.0.0/udp/0/quic-v1"
-            .parse()
-            .expect("multiaddr parsed for worker gossip publisher");
-        let worker_publish_network = SubscriberNetwork::new_for_worker(tx, listen_on)?;
-        // let _ = worker_publish_network.spawn();
-
-        Ok(())
+    async fn test_subscriber_recovers_missed_message() -> eyre::Result<()> {
+        todo!();
     }
 }
