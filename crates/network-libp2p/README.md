@@ -17,7 +17,7 @@ CVVs use anemo for p2p consensus networking at this time, but will eventually tr
 
 ## Worker Publish
 
-Workers publish blocks that reach quorum.
+Workers publish blocks after they reach quorum.
 
 ## Primary Publish
 
@@ -25,9 +25,9 @@ Primaries publish certificates.
 
 ## Subscriber Publish
 
-Subscriber publishes committed subdag results as `ConsensusHeader`s. These headers comprise the consensus chain.
+Subscriber publishes committed subdag results as `ConsensusHeader`s.
+These headers comprise the consensus chain.
 Clients use results from worker and primary topics to execute consensus headers.
-
 
 ## Notes on implementation
 
@@ -43,3 +43,9 @@ Dialing the peer by multiaddr without adding the peer works.
 
 `Gossipsub::add_explicit_peer` directly influences how the Gossipsub protocol considers peers for message propagation.
 When a peer is explicitly added to Gossipsub, it's included in the Gossipsub internal list, which influences the mesh construction for topics and ensures that the peer is considered for message forwarding.
+
+### State sync
+
+Gossipsub messages use the data type's hash digest as the `MessagId`.
+However, `IWANT` and `IHAVE` messages are private, and another protocol type is needed to manage specific state sync requests.
+The gossip network is effective for broadcasting new blocks only.

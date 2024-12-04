@@ -25,7 +25,6 @@ serde = { workspace = true }
 fastcrypto = { workspace = true }
 
 [dev-dependencies]
-reth-tracing = { workspace = true }
 tn-test-utils = { workspace = true }
 
 [lints]

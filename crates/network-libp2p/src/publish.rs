@@ -11,7 +11,7 @@ use futures::{ready, StreamExt as _};
 use libp2p::{
     gossipsub::{self, IdentTopic},
     swarm::SwarmEvent,
-    Multiaddr, PeerId, Swarm,
+    Multiaddr, Swarm,
 };
 use std::{
     future::Future,
@@ -54,25 +54,6 @@ impl PublishNetwork {
         let network = Self { topic, network: swarm, commands };
 
         Ok((network, handle))
-    }
-
-    /// Return this publisher's [PeerId].
-    pub fn local_peer_id(&self) -> &PeerId {
-        self.network.local_peer_id()
-    }
-
-    /// Return an collection of addresses the network is listening on.
-    ///
-    /// NOTE: until the swarm events are polled, this will return empty.
-    /// See unit tests for implementation.
-    pub fn listeners(&self) -> Vec<Multiaddr> {
-        self.network.listeners().cloned().collect()
-    }
-
-    /// Add an explicit peer to support further discovery.
-    pub fn add_explicit_peer(&mut self, peer_id: PeerId, addr: Multiaddr) {
-        self.network.behaviour_mut().add_explicit_peer(&peer_id);
-        self.network.add_peer_address(peer_id, addr);
     }
 
     /// Spawn the network to start publishing gossip.
@@ -224,15 +205,6 @@ impl Future for PublishNetwork {
             }
         }
 
-        // // publish messages to the network after swarm updates
-        // while let Some(msg) = ready!(this.stream.poll_next_unpin(cx)) {
-        //     debug!(target: "publish-network", topic=?this.topic, "publishing msg :D");
-        //     if let Err(e) = this.network.behaviour_mut().publish(this.topic.clone(), msg) {
-        //         error!(target: "publish-network", ?e);
-        //         break;
-        //     }
-        // }
-
         info!(target: "publish-network", topic=?this.topic, "publisher shutting down...");
         Poll::Ready(())
     }
@@ -249,8 +221,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_publish_to_one_peer() -> eyre::Result<()> {
-        reth_tracing::init_test_tracing();
-
         // default any address
         let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1"
             .parse()
@@ -305,83 +275,4 @@ mod tests {
 
         Ok(())
     }
-
-    // /// DOESN'T WORK - trying to dial by peer id after adding explicitly
-    // #[tokio::test]
-    // async fn test_add_explicit_peer_and_dial_by_peer_id() -> eyre::Result<()> {
-    //     reth_tracing::init_test_tracing();
-
-    //     // default any address
-    //     let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1"
-    //         .parse()
-    //         .expect("multiaddr parsed for worker gossip publisher");
-
-    //     // spawn publish
-    //     let (worker_publish_network, worker_publish_network_handle) =
-    //         PublishNetwork::new_for_worker(listen_on.clone())?;
-
-    //     // spawn subscriber
-    //     let (tx_sub, _rx_sub) = mpsc::channel(1);
-    //     let (worker_subscriber_network, worker_subscriber_network_handle) =
-    //         SubscriberNetwork::new_for_worker(tx_sub, listen_on)?;
-
-    //     // dial publisher to establish connection
-    //     //
-    //     // NOTE: this doesn't work - add peer/addr and then dial by peer_id
-    //     // worker_subscriber_network.add_explicit_peer(pub_peer_id, pub_addr.clone());
-    //     // worker_subscriber_network.dial(pub_peer_id)?;
-
-    //     // however, this works
-    //     // worker_subscriber_network.dial(pub_addr)?;
-
-    //     // spawn subscriber network
-    //     worker_subscriber_network.spawn();
-
-    //     // spawn publish network
-    //     worker_publish_network.spawn();
-    //     let pub_id = worker_publish_network_handle.local_peer_id().await?;
-    //     let pub_listeners = worker_publish_network_handle.listeners().await?;
-    //     let pub_addr = pub_listeners.first().expect("pub network is listening").clone();
-
-    //     // TODO: this does not work
-    //     worker_subscriber_network_handle.add_explicit_peer(pub_id, pub_addr).await?;
-
-    //     // dial publishing peer's addr
-    //     tokio::task::yield_now().await;
-    //     tokio::time::sleep(Duration::from_secs(5)).await;
-    //     println!("\n\nDialing...\n\n");
-    //     worker_subscriber_network_handle.dial(pub_id.into()).await?;
-
-    //     // subscribe to topic
-    //     // worker_subscriber_network_handle.subscribe(IdentTopic::new(WORKER_BLOCK_TOPIC)).await?;
-
-    //     // // process dial event for publisher
-    //     // let event = worker_publish_network.network.select_next_some().await;
-    //     // println!("publisher event :D\n{event:?}");
-    //     // let event = worker_publish_network.network.select_next_some().await;
-    //     // println!("publisher event :D\n{event:?}");
-    //     // let event = worker_publish_network.network.select_next_some().await;
-    //     // println!("publisher event :D\n{event:?}");
-
-    //     // by this point, the three events needed to process peer's subscription are complete
-    //     // let sub_addr = worker_subscriber_network_handle.listeners().await?;
-    //     // assert!(!sub_addr.is_empty());
-
-    //     // publish random block
-    //     // let random_block = WorkerBlock::default();
-    //     // let sealed_block = random_block.seal_slow();
-    //     // let expected_result = Vec::from(&sealed_block);
-    //     // let res = tx_pub.send(expected_result.clone()).await;
-    //     // assert!(res.is_ok());
-
-    //     // // wait for subscriber to forward
-    //     // let gossip_block = timeout(Duration::from_secs(5), rx_sub.recv())
-    //     //     .await
-    //     //     .expect("timeout waiting for gossiped worker block")
-    //     //     .expect("worker block received");
-
-    //     // assert_eq!(gossip_block, expected_result);
-
-    //     Ok(())
-    // }
 }

@@ -78,9 +78,6 @@ pub(crate) fn process_network_command(
             }
         }
         NetworkCommand::AddExplicitPeer { peer_id, addr } => {
-            // TODO: need to understand what `add_explicit_peer` actually does
-            //
-            // DO NOT MERGE
             network.add_peer_address(peer_id, addr);
             network.behaviour_mut().add_explicit_peer(&peer_id);
         }

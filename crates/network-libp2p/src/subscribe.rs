@@ -12,8 +12,8 @@ use crate::{
 use futures::{ready, StreamExt as _};
 use libp2p::{
     gossipsub::{self, IdentTopic},
-    swarm::{dial_opts::DialOpts, SwarmEvent},
-    Multiaddr, PeerId, Swarm,
+    swarm::SwarmEvent,
+    Multiaddr, Swarm,
 };
 use std::{
     future::Future,
@@ -26,7 +26,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, trace};
+use tracing::{error, info, trace};
 
 /// The worker's network for publishing sealed worker blocks.
 pub struct SubscriberNetwork {
@@ -34,12 +34,10 @@ pub struct SubscriberNetwork {
     topic: IdentTopic,
     /// The gossip network for flood publishing sealed worker blocks.
     network: Swarm<gossipsub::Behaviour>,
-    /// The stream for receiving sealed worker blocks to publish.
+    /// The stream for forwarding downloaded messages.
     sender: Sender<Vec<u8>>,
     /// The receiver for processing network handle requests.
     commands: ReceiverStream<NetworkCommand>,
-    // /// The [Multiaddr] for the swarm.
-    // multiaddr: Multiaddr,
 }
 
 impl SubscriberNetwork {
@@ -52,42 +50,21 @@ impl SubscriberNetwork {
     where
         M: PublishMessageId<'a>,
     {
-        // create swarm and start listening
-        let mut swarm = start_swarm::<M>(multiaddr)?;
-        // subscribe to topic
-        swarm.behaviour_mut().subscribe(&topic)?;
-
-        // create channels and handle
+        // create handle
         let (handle_tx, network_rx) = mpsc::channel(1);
         let commands = ReceiverStream::new(network_rx);
         let handle = GossipNetworkHandle::new(handle_tx);
+
+        // create swarm and start listening
+        let mut swarm = start_swarm::<M>(multiaddr)?;
+
+        // subscribe to topic
+        swarm.behaviour_mut().subscribe(&topic)?;
+
+        // create Self
         let network = Self { topic, network: swarm, sender, commands };
+
         Ok((network, handle))
-    }
-
-    /// Return this publisher's [PeerId].
-    pub fn local_peer_id(&self) -> &PeerId {
-        self.network.local_peer_id()
-    }
-
-    /// Return an iterator of addresses the network is listening on.
-    pub fn listeners(&self) -> Vec<Multiaddr> {
-        self.network.listeners().cloned().collect()
-    }
-
-    /// Dial a peer to establish connection.
-    ///
-    /// Examples that impl `Into<DialOpts>` are:
-    /// - [Multiaddr]
-    /// - [PeerId] for known peers
-    pub fn dial(&mut self, peer: impl Into<DialOpts>) -> eyre::Result<()> {
-        Ok(self.network.dial(peer)?)
-    }
-
-    /// Add an explicit peer to support further discovery.
-    pub fn add_explicit_peer(&mut self, peer_id: PeerId, addr: Multiaddr) {
-        self.network.behaviour_mut().add_explicit_peer(&peer_id);
-        self.network.add_peer_address(peer_id, addr);
     }
 
     /// Spawn the network to process incoming gossip.
@@ -257,15 +234,7 @@ impl Future for SubscriberNetwork {
             }
         }
 
+        info!(target: "subscriber-network", topic=?this.topic, "subscriber shutting down...");
         Poll::Ready(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-
-    #[tokio::test]
-    async fn test_subscriber_recovers_missed_message() -> eyre::Result<()> {
-        todo!();
     }
 }
