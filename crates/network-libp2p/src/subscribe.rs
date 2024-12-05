@@ -138,6 +138,9 @@ impl Future for SubscriberNetwork {
                         //   header
                         // - message.data is the gossipped worker block / certificate / consensus
                         //   header
+                        //
+                        // NOTE: this implementation assumes valid encode/decode from peers
+                        // TODO: pass the propogation source to receiver and report bad peers back to the swarm
                         if let Err(e) = this.sender.try_send(message.data) {
                             // fatal: receiver dropped or channel queue full
                             error!(target: "subscriber-network", topic=?this.topic, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
