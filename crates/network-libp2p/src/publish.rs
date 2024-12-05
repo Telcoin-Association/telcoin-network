@@ -236,7 +236,7 @@ mod tests {
             SubscriberNetwork::new_for_worker(tx_sub, listen_on)?;
 
         // spawn subscriber network
-        worker_subscriber_network.spawn();
+        worker_subscriber_network.run();
 
         // spawn publish network
         worker_publish_network.spawn();
