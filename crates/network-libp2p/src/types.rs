@@ -93,6 +93,9 @@ pub enum NetworkCommand {
 }
 
 /// Network handle.
+///
+/// The type that sends commands to the running network (swarm) task.
+#[derive(Clone)]
 pub struct GossipNetworkHandle {
     /// Sending channel to the network to process commands.
     sender: mpsc::Sender<NetworkCommand>,

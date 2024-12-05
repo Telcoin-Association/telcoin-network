@@ -86,13 +86,13 @@ impl PublishNetwork {
             loop {
                 tokio::select! {
                     event = self.network.select_next_some() => self.process_event(event).await?,
-                        command = self.commands.recv() => match command {
-                            Some(c) => self.process_command(c).await,
-                            None => {
-                                info!(target: "subscriber-network", topic=?self.topic, "subscriber shutting down...");
-                                return Ok(())
-                            }
+                    command = self.commands.recv() => match command {
+                        Some(c) => self.process_command(c).await,
+                        None => {
+                            info!(target: "subscriber-network", topic=?self.topic, "subscriber shutting down...");
+                            return Ok(())
                         }
+                    }
                 }
             }
         })
