@@ -22,7 +22,7 @@ pub const CONSENSUS_HEADER_TOPIC: &str = "tn_consensus_headers";
 /// for published message topics makes it easier for peers to recover missing data through the
 /// gossip network because the message id is the same as the data type's digest used to reach
 /// consensus.
-pub trait PublishMessageId<'a>: From<&'a Vec<u8>> {
+pub trait PublishMessageId<'a>: From<&'a [u8]> {
     /// Create a message id for a published message to the gossip network.
     ///
     /// Lifetimes are preferred for easier maintainability.
@@ -33,15 +33,15 @@ pub trait PublishMessageId<'a>: From<&'a Vec<u8>> {
 // Implementation for worker gossip network.
 impl<'a> PublishMessageId<'a> for SealedWorkerBlock {
     fn message_id(msg: &gossipsub::Message) -> BlockHash {
-        // tn_types::decode::<Self>(&msg.data).digest()
-        Self::from(&msg.data).digest()
+        let sealed_block = Self::from(msg.data.as_ref());
+        sealed_block.digest()
     }
 }
 
 // Implementation for primary gossip network.
 impl<'a> PublishMessageId<'a> for Certificate {
     fn message_id(msg: &gossipsub::Message) -> BlockHash {
-        let certificate = Self::from(&msg.data);
+        let certificate = Self::from(msg.data.as_ref());
         certificate.digest().into()
     }
 }
@@ -49,8 +49,8 @@ impl<'a> PublishMessageId<'a> for Certificate {
 // Implementation for consensus gossip network.
 impl<'a> PublishMessageId<'a> for ConsensusHeader {
     fn message_id(msg: &gossipsub::Message) -> BlockHash {
-        let certificate = Self::from(&msg.data);
-        certificate.digest()
+        let header = Self::from(msg.data.as_ref());
+        header.digest()
     }
 }
 

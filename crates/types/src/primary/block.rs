@@ -74,8 +74,14 @@ impl From<ConsensusOutput> for ConsensusHeader {
     }
 }
 
-impl From<&Vec<u8>> for ConsensusHeader {
-    fn from(value: &Vec<u8>) -> Self {
+impl From<&[u8]> for ConsensusHeader {
+    fn from(value: &[u8]) -> Self {
         crate::decode(value)
+    }
+}
+
+impl From<&ConsensusHeader> for Vec<u8> {
+    fn from(value: &ConsensusHeader) -> Self {
+        crate::encode(value)
     }
 }

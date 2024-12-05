@@ -211,8 +211,8 @@ impl From<&SealedWorkerBlock> for Vec<u8> {
     }
 }
 
-impl From<&Vec<u8>> for SealedWorkerBlock {
-    fn from(value: &Vec<u8>) -> Self {
+impl From<&[u8]> for SealedWorkerBlock {
+    fn from(value: &[u8]) -> Self {
         crate::decode(value)
     }
 }
