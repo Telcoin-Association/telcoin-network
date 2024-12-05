@@ -7,7 +7,7 @@ use crate::{
         PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
     },
 };
-use futures::{ready, StreamExt as _};
+use futures::StreamExt as _;
 use libp2p::{
     gossipsub::{self, IdentTopic},
     swarm::SwarmEvent,

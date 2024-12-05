@@ -127,15 +127,14 @@ impl SubscriberNetwork {
             SwarmEvent::Behaviour(gossip) => match gossip {
                 gossipsub::Event::Message { propagation_source, message_id, message } => {
                     trace!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?message, "message received from publisher");
-                    // - `propagation_source` is the PeerId created from the  publisher's public
-                    //   key
+                    // - `propagation_source` is the PeerId created from the  publisher's public key
                     // - message_id is the digest of the worker block / certificate / consensus
                     //   header
-                    // - message.data is the gossipped worker block / certificate / consensus
-                    //   header
+                    // - message.data is the gossipped worker block / certificate / consensus header
                     //
                     // NOTE: self implementation assumes valid encode/decode from peers
-                    // TODO: pass the propogation source to receiver and report bad peers back to the swarm
+                    // TODO: pass the propogation source to receiver and report bad peers back to
+                    // the swarm
                     if let Err(e) = self.sender.try_send(message.data) {
                         // fatal: receiver dropped or channel queue full
                         error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
