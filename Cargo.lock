@@ -11362,7 +11362,6 @@ dependencies = [
  "tn-test-utils",
  "tn-types",
  "tokio",
- "tokio-stream",
  "tracing",
 ]
 

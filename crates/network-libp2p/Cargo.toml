@@ -16,7 +16,6 @@ libp2p = { workspace = true, features = [
     "macros",
 ] }
 tokio = { workspace = true, features = ["rt", "net", "sync", "macros", "time"] }
-tokio-stream = { workspace = true }
 tn-types = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
