@@ -457,6 +457,12 @@ mod tests {
 
         println!("malicious peer id: {pub_id:?}");
         println!("malicious message id: {_message_id:?}");
+
+        // peer score
+        let malicious_peer_score =
+            worker_subscriber_network_handle.peer_score(pub_id.clone()).await?;
+        println!("malicious peer score: {malicious_peer_score:?}");
+
         // publish bad bytes
         //
         // `Certificate` does not deserialize to `SealedWorkerBlock`
@@ -468,6 +474,10 @@ mod tests {
 
         // assert peers are disconnected
         let peers = worker_subscriber_network_handle.connected_peers().await?;
+
+        let malicious_peer_score =
+            worker_subscriber_network_handle.peer_score(pub_id.clone()).await?;
+        println!("malicious peer score after: {malicious_peer_score:?}");
         assert!(!peers.contains(&pub_id));
 
         Ok(())

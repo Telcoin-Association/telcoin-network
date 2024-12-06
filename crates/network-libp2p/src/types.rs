@@ -98,6 +98,8 @@ pub enum NetworkCommand {
     },
     /// Collection of this node's connected peers.
     ConnectedPeers { reply: oneshot::Sender<Vec<PeerId>> },
+    /// The peer's score, if it exists.
+    PeerScore { peer_id: PeerId, reply: oneshot::Sender<Option<f64>> },
 }
 
 /// Network handle.
@@ -166,5 +168,12 @@ impl GossipNetworkHandle {
         let (reply, peers) = oneshot::channel();
         self.sender.send(NetworkCommand::ConnectedPeers { reply }).await?;
         Ok(peers.await?)
+    }
+
+    /// Retrieve a specific peer's score, if it exists.
+    pub async fn peer_score(&self, peer_id: PeerId) -> eyre::Result<Option<f64>> {
+        let (reply, score) = oneshot::channel();
+        self.sender.send(NetworkCommand::PeerScore { peer_id, reply }).await?;
+        Ok(score.await?)
     }
 }

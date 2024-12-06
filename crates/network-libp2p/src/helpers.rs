@@ -26,14 +26,6 @@ where
         .with_quic()
         // custom behavior
         .with_behaviour(|keypair| {
-            // To content-address message, we can take the hash of message and use it as an ID.
-            let message_id_fn = |message: &gossipsub::Message| {
-                println!("inside message id fn\n{message:?}");
-                let message_id = M::message_id(message);
-                println!("made it here??");
-                gossipsub::MessageId::new(message_id.as_ref())
-            };
-
             // Set a custom gossipsub configuration
             let gossipsub_config = gossipsub::ConfigBuilder::default()
                 .heartbeat_interval(Duration::from_secs(10)) // This is set to aid debugging by not cluttering the log space
@@ -113,7 +105,13 @@ pub(crate) fn process_network_command(
         NetworkCommand::ConnectedPeers { reply } => {
             let res = network.connected_peers().cloned().collect();
             if let Err(e) = reply.send(res) {
-                error!(target: "gossip-network", ?e, "Subscribe command failed");
+                error!(target: "gossip-network", ?e, "ConnectedPeers command failed");
+            }
+        }
+        NetworkCommand::PeerScore { peer_id, reply } => {
+            let opt_score = network.behaviour_mut().peer_score(&peer_id);
+            if let Err(e) = reply.send(opt_score) {
+                error!(target: "gossip-network", ?e, "PeerScore command failed");
             }
         }
     }
