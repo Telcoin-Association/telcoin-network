@@ -5,7 +5,7 @@
 use crate::{
     helpers::{process_network_command, start_swarm},
     types::{
-        GossipNetworkHandle, NetworkCommand, PublishMessageId, CONSENSUS_HEADER_TOPIC,
+        GossipNetworkHandle, GossipNetworkMessage, NetworkCommand, CONSENSUS_HEADER_TOPIC,
         PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
     },
 };
@@ -43,7 +43,7 @@ impl SubscriberNetwork {
         multiaddr: Multiaddr,
     ) -> eyre::Result<(Self, GossipNetworkHandle)>
     where
-        M: PublishMessageId<'a>,
+        M: GossipNetworkMessage<'a>,
     {
         // create handle
         let (handle_tx, commands) = mpsc::channel(1);

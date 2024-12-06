@@ -1,6 +1,6 @@
 //! Helper methods used for handling network communication.
 
-use crate::types::{NetworkCommand, PublishMessageId};
+use crate::types::{GossipNetworkMessage, NetworkCommand};
 use eyre::eyre;
 use libp2p::{
     gossipsub::{self},
@@ -16,7 +16,7 @@ use tracing::error;
 /// NOTE: the swarm tries to connect to the provided multiaddr.
 pub(crate) fn start_swarm<'a, M>(multiaddr: Multiaddr) -> eyre::Result<Swarm<gossipsub::Behaviour>>
 where
-    M: PublishMessageId<'a>,
+    M: GossipNetworkMessage<'a>,
 {
     // generate a random ed25519 key
     let mut swarm = SwarmBuilder::with_new_identity()
