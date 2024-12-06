@@ -16,7 +16,6 @@ use libp2p::{
     swarm::SwarmEvent,
     Multiaddr, Swarm,
 };
-use tn_types::{Certificate, ConsensusHeader, SealedWorkerBlock};
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
@@ -24,27 +23,27 @@ use tokio::{
 use tracing::{error, info, trace};
 
 /// The worker's network for publishing sealed worker blocks.
-pub struct SubscriberNetwork {
+pub struct SubscriberNetwork<M> {
     /// The topic for publishing.
     topic: IdentTopic,
     /// The gossip network for flood publishing sealed worker blocks.
     network: Swarm<gossipsub::Behaviour>,
     /// The stream for forwarding downloaded messages.
-    sender: Sender<Vec<u8>>,
+    sender: Sender<M>,
     /// The receiver for processing network handle requests.
     commands: Receiver<NetworkCommand>,
 }
 
-impl SubscriberNetwork {
+impl<M> SubscriberNetwork<M>
+where
+    M: GossipNetworkMessage + Send + Sync + 'static,
+{
     /// Create a new instance of Self.
-    pub fn new<M>(
+    pub fn new(
         topic: IdentTopic,
-        sender: mpsc::Sender<Vec<u8>>,
+        sender: mpsc::Sender<M>,
         multiaddr: Multiaddr,
-    ) -> eyre::Result<(Self, GossipNetworkHandle)>
-    where
-        M: GossipNetworkMessage,
-    {
+    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // create handle
         let (handle_tx, commands) = mpsc::channel(1);
         let handle = GossipNetworkHandle::new(handle_tx);
@@ -65,24 +64,24 @@ impl SubscriberNetwork {
     ///
     /// This type is used by worker to subscribe sealed blocks after they reach quorum.
     pub fn new_for_worker(
-        sender: mpsc::Sender<Vec<u8>>,
+        sender: mpsc::Sender<M>,
         multiaddr: Multiaddr,
     ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // worker's default topic
         let topic = gossipsub::IdentTopic::new(WORKER_BLOCK_TOPIC);
-        Self::new::<SealedWorkerBlock>(topic, sender, multiaddr)
+        Self::new(topic, sender, multiaddr)
     }
 
     /// Create a new subscribe network for [Certificate].
     ///
     /// This type is used by primary to subscribe certificates after headers reach quorum.
     pub fn new_for_primary(
-        sender: mpsc::Sender<Vec<u8>>,
+        sender: mpsc::Sender<M>,
         multiaddr: Multiaddr,
     ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // primary's default topic
         let topic = gossipsub::IdentTopic::new(PRIMARY_CERT_TOPIC);
-        Self::new::<Certificate>(topic, sender, multiaddr)
+        Self::new(topic, sender, multiaddr)
     }
 
     /// Create a new subscribe network for [ConsensusHeader].
@@ -90,25 +89,22 @@ impl SubscriberNetwork {
     /// This type is used by consensus to subscribe consensus block headers after the subdag commits
     /// the latest round (finality).
     pub fn new_for_consensus(
-        sender: mpsc::Sender<Vec<u8>>,
+        sender: mpsc::Sender<M>,
         multiaddr: Multiaddr,
     ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // consensus header's default topic
         let topic = gossipsub::IdentTopic::new(CONSENSUS_HEADER_TOPIC);
-        Self::new::<ConsensusHeader>(topic, sender, multiaddr)
+        Self::new(topic, sender, multiaddr)
     }
 
     /// Run the network loop to process incoming gossip.
-    pub fn run<M>(mut self) -> JoinHandle<eyre::Result<()>>
-    where
-        M: GossipNetworkMessage,
-    {
+    pub fn run(mut self) -> JoinHandle<eyre::Result<()>> {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    event = self.network.select_next_some() => self.process_event::<M>(event).await?,
+                    event = self.network.select_next_some() => self.process_event(event).await?,
                     command = self.commands.recv() => match command {
-                        Some(c) => self.process_command(c).await,
+                        Some(c) => self.process_command(c),
                         None => {
                             info!(target: "subscriber-network", topic=?self.topic, "subscriber shutting down...");
                             return Ok(())
@@ -120,12 +116,12 @@ impl SubscriberNetwork {
     }
 
     /// Process commands for the swarm.
-    async fn process_command(&mut self, command: NetworkCommand) {
+    fn process_command(&mut self, command: NetworkCommand) {
         process_network_command(command, &mut self.network);
     }
 
     /// Process events from the swarm.
-    async fn process_event<M>(&mut self, event: SwarmEvent<gossipsub::Event>) -> eyre::Result<()>
+    async fn process_event(&mut self, event: SwarmEvent<gossipsub::Event>) -> eyre::Result<()>
     where
         M: GossipNetworkMessage,
     {
@@ -141,14 +137,14 @@ impl SubscriberNetwork {
                     // NOTE: self implementation assumes valid encode/decode from peers
                     // TODO: pass the propogation source to receiver and report bad peers back to
                     // the swarm
-                    let Ok(msg) = M::try_from(message.data.clone()) else {
+                    let Ok(msg) = M::try_from(message.data) else {
                         // message decoding failed, disconnect from peer
                         //
                         // TODO: test this works
                         let _ = self.network.disconnect_peer_id(propagation_source);
                         return Ok(());
                     };
-                    if let Err(e) = self.sender.try_send(message.data) {
+                    if let Err(e) = self.sender.try_send(msg) {
                         // fatal: receiver dropped or channel queue full
                         error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
                         return Err(eyre!("network receiver dropped!"));
@@ -242,6 +238,196 @@ impl SubscriberNetwork {
                 trace!(target: "subscriber-network", topic=?self.topic, ?_e, "non-exhaustive event match")
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SubscriberNetwork;
+    use crate::{
+        helpers::process_network_command,
+        types::{GossipNetworkHandle, GossipNetworkMessage, NetworkCommand, WORKER_BLOCK_TOPIC},
+        PublishNetwork,
+    };
+    use futures::StreamExt;
+    use libp2p::{
+        gossipsub::{self, IdentTopic},
+        swarm::SwarmEvent,
+        Multiaddr, Swarm, SwarmBuilder,
+    };
+    use std::time::Duration;
+    use tn_test_utils::fixture_batch_with_transactions;
+    use tn_types::{BlockHash, Certificate, SealedWorkerBlock};
+    use tokio::{
+        sync::mpsc::{self, Receiver},
+        task::JoinHandle,
+        time::timeout,
+    };
+
+    /// Malicious type.
+    struct MaliciousPeer {
+        /// Gossipsub to publish malicious messages.
+        swarm: Swarm<gossipsub::Behaviour>,
+        /// The receiver for processing network handle requests.
+        commands: Receiver<NetworkCommand>,
+    }
+
+    impl MaliciousPeer {
+        /// Start a swarm that produces bad messages.
+        fn new(multiaddr: Multiaddr) -> (Self, GossipNetworkHandle) {
+            // generate a random ed25519 key
+            let mut swarm = SwarmBuilder::with_new_identity()
+                // tokio runtime
+                .with_tokio()
+                // quic protocol
+                .with_quic()
+                // custom behavior
+                .with_behaviour(|keypair| {
+                    let message_id_fn = |_: &gossipsub::Message| {
+                        // generate random hashes
+                        let random = BlockHash::random();
+                        gossipsub::MessageId::new(random.as_ref())
+                    };
+
+                    // similar config
+                    let gossipsub_config = gossipsub::ConfigBuilder::default()
+                        .heartbeat_interval(Duration::from_secs(10))
+                        .validation_mode(gossipsub::ValidationMode::Strict)
+                        .message_id_fn(message_id_fn)
+                        .build()
+                        .expect("malicious gossipsub builds");
+
+                    // build a gossipsub network behaviour
+                    let network = gossipsub::Behaviour::new(
+                        gossipsub::MessageAuthenticity::Signed(keypair.clone()),
+                        gossipsub_config,
+                    )?;
+
+                    Ok(network)
+                })
+                .expect("custom network behavior")
+                .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+                .build();
+
+            // start listening
+            swarm.listen_on(multiaddr).expect("malicious network listens on open port");
+
+            let (handle_tx, commands) = mpsc::channel(1);
+            let handle = GossipNetworkHandle::new(handle_tx);
+            (Self { swarm, commands }, handle)
+        }
+
+        /// Run the network loop to process commands and advance swarm state.
+        fn run(mut self) -> JoinHandle<eyre::Result<()>> {
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        event = self.swarm.select_next_some() => self.process_event(event),
+                        command = self.commands.recv() => match command {
+                            Some(c) => process_network_command(c, &mut self.swarm),
+                            None =>  return Ok(()),
+                        }
+                    }
+                }
+            })
+        }
+
+        /// Process swarm events.
+        ///
+        /// Currently ignores everything.
+        fn process_event(&self, event: SwarmEvent<gossipsub::Event>) {
+            match event {
+                SwarmEvent::Behaviour(_) => (),
+                SwarmEvent::ConnectionEstablished { .. } => (),
+                SwarmEvent::ConnectionClosed { .. } => (),
+                SwarmEvent::IncomingConnection { .. } => (),
+                SwarmEvent::IncomingConnectionError { .. } => (),
+                SwarmEvent::OutgoingConnectionError { .. } => (),
+                SwarmEvent::NewListenAddr { .. } => (),
+                SwarmEvent::ExpiredListenAddr { .. } => (),
+                SwarmEvent::ListenerClosed { .. } => (),
+                SwarmEvent::ListenerError { .. } => (),
+                SwarmEvent::Dialing { .. } => (),
+                SwarmEvent::NewExternalAddrCandidate { .. } => (),
+                SwarmEvent::ExternalAddrConfirmed { .. } => (),
+                SwarmEvent::ExternalAddrExpired { .. } => (),
+                SwarmEvent::NewExternalAddrOfPeer { .. } => (),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_peer_removed_after_bad_gossip() -> eyre::Result<()> {
+        // default any address
+        let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1"
+            .parse()
+            .expect("multiaddr parsed for worker gossip publisher");
+
+        // create malicious peer
+        let (malicious_network, malicious_peer) = MaliciousPeer::new(listen_on.clone());
+
+        // create subscriber
+        let (tx_sub, mut rx_sub) = mpsc::channel::<SealedWorkerBlock>(1);
+        let (worker_subscriber_network, worker_subscriber_network_handle) =
+            SubscriberNetwork::new_for_worker(tx_sub, listen_on)?;
+
+        // spawn subscriber network
+        worker_subscriber_network.run();
+
+        // spawn malicious peer
+        malicious_network.run();
+
+        // yield for network to start so listeners update
+        tokio::task::yield_now().await;
+
+        let pub_listeners = malicious_peer.listeners().await?;
+        let pub_addr = pub_listeners.first().expect("pub network is listening").clone();
+        let pub_id = malicious_peer.local_peer_id().await?;
+
+        // dial publisher to exchange information
+        worker_subscriber_network_handle.dial(pub_addr.into()).await?;
+
+        // allow enough time for peer info to exchange from dial
+        //
+        // sleep seems to be the only thing that works here
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // publish random bytes
+        let random_block = fixture_batch_with_transactions(10);
+        let sealed_block = random_block.seal_slow();
+        let valid_message = Vec::try_from(sealed_block.clone())?;
+        let _message_id =
+            malicious_peer.publish(IdentTopic::new(WORKER_BLOCK_TOPIC), valid_message).await?;
+
+        // wait for subscriber to advance
+        let gossip_block = timeout(Duration::from_secs(5), rx_sub.recv())
+            .await
+            .expect("timeout waiting for gossiped worker block")
+            .expect("worker block received");
+
+        assert_eq!(gossip_block, sealed_block);
+
+        // assert peers are connected
+        let peers = worker_subscriber_network_handle.connected_peers().await?;
+        assert!(peers.contains(&pub_id));
+
+        println!("malicious peer id: {pub_id:?}");
+        println!("malicious message id: {_message_id:?}");
+        // publish bad bytes
+        //
+        // `Certificate` does not deserialize to `SealedWorkerBlock`
+        let random_bytes = tn_types::encode(&Certificate::default());
+        malicious_peer.publish(IdentTopic::new(WORKER_BLOCK_TOPIC), random_bytes.to_vec()).await?;
+
+        // sleep for state to advance
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // assert peers are disconnected
+        let peers = worker_subscriber_network_handle.connected_peers().await?;
+        assert!(!peers.contains(&pub_id));
+
         Ok(())
     }
 }

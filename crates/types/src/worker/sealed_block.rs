@@ -212,9 +212,10 @@ impl TryFrom<SealedWorkerBlock> for Vec<u8> {
     }
 }
 
-impl From<Vec<u8>> for SealedWorkerBlock {
-    fn from(value: Vec<u8>) -> Self {
-        crate::decode(&value)
+impl TryFrom<Vec<u8>> for SealedWorkerBlock {
+    type Error = eyre::ErrReport;
+    fn try_from(value: Vec<u8>) -> eyre::Result<Self> {
+        crate::try_decode(&value)
     }
 }
 

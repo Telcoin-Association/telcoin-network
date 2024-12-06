@@ -87,7 +87,7 @@ impl PublishNetwork {
                 tokio::select! {
                     event = self.network.select_next_some() => self.process_event(event).await?,
                     command = self.commands.recv() => match command {
-                        Some(c) => self.process_command(c).await,
+                        Some(c) => self.process_command(c),
                         None => {
                             info!(target: "subscriber-network", topic=?self.topic, "subscriber shutting down...");
                             return Ok(())
@@ -99,7 +99,7 @@ impl PublishNetwork {
     }
 
     /// Process commands for the swarm.
-    async fn process_command(&mut self, command: NetworkCommand) {
+    fn process_command(&mut self, command: NetworkCommand) {
         process_network_command(command, &mut self.network);
     }
 
@@ -224,12 +224,12 @@ mod tests {
             PublishNetwork::new_for_worker(listen_on.clone())?;
 
         // create subscriber
-        let (tx_sub, mut rx_sub) = mpsc::channel(1);
+        let (tx_sub, mut rx_sub) = mpsc::channel::<SealedWorkerBlock>(1);
         let (worker_subscriber_network, worker_subscriber_network_handle) =
             SubscriberNetwork::new_for_worker(tx_sub, listen_on)?;
 
         // spawn subscriber network
-        worker_subscriber_network.run::<SealedWorkerBlock>();
+        worker_subscriber_network.run();
 
         // spawn publish network
         worker_publish_network.run();
@@ -264,7 +264,7 @@ mod tests {
             .expect("timeout waiting for gossiped worker block")
             .expect("worker block received");
 
-        assert_eq!(gossip_block, expected_result);
+        assert_eq!(gossip_block, sealed_block);
 
         Ok(())
     }

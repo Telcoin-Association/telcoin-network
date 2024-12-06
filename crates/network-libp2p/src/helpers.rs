@@ -28,7 +28,9 @@ where
         .with_behaviour(|keypair| {
             // To content-address message, we can take the hash of message and use it as an ID.
             let message_id_fn = |message: &gossipsub::Message| {
+                println!("inside message id fn\n{message:?}");
                 let message_id = M::message_id(message);
+                println!("made it here??");
                 gossipsub::MessageId::new(message_id.as_ref())
             };
 
@@ -101,6 +103,12 @@ pub(crate) fn process_network_command(
         }
         NetworkCommand::Subscribe { topic, reply } => {
             let res = network.behaviour_mut().subscribe(&topic);
+            if let Err(e) = reply.send(res) {
+                error!(target: "gossip-network", ?e, "Subscribe command failed");
+            }
+        }
+        NetworkCommand::ConnectedPeers { reply } => {
+            let res = network.connected_peers().cloned().collect();
             if let Err(e) = reply.send(res) {
                 error!(target: "gossip-network", ?e, "Subscribe command failed");
             }

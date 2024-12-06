@@ -6,7 +6,7 @@ use libp2p::{
     swarm::{dial_opts::DialOpts, DialError},
     Multiaddr, PeerId,
 };
-use tn_types::{decode, encode, BlockHash, Certificate, ConsensusHeader, SealedWorkerBlock};
+use tn_types::{decode, BlockHash, Certificate, ConsensusHeader, SealedWorkerBlock};
 use tokio::sync::{mpsc, oneshot};
 
 /// The topic for NVVs to subscribe to for published worker blocks.
@@ -61,6 +61,7 @@ impl GossipNetworkMessage for ConsensusHeader {
 
 /// Commands for the swarm.
 #[derive(Debug)]
+//TODO: add <M> generic here so devs can only publish correct messages?
 pub enum NetworkCommand {
     /// Listeners
     GetListener { reply: oneshot::Sender<Vec<Multiaddr>> },
@@ -95,6 +96,8 @@ pub enum NetworkCommand {
         msg: Vec<u8>,
         reply: oneshot::Sender<std::result::Result<MessageId, PublishError>>,
     },
+    /// Collection of this node's connected peers.
+    ConnectedPeers { reply: oneshot::Sender<Vec<PeerId>> },
 }
 
 /// Network handle.
@@ -149,10 +152,19 @@ impl GossipNetworkHandle {
     }
 
     /// Publish a message on a certain topic.
+    ///
+    /// TODO: make this <M> generic to prevent accidental publishing of incorrect messages.
     pub async fn publish(&self, topic: IdentTopic, msg: Vec<u8>) -> eyre::Result<MessageId> {
         let (reply, published) = oneshot::channel();
         self.sender.send(NetworkCommand::Publish { topic, msg, reply }).await?;
         let res = published.await?;
         Ok(res?)
+    }
+
+    /// Retrieve a collection of connected peers.
+    pub async fn connected_peers(&self) -> eyre::Result<Vec<PeerId>> {
+        let (reply, peers) = oneshot::channel();
+        self.sender.send(NetworkCommand::ConnectedPeers { reply }).await?;
+        Ok(peers.await?)
     }
 }
