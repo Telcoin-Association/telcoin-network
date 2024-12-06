@@ -37,9 +37,12 @@ where
             // Set a custom gossipsub configuration
             let gossipsub_config = gossipsub::ConfigBuilder::default()
                 .heartbeat_interval(Duration::from_secs(10)) // This is set to aid debugging by not cluttering the log space
-                .validation_mode(gossipsub::ValidationMode::Strict) // this is default - enforce message signing
-                .message_id_fn(message_id_fn) // content-address messages. No two messages of the same content will be
-                // propagated.
+                // validate messages
+                //
+                // valid messages must decode to the expected message types
+                .validate_messages()
+                // explicitly set strict mode (default)
+                .validation_mode(gossipsub::ValidationMode::Strict)
                 .build()
                 .map_err(|e| {
                     error!(?e, "gossipsub publish network");

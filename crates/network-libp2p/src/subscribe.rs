@@ -12,7 +12,7 @@ use crate::{
 use eyre::eyre;
 use futures::StreamExt as _;
 use libp2p::{
-    gossipsub::{self, IdentTopic},
+    gossipsub::{self, IdentTopic, MessageAcceptance},
     swarm::SwarmEvent,
     Multiaddr, Swarm,
 };
@@ -129,25 +129,67 @@ where
             SwarmEvent::Behaviour(gossip) => match gossip {
                 gossipsub::Event::Message { propagation_source, message_id, message } => {
                     trace!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?message, "message received from publisher");
-                    // - `propagation_source` is the PeerId created from the  publisher's public key
-                    // - message_id is the digest of the worker block / certificate / consensus
-                    //   header
-                    // - message.data is the gossipped worker block / certificate / consensus header
+                    // // - `propagation_source` is the PeerId created from the  publisher's public key
+                    // // - message_id is the digest of the worker block / certificate / consensus
+                    // //   header
+                    // // - message.data is the gossipped worker block / certificate / consensus header
+                    // //
+                    // // NOTE: self implementation assumes valid encode/decode from peers
+                    // // TODO: pass the propogation source to receiver and report bad peers back to
+                    // // the swarm
+                    // let Ok(msg) = M::try_from(message.data) else {
+                    //     // message decoding failed, disconnect from peer
+                    //     //
+                    //     // black list peer
+                    //     let _ = self.network.behaviour_mut().blacklist_peer(&propagation_source);
+                    //     // TODO: test this works
+                    //     let _ = self.network.disconnect_peer_id(propagation_source);
+                    //     return Ok(());
+                    // };
+                    // if let Err(e) = self.sender.try_send(msg) {
+                    //     // fatal: receiver dropped or channel queue full
+                    //     error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
+                    //     return Err(eyre!("network receiver dropped!"));
+                    // }
                     //
-                    // NOTE: self implementation assumes valid encode/decode from peers
-                    // TODO: pass the propogation source to receiver and report bad peers back to
-                    // the swarm
-                    let Ok(msg) = M::try_from(message.data) else {
-                        // message decoding failed, disconnect from peer
-                        //
-                        // TODO: test this works
-                        let _ = self.network.disconnect_peer_id(propagation_source);
-                        return Ok(());
-                    };
-                    if let Err(e) = self.sender.try_send(msg) {
-                        // fatal: receiver dropped or channel queue full
-                        error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
-                        return Err(eyre!("network receiver dropped!"));
+
+                    // attempt to decode the message
+                    match M::try_from(message.data) {
+                        Ok(msg) => {
+                            // message decoded successfully
+                            //
+                            // report message as valid and propagate to other peers
+                            if let Err(e) =
+                                self.network.behaviour_mut().report_message_validation_result(
+                                    &message_id,
+                                    &propagation_source,
+                                    MessageAcceptance::Accept,
+                                )
+                            {
+                                error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "error reporting message validation result");
+                            }
+
+                            // forward message to handler
+                            if let Err(e) = self.sender.try_send(msg) {
+                                error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
+                                // fatal - unable to process gossipped messages
+                                return Err(eyre!("network receiver dropped!"));
+                            }
+                        }
+                        Err(_) => {
+                            // decoding failed
+                            //
+                            // reject the message and penalize the sender
+                            if let Err(e) =
+                                self.network.behaviour_mut().report_message_validation_result(
+                                    &message_id,
+                                    &propagation_source,
+                                    MessageAcceptance::Reject,
+                                )
+                            {
+                                error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "error reporting message validation result");
+                            }
+                        }
                     }
                 }
                 gossipsub::Event::Subscribed { peer_id, topic } => {
@@ -292,7 +334,7 @@ mod tests {
 
                     // similar config
                     let gossipsub_config = gossipsub::ConfigBuilder::default()
-                        .heartbeat_interval(Duration::from_secs(10))
+                        .heartbeat_interval(Duration::from_secs(1))
                         .validation_mode(gossipsub::ValidationMode::Strict)
                         .message_id_fn(message_id_fn)
                         .build()

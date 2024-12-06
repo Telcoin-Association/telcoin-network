@@ -1,4 +1,8 @@
 //! Generic abstraction for publishing (flood) to the gossipsub network.
+//!
+//! This network impl is intended to send consensus data using floodsub.
+//!
+//! This network does not subscribe to the topics it publishes.
 
 use crate::{
     helpers::{process_network_command, start_swarm},
