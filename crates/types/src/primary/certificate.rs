@@ -310,9 +310,9 @@ impl Certificate {
     }
 }
 
-impl From<&[u8]> for Certificate {
-    fn from(value: &[u8]) -> Self {
-        crate::decode(value)
+impl From<Vec<u8>> for Certificate {
+    fn from(value: Vec<u8>) -> Self {
+        crate::decode(&value)
     }
 }
 

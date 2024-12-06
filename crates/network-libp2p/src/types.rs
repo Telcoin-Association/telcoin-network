@@ -6,7 +6,7 @@ use libp2p::{
     swarm::{dial_opts::DialOpts, DialError},
     Multiaddr, PeerId,
 };
-use tn_types::{BlockHash, Certificate, ConsensusHeader, SealedWorkerBlock};
+use tn_types::{decode, encode, BlockHash, Certificate, ConsensusHeader, SealedWorkerBlock};
 use tokio::sync::{mpsc, oneshot};
 
 /// The topic for NVVs to subscribe to for published worker blocks.
@@ -22,7 +22,7 @@ pub const CONSENSUS_HEADER_TOPIC: &str = "tn_consensus_headers";
 /// for published message topics makes it easier for peers to recover missing data through the
 /// gossip network because the message id is the same as the data type's digest used to reach
 /// consensus.
-pub trait GossipNetworkMessage<'a>: TryFrom<&'a [u8]> {
+pub trait GossipNetworkMessage: TryFrom<Vec<u8>> {
     /// Create a message id for a published message to the gossip network.
     ///
     /// Lifetimes are preferred for easier maintainability.
@@ -30,31 +30,31 @@ pub trait GossipNetworkMessage<'a>: TryFrom<&'a [u8]> {
     fn message_id(msg: &gossipsub::Message) -> BlockHash;
 
     /// Decode self from bytes.
-    fn decode(data: &'a [u8]) -> std::result::Result<Self, Self::Error> {
+    fn decode(data: Vec<u8>) -> std::result::Result<Self, Self::Error> {
         Self::try_from(data)
     }
 }
 
 // Implementation for worker gossip network.
-impl<'a> GossipNetworkMessage<'a> for SealedWorkerBlock {
+impl GossipNetworkMessage for SealedWorkerBlock {
     fn message_id(msg: &gossipsub::Message) -> BlockHash {
-        let sealed_block = Self::from(msg.data.as_ref());
+        let sealed_block = decode::<Self>(&msg.data);
         sealed_block.digest()
     }
 }
 
 // Implementation for primary gossip network.
-impl<'a> GossipNetworkMessage<'a> for Certificate {
+impl GossipNetworkMessage for Certificate {
     fn message_id(msg: &gossipsub::Message) -> BlockHash {
-        let certificate = Self::from(msg.data.as_ref());
+        let certificate = decode::<Self>(&msg.data);
         certificate.digest().into()
     }
 }
 
 // Implementation for consensus gossip network.
-impl<'a> GossipNetworkMessage<'a> for ConsensusHeader {
+impl GossipNetworkMessage for ConsensusHeader {
     fn message_id(msg: &gossipsub::Message) -> BlockHash {
-        let header = Self::from(msg.data.as_ref());
+        let header = decode::<Self>(&msg.data);
         header.digest()
     }
 }

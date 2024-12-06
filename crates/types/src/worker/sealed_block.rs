@@ -205,15 +205,16 @@ impl Default for WorkerBlock {
     }
 }
 
-impl From<&SealedWorkerBlock> for Vec<u8> {
-    fn from(value: &SealedWorkerBlock) -> Self {
-        crate::encode(value)
+impl TryFrom<SealedWorkerBlock> for Vec<u8> {
+    type Error = eyre::ErrReport;
+    fn try_from(value: SealedWorkerBlock) -> eyre::Result<Self> {
+        crate::try_encode(&value)
     }
 }
 
-impl From<&[u8]> for SealedWorkerBlock {
-    fn from(value: &[u8]) -> Self {
-        crate::decode(value)
+impl From<Vec<u8>> for SealedWorkerBlock {
+    fn from(value: Vec<u8>) -> Self {
+        crate::decode(&value)
     }
 }
 

@@ -32,12 +32,12 @@ pub struct PublishNetwork {
 
 impl PublishNetwork {
     /// Create a new instance of Self.
-    pub fn new<'a, M>(
+    pub fn new<M>(
         topic: IdentTopic,
         multiaddr: Multiaddr,
     ) -> eyre::Result<(Self, GossipNetworkHandle)>
     where
-        M: GossipNetworkMessage<'a>,
+        M: GossipNetworkMessage,
     {
         // create handle
         let (handle_tx, commands) = mpsc::channel(1);
@@ -209,6 +209,7 @@ mod tests {
     use libp2p::{gossipsub::IdentTopic, Multiaddr};
     use std::time::Duration;
     use tn_test_utils::fixture_batch_with_transactions;
+    use tn_types::SealedWorkerBlock;
     use tokio::{sync::mpsc, time::timeout};
 
     #[tokio::test]
@@ -228,7 +229,7 @@ mod tests {
             SubscriberNetwork::new_for_worker(tx_sub, listen_on)?;
 
         // spawn subscriber network
-        worker_subscriber_network.run();
+        worker_subscriber_network.run::<SealedWorkerBlock>();
 
         // spawn publish network
         worker_publish_network.run();
@@ -250,7 +251,7 @@ mod tests {
         // publish random block
         let random_block = fixture_batch_with_transactions(10);
         let sealed_block = random_block.seal_slow();
-        let expected_result = Vec::from(&sealed_block);
+        let expected_result = Vec::try_from(sealed_block.clone())?;
         let message_id = worker_publish_network_handle
             .publish(IdentTopic::new(WORKER_BLOCK_TOPIC), expected_result.clone())
             .await?;

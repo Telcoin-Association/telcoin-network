@@ -14,9 +14,9 @@ use tracing::error;
 /// This is a convenience function to keep publisher/subscriber network DRY.
 ///
 /// NOTE: the swarm tries to connect to the provided multiaddr.
-pub(crate) fn start_swarm<'a, M>(multiaddr: Multiaddr) -> eyre::Result<Swarm<gossipsub::Behaviour>>
+pub(crate) fn start_swarm<M>(multiaddr: Multiaddr) -> eyre::Result<Swarm<gossipsub::Behaviour>>
 where
-    M: GossipNetworkMessage<'a>,
+    M: GossipNetworkMessage,
 {
     // generate a random ed25519 key
     let mut swarm = SwarmBuilder::with_new_identity()

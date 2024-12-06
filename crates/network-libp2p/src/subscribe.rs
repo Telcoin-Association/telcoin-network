@@ -37,13 +37,13 @@ pub struct SubscriberNetwork {
 
 impl SubscriberNetwork {
     /// Create a new instance of Self.
-    pub fn new<'a, M>(
+    pub fn new<M>(
         topic: IdentTopic,
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
     ) -> eyre::Result<(Self, GossipNetworkHandle)>
     where
-        M: GossipNetworkMessage<'a>,
+        M: GossipNetworkMessage,
     {
         // create handle
         let (handle_tx, commands) = mpsc::channel(1);
@@ -99,11 +99,14 @@ impl SubscriberNetwork {
     }
 
     /// Run the network loop to process incoming gossip.
-    pub fn run(mut self) -> JoinHandle<eyre::Result<()>> {
+    pub fn run<M>(mut self) -> JoinHandle<eyre::Result<()>>
+    where
+        M: GossipNetworkMessage,
+    {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    event = self.network.select_next_some() => self.process_event(event).await?,
+                    event = self.network.select_next_some() => self.process_event::<M>(event).await?,
                     command = self.commands.recv() => match command {
                         Some(c) => self.process_command(c).await,
                         None => {
@@ -122,7 +125,10 @@ impl SubscriberNetwork {
     }
 
     /// Process events from the swarm.
-    async fn process_event(&mut self, event: SwarmEvent<gossipsub::Event>) -> eyre::Result<()> {
+    async fn process_event<M>(&mut self, event: SwarmEvent<gossipsub::Event>) -> eyre::Result<()>
+    where
+        M: GossipNetworkMessage,
+    {
         match event {
             SwarmEvent::Behaviour(gossip) => match gossip {
                 gossipsub::Event::Message { propagation_source, message_id, message } => {
@@ -135,6 +141,13 @@ impl SubscriberNetwork {
                     // NOTE: self implementation assumes valid encode/decode from peers
                     // TODO: pass the propogation source to receiver and report bad peers back to
                     // the swarm
+                    let Ok(msg) = M::try_from(message.data.clone()) else {
+                        // message decoding failed, disconnect from peer
+                        //
+                        // TODO: test this works
+                        let _ = self.network.disconnect_peer_id(propagation_source);
+                        return Ok(());
+                    };
                     if let Err(e) = self.sender.try_send(message.data) {
                         // fatal: receiver dropped or channel queue full
                         error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
