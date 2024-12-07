@@ -33,6 +33,8 @@ where
                 .validate_messages()
                 // explicitly set strict mode (default)
                 .validation_mode(gossipsub::ValidationMode::Strict)
+                // TODO: this is only for publishers - NOT SUBSCRIBERS
+                .do_px()
                 .build()
                 .map_err(|e| {
                     error!(?e, "gossipsub publish network");

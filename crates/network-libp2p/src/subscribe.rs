@@ -462,40 +462,45 @@ mod tests {
             .expect("multiaddr parsed for worker gossip publisher");
 
         // create publisher - validator
-        let (worker_publish_network, worker_publish_network_handle) =
-            PublishNetwork::new_for_worker(listen_on.clone())?;
+        let (cvv_network, cvv) = PublishNetwork::new_for_worker(listen_on.clone())?;
+        let _ = cvv_network.run();
+
+        // obtain publisher's information
+        let cvv_id = cvv.local_peer_id().await?;
+        let cvv_listeners = cvv.listeners().await?;
+        let cvv_addr = cvv_listeners.first().expect("cvv network is listening").clone();
+
+        // create legit subscriber
+        let (tx_sub, mut rx_sub) = mpsc::channel::<SealedWorkerBlock>(1);
+        let (honest_network, honest_peer) =
+            SubscriberNetwork::new_for_worker(tx_sub, listen_on.clone(), HashSet::from([cvv_id]))?;
+        let network_topic = honest_network.topic.clone();
+        honest_network.run();
 
         // create malicious peer
-        let (malicious_network, malicious_peer) = MaliciousPeer::new(listen_on.clone());
-
-        // spawn malicious peer
+        let (malicious_network, malicious_peer) = MaliciousPeer::new(listen_on);
         malicious_network.run();
-        let mal_pub_id = malicious_peer.local_peer_id().await?;
-
-        // random peer id - represents validator well-known network key
-        let cvv = PeerId::from_str("1Ad82y2W8cqi6uT37s4MorQWywyy9SUJsgHJDSbigFTYWT")?;
-
-        // create subscriber
-        let (tx_sub, mut rx_sub) = mpsc::channel::<SealedWorkerBlock>(1);
-        let (worker_subscriber_network, worker_subscriber_network_handle) =
-            SubscriberNetwork::new_for_worker(tx_sub, listen_on, HashSet::from([cvv]))?;
-
-        // spawn subscriber network
-        worker_subscriber_network.run();
 
         // yield for network to start so listeners update
         tokio::task::yield_now().await;
 
-        let pub_listeners = malicious_peer.listeners().await?;
-        let pub_addr = pub_listeners.first().expect("pub network is listening").clone();
+        // both subscribers dial to cvv and subscribe
 
         // dial publisher to exchange information
-        worker_subscriber_network_handle.dial(pub_addr.into()).await?;
+        honest_peer.dial(cvv_addr.clone().into()).await?;
+        honest_peer.subscribe(network_topic.clone()).await?;
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        malicious_peer.dial(cvv_addr.clone().into()).await?;
+
+        // subscribe to topic now
+        malicious_peer.subscribe(network_topic.clone()).await?;
 
         // allow enough time for peer info to exchange from dial
         //
         // sleep seems to be the only thing that works here
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
         // // publish random bytes
         // let random_block = fixture_batch_with_transactions(10);
@@ -511,17 +516,32 @@ mod tests {
         //     .expect("worker block received");
 
         // assert_eq!(gossip_block, sealed_block);
+        //
 
-        // assert peers are connected
-        let peers = worker_subscriber_network_handle.connected_peers().await?;
-        assert!(peers.contains(&mal_pub_id));
+        let mal_id = malicious_peer.local_peer_id().await?;
+        let honest_id = malicious_peer.local_peer_id().await?;
 
-        println!("malicious peer id: {mal_pub_id:?}");
+        println!("cvv_id: {cvv_id:?}");
+        println!("honest_id: {honest_id:?}");
+        println!("malicious_id: {mal_id:?}");
+
+        // assert honest node's peers
+        let peers = honest_peer.connected_peers().await?;
+        println!("honest node's peers: {peers:?}");
+        assert!(peers.contains(&cvv_id));
+        assert!(peers.contains(&mal_id));
+
+        // assert malicious node's peers
+        let peers = malicious_peer.connected_peers().await?;
+        println!("mal node's peers: {peers:?}");
+        assert!(peers.contains(&cvv_id));
+        assert!(peers.contains(&honest_id));
+
+        println!("malicious peer id: {mal_id:?}");
         // println!("malicious message id: {_message_id:?}");
 
         // peer score
-        let malicious_peer_score =
-            worker_subscriber_network_handle.peer_score(mal_pub_id.clone()).await?;
+        let malicious_peer_score = honest_peer.peer_score(mal_id.clone()).await?;
         println!("malicious peer score: {malicious_peer_score:?}");
 
         // publish bad bytes
@@ -530,22 +550,19 @@ mod tests {
         let random_bytes = tn_types::encode(&Certificate::default());
         malicious_peer.publish(IdentTopic::new(WORKER_BLOCK_TOPIC), random_bytes.to_vec()).await?;
 
-        let app_score_updated = worker_subscriber_network_handle
-            .set_application_score(mal_pub_id.clone(), -10.0)
-            .await?;
+        let app_score_updated = honest_peer.set_application_score(mal_id.clone(), -10.0).await?;
         assert!(app_score_updated);
 
         // sleep for state to advance
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // assert peers are disconnected
-        // let peers = worker_subscriber_network_handle.connected_peers().await?;
+        // let peers = honest_peer.connected_peers().await?;
 
         // TODO: explicit peers always receive broadcast
-        let malicious_peer_score =
-            worker_subscriber_network_handle.peer_score(mal_pub_id.clone()).await?;
+        let malicious_peer_score = honest_peer.peer_score(mal_id.clone()).await?;
         println!("malicious peer score after: {malicious_peer_score:?}");
-        // assert!(!peers.contains(&mal_pub_id));
+        // assert!(!peers.contains(&mal_id));
 
         // compare mesh vs explicit peers
 
