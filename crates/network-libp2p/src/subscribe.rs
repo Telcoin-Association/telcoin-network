@@ -174,6 +174,16 @@ where
                         .source
                         .is_some_and(|id| self.authorized_publishers.contains(&id))
                     {
+                        // TODO: don't decode this here - let the receiver do this and report application score
+                        if let Ok(msg) = M::decode(message.data.clone()) {
+                            // forward message to handler
+                            if let Err(e) = self.sender.try_send(msg) {
+                                error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
+                                // fatal - unable to process gossipped messages
+                                return Err(eyre!("network receiver dropped!"));
+                            }
+                        }
+
                         MessageAcceptance::Accept
                     } else {
                         MessageAcceptance::Reject
@@ -451,6 +461,10 @@ mod tests {
             .parse()
             .expect("multiaddr parsed for worker gossip publisher");
 
+        // create publisher - validator
+        let (worker_publish_network, worker_publish_network_handle) =
+            PublishNetwork::new_for_worker(listen_on.clone())?;
+
         // create malicious peer
         let (malicious_network, malicious_peer) = MaliciousPeer::new(listen_on.clone());
 
@@ -532,6 +546,8 @@ mod tests {
             worker_subscriber_network_handle.peer_score(mal_pub_id.clone()).await?;
         println!("malicious peer score after: {malicious_peer_score:?}");
         // assert!(!peers.contains(&mal_pub_id));
+
+        // compare mesh vs explicit peers
 
         Ok(())
     }

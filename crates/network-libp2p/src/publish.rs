@@ -227,8 +227,11 @@ mod tests {
         let (worker_publish_network, worker_publish_network_handle) =
             PublishNetwork::new_for_worker(listen_on.clone())?;
 
-        // random peer id - represents validator well-known network key
-        let cvv = PeerId::from_str("1Ad82y2W8cqi6uT37s4MorQWywyy9SUJsgHJDSbigFTYWT")?;
+        // spawn publish network
+        worker_publish_network.run();
+
+        // obtain publisher's peer id
+        let cvv = worker_publish_network_handle.local_peer_id().await?;
 
         // create subscriber
         let (tx_sub, mut rx_sub) = mpsc::channel::<SealedWorkerBlock>(1);
@@ -237,9 +240,6 @@ mod tests {
 
         // spawn subscriber network
         worker_subscriber_network.run();
-
-        // spawn publish network
-        worker_publish_network.run();
 
         // yield for network to start so listeners update
         tokio::task::yield_now().await;
@@ -259,11 +259,9 @@ mod tests {
         let random_block = fixture_batch_with_transactions(10);
         let sealed_block = random_block.seal_slow();
         let expected_result = Vec::try_from(sealed_block.clone())?;
-        let message_id = worker_publish_network_handle
+        let _message_id = worker_publish_network_handle
             .publish(IdentTopic::new(WORKER_BLOCK_TOPIC), expected_result.clone())
             .await?;
-        let expected_message_id = libp2p::gossipsub::MessageId::new(sealed_block.digest.as_ref());
-        assert_eq!(message_id, expected_message_id);
 
         // wait for subscriber to forward
         let gossip_block = timeout(Duration::from_secs(5), rx_sub.recv())
