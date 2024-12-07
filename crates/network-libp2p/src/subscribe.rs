@@ -516,12 +516,18 @@ mod tests {
         let random_bytes = tn_types::encode(&Certificate::default());
         malicious_peer.publish(IdentTopic::new(WORKER_BLOCK_TOPIC), random_bytes.to_vec()).await?;
 
+        let app_score_updated = worker_subscriber_network_handle
+            .set_application_score(mal_pub_id.clone(), -10.0)
+            .await?;
+        assert!(app_score_updated);
+
         // sleep for state to advance
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // assert peers are disconnected
         // let peers = worker_subscriber_network_handle.connected_peers().await?;
 
+        // TODO: explicit peers always receive broadcast
         let malicious_peer_score =
             worker_subscriber_network_handle.peer_score(mal_pub_id.clone()).await?;
         println!("malicious peer score after: {malicious_peer_score:?}");

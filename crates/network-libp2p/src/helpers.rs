@@ -112,5 +112,11 @@ pub(crate) fn process_network_command(
                 error!(target: "gossip-network", ?e, "PeerScore command failed");
             }
         }
+        NetworkCommand::SetApplicationScore { peer_id, new_score, reply } => {
+            let bool = network.behaviour_mut().set_application_score(&peer_id, new_score);
+            if let Err(e) = reply.send(bool) {
+                error!(target: "gossip-network", ?e, "SetApplicationScore command failed");
+            }
+        }
     }
 }
