@@ -73,7 +73,8 @@ Peers below the specified threshold (0) are pruned from the mesh during the hear
 
 - message.source should only be from current committee member
   - duplicates for ConsensusHeaders
-- Message decoding
+- Message decoding is handled within the application.
+  - If the decoding fails, the peer's application score is lowered
 
 ## Ideal flow
 

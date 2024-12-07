@@ -25,6 +25,7 @@ fastcrypto = { workspace = true }
 
 [dev-dependencies]
 tn-test-utils = { workspace = true }
+reth-tracing = { workspace = true }
 
 [lints]
 workspace = true

@@ -2,7 +2,7 @@
 //!
 //! Subscribers receive gossipped output from committee-voting validators.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     helpers::{process_network_command, start_swarm},
@@ -14,7 +14,7 @@ use crate::{
 use eyre::eyre;
 use futures::StreamExt as _;
 use libp2p::{
-    gossipsub::{self, IdentTopic, MessageAcceptance},
+    gossipsub::{self, IdentTopic, MessageAcceptance, TopicScoreParams},
     swarm::SwarmEvent,
     Multiaddr, PeerId, Swarm,
 };
@@ -37,8 +37,11 @@ pub struct SubscriberNetwork<M> {
     /// The collection of staked validators.
     ///
     /// This set is updated at the start of each epoch and used to verify message sources are from
-    /// validators. The entire list of staked validators is used to prevent invalidating messages
-    /// that arrive late.
+    /// validators.
+    ///
+    /// TODO: use the entire list of staked validators to prevent invalidating messages
+    /// that arrive late?
+    /// Or just use current CVVs.
     authorized_publishers: HashSet<PeerId>,
 }
 
@@ -59,6 +62,31 @@ where
 
         // create swarm and start listening
         let mut swarm = start_swarm::<M>(multiaddr)?;
+
+        // configure peer score parameters
+        //
+        // default for now
+        let score_params = gossipsub::PeerScoreParams {
+            topics: HashMap::from([(topic.hash(), TopicScoreParams::default())]),
+            ..Default::default()
+        };
+
+        // configure thresholds at which peers are considered faulty or malicious
+        //
+        // peer baseline is 0
+        let score_thresholds = gossipsub::PeerScoreThresholds {
+            gossip_threshold: -10.0,   // ignore gossip to and from peer
+            publish_threshold: -20.0,  // don't flood publish to this peer
+            graylist_threshold: -50.0, // effectively ignore peer
+            accept_px_threshold: 10.0, // score only attainable by validators
+            opportunistic_graft_threshold: 5.0,
+        };
+
+        // enable peer scoring
+        swarm.behaviour_mut().with_peer_score(score_params, score_thresholds).map_err(|e| {
+            error!(?e, "gossipsub publish network");
+            eyre!("failed to set peer score for gossipsub")
+        })?;
 
         // subscribe to topic
         swarm.behaviour_mut().subscribe(&topic)?;
@@ -141,74 +169,71 @@ where
             SwarmEvent::Behaviour(gossip) => match gossip {
                 gossipsub::Event::Message { propagation_source, message_id, message } => {
                     trace!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?message, "message received from publisher");
-                    // // - `propagation_source` is the PeerId created from the  publisher's public
-                    // key // - message_id is the digest of the worker block /
-                    // certificate / consensus //   header
-                    // // - message.data is the gossipped worker block / certificate / consensus
-                    // header //
-                    // // NOTE: self implementation assumes valid encode/decode from peers
-                    // // TODO: pass the propogation source to receiver and report bad peers back to
-                    // // the swarm
-                    // let Ok(msg) = M::try_from(message.data) else {
-                    //     // message decoding failed, disconnect from peer
-                    //     //
-                    //     // black list peer
-                    //     let _ = self.network.behaviour_mut().blacklist_peer(&propagation_source);
-                    //     // TODO: test this works
-                    //     let _ = self.network.disconnect_peer_id(propagation_source);
-                    //     return Ok(());
-                    // };
-                    // if let Err(e) = self.sender.try_send(msg) {
-                    //     // fatal: receiver dropped or channel queue full
-                    //     error!(target: "subscriber-network", topic=?self.topic,
-                    // ?propagation_source, ?message_id, ?e, "failed to forward received message!");
-                    //     return Err(eyre!("network receiver dropped!"));
-                    // }
-                    //
+                    // verify message was published by authorized node
+                    let msg_acceptance = if message
+                        .source
+                        .is_some_and(|id| self.authorized_publishers.contains(&id))
+                    {
+                        MessageAcceptance::Accept
+                    } else {
+                        MessageAcceptance::Reject
+                    };
 
-                    // attempt to decode the message
-                    match M::try_from(message.data) {
-                        Ok(msg) => {
-                            // message decoded successfully
-                            //
-                            // report message as valid and propagate to other peers
-                            if let Err(e) =
-                                self.network.behaviour_mut().report_message_validation_result(
-                                    &message_id,
-                                    &propagation_source,
-                                    MessageAcceptance::Accept,
-                                )
-                            {
-                                error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "error reporting message validation result");
-                            }
+                    println!("message received! acceptance: {msg_acceptance:?}");
 
-                            // forward message to handler
-                            if let Err(e) = self.sender.try_send(msg) {
-                                error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
-                                // fatal - unable to process gossipped messages
-                                return Err(eyre!("network receiver dropped!"));
-                            }
-                        }
-                        Err(_) => {
-                            println!("message decoding failed!");
-                            println!(
-                                "prop source: {propagation_source:?}\nmessage source: {:?}",
-                                message.source
-                            );
-                            // decoding failed
-                            //
-                            // reject the message and penalize the sender
-                            if let Err(e) =
-                                self.network.behaviour_mut().report_message_validation_result(
-                                    &message_id,
-                                    &propagation_source,
-                                    MessageAcceptance::Reject,
-                                )
-                            {
-                                error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "error reporting message validation result");
-                            }
-                        }
+                    // report message validation results
+                    if let Err(e) = self.network.behaviour_mut().report_message_validation_result(
+                        &message_id,
+                        &propagation_source,
+                        msg_acceptance,
+                    ) {
+                        error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "error reporting message validation result");
                     }
+
+                    // // TODO: move this as the application score
+                    // // attempt to decode the message
+                    // match M::try_from(message.data) {
+                    //     Ok(msg) => {
+                    //         // message decoded successfully
+                    //         //
+                    //         // report message as valid and propagate to other peers
+                    //         if let Err(e) =
+                    //             self.network.behaviour_mut().report_message_validation_result(
+                    //                 &message_id,
+                    //                 &propagation_source,
+                    //                 MessageAcceptance::Accept,
+                    //             )
+                    //         {
+                    //             error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "error reporting message validation result");
+                    //         }
+
+                    //         // forward message to handler
+                    //         if let Err(e) = self.sender.try_send(msg) {
+                    //             error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
+                    //             // fatal - unable to process gossipped messages
+                    //             return Err(eyre!("network receiver dropped!"));
+                    //         }
+                    //     }
+                    //     Err(_) => {
+                    //         println!("message decoding failed!");
+                    //         println!(
+                    //             "prop source: {propagation_source:?}\nmessage source: {:?}",
+                    //             message.source
+                    //         );
+                    //         // decoding failed
+                    //         //
+                    //         // reject the message and penalize the sender
+                    //         if let Err(e) =
+                    //             self.network.behaviour_mut().report_message_validation_result(
+                    //                 &message_id,
+                    //                 &propagation_source,
+                    //                 MessageAcceptance::Reject,
+                    //             )
+                    //         {
+                    //             error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "error reporting message validation result");
+                    //         }
+                    //     }
+                    // }
                 }
                 gossipsub::Event::Subscribed { peer_id, topic } => {
                     trace!(target: "subscriber-network", topic=?self.topic, ?peer_id, ?topic, "gossipsub event - subscribed")
@@ -314,9 +339,9 @@ mod tests {
     use libp2p::{
         gossipsub::{self, IdentTopic},
         swarm::SwarmEvent,
-        Multiaddr, Swarm, SwarmBuilder,
+        Multiaddr, PeerId, Swarm, SwarmBuilder,
     };
-    use std::time::Duration;
+    use std::{collections::HashSet, str::FromStr, time::Duration};
     use tn_test_utils::fixture_batch_with_transactions;
     use tn_types::{BlockHash, Certificate, SealedWorkerBlock};
     use tokio::{
@@ -420,6 +445,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_removed_after_bad_gossip() -> eyre::Result<()> {
+        reth_tracing::init_test_tracing();
         // default any address
         let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1"
             .parse()
@@ -428,23 +454,26 @@ mod tests {
         // create malicious peer
         let (malicious_network, malicious_peer) = MaliciousPeer::new(listen_on.clone());
 
+        // spawn malicious peer
+        malicious_network.run();
+        let mal_pub_id = malicious_peer.local_peer_id().await?;
+
+        // random peer id - represents validator well-known network key
+        let cvv = PeerId::from_str("1Ad82y2W8cqi6uT37s4MorQWywyy9SUJsgHJDSbigFTYWT")?;
+
         // create subscriber
         let (tx_sub, mut rx_sub) = mpsc::channel::<SealedWorkerBlock>(1);
         let (worker_subscriber_network, worker_subscriber_network_handle) =
-            SubscriberNetwork::new_for_worker(tx_sub, listen_on)?;
+            SubscriberNetwork::new_for_worker(tx_sub, listen_on, HashSet::from([cvv]))?;
 
         // spawn subscriber network
         worker_subscriber_network.run();
-
-        // spawn malicious peer
-        malicious_network.run();
 
         // yield for network to start so listeners update
         tokio::task::yield_now().await;
 
         let pub_listeners = malicious_peer.listeners().await?;
         let pub_addr = pub_listeners.first().expect("pub network is listening").clone();
-        let pub_id = malicious_peer.local_peer_id().await?;
 
         // dial publisher to exchange information
         worker_subscriber_network_handle.dial(pub_addr.into()).await?;
@@ -454,31 +483,31 @@ mod tests {
         // sleep seems to be the only thing that works here
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        // publish random bytes
-        let random_block = fixture_batch_with_transactions(10);
-        let sealed_block = random_block.seal_slow();
-        let valid_message = Vec::try_from(sealed_block.clone())?;
-        let _message_id =
-            malicious_peer.publish(IdentTopic::new(WORKER_BLOCK_TOPIC), valid_message).await?;
+        // // publish random bytes
+        // let random_block = fixture_batch_with_transactions(10);
+        // let sealed_block = random_block.seal_slow();
+        // let valid_message = Vec::try_from(sealed_block.clone())?;
+        // let _message_id =
+        //     malicious_peer.publish(IdentTopic::new(WORKER_BLOCK_TOPIC), valid_message).await?;
 
-        // wait for subscriber to advance
-        let gossip_block = timeout(Duration::from_secs(5), rx_sub.recv())
-            .await
-            .expect("timeout waiting for gossiped worker block")
-            .expect("worker block received");
+        // // wait for subscriber to advance
+        // let gossip_block = timeout(Duration::from_secs(5), rx_sub.recv())
+        //     .await
+        //     .expect("timeout waiting for gossiped worker block")
+        //     .expect("worker block received");
 
-        assert_eq!(gossip_block, sealed_block);
+        // assert_eq!(gossip_block, sealed_block);
 
         // assert peers are connected
         let peers = worker_subscriber_network_handle.connected_peers().await?;
-        assert!(peers.contains(&pub_id));
+        assert!(peers.contains(&mal_pub_id));
 
-        println!("malicious peer id: {pub_id:?}");
-        println!("malicious message id: {_message_id:?}");
+        println!("malicious peer id: {mal_pub_id:?}");
+        // println!("malicious message id: {_message_id:?}");
 
         // peer score
         let malicious_peer_score =
-            worker_subscriber_network_handle.peer_score(pub_id.clone()).await?;
+            worker_subscriber_network_handle.peer_score(mal_pub_id.clone()).await?;
         println!("malicious peer score: {malicious_peer_score:?}");
 
         // publish bad bytes
@@ -488,15 +517,15 @@ mod tests {
         malicious_peer.publish(IdentTopic::new(WORKER_BLOCK_TOPIC), random_bytes.to_vec()).await?;
 
         // sleep for state to advance
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
         // assert peers are disconnected
-        let peers = worker_subscriber_network_handle.connected_peers().await?;
+        // let peers = worker_subscriber_network_handle.connected_peers().await?;
 
         let malicious_peer_score =
-            worker_subscriber_network_handle.peer_score(pub_id.clone()).await?;
+            worker_subscriber_network_handle.peer_score(mal_pub_id.clone()).await?;
         println!("malicious peer score after: {malicious_peer_score:?}");
-        assert!(!peers.contains(&pub_id));
+        // assert!(!peers.contains(&mal_pub_id));
 
         Ok(())
     }

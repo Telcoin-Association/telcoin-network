@@ -210,8 +210,8 @@ impl PublishNetwork {
 mod tests {
     use super::PublishNetwork;
     use crate::{types::WORKER_BLOCK_TOPIC, SubscriberNetwork};
-    use libp2p::{gossipsub::IdentTopic, Multiaddr};
-    use std::time::Duration;
+    use libp2p::{gossipsub::IdentTopic, Multiaddr, PeerId};
+    use std::{collections::HashSet, str::FromStr as _, time::Duration};
     use tn_test_utils::fixture_batch_with_transactions;
     use tn_types::SealedWorkerBlock;
     use tokio::{sync::mpsc, time::timeout};
@@ -227,10 +227,13 @@ mod tests {
         let (worker_publish_network, worker_publish_network_handle) =
             PublishNetwork::new_for_worker(listen_on.clone())?;
 
+        // random peer id - represents validator well-known network key
+        let cvv = PeerId::from_str("1Ad82y2W8cqi6uT37s4MorQWywyy9SUJsgHJDSbigFTYWT")?;
+
         // create subscriber
         let (tx_sub, mut rx_sub) = mpsc::channel::<SealedWorkerBlock>(1);
         let (worker_subscriber_network, worker_subscriber_network_handle) =
-            SubscriberNetwork::new_for_worker(tx_sub, listen_on)?;
+            SubscriberNetwork::new_for_worker(tx_sub, listen_on, HashSet::from([cvv]))?;
 
         // spawn subscriber network
         worker_subscriber_network.run();
