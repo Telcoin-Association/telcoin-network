@@ -2,6 +2,8 @@
 //!
 //! Subscribers receive gossipped output from committee-voting validators.
 
+use std::collections::HashSet;
+
 use crate::{
     helpers::{process_network_command, start_swarm},
     types::{
@@ -14,7 +16,7 @@ use futures::StreamExt as _;
 use libp2p::{
     gossipsub::{self, IdentTopic, MessageAcceptance},
     swarm::SwarmEvent,
-    Multiaddr, Swarm,
+    Multiaddr, PeerId, Swarm,
 };
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
@@ -32,6 +34,12 @@ pub struct SubscriberNetwork<M> {
     sender: Sender<M>,
     /// The receiver for processing network handle requests.
     commands: Receiver<NetworkCommand>,
+    /// The collection of staked validators.
+    ///
+    /// This set is updated at the start of each epoch and used to verify message sources are from
+    /// validators. The entire list of staked validators is used to prevent invalidating messages
+    /// that arrive late.
+    authorized_publishers: HashSet<PeerId>,
 }
 
 impl<M> SubscriberNetwork<M>
@@ -43,6 +51,7 @@ where
         topic: IdentTopic,
         sender: mpsc::Sender<M>,
         multiaddr: Multiaddr,
+        authorized_publishers: HashSet<PeerId>,
     ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // create handle
         let (handle_tx, commands) = mpsc::channel(1);
@@ -55,7 +64,7 @@ where
         swarm.behaviour_mut().subscribe(&topic)?;
 
         // create Self
-        let network = Self { topic, network: swarm, sender, commands };
+        let network = Self { topic, network: swarm, sender, commands, authorized_publishers };
 
         Ok((network, handle))
     }
@@ -66,10 +75,11 @@ where
     pub fn new_for_worker(
         sender: mpsc::Sender<M>,
         multiaddr: Multiaddr,
+        authorized_publishers: HashSet<PeerId>,
     ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // worker's default topic
         let topic = gossipsub::IdentTopic::new(WORKER_BLOCK_TOPIC);
-        Self::new(topic, sender, multiaddr)
+        Self::new(topic, sender, multiaddr, authorized_publishers)
     }
 
     /// Create a new subscribe network for [Certificate].
@@ -78,10 +88,11 @@ where
     pub fn new_for_primary(
         sender: mpsc::Sender<M>,
         multiaddr: Multiaddr,
+        authorized_publishers: HashSet<PeerId>,
     ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // primary's default topic
         let topic = gossipsub::IdentTopic::new(PRIMARY_CERT_TOPIC);
-        Self::new(topic, sender, multiaddr)
+        Self::new(topic, sender, multiaddr, authorized_publishers)
     }
 
     /// Create a new subscribe network for [ConsensusHeader].
@@ -91,10 +102,11 @@ where
     pub fn new_for_consensus(
         sender: mpsc::Sender<M>,
         multiaddr: Multiaddr,
+        authorized_publishers: HashSet<PeerId>,
     ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // consensus header's default topic
         let topic = gossipsub::IdentTopic::new(CONSENSUS_HEADER_TOPIC);
-        Self::new(topic, sender, multiaddr)
+        Self::new(topic, sender, multiaddr, authorized_publishers)
     }
 
     /// Run the network loop to process incoming gossip.
@@ -129,11 +141,11 @@ where
             SwarmEvent::Behaviour(gossip) => match gossip {
                 gossipsub::Event::Message { propagation_source, message_id, message } => {
                     trace!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?message, "message received from publisher");
-                    // // - `propagation_source` is the PeerId created from the  publisher's public key
-                    // // - message_id is the digest of the worker block / certificate / consensus
-                    // //   header
-                    // // - message.data is the gossipped worker block / certificate / consensus header
-                    // //
+                    // // - `propagation_source` is the PeerId created from the  publisher's public
+                    // key // - message_id is the digest of the worker block /
+                    // certificate / consensus //   header
+                    // // - message.data is the gossipped worker block / certificate / consensus
+                    // header //
                     // // NOTE: self implementation assumes valid encode/decode from peers
                     // // TODO: pass the propogation source to receiver and report bad peers back to
                     // // the swarm
@@ -148,7 +160,8 @@ where
                     // };
                     // if let Err(e) = self.sender.try_send(msg) {
                     //     // fatal: receiver dropped or channel queue full
-                    //     error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
+                    //     error!(target: "subscriber-network", topic=?self.topic,
+                    // ?propagation_source, ?message_id, ?e, "failed to forward received message!");
                     //     return Err(eyre!("network receiver dropped!"));
                     // }
                     //
@@ -177,6 +190,11 @@ where
                             }
                         }
                         Err(_) => {
+                            println!("message decoding failed!");
+                            println!(
+                                "prop source: {propagation_source:?}\nmessage source: {:?}",
+                                message.source
+                            );
                             // decoding failed
                             //
                             // reject the message and penalize the sender

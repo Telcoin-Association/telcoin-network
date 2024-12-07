@@ -26,15 +26,31 @@ where
         .with_quic()
         // custom behavior
         .with_behaviour(|keypair| {
-            // Set a custom gossipsub configuration
+            // configure peer score parameters
+            //
+            // default for now
+            let score_params = gossipsub::PeerScoreParams::default();
+
+            // configure thresholds at which peers are considered faulty or malicious
+            //
+            // peer baseline is 0
+            let score_thresholds = gossipsub::PeerScoreThresholds {
+                gossip_threshold: -10.0,   // ignore gossip to and from peer
+                publish_threshold: -20.0,  // don't flood publish to this peer
+                graylist_threshold: -50.0, // effectively ignore peer
+                accept_px_threshold: 10.0, // score only attainable by validators
+                opportunistic_graft_threshold: 5.0,
+            };
+
+            // set a custom gossipsub configuration
             let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_secs(10)) // This is set to aid debugging by not cluttering the log space
-                // validate messages
-                //
+                .heartbeat_interval(Duration::from_secs(1))
                 // valid messages must decode to the expected message types
                 .validate_messages()
                 // explicitly set strict mode (default)
                 .validation_mode(gossipsub::ValidationMode::Strict)
+                // .peer_score_params(score_params)
+                // .peer_score_thresholds(score_thresholds)
                 .build()
                 .map_err(|e| {
                     error!(?e, "gossipsub publish network");
@@ -42,10 +58,13 @@ where
                 })?;
 
             // build a gossipsub network behaviour
-            let network = gossipsub::Behaviour::new(
+            let mut network = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(keypair.clone()),
                 gossipsub_config,
             )?;
+
+            // enable peer scoring
+            network.with_peer_score(score_params, score_thresholds)?;
 
             Ok(network)
         })

@@ -49,3 +49,43 @@ When a peer is explicitly added to Gossipsub, it's included in the Gossipsub int
 Gossipsub messages use the data type's hash digest as the `MessagId`.
 However, `IWANT` and `IHAVE` messages are private, and another protocol type is needed to manage specific state sync requests.
 The gossip network is effective for broadcasting new blocks only.
+
+## [Peer Scoring](https://github.com/libp2p/specs/blob/master/pubsub/gossipsub/gossipsub-v1.1.md#peer-scoring)
+
+Peer scores are local values that represent a weighted mix of parameters for all topics on the network that allow nodes to respond quickly to bad actors.
+
+`accept_px_score` should only be attainable by nodes with stake.
+Validators are well-known, so they can help with discovery.
+Peer exchange can happen when a node prunes too many peers.
+Instead of only dropping peers, they also recommend other peers to pruned nodes.
+Nodes should be weary of connecting with suggested peers unless it is from a reliable source.
+
+
+## Heartbeat
+
+Heartbeat interval should be short based on this graphic? https://docs.libp2p.io/concepts/pubsub/overview/#gossip
+
+Heartbeats are when the gossip network applies many state changes.
+Peers below the specified threshold (0) are pruned from the mesh during the heartbeat.
+
+
+## Message Verification
+
+- message.source should only be from current committee member
+  - duplicates for ConsensusHeaders
+- Message decoding
+
+## Ideal flow
+
+- validators are already running p2p networks
+- validators open p2p gossip publish networks
+- TAO deploys archive node to support gossip and discovery
+- bridge subscribes
+  - we want validators to explicitly add these peers?
+  - always flood publish to bridge peers
+- other nodes permissionlessly join gossip network
+
+
+- closed source for now
+- assume only bridging clients for now (testnet)
+- security harden later
