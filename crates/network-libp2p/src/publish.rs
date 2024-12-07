@@ -5,7 +5,7 @@
 //! This network does not subscribe to the topics it publishes.
 
 use crate::{
-    helpers::{process_network_command, start_swarm},
+    helpers::{process_network_command, publisher_gossip_config, start_swarm},
     types::{
         GossipNetworkHandle, GossipNetworkMessage, NetworkCommand, CONSENSUS_HEADER_TOPIC,
         PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
@@ -48,7 +48,8 @@ impl PublishNetwork {
         let handle = GossipNetworkHandle::new(handle_tx);
 
         // create swarm and start listening
-        let swarm = start_swarm::<M>(multiaddr)?;
+        let publish_config = publisher_gossip_config()?;
+        let swarm = start_swarm::<M>(multiaddr, publish_config)?;
 
         // create Self
         let network = Self { topic, network: swarm, commands };

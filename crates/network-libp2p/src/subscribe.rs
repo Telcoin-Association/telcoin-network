@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    helpers::{process_network_command, start_swarm},
+    helpers::{process_network_command, start_swarm, subscriber_gossip_config},
     types::{
         GossipNetworkHandle, GossipNetworkMessage, NetworkCommand, CONSENSUS_HEADER_TOPIC,
         PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
@@ -61,7 +61,8 @@ where
         let handle = GossipNetworkHandle::new(handle_tx);
 
         // create swarm and start listening
-        let mut swarm = start_swarm::<M>(multiaddr)?;
+        let subscriber_config = subscriber_gossip_config()?;
+        let mut swarm = start_swarm::<M>(multiaddr, subscriber_config)?;
 
         // configure peer score parameters
         //

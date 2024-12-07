@@ -4,6 +4,7 @@ use crate::types::{GossipNetworkMessage, NetworkCommand};
 use eyre::eyre;
 use libp2p::{
     gossipsub::{self},
+    identity::Keypair,
     Multiaddr, Swarm, SwarmBuilder,
 };
 use std::time::Duration;
@@ -14,7 +15,10 @@ use tracing::error;
 /// This is a convenience function to keep publisher/subscriber network DRY.
 ///
 /// NOTE: the swarm tries to connect to the provided multiaddr.
-pub(crate) fn start_swarm<M>(multiaddr: Multiaddr) -> eyre::Result<Swarm<gossipsub::Behaviour>>
+pub(crate) fn start_swarm<M>(
+    multiaddr: Multiaddr,
+    gossipsub_config: gossipsub::Config,
+) -> eyre::Result<Swarm<gossipsub::Behaviour>>
 where
     M: GossipNetworkMessage,
 {
@@ -26,21 +30,6 @@ where
         .with_quic()
         // custom behavior
         .with_behaviour(|keypair| {
-            // set a custom gossipsub configuration
-            let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_secs(1))
-                // valid messages must decode to the expected message types
-                .validate_messages()
-                // explicitly set strict mode (default)
-                .validation_mode(gossipsub::ValidationMode::Strict)
-                // TODO: this is only for publishers - NOT SUBSCRIBERS
-                .do_px()
-                .build()
-                .map_err(|e| {
-                    error!(?e, "gossipsub publish network");
-                    eyre!("failed to build gossipsub config for primary")
-                })?;
-
             // build a gossipsub network behaviour
             let network = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(keypair.clone()),
@@ -57,6 +46,34 @@ where
     swarm.listen_on(multiaddr)?;
 
     Ok(swarm)
+}
+
+/// Helper function for publish swarm gossip config.
+pub(crate) fn subscriber_gossip_config() -> eyre::Result<gossipsub::Config> {
+    let config = gossipsub::ConfigBuilder::default()
+        // explicitly set heartbeat interval (default)
+        .heartbeat_interval(Duration::from_secs(1))
+        // explicitly set strict mode (default)
+        .validation_mode(gossipsub::ValidationMode::Strict)
+        // only listen to authorized publishers
+        .validate_messages()
+        .build()?;
+
+    Ok(config)
+}
+
+/// Helper function for publish swarm gossip config.
+pub(crate) fn publisher_gossip_config() -> eyre::Result<gossipsub::Config> {
+    let config = gossipsub::ConfigBuilder::default()
+        // explicitly set heartbeat interval (default)
+        .heartbeat_interval(Duration::from_secs(1))
+        // explicitly set strict mode (default)
+        .validation_mode(gossipsub::ValidationMode::Strict)
+        // support peer exchange
+        .do_px()
+        .build()?;
+
+    Ok(config)
 }
 
 /// Helper function for processing network commands.
