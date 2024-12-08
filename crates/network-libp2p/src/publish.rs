@@ -19,7 +19,7 @@ use libp2p::{
 };
 use tn_types::{Certificate, ConsensusHeader, SealedWorkerBlock};
 use tokio::{
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
 };
 use tracing::{info, trace, warn};
@@ -30,6 +30,8 @@ pub struct PublishNetwork {
     topic: IdentTopic,
     /// The gossip network for flood publishing sealed worker blocks.
     network: Swarm<gossipsub::Behaviour>,
+    /// The sender for network handles.
+    handle: Sender<NetworkCommand>,
     /// The receiver for processing network handle requests.
     commands: Receiver<NetworkCommand>,
 }
@@ -40,21 +42,25 @@ impl PublishNetwork {
         topic: IdentTopic,
         multiaddr: Multiaddr,
         gossipsub_config: gossipsub::Config,
-    ) -> eyre::Result<(Self, GossipNetworkHandle)>
+    ) -> eyre::Result<Self>
     where
         M: GossipNetworkMessage,
     {
         // create handle
-        let (handle_tx, commands) = mpsc::channel(1);
-        let handle = GossipNetworkHandle::new(handle_tx);
+        let (handle, commands) = mpsc::channel(1);
 
         // create swarm and start listening
         let swarm = start_swarm::<M>(multiaddr, gossipsub_config)?;
 
         // create Self
-        let network = Self { topic, network: swarm, commands };
+        let network = Self { topic, network: swarm, handle, commands };
 
-        Ok((network, handle))
+        Ok(network)
+    }
+
+    /// Return a [GossipNetworkHandle] to send commands to this network.
+    pub fn network_handle(&self) -> GossipNetworkHandle {
+        GossipNetworkHandle::new(self.handle.clone())
     }
 
     /// Create a new publish network for [SealedWorkerBlock].
@@ -63,7 +69,7 @@ impl PublishNetwork {
     pub fn new_for_worker(
         multiaddr: Multiaddr,
         gossipsub_config: gossipsub::Config,
-    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
+    ) -> eyre::Result<Self> {
         // worker's default topic
         let topic = gossipsub::IdentTopic::new(WORKER_BLOCK_TOPIC);
         Self::new::<SealedWorkerBlock>(topic, multiaddr, gossipsub_config)
@@ -75,7 +81,7 @@ impl PublishNetwork {
     pub fn new_for_primary(
         multiaddr: Multiaddr,
         gossipsub_config: gossipsub::Config,
-    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
+    ) -> eyre::Result<Self> {
         // primary's default topic
         let topic = gossipsub::IdentTopic::new(PRIMARY_CERT_TOPIC);
         Self::new::<Certificate>(topic, multiaddr, gossipsub_config)
@@ -88,7 +94,7 @@ impl PublishNetwork {
     pub fn new_for_consensus(
         multiaddr: Multiaddr,
         gossipsub_config: gossipsub::Config,
-    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
+    ) -> eyre::Result<Self> {
         // consensus header's default topic
         let topic = gossipsub::IdentTopic::new(CONSENSUS_HEADER_TOPIC);
         Self::new::<ConsensusHeader>(topic, multiaddr, gossipsub_config)
@@ -239,8 +245,9 @@ mod tests {
 
         // create publisher
         let default_pub_config = publisher_gossip_config()?;
-        let (worker_publish_network, worker_publish_network_handle) =
+        let worker_publish_network =
             PublishNetwork::new_for_worker(listen_on.clone(), default_pub_config)?;
+        let worker_publish_network_handle = worker_publish_network.network_handle();
 
         // spawn publish network
         worker_publish_network.run();
@@ -251,13 +258,13 @@ mod tests {
         // create subscriber
         let (tx_sub, mut rx_sub) = mpsc::channel::<SealedWorkerBlock>(1);
         let default_sub_config = subscriber_gossip_config()?;
-        let (worker_subscriber_network, worker_subscriber_network_handle) =
-            SubscriberNetwork::new_for_worker(
-                tx_sub,
-                listen_on,
-                HashSet::from([cvv]),
-                default_sub_config,
-            )?;
+        let worker_subscriber_network = SubscriberNetwork::new_for_worker(
+            tx_sub,
+            listen_on,
+            HashSet::from([cvv]),
+            default_sub_config,
+        )?;
+        let worker_subscriber_network_handle = worker_subscriber_network.network_handle();
 
         // spawn subscriber network
         worker_subscriber_network.run();

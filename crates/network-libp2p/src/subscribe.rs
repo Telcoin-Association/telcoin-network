@@ -31,6 +31,8 @@ pub struct SubscriberNetwork<M> {
     network: Swarm<gossipsub::Behaviour>,
     /// The stream for forwarding downloaded messages.
     sender: Sender<M>,
+    /// The sender for network handles.
+    handle: Sender<NetworkCommand>,
     /// The receiver for processing network handle requests.
     commands: Receiver<NetworkCommand>,
     /// The collection of staked validators.
@@ -55,10 +57,9 @@ where
         multiaddr: Multiaddr,
         authorized_publishers: HashSet<PeerId>,
         gossipsub_config: gossipsub::Config,
-    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
+    ) -> eyre::Result<Self> {
         // create handle
-        let (handle_tx, commands) = mpsc::channel(1);
-        let handle = GossipNetworkHandle::new(handle_tx);
+        let (handle, commands) = mpsc::channel(1);
 
         // create swarm and start listening
         let mut swarm = start_swarm::<M>(multiaddr, gossipsub_config)?;
@@ -92,9 +93,15 @@ where
         swarm.behaviour_mut().subscribe(&topic)?;
 
         // create Self
-        let network = Self { topic, network: swarm, sender, commands, authorized_publishers };
+        let network =
+            Self { topic, network: swarm, sender, handle, commands, authorized_publishers };
 
-        Ok((network, handle))
+        Ok(network)
+    }
+
+    /// Return a [GossipNetworkHandle] to send commands to this network.
+    pub fn network_handle(&self) -> GossipNetworkHandle {
+        GossipNetworkHandle::new(self.handle.clone())
     }
 
     /// Create a new subscribe network for [SealedWorkerBlock].
@@ -105,7 +112,7 @@ where
         multiaddr: Multiaddr,
         authorized_publishers: HashSet<PeerId>,
         gossipsub_config: gossipsub::Config,
-    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
+    ) -> eyre::Result<Self> {
         // worker's default topic
         let topic = gossipsub::IdentTopic::new(WORKER_BLOCK_TOPIC);
         Self::new(topic, sender, multiaddr, authorized_publishers, gossipsub_config)
@@ -119,7 +126,7 @@ where
         multiaddr: Multiaddr,
         authorized_publishers: HashSet<PeerId>,
         gossipsub_config: gossipsub::Config,
-    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
+    ) -> eyre::Result<Self> {
         // primary's default topic
         let topic = gossipsub::IdentTopic::new(PRIMARY_CERT_TOPIC);
         Self::new(topic, sender, multiaddr, authorized_publishers, gossipsub_config)
@@ -134,7 +141,7 @@ where
         multiaddr: Multiaddr,
         authorized_publishers: HashSet<PeerId>,
         gossipsub_config: gossipsub::Config,
-    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
+    ) -> eyre::Result<Self> {
         // consensus header's default topic
         let topic = gossipsub::IdentTopic::new(CONSENSUS_HEADER_TOPIC);
         Self::new(topic, sender, multiaddr, authorized_publishers, gossipsub_config)
@@ -469,7 +476,8 @@ mod tests {
         // create publisher
         //
         // this is essentially a current committee validator that only supports 1 peer connection
-        let (cvv_network, cvv) = PublishNetwork::new_for_worker(listen_on.clone(), pub_config)?;
+        let cvv_network = PublishNetwork::new_for_worker(listen_on.clone(), pub_config)?;
+        let cvv = cvv_network.network_handle();
         let _ = cvv_network.run();
 
         // obtain publisher's information
@@ -480,13 +488,14 @@ mod tests {
         // create legit subscriber
         let (tx_sub, _rx_sub) = mpsc::channel::<SealedWorkerBlock>(1);
         let default_sub_config = subscriber_gossip_config()?;
-        let (honest_network, honest_peer) = SubscriberNetwork::new_for_worker(
+        let honest_network = SubscriberNetwork::new_for_worker(
             tx_sub,
             listen_on.clone(),
             HashSet::from([cvv_id]),
             default_sub_config.clone(),
         )?;
         let network_topic = honest_network.topic.clone();
+        let honest_peer = honest_network.network_handle();
         honest_network.run();
 
         // create malicious peer
