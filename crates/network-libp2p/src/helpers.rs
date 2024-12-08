@@ -49,7 +49,7 @@ where
 }
 
 /// Helper function for publish swarm gossip config.
-pub(crate) fn subscriber_gossip_config() -> eyre::Result<gossipsub::Config> {
+pub fn subscriber_gossip_config() -> eyre::Result<gossipsub::Config> {
     let config = gossipsub::ConfigBuilder::default()
         // explicitly set heartbeat interval (default)
         .heartbeat_interval(Duration::from_secs(1))
@@ -63,7 +63,7 @@ pub(crate) fn subscriber_gossip_config() -> eyre::Result<gossipsub::Config> {
 }
 
 /// Helper function for publish swarm gossip config.
-pub(crate) fn publisher_gossip_config() -> eyre::Result<gossipsub::Config> {
+pub fn publisher_gossip_config() -> eyre::Result<gossipsub::Config> {
     let config = gossipsub::ConfigBuilder::default()
         // explicitly set heartbeat interval (default)
         .heartbeat_interval(Duration::from_secs(1))

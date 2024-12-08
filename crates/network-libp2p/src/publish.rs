@@ -39,6 +39,7 @@ impl PublishNetwork {
     pub fn new<M>(
         topic: IdentTopic,
         multiaddr: Multiaddr,
+        gossipsub_config: gossipsub::Config,
     ) -> eyre::Result<(Self, GossipNetworkHandle)>
     where
         M: GossipNetworkMessage,
@@ -48,8 +49,7 @@ impl PublishNetwork {
         let handle = GossipNetworkHandle::new(handle_tx);
 
         // create swarm and start listening
-        let publish_config = publisher_gossip_config()?;
-        let swarm = start_swarm::<M>(multiaddr, publish_config)?;
+        let swarm = start_swarm::<M>(multiaddr, gossipsub_config)?;
 
         // create Self
         let network = Self { topic, network: swarm, commands };
@@ -60,29 +60,38 @@ impl PublishNetwork {
     /// Create a new publish network for [SealedWorkerBlock].
     ///
     /// This type is used by worker to publish sealed blocks after they reach quorum.
-    pub fn new_for_worker(multiaddr: Multiaddr) -> eyre::Result<(Self, GossipNetworkHandle)> {
+    pub fn new_for_worker(
+        multiaddr: Multiaddr,
+        gossipsub_config: gossipsub::Config,
+    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // worker's default topic
         let topic = gossipsub::IdentTopic::new(WORKER_BLOCK_TOPIC);
-        Self::new::<SealedWorkerBlock>(topic, multiaddr)
+        Self::new::<SealedWorkerBlock>(topic, multiaddr, gossipsub_config)
     }
 
     /// Create a new publish network for [Certificate].
     ///
     /// This type is used by primary to publish certificates after headers reach quorum.
-    pub fn new_for_primary(multiaddr: Multiaddr) -> eyre::Result<(Self, GossipNetworkHandle)> {
+    pub fn new_for_primary(
+        multiaddr: Multiaddr,
+        gossipsub_config: gossipsub::Config,
+    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // primary's default topic
         let topic = gossipsub::IdentTopic::new(PRIMARY_CERT_TOPIC);
-        Self::new::<Certificate>(topic, multiaddr)
+        Self::new::<Certificate>(topic, multiaddr, gossipsub_config)
     }
 
     /// Create a new publish network for [ConsensusHeader].
     ///
     /// This type is used by consensus to publish consensus block headers after the subdag commits
     /// the latest round (finality).
-    pub fn new_for_consensus(multiaddr: Multiaddr) -> eyre::Result<(Self, GossipNetworkHandle)> {
+    pub fn new_for_consensus(
+        multiaddr: Multiaddr,
+        gossipsub_config: gossipsub::Config,
+    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // consensus header's default topic
         let topic = gossipsub::IdentTopic::new(CONSENSUS_HEADER_TOPIC);
-        Self::new::<ConsensusHeader>(topic, multiaddr)
+        Self::new::<ConsensusHeader>(topic, multiaddr, gossipsub_config)
     }
 
     /// Run the network loop to process incoming gossip.
@@ -210,7 +219,11 @@ impl PublishNetwork {
 #[cfg(test)]
 mod tests {
     use super::PublishNetwork;
-    use crate::{types::WORKER_BLOCK_TOPIC, SubscriberNetwork};
+    use crate::{
+        helpers::{publisher_gossip_config, subscriber_gossip_config},
+        types::WORKER_BLOCK_TOPIC,
+        SubscriberNetwork,
+    };
     use libp2p::{gossipsub::IdentTopic, Multiaddr, PeerId};
     use std::{collections::HashSet, str::FromStr as _, time::Duration};
     use tn_test_utils::fixture_batch_with_transactions;
@@ -225,8 +238,9 @@ mod tests {
             .expect("multiaddr parsed for worker gossip publisher");
 
         // create publisher
+        let default_pub_config = publisher_gossip_config()?;
         let (worker_publish_network, worker_publish_network_handle) =
-            PublishNetwork::new_for_worker(listen_on.clone())?;
+            PublishNetwork::new_for_worker(listen_on.clone(), default_pub_config)?;
 
         // spawn publish network
         worker_publish_network.run();
@@ -236,8 +250,14 @@ mod tests {
 
         // create subscriber
         let (tx_sub, mut rx_sub) = mpsc::channel::<SealedWorkerBlock>(1);
+        let default_sub_config = subscriber_gossip_config()?;
         let (worker_subscriber_network, worker_subscriber_network_handle) =
-            SubscriberNetwork::new_for_worker(tx_sub, listen_on, HashSet::from([cvv]))?;
+            SubscriberNetwork::new_for_worker(
+                tx_sub,
+                listen_on,
+                HashSet::from([cvv]),
+                default_sub_config,
+            )?;
 
         // spawn subscriber network
         worker_subscriber_network.run();

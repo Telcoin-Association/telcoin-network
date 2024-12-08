@@ -2,8 +2,6 @@
 //!
 //! Subscribers receive gossipped output from committee-voting validators.
 
-use std::collections::{HashMap, HashSet};
-
 use crate::{
     helpers::{process_network_command, start_swarm, subscriber_gossip_config},
     types::{
@@ -18,6 +16,7 @@ use libp2p::{
     swarm::SwarmEvent,
     Multiaddr, PeerId, Swarm,
 };
+use std::collections::{HashMap, HashSet};
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
@@ -55,14 +54,14 @@ where
         sender: mpsc::Sender<M>,
         multiaddr: Multiaddr,
         authorized_publishers: HashSet<PeerId>,
+        gossipsub_config: gossipsub::Config,
     ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // create handle
         let (handle_tx, commands) = mpsc::channel(1);
         let handle = GossipNetworkHandle::new(handle_tx);
 
         // create swarm and start listening
-        let subscriber_config = subscriber_gossip_config()?;
-        let mut swarm = start_swarm::<M>(multiaddr, subscriber_config)?;
+        let mut swarm = start_swarm::<M>(multiaddr, gossipsub_config)?;
 
         // configure peer score parameters
         //
@@ -105,10 +104,11 @@ where
         sender: mpsc::Sender<M>,
         multiaddr: Multiaddr,
         authorized_publishers: HashSet<PeerId>,
+        gossipsub_config: gossipsub::Config,
     ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // worker's default topic
         let topic = gossipsub::IdentTopic::new(WORKER_BLOCK_TOPIC);
-        Self::new(topic, sender, multiaddr, authorized_publishers)
+        Self::new(topic, sender, multiaddr, authorized_publishers, gossipsub_config)
     }
 
     /// Create a new subscribe network for [Certificate].
@@ -118,10 +118,11 @@ where
         sender: mpsc::Sender<M>,
         multiaddr: Multiaddr,
         authorized_publishers: HashSet<PeerId>,
+        gossipsub_config: gossipsub::Config,
     ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // primary's default topic
         let topic = gossipsub::IdentTopic::new(PRIMARY_CERT_TOPIC);
-        Self::new(topic, sender, multiaddr, authorized_publishers)
+        Self::new(topic, sender, multiaddr, authorized_publishers, gossipsub_config)
     }
 
     /// Create a new subscribe network for [ConsensusHeader].
@@ -132,10 +133,11 @@ where
         sender: mpsc::Sender<M>,
         multiaddr: Multiaddr,
         authorized_publishers: HashSet<PeerId>,
+        gossipsub_config: gossipsub::Config,
     ) -> eyre::Result<(Self, GossipNetworkHandle)> {
         // consensus header's default topic
         let topic = gossipsub::IdentTopic::new(CONSENSUS_HEADER_TOPIC);
-        Self::new(topic, sender, multiaddr, authorized_publishers)
+        Self::new(topic, sender, multiaddr, authorized_publishers, gossipsub_config)
     }
 
     /// Run the network loop to process incoming gossip.
@@ -342,7 +344,7 @@ where
 mod tests {
     use super::SubscriberNetwork;
     use crate::{
-        helpers::process_network_command,
+        helpers::{process_network_command, subscriber_gossip_config},
         types::{GossipNetworkHandle, GossipNetworkMessage, NetworkCommand, WORKER_BLOCK_TOPIC},
         PublishNetwork,
     };
@@ -371,7 +373,10 @@ mod tests {
 
     impl MaliciousPeer {
         /// Start a swarm that produces bad messages.
-        fn new(multiaddr: Multiaddr) -> (Self, GossipNetworkHandle) {
+        fn new(
+            multiaddr: Multiaddr,
+            gossipsub_config: gossipsub::Config,
+        ) -> (Self, GossipNetworkHandle) {
             // generate a random ed25519 key
             let mut swarm = SwarmBuilder::with_new_identity()
                 // tokio runtime
@@ -380,20 +385,6 @@ mod tests {
                 .with_quic()
                 // custom behavior
                 .with_behaviour(|keypair| {
-                    let message_id_fn = |_: &gossipsub::Message| {
-                        // generate random hashes
-                        let random = BlockHash::random();
-                        gossipsub::MessageId::new(random.as_ref())
-                    };
-
-                    // similar config
-                    let gossipsub_config = gossipsub::ConfigBuilder::default()
-                        .heartbeat_interval(Duration::from_secs(1))
-                        .validation_mode(gossipsub::ValidationMode::Strict)
-                        .message_id_fn(message_id_fn)
-                        .build()
-                        .expect("malicious gossipsub builds");
-
                     // build a gossipsub network behaviour
                     let network = gossipsub::Behaviour::new(
                         gossipsub::MessageAuthenticity::Signed(keypair.clone()),
@@ -462,8 +453,23 @@ mod tests {
             .parse()
             .expect("multiaddr parsed for worker gossip publisher");
 
-        // create publisher - validator
-        let (cvv_network, cvv) = PublishNetwork::new_for_worker(listen_on.clone())?;
+        // create pub config
+        let pub_config = gossipsub::ConfigBuilder::default()
+            // same as crate::helpers::publisher_gossip_config()
+            .heartbeat_interval(Duration::from_secs(1))
+            .validation_mode(gossipsub::ValidationMode::Strict)
+            .do_px()
+            // lower number of peers from default to simulate max peer connections
+            .mesh_n(1) // target # peers
+            .mesh_outbound_min(0)
+            .mesh_n_low(0) // min number of peers
+            .mesh_n_high(2) // max number of peers
+            .build()?;
+
+        // create publisher
+        //
+        // this is essentially a current committee validator that only supports 1 peer connection
+        let (cvv_network, cvv) = PublishNetwork::new_for_worker(listen_on.clone(), pub_config)?;
         let _ = cvv_network.run();
 
         // obtain publisher's information
@@ -472,14 +478,19 @@ mod tests {
         let cvv_addr = cvv_listeners.first().expect("cvv network is listening").clone();
 
         // create legit subscriber
-        let (tx_sub, mut rx_sub) = mpsc::channel::<SealedWorkerBlock>(1);
-        let (honest_network, honest_peer) =
-            SubscriberNetwork::new_for_worker(tx_sub, listen_on.clone(), HashSet::from([cvv_id]))?;
+        let (tx_sub, _rx_sub) = mpsc::channel::<SealedWorkerBlock>(1);
+        let default_sub_config = subscriber_gossip_config()?;
+        let (honest_network, honest_peer) = SubscriberNetwork::new_for_worker(
+            tx_sub,
+            listen_on.clone(),
+            HashSet::from([cvv_id]),
+            default_sub_config.clone(),
+        )?;
         let network_topic = honest_network.topic.clone();
         honest_network.run();
 
         // create malicious peer
-        let (malicious_network, malicious_peer) = MaliciousPeer::new(listen_on);
+        let (malicious_network, malicious_peer) = MaliciousPeer::new(listen_on, default_sub_config);
         malicious_network.run();
 
         // yield for network to start so listeners update
