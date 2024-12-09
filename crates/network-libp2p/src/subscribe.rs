@@ -295,3 +295,85 @@ impl SubscriberNetwork {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{types::PRIMARY_CERT_TOPIC, PublishNetwork, SubscriberNetwork};
+    use libp2p::{gossipsub::IdentTopic, Multiaddr};
+    use std::{collections::HashSet, time::Duration};
+    use tn_test_utils::fixture_batch_with_transactions;
+    use tokio::{sync::mpsc, time::timeout};
+
+    #[tokio::test]
+    async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<()> {
+        // default any address
+        let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1"
+            .parse()
+            .expect("multiaddr parsed for worker gossip publisher");
+
+        // create publisher
+        let cvv_network = PublishNetwork::default_for_primary(listen_on.clone())?;
+        let cvv = cvv_network.network_handle();
+
+        // spawn publish network
+        cvv_network.run();
+
+        // obtain publisher's peer id
+        let cvv_id = cvv.local_peer_id().await?;
+
+        // create subscriber
+        let (tx_sub, mut rx_sub) = mpsc::channel(1);
+        let nvv_network =
+            SubscriberNetwork::default_for_primary(tx_sub, listen_on, HashSet::from([cvv_id]))?;
+        let nvv = nvv_network.network_handle();
+
+        // spawn subscriber network
+        nvv_network.run();
+
+        // yield for network to start so listeners update
+        tokio::task::yield_now().await;
+
+        let pub_listeners = cvv.listeners().await?;
+        let pub_addr = pub_listeners.first().expect("pub network is listening").clone();
+
+        // dial publisher to exchange information
+        nvv.dial(pub_addr.into()).await?;
+
+        // allow enough time for peer info to exchange from dial
+        //
+        // sleep seems to be the only thing that works here
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // publish random block
+        let random_block = fixture_batch_with_transactions(10);
+        let sealed_block = random_block.seal_slow();
+        let expected_result = Vec::from(&sealed_block);
+        let _message_id =
+            cvv.publish(IdentTopic::new(PRIMARY_CERT_TOPIC), expected_result.clone()).await?;
+
+        // wait for subscriber to forward
+        let gossip_block = timeout(Duration::from_secs(2), rx_sub.recv())
+            .await
+            .expect("timeout waiting for gossiped worker block")
+            .expect("worker block received");
+
+        assert_eq!(gossip_block, expected_result);
+
+        // remove cvv from whitelist and try to publish again
+        nvv.update_authorized_publishers(HashSet::with_capacity(0)).await?;
+
+        let random_block = fixture_batch_with_transactions(10);
+        let sealed_block = random_block.seal_slow();
+        let expected_result = Vec::from(&sealed_block);
+        let _message_id =
+            cvv.publish(IdentTopic::new(PRIMARY_CERT_TOPIC), expected_result.clone()).await?;
+
+        // message should never be forwarded
+        let timeout = timeout(Duration::from_secs(2), rx_sub.recv()).await;
+        assert!(timeout.is_err());
+
+        // TODO: assert peer score after bad message
+
+        Ok(())
+    }
+}

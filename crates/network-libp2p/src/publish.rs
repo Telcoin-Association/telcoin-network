@@ -224,7 +224,10 @@ impl PublishNetwork {
 #[cfg(test)]
 mod tests {
     use super::PublishNetwork;
-    use crate::{types::WORKER_BLOCK_TOPIC, SubscriberNetwork};
+    use crate::{
+        types::{PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC},
+        SubscriberNetwork,
+    };
     use libp2p::{gossipsub::IdentTopic, Multiaddr};
     use std::{collections::HashSet, time::Duration};
     use tn_test_utils::fixture_batch_with_transactions;
@@ -238,32 +241,32 @@ mod tests {
             .expect("multiaddr parsed for worker gossip publisher");
 
         // create publisher
-        let worker_publish_network = PublishNetwork::default_for_worker(listen_on.clone())?;
-        let worker_publish_network_handle = worker_publish_network.network_handle();
+        let cvv_network = PublishNetwork::default_for_worker(listen_on.clone())?;
+        let cvv = cvv_network.network_handle();
 
         // spawn publish network
-        worker_publish_network.run();
+        cvv_network.run();
 
         // obtain publisher's peer id
-        let cvv = worker_publish_network_handle.local_peer_id().await?;
+        let cvv_id = cvv.local_peer_id().await?;
 
         // create subscriber
         let (tx_sub, mut rx_sub) = mpsc::channel(1);
-        let worker_subscriber_network =
-            SubscriberNetwork::default_for_worker(tx_sub, listen_on, HashSet::from([cvv]))?;
-        let worker_subscriber_network_handle = worker_subscriber_network.network_handle();
+        let nvv_network =
+            SubscriberNetwork::default_for_worker(tx_sub, listen_on, HashSet::from([cvv_id]))?;
+        let nvv = nvv_network.network_handle();
 
         // spawn subscriber network
-        worker_subscriber_network.run();
+        nvv_network.run();
 
         // yield for network to start so listeners update
         tokio::task::yield_now().await;
 
-        let pub_listeners = worker_publish_network_handle.listeners().await?;
+        let pub_listeners = cvv.listeners().await?;
         let pub_addr = pub_listeners.first().expect("pub network is listening").clone();
 
         // dial publisher to exchange information
-        worker_subscriber_network_handle.dial(pub_addr.into()).await?;
+        nvv.dial(pub_addr.into()).await?;
 
         // allow enough time for peer info to exchange from dial
         //
@@ -274,9 +277,15 @@ mod tests {
         let random_block = fixture_batch_with_transactions(10);
         let sealed_block = random_block.seal_slow();
         let expected_result = Vec::from(&sealed_block);
-        let _message_id = worker_publish_network_handle
-            .publish(IdentTopic::new(WORKER_BLOCK_TOPIC), expected_result.clone())
-            .await?;
+
+        // publish on wrong topic - no peers
+        let expected_failure =
+            cvv.publish(IdentTopic::new(PRIMARY_CERT_TOPIC), expected_result.clone()).await;
+        assert!(expected_failure.is_err());
+
+        // publish correct message
+        let _message_id =
+            cvv.publish(IdentTopic::new(WORKER_BLOCK_TOPIC), expected_result.clone()).await?;
 
         // wait for subscriber to forward
         let gossip_block = timeout(Duration::from_secs(5), rx_sub.recv())
