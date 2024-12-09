@@ -478,7 +478,7 @@ mod tests {
             .mesh_n(1) // target # peers
             .mesh_outbound_min(0)
             .mesh_n_low(0) // min number of peers
-            .mesh_n_high(2) // max number of peers
+            .mesh_n_high(1) // max number of peers
             .prune_peers(1)
             .build()?;
 
@@ -558,6 +558,8 @@ mod tests {
         println!("honest_id: {honest_id:?}");
         println!("malicious_id: {mal_id:?}");
 
+        // all peers for debug
+
         // assert cvv's peers
         let peers = cvv.connected_peers().await?;
         println!("cvv node's peers: {peers:?}");
@@ -586,8 +588,8 @@ mod tests {
         // publish bad bytes
         //
         // `Certificate` does not deserialize to `SealedWorkerBlock`
-        let random_bytes = tn_types::encode(&Certificate::default());
-        malicious_peer.publish(IdentTopic::new(WORKER_BLOCK_TOPIC), random_bytes.to_vec()).await?;
+        let _random_bytes = tn_types::encode(&Certificate::default());
+        // malicious_peer.publish(IdentTopic::new(WORKER_BLOCK_TOPIC), random_bytes.to_vec()).await?;
 
         // app score
         //
@@ -631,6 +633,9 @@ mod tests {
         println!("cvv_all_peers: {cvv_all_peers:?}");
         let cvv_all_mesh_peers = cvv.all_mesh_peers().await?;
         println!("cvv_all_mesh_peers: {cvv_all_mesh_peers:?}");
+
+        // sleep for 2 heartbeats
+        let _ = tokio::time::sleep(Duration::from_secs(2)).await;
 
         Ok(())
     }

@@ -144,6 +144,13 @@ pub(crate) fn process_network_command(
                 .all_peers()
                 .map(|(peer_id, vec)| (peer_id.clone(), vec.into_iter().cloned().collect()))
                 .collect();
+
+            // delete this
+            let this_id_delete = network.local_peer_id().clone();
+            let peer_protocols: Vec<_> = network.behaviour_mut().peer_protocol().collect();
+            println!("\n\n{this_id_delete:?}\npeer_protcols:\n{peer_protocols:?}\n\n");
+            // done
+
             if let Err(e) = reply.send(collection) {
                 error!(target: "gossip-network", ?e, "AllPeers command failed");
             }
