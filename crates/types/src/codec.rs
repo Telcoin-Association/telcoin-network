@@ -71,10 +71,3 @@ pub fn try_decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> eyre::Result<T> {
 pub fn encode<T: Serialize>(obj: &T) -> Vec<u8> {
     bcs::to_bytes(obj).unwrap_or_else(|_| panic!("Serialization should not fail"))
 }
-
-/// Try to encode an object to a byte vector.
-///
-/// This version will be optimized without regard to binary sort order.
-pub fn try_encode<T: Serialize>(obj: &T) -> eyre::Result<Vec<u8>> {
-    Ok(bcs::to_bytes(obj)?)
-}

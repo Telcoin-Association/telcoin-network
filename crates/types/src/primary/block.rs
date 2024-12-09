@@ -74,10 +74,9 @@ impl From<ConsensusOutput> for ConsensusHeader {
     }
 }
 
-impl TryFrom<Vec<u8>> for ConsensusHeader {
-    type Error = eyre::ErrReport;
-    fn try_from(value: Vec<u8>) -> eyre::Result<Self> {
-        crate::try_decode(&value)
+impl From<&[u8]> for ConsensusHeader {
+    fn from(value: &[u8]) -> Self {
+        crate::decode(value)
     }
 }
 
