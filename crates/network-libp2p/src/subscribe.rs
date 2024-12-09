@@ -100,7 +100,7 @@ impl SubscriberNetwork {
     /// Create a new subscribe network for [SealedWorkerBlock].
     ///
     /// This type is used by worker to subscribe sealed blocks after they reach quorum.
-    pub fn new_default_for_worker(
+    pub fn default_for_worker(
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
         authorized_publishers: HashSet<PeerId>,
@@ -115,7 +115,7 @@ impl SubscriberNetwork {
     /// Create a new subscribe network for [Certificate].
     ///
     /// This type is used by primary to subscribe certificates after headers reach quorum.
-    pub fn new_default_for_primary(
+    pub fn default_for_primary(
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
         authorized_publishers: HashSet<PeerId>,
@@ -131,7 +131,7 @@ impl SubscriberNetwork {
     ///
     /// This type is used by consensus to subscribe consensus block headers after the subdag commits
     /// the latest round (finality).
-    pub fn new_default_for_consensus(
+    pub fn default_for_consensus(
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
         authorized_publishers: HashSet<PeerId>,

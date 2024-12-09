@@ -62,7 +62,7 @@ impl PublishNetwork {
     /// Create a new publish network for [SealedWorkerBlock].
     ///
     /// This type is used by worker to publish sealed blocks after they reach quorum.
-    pub fn new_default_for_worker(multiaddr: Multiaddr) -> eyre::Result<Self> {
+    pub fn default_for_worker(multiaddr: Multiaddr) -> eyre::Result<Self> {
         // worker's default topic
         let topic = gossipsub::IdentTopic::new(WORKER_BLOCK_TOPIC);
         // default publish gossipsub config
@@ -73,7 +73,7 @@ impl PublishNetwork {
     /// Create a new publish network for [Certificate].
     ///
     /// This type is used by primary to publish certificates after headers reach quorum.
-    pub fn new_default_for_primary(multiaddr: Multiaddr) -> eyre::Result<Self> {
+    pub fn default_for_primary(multiaddr: Multiaddr) -> eyre::Result<Self> {
         // primary's default topic
         let topic = gossipsub::IdentTopic::new(PRIMARY_CERT_TOPIC);
         // default publish gossipsub config
@@ -85,7 +85,7 @@ impl PublishNetwork {
     ///
     /// This type is used by consensus to publish consensus block headers after the subdag commits
     /// the latest round (finality).
-    pub fn new_default_for_consensus(multiaddr: Multiaddr) -> eyre::Result<Self> {
+    pub fn default_for_consensus(multiaddr: Multiaddr) -> eyre::Result<Self> {
         // consensus header's default topic
         let topic = gossipsub::IdentTopic::new(CONSENSUS_HEADER_TOPIC);
         // default publish gossipsub config
@@ -232,7 +232,7 @@ mod tests {
             .expect("multiaddr parsed for worker gossip publisher");
 
         // create publisher
-        let worker_publish_network = PublishNetwork::new_default_for_worker(listen_on.clone())?;
+        let worker_publish_network = PublishNetwork::default_for_worker(listen_on.clone())?;
         let worker_publish_network_handle = worker_publish_network.network_handle();
 
         // spawn publish network
@@ -244,7 +244,7 @@ mod tests {
         // create subscriber
         let (tx_sub, mut rx_sub) = mpsc::channel(1);
         let worker_subscriber_network =
-            SubscriberNetwork::new_default_for_worker(tx_sub, listen_on, HashSet::from([cvv]))?;
+            SubscriberNetwork::default_for_worker(tx_sub, listen_on, HashSet::from([cvv]))?;
         let worker_subscriber_network_handle = worker_subscriber_network.network_handle();
 
         // spawn subscriber network
