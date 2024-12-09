@@ -11358,7 +11358,6 @@ dependencies = [
  "fastcrypto",
  "futures",
  "libp2p",
- "reth-tracing",
  "serde",
  "tn-test-utils",
  "tn-types",
