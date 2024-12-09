@@ -3,20 +3,20 @@
 //! Subscribers receive gossipped output from committee-voting validators.
 
 use crate::{
-    helpers::{process_network_command, start_swarm},
+    helpers::{process_network_command, start_swarm, subscriber_gossip_config},
     types::{
-        GossipNetworkHandle, NetworkCommand, PublishMessageId, CONSENSUS_HEADER_TOPIC,
-        PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
+        GossipNetworkHandle, NetworkCommand, CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC,
+        WORKER_BLOCK_TOPIC,
     },
 };
 use eyre::eyre;
 use futures::StreamExt as _;
 use libp2p::{
-    gossipsub::{self, IdentTopic},
+    gossipsub::{self, IdentTopic, MessageAcceptance, TopicScoreParams},
     swarm::SwarmEvent,
-    Multiaddr, Swarm,
+    Multiaddr, PeerId, Swarm,
 };
-use tn_types::{Certificate, ConsensusHeader, SealedWorkerBlock};
+use std::collections::{HashMap, HashSet};
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
@@ -31,71 +31,115 @@ pub struct SubscriberNetwork {
     network: Swarm<gossipsub::Behaviour>,
     /// The stream for forwarding downloaded messages.
     sender: Sender<Vec<u8>>,
+    /// The sender for network handles.
+    handle: Sender<NetworkCommand>,
     /// The receiver for processing network handle requests.
     commands: Receiver<NetworkCommand>,
+    /// The collection of staked validators.
+    ///
+    /// This set must be updated at the start of each epoch. It is used to verify message sources are from validators.
+    authorized_publishers: HashSet<PeerId>,
 }
 
 impl SubscriberNetwork {
     /// Create a new instance of Self.
-    pub fn new<'a, M>(
+    pub fn new(
         topic: IdentTopic,
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> eyre::Result<(Self, GossipNetworkHandle)>
-    where
-        M: PublishMessageId<'a>,
-    {
+        authorized_publishers: HashSet<PeerId>,
+        gossipsub_config: gossipsub::Config,
+    ) -> eyre::Result<Self> {
         // create handle
-        let (handle_tx, commands) = mpsc::channel(1);
-        let handle = GossipNetworkHandle::new(handle_tx);
+        let (handle, commands) = mpsc::channel(1);
 
         // create swarm and start listening
-        let mut swarm = start_swarm::<M>(multiaddr)?;
+        let mut swarm = start_swarm(multiaddr, gossipsub_config)?;
+
+        // configure peer score parameters
+        //
+        // default for now
+        let score_params = gossipsub::PeerScoreParams {
+            topics: HashMap::from([(topic.hash(), TopicScoreParams::default())]),
+            ..Default::default()
+        };
+
+        // configure thresholds at which peers are considered faulty or malicious
+        //
+        // peer baseline is 0
+        let score_thresholds = gossipsub::PeerScoreThresholds {
+            gossip_threshold: -10.0,   // ignore gossip to and from peer
+            publish_threshold: -20.0,  // don't flood publish to this peer
+            graylist_threshold: -50.0, // effectively ignore peer
+            accept_px_threshold: 10.0, // score only attainable by validators
+            opportunistic_graft_threshold: 5.0,
+        };
+
+        // enable peer scoring
+        swarm.behaviour_mut().with_peer_score(score_params, score_thresholds).map_err(|e| {
+            error!(?e, "gossipsub publish network");
+            eyre!("failed to set peer score for gossipsub")
+        })?;
 
         // subscribe to topic
         swarm.behaviour_mut().subscribe(&topic)?;
 
         // create Self
-        let network = Self { topic, network: swarm, sender, commands };
+        let network =
+            Self { topic, network: swarm, sender, handle, commands, authorized_publishers };
 
-        Ok((network, handle))
+        Ok(network)
+    }
+
+    /// Return a [GossipNetworkHandle] to send commands to this network.
+    pub fn network_handle(&self) -> GossipNetworkHandle {
+        GossipNetworkHandle::new(self.handle.clone())
     }
 
     /// Create a new subscribe network for [SealedWorkerBlock].
     ///
     /// This type is used by worker to subscribe sealed blocks after they reach quorum.
-    pub fn new_for_worker(
+    pub fn new_default_for_worker(
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
+        authorized_publishers: HashSet<PeerId>,
+    ) -> eyre::Result<Self> {
         // worker's default topic
         let topic = gossipsub::IdentTopic::new(WORKER_BLOCK_TOPIC);
-        Self::new::<SealedWorkerBlock>(topic, sender, multiaddr)
+        // default gossipsub config
+        let gossipsub_config = subscriber_gossip_config()?;
+        Self::new(topic, sender, multiaddr, authorized_publishers, gossipsub_config)
     }
 
     /// Create a new subscribe network for [Certificate].
     ///
     /// This type is used by primary to subscribe certificates after headers reach quorum.
-    pub fn new_for_primary(
+    pub fn new_default_for_primary(
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
+        authorized_publishers: HashSet<PeerId>,
+    ) -> eyre::Result<Self> {
         // primary's default topic
         let topic = gossipsub::IdentTopic::new(PRIMARY_CERT_TOPIC);
-        Self::new::<Certificate>(topic, sender, multiaddr)
+        // default gossipsub config
+        let gossipsub_config = subscriber_gossip_config()?;
+        Self::new(topic, sender, multiaddr, authorized_publishers, gossipsub_config)
     }
 
     /// Create a new subscribe network for [ConsensusHeader].
     ///
     /// This type is used by consensus to subscribe consensus block headers after the subdag commits
     /// the latest round (finality).
-    pub fn new_for_consensus(
+    pub fn new_default_for_consensus(
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
-    ) -> eyre::Result<(Self, GossipNetworkHandle)> {
+        authorized_publishers: HashSet<PeerId>,
+    ) -> eyre::Result<Self> {
         // consensus header's default topic
         let topic = gossipsub::IdentTopic::new(CONSENSUS_HEADER_TOPIC);
-        Self::new::<ConsensusHeader>(topic, sender, multiaddr)
+        // default gossipsub config
+        let gossipsub_config = subscriber_gossip_config()?;
+        Self::new(topic, sender, multiaddr, authorized_publishers, gossipsub_config)
     }
 
     /// Run the network loop to process incoming gossip.
@@ -105,7 +149,7 @@ impl SubscriberNetwork {
                 tokio::select! {
                     event = self.network.select_next_some() => self.process_event(event).await?,
                     command = self.commands.recv() => match command {
-                        Some(c) => self.process_command(c).await,
+                        Some(c) => self.process_command(c),
                         None => {
                             info!(target: "subscriber-network", topic=?self.topic, "subscriber shutting down...");
                             return Ok(())
@@ -117,7 +161,7 @@ impl SubscriberNetwork {
     }
 
     /// Process commands for the swarm.
-    async fn process_command(&mut self, command: NetworkCommand) {
+    fn process_command(&mut self, command: NetworkCommand) {
         process_network_command(command, &mut self.network);
     }
 
@@ -127,18 +171,30 @@ impl SubscriberNetwork {
             SwarmEvent::Behaviour(gossip) => match gossip {
                 gossipsub::Event::Message { propagation_source, message_id, message } => {
                     trace!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?message, "message received from publisher");
-                    // - `propagation_source` is the PeerId created from the  publisher's public key
-                    // - message_id is the digest of the worker block / certificate / consensus
-                    //   header
-                    // - message.data is the gossipped worker block / certificate / consensus header
-                    //
-                    // NOTE: self implementation assumes valid encode/decode from peers
-                    // TODO: pass the propogation source to receiver and report bad peers back to
-                    // the swarm
-                    if let Err(e) = self.sender.try_send(message.data) {
-                        // fatal: receiver dropped or channel queue full
-                        error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
-                        return Err(eyre!("network receiver dropped!"));
+                    // verify message was published by authorized node
+                    let msg_acceptance = if message
+                        .source
+                        .is_some_and(|id| self.authorized_publishers.contains(&id))
+                    {
+                        // forward message to handler
+                        if let Err(e) = self.sender.try_send(message.data) {
+                            error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
+                            // fatal - unable to process gossipped messages
+                            return Err(eyre!("network receiver dropped!"));
+                        }
+
+                        MessageAcceptance::Accept
+                    } else {
+                        MessageAcceptance::Reject
+                    };
+
+                    // report message validation results
+                    if let Err(e) = self.network.behaviour_mut().report_message_validation_result(
+                        &message_id,
+                        &propagation_source,
+                        msg_acceptance,
+                    ) {
+                        error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "error reporting message validation result");
                     }
                 }
                 gossipsub::Event::Subscribed { peer_id, topic } => {
