@@ -182,6 +182,27 @@ impl GossipNetworkHandle {
         Ok(peers.await?)
     }
 
+    /// Map of all known peers and their associated subscribed topics.
+    pub async fn all_peers(&self) -> eyre::Result<HashMap<PeerId, Vec<TopicHash>>> {
+        let (reply, all_peers) = oneshot::channel();
+        self.sender.send(NetworkCommand::AllPeers { reply }).await?;
+        Ok(all_peers.await?)
+    }
+
+    /// Collection of all mesh peers.
+    pub async fn all_mesh_peers(&self) -> eyre::Result<Vec<PeerId>> {
+        let (reply, all_mesh_peers) = oneshot::channel();
+        self.sender.send(NetworkCommand::AllMeshPeers { reply }).await?;
+        Ok(all_mesh_peers.await?)
+    }
+
+    /// Collection of all mesh peers by a certain topic hash.
+    pub async fn mesh_peers(&self, topic: TopicHash) -> eyre::Result<Vec<PeerId>> {
+        let (reply, mesh_peers) = oneshot::channel();
+        self.sender.send(NetworkCommand::MeshPeers { topic, reply }).await?;
+        Ok(mesh_peers.await?)
+    }
+
     /// Retrieve a specific peer's score, if it exists.
     pub async fn peer_score(&self, peer_id: PeerId) -> eyre::Result<Option<f64>> {
         let (reply, score) = oneshot::channel();

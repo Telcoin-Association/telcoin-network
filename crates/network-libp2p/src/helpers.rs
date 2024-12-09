@@ -71,6 +71,7 @@ pub fn publisher_gossip_config() -> eyre::Result<gossipsub::Config> {
         .validation_mode(gossipsub::ValidationMode::Strict)
         // support peer exchange
         .do_px()
+        .prune_peers(6)
         .build()?;
 
     Ok(config)

@@ -303,6 +303,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_peer_exchange() -> eyre::Result<()> {
+        todo!();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_peer_status_after_dialing() -> eyre::Result<()> {
         // default any address
         let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1"
@@ -315,14 +321,14 @@ mod tests {
             PublishNetwork::new_for_worker(listen_on.clone(), default_pub_config)?;
 
         // handle
-        let authority = authority_network.network_handle();
+        let cvv = authority_network.network_handle();
 
         // spawn publish network
         authority_network.run();
 
         // obtain publisher's peer id
-        let cvv = authority.local_peer_id().await?;
-        println!("cvv peer_id: {cvv:?}");
+        let cvv_peer_id = cvv.local_peer_id().await?;
+        println!("cvv peer_id: {cvv_peer_id:?}");
 
         // create subscriber
         let (tx_sub, _rx_sub) = mpsc::channel::<SealedWorkerBlock>(1);
@@ -330,7 +336,7 @@ mod tests {
         let nvv_network = SubscriberNetwork::new_for_worker(
             tx_sub,
             listen_on,
-            HashSet::from([cvv]),
+            HashSet::from([cvv_peer_id]),
             default_sub_config,
         )?;
         let nvv = nvv_network.network_handle();
@@ -341,7 +347,7 @@ mod tests {
         // yield for network to start so listeners update
         tokio::task::yield_now().await;
 
-        let authority_listeners = authority.listeners().await?;
+        let authority_listeners = cvv.listeners().await?;
         let authority_addr =
             authority_listeners.first().cloned().expect("pub network is listening");
 
@@ -356,9 +362,34 @@ mod tests {
         let nvv_peer_id = nvv.local_peer_id().await?;
         println!("nvv_peer_id: {nvv_peer_id:?}");
         let nvv_peers = nvv.connected_peers().await?;
-        let authority_peers = authority.connected_peers().await?;
-        println!("authority_peers: {authority_peers:?}");
+        let cvv_peers = cvv.connected_peers().await?;
+        println!("cvv_peers: {cvv_peers:?}");
         println!("nvv_peers: {nvv_peers:?}");
+
+        let nvv_all_peers = nvv.all_peers().await?;
+        println!("nvv_all_peers: {nvv_all_peers:?}");
+        let nvv_all_mesh_peers = nvv.all_mesh_peers().await?;
+        println!("nvv_all_mesh_peers: {nvv_all_mesh_peers:?}");
+
+        let cvv_all_peers = cvv.all_peers().await?;
+        println!("cvv_all_peers: {cvv_all_peers:?}");
+        let cvv_all_mesh_peers = cvv.all_mesh_peers().await?;
+        println!("cvv_all_mesh_peers: {cvv_all_mesh_peers:?}");
+
+        // subscribe to topic
+        let subscribe_res = nvv.subscribe(IdentTopic::new(WORKER_BLOCK_TOPIC)).await?;
+        // already subscribed
+        assert!(!subscribe_res);
+
+        let nvv_all_peers = nvv.all_peers().await?;
+        println!("after nvv_all_peers: {nvv_all_peers:?}");
+        let nvv_all_mesh_peers = nvv.all_mesh_peers().await?;
+        println!("after nvv_all_mesh_peers: {nvv_all_mesh_peers:?}");
+
+        let cvv_all_peers = cvv.all_peers().await?;
+        println!("after cvv_all_peers: {cvv_all_peers:?}");
+        let cvv_all_mesh_peers = cvv.all_mesh_peers().await?;
+        println!("after cvv_all_mesh_peers: {cvv_all_mesh_peers:?}");
 
         Ok(())
     }

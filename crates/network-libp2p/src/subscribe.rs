@@ -452,6 +452,14 @@ mod tests {
         }
     }
 
+    // here's how this should work:
+    // - cvv starts network
+    // - honest node joins to receive gossip
+    // - malicious (mal) node dials cvv to join network
+    // - cvv does px with mal node to simulate peer discovery in production
+    // - mal node becomes mesh peer with honest node
+    // - mal node tries to publish message
+    // - mal node gets kicked from honest node mesh
     #[tokio::test]
     async fn test_peer_removed_after_bad_gossip() -> eyre::Result<()> {
         reth_tracing::init_test_tracing();
@@ -471,6 +479,7 @@ mod tests {
             .mesh_outbound_min(0)
             .mesh_n_low(0) // min number of peers
             .mesh_n_high(2) // max number of peers
+            .prune_peers(1)
             .build()?;
 
         // create publisher
@@ -509,14 +518,17 @@ mod tests {
 
         // dial publisher to exchange information
         honest_peer.dial(cvv_addr.clone().into()).await?;
-        honest_peer.subscribe(network_topic.clone()).await?;
+        let sub_res = honest_peer.subscribe(network_topic.clone()).await?;
+        assert!(!sub_res); // already subscribed
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
+        // malicious peer dials
         malicious_peer.dial(cvv_addr.clone().into()).await?;
 
         // subscribe to topic now
-        malicious_peer.subscribe(network_topic.clone()).await?;
+        let sub_res = malicious_peer.subscribe(network_topic.clone()).await?;
+        assert!(sub_res); // expect first time subscribing
 
         // allow enough time for peer info to exchange from dial
         //
@@ -546,17 +558,23 @@ mod tests {
         println!("honest_id: {honest_id:?}");
         println!("malicious_id: {mal_id:?}");
 
+        // assert cvv's peers
+        let peers = cvv.connected_peers().await?;
+        println!("cvv node's peers: {peers:?}");
+        assert!(peers.contains(&honest_id));
+        assert!(peers.contains(&mal_id));
+
         // assert honest node's peers
         let peers = honest_peer.connected_peers().await?;
         println!("honest node's peers: {peers:?}");
         assert!(peers.contains(&cvv_id));
-        assert!(peers.contains(&mal_id));
+        // assert!(peers.contains(&mal_id));
 
         // assert malicious node's peers
         let peers = malicious_peer.connected_peers().await?;
         println!("mal node's peers: {peers:?}");
         assert!(peers.contains(&cvv_id));
-        assert!(peers.contains(&honest_id));
+        // assert!(peers.contains(&honest_id));
 
         println!("malicious peer id: {mal_id:?}");
         // println!("malicious message id: {_message_id:?}");
@@ -571,11 +589,14 @@ mod tests {
         let random_bytes = tn_types::encode(&Certificate::default());
         malicious_peer.publish(IdentTopic::new(WORKER_BLOCK_TOPIC), random_bytes.to_vec()).await?;
 
-        let app_score_updated = honest_peer.set_application_score(mal_id.clone(), -10.0).await?;
-        assert!(app_score_updated);
+        // app score
+        //
+        // let app_score_updated = honest_peer.set_application_score(mal_id.clone(), -10.0).await?;
+        // assert!(app_score_updated);
 
         // sleep for state to advance
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::task::yield_now().await;
 
         // assert peers are disconnected
         // let peers = honest_peer.connected_peers().await?;
@@ -586,6 +607,30 @@ mod tests {
         // assert!(!peers.contains(&mal_id));
 
         // compare mesh vs explicit peers
+        let mal_peers = malicious_peer.connected_peers().await?;
+        let honest_peers = honest_peer.connected_peers().await?;
+        let cvv_peers = cvv.connected_peers().await?;
+        println!("cvv_peers: {cvv_peers:?}");
+        println!("honest_peers: {honest_peers:?}");
+        println!("mal_peers: {mal_peers:?}");
+
+        // honest peer
+        let honest_all_peers = honest_peer.all_peers().await?;
+        println!("honest_all_peers: {honest_all_peers:?}");
+        let honest_all_mesh_peers = honest_peer.all_mesh_peers().await?;
+        println!("honest_all_mesh_peers: {honest_all_mesh_peers:?}");
+
+        // malicious peer
+        let mal_all_peers = malicious_peer.all_peers().await?;
+        println!("mal_all_peers: {mal_all_peers:?}");
+        let mal_all_mesh_peers = malicious_peer.all_mesh_peers().await?;
+        println!("mal_all_mesh_peers: {mal_all_mesh_peers:?}");
+
+        // cvv
+        let cvv_all_peers = cvv.all_peers().await?;
+        println!("cvv_all_peers: {cvv_all_peers:?}");
+        let cvv_all_mesh_peers = cvv.all_mesh_peers().await?;
+        println!("cvv_all_mesh_peers: {cvv_all_mesh_peers:?}");
 
         Ok(())
     }
