@@ -3,7 +3,7 @@
 //! Subscribers receive gossipped output from committee-voting validators.
 
 use crate::{
-    helpers::{process_network_command, start_swarm, subscriber_gossip_config},
+    helpers::{process_swarm_command, start_swarm, subscriber_gossip_config},
     types::{
         GossipNetworkHandle, NetworkCommand, CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC,
         WORKER_BLOCK_TOPIC,
@@ -168,7 +168,7 @@ impl SubscriberNetwork {
                 self.authorized_publishers = authorities;
                 let _ = reply.send(Ok(()));
             }
-            _ => process_network_command(command, &mut self.network),
+            NetworkCommand::Swarm(c) => process_swarm_command(c, &mut self.network),
         }
     }
 

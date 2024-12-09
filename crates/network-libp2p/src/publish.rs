@@ -5,7 +5,7 @@
 //! This network does not subscribe to the topics it publishes.
 
 use crate::{
-    helpers::{process_network_command, publisher_gossip_config, start_swarm},
+    helpers::{process_swarm_command, publisher_gossip_config, start_swarm},
     types::{
         GossipNetworkHandle, NetworkCommand, CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC,
         WORKER_BLOCK_TOPIC,
@@ -118,7 +118,7 @@ impl PublishNetwork {
             NetworkCommand::UpdateAuthorizedPublishers { reply, .. } => {
                 let _ = reply.send(Err(eyre!("invalid command for publisher!")));
             }
-            _ => process_network_command(command, &mut self.network),
+            NetworkCommand::Swarm(c) => process_swarm_command(c, &mut self.network),
         }
     }
 
