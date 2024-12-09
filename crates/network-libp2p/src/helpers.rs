@@ -137,7 +137,7 @@ pub(crate) fn process_network_command(
             let collection = network
                 .behaviour_mut()
                 .all_peers()
-                .map(|(peer_id, vec)| (peer_id.clone(), vec.into_iter().cloned().collect()))
+                .map(|(peer_id, vec)| (*peer_id, vec.into_iter().cloned().collect()))
                 .collect();
 
             if let Err(e) = reply.send(collection) {

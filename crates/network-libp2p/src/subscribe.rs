@@ -37,7 +37,8 @@ pub struct SubscriberNetwork {
     commands: Receiver<NetworkCommand>,
     /// The collection of staked validators.
     ///
-    /// This set must be updated at the start of each epoch. It is used to verify message sources are from validators.
+    /// This set must be updated at the start of each epoch. It is used to verify message sources
+    /// are from validators.
     authorized_publishers: HashSet<PeerId>,
 }
 

@@ -267,7 +267,7 @@ mod tests {
         // publish random block
         let random_block = fixture_batch_with_transactions(10);
         let sealed_block = random_block.seal_slow();
-        let expected_result = Vec::try_from(sealed_block.clone())?;
+        let expected_result = Vec::from(&sealed_block);
         let _message_id = worker_publish_network_handle
             .publish(IdentTopic::new(WORKER_BLOCK_TOPIC), expected_result.clone())
             .await?;
