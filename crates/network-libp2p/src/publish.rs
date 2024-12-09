@@ -301,4 +301,65 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_peer_status_after_dialing() -> eyre::Result<()> {
+        // default any address
+        let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1"
+            .parse()
+            .expect("multiaddr parsed for worker gossip publisher");
+
+        // create publisher
+        let default_pub_config = publisher_gossip_config()?;
+        let authority_network =
+            PublishNetwork::new_for_worker(listen_on.clone(), default_pub_config)?;
+
+        // handle
+        let authority = authority_network.network_handle();
+
+        // spawn publish network
+        authority_network.run();
+
+        // obtain publisher's peer id
+        let cvv = authority.local_peer_id().await?;
+        println!("cvv peer_id: {cvv:?}");
+
+        // create subscriber
+        let (tx_sub, _rx_sub) = mpsc::channel::<SealedWorkerBlock>(1);
+        let default_sub_config = subscriber_gossip_config()?;
+        let nvv_network = SubscriberNetwork::new_for_worker(
+            tx_sub,
+            listen_on,
+            HashSet::from([cvv]),
+            default_sub_config,
+        )?;
+        let nvv = nvv_network.network_handle();
+
+        // spawn subscriber network
+        nvv_network.run();
+
+        // yield for network to start so listeners update
+        tokio::task::yield_now().await;
+
+        let authority_listeners = authority.listeners().await?;
+        let authority_addr =
+            authority_listeners.first().cloned().expect("pub network is listening");
+
+        // dial publisher to exchange information
+        nvv.dial(authority_addr.into()).await?;
+
+        // allow enough time for peer info to exchange from dial
+        //
+        // sleep seems to be the only thing that works here
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let nvv_peer_id = nvv.local_peer_id().await?;
+        println!("nvv_peer_id: {nvv_peer_id:?}");
+        let nvv_peers = nvv.connected_peers().await?;
+        let authority_peers = authority.connected_peers().await?;
+        println!("authority_peers: {authority_peers:?}");
+        println!("nvv_peers: {nvv_peers:?}");
+
+        Ok(())
+    }
 }

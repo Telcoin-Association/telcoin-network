@@ -1,8 +1,10 @@
 //! Constants and trait implementations for network compatibility.
 
+use std::collections::HashMap;
+
 use fastcrypto::hash::Hash as _;
 use libp2p::{
-    gossipsub::{self, IdentTopic, MessageId, PublishError, SubscriptionError},
+    gossipsub::{self, IdentTopic, MessageId, PublishError, SubscriptionError, TopicHash},
     swarm::{dial_opts::DialOpts, DialError},
     Multiaddr, PeerId,
 };
@@ -96,8 +98,14 @@ pub enum NetworkCommand {
         msg: Vec<u8>,
         reply: oneshot::Sender<std::result::Result<MessageId, PublishError>>,
     },
+    /// Map of all known peers and their associated subscribed topics.
+    AllPeers { reply: oneshot::Sender<HashMap<PeerId, Vec<TopicHash>>> },
     /// Collection of this node's connected peers.
     ConnectedPeers { reply: oneshot::Sender<Vec<PeerId>> },
+    /// Collection of all mesh peers.
+    AllMeshPeers { reply: oneshot::Sender<Vec<PeerId>> },
+    /// Collection of all mesh peers by a certain topic hash.
+    MeshPeers { topic: TopicHash, reply: oneshot::Sender<Vec<PeerId>> },
     /// The peer's score, if it exists.
     PeerScore { peer_id: PeerId, reply: oneshot::Sender<Option<f64>> },
     /// Set peer's application score.

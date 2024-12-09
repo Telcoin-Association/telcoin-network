@@ -90,3 +90,17 @@ Peers below the specified threshold (0) are pruned from the mesh during the hear
 - closed source for now
 - assume only bridging clients for now (testnet)
 - security harden later
+
+
+## Problem: Storing pub network keys on chain
+
+How to update these pubkeys?
+- submit update to consensus registry
+
+Worth having a public "trusted" consensus registry?
+- Node operators apply to be whitelisted?
+- check `propagation_source` on whitelist?
+- updated on epoch boundary?
+
+Overkill?
+Too centralized?

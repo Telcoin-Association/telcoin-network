@@ -137,5 +137,27 @@ pub(crate) fn process_network_command(
                 error!(target: "gossip-network", ?e, "SetApplicationScore command failed");
             }
         }
+        NetworkCommand::AllPeers { reply } => {
+            let collection = network
+                .behaviour_mut()
+                .all_peers()
+                .map(|(peer_id, vec)| (peer_id.clone(), vec.into_iter().cloned().collect()))
+                .collect();
+            if let Err(e) = reply.send(collection) {
+                error!(target: "gossip-network", ?e, "AllPeers command failed");
+            }
+        }
+        NetworkCommand::AllMeshPeers { reply } => {
+            let collection = network.behaviour_mut().all_mesh_peers().cloned().collect();
+            if let Err(e) = reply.send(collection) {
+                error!(target: "gossip-network", ?e, "AllMeshPeers command failed");
+            }
+        }
+        NetworkCommand::MeshPeers { topic, reply } => {
+            let collection = network.behaviour_mut().mesh_peers(&topic).cloned().collect();
+            if let Err(e) = reply.send(collection) {
+                error!(target: "gossip-network", ?e, "MeshPeers command failed");
+            }
+        }
     }
 }
