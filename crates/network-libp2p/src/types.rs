@@ -5,7 +5,7 @@ use libp2p::{
     swarm::{dial_opts::DialOpts, DialError},
     Multiaddr, PeerId,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::{mpsc, oneshot};
 
 /// The topic for NVVs to subscribe to for published worker blocks.
@@ -19,6 +19,15 @@ pub const CONSENSUS_HEADER_TOPIC: &str = "tn_consensus_headers";
 #[derive(Debug)]
 //TODO: add <M> generic here so devs can only publish correct messages?
 pub enum NetworkCommand {
+    /// Update the list of authorized publishers.
+    ///
+    /// This list is used to verify messages came from an authorized source.
+    UpdateAuthorizedPublishers {
+        /// The unique set of authorized peers.
+        authorities: HashSet<PeerId>,
+        /// The acknowledgement that the set was updated.
+        reply: oneshot::Sender<eyre::Result<()>>,
+    },
     /// Listeners
     GetListener { reply: oneshot::Sender<Vec<Multiaddr>> },
     /// Add explicit peer to add.
@@ -81,6 +90,16 @@ impl GossipNetworkHandle {
     /// Create a new instance of Self.
     pub fn new(sender: mpsc::Sender<NetworkCommand>) -> Self {
         Self { sender }
+    }
+
+    /// Update the list of authorized publishers.
+    pub async fn update_authorized_publishers(
+        &self,
+        authorities: HashSet<PeerId>,
+    ) -> eyre::Result<()> {
+        let (reply, ack) = oneshot::channel();
+        self.sender.send(NetworkCommand::UpdateAuthorizedPublishers { authorities, reply }).await?;
+        ack.await?
     }
 
     /// Request listeners from the swarm.

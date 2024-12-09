@@ -11,6 +11,7 @@ use crate::{
         WORKER_BLOCK_TOPIC,
     },
 };
+use eyre::eyre;
 use futures::StreamExt as _;
 use libp2p::{
     gossipsub::{self, IdentTopic},
@@ -113,7 +114,12 @@ impl PublishNetwork {
 
     /// Process commands for the swarm.
     fn process_command(&mut self, command: NetworkCommand) {
-        process_network_command(command, &mut self.network);
+        match command {
+            NetworkCommand::UpdateAuthorizedPublishers { reply, .. } => {
+                let _ = reply.send(Err(eyre!("invalid command for publisher!")));
+            }
+            _ => process_network_command(command, &mut self.network),
+        }
     }
 
     /// Process events from the swarm.

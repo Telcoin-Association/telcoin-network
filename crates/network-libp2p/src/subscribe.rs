@@ -163,7 +163,13 @@ impl SubscriberNetwork {
 
     /// Process commands for the swarm.
     fn process_command(&mut self, command: NetworkCommand) {
-        process_network_command(command, &mut self.network);
+        match command {
+            NetworkCommand::UpdateAuthorizedPublishers { authorities, reply } => {
+                self.authorized_publishers = authorities;
+                let _ = reply.send(Ok(()));
+            }
+            _ => process_network_command(command, &mut self.network),
+        }
     }
 
     /// Process events from the swarm.

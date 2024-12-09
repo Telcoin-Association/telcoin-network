@@ -156,5 +156,6 @@ pub(crate) fn process_network_command(
                 error!(target: "gossip-network", ?e, "MeshPeers command failed");
             }
         }
+        _ => (),
     }
 }
