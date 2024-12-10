@@ -11359,6 +11359,7 @@ dependencies = [
  "futures",
  "libp2p",
  "serde",
+ "thiserror",
  "tn-test-utils",
  "tn-types",
  "tokio",

@@ -19,11 +19,12 @@ tokio = { workspace = true, features = ["rt", "net", "sync", "macros", "time"] }
 tn-types = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
-eyre = { workspace = true }
 serde = { workspace = true }
 fastcrypto = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
+eyre = { workspace = true }
 tn-test-utils = { workspace = true }
 
 [lints]
