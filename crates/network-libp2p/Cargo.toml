@@ -24,7 +24,6 @@ fastcrypto = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-eyre = { workspace = true }
 tn-test-utils = { workspace = true }
 
 [lints]

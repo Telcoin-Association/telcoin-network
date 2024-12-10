@@ -1,6 +1,6 @@
 //! Helper methods used for handling network communication.
 
-use crate::types::SwarmCommand;
+use crate::{error::NetworkResult, types::SwarmCommand};
 use libp2p::{
     gossipsub::{self},
     Multiaddr, Swarm, SwarmBuilder,
@@ -16,7 +16,7 @@ use tracing::error;
 pub(crate) fn start_swarm(
     multiaddr: Multiaddr,
     gossipsub_config: gossipsub::Config,
-) -> eyre::Result<Swarm<gossipsub::Behaviour>> {
+) -> NetworkResult<Swarm<gossipsub::Behaviour>> {
     // generate a random ed25519 key
     let mut swarm = SwarmBuilder::with_new_identity()
         // tokio runtime
@@ -44,7 +44,7 @@ pub(crate) fn start_swarm(
 }
 
 /// Helper function for publish swarm gossip config.
-pub fn subscriber_gossip_config() -> eyre::Result<gossipsub::Config> {
+pub fn subscriber_gossip_config() -> NetworkResult<gossipsub::Config> {
     let config = gossipsub::ConfigBuilder::default()
         // explicitly set heartbeat interval (default)
         .heartbeat_interval(Duration::from_secs(1))
@@ -58,7 +58,7 @@ pub fn subscriber_gossip_config() -> eyre::Result<gossipsub::Config> {
 }
 
 /// Helper function for publish swarm gossip config.
-pub fn publisher_gossip_config() -> eyre::Result<gossipsub::Config> {
+pub fn publisher_gossip_config() -> NetworkResult<gossipsub::Config> {
     let config = gossipsub::ConfigBuilder::default()
         // explicitly set heartbeat interval (default)
         .heartbeat_interval(Duration::from_secs(1))

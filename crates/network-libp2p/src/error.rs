@@ -1,8 +1,11 @@
 //! Error types for TN network.
 
+use std::io;
+
 use libp2p::{
-    gossipsub::{PublishError, SubscriptionError},
+    gossipsub::{ConfigBuilderError, PublishError, SubscriptionError},
     swarm::DialError,
+    TransportError,
 };
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -22,12 +25,24 @@ pub enum NetworkError {
     /// Gossipsub error subscribing to topic.
     #[error(transparent)]
     Subscription(#[from] SubscriptionError),
+    /// mpsc try send
+    #[error("mpsc try send error: {0}")]
+    MpscTrySend(String),
     /// mpsc receiver dropped.
     #[error("mpsc error: {0}")]
     MpscSender(String),
     /// oneshot sender dropped.
     #[error("oneshot error: {0}")]
     AckChannelClosed(String),
+    /// Swarm failed to connect on listen address.
+    #[error(transparent)]
+    Listen(#[from] TransportError<io::Error>),
+    /// Failed to build gossipsub config.
+    #[error(transparent)]
+    GossipsubConfig(#[from] ConfigBuilderError),
+    /// Failed to build swarm with peer scoring enabled.
+    #[error("{0}")]
+    EnablePeerScoreBehavior(String),
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {
@@ -39,5 +54,11 @@ impl From<oneshot::error::RecvError> for NetworkError {
 impl<T> From<mpsc::error::SendError<T>> for NetworkError {
     fn from(e: mpsc::error::SendError<T>) -> Self {
         Self::MpscSender(e.to_string())
+    }
+}
+
+impl<T> From<mpsc::error::TrySendError<T>> for NetworkError {
+    fn from(e: mpsc::error::TrySendError<T>) -> Self {
+        Self::MpscTrySend(e.to_string())
     }
 }
