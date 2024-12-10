@@ -3,11 +3,11 @@
 //! Subscribers receive gossipped output from committee-voting validators.
 
 use crate::{
-    error::{NetworkError, NetworkResult},
+    error::NetworkError,
     helpers::{process_swarm_command, start_swarm, subscriber_gossip_config},
     types::{
-        GossipNetworkHandle, NetworkCommand, CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC,
-        WORKER_BLOCK_TOPIC,
+        GossipNetworkHandle, NetworkCommand, NetworkResult, CONSENSUS_HEADER_TOPIC,
+        PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
     },
 };
 use futures::StreamExt as _;
@@ -299,7 +299,8 @@ impl SubscriberNetwork {
 #[cfg(test)]
 mod tests {
     use crate::{
-        error::NetworkResult, types::PRIMARY_CERT_TOPIC, PublishNetwork, SubscriberNetwork,
+        types::{NetworkResult, PRIMARY_CERT_TOPIC},
+        PublishNetwork, SubscriberNetwork,
     };
     use libp2p::{gossipsub::IdentTopic, Multiaddr};
     use std::{collections::HashSet, time::Duration};

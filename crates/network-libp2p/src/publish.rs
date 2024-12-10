@@ -5,11 +5,10 @@
 //! This network does not subscribe to the topics it publishes.
 
 use crate::{
-    error::NetworkResult,
     helpers::{process_swarm_command, publisher_gossip_config, start_swarm},
     types::{
-        GossipNetworkHandle, NetworkCommand, CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC,
-        WORKER_BLOCK_TOPIC,
+        GossipNetworkHandle, NetworkCommand, NetworkResult, CONSENSUS_HEADER_TOPIC,
+        PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
     },
 };
 use futures::StreamExt as _;
@@ -227,8 +226,7 @@ impl PublishNetwork {
 mod tests {
     use super::PublishNetwork;
     use crate::{
-        error::NetworkResult,
-        types::{PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC},
+        types::{NetworkResult, PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC},
         SubscriberNetwork,
     };
     use libp2p::{gossipsub::IdentTopic, Multiaddr};

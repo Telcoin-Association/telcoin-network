@@ -1,6 +1,6 @@
 //! Helper methods used for handling network communication.
 
-use crate::{error::NetworkResult, types::SwarmCommand};
+use crate::types::{NetworkResult, SwarmCommand};
 use libp2p::{
     gossipsub::{self},
     Multiaddr, Swarm, SwarmBuilder,

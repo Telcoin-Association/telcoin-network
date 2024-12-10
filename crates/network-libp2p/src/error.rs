@@ -1,17 +1,13 @@
 //! Error types for TN network.
 
-use std::io;
-
 use libp2p::{
     gossipsub::{ConfigBuilderError, PublishError, SubscriptionError},
     swarm::DialError,
     TransportError,
 };
+use std::io;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
-
-/// The result for network operations.
-pub type NetworkResult<T> = Result<T, NetworkError>;
 
 /// Networking error type.
 #[derive(Debug, Error)]

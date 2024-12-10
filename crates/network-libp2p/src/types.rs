@@ -1,6 +1,6 @@
 //! Constants and trait implementations for network compatibility.
 
-use crate::error::NetworkResult;
+use crate::error::NetworkError;
 use libp2p::{
     gossipsub::{IdentTopic, MessageId, PublishError, SubscriptionError, TopicHash},
     swarm::{dial_opts::DialOpts, DialError},
@@ -8,6 +8,9 @@ use libp2p::{
 };
 use std::collections::{HashMap, HashSet};
 use tokio::sync::{mpsc, oneshot};
+
+/// The result for network operations.
+pub type NetworkResult<T> = Result<T, NetworkError>;
 
 /// The topic for NVVs to subscribe to for published worker blocks.
 pub const WORKER_BLOCK_TOPIC: &str = "tn_worker_blocks";
@@ -18,7 +21,6 @@ pub const CONSENSUS_HEADER_TOPIC: &str = "tn_consensus_headers";
 
 /// Commands for the swarm.
 #[derive(Debug)]
-//TODO: add <M> generic here so devs can only publish correct messages?
 pub enum NetworkCommand {
     /// Update the list of authorized publishers.
     ///
