@@ -3,13 +3,13 @@
 //! Subscribers receive gossipped output from committee-voting validators.
 
 use crate::{
+    error::NetworkError,
     helpers::{process_swarm_command, start_swarm, subscriber_gossip_config},
     types::{
-        GossipNetworkHandle, NetworkCommand, CONSENSUS_HEADER_TOPIC, PRIMARY_CERT_TOPIC,
-        WORKER_BLOCK_TOPIC,
+        GossipNetworkHandle, NetworkCommand, NetworkResult, CONSENSUS_HEADER_TOPIC,
+        PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC,
     },
 };
-use eyre::eyre;
 use futures::StreamExt as _;
 use libp2p::{
     gossipsub::{self, IdentTopic, MessageAcceptance, TopicScoreParams},
@@ -50,7 +50,7 @@ impl SubscriberNetwork {
         multiaddr: Multiaddr,
         authorized_publishers: HashSet<PeerId>,
         gossipsub_config: gossipsub::Config,
-    ) -> eyre::Result<Self> {
+    ) -> NetworkResult<Self> {
         // create handle
         let (handle, commands) = mpsc::channel(1);
 
@@ -80,8 +80,8 @@ impl SubscriberNetwork {
 
         // enable peer scoring
         swarm.behaviour_mut().with_peer_score(score_params, score_thresholds).map_err(|e| {
-            error!(?e, "gossipsub subscriber network");
-            eyre!("failed to set peer score for gossipsub")
+            error!(?e, "gossipsub publish network");
+            NetworkError::EnablePeerScoreBehavior(e)
         })?;
 
         // subscribe to topic
@@ -106,7 +106,7 @@ impl SubscriberNetwork {
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
         authorized_publishers: HashSet<PeerId>,
-    ) -> eyre::Result<Self> {
+    ) -> NetworkResult<Self> {
         // worker's default topic
         let topic = gossipsub::IdentTopic::new(WORKER_BLOCK_TOPIC);
         // default gossipsub config
@@ -121,7 +121,7 @@ impl SubscriberNetwork {
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
         authorized_publishers: HashSet<PeerId>,
-    ) -> eyre::Result<Self> {
+    ) -> NetworkResult<Self> {
         // primary's default topic
         let topic = gossipsub::IdentTopic::new(PRIMARY_CERT_TOPIC);
         // default gossipsub config
@@ -137,7 +137,7 @@ impl SubscriberNetwork {
         sender: mpsc::Sender<Vec<u8>>,
         multiaddr: Multiaddr,
         authorized_publishers: HashSet<PeerId>,
-    ) -> eyre::Result<Self> {
+    ) -> NetworkResult<Self> {
         // consensus header's default topic
         let topic = gossipsub::IdentTopic::new(CONSENSUS_HEADER_TOPIC);
         // default gossipsub config
@@ -146,7 +146,7 @@ impl SubscriberNetwork {
     }
 
     /// Run the network loop to process incoming gossip.
-    pub fn run(mut self) -> JoinHandle<eyre::Result<()>> {
+    pub fn run(mut self) -> JoinHandle<NetworkResult<()>> {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -175,7 +175,7 @@ impl SubscriberNetwork {
     }
 
     /// Process events from the swarm.
-    async fn process_event(&mut self, event: SwarmEvent<gossipsub::Event>) -> eyre::Result<()> {
+    async fn process_event(&mut self, event: SwarmEvent<gossipsub::Event>) -> NetworkResult<()> {
         match event {
             SwarmEvent::Behaviour(gossip) => match gossip {
                 gossipsub::Event::Message { propagation_source, message_id, message } => {
@@ -189,7 +189,7 @@ impl SubscriberNetwork {
                         if let Err(e) = self.sender.try_send(message.data) {
                             error!(target: "subscriber-network", topic=?self.topic, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
                             // fatal - unable to process gossipped messages
-                            return Err(eyre!("network receiver dropped!"));
+                            return Err(e.into());
                         }
 
                         MessageAcceptance::Accept
@@ -302,7 +302,10 @@ impl SubscriberNetwork {
 mod tests {
     use crate::{
         helpers::{process_swarm_command, subscriber_gossip_config},
-        types::{GossipNetworkHandle, NetworkCommand, PRIMARY_CERT_TOPIC, WORKER_BLOCK_TOPIC},
+        types::{
+            GossipNetworkHandle, NetworkCommand, NetworkResult, PRIMARY_CERT_TOPIC,
+            WORKER_BLOCK_TOPIC,
+        },
         PublishNetwork, SubscriberNetwork,
     };
     use futures::StreamExt as _;
@@ -362,7 +365,7 @@ mod tests {
         }
 
         /// Run the network loop to process commands and advance swarm state.
-        fn run(mut self) -> JoinHandle<eyre::Result<()>> {
+        fn run(mut self) -> JoinHandle<NetworkResult<()>> {
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -405,7 +408,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<()> {
+    async fn test_msg_verification_ignores_unauthorized_publisher() -> NetworkResult<()> {
         // default any address
         let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1"
             .parse()
@@ -484,7 +487,7 @@ mod tests {
     // - mal node tries to publish message
     // - mal node gets kicked from honest node mesh
     #[tokio::test]
-    async fn test_peer_exchange() -> eyre::Result<()> {
+    async fn test_peer_exchange() -> NetworkResult<()> {
         // TODO: remove this
         reth_tracing::init_test_tracing();
 
