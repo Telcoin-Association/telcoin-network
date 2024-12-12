@@ -11357,6 +11357,7 @@ dependencies = [
  "fastcrypto",
  "futures",
  "libp2p",
+ "parking_lot 0.12.3",
  "reth-tracing",
  "serde",
  "thiserror",
