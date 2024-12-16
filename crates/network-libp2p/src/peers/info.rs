@@ -1,6 +1,6 @@
 //! Information shared between peers.
 
-use super::status::ConnectionStatus;
+use super::{score::Score, status::ConnectionStatus};
 use libp2p::Multiaddr;
 use serde::Serialize;
 use std::{collections::HashSet, time::Instant};

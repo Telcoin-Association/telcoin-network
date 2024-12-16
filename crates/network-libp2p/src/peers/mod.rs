@@ -6,6 +6,7 @@ use libp2p::PeerId;
 use std::collections::HashMap;
 mod banned;
 mod info;
+mod score;
 mod status;
 
 pub struct PeerService {
