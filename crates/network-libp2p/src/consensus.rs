@@ -2,7 +2,7 @@
 //!
 //! This network is used by workers and primaries to reliably send consensus messages.
 
-use libp2p::Swarm;
+use libp2p::{request_response, Swarm};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 pub struct ConsensusNetwork {
