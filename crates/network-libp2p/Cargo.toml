@@ -24,6 +24,9 @@ serde = { workspace = true }
 fastcrypto = { workspace = true }
 thiserror = { workspace = true }
 
+# req/res requires async_trait
+async-trait = { workspace = true }
+
 [dev-dependencies]
 tn-test-utils = { workspace = true }
 
