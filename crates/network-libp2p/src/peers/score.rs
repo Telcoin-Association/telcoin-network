@@ -194,14 +194,10 @@ impl RealScore {
 
     /// Assess time intervals to update scores accordingly.
     ///
+    /// This method decays the current score using an exponential decay based on a constant half life. The `checked_duration_since` method is used instead of `elapsed` because `last_updated` is set in the future when peers are banned. Banned peers return `None`, so their score will not be decayed.
+    ///
     /// NOTE: this is kept separate mainly for testing purposes.
     fn update_at(&mut self, now: Instant) {
-        // Decay the current score
-        // Using exponential decay based on a constant half life.
-
-        // It is important that we use here `checked_duration_since` instead of elapsed, since
-        // we set last_updated to the future when banning peers. Therefore `checked_duration_since`
-        // will return None in this case and the score does not get decayed.
         if let Some(secs_since_update) =
             now.checked_duration_since(self.last_updated).map(|d| d.as_secs())
         {
