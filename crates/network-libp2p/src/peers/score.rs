@@ -5,6 +5,11 @@
 //!
 //! Heavily inspired by Sigma Prime Lighthouse's scoring system.
 
+// !!~~~~~~~~~~
+// TODO: do not merge until this is resolved
+//
+//
+//
 // lazy_static::lazy_static! {
 //     static ref HALFLIFE_DECAY: f64 = -(2.0f64.ln()) / SCORE_HALFLIFE;
 // }
@@ -202,7 +207,9 @@ impl RealScore {
             now.checked_duration_since(self.last_updated).map(|d| d.as_secs())
         {
             // e^(-ln(2)/HL*t)
-            let decay_factor = (*HALFLIFE_DECAY * secs_since_update as f64).exp();
+            let todo_delete_me = -(2.0f64.ln()) / SCORE_HALFLIFE;
+            // let decay_factor = (*HALFLIFE_DECAY * secs_since_update as f64).exp();
+            let decay_factor = (todo_delete_me * secs_since_update as f64).exp();
             self.telcoin_score *= decay_factor;
             self.last_updated = now;
             self.update_score();
