@@ -10,6 +10,7 @@ exclude.workspace = true
 
 [dependencies]
 libp2p = { workspace = true, features = [
+    "request-response",
     "gossipsub",
     "tokio",
     "quic",
