@@ -40,8 +40,8 @@ const MAX_RESPONSE_SIZE: u64 = 10 * 1024 * 1024;
 #[async_trait]
 impl<Req, Res> Codec for TNCodec<Req, Res>
 where
-    Req: Send + DeserializeOwned,
-    Res: Send + Serialize,
+    Req: Send + Serialize + DeserializeOwned + 'static,
+    Res: Send + Serialize + DeserializeOwned + 'static,
 {
     type Protocol = StreamProtocol;
 
@@ -51,7 +51,6 @@ where
     #[doc = " The type of inbound and outbound responses."]
     type Response = Res;
 
-    #[doc = " Reads a request from the given I/O stream according to the"]
     async fn read_request<T>(
         &mut self,
         _: &Self::Protocol,
@@ -65,6 +64,8 @@ where
         io.take(MAX_COMPRESSED_REQUEST_SIZE).read_to_end(&mut compressed).await?;
 
         // spawn blocking task
+        //
+        // NOTE: io limited by max allowable size
         tokio::task::spawn_blocking(move || {
             let mut decoder = snap::read::FrameDecoder::new(&compressed[..]);
             let mut uncompressed = Vec::new();
@@ -73,29 +74,9 @@ where
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
         })
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??
-
-        // // create cursor for sync snappy decoding
-        // let mut decoded_buffer = Vec::new();
-        // let mut limit_reader = std::io::Cursor::new(&mut bytes);
-        // let mut snappy_decoder = snap::read::FrameDecoder::new(&mut limit_reader);
-
-        // // now decode
-        // snappy_decoder.read_to_end(&mut decoded_buffer)?;
-        // bcs::from_bytes(decoded_buffer.as_slice())
-        //     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-
-        // let result: T = tokio::task::spawn_blocking(move || {
-        //         let mut decoder = FrameDecoder::new(&compressed[..]);
-        //         let mut decompressed = Vec::new();
-        //         std::io::Read::read_to_end(&mut decoder, &mut decompressed)?;
-        //         bcs::from_bytes(&decompressed).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-        //     })
-        //     .await
-        //     .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Join error: {}", e)))??;
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
     }
 
-    #[doc = " Reads a response from the given I/O stream according to the"]
     async fn read_response<T>(
         &mut self,
         _: &Self::Protocol,
@@ -104,16 +85,24 @@ where
     where
         T: AsyncRead + Unpin + Send,
     {
-        // TODO: create Vec with capacity
-        // let mut buf = Vec::new();
-        // let mut snappy_encoder = snap::write::FrameEncoder::new(&mut buf);
-        // bcs::serialize_into(&mut snappy_encoder, io)?;
-        // drop(snappy_encoder);
-        // buf.into().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-        todo!()
+        // async read bytes
+        let mut compressed = Vec::new();
+        io.take(MAX_COMPRESSED_REQUEST_SIZE).read_to_end(&mut compressed).await?;
+
+        // spawn blocking task
+        //
+        // NOTE: io limited by max allowable size
+        tokio::task::spawn_blocking(move || {
+            let mut decoder = snap::read::FrameDecoder::new(&compressed[..]);
+            let mut uncompressed = Vec::new();
+            std::io::Read::read_to_end(&mut decoder, &mut uncompressed)?;
+            bcs::from_bytes(&uncompressed)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        })
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
     }
 
-    #[doc = " Writes a request to the given I/O stream according to the"]
     async fn write_request<T>(
         &mut self,
         _: &Self::Protocol,
@@ -123,7 +112,12 @@ where
     where
         T: AsyncWrite + Unpin + Send,
     {
-        todo!()
+        tokio::task::spawn_blocking(|| {
+            let mut snappy_encoder = snap::write::FrameEncoder::new(&mut io);
+            bcs::serialize_into(&mut snappy_encoder, &req)?;
+        })
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
 
     #[doc = " Writes a response to the given I/O stream according to the"]
