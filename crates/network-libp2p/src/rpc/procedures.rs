@@ -67,7 +67,7 @@ pub enum RPCErrorCode {
 /// Requests from other peers.
 pub enum InboundRequest {
     /// A new certificate broadcast from peer.
-    Certificate(Certificate),
+    NewCertificate(Certificate),
     /// Primary request for vote on new header.
     PrimaryVote(PrimaryVoteRequest),
     /// Request for missing certificates.
