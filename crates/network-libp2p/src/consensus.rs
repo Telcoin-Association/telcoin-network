@@ -112,12 +112,13 @@ where
     where
         T: AsyncWrite + Unpin + Send,
     {
-        tokio::task::spawn_blocking(|| {
-            let mut snappy_encoder = snap::write::FrameEncoder::new(&mut io);
-            bcs::serialize_into(&mut snappy_encoder, &req)?;
-        })
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        // tokio::task::spawn_blocking(|| {
+        //     let mut snappy_encoder = snap::write::FrameEncoder::new(&mut io);
+        //     bcs::serialize_into(&mut snappy_encoder, &req)?;
+        // })
+        // .await
+        // .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        todo!()
     }
 
     #[doc = " Writes a response to the given I/O stream according to the"]

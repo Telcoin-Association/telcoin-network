@@ -25,9 +25,18 @@ fastcrypto = { workspace = true }
 thiserror = { workspace = true }
 
 # req/res requires async_trait
-async-trait = { workspace = true }
+#
+#
+# TODO: remove this after ssz
+#
 bcs = { workspace = true }
-snap = "1.1.0"
+#
+# !!!~~~~~k
+async-trait = { workspace = true }
+ethereum_ssz = { workspace = true }
+snap = { workspace=true }
+unsigned-varint = { workspace = true, features = ["codec"] }
+tokio-util = { workspace = true, features = ["codec"] }
 
 [dev-dependencies]
 tn-test-utils = { workspace = true }
