@@ -34,9 +34,11 @@ bcs = { workspace = true }
 # !!!~~~~~k
 async-trait = { workspace = true }
 ethereum_ssz = { workspace = true }
+ethereum_ssz_derive = { workspace = true }
 snap = { workspace=true }
 unsigned-varint = { workspace = true, features = ["codec"] }
 tokio-util = { workspace = true, features = ["codec"] }
+roaring = { workspace = true }
 
 [dev-dependencies]
 tn-test-utils = { workspace = true }
