@@ -110,7 +110,7 @@ impl Encoder<RPCCodedResponse> for TNCodec {
         item: RPCCodedResponse,
         dst: &mut libp2p::bytes::BytesMut,
     ) -> Result<(), Self::Error> {
-        let bytes: Vec<u8> = match item {
+        let bytes = match item {
             RPCCodedResponse::Success(data) => data.as_ssz_bytes(),
             RPCCodedResponse::Error(rpcerror_code) => Vec::new(),
         };

@@ -62,8 +62,8 @@ enr = { version = "0.12.1", default-features = false, features = [
 # serializing
 snap = "1.1.0"
 unsigned-varint = "0.8"
-ethereum_ssz = "0.5"
-ethereum_ssz_derive = "0.5"
+ethereum_ssz = "0.8"
+ethereum_ssz_derive = "0.8"
 tokio-util = "0.7"
 
 # crypto
