@@ -3122,46 +3122,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ethereum_serde_utils"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70cbccfccf81d67bff0ab36e591fa536c8a935b078a7b0e58c1d00d418332fc9"
-dependencies = [
- "alloy-primitives",
- "hex",
- "serde",
- "serde_derive",
- "serde_json",
-]
-
-[[package]]
-name = "ethereum_ssz"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "036c84bd29bff35e29bbee3c8fc0e2fb95db12b6f2f3cae82a827fbc97256f3a"
-dependencies = [
- "alloy-primitives",
- "ethereum_serde_utils",
- "itertools 0.13.0",
- "serde",
- "serde_derive",
- "smallvec",
- "typenum",
-]
-
-[[package]]
-name = "ethereum_ssz_derive"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dc8e67e1f770f5aa4c2c2069aaaf9daee7ac21bed357a71b911b37a58966cfb"
-dependencies = [
- "darling 0.20.10",
- "proc-macro2",
- "quote",
- "syn 2.0.77",
-]
-
-[[package]]
 name = "event-listener"
 version = "5.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11427,8 +11387,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bcs",
- "ethereum_ssz",
- "ethereum_ssz_derive",
  "fastcrypto",
  "futures",
  "libp2p",
@@ -11441,7 +11399,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "unsigned-varint 0.8.0",
 ]
 
 [[package]]
@@ -12434,10 +12391,6 @@ name = "unsigned-varint"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb066959b24b5196ae73cb057f45598450d2c5f71460e98c49b738086eff9c06"
-dependencies = [
- "bytes",
- "tokio-util",
-]
 
 [[package]]
 name = "untrusted"

@@ -4,7 +4,7 @@ mod consensus;
 pub mod error;
 mod helpers;
 mod publish;
-mod rpc;
+// mod rpc;
 mod subscribe;
 pub mod types;
 pub use publish::*;
