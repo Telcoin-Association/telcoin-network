@@ -119,6 +119,15 @@ where
         let comp_length = self.compressed_buffer.len();
         println!("compressed len before: {comp_length:?}");
 
+        // retrieve prefix for uncompressed message length
+        let mut prefix = [0; 4];
+        io.read_exact(&mut prefix).await?;
+
+        // NOTE: cast usize to u32 safe
+        let length = u32::from_le_bytes(prefix) as usize;
+
+        println!("prefix: {prefix:?}");
+
         // take max request size so request buffer doesn't reallocate
         let mut vec = Vec::new();
         io.take(self.max_compress_len).read_to_end(&mut vec).await?;
@@ -148,6 +157,7 @@ where
         println!("compressed len after read: {comp_length:?}");
         println!("compressed_buffer:\n{:?}", self.compressed_buffer);
         println!("request_buffer\n{:?}", self.request_buffer);
+
         // determine max compression length possible based on msg prefix
         //
         // NOTE: usize -> u64 won't lose precision (even on 32)
@@ -228,19 +238,25 @@ where
             ));
         }
 
+        // length prefix for uncompressed bytes
+        //
+        // NOTE: 32bit max 4,294,967,295
+        let prefix = (bytes.len() as u32).to_le_bytes();
+
+        println!("prefix: {prefix:?}");
+
+        io.write_all(&prefix).await?;
+
         // encode uncompressed bytes length prefix using unsigned varint
         // self.prefix.encode(bytes.len(), &mut out)?;
 
         // compress data
-        let mut writer = snap::write::FrameEncoder::new(Vec::new());
-        writer.write_all(&bytes)?;
-        writer.flush()?;
+        let mut encoder = snap::write::FrameEncoder::new(Vec::new());
+        encoder.write_all(&bytes)?;
+        encoder.flush()?;
 
         // add compressed bytes to prefix
-        // out.extend_from_slice(writer.get_ref());
-
-        // io.write_all(out.as_ref()).await?;
-        io.write_all(writer.get_ref()).await?;
+        io.write_all(encoder.get_ref()).await?;
         Ok(())
     }
 
