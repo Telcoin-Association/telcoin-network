@@ -28,7 +28,6 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 bcs = { workspace = true }
 snap = { workspace = true }
-tokio-util = { workspace = true, features = ["codec"] }
 roaring = { workspace = true }
 
 [dev-dependencies]
