@@ -84,6 +84,7 @@ impl<Req, Res> TNCodec<Req, Res> {
         self.decode_buffer.resize(length, 0);
 
         // take max possible compression size based on reported length
+        // this is used to limit the amount read in case peer used malicious prefix
         //
         // NOTE: usize -> u64 won't lose precision (even on 32bit system)
         let max_compress_len = snap::raw::max_compress_len(length);
