@@ -98,6 +98,42 @@ impl<Req, Res> TNCodec<Req, Res> {
         bcs::from_bytes(&self.decode_buffer)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
+
+    /// Convenience method to keep WRITE logic DRY.
+    ///
+    /// This method is used to write requests and responses from peers.
+    #[inline]
+    async fn encode_message<T, M>(&mut self, io: &mut T, msg: M) -> std::io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+        M: Send + Serialize + DeserializeOwned + 'static,
+    {
+        // global encode
+        let bytes = encode(&msg);
+
+        // ensure encoded bytes are within bounds
+        if bytes.len() > self.max_chunk_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "encode data > max_chunk_size",
+            ));
+        }
+
+        // length prefix for uncompressed bytes
+        //
+        // NOTE: 32bit max 4,294,967,295
+        let prefix = (bytes.len() as u32).to_le_bytes();
+        io.write_all(&prefix).await?;
+
+        // compress data
+        let mut encoder = snap::write::FrameEncoder::new(Vec::new());
+        encoder.write_all(&bytes)?;
+        encoder.flush()?;
+
+        // add compressed bytes to prefix
+        io.write_all(encoder.get_ref()).await?;
+        Ok(())
+    }
 }
 
 impl<Req, Res> Default for TNCodec<Req, Res> {
@@ -132,44 +168,7 @@ where
     where
         T: AsyncRead + Unpin + Send,
     {
-        // clear buffers
-        self.compressed_buffer.clear();
-        self.decode_buffer.clear();
-
-        // retrieve prefix for uncompressed message length
-        let mut prefix = [0; 4];
-        io.read_exact(&mut prefix).await?;
-
-        // NOTE: cast usize to u32 is safe
-        let length = u32::from_le_bytes(prefix) as usize;
-
-        // ensure message length within bounds
-        if length > self.max_chunk_size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "prefix indicates message size is too large",
-            ));
-        }
-
-        // resize buffer to reported message size
-        //
-        // NOTE: this should not reallocate
-        self.decode_buffer.resize(length, 0);
-
-        // take max possible compression size based on reported length
-        //
-        // NOTE: usize -> u64 won't lose precision (even on 32bit system)
-        let max_compress_len = snap::raw::max_compress_len(length);
-        io.take(max_compress_len as u64).read_to_end(&mut self.compressed_buffer).await?;
-
-        // decompress bytes
-        let reader = std::io::Cursor::new(&mut self.compressed_buffer);
-        let mut snappy_decoder = FrameDecoder::new(reader);
-        snappy_decoder.read_exact(&mut self.decode_buffer)?;
-
-        // decode bytes
-        bcs::from_bytes(&self.decode_buffer)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        self.decode_message(io).await
     }
 
     async fn read_response<T>(
@@ -180,44 +179,7 @@ where
     where
         T: AsyncRead + Unpin + Send,
     {
-        // clear buffers
-        self.compressed_buffer.clear();
-        self.decode_buffer.clear();
-
-        // retrieve prefix for uncompressed message length
-        let mut prefix = [0; 4];
-        io.read_exact(&mut prefix).await?;
-
-        // NOTE: cast usize to u32 is safe
-        let length = u32::from_le_bytes(prefix) as usize;
-
-        // ensure message length within bounds
-        if length > self.max_chunk_size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "prefix indicates message size is too large",
-            ));
-        }
-
-        // resize buffer to reported message size
-        //
-        // NOTE: this should not reallocate
-        self.decode_buffer.resize(length, 0);
-
-        // take max possible compression size based on reported length
-        //
-        // NOTE: usize -> u64 won't lose precision (even on 32bit system)
-        let max_compress_len = snap::raw::max_compress_len(length);
-        io.take(max_compress_len as u64).read_to_end(&mut self.compressed_buffer).await?;
-
-        // decompress bytes
-        let reader = std::io::Cursor::new(&mut self.compressed_buffer);
-        let mut snappy_decoder = FrameDecoder::new(reader);
-        snappy_decoder.read_exact(&mut self.decode_buffer)?;
-
-        // decode bytes
-        bcs::from_bytes(&self.decode_buffer)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        self.decode_message(io).await
     }
 
     async fn write_request<T>(
@@ -229,31 +191,7 @@ where
     where
         T: AsyncWrite + Unpin + Send,
     {
-        // global encode
-        let bytes = encode(&req);
-
-        // ensure encoded bytes are within bounds
-        if bytes.len() > self.max_chunk_size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "encode data > max_chunk_size",
-            ));
-        }
-
-        // length prefix for uncompressed bytes
-        //
-        // NOTE: 32bit max 4,294,967,295
-        let prefix = (bytes.len() as u32).to_le_bytes();
-        io.write_all(&prefix).await?;
-
-        // compress data
-        let mut encoder = snap::write::FrameEncoder::new(Vec::new());
-        encoder.write_all(&bytes)?;
-        encoder.flush()?;
-
-        // add compressed bytes to prefix
-        io.write_all(encoder.get_ref()).await?;
-        Ok(())
+        self.encode_message(io, req).await
     }
 
     async fn write_response<T>(
@@ -265,31 +203,7 @@ where
     where
         T: AsyncWrite + Unpin + Send,
     {
-        // global encode
-        let bytes = encode(&res);
-
-        // ensure encoded bytes are within bounds
-        if bytes.len() > self.max_chunk_size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "encode data > max_chunk_size",
-            ));
-        }
-
-        // length prefix for uncompressed bytes
-        //
-        // NOTE: 32bit max 4,294,967,295
-        let prefix = (bytes.len() as u32).to_le_bytes();
-        io.write_all(&prefix).await?;
-
-        // compress data
-        let mut encoder = snap::write::FrameEncoder::new(Vec::new());
-        encoder.write_all(&bytes)?;
-        encoder.flush()?;
-
-        // add compressed bytes to prefix
-        io.write_all(encoder.get_ref()).await?;
-        Ok(())
+        self.encode_message(io, res).await
     }
 }
 
