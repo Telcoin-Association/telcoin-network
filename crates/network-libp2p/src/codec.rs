@@ -1,8 +1,7 @@
 //! Codec for encoding/decoding consensus network messages.
 
 use async_trait::async_trait;
-use futures::AsyncWriteExt;
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite};
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response::Codec, StreamProtocol};
 use serde::{de::DeserializeOwned, Serialize};
 use snap::read::FrameDecoder;
@@ -13,6 +12,14 @@ use std::{
 use tn_types::encode;
 
 /// The Telcoin Network request/response codec for consensus messages between peers.
+///
+/// The codec reuses pre-allocated buffers to asynchronously read messages per the libp2p [Codec]
+/// trait. All messages include a 4-byte prefix that indicates the message's uncompressed length.
+/// Peers use this prefix to safely decompress and decode messages from peers.
+///
+/// TODO:
+/// - handle peer scores when messages are malicious
+/// - verify StreamProtocol between peers
 pub struct TNCodec<Req, Res> {
     /// The fixed-size buffer for compressed messages.
     compressed_buffer: Vec<u8>,
@@ -241,6 +248,7 @@ where
 mod tests {
     use super::*;
     use serde::Deserialize;
+    use tn_test_utils::fixture_batch_with_transactions;
     use tn_types::{BlockHash, WorkerBlock};
 
     #[derive(Serialize, Deserialize, Default, PartialEq, Clone, Debug)]
@@ -252,22 +260,55 @@ mod tests {
 
     #[tokio::test]
     async fn test_encode_decode_same_message() {
-        let max_chunk_size = 10 * 1024 * 1024; // 10mb
+        let max_chunk_size = 1024 * 1024; // 1mb
         let mut codec = TNCodec::<WorkerBlock, WorkerBlock>::new(max_chunk_size);
         let protocol = StreamProtocol::new("/test");
-        // let mut encoded = futures::io::Cursor::new(Vec::new());
+
+        // encode request
         let mut encoded = Vec::new();
-        // let block =
-        //     TestData { timestamp: 12345, base_fee_per_gas: Some(54321), hash: BlockHash::random() };
         let block = WorkerBlock::default();
         codec
             .write_request(&protocol, &mut encoded, block.clone())
             .await
-            .expect("write request valid");
-        println!("encoded:\n{encoded:?}");
+            .expect("write valid request");
+
+        // now decode request
         let decoded =
-            codec.read_request(&protocol, &mut encoded.as_ref()).await.expect("read request valid");
-        println!("decoded??:\n{decoded:?}");
+            codec.read_request(&protocol, &mut encoded.as_ref()).await.expect("read valid request");
         assert_eq!(decoded, block);
+
+        // encode response
+        let mut encoded = Vec::new();
+        let block = fixture_batch_with_transactions(100);
+        codec
+            .write_response(&protocol, &mut encoded, block.clone())
+            .await
+            .expect("write valid response");
+
+        // now decode response
+        let decoded = codec
+            .read_response(&protocol, &mut encoded.as_ref())
+            .await
+            .expect("read valid response");
+        assert_eq!(decoded, block);
+    }
+
+    #[tokio::test]
+    async fn test_fail_to_write_message_too_big() {
+        let max_chunk_size = 100; // 100 bytes is too small
+        let mut codec = TNCodec::<WorkerBlock, WorkerBlock>::new(max_chunk_size);
+        let protocol = StreamProtocol::new("/test");
+
+        // encode request
+        let mut encoded = Vec::new();
+        let block = fixture_batch_with_transactions(1);
+        let res = codec.write_request(&protocol, &mut encoded, block.clone()).await;
+        assert!(res.is_err());
+
+        // encode response
+        let mut encoded = Vec::new();
+        let block = fixture_batch_with_transactions(1);
+        let res = codec.write_response(&protocol, &mut encoded, block.clone()).await;
+        assert!(res.is_err());
     }
 }
