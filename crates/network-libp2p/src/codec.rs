@@ -49,6 +49,55 @@ impl<Req, Res> TNCodec<Req, Res> {
             _phantom: PhantomData::<(Req, Res)>,
         }
     }
+
+    /// Convenience method to keep READ logic DRY.
+    ///
+    /// This method is used to read requests and responses from peers.
+    #[inline]
+    async fn decode_message<T, M>(&mut self, io: &mut T) -> std::io::Result<M>
+    where
+        T: AsyncRead + Unpin + Send,
+        M: Send + Serialize + DeserializeOwned + 'static,
+    {
+        // clear buffers
+        self.compressed_buffer.clear();
+        self.decode_buffer.clear();
+
+        // retrieve prefix for uncompressed message length
+        let mut prefix = [0; 4];
+        io.read_exact(&mut prefix).await?;
+
+        // NOTE: cast usize to u32 is safe
+        let length = u32::from_le_bytes(prefix) as usize;
+
+        // ensure message length within bounds
+        if length > self.max_chunk_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "prefix indicates message size is too large",
+            ));
+        }
+
+        // resize buffer to reported message size
+        //
+        // NOTE: this should not reallocate
+        self.decode_buffer.resize(length, 0);
+
+        // take max possible compression size based on reported length
+        //
+        // NOTE: usize -> u64 won't lose precision (even on 32bit system)
+        let max_compress_len = snap::raw::max_compress_len(length);
+        io.take(max_compress_len as u64).read_to_end(&mut self.compressed_buffer).await?;
+
+        // decompress bytes
+        let reader = std::io::Cursor::new(&mut self.compressed_buffer);
+        let mut snappy_decoder = FrameDecoder::new(reader);
+        snappy_decoder.read_exact(&mut self.decode_buffer)?;
+
+        // decode bytes
+        bcs::from_bytes(&self.decode_buffer)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    }
 }
 
 impl<Req, Res> Default for TNCodec<Req, Res> {
@@ -309,6 +358,136 @@ mod tests {
         let mut encoded = Vec::new();
         let block = fixture_batch_with_transactions(1);
         let res = codec.write_response(&protocol, &mut encoded, block.clone()).await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_reject_message_prefix_too_big() {
+        let max_chunk_size = 100; // 100 bytes is too small
+        let mut honest_peer = TNCodec::<WorkerBlock, WorkerBlock>::new(max_chunk_size);
+        let protocol = StreamProtocol::new("/test");
+        // malicious peer writes legit messages that are too big
+        // "legit" means correct prefix and valid data. the only problem is message too big
+        let mut malicious_peer = TNCodec::<WorkerBlock, WorkerBlock>::new(1024 * 1024);
+
+        //
+        // test requests first
+        //
+        // sanity check that block within bounds works
+        let mut encoded = Vec::new();
+        let block = WorkerBlock::default(); // 72 bytes uncompressed
+        malicious_peer
+            .write_request(&protocol, &mut encoded, block.clone())
+            .await
+            .expect("write legit and valid request");
+        let decoded = honest_peer
+            .read_request(&protocol, &mut encoded.as_ref())
+            .await
+            .expect("read valid request");
+        assert_eq!(decoded, block);
+
+        // now encode legit message that's too big for honest peer
+        let mut encoded = Vec::new();
+        let block = fixture_batch_with_transactions(1);
+        malicious_peer
+            .write_request(&protocol, &mut encoded, block.clone())
+            .await
+            .expect("write legit request");
+        // prefix length should cause error
+        let res = honest_peer.read_request(&protocol, &mut encoded.as_ref()).await;
+        assert!(res.is_err());
+
+        //
+        // test the same for responses
+        //
+        // sanity check that block within bounds works
+        let mut encoded = Vec::new();
+        let block = WorkerBlock::default(); // 72 bytes uncompressed
+        malicious_peer
+            .write_response(&protocol, &mut encoded, block.clone())
+            .await
+            .expect("write legit and valid response");
+        let decoded = honest_peer
+            .read_response(&protocol, &mut encoded.as_ref())
+            .await
+            .expect("read valid response");
+        assert_eq!(decoded, block);
+
+        // now encode legit message that's too big for honest peer
+        let mut encoded = Vec::new();
+        let block = fixture_batch_with_transactions(1);
+        malicious_peer
+            .write_response(&protocol, &mut encoded, block.clone())
+            .await
+            .expect("write legit response");
+        // prefix length should cause error
+        let res = honest_peer.read_response(&protocol, &mut encoded.as_ref()).await;
+        assert!(res.is_err())
+    }
+
+    #[tokio::test]
+    async fn test_malicious_prefix_deceives_peer_to_read_message_and_fails() {
+        let max_chunk_size = 100; // 100 bytes max message size
+        let mut honest_peer = TNCodec::<WorkerBlock, WorkerBlock>::new(max_chunk_size);
+        let protocol = StreamProtocol::new("/test");
+        // malicious peer writes legit messages that are too big
+        // "legit" means correct prefix and valid data. the only problem is message too big
+        let mut malicious_peer = TNCodec::<WorkerBlock, WorkerBlock>::new(1024 * 1024);
+
+        //
+        // test requests first
+        //
+        // encode valid message that's too big and change prefix to deceive peer into trying to read content
+        let mut encoded = Vec::new();
+        let block = fixture_batch_with_transactions(1);
+        malicious_peer
+            .write_request(&protocol, &mut encoded, block.clone())
+            .await
+            .expect("write legit request");
+        // assert prefix is greater than peer's max chunk size
+        let mut actual_prefix = [0; 4];
+        actual_prefix.clone_from_slice(&encoded[0..4]);
+        let actual_length = u32::from_le_bytes(actual_prefix) as usize;
+
+        // sanity check
+        assert!(actual_length > max_chunk_size);
+        assert!(encoded.len() > max_chunk_size);
+
+        // manipulate prefix to obfuscate actual message size is too big
+        // this sets prefix to the honest peer's max message length,
+        // which is considered valid and within message size bounds
+        encoded[0..4].clone_from_slice(&100u32.to_le_bytes());
+
+        // should cause an unexpected EOF
+        let res = honest_peer.read_request(&protocol, &mut encoded.as_ref()).await;
+        assert!(res.is_err());
+
+        //
+        // test responses first
+        //
+        // encode valid message that's too big and change prefix to deceive peer into trying to read content
+        let mut encoded = Vec::new();
+        let block = fixture_batch_with_transactions(1);
+        malicious_peer
+            .write_response(&protocol, &mut encoded, block.clone())
+            .await
+            .expect("write legit response");
+        // assert prefix is greater than peer's max chunk size
+        let mut actual_prefix = [0; 4];
+        actual_prefix.clone_from_slice(&encoded[0..4]);
+        let actual_length = u32::from_le_bytes(actual_prefix) as usize;
+
+        // sanity check
+        assert!(actual_length > max_chunk_size);
+        assert!(encoded.len() > max_chunk_size);
+
+        // manipulate prefix to obfuscate actual message size is too big
+        // this sets prefix to the honest peer's max message length,
+        // which is considered valid and within message size bounds
+        encoded[0..4].clone_from_slice(&100u32.to_le_bytes());
+
+        // should cause an unexpected EOF
+        let res = honest_peer.read_response(&protocol, &mut encoded.as_ref()).await;
         assert!(res.is_err());
     }
 }
