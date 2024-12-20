@@ -29,40 +29,40 @@ pub struct ConsensusNetwork<C: Codec + Send + Clone + 'static> {
 }
 
 /// The Telcoin Network request/response codec for consensus messages between peers.
-pub struct TNCodec<T, U> {
-    /// The max possible compression length based on the max uncompressed message size.
-    max_compress_len: u64,
+pub struct TNCodec<Req, Res> {
     /// The fixed-size buffer for compressed messages.
     compressed_buffer: Vec<u8>,
     /// The fixed-size buffer for requests.
     decode_buffer: Vec<u8>,
-    /// The fixed-size buffer for responses.
-    response_buffer: BytesMut,
-    /// The maximum size (bytes) in a chunked request/response.
+    /// The maximum size (bytes) for a single message.
+    ///
+    /// The 4-byte message prefix does not count towards this value.
     max_chunk_size: usize,
-    /// Phantom data for trait
-    _phantom: PhantomData<(T, U)>,
+    /// Phantom data for codec that indicates network message type.
+    _phantom: PhantomData<(Req, Res)>,
 }
 
-impl<T, U> TNCodec<T, U> {
+impl<Req, Res> TNCodec<Req, Res> {
     /// Create a new instance of Self.
     pub fn new(max_chunk_size: usize) -> Self {
         // create buffer from max possible compression length based on max request size
-        let max_compress_len = snap::raw::max_compress_len(MAX_REQUEST_SIZE);
+        let max_compress_len = snap::raw::max_compress_len(max_chunk_size);
         let compressed_buffer = Vec::with_capacity(max_compress_len);
-
-        let decode_buffer = Vec::with_capacity(MAX_REQUEST_SIZE);
-        let response_buffer = BytesMut::with_capacity(MAX_RESPONSE_SIZE);
+        // allocate capacity for decoding max message size
+        let decode_buffer = Vec::with_capacity(max_chunk_size);
 
         Self {
-            // NOTE: usize -> u64 won't lose precision (even on 32bit systems)
-            max_compress_len: max_compress_len as u64,
             compressed_buffer,
             decode_buffer,
-            response_buffer,
             max_chunk_size,
-            _phantom: PhantomData::<(T, U)>,
+            _phantom: PhantomData::<(Req, Res)>,
         }
+    }
+}
+
+impl<Req, Res> Default for TNCodec<Req, Res> {
+    fn default() -> Self {
+        Self::new(MAX_REQUEST_SIZE)
     }
 }
 
@@ -73,10 +73,6 @@ impl<T, U> TNCodec<T, U> {
 ///
 /// TODO: add the message overhead as the max request size
 const MAX_REQUEST_SIZE: usize = 1024 * 1024;
-/// Max response size in bytes
-///
-/// TODO: syncing max size? This is 10 MB
-const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 
 #[async_trait]
 impl<Req, Res> Codec for TNCodec<Req, Res>
@@ -108,7 +104,7 @@ where
         let length = u32::from_le_bytes(prefix) as usize;
 
         // ensure message length within bounds
-        if length > MAX_REQUEST_SIZE {
+        if length > self.max_chunk_size {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "prefix indicates message size is too large",
@@ -156,7 +152,7 @@ where
         let length = u32::from_le_bytes(prefix) as usize;
 
         // ensure message length within bounds
-        if length > MAX_REQUEST_SIZE {
+        if length > self.max_chunk_size {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "prefix indicates message size is too large",
@@ -271,14 +267,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_encode_decode() {
+    async fn test_encode_decode_same_message() {
         let max_chunk_size = 10 * 1024 * 1024; // 10mb
-        let mut codec = TNCodec::<TestData, TestData>::new(max_chunk_size);
+        let mut codec = TNCodec::<WorkerBlock, WorkerBlock>::new(max_chunk_size);
         let protocol = StreamProtocol::new("/test");
         // let mut encoded = futures::io::Cursor::new(Vec::new());
         let mut encoded = Vec::new();
-        let block =
-            TestData { timestamp: 12345, base_fee_per_gas: Some(54321), hash: BlockHash::random() };
+        // let block =
+        //     TestData { timestamp: 12345, base_fee_per_gas: Some(54321), hash: BlockHash::random() };
+        let block = WorkerBlock::default();
         codec
             .write_request(&protocol, &mut encoded, block.clone())
             .await
