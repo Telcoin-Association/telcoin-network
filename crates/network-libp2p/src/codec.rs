@@ -11,6 +11,9 @@ use std::{
 };
 use tn_types::encode;
 
+/// Convenience type for all traits implemented for messages used for TN request-response codec.
+pub trait TNMessage: Send + Serialize + DeserializeOwned + Clone + 'static {}
+
 /// The Telcoin Network request/response codec for consensus messages between peers.
 ///
 /// The codec reuses pre-allocated buffers to asynchronously read messages per the libp2p [Codec]
@@ -20,6 +23,7 @@ use tn_types::encode;
 /// TODO:
 /// - handle peer scores when messages are malicious
 /// - verify StreamProtocol between peers
+#[derive(Clone, Debug)]
 pub struct TNCodec<Req, Res> {
     /// The fixed-size buffer for compressed messages.
     compressed_buffer: Vec<u8>,
@@ -57,7 +61,7 @@ impl<Req, Res> TNCodec<Req, Res> {
     async fn decode_message<T, M>(&mut self, io: &mut T) -> std::io::Result<M>
     where
         T: AsyncRead + Unpin + Send,
-        M: Send + Serialize + DeserializeOwned + 'static,
+        M: TNMessage,
     {
         // clear buffers
         self.compressed_buffer.clear();
@@ -107,7 +111,7 @@ impl<Req, Res> TNCodec<Req, Res> {
     async fn encode_message<T, M>(&mut self, io: &mut T, msg: M) -> std::io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
-        M: Send + Serialize + DeserializeOwned + 'static,
+        M: TNMessage,
     {
         // global encode
         let bytes = encode(&msg);
@@ -154,8 +158,8 @@ const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 #[async_trait]
 impl<Req, Res> Codec for TNCodec<Req, Res>
 where
-    Req: Send + Serialize + DeserializeOwned + 'static,
-    Res: Send + Serialize + DeserializeOwned + 'static,
+    Req: TNMessage,
+    Res: TNMessage,
 {
     type Protocol = StreamProtocol;
     type Request = Req;
@@ -214,6 +218,9 @@ mod tests {
     use serde::Deserialize;
     use tn_test_utils::fixture_batch_with_transactions;
     use tn_types::{BlockHash, WorkerBlock};
+
+    // impl TNMessage for compiler
+    impl TNMessage for WorkerBlock {}
 
     #[derive(Serialize, Deserialize, Default, PartialEq, Clone, Debug)]
     struct TestData {
