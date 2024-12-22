@@ -11394,6 +11394,8 @@ dependencies = [
  "serde",
  "snap",
  "thiserror",
+ "tn-config",
+ "tn-storage",
  "tn-test-utils",
  "tn-types",
  "tokio",

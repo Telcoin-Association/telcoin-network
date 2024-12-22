@@ -40,6 +40,7 @@ pub enum NetworkCommand {
 #[derive(Debug)]
 //TODO: add <M> generic here so devs can only publish correct messages?
 pub enum SwarmCommand {
+    // TODO: add `StartListening` command to start listening on multiaddr
     /// Listeners
     GetListener { reply: oneshot::Sender<Vec<Multiaddr>> },
     /// Add explicit peer to add.

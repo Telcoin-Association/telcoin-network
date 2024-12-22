@@ -1,9 +1,14 @@
 //! Helper methods used for handling network communication.
 
-use crate::types::{NetworkResult, SwarmCommand};
+use crate::{
+    codec::TNCodec,
+    consensus::TNBehavior,
+    types::{NetworkResult, SwarmCommand},
+};
 use libp2p::{
     gossipsub::{self},
-    Multiaddr, Swarm, SwarmBuilder,
+    request_response::{self, Codec, ProtocolSupport},
+    Multiaddr, StreamProtocol, Swarm, SwarmBuilder,
 };
 use std::time::Duration;
 use tracing::error;
@@ -33,6 +38,7 @@ pub(crate) fn start_swarm(
 
             Ok(network)
         })
+        // TODO: use NetworkError here
         .expect("worker publish swarm behavior valid")
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
@@ -43,13 +49,22 @@ pub(crate) fn start_swarm(
     Ok(swarm)
 }
 
-/// Helper function for publish swarm gossip config.
-pub fn subscriber_gossip_config() -> NetworkResult<gossipsub::Config> {
-    let config = gossipsub::ConfigBuilder::default()
+/// Helper function to apply all specific configurations for all default TN gossipsub behaviors.
+///
+/// This function ensures that expected defaults are always present, even if the upstream libp2p dependency changes.
+fn apply_default_gossipsub_configurations(builder: &mut gossipsub::ConfigBuilder) {
+    builder
         // explicitly set heartbeat interval (default)
         .heartbeat_interval(Duration::from_secs(1))
         // explicitly set strict mode (default)
-        .validation_mode(gossipsub::ValidationMode::Strict)
+        .validation_mode(gossipsub::ValidationMode::Strict);
+}
+
+/// Helper function for publish swarm gossip config.
+pub fn subscriber_gossip_config() -> NetworkResult<gossipsub::Config> {
+    let mut builder = gossipsub::ConfigBuilder::default();
+    apply_default_gossipsub_configurations(&mut builder);
+    let config = builder
         // only listen to authorized publishers
         .validate_messages()
         .build()?;
@@ -59,14 +74,28 @@ pub fn subscriber_gossip_config() -> NetworkResult<gossipsub::Config> {
 
 /// Helper function for publish swarm gossip config.
 pub fn publisher_gossip_config() -> NetworkResult<gossipsub::Config> {
-    let config = gossipsub::ConfigBuilder::default()
-        // explicitly set heartbeat interval (default)
-        .heartbeat_interval(Duration::from_secs(1))
-        // explicitly set strict mode (default)
-        .validation_mode(gossipsub::ValidationMode::Strict)
+    let mut builder = gossipsub::ConfigBuilder::default();
+    apply_default_gossipsub_configurations(&mut builder);
+    let config = builder
         // support peer exchange
         .do_px()
-        .prune_peers(6)
+        .build()?;
+
+    Ok(config)
+}
+
+/// Helper function for primary swarm gossip config.
+pub fn primary_gossip_config() -> NetworkResult<gossipsub::Config> {
+    let mut builder = gossipsub::ConfigBuilder::default();
+    apply_default_gossipsub_configurations(&mut builder);
+    let config = builder
+        // support peer exchange
+        .do_px()
+        // TODO: probably validate messages here?
+        // - depends on the type of message
+        //      - match topic
+        //      - new consensus data only from current committee
+        //      - epoch boundary from all staked validators
         .build()?;
 
     Ok(config)

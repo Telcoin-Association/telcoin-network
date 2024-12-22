@@ -18,11 +18,13 @@ libp2p = { workspace = true, features = [
 ] }
 tokio = { workspace = true, features = ["rt", "net", "sync", "macros", "time"] }
 tn-types = { workspace = true }
+tn-config = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 fastcrypto = { workspace = true }
 thiserror = { workspace = true }
+tn-storage = { workspace = true }
 
 # req/res requires async_trait
 async-trait = { workspace = true }
