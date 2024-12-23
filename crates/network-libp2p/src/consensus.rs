@@ -2,8 +2,6 @@
 //!
 //! This network is used by workers and primaries to reliably send consensus messages.
 
-use std::time::Duration;
-
 use crate::{
     codec::{TNCodec, TNMessage},
     helpers::primary_gossip_config,
@@ -15,6 +13,7 @@ use libp2p::{
     swarm::NetworkBehaviour,
     StreamProtocol, Swarm, SwarmBuilder,
 };
+use std::time::Duration;
 use tn_config::ConsensusConfig;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -112,7 +111,7 @@ where
         let behavior = TNBehavior::new(gossipsub, req_res);
 
         // create swarm
-        let mut swarm = SwarmBuilder::with_existing_identity(keypair)
+        let swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_quic()
             .with_behaviour(|_| behavior)
