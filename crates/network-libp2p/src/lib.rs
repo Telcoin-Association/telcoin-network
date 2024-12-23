@@ -4,6 +4,7 @@ mod codec;
 mod consensus;
 pub mod error;
 mod helpers;
+mod messages;
 mod publish;
 mod subscribe;
 pub mod types;

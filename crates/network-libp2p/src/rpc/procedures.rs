@@ -65,20 +65,4 @@ pub enum RPCErrorCode {
 }
 
 /// Requests from other peers.
-pub enum InboundRequest {
-    /// A new certificate broadcast from peer.
-    NewCertificate(Certificate),
-    /// Primary request for vote on new header.
-    PrimaryVote(PrimaryVoteRequest),
-    /// Request for missing certificates.
-    FetchCertificates(MissingCertificatesRequest),
-    /// Request for missing worker blocks.
-    ///
-    /// TODO: this is Primary -> Worker only
-    FetchBlocks(FetchBlocksRequest),
-    /// Worker is missing blocks
-    ///
-    /// TODO: this is Worker <-> Worker,
-    /// need a way to separate worker/primary requests.
-    MissingBlocks(MissingBlocksRequest),
-}
+pub enum InboundRequest {}
