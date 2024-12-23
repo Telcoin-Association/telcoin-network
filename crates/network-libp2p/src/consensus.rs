@@ -86,7 +86,8 @@ where
         //
         //
         // TODO: pass keypair as arg so this function stays agnostic to primary/worker
-        // - don't put helper method on key config bc that is TN-specific, and this is required by libp2p
+        // - don't put helper method on key config bc that is TN-specific, and this is required by
+        //   libp2p
         // - need to separate worker/primary network signatures
         let mut key_bytes = config.key_config().primary_network_keypair().as_ref().to_vec();
         let keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut key_bytes).expect("TODO");

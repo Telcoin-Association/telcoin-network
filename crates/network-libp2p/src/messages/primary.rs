@@ -1,81 +1,78 @@
 //! Messages for the primary protocol.
 
-use std::collections::{BTreeMap, BTreeSet};
-
+use crate::types::NetworkResult;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use tn_types::{AuthorityIdentifier, Certificate, Header, Round};
-use tracing::warn;
+use std::collections::{BTreeMap, BTreeSet};
+use tn_types::{AuthorityIdentifier, Certificate, CertificateDigest, Header, Round, Vote};
 
 /// Requests from Primary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PrimaryRequest {
     /// A new certificate broadcast from peer.
-    NewCertificate(Certificate),
+    ///
+    /// NOTE: expect no response
+    NewCertificate {
+        /// The certificate from this peer.
+        certificate: Certificate,
+    },
     /// Primary request for vote on new header.
-    PrimaryVote(PrimaryVoteRequest),
+    Vote {
+        /// This primary's header for the round.
+        header: Header,
+        /// Parent certificates provided by the requesting peer in case the primary's peer is
+        /// missing them. The peer requires parent certs in order to vote.
+        parents: Vec<Certificate>,
+    },
     /// Request for missing certificates.
-    FetchCertificates(MissingCertificatesRequest),
-}
-
-/// Used by the primary to request a vote from other primaries on newly produced headers.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PrimaryVoteRequest {
-    /// This primary's header for round.
-    pub header: Header,
-    /// Parent certificates provided by the requesting peer
-    /// in case the primary's peer doesn't yet
-    /// have them. The peer requires parent certs in order to offer a vote.
-    pub parents: Vec<Certificate>,
+    MissingCertificates {
+        /// Inner type with specific helper methods for requesting missing certificates.
+        inner: MissingCertificatesRequest,
+    },
 }
 
 /// Used by the primary to fetch certificates from other primaries.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissingCertificatesRequest {
-    /// The exclusive lower bound is a round number where each primary should return certificates
-    /// above that. This corresponds to the GC round at the requestor.
+    /// The request is for certificates AFTER this round (non-inclusive). The boundary indicates
+    /// the difference between the requestor's GC round and is the last round for which this peer
+    /// has sufficient certificates.
     pub exclusive_lower_bound: Round,
-    /// This contains per authority serialized RoaringBitmap for the round diffs between
-    /// - rounds of certificates to be skipped from the response and
-    /// - the GC round.
-    ///
-    /// These rounds are skipped because the requestor already has them.
+    /// Rounds that should be skipped while processing this request (by authority). The rounds are
+    /// serialized as [RoaringBitmap]s.
     pub skip_rounds: Vec<(AuthorityIdentifier, Vec<u8>)>,
-    /// Maximum number of certificates that should be returned.
+    /// The maximum number of expected certificates included in the response.
     pub max_items: usize,
 }
 
 impl MissingCertificatesRequest {
-    #[allow(clippy::mutable_key_type)]
-    pub fn get_bounds(&self) -> (Round, BTreeMap<AuthorityIdentifier, BTreeSet<Round>>) {
+    /// Deserialize the [RoaringBitmap] representing the difference between the requesting peer's
+    /// lower boundary and their GC round.
+    pub fn get_bounds(
+        &self,
+    ) -> NetworkResult<(Round, BTreeMap<AuthorityIdentifier, BTreeSet<Round>>)> {
         let skip_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>> = self
             .skip_rounds
             .iter()
-            .filter_map(|(k, serialized)| {
-                match RoaringBitmap::deserialize_from(&mut &serialized[..]) {
-                    Ok(bitmap) => {
-                        let rounds: BTreeSet<Round> = bitmap
-                            .into_iter()
-                            .map(|r| self.exclusive_lower_bound + r as Round)
-                            .collect();
-                        Some((*k, rounds))
-                    }
-                    Err(e) => {
-                        warn!("Failed to deserialize RoaringBitmap {e}");
-                        None
-                    }
-                }
+            .map(|(k, serialized)| {
+                let rounds = RoaringBitmap::deserialize_from(&serialized[..])?
+                    .into_iter()
+                    .map(|r| self.exclusive_lower_bound + r as Round)
+                    .collect::<BTreeSet<Round>>();
+                Ok((*k, rounds))
             })
-            .collect();
-        (self.exclusive_lower_bound, skip_rounds)
+            .collect::<NetworkResult<BTreeMap<_, _>>>()?;
+        Ok((self.exclusive_lower_bound, skip_rounds))
     }
 
-    #[allow(clippy::mutable_key_type)]
+    /// Set the bounds for requesting missing certificates based on the current GC round.
+    ///
+    /// This method specifies which rounds should be skipped because they are already in storage.
     pub fn set_bounds(
         mut self,
         gc_round: Round,
         skip_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>>,
-    ) -> Self {
+    ) -> NetworkResult<Self> {
         self.exclusive_lower_bound = gc_round;
         self.skip_rounds = skip_rounds
             .into_iter()
@@ -83,16 +80,18 @@ impl MissingCertificatesRequest {
                 let mut serialized = Vec::new();
                 rounds
                     .into_iter()
-                    .map(|v| u32::try_from(v - gc_round).unwrap())
-                    .collect::<RoaringBitmap>()
-                    .serialize_into(&mut serialized)
-                    .unwrap();
-                (k, serialized)
+                    .map(|v| u32::try_from(v - gc_round))
+                    .collect::<Result<RoaringBitmap, std::num::TryFromIntError>>()?
+                    .serialize_into(&mut serialized)?;
+
+                Ok((k, serialized))
             })
-            .collect();
-        self
+            .collect::<NetworkResult<Vec<_>>>()?;
+
+        Ok(self)
     }
 
+    /// Specify the maximum number of expected certificates in the peer's response.
     pub fn set_max_items(mut self, max_items: usize) -> Self {
         self.max_items = max_items;
         self
@@ -107,4 +106,21 @@ impl MissingCertificatesRequest {
 
 /// Response to primary requests.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum PrimaryResponse {}
+pub enum PrimaryResponse {
+    /// The peer's vote if successfule. If the peer was unable to verify parents, the missing
+    /// certificate digests are included.
+    Vote {
+        /// The vote, if the peer considered the proposed header valid.
+        vote: Option<Vote>,
+        /// Missing certificate digests for peer to vote.
+        ///
+        /// The peer needs to process these certificates before it can vote for this primary's
+        /// header.
+        missing: Vec<CertificateDigest>,
+    },
+    /// The requested missing certificates.
+    MissingCertificates {
+        /// The collection of missing certificates.
+        certificates: Vec<Certificate>,
+    },
+}

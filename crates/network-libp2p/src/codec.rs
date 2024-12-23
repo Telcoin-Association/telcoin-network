@@ -359,7 +359,8 @@ mod tests {
         //
         // test requests first
         //
-        // encode valid message that's too big and change prefix to deceive peer into trying to read content
+        // encode valid message that's too big and change prefix to deceive peer into trying to read
+        // content
         let mut encoded = Vec::new();
         let block = fixture_batch_with_transactions(1);
         malicious_peer
@@ -387,7 +388,8 @@ mod tests {
         //
         // test responses first
         //
-        // encode valid message that's too big and change prefix to deceive peer into trying to read content
+        // encode valid message that's too big and change prefix to deceive peer into trying to read
+        // content
         let mut encoded = Vec::new();
         let block = fixture_batch_with_transactions(1);
         malicious_peer

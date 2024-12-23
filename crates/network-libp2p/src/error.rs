@@ -39,6 +39,12 @@ pub enum NetworkError {
     /// Failed to build swarm with peer scoring enabled.
     #[error("{0}")]
     EnablePeerScoreBehavior(String),
+    /// Error conversion from [std::io::Error]
+    #[error(transparent)]
+    StdIo(#[from] std::io::Error),
+    /// Error converted from [std::num::TryFromIntError]
+    #[error(transparent)]
+    TryFromIntError(#[from] std::num::TryFromIntError),
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {

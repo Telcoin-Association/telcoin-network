@@ -51,7 +51,8 @@ pub(crate) fn start_swarm(
 
 /// Helper function to apply all specific configurations for all default TN gossipsub behaviors.
 ///
-/// This function ensures that expected defaults are always present, even if the upstream libp2p dependency changes.
+/// This function ensures that expected defaults are always present, even if the upstream libp2p
+/// dependency changes.
 fn apply_default_gossipsub_configurations(builder: &mut gossipsub::ConfigBuilder) {
     builder
         // explicitly set heartbeat interval (default)
