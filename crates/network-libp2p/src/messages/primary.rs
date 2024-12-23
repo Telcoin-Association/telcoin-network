@@ -8,6 +8,7 @@ use tn_types::{AuthorityIdentifier, Certificate, Header, Round};
 use tracing::warn;
 
 /// Requests from Primary.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PrimaryRequest {
     /// A new certificate broadcast from peer.
     NewCertificate(Certificate),
@@ -105,4 +106,5 @@ impl MissingCertificatesRequest {
 //
 
 /// Response to primary requests.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PrimaryResponse {}
