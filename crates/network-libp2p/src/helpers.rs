@@ -106,66 +106,67 @@ pub fn primary_gossip_config() -> NetworkResult<gossipsub::Config> {
 ///
 /// This function calls methods on the swarm.
 #[inline]
-pub(crate) fn process_swarm_command(
-    command: SwarmCommand,
-    network: &mut Swarm<gossipsub::Behaviour>,
-) {
+pub(crate) fn process_swarm_command<C>(command: SwarmCommand, swarm: &mut Swarm<TNBehavior<C>>)
+where
+    C: Codec + Send + Clone + 'static,
+{
     match command {
         SwarmCommand::GetListener { reply } => {
-            let addrs = network.listeners().cloned().collect();
+            let addrs = swarm.listeners().cloned().collect();
             if let Err(e) = reply.send(addrs) {
                 error!(target: "gossip-network", ?e, "GetListeners command failed");
             }
         }
         SwarmCommand::AddExplicitPeer { peer_id, addr } => {
-            network.add_peer_address(peer_id, addr);
-            network.behaviour_mut().add_explicit_peer(&peer_id);
+            swarm.add_peer_address(peer_id, addr);
+            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
         }
         SwarmCommand::Dial { dial_opts, reply } => {
-            let res = network.dial(dial_opts);
+            let res = swarm.dial(dial_opts);
             if let Err(e) = reply.send(res) {
                 error!(target: "gossip-network", ?e, "AddExplicitPeer command failed");
             }
         }
         SwarmCommand::LocalPeerId { reply } => {
-            let peer_id = *network.local_peer_id();
+            let peer_id = *swarm.local_peer_id();
             if let Err(e) = reply.send(peer_id) {
                 error!(target: "gossip-network", ?e, "LocalPeerId command failed");
             }
         }
         SwarmCommand::Publish { topic, msg, reply } => {
-            let res = network.behaviour_mut().publish(topic, msg);
+            let res = swarm.behaviour_mut().gossipsub.publish(topic, msg);
             if let Err(e) = reply.send(res) {
                 error!(target: "gossip-network", ?e, "Publish command failed");
             }
         }
         SwarmCommand::Subscribe { topic, reply } => {
-            let res = network.behaviour_mut().subscribe(&topic);
+            let res = swarm.behaviour_mut().gossipsub.subscribe(&topic);
             if let Err(e) = reply.send(res) {
                 error!(target: "gossip-network", ?e, "Subscribe command failed");
             }
         }
         SwarmCommand::ConnectedPeers { reply } => {
-            let res = network.connected_peers().cloned().collect();
+            let res = swarm.connected_peers().cloned().collect();
             if let Err(e) = reply.send(res) {
                 error!(target: "gossip-network", ?e, "ConnectedPeers command failed");
             }
         }
         SwarmCommand::PeerScore { peer_id, reply } => {
-            let opt_score = network.behaviour_mut().peer_score(&peer_id);
+            let opt_score = swarm.behaviour_mut().gossipsub.peer_score(&peer_id);
             if let Err(e) = reply.send(opt_score) {
                 error!(target: "gossip-network", ?e, "PeerScore command failed");
             }
         }
         SwarmCommand::SetApplicationScore { peer_id, new_score, reply } => {
-            let bool = network.behaviour_mut().set_application_score(&peer_id, new_score);
+            let bool = swarm.behaviour_mut().gossipsub.set_application_score(&peer_id, new_score);
             if let Err(e) = reply.send(bool) {
                 error!(target: "gossip-network", ?e, "SetApplicationScore command failed");
             }
         }
         SwarmCommand::AllPeers { reply } => {
-            let collection = network
+            let collection = swarm
                 .behaviour_mut()
+                .gossipsub
                 .all_peers()
                 .map(|(peer_id, vec)| (*peer_id, vec.into_iter().cloned().collect()))
                 .collect();
@@ -175,13 +176,13 @@ pub(crate) fn process_swarm_command(
             }
         }
         SwarmCommand::AllMeshPeers { reply } => {
-            let collection = network.behaviour_mut().all_mesh_peers().cloned().collect();
+            let collection = swarm.behaviour_mut().gossipsub.all_mesh_peers().cloned().collect();
             if let Err(e) = reply.send(collection) {
                 error!(target: "gossip-network", ?e, "AllMeshPeers command failed");
             }
         }
         SwarmCommand::MeshPeers { topic, reply } => {
-            let collection = network.behaviour_mut().mesh_peers(&topic).cloned().collect();
+            let collection = swarm.behaviour_mut().gossipsub.mesh_peers(&topic).cloned().collect();
             if let Err(e) = reply.send(collection) {
                 error!(target: "gossip-network", ?e, "MeshPeers command failed");
             }
