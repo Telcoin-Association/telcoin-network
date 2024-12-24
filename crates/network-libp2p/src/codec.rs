@@ -6,13 +6,14 @@ use libp2p::{request_response::Codec, StreamProtocol};
 use serde::{de::DeserializeOwned, Serialize};
 use snap::read::FrameDecoder;
 use std::{
+    fmt,
     io::{Read as _, Write as _},
     marker::PhantomData,
 };
 use tn_types::encode;
 
 /// Convenience type for all traits implemented for messages used for TN request-response codec.
-pub trait TNMessage: Send + Serialize + DeserializeOwned + Clone + 'static {}
+pub trait TNMessage: Send + Serialize + DeserializeOwned + Clone + fmt::Debug + 'static {}
 
 /// The Telcoin Network request/response codec for consensus messages between peers.
 ///

@@ -153,11 +153,11 @@ where
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    event = self.swarm.select_next_some() => todo!(),//self.process_event(event).await?,
+                    event = self.swarm.select_next_some() => self.process_event(event).await?,
                     command = self.commands.recv() => match command {
                         Some(c) => self.process_command(c),
                         None => {
-                            info!(target: "subscriber-network", topics=?self.topics, "subscriber shutting down...");
+                            info!(target: "consensus-network", topics=?self.topics, "subscriber shutting down...");
                             return Ok(())
                         }
                     }
@@ -178,49 +178,60 @@ where
     }
 
     /// Process events from the swarm.
-    async fn process_event(&mut self, event: SwarmEvent<gossipsub::Event>) -> NetworkResult<()> {
+    async fn process_event(
+        &mut self,
+        event: SwarmEvent<TNBehaviorEvent<TNCodec<Req, Res>>>,
+    ) -> NetworkResult<()> {
         match event {
-            SwarmEvent::Behaviour(gossip) => match gossip {
-                gossipsub::Event::Message { propagation_source, message_id, message } => {
-                    trace!(target: "subscriber-network", topic=?self.topics, ?propagation_source, ?message_id, ?message, "message received from publisher");
-                    // verify message was published by authorized node
-                    let msg_acceptance = if message
-                        .source
-                        .is_some_and(|id| self.authorized_publishers.contains(&id))
-                    {
-                        // forward message to handler
-                        if let Err(e) = self.sender.try_send(message.data) {
-                            error!(target: "subscriber-network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
-                            // fatal - unable to process gossipped messages
-                            return Err(e.into());
+            SwarmEvent::Behaviour(behavior) => match behavior {
+                TNBehaviorEvent::Gossipsub(gossip) => match gossip {
+                    gossipsub::Event::Message { propagation_source, message_id, message } => {
+                        trace!(target: "consensus-network", topic=?self.topics, ?propagation_source, ?message_id, ?message, "message received from publisher");
+                        // verify message was published by authorized node
+                        let msg_acceptance = if message
+                            .source
+                            .is_some_and(|id| self.authorized_publishers.contains(&id))
+                        {
+                            // forward message to handler
+                            if let Err(e) = self.sender.try_send(message.data) {
+                                error!(target: "consensus-network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
+                                // fatal - unable to process gossipped messages
+                                return Err(e.into());
+                            }
+
+                            MessageAcceptance::Accept
+                        } else {
+                            MessageAcceptance::Reject
+                        };
+
+                        // report message validation results
+                        if let Err(e) =
+                            self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                &message_id,
+                                &propagation_source,
+                                msg_acceptance,
+                            )
+                        {
+                            error!(target: "consensus-network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "error reporting message validation result");
                         }
-
-                        MessageAcceptance::Accept
-                    } else {
-                        MessageAcceptance::Reject
-                    };
-
-                    // report message validation results
-                    if let Err(e) =
-                        self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
-                            &message_id,
-                            &propagation_source,
-                            msg_acceptance,
-                        )
-                    {
-                        error!(target: "subscriber-network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "error reporting message validation result");
                     }
-                }
-                gossipsub::Event::Subscribed { peer_id, topic } => {
-                    trace!(target: "subscriber-network", topics=?self.topics, ?peer_id, ?topic, "gossipsub event - subscribed")
-                }
-                gossipsub::Event::Unsubscribed { peer_id, topic } => {
-                    trace!(target: "subscriber-network", topics=?self.topics, ?peer_id, ?topic, "gossipsub event - unsubscribed")
-                }
-                gossipsub::Event::GossipsubNotSupported { peer_id } => {
-                    // TODO: remove peer at self point?
-                    trace!(target: "subscriber-network", topics=?self.topics, ?peer_id, "gossipsub event - not supported")
-                }
+                    gossipsub::Event::Subscribed { peer_id, topic } => {
+                        trace!(target: "consensus-network", topics=?self.topics, ?peer_id, ?topic, "gossipsub event - subscribed")
+                    }
+                    gossipsub::Event::Unsubscribed { peer_id, topic } => {
+                        trace!(target: "consensus-network", topics=?self.topics, ?peer_id, ?topic, "gossipsub event - unsubscribed")
+                    }
+                    gossipsub::Event::GossipsubNotSupported { peer_id } => {
+                        // TODO: remove peer at self point?
+                        trace!(target: "consensus-network", topics=?self.topics, ?peer_id, "gossipsub event - not supported")
+                    }
+                },
+                TNBehaviorEvent::ReqRes(rpc) => match rpc {
+                    request_response::Event::Message { peer, message } => todo!(),
+                    request_response::Event::OutboundFailure { peer, request_id, error } => todo!(),
+                    request_response::Event::InboundFailure { peer, request_id, error } => todo!(),
+                    request_response::Event::ResponseSent { peer, request_id } => todo!(),
+                },
             },
             SwarmEvent::ConnectionEstablished {
                 peer_id,
@@ -230,7 +241,7 @@ where
                 concurrent_dial_errors,
                 established_in,
             } => {
-                trace!(target: "subscriber-network", topics=?self.topics, ?peer_id, ?connection_id, ?endpoint, ?num_established, ?concurrent_dial_errors, ?established_in, "connection established")
+                trace!(target: "consensus-network", topics=?self.topics, ?peer_id, ?connection_id, ?endpoint, ?num_established, ?concurrent_dial_errors, ?established_in, "connection established")
             }
             SwarmEvent::ConnectionClosed {
                 peer_id,
@@ -239,7 +250,7 @@ where
                 num_established,
                 cause,
             } => trace!(
-                target: "subscriber-network",
+                target: "consensus-network",
                 topics=?self.topics,
                 ?peer_id,
                 ?connection_id,
@@ -249,7 +260,7 @@ where
                 "connection closed"
             ),
             SwarmEvent::IncomingConnection { connection_id, local_addr, send_back_addr } => {
-                trace!(target: "subscriber-network", topics=?self.topics, ?connection_id, ?local_addr, ?send_back_addr, "incoming connection")
+                trace!(target: "consensus-network", topics=?self.topics, ?connection_id, ?local_addr, ?send_back_addr, "incoming connection")
             }
             SwarmEvent::IncomingConnectionError {
                 connection_id,
@@ -257,7 +268,7 @@ where
                 send_back_addr,
                 error,
             } => trace!(
-                target: "subscriber-network",
+                target: "consensus-network",
                 topics=?self.topics,
                 ?connection_id,
                 ?local_addr,
@@ -266,37 +277,37 @@ where
                 "incoming connection error"
             ),
             SwarmEvent::OutgoingConnectionError { connection_id, peer_id, error } => {
-                trace!(target: "subscriber-network", topics=?self.topics, ?connection_id, ?peer_id, ?error, "outgoing connection error")
+                trace!(target: "consensus-network", topics=?self.topics, ?connection_id, ?peer_id, ?error, "outgoing connection error")
             }
             SwarmEvent::NewListenAddr { listener_id, address } => {
-                trace!(target: "subscriber-network", topics=?self.topics, ?listener_id, ?address, "new listener addr")
+                trace!(target: "consensus-network", topics=?self.topics, ?listener_id, ?address, "new listener addr")
             }
             SwarmEvent::ExpiredListenAddr { listener_id, address } => {
-                trace!(target: "subscriber-network", topics=?self.topics, ?listener_id, ?address, "expired listen addr")
+                trace!(target: "consensus-network", topics=?self.topics, ?listener_id, ?address, "expired listen addr")
             }
             SwarmEvent::ListenerClosed { listener_id, addresses, reason } => {
-                trace!(target: "subscriber-network", topics=?self.topics, ?listener_id, ?addresses, ?reason, "listener closed")
+                trace!(target: "consensus-network", topics=?self.topics, ?listener_id, ?addresses, ?reason, "listener closed")
             }
             SwarmEvent::ListenerError { listener_id, error } => {
-                trace!(target: "subscriber-network", topics=?self.topics, ?listener_id, ?error, "listener error")
+                trace!(target: "consensus-network", topics=?self.topics, ?listener_id, ?error, "listener error")
             }
             SwarmEvent::Dialing { peer_id, connection_id } => {
-                trace!(target: "subscriber-network", topics=?self.topics, ? peer_id, ?connection_id, "dialing")
+                trace!(target: "consensus-network", topics=?self.topics, ? peer_id, ?connection_id, "dialing")
             }
             SwarmEvent::NewExternalAddrCandidate { address } => {
-                trace!(target: "subscriber-network", topics=?self.topics, ?address, "new external addr candidate")
+                trace!(target: "consensus-network", topics=?self.topics, ?address, "new external addr candidate")
             }
             SwarmEvent::ExternalAddrConfirmed { address } => {
-                trace!(target: "subscriber-network", topics=?self.topics, ?address, "external addr confirmed")
+                trace!(target: "consensus-network", topics=?self.topics, ?address, "external addr confirmed")
             }
             SwarmEvent::ExternalAddrExpired { address } => {
-                trace!(target: "subscriber-network", topics=?self.topics, ?address, "external addr expired")
+                trace!(target: "consensus-network", topics=?self.topics, ?address, "external addr expired")
             }
             SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => {
-                trace!(target: "subscriber-network", topics=?self.topics, ?peer_id, ?address, "new external addr of peer")
+                trace!(target: "consensus-network", topics=?self.topics, ?peer_id, ?address, "new external addr of peer")
             }
             _e => {
-                trace!(target: "subscriber-network", topics=?self.topics, ?_e, "non-exhaustive event match")
+                trace!(target: "consensus-network", topics=?self.topics, ?_e, "non-exhaustive event match")
             }
         }
         Ok(())
