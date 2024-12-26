@@ -227,10 +227,14 @@ where
                     }
                 },
                 TNBehaviorEvent::ReqRes(rpc) => match rpc {
-                    request_response::Event::Message { peer, message } => todo!(),
+                    request_response::Event::Message { peer, message } => {
+                        info!(target: "consensus-network",  ?peer, ?message, "req/res MESSAGE event")
+                    }
                     request_response::Event::OutboundFailure { peer, request_id, error } => todo!(),
                     request_response::Event::InboundFailure { peer, request_id, error } => todo!(),
-                    request_response::Event::ResponseSent { peer, request_id } => todo!(),
+                    request_response::Event::ResponseSent { peer, request_id } => {
+                        info!(target: "consensus-network",  ?peer, ?request_id, "req/res RESPONSE_SENT event")
+                    }
                 },
             },
             SwarmEvent::ConnectionEstablished {

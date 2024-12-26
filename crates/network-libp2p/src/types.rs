@@ -2,9 +2,10 @@
 
 use crate::error::NetworkError;
 use libp2p::{
+    core::transport::ListenerId,
     gossipsub::{IdentTopic, MessageId, PublishError, SubscriptionError, TopicHash},
-    swarm::{dial_opts::DialOpts, DialError},
-    Multiaddr, PeerId,
+    swarm::{dial_opts::DialOpts, DialError, ListenError},
+    Multiaddr, PeerId, TransportError,
 };
 use std::collections::{HashMap, HashSet};
 use tokio::sync::{mpsc, oneshot};
@@ -40,7 +41,12 @@ pub enum NetworkCommand {
 #[derive(Debug)]
 //TODO: add <M> generic here so devs can only publish correct messages?
 pub enum SwarmCommand {
-    // TODO: add `StartListening` command to start listening on multiaddr
+    StartListening {
+        /// The [Multiaddr] for the swarm to connect.
+        multiaddr: Multiaddr,
+        /// Oneshot channel for reply.
+        reply: oneshot::Sender<Result<ListenerId, TransportError<std::io::Error>>>,
+    },
     /// Listeners
     GetListener { reply: oneshot::Sender<Vec<Multiaddr>> },
     /// Add explicit peer to add.
@@ -112,6 +118,18 @@ impl GossipNetworkHandle {
         ack.await?
     }
 
+    /// Start swarm listening on the given address. Returns an error if the address is not supported.
+    ///
+    /// Return swarm error to caller.
+    pub async fn start_listening(&self, multiaddr: Multiaddr) -> NetworkResult<ListenerId> {
+        let (reply, ack) = oneshot::channel();
+        self.sender
+            .send(NetworkCommand::Swarm(SwarmCommand::StartListening { multiaddr, reply }))
+            .await?;
+        let res = ack.await?;
+        res.map_err(Into::into)
+    }
+
     /// Request listeners from the swarm.
     pub async fn listeners(&self) -> NetworkResult<Vec<Multiaddr>> {
         let (reply, listeners) = oneshot::channel();
@@ -128,6 +146,8 @@ impl GossipNetworkHandle {
     }
 
     /// Dial a peer.
+    ///
+    /// Return swarm error to caller.
     pub async fn dial(&self, dial_opts: DialOpts) -> NetworkResult<()> {
         let (reply, ack) = oneshot::channel();
         self.sender.send(NetworkCommand::Swarm(SwarmCommand::Dial { dial_opts, reply })).await?;
@@ -143,6 +163,8 @@ impl GossipNetworkHandle {
     }
 
     /// Subscribe to a topic.
+    ///
+    /// Return swarm error to caller.
     pub async fn subscribe(&self, topic: IdentTopic) -> NetworkResult<bool> {
         let (reply, already_subscribed) = oneshot::channel();
         self.sender.send(NetworkCommand::Swarm(SwarmCommand::Subscribe { topic, reply })).await?;
@@ -152,7 +174,7 @@ impl GossipNetworkHandle {
 
     /// Publish a message on a certain topic.
     ///
-    /// TODO: make this <M> generic to prevent accidental publishing of incorrect messages.
+    /// TODO: make this <M> generic to prevent accidental publishing of incorrect messages?
     pub async fn publish(&self, topic: IdentTopic, msg: Vec<u8>) -> NetworkResult<MessageId> {
         let (reply, published) = oneshot::channel();
         self.sender

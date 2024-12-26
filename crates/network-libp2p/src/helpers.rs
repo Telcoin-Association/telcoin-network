@@ -111,6 +111,12 @@ where
     C: Codec + Send + Clone + 'static,
 {
     match command {
+        SwarmCommand::StartListening { multiaddr, reply } => {
+            let res = swarm.listen_on(multiaddr);
+            if let Err(e) = reply.send(res) {
+                error!(target: "swarm-command", ?e, "StartListening failed to send result");
+            }
+        }
         SwarmCommand::GetListener { reply } => {
             let addrs = swarm.listeners().cloned().collect();
             if let Err(e) = reply.send(addrs) {
