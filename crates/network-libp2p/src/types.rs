@@ -1,9 +1,10 @@
 //! Constants and trait implementations for network compatibility.
 
-use crate::error::NetworkError;
+use crate::{codec::TNMessage, error::NetworkError};
 use libp2p::{
     core::transport::ListenerId,
     gossipsub::{IdentTopic, MessageId, PublishError, SubscriptionError, TopicHash},
+    request_response::OutboundRequestId,
     swarm::{dial_opts::DialOpts, DialError, ListenError},
     Multiaddr, PeerId, TransportError,
 };
@@ -31,7 +32,10 @@ pub enum NetworkEvent {
 
 /// Commands for the swarm.
 #[derive(Debug)]
-pub enum NetworkCommand {
+pub enum NetworkCommand<Req>
+where
+    Req: TNMessage,
+{
     /// Update the list of authorized publishers.
     ///
     /// This list is used to verify messages came from an authorized source.
@@ -43,13 +47,16 @@ pub enum NetworkCommand {
         reply: oneshot::Sender<NetworkResult<()>>,
     },
     /// Commands to manage the network's swarm.
-    Swarm(SwarmCommand),
+    Swarm(SwarmCommand<Req>),
 }
 
 /// Commands for the swarm.
 #[derive(Debug)]
 //TODO: add <M> generic here so devs can only publish correct messages?
-pub enum SwarmCommand {
+pub enum SwarmCommand<Req>
+where
+    Req: TNMessage,
+{
     StartListening {
         /// The [Multiaddr] for the swarm to connect.
         multiaddr: Multiaddr,
@@ -78,6 +85,22 @@ pub enum SwarmCommand {
     },
     /// Return an owned copy of this node's [PeerId].
     LocalPeerId { reply: oneshot::Sender<PeerId> },
+    /// Send a request to a peer.
+    ///
+    /// The caller is responsible for decoding message bytes and reporting peers who return bad data. Peers that send messages that fail to decode must receive an application score penalty.
+    SendRequest {
+        /// The destination peer.
+        peer: PeerId,
+        /// The request to send.
+        request: Req,
+        /// Channel for forwarding any responses.
+        reply: oneshot::Sender<NetworkResult<Vec<u8>>>,
+    },
+    /// Send response to a peer's request.
+    SendResponse {
+        /// The encoded message data.
+        response: Vec<u8>,
+    },
     /// Subscribe to a topic.
     Subscribe { topic: IdentTopic, reply: oneshot::Sender<Result<bool, SubscriptionError>> },
     /// Publish a message to topic subscribers.
@@ -106,14 +129,20 @@ pub enum SwarmCommand {
 ///
 /// The type that sends commands to the running network (swarm) task.
 #[derive(Clone)]
-pub struct NetworkHandle {
+pub struct NetworkHandle<Req>
+where
+    Req: TNMessage,
+{
     /// Sending channel to the network to process commands.
-    sender: mpsc::Sender<NetworkCommand>,
+    sender: mpsc::Sender<NetworkCommand<Req>>,
 }
 
-impl NetworkHandle {
+impl<Req> NetworkHandle<Req>
+where
+    Req: TNMessage,
+{
     /// Create a new instance of Self.
-    pub fn new(sender: mpsc::Sender<NetworkCommand>) -> Self {
+    pub fn new(sender: mpsc::Sender<NetworkCommand<Req>>) -> Self {
         Self { sender }
     }
 
@@ -245,5 +274,18 @@ impl NetworkHandle {
             }))
             .await?;
         score.await.map_err(Into::into)
+    }
+
+    /// Send a request to a peer.
+    pub async fn send_request(
+        &self,
+        request: Req,
+        peer: PeerId,
+        reply: oneshot::Sender<NetworkResult<Vec<u8>>>,
+    ) -> NetworkResult<()> {
+        self.sender
+            .send(NetworkCommand::Swarm(SwarmCommand::SendRequest { peer, request, reply }))
+            .await
+            .map_err(Into::into)
     }
 }

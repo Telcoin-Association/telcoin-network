@@ -11333,6 +11333,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bcs",
+ "eyre",
  "fastcrypto",
  "futures",
  "libp2p",

@@ -4,8 +4,7 @@
 
 use crate::{
     codec::{TNCodec, TNMessage},
-    helpers::{primary_gossip_config, process_swarm_command},
-    types::{NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
+    types::{NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult, SwarmCommand},
 };
 use futures::StreamExt as _;
 use libp2p::{
@@ -76,9 +75,9 @@ where
     /// The stream for forwarding network events.
     event_stream: Sender<NetworkEvent>,
     /// The sender for network handles.
-    handle: Sender<NetworkCommand>,
+    handle: Sender<NetworkCommand<Req>>,
     /// The receiver for processing network handle requests.
-    commands: Receiver<NetworkCommand>,
+    commands: Receiver<NetworkCommand<Req>>,
     /// The collection of staked validators.
     ///
     /// This set must be updated at the start of each epoch. It is used to verify message sources
@@ -163,7 +162,7 @@ where
     /// Return a [NetworkHandle] to send commands to this network.
     ///
     /// TODO: this should just be `NetworkHandle`
-    pub fn network_handle(&self) -> NetworkHandle {
+    pub fn network_handle(&self) -> NetworkHandle<Req> {
         NetworkHandle::new(self.handle.clone())
     }
 
@@ -186,13 +185,112 @@ where
     }
 
     /// Process commands for the swarm.
-    fn process_command(&mut self, command: NetworkCommand) {
+    fn process_command(&mut self, command: NetworkCommand<Req>) {
         match command {
             NetworkCommand::UpdateAuthorizedPublishers { authorities, reply } => {
                 self.authorized_publishers = authorities;
                 let _ = reply.send(Ok(()));
             }
-            NetworkCommand::Swarm(c) => process_swarm_command(c, &mut self.swarm),
+            NetworkCommand::Swarm(c) => self.process_swarm_command(c),
+        }
+    }
+
+    /// Process commands for the swarm.
+    fn process_swarm_command(&mut self, command: SwarmCommand<Req>) {
+        match command {
+            SwarmCommand::StartListening { multiaddr, reply } => {
+                let res = self.swarm.listen_on(multiaddr);
+                if let Err(e) = reply.send(res) {
+                    error!(target: "swarm-command", ?e, "StartListening failed to send result");
+                }
+            }
+            SwarmCommand::GetListener { reply } => {
+                let addrs = self.swarm.listeners().cloned().collect();
+                if let Err(e) = reply.send(addrs) {
+                    error!(target: "gossip-network", ?e, "GetListeners command failed");
+                }
+            }
+            SwarmCommand::AddExplicitPeer { peer_id, addr } => {
+                self.swarm.add_peer_address(peer_id, addr);
+                self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+            }
+            SwarmCommand::Dial { dial_opts, reply } => {
+                let res = self.swarm.dial(dial_opts);
+                if let Err(e) = reply.send(res) {
+                    error!(target: "gossip-network", ?e, "AddExplicitPeer command failed");
+                }
+            }
+            SwarmCommand::LocalPeerId { reply } => {
+                let peer_id = *self.swarm.local_peer_id();
+                if let Err(e) = reply.send(peer_id) {
+                    error!(target: "gossip-network", ?e, "LocalPeerId command failed");
+                }
+            }
+            SwarmCommand::Publish { topic, msg, reply } => {
+                let res = self.swarm.behaviour_mut().gossipsub.publish(topic, msg);
+                if let Err(e) = reply.send(res) {
+                    error!(target: "gossip-network", ?e, "Publish command failed");
+                }
+            }
+            SwarmCommand::Subscribe { topic, reply } => {
+                let res = self.swarm.behaviour_mut().gossipsub.subscribe(&topic);
+                if let Err(e) = reply.send(res) {
+                    error!(target: "gossip-network", ?e, "Subscribe command failed");
+                }
+            }
+            SwarmCommand::ConnectedPeers { reply } => {
+                let res = self.swarm.connected_peers().cloned().collect();
+                if let Err(e) = reply.send(res) {
+                    error!(target: "gossip-network", ?e, "ConnectedPeers command failed");
+                }
+            }
+            SwarmCommand::PeerScore { peer_id, reply } => {
+                let opt_score = self.swarm.behaviour_mut().gossipsub.peer_score(&peer_id);
+                if let Err(e) = reply.send(opt_score) {
+                    error!(target: "gossip-network", ?e, "PeerScore command failed");
+                }
+            }
+            SwarmCommand::SetApplicationScore { peer_id, new_score, reply } => {
+                let bool =
+                    self.swarm.behaviour_mut().gossipsub.set_application_score(&peer_id, new_score);
+                if let Err(e) = reply.send(bool) {
+                    error!(target: "gossip-network", ?e, "SetApplicationScore command failed");
+                }
+            }
+            SwarmCommand::AllPeers { reply } => {
+                let collection = self
+                    .swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .all_peers()
+                    .map(|(peer_id, vec)| (*peer_id, vec.into_iter().cloned().collect()))
+                    .collect();
+
+                if let Err(e) = reply.send(collection) {
+                    error!(target: "gossip-network", ?e, "AllPeers command failed");
+                }
+            }
+            SwarmCommand::AllMeshPeers { reply } => {
+                let collection =
+                    self.swarm.behaviour_mut().gossipsub.all_mesh_peers().cloned().collect();
+                if let Err(e) = reply.send(collection) {
+                    error!(target: "gossip-network", ?e, "AllMeshPeers command failed");
+                }
+            }
+            SwarmCommand::MeshPeers { topic, reply } => {
+                let collection =
+                    self.swarm.behaviour_mut().gossipsub.mesh_peers(&topic).cloned().collect();
+                if let Err(e) = reply.send(collection) {
+                    error!(target: "gossip-network", ?e, "MeshPeers command failed");
+                }
+            }
+            SwarmCommand::SendRequest { peer, request, reply } => {
+                let request_id = self.swarm.behaviour_mut().req_res.send_request(&peer, request);
+                self.pending_requests.insert(request_id, reply);
+            }
+            SwarmCommand::SendResponse { response } => {
+                todo!()
+            }
         }
     }
 
@@ -355,14 +453,17 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::helpers::primary_gossip_config;
+
     use super::*;
+    use eyre::OptionExt;
     use libp2p::Multiaddr;
     use tn_storage::mem_db::MemDatabase;
-    use tn_test_utils::CommitteeFixture;
+    use tn_test_utils::{fixture_batch_with_transactions, CommitteeFixture};
     use tn_types::WorkerBlock;
 
     #[tokio::test]
-    async fn test_worker_network() {
+    async fn test_worker_network() -> eyre::Result<()> {
         // TODO: reload known peers from database,
         // - use this file on startup for "discoverability" at genesis
 
@@ -375,7 +476,7 @@ mod tests {
         let authority_1 = all_nodes.authorities().next().expect("first authority");
         let config_1 = authority_1.consensus_config();
         let (tx, network_messages) = mpsc::channel(1);
-        let authorized_publishers = all_nodes
+        let authorized_publishers: HashSet<PeerId> = all_nodes
             .authorities()
             .map(|a| {
                 let mut key_bytes = a.primary_network_keypair().as_ref().to_vec();
@@ -388,26 +489,34 @@ mod tests {
             .collect();
 
         println!("authorized publishers: {:?}", authorized_publishers);
-        let gossipsub_config = primary_gossip_config().expect("default primary gossipsub config");
+        let gossipsub_config = primary_gossip_config()?;
         let topics = vec![IdentTopic::new("test-topic")];
         let peer1_network = ConsensusNetwork::<WorkerBlock, WorkerBlock>::new(
             &config_1,
             tx,
-            authorized_publishers,
+            authorized_publishers.clone(),
             gossipsub_config,
             topics.clone(),
-        )
-        .expect("consensus network for peer 1");
+        )?;
 
         // spawn task
         let peer1 = peer1_network.network_handle();
         peer1_network.run();
 
         // start swarm listening on default any address
-        let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1"
-            .parse()
-            .expect("multiaddr parsed for worker gossip publisher");
-        peer1.start_listening(listen_on).await.expect("peer1 listening");
+        let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse()?;
+        peer1.start_listening(listen_on).await?;
+        let peer1_id = peer1.local_peer_id().await?;
+
+        let worker_block = fixture_batch_with_transactions(3);
+        let mut other_peers = authorized_publishers.iter().filter(|id| *id != &peer1_id);
+
+        let peer2 = other_peers.next().ok_or_eyre("committee must have more than 1 peer")?;
+        let (tx, network_reply) = oneshot::channel();
+        peer1.send_request(worker_block, *peer2, tx).await?;
+
+        let outbound_id = network_reply.await?;
+        println!("outbound id: {outbound_id:?}");
 
         //
 

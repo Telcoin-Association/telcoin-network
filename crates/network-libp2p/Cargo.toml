@@ -34,6 +34,7 @@ roaring = { workspace = true }
 
 [dev-dependencies]
 tn-test-utils = { workspace = true }
+eyre = { workspace = true }
 
 [lints]
 workspace = true
