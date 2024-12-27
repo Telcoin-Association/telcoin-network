@@ -14,6 +14,10 @@ impl Multiaddr {
         Self(addr)
     }
 
+    pub fn inner(&self) -> ::multiaddr::Multiaddr {
+        self.0.clone()
+    }
+
     pub fn empty() -> Self {
         Self(::multiaddr::Multiaddr::empty())
     }
