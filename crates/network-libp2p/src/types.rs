@@ -20,6 +20,15 @@ pub const PRIMARY_CERT_TOPIC: &str = "tn_certificates";
 /// The topic for NVVs to subscribe to for published consensus chain.
 pub const CONSENSUS_HEADER_TOPIC: &str = "tn_consensus_headers";
 
+/// Events created from network activity.
+#[derive(Debug)]
+pub enum NetworkEvent {
+    /// Direct request from peer.
+    Request,
+    /// Gossip message received.
+    Gossip(Vec<u8>),
+}
+
 /// Commands for the swarm.
 #[derive(Debug)]
 pub enum NetworkCommand {
@@ -97,12 +106,12 @@ pub enum SwarmCommand {
 ///
 /// The type that sends commands to the running network (swarm) task.
 #[derive(Clone)]
-pub struct GossipNetworkHandle {
+pub struct NetworkHandle {
     /// Sending channel to the network to process commands.
     sender: mpsc::Sender<NetworkCommand>,
 }
 
-impl GossipNetworkHandle {
+impl NetworkHandle {
     /// Create a new instance of Self.
     pub fn new(sender: mpsc::Sender<NetworkCommand>) -> Self {
         Self { sender }
