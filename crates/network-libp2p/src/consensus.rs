@@ -5,19 +5,25 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     helpers::{primary_gossip_config, process_swarm_command},
-    types::{GossipNetworkHandle, NetworkCommand, NetworkResult},
+    types::{NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
 };
 use futures::StreamExt as _;
 use libp2p::{
     gossipsub::{self, IdentTopic, MessageAcceptance},
-    request_response::{self, Codec, ProtocolSupport},
+    request_response::{self, Codec, OutboundRequestId, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
     PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 use tn_config::ConsensusConfig;
 use tokio::{
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        oneshot,
+    },
     task::JoinHandle,
 };
 use tracing::{error, info, trace, warn};
@@ -66,9 +72,9 @@ where
     /// The gossip network for flood publishing sealed worker blocks.
     swarm: Swarm<TNBehavior<TNCodec<Req, Res>>>,
     /// The subscribed gossip network topics.
-    topics: HashSet<IdentTopic>,
-    /// The stream for forwarding downloaded messages.
-    sender: Sender<Vec<u8>>,
+    topics: Vec<IdentTopic>,
+    /// The stream for forwarding network events.
+    event_stream: Sender<NetworkEvent>,
     /// The sender for network handles.
     handle: Sender<NetworkCommand>,
     /// The receiver for processing network handle requests.
@@ -78,6 +84,10 @@ where
     /// This set must be updated at the start of each epoch. It is used to verify message sources
     /// are from validators.
     authorized_publishers: HashSet<PeerId>,
+    /// The collection of pending requests.
+    ///
+    /// Callers include a oneshot channel for the network to return results. The caller is responsible for decoding message bytes and reporting peers who return bad data. Peers that send messages that fail to decode must receive an application score penalty.
+    pending_requests: HashMap<OutboundRequestId, oneshot::Sender<NetworkResult<Vec<u8>>>>,
 }
 
 impl<Req, Res> ConsensusNetwork<Req, Res>
@@ -91,10 +101,10 @@ where
     /// !!!~~~~~~~k
     pub fn new<DB>(
         config: &ConsensusConfig<DB>,
-        sender: mpsc::Sender<Vec<u8>>,
+        event_stream: mpsc::Sender<NetworkEvent>,
         authorized_publishers: HashSet<PeerId>,
         gossipsub_config: gossipsub::Config,
-        topics: HashSet<IdentTopic>,
+        topics: Vec<IdentTopic>,
     ) -> NetworkResult<Self>
     where
         // TODO: need to import tn-storage just for this trait?
@@ -138,14 +148,23 @@ where
             .build();
 
         let (handle, commands) = tokio::sync::mpsc::channel(100);
-        Ok(Self { swarm, topics, handle, commands, sender, authorized_publishers })
+        let pending_requests = HashMap::new();
+        Ok(Self {
+            swarm,
+            topics,
+            handle,
+            commands,
+            event_stream,
+            authorized_publishers,
+            pending_requests,
+        })
     }
 
     /// Return a [NetworkHandle] to send commands to this network.
     ///
     /// TODO: this should just be `NetworkHandle`
-    pub fn network_handle(&self) -> GossipNetworkHandle {
-        GossipNetworkHandle::new(self.handle.clone())
+    pub fn network_handle(&self) -> NetworkHandle {
+        NetworkHandle::new(self.handle.clone())
     }
 
     /// Run the network loop to process incoming gossip.
@@ -193,9 +212,11 @@ where
                             .is_some_and(|id| self.authorized_publishers.contains(&id))
                         {
                             // forward message to handler
-                            if let Err(e) = self.sender.try_send(message.data) {
-                                error!(target: "consensus-network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "failed to forward received message!");
-                                // fatal - unable to process gossipped messages
+                            if let Err(e) =
+                                self.event_stream.try_send(NetworkEvent::Gossip(message.data))
+                            {
+                                error!(target: "consensus-network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
+                                // fatal - unable to process gossip messages
                                 return Err(e.into());
                             }
 
@@ -228,7 +249,21 @@ where
                 },
                 TNBehaviorEvent::ReqRes(rpc) => match rpc {
                     request_response::Event::Message { peer, message } => {
-                        info!(target: "consensus-network",  ?peer, ?message, "req/res MESSAGE event")
+                        info!(target: "consensus-network",  ?peer, ?message, "req/res MESSAGE event");
+
+                        match message {
+                            request_response::Message::Request { request_id, request, channel } => {
+                                // forward request to handler without blocking other events
+                                if let Err(e) = self.event_stream.try_send(NetworkEvent::Request) {
+                                    error!(target: "consensus-network", topics=?self.topics, ?request_id, ?request, ?e, "failed to forward request!");
+                                    // fatal - unable to process requests
+                                    return Err(e.into());
+                                }
+                            }
+                            request_response::Message::Response { request_id, response } => {
+                                todo!()
+                            }
+                        }
                     }
                     request_response::Event::OutboundFailure { peer, request_id, error } => todo!(),
                     request_response::Event::InboundFailure { peer, request_id, error } => todo!(),
@@ -321,10 +356,61 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libp2p::Multiaddr;
+    use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils::CommitteeFixture;
+    use tn_types::WorkerBlock;
 
     #[tokio::test]
     async fn test_worker_network() {
-        // let network = ConsensusNetwork::new();
+        // TODO: reload known peers from database,
+        // - use this file on startup for "discoverability" at genesis
+
+        let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+
+        //
+        //=== peer 1
+        //
+
+        let authority_1 = all_nodes.authorities().next().expect("first authority");
+        let config_1 = authority_1.consensus_config();
+        let (tx, network_messages) = mpsc::channel(1);
+        let authorized_publishers = all_nodes
+            .authorities()
+            .map(|a| {
+                let mut key_bytes = a.primary_network_keypair().as_ref().to_vec();
+                let keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut key_bytes)
+                    .expect("primary ed25519 key from bytes");
+                let public_key = keypair.public();
+
+                PeerId::from_public_key(&public_key)
+            })
+            .collect();
+
+        println!("authorized publishers: {:?}", authorized_publishers);
+        let gossipsub_config = primary_gossip_config().expect("default primary gossipsub config");
+        let topics = vec![IdentTopic::new("test-topic")];
+        let peer1_network = ConsensusNetwork::<WorkerBlock, WorkerBlock>::new(
+            &config_1,
+            tx,
+            authorized_publishers,
+            gossipsub_config,
+            topics.clone(),
+        )
+        .expect("consensus network for peer 1");
+
+        // spawn task
+        let peer1 = peer1_network.network_handle();
+        peer1_network.run();
+
+        // start swarm listening on default any address
+        let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1"
+            .parse()
+            .expect("multiaddr parsed for worker gossip publisher");
+        peer1.start_listening(listen_on).await.expect("peer1 listening");
+
+        //
+
         todo!()
     }
 }
