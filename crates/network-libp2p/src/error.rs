@@ -45,6 +45,13 @@ pub enum NetworkError {
     /// Error converted from [std::num::TryFromIntError]
     #[error(transparent)]
     TryFromIntError(#[from] std::num::TryFromIntError),
+    /// Libp2p `ResponseChannel` already closed due to timeout or loss of connection.
+    #[error("Response channel closed.")]
+    SendResponse,
+    /// The oneshot channel for a request was lost.
+    /// NOTE: this is not expected to happen.
+    #[error("Request channel lost. Unable to return peer's response to original caller.")]
+    RequestChannelLost,
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {

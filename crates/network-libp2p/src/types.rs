@@ -4,8 +4,7 @@ use crate::{codec::TNMessage, error::NetworkError};
 use libp2p::{
     core::transport::ListenerId,
     gossipsub::{IdentTopic, MessageId, PublishError, SubscriptionError, TopicHash},
-    request_response::OutboundRequestId,
-    swarm::{dial_opts::DialOpts, DialError, ListenError},
+    request_response::ResponseChannel,
     Multiaddr, PeerId, TransportError,
 };
 use std::collections::{HashMap, HashSet};
@@ -23,18 +22,24 @@ pub const CONSENSUS_HEADER_TOPIC: &str = "tn_consensus_headers";
 
 /// Events created from network activity.
 #[derive(Debug)]
-pub enum NetworkEvent {
+pub enum NetworkEvent<Req, Res> {
     /// Direct request from peer.
-    Request,
+    Request {
+        /// The network request type.
+        request: Req,
+        /// The network response channel.
+        channel: ResponseChannel<Res>,
+    },
     /// Gossip message received.
     Gossip(Vec<u8>),
 }
 
 /// Commands for the swarm.
 #[derive(Debug)]
-pub enum NetworkCommand<Req>
+pub enum NetworkCommand<Req, Res>
 where
     Req: TNMessage,
+    Res: TNMessage,
 {
     /// Update the list of authorized publishers.
     ///
@@ -47,15 +52,16 @@ where
         reply: oneshot::Sender<NetworkResult<()>>,
     },
     /// Commands to manage the network's swarm.
-    Swarm(SwarmCommand<Req>),
+    Swarm(SwarmCommand<Req, Res>),
 }
 
 /// Commands for the swarm.
 #[derive(Debug)]
 //TODO: add <M> generic here so devs can only publish correct messages?
-pub enum SwarmCommand<Req>
+pub enum SwarmCommand<Req, Res>
 where
     Req: TNMessage,
+    Res: TNMessage,
 {
     StartListening {
         /// The [Multiaddr] for the swarm to connect.
@@ -76,12 +82,12 @@ where
     },
     /// Dial a peer to establish a connection.
     Dial {
-        /// The peer's address and peer id both impl Into<DialOpts>.
-        ///
-        /// However, it seems best to use the peer's [Multiaddr].
-        dial_opts: DialOpts,
+        /// The peer's id.
+        peer_id: PeerId,
+        /// The peer's address.
+        peer_addr: Multiaddr,
         /// Oneshot for reply
-        reply: oneshot::Sender<Result<(), DialError>>,
+        reply: oneshot::Sender<NetworkResult<()>>,
     },
     /// Return an owned copy of this node's [PeerId].
     LocalPeerId { reply: oneshot::Sender<PeerId> },
@@ -94,12 +100,16 @@ where
         /// The request to send.
         request: Req,
         /// Channel for forwarding any responses.
-        reply: oneshot::Sender<NetworkResult<Vec<u8>>>,
+        reply: oneshot::Sender<Res>,
     },
     /// Send response to a peer's request.
     SendResponse {
         /// The encoded message data.
-        response: Vec<u8>,
+        response: Res,
+        /// The libp2p response channel.
+        channel: ResponseChannel<Res>,
+        /// Oneshot channel for returning result.
+        reply: oneshot::Sender<Result<(), Res>>,
     },
     /// Subscribe to a topic.
     Subscribe { topic: IdentTopic, reply: oneshot::Sender<Result<bool, SubscriptionError>> },
@@ -129,20 +139,22 @@ where
 ///
 /// The type that sends commands to the running network (swarm) task.
 #[derive(Clone)]
-pub struct NetworkHandle<Req>
+pub struct NetworkHandle<Req, Res>
 where
     Req: TNMessage,
+    Res: TNMessage,
 {
     /// Sending channel to the network to process commands.
-    sender: mpsc::Sender<NetworkCommand<Req>>,
+    sender: mpsc::Sender<NetworkCommand<Req, Res>>,
 }
 
-impl<Req> NetworkHandle<Req>
+impl<Req, Res> NetworkHandle<Req, Res>
 where
     Req: TNMessage,
+    Res: TNMessage,
 {
     /// Create a new instance of Self.
-    pub fn new(sender: mpsc::Sender<NetworkCommand<Req>>) -> Self {
+    pub fn new(sender: mpsc::Sender<NetworkCommand<Req, Res>>) -> Self {
         Self { sender }
     }
 
@@ -186,9 +198,11 @@ where
     /// Dial a peer.
     ///
     /// Return swarm error to caller.
-    pub async fn dial(&self, dial_opts: DialOpts) -> NetworkResult<()> {
+    pub async fn dial(&self, peer_id: PeerId, peer_addr: Multiaddr) -> NetworkResult<()> {
         let (reply, ack) = oneshot::channel();
-        self.sender.send(NetworkCommand::Swarm(SwarmCommand::Dial { dial_opts, reply })).await?;
+        self.sender
+            .send(NetworkCommand::Swarm(SwarmCommand::Dial { peer_id, peer_addr, reply }))
+            .await?;
         let res = ack.await?;
         res.map_err(Into::into)
     }
@@ -281,11 +295,24 @@ where
         &self,
         request: Req,
         peer: PeerId,
-        reply: oneshot::Sender<NetworkResult<Vec<u8>>>,
-    ) -> NetworkResult<()> {
+    ) -> NetworkResult<oneshot::Receiver<Res>> {
+        let (reply, to_caller) = oneshot::channel();
         self.sender
             .send(NetworkCommand::Swarm(SwarmCommand::SendRequest { peer, request, reply }))
-            .await
-            .map_err(Into::into)
+            .await?;
+        Ok(to_caller)
+    }
+
+    /// Respond to a peer's request.
+    pub async fn send_response(
+        &self,
+        response: Res,
+        channel: ResponseChannel<Res>,
+    ) -> NetworkResult<()> {
+        let (reply, res) = oneshot::channel();
+        self.sender
+            .send(NetworkCommand::Swarm(SwarmCommand::SendResponse { response, channel, reply }))
+            .await?;
+        res.await?.map_err(|_| NetworkError::SendResponse)
     }
 }

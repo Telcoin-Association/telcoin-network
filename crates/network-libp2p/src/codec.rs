@@ -116,9 +116,11 @@ impl<Req, Res> TNCodec<Req, Res> {
     {
         // global encode
         let bytes = encode(&msg);
+        println!("bytes? {:?}", bytes);
 
         // ensure encoded bytes are within bounds
         if bytes.len() > self.max_chunk_size {
+            println!("bytes length greater than max allowable size: {:?}", self.max_chunk_size);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "encode data > max_chunk_size",
@@ -129,15 +131,22 @@ impl<Req, Res> TNCodec<Req, Res> {
         //
         // NOTE: 32bit max 4,294,967,295
         let prefix = (bytes.len() as u32).to_le_bytes();
+        println!("prefix: {:?}", prefix);
         io.write_all(&prefix).await?;
 
         // compress data
         let mut encoder = snap::write::FrameEncoder::new(Vec::new());
+        println!("writing now...");
         encoder.write_all(&bytes)?;
+        println!("time to flush XD");
         encoder.flush()?;
+
+        println!("flushed... writing all:\n{:?}\n\n", encoder.get_ref());
 
         // add compressed bytes to prefix
         io.write_all(encoder.get_ref()).await?;
+
+        println!("returning Ok()...");
         Ok(())
     }
 }

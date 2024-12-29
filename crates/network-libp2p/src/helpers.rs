@@ -1,24 +1,18 @@
 //! Helper methods used for handling network communication.
 
-use crate::{
-    codec::{TNCodec, TNMessage},
-    consensus::TNBehavior,
-    types::{NetworkResult, SwarmCommand},
-};
+use crate::types::NetworkResult;
 use libp2p::{
     gossipsub::{self},
-    request_response::{self, Codec, ProtocolSupport},
-    Multiaddr, StreamProtocol, Swarm, SwarmBuilder,
+    Multiaddr, Swarm, SwarmBuilder,
 };
 use std::time::Duration;
-use tracing::error;
 
 /// Generate a swarm type for use with gossip network and start listening.
 ///
 /// This is a convenience function to keep publisher/subscriber network DRY.
 ///
 /// NOTE: the swarm tries to connect to the provided multiaddr.
-pub(crate) fn start_swarm(
+pub(crate) fn _start_swarm(
     multiaddr: Multiaddr,
     gossipsub_config: gossipsub::Config,
 ) -> NetworkResult<Swarm<gossipsub::Behaviour>> {
@@ -53,7 +47,7 @@ pub(crate) fn start_swarm(
 ///
 /// This function ensures that expected defaults are always present, even if the upstream libp2p
 /// dependency changes.
-fn apply_default_gossipsub_configurations(builder: &mut gossipsub::ConfigBuilder) {
+fn _apply_default_gossipsub_configurations(builder: &mut gossipsub::ConfigBuilder) {
     builder
         // explicitly set heartbeat interval (default)
         .heartbeat_interval(Duration::from_secs(1))
@@ -62,9 +56,9 @@ fn apply_default_gossipsub_configurations(builder: &mut gossipsub::ConfigBuilder
 }
 
 /// Helper function for publish swarm gossip config.
-pub fn subscriber_gossip_config() -> NetworkResult<gossipsub::Config> {
+pub fn _subscriber_gossip_config() -> NetworkResult<gossipsub::Config> {
     let mut builder = gossipsub::ConfigBuilder::default();
-    apply_default_gossipsub_configurations(&mut builder);
+    _apply_default_gossipsub_configurations(&mut builder);
     let config = builder
         // only listen to authorized publishers
         .validate_messages()
@@ -74,9 +68,9 @@ pub fn subscriber_gossip_config() -> NetworkResult<gossipsub::Config> {
 }
 
 /// Helper function for publish swarm gossip config.
-pub fn publisher_gossip_config() -> NetworkResult<gossipsub::Config> {
+pub fn _publisher_gossip_config() -> NetworkResult<gossipsub::Config> {
     let mut builder = gossipsub::ConfigBuilder::default();
-    apply_default_gossipsub_configurations(&mut builder);
+    _apply_default_gossipsub_configurations(&mut builder);
     let config = builder
         // support peer exchange
         .do_px()
@@ -86,9 +80,9 @@ pub fn publisher_gossip_config() -> NetworkResult<gossipsub::Config> {
 }
 
 /// Helper function for primary swarm gossip config.
-pub fn primary_gossip_config() -> NetworkResult<gossipsub::Config> {
+pub fn _primary_gossip_config() -> NetworkResult<gossipsub::Config> {
     let mut builder = gossipsub::ConfigBuilder::default();
-    apply_default_gossipsub_configurations(&mut builder);
+    _apply_default_gossipsub_configurations(&mut builder);
     let config = builder
         // support peer exchange
         .do_px()

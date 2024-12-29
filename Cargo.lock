@@ -11337,7 +11337,6 @@ dependencies = [
  "fastcrypto",
  "futures",
  "libp2p",
- "reth-tracing",
  "roaring",
  "serde",
  "snap",
