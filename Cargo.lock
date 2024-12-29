@@ -11337,6 +11337,7 @@ dependencies = [
  "fastcrypto",
  "futures",
  "libp2p",
+ "reth-tracing",
  "roaring",
  "serde",
  "snap",
@@ -11597,6 +11598,7 @@ dependencies = [
  "tokio",
  "tonic 0.10.2",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -29,6 +29,9 @@ pub use helpers::*;
 mod telcoin_temp_dirs;
 pub use telcoin_temp_dirs::*;
 
+mod tracing;
+pub use tracing::init_test_tracing;
+
 #[cfg(test)]
 mod output_tests;
 #[cfg(test)]

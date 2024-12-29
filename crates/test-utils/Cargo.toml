@@ -63,6 +63,7 @@ alloy = { workspace = true, features = [
     "signer-local",
     "network",
 ] }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
