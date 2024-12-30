@@ -189,136 +189,6 @@ where
         })
     }
 
-    /// Process commands for the network.
-    fn process_command(&mut self, command: NetworkCommand<Req, Res>) {
-        match command {
-            NetworkCommand::UpdateAuthorizedPublishers { authorities, reply } => {
-                self.authorized_publishers = authorities;
-                if let Err(e) = reply.send(Ok(())) {
-                    error!(target: "network", ?e, "UpdateAuthorizedPublishers failed to send result");
-                }
-            }
-            NetworkCommand::StartListening { multiaddr, reply } => {
-                let res = self.swarm.listen_on(multiaddr);
-                if let Err(e) = reply.send(res) {
-                    error!(target: "network", ?e, "StartListening failed to send result");
-                }
-            }
-            NetworkCommand::GetListener { reply } => {
-                let addrs = self.swarm.listeners().cloned().collect();
-                if let Err(e) = reply.send(addrs) {
-                    error!(target: "network", ?e, "GetListeners command failed");
-                }
-            }
-            NetworkCommand::AddExplicitPeer { peer_id, addr } => {
-                self.swarm.add_peer_address(peer_id, addr);
-                self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-            }
-            NetworkCommand::Dial { peer_id, peer_addr, reply } => {
-                if let hash_map::Entry::Vacant(entry) = self.pending_dials.entry(peer_id) {
-                    // TODO: support kademlia?
-                    //
-                    // self.swarm
-                    //     .behaviour_mut()
-                    //     .kademlia
-                    //     .add_address(&peer_id, peer_addr.clone());
-                    match self.swarm.dial(peer_addr.with(Protocol::P2p(peer_id))) {
-                        Ok(()) => {
-                            entry.insert(reply);
-                        }
-                        Err(e) => {
-                            if let Err(e) = reply.send(Err(e.into())) {
-                                error!(target: "network", ?e, "AddExplicitPeer oneshot dropped");
-                            }
-                        }
-                    }
-                } else {
-                    // return error - dial attempt already tracked for peer
-                    //
-                    // may be necessary to update entry in future, but for now assume only one dial attempt
-                    if let Err(e) = reply.send(Err(NetworkError::RedialAttempt)) {
-                        error!(target: "network", ?e, "AddExplicitPeer oneshot dropped");
-                    }
-                }
-            }
-            NetworkCommand::LocalPeerId { reply } => {
-                let peer_id = *self.swarm.local_peer_id();
-                if let Err(e) = reply.send(peer_id) {
-                    error!(target: "network", ?e, "LocalPeerId command failed");
-                }
-            }
-            NetworkCommand::Publish { topic, msg, reply } => {
-                let res = self.swarm.behaviour_mut().gossipsub.publish(topic, msg);
-                if let Err(e) = reply.send(res) {
-                    error!(target: "network", ?e, "Publish command failed");
-                }
-            }
-            NetworkCommand::Subscribe { topic, reply } => {
-                let res = self.swarm.behaviour_mut().gossipsub.subscribe(&topic);
-                if let Err(e) = reply.send(res) {
-                    error!(target: "network", ?e, "Subscribe command failed");
-                }
-            }
-            NetworkCommand::ConnectedPeers { reply } => {
-                let res = self.swarm.connected_peers().cloned().collect();
-                if let Err(e) = reply.send(res) {
-                    error!(target: "network", ?e, "ConnectedPeers command failed");
-                }
-            }
-            NetworkCommand::PeerScore { peer_id, reply } => {
-                let opt_score = self.swarm.behaviour_mut().gossipsub.peer_score(&peer_id);
-                if let Err(e) = reply.send(opt_score) {
-                    error!(target: "network", ?e, "PeerScore command failed");
-                }
-            }
-            NetworkCommand::SetApplicationScore { peer_id, new_score, reply } => {
-                let bool =
-                    self.swarm.behaviour_mut().gossipsub.set_application_score(&peer_id, new_score);
-                if let Err(e) = reply.send(bool) {
-                    error!(target: "network", ?e, "SetApplicationScore command failed");
-                }
-            }
-            NetworkCommand::AllPeers { reply } => {
-                let collection = self
-                    .swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .all_peers()
-                    .map(|(peer_id, vec)| (*peer_id, vec.into_iter().cloned().collect()))
-                    .collect();
-
-                if let Err(e) = reply.send(collection) {
-                    error!(target: "network", ?e, "AllPeers command failed");
-                }
-            }
-            NetworkCommand::AllMeshPeers { reply } => {
-                let collection =
-                    self.swarm.behaviour_mut().gossipsub.all_mesh_peers().cloned().collect();
-                if let Err(e) = reply.send(collection) {
-                    error!(target: "network", ?e, "AllMeshPeers command failed");
-                }
-            }
-            NetworkCommand::MeshPeers { topic, reply } => {
-                let collection =
-                    self.swarm.behaviour_mut().gossipsub.mesh_peers(&topic).cloned().collect();
-                if let Err(e) = reply.send(collection) {
-                    error!(target: "network", ?e, "MeshPeers command failed");
-                }
-            }
-            NetworkCommand::SendRequest { peer, request, reply } => {
-                tracing::debug!("inside NetworkCommand send request");
-                let request_id = self.swarm.behaviour_mut().req_res.send_request(&peer, request);
-                self.pending_requests.insert(request_id, reply);
-            }
-            NetworkCommand::SendResponse { response, channel, reply } => {
-                let res = self.swarm.behaviour_mut().req_res.send_response(channel, response);
-                if let Err(e) = reply.send(res) {
-                    error!(target: "network", ?e, "SendResponse command failed");
-                }
-            }
-        }
-    }
-
     /// Process events from the swarm.
     async fn process_event(
         &mut self,
@@ -517,6 +387,136 @@ where
             }
         }
         Ok(())
+    }
+
+    /// Process commands for the network.
+    fn process_command(&mut self, command: NetworkCommand<Req, Res>) {
+        match command {
+            NetworkCommand::UpdateAuthorizedPublishers { authorities, reply } => {
+                self.authorized_publishers = authorities;
+                if let Err(e) = reply.send(Ok(())) {
+                    error!(target: "network", ?e, "UpdateAuthorizedPublishers failed to send result");
+                }
+            }
+            NetworkCommand::StartListening { multiaddr, reply } => {
+                let res = self.swarm.listen_on(multiaddr);
+                if let Err(e) = reply.send(res) {
+                    error!(target: "network", ?e, "StartListening failed to send result");
+                }
+            }
+            NetworkCommand::GetListener { reply } => {
+                let addrs = self.swarm.listeners().cloned().collect();
+                if let Err(e) = reply.send(addrs) {
+                    error!(target: "network", ?e, "GetListeners command failed");
+                }
+            }
+            NetworkCommand::AddExplicitPeer { peer_id, addr } => {
+                self.swarm.add_peer_address(peer_id, addr);
+                self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+            }
+            NetworkCommand::Dial { peer_id, peer_addr, reply } => {
+                if let hash_map::Entry::Vacant(entry) = self.pending_dials.entry(peer_id) {
+                    // TODO: support kademlia?
+                    //
+                    // self.swarm
+                    //     .behaviour_mut()
+                    //     .kademlia
+                    //     .add_address(&peer_id, peer_addr.clone());
+                    match self.swarm.dial(peer_addr.with(Protocol::P2p(peer_id))) {
+                        Ok(()) => {
+                            entry.insert(reply);
+                        }
+                        Err(e) => {
+                            if let Err(e) = reply.send(Err(e.into())) {
+                                error!(target: "network", ?e, "AddExplicitPeer oneshot dropped");
+                            }
+                        }
+                    }
+                } else {
+                    // return error - dial attempt already tracked for peer
+                    //
+                    // may be necessary to update entry in future, but for now assume only one dial attempt
+                    if let Err(e) = reply.send(Err(NetworkError::RedialAttempt)) {
+                        error!(target: "network", ?e, "AddExplicitPeer oneshot dropped");
+                    }
+                }
+            }
+            NetworkCommand::LocalPeerId { reply } => {
+                let peer_id = *self.swarm.local_peer_id();
+                if let Err(e) = reply.send(peer_id) {
+                    error!(target: "network", ?e, "LocalPeerId command failed");
+                }
+            }
+            NetworkCommand::Publish { topic, msg, reply } => {
+                let res = self.swarm.behaviour_mut().gossipsub.publish(topic, msg);
+                if let Err(e) = reply.send(res) {
+                    error!(target: "network", ?e, "Publish command failed");
+                }
+            }
+            NetworkCommand::Subscribe { topic, reply } => {
+                let res = self.swarm.behaviour_mut().gossipsub.subscribe(&topic);
+                if let Err(e) = reply.send(res) {
+                    error!(target: "network", ?e, "Subscribe command failed");
+                }
+            }
+            NetworkCommand::ConnectedPeers { reply } => {
+                let res = self.swarm.connected_peers().cloned().collect();
+                if let Err(e) = reply.send(res) {
+                    error!(target: "network", ?e, "ConnectedPeers command failed");
+                }
+            }
+            NetworkCommand::PeerScore { peer_id, reply } => {
+                let opt_score = self.swarm.behaviour_mut().gossipsub.peer_score(&peer_id);
+                if let Err(e) = reply.send(opt_score) {
+                    error!(target: "network", ?e, "PeerScore command failed");
+                }
+            }
+            NetworkCommand::SetApplicationScore { peer_id, new_score, reply } => {
+                let bool =
+                    self.swarm.behaviour_mut().gossipsub.set_application_score(&peer_id, new_score);
+                if let Err(e) = reply.send(bool) {
+                    error!(target: "network", ?e, "SetApplicationScore command failed");
+                }
+            }
+            NetworkCommand::AllPeers { reply } => {
+                let collection = self
+                    .swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .all_peers()
+                    .map(|(peer_id, vec)| (*peer_id, vec.into_iter().cloned().collect()))
+                    .collect();
+
+                if let Err(e) = reply.send(collection) {
+                    error!(target: "network", ?e, "AllPeers command failed");
+                }
+            }
+            NetworkCommand::AllMeshPeers { reply } => {
+                let collection =
+                    self.swarm.behaviour_mut().gossipsub.all_mesh_peers().cloned().collect();
+                if let Err(e) = reply.send(collection) {
+                    error!(target: "network", ?e, "AllMeshPeers command failed");
+                }
+            }
+            NetworkCommand::MeshPeers { topic, reply } => {
+                let collection =
+                    self.swarm.behaviour_mut().gossipsub.mesh_peers(&topic).cloned().collect();
+                if let Err(e) = reply.send(collection) {
+                    error!(target: "network", ?e, "MeshPeers command failed");
+                }
+            }
+            NetworkCommand::SendRequest { peer, request, reply } => {
+                tracing::debug!("inside NetworkCommand send request");
+                let request_id = self.swarm.behaviour_mut().req_res.send_request(&peer, request);
+                self.pending_requests.insert(request_id, reply);
+            }
+            NetworkCommand::SendResponse { response, channel, reply } => {
+                let res = self.swarm.behaviour_mut().req_res.send_response(channel, response);
+                if let Err(e) = reply.send(res) {
+                    error!(target: "network", ?e, "SendResponse command failed");
+                }
+            }
+        }
     }
 }
 
