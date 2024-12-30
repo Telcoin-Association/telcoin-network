@@ -131,7 +131,7 @@ where
 
         // TODO: take this from configuration through CLI
         // - ex) "/telcoin-network/mainnet/0.0.1"
-        let protocols = [(StreamProtocol::new("/tn-consensus"), ProtocolSupport::Full)];
+        let protocols = [(StreamProtocol::new("/telcoin-network/0.0.0"), ProtocolSupport::Full)];
         let req_res = request_response::Behaviour::with_codec(
             tn_codec,
             protocols,
@@ -151,6 +151,7 @@ where
             .build();
 
         let (handle, commands) = tokio::sync::mpsc::channel(100);
+
         Ok(Self {
             swarm,
             topics,
