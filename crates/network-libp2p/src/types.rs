@@ -91,7 +91,7 @@ where
         /// The request to send.
         request: Req,
         /// Channel for forwarding any responses.
-        reply: oneshot::Sender<Res>,
+        reply: oneshot::Sender<NetworkResult<Res>>,
     },
     /// Send response to a peer's request.
     SendResponse {
@@ -276,7 +276,7 @@ where
         &self,
         request: Req,
         peer: PeerId,
-    ) -> NetworkResult<oneshot::Receiver<Res>> {
+    ) -> NetworkResult<oneshot::Receiver<NetworkResult<Res>>> {
         let (reply, to_caller) = oneshot::channel();
         self.sender.send(NetworkCommand::SendRequest { peer, request, reply }).await?;
         Ok(to_caller)

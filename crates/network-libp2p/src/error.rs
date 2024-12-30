@@ -2,6 +2,7 @@
 
 use libp2p::{
     gossipsub::{ConfigBuilderError, PublishError, SubscriptionError},
+    request_response::OutboundFailure,
     swarm::DialError,
     TransportError,
 };
@@ -50,8 +51,11 @@ pub enum NetworkError {
     SendResponse,
     /// The oneshot channel for a request was lost.
     /// NOTE: this is not expected to happen.
-    #[error("Request channel lost. Unable to return peer's response to original caller.")]
-    RequestChannelLost,
+    #[error("Pending request channel lost. Unable to return peer's response to original caller.")]
+    PendingRequestChannelLost,
+    /// Failed to send request/response outbound to peer.
+    #[error("Outbound failure: {0}")]
+    Outbound(#[from] OutboundFailure),
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {

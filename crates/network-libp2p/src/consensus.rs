@@ -90,7 +90,7 @@ where
     /// The collection of pending requests.
     ///
     /// Callers include a oneshot channel for the network to return response. The caller is responsible for decoding message bytes and reporting peers who return bad data. Peers that send messages that fail to decode must receive an application score penalty.
-    pending_requests: HashMap<OutboundRequestId, oneshot::Sender<Res>>,
+    pending_requests: HashMap<OutboundRequestId, oneshot::Sender<NetworkResult<Res>>>,
 }
 
 impl<Req, Res> ConsensusNetwork<Req, Res>
@@ -383,24 +383,36 @@ where
                             }
                             request_response::Message::Response { request_id, response } => {
                                 // forward response to original caller
+                                //
+                                // TODO: is this fatal error?
                                 if let Err(e) = self
                                     .pending_requests
                                     .remove(&request_id)
-                                    .ok_or(NetworkError::RequestChannelLost)?
-                                    .send(response)
+                                    .ok_or(NetworkError::PendingRequestChannelLost)?
+                                    .send(Ok(response))
                                 {
                                     error!(target: "consensus-network", topics=?self.topics, ?request_id, ?e, "failed to forward request!");
                                     // fatal - unable to process requests
-                                    return Err(NetworkError::RequestChannelLost);
+                                    return Err(NetworkError::PendingRequestChannelLost);
                                 }
                             }
                         }
                     }
                     request_response::Event::OutboundFailure { peer, request_id, error } => {
-                        println!(
-                            "outbound failure?? - {:?} - {:?} - {:?}",
-                            peer, request_id, error
-                        );
+                        error!("outbound failure?? - {:?} - {:?} - {:?}", peer, request_id, error);
+                        // forward response to original caller
+                        //
+                        // TODO: is this fatal error?
+                        if let Err(e) = self
+                            .pending_requests
+                            .remove(&request_id)
+                            .ok_or(NetworkError::PendingRequestChannelLost)?
+                            .send(Err(error.into()))
+                        {
+                            error!(target: "consensus-network", topics=?self.topics, ?request_id, ?e, "failed to forward request!");
+                            // fatal - unable to process requests
+                            return Err(NetworkError::PendingRequestChannelLost);
+                        }
                     }
                     request_response::Event::InboundFailure { peer, request_id, error } => {
                         println!("inbound failure?? - {:?} - {:?} - {:?}", peer, request_id, error);
@@ -612,10 +624,10 @@ mod tests {
             // send response
             peer1.send_response(worker_block_res.clone(), channel).await?;
         } else {
-            panic!("wrong network event received");
+            panic!("unexpected network event received");
         }
 
-        let response = timeout(dur, network_res).await?.expect("outbound id recv");
+        let response = timeout(dur, network_res).await?.expect("outbound id recv")?;
 
         assert_eq!(response, worker_block_res);
 
