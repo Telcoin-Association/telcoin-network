@@ -16,6 +16,9 @@ pub enum NetworkError {
     /// Swarm error dialing a peer.
     #[error(transparent)]
     Dial(#[from] DialError),
+    /// Dial attempt currently ongoing for peer.
+    #[error("Peer already dialed")]
+    RedialAttempt,
     /// Gossipsub error publishing message.
     #[error(transparent)]
     Publish(#[from] PublishError),

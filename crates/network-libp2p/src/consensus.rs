@@ -9,9 +9,9 @@ use crate::{
 };
 use futures::StreamExt as _;
 use libp2p::{
-    gossipsub::{self, IdentTopic, MessageAcceptance},
+    gossipsub::{self, Event as GossipEvent, IdentTopic, MessageAcceptance},
     multiaddr::Protocol,
-    request_response::{self, Codec, OutboundRequestId, ProtocolSupport},
+    request_response::{self, Codec, Event as ReqResEvent, OutboundRequestId, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
     PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
@@ -182,7 +182,7 @@ where
                     command = self.commands.recv() => match command {
                         Some(c) => self.process_command(c),
                         None => {
-                            info!(target: "consensus-network", topics=?self.topics, "subscriber shutting down...");
+                            info!(target: "network", topics=?self.topics, "subscriber shutting down...");
                             return Ok(())
                         }
                     }
@@ -196,18 +196,20 @@ where
         match command {
             NetworkCommand::UpdateAuthorizedPublishers { authorities, reply } => {
                 self.authorized_publishers = authorities;
-                let _ = reply.send(Ok(()));
+                if let Err(e) = reply.send(Ok(())) {
+                    error!(target: "network", ?e, "UpdateAuthorizedPublishers failed to send result");
+                }
             }
             NetworkCommand::StartListening { multiaddr, reply } => {
                 let res = self.swarm.listen_on(multiaddr);
                 if let Err(e) = reply.send(res) {
-                    error!(target: "swarm-command", ?e, "StartListening failed to send result");
+                    error!(target: "network", ?e, "StartListening failed to send result");
                 }
             }
             NetworkCommand::GetListener { reply } => {
                 let addrs = self.swarm.listeners().cloned().collect();
                 if let Err(e) = reply.send(addrs) {
-                    error!(target: "gossip-network", ?e, "GetListeners command failed");
+                    error!(target: "network", ?e, "GetListeners command failed");
                 }
             }
             NetworkCommand::AddExplicitPeer { peer_id, addr } => {
@@ -233,44 +235,49 @@ where
                         }
                     }
                 } else {
-                    todo!("Already dialed peer.");
+                    // return error - dial attempt already tracked for peer
+                    //
+                    // may be necessary to update entry in future, but for now assume only one dial attempt
+                    if let Err(e) = reply.send(Err(NetworkError::RedialAttempt)) {
+                        error!(target: "network", ?e, "AddExplicitPeer oneshot dropped");
+                    }
                 }
             }
             NetworkCommand::LocalPeerId { reply } => {
                 let peer_id = *self.swarm.local_peer_id();
                 if let Err(e) = reply.send(peer_id) {
-                    error!(target: "gossip-network", ?e, "LocalPeerId command failed");
+                    error!(target: "network", ?e, "LocalPeerId command failed");
                 }
             }
             NetworkCommand::Publish { topic, msg, reply } => {
                 let res = self.swarm.behaviour_mut().gossipsub.publish(topic, msg);
                 if let Err(e) = reply.send(res) {
-                    error!(target: "gossip-network", ?e, "Publish command failed");
+                    error!(target: "network", ?e, "Publish command failed");
                 }
             }
             NetworkCommand::Subscribe { topic, reply } => {
                 let res = self.swarm.behaviour_mut().gossipsub.subscribe(&topic);
                 if let Err(e) = reply.send(res) {
-                    error!(target: "gossip-network", ?e, "Subscribe command failed");
+                    error!(target: "network", ?e, "Subscribe command failed");
                 }
             }
             NetworkCommand::ConnectedPeers { reply } => {
                 let res = self.swarm.connected_peers().cloned().collect();
                 if let Err(e) = reply.send(res) {
-                    error!(target: "gossip-network", ?e, "ConnectedPeers command failed");
+                    error!(target: "network", ?e, "ConnectedPeers command failed");
                 }
             }
             NetworkCommand::PeerScore { peer_id, reply } => {
                 let opt_score = self.swarm.behaviour_mut().gossipsub.peer_score(&peer_id);
                 if let Err(e) = reply.send(opt_score) {
-                    error!(target: "gossip-network", ?e, "PeerScore command failed");
+                    error!(target: "network", ?e, "PeerScore command failed");
                 }
             }
             NetworkCommand::SetApplicationScore { peer_id, new_score, reply } => {
                 let bool =
                     self.swarm.behaviour_mut().gossipsub.set_application_score(&peer_id, new_score);
                 if let Err(e) = reply.send(bool) {
-                    error!(target: "gossip-network", ?e, "SetApplicationScore command failed");
+                    error!(target: "network", ?e, "SetApplicationScore command failed");
                 }
             }
             NetworkCommand::AllPeers { reply } => {
@@ -283,21 +290,21 @@ where
                     .collect();
 
                 if let Err(e) = reply.send(collection) {
-                    error!(target: "gossip-network", ?e, "AllPeers command failed");
+                    error!(target: "network", ?e, "AllPeers command failed");
                 }
             }
             NetworkCommand::AllMeshPeers { reply } => {
                 let collection =
                     self.swarm.behaviour_mut().gossipsub.all_mesh_peers().cloned().collect();
                 if let Err(e) = reply.send(collection) {
-                    error!(target: "gossip-network", ?e, "AllMeshPeers command failed");
+                    error!(target: "network", ?e, "AllMeshPeers command failed");
                 }
             }
             NetworkCommand::MeshPeers { topic, reply } => {
                 let collection =
                     self.swarm.behaviour_mut().gossipsub.mesh_peers(&topic).cloned().collect();
                 if let Err(e) = reply.send(collection) {
-                    error!(target: "gossip-network", ?e, "MeshPeers command failed");
+                    error!(target: "network", ?e, "MeshPeers command failed");
                 }
             }
             NetworkCommand::SendRequest { peer, request, reply } => {
@@ -308,7 +315,7 @@ where
             NetworkCommand::SendResponse { response, channel, reply } => {
                 let res = self.swarm.behaviour_mut().req_res.send_response(channel, response);
                 if let Err(e) = reply.send(res) {
-                    error!(target: "network", ?e, "MeshPeers command failed");
+                    error!(target: "network", ?e, "SendResponse command failed");
                 }
             }
         }
@@ -322,8 +329,8 @@ where
         match event {
             SwarmEvent::Behaviour(behavior) => match behavior {
                 TNBehaviorEvent::Gossipsub(gossip) => match gossip {
-                    gossipsub::Event::Message { propagation_source, message_id, message } => {
-                        trace!(target: "consensus-network", topic=?self.topics, ?propagation_source, ?message_id, ?message, "message received from publisher");
+                    GossipEvent::Message { propagation_source, message_id, message } => {
+                        trace!(target: "network", topic=?self.topics, ?propagation_source, ?message_id, ?message, "message received from publisher");
                         // verify message was published by authorized node
                         let msg_acceptance = if message
                             .source
@@ -333,7 +340,7 @@ where
                             if let Err(e) =
                                 self.event_stream.try_send(NetworkEvent::Gossip(message.data))
                             {
-                                error!(target: "consensus-network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
+                                error!(target: "network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
                                 // fatal - unable to process gossip messages
                                 return Err(e.into());
                             }
@@ -351,23 +358,23 @@ where
                                 msg_acceptance,
                             )
                         {
-                            error!(target: "consensus-network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "error reporting message validation result");
+                            error!(target: "network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "error reporting message validation result");
                         }
                     }
-                    gossipsub::Event::Subscribed { peer_id, topic } => {
-                        trace!(target: "consensus-network", topics=?self.topics, ?peer_id, ?topic, "gossipsub event - subscribed")
+                    GossipEvent::Subscribed { peer_id, topic } => {
+                        trace!(target: "network", topics=?self.topics, ?peer_id, ?topic, "gossipsub event - subscribed")
                     }
-                    gossipsub::Event::Unsubscribed { peer_id, topic } => {
-                        trace!(target: "consensus-network", topics=?self.topics, ?peer_id, ?topic, "gossipsub event - unsubscribed")
+                    GossipEvent::Unsubscribed { peer_id, topic } => {
+                        trace!(target: "network", topics=?self.topics, ?peer_id, ?topic, "gossipsub event - unsubscribed")
                     }
-                    gossipsub::Event::GossipsubNotSupported { peer_id } => {
+                    GossipEvent::GossipsubNotSupported { peer_id } => {
                         // TODO: remove peer at self point?
-                        trace!(target: "consensus-network", topics=?self.topics, ?peer_id, "gossipsub event - not supported")
+                        trace!(target: "network", topics=?self.topics, ?peer_id, "gossipsub event - not supported")
                     }
                 },
                 TNBehaviorEvent::ReqRes(rpc) => match rpc {
-                    request_response::Event::Message { peer, message } => {
-                        info!(target: "consensus-network",  ?peer, ?message, "req/res MESSAGE event");
+                    ReqResEvent::Message { peer, message } => {
+                        trace!(target: "network",  ?peer, ?message, "req/res MESSAGE event");
 
                         match message {
                             request_response::Message::Request { request_id, request, channel } => {
@@ -376,49 +383,44 @@ where
                                     .event_stream
                                     .try_send(NetworkEvent::Request { request, channel })
                                 {
-                                    error!(target: "consensus-network", topics=?self.topics, ?request_id, ?e, "failed to forward request!");
+                                    error!(target: "network", topics=?self.topics, ?request_id, ?e, "failed to forward request!");
                                     // fatal - unable to process requests
                                     return Err(e.into());
                                 }
                             }
                             request_response::Message::Response { request_id, response } => {
-                                // forward response to original caller
-                                //
-                                // TODO: is this fatal error?
-                                if let Err(e) = self
+                                // try to forward response to original caller
+                                let _ = self
                                     .pending_requests
                                     .remove(&request_id)
                                     .ok_or(NetworkError::PendingRequestChannelLost)?
-                                    .send(Ok(response))
-                                {
-                                    error!(target: "consensus-network", topics=?self.topics, ?request_id, ?e, "failed to forward request!");
-                                    // fatal - unable to process requests
-                                    return Err(NetworkError::PendingRequestChannelLost);
-                                }
+                                    .send(Ok(response));
                             }
                         }
                     }
-                    request_response::Event::OutboundFailure { peer, request_id, error } => {
-                        error!("outbound failure?? - {:?} - {:?} - {:?}", peer, request_id, error);
-                        // forward response to original caller
+                    ReqResEvent::OutboundFailure { peer, request_id, error } => {
+                        error!(target: "network", ?peer, ?error, "outbound failure");
+                        // try to forward error to original caller
                         //
-                        // TODO: is this fatal error?
-                        if let Err(e) = self
+                        // TODO: how to handle these failures?
+                        // -
+                        let _ = self
                             .pending_requests
                             .remove(&request_id)
                             .ok_or(NetworkError::PendingRequestChannelLost)?
-                            .send(Err(error.into()))
-                        {
-                            error!(target: "consensus-network", topics=?self.topics, ?request_id, ?e, "failed to forward request!");
-                            // fatal - unable to process requests
-                            return Err(NetworkError::PendingRequestChannelLost);
-                        }
+                            .send(Err(error.into()));
                     }
-                    request_response::Event::InboundFailure { peer, request_id, error } => {
-                        println!("inbound failure?? - {:?} - {:?} - {:?}", peer, request_id, error);
+                    ReqResEvent::InboundFailure { peer, request_id, error } => {
+                        error!(target: "network", ?peer, ?request_id, ?error, "inbound failure");
+                        // TODO: how to handle these failures?
+                        // - connection closed: do nothing
+                        // - response ommitted: do nothing
+                        // - inbound timeout: do nothing
+                        // - inbound stream failed: malicious encoding? report peer?
+                        todo!()
                     }
-                    request_response::Event::ResponseSent { peer, request_id } => {
-                        trace!(target: "consensus-network",  ?peer, ?request_id, "response sent")
+                    ReqResEvent::ResponseSent { peer, request_id } => {
+                        trace!(target: "network",  ?peer, ?request_id, "response sent")
                     }
                 },
             },
@@ -430,7 +432,7 @@ where
                 concurrent_dial_errors,
                 established_in,
             } => {
-                trace!(target: "consensus-network", topics=?self.topics, ?peer_id, ?connection_id, ?endpoint, ?num_established, ?concurrent_dial_errors, ?established_in, "connection established");
+                trace!(target: "network", topics=?self.topics, ?peer_id, ?connection_id, ?endpoint, ?num_established, ?concurrent_dial_errors, ?established_in, "connection established");
                 if endpoint.is_dialer() {
                     if let Some(sender) = self.pending_dials.remove(&peer_id) {
                         if let Err(e) = sender.send(Ok(())) {
@@ -446,7 +448,7 @@ where
                 num_established,
                 cause,
             } => trace!(
-                target: "consensus-network",
+                target: "network",
                 topics=?self.topics,
                 ?peer_id,
                 ?connection_id,
@@ -456,7 +458,7 @@ where
                 "connection closed"
             ),
             SwarmEvent::IncomingConnection { connection_id, local_addr, send_back_addr } => {
-                trace!(target: "consensus-network", topics=?self.topics, ?connection_id, ?local_addr, ?send_back_addr, "incoming connection")
+                trace!(target: "network", topics=?self.topics, ?connection_id, ?local_addr, ?send_back_addr, "incoming connection")
             }
             SwarmEvent::IncomingConnectionError {
                 connection_id,
@@ -464,7 +466,7 @@ where
                 send_back_addr,
                 error,
             } => trace!(
-                target: "consensus-network",
+                target: "network",
                 topics=?self.topics,
                 ?connection_id,
                 ?local_addr,
@@ -473,7 +475,7 @@ where
                 "incoming connection error"
             ),
             SwarmEvent::OutgoingConnectionError { connection_id, peer_id, error } => {
-                trace!(target: "consensus-network", topics=?self.topics, ?connection_id, ?peer_id, ?error, "outgoing connection error");
+                trace!(target: "network", topics=?self.topics, ?connection_id, ?peer_id, ?error, "outgoing connection error");
                 if let Some(peer_id) = peer_id {
                     if let Some(sender) = self.pending_dials.remove(&peer_id) {
                         if let Err(e) = sender.send(Err(error.into())) {
@@ -483,34 +485,34 @@ where
                 }
             }
             SwarmEvent::NewListenAddr { listener_id, address } => {
-                trace!(target: "consensus-network", topics=?self.topics, ?listener_id, ?address, "new listener addr")
+                trace!(target: "network", topics=?self.topics, ?listener_id, ?address, "new listener addr")
             }
             SwarmEvent::ExpiredListenAddr { listener_id, address } => {
-                trace!(target: "consensus-network", topics=?self.topics, ?listener_id, ?address, "expired listen addr")
+                trace!(target: "network", topics=?self.topics, ?listener_id, ?address, "expired listen addr")
             }
             SwarmEvent::ListenerClosed { listener_id, addresses, reason } => {
-                trace!(target: "consensus-network", topics=?self.topics, ?listener_id, ?addresses, ?reason, "listener closed")
+                trace!(target: "network", topics=?self.topics, ?listener_id, ?addresses, ?reason, "listener closed")
             }
             SwarmEvent::ListenerError { listener_id, error } => {
-                trace!(target: "consensus-network", topics=?self.topics, ?listener_id, ?error, "listener error")
+                trace!(target: "network", topics=?self.topics, ?listener_id, ?error, "listener error")
             }
             SwarmEvent::Dialing { peer_id, connection_id } => {
-                trace!(target: "consensus-network", topics=?self.topics, ? peer_id, ?connection_id, "dialing")
+                trace!(target: "network", topics=?self.topics, ? peer_id, ?connection_id, "dialing")
             }
             SwarmEvent::NewExternalAddrCandidate { address } => {
-                trace!(target: "consensus-network", topics=?self.topics, ?address, "new external addr candidate")
+                trace!(target: "network", topics=?self.topics, ?address, "new external addr candidate")
             }
             SwarmEvent::ExternalAddrConfirmed { address } => {
-                trace!(target: "consensus-network", topics=?self.topics, ?address, "external addr confirmed")
+                trace!(target: "network", topics=?self.topics, ?address, "external addr confirmed")
             }
             SwarmEvent::ExternalAddrExpired { address } => {
-                trace!(target: "consensus-network", topics=?self.topics, ?address, "external addr expired")
+                trace!(target: "network", topics=?self.topics, ?address, "external addr expired")
             }
             SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => {
-                trace!(target: "consensus-network", topics=?self.topics, ?peer_id, ?address, "new external addr of peer")
+                trace!(target: "network", topics=?self.topics, ?peer_id, ?address, "new external addr of peer")
             }
             _e => {
-                trace!(target: "consensus-network", topics=?self.topics, ?_e, "non-exhaustive event match")
+                trace!(target: "network", topics=?self.topics, ?_e, "non-exhaustive event match")
             }
         }
         Ok(())
@@ -532,7 +534,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_network() -> eyre::Result<()> {
-        tn_test_utils::init_test_tracing();
         // TODO: reload known peers from database,
         // - use this file on startup for "discoverability" at genesis
 
@@ -611,7 +612,7 @@ mod tests {
         if let NetworkEvent::Request { request, channel } = event {
             assert_eq!(request, worker_block_req);
             // send response
-            peer1.send_response(worker_block_res.clone(), channel).await?;
+            peer2.send_response(worker_block_res.clone(), channel).await?;
         } else {
             panic!("unexpected network event received");
         }
@@ -624,8 +625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_outbound_failure() -> eyre::Result<()> {
-        tn_test_utils::init_test_tracing();
+    async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
         let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
         let mut authorities = all_nodes.authorities();
         let authority_1 = authorities.next().expect("first authority");
@@ -668,37 +668,123 @@ mod tests {
         )?;
 
         // spawn tasks
-        let peer1 = peer1_network.network_handle();
+        let malicious_peer = peer1_network.network_handle();
         peer1_network.run();
 
-        let peer2 = peer2_network.network_handle();
+        let honest_peer = peer2_network.network_handle();
         peer2_network.run();
 
         // start swarm listening on default any address
         let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse()?;
-        peer1.start_listening(listen_on.clone()).await?;
-        peer2.start_listening(listen_on).await?;
-        let peer1_id = peer1.local_peer_id().await?;
-        println!("\npeer 1: {peer1_id:?}");
-        let peer2_id = peer2.local_peer_id().await?;
-        println!("peer 2: {peer2_id:?}\n");
-        let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
+        malicious_peer.start_listening(listen_on.clone()).await?;
+        honest_peer.start_listening(listen_on).await?;
+
+        let honest_peer_id = honest_peer.local_peer_id().await?;
+        let honest_peer_addr =
+            honest_peer.listeners().await?.first().expect("honest_peer listen addr").clone();
 
         let malicious_bytes = Certificate::default();
 
-        // dial peer2
-        peer1.dial(peer2_id, peer2_addr).await?;
+        // dial honest peer
+        malicious_peer.dial(honest_peer_id, honest_peer_addr).await?;
 
         // honest peer returns `OutboundFailure` error
         //
         // TODO: this should affect malicious peer's local score
         // - how can honest peer liimit malicious requests?
-        let network_res = peer1.send_request(malicious_bytes, peer2_id).await?;
+        let network_res = malicious_peer.send_request(malicious_bytes, honest_peer_id).await?;
         let res = timeout(Duration::from_secs(5), network_res)
             .await?
             .expect("first network event received");
 
         assert!(res.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_outbound_failure_malicious_response() -> eyre::Result<()> {
+        let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+        let mut authorities = all_nodes.authorities();
+        let authority_1 = authorities.next().expect("first authority");
+        let authority_2 = authorities.next().expect("second authority");
+        let config_1 = authority_1.consensus_config();
+        let config_2 = authority_2.consensus_config();
+        let (tx1, _network_events_1) = mpsc::channel(1);
+        let (tx2, mut network_events_2) = mpsc::channel(1);
+        let authorized_publishers: HashSet<PeerId> = all_nodes
+            .authorities()
+            .map(|a| {
+                let mut key_bytes = a.primary_network_keypair().as_ref().to_vec();
+                let keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut key_bytes)
+                    .expect("primary ed25519 key from bytes");
+                let public_key = keypair.public();
+
+                PeerId::from_public_key(&public_key)
+            })
+            .collect();
+
+        let gossipsub_config = _primary_gossip_config()?;
+        let topics = vec![IdentTopic::new("test-topic")];
+
+        // honest peer1
+        let peer1_network = ConsensusNetwork::<WorkerBlock, WorkerBlock>::new(
+            &config_1,
+            tx1,
+            authorized_publishers.clone(),
+            gossipsub_config.clone(),
+            topics.clone(),
+        )?;
+
+        // malicious peer2
+        let peer2_network = ConsensusNetwork::<WorkerBlock, Certificate>::new(
+            &config_2,
+            tx2,
+            authorized_publishers.clone(),
+            gossipsub_config.clone(),
+            topics.clone(),
+        )?;
+
+        // spawn tasks
+        let honest_peer = peer1_network.network_handle();
+        peer1_network.run();
+
+        let malicious_peer = peer2_network.network_handle();
+        peer2_network.run();
+
+        // start swarm listening on default any address
+        let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse()?;
+        honest_peer.start_listening(listen_on.clone()).await?;
+        malicious_peer.start_listening(listen_on).await?;
+        let malicious_peer_id = malicious_peer.local_peer_id().await?;
+        let malicious_peer_addr =
+            malicious_peer.listeners().await?.first().expect("malicious_peer listen addr").clone();
+
+        // dial malicious_peer
+        honest_peer.dial(malicious_peer_id, malicious_peer_addr).await?;
+
+        // send request and wait for malicious response
+        let max_time = Duration::from_secs(5);
+        let honest_req = fixture_batch_with_transactions(1);
+        let network_res = honest_peer.send_request(honest_req.clone(), malicious_peer_id).await?;
+        let event = timeout(max_time, network_events_2.recv())
+            .await?
+            .expect("first network event received");
+
+        // expect network event
+        if let NetworkEvent::Request { request, channel } = event {
+            assert_eq!(request, honest_req);
+            // send response
+            let malicious_reply = Certificate::default();
+            malicious_peer.send_response(malicious_reply, channel).await?;
+        } else {
+            panic!("unexpected network event received");
+        }
+
+        // expect response
+        let response =
+            timeout(max_time, network_res).await?.expect("response received within time");
+        assert!(response.is_err());
 
         Ok(())
     }
