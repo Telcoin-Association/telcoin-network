@@ -51,18 +51,9 @@ where
         /// The acknowledgement that the set was updated.
         reply: oneshot::Sender<NetworkResult<()>>,
     },
-    /// Commands to manage the network's swarm.
-    Swarm(SwarmCommand<Req, Res>),
-}
-
-/// Commands for the swarm.
-#[derive(Debug)]
-//TODO: add <M> generic here so devs can only publish correct messages?
-pub enum SwarmCommand<Req, Res>
-where
-    Req: TNMessage,
-    Res: TNMessage,
-{
+    /// Start listening on the provided multiaddr.
+    ///
+    /// Return the result to caller.
     StartListening {
         /// The [Multiaddr] for the swarm to connect.
         multiaddr: Multiaddr,
@@ -173,9 +164,7 @@ where
     /// Return swarm error to caller.
     pub async fn start_listening(&self, multiaddr: Multiaddr) -> NetworkResult<ListenerId> {
         let (reply, ack) = oneshot::channel();
-        self.sender
-            .send(NetworkCommand::Swarm(SwarmCommand::StartListening { multiaddr, reply }))
-            .await?;
+        self.sender.send(NetworkCommand::StartListening { multiaddr, reply }).await?;
         let res = ack.await?;
         res.map_err(Into::into)
     }
@@ -183,14 +172,14 @@ where
     /// Request listeners from the swarm.
     pub async fn listeners(&self) -> NetworkResult<Vec<Multiaddr>> {
         let (reply, listeners) = oneshot::channel();
-        self.sender.send(NetworkCommand::Swarm(SwarmCommand::GetListener { reply })).await?;
+        self.sender.send(NetworkCommand::GetListener { reply }).await?;
         listeners.await.map_err(Into::into)
     }
 
     /// Add explicit peer.
     pub async fn add_explicit_peer(&self, peer_id: PeerId, addr: Multiaddr) -> NetworkResult<()> {
         self.sender
-            .send(NetworkCommand::Swarm(SwarmCommand::AddExplicitPeer { peer_id, addr }))
+            .send(NetworkCommand::AddExplicitPeer { peer_id, addr })
             .await
             .map_err(Into::into)
     }
@@ -200,9 +189,7 @@ where
     /// Return swarm error to caller.
     pub async fn dial(&self, peer_id: PeerId, peer_addr: Multiaddr) -> NetworkResult<()> {
         let (reply, ack) = oneshot::channel();
-        self.sender
-            .send(NetworkCommand::Swarm(SwarmCommand::Dial { peer_id, peer_addr, reply }))
-            .await?;
+        self.sender.send(NetworkCommand::Dial { peer_id, peer_addr, reply }).await?;
         let res = ack.await?;
         res.map_err(Into::into)
     }
@@ -210,7 +197,7 @@ where
     /// Get local peer id.
     pub async fn local_peer_id(&self) -> NetworkResult<PeerId> {
         let (reply, peer_id) = oneshot::channel();
-        self.sender.send(NetworkCommand::Swarm(SwarmCommand::LocalPeerId { reply })).await?;
+        self.sender.send(NetworkCommand::LocalPeerId { reply }).await?;
         peer_id.await.map_err(Into::into)
     }
 
@@ -219,7 +206,7 @@ where
     /// Return swarm error to caller.
     pub async fn subscribe(&self, topic: IdentTopic) -> NetworkResult<bool> {
         let (reply, already_subscribed) = oneshot::channel();
-        self.sender.send(NetworkCommand::Swarm(SwarmCommand::Subscribe { topic, reply })).await?;
+        self.sender.send(NetworkCommand::Subscribe { topic, reply }).await?;
         let res = already_subscribed.await?;
         res.map_err(Into::into)
     }
@@ -229,9 +216,7 @@ where
     /// TODO: make this <M> generic to prevent accidental publishing of incorrect messages?
     pub async fn publish(&self, topic: IdentTopic, msg: Vec<u8>) -> NetworkResult<MessageId> {
         let (reply, published) = oneshot::channel();
-        self.sender
-            .send(NetworkCommand::Swarm(SwarmCommand::Publish { topic, msg, reply }))
-            .await?;
+        self.sender.send(NetworkCommand::Publish { topic, msg, reply }).await?;
 
         published.await?.map_err(Into::into)
     }
@@ -239,35 +224,35 @@ where
     /// Retrieve a collection of connected peers.
     pub async fn connected_peers(&self) -> NetworkResult<Vec<PeerId>> {
         let (reply, peers) = oneshot::channel();
-        self.sender.send(NetworkCommand::Swarm(SwarmCommand::ConnectedPeers { reply })).await?;
+        self.sender.send(NetworkCommand::ConnectedPeers { reply }).await?;
         peers.await.map_err(Into::into)
     }
 
     /// Map of all known peers and their associated subscribed topics.
     pub async fn all_peers(&self) -> NetworkResult<HashMap<PeerId, Vec<TopicHash>>> {
         let (reply, all_peers) = oneshot::channel();
-        self.sender.send(NetworkCommand::Swarm(SwarmCommand::AllPeers { reply })).await?;
+        self.sender.send(NetworkCommand::AllPeers { reply }).await?;
         all_peers.await.map_err(Into::into)
     }
 
     /// Collection of all mesh peers.
     pub async fn all_mesh_peers(&self) -> NetworkResult<Vec<PeerId>> {
         let (reply, all_mesh_peers) = oneshot::channel();
-        self.sender.send(NetworkCommand::Swarm(SwarmCommand::AllMeshPeers { reply })).await?;
+        self.sender.send(NetworkCommand::AllMeshPeers { reply }).await?;
         all_mesh_peers.await.map_err(Into::into)
     }
 
     /// Collection of all mesh peers by a certain topic hash.
     pub async fn mesh_peers(&self, topic: TopicHash) -> NetworkResult<Vec<PeerId>> {
         let (reply, mesh_peers) = oneshot::channel();
-        self.sender.send(NetworkCommand::Swarm(SwarmCommand::MeshPeers { topic, reply })).await?;
+        self.sender.send(NetworkCommand::MeshPeers { topic, reply }).await?;
         mesh_peers.await.map_err(Into::into)
     }
 
     /// Retrieve a specific peer's score, if it exists.
     pub async fn peer_score(&self, peer_id: PeerId) -> NetworkResult<Option<f64>> {
         let (reply, score) = oneshot::channel();
-        self.sender.send(NetworkCommand::Swarm(SwarmCommand::PeerScore { peer_id, reply })).await?;
+        self.sender.send(NetworkCommand::PeerScore { peer_id, reply }).await?;
         score.await.map_err(Into::into)
     }
 
@@ -280,26 +265,20 @@ where
         new_score: f64,
     ) -> NetworkResult<bool> {
         let (reply, score) = oneshot::channel();
-        self.sender
-            .send(NetworkCommand::Swarm(SwarmCommand::SetApplicationScore {
-                peer_id,
-                new_score,
-                reply,
-            }))
-            .await?;
+        self.sender.send(NetworkCommand::SetApplicationScore { peer_id, new_score, reply }).await?;
         score.await.map_err(Into::into)
     }
 
     /// Send a request to a peer.
+    ///
+    /// Returns a handle for the caller to await the peer's response.
     pub async fn send_request(
         &self,
         request: Req,
         peer: PeerId,
     ) -> NetworkResult<oneshot::Receiver<Res>> {
         let (reply, to_caller) = oneshot::channel();
-        self.sender
-            .send(NetworkCommand::Swarm(SwarmCommand::SendRequest { peer, request, reply }))
-            .await?;
+        self.sender.send(NetworkCommand::SendRequest { peer, request, reply }).await?;
         Ok(to_caller)
     }
 
@@ -310,9 +289,7 @@ where
         channel: ResponseChannel<Res>,
     ) -> NetworkResult<()> {
         let (reply, res) = oneshot::channel();
-        self.sender
-            .send(NetworkCommand::Swarm(SwarmCommand::SendResponse { response, channel, reply }))
-            .await?;
+        self.sender.send(NetworkCommand::SendResponse { response, channel, reply }).await?;
         res.await?.map_err(|_| NetworkError::SendResponse)
     }
 }
