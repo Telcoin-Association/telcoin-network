@@ -5,8 +5,4 @@ mod consensus;
 pub mod error;
 mod helpers;
 mod messages;
-// mod publish;
-// mod subscribe;
 pub mod types;
-// pub use publish::*;
-// pub use subscribe::*;

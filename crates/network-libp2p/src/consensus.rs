@@ -789,4 +789,98 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_publish_to_one_peer() -> eyre::Result<()> {
+        tn_test_utils::init_test_tracing();
+        let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+        let mut authorities = all_nodes.authorities();
+        let authority_1 = authorities.next().expect("first authority");
+        let authority_2 = authorities.next().expect("second authority");
+        let config_1 = authority_1.consensus_config();
+        let config_2 = authority_2.consensus_config();
+        let (tx1, _network_events_1) = mpsc::channel(1);
+        let (tx2, mut nvv_network_events) = mpsc::channel(1);
+        let authorized_publishers: HashSet<PeerId> = all_nodes
+            .authorities()
+            .map(|a| {
+                let mut key_bytes = a.primary_network_keypair().as_ref().to_vec();
+                let keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut key_bytes)
+                    .expect("primary ed25519 key from bytes");
+                let public_key = keypair.public();
+
+                PeerId::from_public_key(&public_key)
+            })
+            .collect();
+
+        let gossipsub_config = _primary_gossip_config()?;
+        let correct_topic = IdentTopic::new("test-topic");
+        let topics = vec![correct_topic.clone()];
+
+        // honest cvv
+        let cvv_network = ConsensusNetwork::<WorkerBlock, WorkerBlock>::new(
+            &config_1,
+            tx1,
+            authorized_publishers.clone(),
+            gossipsub_config.clone(),
+            topics.clone(),
+        )?;
+
+        // honest nvv
+        let nvv_network = ConsensusNetwork::<WorkerBlock, WorkerBlock>::new(
+            &config_2,
+            tx2,
+            authorized_publishers.clone(),
+            gossipsub_config.clone(),
+            topics.clone(),
+        )?;
+
+        // spawn tasks
+        let cvv = cvv_network.network_handle();
+        cvv_network.run();
+
+        let nvv = nvv_network.network_handle();
+        nvv_network.run();
+
+        // start swarm listening on default any address
+        let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse()?;
+        cvv.start_listening(listen_on.clone()).await?;
+        nvv.start_listening(listen_on).await?;
+        let cvv_id = cvv.local_peer_id().await?;
+        let cvv_addr = cvv.listeners().await?.first().expect("peer2 listen addr").clone();
+
+        // subscribe
+        nvv.subscribe(correct_topic.clone()).await?;
+
+        // dial cvv
+        nvv.dial(cvv_id, cvv_addr).await?;
+
+        // publish random block
+        let random_block = fixture_batch_with_transactions(10);
+        let sealed_block = random_block.seal_slow();
+        let expected_result = Vec::from(&sealed_block);
+
+        // sleep for gossip connection time lapse
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // publish on wrong topic - no peers
+        let expected_failure =
+            cvv.publish(IdentTopic::new("WRONG_TOPIC"), expected_result.clone()).await;
+        assert!(expected_failure.is_err());
+
+        // publish correct message and wait to receive
+        let _message_id = cvv.publish(correct_topic, expected_result.clone()).await?;
+        let event = timeout(Duration::from_secs(5), nvv_network_events.recv())
+            .await?
+            .expect("worker block received");
+
+        // assert gossip message
+        if let NetworkEvent::Gossip(msg) = event {
+            assert_eq!(msg, expected_result);
+        } else {
+            panic!("unexpected network event received");
+        }
+
+        Ok(())
+    }
 }

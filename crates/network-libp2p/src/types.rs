@@ -217,7 +217,6 @@ where
     pub async fn publish(&self, topic: IdentTopic, msg: Vec<u8>) -> NetworkResult<MessageId> {
         let (reply, published) = oneshot::channel();
         self.sender.send(NetworkCommand::Publish { topic, msg, reply }).await?;
-
         published.await?.map_err(Into::into)
     }
 
