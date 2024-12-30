@@ -113,8 +113,6 @@ where
         // TODO: need to import tn-storage just for this trait?
         DB: tn_storage::traits::Database,
     {
-        //
-        //
         // TODO: pass keypair as arg so this function stays agnostic to primary/worker
         // - don't put helper method on key config bc that is TN-specific, and this is required by
         //   libp2p
@@ -126,22 +124,21 @@ where
             gossipsub::MessageAuthenticity::Signed(keypair.clone()),
             gossipsub_config,
         )
-        .expect("TODO");
+        .map_err(|e| NetworkError::GossipBehavior(e))?;
 
-        // ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        //
-        // revisit keypair approach
-
-        // TODO: use const
+        // TODO: use const as default and read from config
         let tn_codec = TNCodec::<Req, Res>::new(1024 * 1024);
-        // TODO: is StreamProtocol sufficient?
-        // - ProtocolSupport::Full?
+
+        // TODO: take this from configuration through CLI
+        // - ex) "/telcoin-network/mainnet/0.0.1"
         let protocols = [(StreamProtocol::new("/tn-consensus"), ProtocolSupport::Full)];
         let req_res = request_response::Behaviour::with_codec(
             tn_codec,
             protocols,
             request_response::Config::default(),
         );
+
+        // create custom behavior
         let behavior = TNBehavior::new(gossipsub, req_res);
 
         // create swarm
@@ -149,7 +146,7 @@ where
             .with_tokio()
             .with_quic()
             .with_behaviour(|_| behavior)
-            .expect("TODO")
+            .map_err(|_| NetworkError::BuildSwarm)?
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
 
@@ -401,9 +398,6 @@ where
                     ReqResEvent::OutboundFailure { peer, request_id, error } => {
                         error!(target: "network", ?peer, ?error, "outbound failure");
                         // try to forward error to original caller
-                        //
-                        // TODO: how to handle these failures?
-                        // -
                         let _ = self
                             .pending_requests
                             .remove(&request_id)
@@ -411,13 +405,12 @@ where
                             .send(Err(error.into()));
                     }
                     ReqResEvent::InboundFailure { peer, request_id, error } => {
-                        error!(target: "network", ?peer, ?request_id, ?error, "inbound failure");
                         // TODO: how to handle these failures?
                         // - connection closed: do nothing
                         // - response ommitted: do nothing
                         // - inbound timeout: do nothing
                         // - inbound stream failed: malicious encoding? report peer?
-                        todo!()
+                        error!(target: "network", ?peer, ?request_id, ?error, "inbound failure");
                     }
                     ReqResEvent::ResponseSent { peer, request_id } => {
                         trace!(target: "network",  ?peer, ?request_id, "response sent")
@@ -487,8 +480,13 @@ where
             SwarmEvent::NewListenAddr { listener_id, address } => {
                 trace!(target: "network", topics=?self.topics, ?listener_id, ?address, "new listener addr")
             }
-            SwarmEvent::ExpiredListenAddr { listener_id, address } => {
-                trace!(target: "network", topics=?self.topics, ?listener_id, ?address, "expired listen addr")
+            SwarmEvent::ExpiredListenAddr { address, .. } => {
+                // log listening addr
+                info!(
+                    target: "network",
+                    address = ?address.with(Protocol::P2p(*self.swarm.local_peer_id())),
+                    "network listening"
+                );
             }
             SwarmEvent::ListenerClosed { listener_id, addresses, reason } => {
                 trace!(target: "network", topics=?self.topics, ?listener_id, ?addresses, ?reason, "listener closed")
@@ -780,6 +778,8 @@ mod tests {
         } else {
             panic!("unexpected network event received");
         }
+
+        tokio::time::sleep(max_time).await;
 
         // expect response
         let response =

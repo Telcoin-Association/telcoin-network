@@ -52,13 +52,18 @@ pub enum NetworkError {
     /// Libp2p `ResponseChannel` already closed due to timeout or loss of connection.
     #[error("Response channel closed.")]
     SendResponse,
-    /// The oneshot channel for a request was lost.
-    /// NOTE: this is not expected to happen.
+    /// The oneshot channel for a request was lost. This is not expected to happen.
     #[error("Pending request channel lost. Unable to return peer's response to original caller.")]
     PendingRequestChannelLost,
     /// Failed to send request/response outbound to peer.
     #[error("Outbound failure: {0}")]
     Outbound(#[from] OutboundFailure),
+    /// Failed to create gossipsub behavior.
+    #[error("{0}")]
+    GossipBehavior(&'static str),
+    /// Failed to build swarm with behavior.
+    #[error("SwarmBuilder::with_behaviour failed somehow.")]
+    BuildSwarm,
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {
