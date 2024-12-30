@@ -418,7 +418,7 @@ where
                         println!("inbound failure?? - {:?} - {:?} - {:?}", peer, request_id, error);
                     }
                     request_response::Event::ResponseSent { peer, request_id } => {
-                        info!(target: "consensus-network",  ?peer, ?request_id, "req/res RESPONSE_SENT event")
+                        trace!(target: "consensus-network",  ?peer, ?request_id, "response sent")
                     }
                 },
             },
@@ -524,8 +524,11 @@ mod tests {
     use libp2p::Multiaddr;
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils::{fixture_batch_with_transactions, CommitteeFixture};
-    use tn_types::WorkerBlock;
+    use tn_types::{Certificate, WorkerBlock};
     use tokio::time::timeout;
+
+    // impl trait for temp testing
+    impl TNMessage for Certificate {}
 
     #[tokio::test]
     async fn test_worker_network() -> eyre::Result<()> {
@@ -534,18 +537,13 @@ mod tests {
         // - use this file on startup for "discoverability" at genesis
 
         let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
-
-        //
-        //=== peer 1
-        //
-
         let mut authorities = all_nodes.authorities();
         let authority_1 = authorities.next().expect("first authority");
         let authority_2 = authorities.next().expect("second authority");
         let config_1 = authority_1.consensus_config();
         let config_2 = authority_2.consensus_config();
-        let (tx1, mut network_messages1) = mpsc::channel(1);
-        let (tx2, mut network_messages2) = mpsc::channel(1);
+        let (tx1, _network_events_1) = mpsc::channel(1);
+        let (tx2, mut network_events_2) = mpsc::channel(1);
         let authorized_publishers: HashSet<PeerId> = all_nodes
             .authorities()
             .map(|a| {
@@ -558,10 +556,10 @@ mod tests {
             })
             .collect();
 
-        println!("authorized publishers: {:?}", authorized_publishers);
         let gossipsub_config = _primary_gossip_config()?;
         let topics = vec![IdentTopic::new("test-topic")];
-        // peer1
+
+        // honest peer1
         let peer1_network = ConsensusNetwork::<WorkerBlock, WorkerBlock>::new(
             &config_1,
             tx1,
@@ -570,7 +568,97 @@ mod tests {
             topics.clone(),
         )?;
 
-        // peer2
+        // honest peer2
+        let peer2_network = ConsensusNetwork::<WorkerBlock, WorkerBlock>::new(
+            &config_2,
+            tx2,
+            authorized_publishers.clone(),
+            gossipsub_config.clone(),
+            topics.clone(),
+        )?;
+
+        // spawn tasks
+        let peer1 = peer1_network.network_handle();
+        peer1_network.run();
+
+        let peer2 = peer2_network.network_handle();
+        peer2_network.run();
+
+        // start swarm listening on default any address
+        let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse()?;
+        peer1.start_listening(listen_on.clone()).await?;
+        peer2.start_listening(listen_on).await?;
+        let peer2_id = peer2.local_peer_id().await?;
+        let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
+
+        let worker_block_req = fixture_batch_with_transactions(3);
+        let worker_block_res = fixture_batch_with_transactions(3);
+
+        // sanity check
+        assert_ne!(worker_block_req, worker_block_res);
+
+        // dial peer2
+        peer1.dial(peer2_id, peer2_addr).await?;
+
+        // send request and wait for response
+        let max_time = Duration::from_secs(5);
+        let network_res = peer1.send_request(worker_block_req.clone(), peer2_id).await?;
+        let event = timeout(max_time, network_events_2.recv())
+            .await?
+            .expect("first network event received");
+
+        // expect network event
+        if let NetworkEvent::Request { request, channel } = event {
+            assert_eq!(request, worker_block_req);
+            // send response
+            peer1.send_response(worker_block_res.clone(), channel).await?;
+        } else {
+            panic!("unexpected network event received");
+        }
+
+        // expect response
+        let response = timeout(max_time, network_res).await?.expect("outbound id recv")?;
+        assert_eq!(response, worker_block_res);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_outbound_failure() -> eyre::Result<()> {
+        tn_test_utils::init_test_tracing();
+        let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+        let mut authorities = all_nodes.authorities();
+        let authority_1 = authorities.next().expect("first authority");
+        let authority_2 = authorities.next().expect("second authority");
+        let config_1 = authority_1.consensus_config();
+        let config_2 = authority_2.consensus_config();
+        let (tx1, _network_events_1) = mpsc::channel(1);
+        let (tx2, _network_events_2) = mpsc::channel(1);
+        let authorized_publishers: HashSet<PeerId> = all_nodes
+            .authorities()
+            .map(|a| {
+                let mut key_bytes = a.primary_network_keypair().as_ref().to_vec();
+                let keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut key_bytes)
+                    .expect("primary ed25519 key from bytes");
+                let public_key = keypair.public();
+
+                PeerId::from_public_key(&public_key)
+            })
+            .collect();
+
+        let gossipsub_config = _primary_gossip_config()?;
+        let topics = vec![IdentTopic::new("test-topic")];
+
+        // malicious peer1
+        let peer1_network = ConsensusNetwork::<Certificate, Certificate>::new(
+            &config_1,
+            tx1,
+            authorized_publishers.clone(),
+            gossipsub_config.clone(),
+            topics.clone(),
+        )?;
+
+        // honest peer2
         let peer2_network = ConsensusNetwork::<WorkerBlock, WorkerBlock>::new(
             &config_2,
             tx2,
@@ -591,45 +679,26 @@ mod tests {
         peer1.start_listening(listen_on.clone()).await?;
         peer2.start_listening(listen_on).await?;
         let peer1_id = peer1.local_peer_id().await?;
+        println!("\npeer 1: {peer1_id:?}");
         let peer2_id = peer2.local_peer_id().await?;
+        println!("peer 2: {peer2_id:?}\n");
         let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
 
-        let worker_block_req = fixture_batch_with_transactions(3);
-        let worker_block_res = fixture_batch_with_transactions(3);
-
-        // sanity check
-        assert_ne!(worker_block_req, worker_block_res);
-
-        // let mut other_peers =
-        //     authorized_publishers.iter().filter(|id| *id != &peer1_id && *id != &peer2_id);
-        // let peer2 = other_peers.next().ok_or_eyre("committee must have more than 1 peer")?;
+        let malicious_bytes = Certificate::default();
 
         // dial peer2
         peer1.dial(peer2_id, peer2_addr).await?;
-        // peer2.dial(peer1_addr.into()).await?;
 
-        // allow enough time for peer info to exchange from dial
+        // honest peer returns `OutboundFailure` error
         //
-        // sleep seems to be the only thing that works here
+        // TODO: this should affect malicious peer's local score
+        // - how can honest peer liimit malicious requests?
+        let network_res = peer1.send_request(malicious_bytes, peer2_id).await?;
+        let res = timeout(Duration::from_secs(5), network_res)
+            .await?
+            .expect("first network event received");
 
-        println!("\n\n\nmade it here!!!!");
-        let network_res = peer1.send_request(worker_block_req.clone(), peer2_id).await?;
-
-        let dur = Duration::from_secs(5);
-        let event =
-            timeout(dur, network_messages2.recv()).await?.expect("first network event received");
-
-        if let NetworkEvent::Request { request, channel } = event {
-            assert_eq!(request, worker_block_req);
-            // send response
-            peer1.send_response(worker_block_res.clone(), channel).await?;
-        } else {
-            panic!("unexpected network event received");
-        }
-
-        let response = timeout(dur, network_res).await?.expect("outbound id recv")?;
-
-        assert_eq!(response, worker_block_res);
+        assert!(res.is_err());
 
         Ok(())
     }
