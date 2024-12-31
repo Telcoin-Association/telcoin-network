@@ -9,6 +9,7 @@ pub enum WorkerRequest {
     /// Broadcast a newly produced worker block.
     ///
     /// NOTE: expect no response
+    /// TODO: gossip this instead?
     NewBlock(SealedWorkerBlock),
     /// The missing blocks for this peer.
     MissingBlocks {

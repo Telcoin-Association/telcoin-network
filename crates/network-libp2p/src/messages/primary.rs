@@ -12,6 +12,7 @@ pub enum PrimaryRequest {
     /// A new certificate broadcast from peer.
     ///
     /// NOTE: expect no response
+    /// TODO: gossip this instead
     NewCertificate {
         /// The certificate from this peer.
         certificate: Certificate,

@@ -106,7 +106,6 @@ where
         config: &ConsensusConfig<DB>,
         event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
         authorized_publishers: HashSet<PeerId>,
-        gossipsub_config: gossipsub::Config,
         topics: Vec<IdentTopic>,
     ) -> NetworkResult<Self>
     where
@@ -120,6 +119,16 @@ where
         let mut key_bytes = config.key_config().primary_network_keypair().as_ref().to_vec();
         let keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut key_bytes).expect("TODO");
 
+        let gossipsub_config = gossipsub::ConfigBuilder::default()
+            // explicitly set default
+            .heartbeat_interval(Duration::from_secs(1))
+            // explicitly set default
+            .validation_mode(gossipsub::ValidationMode::Strict)
+            // support peer exchange
+            .do_px()
+            // TN specific: filter against authorized_publishers
+            .validate_messages()
+            .build()?;
         let gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(keypair.clone()),
             gossipsub_config,
@@ -523,7 +532,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::helpers::_primary_gossip_config;
     use libp2p::Multiaddr;
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils::{fixture_batch_with_transactions, CommitteeFixture};
@@ -558,7 +566,6 @@ mod tests {
             })
             .collect();
 
-        let gossipsub_config = _primary_gossip_config()?;
         let topics = vec![IdentTopic::new("test-topic")];
 
         // honest peer1
@@ -566,7 +573,6 @@ mod tests {
             &config_1,
             tx1,
             authorized_publishers.clone(),
-            gossipsub_config.clone(),
             topics.clone(),
         )?;
 
@@ -575,7 +581,6 @@ mod tests {
             &config_2,
             tx2,
             authorized_publishers.clone(),
-            gossipsub_config.clone(),
             topics.clone(),
         )?;
 
@@ -647,7 +652,6 @@ mod tests {
             })
             .collect();
 
-        let gossipsub_config = _primary_gossip_config()?;
         let topics = vec![IdentTopic::new("test-topic")];
 
         // malicious peer1
@@ -655,7 +659,6 @@ mod tests {
             &config_1,
             tx1,
             authorized_publishers.clone(),
-            gossipsub_config.clone(),
             topics.clone(),
         )?;
 
@@ -664,7 +667,6 @@ mod tests {
             &config_2,
             tx2,
             authorized_publishers.clone(),
-            gossipsub_config.clone(),
             topics.clone(),
         )?;
 
@@ -725,7 +727,6 @@ mod tests {
             })
             .collect();
 
-        let gossipsub_config = _primary_gossip_config()?;
         let topics = vec![IdentTopic::new("test-topic")];
 
         // honest peer1
@@ -733,7 +734,6 @@ mod tests {
             &config_1,
             tx1,
             authorized_publishers.clone(),
-            gossipsub_config.clone(),
             topics.clone(),
         )?;
 
@@ -742,7 +742,6 @@ mod tests {
             &config_2,
             tx2,
             authorized_publishers.clone(),
-            gossipsub_config.clone(),
             topics.clone(),
         )?;
 
@@ -815,7 +814,6 @@ mod tests {
             })
             .collect();
 
-        let gossipsub_config = _primary_gossip_config()?;
         let correct_topic = IdentTopic::new("test-topic");
         let topics = vec![correct_topic.clone()];
 
@@ -824,7 +822,6 @@ mod tests {
             &config_1,
             tx1,
             authorized_publishers.clone(),
-            gossipsub_config.clone(),
             topics.clone(),
         )?;
 
@@ -833,7 +830,6 @@ mod tests {
             &config_2,
             tx2,
             authorized_publishers.clone(),
-            gossipsub_config.clone(),
             topics.clone(),
         )?;
 
@@ -909,7 +905,6 @@ mod tests {
             })
             .collect();
 
-        let gossipsub_config = _primary_gossip_config()?;
         let correct_topic = IdentTopic::new("test-topic");
         let topics = vec![correct_topic.clone()];
 
@@ -918,7 +913,6 @@ mod tests {
             &config_1,
             tx1,
             authorized_publishers.clone(),
-            gossipsub_config.clone(),
             topics.clone(),
         )?;
 
@@ -927,7 +921,6 @@ mod tests {
             &config_2,
             tx2,
             authorized_publishers.clone(),
-            gossipsub_config.clone(),
             topics.clone(),
         )?;
 
@@ -988,4 +981,8 @@ mod tests {
 
         Ok(())
     }
+
+    // - test gossip to multiple peers
+    // - use actual req/res message types
+    //      - gossip for worker blocks?
 }
