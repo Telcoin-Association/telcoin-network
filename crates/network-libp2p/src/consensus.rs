@@ -526,20 +526,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{PrimaryRequest, PrimaryResponse, WorkerRequest, WorkerResponse};
     use libp2p::Multiaddr;
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils::{fixture_batch_with_transactions, CommitteeFixture};
-    use tn_types::{Certificate, WorkerBlock};
+    use tn_types::{BlockHash, Certificate, Header, SealedWorkerBlock, WorkerBlock};
     use tokio::time::timeout;
 
-    // impl trait for temp testing
-    impl TNMessage for Certificate {}
-
     #[tokio::test]
-    async fn test_worker_network() -> eyre::Result<()> {
-        // TODO: reload known peers from database,
-        // - use this file on startup for "discoverability" at genesis
-
+    async fn test_valid_req_res() -> eyre::Result<()> {
         let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
         let mut authorities = all_nodes.authorities();
         let authority_1 = authorities.next().expect("first authority");
@@ -563,7 +558,7 @@ mod tests {
         let topics = vec![IdentTopic::new("test-topic")];
 
         // honest peer1
-        let peer1_network = ConsensusNetwork::<WorkerBlock, WorkerBlock>::new(
+        let peer1_network = ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(
             &config_1,
             tx1,
             authorized_publishers.clone(),
@@ -571,7 +566,7 @@ mod tests {
         )?;
 
         // honest peer2
-        let peer2_network = ConsensusNetwork::<WorkerBlock, WorkerBlock>::new(
+        let peer2_network = ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(
             &config_2,
             tx2,
             authorized_publishers.clone(),
@@ -592,11 +587,10 @@ mod tests {
         let peer2_id = peer2.local_peer_id().await?;
         let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
 
-        let worker_block_req = fixture_batch_with_transactions(3);
-        let worker_block_res = fixture_batch_with_transactions(3);
-
-        // sanity check
-        assert_ne!(worker_block_req, worker_block_res);
+        let missing_block = fixture_batch_with_transactions(3).seal_slow();
+        let digests = vec![missing_block.digest()];
+        let worker_block_req = WorkerRequest::MissingBlocks { digests };
+        let worker_block_res = WorkerResponse::MissingBlocks { blocks: vec![missing_block] };
 
         // dial peer2
         peer1.dial(peer2_id, peer2_addr).await?;
@@ -649,7 +643,9 @@ mod tests {
         let topics = vec![IdentTopic::new("test-topic")];
 
         // malicious peer1
-        let peer1_network = ConsensusNetwork::<Certificate, Certificate>::new(
+        //
+        // although these are honest req/res types, they are incorrect for the honest peer's "worker" network
+        let peer1_network = ConsensusNetwork::<PrimaryRequest, PrimaryResponse>::new(
             &config_1,
             tx1,
             authorized_publishers.clone(),
@@ -657,7 +653,7 @@ mod tests {
         )?;
 
         // honest peer2
-        let peer2_network = ConsensusNetwork::<WorkerBlock, WorkerBlock>::new(
+        let peer2_network = ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(
             &config_2,
             tx2,
             authorized_publishers.clone(),
@@ -680,7 +676,11 @@ mod tests {
         let honest_peer_addr =
             honest_peer.listeners().await?.first().expect("honest_peer listen addr").clone();
 
-        let malicious_bytes = Certificate::default();
+        // this type already impl `TNMessage` but this could be incorrect message type
+        let malicious_msg = PrimaryRequest::Vote {
+            header: Header::default(),
+            parents: vec![Certificate::default()],
+        };
 
         // dial honest peer
         malicious_peer.dial(honest_peer_id, honest_peer_addr).await?;
@@ -689,8 +689,8 @@ mod tests {
         //
         // TODO: this should affect malicious peer's local score
         // - how can honest peer liimit malicious requests?
-        let network_res = malicious_peer.send_request(malicious_bytes, honest_peer_id).await?;
-        let res = timeout(Duration::from_secs(5), network_res)
+        let network_res = malicious_peer.send_request(malicious_msg, honest_peer_id).await?;
+        let res = timeout(Duration::from_secs(2), network_res)
             .await?
             .expect("first network event received");
 
@@ -724,7 +724,7 @@ mod tests {
         let topics = vec![IdentTopic::new("test-topic")];
 
         // honest peer1
-        let peer1_network = ConsensusNetwork::<WorkerBlock, WorkerBlock>::new(
+        let peer1_network = ConsensusNetwork::<PrimaryRequest, PrimaryResponse>::new(
             &config_1,
             tx1,
             authorized_publishers.clone(),
@@ -732,7 +732,10 @@ mod tests {
         )?;
 
         // malicious peer2
-        let peer2_network = ConsensusNetwork::<WorkerBlock, Certificate>::new(
+        //
+        // although these are honest req/res types, they are incorrect for the honest peer's "primary" network
+        // this allows the network to receive "correct" messages and respond with bad messages
+        let peer2_network = ConsensusNetwork::<PrimaryRequest, WorkerResponse>::new(
             &config_2,
             tx2,
             authorized_publishers.clone(),
@@ -759,7 +762,10 @@ mod tests {
 
         // send request and wait for malicious response
         let max_time = Duration::from_secs(2);
-        let honest_req = fixture_batch_with_transactions(1);
+        let honest_req = PrimaryRequest::Vote {
+            header: Header::default(),
+            parents: vec![Certificate::default()],
+        };
         let network_res = honest_peer.send_request(honest_req.clone(), malicious_peer_id).await?;
         let event = timeout(max_time, network_events_2.recv())
             .await?
@@ -769,13 +775,12 @@ mod tests {
         if let NetworkEvent::Request { request, channel } = event {
             assert_eq!(request, honest_req);
             // send response
-            let malicious_reply = Certificate::default();
+            let block = fixture_batch_with_transactions(1).seal_slow();
+            let malicious_reply = WorkerResponse::MissingBlocks { blocks: vec![block] };
             malicious_peer.send_response(malicious_reply, channel).await?;
         } else {
             panic!("unexpected network event received");
         }
-
-        tokio::time::sleep(max_time).await;
 
         // expect response
         let response =
@@ -787,7 +792,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_publish_to_one_peer() -> eyre::Result<()> {
-        tn_test_utils::init_test_tracing();
         let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
         let mut authorities = all_nodes.authorities();
         let authority_1 = authorities.next().expect("first authority");
@@ -812,7 +816,7 @@ mod tests {
         let topics = vec![correct_topic.clone()];
 
         // honest cvv
-        let cvv_network = ConsensusNetwork::<WorkerBlock, WorkerBlock>::new(
+        let cvv_network = ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(
             &config_1,
             tx1,
             authorized_publishers.clone(),
@@ -820,7 +824,7 @@ mod tests {
         )?;
 
         // honest nvv
-        let nvv_network = ConsensusNetwork::<WorkerBlock, WorkerBlock>::new(
+        let nvv_network = ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(
             &config_2,
             tx2,
             authorized_publishers.clone(),
@@ -878,7 +882,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<()> {
-        tn_test_utils::init_test_tracing();
         let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
         let mut authorities = all_nodes.authorities();
         let authority_1 = authorities.next().expect("first authority");
@@ -903,7 +906,7 @@ mod tests {
         let topics = vec![correct_topic.clone()];
 
         // honest cvv
-        let cvv_network = ConsensusNetwork::<WorkerBlock, WorkerBlock>::new(
+        let cvv_network = ConsensusNetwork::<PrimaryRequest, PrimaryResponse>::new(
             &config_1,
             tx1,
             authorized_publishers.clone(),
@@ -911,7 +914,7 @@ mod tests {
         )?;
 
         // honest nvv
-        let nvv_network = ConsensusNetwork::<WorkerBlock, WorkerBlock>::new(
+        let nvv_network = ConsensusNetwork::<PrimaryRequest, PrimaryResponse>::new(
             &config_2,
             tx2,
             authorized_publishers.clone(),
@@ -976,7 +979,9 @@ mod tests {
         Ok(())
     }
 
+    // TODO: reload known peers from database,
+    // - use this file on startup for "discoverability" at genesis
+    // also:
     // - test gossip to multiple peers
-    // - use actual req/res message types
     //      - gossip for worker blocks?
 }

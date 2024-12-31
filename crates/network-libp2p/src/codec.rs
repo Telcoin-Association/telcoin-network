@@ -23,7 +23,6 @@ pub trait TNMessage: Send + Serialize + DeserializeOwned + Clone + fmt::Debug + 
 ///
 /// TODO:
 /// - handle peer scores when messages are malicious
-/// - verify StreamProtocol between peers
 #[derive(Clone, Debug)]
 pub struct TNCodec<Req, Res> {
     /// The fixed-size buffer for compressed messages.
