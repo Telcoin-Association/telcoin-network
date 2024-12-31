@@ -2,6 +2,9 @@
 //!
 //! This network is used by workers and primaries to reliably send consensus messages.
 
+// TODO: remove this attribute after replacing network layer
+#![allow(unused)]
+
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
@@ -99,9 +102,6 @@ where
     Res: TNMessage,
 {
     /// Create a new instance of Self.
-    ///
-    /// TODO: add NetworkResult errors before merge - using `expect` for quicker refactors
-    /// !!!~~~~~~~k
     pub fn new<DB>(
         config: &ConsensusConfig<DB>,
         event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
@@ -136,7 +136,7 @@ where
         .map_err(|e| NetworkError::GossipBehavior(e))?;
 
         // TODO: use const as default and read from config
-        let tn_codec = TNCodec::<Req, Res>::new(1024 * 1024);
+        let tn_codec = TNCodec::<Req, Res>::new(1024 * 1024); // 1mb
 
         // TODO: take this from configuration through CLI
         // - ex) "/telcoin-network/mainnet/0.0.1"
@@ -425,12 +425,6 @@ where
             }
             NetworkCommand::Dial { peer_id, peer_addr, reply } => {
                 if let hash_map::Entry::Vacant(entry) = self.pending_dials.entry(peer_id) {
-                    // TODO: support kademlia?
-                    //
-                    // self.swarm
-                    //     .behaviour_mut()
-                    //     .kademlia
-                    //     .add_address(&peer_id, peer_addr.clone());
                     match self.swarm.dial(peer_addr.with(Protocol::P2p(peer_id))) {
                         Ok(()) => {
                             entry.insert(reply);
