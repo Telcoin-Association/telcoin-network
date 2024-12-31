@@ -1,5 +1,8 @@
 //! Messages for the primary protocol.
 
+// TODO: remove this attribute after replacing network layer
+#![allow(unused)]
+
 use crate::types::NetworkResult;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
