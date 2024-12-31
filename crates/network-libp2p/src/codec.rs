@@ -295,7 +295,8 @@ mod tests {
         let mut honest_peer = TNCodec::<PrimaryRequest, PrimaryResponse>::new(max_chunk_size);
         let protocol = StreamProtocol::new("/tn-test");
         // malicious peer writes legit messages that are too big
-        // "legit" means correct prefix and valid data. the only problem is message too big for receiving peer
+        // "legit" means correct prefix and valid data. the only problem is message too big for
+        // receiving peer
         let mut malicious_peer = TNCodec::<PrimaryRequest, PrimaryResponse>::new(1024 * 1024);
 
         //

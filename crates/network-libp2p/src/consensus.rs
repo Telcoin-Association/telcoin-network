@@ -92,7 +92,9 @@ where
     pending_dials: HashMap<PeerId, oneshot::Sender<NetworkResult<()>>>,
     /// The collection of pending requests.
     ///
-    /// Callers include a oneshot channel for the network to return response. The caller is responsible for decoding message bytes and reporting peers who return bad data. Peers that send messages that fail to decode must receive an application score penalty.
+    /// Callers include a oneshot channel for the network to return response. The caller is
+    /// responsible for decoding message bytes and reporting peers who return bad data. Peers that
+    /// send messages that fail to decode must receive an application score penalty.
     pending_requests: HashMap<OutboundRequestId, oneshot::Sender<NetworkResult<Res>>>,
 }
 
@@ -133,7 +135,7 @@ where
             gossipsub::MessageAuthenticity::Signed(keypair.clone()),
             gossipsub_config,
         )
-        .map_err(|e| NetworkError::GossipBehavior(e))?;
+        .map_err(NetworkError::GossipBehavior)?;
 
         // TODO: use const as default and read from config
         let tn_codec = TNCodec::<Req, Res>::new(1024 * 1024); // 1mb
@@ -438,7 +440,8 @@ where
                 } else {
                     // return error - dial attempt already tracked for peer
                     //
-                    // may be necessary to update entry in future, but for now assume only one dial attempt
+                    // may be necessary to update entry in future, but for now assume only one dial
+                    // attempt
                     if let Err(e) = reply.send(Err(NetworkError::RedialAttempt)) {
                         error!(target: "network", ?e, "AddExplicitPeer oneshot dropped");
                     }
@@ -644,7 +647,8 @@ mod tests {
 
         // malicious peer1
         //
-        // although these are honest req/res types, they are incorrect for the honest peer's "worker" network
+        // although these are honest req/res types, they are incorrect for the honest peer's
+        // "worker" network
         let peer1_network = ConsensusNetwork::<PrimaryRequest, PrimaryResponse>::new(
             &config_1,
             tx1,
@@ -733,8 +737,9 @@ mod tests {
 
         // malicious peer2
         //
-        // although these are honest req/res types, they are incorrect for the honest peer's "primary" network
-        // this allows the network to receive "correct" messages and respond with bad messages
+        // although these are honest req/res types, they are incorrect for the honest peer's
+        // "primary" network this allows the network to receive "correct" messages and
+        // respond with bad messages
         let peer2_network = ConsensusNetwork::<PrimaryRequest, WorkerResponse>::new(
             &config_2,
             tx2,
@@ -978,10 +983,4 @@ mod tests {
 
         Ok(())
     }
-
-    // TODO: reload known peers from database,
-    // - use this file on startup for "discoverability" at genesis
-    // also:
-    // - test gossip to multiple peers
-    //      - gossip for worker blocks?
 }

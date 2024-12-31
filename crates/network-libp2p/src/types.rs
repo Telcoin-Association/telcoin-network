@@ -84,7 +84,9 @@ where
     LocalPeerId { reply: oneshot::Sender<PeerId> },
     /// Send a request to a peer.
     ///
-    /// The caller is responsible for decoding message bytes and reporting peers who return bad data. Peers that send messages that fail to decode must receive an application score penalty.
+    /// The caller is responsible for decoding message bytes and reporting peers who return bad
+    /// data. Peers that send messages that fail to decode must receive an application score
+    /// penalty.
     SendRequest {
         /// The destination peer.
         peer: PeerId,
@@ -159,7 +161,8 @@ where
         ack.await?
     }
 
-    /// Start swarm listening on the given address. Returns an error if the address is not supported.
+    /// Start swarm listening on the given address. Returns an error if the address is not
+    /// supported.
     ///
     /// Return swarm error to caller.
     pub async fn start_listening(&self, multiaddr: Multiaddr) -> NetworkResult<ListenerId> {
