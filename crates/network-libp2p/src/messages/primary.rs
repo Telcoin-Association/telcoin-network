@@ -3,11 +3,15 @@
 // TODO: remove this attribute after replacing network layer
 #![allow(unused)]
 
-use crate::types::NetworkResult;
+use crate::{codec::TNMessage, types::NetworkResult};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use tn_types::{AuthorityIdentifier, Certificate, CertificateDigest, Header, Round, Vote};
+
+// impl TNMessage trait for types
+impl TNMessage for PrimaryRequest {}
+impl TNMessage for PrimaryResponse {}
 
 /// Requests from Primary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

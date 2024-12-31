@@ -1,7 +1,12 @@
 //! P2p messages between workers.
 
+use crate::codec::TNMessage;
 use serde::{Deserialize, Serialize};
 use tn_types::{BlockHash, SealedWorkerBlock};
+
+// impl TNMessage trait for types
+impl TNMessage for WorkerRequest {}
+impl TNMessage for WorkerResponse {}
 
 /// Requests between workers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
