@@ -217,12 +217,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{PrimaryRequest, PrimaryResponse};
     use serde::Deserialize;
-    use tn_test_utils::fixture_batch_with_transactions;
-    use tn_types::{BlockHash, WorkerBlock};
-
-    // impl TNMessage for compiler
-    impl TNMessage for WorkerBlock {}
+    use tn_types::{BlockHash, Certificate, CertificateDigest, Header};
 
     #[derive(Serialize, Deserialize, Default, PartialEq, Clone, Debug)]
     struct TestData {
@@ -234,27 +231,31 @@ mod tests {
     #[tokio::test]
     async fn test_encode_decode_same_message() {
         let max_chunk_size = 1024 * 1024; // 1mb
-        let mut codec = TNCodec::<WorkerBlock, WorkerBlock>::new(max_chunk_size);
-        let protocol = StreamProtocol::new("/test");
+        let mut codec = TNCodec::<PrimaryRequest, PrimaryResponse>::new(max_chunk_size);
+        let protocol = StreamProtocol::new("/tn-test");
 
         // encode request
         let mut encoded = Vec::new();
-        let block = WorkerBlock::default();
+        let request = PrimaryRequest::Vote {
+            header: Header::default(),
+            parents: vec![Certificate::default()],
+        };
         codec
-            .write_request(&protocol, &mut encoded, block.clone())
+            .write_request(&protocol, &mut encoded, request.clone())
             .await
             .expect("write valid request");
 
         // now decode request
         let decoded =
             codec.read_request(&protocol, &mut encoded.as_ref()).await.expect("read valid request");
-        assert_eq!(decoded, block);
+        assert_eq!(decoded, request);
 
         // encode response
         let mut encoded = Vec::new();
-        let block = fixture_batch_with_transactions(100);
+        let response =
+            PrimaryResponse::Vote { vote: None, missing: vec![CertificateDigest::new([b'a'; 32])] };
         codec
-            .write_response(&protocol, &mut encoded, block.clone())
+            .write_response(&protocol, &mut encoded, response.clone())
             .await
             .expect("write valid response");
 
@@ -263,58 +264,71 @@ mod tests {
             .read_response(&protocol, &mut encoded.as_ref())
             .await
             .expect("read valid response");
-        assert_eq!(decoded, block);
+        assert_eq!(decoded, response);
     }
 
     #[tokio::test]
     async fn test_fail_to_write_message_too_big() {
         let max_chunk_size = 100; // 100 bytes is too small
-        let mut codec = TNCodec::<WorkerBlock, WorkerBlock>::new(max_chunk_size);
-        let protocol = StreamProtocol::new("/test");
+        let mut codec = TNCodec::<PrimaryRequest, PrimaryResponse>::new(max_chunk_size);
+        let protocol = StreamProtocol::new("/tn-test");
 
         // encode request
         let mut encoded = Vec::new();
-        let block = fixture_batch_with_transactions(1);
-        let res = codec.write_request(&protocol, &mut encoded, block.clone()).await;
+        let request = PrimaryRequest::Vote {
+            header: Header::default(),
+            parents: vec![Certificate::default()],
+        };
+        let res = codec.write_request(&protocol, &mut encoded, request).await;
         assert!(res.is_err());
 
         // encode response
         let mut encoded = Vec::new();
-        let block = fixture_batch_with_transactions(1);
-        let res = codec.write_response(&protocol, &mut encoded, block.clone()).await;
+        let response =
+            PrimaryResponse::MissingCertificates { certificates: vec![Certificate::default()] };
+        let res = codec.write_response(&protocol, &mut encoded, response).await;
         assert!(res.is_err());
     }
 
     #[tokio::test]
     async fn test_reject_message_prefix_too_big() {
-        let max_chunk_size = 100; // 100 bytes is too small
-        let mut honest_peer = TNCodec::<WorkerBlock, WorkerBlock>::new(max_chunk_size);
-        let protocol = StreamProtocol::new("/test");
+        let max_chunk_size = 208; // 208 bytes
+        let mut honest_peer = TNCodec::<PrimaryRequest, PrimaryResponse>::new(max_chunk_size);
+        let protocol = StreamProtocol::new("/tn-test");
         // malicious peer writes legit messages that are too big
-        // "legit" means correct prefix and valid data. the only problem is message too big
-        let mut malicious_peer = TNCodec::<WorkerBlock, WorkerBlock>::new(1024 * 1024);
+        // "legit" means correct prefix and valid data. the only problem is message too big for receiving peer
+        let mut malicious_peer = TNCodec::<PrimaryRequest, PrimaryResponse>::new(1024 * 1024);
 
         //
         // test requests first
         //
         // sanity check that block within bounds works
         let mut encoded = Vec::new();
-        let block = WorkerBlock::default(); // 72 bytes uncompressed
+
+        // this is 208 bytes uncompressed (max chunk size)
+        let request = PrimaryRequest::Vote {
+            header: Header::default(),
+            parents: vec![Certificate::default()],
+        };
         malicious_peer
-            .write_request(&protocol, &mut encoded, block.clone())
+            .write_request(&protocol, &mut encoded, request.clone())
             .await
             .expect("write legit and valid request");
         let decoded = honest_peer
             .read_request(&protocol, &mut encoded.as_ref())
             .await
             .expect("read valid request");
-        assert_eq!(decoded, block);
+        assert_eq!(decoded, request);
 
         // now encode legit message that's too big for honest peer
         let mut encoded = Vec::new();
-        let block = fixture_batch_with_transactions(1);
+        // this is 344 bytes uncompressed
+        let big_request = PrimaryRequest::Vote {
+            header: Header::default(),
+            parents: vec![Certificate::default(), Certificate::default()],
+        };
         malicious_peer
-            .write_request(&protocol, &mut encoded, block.clone())
+            .write_request(&protocol, &mut encoded, big_request)
             .await
             .expect("write legit request");
         // prefix length should cause error
@@ -326,22 +340,27 @@ mod tests {
         //
         // sanity check that block within bounds works
         let mut encoded = Vec::new();
-        let block = WorkerBlock::default(); // 72 bytes uncompressed
+        // 138 bytes uncompressed
+        let response =
+            PrimaryResponse::MissingCertificates { certificates: vec![Certificate::default()] };
         malicious_peer
-            .write_response(&protocol, &mut encoded, block.clone())
+            .write_response(&protocol, &mut encoded, response.clone())
             .await
             .expect("write legit and valid response");
         let decoded = honest_peer
             .read_response(&protocol, &mut encoded.as_ref())
             .await
             .expect("read valid response");
-        assert_eq!(decoded, block);
+        assert_eq!(decoded, response);
 
         // now encode legit message that's too big for honest peer
         let mut encoded = Vec::new();
-        let block = fixture_batch_with_transactions(1);
+        // 274 bytes uncompressed
+        let big_response = PrimaryResponse::MissingCertificates {
+            certificates: vec![Certificate::default(), Certificate::default()],
+        };
         malicious_peer
-            .write_response(&protocol, &mut encoded, block.clone())
+            .write_response(&protocol, &mut encoded, big_response)
             .await
             .expect("write legit response");
         // prefix length should cause error
@@ -351,12 +370,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_malicious_prefix_deceives_peer_to_read_message_and_fails() {
-        let max_chunk_size = 100; // 100 bytes max message size
-        let mut honest_peer = TNCodec::<WorkerBlock, WorkerBlock>::new(max_chunk_size);
-        let protocol = StreamProtocol::new("/test");
+        let max_chunk_size = 208; // 208 bytes max message size
+        let mut honest_peer = TNCodec::<PrimaryRequest, PrimaryResponse>::new(max_chunk_size);
+        let protocol = StreamProtocol::new("/tn-test");
         // malicious peer writes legit messages that are too big
         // "legit" means correct prefix and valid data. the only problem is message too big
-        let mut malicious_peer = TNCodec::<WorkerBlock, WorkerBlock>::new(1024 * 1024);
+        let mut malicious_peer = TNCodec::<PrimaryRequest, PrimaryResponse>::new(1024 * 1024);
 
         //
         // test requests first
@@ -364,19 +383,24 @@ mod tests {
         // encode valid message that's too big and change prefix to deceive peer into trying to read
         // content
         let mut encoded = Vec::new();
-        let block = fixture_batch_with_transactions(1);
+        // this is 344 bytes uncompressed
+        // but only 74 bytes compressed (within max size)
+        let big_request = PrimaryRequest::Vote {
+            header: Header::default(),
+            parents: vec![Certificate::default(), Certificate::default()],
+        };
         malicious_peer
-            .write_request(&protocol, &mut encoded, block.clone())
+            .write_request(&protocol, &mut encoded, big_request)
             .await
             .expect("write legit request");
         // assert prefix is greater than peer's max chunk size
         let mut actual_prefix = [0; 4];
         actual_prefix.clone_from_slice(&encoded[0..4]);
-        let actual_length = u32::from_le_bytes(actual_prefix) as usize;
+        let honest_length = u32::from_le_bytes(actual_prefix) as usize;
 
         // sanity check
-        assert!(actual_length > max_chunk_size);
-        assert!(encoded.len() > max_chunk_size);
+        assert!(honest_length > max_chunk_size);
+        assert!(encoded.len() < max_chunk_size);
 
         // manipulate prefix to obfuscate actual message size is too big
         // this sets prefix to the honest peer's max message length,
@@ -393,19 +417,23 @@ mod tests {
         // encode valid message that's too big and change prefix to deceive peer into trying to read
         // content
         let mut encoded = Vec::new();
-        let block = fixture_batch_with_transactions(1);
+        // this is 274 bytes uncompressed (more than max)
+        // but only 62 bytes compressed (within max size)
+        let big_response = PrimaryResponse::MissingCertificates {
+            certificates: vec![Certificate::default(), Certificate::default()],
+        };
         malicious_peer
-            .write_response(&protocol, &mut encoded, block.clone())
+            .write_response(&protocol, &mut encoded, big_response)
             .await
             .expect("write legit response");
         // assert prefix is greater than peer's max chunk size
         let mut actual_prefix = [0; 4];
         actual_prefix.clone_from_slice(&encoded[0..4]);
-        let actual_length = u32::from_le_bytes(actual_prefix) as usize;
+        let honest_length = u32::from_le_bytes(actual_prefix) as usize;
 
         // sanity check
-        assert!(actual_length > max_chunk_size);
-        assert!(encoded.len() > max_chunk_size);
+        assert!(honest_length > max_chunk_size);
+        assert!(encoded.len() < max_chunk_size);
 
         // manipulate prefix to obfuscate actual message size is too big
         // this sets prefix to the honest peer's max message length,
