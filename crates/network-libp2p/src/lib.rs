@@ -5,3 +5,6 @@ mod consensus;
 pub mod error;
 mod messages;
 pub mod types;
+
+// export message types
+pub use messages::{PrimaryRequest, PrimaryResponse, WorkerRequest, WorkerResponse};
