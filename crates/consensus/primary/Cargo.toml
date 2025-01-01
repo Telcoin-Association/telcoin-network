@@ -49,6 +49,8 @@ tn-primary-metrics = { workspace = true }
 anemo = { workspace = true }
 anemo-tower = { workspace = true }
 
+tn-network-libp2p = { workspace = true }
+
 [dev-dependencies]
 dashmap = { workspace = true }
 async-trait = { workspace = true }

@@ -63,7 +63,7 @@ impl Primary {
         config.parameters().tracing();
 
         // Some info statements
-        let own_peer_id = PeerId(config.key_config().primary_network_public_key().0.to_bytes());
+        let own_peer_id = PeerId(config.key_config().primary_network_public_key().to_bytes());
         info!(
             "Boot primary node with peer id {} and public key {}",
             own_peer_id,
@@ -239,7 +239,7 @@ impl Primary {
         let primary_peer_ids = config
             .committee()
             .authorities()
-            .map(|authority| PeerId(authority.network_key().0.to_bytes()));
+            .map(|authority| PeerId(authority.network_key().to_bytes()));
         let routes = anemo::Router::new()
             .add_rpc_service(primary_service)
             .route_layer(RequireAuthorizationLayer::new(AllowedPeers::new(primary_peer_ids)))
@@ -299,7 +299,7 @@ impl Primary {
         peer_name: NetworkPublicKey,
         address: &Multiaddr,
     ) -> (PeerId, Address) {
-        let peer_id = PeerId(peer_name.0.to_bytes());
+        let peer_id = PeerId(peer_name.to_bytes());
         let address = address.to_anemo_address().unwrap();
         let peer_info = PeerInfo {
             peer_id,

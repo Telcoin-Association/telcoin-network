@@ -53,8 +53,8 @@ impl KeyConfig {
     /// Useful for testing.
     pub fn with_random<R: AllowedRng>(rng: &mut R) -> Self {
         let primary_keypair = BlsKeypair::generate(rng);
-        let network_keypair = NetworkKeypair::generate(rng);
-        let worker_network_keypair = NetworkKeypair::generate(rng);
+        let network_keypair = NetworkKeypair::generate();
+        let worker_network_keypair = NetworkKeypair::generate();
         Self {
             inner: Arc::new(KeyConfigInner {
                 primary_keypair,
@@ -71,8 +71,8 @@ impl KeyConfig {
         primary_keypair: BlsKeypair,
         rng: &mut R,
     ) -> Self {
-        let network_keypair = NetworkKeypair::generate(rng);
-        let worker_network_keypair = NetworkKeypair::generate(rng);
+        let network_keypair = NetworkKeypair::generate();
+        let worker_network_keypair = NetworkKeypair::generate();
         Self {
             inner: Arc::new(KeyConfigInner {
                 primary_keypair,

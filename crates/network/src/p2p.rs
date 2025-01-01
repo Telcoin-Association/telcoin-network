@@ -28,7 +28,7 @@ where
     // Safety
     // Since this spawns an unbounded task, this should be called in a time-restricted fashion.
 
-    let peer_id = PeerId(peer.0.to_bytes());
+    let peer_id = PeerId(peer.as_bytes());
     let message_send = move || {
         let network = network.clone();
         let f = f.clone();
@@ -65,7 +65,7 @@ impl PrimaryToPrimaryRpc for anemo::Network {
         peer: &NetworkPublicKey,
         request: impl anemo::types::request::IntoRequest<FetchCertificatesRequest> + Send,
     ) -> Result<FetchCertificatesResponse> {
-        let peer_id = PeerId(peer.0.to_bytes());
+        let peer_id = PeerId(peer.as_bytes());
         let peer = self
             .peer(peer_id)
             .ok_or_else(|| format_err!("Network has no connection with peer {peer_id}"))?;
@@ -101,7 +101,7 @@ impl WorkerRpc for anemo::Network {
         peer: &NetworkPublicKey,
         request: impl anemo::types::request::IntoRequest<RequestBlocksRequest> + Send,
     ) -> Result<RequestBlocksResponse> {
-        let peer_id = PeerId(peer.0.to_bytes());
+        let peer_id = PeerId(peer.as_bytes());
         let peer = self
             .peer(peer_id)
             .ok_or_else(|| format_err!("Network has no connection with peer {peer_id}"))?;

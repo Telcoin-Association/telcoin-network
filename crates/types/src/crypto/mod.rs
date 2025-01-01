@@ -23,12 +23,12 @@ use std::future::Future;
 // This re-export allows using the trait-defined APIs
 pub use fastcrypto::traits;
 use reth_chainspec::ChainSpec;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 mod intent;
-mod network;
+// mod network;
 use crate::encode;
 pub use intent::*;
-pub use network::*;
+// pub use network::*;
 
 //
 // CONSENSUS
@@ -50,12 +50,56 @@ pub type BlsKeypair = bls12381::min_sig::BLS12381KeyPair;
 //
 // NETWORK
 //
+// /// Cryptographic material with an immediate conversion to/from Base64 strings.
+// ///
+// /// This is an [extension trait](https://rust-lang.github.io/rfcs/0445-extension-trait-conventions.html) of `ToFromBytes` above.
+// ///
+// pub trait EncodeDecodeBase64: Sized {
+//     fn encode_base64(&self) -> String;
+//     fn decode_base64(value: &str) -> Result<Self, eyre::Report>;
+// }
+
+// impl<T: ToFromBytes> EncodeDecodeBase64 for T {
+//     fn encode_base64(&self) -> String {
+//         Base64::encode(self.as_bytes())
+//     }
+
+//     fn decode_base64(value: &str) -> eyre::Result<Self> {
+//         let bytes = Base64::decode(value)?;
+//         <T as ToFromBytes>::from_bytes(&bytes).map_err(|e| e.into())
+//     }
+// }
+
 /// Public key used to sign network messages between peers during consensus.
-pub type NetworkPublicKey = ed25519::Ed25519PublicKey;
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct NetworkPublicKey([u8; 32]);
+
+impl NetworkPublicKey {
+    /// Create an insecure default.
+    pub fn insecure_default() -> Self {
+        Self([0; 32])
+    }
+
+    /// As bytes temp - DO NOT MERGE
+    pub fn as_bytes(&self) -> [u8; 32] {
+        self.0.clone()
+    }
+}
+
+impl From<libp2p::identity::ed25519::PublicKey> for NetworkPublicKey {
+    fn from(value: libp2p::identity::ed25519::PublicKey) -> Self {
+        Self(value.to_bytes())
+    }
+}
+
 /// Keypair used to sign network messages between peers during consensus.
-pub type NetworkKeypair = ed25519::Ed25519KeyPair;
+pub type NetworkKeypairType = libp2p::identity::ed25519::Keypair;
+
+/// Wrapper around keypair.
+pub type NetworkKeypair = libp2p::identity::ed25519::Keypair;
+
 /// Signature using network key.
-pub type NetworkSignature = ed25519::Ed25519Signature;
+pub type NetworkSignature = [u8; 64];
 //
 // EXECUTION
 //

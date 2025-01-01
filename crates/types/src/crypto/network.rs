@@ -23,11 +23,7 @@ impl ProtocolSignature for NetworkSignature {
         secret.sign(&message)
     }
 
-    fn verify_secure<T>(
-        &self,
-        value: &IntentMessage<T>,
-        public_key: &NetworkPublicKey,
-    ) -> Result<(), FastCryptoError>
+    fn verify_secure<T>(&self, value: &IntentMessage<T>, public_key: &NetworkPublicKey) -> bool
     where
         T: Serialize,
     {

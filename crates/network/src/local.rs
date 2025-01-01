@@ -76,12 +76,12 @@ impl LocalNetwork {
     }
 
     pub fn new_from_keypair(primary_network_keypair: &NetworkKeypair) -> Self {
-        Self::new(PeerId(primary_network_keypair.public().0.into()))
+        Self::new(PeerId(primary_network_keypair.public().to_bytes().into()))
     }
 
     /// Create a new [LocalNetwork] from the primary's network key.
     pub fn new_from_public_key(primary_network_public_key: &NetworkPublicKey) -> Self {
-        Self::new(PeerId(primary_network_public_key.0.into()))
+        Self::new(PeerId(primary_network_public_key.clone().as_bytes()))
     }
 
     pub fn new_with_empty_id() -> Self {
@@ -160,7 +160,7 @@ impl PrimaryToWorkerClient for LocalNetwork {
         worker_name: NetworkPublicKey,
         request: WorkerSynchronizeMessage,
     ) -> Result<(), LocalClientError> {
-        let c = self.get_primary_to_worker_handler(PeerId(worker_name.0.into())).await?;
+        let c = self.get_primary_to_worker_handler(PeerId(worker_name.as_bytes())).await?;
         select! {
             resp = c.synchronize(Request::new(request)) => {
                 resp.map_err(|e| LocalClientError::Internal(format!("{e:?}")))?;
@@ -177,7 +177,7 @@ impl PrimaryToWorkerClient for LocalNetwork {
         worker_name: NetworkPublicKey,
         request: FetchBlocksRequest,
     ) -> Result<FetchBlocksResponse, LocalClientError> {
-        let c = self.get_primary_to_worker_handler(PeerId(worker_name.0.into())).await?;
+        let c = self.get_primary_to_worker_handler(PeerId(worker_name.as_bytes())).await?;
         select! {
             resp = c.fetch_blocks(Request::new(request)) => {
                 Ok(resp.map_err(|e| LocalClientError::Internal(format!("{e:?}")))?.into_inner())

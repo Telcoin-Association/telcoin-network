@@ -29,6 +29,8 @@ bytes = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
 snap = "1.1.0"
 
+fastcrypto = { workspace = true }
+
 [build-dependencies]
 rustversion = "1.0.9"
 anemo-build = { workspace = true }

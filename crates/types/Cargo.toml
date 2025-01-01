@@ -49,5 +49,7 @@ serde_yaml = { workspace = true }
 secp256k1 = { workspace = true }
 alloy = { workspace = true }
 
+libp2p = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }

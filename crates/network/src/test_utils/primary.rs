@@ -29,7 +29,7 @@ impl PrimaryToPrimaryMockServer {
         let routes = anemo::Router::new().add_rpc_service(service);
         let network = anemo::Network::bind(addr)
             .server_name("narwhal")
-            .private_key(network_keypair.private().0.to_bytes())
+            // .private_key(network_keypair.private().0.to_bytes())
             .start(routes)
             .unwrap();
         info!("starting network on: {}", network.local_addr());
@@ -82,7 +82,7 @@ impl PrimaryToWorkerMockServer {
         let routes = anemo::Router::new().add_rpc_service(service);
         let network = anemo::Network::bind(addr)
             .server_name("narwhal")
-            .private_key(keypair.private().0.to_bytes())
+            // .private_key(keypair.private().0.to_bytes())
             .start(routes)
             .unwrap();
         info!("starting network on: {}", network.local_addr());

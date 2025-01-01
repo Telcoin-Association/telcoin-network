@@ -29,7 +29,7 @@ pub type Epoch = u64;
 /// The voting power an authority has within the committee.
 pub type Stake = u64;
 
-#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct Authority {
     /// The id under which we identify this authority across Narwhal
     #[serde(skip)]
@@ -162,7 +162,7 @@ impl Authority {
 ///
 /// TODO: remove default? Added for compatibility with [ConfigTrait].
 /// Probably a better way to do this.
-#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq, Default)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
 pub struct Committee {
     /// The authorities of epoch.
     authorities: BTreeMap<BlsPublicKey, Authority>,
@@ -613,7 +613,7 @@ mod tests {
         let authorities = (0..num_of_authorities)
             .map(|i| {
                 let keypair = BlsKeypair::generate(&mut rng);
-                let network_keypair = NetworkKeypair::generate(&mut rng);
+                let network_keypair = NetworkKeypair::generate();
                 let execution_address = Address::random();
 
                 let a = Authority::new(
@@ -621,7 +621,7 @@ mod tests {
                     1,
                     Multiaddr::empty(),
                     execution_address,
-                    network_keypair.public().clone(),
+                    network_keypair.public().into(),
                     i.to_string(),
                 );
 

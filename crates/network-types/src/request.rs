@@ -3,8 +3,10 @@ use reth_primitives::SealedHeader;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use tn_types::{AuthorityIdentifier, BlockHash, Certificate, Header, NetworkPublicKey, Round};
+use tn_types::{AuthorityIdentifier, BlockHash, Certificate, Header, Round};
 use tracing::warn;
+
+type NetworkPublicKey = fastcrypto::ed25519::Ed25519PublicKey;
 
 /// Request for broadcasting certificates to peers.
 #[derive(Clone, Debug, Serialize, Deserialize)]

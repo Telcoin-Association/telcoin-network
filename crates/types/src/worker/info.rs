@@ -26,7 +26,7 @@ pub type WorkerId = u16;
 /// - [NetworkPublicKey] for identifying network messages.
 /// - [Multiaddr] for receiving transactions.
 /// - [Multiaddr] for receiving messages from other workers and the primary.
-#[derive(Clone, Serialize, Deserialize, Eq, Hash, PartialEq, Debug)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
 pub struct WorkerInfo {
     /// The network public key of this worker used to sign worker messages (ie - batches).
     pub name: NetworkPublicKey,

@@ -5,6 +5,8 @@ use tn_types::{
     BlockHash, Certificate, CertificateDigest, Vote, WorkerBlock, WorkerId, WorkerInfo,
 };
 
+type NetworkPublicKey = fastcrypto::ed25519::Ed25519PublicKey;
+
 /// Response from peers after receiving a certificate.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SendCertificateResponse {
@@ -37,7 +39,7 @@ pub struct FetchBlocksResponse {
 }
 
 /// Information for the workers.
-#[derive(Clone, Serialize, Deserialize, Eq, PartialEq, Debug)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
 pub struct WorkerInfoResponse {
     /// Map of workers' id and their network addresses.
     pub workers: BTreeMap<WorkerId, WorkerInfo>,

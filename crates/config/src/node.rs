@@ -6,15 +6,17 @@ use reth_chainspec::ChainSpec;
 use reth_primitives::{Address, Genesis};
 use serde::{Deserialize, Serialize};
 use std::{
+    fs::File,
+    io::Read as _,
     num::NonZeroU32,
     path::{Path, PathBuf},
     time::Duration,
 };
 use tn_types::{
-    adiri_genesis, get_available_tcp_port, BlsPublicKey, BlsSignature, Multiaddr, NetworkPublicKey,
-    WorkerIndex,
+    adiri_genesis, get_available_tcp_port, BlsPublicKey, BlsSignature, Multiaddr, NetworkKeypair,
+    NetworkPublicKey, WorkerIndex,
 };
-use tracing::info;
+use tracing::{debug, info};
 
 /// The filename to use when reading/writing the validator's BlsKey.
 pub const BLS_KEYFILE: &str = "bls.key";
@@ -403,3 +405,67 @@ where
     let contents = std::fs::read_to_string(path)?;
     KP::decode_base64(contents.as_str().trim()).map_err(|e| eyre::eyre!(e))
 }
+
+/// Try to load an ed25519 network key from file.
+///
+/// If the read fails, generate a new key and write to fs.
+pub fn read_network_key_from_file<P>(path: P) -> eyre::Result<NetworkKeypair>
+where
+    P: AsRef<Path>,
+{
+    if let Ok(mut network_secret) = File::open(path) {
+        let mut key = Vec::with_capacity(36);
+        match network_secret.read_to_end(&mut key) {
+            Ok(_) => NetworkKeypair::try_from_bytes(key.as_ref())?,
+            Err(e) => {
+                debug!(target: "config", ?e, "failed to read network key file");
+                todo!()
+            }
+        }
+    } else {
+        todo!()
+    }
+}
+
+// /// Loads a private key from disk. If this fails, a new key is
+// /// generated and is then saved to disk.
+// ///
+// /// Currently only secp256k1 keys are allowed, as these are the only keys supported by discv5.
+// pub fn load_private_key(config: &NetworkConfig, log: &slog::Logger) -> Keypair {
+//     // check for key from disk
+//     let network_key_f = config.network_dir.join(NETWORK_KEY_FILENAME);
+//     if let Ok(mut network_key_file) = File::open(network_key_f.clone()) {
+//         let mut key_bytes: Vec<u8> = Vec::with_capacity(36);
+//         match network_key_file.read_to_end(&mut key_bytes) {
+//             Err(_) => debug!(log, "Could not read network key file"),
+//             Ok(_) => {
+//                 // only accept secp256k1 keys for now
+//                 if let Ok(secret_key) = secp256k1::SecretKey::try_from_bytes(&mut key_bytes) {
+//                     let kp: secp256k1::Keypair = secret_key.into();
+//                     debug!(log, "Loaded network key from disk.");
+//                     return kp.into();
+//                 } else {
+//                     debug!(log, "Network key file is not a valid secp256k1 key");
+//                 }
+//             }
+//         }
+//     }
+
+//     // if a key could not be loaded from disk, generate a new one and save it
+//     let local_private_key = secp256k1::Keypair::generate();
+//     let _ = std::fs::create_dir_all(&config.network_dir);
+//     match File::create(network_key_f.clone())
+//         .and_then(|mut f| f.write_all(&local_private_key.secret().to_bytes()))
+//     {
+//         Ok(_) => {
+//             debug!(log, "New network key generated and written to disk");
+//         }
+//         Err(e) => {
+//             warn!(
+//                 log,
+//                 "Could not write node key to file: {:?}. error: {}", network_key_f, e
+//             );
+//         }
+//     }
+//     local_private_key.into()
+// }
