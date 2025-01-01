@@ -10,7 +10,6 @@ use std::{
     io::{Read as _, Write as _},
     marker::PhantomData,
 };
-use tn_types::encode;
 
 /// Convenience type for all traits implemented for messages used for TN request-response codec.
 pub trait TNMessage: Send + Serialize + DeserializeOwned + Clone + fmt::Debug + 'static {}
@@ -71,7 +70,7 @@ impl<Req, Res> TNCodec<Req, Res> {
         let mut prefix = [0; 4];
         io.read_exact(&mut prefix).await?;
 
-        // NOTE: cast usize to u32 is safe
+        // NOTE: cast u32 to usize is safe
         let length = u32::from_le_bytes(prefix) as usize;
 
         // ensure message length within bounds
@@ -113,11 +112,18 @@ impl<Req, Res> TNCodec<Req, Res> {
         T: AsyncWrite + Unpin + Send,
         M: TNMessage,
     {
-        // global encode
-        let bytes = encode(&msg);
+        // clear buffers
+        self.compressed_buffer.clear();
+        self.decode_buffer.clear();
+
+        // encode into allocated buffer
+        bcs::serialize_into(&mut self.decode_buffer, &msg).map_err(|e| {
+            let error = format!("bcs serialization: {}", e);
+            std::io::Error::new(std::io::ErrorKind::Other, error)
+        })?;
 
         // ensure encoded bytes are within bounds
-        if bytes.len() > self.max_chunk_size {
+        if self.decode_buffer.len() > self.max_chunk_size {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "encode data > max_chunk_size",
@@ -127,12 +133,12 @@ impl<Req, Res> TNCodec<Req, Res> {
         // length prefix for uncompressed bytes
         //
         // NOTE: 32bit max 4,294,967,295
-        let prefix = (bytes.len() as u32).to_le_bytes();
+        let prefix = (self.decode_buffer.len() as u32).to_le_bytes();
         io.write_all(&prefix).await?;
 
-        // compress data
-        let mut encoder = snap::write::FrameEncoder::new(Vec::new());
-        encoder.write_all(&bytes)?;
+        // compress data using allocated buffer
+        let mut encoder = snap::write::FrameEncoder::new(&mut self.compressed_buffer);
+        encoder.write_all(&self.decode_buffer)?;
         encoder.flush()?;
 
         // add compressed bytes to prefix
