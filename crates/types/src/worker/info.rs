@@ -54,7 +54,7 @@ impl Default for WorkerInfo {
             )
             .parse()
             .expect("multiaddress parsed for worker txs"),
-            worker_address: format!("/ip4/{}/udp/{}", &host, worker_udp_port)
+            worker_address: format!("/ip4/{}/udp/{}/quic-v1", &host, worker_udp_port)
                 .parse()
                 .expect("multiaddr parsed for worker consensus"),
         }

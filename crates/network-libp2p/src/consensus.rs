@@ -2,9 +2,6 @@
 //!
 //! This network is used by workers and primaries to reliably send consensus messages.
 
-// TODO: remove this attribute after replacing network layer
-#![allow(unused)]
-
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
@@ -103,16 +100,17 @@ where
     Req: TNMessage,
     Res: TNMessage,
 {
-    // /// Convenience method for spawning a primary network instance.
-    // pub fn new_for_primary(
-    //     config: &ConsensusConfig<DB>,
-    //     event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
-    //     authorized_publishers: HashSet<PeerId>,
-    //     topics: Vec<IdentTopic>,
-    // ) -> NetworkResult<Self> {
-    //     let authorized_publishers = config.committee().
-    //     Self::new(config, event_stream)
-    // }
+    /// Convenience method for spawning a primary network instance.
+    pub fn new_for_primary<DB>(
+        config: &ConsensusConfig<DB>,
+        event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
+    ) -> NetworkResult<Self>
+    where
+        DB: tn_storage::traits::Database,
+    {
+        let topics = vec![IdentTopic::new("tn-primary")];
+        Self::new(config, event_stream, topics)
+    }
 
     /// Create a new instance of Self.
     pub fn new<DB>(
@@ -541,10 +539,9 @@ where
 mod tests {
     use super::*;
     use crate::{PrimaryRequest, PrimaryResponse, WorkerRequest, WorkerResponse};
-    use libp2p::Multiaddr;
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils::{fixture_batch_with_transactions, CommitteeFixture};
-    use tn_types::{BlockHash, Certificate, Header, SealedWorkerBlock, WorkerBlock};
+    use tn_types::{Certificate, Header};
     use tokio::time::timeout;
 
     #[tokio::test]
@@ -575,9 +572,10 @@ mod tests {
         peer2_network.run();
 
         // start swarm listening on default any address
-        let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse()?;
-        peer1.start_listening(listen_on.clone()).await?;
-        peer2.start_listening(listen_on).await?;
+        let listen_on_1 = config_1.authority().primary_network_address().inner();
+        peer1.start_listening(listen_on_1).await?;
+        let listen_on_2 = config_2.authority().primary_network_address().inner();
+        peer2.start_listening(listen_on_2).await?;
         let peer2_id = peer2.local_peer_id().await?;
         let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
 
@@ -646,9 +644,10 @@ mod tests {
         peer2_network.run();
 
         // start swarm listening on default any address
-        let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse()?;
-        malicious_peer.start_listening(listen_on.clone()).await?;
-        honest_peer.start_listening(listen_on).await?;
+        let listen_on_1 = config_1.authority().primary_network_address().inner();
+        let listen_on_2 = config_2.authority().primary_network_address().inner();
+        malicious_peer.start_listening(listen_on_1).await?;
+        honest_peer.start_listening(listen_on_2).await?;
 
         let honest_peer_id = honest_peer.local_peer_id().await?;
         let honest_peer_addr =
@@ -715,9 +714,10 @@ mod tests {
         peer2_network.run();
 
         // start swarm listening on default any address
-        let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse()?;
-        honest_peer.start_listening(listen_on.clone()).await?;
-        malicious_peer.start_listening(listen_on).await?;
+        let listen_on_1 = config_1.authority().primary_network_address().inner();
+        let listen_on_2 = config_2.authority().primary_network_address().inner();
+        honest_peer.start_listening(listen_on_1).await?;
+        malicious_peer.start_listening(listen_on_2).await?;
         let malicious_peer_id = malicious_peer.local_peer_id().await?;
         let malicious_peer_addr =
             malicious_peer.listeners().await?.first().expect("malicious_peer listen addr").clone();
@@ -784,9 +784,10 @@ mod tests {
         nvv_network.run();
 
         // start swarm listening on default any address
-        let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse()?;
-        cvv.start_listening(listen_on.clone()).await?;
-        nvv.start_listening(listen_on).await?;
+        let listen_on_cvv = config_1.authority().primary_network_address().inner();
+        let listen_on_nvv = config_2.authority().primary_network_address().inner();
+        cvv.start_listening(listen_on_cvv).await?;
+        nvv.start_listening(listen_on_nvv).await?;
         let cvv_id = cvv.local_peer_id().await?;
         let cvv_addr = cvv.listeners().await?.first().expect("peer2 listen addr").clone();
 
@@ -860,9 +861,10 @@ mod tests {
         nvv_network.run();
 
         // start swarm listening on default any address
-        let listen_on: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse()?;
-        cvv.start_listening(listen_on.clone()).await?;
-        nvv.start_listening(listen_on).await?;
+        let listen_on_cvv = config_1.authority().primary_network_address().inner();
+        let listen_on_nvv = config_2.authority().primary_network_address().inner();
+        cvv.start_listening(listen_on_cvv).await?;
+        nvv.start_listening(listen_on_nvv).await?;
         let cvv_id = cvv.local_peer_id().await?;
         let cvv_addr = cvv.listeners().await?.first().expect("peer2 listen addr").clone();
 

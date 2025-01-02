@@ -6,5 +6,6 @@ pub mod error;
 mod messages;
 pub mod types;
 
-// export message types
+// export types
+pub use consensus::ConsensusNetwork;
 pub use messages::{PrimaryRequest, PrimaryResponse, WorkerRequest, WorkerResponse};

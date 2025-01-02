@@ -111,7 +111,7 @@ pub fn test_network(keypair: NetworkKeypair, address: &Multiaddr) -> anemo::Netw
 
 pub fn random_network() -> anemo::Network {
     let network_key = NetworkKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
-    let address = "/ip4/127.0.0.1/udp/0".parse().unwrap();
+    let address = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
     test_network(network_key, &address)
 }
 

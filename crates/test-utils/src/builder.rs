@@ -117,7 +117,7 @@ where
                 0
             };
             let primary_network_address: Multiaddr =
-                format!("/ip4/{host}/udp/{port}").parse().unwrap();
+                format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap();
             let authority = Authority::new_for_test(
                 (i as u16).into(),
                 key_config.primary_public_key(),

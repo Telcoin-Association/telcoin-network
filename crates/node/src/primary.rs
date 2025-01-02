@@ -51,12 +51,14 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
             .spawn_consensus(&self.consensus_bus, self.primary.network().clone(), task_manager)
             .await?;
 
-        self.primary.spawn(
-            self.consensus_config.clone(),
-            &self.consensus_bus,
-            leader_schedule,
-            task_manager,
-        );
+        self.primary
+            .spawn(
+                self.consensus_config.clone(),
+                &self.consensus_bus,
+                leader_schedule,
+                task_manager,
+            )
+            .await;
         Ok(())
     }
 
