@@ -1,9 +1,9 @@
 //! Configuration for consensus network (primary and worker).
 use anemo::Config as AnemoConfig;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use tn_network::local::LocalNetwork;
 use tn_storage::{traits::Database, NodeStorage};
-use tn_types::{Authority, Committee, Notifier, WorkerCache};
+use tn_types::{traits::ToFromBytes, Authority, Committee, Notifier, WorkerCache};
 
 use crate::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, Parameters, TelcoinDirs};
 
@@ -203,5 +203,27 @@ where
 
     pub fn anemo_config(&self) -> &AnemoConfig {
         &self.inner.anemo_config
+    }
+
+    /// Authorized publishers for gossip messages.
+    ///
+    /// TODO: this is used to limit the authors that can publish to gossipsub network.
+    /// However, epoch boundary should allow any staked address to publish for attestation results.
+    /// Consider matching by topic and using a second hashset?
+    /// - current_committee
+    /// - all_staked_nodes?
+    pub fn authorized_publishers(&self) -> HashSet<libp2p::identity::PeerId> {
+        self.committee()
+            .authorities()
+            .map(|a| {
+                // TODO: this is temp workaround until fastcrypto ed25519 replaced
+                let mut key_bytes = a.network_key().as_ref().to_vec();
+                let ed_public_key =
+                    libp2p::identity::ed25519::PublicKey::try_from_bytes(&mut key_bytes)
+                        .expect("primary ed25519 public key from bytes");
+
+                libp2p::PeerId::from_public_key(&ed_public_key.into())
+            })
+            .collect()
     }
 }

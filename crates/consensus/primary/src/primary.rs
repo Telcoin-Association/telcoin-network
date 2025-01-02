@@ -34,6 +34,7 @@ use tn_network::{
     failpoints::FailpointsMakeCallbackHandler,
     metrics::MetricsMakeCallbackHandler,
 };
+use tn_network_libp2p::types::NetworkHandle;
 use tn_network_types::PrimaryToPrimaryServer;
 use tn_storage::traits::Database;
 use tn_types::{traits::EncodeDecodeBase64, Multiaddr, NetworkPublicKey, Protocol, TaskManager};
@@ -47,6 +48,8 @@ pub mod primary_tests;
 pub struct Primary<DB> {
     /// The Primary's network.
     network: Network,
+    /// The handle to the primary's network.
+    // network_handle: NetworkHandle,
     synchronizer: Arc<Synchronizer<DB>>,
     peer_types: Option<HashMap<PeerId, String>>,
 }
@@ -75,6 +78,7 @@ impl<DB: Database> Primary<DB> {
             .set_worker_to_primary_local_handler(Arc::new(worker_receiver_handler));
 
         let synchronizer = Arc::new(Synchronizer::new(config.clone(), consensus_bus));
+        // let network_libp2p =
         let network = Self::start_network(&config, synchronizer.clone(), consensus_bus);
 
         let mut peer_types = HashMap::new();

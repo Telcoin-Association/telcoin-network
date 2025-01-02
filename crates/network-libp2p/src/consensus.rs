@@ -103,11 +103,21 @@ where
     Req: TNMessage,
     Res: TNMessage,
 {
+    // /// Convenience method for spawning a primary network instance.
+    // pub fn new_for_primary(
+    //     config: &ConsensusConfig<DB>,
+    //     event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
+    //     authorized_publishers: HashSet<PeerId>,
+    //     topics: Vec<IdentTopic>,
+    // ) -> NetworkResult<Self> {
+    //     let authorized_publishers = config.committee().
+    //     Self::new(config, event_stream)
+    // }
+
     /// Create a new instance of Self.
     pub fn new<DB>(
         config: &ConsensusConfig<DB>,
         event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
-        authorized_publishers: HashSet<PeerId>,
         topics: Vec<IdentTopic>,
     ) -> NetworkResult<Self>
     where
@@ -162,6 +172,7 @@ where
             .build();
 
         let (handle, commands) = tokio::sync::mpsc::channel(100);
+        let authorized_publishers = config.authorized_publishers();
 
         Ok(Self {
             swarm,
@@ -546,35 +557,15 @@ mod tests {
         let config_2 = authority_2.consensus_config();
         let (tx1, _network_events_1) = mpsc::channel(1);
         let (tx2, mut network_events_2) = mpsc::channel(1);
-        let authorized_publishers: HashSet<PeerId> = all_nodes
-            .authorities()
-            .map(|a| {
-                let mut key_bytes = a.primary_network_keypair().as_ref().to_vec();
-                let keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut key_bytes)
-                    .expect("primary ed25519 key from bytes");
-                let public_key = keypair.public();
-
-                PeerId::from_public_key(&public_key)
-            })
-            .collect();
-
         let topics = vec![IdentTopic::new("test-topic")];
 
         // honest peer1
-        let peer1_network = ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(
-            &config_1,
-            tx1,
-            authorized_publishers.clone(),
-            topics.clone(),
-        )?;
+        let peer1_network =
+            ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(&config_1, tx1, topics.clone())?;
 
         // honest peer2
-        let peer2_network = ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(
-            &config_2,
-            tx2,
-            authorized_publishers.clone(),
-            topics.clone(),
-        )?;
+        let peer2_network =
+            ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(&config_2, tx2, topics.clone())?;
 
         // spawn tasks
         let peer1 = peer1_network.network_handle();
@@ -631,18 +622,6 @@ mod tests {
         let config_2 = authority_2.consensus_config();
         let (tx1, _network_events_1) = mpsc::channel(1);
         let (tx2, _network_events_2) = mpsc::channel(1);
-        let authorized_publishers: HashSet<PeerId> = all_nodes
-            .authorities()
-            .map(|a| {
-                let mut key_bytes = a.primary_network_keypair().as_ref().to_vec();
-                let keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut key_bytes)
-                    .expect("primary ed25519 key from bytes");
-                let public_key = keypair.public();
-
-                PeerId::from_public_key(&public_key)
-            })
-            .collect();
-
         let topics = vec![IdentTopic::new("test-topic")];
 
         // malicious peer1
@@ -652,17 +631,12 @@ mod tests {
         let peer1_network = ConsensusNetwork::<PrimaryRequest, PrimaryResponse>::new(
             &config_1,
             tx1,
-            authorized_publishers.clone(),
             topics.clone(),
         )?;
 
         // honest peer2
-        let peer2_network = ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(
-            &config_2,
-            tx2,
-            authorized_publishers.clone(),
-            topics.clone(),
-        )?;
+        let peer2_network =
+            ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(&config_2, tx2, topics.clone())?;
 
         // spawn tasks
         let malicious_peer = peer1_network.network_handle();
@@ -713,25 +687,12 @@ mod tests {
         let config_2 = authority_2.consensus_config();
         let (tx1, _network_events_1) = mpsc::channel(1);
         let (tx2, mut network_events_2) = mpsc::channel(1);
-        let authorized_publishers: HashSet<PeerId> = all_nodes
-            .authorities()
-            .map(|a| {
-                let mut key_bytes = a.primary_network_keypair().as_ref().to_vec();
-                let keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut key_bytes)
-                    .expect("primary ed25519 key from bytes");
-                let public_key = keypair.public();
-
-                PeerId::from_public_key(&public_key)
-            })
-            .collect();
-
         let topics = vec![IdentTopic::new("test-topic")];
 
         // honest peer1
         let peer1_network = ConsensusNetwork::<PrimaryRequest, PrimaryResponse>::new(
             &config_1,
             tx1,
-            authorized_publishers.clone(),
             topics.clone(),
         )?;
 
@@ -743,7 +704,6 @@ mod tests {
         let peer2_network = ConsensusNetwork::<PrimaryRequest, WorkerResponse>::new(
             &config_2,
             tx2,
-            authorized_publishers.clone(),
             topics.clone(),
         )?;
 
@@ -805,36 +765,16 @@ mod tests {
         let config_2 = authority_2.consensus_config();
         let (tx1, _network_events_1) = mpsc::channel(1);
         let (tx2, mut nvv_network_events) = mpsc::channel(1);
-        let authorized_publishers: HashSet<PeerId> = all_nodes
-            .authorities()
-            .map(|a| {
-                let mut key_bytes = a.primary_network_keypair().as_ref().to_vec();
-                let keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut key_bytes)
-                    .expect("primary ed25519 key from bytes");
-                let public_key = keypair.public();
-
-                PeerId::from_public_key(&public_key)
-            })
-            .collect();
-
         let correct_topic = IdentTopic::new("test-topic");
         let topics = vec![correct_topic.clone()];
 
         // honest cvv
-        let cvv_network = ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(
-            &config_1,
-            tx1,
-            authorized_publishers.clone(),
-            topics.clone(),
-        )?;
+        let cvv_network =
+            ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(&config_1, tx1, topics.clone())?;
 
         // honest nvv
-        let nvv_network = ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(
-            &config_2,
-            tx2,
-            authorized_publishers.clone(),
-            topics.clone(),
-        )?;
+        let nvv_network =
+            ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(&config_2, tx2, topics.clone())?;
 
         // spawn tasks
         let cvv = cvv_network.network_handle();
@@ -895,18 +835,6 @@ mod tests {
         let config_2 = authority_2.consensus_config();
         let (tx1, _network_events_1) = mpsc::channel(1);
         let (tx2, mut nvv_network_events) = mpsc::channel(1);
-        let authorized_publishers: HashSet<PeerId> = all_nodes
-            .authorities()
-            .map(|a| {
-                let mut key_bytes = a.primary_network_keypair().as_ref().to_vec();
-                let keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut key_bytes)
-                    .expect("primary ed25519 key from bytes");
-                let public_key = keypair.public();
-
-                PeerId::from_public_key(&public_key)
-            })
-            .collect();
-
         let correct_topic = IdentTopic::new("test-topic");
         let topics = vec![correct_topic.clone()];
 
@@ -914,7 +842,6 @@ mod tests {
         let cvv_network = ConsensusNetwork::<PrimaryRequest, PrimaryResponse>::new(
             &config_1,
             tx1,
-            authorized_publishers.clone(),
             topics.clone(),
         )?;
 
@@ -922,7 +849,6 @@ mod tests {
         let nvv_network = ConsensusNetwork::<PrimaryRequest, PrimaryResponse>::new(
             &config_2,
             tx2,
-            authorized_publishers.clone(),
             topics.clone(),
         )?;
 

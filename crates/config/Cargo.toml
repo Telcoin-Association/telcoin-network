@@ -30,6 +30,7 @@ reth-chainspec = { workspace = true }
 reth-primitives = { workspace = true }
 humantime-serde = { workspace = true }
 anemo = { workspace = true }
+libp2p = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
