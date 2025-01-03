@@ -34,10 +34,11 @@ use tn_network::{
     failpoints::FailpointsMakeCallbackHandler,
     metrics::MetricsMakeCallbackHandler,
 };
-use tn_network_libp2p::types::NetworkHandle;
+use tn_network_libp2p::{types::NetworkHandle, ConsensusNetwork, PrimaryRequest, PrimaryResponse};
 use tn_network_types::PrimaryToPrimaryServer;
 use tn_storage::traits::Database;
 use tn_types::{traits::EncodeDecodeBase64, Multiaddr, NetworkPublicKey, Protocol, TaskManager};
+use tokio::sync::mpsc;
 use tower::ServiceBuilder;
 use tracing::info;
 
@@ -48,8 +49,10 @@ pub mod primary_tests;
 pub struct Primary<DB> {
     /// The Primary's network.
     network: Network,
-    /// The handle to the primary's network.
-    // network_handle: NetworkHandle,
+    /// The handle to the primary's network, if the network has started.
+    ///
+    /// The `Option` is filled after `Self::spawn` is called.
+    network_handle: Option<NetworkHandle<PrimaryRequest, PrimaryResponse>>,
     synchronizer: Arc<Synchronizer<DB>>,
     peer_types: Option<HashMap<PeerId, String>>,
 }
@@ -78,7 +81,8 @@ impl<DB: Database> Primary<DB> {
             .set_worker_to_primary_local_handler(Arc::new(worker_receiver_handler));
 
         let synchronizer = Arc::new(Synchronizer::new(config.clone(), consensus_bus));
-        // let network_libp2p =
+
+        // TODO: REMOVE THIS
         let network = Self::start_network(&config, synchronizer.clone(), consensus_bus);
 
         let mut peer_types = HashMap::new();
@@ -116,17 +120,29 @@ impl<DB: Database> Primary<DB> {
             peer_types.insert(peer_id, "other_worker".to_string());
             info!("Adding others worker with peer id {} and address {}", peer_id, address);
         }
-        Self { network, synchronizer, peer_types: Some(peer_types) }
+        Self { network, network_handle: None, synchronizer, peer_types: Some(peer_types) }
     }
 
     /// Spawns the primary.
-    pub fn spawn(
+    pub async fn spawn(
         &mut self,
         config: ConsensusConfig<DB>,
         consensus_bus: &ConsensusBus,
         leader_schedule: LeaderSchedule,
         task_manager: &TaskManager,
     ) {
+        // TODO: use the channel buffer constant
+        let (event_stream, event_receiver) = mpsc::channel(10_000);
+        let network_libp2p =
+            ConsensusNetwork::new_for_primary(&config, event_stream).expect("primary network");
+        let network_handle = network_libp2p.network_handle();
+
+        // spawn network and start listening
+        task_manager.spawn_task("primary-network", async move { network_libp2p.run() });
+        // TODO: fix this type - only temp - DO NOT MERGE
+        let multiaddr = config.authority().primary_network_address().inner();
+        network_handle.start_listening(multiaddr).await.expect("network listening");
+
         self.synchronizer.spawn(task_manager);
         let _ = tn_network::connectivity::ConnectionMonitor::spawn(
             self.network.downgrade(),
@@ -188,6 +204,9 @@ impl<DB: Database> Primary<DB> {
             self.network.clone(),
             task_manager,
         );
+
+        // store handle to network
+        self.network_handle = Some(network_handle);
 
         // NOTE: This log entry is used to compute performance.
         info!(
