@@ -4,10 +4,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
+    anemo_network::{PrimaryReceiverHandler, WorkerReceiverHandler},
     certificate_fetcher::CertificateFetcher,
     certifier::Certifier,
     consensus::LeaderSchedule,
-    network::{PrimaryReceiverHandler, WorkerReceiverHandler},
     proposer::Proposer,
     state_handler::StateHandler,
     synchronizer::Synchronizer,

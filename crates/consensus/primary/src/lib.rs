@@ -5,11 +5,11 @@
 #![warn(future_incompatible, nonstandard_style, rust_2018_idioms, rust_2021_compatibility)]
 
 mod aggregators;
+mod anemo_network;
 mod certificate_fetcher;
 mod certifier;
 pub mod consensus;
 mod error;
-mod network;
 mod primary;
 mod proposer;
 mod state_handler;
