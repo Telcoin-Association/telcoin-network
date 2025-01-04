@@ -10,6 +10,7 @@ mod certificate_fetcher;
 mod certifier;
 pub mod consensus;
 mod error;
+mod network;
 mod primary;
 mod proposer;
 mod state_handler;
