@@ -222,15 +222,26 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PrimaryRequest, PrimaryResponse};
     use serde::Deserialize;
-    use tn_types::{BlockHash, Certificate, CertificateDigest, Header};
+    use tn_types::{Certificate, CertificateDigest, Header, Vote};
 
-    #[derive(Serialize, Deserialize, Default, PartialEq, Clone, Debug)]
-    struct TestData {
-        timestamp: u64,
-        base_fee_per_gas: Option<u64>,
-        hash: BlockHash,
+    // impl TNMessage trait for test types
+    impl TNMessage for PrimaryRequest {}
+    impl TNMessage for PrimaryResponse {}
+
+    /// Requests from Primary.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    enum PrimaryRequest {
+        NewCertificate { certificate: Certificate },
+        Vote { header: Header, parents: Vec<Certificate> },
+    }
+
+    /// Response to primary requests.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    enum PrimaryResponse {
+        Vote(Vote),
+        MissingCertificates(Vec<Certificate>),
+        MissingParents(Vec<CertificateDigest>),
     }
 
     #[tokio::test]

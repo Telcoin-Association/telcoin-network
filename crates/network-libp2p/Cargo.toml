@@ -22,7 +22,6 @@ tn-config = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
-fastcrypto = { workspace = true }
 thiserror = { workspace = true }
 tn-storage = { workspace = true }
 
@@ -30,7 +29,6 @@ tn-storage = { workspace = true }
 async-trait = { workspace = true }
 bcs = { workspace = true }
 snap = { workspace = true }
-roaring = { workspace = true }
 
 [dev-dependencies]
 tn-test-utils = { workspace = true }

@@ -538,11 +538,60 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PrimaryRequest, PrimaryResponse, WorkerRequest, WorkerResponse};
+    use serde::{Deserialize, Serialize};
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils::{fixture_batch_with_transactions, CommitteeFixture};
-    use tn_types::{Certificate, Header};
+    use tn_types::{BlockHash, Certificate, CertificateDigest, Header, SealedWorkerBlock, Vote};
     use tokio::time::timeout;
+
+    // TODO: consolidate these to be common for all unit tests
+    // impl TNMessage trait for types
+    impl TNMessage for WorkerRequest {}
+    impl TNMessage for WorkerResponse {}
+
+    /// Requests between workers.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    enum WorkerRequest {
+        /// Broadcast a newly produced worker block.
+        ///
+        /// NOTE: expect no response
+        /// TODO: gossip this instead?
+        NewBlock(SealedWorkerBlock),
+        /// The collection of missing [BlockHash]es for this peer.
+        MissingBlocks(Vec<BlockHash>),
+    }
+
+    /// Response to worker requests.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    enum WorkerResponse {
+        /// Return the missing blocks requested by the peer.
+        ///
+        /// TODO: anemo included `size_limit_reached: bool` field
+        /// but this should be trustless. See `RequestBlocksResponse` message.
+        MissingBlocks {
+            /// The collection of requested blocks.
+            blocks: Vec<SealedWorkerBlock>,
+        },
+    }
+
+    // impl TNMessage trait for test types
+    impl TNMessage for PrimaryRequest {}
+    impl TNMessage for PrimaryResponse {}
+
+    /// Requests from Primary.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    enum PrimaryRequest {
+        NewCertificate { certificate: Certificate },
+        Vote { header: Header, parents: Vec<Certificate> },
+    }
+
+    /// Response to primary requests.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    enum PrimaryResponse {
+        Vote(Vote),
+        MissingCertificates(Vec<Certificate>),
+        MissingParents(Vec<CertificateDigest>),
+    }
 
     #[tokio::test]
     async fn test_valid_req_res() -> eyre::Result<()> {
@@ -581,7 +630,7 @@ mod tests {
 
         let missing_block = fixture_batch_with_transactions(3).seal_slow();
         let digests = vec![missing_block.digest()];
-        let worker_block_req = WorkerRequest::MissingBlocks { digests };
+        let worker_block_req = WorkerRequest::MissingBlocks(digests);
         let worker_block_res = WorkerResponse::MissingBlocks { blocks: vec![missing_block] };
 
         // dial peer2
@@ -908,77 +957,6 @@ mod tests {
         assert!(timeout.is_err());
 
         // TODO: assert peer score after bad message
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_vote_fails() -> eyre::Result<()> {
-        let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
-        let mut authorities = all_nodes.authorities();
-        let authority_1 = authorities.next().expect("first authority");
-        let authority_2 = authorities.next().expect("second authority");
-        let config_1 = authority_1.consensus_config();
-        let config_2 = authority_2.consensus_config();
-        let (tx1, _network_events_1) = mpsc::channel(1);
-        let (tx2, mut network_events_2) = mpsc::channel(1);
-        let topics = vec![IdentTopic::new("test-topic")];
-
-        // honest peer1
-        let peer1_network = ConsensusNetwork::<PrimaryRequest, PrimaryResponse>::new(
-            &config_1,
-            tx1,
-            topics.clone(),
-        )?;
-
-        // honest peer2
-        let peer2_network = ConsensusNetwork::<PrimaryRequest, PrimaryResponse>::new(
-            &config_2,
-            tx2,
-            topics.clone(),
-        )?;
-
-        // spawn tasks
-        let peer1 = peer1_network.network_handle();
-        peer1_network.run();
-
-        let peer2 = peer2_network.network_handle();
-        peer2_network.run();
-
-        // start swarm listening on default any address
-        let listen_on_1 = config_1.authority().primary_network_address().inner();
-        peer1.start_listening(listen_on_1).await?;
-        let listen_on_2 = config_2.authority().primary_network_address().inner();
-        peer2.start_listening(listen_on_2).await?;
-        let peer2_id = peer2.local_peer_id().await?;
-        let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
-
-        let missing_block = fixture_batch_with_transactions(3).seal_slow();
-        let digests = vec![missing_block.digest()];
-        let primary_vote_req = PrimaryRequest::Vote { header: Header::default(), parents: vec![] };
-
-        // dial peer2
-        peer1.dial(peer2_id, peer2_addr).await?;
-
-        // send request and wait for response
-        let max_time = Duration::from_secs(5);
-        let network_res = peer1.send_request(primary_vote_req.clone(), peer2_id).await?;
-        let event = timeout(max_time, network_events_2.recv())
-            .await?
-            .expect("first network event received");
-
-        // // expect network event
-        // if let NetworkEvent::Request { request, channel } = event {
-        //     assert_eq!(request, primary_vote_req);
-        //     // send response
-        //     peer2.send_response(primary_vote_res.clone(), channel).await?;
-        // } else {
-        //     panic!("unexpected network event received");
-        // }
-
-        // // expect response
-        // let response = timeout(max_time, network_res).await?.expect("outbound id recv")?;
-        // assert_eq!(response, primary_vote_res);
 
         Ok(())
     }

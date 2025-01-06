@@ -13,27 +13,28 @@ use tokio::sync::{mpsc, oneshot};
 /// The result for network operations.
 pub type NetworkResult<T> = Result<T, NetworkError>;
 
-/// Helper trait to cast [NetworkResult] into an RPC message.
+/// Helper trait to cast lib-specific results into RPC messages.
 pub trait IntoResponse<M> {
     /// Convert a [Result] into a [TNMessage] type.
     fn into_response(self) -> M;
 }
 
-impl<T> IntoResponse<T> for NetworkResult<T>
+impl<M, E> IntoResponse<M> for Result<M, E>
 where
-    T: TNMessage + IntoRpcError,
+    M: TNMessage + IntoRpcError<E>,
 {
-    fn into_response(self) -> T {
+    fn into_response(self) -> M {
         match self {
             Ok(msg) => msg,
-            Err(e) => T::into_error(e),
+            Err(e) => M::into_error(e),
         }
     }
 }
 
-pub trait IntoRpcError {
+/// Convenience trait for casting lib-specific error types to RPC application-layer error messages.
+pub trait IntoRpcError<E> {
     /// Convert application-layer error into message.
-    fn into_error(error: NetworkError) -> Self;
+    fn into_error(error: E) -> Self;
 }
 
 /// The topic for NVVs to subscribe to for published worker blocks.

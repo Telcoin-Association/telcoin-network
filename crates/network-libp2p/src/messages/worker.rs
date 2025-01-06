@@ -16,11 +16,8 @@ pub enum WorkerRequest {
     /// NOTE: expect no response
     /// TODO: gossip this instead?
     NewBlock(SealedWorkerBlock),
-    /// The missing blocks for this peer.
-    MissingBlocks {
-        /// The collection of missing [BlockHash]es.
-        digests: Vec<BlockHash>,
-    },
+    /// The collection of missing [BlockHash]es for this peer.
+    MissingBlocks(Vec<BlockHash>),
 }
 
 /// Response to worker requests.
