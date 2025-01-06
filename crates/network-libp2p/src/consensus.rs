@@ -973,7 +973,13 @@ mod tests {
         let fastcrypto_to_libp2p = config.authorized_publishers();
         // assert libp2p -> fastcrypto works
         for key in fastcrypto_to_libp2p.iter() {
-            assert!(config.ed25519_libp2p_to_fastcrypto(key).is_some())
+            let fc_key =
+                config.ed25519_libp2p_to_fastcrypto(key).expect("libp2p to fastcrypto ed25519 key");
+            let libp2p_key_again = config
+                .ed25519_fastcrypto_to_libp2p(&fc_key)
+                .expect("fastcrypto to libp2p ed25519 key");
+            // sanity check - cast back to original type
+            assert_eq!(fc_key.as_ref(), &libp2p_key_again.as_ref().digest()[4..]);
         }
     }
 

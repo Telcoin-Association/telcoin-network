@@ -248,7 +248,10 @@ where
         peer_id: &libp2p::PeerId,
     ) -> Option<fastcrypto::ed25519::Ed25519PublicKey> {
         let bytes = peer_id.as_ref().digest();
-        println!("{} bytes: {bytes:?}", bytes.len());
-        fastcrypto::ed25519::Ed25519PublicKey::from_bytes(&bytes).ok()
+        // skip first 4 bytes:
+        // - 2 bytes: pubkey type (TN is ed25519 only)
+        // - 1 byte: overhead for multihash type
+        // - 1 byte: pubkey size
+        fastcrypto::ed25519::Ed25519PublicKey::from_bytes(&bytes[4..]).ok()
     }
 }
