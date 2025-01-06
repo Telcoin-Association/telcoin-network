@@ -140,23 +140,38 @@ where
             .inc_by(num_parents as u64);
 
         // TODO: DO NOT MERGE - remove this once config updated
-        // let converted_network_key =
+        let converted_network_key =
+            self.consensus_config.ed25519_libp2p_to_fastcrypto(&peer).ok_or(HeaderError::PeerId)?;
         // !!^^^^^^end
 
         // ensure request for vote came from the header's author
-        // let committee_peer =
-        //     committee.authority_by_network_key(&peer_network_key).ok_or_else(|| {
-        //         HeaderError::NetworkError(format!(
-        //             "Unable to find authority with network key {peer_network_key:?}"
-        //         ))
-        //     })?;
-        // ensure!(
-        //     header.author() == peer_authority.id(),
-        //     DagError::NetworkError(format!(
-        //         "Header author {:?} must match requesting peer {peer_authority:?}",
-        //         header.author()
-        //     ))
-        // );
+        let committee_peer = committee
+            .authority_by_network_key(&converted_network_key)
+            .ok_or(HeaderError::AuthorityByNetworkKey)?;
+        ensure!(header.author() == committee_peer.id(), HeaderError::PeerNotAuthor);
+
+        // TODO: ensure peer's header isn't too far in the past
+        //  - peer can't propose a block from round 1 when this node is on 100
+        // ^^^^^^^^^^^^^^^^^^^^^^^^^^ TODO: check if header is too old
+        //
+        //
+
+        // logic:
+        // - ensure block header isn't too far in the past
+        // - ensure block header isn't too far in the future
+        //      - if block header is ahead, but within bounds, then wait for EL results
+
+        // check watch channel that latest block num is within bounds
+        // proposed headers must be within a few blocks of this header's block number
+        let latest_block_num = self.consensus_bus.recent_blocks().borrow().latest_block_num_hash();
+        ensure!(
+            header.latest_execution_block_num <= latest_block_num.number + 3,
+            HeaderError::AdvancedExecution(
+                header.latest_execution_block_num,
+                latest_block_num.number
+            )
+        );
+        // then, if within limits, wait for execution updates
 
         todo!()
     }

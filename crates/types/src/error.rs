@@ -217,4 +217,19 @@ pub enum HeaderError {
     /// Vote request includes too many parents.
     #[error("Too many parents in vote request: {0} > {1}")]
     TooManyParents(usize, usize),
+    /// Authority network key is missing from committee.
+    #[error("Failed to find author in committee by network key.")]
+    AuthorityByNetworkKey,
+    /// The header wasn't proposed by the author.
+    #[error("The peer proposing this header is not the author.")]
+    PeerNotAuthor,
+    /// The header's execution results are too old.
+    #[error("Peer is on block {0}, but this node is only at {1}")]
+    AdvancedExecution(u64, u64),
+
+    /// TODO: this is temporary
+    ///
+    /// Failed to convert libp2p::PeerId to fastcrypto::ed25519
+    #[error("Failed to convert libp2p::PeerId into fastcrypto::ed25519")]
+    PeerId,
 }
