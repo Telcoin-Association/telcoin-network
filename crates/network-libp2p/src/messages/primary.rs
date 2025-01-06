@@ -1,6 +1,10 @@
 //! Messages for the primary protocol.
 
-use crate::{codec::TNMessage, types::NetworkResult};
+use crate::{
+    codec::TNMessage,
+    error::NetworkError,
+    types::{IntoRpcError, NetworkResult},
+};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -130,6 +134,14 @@ pub enum PrimaryResponse {
     /// If the peer was unable to verify parents for a proposed header, they respond requesting
     /// the missing certificate by digest.
     MissingParents(Vec<CertificateDigest>),
+}
+
+impl IntoRpcError for PrimaryResponse {
+    fn into_error(error: NetworkError) -> Self {
+        match error {
+            _ => Self::Error(PrimaryRPCError::HeaderInvalid(error.to_string())),
+        }
+    }
 }
 
 /// Application-specific error type while handling Primary request.

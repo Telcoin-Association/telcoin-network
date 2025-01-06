@@ -8,4 +8,5 @@ pub mod types;
 
 // export types
 pub use consensus::ConsensusNetwork;
+pub use libp2p::request_response::ResponseChannel;
 pub use messages::{PrimaryRequest, PrimaryResponse, WorkerRequest, WorkerResponse};
