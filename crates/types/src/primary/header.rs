@@ -12,7 +12,7 @@ use std::{collections::BTreeSet, fmt};
 
 use crate::{
     crypto, encode,
-    error::{DagError, DagResult},
+    error::{DagError, DagResult, HeaderError, HeaderResult},
     now, AuthorityIdentifier, CertificateDigest, Committee, Epoch, Round, TimestampSec, VoteDigest,
     WorkerBlock, WorkerCache, WorkerId,
 };
@@ -104,10 +104,10 @@ impl Header {
     /// Ensure the header is valid based on the current committee and workercache.
     ///
     /// The digest is calculated with the sealed header, so the EL data is also verified.
-    pub fn validate(&self, committee: &Committee, worker_cache: &WorkerCache) -> DagResult<()> {
+    pub fn validate(&self, committee: &Committee, worker_cache: &WorkerCache) -> HeaderResult<()> {
         // Ensure the header is from the correct epoch.
         if self.epoch != committee.epoch() {
-            return Err(DagError::InvalidEpoch {
+            return Err(HeaderError::InvalidEpoch {
                 expected: committee.epoch(),
                 received: self.epoch,
             });
@@ -115,49 +115,55 @@ impl Header {
 
         // Ensure the header digest is well formed.
         if Hash::digest(self) != self.digest() {
-            return Err(DagError::InvalidHeaderDigest);
+            return Err(HeaderError::InvalidHeaderDigest);
         }
 
         // Ensure the authority has voting rights.
         let voting_rights = committee.stake_by_id(self.author);
         if voting_rights == 0 {
-            return Err(DagError::UnknownAuthority(self.author.to_string()));
+            return Err(HeaderError::UnknownAuthority(self.author.to_string()));
         }
 
         // Ensure all worker ids are correct.
         for (worker_id, _) in self.payload.values() {
             worker_cache
-                .worker(committee.authority(&self.author).unwrap().protocol_key(), worker_id)
-                .map_err(|_| DagError::HeaderHasBadWorkerIds(self.digest()))?;
+                .worker(
+                    committee
+                        .authority(&self.author)
+                        .ok_or(HeaderError::UnknownAuthority(self.author.to_string()))?
+                        .protocol_key(),
+                    worker_id,
+                )
+                .map_err(|_| HeaderError::UnkownWorkerId)?;
         }
 
-        // Ensure system messages are valid.
-        let mut has_dkg_message = false;
-        let mut has_dkg_confirmation = false;
-        for m in self.system_messages.iter() {
-            match m {
-                SystemMessage::DkgMessage(msg) => {
-                    if msg.sender != self.author.0 {
-                        return Err(DagError::InvalidSystemMessage);
-                    }
-                    // A header must have no more than one DkgMessage.
-                    if has_dkg_message {
-                        return Err(DagError::DuplicateSystemMessage);
-                    }
-                    has_dkg_message = true;
-                }
-                SystemMessage::DkgConfirmation(conf) => {
-                    if conf.sender != self.author.0 {
-                        return Err(DagError::InvalidSystemMessage);
-                    }
-                    // A header must have no more than one DkgConfirmation.
-                    if has_dkg_confirmation {
-                        return Err(DagError::DuplicateSystemMessage);
-                    }
-                    has_dkg_confirmation = true;
-                }
-            }
-        }
+        // // Ensure system messages are valid.
+        // let mut has_dkg_message = false;
+        // let mut has_dkg_confirmation = false;
+        // for m in self.system_messages.iter() {
+        //     match m {
+        //         SystemMessage::DkgMessage(msg) => {
+        //             if msg.sender != self.author.0 {
+        //                 return Err(DagError::InvalidSystemMessage);
+        //             }
+        //             // A header must have no more than one DkgMessage.
+        //             if has_dkg_message {
+        //                 return Err(DagError::DuplicateSystemMessage);
+        //             }
+        //             has_dkg_message = true;
+        //         }
+        //         SystemMessage::DkgConfirmation(conf) => {
+        //             if conf.sender != self.author.0 {
+        //                 return Err(DagError::InvalidSystemMessage);
+        //             }
+        //             // A header must have no more than one DkgConfirmation.
+        //             if has_dkg_confirmation {
+        //                 return Err(DagError::DuplicateSystemMessage);
+        //             }
+        //             has_dkg_confirmation = true;
+        //         }
+        //     }
+        // }
 
         Ok(())
     }

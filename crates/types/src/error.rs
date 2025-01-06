@@ -29,6 +29,10 @@ pub type StoreError = eyre::Report;
 
 #[derive(Debug, Error)]
 pub enum DagError {
+    // TEMPORARY - use this in certificate error instead
+    #[error(transparent)]
+    Header(#[from] HeaderError),
+
     #[error("Channel {0} has closed unexpectedly")]
     ClosedChannel(String),
 
@@ -190,4 +194,23 @@ pub enum CommitteeUpdateError {
 
     #[error("Node {0} has a different stake than expected")]
     DifferentStake(String),
+}
+
+/// Result alias for [`HeaderError`].
+pub type HeaderResult<T> = Result<T, HeaderError>;
+
+/// Core error variants when executing the output from consensus and extending the canonical block.
+#[derive(Debug, Error)]
+pub enum HeaderError {
+    /// Invalid header request
+    #[error("Invalid epoch (expected {expected}, received {received})")]
+    InvalidEpoch { expected: Epoch, received: Epoch },
+    /// The expected digest does not match the peer's sealed header.
+    #[error("Invalid header digest")]
+    InvalidHeaderDigest,
+    /// The author is not in the current committee.
+    #[error("Received message from unknown authority {0}")]
+    UnknownAuthority(String),
+    #[error("Header has an unknown worker ID")]
+    UnkownWorkerId,
 }
