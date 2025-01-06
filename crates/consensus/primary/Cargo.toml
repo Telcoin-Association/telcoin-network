@@ -50,6 +50,8 @@ anemo = { workspace = true }
 anemo-tower = { workspace = true }
 
 tn-network-libp2p = { workspace = true }
+roaring = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 dashmap = { workspace = true }

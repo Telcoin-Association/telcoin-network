@@ -49,6 +49,8 @@ pub const CONSENSUS_HEADER_TOPIC: &str = "tn_consensus_headers";
 pub enum NetworkEvent<Req, Res> {
     /// Direct request from peer.
     Request {
+        /// The peer that made the request.
+        peer: PeerId,
         /// The network request type.
         request: Req,
         /// The network response channel.

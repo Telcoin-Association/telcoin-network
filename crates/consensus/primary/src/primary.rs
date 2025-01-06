@@ -8,6 +8,7 @@ use crate::{
     certificate_fetcher::CertificateFetcher,
     certifier::Certifier,
     consensus::LeaderSchedule,
+    network::{PrimaryRequest, PrimaryResponse},
     proposer::Proposer,
     state_handler::StateHandler,
     synchronizer::Synchronizer,
@@ -34,7 +35,7 @@ use tn_network::{
     failpoints::FailpointsMakeCallbackHandler,
     metrics::MetricsMakeCallbackHandler,
 };
-use tn_network_libp2p::{types::NetworkHandle, ConsensusNetwork, PrimaryRequest, PrimaryResponse};
+use tn_network_libp2p::{types::NetworkHandle, ConsensusNetwork};
 use tn_network_types::PrimaryToPrimaryServer;
 use tn_storage::traits::Database;
 use tn_types::{traits::EncodeDecodeBase64, Multiaddr, NetworkPublicKey, Protocol, TaskManager};

@@ -3,7 +3,9 @@ use anemo::Config as AnemoConfig;
 use std::{collections::HashSet, sync::Arc};
 use tn_network::local::LocalNetwork;
 use tn_storage::{traits::Database, NodeStorage};
-use tn_types::{traits::ToFromBytes, Authority, Committee, Notifier, WorkerCache};
+use tn_types::{
+    traits::ToFromBytes, Authority, Committee, NetworkPublicKey, Notifier, WorkerCache,
+};
 
 use crate::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, Parameters, TelcoinDirs};
 
@@ -217,13 +219,36 @@ where
             .authorities()
             .map(|a| {
                 // TODO: this is temp workaround until fastcrypto ed25519 replaced
-                let mut key_bytes = a.network_key().as_ref().to_vec();
-                let ed_public_key =
-                    libp2p::identity::ed25519::PublicKey::try_from_bytes(&mut key_bytes)
-                        .expect("primary ed25519 public key from bytes");
-
-                libp2p::PeerId::from_public_key(&ed_public_key.into())
+                let fc = a.network_key();
+                self.ed25519_fastcrypto_to_libp2p(&fc)
+                    .expect("fastcrypto to libp2p PeerId always works")
             })
             .collect()
+    }
+
+    /// Helper method to convert fastcrypto -> libp2p ed25519.
+    ///
+    /// TODO: consolidate key libraries
+    pub fn ed25519_fastcrypto_to_libp2p(
+        &self,
+        fastcrypto: &NetworkPublicKey,
+    ) -> Option<libp2p::PeerId> {
+        let mut bytes = fastcrypto.as_ref().to_vec();
+        let ed_public_key = libp2p::identity::ed25519::PublicKey::try_from_bytes(&mut bytes).ok();
+        ed_public_key.map(|k| libp2p::PeerId::from_public_key(&k.into()))
+    }
+
+    /// Helper method to convert libp2p -> fastcrypto ed25519.
+    ///
+    /// TODO: consolidate key libraries
+    ///
+    /// NOTE: this sporadically fails when used with `PeerId::random()`.
+    pub fn ed25519_libp2p_to_fastcrypto(
+        &self,
+        peer_id: &libp2p::PeerId,
+    ) -> Option<fastcrypto::ed25519::Ed25519PublicKey> {
+        let bytes = peer_id.as_ref().digest();
+        println!("{} bytes: {bytes:?}", bytes.len());
+        fastcrypto::ed25519::Ed25519PublicKey::from_bytes(&bytes).ok()
     }
 }

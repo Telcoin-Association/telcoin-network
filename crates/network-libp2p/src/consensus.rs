@@ -127,7 +127,7 @@ where
         //   libp2p
         // - need to separate worker/primary network signatures
         let mut key_bytes = config.key_config().primary_network_keypair().as_ref().to_vec();
-        let keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut key_bytes).expect("TODO");
+        let keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut key_bytes)?;
 
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             // explicitly set default
@@ -269,10 +269,11 @@ where
                         match message {
                             request_response::Message::Request { request_id, request, channel } => {
                                 // forward request to handler without blocking other events
-                                if let Err(e) = self
-                                    .event_stream
-                                    .try_send(NetworkEvent::Request { request, channel })
-                                {
+                                if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
+                                    peer,
+                                    request,
+                                    channel,
+                                }) {
                                     error!(target: "network", topics=?self.topics, ?request_id, ?e, "failed to forward request!");
                                     // fatal - unable to process requests
                                     return Err(e.into());
@@ -644,7 +645,7 @@ mod tests {
             .expect("first network event received");
 
         // expect network event
-        if let NetworkEvent::Request { request, channel } = event {
+        if let NetworkEvent::Request { request, channel, .. } = event {
             assert_eq!(request, worker_block_req);
             // send response
             peer2.send_response(worker_block_res.clone(), channel).await?;
@@ -786,7 +787,7 @@ mod tests {
             .expect("first network event received");
 
         // expect network event
-        if let NetworkEvent::Request { request, channel } = event {
+        if let NetworkEvent::Request { request, channel, .. } = event {
             assert_eq!(request, honest_req);
             // send response
             let block = fixture_batch_with_transactions(1).seal_slow();
@@ -959,6 +960,21 @@ mod tests {
         // TODO: assert peer score after bad message
 
         Ok(())
+    }
+
+    #[test]
+    fn test_peer_id_to_from_fastcrypto() {
+        let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+        let mut authorities = all_nodes.authorities();
+        let authority = authorities.next().expect("first authority");
+        let config = authority.consensus_config();
+
+        // converts fastcrypto -> libp2p or panics
+        let fastcrypto_to_libp2p = config.authorized_publishers();
+        // assert libp2p -> fastcrypto works
+        for key in fastcrypto_to_libp2p.iter() {
+            assert!(config.ed25519_libp2p_to_fastcrypto(key).is_some())
+        }
     }
 
     // test peer floods requests?

@@ -9,5 +9,7 @@ pub mod types;
 // export types
 pub use codec::TNMessage;
 pub use consensus::ConsensusNetwork;
-pub use libp2p::request_response::ResponseChannel;
 pub use messages::{WorkerRequest, WorkerResponse};
+
+// re-export specific libp2p types
+pub use libp2p::{identity::PeerId, request_response::ResponseChannel};

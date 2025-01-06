@@ -211,6 +211,10 @@ pub enum HeaderError {
     /// The author is not in the current committee.
     #[error("Received message from unknown authority {0}")]
     UnknownAuthority(String),
+    /// Worker's ID is not in the cache.
     #[error("Header has an unknown worker ID")]
     UnkownWorkerId,
+    /// Vote request includes too many parents.
+    #[error("Too many parents in vote request: {0} > {1}")]
+    TooManyParents(usize, usize),
 }
