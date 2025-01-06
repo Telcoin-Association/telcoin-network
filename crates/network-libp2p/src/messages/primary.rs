@@ -4,7 +4,10 @@ use crate::{codec::TNMessage, types::NetworkResult};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use tn_types::{AuthorityIdentifier, Certificate, CertificateDigest, Header, Round, Vote};
+use thiserror::Error;
+use tn_types::{
+    error::DagError, AuthorityIdentifier, Certificate, CertificateDigest, Header, Round, Vote,
+};
 
 // impl TNMessage trait for types
 impl TNMessage for PrimaryRequest {}
@@ -112,22 +115,29 @@ impl MissingCertificatesRequest {
 /// Response to primary requests.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PrimaryResponse {
-    /// The peer's vote if successfule. If the peer was unable to verify parents, the missing
-    /// certificate digests are included.
-    Vote {
-        /// The vote, if the peer considered the proposed header valid.
-        vote: Option<Vote>,
-        /// Missing certificate digests for peer to vote.
-        ///
-        /// The peer needs to process these certificates before it can vote for this primary's
-        /// header.
-        missing: Vec<CertificateDigest>,
-    },
-    /// The requested missing certificates.
-    MissingCertificates {
-        /// The collection of missing certificates.
-        certificates: Vec<Certificate>,
-    },
+    /// The peer's vote if the peer considered the proposed header valid.
+    Vote(Vote),
+    /// The requested certificates requested by a peer.
+    MissingCertificates(Vec<Certificate>),
+    /// RPC error while handling request.
+    ///
+    /// This is an application-layer error response.
+    Error(PrimaryRPCError),
+
+    // TODO: requests include parents, so this should never happen?
+    /// Missing certificates in order to vote.
+    ///
+    /// If the peer was unable to verify parents for a proposed header, they respond requesting
+    /// the missing certificate by digest.
+    MissingParents(Vec<CertificateDigest>),
+}
+
+/// Application-specific error type while handling Primary request.
+#[derive(Error, Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum PrimaryRPCError {
+    /// Header invalid.
+    #[error("Header invalid: {0}")]
+    HeaderInvalid(String),
 }
 
 #[cfg(test)]

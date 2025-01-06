@@ -257,8 +257,7 @@ mod tests {
 
         // encode response
         let mut encoded = Vec::new();
-        let response =
-            PrimaryResponse::Vote { vote: None, missing: vec![CertificateDigest::new([b'a'; 32])] };
+        let response = PrimaryResponse::MissingParents(vec![CertificateDigest::new([b'a'; 32])]);
         codec
             .write_response(&protocol, &mut encoded, response.clone())
             .await
@@ -289,8 +288,7 @@ mod tests {
 
         // encode response
         let mut encoded = Vec::new();
-        let response =
-            PrimaryResponse::MissingCertificates { certificates: vec![Certificate::default()] };
+        let response = PrimaryResponse::MissingCertificates(vec![Certificate::default()]);
         let res = codec.write_response(&protocol, &mut encoded, response).await;
         assert!(res.is_err());
     }
@@ -347,8 +345,7 @@ mod tests {
         // sanity check that block within bounds works
         let mut encoded = Vec::new();
         // 138 bytes uncompressed
-        let response =
-            PrimaryResponse::MissingCertificates { certificates: vec![Certificate::default()] };
+        let response = PrimaryResponse::MissingCertificates(vec![Certificate::default()]);
         malicious_peer
             .write_response(&protocol, &mut encoded, response.clone())
             .await
@@ -362,9 +359,10 @@ mod tests {
         // now encode legit message that's too big for honest peer
         let mut encoded = Vec::new();
         // 274 bytes uncompressed
-        let big_response = PrimaryResponse::MissingCertificates {
-            certificates: vec![Certificate::default(), Certificate::default()],
-        };
+        let big_response = PrimaryResponse::MissingCertificates(vec![
+            Certificate::default(),
+            Certificate::default(),
+        ]);
         malicious_peer
             .write_response(&protocol, &mut encoded, big_response)
             .await
@@ -425,9 +423,10 @@ mod tests {
         let mut encoded = Vec::new();
         // this is 274 bytes uncompressed (more than max)
         // but only 62 bytes compressed (within max size)
-        let big_response = PrimaryResponse::MissingCertificates {
-            certificates: vec![Certificate::default(), Certificate::default()],
-        };
+        let big_response = PrimaryResponse::MissingCertificates(vec![
+            Certificate::default(),
+            Certificate::default(),
+        ]);
         malicious_peer
             .write_response(&protocol, &mut encoded, big_response)
             .await
