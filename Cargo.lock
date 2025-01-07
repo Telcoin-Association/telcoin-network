@@ -11473,7 +11473,6 @@ dependencies = [
  "reqwest 0.12.7",
  "reth",
  "reth-primitives",
- "reth-tracing",
  "roaring",
  "serde",
  "tap",

@@ -7,8 +7,6 @@ use std::{
     num::NonZeroUsize,
     sync::Arc,
 };
-
-use reth_tracing::init_test_tracing;
 use tempfile::TempDir;
 use tn_storage::{mem_db::MemDatabase, open_db, ConsensusStore};
 use tn_types::AuthorityIdentifier;
@@ -161,7 +159,6 @@ async fn test_leader_schedule() {
 /// TODO: this test is failing - I think it's due to bad stake threshold
 #[tokio::test]
 async fn test_leader_schedule_from_store() {
-    init_test_tracing();
     // GIVEN
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();

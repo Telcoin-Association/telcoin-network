@@ -71,7 +71,6 @@ tn-worker = { workspace = true }
 tn-storage = { workspace = true }
 reqwest = { workspace = true }
 bytes = { workspace = true }
-reth-tracing = { workspace = true }
 tn-block-validator = { workspace = true, features = ["test-utils"] }
 reth = { workspace = true }
 

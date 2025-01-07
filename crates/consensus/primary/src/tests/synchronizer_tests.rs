@@ -83,7 +83,6 @@ async fn accept_certificates() {
 #[tokio::test]
 async fn accept_suspended_certificates() {
     const NUM_AUTHORITIES: usize = 4;
-    reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
         .committee_size(NonZeroUsize::new(NUM_AUTHORITIES).unwrap())
@@ -477,7 +476,6 @@ async fn sanitize_fetched_certificates() {
 
 #[tokio::test]
 async fn sync_batches_drops_old() {
-    reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
         .committee_size(NonZeroUsize::new(4).unwrap())
@@ -533,7 +531,6 @@ async fn gc_suspended_certificates() {
     const NUM_AUTHORITIES: usize = 4;
     const GC_DEPTH: Round = 5;
 
-    reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
         .committee_size(NonZeroUsize::new(NUM_AUTHORITIES).unwrap())
