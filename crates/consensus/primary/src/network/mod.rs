@@ -17,6 +17,7 @@ use tn_types::{
     Certificate, Header,
 };
 use tokio::sync::mpsc;
+use tracing::{debug, error};
 mod message;
 
 /// Convenience type for Primary network.
@@ -90,7 +91,7 @@ where
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
         tokio::spawn(async move {
-            let response = request_handler.vote(peer, header, parents).into_response();
+            let response = request_handler.vote(peer, header, parents).await.into_response();
             let _ = network_handle.send_response(response, channel).await;
         });
     }
@@ -115,7 +116,7 @@ where
     }
 
     /// Evaluate request to possibly issue a vote in support of peer's header.
-    fn vote(
+    async fn vote(
         &self,
         peer: PeerId,
         header: Header,
@@ -163,16 +164,48 @@ where
 
         // check watch channel that latest block num is within bounds
         // proposed headers must be within a few blocks of this header's block number
-        let latest_block_num = self.consensus_bus.recent_blocks().borrow().latest_block_num_hash();
-        ensure!(
-            header.latest_execution_block_num <= latest_block_num.number + 3,
-            HeaderError::AdvancedExecution(
-                header.latest_execution_block_num,
-                latest_block_num.number
-            )
-        );
-        // then, if within limits, wait for execution updates
+        // let mut watch_execution_results = self.consensus_bus.recent_blocks().subscribe();
+        let mut latest_block_num_hash =
+            self.consensus_bus.recent_blocks().borrow().latest_block_num_hash();
 
+        // TODO: update watch channel to map consensus round with block numhash?
+        //
+        // peer built off round 1 <= we're on round 100 + 3
+        // however, the block number doesn't equate to the actual round of the block
+        // which would be more appropriate to check in this case
+
+        // if peer is ahead, wait for execution to catch up
+        //
+        // NOTE: this doesn't hurt anything since this node shouldn't vote until execution is caught up
+        let mut watch_execution_result = self.consensus_bus.recent_blocks().subscribe();
+        while header.latest_execution_block_num > latest_block_num_hash.number {
+            watch_execution_result.changed().await.map_err(|_| HeaderError::ClosedWatchChannel)?;
+            latest_block_num_hash =
+                self.consensus_bus.recent_blocks().borrow().latest_block_num_hash();
+        }
+
+        // ensure execution results match. execution happens in waves per round, so the latest block number is likely to increase by more than 1
+        //
+        // NOTE: it's expected to be nearly a 0% chance that a recent block hash would match and have the wrong block number
+        let recent_blocks = self.consensus_bus.recent_blocks().borrow();
+        if !recent_blocks.contains_hash(header.latest_execution_block) {
+            error!(
+                target: "primary",
+                peer_num = header.latest_execution_block_num,
+                peer_hash = ?header.latest_execution_block,
+                expected = ?recent_blocks.latest_block(),
+                "unexpected execution result received"
+            );
+            return Err(HeaderError::UnknownExecutionResult(
+                header.latest_execution_block_num,
+                header.latest_execution_block,
+            ));
+        }
+
+        // drop read lock for watch channel
+        drop(recent_blocks);
+
+        debug!(target: "primary", ?header, round = header.round(), "Processing vote request from peer");
         todo!()
     }
 }

@@ -6,6 +6,7 @@ use crate::{
     crypto, CertificateDigest, Epoch, HeaderDigest, Round, TimestampSec, VoteDigest, WorkerId,
 };
 use fastcrypto::hash::Digest;
+use reth_primitives::BlockHash;
 use std::sync::Arc;
 use thiserror::Error;
 use tn_utils::sync::notify_once::NotifyOnce;
@@ -221,12 +222,14 @@ pub enum HeaderError {
     #[error("Failed to find author in committee by network key.")]
     AuthorityByNetworkKey,
     /// The header wasn't proposed by the author.
-    #[error("The peer proposing this header is not the author.")]
+    #[error("The proposing peer is not the author.")]
     PeerNotAuthor,
-    /// The header's execution results are too old.
-    #[error("Peer is on block {0}, but this node is only at {1}")]
-    AdvancedExecution(u64, u64),
-
+    /// The watch channel for execution results was dropped.
+    #[error("Watch channel for execution results dropped.")]
+    ClosedWatchChannel,
+    /// The proposed header contains a different execution result.
+    #[error("Peer's execution result for block {0}: {1:?}")]
+    UnknownExecutionResult(u64, BlockHash),
     /// TODO: this is temporary
     ///
     /// Failed to convert libp2p::PeerId to fastcrypto::ed25519
