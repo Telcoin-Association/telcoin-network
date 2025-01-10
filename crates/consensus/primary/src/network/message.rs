@@ -121,18 +121,16 @@ pub enum PrimaryResponse {
     /// The peer's vote if the peer considered the proposed header valid.
     Vote(Vote),
     /// The requested certificates requested by a peer.
-    MissingCertificates(Vec<Certificate>),
-    /// RPC error while handling request.
-    ///
-    /// This is an application-layer error response.
-    Error(PrimaryRPCError),
-
-    // TODO: requests include parents, so this should never happen?
+    RequestedCertificates(Vec<Certificate>),
     /// Missing certificates in order to vote.
     ///
     /// If the peer was unable to verify parents for a proposed header, they respond requesting
     /// the missing certificate by digest.
-    _MissingParents(Vec<CertificateDigest>),
+    MissingParents(Vec<CertificateDigest>),
+    /// RPC error while handling request.
+    ///
+    /// This is an application-layer error response.
+    Error(PrimaryRPCError),
 }
 
 impl IntoRpcError<HeaderError> for PrimaryResponse {

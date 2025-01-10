@@ -239,6 +239,9 @@ pub enum HeaderError {
     /// The proposed header's round is too far behind.
     #[error("Header round {0} is too old for GC round {1}")]
     TooOld(Round, Round),
+    /// The header contains a parent with an invalid aggregate BLS signature.
+    #[error("Header's parent missing aggregate BLS signature.")]
+    ParentMissingSignature,
 
     /// TODO: this is temporary
     ///

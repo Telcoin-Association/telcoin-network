@@ -2,6 +2,7 @@
 //! Network contains logic for type that sends and receives messages between other primaries.
 
 use crate::{anemo_network::PrimaryReceiverHandler, synchronizer::Synchronizer, ConsensusBus};
+use fastcrypto::hash::Hash;
 pub use message::{PrimaryRequest, PrimaryResponse};
 use parking_lot::Mutex;
 use std::{collections::BTreeMap, sync::Arc};
@@ -15,7 +16,7 @@ use tn_storage::traits::Database;
 use tn_types::{
     ensure,
     error::{HeaderError, HeaderResult},
-    AuthorityIdentifier, Certificate, CertificateDigest, Header, Round,
+    AuthorityIdentifier, Certificate, CertificateDigest, Header, Round, SignatureVerificationState,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error};
@@ -112,7 +113,7 @@ struct RequestHandler<DB> {
     synchronizer: Arc<Synchronizer<DB>>,
     /// The digests of parents that are currently being requested from peers.
     ///
-    /// Missing parents are requested from peers. This is a local map to track in-flight requests for missing parents. The values are associated with the first authority that proposed a header with these parents.
+    /// Missing parents are requested from peers. This is a local map to track in-flight requests for missing parents. The values are associated with the first authority that proposed a header with these parents. The node keeps track of requested Certificates to prevent unsolicited certificate attacks.
     requested_parents: Arc<Mutex<BTreeMap<(Round, CertificateDigest), AuthorityIdentifier>>>,
 }
 
@@ -206,13 +207,13 @@ where
         // ensure execution results match. execution happens in waves per round, so the latest block number is likely to increase by more than 1
         //
         // NOTE: it's expected to be nearly a 0% chance that a recent block hash would match and have the wrong block number
-        let recent_blocks = self.consensus_bus.recent_blocks().borrow();
-        if !recent_blocks.contains_hash(header.latest_execution_block) {
+        if !self.consensus_bus.recent_blocks().borrow().contains_hash(header.latest_execution_block)
+        {
             error!(
                 target: "primary",
                 peer_num = header.latest_execution_block_num,
                 peer_hash = ?header.latest_execution_block,
-                expected = ?recent_blocks.latest_block(),
+                expected = ?self.consensus_bus.recent_blocks().borrow().latest_block(),
                 "unexpected execution result received"
             );
             return Err(HeaderError::UnknownExecutionResult(
@@ -220,9 +221,6 @@ where
                 header.latest_execution_block,
             ));
         }
-
-        // drop read lock for watch channel
-        drop(recent_blocks);
 
         debug!(target: "primary", ?header, round = header.round(), "Processing vote request from peer");
 
@@ -233,12 +231,35 @@ where
         // NOTE: this is a latency optimization and is not required for liveness
         if parents.is_empty() {
             // check if any parents missing
-            // let missing_digests = self
-            todo!()
+            let missing_parents = self.check_for_missing_parents(&header).await?;
+            if !missing_parents.is_empty() {
+                // return request for missing parents
+                debug!(
+                    "Received vote request for {:?} with unknown parents {:?}",
+                    header, missing_parents
+                );
+                return Ok(PrimaryResponse::MissingParents(missing_parents));
+            }
         } else {
-            // validate parents included with new proposal
-            todo!()
+            // validate parent signatures are present and set verification state to unverified
+            let verified = parents
+                .into_iter()
+                .map(|mut cert| {
+                    let sig = cert
+                        .aggregated_signature()
+                        .cloned()
+                        .ok_or(HeaderError::ParentMissingSignature)?;
+                    cert.set_signature_verification_state(SignatureVerificationState::Unverified(
+                        sig,
+                    ));
+                    Ok(cert)
+                })
+                .collect::<HeaderResult<Vec<Certificate>>>()?;
+
+            // try to accept parent certificates
+            self.try_accept_unknown_certs(&header, verified).await?;
         }
+        todo!()
     }
 
     /// Helper method to retrieve parents for header.
@@ -285,5 +306,33 @@ where
         });
 
         Ok(unknown_certs)
+    }
+
+    /// Try to accept parents included with peer's request for vote.
+    ///
+    /// Parents are expected with a vote request after this node rejects a proposed header due to missing parents. The certificates are only processed if this node has requested them.
+    async fn try_accept_unknown_certs(
+        &self,
+        header: &Header,
+        mut parents: Vec<Certificate>,
+    ) -> HeaderResult<()> {
+        // sanitize request
+        let requested_parents = self.requested_parents.lock();
+        parents.retain(|cert| {
+            let req = (cert.round(), cert.digest());
+            if let Some(authority) = requested_parents.get(&req) {
+                *authority == header.author()
+            } else {
+                false
+            }
+        });
+
+        // try to accept
+        for parent in parents {
+            // self.synchronizer.try_accept_certificate(parent).await?;
+            todo!()
+        }
+
+        Ok(())
     }
 }
