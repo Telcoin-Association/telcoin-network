@@ -10,7 +10,7 @@ use reth_primitives::BlockHash;
 use std::sync::Arc;
 use thiserror::Error;
 use tn_utils::sync::notify_once::NotifyOnce;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Return an error if the condition is false.
 #[macro_export(local_inner_macros)]
@@ -284,6 +284,9 @@ pub enum CertificateError {
     /// The certificate is too far in the future for this node.
     #[error("Certificate for round {0} is too new for this primary at round {1}")]
     TooNew(Round, Round),
+    /// Oneshot channel dropped while processing the certificate.
+    #[error("Failed to process certificate - oneshot sender error")]
+    ResChannelClosed(String),
 
     /// TODO: DELETE THIS - only used to debug notify and suspend
     #[error("Certificate suspended: {0}")]

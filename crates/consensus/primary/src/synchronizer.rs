@@ -1182,7 +1182,7 @@ impl<DB: Database> Synchronizer<DB> {
             .await
             .map_err(|_| CertificateError::TNSend)?;
 
-        res.await.expect("Synchronizer should shut down before certificate acceptor task.")?;
+        res.await.map_err(|e| CertificateError::ResChannelClosed(e.to_string()))??;
 
         Ok(())
     }
@@ -1210,32 +1210,32 @@ impl<DB: Database> Synchronizer<DB> {
     pub async fn notify_read_parent_certificates(
         &self,
         header: &Header,
-    ) -> DagResult<Vec<Certificate>> {
+    ) -> HeaderResult<Vec<Certificate>> {
         let mut parents = Vec::new();
         if header.round() == 1 {
             for digest in header.parents() {
                 match self.inner.genesis.get(digest) {
                     Some(certificate) => parents.push(certificate.clone()),
-                    None => return Err(DagError::InvalidGenesisParent(*digest)),
+                    None => return Err(HeaderError::InvalidGenesisParent(*digest)),
                 };
             }
         } else {
             let mut cert_notifications: FuturesOrdered<_> = header
                 .parents()
                 .iter()
-                .map(|digest| async {
+                .map(|digest| {
                     self.inner
                         .consensus_config
                         .node_storage()
                         .certificate_store
                         .notify_read(*digest)
-                        .await
                 })
                 .collect();
             while let Some(result) = cert_notifications.next().await {
                 parents.push(result?);
             }
         }
+
         Ok(parents)
     }
 

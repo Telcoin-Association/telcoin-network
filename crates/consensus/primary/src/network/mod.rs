@@ -5,7 +5,10 @@ use crate::{anemo_network::PrimaryReceiverHandler, synchronizer::Synchronizer, C
 use fastcrypto::hash::Hash;
 pub use message::{PrimaryRequest, PrimaryResponse};
 use parking_lot::Mutex;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     types::{IntoResponse as _, NetworkEvent, NetworkHandle, NetworkResult},
@@ -15,7 +18,7 @@ use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::traits::Database;
 use tn_types::{
     ensure,
-    error::{HeaderError, HeaderResult},
+    error::{CertificateError, HeaderError, HeaderResult},
     AuthorityIdentifier, Certificate, CertificateDigest, Header, Round, SignatureVerificationState,
 };
 use tokio::sync::mpsc;
@@ -259,6 +262,50 @@ where
             // try to accept parent certificates
             self.try_accept_unknown_certs(&header, verified).await?;
         }
+
+        // Confirm all parents are accepted. If any are missing, this call will wait until they are stored in the db. Eventually, this method will timeout or get cancelled for certificates that never arrive.
+        //
+        // NOTE: this check is necessary for correctness.
+        let parents = self.synchronizer.notify_read_parent_certificates(&header).await?;
+
+        // Verify parent certs. Ensure the parents:
+        // - are from the previous round
+        // - created before the header
+        // - are from unique authorities
+        // - form a quorum through staked weight
+        let mut parent_authorities = BTreeSet::new();
+        let mut stake = 0;
+        for parent in parents.iter() {
+            ensure!(
+                parent.round() + 1 == header.round(),
+                HeaderError::InvalidParent(
+                    "Certificate is not from the previous round".to_string()
+                )
+            );
+            // TODO: confirm this must always be larger - this deviates from original:
+            // header.created_at() >= parent.header().created_at(),
+            // Old logic was >= - but this seems wrong
+            ensure!(
+                header.created_at() > parent.header().created_at(),
+                HeaderError::InvalidParent(format!(
+                    "Header was not created after parent. Header timestamp: {0} - parent timestamp: {1}",
+                    header.created_at(),
+                    parent.header.created_at()
+                ))
+            );
+            ensure!(
+                parent_authorities.insert(parent.header().author()),
+                HeaderError::InvalidParent("Parent authors are not unique".to_string())
+            );
+            stake += committee.stake_by_id(parent.origin());
+        }
+
+        // verify aggregate signatures form quorum
+        ensure!(
+            stake >= committee.quorum_threshold(),
+            HeaderError::InvalidParent(CertificateError::Inquorate.to_string())
+        );
+
         todo!()
     }
 
