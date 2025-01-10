@@ -1,9 +1,10 @@
 // Copyright (c) Telcoin, LLC
 //! Network contains logic for type that sends and receives messages between other primaries.
 
-use crate::{anemo_network::PrimaryReceiverHandler, ConsensusBus};
+use crate::{anemo_network::PrimaryReceiverHandler, synchronizer::Synchronizer, ConsensusBus};
 pub use message::{PrimaryRequest, PrimaryResponse};
-use std::sync::Arc;
+use parking_lot::Mutex;
+use std::{collections::BTreeMap, sync::Arc};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     types::{IntoResponse as _, NetworkEvent, NetworkHandle, NetworkResult},
@@ -14,11 +15,14 @@ use tn_storage::traits::Database;
 use tn_types::{
     ensure,
     error::{HeaderError, HeaderResult},
-    Certificate, Header,
+    AuthorityIdentifier, Certificate, CertificateDigest, Header, Round,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error};
 mod message;
+
+/// The maximum number of rounds that a proposed header can be behind.
+const HEADER_AGE_LIMIT: Round = 3;
 
 /// Convenience type for Primary network.
 type Req = PrimaryRequest;
@@ -104,6 +108,12 @@ struct RequestHandler<DB> {
     consensus_config: ConsensusConfig<DB>,
     /// Inner-processs channel bus.
     consensus_bus: ConsensusBus,
+    /// Synchronizer has ability to fetch missing data from peers.
+    synchronizer: Arc<Synchronizer<DB>>,
+    /// The digests of parents that are currently being requested from peers.
+    ///
+    /// Missing parents are requested from peers. This is a local map to track in-flight requests for missing parents. The values are associated with the first authority that proposed a header with these parents.
+    requested_parents: Arc<Mutex<BTreeMap<(Round, CertificateDigest), AuthorityIdentifier>>>,
 }
 
 impl<DB> RequestHandler<DB>
@@ -111,8 +121,17 @@ where
     DB: Database,
 {
     /// Create a new instance of Self.
-    pub fn new(consensus_config: ConsensusConfig<DB>, consensus_bus: ConsensusBus) -> Self {
-        Self { consensus_config, consensus_bus }
+    pub fn new(
+        consensus_config: ConsensusConfig<DB>,
+        consensus_bus: ConsensusBus,
+        synchronizer: Arc<Synchronizer<DB>>,
+    ) -> Self {
+        Self {
+            consensus_config,
+            consensus_bus,
+            synchronizer,
+            requested_parents: Default::default(),
+        }
     }
 
     /// Evaluate request to possibly issue a vote in support of peer's header.
@@ -220,5 +239,51 @@ where
             // validate parents included with new proposal
             todo!()
         }
+    }
+
+    /// Helper method to retrieve parents for header.
+    ///
+    /// Certificates are considered "known" if they are in local storage, suspended, or already requested from a peer.
+    async fn check_for_missing_parents(
+        &self,
+        header: &Header,
+    ) -> HeaderResult<Vec<CertificateDigest>> {
+        // check synchronizer state for parents
+        let mut unknown_certs = self.synchronizer.get_unknown_parent_digests(header).await?;
+
+        // ensure header is not too old
+        let current_round = self.consensus_bus.narwhal_round_updates().borrow();
+        let limit = current_round.saturating_sub(HEADER_AGE_LIMIT);
+        ensure!(limit <= header.round(), HeaderError::TooOld(header.round(), limit));
+
+        // drop borrow
+        drop(current_round);
+
+        // lock to ensure consistency between limit_round and where parent_digests are gc'ed
+        let mut current_requests = self.requested_parents.lock();
+
+        // remove entries that are past the limit
+        //
+        // NOTE: the minimum parent round is the limit - 1
+        while let Some(((round, _), _)) = current_requests.first_key_value() {
+            if round < &limit.saturating_sub(1) {
+                current_requests.pop_first();
+            } else {
+                break;
+            }
+        }
+
+        // filter out parents that were already requested and new ones
+        unknown_certs.retain(|digest| {
+            let key = (header.round() - 1, *digest);
+            if !current_requests.contains_key(&key) {
+                current_requests.insert(key, header.author());
+                true
+            } else {
+                false
+            }
+        });
+
+        Ok(unknown_certs)
     }
 }

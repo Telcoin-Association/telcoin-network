@@ -29,7 +29,7 @@ use tn_network_types::WorkerSynchronizeMessage;
 use tn_storage::traits::Database;
 use tn_types::{
     ensure,
-    error::{AcceptNotification, DagError, DagResult},
+    error::{AcceptNotification, DagError, DagResult, HeaderError, HeaderResult},
     Certificate, CertificateDigest, Committee, Header, Round, SignatureVerificationState,
     TaskManager, TnReceiver, TnSender, CHANNEL_CAPACITY,
 };
@@ -220,17 +220,17 @@ impl<DB: Database> Inner<DB> {
         Ok(())
     }
 
-    /// Returns parent digests that do no exist either in storage or among suspended.
+    /// Returns parent digests that do no exist in neither storage nor among suspended state.
     async fn get_unknown_parent_digests(
         &self,
         header: &Header,
-    ) -> DagResult<Vec<CertificateDigest>> {
+    ) -> HeaderResult<Vec<CertificateDigest>> {
         let _scope = monitored_scope("Synchronizer::get_unknown_parent_digests");
 
         if header.round() == 1 {
             for digest in header.parents() {
                 if !self.genesis.contains_key(digest) {
-                    return Err(DagError::InvalidGenesisParent(*digest));
+                    return Err(HeaderError::InvalidGenesisParent(*digest));
                 }
             }
             return Ok(Vec::new());
@@ -1250,7 +1250,7 @@ impl<DB: Database> Synchronizer<DB> {
     pub async fn get_unknown_parent_digests(
         &self,
         header: &Header,
-    ) -> DagResult<Vec<CertificateDigest>> {
+    ) -> HeaderResult<Vec<CertificateDigest>> {
         self.inner.get_unknown_parent_digests(header).await
     }
 

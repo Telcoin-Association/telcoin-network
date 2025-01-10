@@ -230,6 +230,16 @@ pub enum HeaderError {
     /// The proposed header contains a different execution result.
     #[error("Peer's execution result for block {0}: {1:?}")]
     UnknownExecutionResult(u64, BlockHash),
+    /// Invalid parent for genesis.
+    #[error("Invalid parent for genesis: {0}")]
+    InvalidGenesisParent(CertificateDigest),
+    /// Error retrieving value from storage.
+    #[error("Storage failure: {0}")]
+    StoreError(#[from] StoreError),
+    /// The proposed header's round is too far behind.
+    #[error("Header round {0} is too old for GC round {1}")]
+    TooOld(Round, Round),
+
     /// TODO: this is temporary
     ///
     /// Failed to convert libp2p::PeerId to fastcrypto::ed25519
