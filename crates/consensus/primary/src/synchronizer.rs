@@ -817,7 +817,7 @@ impl<DB: Database> Synchronizer<DB> {
     /// contain a value that can be awaited on, for signaling when the certificate is accepted.
     pub async fn try_accept_certificate(&self, certificate: Certificate) -> DagResult<()> {
         let _scope = monitored_scope("Synchronizer::try_accept_certificate");
-        self.process_certificate_internal(certificate, true, true).await
+        self.process_certificate_internal(certificate, true).await
     }
 
     /// Tries to accept a batch of certificates from certificate fetcher.
@@ -920,7 +920,7 @@ impl<DB: Database> Synchronizer<DB> {
     pub async fn accept_own_certificate(&self, certificate: Certificate) -> DagResult<()> {
         let authority = self.inner.consensus_config.authority().id();
         // Process the new certificate.
-        match self.process_certificate_internal(certificate.clone(), false, false).await {
+        match self.process_certificate_internal(certificate.clone(), false).await {
             Ok(_) => {
                 trace!(target: "primary::synchronizer", ?authority, ?certificate, "successfully processed certificate")
             }
@@ -1072,8 +1072,7 @@ impl<DB: Database> Synchronizer<DB> {
     async fn process_certificate_internal(
         &self,
         mut certificate: Certificate,
-        early_suspend: bool,
-        sanitize: bool,
+        external: bool, // true if received from peers, false if certificate is own
     ) -> DagResult<()> {
         let _scope = monitored_scope("Synchronizer::process_certificate_internal");
         let digest = certificate.digest();
@@ -1087,9 +1086,9 @@ impl<DB: Database> Synchronizer<DB> {
                 .inc();
             return Ok(());
         }
-        // Ensure parents are checked if !early_suspend.
-        // See comments above `try_accept_fetched_certificate()` for details.
-        if early_suspend {
+
+        // scrutinize certificates received from peers
+        if external {
             if let Some(notify) = self.inner.state.lock().await.check_suspended(&digest) {
                 trace!(target: "primary::synchronizer", ?digest, "certificate is still suspended - returning suspended error...");
                 self.inner
@@ -1101,9 +1100,7 @@ impl<DB: Database> Synchronizer<DB> {
                     .inc();
                 return Err(DagError::Suspended(notify));
             }
-        }
 
-        if sanitize {
             certificate = self.sanitize_certificate(certificate)?;
         }
 
@@ -1178,7 +1175,7 @@ impl<DB: Database> Synchronizer<DB> {
         let (sender, receiver) = oneshot::channel();
         self.inner
             .tx_certificate_acceptor
-            .send((vec![certificate], sender, early_suspend))
+            .send((vec![certificate], sender, external))
             .await
             .expect("Synchronizer should shut down before certificate acceptor task.");
         receiver.await.expect("Synchronizer should shut down before certificate acceptor task.")?;
