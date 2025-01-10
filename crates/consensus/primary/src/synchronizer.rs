@@ -808,6 +808,9 @@ impl<DB: Database> Synchronizer<DB> {
         );
     }
 
+    // NOTE: this is called when primary receives:
+    // - vote request
+    // - gossip certificate
     /// Validates the certificate and accepts it into the DAG, if the certificate can be verified
     /// and has all parents in the certificate store. Otherwise an error is returned.
     /// If the certificate has missing parents and cannot be accepted immediately, the error would
@@ -815,18 +818,6 @@ impl<DB: Database> Synchronizer<DB> {
     pub async fn try_accept_certificate(&self, certificate: Certificate) -> DagResult<()> {
         let _scope = monitored_scope("Synchronizer::try_accept_certificate");
         self.process_certificate_internal(certificate, true, true).await
-    }
-
-    /// Tries to accept a certificate from certificate fetcher.
-    /// Fetched certificates are already sanitized, so it is unnecessary to duplicate the work.
-    /// Also, this method always checks parents of fetched certificates and uses the result to
-    /// validate the suspended certificates state, instead of relying on suspended certificates to
-    /// potentially return early. This helps to verify consistency, and has little extra cost
-    /// because fetched certificates usually are not suspended.
-    #[allow(dead_code)]
-    pub async fn try_accept_fetched_certificate(&self, certificate: Certificate) -> DagResult<()> {
-        let _scope = monitored_scope("Synchronizer::try_accept_fetched_certificate");
-        self.process_certificate_internal(certificate, false, false).await
     }
 
     /// Tries to accept a batch of certificates from certificate fetcher.

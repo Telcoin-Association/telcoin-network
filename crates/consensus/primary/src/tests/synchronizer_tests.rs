@@ -590,7 +590,7 @@ async fn gc_suspended_certificates() {
                 ),
             )
         }
-        match synchronizer.try_accept_fetched_certificate(verified_cert).await {
+        match synchronizer.try_accept_certificate(verified_cert).await {
             Ok(()) => panic!("Unexpected acceptance of {cert:?}"),
             Err(DagError::Suspended(_)) => {
                 continue;
