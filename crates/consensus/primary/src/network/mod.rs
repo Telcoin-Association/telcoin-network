@@ -329,8 +329,10 @@ where
 
         // try to accept
         for parent in parents {
-            // self.synchronizer.try_accept_certificate(parent).await?;
-            todo!()
+            self.synchronizer
+                .try_accept_certificate(parent)
+                .await
+                .map_err(|e| HeaderError::InvalidParent(e.to_string()))?;
         }
 
         Ok(())

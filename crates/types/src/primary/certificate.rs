@@ -8,7 +8,7 @@ use crate::{
         BlsSignature, ValidatorAggregateSignature,
     },
     ensure,
-    error::{DagError, DagResult},
+    error::{CertificateError, CertificateResult, DagError, DagResult, HeaderError},
     now,
     serde::NarwhalBitmap,
     AuthorityIdentifier, Committee, Epoch, Header, Round, Stake, TimestampSec, WorkerCache,
@@ -181,11 +181,14 @@ impl Certificate {
         self,
         committee: &Committee,
         worker_cache: &WorkerCache,
-    ) -> DagResult<Certificate> {
-        // Ensure the header is from the correct epoch.
+    ) -> CertificateResult<Certificate> {
+        // ensure the header is from the correct epoch
         ensure!(
             self.epoch() == committee.epoch(),
-            DagError::InvalidEpoch { expected: committee.epoch(), received: self.epoch() }
+            CertificateError::from(HeaderError::InvalidEpoch {
+                expected: committee.epoch(),
+                received: self.epoch()
+            })
         );
 
         // Genesis certificates are always valid.
@@ -198,30 +201,30 @@ impl Certificate {
 
         let (weight, pks) = self.signed_by(committee);
 
-        ensure!(weight >= committee.quorum_threshold(), DagError::CertificateRequiresQuorum);
+        ensure!(weight >= committee.quorum_threshold(), CertificateError::Inquorate);
 
         let verified_cert = self.verify_signature(pks)?;
 
         Ok(verified_cert)
     }
 
-    fn verify_signature(mut self, pks: Vec<BlsPublicKey>) -> DagResult<Certificate> {
+    fn verify_signature(mut self, pks: Vec<BlsPublicKey>) -> CertificateResult<Certificate> {
         let aggregrate_signature_bytes = match self.signature_verification_state {
             SignatureVerificationState::VerifiedIndirectly(_)
             | SignatureVerificationState::VerifiedDirectly(_)
             | SignatureVerificationState::Genesis => return Ok(self),
             SignatureVerificationState::Unverified(ref bytes) => bytes,
             SignatureVerificationState::Unsigned(_) => {
-                return Err(DagError::CertificateRequiresQuorum);
+                return Err(CertificateError::Inquorate);
             }
         };
 
         // Verify the signatures
         let certificate_digest = self.digest();
-        BlsAggregateSignature::try_from(aggregrate_signature_bytes)
-            .map_err(|_| DagError::InvalidSignature)?
-            .verify_secure(&to_intent_message(certificate_digest), &pks[..])
-            .map_err(|_| DagError::InvalidSignature)?;
+        BlsAggregateSignature::try_from(aggregrate_signature_bytes)?
+            // .map_err(|e| CertificateError::InvalidSignature(e))?
+            .verify_secure(&to_intent_message(certificate_digest), &pks[..])?;
+        // .map_err(|e| CertificateError::InvalidSignature(e))?;
 
         self.signature_verification_state =
             SignatureVerificationState::VerifiedDirectly(aggregrate_signature_bytes.clone());

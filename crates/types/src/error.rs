@@ -5,11 +5,12 @@
 use crate::{
     crypto, CertificateDigest, Epoch, HeaderDigest, Round, TimestampSec, VoteDigest, WorkerId,
 };
-use fastcrypto::hash::Digest;
+use fastcrypto::{error::FastCryptoError, hash::Digest};
 use reth_primitives::BlockHash;
 use std::sync::Arc;
 use thiserror::Error;
 use tn_utils::sync::notify_once::NotifyOnce;
+use tokio::sync::mpsc;
 
 /// Return an error if the condition is false.
 #[macro_export(local_inner_macros)]
@@ -33,6 +34,9 @@ pub enum DagError {
     // TEMPORARY - use this in certificate error instead
     #[error(transparent)]
     Header(#[from] HeaderError),
+    // TEMPORARY - use this for compiler until anemo replaced
+    #[error(transparent)]
+    Certificate(#[from] CertificateError),
 
     #[error("Channel {0} has closed unexpectedly")]
     ClosedChannel(String),
@@ -200,7 +204,7 @@ pub enum CommitteeUpdateError {
 /// Result alias for [`HeaderError`].
 pub type HeaderResult<T> = Result<T, HeaderError>;
 
-/// Core error variants when executing the output from consensus and extending the canonical block.
+/// Core error variants when verifying and processing a Header.
 #[derive(Debug, Error)]
 pub enum HeaderError {
     /// Invalid header request
@@ -235,17 +239,53 @@ pub enum HeaderError {
     InvalidGenesisParent(CertificateDigest),
     /// Error retrieving value from storage.
     #[error("Storage failure: {0}")]
-    StoreError(#[from] StoreError),
+    Storage(#[from] StoreError),
     /// The proposed header's round is too far behind.
     #[error("Header round {0} is too old for GC round {1}")]
     TooOld(Round, Round),
     /// The header contains a parent with an invalid aggregate BLS signature.
     #[error("Header's parent missing aggregate BLS signature.")]
     ParentMissingSignature,
+    /// A parent certificate is invalid.
+    #[error("Invalid parent: {0}")]
+    InvalidParent(String),
 
     /// TODO: this is temporary
     ///
     /// Failed to convert libp2p::PeerId to fastcrypto::ed25519
     #[error("Failed to convert libp2p::PeerId into fastcrypto::ed25519")]
     PeerId,
+}
+
+/// Result alias for [`CertificateError`].
+pub type CertificateResult<T> = Result<T, CertificateError>;
+
+/// Core error variants when verifying and processing a Certificate.
+#[derive(Debug, Error)]
+pub enum CertificateError {
+    /// Processing was suspended to retrieve parent certificates.
+    #[error("Processing was suspended to retrieve parent certificates")]
+    Suspended,
+    /// Error retrieving value from storage.
+    #[error("Storage failure: {0}")]
+    Storage(#[from] StoreError),
+    /// Header error
+    #[error(transparent)]
+    Header(#[from] HeaderError),
+    /// The weight of the certificate's signatures does not reach quorum (2f + 1)
+    #[error("The weight of the aggregate signatures fails to reach quorum.")]
+    Inquorate,
+    /// The BLS aggregate signature is invalid
+    #[error("Invalid aggregate signature")]
+    InvalidSignature(#[from] FastCryptoError),
+    /// mpsc sender dropped while processig the certificate
+    #[error("Failed to process certificate - TN sender error")]
+    TNSend,
+    /// The certificate is too far in the future for this node.
+    #[error("Certificate for round {0} is too new for this primary at round {1}")]
+    TooNew(Round, Round),
+
+    /// TODO: DELETE THIS - only used to debug notify and suspend
+    #[error("Certificate suspended: {0}")]
+    DeleteThisOne(String),
 }

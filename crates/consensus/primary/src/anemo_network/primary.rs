@@ -25,7 +25,10 @@ use tn_storage::{
     tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
     traits::Database,
 };
-use tn_types::{error::DagError, validate_received_certificate_version, ConsensusHeader};
+use tn_types::{
+    error::{CertificateError, DagError},
+    validate_received_certificate_version, ConsensusHeader,
+};
 use tracing::{debug, instrument, warn};
 
 use super::PrimaryReceiverHandler;
@@ -49,9 +52,9 @@ impl<DB: Database> PrimaryToPrimary for PrimaryReceiverHandler<DB> {
                 )
             })?;
 
-        match self.synchronizer.try_accept_certificate(certificate).await {
+        match self.synchronizer.try_accept_certificate(certificate).await.map_err(Into::into) {
             Ok(()) => Ok(anemo::Response::new(SendCertificateResponse { accepted: true })),
-            Err(DagError::Suspended(_)) => {
+            Err(DagError::Certificate(CertificateError::Suspended)) => {
                 Ok(anemo::Response::new(SendCertificateResponse { accepted: false }))
             }
             Err(e) => Err(anemo::rpc::Status::internal(e.to_string())),

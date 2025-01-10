@@ -29,7 +29,10 @@ use tn_network_types::WorkerSynchronizeMessage;
 use tn_storage::traits::Database;
 use tn_types::{
     ensure,
-    error::{AcceptNotification, DagError, DagResult, HeaderError, HeaderResult},
+    error::{
+        AcceptNotification, CertificateError, CertificateResult, DagError, DagResult, HeaderError,
+        HeaderResult,
+    },
     Certificate, CertificateDigest, Committee, Header, Round, SignatureVerificationState,
     TaskManager, TnReceiver, TnSender, CHANNEL_CAPACITY,
 };
@@ -64,7 +67,7 @@ struct Inner<DB> {
     /// `process_certificates_with_lock()` in a loop.
     /// See comment above `process_certificates_with_lock()` for why this is necessary.
     tx_certificate_acceptor:
-        MeteredMpscChannel<(Vec<Certificate>, oneshot::Sender<DagResult<()>>, bool)>,
+        MeteredMpscChannel<(Vec<Certificate>, oneshot::Sender<CertificateResult<()>>, bool)>,
     consensus_bus: ConsensusBus,
     /// Genesis digests and contents.
     genesis: HashMap<CertificateDigest, Certificate>,
@@ -79,19 +82,12 @@ struct Inner<DB> {
 
 impl<DB: Database> Inner<DB> {
     /// Checks if the certificate is valid and can potentially be accepted into the DAG.
-    fn sanitize_certificate(&self, certificate: Certificate) -> DagResult<Certificate> {
-        ensure!(
-            self.consensus_config.committee().epoch() == certificate.epoch(),
-            DagError::InvalidEpoch {
-                expected: self.consensus_config.committee().epoch(),
-                received: certificate.epoch()
-            }
-        );
+    fn sanitize_certificate(&self, certificate: Certificate) -> CertificateResult<Certificate> {
         // Ok to drop old certificate, because it will never be included into the consensus dag.
         let gc_round = self.gc_round.load(Ordering::Acquire);
         ensure!(
             gc_round < certificate.round(),
-            DagError::TooOld(certificate.digest().into(), certificate.round(), gc_round)
+            CertificateError::from(HeaderError::TooOld(certificate.round(), gc_round))
         );
         // Verify the certificate (and the embedded header).
         certificate.verify(self.consensus_config.committee(), self.consensus_config.worker_cache())
@@ -220,7 +216,7 @@ impl<DB: Database> Inner<DB> {
         Ok(())
     }
 
-    /// Returns parent digests that do no exist in neither storage nor among suspended state.
+    /// Returns parent digests that do not exist in storage nor suspended state.
     async fn get_unknown_parent_digests(
         &self,
         header: &Header,
@@ -258,14 +254,14 @@ impl<DB: Database> Inner<DB> {
     async fn get_missing_parents(
         &self,
         certificate: &Certificate,
-    ) -> DagResult<Vec<CertificateDigest>> {
+    ) -> CertificateResult<Vec<CertificateDigest>> {
         let _scope = monitored_scope("Synchronizer::get_missing_parents");
 
         let mut result = Vec::new();
         if certificate.round() == 1 {
             for digest in certificate.header().parents() {
                 if !self.genesis.contains_key(digest) {
-                    return Err(DagError::InvalidGenesisParent(*digest));
+                    return Err(CertificateError::from(HeaderError::InvalidGenesisParent(*digest)));
                 }
             }
             return Ok(result);
@@ -286,7 +282,7 @@ impl<DB: Database> Inner<DB> {
                 .certificate_fetcher()
                 .send(CertificateFetcherCommand::Ancestors(certificate.clone()))
                 .await
-                .map_err(|_| DagError::ShuttingDown)?;
+                .map_err(|_| CertificateError::TNSend)?;
         }
         Ok(result)
     }
@@ -440,7 +436,7 @@ impl<DB: Database> Inner<DB> {
         &self,
         certificates: Vec<Certificate>,
         early_suspend: bool,
-    ) -> DagResult<()> {
+    ) -> CertificateResult<()> {
         let _scope = monitored_scope("Synchronizer::process_certificates_with_lock");
 
         // We re-check here in case we already have in pipeline the same certificate for processing
@@ -484,7 +480,6 @@ impl<DB: Database> Inner<DB> {
         // single certificate.
         //
         // TODO: simplify the logic here by separating try_accept_certificate() and notify_accept().
-        // let mut result = Ok(());
         let mut result = Ok(());
 
         for certificate in certificates {
@@ -504,7 +499,7 @@ impl<DB: Database> Inner<DB> {
                         .certificates_suspended
                         .with_label_values(&["dedup_locked"])
                         .inc();
-                    result = Err(DagError::Suspended(notify));
+                    result = Err(CertificateError::Suspended);
                     continue;
                 }
             }
@@ -531,16 +526,20 @@ impl<DB: Database> Inner<DB> {
                         .node_metrics
                         .certificates_currently_suspended
                         .set(state.num_suspended() as i64);
-                    result = Err(DagError::Suspended(notify));
+                    result = Err(CertificateError::Suspended);
                     continue;
                 }
             }
 
             let suspended_certs = state.accept_children(certificate.round(), certificate.digest());
             // Accept in causal order.
-            self.accept_certificate_internal(&state, certificate).await?;
+            self.accept_certificate_internal(&state, certificate)
+                .await
+                .map_err(|e| CertificateError::DeleteThisOne(e.to_string()))?;
             for suspended in suspended_certs {
-                self.accept_suspended_certificate(&state, suspended).await?;
+                self.accept_suspended_certificate(&state, suspended)
+                    .await
+                    .map_err(|e| CertificateError::DeleteThisOne(e.to_string()))?;
             }
         }
 
@@ -561,7 +560,7 @@ impl<DB: Database> Inner<DB> {
     ) -> DagResult<()> {
         let authority_id = self.consensus_config.authority().id();
         if header.author() == authority_id {
-            debug!(target: "primary::synchronizer", "skipping sync_gatches for header - no need to sync payload from own workers");
+            debug!(target: "primary::synchronizer", "skipping sync_batches for header - no need to sync payload from own workers");
             return Ok(());
         }
 
@@ -815,7 +814,7 @@ impl<DB: Database> Synchronizer<DB> {
     /// and has all parents in the certificate store. Otherwise an error is returned.
     /// If the certificate has missing parents and cannot be accepted immediately, the error would
     /// contain a value that can be awaited on, for signaling when the certificate is accepted.
-    pub async fn try_accept_certificate(&self, certificate: Certificate) -> DagResult<()> {
+    pub async fn try_accept_certificate(&self, certificate: Certificate) -> CertificateResult<()> {
         let _scope = monitored_scope("Synchronizer::try_accept_certificate");
         self.process_certificate_internal(certificate, true).await
     }
@@ -924,13 +923,14 @@ impl<DB: Database> Synchronizer<DB> {
             Ok(_) => {
                 trace!(target: "primary::synchronizer", ?authority, ?certificate, "successfully processed certificate")
             }
-            result @ Err(DagError::ShuttingDown) => {
-                error!(target: "primary::synchronizer", ?authority, ?certificate, ?result, "failed to process certificate internally - shutting down...");
-                return Err(DagError::ShuttingDown);
-            }
+            // result @ Err(DagError::Certificate(_)) => {
+            //     error!(target: "primary::synchronizer", ?authority, ?certificate, ?result, "failed to process certificate internally - shutting down...");
+            //     return Err(DagError::ShuttingDown);
+            // }
+            // TODO: double check this
             Err(e) => {
                 error!(target: "primary::synchronizer", ?authority, ?certificate, "failed to process certificate internally - PANIC");
-                panic!("Failed to process locally-created certificate: {e}")
+                return Err(DagError::ShuttingDown);
             }
         };
 
@@ -972,7 +972,7 @@ impl<DB: Database> Synchronizer<DB> {
     }
 
     /// Checks if the certificate is valid and can potentially be accepted into the DAG.
-    fn sanitize_certificate(&self, certificate: Certificate) -> DagResult<Certificate> {
+    fn sanitize_certificate(&self, certificate: Certificate) -> CertificateResult<Certificate> {
         self.inner.sanitize_certificate(certificate)
     }
 
@@ -1067,13 +1067,20 @@ impl<DB: Database> Synchronizer<DB> {
         Ok(certificates)
     }
 
-    /// NOTE: when making changes to this function, check if the same change needs to be made to
+    /// Process a certificate that was received.
+    ///
+    /// The `external` argument indicates if the certificate was received from a external peer or created internally. Certificates received from peers should be fully verified. Certificates produced by this node are trusted.
+    ///
+    /// TODO:
+    /// old NOTE: when making changes to this function, check if the same change needs to be made to
     /// try_accept_fetched_certificates() which is the batched version.
+    ///
+    ///
     async fn process_certificate_internal(
         &self,
         mut certificate: Certificate,
-        external: bool, // true if received from peers, false if certificate is own
-    ) -> DagResult<()> {
+        external: bool,
+    ) -> CertificateResult<()> {
         let _scope = monitored_scope("Synchronizer::process_certificate_internal");
         let digest = certificate.digest();
         if self.inner.consensus_config.node_storage().certificate_store.contains(&digest)? {
@@ -1098,7 +1105,7 @@ impl<DB: Database> Synchronizer<DB> {
                     .certificates_suspended
                     .with_label_values(&["dedup"])
                     .inc();
-                return Err(DagError::Suspended(notify));
+                return Err(CertificateError::Suspended);
             }
 
             certificate = self.sanitize_certificate(certificate)?;
@@ -1140,7 +1147,7 @@ impl<DB: Database> Synchronizer<DB> {
             .parents()
             .send((vec![], minimal_round_for_parents))
             .await
-            .map_err(|_| DagError::ShuttingDown)?;
+            .map_err(|_| CertificateError::TNSend)?;
 
         // Instruct workers to download any missing batches referenced in this certificate.
         // Since this header got certified, we are sure that all the data it refers to (ie. its
@@ -1152,7 +1159,7 @@ impl<DB: Database> Synchronizer<DB> {
             .tx_batch_tasks
             .send((header.clone(), max_age))
             .await
-            .map_err(|_| DagError::ShuttingDown)?;
+            .map_err(|_| CertificateError::TNSend)?;
 
         let highest_processed_round = self.inner.highest_processed_round.load(Ordering::Acquire);
         if highest_processed_round + NEW_CERTIFICATE_ROUND_LIMIT < certificate.round() {
@@ -1161,24 +1168,22 @@ impl<DB: Database> Synchronizer<DB> {
                 .certificate_fetcher()
                 .send(CertificateFetcherCommand::Ancestors(certificate.clone()))
                 .await
-                .map_err(|_| DagError::ShuttingDown)?;
+                .map_err(|_| CertificateError::TNSend)?;
 
             error!(target: "primary::synchronizer", "processed certificate that is too new");
 
-            return Err(DagError::TooNew(
-                certificate.digest().into(),
-                certificate.round(),
-                highest_processed_round,
-            ));
+            return Err(CertificateError::TooNew(certificate.round(), highest_processed_round));
         }
 
-        let (sender, receiver) = oneshot::channel();
+        let (sender, res) = oneshot::channel();
         self.inner
             .tx_certificate_acceptor
             .send((vec![certificate], sender, external))
             .await
-            .expect("Synchronizer should shut down before certificate acceptor task.");
-        receiver.await.expect("Synchronizer should shut down before certificate acceptor task.")?;
+            .map_err(|_| CertificateError::TNSend)?;
+
+        res.await.expect("Synchronizer should shut down before certificate acceptor task.")?;
+
         Ok(())
     }
 
@@ -1250,7 +1255,7 @@ impl<DB: Database> Synchronizer<DB> {
         &self,
         certificate: &Certificate,
     ) -> DagResult<Vec<CertificateDigest>> {
-        self.inner.get_missing_parents(certificate).await
+        self.inner.get_missing_parents(certificate).await.map_err(Into::into)
     }
 
     /// Returns the number of suspended certificates and missing certificates.
