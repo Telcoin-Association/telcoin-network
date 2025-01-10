@@ -111,8 +111,8 @@ impl<DB: Database> Inner<DB> {
         // Send it to the `Proposer`.
         self.consensus_bus
             .parents()
-            .send((parents, certificate.round()))
-            .await
+            .try_send((parents, certificate.round()))
+            // .await
             .map_err(|_| DagError::ShuttingDown)
     }
 
@@ -431,7 +431,7 @@ impl<DB: Database> Inner<DB> {
     /// If yes, writing the certificate to storage and sending it to consensus need to happen
     /// atomically. Otherwise, there will be divergence between certificate storage and consensus
     /// DAG. A certificate that is sent to consensus must have all of its parents already in
-    /// the consensu DAG.
+    /// the consensus DAG.
     ///
     /// Because of the atomicity requirement, this function cannot be made cancellation safe.
     /// So it is run in a loop inside a separate task, connected to `Synchronizer` via a channel.
@@ -981,7 +981,7 @@ impl<DB: Database> Synchronizer<DB> {
     }
 
     /// Checks if the certificate is valid and can potentially be accepted into the DAG.
-    pub fn sanitize_certificate(&self, certificate: Certificate) -> DagResult<Certificate> {
+    fn sanitize_certificate(&self, certificate: Certificate) -> DagResult<Certificate> {
         self.inner.sanitize_certificate(certificate)
     }
 
@@ -1518,5 +1518,37 @@ mod tests {
         // THEN
         assert_eq!(state.num_missing(), 1);
         assert_eq!(state.num_suspended(), 4);
+    }
+
+    #[tokio::test]
+    async fn delete_my_atomic_test() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // Task that updates the counter
+        let counter_updater = std::sync::Arc::clone(&counter);
+        tokio::spawn(async move {
+            for _ in 0..10 {
+                // Increment the counter
+                counter_updater.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+        });
+
+        // Tasks that read the counter
+        let readers: Vec<_> = (0..5)
+            .map(|_| {
+                let counter_reader = std::sync::Arc::clone(&counter);
+                tokio::spawn(async move {
+                    loop {
+                        let value = counter_reader.load(std::sync::atomic::Ordering::SeqCst);
+                        println!("Current value: {}", value);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    }
+                })
+            })
+            .collect();
+
+        // Wait for the updater task to finish (in a real application, you might handle this differently)
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     }
 }

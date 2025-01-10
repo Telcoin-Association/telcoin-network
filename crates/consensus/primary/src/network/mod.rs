@@ -206,6 +206,19 @@ where
         drop(recent_blocks);
 
         debug!(target: "primary", ?header, round = header.round(), "Processing vote request from peer");
-        todo!()
+
+        // certifier optimistically sends header without parents
+        // however, peers may request missing certificates from the a proposer
+        // when this happens, the proposer sends a new vote request with the missing parents requested by this peer
+        //
+        // NOTE: this is a latency optimization and is not required for liveness
+        if parents.is_empty() {
+            // check if any parents missing
+            // let missing_digests = self
+            todo!()
+        } else {
+            // validate parents included with new proposal
+            todo!()
+        }
     }
 }
