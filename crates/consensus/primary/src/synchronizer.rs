@@ -396,7 +396,7 @@ impl<DB: Database> Inner<DB> {
     /// Inner wrapped in an Arc vs &self.
     async fn synchronize_blocks(inner: Arc<Inner<DB>>) {
         let mut rx_batch_tasks = inner.tx_batch_tasks.subscribe();
-        let mut batch_tasks: JoinSet<DagResult<()>> = JoinSet::new();
+        let mut batch_tasks: JoinSet<HeaderResult<()>> = JoinSet::new();
 
         loop {
             tokio::select! {
@@ -552,13 +552,19 @@ impl<DB: Database> Inner<DB> {
         result
     }
 
+    /// This method is called:
+    /// - when peer requests to vote
+    /// - long running task to sync blocks
     async fn sync_batches_internal(
         &self,
         header: &Header,
         max_age: Round,
         is_certified: bool,
-    ) -> DagResult<()> {
+    ) -> HeaderResult<()> {
         let authority_id = self.consensus_config.authority().id();
+
+        // TODO: this is already checked durng vote,
+        // but what about long running task to sync blocks?
         if header.author() == authority_id {
             debug!(target: "primary::synchronizer", "skipping sync_batches for header - no need to sync payload from own workers");
             return Ok(());
@@ -571,11 +577,7 @@ impl<DB: Database> Inner<DB> {
         let mut consensus_round = rx_consensus_round_updates.borrow().committed_round;
         ensure!(
             header.round() >= consensus_round.saturating_sub(max_age),
-            DagError::TooOld(
-                header.digest().into(),
-                header.round(),
-                consensus_round.saturating_sub(max_age)
-            )
+            HeaderError::TooOld(header.round(), consensus_round.saturating_sub(max_age))
         );
 
         let mut missing = HashMap::new();
@@ -651,7 +653,7 @@ impl<DB: Database> Inner<DB> {
                 results = &mut wait_synchronize => {
                     break results
                         .map(|_| ())
-                        .map_err(|e| DagError::NetworkError(format!("error synchronizing batches: {e:?}")))
+                        .map_err(|e| HeaderError::SyncBatches(format!("error synchronizing batches: {e:?}")))
                 },
                 // This aborts based on consensus round and not narwhal round. When this function
                 // is used as part of handling vote requests, this may cause us to wait a bit
@@ -665,8 +667,7 @@ impl<DB: Database> Inner<DB> {
                     consensus_round = rx_consensus_round_updates.borrow().committed_round;
                     ensure!(
                         header.round() >= consensus_round.saturating_sub(max_age),
-                        DagError::TooOld(
-                            header.digest().into(),
+                        HeaderError::TooOld(
                             header.round(),
                             consensus_round.saturating_sub(max_age),
                         )
@@ -1191,7 +1192,7 @@ impl<DB: Database> Synchronizer<DB> {
     /// Blocks until either synchronization is complete, or the current consensus rounds advances
     /// past the max allowed age. (`max_age == 0` means the header's round must match current
     /// round.)
-    pub async fn sync_header_batches(&self, header: &Header, max_age: Round) -> DagResult<()> {
+    pub async fn sync_header_batches(&self, header: &Header, max_age: Round) -> HeaderResult<()> {
         self.inner.sync_batches_internal(header, max_age, false).await
     }
 

@@ -249,6 +249,12 @@ pub enum HeaderError {
     /// A parent certificate is invalid.
     #[error("Invalid parent: {0}")]
     InvalidParent(String),
+    /// Error syncing batches
+    #[error("{0}")]
+    SyncBatches(String),
+    /// The header's timestamp is too far in the future
+    #[error("Invalid timestamp. Created at: {0}, received at {1})")]
+    InvalidTimestamp(TimestampSec, TimestampSec),
 
     /// TODO: this is temporary
     ///

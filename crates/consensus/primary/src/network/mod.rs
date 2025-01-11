@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
+    time::Duration,
 };
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
@@ -19,14 +20,18 @@ use tn_storage::traits::Database;
 use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
-    AuthorityIdentifier, Certificate, CertificateDigest, Header, Round, SignatureVerificationState,
+    now, AuthorityIdentifier, Certificate, CertificateDigest, Header, Round,
+    SignatureVerificationState,
 };
 use tokio::sync::mpsc;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 mod message;
 
 /// The maximum number of rounds that a proposed header can be behind.
 const HEADER_AGE_LIMIT: Round = 3;
+
+/// The tolerable amount of time to wait if a header is proposed before the current time. This accounts for small drifts in time keeping between nodes. The timestamp for headers is currently measured in secs.
+const MAX_HEADER_TIME_DRIFT_TOLERANCE: u64 = 1;
 
 /// Convenience type for Primary network.
 type Req = PrimaryRequest;
@@ -305,6 +310,32 @@ where
             stake >= committee.quorum_threshold(),
             HeaderError::InvalidParent(CertificateError::Inquorate.to_string())
         );
+
+        // parents valid - now verify batches
+        //
+        // TODO: can this be parallelized?
+        // Need to ensure an invalid parent attack shuts down batch sync
+        //
+        // TODO: this is called during Synchornizer::process_certificate_internal
+        // - does this need to be called again?
+        self.synchronizer.sync_header_batches(&header, 0).await?;
+
+        // verify header was created in the past
+        let now = now();
+        if &now < header.created_at() {
+            // wait if the difference is small enough
+            if *header.created_at() - now <= MAX_HEADER_TIME_DRIFT_TOLERANCE {
+                tokio::time::sleep(Duration::from_secs(*header.created_at() - now)).await;
+            } else {
+                // created_at is too far in the future
+                warn!(
+                    "Rejected header {:?} due to timestamp {} newer than {now}",
+                    header,
+                    *header.created_at()
+                );
+                return Err(HeaderError::InvalidTimestamp(*header.created_at(), now));
+            }
+        }
 
         todo!()
     }
