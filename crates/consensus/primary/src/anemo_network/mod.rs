@@ -258,9 +258,11 @@ impl<DB: Database> PrimaryReceiverHandler<DB> {
         }
 
         // Check if we can vote for this header.
+        //
         // Send the vote when:
-        // 1. when there is no existing vote for this publicKey & epoch/round
-        // 2. when there is a vote for this publicKey & epoch/round, and the vote is the same
+        // 1. when there is no existing vote for this public key for the epoch/round
+        // 2. when there is a vote for this public key & epoch/round, and the vote is the same
+        //
         // Taking the inverse of these two, the only time we don't want to vote is when:
         // there is a digest for the publicKey & epoch/round, and it does not match the digest
         // of the vote we create for this header.

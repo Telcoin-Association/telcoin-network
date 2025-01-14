@@ -563,7 +563,7 @@ impl<DB: Database> Inner<DB> {
     ) -> HeaderResult<()> {
         let authority_id = self.consensus_config.authority().id();
 
-        // TODO: this is already checked durng vote,
+        // TODO: this is already checked during vote,
         // but what about long running task to sync blocks?
         if header.author() == authority_id {
             debug!(target: "primary::synchronizer", "skipping sync_batches for header - no need to sync payload from own workers");

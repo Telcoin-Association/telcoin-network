@@ -244,7 +244,7 @@ pub enum HeaderError {
     #[error("Header round {0} is too old for GC round {1}")]
     TooOld(Round, Round),
     /// The header contains a parent with an invalid aggregate BLS signature.
-    #[error("Header's parent missing aggregate BLS signature.")]
+    #[error("Header's parent missing aggregate BLS signature")]
     ParentMissingSignature,
     /// A parent certificate is invalid.
     #[error("Invalid parent: {0}")]
@@ -255,6 +255,12 @@ pub enum HeaderError {
     /// The header's timestamp is too far in the future
     #[error("Invalid timestamp. Created at: {0}, received at {1})")]
     InvalidTimestamp(TimestampSec, TimestampSec),
+    /// Already voted for this header.
+    #[error("Already voted for header {0} at round {1}")]
+    AlreadyVoted(HeaderDigest, Round),
+    /// The proposed header is older than the node's last vote for a proposed header from this peer.
+    #[error("Already voted for a header in a later round for this peer. This header's round: {0}. Last voted for round: {1}.")]
+    AlreadyVotedForLaterRound(Round, Round),
 
     /// TODO: this is temporary
     ///

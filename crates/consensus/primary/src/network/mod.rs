@@ -21,7 +21,7 @@ use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, AuthorityIdentifier, Certificate, CertificateDigest, Header, Round,
-    SignatureVerificationState,
+    SignatureVerificationState, Vote,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
@@ -334,6 +334,65 @@ where
                     *header.created_at()
                 );
                 return Err(HeaderError::InvalidTimestamp(*header.created_at(), now));
+            }
+        }
+
+        // Check if node should vote for this header:
+        // 1. when there is no existing vote for this public key for the epoch/round
+        // 2. when there is a vote for this public key & epoch/round, and the vote is the same
+        //
+        // The only time the node shouldn't vote is:
+        // - there is a digest for the public key for this epoch/round and it does not match the vote digest
+        // - if this header is older than the previously voted on header matching the epoch/round
+        //
+        // check storage for a previous vote
+        //
+        // if a vote already exists for this author:
+        // - ensure correct epoch
+        // - ensure previous vote is older than current header round
+        // - check if digests match to avoid voting twice for header in the same round
+        let previous_vote = self
+            .consensus_config
+            .node_storage()
+            .vote_digest_store
+            .read(&header.author())
+            .map_err(HeaderError::Storage)?;
+        if let Some(vote_info) = previous_vote {
+            ensure!(
+                header.epoch() == vote_info.epoch(),
+                HeaderError::InvalidEpoch { expected: header.epoch(), received: vote_info.epoch() }
+            );
+            ensure!(
+                header.round() >= vote_info.round(),
+                HeaderError::AlreadyVotedForLaterRound(header.round(), vote_info.round(),)
+            );
+            if header.round() == vote_info.round() {
+                // Make sure we don't vote twice for the same authority in the same epoch/round.
+                let vote = Vote::new(
+                    &header,
+                    &self.consensus_config.authority().id(),
+                    self.consensus_config.key_config(),
+                )
+                .await;
+                if vote.digest() != vote_info.vote_digest() {
+                    warn!(
+                        "Authority {} submitted different header {:?} for voting",
+                        header.author(),
+                        header,
+                    );
+
+                    // metrics
+                    self.consensus_bus
+                        .primary_metrics()
+                        .node_metrics
+                        .votes_dropped_equivocation_protection
+                        .inc();
+
+                    return Err(HeaderError::AlreadyVoted(header.digest(), header.round()));
+                }
+
+                debug!("Resending vote {vote:?} for {} at round {}", header, header.round());
+                return Ok(PrimaryResponse::Vote(vote));
             }
         }
 
