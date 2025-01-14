@@ -446,12 +446,9 @@ where
         let mut unknown_certs = self.synchronizer.get_unknown_parent_digests(header).await?;
 
         // ensure header is not too old
-        let current_round = self.consensus_bus.narwhal_round_updates().borrow();
-        let limit = current_round.saturating_sub(HEADER_AGE_LIMIT);
+        let limit =
+            self.consensus_bus.narwhal_round_updates().borrow().saturating_sub(HEADER_AGE_LIMIT);
         ensure!(limit <= header.round(), HeaderError::TooOld(header.round(), limit));
-
-        // drop borrow
-        drop(current_round);
 
         // lock to ensure consistency between limit_round and where parent_digests are gc'ed
         let mut current_requests = self.requested_parents.lock();
