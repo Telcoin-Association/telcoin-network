@@ -258,7 +258,8 @@ pub enum HeaderError {
     /// Already voted for this header.
     #[error("Already voted for header {0} at round {1}")]
     AlreadyVoted(HeaderDigest, Round),
-    /// The proposed header is older than the node's last vote for a proposed header from this peer.
+    /// The proposed header is older than the node's last vote for a proposed header from this
+    /// peer.
     #[error("Already voted for a header in a later round for this peer. This header's round: {0}. Last voted for round: {1}.")]
     AlreadyVotedForLaterRound(Round, Round),
 

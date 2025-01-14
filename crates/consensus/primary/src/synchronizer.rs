@@ -925,7 +925,8 @@ impl<DB: Database> Synchronizer<DB> {
                 trace!(target: "primary::synchronizer", ?authority, ?certificate, "successfully processed certificate")
             }
             // result @ Err(DagError::Certificate(_)) => {
-            //     error!(target: "primary::synchronizer", ?authority, ?certificate, ?result, "failed to process certificate internally - shutting down...");
+            //     error!(target: "primary::synchronizer", ?authority, ?certificate, ?result,
+            // "failed to process certificate internally - shutting down...");
             //     return Err(DagError::ShuttingDown);
             // }
             // TODO: double check this
@@ -1070,12 +1071,13 @@ impl<DB: Database> Synchronizer<DB> {
 
     /// Process a certificate that was received.
     ///
-    /// The `external` argument indicates if the certificate was received from a external peer or created internally. Certificates received from peers should be fully verified. Certificates produced by this node are trusted.
+    /// The `external` argument indicates if the certificate was received from a external peer or
+    /// created internally. Certificates received from peers should be fully verified. Certificates
+    /// produced by this node are trusted.
     ///
     /// TODO:
     /// old NOTE: when making changes to this function, check if the same change needs to be made to
     /// try_accept_fetched_certificates() which is the batched version.
-    ///
     ///
     async fn process_certificate_internal(
         &self,
@@ -1542,7 +1544,8 @@ mod tests {
             })
             .collect();
 
-        // Wait for the updater task to finish (in a real application, you might handle this differently)
+        // Wait for the updater task to finish (in a real application, you might handle this
+        // differently)
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     }
 }

@@ -30,7 +30,9 @@ mod message;
 /// The maximum number of rounds that a proposed header can be behind.
 const HEADER_AGE_LIMIT: Round = 3;
 
-/// The tolerable amount of time to wait if a header is proposed before the current time. This accounts for small drifts in time keeping between nodes. The timestamp for headers is currently measured in secs.
+/// The tolerable amount of time to wait if a header is proposed before the current time. This
+/// accounts for small drifts in time keeping between nodes. The timestamp for headers is currently
+/// measured in secs.
 const MAX_HEADER_TIME_DRIFT_TOLERANCE: u64 = 1;
 
 /// Convenience type for Primary network.
@@ -121,7 +123,10 @@ struct RequestHandler<DB> {
     synchronizer: Arc<Synchronizer<DB>>,
     /// The digests of parents that are currently being requested from peers.
     ///
-    /// Missing parents are requested from peers. This is a local map to track in-flight requests for missing parents. The values are associated with the first authority that proposed a header with these parents. The node keeps track of requested Certificates to prevent unsolicited certificate attacks.
+    /// Missing parents are requested from peers. This is a local map to track in-flight requests
+    /// for missing parents. The values are associated with the first authority that proposed a
+    /// header with these parents. The node keeps track of requested Certificates to prevent
+    /// unsolicited certificate attacks.
     requested_parents: Arc<Mutex<BTreeMap<(Round, CertificateDigest), AuthorityIdentifier>>>,
 }
 
@@ -204,7 +209,8 @@ where
 
         // if peer is ahead, wait for execution to catch up
         //
-        // NOTE: this doesn't hurt anything since this node shouldn't vote until execution is caught up
+        // NOTE: this doesn't hurt anything since this node shouldn't vote until execution is caught
+        // up
         let mut watch_execution_result = self.consensus_bus.recent_blocks().subscribe();
         while header.latest_execution_block_num > latest_block_num_hash.number {
             watch_execution_result.changed().await.map_err(|_| HeaderError::ClosedWatchChannel)?;
@@ -212,9 +218,11 @@ where
                 self.consensus_bus.recent_blocks().borrow().latest_block_num_hash();
         }
 
-        // ensure execution results match. execution happens in waves per round, so the latest block number is likely to increase by more than 1
+        // ensure execution results match. execution happens in waves per round, so the latest block
+        // number is likely to increase by more than 1
         //
-        // NOTE: it's expected to be nearly a 0% chance that a recent block hash would match and have the wrong block number
+        // NOTE: it's expected to be nearly a 0% chance that a recent block hash would match and
+        // have the wrong block number
         if !self.consensus_bus.recent_blocks().borrow().contains_hash(header.latest_execution_block)
         {
             error!(
@@ -234,7 +242,8 @@ where
 
         // certifier optimistically sends header without parents
         // however, peers may request missing certificates from the a proposer
-        // when this happens, the proposer sends a new vote request with the missing parents requested by this peer
+        // when this happens, the proposer sends a new vote request with the missing parents
+        // requested by this peer
         //
         // NOTE: this is a latency optimization and is not required for liveness
         if parents.is_empty() {
@@ -268,7 +277,9 @@ where
             self.try_accept_unknown_certs(&header, verified).await?;
         }
 
-        // Confirm all parents are accepted. If any are missing, this call will wait until they are stored in the db. Eventually, this method will timeout or get cancelled for certificates that never arrive.
+        // Confirm all parents are accepted. If any are missing, this call will wait until they are
+        // stored in the db. Eventually, this method will timeout or get cancelled for certificates
+        // that never arrive.
         //
         // NOTE: this check is necessary for correctness.
         let parents = self.synchronizer.notify_read_parent_certificates(&header).await?;
@@ -291,7 +302,8 @@ where
             // @Steve - can you double check me here?
             //
             // confirm header created_at must always be larger than parent
-            // - note: this is always in secs, so this would prevent sub-sec block production which is a goal
+            // - note: this is always in secs, so this would prevent sub-sec block production which
+            //   is a goal
             //
             // this deviates from original:
             // header.created_at() >= parent.header().created_at(),
@@ -351,7 +363,8 @@ where
         // 2. when there is a vote for this public key & epoch/round, and the vote is the same
         //
         // The only time the node shouldn't vote is:
-        // - there is a digest for the public key for this epoch/round and it does not match the vote digest
+        // - there is a digest for the public key for this epoch/round and it does not match the
+        //   vote digest
         // - if this header is older than the previously voted on header matching the epoch/round
         //
         // check storage for a previous vote
@@ -423,7 +436,8 @@ where
 
     /// Helper method to retrieve parents for header.
     ///
-    /// Certificates are considered "known" if they are in local storage, suspended, or already requested from a peer.
+    /// Certificates are considered "known" if they are in local storage, suspended, or already
+    /// requested from a peer.
     async fn check_for_missing_parents(
         &self,
         header: &Header,
@@ -469,7 +483,8 @@ where
 
     /// Try to accept parents included with peer's request for vote.
     ///
-    /// Parents are expected with a vote request after this node rejects a proposed header due to missing parents. The certificates are only processed if this node has requested them.
+    /// Parents are expected with a vote request after this node rejects a proposed header due to
+    /// missing parents. The certificates are only processed if this node has requested them.
     async fn try_accept_unknown_certs(
         &self,
         header: &Header,
