@@ -287,7 +287,13 @@ where
                     "Certificate is not from the previous round".to_string()
                 )
             );
-            // TODO: confirm this must always be larger - this deviates from original:
+
+            // @Steve - can you double check me here?
+            //
+            // confirm header created_at must always be larger than parent
+            // - note: this is always in secs, so this would prevent sub-sec block production which is a goal
+            //
+            // this deviates from original:
             // header.created_at() >= parent.header().created_at(),
             // Old logic was >= - but this seems wrong
             ensure!(
@@ -298,10 +304,12 @@ where
                     parent.header.created_at()
                 ))
             );
+
             ensure!(
                 parent_authorities.insert(parent.header().author()),
                 HeaderError::InvalidParent("Parent authors are not unique".to_string())
             );
+
             stake += committee.stake_by_id(parent.origin());
         }
 
@@ -316,7 +324,7 @@ where
         // TODO: can this be parallelized?
         // Need to ensure an invalid parent attack shuts down batch sync
         //
-        // TODO: this is called during Synchornizer::process_certificate_internal
+        // TODO: this is called during Synchronizer::process_certificate_internal
         // - does this need to be called again?
         self.synchronizer.sync_header_batches(&header, 0).await?;
 
@@ -333,6 +341,7 @@ where
                     header,
                     *header.created_at()
                 );
+
                 return Err(HeaderError::InvalidTimestamp(*header.created_at(), now));
             }
         }
@@ -396,7 +405,20 @@ where
             }
         }
 
-        todo!()
+        // this node hasn't voted yet
+        let vote = Vote::new(
+            &header,
+            &self.consensus_config.authority().id(),
+            self.consensus_config.key_config(),
+        )
+        .await;
+
+        debug!(target: "primary", "Created vote {vote:?} for {} at round {}", header, header.round());
+
+        // Update the vote digest store with the vote we just sent.
+        self.consensus_config.node_storage().vote_digest_store.write(&vote)?;
+
+        Ok(PrimaryResponse::Vote(vote))
     }
 
     /// Helper method to retrieve parents for header.
