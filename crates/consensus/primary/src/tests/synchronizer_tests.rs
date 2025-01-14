@@ -23,7 +23,7 @@ use tn_test_utils::{
     CommitteeFixture,
 };
 use tn_types::{
-    error::{CertificateError, DagError},
+    error::{CertificateError, DagError, HeaderError},
     BlsAggregateSignatureBytes, Certificate, Committee, Round, SignatureVerificationState,
     TaskManager, TnReceiver, TnSender,
 };
@@ -539,7 +539,7 @@ async fn sync_batches_drops_old() {
         let _ = cb.consensus_round_updates().send(ConsensusRound::new(30, 0));
     });
     match synchronizer.sync_header_batches(&test_header, 10).await {
-        Err(DagError::TooOld(_, _, _)) => (),
+        Err(HeaderError::TooOld(_, _)) => (),
         result => panic!("unexpected result {result:?}"),
     }
 }

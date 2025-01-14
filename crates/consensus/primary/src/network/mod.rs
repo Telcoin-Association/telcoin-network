@@ -302,12 +302,12 @@ where
             // @Steve - can you double check me here?
             //
             // confirm header created_at must always be larger than parent
-            // - note: this is always in secs, so this would prevent sub-sec block production which
-            //   is a goal
             //
             // this deviates from original:
             // header.created_at() >= parent.header().created_at(),
             // Old logic was >= - but this seems wrong
+            // - note: this is always in secs, so this would prevent sub-sec block production which
+            //   is a goal
             ensure!(
                 header.created_at() > parent.header().created_at(),
                 HeaderError::InvalidParent(format!(
