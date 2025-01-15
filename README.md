@@ -120,3 +120,13 @@ forge build
 ### Optional: Foundry tests
 
 To run the fuzz tests run `forge test`. Note that contract information is best viewed in each contract's interface where its API is defined and documented in NatSpec format.
+
+
+## Acknowledgements
+
+Telcoin Network is an EVM-compatible blockchain built with DAG-based consensus.
+While building the protocol, we studied and explored many different projects to identify what worked well and where we could make improvements.
+
+We want to extend our sincere appreciation to the following teams:
+- [reth](https://github.com/paradigmxyz/reth): Reth stands out for their dedication to implementing the Ethereum protocol with clean, well-written code. Their unwavering commitment to building a strong open-source community has reached far beyond the Ethereum ecosystem. We are truly grateful for their leadership and the inspiration they continue to provide.
+- [sui](https://github.com/MystenLabs/sui): Telcoin Network uses a version of Bullshark that was heavily derived from Mysten Lab's Sui codebase under Apache 2.0 license. Because this code was already released under the Apache License, we decided to start with a derivation of their work to iterate more quickly. We thank the Mysten Labs team for pioneering BFT consensus protocols and publishing their libraries.
