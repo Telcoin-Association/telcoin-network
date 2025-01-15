@@ -509,3 +509,81 @@ where
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        network::{PrimaryNetwork, PrimaryRequest, RequestHandler},
+        synchronizer::Synchronizer,
+        ConsensusBus,
+    };
+    use std::sync::Arc;
+    use tn_network_libp2p::{
+        types::{NetworkEvent, NetworkHandle},
+        ResponseChannel,
+    };
+    use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils::CommitteeFixture;
+    use tn_types::{TaskManager, TnSender as _};
+    use tokio::sync::mpsc;
+
+    /// Helper function to create an instance of [PrimaryNetwork].
+    fn primary_network_for_test() -> PrimaryNetwork<MemDatabase> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+        let primary = fixture.authorities().last().unwrap();
+        let config = primary.consensus_config();
+        let certificate_store = config.node_storage().certificate_store.clone();
+        let cb = ConsensusBus::new();
+
+        // Make a synchronizer.
+        let synchronizer = Arc::new(Synchronizer::new(config.clone(), &cb));
+        let task_manager = TaskManager::default();
+        synchronizer.spawn(&task_manager);
+
+        // create primary network
+        let (wan, network_events) = mpsc::channel(1);
+        let (network_handle_tx, network_commands) = mpsc::channel(1);
+        let network_handle = NetworkHandle::new(network_handle_tx);
+        let request_handler = RequestHandler::new(config, cb, synchronizer);
+        PrimaryNetwork::new(network_events, network_handle, request_handler)
+    }
+
+    #[tokio::test]
+    async fn test_vote_succeeds() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+        let primary0 = fixture.authorities().next().expect("4 authorities in committee fixture");
+        let config = primary0.consensus_config();
+        let certificate_store = config.node_storage().certificate_store.clone();
+        let cb = ConsensusBus::new();
+        // Make a synchronizer.
+        let synchronizer = Arc::new(Synchronizer::new(config.clone(), &cb));
+        let task_manager = TaskManager::default();
+        synchronizer.spawn(&task_manager);
+
+        // create primary network
+        let (wan, network_events) = mpsc::channel(1);
+        let (network_handle_tx, network_commands) = mpsc::channel(1);
+        let network_handle = NetworkHandle::new(network_handle_tx);
+        let request_handler = RequestHandler::new(config.clone(), cb, synchronizer);
+        let mut primary_network =
+            PrimaryNetwork::new(network_events, network_handle, request_handler);
+
+        // spawn primary network
+        task_manager.spawn_task("primary-test-network", primary_network.spawn());
+
+        // simulate vote request from last peer in committee fixture
+        let primary_peer =
+            fixture.authorities().last().expect("4 authorities in committee fixture");
+        let header = fixture.header_from_last_authority();
+        // sanity check
+        assert_eq!(primary_peer.id(), header.author());
+        let parents = vec![];
+        let request = PrimaryRequest::Vote { header, parents };
+        let peer_network_key = primary_peer.primary_network_public_key();
+        let peer_id = config
+            .ed25519_fastcrypto_to_libp2p(&peer_network_key)
+            .expect("fastcrypto to libp2p PeerId");
+        // let response_channel = ResponseChannel::new();
+        let _ = wan.send(NetworkEvent::Request { peer: peer_id, request, channel: todo!() }).await;
+    }
+}

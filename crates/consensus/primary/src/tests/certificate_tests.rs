@@ -19,7 +19,7 @@ fn test_empty_certificate_verification() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
 
     let committee = fixture.committee();
-    let header = fixture.header();
+    let header = fixture.header_from_last_authority();
     // You should not be allowed to create a certificate that does not satisfying quorum
     // requirements
     assert!(Certificate::new_unverified(&committee, header.clone(), Vec::new()).is_err());
@@ -56,7 +56,7 @@ fn test_empty_certificate_verification() {
 fn test_valid_certificate_v2_verification() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
-    let header = fixture.header();
+    let header = fixture.header_from_last_authority();
 
     let mut signatures = Vec::new();
 
@@ -81,7 +81,7 @@ fn test_valid_certificate_v2_verification() {
 fn test_certificate_insufficient_signatures() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
-    let header = fixture.header();
+    let header = fixture.header_from_last_authority();
 
     let mut signatures = Vec::new();
 
@@ -102,7 +102,7 @@ fn test_certificate_insufficient_signatures() {
 fn test_certificate_validly_repeated_public_keys() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
-    let header = fixture.header();
+    let header = fixture.header_from_last_authority();
 
     let mut signatures = Vec::new();
 
@@ -126,7 +126,7 @@ fn test_certificate_validly_repeated_public_keys() {
 fn test_unknown_signature_in_certificate() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
-    let header = fixture.header();
+    let header = fixture.header_from_last_authority();
 
     let mut signatures = Vec::new();
 
@@ -154,7 +154,7 @@ proptest::proptest! {
             .committee_size(NonZeroUsize::new(committee_size).unwrap())
             .build();
         let committee = fixture.committee();
-        let header = fixture.header();
+        let header = fixture.header_from_last_authority();
 
         let mut signatures = Vec::new();
 
