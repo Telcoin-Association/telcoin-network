@@ -73,13 +73,4 @@ reth = { workspace = true }
 
 [features]
 default = []
-benchmark = []
 test-utils = []
-
-[lib]
-bench = false
-
-[[bench]]
-name = "process_certificates"
-harness = false
-required-features = ["benchmark"]

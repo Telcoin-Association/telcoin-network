@@ -392,24 +392,10 @@ impl<DB: Database> Consensus<DB> {
                     let mut committed_certificates = Vec::new();
 
                     // Output the sequence in the right order.
-                    let mut i = 0;
                     for committed_sub_dag in committed_sub_dags {
                          tracing::debug!("Commit in Sequence {:?}", committed_sub_dag.sub_dag_index);
 
                         for certificate in &committed_sub_dag.certificates {
-                            i+=1;
-
-                            if i % 5_000 == 0 {
-                                #[cfg(not(feature = "benchmark"))]
-                                tracing::debug!("Committed {}", certificate.header());
-                            }
-
-                            #[cfg(feature = "benchmark")]
-                            for digest in certificate.header().payload().keys() {
-                                // NOTE: This log entry is used to compute performance.
-                                tracing::info!("Committed {} -> {:?}", certificate.header(), digest);
-                            }
-
                             committed_certificates.push(certificate.clone());
                         }
 

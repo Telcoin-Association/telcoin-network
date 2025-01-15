@@ -8,9 +8,6 @@
 //! This library implements a `ClosureMetric` for crate `prometheus` whose value is computed at
 //! the time of collection by a provided closure.
 
-// TODO: add example usage once constructor macros are implemented.
-// (For now, look at tests for an example.)
-
 use eyre::{eyre, Result};
 use prometheus::{core, proto};
 

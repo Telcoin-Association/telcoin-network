@@ -1,20 +1,16 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! IT tests
+
 use fastcrypto::hash::Hash;
+use std::{collections::BTreeSet, sync::Arc};
 use tn_executor::get_restored_consensus_output;
 use tn_primary::{
     consensus::{Bullshark, Consensus, ConsensusMetrics, LeaderSchedule, LeaderSwapTable},
     ConsensusBus,
 };
-
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{TaskManager, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
-
-use std::{collections::BTreeSet, sync::Arc};
-
 use tn_types::{Certificate, TnReceiver, TnSender};
+use tn_types::{TaskManager, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
 
 #[tokio::test]
 async fn test_recovery() {
@@ -91,68 +87,3 @@ async fn test_recovery() {
         assert_eq!(consensus_output.len(), (2 - last_executed_certificate_index) as usize);
     }
 }
-
-// TODO: this needs to work again
-// #[tokio::test]
-// async fn test_internal_consensus_output() {
-//     // Enabled debug tracing so we can easily observe the
-//     // nodes logs.
-//     let _guard = setup_test_tracing();
-
-// let manager = TaskManager::current();
-// let executor = manager.executor();
-//     let mut cluster = Cluster::new(None, executor);
-
-//     // start the cluster
-//     cluster.start(Some(4), Some(1), None).await;
-
-//     // get a client to send transactions
-//     let worker_id = 0;
-
-//     let authority = cluster.authority(0);
-//     // let mut client = authority.new_transactions_client(&worker_id).await;
-
-//     // Subscribe to the transaction confirmation channel
-//     let mut receiver = authority.primary().await.tx_transaction_confirmation.subscribe();
-
-//     // Create arbitrary transactions
-//     // let mut transactions = Vec::new();
-
-//     const NUM_OF_TRANSACTIONS: u32 = 10;
-//     // for i in 0..NUM_OF_TRANSACTIONS {
-//     //     let tx = string_transaction(i);
-
-//     //     // serialise and send
-//     //     let tr = bcs::to_bytes(&tx).unwrap();
-//     //     let txn = TransactionProto { transaction: Bytes::from(tr) };
-//     //     client.submit_transaction(txn).await.unwrap();
-
-//     //     transactions.push(tx);
-//     // }
-
-//     // wait for transactions to complete
-//     loop {
-//         let result = receiver.recv().await.unwrap();
-
-//         // deserialise transaction
-//         let output_transaction = bcs::from_bytes::<String>(&result).unwrap();
-
-//         // we always remove the first transaction and check with the one
-//         // sequenced. We want the transactions to be sequenced in the
-//         // same order as we post them.
-//         let expected_transaction = transactions.remove(0);
-
-//         assert_eq!(
-//             expected_transaction, output_transaction,
-//             "Expected to have received transaction with same id. Ordering is important"
-//         );
-
-//         if transactions.is_empty() {
-//             break;
-//         }
-//     }
-// }
-
-// // fn string_transaction(id: u32) -> String {
-// //     format!("test transaction:{id}")
-// // }
