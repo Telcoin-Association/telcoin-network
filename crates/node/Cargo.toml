@@ -98,6 +98,3 @@ tn-primary = { workspace = true }
 assert_matches = { workspace = true }
 tempfile = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
-
-[features]
-trace_transaction = ["tn-worker/trace_transaction"]

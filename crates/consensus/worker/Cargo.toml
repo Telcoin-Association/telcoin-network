@@ -50,7 +50,3 @@ tn-primary = { workspace = true }
 reth-tracing = { workspace = true }
 tn-network = { workspace = true, features = ["test-utils"] }
 bytes = { workspace = true }
-
-[features]
-benchmark = []
-trace_transaction = []
