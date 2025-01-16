@@ -1,23 +1,18 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
-
 //! Implement a container for channels used internally by consensus.
 //! This allows easier examination of message flow and avoids excessives channel passing as
 //! arguments.
-
-use std::sync::Arc;
-
-use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
-use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
-use tn_types::{
-    Certificate, CommittedSubDag, ConsensusOutput, Header, Round, TnSender, CHANNEL_CAPACITY,
-};
-use tokio::sync::{broadcast, watch};
 
 use crate::{
     certificate_fetcher::CertificateFetcherCommand, consensus::ConsensusRound,
     proposer::OurDigestMessage, RecentBlocks,
 };
+use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
+use std::sync::Arc;
+use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
+use tn_types::{
+    Certificate, CommittedSubDag, ConsensusOutput, Header, Round, TnSender, CHANNEL_CAPACITY,
+};
+use tokio::sync::{broadcast, watch};
 
 /// Has sync completed?
 #[derive(Copy, Clone, Debug, Default)]

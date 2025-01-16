@@ -1,6 +1,4 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Certificate fetcher tests
 
 use crate::{certificate_fetcher::CertificateFetcher, synchronizer::Synchronizer, ConsensusBus};
 use anemo::async_trait;

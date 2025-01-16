@@ -1,15 +1,11 @@
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-use consensus_metrics::monitored_future;
-use tn_types::{AuthorityIdentifier, Noticer, TaskManager, TnReceiver, TnSender};
-
-use tap::TapFallible;
-use tn_types::{Certificate, Round};
-use tracing::{debug, error, info, warn};
+//! Filter consensus results to update execution state.
 
 use crate::ConsensusBus;
+use consensus_metrics::monitored_future;
+use tap::TapFallible;
+use tn_types::{AuthorityIdentifier, Noticer, TaskManager, TnReceiver, TnSender};
+use tn_types::{Certificate, Round};
+use tracing::{debug, error, info, warn};
 
 /// Updates Narwhal system state based on certificates received from consensus.
 pub struct StateHandler {

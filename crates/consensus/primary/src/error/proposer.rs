@@ -1,7 +1,6 @@
 //! Error types for primary's Proposer task.
 
 use std::time::Duration;
-
 use tn_types::Header;
 use tokio::sync::{oneshot, watch};
 

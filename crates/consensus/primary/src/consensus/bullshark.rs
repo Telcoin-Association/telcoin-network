@@ -1,7 +1,5 @@
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Bullshark
+
 use crate::consensus::{
     utils, ConsensusError, ConsensusMetrics, ConsensusState, Dag, LeaderSchedule, LeaderSwapTable,
     Outcome,
@@ -9,9 +7,8 @@ use crate::consensus::{
 use fastcrypto::hash::Hash;
 use std::{collections::VecDeque, sync::Arc};
 use tn_storage::{traits::Database, ConsensusStore};
-use tn_types::{Committee, Stake};
-
 use tn_types::{Certificate, CommittedSubDag, ReputationScores, Round};
+use tn_types::{Committee, Stake};
 use tokio::time::Instant;
 use tracing::{debug, error_span};
 

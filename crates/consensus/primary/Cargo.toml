@@ -70,7 +70,3 @@ bytes = { workspace = true }
 reth-tracing = { workspace = true }
 tn-block-validator = { workspace = true, features = ["test-utils"] }
 reth = { workspace = true }
-
-[features]
-default = []
-test-utils = []

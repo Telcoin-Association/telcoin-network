@@ -1,7 +1,6 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Leader schedule for identifying the next leader for the round.
 
+use super::Dag;
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 use std::{
@@ -11,11 +10,8 @@ use std::{
 };
 use tn_storage::{traits::Database, ConsensusStore};
 use tn_types::{Authority, AuthorityIdentifier, Committee, Stake};
-
 use tn_types::{Certificate, ReputationScores, Round};
 use tracing::{debug, trace};
-
-use super::Dag;
 
 #[cfg(test)]
 #[path = "tests/leader_schedule_tests.rs"]

@@ -1,10 +1,5 @@
 //! Certifier broadcasts headers and certificates for this primary.
 
-// Copyright (c) Telcoin, LLC
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 use crate::{aggregators::VotesAggregator, synchronizer::Synchronizer, ConsensusBus};
 use anemo::{rpc::Status, Request, Response};
 use consensus_metrics::monitored_future;

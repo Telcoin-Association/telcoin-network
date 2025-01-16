@@ -1,8 +1,5 @@
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Aggregate certificates for the round.
+
 use std::collections::HashSet;
 use tn_types::{AuthorityIdentifier, Certificate, Committee, Stake};
 use tracing::trace;

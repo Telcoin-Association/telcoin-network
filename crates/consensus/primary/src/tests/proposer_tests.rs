@@ -1,9 +1,5 @@
-// Copyright (c) Telcoin, LLC
-// Copyright(C) Facebook, Inc. and its affiliates.
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Proposer unit tests.
+
 use super::*;
 use crate::consensus::LeaderSwapTable;
 use consensus_metrics::spawn_logged_monitored_task;

@@ -1,19 +1,14 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Aggregate votes after proposing a header.
+
 use fastcrypto::hash::{Digest, Hash};
 use std::{collections::HashSet, sync::Arc};
 use tn_primary_metrics::PrimaryMetrics;
-use tn_types::{AuthorityIdentifier, Committee, Stake};
-
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
-    to_intent_message, BlsAggregateSignature, BlsSignature, Certificate, Header, ProtocolSignature,
-    SignatureVerificationState, ValidatorAggregateSignature, Vote,
+    to_intent_message, AuthorityIdentifier, BlsAggregateSignature, BlsSignature, Certificate,
+    Committee, Header, ProtocolSignature, SignatureVerificationState, Stake,
+    ValidatorAggregateSignature, Vote,
 };
 use tracing::{trace, warn};
 

@@ -1,10 +1,8 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Randomized tests
 
 use crate::consensus::{
-    make_consensus_store, Bullshark, ConsensusMetrics, ConsensusState, LeaderSchedule,
-    LeaderSwapTable,
+    consensus_utils::make_consensus_store, Bullshark, ConsensusMetrics, ConsensusState,
+    LeaderSchedule, LeaderSwapTable,
 };
 use fastcrypto::hash::{Hash, HashFunction};
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -21,11 +19,9 @@ use std::{
     sync::Arc,
 };
 use tn_storage::{mem_db::MemDatabase, open_db, traits::Database, ConsensusStore};
-use tn_types::{Authority, AuthorityIdentifier, Committee, Stake};
-
 use tn_test_utils::{mock_certificate_with_rand, CommitteeFixture};
+use tn_types::{Authority, AuthorityIdentifier, Committee, Stake};
 use tn_types::{Certificate, CertificateDigest, Round};
-#[allow(unused_imports)]
 use tokio::sync::mpsc::channel;
 
 #[derive(Copy, Clone, Debug)]
@@ -72,6 +68,7 @@ impl ExecutionPlan {
 
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+/// TODO: this tests runs forever
 async fn bullshark_randomised_tests() {
     // Configuration regarding the randomized tests. The tests will run for different values
     // on the below parameters to increase the different cases we can generate.

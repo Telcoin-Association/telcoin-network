@@ -1,21 +1,16 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Consensus tests
 
-use std::{collections::BTreeSet, sync::Arc};
-
+use crate::{
+    consensus::{Bullshark, Consensus, ConsensusMetrics, LeaderSchedule, LeaderSwapTable},
+    ConsensusBus,
+};
 use fastcrypto::hash::Hash;
-
+use std::{collections::BTreeSet, sync::Arc};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
 use tn_types::{
     Certificate, ReputationScores, TaskManager, TnReceiver, TnSender,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
-};
-
-use crate::{
-    consensus::{Bullshark, Consensus, ConsensusMetrics, LeaderSchedule, LeaderSwapTable},
-    ConsensusBus,
 };
 
 /// This test is trying to compare the output of the Consensus algorithm when:

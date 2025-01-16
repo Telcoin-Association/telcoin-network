@@ -1,7 +1,5 @@
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Fetch missing certificates from peers and verify them.
+
 use crate::{synchronizer::Synchronizer, ConsensusBus};
 use anemo::Request;
 use consensus_metrics::{monitored_future, monitored_scope};
@@ -13,16 +11,15 @@ use std::{
     time::Duration,
 };
 use tn_network::PrimaryToPrimaryRpc;
+use tn_network_types::{FetchCertificatesRequest, FetchCertificatesResponse};
 use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::{traits::Database, CertificateStore};
 use tn_types::{
-    AuthorityIdentifier, Committee, NetworkPublicKey, Noticer, TaskManager, TnReceiver, TnSender,
-};
-
-use tn_network_types::{FetchCertificatesRequest, FetchCertificatesResponse};
-use tn_types::{
     error::{DagError, DagResult},
     validate_received_certificate_version, Certificate, Round,
+};
+use tn_types::{
+    AuthorityIdentifier, Committee, NetworkPublicKey, Noticer, TaskManager, TnReceiver, TnSender,
 };
 use tokio::{
     task::JoinSet,

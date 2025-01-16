@@ -1,31 +1,21 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Consensus
 
 mod bullshark;
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(test)]
 #[path = "tests/consensus_utils.rs"]
 mod consensus_utils;
 mod leader_schedule;
 mod state;
 mod utils;
-
-#[cfg(any(test, feature = "test-utils"))]
-pub use crate::consensus::consensus_utils::{
-    make_certificate_store, make_consensus_store, NUM_SUB_DAGS_PER_SCHEDULE,
-};
 pub use crate::consensus::{
     bullshark::Bullshark,
     leader_schedule::{LeaderSchedule, LeaderSwapTable},
     state::{Consensus, ConsensusRound, ConsensusState, Dag},
     utils::gc_round,
 };
-
-pub use tn_primary_metrics::consensus::{ChannelMetrics, ConsensusMetrics};
-
 use thiserror::Error;
+pub use tn_primary_metrics::consensus::{ChannelMetrics, ConsensusMetrics};
 use tn_storage::StoreError;
-
 use tn_types::Certificate;
 
 /// The default channel size used in the consensus and subscriber logic.

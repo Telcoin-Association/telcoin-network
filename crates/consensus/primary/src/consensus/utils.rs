@@ -1,7 +1,5 @@
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Consensus utils
+
 use crate::consensus::ConsensusState;
 use std::collections::HashSet;
 use tn_types::{Certificate, Round};

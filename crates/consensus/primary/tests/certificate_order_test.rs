@@ -1,6 +1,5 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Certificate order
+
 use indexmap::IndexMap;
 use rand::{rngs::OsRng, seq::SliceRandom};
 use reth_primitives::BlockNumHash;

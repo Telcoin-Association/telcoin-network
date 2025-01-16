@@ -1,8 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright(C) Facebook, Inc. and its affiliates.
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 //! The Proposer is responsible for proposing the primary's next header when certain conditions are
 //! met.
 //!

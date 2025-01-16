@@ -1,11 +1,7 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
-
 //! Track the most recent execution blocks for the consensus layer.
 
-use std::collections::VecDeque;
-
 use reth_primitives::{BlockNumHash, SealedHeader};
+use std::collections::VecDeque;
 use tn_types::BlockHash;
 
 /// Tracks 'num_blocks' most recently executed block hashes and numbers.

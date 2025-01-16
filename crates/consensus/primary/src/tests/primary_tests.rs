@@ -1,6 +1,5 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Primary tests
+
 use super::{Primary, PrimaryReceiverHandler};
 use crate::{
     consensus::{LeaderSchedule, LeaderSwapTable},

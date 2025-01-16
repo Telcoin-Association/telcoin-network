@@ -1,22 +1,17 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Leader schedule tests
 
+use crate::consensus::{Dag, LeaderSchedule, LeaderSwapTable};
+use reth_tracing::init_test_tracing;
 use std::{
     collections::{BTreeSet, HashMap},
     num::NonZeroUsize,
     sync::Arc,
 };
-
-use reth_tracing::init_test_tracing;
 use tempfile::TempDir;
 use tn_storage::{mem_db::MemDatabase, open_db, ConsensusStore};
-use tn_types::AuthorityIdentifier;
-
 use tn_test_utils::{mock_certificate, CommitteeFixture};
+use tn_types::AuthorityIdentifier;
 use tn_types::{Certificate, CommittedSubDag, ReputationScores, Round};
-
-use crate::consensus::{Dag, LeaderSchedule, LeaderSwapTable};
 
 #[tokio::test]
 async fn test_leader_swap_table() {

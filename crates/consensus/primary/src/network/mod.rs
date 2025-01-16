@@ -1,12 +1,8 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Primary Receiver Handler is the entrypoint for peer network requests.
 //!
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
+
 use crate::{synchronizer::Synchronizer, ConsensusBus};
 use fastcrypto::hash::Hash;
 use parking_lot::Mutex;
@@ -28,7 +24,6 @@ use tn_types::{
     Header, NetworkPublicKey, Round, Vote,
 };
 use tracing::{debug, error, warn};
-mod engine;
 mod primary;
 mod worker;
 
