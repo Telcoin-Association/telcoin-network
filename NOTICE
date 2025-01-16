@@ -1,8 +1,10 @@
 # NOTICE
 
 Portions of this project are derived from work by:
-- Facebook, Inc. and its affiliates (c) 2021
-- Mysten Labs, Inc. (c) 2021
-- Reth Contributors (c) 2022-2025
+- Reth Contributors (c) 2022-2025 (Apache/MIT)
+- Mysten Labs, Inc. (c) 2021 (Apache)
+- Facebook, Inc. and its affiliates (c) 2021 (Apache)
 
 Licensed under the [Apache License, Version 2.0](./LICENSE-APACHE) or [MIT](./LICENSE-MIT).
+
+If you are a member of one of these teams and take issue with this acknowledgement, please contact `compliance@telcoin.org` so we can help.
