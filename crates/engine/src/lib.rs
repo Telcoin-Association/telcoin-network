@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT or Apache-2.0
 //! Execute output from consensus layer to extend the canonical chain.
 //!
 //! The engine listens to a stream of output from consensus and constructs a new block.

@@ -10,12 +10,15 @@ Copyright (c) 2021, Facebook, Inc. and its affiliates (Apache)
 Copyright (c) 2021, Mysten Labs, Inc. (Apache)
 
 The following packages include code from Sui:
-- [tn-primary](./crates/consensus/primary)
-- [tn-primary-metrics](./crates/consensus/primary-metrics)
-- [tn-worker](./crates/consensus/worker)
 - [tn-network](./crates/network)
 - [tn-network-types](./crates/network-types)
+- [tn-primary](./crates/consensus/primary)
+- [tn-primary-metrics](./crates/consensus/primary-metrics)
+- [tn-storage](./crates/storage/rocks)
 - [tn-test-utils](./crates/test-utils)
+- [tn-types](./crates/types)
+- [tn-utils](./crates/tn-utils)
+- [tn-worker](./crates/consensus/worker)
 
 The Sui code is licensed under the Apache License, Version 2.0.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT or Apache-2.0
 //! The block builder maintains the transaction pool and builds the next block.
 //!
 //! The block builder listens for canonical state changes from the engine and updates the

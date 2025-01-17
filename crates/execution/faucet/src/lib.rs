@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT or Apache-2.0
 //! Faucet components needed for the faucet to run.
 //!
 //! Includes config and cache for bridging rpc and faucet service.
