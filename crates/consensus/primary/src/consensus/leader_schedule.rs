@@ -9,8 +9,9 @@ use std::{
     sync::Arc,
 };
 use tn_storage::{traits::Database, ConsensusStore};
-use tn_types::{Authority, AuthorityIdentifier, Committee, Stake};
-use tn_types::{Certificate, ReputationScores, Round};
+use tn_types::{
+    Authority, AuthorityIdentifier, Certificate, Committee, ReputationScores, Round, Stake,
+};
 use tracing::{debug, trace};
 
 #[cfg(test)]

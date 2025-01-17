@@ -10,8 +10,7 @@ use std::{
 use tempfile::TempDir;
 use tn_storage::{mem_db::MemDatabase, open_db, ConsensusStore};
 use tn_test_utils::{mock_certificate, CommitteeFixture};
-use tn_types::AuthorityIdentifier;
-use tn_types::{Certificate, CommittedSubDag, ReputationScores, Round};
+use tn_types::{AuthorityIdentifier, Certificate, CommittedSubDag, ReputationScores, Round};
 
 #[tokio::test]
 async fn test_leader_swap_table() {

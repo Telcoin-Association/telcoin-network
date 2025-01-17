@@ -500,9 +500,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
         })
         .collect();
 
-    // let mut results = Vec::new();
     while let Some(res) = requests.next().await {
-        // results.push(res?);
         assert!(res.is_ok());
     }
 
@@ -513,12 +511,6 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
             tokio::spawn({
                 let client = client.clone();
                 async move {
-                    // client
-                    //     .clone()
-                    //     .request::<String, _>("faucet_transfer", rpc_params![address])
-                    //     .await
-                    //     .expect("request successful")
-
                     // ensure account balance increased
                     //
                     // account balance is only updates on final execution

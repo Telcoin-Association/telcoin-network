@@ -20,8 +20,9 @@ use std::{
 };
 use tn_storage::{mem_db::MemDatabase, open_db, traits::Database, ConsensusStore};
 use tn_test_utils::{mock_certificate_with_rand, CommitteeFixture};
-use tn_types::{Authority, AuthorityIdentifier, Committee, Stake};
-use tn_types::{Certificate, CertificateDigest, Round};
+use tn_types::{
+    Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Round, Stake,
+};
 use tokio::sync::mpsc::channel;
 
 #[derive(Copy, Clone, Debug)]

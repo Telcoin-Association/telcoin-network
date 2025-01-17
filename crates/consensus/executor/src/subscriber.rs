@@ -213,15 +213,16 @@ pub async fn can_cvv<DB: Database>(
         last_executed_block.sub_dag.leader.round(),
         config.parameters().gc_depth
     );
-    let (last_consensus_epoch, last_consensus_round) =
-        if let Some(commit) = config.node_storage().consensus_store.get_latest_sub_dag() {
-            // TODO- replace 0 with the epoch once we have them..
-            (0, commit.leader_round)
-        } else {
-            // Use 0, 0 here if we have no sub-dag instead of info from last_executed_block.
-            // On restart last_executed_block might fool us into thinking we are good to be an CVV...
-            (0, 0)
-        };
+    let (last_consensus_epoch, last_consensus_round) = if let Some(commit) =
+        config.node_storage().consensus_store.get_latest_sub_dag()
+    {
+        // TODO- replace 0 with the epoch once we have them..
+        (0, commit.leader_round)
+    } else {
+        // Use 0, 0 here if we have no sub-dag instead of info from last_executed_block.
+        // On restart last_executed_block might fool us into thinking we are good to be an CVV...
+        (0, 0)
+    };
     if max_epoch == last_consensus_epoch
         && (last_consensus_round + config.parameters().gc_depth) > max_round
     {

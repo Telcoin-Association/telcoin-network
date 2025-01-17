@@ -16,10 +16,8 @@ use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::{traits::Database, CertificateStore};
 use tn_types::{
     error::{DagError, DagResult},
-    validate_received_certificate_version, Certificate, Round,
-};
-use tn_types::{
-    AuthorityIdentifier, Committee, NetworkPublicKey, Noticer, TaskManager, TnReceiver, TnSender,
+    validate_received_certificate_version, AuthorityIdentifier, Certificate, Committee,
+    NetworkPublicKey, Noticer, Round, TaskManager, TnReceiver, TnSender,
 };
 use tokio::{
     task::JoinSet,

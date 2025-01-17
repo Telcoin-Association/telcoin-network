@@ -10,8 +10,7 @@ use mockall::automock;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_primary::ConsensusBus;
-use tn_storage::traits::Database;
-use tn_storage::{CertificateStore, ConsensusStore};
+use tn_storage::{traits::Database, CertificateStore, ConsensusStore};
 use tn_types::{CertificateDigest, CommittedSubDag, ConsensusOutput, Noticer, TaskManager};
 use tracing::info;
 
@@ -53,7 +52,8 @@ impl Executor {
 
 /// Restore the last committed sub dag based on the latest execution result.
 ///
-/// The next subdag after the passed `last_executed_sub_dag_index` is used. Callers must ensure that the value passed is the last fully-executed subdag index.
+/// The next subdag after the passed `last_executed_sub_dag_index` is used. Callers must ensure that
+/// the value passed is the last fully-executed subdag index.
 pub async fn get_restored_consensus_output<DB: Database>(
     consensus_store: Arc<ConsensusStore<DB>>,
     certificate_store: CertificateStore<DB>,

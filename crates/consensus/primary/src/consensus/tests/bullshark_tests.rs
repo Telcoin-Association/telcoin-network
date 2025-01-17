@@ -8,8 +8,7 @@ use crate::{
     },
     ConsensusBus,
 };
-use std::collections::BTreeSet;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use tn_config::ConsensusConfig;
 use tn_storage::{mem_db::MemDatabase, open_db};
 use tn_test_utils::{CommitteeFixture, TelcoinTempDirs};

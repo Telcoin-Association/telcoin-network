@@ -10,6 +10,7 @@ mod helpers;
 mod multiaddr;
 mod notifier;
 mod primary;
+mod serde;
 mod sync;
 mod task_manager;
 mod worker;

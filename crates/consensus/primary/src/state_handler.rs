@@ -3,8 +3,9 @@
 use crate::ConsensusBus;
 use consensus_metrics::monitored_future;
 use tap::TapFallible;
-use tn_types::{AuthorityIdentifier, Noticer, TaskManager, TnReceiver, TnSender};
-use tn_types::{Certificate, Round};
+use tn_types::{
+    AuthorityIdentifier, Certificate, Noticer, Round, TaskManager, TnReceiver, TnSender,
+};
 use tracing::{debug, error, info, warn};
 
 /// Updates Narwhal system state based on certificates received from consensus.

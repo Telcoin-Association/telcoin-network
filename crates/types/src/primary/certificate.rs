@@ -11,7 +11,7 @@ use crate::{
     ensure,
     error::{DagError, DagResult},
     now,
-    serde::NarwhalBitmap,
+    serde::CertificateSignatures,
     AuthorityIdentifier, Committee, Epoch, Header, Round, Stake, TimestampSec, WorkerCache,
 };
 use base64::{engine::general_purpose, Engine};
@@ -33,8 +33,8 @@ pub struct Certificate {
     pub header: Header,
     /// Container for [BlsAggregateSignatureBytes].
     pub signature_verification_state: SignatureVerificationState,
-    /// Signatures of all authorities?
-    #[serde_as(as = "NarwhalBitmap")]
+    /// Signatures of all authorities
+    #[serde_as(as = "CertificateSignatures")]
     signed_authorities: roaring::RoaringBitmap,
     /// Timestamp for certificate creation.
     ///

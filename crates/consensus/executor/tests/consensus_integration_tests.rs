@@ -9,8 +9,7 @@ use tn_primary::{
 };
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{Certificate, TnReceiver, TnSender};
-use tn_types::{TaskManager, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
+use tn_types::{Certificate, TaskManager, TnReceiver, TnSender, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
 
 #[tokio::test]
 async fn test_recovery() {
