@@ -17,7 +17,7 @@ use tn_config::KeyConfig;
 use tn_storage::traits::Database;
 use tn_types::{
     get_available_udp_port, traits::KeyPair, Authority, BlsKeypair, Committee, Epoch, Multiaddr,
-    Stake, WorkerCache, WorkerIndex,
+    Stake, WorkerCache, WorkerIndex, DEFAULT_PRIMARY_PORT, DEFAULT_WORKER_PORT,
 };
 
 pub struct Builder<DB, F, R = OsRng> {
@@ -112,7 +112,7 @@ where
                 KeyConfig::with_primary_random_networks(primary_keypair.copy(), &mut rng);
             let host = "127.0.0.1";
             let port = if self.randomize_ports {
-                get_available_udp_port(host).unwrap_or_default()
+                get_available_udp_port(host).unwrap_or(DEFAULT_WORKER_PORT)
             } else {
                 0
             };
@@ -150,7 +150,7 @@ where
                     self.number_of_workers,
                     |host| {
                         if self.randomize_ports {
-                            get_available_udp_port(host).unwrap_or_default()
+                            get_available_udp_port(host).unwrap_or(DEFAULT_PRIMARY_PORT)
                         } else {
                             0
                         }

@@ -17,6 +17,8 @@ use std::{
     str::FromStr,
 };
 
+use super::DEFAULT_WORKER_PORT;
+
 /// The unique identifier for a worker (per primary).
 ///
 /// Workers communicate with peers of the same `WorkerId`.
@@ -49,7 +51,7 @@ impl Default for WorkerInfo {
             transactions: format!(
                 "/ip4/{}/tcp/{}/http",
                 &host,
-                get_available_tcp_port(&host).unwrap_or_default()
+                get_available_tcp_port(&host).unwrap_or(DEFAULT_WORKER_PORT)
             )
             .parse()
             .expect("multiaddress parsed for worker txs"),

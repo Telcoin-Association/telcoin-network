@@ -331,22 +331,6 @@ where
             )
         });
 
-        // let mut hooks = EngineHooks::new();
-
-        // let static_file_producer = StaticFileProducer::new(
-        //     provider_factory.clone(),
-        //     provider_factory.static_file_provider(),
-        //     prune.node_config.clone().unwrap_or_default().segments,
-        // );
-        // let static_file_producer_events = static_file_producer.lock().events();
-        // hooks.add(StaticFileHook::new(static_file_producer.clone(), Box::new(executor.clone())));
-        // info!(target: "tn::batch_maker", "StaticFileProducer initialized");
-
-        // TODO: adjust instance ports?
-        //
-        //.node_config.adjust_instance_ports();
-        //
-
         // spawn RPC
         let rpc_builder = RpcModuleBuilder::default()
             .with_provider(self.blockchain_db.clone())

@@ -235,8 +235,10 @@ impl Default for NetworkAdminServerParameters {
     fn default() -> Self {
         let host = "127.0.0.1";
         Self {
-            primary_network_admin_server_port: get_available_udp_port(host).unwrap_or_default(),
-            worker_network_admin_server_base_port: get_available_udp_port(host).unwrap_or_default(),
+            primary_network_admin_server_port: get_available_udp_port(host)
+                .expect("udp port is available for primary"),
+            worker_network_admin_server_base_port: get_available_udp_port(host)
+                .expect("udp port is available for worker admin server"),
         }
     }
 }
@@ -322,7 +324,8 @@ impl Default for PrometheusMetricsParameters {
             socket_addr: format!(
                 "/ip4/{}/tcp/{}/http",
                 host,
-                get_available_tcp_port(host).unwrap_or_default()
+                get_available_tcp_port(host)
+                    .expect("os has available TCP port for default prometheus metrics")
             )
             .parse()
             .unwrap(),
