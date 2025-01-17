@@ -61,6 +61,13 @@ where
 
     let mut engine_state = engine.get_provider().await.canonical_state_stream();
     let eng_bus = primary.consensus_bus().await;
+
+    // Prime the recent_blocks watch with latest executed blocks.
+    let block_capacity = eng_bus.recent_blocks().borrow().block_capacity();
+    for recent_block in engine.last_executed_output_blocks(block_capacity).await? {
+        eng_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(recent_block.seal_slow()));
+    }
+
     if tn_executor::subscriber::can_cvv(
         eng_bus.clone(),
         consensus_config.clone(),
@@ -68,15 +75,9 @@ where
     )
     .await
     {
-        eng_bus.node_mode().send_modify(|v| *v = NodeMode::Cvv);
+        eng_bus.node_mode().send_modify(|v| *v = NodeMode::CvvActive);
     } else {
-        eng_bus.node_mode().send_modify(|v| *v = NodeMode::Nvv);
-    }
-
-    // Prime the recent_blocks watch with latest executed blocks.
-    let block_capacity = eng_bus.recent_blocks().borrow().block_capacity();
-    for recent_block in engine.last_executed_output_blocks(block_capacity).await? {
-        eng_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(recent_block.seal_slow()));
+        eng_bus.node_mode().send_modify(|v| *v = NodeMode::CvvInactive);
     }
 
     // Spawn a task to update the consensus bus with new execution blocks as they are produced.
@@ -98,11 +99,11 @@ where
         }
     });
 
-    // start the primary
-    let mut primary_task_manager = primary.start().await?;
-
     // create receiving channel before spawning primary to ensure messages are not lost
     let consensus_output_rx = primary.consensus_bus().await.subscribe_consensus_output();
+
+    // start the primary
+    let mut primary_task_manager = primary.start().await?;
 
     let validator = engine.new_block_validator().await;
     // start the worker

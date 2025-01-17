@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, Ordering},
         Arc,
     },
     time::Duration,
@@ -52,11 +52,11 @@ struct Inner<DB> {
     /// Node config.
     consensus_config: ConsensusConfig<DB>,
     /// Highest round that has been GC'ed.
-    gc_round: AtomicU64,
+    gc_round: AtomicU32,
     /// Highest round of certificate accepted into the certificate store.
-    highest_processed_round: AtomicU64,
+    highest_processed_round: AtomicU32,
     /// Highest round of verfied certificate that has been received.
-    highest_received_round: AtomicU64,
+    highest_received_round: AtomicU32,
     /// Send certificates to be accepted into a separate task that runs
     /// `process_certificates_with_lock()` in a loop.
     /// See comment above `process_certificates_with_lock()` for why this is necessary.
@@ -67,7 +67,7 @@ struct Inner<DB> {
     genesis: HashMap<CertificateDigest, Certificate>,
     /// A background task that synchronizes batches. A tuple of a header and the maximum accepted
     /// age is sent over.
-    tx_batch_tasks: MeteredMpscChannel<(Header, u64)>,
+    tx_batch_tasks: MeteredMpscChannel<(Header, Round)>,
     /// Aggregates certificates to use as parents for new headers.
     certificates_aggregators: Mutex<BTreeMap<Round, Box<CertificatesAggregator>>>,
     /// State for tracking suspended certificates and when they can be accepted.
@@ -711,9 +711,9 @@ impl<DB: Database> Synchronizer<DB> {
 
         let inner = Arc::new(Inner {
             consensus_config,
-            gc_round: AtomicU64::new(gc_round),
-            highest_processed_round: AtomicU64::new(highest_processed_round),
-            highest_received_round: AtomicU64::new(0),
+            gc_round: AtomicU32::new(gc_round),
+            highest_processed_round: AtomicU32::new(highest_processed_round),
+            highest_received_round: AtomicU32::new(0),
             tx_certificate_acceptor,
             consensus_bus: consensus_bus.clone(),
             genesis,
@@ -992,7 +992,7 @@ impl<DB: Database> Synchronizer<DB> {
         const VERIFY_CERTIFICATES_V2_BATCH_SIZE: usize = 50;
         // Number of rounds to force verfication of certificates by signature, to bound the maximum
         // number of certificates with bad signatures in storage.
-        const CERTIFICATE_VERIFICATION_ROUND_INTERVAL: u64 = 50;
+        const CERTIFICATE_VERIFICATION_ROUND_INTERVAL: u32 = 50;
 
         let mut all_digests = HashSet::<CertificateDigest>::new();
         let mut all_parents = HashSet::<CertificateDigest>::new();
@@ -1402,7 +1402,7 @@ impl State {
     fn run_gc_once(
         &mut self,
         gc_round: Round,
-    ) -> Option<((u64, CertificateDigest), Option<SuspendedCertificate>)> {
+    ) -> Option<((Round, CertificateDigest), Option<SuspendedCertificate>)> {
         // Accept suspended certificates at and below gc round because their parents will not
         // be accepted into the DAG store anymore, in sanitize_certificate().
         let ((round, digest), _children) = self.missing.first_key_value()?;

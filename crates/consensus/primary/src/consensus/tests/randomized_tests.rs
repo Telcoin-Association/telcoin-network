@@ -496,7 +496,7 @@ fn generate_and_run_execution_plans<DB: Database>(
         // Now create a new Bullshark engine
         let metrics = Arc::new(ConsensusMetrics::default());
         let mut state = ConsensusState::new(metrics.clone(), gc_depth);
-        const SUB_DAGS_PER_SCHEDULE: u64 = 5;
+        const SUB_DAGS_PER_SCHEDULE: u32 = 5;
         let bad_nodes_stake_threshold = 0;
         let mut bullshark = Bullshark::new(
             committee.clone(),

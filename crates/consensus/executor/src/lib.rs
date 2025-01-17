@@ -10,8 +10,8 @@ use mockall::automock;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_primary::ConsensusBus;
-use tn_storage::{traits::Database, CertificateStore, ConsensusStore};
-use tn_types::{CertificateDigest, CommittedSubDag, ConsensusOutput, Noticer, TaskManager};
+use tn_storage::{traits::Database, ConsensusStore};
+use tn_types::{CommittedSubDag, ConsensusOutput, Noticer, TaskManager};
 use tracing::info;
 
 /// Convenience type representing a serialized transaction.
@@ -56,7 +56,6 @@ impl Executor {
 /// the value passed is the last fully-executed subdag index.
 pub async fn get_restored_consensus_output<DB: Database>(
     consensus_store: Arc<ConsensusStore<DB>>,
-    certificate_store: CertificateStore<DB>,
     last_executed_sub_dag_index: u64,
 ) -> Result<Vec<CommittedSubDag>, SubscriberError> {
     let restore_sub_dag_index_from = last_executed_sub_dag_index + 1;
@@ -66,14 +65,7 @@ pub async fn get_restored_consensus_output<DB: Database>(
 
     let mut sub_dags = Vec::new();
     for compressed_sub_dag in compressed_sub_dags {
-        let certificate_digests: Vec<CertificateDigest> = compressed_sub_dag.certificates();
-
-        let certificates =
-            certificate_store.read_all(certificate_digests)?.into_iter().flatten().collect();
-
-        let leader = certificate_store.read(compressed_sub_dag.leader())?.unwrap();
-
-        sub_dags.push(CommittedSubDag::from_commit(compressed_sub_dag, certificates, leader));
+        sub_dags.push(compressed_sub_dag);
     }
 
     Ok(sub_dags)

@@ -8,6 +8,7 @@ use crate::{
 };
 use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
 use std::sync::Arc;
+use tn_config::Parameters;
 use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
 use tn_types::{
     Certificate, CommittedSubDag, ConsensusOutput, Header, Round, TnSender, CHANNEL_CAPACITY,
@@ -19,14 +20,30 @@ use tokio::sync::{broadcast, watch};
 pub enum NodeMode {
     /// This is a full CVV that can participate in consensus.
     #[default]
-    Cvv,
+    CvvActive,
     /// This node can only follow consensus via consensus output.
-    Nvv,
+    /// It is staked and can be a CVV but is either currently not in the
+    /// committee or is "catching up" to participate after a failure.
+    CvvInactive,
+    /// Node that is following consensus output but is not staked and will never
+    /// join a committee.
+    Observer,
 }
 
 impl NodeMode {
+    /// True if this node is an active CVV.
+    pub fn is_active_cvv(&self) -> bool {
+        matches!(self, NodeMode::CvvActive)
+    }
+
+    /// True if this node is a CVV (i.e. staked and able to participate in a committee).
     pub fn is_cvv(&self) -> bool {
-        matches!(self, NodeMode::Cvv)
+        matches!(self, NodeMode::CvvActive | NodeMode::CvvInactive)
+    }
+
+    /// True if this node is only an obsever and will never participate in an committee.
+    pub fn is_observer(&self) -> bool {
+        matches!(self, NodeMode::Observer)
     }
 }
 
@@ -108,7 +125,19 @@ impl Default for ConsensusBus {
 /// tests). This allows us to not create and pass channels all over the place add-hoc.
 /// It also allows makes it much easier to find where channels are fed and consumed.
 impl ConsensusBus {
+    /// Create a new consensus bus.
     pub fn new() -> Self {
+        // Using default GC depth for blocks to keep in memory.  This should
+        // allow for twice the blocks as would be needed for a margin of safety
+        // (some testing liked this).  Using the default to not overly complicate
+        // creation of the bus.
+        // This is basically for testing.
+        Self::new_with_recent_blocks(Parameters::default_gc_depth())
+    }
+
+    /// Create a new consensus bus.
+    /// Store recent_blocks number of the last generated execution blocks.
+    pub fn new_with_recent_blocks(recent_blocks: u32) -> Self {
         let consensus_metrics = Arc::new(ConsensusMetrics::default());
         let primary_metrics = Arc::new(Metrics::default()); // Initialize the metrics
         let channel_metrics = Arc::new(ChannelMetrics::default());
@@ -152,8 +181,10 @@ impl ConsensusBus {
             &primary_metrics.primary_channel_metrics.tx_committed_own_headers_total,
         );
 
-        let (tx_narwhal_round_updates, _rx_narwhal_round_updates) = watch::channel(0u64);
-        let (tx_recent_blocks, _rx_recent_blocks) = watch::channel(RecentBlocks::new(3));
+        let (tx_narwhal_round_updates, _rx_narwhal_round_updates) = watch::channel(0u32);
+
+        let (tx_recent_blocks, _rx_recent_blocks) =
+            watch::channel(RecentBlocks::new(recent_blocks as usize));
         let (tx_sync_status, _rx_sync_status) = watch::channel(NodeMode::default());
 
         let sequence =
@@ -230,7 +261,7 @@ impl ConsensusBus {
     }
 
     /// Signals a new narwhal round
-    pub fn narwhal_round_updates(&self) -> &watch::Sender<u64> {
+    pub fn narwhal_round_updates(&self) -> &watch::Sender<Round> {
         &self.inner.tx_narwhal_round_updates
     }
 

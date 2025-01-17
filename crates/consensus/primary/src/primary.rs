@@ -283,7 +283,7 @@ impl<DB: Database> Primary<DB> {
             .config(anemo_config.clone())
             .outbound_request_layer(outbound_layer.clone())
             .start(service.clone())
-            .expect("primary network bind");
+            .unwrap_or_else(|_| panic!("primary network bind: {addr}"));
 
         info!("Primary {} listening on {}", config.authority().id(), address);
         network

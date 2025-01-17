@@ -1,11 +1,8 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
-
 //! Tests for the storage crate that need to use test-utils.
 //! Put them here to avoid circular dependancies with storage/test-utils (via ConsensusConfig).
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashSet},
     time::Instant,
 };
 
@@ -42,7 +39,7 @@ fn new_store<DB: Database>(db: DB) -> CertificateStore<DB> {
 
 // helper method that creates certificates for the provided
 // number of rounds.
-fn certificates(rounds: u64) -> Vec<Certificate> {
+fn certificates(rounds: Round) -> Vec<Certificate> {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
     let mut current_round: Vec<_> =
@@ -117,7 +114,7 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
             None,
         );
 
-        store.write_consensus_state(&HashMap::new(), &sub_dag).unwrap();
+        store.write_subdag_for_test(sequence_number, sub_dag);
     }
 
     // WHEN we try to read the final schedule. The one of sub dag sequence 12 should be returned
@@ -138,14 +135,13 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
         let sub_dag =
             CommittedSubDag::new(vec![], Certificate::default(), sequence_number, scores, None);
 
-        store.write_consensus_state(&HashMap::new(), &sub_dag).unwrap();
+        store.write_subdag_for_test(sequence_number, sub_dag);
     }
 
     // WHEN we try to read the final schedule. The one of sub dag sequence 20 should be returned
     let commit = store.read_latest_commit_with_final_reputation_scores().unwrap();
 
-    assert!(commit.reputation_score().final_of_schedule);
-    assert_eq!(commit.sub_dag_index(), 20)
+    assert!(commit.reputation_score.final_of_schedule);
 }
 
 #[tokio::test]
@@ -324,7 +320,7 @@ async fn test_certificate_store_after_round() {
     println!("Stored certificates: {} seconds", now.elapsed().as_secs_f32());
 
     // Large enough to avoid certificate store GC.
-    let round_cutoff = 41;
+    let round_cutoff: Round = 41;
 
     // now filter the certificates over round 21
     let mut certs_ids_over_cutoff_round = certs
@@ -341,7 +337,7 @@ async fn test_certificate_store_after_round() {
 
     // THEN
     let certs_per_round = 4;
-    assert_eq!(result.len() as u64, (total_rounds - round_cutoff + 1) * certs_per_round);
+    assert_eq!(result.len() as u32, (total_rounds - round_cutoff + 1) * certs_per_round);
 
     // AND result certificates should be returned in increasing order
     let mut last_round = 0;

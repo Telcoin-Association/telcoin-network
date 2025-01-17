@@ -19,7 +19,8 @@ use std::{
 };
 
 /// The epoch number.
-pub type Epoch = u64;
+/// Becomes the upper 32 bits of a nonce (with rounds the low bits).
+pub type Epoch = u32;
 
 // TODO: This actually represents voting power (out of 10,000) and not amount staked.
 // Consider renaming to `VotingPower`.

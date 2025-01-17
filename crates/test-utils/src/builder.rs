@@ -1,7 +1,5 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
-
 //! The builder responsible for creating all aspects of the committee fixture.
+
 use super::{AuthorityFixture, CommitteeFixture};
 use rand::{
     rngs::{OsRng, StdRng},

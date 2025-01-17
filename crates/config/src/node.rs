@@ -151,7 +151,7 @@ pub struct Parameters {
 
     /// The depth of the garbage collection (Denominated in number of rounds).
     #[serde(default = "Parameters::default_gc_depth")]
-    pub gc_depth: u64,
+    pub gc_depth: u32,
     /// The delay after which the synchronizer retries to send sync requests. Denominated in ms.
     #[serde(with = "humantime_serde", default = "Parameters::default_sync_retry_delay")]
     pub sync_retry_delay: Duration,
@@ -197,7 +197,7 @@ impl Parameters {
         Duration::from_secs(5)
     }
 
-    fn default_gc_depth() -> u64 {
+    pub fn default_gc_depth() -> u32 {
         50
     }
 

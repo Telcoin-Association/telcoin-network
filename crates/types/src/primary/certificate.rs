@@ -240,6 +240,11 @@ impl Certificate {
         self.header.epoch()
     }
 
+    /// The nonce this certificate.
+    pub fn nonce(&self) -> u64 {
+        self.header.nonce()
+    }
+
     /// The author of the certificate.
     pub fn origin(&self) -> AuthorityIdentifier {
         self.header.author()

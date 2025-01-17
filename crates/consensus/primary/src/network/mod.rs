@@ -132,8 +132,10 @@ impl<DB: Database> PrimaryReceiverHandler<DB> {
         let mut latest_block_num =
             self.consensus_bus.recent_blocks().borrow().latest_block_num_hash();
         // Make sure we are within a few blocks of this headers block number.
+        // Using half the GC window should roughly cover the blocks from the current window.
+        let allowed_previous_blocks = self.consensus_config.config().parameters.gc_depth as u64 / 2;
         ensure!(
-            header.latest_execution_block_num <= latest_block_num.number + 3,
+            header.latest_execution_block_num <= latest_block_num.number + allowed_previous_blocks,
             DagError::NetworkError(format!(
                 "Header latest execution block {}/{} is too far ahead of us, we are at block {}",
                 header.latest_execution_block_num,
@@ -153,7 +155,7 @@ impl<DB: Database> PrimaryReceiverHandler<DB> {
                 .recent_blocks()
                 .borrow()
                 .contains_hash(header.latest_execution_block),
-            // Note, errors are currently "flattened" bus if/when we return better errors may want
+            // Note, errors are currently "flattened" but if/when we return better errors may want
             // to make this specific in case we want to take action on this (i.e. are
             // we on our own fork?).
             DagError::NetworkError(format!(

@@ -1,6 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
-
 //! Authority fixture for the cluster
 
 use crate::{

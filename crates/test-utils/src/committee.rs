@@ -1,17 +1,12 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Committe fixture for all authorities and their workers within a committee for a specific epoch.
+
+use super::{AuthorityFixture, Builder};
 use crate::fixture_batch_with_transactions;
+use std::collections::BTreeSet;
 use tn_storage::traits::Database;
 use tn_types::{
     Certificate, CertificateDigest, Committee, Header, HeaderBuilder, Round, Vote, WorkerCache,
 };
-
-use super::{AuthorityFixture, Builder};
-use std::collections::BTreeSet;
 
 /// Fixture representing a committee to reach consensus.
 ///

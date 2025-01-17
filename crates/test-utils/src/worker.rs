@@ -1,9 +1,6 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
-
 //! Worker fixture for the cluster
 
-use crate::temp_dir;
+use crate::{temp_dir, TestExecutionNode};
 use anemo::Network;
 use fastcrypto::traits::KeyPair as _;
 use std::path::PathBuf;
@@ -12,8 +9,6 @@ use tn_node::worker::WorkerNode;
 use tn_storage::traits::Database;
 use tn_types::{AuthorityIdentifier, Multiaddr, NetworkKeypair, WorkerId, WorkerInfo};
 use tracing::info;
-
-use crate::TestExecutionNode;
 
 #[derive(Clone)]
 pub struct WorkerNodeDetails<DB> {

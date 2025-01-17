@@ -1,7 +1,5 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
-
 //! Primary fixture for the cluster
+
 use anemo::Network;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;

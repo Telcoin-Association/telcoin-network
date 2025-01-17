@@ -85,6 +85,7 @@ jsonrpsee = { workspace = true }
 k256 = "0.13.3"
 tn-test-utils = { workspace = true }
 tonic = { workspace = true }
+nix = { version = "0.29", features = ["signal"] }
 
 [features]
 default = []

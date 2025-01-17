@@ -1,7 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 use rocksdb::Error as RocksError;
 use serde::{Deserialize, Serialize};
 use std::{fmt, fmt::Display};

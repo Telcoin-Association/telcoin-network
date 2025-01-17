@@ -1,8 +1,5 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Cluster fixture to represent a local network.
+
 use crate::{authority::AuthorityDetails, default_test_execution_node, CommitteeFixture};
 use itertools::Itertools;
 use std::{collections::HashMap, time::Duration};

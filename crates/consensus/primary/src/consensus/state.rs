@@ -2,7 +2,7 @@
 
 use crate::{
     consensus::{bullshark::Bullshark, utils::gc_round, ConsensusError, ConsensusMetrics},
-    ConsensusBus,
+    ConsensusBus, NodeMode,
 };
 use consensus_metrics::monitored_future;
 use fastcrypto::hash::Hash;
@@ -15,8 +15,8 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_storage::{traits::Database, CertificateStore};
 use tn_types::{
-    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Committee,
-    ConsensusCommit, Noticer, Round, SequenceNumber, TaskManager, Timestamp, TnReceiver, TnSender,
+    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Committee, Noticer,
+    Round, TaskManager, Timestamp, TnReceiver, TnSender,
 };
 use tracing::{debug, info, instrument};
 
@@ -47,6 +47,7 @@ pub struct ConsensusState {
 }
 
 impl ConsensusState {
+    /// Create a new empty ConsensusState.  Used for tests.
     pub fn new(metrics: Arc<ConsensusMetrics>, gc_depth: Round) -> Self {
         Self {
             last_round: ConsensusRound::default(),
@@ -63,7 +64,7 @@ impl ConsensusState {
         last_committed_round: Round,
         gc_depth: Round,
         recovered_last_committed: HashMap<AuthorityIdentifier, Round>,
-        latest_sub_dag: Option<ConsensusCommit>,
+        latest_sub_dag: Option<CommittedSubDag>,
         cert_store: CertificateStore<DB>,
     ) -> Self {
         let last_round = ConsensusRound::new_with_gc_depth(last_committed_round, gc_depth);
@@ -78,25 +79,10 @@ impl ConsensusState {
 
         let last_committed_sub_dag = if let Some(latest_sub_dag) = latest_sub_dag.as_ref() {
             let mut certificates = Vec::new();
-            let mut missing_certs = false;
-            for cert in latest_sub_dag.certificates() {
-                if let Ok(Some(c)) = cert_store.read(cert) {
-                    certificates.push(c);
-                } else {
-                    missing_certs = true;
-                }
+            for cert in &latest_sub_dag.certificates {
+                certificates.push(cert.clone());
             }
-
-            if missing_certs {
-                None
-            } else {
-                cert_store
-                    .read(latest_sub_dag.leader())
-                    .expect("failed to access the certificate store!")
-                    .map(|leader| {
-                        CommittedSubDag::from_commit(latest_sub_dag.clone(), certificates, leader)
-                    })
-            }
+            Some(latest_sub_dag.clone())
         } else {
             None
         };
@@ -154,7 +140,7 @@ impl ConsensusState {
         certificate: &Certificate,
     ) -> Result<bool, ConsensusError> {
         if certificate.round() <= gc_round {
-            debug!(
+            debug!(target: "telcoin::consensus_state",
                 "Ignoring certificate {:?} as it is at or before gc round {}",
                 certificate, gc_round
             );
@@ -200,7 +186,7 @@ impl ConsensusState {
             .observe(certificate.created_at().elapsed().as_secs_f64());
 
         // NOTE: This log entry is used to compute performance.
-        tracing::debug!(
+        tracing::debug!(target: "telcoin::consensus_state",
             "Certificate {:?} took {} seconds to be committed at round {}",
             certificate.digest(),
             elapsed,
@@ -228,13 +214,8 @@ impl ConsensusState {
                 }
             }
         } else {
-            tracing::error!("Parent round not found in DAG for {certificate:?}!");
+            tracing::error!(target: "telcoin::consensus_state", "Parent round not found in DAG for {certificate:?}!");
         }
-    }
-
-    /// Provides the next index to be used for the next produced sub dag
-    pub fn next_sub_dag_index(&self) -> SequenceNumber {
-        self.last_committed_sub_dag.as_ref().map(|s| s.sub_dag_index).unwrap_or_default() + 1
     }
 }
 
@@ -351,78 +332,117 @@ impl<DB: Database> Consensus<DB> {
         match self.run_inner().await {
             Ok(_) => {}
             Err(err @ ConsensusError::ShuttingDown) => {
-                debug!("{:?}", err)
+                debug!(target: "telcoin::consensus_state", "{:?}", err)
             }
             Err(err) => panic!("Failed to run consensus: {:?}", err),
         }
     }
 
     async fn run_inner(mut self) -> Result<(), ConsensusError> {
+        // Clone the bus or the borrow checker will yell at us...
+        let bus_clone = self.consensus_bus.clone();
+        let mut rx_new_certificates = bus_clone.new_certificates().subscribe();
         // Listen to incoming certificates.
-        let mut rx_new_certificates = self.consensus_bus.new_certificates().subscribe();
-        'main: loop {
+        loop {
             tokio::select! {
-
                 _ = &self.rx_shutdown => {
                     return Ok(())
                 }
 
                 Some(certificate) = rx_new_certificates.recv() => {
-                    match certificate.epoch().cmp(&self.committee.epoch()) {
-                        Ordering::Equal => {
-                            // we can proceed.
-                        }
-                        _ => {
-                            tracing::debug!("Already moved to the next epoch");
-                            continue 'main;
-                        }
-                    }
-
-                    // Process the certificate using the selected consensus protocol.
-                    let (_, committed_sub_dags) = self.protocol.process_certificate(&mut self.state, certificate)?;
-
-                    // We extract a list of headers from this specific validator that
-                    // have been agreed upon, and signal this back to the narwhal sub-system
-                    // to be used to re-send batches that have not made it to a commit.
-                    let mut committed_certificates = Vec::new();
-
-                    // Output the sequence in the right order.
-                    for committed_sub_dag in committed_sub_dags {
-                         tracing::debug!("Commit in Sequence {:?}", committed_sub_dag.sub_dag_index);
-
-                        for certificate in &committed_sub_dag.certificates {
-                            committed_certificates.push(certificate.clone());
-                        }
-
-                        // Don't send a committed sub dag if we are syncing- the sync process should take care of this.
-                            // NOTE: The size of the sub-dag can be arbitrarily large (depending on the network condition
-                            // and Byzantine leaders).
-                            self.consensus_bus.sequence().send(committed_sub_dag).await.map_err(|_|ConsensusError::ShuttingDown)?;
-                    }
-
-                    if !committed_certificates.is_empty(){
-                        // Highest committed certificate round is the leader round / commit round
-                        // expected by primary.
-                        let leader_commit_round = committed_certificates.iter().map(|c| c.round()).max().unwrap();
-
-                        self.consensus_bus.committed_certificates()
-                            .send((leader_commit_round, committed_certificates))
-                            .await
-                            .map_err(|_|ConsensusError::ShuttingDown)?;
-
-                        assert_eq!(self.state.last_round.committed_round, leader_commit_round);
-
-                            self.consensus_bus.consensus_round_updates().send(self.state.last_round)
-                                .map_err(|_|ConsensusError::ShuttingDown)?;
-                    }
-
-                    self.metrics
-                        .consensus_dag_rounds
-                        .with_label_values(&[])
-                        .set(self.state.dag.len() as i64);
+                    self.new_certificate(certificate).await?;
                 },
-
             }
         }
+    }
+
+    /// Process a new certificate.
+    async fn new_certificate(&mut self, certificate: Certificate) -> Result<(), ConsensusError> {
+        match certificate.epoch().cmp(&self.committee.epoch()) {
+            Ordering::Equal => {
+                // we can proceed.
+            }
+            _ => {
+                tracing::debug!(target: "telcoin::consensus_state", "Already moved to the next epoch");
+                return Ok(());
+            }
+        }
+        let mut rx_recent_blocks = self.consensus_bus.recent_blocks().subscribe();
+        // Process the certificate using the selected consensus protocol.
+        let (_, committed_sub_dags) =
+            self.protocol.process_certificate(&mut self.state, certificate)?;
+        if self.consensus_bus.node_mode().borrow().is_active_cvv() {
+            // We extract a list of headers from this specific validator that
+            // have been agreed upon, and signal this back to the narwhal sub-system
+            // to be used to re-send batches that have not made it to a commit.
+            let mut committed_certificates = Vec::new();
+
+            // Output the sequence in the right order.
+            for committed_sub_dag in committed_sub_dags {
+                // We need to make sure execution has caught up so we can verify we have not forked.
+                // This will force the follow function to not outrun execution...  this is probably
+                // fine. Also once we can follow gossiped consensus output this will not really be
+                // an issue (except during initial catch up).
+                let base_execution_block_num =
+                    committed_sub_dag.leader.header.latest_execution_block_num;
+                let mut latest_exec_block_num =
+                    self.consensus_bus.recent_blocks().borrow().latest_block_num_hash();
+                while base_execution_block_num > latest_exec_block_num.number {
+                    rx_recent_blocks.changed().await.map_err(|_e| {
+                        // Lost the channel should be shutting down.
+                        ConsensusError::ShuttingDown
+                    })?;
+                    latest_exec_block_num =
+                        self.consensus_bus.recent_blocks().borrow().latest_block_num_hash();
+                }
+                let base_execution_block = committed_sub_dag.leader.header.latest_execution_block;
+                if !self.consensus_bus.recent_blocks().borrow().contains_hash(base_execution_block)
+                {
+                    // This seems to be a bogus sub dag, we are out of sync...
+                    tracing::error!(target: "telcoin::consensus_state", "Got a bogus sub dag from bullshark, we are out of sync!");
+                    self.consensus_bus.node_mode().send_modify(|v| *v = NodeMode::CvvInactive);
+                    break;
+                }
+                tracing::debug!(target: "telcoin::consensus_state", "Commit in Sequence {:?}", committed_sub_dag.leader.nonce());
+
+                for certificate in &committed_sub_dag.certificates {
+                    committed_certificates.push(certificate.clone());
+                }
+
+                // NOTE: The size of the sub-dag can be arbitrarily large (depending on the network
+                // condition and Byzantine leaders).
+                self.consensus_bus
+                    .sequence()
+                    .send(committed_sub_dag)
+                    .await
+                    .map_err(|_| ConsensusError::ShuttingDown)?;
+            }
+
+            if !committed_certificates.is_empty() {
+                // Highest committed certificate round is the leader round / commit round
+                // expected by primary.
+                let leader_commit_round =
+                    committed_certificates.iter().map(|c| c.round()).max().unwrap();
+
+                self.consensus_bus
+                    .committed_certificates()
+                    .send((leader_commit_round, committed_certificates))
+                    .await
+                    .map_err(|_| ConsensusError::ShuttingDown)?;
+
+                assert_eq!(self.state.last_round.committed_round, leader_commit_round);
+
+                self.consensus_bus
+                    .consensus_round_updates()
+                    .send(self.state.last_round)
+                    .map_err(|_| ConsensusError::ShuttingDown)?;
+            }
+
+            self.metrics
+                .consensus_dag_rounds
+                .with_label_values(&[])
+                .set(self.state.dag.len() as i64);
+        }
+        Ok(())
     }
 }

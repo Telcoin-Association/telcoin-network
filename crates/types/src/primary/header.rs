@@ -218,6 +218,11 @@ impl Header {
     pub fn latest_execution_block_num_hash(&self) -> BlockNumHash {
         BlockNumHash { hash: self.latest_execution_block, number: self.latest_execution_block_num }
     }
+
+    /// The nonce this header.
+    pub fn nonce(&self) -> u64 {
+        (self.epoch as u64) << 32 | self.round as u64
+    }
 }
 
 impl From<Header> for CertificateDigest {

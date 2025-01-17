@@ -30,7 +30,8 @@ pub use vote::*;
 pub const DEFAULT_BAD_NODES_STAKE_THRESHOLD: u64 = 0;
 
 /// The round number.
-pub type Round = u64;
+/// Becomes the lower 32 bits of a nonce (with epoch the high bits).
+pub type Round = u32;
 
 /// The epoch UNIX timestamp in seconds.
 pub type TimestampSec = u64;

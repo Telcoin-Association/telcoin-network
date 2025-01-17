@@ -392,7 +392,8 @@ impl<DB: Database> Proposer<DB> {
         // NOTE: committee size is asserted >1 during Committee::load()
         if (next_round % 2 == 0
             && self.leader_schedule.leader(next_round).id() == self.authority_id)
-            || (next_round % 2 != 0 && self.committee.leader(next_round).id() == self.authority_id)
+            || (next_round % 2 != 0
+                && self.committee.leader(next_round as u64).id() == self.authority_id)
         {
             Duration::ZERO
         } else {
@@ -828,6 +829,13 @@ where
             if pin!(&this.rx_shutdown).poll(cx).is_ready() {
                 warn!(target: "primary::proposer", authority=?this.authority_id, round=this.round, "received shutdown signal...");
                 return Poll::Ready(Ok(()));
+            }
+
+            if !this.consensus_bus.node_mode().borrow().is_active_cvv() {
+                // TODO Note this will need to become smarter...
+                // We will not be able to go back to active mode since only shutdown polled.
+                // Fixing this ASAP.
+                return Poll::Pending;
             }
 
             // check for new digests from workers and send ack back to worker

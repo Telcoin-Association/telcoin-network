@@ -1,6 +1,7 @@
 //! IT tests
 
 use fastcrypto::hash::Hash;
+use reth_primitives::{Header, B256};
 use std::{collections::BTreeSet, sync::Arc};
 use tn_executor::get_restored_consensus_output;
 use tn_primary::{
@@ -34,7 +35,7 @@ async fn test_recovery() {
     let (_, certificate) = tn_test_utils::mock_certificate(&committee, ids[1], 5, next_parents);
     certificates.push_back(certificate);
 
-    const NUM_SUB_DAGS_PER_SCHEDULE: u64 = 100;
+    const NUM_SUB_DAGS_PER_SCHEDULE: u32 = 100;
     let metrics = Arc::new(ConsensusMetrics::default());
     let bullshark = Bullshark::new(
         committee.clone(),
@@ -48,8 +49,10 @@ async fn test_recovery() {
     let cb = ConsensusBus::new();
     let cb_clone = cb.clone();
     let mut rx_output = cb.sequence().subscribe();
+    let dummy_parent = Header::default().seal(B256::default());
+    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     // pretend we are synced and ready to go so test can run...
-    cb.node_mode().send(tn_primary::NodeMode::Cvv).unwrap();
+    cb.node_mode().send(tn_primary::NodeMode::CvvActive).unwrap();
     Consensus::spawn(config_1, &cb, bullshark, &TaskManager::default());
     tokio::spawn(async move {
         let mut rx_primary = cb_clone.committed_certificates().subscribe();
@@ -68,7 +71,8 @@ async fn test_recovery() {
     let expected_committed_sub_dags = 2;
     for i in 1..=expected_committed_sub_dags {
         let sub_dag = rx_output.recv().await.unwrap();
-        assert_eq!(sub_dag.sub_dag_index, i);
+        assert_eq!(sub_dag.leader.round(), i * 2);
+        consensus_store.write_subdag_for_test(i as u64 * 2, sub_dag);
     }
 
     // Now assume that we want to recover from a crash. We are testing all the recovery cases
@@ -76,9 +80,9 @@ async fn test_recovery() {
     for last_executed_certificate_index in 0..=expected_committed_sub_dags {
         let consensus_output = get_restored_consensus_output(
             consensus_store.clone(),
-            certificate_store.clone(),
-            // &execution_state,
-            last_executed_certificate_index,
+            last_executed_certificate_index as u64 * 2, /* Note when we have more that epoc 0
+                                                         * this
+                                                         * may break... */
         )
         .await
         .expect("consensus output is restored from storage");

@@ -1,7 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 use rocksdb::{CompactionDecision, MergeOperands};
 use std::cmp::Ordering;
 

@@ -1,16 +1,18 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
-use rocksdb::{properties, AsColumnFamilyRef, Transaction};
-use tn_types::{decode, encode, encode_key};
-
+use super::{
+    default_db_options,
+    iter::Iter,
+    metrics::{DBMetrics, RocksDBPerfContext, SamplingInterval},
+    open_cf_opts_transactional, MetricConf, ReadWriteOptions, METRICS_ERROR,
+    ROCKSDB_PROPERTY_TOTAL_BLOB_FILES_SIZE,
+};
 use crate::{
     rocks::CF_METRICS_REPORT_PERIOD_MILLIS,
     traits::{DBIter, Database, DbTx, DbTxMut, Table},
     BATCHES_CF, CERTIFICATES_CF, CERTIFICATE_DIGEST_BY_ORIGIN_CF, CERTIFICATE_DIGEST_BY_ROUND_CF,
-    COMMITTED_SUB_DAG_INDEX_CF, LAST_COMMITTED_CF, LAST_PROPOSED_CF, PAYLOAD_CF, VOTES_CF,
+    CONSENSUS_BLOCK_CF, CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF, LAST_PROPOSED_CF, PAYLOAD_CF,
+    VOTES_CF,
 };
+use rocksdb::{properties, AsColumnFamilyRef, Transaction};
 use std::{
     fmt::Debug,
     path::Path,
@@ -20,14 +22,7 @@ use std::{
     },
     time::Duration,
 };
-
-use super::{
-    default_db_options,
-    iter::Iter,
-    metrics::{DBMetrics, RocksDBPerfContext, SamplingInterval},
-    open_cf_opts_transactional, MetricConf, ReadWriteOptions, METRICS_ERROR,
-    ROCKSDB_PROPERTY_TOTAL_BLOB_FILES_SIZE,
-};
+use tn_types::{decode, encode, encode_key};
 
 pub struct RocksDbTxMut<'txn> {
     db: RocksDatabase,
@@ -208,8 +203,8 @@ impl RocksDatabase {
                     .optimize_for_large_values_no_scan(1 << 10)
                     .options,
             ),
-            (LAST_COMMITTED_CF, cf_options.clone()),
-            (COMMITTED_SUB_DAG_INDEX_CF, cf_options),
+            (CONSENSUS_BLOCK_CF, cf_options.clone()),
+            (CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF, cf_options),
         ];
         let rocksdb = open_cf_opts_transactional(
             path,

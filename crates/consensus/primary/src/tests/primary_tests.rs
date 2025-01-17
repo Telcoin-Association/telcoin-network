@@ -868,7 +868,7 @@ async fn test_fetch_certificates_handler() {
     // Each test case contains (lower bound round, skip rounds, max items, expected output).
     let test_cases = vec![
         (0, vec![vec![], vec![], vec![], vec![]], 20, vec![1, 1, 1, 1, 2, 2, 2, 3, 3, 4]),
-        (0, vec![vec![1u64], vec![1], vec![], vec![]], 20, vec![1, 1, 2, 2, 2, 3, 3, 4]),
+        (0, vec![vec![1u32], vec![1], vec![], vec![]], 20, vec![1, 1, 2, 2, 2, 3, 3, 4]),
         (0, vec![vec![], vec![], vec![1], vec![1]], 20, vec![1, 1, 2, 2, 2, 3, 3, 4]),
         (1, vec![vec![], vec![], vec![2], vec![2]], 4, vec![2, 3, 3, 4]),
         (1, vec![vec![], vec![], vec![2], vec![2]], 2, vec![2, 3]),

@@ -1,7 +1,6 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
-
 //! Helper methods for creating useful structs during tests.
+
+use crate::execution::TransactionFactory;
 use fastcrypto::{hash::Hash, traits::KeyPair as _};
 use indexmap::IndexMap;
 use rand::{
@@ -21,8 +20,6 @@ use tn_types::{
     Certificate, CertificateDigest, Committee, Epoch, HeaderBuilder, Multiaddr, NetworkKeypair,
     ProtocolSignature, Round, Stake, TimestampSec, WorkerBlock, WorkerId,
 };
-
-use crate::execution::TransactionFactory;
 
 pub const VOTES_CF: &str = "votes";
 pub const HEADERS_CF: &str = "headers";
