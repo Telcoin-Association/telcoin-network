@@ -46,7 +46,6 @@ struct AuthorityDetailsInternal<DB> {
     execution: TestExecutionNode,
 }
 
-#[allow(clippy::arc_with_non_send_sync, clippy::too_many_arguments)]
 impl<DB: Database> AuthorityDetails<DB> {
     pub fn new(
         id: usize,

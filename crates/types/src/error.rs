@@ -1,7 +1,5 @@
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Error types whenn validating types during consensus.
+
 use crate::{
     crypto, CertificateDigest, Epoch, HeaderDigest, Round, TimestampSec, VoteDigest, WorkerId,
 };

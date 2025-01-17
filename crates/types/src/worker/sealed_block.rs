@@ -1,11 +1,7 @@
-// Copyright (c) Telcoin, LLC
-
 //! Block implementation for consensus.
 //!
 //! Blocks hold transactions and other data. This type is used to represent worker proposals that
 //! have reached quorum.
-
-use std::fmt::Debug;
 
 use crate::{adiri_chain_spec, crypto, encode, now, TimestampSec};
 use fastcrypto::hash::HashFunction;
@@ -13,6 +9,7 @@ use reth_primitives::{
     constants::MIN_PROTOCOL_BASE_FEE, Address, BlockHash, Header, SealedBlock, TransactionSigned,
 };
 use serde::{Deserialize, Serialize};
+use std::fmt::Debug;
 use thiserror::Error;
 use tokio::sync::oneshot;
 

@@ -1,3 +1,9 @@
+use crate::{
+    crypto, encode,
+    error::{DagError, DagResult},
+    now, AuthorityIdentifier, CertificateDigest, Committee, Epoch, Round, TimestampSec, VoteDigest,
+    WorkerBlock, WorkerCache, WorkerId,
+};
 use alloy_rlp::MaxEncodedLenAssoc;
 use base64::{engine::general_purpose, Engine};
 use derive_builder::Builder;
@@ -9,13 +15,6 @@ use reth_primitives::{BlockHash, BlockNumber};
 use reth_rpc_types::BlockNumHash;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt};
-
-use crate::{
-    crypto, encode,
-    error::{DagError, DagResult},
-    now, AuthorityIdentifier, CertificateDigest, Committee, Epoch, Round, TimestampSec, VoteDigest,
-    WorkerBlock, WorkerCache, WorkerId,
-};
 
 /// Messages generated internally by Narwhal that are included in headers for sequencing.
 #[allow(clippy::large_enum_variant)]

@@ -1,4 +1,5 @@
 //! Worker peer information.
+
 use crate::{
     crypto::{BlsPublicKey, NetworkPublicKey},
     error::ConfigError,

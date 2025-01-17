@@ -1,11 +1,12 @@
+//! Notify subscribers - useful for shutdown.
+
+use parking_lot::Mutex;
 use std::{
     future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, Waker},
 };
-
-use parking_lot::Mutex;
 
 /// A Noticer is a future that will resolve when the Notifier it is subscribed to is notified.
 /// Used for simple notification schemes (like shutdown signals).
@@ -92,11 +93,9 @@ impl Future for &Noticer {
 
 #[cfg(test)]
 mod test {
-    use std::{sync::Arc, time::Duration};
-
-    use parking_lot::Mutex;
-
     use crate::Notifier;
+    use parking_lot::Mutex;
+    use std::{sync::Arc, time::Duration};
 
     #[tokio::test]
     async fn test_notifier() {

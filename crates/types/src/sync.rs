@@ -1,6 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
-
 //! Provide abstractions over sync chanel code.
 //! This will allow us to insulate from specific implementations and more easily swap
 //! as needed (for instance moving from MPSC to Broadcast).
@@ -11,7 +8,6 @@ use std::{
     future::Future,
     task::{Context, Poll},
 };
-
 use tokio::sync::{broadcast, mpsc};
 
 /// The default channel capacity for each channel.

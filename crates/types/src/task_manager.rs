@@ -1,6 +1,7 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
+//! Task manager interface to spawn tasks to the tokio runtime.
 
+use crate::Notifier;
+use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use std::{
     fmt::{Debug, Display},
     future::Future,
@@ -8,14 +9,10 @@ use std::{
     task::Poll,
     time::Duration,
 };
-
-use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::{
     sync::mpsc,
     task::{JoinError, JoinHandle},
 };
-
-use crate::Notifier;
 
 /// Used for the futures that will resolve when tasks do.
 /// Allows us to hold a FuturesUnordered in directly in the TaskManager struct.
