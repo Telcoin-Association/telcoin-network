@@ -11,8 +11,8 @@ use std::{
     time::Duration,
 };
 use tn_types::{
-    adiri_genesis, get_available_tcp_port, BlsPublicKey, BlsSignature, Multiaddr, NetworkPublicKey,
-    WorkerIndex,
+    adiri_genesis, get_available_tcp_port, get_available_udp_port, BlsPublicKey, BlsSignature,
+    Multiaddr, NetworkPublicKey, WorkerIndex,
 };
 use tracing::info;
 
@@ -235,8 +235,8 @@ impl Default for NetworkAdminServerParameters {
     fn default() -> Self {
         let host = "127.0.0.1";
         Self {
-            primary_network_admin_server_port: get_available_tcp_port(host).unwrap_or_default(),
-            worker_network_admin_server_base_port: get_available_tcp_port(host).unwrap_or_default(),
+            primary_network_admin_server_port: get_available_udp_port(host).unwrap_or_default(),
+            worker_network_admin_server_base_port: get_available_udp_port(host).unwrap_or_default(),
         }
     }
 }

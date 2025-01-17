@@ -2,7 +2,7 @@
 use crate::{
     crypto::{BlsPublicKey, NetworkPublicKey},
     error::ConfigError,
-    get_available_tcp_port, Epoch, Multiaddr,
+    get_available_tcp_port, get_available_udp_port, Epoch, Multiaddr,
 };
 use eyre::ContextCompat;
 use fastcrypto::traits::{EncodeDecodeBase64, InsecureDefault};
@@ -42,8 +42,7 @@ impl Default for WorkerInfo {
     fn default() -> Self {
         // TODO: env vars should be applied at the CLI level, not here
         let host = std::env::var("NARWHAL_HOST").unwrap_or("127.0.0.1".to_string());
-        let worker_udp_port = get_available_tcp_port(&host).unwrap_or(49594).to_string();
-        // let worker_udp_port = std::env::var("WORKER_UDP_PORT").unwrap_or("49594".to_string());
+        let worker_udp_port = get_available_udp_port(&host).unwrap_or(49594).to_string();
 
         Self {
             name: NetworkPublicKey::insecure_default(),
