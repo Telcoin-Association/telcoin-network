@@ -1,10 +1,10 @@
 # How TN CI Works
 
-TN CI is rapidly evolving and relying on GitHub actions to build and test the workspace takes over 45 minutes (before fmt or clippy).
+GitHub actions takes over 45 minutes to build and test the workspace (before fmt or clippy lint checks).
 
 Instead of relying on cloud infrastructure, the core team is responsible for submitting an attestation transaction to the git commit hash attestation contract (currently deployed at `0xde9700e89e0999854e5bfd7357a803d8fc476bb0`).
 
-The worker takes the HEAD commit hash and verifies an attestation was push on-chain.
+The worker takes the HEAD commit hash and verifies an attestation was pushed on-chain.
 
 ## Environment
 Attesting devs must have "MAINTAINER" role to update contract state.
