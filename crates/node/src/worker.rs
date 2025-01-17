@@ -1,7 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Hierarchical type to hold tasks spawned for a worker in the network.
 use anemo::{Network, PeerId};
 use std::sync::Arc;

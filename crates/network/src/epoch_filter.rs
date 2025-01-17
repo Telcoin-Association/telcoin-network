@@ -1,7 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 use anemo::{rpc::Status, Request, Response};
 use anemo_tower::auth::AuthorizeRequest;
 use bytes::Bytes;

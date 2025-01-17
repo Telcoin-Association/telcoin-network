@@ -1,7 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 use axum::{extract::Extension, http::StatusCode, routing::get, Json, Router};
 use consensus_metrics::monitored_future;
 use std::{

@@ -1,8 +1,4 @@
 //! Client implementation for local network messages between primary and worker.
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 use crate::{
     error::LocalClientError,
     traits::{PrimaryToWorkerClient, WorkerToPrimaryClient},

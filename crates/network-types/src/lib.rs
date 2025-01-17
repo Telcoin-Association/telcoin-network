@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
 //! Network messages for anemo communication
+// SPDX-License-Identifier: Apache-2.0
 
 mod codec;
 mod notify;

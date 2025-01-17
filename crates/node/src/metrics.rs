@@ -1,6 +1,4 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Node metrics
 use axum::{routing::get, Extension, Router};
 use consensus_metrics::{metrics, spawn_logged_monitored_task};
 use prometheus::{Error as PrometheusError, Registry};
