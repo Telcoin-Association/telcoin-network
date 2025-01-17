@@ -1,5 +1,5 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT or Apache-2.0
+//! Impermanent storage in memory - useful for tests.
 
 use std::{
     collections::{BTreeMap, HashMap},

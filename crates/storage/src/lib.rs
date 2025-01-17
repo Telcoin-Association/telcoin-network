@@ -1,8 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT or Apache-2.0
+//! Persistent storage types
 
 #![warn(future_incompatible, nonstandard_style, rust_2018_idioms, rust_2021_compatibility)]
 

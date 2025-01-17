@@ -14,7 +14,7 @@ The following packages include code from Sui:
 - [tn-network-types](./crates/network-types)
 - [tn-primary](./crates/consensus/primary)
 - [tn-primary-metrics](./crates/consensus/primary-metrics)
-- [tn-storage](./crates/storage/rocks)
+- [tn-storage](./crates/storage)
 - [tn-test-utils](./crates/test-utils)
 - [tn-types](./crates/types)
 - [tn-utils](./crates/tn-utils)

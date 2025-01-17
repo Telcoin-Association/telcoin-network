@@ -1,7 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 use crate::{tables::Votes, traits::Database};
 use tn_types::{AuthorityIdentifier, Vote, VoteInfo};
 use tn_utils::fail_point;

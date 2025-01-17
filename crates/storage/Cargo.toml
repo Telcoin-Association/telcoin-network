@@ -2,7 +2,7 @@
 name = "tn-storage"
 version.workspace = true
 edition = "2021"
-license = "Apache-2.0"
+license = "MIT or Apache-2.0"
 authors = [
     "Grant Kee <grant@telcoin.org>",
     "Steven Stanfield <steve@telcoin.org>",

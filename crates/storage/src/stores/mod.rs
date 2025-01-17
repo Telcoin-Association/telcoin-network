@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Specific store implementations used by the network.
 
 mod certificate_store;

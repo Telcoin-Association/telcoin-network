@@ -1,5 +1,4 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
+//! Impl db traits for mdbx.
 
 use std::{
     marker::PhantomData,

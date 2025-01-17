@@ -1,5 +1,4 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod database;
 mod metrics;
