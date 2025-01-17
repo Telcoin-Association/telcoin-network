@@ -68,11 +68,3 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 futures.workspace = true
-
-[[bench]]
-name = "batch_digest"
-harness = false
-
-[[bench]]
-name = "verify_certificate"
-harness = false
