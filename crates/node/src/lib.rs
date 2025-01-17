@@ -1,5 +1,5 @@
-// Copyright (c) Telcoin, LLC
 // SPDX-License-Identifier: Apache-2.0
+//! Library for managing all components used by a full-node in a single process.
 
 use crate::{primary::PrimaryNode, worker::WorkerNode};
 use engine::{ExecutionNode, TnBuilder};

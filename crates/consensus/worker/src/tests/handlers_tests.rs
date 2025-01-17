@@ -1,8 +1,4 @@
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
+/// Network synchronize tests
 use std::vec;
 use tempfile::TempDir;
 use tn_network_types::{MockWorkerToWorker, WorkerToWorkerServer};

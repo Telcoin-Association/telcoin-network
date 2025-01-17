@@ -1,6 +1,4 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Worker metrics
 
 use prometheus::{
     default_registry, register_histogram_vec_with_registry, register_histogram_with_registry,

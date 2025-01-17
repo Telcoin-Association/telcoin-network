@@ -1,6 +1,4 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Fetch blocks from peers
 
 use crate::metrics::WorkerMetrics;
 use anemo::Network;

@@ -1,10 +1,6 @@
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 //! The network interface for WAN worker communication and LAN communication with this worker's
 //! primary.
+
 use crate::block_fetcher::WorkerBlockFetcher;
 use anemo::{types::response::StatusCode, Network};
 use async_trait::async_trait;

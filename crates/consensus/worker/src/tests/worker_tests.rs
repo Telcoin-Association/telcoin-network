@@ -1,14 +1,10 @@
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 //! This mod tests retrieving peers from the admin server.
 //!
 //! Admin server isn't publicly exposed and likely to be removed in the future.
 //! This test is preserved for the time being as an example of testing anemo RPC server code.
 //!
 //! NOTE: this test is never run and is #[ignore]d for clarity.
+
 use super::*;
 use async_trait::async_trait;
 use fastcrypto::encoding::{Encoding, Hex};

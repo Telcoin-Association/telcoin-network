@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Process consensus output and execute every transaction.
 
 mod errors;

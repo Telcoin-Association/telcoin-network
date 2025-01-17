@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Primary actors
 
 #![warn(future_incompatible, nonstandard_style, rust_2018_idioms, rust_2021_compatibility)]

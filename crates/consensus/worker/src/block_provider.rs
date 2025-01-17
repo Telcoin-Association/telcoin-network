@@ -1,8 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 //! The receiving side of the execution layer's `BlockProvider`.
 //!
 //! Consensus `BlockProvider` takes a block from the EL, stores it,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Consensus metrics are used throughout consensus to capture metrics while using async channels.
 
 use axum::{http::StatusCode, routing::get, Router};
