@@ -267,7 +267,10 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
     let number = u64::from_str_radix(&block["number"].as_str().unwrap_or_default()[2..], 16)?;
     let block = get_block(&client_urls[2], Some(number))?;
     if block0["hash"] != block["hash"] {
-        return Err(Report::msg("Blocks between validators not the same!".to_string()));
+        return Err(Report::msg(format!(
+            "Blocks between validators not the same! block0: {:?} - block: {:?}",
+            block0["hash"], block["hash"]
+        )));
     }
     let number = u64::from_str_radix(&block["number"].as_str().unwrap_or_default()[2..], 16)?;
     let block = get_block(&client_urls[3], Some(number))?;
