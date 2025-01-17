@@ -1,11 +1,5 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 use futures::future::BoxFuture;
 use std::{collections::HashMap, future::Future, sync::Arc};
-
-// pub use sui_proc_macros::*;
 
 /// Evaluates an expression in a new thread which will not be subject to interception of
 /// getrandom(), clock_gettime(), etc.
