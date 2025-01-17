@@ -23,13 +23,15 @@ pub use execution::{
 pub mod helpers;
 pub use helpers::*;
 
-mod telcoin_temp_dirs;
-pub use telcoin_temp_dirs::*;
+mod temp_dirs;
+pub use temp_dirs::*;
 
 mod tracing;
 pub use tracing::init_test_tracing;
 
 #[cfg(test)]
+#[path = "tests/output_tests.rs"]
 mod output_tests;
 #[cfg(test)]
+#[path = "tests/storage_tests.rs"]
 mod storage_tests;
