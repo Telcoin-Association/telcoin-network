@@ -83,10 +83,10 @@ fn build_anemo_services(out_dir: &Path) {
         )
         .method(
             anemo_build::manual::Method::builder()
-                .name("fetch_blocks")
-                .route_name("FetchBlocks")
-                .request_type("crate::FetchBlocksRequest")
-                .response_type("crate::FetchBlocksResponse")
+                .name("fetch_batches")
+                .route_name("FetchBatches")
+                .request_type("crate::FetchBatchesRequest")
+                .response_type("crate::FetchBatchResponse")
                 .codec_path(codec_path)
                 .build(),
         )
@@ -128,18 +128,18 @@ fn build_anemo_services(out_dir: &Path) {
         .attributes(automock_attribute.clone())
         .method(
             anemo_build::manual::Method::builder()
-                .name("report_own_block")
-                .route_name("ReportOwnBlock")
-                .request_type("crate::WorkerOwnBlockMessage")
+                .name("report_own_batch")
+                .route_name("ReportOwnBatch")
+                .request_type("crate::WorkerOwnBatchMessage")
                 .response_type("()")
                 .codec_path(codec_path)
                 .build(),
         )
         .method(
             anemo_build::manual::Method::builder()
-                .name("report_others_block")
-                .route_name("ReportOthersBlock")
-                .request_type("crate::WorkerOthersBlockMessage")
+                .name("report_others_batch")
+                .route_name("ReportOthersBatch")
+                .request_type("crate::WorkerOthersBatchMessage")
                 .response_type("()")
                 .codec_path(codec_path)
                 .build(),
@@ -152,9 +152,9 @@ fn build_anemo_services(out_dir: &Path) {
         .attributes(automock_attribute)
         .method(
             anemo_build::manual::Method::builder()
-                .name("report_block")
-                .route_name("ReportBlock")
-                .request_type("crate::WorkerBatchMessage")
+                .name("report_batch")
+                .route_name("ReportBatch")
+                .request_type("crate::BatchMessage")
                 .response_type("()")
                 .codec_path(codec_path)
                 .build(),
@@ -162,9 +162,9 @@ fn build_anemo_services(out_dir: &Path) {
         .method(
             anemo_build::manual::Method::builder()
                 .name("request_batches")
-                .route_name("RequestBlocks")
-                .request_type("crate::RequestBlocksRequest")
-                .response_type("crate::RequestBlocksResponse")
+                .route_name("RequestBatches")
+                .request_type("crate::RequestBatchesRequest")
+                .response_type("crate::RequestBatchesResponse")
                 .codec_path(codec_path)
                 .build(),
         )

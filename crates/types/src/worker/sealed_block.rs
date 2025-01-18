@@ -1,6 +1,6 @@
-//! Block implementation for consensus.
+//! Batch implementation for consensus.
 //!
-//! Blocks hold transactions and other data. This type is used to represent worker proposals that
+//! Batches hold transactions and other data. This type is used to represent worker proposals that
 //! have reached quorum.
 
 use crate::{adiri_chain_spec, crypto, encode, now, TimestampSec};
@@ -11,15 +11,10 @@ use reth_primitives::{
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use thiserror::Error;
-use tokio::sync::oneshot;
 
-/// Type for sending ack back to EL once a batch is sealed.
-/// TODO: support propagating errors from the worker to the primary.
-pub type WorkerBlockResponse = oneshot::Sender<BlockHash>;
-
-/// batch validation error types
+/// Batch validation error types
 #[derive(Error, Debug, Clone)]
-pub enum WorkerBlockConversionError {
+pub enum BatchConversionError {
     /// Errors from BlockExecution
     #[error("Failed to recover signers for sealed batch:\n{0:?}\n")]
     RecoverSigners(SealedBlock),
@@ -30,28 +25,28 @@ pub enum WorkerBlockConversionError {
 
 /// The batch for workers to communicate for consensus.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
-pub struct SealedWorkerBlock {
+pub struct SealedBatch {
     /// The immutable batch fields.
-    pub batch: WorkerBlock,
+    pub batch: Batch,
     /// The immutable digest of the batch.
     pub digest: BlockHash,
 }
 
-impl SealedWorkerBlock {
+impl SealedBatch {
     /// Create a new instance of Self.
     ///
     /// WARNING: this does not verify the provided digest matches the provided batch.
-    pub fn new(batch: WorkerBlock, digest: BlockHash) -> Self {
+    pub fn new(batch: Batch, digest: BlockHash) -> Self {
         Self { batch, digest }
     }
 
     /// Consume self to extract the batch so it can be modified.
-    pub fn unseal(self) -> WorkerBlock {
+    pub fn unseal(self) -> Batch {
         self.batch
     }
 
     /// Return the sealed batch fields.
-    pub fn batch(&self) -> &WorkerBlock {
+    pub fn batch(&self) -> &Batch {
         &self.batch
     }
 
@@ -62,8 +57,8 @@ impl SealedWorkerBlock {
 
     /// Split Self into separate parts.
     ///
-    /// This is the inverse of [`WorkerBlock::seal_slow`].
-    pub fn split(self) -> (WorkerBlock, BlockHash) {
+    /// This is the inverse of [`Batch::seal_slow`].
+    pub fn split(self) -> (Batch, BlockHash) {
         (self.batch, self.digest)
     }
 
@@ -75,7 +70,7 @@ impl SealedWorkerBlock {
 
 /// The batch for workers to communicate for consensus.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
-pub struct WorkerBlock {
+pub struct Batch {
     /// The collection of transactions executed in this batch.
     pub transactions: Vec<TransactionSigned>,
     /// The Keccak 256-bit hash of the parent
@@ -102,7 +97,7 @@ pub struct WorkerBlock {
     pub received_at: Option<TimestampSec>,
 }
 
-impl WorkerBlock {
+impl Batch {
     /// Create a new batch for testing only!
     ///
     /// This is NOT a valid batch for consensus.
@@ -175,23 +170,23 @@ impl WorkerBlock {
     /// Seal the header with a known hash.
     ///
     /// WARNING: This method does not verify whether the hash is correct.
-    pub fn seal(self, digest: BlockHash) -> SealedWorkerBlock {
-        SealedWorkerBlock::new(self, digest)
+    pub fn seal(self, digest: BlockHash) -> SealedBatch {
+        SealedBatch::new(self, digest)
     }
 
     /// Seal the batch.
     ///
     /// Calculate the hash and seal the batch so it can't be changed.
     ///
-    /// NOTE: `WorkerBlock::received_at` is skipped during serialization and is excluded from the
+    /// NOTE: `Batch::received_at` is skipped during serialization and is excluded from the
     /// digest.
-    pub fn seal_slow(self) -> SealedWorkerBlock {
+    pub fn seal_slow(self) -> SealedBatch {
         let digest = self.digest();
         self.seal(digest)
     }
 }
 
-impl Default for WorkerBlock {
+impl Default for Batch {
     fn default() -> Self {
         Self {
             transactions: vec![],
@@ -204,13 +199,13 @@ impl Default for WorkerBlock {
     }
 }
 
-impl From<&SealedWorkerBlock> for Vec<u8> {
-    fn from(value: &SealedWorkerBlock) -> Self {
+impl From<&SealedBatch> for Vec<u8> {
+    fn from(value: &SealedBatch) -> Self {
         crate::encode(value)
     }
 }
 
-impl From<&[u8]> for SealedWorkerBlock {
+impl From<&[u8]> for SealedBatch {
     fn from(value: &[u8]) -> Self {
         crate::decode(value)
     }
@@ -218,13 +213,13 @@ impl From<&[u8]> for SealedWorkerBlock {
 
 /// Return the max gas per batch in effect at timestamp.
 /// Currently allways 30,000,000 but can change in the future at a fork.
-pub fn max_worker_batch_gas(_timestamp: u64) -> u64 {
+pub fn max_batch_gas(_timestamp: u64) -> u64 {
     30_000_000
 }
 
 /// Max batch size in effect at a timestamp.  Measured in bytes.
 /// Currently allways 1,000,000 but can change in the future at a fork.
-pub fn max_worker_batch_size(_timestamp: u64) -> usize {
+pub fn max_batch_size(_timestamp: u64) -> usize {
     1_000_000
 }
 
@@ -232,14 +227,14 @@ pub fn max_worker_batch_size(_timestamp: u64) -> usize {
 /// of a batch of transactions (from another validator).
 ///
 /// Invalid transactions will not receive further processing.
-pub trait WorkerBatchValidation: Send + Sync {
+pub trait BatchValidation: Send + Sync {
     /// Determines if this batch can be voted on
-    fn validate_batch(&self, b: SealedWorkerBlock) -> Result<(), WorkerBatchValidationError>;
+    fn validate_batch(&self, b: SealedBatch) -> Result<(), BatchValidationError>;
 }
 
 /// Block validation error types
 #[derive(Error, Debug)]
-pub enum WorkerBatchValidationError {
+pub enum BatchValidationError {
     /// The sealed batch hash does not match this worker's calculated digest.
     #[error("Invalid digest for sealed batch.")]
     InvalidDigest,
@@ -252,10 +247,10 @@ pub enum WorkerBatchValidationError {
         timestamp: u64,
     },
     /// Canonical chain header cannot be found.
-    #[error("Canonical chain header {batch_hash} can't be found for peer batch's parent")]
+    #[error("Canonical chain header {block_hash} can't be found for peer batch's parent")]
     CanonicalChain {
-        /// The batch hash of the missing canonical chain header.
-        batch_hash: BlockHash,
+        /// The executed block hash of the missing canonical chain header.
+        block_hash: BlockHash,
     },
 
     /// Error when the max gas included in the header exceeds the batch's gas limit.

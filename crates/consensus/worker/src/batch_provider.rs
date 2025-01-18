@@ -1,14 +1,14 @@
-//! The receiving side of the execution layer's `BlockProvider`.
+//! The receiving side of the execution layer's `BatchProvider`.
 //!
-//! Consensus `BlockProvider` takes a batch from the EL, stores it,
+//! Consensus `BatchProvider` takes a batch from the EL, stores it,
 //! and sends it to the quorum waiter for broadcasting to peers.
 
 use crate::{metrics::WorkerMetrics, quorum_waiter::QuorumWaiterTrait};
 use std::{sync::Arc, time::Duration};
 use tn_network::{local::LocalNetwork, WorkerToPrimaryClient as _};
-use tn_network_types::WorkerOwnBlockMessage;
-use tn_storage::{tables::WorkerBlocks, traits::Database};
-use tn_types::{error::BlockSealError, SealedWorkerBlock, WorkerBatchSender, WorkerId};
+use tn_network_types::WorkerOwnBatchMessage;
+use tn_storage::{tables::Batches, traits::Database};
+use tn_types::{error::BlockSealError, BatchSender, SealedBatch, WorkerId};
 use tracing::error;
 
 #[cfg(test)]
@@ -17,7 +17,7 @@ pub mod batch_provider_tests;
 
 /// Process batch from EL into sealed batches for CL.
 #[derive(Clone)]
-pub struct BlockProvider<DB, QW> {
+pub struct BatchProvider<DB, QW> {
     /// Our worker's id.
     id: WorkerId,
     /// Use `QuorumWaiter` to attest to batches.
@@ -29,18 +29,18 @@ pub struct BlockProvider<DB, QW> {
     /// The batch store to store our own batches.
     store: DB,
     /// Channel sender for alternate batch submision if not calling seal directly.
-    tx_batches: WorkerBatchSender,
+    tx_batches: BatchSender,
     /// The amount of time to wait on a reply from peer before timing out.
     timeout: Duration,
 }
 
-impl<DB, QW> std::fmt::Debug for BlockProvider<DB, QW> {
+impl<DB, QW> std::fmt::Debug for BatchProvider<DB, QW> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "BlockProvider for worker {}", self.id)
+        write!(f, "BatchProvider for worker {}", self.id)
     }
 }
 
-impl<DB: Database, QW: QuorumWaiterTrait> BlockProvider<DB, QW> {
+impl<DB: Database, QW: QuorumWaiterTrait> BatchProvider<DB, QW> {
     pub fn new(
         id: WorkerId,
         quorum_waiter: QW,
@@ -65,12 +65,12 @@ impl<DB: Database, QW: QuorumWaiterTrait> BlockProvider<DB, QW> {
         this
     }
 
-    pub fn batches_tx(&self) -> WorkerBatchSender {
+    pub fn batches_tx(&self) -> BatchSender {
         self.tx_batches.clone()
     }
 
     /// Seal and broadcast the current batch.
-    pub async fn seal(&self, sealed_batch: SealedWorkerBlock) -> Result<(), BlockSealError> {
+    pub async fn seal(&self, sealed_batch: SealedBatch) -> Result<(), BlockSealError> {
         let size = sealed_batch.size();
 
         self.node_metrics
@@ -114,14 +114,14 @@ impl<DB: Database, QW: QuorumWaiterTrait> BlockProvider<DB, QW> {
         // Now save it to disk
         let (batch, digest) = sealed_batch.split();
 
-        if let Err(e) = self.store.insert::<WorkerBlocks>(&digest, &batch) {
+        if let Err(e) = self.store.insert::<Batches>(&digest, &batch) {
             error!(target: "worker::batch_provider", "Store failed with error: {:?}", e);
             return Err(BlockSealError::FatalDBFailure);
         }
 
         // Send the batch to the primary.
         let message =
-            WorkerOwnBlockMessage { worker_id: self.id, digest, timestamp: batch.created_at() };
+            WorkerOwnBatchMessage { worker_id: self.id, digest, timestamp: batch.created_at() };
         if let Err(err) = self.client.report_own_batch(message).await {
             error!(target: "worker::batch_provider", "Failed to report our batch: {err:?}");
             // Should we return an error here?  Doing so complicates some tests but also the batch

@@ -85,7 +85,7 @@ pub struct WorkerMetrics {
     /// Latency of broadcasting batches to a quorum in seconds.
     pub batch_broadcast_quorum_latency: Histogram,
     /// Counter of remote/local batch fetch statuses.
-    pub worker_batch_fetch: IntCounterVec,
+    pub batch_fetch: IntCounterVec,
     /// Time it takes to download a payload from local worker peer
     pub worker_local_fetch_latency: Histogram,
     /// Time it takes to download a payload from remote peer
@@ -132,8 +132,8 @@ impl WorkerMetrics {
                 LATENCY_SEC_BUCKETS.to_vec(),
                 registry
             )?,
-            worker_batch_fetch: register_int_counter_vec_with_registry!(
-                "worker_batch_fetch",
+            batch_fetch: register_int_counter_vec_with_registry!(
+                "batch_fetch",
                 "Counter of remote/local batch fetch statuses",
                 &["source", "status"],
                 registry
@@ -183,14 +183,14 @@ impl Default for WorkerMetrics {
 #[derive(Clone)]
 pub struct WorkerChannelMetrics {
     /// occupancy of the channel from the `worker::TxReceiverhandler` to the
-    /// `worker::BlockProvider`
+    /// `worker::BatchProvider`
     pub tx_batch_maker: IntGauge,
-    /// occupancy of the channel from the `worker::BlockProvider` to the `worker::QuorumWaiter`
+    /// occupancy of the channel from the `worker::BatchProvider` to the `worker::QuorumWaiter`
     pub tx_quorum_waiter: IntGauge,
     /// total received from the channel from the `worker::TxReceiverhandler` to the
-    /// `worker::BlockProvider`
+    /// `worker::BatchProvider`
     pub tx_batch_maker_total: IntCounter,
-    /// total received from the channel from the `worker::BlockProvider` to the
+    /// total received from the channel from the `worker::BatchProvider` to the
     /// `worker::QuorumWaiter`
     pub tx_quorum_waiter_total: IntCounter,
 }
@@ -200,24 +200,24 @@ impl WorkerChannelMetrics {
         Ok(Self {
             tx_batch_maker: register_int_gauge_with_registry!(
                 "tx_batch_maker",
-                "occupancy of the channel from the `worker::TxReceiverhandler` to the `worker::BlockProvider`",
+                "occupancy of the channel from the `worker::TxReceiverhandler` to the `worker::BatchProvider`",
                 registry
             )?,
             tx_quorum_waiter: register_int_gauge_with_registry!(
                 "tx_quorum_waiter",
-                "occupancy of the channel from the `worker::BlockProvider` to the `worker::QuorumWaiter`",
+                "occupancy of the channel from the `worker::BatchProvider` to the `worker::QuorumWaiter`",
                 registry
             )?,
 
             // Totals:
             tx_batch_maker_total: register_int_counter_with_registry!(
                 "tx_batch_maker_total",
-                "total received from the channel from the `worker::TxReceiverhandler` to the `worker::BlockProvider`",
+                "total received from the channel from the `worker::TxReceiverhandler` to the `worker::BatchProvider`",
                 registry
             )?,
             tx_quorum_waiter_total: register_int_counter_with_registry!(
                 "tx_quorum_waiter_total",
-                "total received from the channel from the `worker::BlockProvider` to the `worker::QuorumWaiter`",
+                "total received from the channel from the `worker::BatchProvider` to the `worker::QuorumWaiter`",
                 registry
             )?,
         })

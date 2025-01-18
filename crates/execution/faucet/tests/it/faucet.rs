@@ -38,8 +38,8 @@ use tn_test_utils::{
     TransactionFactory,
 };
 use tn_types::{
-    adiri_genesis, error::BlockSealError, Notifier, SealedWorkerBlock, TaskManager,
-    TransactionSigned, WorkerBlock,
+    adiri_genesis, error::BlockSealError, Batch, Notifier, SealedBatch, TaskManager,
+    TransactionSigned,
 };
 use tn_worker::{
     metrics::WorkerMetrics,
@@ -53,11 +53,11 @@ use tokio::{
 use tracing::debug;
 
 #[derive(Clone, Debug)]
-struct TestChanQuorumWaiter(Sender<SealedWorkerBlock>);
+struct TestChanQuorumWaiter(Sender<SealedBatch>);
 impl QuorumWaiterTrait for TestChanQuorumWaiter {
     fn verify_batch(
         &self,
-        batch: SealedWorkerBlock,
+        batch: SealedBatch,
         _timeout: Duration,
     ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
         let chan = self.0.clone();
@@ -293,7 +293,7 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     let duration = Duration::from_secs(15);
 
     // wait for canon event or timeout
-    let new_batch: SealedWorkerBlock =
+    let new_batch: SealedBatch =
         time::timeout(duration, next_batch.recv()).await?.expect("batch received");
 
     let batch_txs = new_batch.batch().transactions();
@@ -602,7 +602,7 @@ async fn test_faucet_transfers_stablecoin_with_google_kms() -> eyre::Result<()> 
     let duration = Duration::from_secs(15);
 
     // wait for canon event or timeout
-    let (new_batch, ack): (SealedWorkerBlock, oneshot::Sender<Result<(), BlockSealError>>) =
+    let (new_batch, ack): (SealedBatch, oneshot::Sender<Result<(), BlockSealError>>) =
         time::timeout(duration, next_batch.recv()).await?.expect("batch received");
 
     // send ack
@@ -770,7 +770,7 @@ async fn get_contract_state_for_genesis(
 
     // execute batch
     let parent = chain.sealed_genesis_header();
-    let batch = WorkerBlock {
+    let batch = Batch {
         transactions: raw_txs_to_execute,
         parent_hash: parent.hash(),
         ..Default::default()

@@ -533,7 +533,7 @@ mod tests {
     use libp2p::Multiaddr;
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils::{fixture_batch_with_transactions, CommitteeFixture};
-    use tn_types::{BlockHash, Certificate, Header, SealedWorkerBlock, WorkerBlock};
+    use tn_types::{Batch, BlockHash, Certificate, Header, SealedBatch};
     use tokio::time::timeout;
 
     #[tokio::test]
@@ -592,31 +592,31 @@ mod tests {
 
         let missing_block = fixture_batch_with_transactions(3).seal_slow();
         let digests = vec![missing_block.digest()];
-        let worker_block_req = WorkerRequest::MissingBlocks { digests };
-        let worker_block_res = WorkerResponse::MissingBlocks { blocks: vec![missing_block] };
+        let batch_req = WorkerRequest::MissingBlocks { digests };
+        let batch_res = WorkerResponse::MissingBlocks { blocks: vec![missing_block] };
 
         // dial peer2
         peer1.dial(peer2_id, peer2_addr).await?;
 
         // send request and wait for response
         let max_time = Duration::from_secs(5);
-        let network_res = peer1.send_request(worker_block_req.clone(), peer2_id).await?;
+        let network_res = peer1.send_request(batch_req.clone(), peer2_id).await?;
         let event = timeout(max_time, network_events_2.recv())
             .await?
             .expect("first network event received");
 
         // expect network event
         if let NetworkEvent::Request { request, channel } = event {
-            assert_eq!(request, worker_block_req);
+            assert_eq!(request, batch_req);
             // send response
-            peer2.send_response(worker_block_res.clone(), channel).await?;
+            peer2.send_response(batch_res.clone(), channel).await?;
         } else {
             panic!("unexpected network event received");
         }
 
         // expect response
         let response = timeout(max_time, network_res).await?.expect("outbound id recv")?;
-        assert_eq!(response, worker_block_res);
+        assert_eq!(response, batch_res);
 
         Ok(())
     }

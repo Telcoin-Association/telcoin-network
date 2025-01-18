@@ -8,10 +8,7 @@
 
 use reth_primitives::{IntoRecoveredTransaction, TxHash};
 use reth_transaction_pool::TransactionPool;
-use tn_types::{
-    max_worker_block_gas, max_worker_block_size, now, PendingBlockConfig, WorkerBatchBuilderArgs,
-    WorkerBlock,
-};
+use tn_types::{max_batch_gas, max_batch_size, now, Batch, BatchBuilderArgs, PendingBlockConfig};
 use tracing::{debug, warn};
 
 /// The output from building the next block.
@@ -20,7 +17,7 @@ use tracing::{debug, warn};
 #[derive(Debug)]
 pub struct BlockBuilderOutput {
     /// The batch info for the worker to propose.
-    pub(crate) batch: WorkerBlock,
+    pub(crate) batch: Batch,
     /// The transaction hashes mined in this worker's batch.
     ///
     /// NOTE: canonical changes update `ChangedAccount` and changed senders.
@@ -44,13 +41,13 @@ pub struct BlockBuilderOutput {
 /// with very high gas limits. It's impossible to know the amount of gas a transaction
 /// will use without executing it, and the worker does not execute transactions.
 #[inline]
-pub fn build_batch<P>(args: WorkerBatchBuilderArgs<P>) -> BlockBuilderOutput
+pub fn build_batch<P>(args: BatchBuilderArgs<P>) -> BlockBuilderOutput
 where
     P: TransactionPool,
 {
-    let WorkerBatchBuilderArgs { pool, batch_config } = args;
-    let gas_limit = max_worker_block_gas(batch_config.parent_info.tip.timestamp);
-    let max_size = max_worker_block_size(batch_config.parent_info.tip.timestamp);
+    let BatchBuilderArgs { pool, batch_config } = args;
+    let gas_limit = max_batch_gas(batch_config.parent_info.tip.timestamp);
+    let max_size = max_batch_size(batch_config.parent_info.tip.timestamp);
     let PendingBlockConfig { beneficiary, parent_info } = batch_config;
 
     // NOTE: this obtains a `read` lock on the tx pool
@@ -121,7 +118,7 @@ where
     }
 
     // batch
-    let batch = WorkerBlock {
+    let batch = Batch {
         transactions,
         parent_hash,
         beneficiary,

@@ -1,7 +1,7 @@
 //! Error types for Telcoin Network Block Builder.
 
 use reth_errors::{CanonicalError, ProviderError, RethError};
-use tn_types::WorkerBlockConversionError;
+use tn_types::BatchConversionError;
 use tokio::sync::{mpsc, oneshot};
 
 /// Result alias for [`TNEngineError`].
@@ -18,7 +18,7 @@ pub enum BlockBuilderError {
     Provider(#[from] ProviderError),
     /// Error converting batch to `SealedBlockWithSenders`.
     #[error(transparent)]
-    Batch(#[from] WorkerBlockConversionError),
+    Batch(#[from] BatchConversionError),
     /// The next batch digest is missing.
     #[error("Missing next batch digest for recovered sealed block with senders.")]
     NextBatchDigestMissing,

@@ -17,7 +17,7 @@ CVVs use anemo for p2p consensus networking at this time, but will eventually tr
 
 ## Worker Publish
 
-Workers publish blocks after they reach quorum.
+Workers publish batches after they reach quorum.
 
 ## Primary Publish
 
@@ -48,7 +48,7 @@ When a peer is explicitly added to Gossipsub, it's included in the Gossipsub int
 
 Gossipsub messages use the data type's hash digest as the `MessagId`.
 However, `IWANT` and `IHAVE` messages are private, and another protocol type is needed to manage specific state sync requests.
-The gossip network is effective for broadcasting new blocks only.
+The gossip network is effective for broadcasting new batchess only.
 
 ### Message Verification
 

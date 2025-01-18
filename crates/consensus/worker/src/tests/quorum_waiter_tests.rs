@@ -29,7 +29,7 @@ async fn wait_for_quorum() {
 
     // Make a batch.
     let sealed_batch = batch().seal_slow();
-    let message = WorkerBatchMessage { sealed_worker_batch: sealed_batch.clone() };
+    let message = BatchMessage { sealed_batch: sealed_batch.clone() };
 
     // Spawn enough listeners to acknowledge our batches.
     let mut listener_handles = Vec::new();
@@ -50,7 +50,7 @@ async fn wait_for_quorum() {
 
     // Send a second batch.
     let sealed_batch2 = batch().seal_slow();
-    let message2 = WorkerBatchMessage { sealed_worker_batch: sealed_batch2.clone() };
+    let message2 = BatchMessage { sealed_batch: sealed_batch2.clone() };
 
     // Forward the batch along with the handlers to the `QuorumWaiter`.
     let attest2_handle = quorum_waiter.verify_batch(sealed_batch2.clone(), Duration::from_secs(10));

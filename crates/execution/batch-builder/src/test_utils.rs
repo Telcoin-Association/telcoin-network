@@ -18,14 +18,14 @@ use std::{
     time::Instant,
 };
 use tn_types::{
-    LastCanonicalUpdate, PendingBlockConfig, TransactionSigned, WorkerBatchBuilderArgs, WorkerBlock,
+    Batch, BatchBuilderArgs, LastCanonicalUpdate, PendingBlockConfig, TransactionSigned,
 };
 use tokio::sync::mpsc::{self, Receiver};
 
 /// Attempt to update batch with accurate header information.
 ///
 /// NOTE: this is loosely based on reth's auto-seal consensus
-pub fn execute_test_batch(test_batch: &mut WorkerBlock, parent: &SealedHeader) {
+pub fn execute_test_batch(test_batch: &mut Batch, parent: &SealedHeader) {
     let pool = TestPool::new(test_batch.transactions.clone());
 
     let parent_info = LastCanonicalUpdate {
@@ -35,7 +35,7 @@ pub fn execute_test_batch(test_batch: &mut WorkerBlock, parent: &SealedHeader) {
     };
 
     let batch_config = PendingBlockConfig::new(test_batch.beneficiary, parent_info);
-    let args = WorkerBatchBuilderArgs { pool, batch_config };
+    let args = BatchBuilderArgs { pool, batch_config };
     let BlockBuilderOutput { batch, .. } = build_batch(args);
     test_batch.parent_hash = batch.parent_hash;
     test_batch.beneficiary = batch.beneficiary;

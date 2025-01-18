@@ -37,8 +37,7 @@ use std::{
     time::Duration,
 };
 use tn_types::{
-    error::BlockSealError, LastCanonicalUpdate, PendingBlockConfig, WorkerBatchBuilderArgs,
-    WorkerBatchSender,
+    error::BlockSealError, BatchBuilderArgs, BatchSender, LastCanonicalUpdate, PendingBlockConfig,
 };
 use tokio::{sync::oneshot, time::Interval};
 use tracing::{debug, error, trace, warn};
@@ -90,7 +89,7 @@ pub struct BlockBuilder<BT, Pool> {
     /// The worker's block maker sends an ack once the block has been stored in db
     /// which guarantees the worker will attempt to broadcast the new block until
     /// quorum is reached.
-    to_worker: WorkerBatchSender,
+    to_worker: BatchSender,
     /// The address for batch's beneficiary.
     address: Address,
     /// Maximum amount of time to wait before querying block builds.
@@ -110,7 +109,7 @@ where
         pool: Pool,
         canonical_state_stream: CanonStateNotificationStream,
         latest_canon_state: LastCanonicalUpdate,
-        to_worker: WorkerBatchSender,
+        to_worker: BatchSender,
         address: Address,
         max_delay: Duration,
     ) -> Self {
@@ -203,7 +202,7 @@ where
 
         // configure params for next block to build
         let config = PendingBlockConfig::new(self.address, self.latest_canon_state.clone());
-        let build_args = WorkerBatchBuilderArgs::new(pool.clone(), config);
+        let build_args = BatchBuilderArgs::new(pool.clone(), config);
         let (result, done) = oneshot::channel();
 
         // spawn block building task and forward to worker
@@ -442,11 +441,11 @@ mod tests {
     use tempfile::TempDir;
     use tn_engine::execute_consensus_output;
     use tn_network::local::LocalNetwork;
-    use tn_storage::{open_db, tables::WorkerBlocks, traits::Database};
+    use tn_storage::{open_db, tables::Batches, traits::Database};
     use tn_test_utils::{adiri_genesis_seeded, get_gas_price, TransactionFactory};
     use tn_types::{
         adiri_genesis, AutoSealConsensus, BuildArguments, CommittedSubDag, Consensus,
-        ConsensusHeader, ConsensusOutput, SealedWorkerBlock,
+        ConsensusHeader, ConsensusOutput, SealedBatch,
     };
     use tn_worker::{
         metrics::WorkerMetrics,
@@ -460,7 +459,7 @@ mod tests {
     impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
         fn verify_batch(
             &self,
-            _batch: SealedWorkerBlock,
+            _batch: SealedBatch,
             _timeout: Duration,
         ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
             tokio::spawn(async move { Ok(()) })
@@ -596,7 +595,7 @@ mod tests {
         for _ in 0..5 {
             let _ = tokio::time::sleep(Duration::from_secs(1)).await;
             // Ensure the block is stored
-            if let Some((_, wb)) = store.iter::<WorkerBlocks>().next() {
+            if let Some((_, wb)) = store.iter::<Batches>().next() {
                 new_batch = Some(wb);
                 break;
             }
@@ -843,9 +842,9 @@ mod tests {
                     None,
                 )
                 .into(),
-                blocks: vec![vec![]],
+                batches: vec![vec![]],
                 beneficiary: address,
-                block_digests: Default::default(),
+                batch_digests: Default::default(),
                 parent_hash: ConsensusHeader::default().digest(),
                 number: 0,
             };

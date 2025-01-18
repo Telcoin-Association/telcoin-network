@@ -1,7 +1,7 @@
 //! The network interface for WAN worker communication and LAN communication with this worker's
 //! primary.
 
-use crate::batch_fetcher::WorkerBatchFetcher;
+use crate::batch_fetcher::BatchFetcher;
 use anemo::{types::response::StatusCode, Network};
 use async_trait::async_trait;
 use eyre::Result;
@@ -9,15 +9,15 @@ use itertools::Itertools;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tn_network::{local::LocalNetwork, WorkerToPrimaryClient as _};
 use tn_network_types::{
-    FetchBlocksRequest, FetchBlocksResponse, PrimaryToWorker, RequestBlocksRequest,
-    RequestBlocksResponse, WorkerBatchMessage, WorkerOthersBlockMessage, WorkerSynchronizeMessage,
-    WorkerToWorker, WorkerToWorkerClient,
+    BatchMessage, FetchBatchResponse, FetchBatchesRequest, PrimaryToWorker, RequestBatchesRequest,
+    RequestBatchesResponse, WorkerOthersBatchMessage, WorkerSynchronizeMessage, WorkerToWorker,
+    WorkerToWorkerClient,
 };
 use tn_storage::{
-    tables::WorkerBlocks,
+    tables::Batches,
     traits::{Database, DbTxMut},
 };
-use tn_types::{now, Committee, SealedWorkerBlock, WorkerBatchValidation, WorkerCache, WorkerId};
+use tn_types::{now, BatchValidation, Committee, SealedBatch, WorkerCache, WorkerId};
 use tracing::{debug, trace};
 
 #[cfg(test)]
@@ -34,41 +34,41 @@ pub struct WorkerReceiverHandler<DB> {
     /// Database for storing batches received from peers.
     pub store: DB,
     /// The type that validates batches received from peers.
-    pub validator: Arc<dyn WorkerBatchValidation>,
+    pub validator: Arc<dyn BatchValidation>,
 }
 
 #[async_trait]
 impl<DB: Database> WorkerToWorker for WorkerReceiverHandler<DB> {
     async fn report_batch(
         &self,
-        request: anemo::Request<WorkerBatchMessage>,
+        request: anemo::Request<BatchMessage>,
     ) -> Result<anemo::Response<()>, anemo::rpc::Status> {
         // own peer id for error handling
         let peer_id = request.peer_id().copied();
         let message = request.into_body();
-        let WorkerBatchMessage { sealed_worker_batch } = message;
+        let BatchMessage { sealed_batch } = message;
         // validate batch - log error if invalid
-        if let Err(err) = self.validator.validate_batch(sealed_worker_batch.clone()) {
+        if let Err(err) = self.validator.validate_batch(sealed_batch.clone()) {
             return Err(anemo::rpc::Status::new_with_message(
                 StatusCode::BadRequest,
                 format!(
                     "Invalid batch from peer {:?}: {err}\nsealed_\nbad batch:\n{:?}",
-                    peer_id, sealed_worker_batch,
+                    peer_id, sealed_batch,
                 ),
             ));
         }
 
-        let (mut worker_batch, digest) = sealed_worker_batch.split();
+        let (mut batch, digest) = sealed_batch.split();
 
         // Set received_at timestamp for remote batch.
-        worker_batch.set_received_at(now());
-        self.store.insert::<WorkerBlocks>(&digest, &worker_batch).map_err(|e| {
+        batch.set_received_at(now());
+        self.store.insert::<Batches>(&digest, &batch).map_err(|e| {
             anemo::rpc::Status::internal(format!("failed to write to batch store: {e:?}"))
         })?;
 
         // notify primary for payload store
         self.client
-            .report_others_batch(WorkerOthersBlockMessage { digest, worker_id: self.id })
+            .report_others_batch(WorkerOthersBatchMessage { digest, worker_id: self.id })
             .await
             .map_err(|e| anemo::rpc::Status::internal(e.to_string()))?;
 
@@ -77,8 +77,8 @@ impl<DB: Database> WorkerToWorker for WorkerReceiverHandler<DB> {
 
     async fn request_batches(
         &self,
-        request: anemo::Request<RequestBlocksRequest>,
-    ) -> Result<anemo::Response<RequestBlocksResponse>, anemo::rpc::Status> {
+        request: anemo::Request<RequestBatchesRequest>,
+    ) -> Result<anemo::Response<RequestBatchesResponse>, anemo::rpc::Status> {
         const MAX_REQUEST_BATCHES_RESPONSE_SIZE: usize = 6_000_000;
         const BATCH_DIGESTS_READ_CHUNK_SIZE: usize = 200;
 
@@ -93,7 +93,7 @@ impl<DB: Database> WorkerToWorker for WorkerReceiverHandler<DB> {
 
         for digests_chunks in digests_chunks {
             let stored_batches =
-                self.store.multi_get::<WorkerBlocks>(digests_chunks.iter()).map_err(|e| {
+                self.store.multi_get::<Batches>(digests_chunks.iter()).map_err(|e| {
                     anemo::rpc::Status::internal(format!("failed to read from batch store: {e:?}"))
                 })?;
 
@@ -109,7 +109,7 @@ impl<DB: Database> WorkerToWorker for WorkerReceiverHandler<DB> {
             }
         }
 
-        Ok(anemo::Response::new(RequestBlocksResponse { batches, is_size_limit_reached }))
+        Ok(anemo::Response::new(RequestBatchesResponse { batches, is_size_limit_reached }))
     }
 }
 
@@ -128,9 +128,9 @@ pub struct PrimaryReceiverHandler<DB> {
     /// Synchronize header payloads from other workers.
     pub network: Option<Network>,
     /// Fetch certificate payloads from other workers.
-    pub batch_fetcher: Option<WorkerBatchFetcher<DB>>,
+    pub batch_fetcher: Option<BatchFetcher<DB>>,
     /// Validate incoming batches
-    pub validator: Arc<dyn WorkerBatchValidation>,
+    pub validator: Arc<dyn BatchValidation>,
 }
 
 #[async_trait]
@@ -149,7 +149,7 @@ impl<DB: Database> PrimaryToWorker for PrimaryReceiverHandler<DB> {
         let mut missing = HashSet::new();
         for digest in message.digests.iter() {
             // Check if we already have the batch.
-            match self.store.get::<WorkerBlocks>(digest) {
+            match self.store.get::<Batches>(digest) {
                 Ok(None) => {
                     missing.insert(*digest);
                     debug!("Requesting sync for batch {digest}");
@@ -188,7 +188,7 @@ impl<DB: Database> PrimaryToWorker for PrimaryReceiverHandler<DB> {
 
         // Attempt to retrieve missing batches.
         // Retried at a higher level in Synchronizer::sync_batches_internal().
-        let request = RequestBlocksRequest { batch_digests: missing.iter().cloned().collect() };
+        let request = RequestBatchesRequest { batch_digests: missing.iter().cloned().collect() };
         debug!("Sending RequestBatchesRequest to {worker_name}: {request:?}");
 
         let response = client
@@ -198,11 +198,11 @@ impl<DB: Database> PrimaryToWorker for PrimaryReceiverHandler<DB> {
             .await?
             .into_inner();
 
-        let sealed_batches_from_response: Vec<SealedWorkerBlock> = missing
+        let sealed_batches_from_response: Vec<SealedBatch> = missing
             .iter()
             .cloned()
             .zip(response.batches)
-            .map(|(digest, batch)| SealedWorkerBlock::new(batch, digest))
+            .map(|(digest, batch)| SealedBatch::new(batch, digest))
             .collect();
 
         for sealed_batch in sealed_batches_from_response.into_iter() {
@@ -225,7 +225,7 @@ impl<DB: Database> PrimaryToWorker for PrimaryReceiverHandler<DB> {
                         "failed to create batch transaction to commit: {e:?}"
                     ))
                 })?;
-                tx.insert::<WorkerBlocks>(&digest, &batch).map_err(|e| {
+                tx.insert::<Batches>(&digest, &batch).map_err(|e| {
                     anemo::rpc::Status::internal(format!(
                         "failed to batch transaction to commit: {e:?}"
                     ))
@@ -244,8 +244,8 @@ impl<DB: Database> PrimaryToWorker for PrimaryReceiverHandler<DB> {
 
     async fn fetch_batches(
         &self,
-        request: anemo::Request<FetchBlocksRequest>,
-    ) -> Result<anemo::Response<FetchBlocksResponse>, anemo::rpc::Status> {
+        request: anemo::Request<FetchBatchesRequest>,
+    ) -> Result<anemo::Response<FetchBatchResponse>, anemo::rpc::Status> {
         let Some(batch_fetcher) = self.batch_fetcher.as_ref() else {
             return Err(anemo::rpc::Status::new_with_message(
                 StatusCode::BadRequest,
@@ -254,6 +254,6 @@ impl<DB: Database> PrimaryToWorker for PrimaryReceiverHandler<DB> {
         };
         let request = request.into_body();
         let batches = batch_fetcher.fetch(request.digests, request.known_workers).await;
-        Ok(anemo::Response::new(FetchBlocksResponse { batches }))
+        Ok(anemo::Response::new(FetchBatchResponse { batches }))
     }
 }

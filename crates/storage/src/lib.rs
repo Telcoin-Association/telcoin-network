@@ -14,8 +14,8 @@ pub use redb::database::ReDB;
 #[cfg(feature = "rocksdb")]
 use rocks::database::RocksDatabase;
 use tables::{
-    CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
-    ConsensusBlockNumbersByDigest, ConsensusBlocks, LastProposed, Payload, Votes, WorkerBlocks,
+    Batches, CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
+    ConsensusBlockNumbersByDigest, ConsensusBlocks, LastProposed, Payload, Votes,
 };
 // Always build redb, we use it as the default for persistant consensus data.
 pub mod layered_db;
@@ -69,8 +69,8 @@ macro_rules! tables {
 pub mod tables {
     use super::{PayloadToken, ProposerKey};
     use tn_types::{
-        AuthorityIdentifier, BlockHash, Certificate, CertificateDigest, ConsensusHeader, Header,
-        Round, VoteInfo, WorkerBlock, WorkerId,
+        AuthorityIdentifier, Batch, BlockHash, Certificate, CertificateDigest, ConsensusHeader,
+        Header, Round, VoteInfo, WorkerId,
     };
 
     tables!(
@@ -81,7 +81,7 @@ pub mod tables {
         CertificateDigestByOrigin;crate::CERTIFICATE_DIGEST_BY_ORIGIN_CF;<(AuthorityIdentifier, Round), CertificateDigest>,
         Payload;crate::PAYLOAD_CF;<(BlockHash, WorkerId), PayloadToken>,
         // Table is used for "normal" consensus as well as for the consensus chain.
-        WorkerBlocks;crate::BATCHES_CF;<BlockHash, WorkerBlock>,
+        Batches;crate::BATCHES_CF;<BlockHash, Batch>,
         // These tables are for the consensus chain not the normal consensus.
         ConsensusBlocks;crate::CONSENSUS_BLOCK_CF;<u64, ConsensusHeader>,
         ConsensusBlockNumbersByDigest;crate::CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF;<BlockHash, u64>
@@ -124,7 +124,7 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
     db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
     db.open_table::<Payload>().expect("failed to open table!");
-    db.open_table::<WorkerBlocks>().expect("failed to open table!");
+    db.open_table::<Batches>().expect("failed to open table!");
     db.open_table::<ConsensusBlocks>().expect("failed to open table!");
     db.open_table::<ConsensusBlockNumbersByDigest>().expect("failed to open table!");
 
@@ -135,7 +135,7 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<CertificateDigestByRound>();
     db.open_table::<CertificateDigestByOrigin>();
     db.open_table::<Payload>();
-    db.open_table::<WorkerBlocks>();
+    db.open_table::<Batches>();
     db.open_table::<ConsensusBlocks>();
     db.open_table::<ConsensusBlockNumbersByDigest>();
     db
@@ -152,7 +152,7 @@ fn _open_rocks<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDataba
     db.open_table::<CertificateDigestByRound>();
     db.open_table::<CertificateDigestByOrigin>();
     db.open_table::<Payload>();
-    db.open_table::<WorkerBlocks>();
+    db.open_table::<Batches>();
     db.open_table::<ConsensusBlocks>();
     db.open_table::<ConsensusBlockNumbersByDigest>();
     db
@@ -168,7 +168,7 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
     db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
     db.open_table::<Payload>().expect("failed to open table!");
-    db.open_table::<WorkerBlocks>().expect("failed to open table!");
+    db.open_table::<Batches>().expect("failed to open table!");
     db.open_table::<ConsensusBlocks>().expect("failed to open table!");
     db.open_table::<ConsensusBlockNumbersByDigest>().expect("failed to open table!");
 
@@ -179,7 +179,7 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<CertificateDigestByRound>();
     db.open_table::<CertificateDigestByOrigin>();
     db.open_table::<Payload>();
-    db.open_table::<WorkerBlocks>();
+    db.open_table::<Batches>();
     db.open_table::<ConsensusBlocks>();
     db.open_table::<ConsensusBlockNumbersByDigest>();
     db

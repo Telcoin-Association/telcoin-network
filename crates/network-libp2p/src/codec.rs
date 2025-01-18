@@ -308,7 +308,7 @@ mod tests {
         //
         // test requests first
         //
-        // sanity check that block within bounds works
+        // sanity check
         let mut encoded = Vec::new();
 
         // this is 208 bytes uncompressed (max chunk size)

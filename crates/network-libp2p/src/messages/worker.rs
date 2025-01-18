@@ -2,7 +2,7 @@
 
 use crate::codec::TNMessage;
 use serde::{Deserialize, Serialize};
-use tn_types::{BlockHash, SealedWorkerBlock};
+use tn_types::{BlockHash, SealedBatch};
 
 // impl TNMessage trait for types
 impl TNMessage for WorkerRequest {}
@@ -15,9 +15,9 @@ pub enum WorkerRequest {
     ///
     /// NOTE: expect no response
     /// TODO: gossip this instead?
-    NewBlock(SealedWorkerBlock),
-    /// The missing blocks for this peer.
-    MissingBlocks {
+    NewBlock(SealedBatch),
+    /// The missing batches for this peer.
+    MissingBatches {
         /// The collection of missing [BlockHash]es.
         digests: Vec<BlockHash>,
     },
@@ -29,9 +29,9 @@ pub enum WorkerResponse {
     /// Return the missing blocks requested by the peer.
     ///
     /// TODO: anemo included `size_limit_reached: bool` field
-    /// but this should be trustless. See `RequestBlocksResponse` message.
-    MissingBlocks {
-        /// The collection of requested blocks.
-        blocks: Vec<SealedWorkerBlock>,
+    /// but this should be trustless. See `RequestBatchesResponse` message.
+    MissingBatches {
+        /// The collection of requested batches.
+        batches: Vec<SealedBatch>,
     },
 }

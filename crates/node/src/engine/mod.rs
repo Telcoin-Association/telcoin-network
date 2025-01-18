@@ -26,9 +26,7 @@ mod worker;
 use self::inner::ExecutionNodeInner;
 use reth_provider::providers::BlockchainProvider;
 use tn_faucet::FaucetArgs;
-use tn_types::{
-    ConsensusOutput, Noticer, TaskManager, WorkerBatchSender, WorkerBatchValidation, WorkerId,
-};
+use tn_types::{BatchSender, BatchValidation, ConsensusOutput, Noticer, TaskManager, WorkerId};
 use tokio::sync::{broadcast, RwLock};
 pub use worker::*;
 
@@ -88,7 +86,7 @@ where
     pub async fn start_batch_builder(
         &self,
         worker_id: WorkerId,
-        block_provider_sender: WorkerBatchSender,
+        block_provider_sender: BatchSender,
         task_manager: &TaskManager,
         rx_shutdown: Noticer,
     ) -> eyre::Result<()> {
@@ -97,7 +95,7 @@ where
     }
 
     /// Batch validator
-    pub async fn new_batch_validator(&self) -> Arc<dyn WorkerBatchValidation> {
+    pub async fn new_batch_validator(&self) -> Arc<dyn BatchValidation> {
         let guard = self.internal.read().await;
         guard.new_batch_validator()
     }

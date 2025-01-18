@@ -44,8 +44,8 @@ use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
 use tn_rpc::{TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
-    Consensus, ConsensusOutput, LastCanonicalUpdate, Noticer, TaskManager, WorkerBatchSender,
-    WorkerBatchValidation, WorkerId,
+    BatchSender, BatchValidation, Consensus, ConsensusOutput, LastCanonicalUpdate, Noticer,
+    TaskManager, WorkerId,
 };
 use tokio::sync::{broadcast, mpsc::unbounded_channel};
 use tokio_stream::wrappers::BroadcastStream;
@@ -209,7 +209,7 @@ where
     pub(super) async fn start_batch_builder(
         &mut self,
         worker_id: WorkerId,
-        block_provider_sender: WorkerBatchSender,
+        block_provider_sender: BatchSender,
         task_manager: &TaskManager,
         rx_shutdown: Noticer,
     ) -> eyre::Result<()> {
@@ -317,16 +317,16 @@ where
             latest_canon_state,
             block_provider_sender,
             self.address,
-            self.tn_config.parameters.max_worker_block_delay,
+            self.tn_config.parameters.max_batch_delay,
         );
 
         // spawn block builder task
-        task_manager.spawn_task("block builder", async move {
+        task_manager.spawn_task("batch builder", async move {
             tokio::select!(
                 _ = &rx_shutdown => {
                 }
                 res = batch_builder => {
-                    info!(target: "tn::execution", ?res, "block builder task exited");
+                    info!(target: "tn::execution", ?res, "batch builder task exited");
                 }
             )
         });
@@ -388,7 +388,7 @@ where
     }
 
     /// Create a new block validator.
-    pub(super) fn new_batch_validator(&self) -> Arc<dyn WorkerBatchValidation> {
+    pub(super) fn new_batch_validator(&self) -> Arc<dyn BatchValidation> {
         // batch validator
         Arc::new(BlockValidator::<DB>::new(self.blockchain_db.clone()))
     }

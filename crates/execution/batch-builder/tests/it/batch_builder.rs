@@ -24,17 +24,17 @@ use reth_transaction_pool::{
 };
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tempfile::TempDir;
-use tn_batch_builder::{test_utils::execute_test_worker_batch, BlockBuilder};
+use tn_batch_builder::{test_utils::execute_test_batch, BlockBuilder};
 use tn_batch_validator::BlockValidator;
 use tn_engine::execute_consensus_output;
 use tn_network::local::LocalNetwork;
 use tn_network_types::MockWorkerToPrimary;
-use tn_storage::{open_db, tables::WorkerBlocks, traits::Database};
+use tn_storage::{open_db, tables::Batches, traits::Database};
 use tn_test_utils::{get_gas_price, test_genesis, TransactionFactory};
 use tn_types::{
-    AutoSealConsensus, BuildArguments, Certificate, CommittedSubDag, Consensus, ConsensusHeader,
-    ConsensusOutput, LastCanonicalUpdate, ReputationScores, SealedWorkerBlock,
-    WorkerBatchValidation, WorkerBlock,
+    AutoSealConsensus, Batch, BatchValidation, BuildArguments, Certificate, CommittedSubDag,
+    Consensus, ConsensusHeader, ConsensusOutput, LastCanonicalUpdate, ReputationScores,
+    SealedBatch,
 };
 use tn_worker::{
     metrics::WorkerMetrics,
@@ -49,7 +49,7 @@ struct TestMakeBlockQuorumWaiter();
 impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
     fn verify_batch(
         &self,
-        _batch: SealedWorkerBlock,
+        _batch: SealedBatch,
         _timeout: Duration,
     ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
         tokio::spawn(async move { Ok(()) })
@@ -208,8 +208,8 @@ async fn test_make_batch_el_to_cl() {
     for _ in 0..5 {
         let _ = tokio::time::sleep(Duration::from_secs(1)).await;
         // Ensure the batch is stored
-        if let Some((digest, wb)) = store.iter::<WorkerBlocks>().next() {
-            sealed_batch = Some(SealedWorkerBlock::new(wb, digest));
+        if let Some((digest, wb)) = store.iter::<Batches>().next() {
+            sealed_batch = Some(SealedBatch::new(wb, digest));
             break;
         }
     }
@@ -222,7 +222,7 @@ async fn test_make_batch_el_to_cl() {
     assert!(valid_batch_result.is_ok());
 
     // ensure expected transaction is in batch
-    let expected_batch = WorkerBlock {
+    let expected_batch = Batch {
         transactions: vec![transaction1.clone(), transaction2.clone(), transaction3.clone()],
         received_at: None,
         ..*sealed_batch.batch()
@@ -234,12 +234,12 @@ async fn test_make_batch_el_to_cl() {
 
     // ensure enough time passes for store to pass
     let _ = tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    let first_batch = store.iter::<WorkerBlocks>().next();
+    let first_batch = store.iter::<Batches>().next();
     debug!("first batch? {:?}", first_batch);
 
     // Ensure the batch is stored
     let batch_from_store = store
-        .get::<WorkerBlocks>(&expected_batch.digest())
+        .get::<Batches>(&expected_batch.digest())
         .expect("store searched for batch")
         .expect("batch in store");
     assert_eq!(batch_from_store.beneficiary, address);
@@ -409,8 +409,8 @@ async fn test_batch_builder_produces_valid_batchess() {
     let valid_batch_result = batch_validator.validate_block(first_batch.clone());
     assert!(valid_batch_result.is_ok());
 
-    // ensure expected transaction is in block
-    let expected_batch = WorkerBlock {
+    // ensure expected transaction is in batch
+    let expected_batch = Batch {
         transactions: vec![transaction1.clone(), transaction2.clone(), transaction3.clone()],
         received_at: None,
         ..*first_batch.batch()
@@ -600,16 +600,16 @@ async fn test_canonical_notification_updates_pool() {
     let queued_pool_len = txpool.pool_size().queued;
     assert_eq!(queued_pool_len, 1);
 
-    // ensure expected transaction is in block
-    let mut first_batch = WorkerBlock {
+    // ensure expected transaction is in batch
+    let mut first_batch = Batch {
         transactions: vec![transaction1.clone(), transaction2.clone(), transaction3.clone()],
         ..Default::default()
     };
 
-    execute_test_worker_batch(&mut first_batch, &chain.sealed_genesis_header());
+    execute_test_batch(&mut first_batch, &chain.sealed_genesis_header());
 
     // execute batch - create output for consistency
-    let block_digests = VecDeque::from([first_batch.digest()]);
+    let batch_digests = VecDeque::from([first_batch.digest()]);
     let output = ConsensusOutput {
         sub_dag: CommittedSubDag::new(
             vec![Certificate::default()],
@@ -621,7 +621,7 @@ async fn test_canonical_notification_updates_pool() {
         .into(),
         batches: vec![vec![first_batch]],
         beneficiary: address,
-        block_digests,
+        batch_digests,
         parent_hash: ConsensusHeader::default().digest(),
         number: 0,
     };

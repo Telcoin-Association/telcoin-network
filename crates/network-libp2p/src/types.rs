@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 pub type NetworkResult<T> = Result<T, NetworkError>;
 
 /// The topic for NVVs to subscribe to for published batches.
-pub const WORKER_BLOCK_TOPIC: &str = "tn_worker_blocks";
+pub const WORKER_BLOCK_TOPIC: &str = "tn_batches";
 /// The topic for NVVs to subscribe to for published primary certificates.
 pub const PRIMARY_CERT_TOPIC: &str = "tn_certificates";
 /// The topic for NVVs to subscribe to for published consensus chain.

@@ -36,7 +36,7 @@ use tempfile::tempdir;
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
 use tn_node::engine::{ExecutionNode, TnBuilder};
-use tn_types::{adiri_genesis, now, ExecutionKeypair, TaskManager, TimestampSec, WorkerBlock};
+use tn_types::{adiri_genesis, now, Batch, ExecutionKeypair, TaskManager, TimestampSec};
 use tracing::debug;
 
 /// Convnenience type for testing Execution Node.
@@ -211,7 +211,7 @@ pub fn adiri_genesis_seeded(accounts: Vec<Address>) -> Genesis {
 /// Helper function to seed an instance of Genesis with accounts from a random batch.
 pub fn seeded_genesis_from_random_batch(
     genesis: Genesis,
-    batch: &WorkerBlock,
+    batch: &Batch,
 ) -> (Genesis, Vec<TransactionSigned>, Vec<Address>) {
     let mut senders = vec![];
     let mut accounts_to_seed = Vec::new();
@@ -240,7 +240,7 @@ pub fn seeded_genesis_from_random_batch(
 /// further use it testing.
 pub fn seeded_genesis_from_random_batches<'a>(
     mut genesis: Genesis,
-    batches: impl IntoIterator<Item = &'a WorkerBlock>,
+    batches: impl IntoIterator<Item = &'a Batch>,
 ) -> (Genesis, Vec<Vec<TransactionSigned>>, Vec<Vec<Address>>) {
     let mut txs = vec![];
     let mut senders = vec![];
@@ -286,7 +286,7 @@ pub struct OptionalTestBatchParams {
 /// Currently only used by faucet tests to obtain faucet contract account info
 /// by simulating deploying proxy contract. The results are then put into genesis.
 pub fn execution_outcome_for_tests<P, E>(
-    worker_block: &WorkerBlock,
+    batch: &Batch,
     parent: &SealedHeader,
     provider: &P,
     executor: &E,
@@ -322,13 +322,13 @@ where
 
     // decode batch transactions
     let mut txs = vec![];
-    for tx in worker_block.transactions() {
+    for tx in batch.transactions() {
         let tx_signed = tx.clone();
         txs.push(tx_signed);
     }
 
     // update header's transactions root
-    header.transactions_root = if worker_block.transactions().is_empty() {
+    header.transactions_root = if batch.transactions().is_empty() {
         EMPTY_TRANSACTIONS
     } else {
         proofs::calculate_transaction_root(&txs)

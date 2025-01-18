@@ -161,8 +161,8 @@ pub struct Parameters {
     pub sync_retry_nodes: usize,
     /// The delay after which the workers seal a batch of transactions, even if `max_batch_size`
     /// is not reached.
-    #[serde(with = "humantime_serde", default = "Parameters::default_max_worker_block_delay")]
-    pub max_worker_block_delay: Duration,
+    #[serde(with = "humantime_serde", default = "Parameters::default_max_batch_delay")]
+    pub max_batch_delay: Duration,
     /// The maximum number of concurrent requests for messages accepted from an un-trusted entity
     #[serde(default = "Parameters::default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
@@ -176,8 +176,8 @@ pub struct Parameters {
     #[serde(default = "AnemoParameters::default")]
     pub anemo: AnemoParameters,
     /// Worker timeout when request vote from peers.
-    #[serde(default = "Parameters::default_worker_block_vote_timeout")]
-    pub worker_block_vote_timeout: Duration,
+    #[serde(default = "Parameters::default_batch_vote_timeout")]
+    pub batch_vote_timeout: Duration,
 }
 
 impl Parameters {
@@ -209,7 +209,7 @@ impl Parameters {
         3
     }
 
-    fn default_max_worker_block_delay() -> Duration {
+    fn default_max_batch_delay() -> Duration {
         Duration::from_secs(1)
     }
 
@@ -217,7 +217,7 @@ impl Parameters {
         500_000
     }
 
-    fn default_worker_block_vote_timeout() -> Duration {
+    fn default_batch_vote_timeout() -> Duration {
         Duration::from_secs(10)
     }
 }
@@ -352,12 +352,12 @@ impl Default for Parameters {
             gc_depth: Parameters::default_gc_depth(),
             sync_retry_delay: Parameters::default_sync_retry_delay(),
             sync_retry_nodes: Parameters::default_sync_retry_nodes(),
-            max_worker_block_delay: Parameters::default_max_worker_block_delay(),
+            max_batch_delay: Parameters::default_max_batch_delay(),
             max_concurrent_requests: Parameters::default_max_concurrent_requests(),
             prometheus_metrics: PrometheusMetricsParameters::default(),
             network_admin_server: NetworkAdminServerParameters::default(),
             anemo: AnemoParameters::default(),
-            worker_block_vote_timeout: Parameters::default_worker_block_vote_timeout(),
+            batch_vote_timeout: Parameters::default_batch_vote_timeout(),
         }
     }
 }
@@ -381,7 +381,7 @@ impl Parameters {
         info!("Garbage collection depth set to {} rounds", self.gc_depth);
         info!("Sync retry delay set to {} ms", self.sync_retry_delay.as_millis());
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
-        info!("Max batch delay set to {} ms", self.max_worker_block_delay.as_millis());
+        info!("Max batch delay set to {} ms", self.max_batch_delay.as_millis());
         info!("Max concurrent requests set to {}", self.max_concurrent_requests);
         info!("Prometheus metrics server will run on {}", self.prometheus_metrics.socket_addr);
         info!(

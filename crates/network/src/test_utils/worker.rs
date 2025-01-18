@@ -1,7 +1,7 @@
 //! Mock implementations for Worker to Primary/Worker.
 use anemo::async_trait;
 use tn_network_types::{
-    RequestBlocksRequest, RequestBlocksResponse, WorkerBatchMessage, WorkerToWorker,
+    BatchMessage, RequestBatchesRequest, RequestBatchesResponse, WorkerToWorker,
     WorkerToWorkerServer,
 };
 use tn_types::{traits::KeyPair as _, Multiaddr, NetworkKeypair};
@@ -9,14 +9,14 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tracing::info;
 
 pub struct WorkerToWorkerMockServer {
-    batch_sender: Sender<WorkerBatchMessage>,
+    batch_sender: Sender<BatchMessage>,
 }
 
 impl WorkerToWorkerMockServer {
     pub fn spawn(
         keypair: NetworkKeypair,
         address: Multiaddr,
-    ) -> (Receiver<WorkerBatchMessage>, anemo::Network) {
+    ) -> (Receiver<BatchMessage>, anemo::Network) {
         let addr = address.to_anemo_address().unwrap();
         // Channel size 1000, should be big enough for testing even if ignoring the receiver..
         let (batch_sender, batch_receiver) = channel(1000);
@@ -35,9 +35,9 @@ impl WorkerToWorkerMockServer {
 
 #[async_trait]
 impl WorkerToWorker for WorkerToWorkerMockServer {
-    async fn report_block(
+    async fn report_batch(
         &self,
-        request: anemo::Request<WorkerBatchMessage>,
+        request: anemo::Request<BatchMessage>,
     ) -> Result<anemo::Response<()>, anemo::rpc::Status> {
         let message = request.into_body();
 
@@ -48,8 +48,8 @@ impl WorkerToWorker for WorkerToWorkerMockServer {
 
     async fn request_batches(
         &self,
-        _request: anemo::Request<RequestBlocksRequest>,
-    ) -> Result<anemo::Response<RequestBlocksResponse>, anemo::rpc::Status> {
+        _request: anemo::Request<RequestBatchesRequest>,
+    ) -> Result<anemo::Response<RequestBatchesResponse>, anemo::rpc::Status> {
         tracing::error!("Not implemented WorkerToWorkerMockServer::request_batches");
         Err(anemo::rpc::Status::internal("Unimplemented"))
     }

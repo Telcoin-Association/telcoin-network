@@ -4,12 +4,12 @@ use reth_db::database::Database;
 use reth_primitives::Header;
 use reth_provider::{providers::BlockchainProvider, BlockIdReader, HeaderProvider};
 use tn_types::{
-    max_worker_block_gas, max_worker_block_size, SealedWorkerBlock, TransactionSigned,
-    WorkerBatchValidation, WorkerBatchValidationError,
+    max_batch_gas, max_batch_size, BatchValidation, BatchValidationError, SealedBatch,
+    TransactionSigned,
 };
 
 /// Type convenience for implementing block validation errors.
-type BlockValidationResult<T> = Result<T, WorkerBatchValidationError>;
+type BlockValidationResult<T> = Result<T, BatchValidationError>;
 
 /// Block validator
 #[derive(Clone)]
@@ -22,34 +22,34 @@ where
 }
 
 #[async_trait::async_trait]
-impl<DB> WorkerBatchValidation for BlockValidator<DB>
+impl<DB> BatchValidation for BlockValidator<DB>
 where
     DB: Database + Sized + Clone + 'static,
 {
     /// Validate a peer's batch.
     ///
-    /// Workers do not execute full blocks. This method validates the required information.
-    fn validate_block(&self, sealed_block: SealedWorkerBlock) -> BlockValidationResult<()> {
+    /// Workers do not execute full batches. This method validates the required information.
+    fn validate_batch(&self, sealed_batch: SealedBatch) -> BlockValidationResult<()> {
         // ensure digest matches batch
-        let (block, digest) = sealed_block.split();
-        let verified_hash = block.clone().seal_slow().digest();
+        let (batch, digest) = sealed_batch.split();
+        let verified_hash = batch.clone().seal_slow().digest();
         if digest != verified_hash {
-            return Err(WorkerBatchValidationError::InvalidDigest);
+            return Err(BatchValidationError::InvalidDigest);
         }
 
         // TODO: validate individual transactions against parent
 
         // obtain info for validation
-        let transactions = block.transactions();
+        let transactions = batch.transactions();
 
         // first step towards validating parent's header
         // Note this is really a "best effort" check.  If we have not
-        // executed parent_hash yet then it will use the last executed block if
+        // executed parent_hash yet then it will use the last executed batch if
         // available.  Making it manditory would require waiting to see
         // if we execute it soon to avoid false failures.
         // The primary header should get checked so this should be ok.
         let parent =
-            self.blockchain_db.header(&block.parent_hash).unwrap_or_default().unwrap_or_else(
+            self.blockchain_db.header(&batch.parent_hash).unwrap_or_default().unwrap_or_else(
                 || {
                     let finalized_block_num_hash =
                         self.blockchain_db.finalized_block_num_hash().unwrap_or_default();
@@ -65,13 +65,13 @@ where
             );
 
         // validate timestamp vs parent
-        self.validate_against_parent_timestamp(block.timestamp, &parent)?;
+        self.validate_against_parent_timestamp(batch.timestamp, &parent)?;
 
         // validate gas limit
-        self.validate_block_gas(block.total_possible_gas(), block.timestamp)?;
+        self.validate_batch_gas(batch.total_possible_gas(), batch.timestamp)?;
 
-        // validate block size (bytes)
-        self.validate_block_size_bytes(transactions, block.timestamp)?;
+        // validate batch size (bytes)
+        self.validate_batch_size_bytes(transactions, batch.timestamp)?;
 
         // validate beneficiary?
         // no - tips would go to someone else
@@ -99,7 +99,7 @@ where
         parent: &Header,
     ) -> BlockValidationResult<()> {
         if timestamp <= parent.timestamp {
-            return Err(WorkerBatchValidationError::TimestampIsInPast {
+            return Err(BatchValidationError::TimestampIsInPast {
                 parent_timestamp: parent.timestamp,
                 timestamp,
             });
@@ -111,15 +111,15 @@ where
     ///
     /// Actual amount of gas used cannot be determined until execution.
     #[inline]
-    fn validate_block_gas(
+    fn validate_batch_gas(
         &self,
         total_possible_gas: u64,
         timestamp: u64,
     ) -> BlockValidationResult<()> {
         // ensure total tx gas limit fits into block's gas limit
-        let max_tx_gas = max_worker_block_gas(timestamp);
+        let max_tx_gas = max_batch_gas(timestamp);
         if total_possible_gas > max_tx_gas {
-            return Err(WorkerBatchValidationError::HeaderMaxGasExceedsGasLimit {
+            return Err(BatchValidationError::HeaderMaxGasExceedsGasLimit {
                 total_possible_gas,
                 gas_limit: max_tx_gas,
             });
@@ -128,7 +128,7 @@ where
     }
 
     /// Validate the size of transactions (in bytes).
-    fn validate_block_size_bytes(
+    fn validate_batch_size_bytes(
         &self,
         transactions: &[TransactionSigned],
         timestamp: u64,
@@ -138,12 +138,12 @@ where
             .iter()
             .map(|tx| tx.size())
             .reduce(|total, size| total + size)
-            .ok_or(WorkerBatchValidationError::CalculateTransactionByteSize)?;
-        let max_tx_bytes = max_worker_block_size(timestamp);
+            .ok_or(BatchValidationError::CalculateTransactionByteSize)?;
+        let max_tx_bytes = max_batch_size(timestamp);
 
         // allow txs that equal max tx bytes
         if total_bytes > max_tx_bytes {
-            return Err(WorkerBatchValidationError::HeaderTransactionBytesExceedsMax(total_bytes));
+            return Err(BatchValidationError::HeaderTransactionBytesExceedsMax(total_bytes));
         }
 
         Ok(())
@@ -163,8 +163,8 @@ pub struct NoopBlockValidator;
 
 #[cfg(any(test, feature = "test-utils"))]
 #[async_trait::async_trait]
-impl WorkerBatchValidation for NoopBlockValidator {
-    fn validate_block(&self, _block: SealedWorkerBlock) -> Result<(), WorkerBatchValidationError> {
+impl BatchValidation for NoopBlockValidator {
+    fn validate_batch(&self, _batch: SealedBatch) -> Result<(), BatchValidationError> {
         Ok(())
     }
 }
@@ -190,11 +190,11 @@ mod tests {
     use reth_prune::PruneModes;
     use std::{str::FromStr, sync::Arc};
     use tn_test_utils::{test_genesis, TransactionFactory};
-    use tn_types::{adiri_genesis, max_worker_block_gas, Consensus, WorkerBlock};
+    use tn_types::{adiri_genesis, max_batch_gas, Batch, Consensus};
     use tracing::debug;
 
     /// Return the next valid sealed batch
-    fn next_valid_sealed_worker_block() -> SealedWorkerBlock {
+    fn next_valid_sealed_batch() -> SealedBatch {
         let timestamp = 1701790139;
         // create valid transactions
         let mut tx_factory = TransactionFactory::new();
@@ -235,8 +235,8 @@ mod tests {
         // sealed batch
         //
         // intentionally used hard-coded values
-        SealedWorkerBlock::new(
-            WorkerBlock {
+        SealedBatch::new(
+            Batch {
                 transactions: valid_txs,
                 parent_hash: hex!(
                     "a0673579c1a31037ee29a7e3cb7b1495a020bf21d958269ea8291a64326667c5"
@@ -254,7 +254,7 @@ mod tests {
     /// Convenience type for creating test assets.
     struct TestTools {
         /// The expected sealed batch.
-        valid_block: SealedWorkerBlock,
+        valid_batch: SealedBatch,
         /// Validator
         validator: BlockValidator<Arc<TempDatabase<DatabaseEnv>>>,
     }
@@ -295,22 +295,22 @@ mod tests {
                 .expect("blockchain db valid");
 
         let validator = BlockValidator::new(blockchain_db);
-        let valid_block = next_valid_sealed_worker_block();
+        let valid_batch = next_valid_sealed_batch();
 
         // block validator
-        TestTools { valid_block, validator }
+        TestTools { valid_batch, validator }
     }
 
     #[tokio::test]
-    async fn test_valid_block() {
-        let TestTools { valid_block, validator } = test_tools().await;
-        let result = validator.validate_block(valid_block.clone());
+    async fn test_valid_batch() {
+        let TestTools { valid_batch, validator } = test_tools().await;
+        let result = validator.validate_block(valid_batch.clone());
         assert!(result.is_ok());
 
         // ensure non-serialized data does not affect validity
-        let (mut worker_block, _) = valid_block.split();
-        worker_block.received_at = Some(tn_types::now());
-        let different_block = worker_block.seal_slow();
+        let (mut batch, _) = valid_batch.split();
+        batch.received_at = Some(tn_types::now());
+        let different_block = batch.seal_slow();
         let result = validator.validate_block(different_block);
         assert!(result.is_ok());
     }
@@ -320,14 +320,13 @@ mod tests {
     // This check will lead to occasional false errors and should not be critical since
     // we should be validating parentage when building actual blocks (including any
     // needed waits for execution).
-    async fn _test_invalid_block_wrong_parent_hash() {
-        let TestTools { valid_block, validator } = test_tools().await;
-        let (worker_block, _) = valid_block.split();
-        let WorkerBlock {
-            transactions, beneficiary, timestamp, base_fee_per_gas, received_at, ..
-        } = worker_block;
+    async fn _test_invalid_batch_wrong_parent_hash() {
+        let TestTools { valid_batch, validator } = test_tools().await;
+        let (batch, _) = valid_batch.split();
+        let Batch { transactions, beneficiary, timestamp, base_fee_per_gas, received_at, .. } =
+            batch;
         let wrong_parent_hash = B256::random();
-        let invalid_block = WorkerBlock {
+        let invalid_batch = Batch {
             transactions,
             parent_hash: wrong_parent_hash,
             beneficiary,
@@ -336,39 +335,39 @@ mod tests {
             received_at,
         };
         assert_matches!(
-            validator.validate_block(invalid_block.seal_slow()),
-            Err(WorkerBatchValidationError::CanonicalChain { block_hash }) if block_hash == wrong_parent_hash
+            validator.validate_block(invalid_batch.seal_slow()),
+            Err(BatchValidationError::CanonicalChain { block_hash }) if batch_hash == wrong_parent_hash
         );
     }
 
     #[tokio::test]
-    async fn test_invalid_block_wrong_timestamp() {
-        let TestTools { valid_block, validator } = test_tools().await;
-        let (mut worker_block, _) = valid_block.split();
+    async fn test_invalid_batch_wrong_timestamp() {
+        let TestTools { valid_batch, validator } = test_tools().await;
+        let (mut batch, _) = valid_batch.split();
 
-        // test worker_block timestamp same as parent
+        // test batch timestamp same as parent
         let wrong_timestamp = adiri_genesis().timestamp;
-        worker_block.timestamp = wrong_timestamp;
+        batch.timestamp = wrong_timestamp;
 
         assert_matches!(
-            validator.validate_block(worker_block.clone().seal_slow()),
-            Err(WorkerBatchValidationError::TimestampIsInPast{parent_timestamp, timestamp}) if parent_timestamp == wrong_timestamp && timestamp == wrong_timestamp
+            validator.validate_block(batch.clone().seal_slow()),
+            Err(BatchValidationError::TimestampIsInPast{parent_timestamp, timestamp}) if parent_timestamp == wrong_timestamp && timestamp == wrong_timestamp
         );
 
         // test header timestamp before parent
-        worker_block.timestamp = wrong_timestamp - 1;
+        batch.timestamp = wrong_timestamp - 1;
 
         assert_matches!(
-            validator.validate_block(worker_block.seal_slow()),
-            Err(WorkerBatchValidationError::TimestampIsInPast{parent_timestamp, timestamp}) if parent_timestamp == wrong_timestamp && timestamp == wrong_timestamp - 1
+            validator.validate_block(batch.seal_slow()),
+            Err(BatchValidationError::TimestampIsInPast{parent_timestamp, timestamp}) if parent_timestamp == wrong_timestamp && timestamp == wrong_timestamp - 1
         );
     }
 
     #[tokio::test]
-    async fn test_invalid_block_excess_gas_used() {
+    async fn test_invalid_batch_excess_gas_used() {
         // Set excessive gas limit.
-        let TestTools { valid_block, validator } = test_tools().await;
-        let (worker_block, _) = valid_block.split();
+        let TestTools { valid_batch, validator } = test_tools().await;
+        let (batch, _) = valid_batch.split();
 
         // sign excessive transaction
         let mut tx_factory = TransactionFactory::new();
@@ -379,17 +378,16 @@ mod tests {
         // create transaction with max gas limit above the max allowed
         let invalid_transaction = tx_factory.create_eip1559(
             chain.clone(),
-            Some(max_worker_block_gas(worker_block.timestamp) + 1),
+            Some(max_batch_gas(batch.timestamp) + 1),
             gas_price,
             Some(Address::ZERO),
             value, // 1 TEL
             Bytes::new(),
         );
 
-        let WorkerBlock {
-            beneficiary, timestamp, base_fee_per_gas, received_at, parent_hash, ..
-        } = worker_block;
-        let invalid_block = WorkerBlock {
+        let Batch { beneficiary, timestamp, base_fee_per_gas, received_at, parent_hash, .. } =
+            batch;
+        let invalid_batch = Batch {
             transactions: vec![invalid_transaction],
             parent_hash,
             beneficiary,
@@ -400,8 +398,8 @@ mod tests {
 
         assert_matches!(
             validator
-                .validate_block_gas(invalid_block.total_possible_gas(), invalid_block.timestamp),
-            Err(WorkerBatchValidationError::HeaderMaxGasExceedsGasLimit {
+                .validate_batch_gas(invalid_batch.total_possible_gas(), invalid_batch.timestamp),
+            Err(BatchValidationError::HeaderMaxGasExceedsGasLimit {
                 total_possible_gas: _,
                 gas_limit: _
             })
@@ -409,8 +407,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_invalid_block_wrong_size_in_bytes() {
-        let TestTools { valid_block, validator } = test_tools().await;
+    async fn test_invalid_batch_wrong_size_in_bytes() {
+        let TestTools { valid_batch, validator } = test_tools().await;
         // create enough transactions to exceed 1MB
         // TODO: clean this up - taken from `test_types` fn
         // because validator uses provided with same genesis
@@ -435,7 +433,7 @@ mod tests {
         // currently: 4695 txs at 1000035 bytes
         let mut too_many_txs = Vec::new();
         let mut total_bytes = 0;
-        while total_bytes < max_worker_block_size(0) {
+        while total_bytes < max_batch_size(0) {
             let tx = tx_factory.create_explicit_eip1559(
                 Some(chain.chain.id()),
                 None,                    // default nonce
@@ -458,20 +456,20 @@ mod tests {
         assert_eq!(too_many_txs.len(), 4695);
 
         // update header so tx root is correct
-        let (mut block, _hash) = valid_block.split();
+        let (mut block, _hash) = valid_batch.split();
         block.transactions = too_many_txs;
-        let invalid_block = block.clone().seal_slow();
+        let invalid_batch = block.clone().seal_slow();
 
         assert_matches!(
-            validator.validate_block(invalid_block),
-            Err(WorkerBatchValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == total_bytes
+            validator.validate_block(invalid_batch),
+            Err(BatchValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == total_bytes
         );
 
         // Generate 1MB vec of 1s - total bytes are: 1_000_213
         let big_input = vec![1u8; 1_000_000];
 
         // create giant tx
-        let max_gas = max_worker_block_gas(0);
+        let max_gas = max_batch_gas(0);
         let giant_tx = tx_factory.create_explicit_eip1559(
             Some(chain.chain.id()),
             Some(0),                      // make this first tx in block 1
@@ -490,10 +488,10 @@ mod tests {
 
         let invalid_txs = vec![giant_tx];
         block.transactions = invalid_txs;
-        let invalid_block = block.seal_slow();
+        let invalid_batch = block.seal_slow();
         assert_matches!(
-            validator.validate_block(invalid_block),
-            Err(WorkerBatchValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == too_big
+            validator.validate_block(invalid_batch),
+            Err(BatchValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == too_big
         );
     }
 

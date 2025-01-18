@@ -111,7 +111,7 @@ mod tests {
     use crate::{open_db, PayloadStore};
     use futures::future::join_all;
     use tempfile::TempDir;
-    use tn_types::WorkerBlock;
+    use tn_types::Batch;
 
     #[tokio::test]
     async fn test_notify_read() {
@@ -120,7 +120,7 @@ mod tests {
         let store = PayloadStore::new(db);
 
         // run the tests a few times
-        let batch: WorkerBlock = tn_test_utils::fixture_batch_with_transactions(10);
+        let batch: Batch = tn_test_utils::fixture_batch_with_transactions(10);
         let id = batch.digest();
         let worker_id = 0;
 

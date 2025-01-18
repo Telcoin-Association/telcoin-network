@@ -13,12 +13,12 @@ use std::{
     time::Duration,
 };
 use tn_network::WorkerRpc;
-use tn_network_types::{RequestBlocksRequest, RequestBlocksResponse};
+use tn_network_types::{RequestBatchesRequest, RequestBatchesResponse};
 use tn_storage::{
-    tables::WorkerBlocks,
+    tables::Batches,
     traits::{Database, DbTxMut},
 };
-use tn_types::{now, BlockHash, NetworkPublicKey, WorkerBlock};
+use tn_types::{now, Batch, BlockHash, NetworkPublicKey};
 use tokio::{
     select,
     time::{sleep, sleep_until, Instant},
@@ -28,21 +28,26 @@ use tracing::debug;
 const REMOTE_PARALLEL_FETCH_INTERVAL: Duration = Duration::from_secs(2);
 const WORKER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
-pub struct WorkerBatchFetcher<DB> {
+pub struct BatchFetcher<DB> {
     name: NetworkPublicKey,
-    network: Arc<dyn RequestBlocksNetwork>,
+    network: Arc<dyn RequestBatchesNetwork>,
     batch_store: DB,
     metrics: Arc<WorkerMetrics>,
 }
 
-impl<DB: Database> WorkerBatchFetcher<DB> {
+impl<DB: Database> BatchFetcher<DB> {
     pub fn new(
         name: NetworkPublicKey,
         network: Network,
         batch_store: DB,
         metrics: Arc<WorkerMetrics>,
     ) -> Self {
-        Self { name, network: Arc::new(RequestBlocksNetworkImpl { network }), batch_store, metrics }
+        Self {
+            name,
+            network: Arc::new(RequestBatchesNetworkImpl { network }),
+            batch_store,
+            metrics,
+        }
     }
 
     /// Bulk fetches payload from local storage and remote workers.
@@ -51,7 +56,7 @@ impl<DB: Database> WorkerBatchFetcher<DB> {
         &self,
         digests: HashSet<BlockHash>,
         known_workers: HashSet<NetworkPublicKey>,
-    ) -> HashMap<BlockHash, WorkerBlock> {
+    ) -> HashMap<BlockHash, Batch> {
         debug!(
             "Attempting to fetch {} digests from {} workers",
             digests.len(),
@@ -112,7 +117,7 @@ impl<DB: Database> WorkerBatchFetcher<DB> {
                                 batch.set_received_at(now());
                                 updated_new_batches.insert(*digest, batch.clone());
                                 // Also persist the batches, so they are available after restarts.
-                                if let Err(e) = txn.insert::<WorkerBlocks>(digest, &batch) {
+                                if let Err(e) = txn.insert::<Batches>(digest, &batch) {
                                     tracing::error!("failed to insert batch! We can not continue.. {e}");
                                     panic!("failed to insert batch! We can not continue.. {e}");
                                 }
@@ -139,7 +144,7 @@ impl<DB: Database> WorkerBatchFetcher<DB> {
         }
     }
 
-    async fn fetch_local(&self, digests: HashSet<BlockHash>) -> HashMap<BlockHash, WorkerBlock> {
+    async fn fetch_local(&self, digests: HashSet<BlockHash>) -> HashMap<BlockHash, Batch> {
         let mut fetched_batches = HashMap::new();
         if digests.is_empty() {
             return fetched_batches;
@@ -148,13 +153,13 @@ impl<DB: Database> WorkerBatchFetcher<DB> {
         // Continue to bulk request from local worker until no remaining digests
         // are available.
         debug!("Local attempt to fetch {} digests", digests.len());
-        if let Ok(local_batches) = self.batch_store.multi_get::<WorkerBlocks>(digests.iter()) {
+        if let Ok(local_batches) = self.batch_store.multi_get::<Batches>(digests.iter()) {
             for (digest, batch) in digests.into_iter().zip(local_batches.into_iter()) {
                 if let Some(batch) = batch {
-                    self.metrics.worker_batch_fetch.with_label_values(&["local", "success"]).inc();
+                    self.metrics.batch_fetch.with_label_values(&["local", "success"]).inc();
                     fetched_batches.insert(digest, batch);
                 } else {
-                    self.metrics.worker_batch_fetch.with_label_values(&["local", "missing"]).inc();
+                    self.metrics.batch_fetch.with_label_values(&["local", "missing"]).inc();
                 }
             }
         }
@@ -169,7 +174,7 @@ impl<DB: Database> WorkerBatchFetcher<DB> {
         &self,
         worker: NetworkPublicKey,
         digests: HashSet<BlockHash>,
-    ) -> HashMap<BlockHash, WorkerBlock> {
+    ) -> HashMap<BlockHash, Batch> {
         // TODO: Make these config parameters
         let max_timeout = Duration::from_secs(60);
         let mut timeout = Duration::from_secs(10);
@@ -185,30 +190,21 @@ impl<DB: Database> WorkerBatchFetcher<DB> {
             drop(request_guard);
             match response {
                 Ok(remote_batches) => {
-                    self.metrics.worker_batch_fetch.with_label_values(&["remote", "success"]).inc();
+                    self.metrics.batch_fetch.with_label_values(&["remote", "success"]).inc();
                     debug!("Found {} batches remotely", remote_batches.len());
                     return remote_batches;
                 }
                 Err(err) => {
                     if err.to_string().contains("Timeout") {
-                        self.metrics
-                            .worker_batch_fetch
-                            .with_label_values(&["remote", "timeout"])
-                            .inc();
+                        self.metrics.batch_fetch.with_label_values(&["remote", "timeout"]).inc();
                         debug!("Timed out retrieving payloads {digests:?} from {worker} attempt {attempt}: {err}");
                     } else if err.to_string().contains("[Protocol violation]") {
-                        self.metrics
-                            .worker_batch_fetch
-                            .with_label_values(&["remote", "fail"])
-                            .inc();
+                        self.metrics.batch_fetch.with_label_values(&["remote", "fail"]).inc();
                         debug!("Failed retrieving payloads {digests:?} from possibly byzantine {worker} attempt {attempt}: {err}");
                         // Do not bother retrying if the remote worker is byzantine.
                         return HashMap::new();
                     } else {
-                        self.metrics
-                            .worker_batch_fetch
-                            .with_label_values(&["remote", "fail"])
-                            .inc();
+                        self.metrics.batch_fetch.with_label_values(&["remote", "fail"]).inc();
                         debug!("Error retrieving payloads {digests:?} from {worker} attempt {attempt}: {err}");
                     }
                 }
@@ -227,13 +223,13 @@ impl<DB: Database> WorkerBatchFetcher<DB> {
         digests_to_fetch: HashSet<BlockHash>,
         worker: NetworkPublicKey,
         timeout: Duration,
-    ) -> eyre::Result<HashMap<BlockHash, WorkerBlock>> {
+    ) -> eyre::Result<HashMap<BlockHash, Batch>> {
         let mut fetched_batches = HashMap::new();
         if digests_to_fetch.is_empty() {
             return Ok(fetched_batches);
         }
 
-        let RequestBlocksResponse { batches, is_size_limit_reached: _ } = self
+        let RequestBatchesResponse { batches, is_size_limit_reached: _ } = self
             .network
             .request_batches(
                 digests_to_fetch.clone().into_iter().collect(),
@@ -278,29 +274,29 @@ impl Drop for PendingGuard<'_> {
 // Trait for unit tests
 // TODO: migrate this WorkerRpc.
 #[async_trait]
-pub trait RequestBlocksNetwork: Send + Sync {
+pub trait RequestBatchesNetwork: Send + Sync {
     async fn request_batches(
         &self,
         batch_digests: Vec<BlockHash>,
         worker: NetworkPublicKey,
         timeout: Duration,
-    ) -> eyre::Result<RequestBlocksResponse>;
+    ) -> eyre::Result<RequestBatchesResponse>;
 }
 
-struct RequestBlocksNetworkImpl {
+struct RequestBatchesNetworkImpl {
     network: anemo::Network,
 }
 
 #[async_trait]
-impl RequestBlocksNetwork for RequestBlocksNetworkImpl {
+impl RequestBatchesNetwork for RequestBatchesNetworkImpl {
     async fn request_batches(
         &self,
         batch_digests: Vec<BlockHash>,
         worker: NetworkPublicKey,
         timeout: Duration,
-    ) -> eyre::Result<RequestBlocksResponse> {
+    ) -> eyre::Result<RequestBatchesResponse> {
         let request =
-            anemo::Request::new(RequestBlocksRequest { batch_digests }).with_timeout(timeout);
+            anemo::Request::new(RequestBatchesRequest { batch_digests }).with_timeout(timeout);
         self.network.request_batches(&worker, request).await
     }
 }
@@ -317,18 +313,18 @@ mod tests {
 
     #[tokio::test]
     pub async fn test_fetcher() {
-        let mut network = TestRequestBlocksNetwork::new();
+        let mut network = TestRequestBatchesNetwork::new();
         let temp_dir = TempDir::new().unwrap();
         let batch_store = open_db(temp_dir.path());
-        let batch1 = WorkerBlock { transactions: vec![transaction()], ..Default::default() };
-        let batch2 = WorkerBlock { transactions: vec![transaction()], ..Default::default() };
+        let batch1 = Batch { transactions: vec![transaction()], ..Default::default() };
+        let batch2 = Batch { transactions: vec![transaction()], ..Default::default() };
         let (digests, known_workers) = (
             HashSet::from_iter(vec![batch1.digest(), batch2.digest()]),
             HashSet::from_iter(test_pks(&[1, 2])),
         );
         network.put(&[1, 2], batch1.clone());
         network.put(&[2, 3], batch2.clone());
-        let fetcher = WorkerBatchFetcher {
+        let fetcher = BatchFetcher {
             name: test_pk(0),
             network: Arc::new(network.clone()),
             batch_store: batch_store.clone(),
@@ -350,11 +346,11 @@ mod tests {
         }
         assert_eq!(fetched_batches, expected_batches);
         assert_eq!(
-            batch_store.get::<WorkerBlocks>(&batch1.digest()).unwrap().unwrap().digest(),
+            batch_store.get::<Batches>(&batch1.digest()).unwrap().unwrap().digest(),
             batch1.digest()
         );
         assert_eq!(
-            batch_store.get::<WorkerBlocks>(&batch2.digest()).unwrap().unwrap().digest(),
+            batch_store.get::<Batches>(&batch2.digest()).unwrap().unwrap().digest(),
             batch2.digest()
         );
     }
@@ -363,23 +359,23 @@ mod tests {
     pub async fn test_fetcher_locally_with_remaining() {
         // Limit is set to two batches in test request_batches(). Request 3 batches
         // and ensure another request is sent to get the remaining batches.
-        let mut network = TestRequestBlocksNetwork::new();
+        let mut network = TestRequestBatchesNetwork::new();
         let temp_dir = TempDir::new().unwrap();
         let batch_store = open_db(temp_dir.path());
-        let batch1 = WorkerBlock { transactions: vec![transaction()], ..Default::default() };
-        let batch2 = WorkerBlock { transactions: vec![transaction()], ..Default::default() };
-        let batch3 = WorkerBlock { transactions: vec![transaction()], ..Default::default() };
+        let batch1 = Batch { transactions: vec![transaction()], ..Default::default() };
+        let batch2 = Batch { transactions: vec![transaction()], ..Default::default() };
+        let batch3 = Batch { transactions: vec![transaction()], ..Default::default() };
         let (digests, known_workers) = (
             HashSet::from_iter(vec![batch1.digest(), batch2.digest(), batch3.digest()]),
             HashSet::from_iter(test_pks(&[1, 2, 3])),
         );
         for batch in &[&batch1, &batch2, &batch3] {
-            batch_store.insert::<WorkerBlocks>(&batch.digest(), batch).unwrap();
+            batch_store.insert::<Batches>(&batch.digest(), batch).unwrap();
         }
         network.put(&[1, 2], batch1.clone());
         network.put(&[2, 3], batch2.clone());
         network.put(&[3, 4], batch3.clone());
-        let fetcher = WorkerBatchFetcher {
+        let fetcher = BatchFetcher {
             name: test_pk(0),
             network: Arc::new(network.clone()),
             batch_store,
@@ -398,12 +394,12 @@ mod tests {
     pub async fn test_fetcher_remote_with_remaining() {
         // Limit is set to two batches in test request_batches(). Request 3 batches
         // and ensure another request is sent to get the remaining batches.
-        let mut network = TestRequestBlocksNetwork::new();
+        let mut network = TestRequestBatchesNetwork::new();
         let temp_dir = TempDir::new().unwrap();
         let batch_store = open_db(temp_dir.path());
-        let batch1 = WorkerBlock { transactions: vec![transaction()], ..Default::default() };
-        let batch2 = WorkerBlock { transactions: vec![transaction()], ..Default::default() };
-        let batch3 = WorkerBlock { transactions: vec![transaction()], ..Default::default() };
+        let batch1 = Batch { transactions: vec![transaction()], ..Default::default() };
+        let batch2 = Batch { transactions: vec![transaction()], ..Default::default() };
+        let batch3 = Batch { transactions: vec![transaction()], ..Default::default() };
         let (digests, known_workers) = (
             HashSet::from_iter(vec![batch1.digest(), batch2.digest(), batch3.digest()]),
             HashSet::from_iter(test_pks(&[2, 3, 4])),
@@ -411,7 +407,7 @@ mod tests {
         network.put(&[3, 4], batch1.clone());
         network.put(&[2, 3], batch2.clone());
         network.put(&[2, 3, 4], batch3.clone());
-        let fetcher = WorkerBatchFetcher {
+        let fetcher = BatchFetcher {
             name: test_pk(0),
             network: Arc::new(network.clone()),
             batch_store,
@@ -439,21 +435,21 @@ mod tests {
 
     #[tokio::test]
     pub async fn test_fetcher_local_and_remote() {
-        let mut network = TestRequestBlocksNetwork::new();
+        let mut network = TestRequestBatchesNetwork::new();
         let temp_dir = TempDir::new().unwrap();
         let batch_store = open_db(temp_dir.path());
-        let batch1 = WorkerBlock { transactions: vec![transaction()], ..Default::default() };
-        let batch2 = WorkerBlock { transactions: vec![transaction()], ..Default::default() };
-        let batch3 = WorkerBlock { transactions: vec![transaction()], ..Default::default() };
+        let batch1 = Batch { transactions: vec![transaction()], ..Default::default() };
+        let batch2 = Batch { transactions: vec![transaction()], ..Default::default() };
+        let batch3 = Batch { transactions: vec![transaction()], ..Default::default() };
         let (digests, known_workers) = (
             HashSet::from_iter(vec![batch1.digest(), batch2.digest(), batch3.digest()]),
             HashSet::from_iter(test_pks(&[1, 2, 3, 4])),
         );
-        batch_store.insert::<WorkerBlocks>(&batch1.digest(), &batch1).unwrap();
+        batch_store.insert::<Batches>(&batch1.digest(), &batch1).unwrap();
         network.put(&[1, 2, 3], batch1.clone());
         network.put(&[2, 3, 4], batch2.clone());
         network.put(&[1, 4], batch3.clone());
-        let fetcher = WorkerBatchFetcher {
+        let fetcher = BatchFetcher {
             name: test_pk(0),
             network: Arc::new(network.clone()),
             batch_store,
@@ -485,7 +481,7 @@ mod tests {
 
     #[tokio::test]
     pub async fn test_fetcher_response_size_limit() {
-        let mut network = TestRequestBlocksNetwork::new();
+        let mut network = TestRequestBatchesNetwork::new();
         let temp_dir = TempDir::new().unwrap();
         let batch_store = open_db(temp_dir.path());
         let num_digests = 12;
@@ -493,15 +489,15 @@ mod tests {
         let mut local_digests = Vec::new();
         // 6 batches available locally with response size limit of 2
         for _i in 0..num_digests / 2 {
-            let batch = WorkerBlock { transactions: vec![transaction()], ..Default::default() };
+            let batch = Batch { transactions: vec![transaction()], ..Default::default() };
             local_digests.push(batch.digest());
-            batch_store.insert::<WorkerBlocks>(&batch.digest(), &batch).unwrap();
+            batch_store.insert::<Batches>(&batch.digest(), &batch).unwrap();
             network.put(&[1, 2, 3], batch.clone());
             expected_batches.push(batch);
         }
         // 6 batches available remotely with response size limit of 2
         for _i in (num_digests / 2)..num_digests {
-            let batch = WorkerBlock { transactions: vec![transaction()], ..Default::default() };
+            let batch = Batch { transactions: vec![transaction()], ..Default::default() };
             network.put(&[1, 2, 3], batch.clone());
             expected_batches.push(batch);
         }
@@ -513,7 +509,7 @@ mod tests {
             HashSet::from_iter(expected_batches.clone().into_keys()),
             HashSet::from_iter(test_pks(&[1, 2, 3])),
         );
-        let fetcher = WorkerBatchFetcher {
+        let fetcher = BatchFetcher {
             name: test_pk(0),
             network: Arc::new(network.clone()),
             batch_store,
@@ -541,17 +537,17 @@ mod tests {
     // TODO: add test for timeouts, failures and retries.
 
     #[derive(Clone)]
-    struct TestRequestBlocksNetwork {
+    struct TestRequestBatchesNetwork {
         // Worker name -> batch digests it has -> batches.
-        data: HashMap<NetworkPublicKey, HashMap<BlockHash, WorkerBlock>>,
+        data: HashMap<NetworkPublicKey, HashMap<BlockHash, Batch>>,
     }
 
-    impl TestRequestBlocksNetwork {
+    impl TestRequestBatchesNetwork {
         pub fn new() -> Self {
             Self { data: HashMap::new() }
         }
 
-        pub fn put(&mut self, keys: &[u8], batch: WorkerBlock) {
+        pub fn put(&mut self, keys: &[u8], batch: Batch) {
             for key in keys {
                 let key = test_pk(*key);
                 let entry = self.data.entry(key).or_default();
@@ -561,15 +557,15 @@ mod tests {
     }
 
     #[async_trait]
-    impl RequestBlocksNetwork for TestRequestBlocksNetwork {
+    impl RequestBatchesNetwork for TestRequestBatchesNetwork {
         async fn request_batches(
             &self,
             digests: Vec<BlockHash>,
             worker: NetworkPublicKey,
             _timeout: Duration,
-        ) -> eyre::Result<RequestBlocksResponse> {
+        ) -> eyre::Result<RequestBatchesResponse> {
             // Use this to simulate server side response size limit in RequestBlocks
-            const MAX_request_batches_RESPONSE_SIZE: usize = 2;
+            const MAX_REQUEST_BATCHES_RESPONSE_SIZE: usize = 2;
             const MAX_READ_BLOCK_DIGESTS: usize = 5;
 
             let mut is_size_limit_reached = false;
@@ -592,7 +588,7 @@ mod tests {
                 }
             }
 
-            Ok(RequestBlocksResponse { batches, is_size_limit_reached })
+            Ok(RequestBatchesResponse { batches, is_size_limit_reached })
         }
     }
 

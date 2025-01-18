@@ -1,8 +1,8 @@
 //! The main worker type
 
 use crate::{
-    batch_fetcher::WorkerBatchFetcher,
-    batch_provider::BlockProvider,
+    batch_fetcher::BatchFetcher,
+    batch_provider::BatchProvider,
     metrics::{Metrics, WorkerMetrics},
     network::{PrimaryReceiverHandler, WorkerReceiverHandler},
     quorum_waiter::QuorumWaiter,
@@ -31,8 +31,8 @@ use tn_network::{
 use tn_network_types::WorkerToWorkerServer;
 use tn_storage::traits::Database;
 use tn_types::{
-    traits::KeyPair as _, AuthorityIdentifier, Multiaddr, NetworkPublicKey, Noticer, Protocol,
-    TaskManager, WorkerBatchValidation, WorkerId,
+    traits::KeyPair as _, AuthorityIdentifier, BatchValidation, Multiaddr, NetworkPublicKey,
+    Noticer, Protocol, TaskManager, WorkerId,
 };
 use tower::ServiceBuilder;
 use tracing::{error, info};
@@ -72,11 +72,11 @@ impl<DB: Database> Worker<DB> {
     /// Create an instance of `Self` and start all tasks to participate in consensus.
     pub fn spawn(
         id: WorkerId,
-        validator: Arc<dyn WorkerBatchValidation>,
+        validator: Arc<dyn BatchValidation>,
         metrics: Metrics,
         consensus_config: ConsensusConfig<DB>,
         task_manager: &TaskManager,
-    ) -> (Self, BlockProvider<DB, QuorumWaiter>) {
+    ) -> (Self, BatchProvider<DB, QuorumWaiter>) {
         let worker_name = consensus_config.key_config().worker_network_public_key();
         let worker_peer_id = PeerId(worker_name.0.to_bytes());
         info!("Boot worker node with id {} peer id {}", id, worker_peer_id,);
@@ -86,7 +86,7 @@ impl<DB: Database> Worker<DB> {
         // Receive incoming messages from other workers.
         let network = Self::start_network(id, &consensus_config, validator.clone(), &metrics);
 
-        let batch_fetcher = WorkerBatchFetcher::new(
+        let batch_fetcher = BatchFetcher::new(
             worker_name,
             network.clone(),
             consensus_config.node_storage().batch_store.clone(),
@@ -197,7 +197,7 @@ impl<DB: Database> Worker<DB> {
     fn start_network(
         id: WorkerId,
         consensus_config: &ConsensusConfig<DB>,
-        validator: Arc<dyn WorkerBatchValidation>,
+        validator: Arc<dyn BatchValidation>,
         metrics: &Metrics,
     ) -> Network {
         let mut worker_service = WorkerToWorkerServer::new(WorkerReceiverHandler {
@@ -341,7 +341,7 @@ impl<DB: Database> Worker<DB> {
         node_metrics: Arc<WorkerMetrics>,
         client: LocalNetwork,
         network: anemo::Network,
-    ) -> BlockProvider<DB, QuorumWaiter> {
+    ) -> BatchProvider<DB, QuorumWaiter> {
         info!(target: "worker::worker", "Starting handler for transactions");
 
         // The `QuorumWaiter` waits for 2f authorities to acknowledge receiving the batch
@@ -355,13 +355,13 @@ impl<DB: Database> Worker<DB> {
             node_metrics.clone(),
         );
 
-        BlockProvider::new(
+        BatchProvider::new(
             id,
             quorum_waiter,
             node_metrics,
             client,
             consensus_config.database().clone(),
-            consensus_config.parameters().worker_batch_vote_timeout,
+            consensus_config.parameters().batch_vote_timeout,
         )
     }
 

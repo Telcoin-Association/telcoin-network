@@ -6,10 +6,10 @@ use tempfile::TempDir;
 use tn_network_types::MockWorkerToPrimary;
 use tn_storage::open_db;
 use tn_test_utils::transaction;
-use tn_types::WorkerBlock;
+use tn_types::Batch;
 
 #[derive(Clone, Debug)]
-struct TestMakeBlockQuorumWaiter(Arc<Mutex<Option<SealedWorkerBlock>>>);
+struct TestMakeBlockQuorumWaiter(Arc<Mutex<Option<SealedBatch>>>);
 impl TestMakeBlockQuorumWaiter {
     fn new_test() -> Self {
         Self(Arc::new(Mutex::new(None)))
@@ -18,7 +18,7 @@ impl TestMakeBlockQuorumWaiter {
 impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
     fn verify_batch(
         &self,
-        batch: SealedWorkerBlock,
+        batch: SealedBatch,
         _timeout: Duration,
     ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
         let data = self.0.clone();
@@ -41,23 +41,21 @@ async fn make_batch() {
     mock_server.expect_report_own_batch().returning(|_| Ok(anemo::Response::new(())));
     client.set_worker_to_primary_local_handler(Arc::new(mock_server));
 
-    // Spawn a `BlockProvider` instance.
+    // Spawn a `BatchProvider` instance.
     let id = 0;
     let qw = TestMakeBlockQuorumWaiter::new_test();
     let timeout = Duration::from_secs(5);
     let batch_provider =
-        BlockProvider::new(id, qw.clone(), Arc::new(node_metrics), client, store.clone(), timeout);
+        BatchProvider::new(id, qw.clone(), Arc::new(node_metrics), client, store.clone(), timeout);
 
     // Send enough transactions to seal a batch.
     let tx = transaction();
-    let new_batch =
-        WorkerBlock { transactions: vec![tx.clone(), tx.clone()], ..Default::default() };
+    let new_batch = Batch { transactions: vec![tx.clone(), tx.clone()], ..Default::default() };
 
     batch_provider.seal(new_batch.clone().seal_slow()).await.unwrap();
 
     // Ensure the batch is as expected.
-    let expected_batch =
-        WorkerBlock { transactions: vec![tx.clone(), tx.clone()], ..Default::default() };
+    let expected_batch = Batch { transactions: vec![tx.clone(), tx.clone()], ..Default::default() };
 
     assert_eq!(
         new_batch.transactions(),
@@ -70,7 +68,7 @@ async fn make_batch() {
     );
 
     // Ensure the batch is stored
-    assert!(store.get::<WorkerBlocks>(&expected_batch.digest()).unwrap().is_some());
+    assert!(store.get::<Batches>(&expected_batch.digest()).unwrap().is_some());
 }
 
 // #[tokio::test]

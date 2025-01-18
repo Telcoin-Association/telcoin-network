@@ -2,7 +2,7 @@
 //! See test_utils output_tests.rs for this modules tests.
 
 use super::ConsensusHeader;
-use crate::{crypto, encode, Certificate, ReputationScores, Round, TimestampSec, WorkerBlock};
+use crate::{crypto, encode, Batch, Certificate, ReputationScores, Round, TimestampSec};
 use fastcrypto::hash::{Digest, Hash, HashFunction};
 use reth_primitives::{Address, BlockHash, B256};
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,7 @@ pub struct ConsensusOutput {
     ///
     /// This field is not included in [Self] digest. To validate,
     /// hash these batches and compare to [Self::batch_digests].
-    pub batches: Vec<Vec<WorkerBlock>>,
+    pub batches: Vec<Vec<Batch>>,
     /// The beneficiary for block rewards.
     pub beneficiary: Address,
     /// The ordered set of [BlockHash].
@@ -76,7 +76,7 @@ impl ConsensusOutput {
         self.batch_digests.pop_front()
     }
 
-    pub fn flatten_worker_batches(&self) -> Vec<WorkerBlock> {
+    pub fn flatten_batches(&self) -> Vec<Batch> {
         self.batches.iter().flat_map(|batches| batches.iter().cloned()).collect()
     }
 

@@ -2,8 +2,8 @@ use crate::{error::LocalClientError, CancelOnDropHandler};
 use eyre::Result;
 use std::future::Future;
 use tn_network_types::{
-    FetchBlocksRequest, FetchBlocksResponse, FetchCertificatesRequest, FetchCertificatesResponse,
-    RequestBlocksRequest, RequestBlocksResponse, WorkerOthersBlockMessage, WorkerOwnBlockMessage,
+    FetchBatchResponse, FetchBatchesRequest, FetchCertificatesRequest, FetchCertificatesResponse,
+    RequestBatchesRequest, RequestBatchesResponse, WorkerOthersBatchMessage, WorkerOwnBatchMessage,
     WorkerSynchronizeMessage,
 };
 use tn_types::NetworkPublicKey;
@@ -46,22 +46,22 @@ pub trait PrimaryToWorkerClient {
         request: WorkerSynchronizeMessage,
     ) -> impl Future<Output = Result<(), LocalClientError>>;
 
-    fn fetch_blocks(
+    fn fetch_batches(
         &self,
         worker_name: NetworkPublicKey,
-        request: FetchBlocksRequest,
-    ) -> impl Future<Output = Result<FetchBlocksResponse, LocalClientError>>;
+        request: FetchBatchesRequest,
+    ) -> impl Future<Output = Result<FetchBatchResponse, LocalClientError>>;
 }
 
 pub trait WorkerToPrimaryClient {
-    fn report_own_block(
+    fn report_own_batch(
         &self,
-        request: WorkerOwnBlockMessage,
+        request: WorkerOwnBatchMessage,
     ) -> impl Future<Output = Result<(), LocalClientError>>;
 
-    fn report_others_block(
+    fn report_others_batch(
         &self,
-        request: WorkerOthersBlockMessage,
+        request: WorkerOthersBatchMessage,
     ) -> impl Future<Output = Result<(), LocalClientError>>;
 }
 
@@ -69,6 +69,6 @@ pub trait WorkerRpc {
     fn request_batches(
         &self,
         peer: &NetworkPublicKey,
-        request: impl anemo::types::request::IntoRequest<RequestBlocksRequest> + Send,
-    ) -> impl Future<Output = Result<RequestBlocksResponse>>;
+        request: impl anemo::types::request::IntoRequest<RequestBatchesRequest> + Send,
+    ) -> impl Future<Output = Result<RequestBatchesResponse>>;
 }

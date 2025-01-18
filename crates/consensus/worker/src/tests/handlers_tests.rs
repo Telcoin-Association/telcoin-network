@@ -36,7 +36,7 @@ async fn synchronize() {
         .expect_request_batches()
         .withf(move |request| request.body().batch_digests == vec![digest])
         .return_once(move |_| {
-            Ok(anemo::Response::new(RequestBlocksResponse {
+            Ok(anemo::Response::new(RequestBatchesResponse {
                 batches: vec![mock_batch_response],
                 is_size_limit_reached: false,
             }))
@@ -65,14 +65,14 @@ async fn synchronize() {
     };
 
     // Verify the batch is not in store
-    assert!(store.get::<WorkerBlocks>(&digest).unwrap().is_none());
+    assert!(store.get::<Batches>(&digest).unwrap().is_none());
 
     // Send a sync request.
     let request = anemo::Request::new(message);
     handler.synchronize(request).await.unwrap();
 
     // Verify it is now stored
-    assert!(store.get::<WorkerBlocks>(&digest).unwrap().is_some());
+    assert!(store.get::<Batches>(&digest).unwrap().is_some());
 }
 
 #[tokio::test]
@@ -106,7 +106,7 @@ async fn synchronize_when_batch_exists() {
     let batch = batch();
     let batch_id = batch.digest();
     let missing = vec![batch_id];
-    store.insert::<WorkerBlocks>(&batch_id, &batch).unwrap();
+    store.insert::<Batches>(&batch_id, &batch).unwrap();
 
     // Send a sync request.
     let target_primary = fixture.authorities().nth(1).unwrap();

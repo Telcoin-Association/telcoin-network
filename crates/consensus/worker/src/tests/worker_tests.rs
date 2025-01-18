@@ -18,7 +18,7 @@ use tn_primary::{
 };
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::SealedWorkerBlock;
+use tn_types::SealedBatch;
 
 // A test validator that rejects every batch
 #[derive(Clone)]
@@ -29,7 +29,7 @@ struct NilBatchValidator;
 impl BlockValidation for NilBatchValidator {
     type Error = eyre::Report;
 
-    async fn validate_batch(&self, _txs: SealedWorkerBlock) -> Result<(), Self::Error> {
+    async fn validate_batch(&self, _txs: SealedBatch) -> Result<(), Self::Error> {
         eyre::bail!("Invalid batch");
     }
 }

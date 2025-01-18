@@ -3,8 +3,8 @@ use anemo::{Network, PeerId};
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_storage::traits::Database as ConsensusDatabase;
-use tn_types::{TaskManager, WorkerBatchValidation, WorkerId};
-use tn_worker::{metrics::Metrics, quorum_waiter::QuorumWaiter, BlockProvider, Worker};
+use tn_types::{BatchValidation, TaskManager, WorkerId};
+use tn_worker::{metrics::Metrics, quorum_waiter::QuorumWaiter, BatchProvider, Worker};
 use tokio::sync::RwLock;
 use tracing::instrument;
 
@@ -25,8 +25,8 @@ impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
     #[instrument(name = "worker", skip_all)]
     async fn start(
         &mut self,
-        validator: Arc<dyn WorkerBatchValidation>,
-    ) -> eyre::Result<(TaskManager, BlockProvider<CDB, QuorumWaiter>)> {
+        validator: Arc<dyn BatchValidation>,
+    ) -> eyre::Result<(TaskManager, BatchProvider<CDB, QuorumWaiter>)> {
         let task_manager = TaskManager::new("Worker Task Manager");
         self.own_peer_id = Some(PeerId(
             self.consensus_config.key_config().primary_network_public_key().0.to_bytes(),
@@ -34,7 +34,7 @@ impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
 
         let metrics = Metrics::default();
 
-        let (worker, block_provider) = Worker::spawn(
+        let (worker, batch_provider) = Worker::spawn(
             self.id,
             validator,
             metrics,
@@ -45,7 +45,7 @@ impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
         // now keep the handles
         self.worker = Some(worker);
 
-        Ok((task_manager, block_provider))
+        Ok((task_manager, batch_provider))
     }
 }
 
@@ -63,8 +63,8 @@ impl<CDB: ConsensusDatabase> WorkerNode<CDB> {
 
     pub async fn start(
         &self,
-        validator: Arc<dyn WorkerBatchValidation>,
-    ) -> eyre::Result<(TaskManager, BlockProvider<CDB, QuorumWaiter>)> {
+        validator: Arc<dyn BatchValidation>,
+    ) -> eyre::Result<(TaskManager, BatchProvider<CDB, QuorumWaiter>)> {
         let mut guard = self.internal.write().await;
         guard.start(validator).await
     }

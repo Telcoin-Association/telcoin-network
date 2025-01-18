@@ -12,8 +12,8 @@ use std::{
 };
 use thiserror::Error;
 use tn_network::{CancelOnDropHandler, ReliableNetwork};
-use tn_network_types::WorkerBatchMessage;
-use tn_types::{Authority, Committee, SealedWorkerBlock, Stake, WorkerCache, WorkerId};
+use tn_network_types::BatchMessage;
+use tn_types::{Authority, Committee, SealedBatch, Stake, WorkerCache, WorkerId};
 use tokio::task::JoinHandle;
 
 #[cfg(test)]
@@ -36,7 +36,7 @@ pub trait QuorumWaiterTrait: Send + Sync + Clone + Unpin + 'static {
     /// otherwise it might be possible if the network improves.
     fn verify_batch(
         &self,
-        batch: SealedWorkerBlock,
+        batch: SealedBatch,
         timeout: Duration,
     ) -> JoinHandle<Result<(), QuorumWaiterError>>;
 }
@@ -110,7 +110,7 @@ impl QuorumWaiter {
 impl QuorumWaiterTrait for QuorumWaiter {
     fn verify_batch(
         &self,
-        sealed_worker_batch: SealedWorkerBlock,
+        sealed_batch: SealedBatch,
         timeout: Duration,
     ) -> JoinHandle<Result<(), QuorumWaiterError>> {
         let inner = self.inner.clone();
@@ -125,7 +125,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                     .map(|(name, info)| (name, info.name))
                     .collect();
                 let (primary_names, worker_names): (Vec<_>, _) = workers.into_iter().unzip();
-                let message = WorkerBatchMessage { sealed_worker_batch };
+                let message = BatchMessage { sealed_batch };
                 let handlers = inner.network.broadcast(worker_names, &message);
                 let _timer = inner.metrics.batch_broadcast_quorum_latency.start_timer();
 

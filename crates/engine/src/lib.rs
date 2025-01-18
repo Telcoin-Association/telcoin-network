@@ -324,10 +324,10 @@ mod tests {
     use reth_provider::{BlockIdReader, BlockNumReader, BlockReader, TransactionVariant};
     use reth_tracing::init_test_tracing;
     use std::{collections::VecDeque, str::FromStr as _, sync::Arc, time::Duration};
-    use tn_batch_builder::test_utils::execute_test_worker_batch;
+    use tn_batch_builder::test_utils::execute_test_batch;
     use tn_test_utils::{default_test_execution_node, seeded_genesis_from_random_batches};
     use tn_types::{
-        adiri_chain_spec_arc, adiri_genesis, max_worker_block_gas, now, BlockHash, Certificate,
+        adiri_chain_spec_arc, adiri_genesis, max_batch_gas, now, BlockHash, Certificate,
         CommittedSubDag, ConsensusHeader, ConsensusOutput, Notifier, ReputationScores, TaskManager,
     };
     use tokio::{sync::oneshot, time::timeout};
@@ -365,9 +365,9 @@ mod tests {
                 previous_sub_dag,
             )
             .into(),
-            blocks: Default::default(), // empty
+            batches: Default::default(), // empty
             beneficiary,
-            block_digests: Default::default(), // empty
+            batch_digests: Default::default(), // empty
             parent_hash: ConsensusHeader::default().digest(),
             number: 0,
         };
@@ -548,7 +548,7 @@ mod tests {
             batch.base_fee_per_gas = Some(inc_base_fee);
 
             // actually execute the block now
-            execute_test_worker_batch(batch, &parent);
+            execute_test_batch(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
         }
 
@@ -564,7 +564,7 @@ mod tests {
             batch.base_fee_per_gas = Some(inc_base_fee);
 
             // actually execute the block now
-            execute_test_worker_batch(batch, &parent);
+            execute_test_batch(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
         }
         // Reload all_batches so we can calculate mix_hash properly later.
@@ -599,9 +599,9 @@ mod tests {
             .expect("beneficiary address from str");
         let consensus_output_1 = ConsensusOutput {
             sub_dag: subdag_1.clone(),
-            blocks: vec![batches_1],
+            batches: vec![batches_1],
             beneficiary: beneficiary_1,
-            block_digests: batch_digests_1.clone(),
+            batch_digests: batch_digests_1.clone(),
             parent_hash: ConsensusHeader::default().digest(),
             number: 0,
         };
@@ -627,9 +627,9 @@ mod tests {
             .expect("beneficiary address from str");
         let consensus_output_2 = ConsensusOutput {
             sub_dag: subdag_2,
-            blocks: vec![batches_2],
+            batches: vec![batches_2],
             beneficiary: beneficiary_2,
-            block_digests: batch_digests_2.clone(),
+            batch_digests: batch_digests_2.clone(),
             parent_hash: consensus_output_1.consensus_header_hash(),
             number: 1,
         };
@@ -789,7 +789,7 @@ mod tests {
             // gas limit should come from batch
             //
             // TODO: ensure batch validation prevents peer workers from changing this value
-            assert_eq!(block.gas_limit, max_worker_block_gas(block.number));
+            assert_eq!(block.gas_limit, max_batch_gas(block.number));
             // difficulty should match the batch's index within consensus output
             assert_eq!(block.difficulty, U256::from(expected_batch_index));
             // assert batch digest match extra data
@@ -858,7 +858,7 @@ mod tests {
             batch.base_fee_per_gas = Some(inc_base_fee);
 
             // actually execute the block now
-            execute_test_worker_batch(batch, &parent);
+            execute_test_batch(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
         }
 
@@ -874,7 +874,7 @@ mod tests {
             batch.base_fee_per_gas = Some(inc_base_fee);
 
             // actually execute the block now
-            execute_test_worker_batch(batch, &parent);
+            execute_test_batch(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
         }
         // Reload all_batches so we can calculate mix_hash properly later.
@@ -932,9 +932,9 @@ mod tests {
             .expect("beneficiary address from str");
         let consensus_output_1 = ConsensusOutput {
             sub_dag: subdag_1.clone(),
-            blocks: vec![batches_1],
+            batches: vec![batches_1],
             beneficiary: beneficiary_1,
-            block_digests: batch_digests_1.clone(),
+            batch_digests: batch_digests_1.clone(),
             parent_hash: ConsensusHeader::default().digest(),
             number: 0,
         };
@@ -962,9 +962,9 @@ mod tests {
             .expect("beneficiary address from str");
         let consensus_output_2 = ConsensusOutput {
             sub_dag: subdag_2,
-            blocks: vec![batches_2],
+            batches: vec![batches_2],
             beneficiary: beneficiary_2,
-            block_digests: batch_digests_2.clone(),
+            batch_digests: batch_digests_2.clone(),
             parent_hash: consensus_output_1.consensus_header_hash(),
             number: 1,
         };
@@ -1072,7 +1072,7 @@ mod tests {
                 assert!(block.senders.is_empty());
                 assert!(block.body.is_empty());
                 // gas used should NOT be the same as bc duplicate transaction are ignored
-                assert_ne!(block.gas_used, max_worker_block_gas(block.number));
+                assert_ne!(block.gas_used, max_batch_gas(block.number));
                 // gas used should be zero bc all transactions were duplicates
                 assert_eq!(block.gas_used, 0);
             } else {
@@ -1139,7 +1139,7 @@ mod tests {
             // gas limit should come from batch
             //
             // TODO: ensure batch validation prevents peer workers from changing this value
-            assert_eq!(block.gas_limit, max_worker_block_gas(block.number));
+            assert_eq!(block.gas_limit, max_batch_gas(block.number));
             // difficulty should match the batch's index within consensus output
             assert_eq!(block.difficulty, U256::from(expected_batch_index));
             // assert batch digest match extra data
@@ -1190,7 +1190,7 @@ mod tests {
             batch.base_fee_per_gas = Some(inc_base_fee);
 
             // actually execute the block now
-            execute_test_worker_batch(batch, &parent);
+            execute_test_batch(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
         }
 
@@ -1206,7 +1206,7 @@ mod tests {
             batch.base_fee_per_gas = Some(inc_base_fee);
 
             // actually execute the block now
-            execute_test_worker_batch(batch, &parent);
+            execute_test_batch(batch, &parent);
             debug!("{idx}\n{:?}\n", batch);
         }
 
@@ -1238,9 +1238,9 @@ mod tests {
             .expect("beneficiary address from str");
         let consensus_output_1 = ConsensusOutput {
             sub_dag: subdag_1.clone(),
-            blocks: vec![batches_1],
+            batches: vec![batches_1],
             beneficiary: beneficiary_1,
-            block_digests: batch_digests_1,
+            batch_digests: batch_digests_1,
             parent_hash: ConsensusHeader::default().digest(),
             number: 0,
         };
@@ -1267,9 +1267,9 @@ mod tests {
             .expect("beneficiary address from str");
         let consensus_output_2 = ConsensusOutput {
             sub_dag: subdag_2,
-            blocks: vec![batches_2],
+            batches: vec![batches_2],
             beneficiary: beneficiary_2,
-            block_digests: batch_digests_2,
+            batch_digests: batch_digests_2,
             parent_hash: consensus_output_1.consensus_header_hash(),
             number: 1,
         };

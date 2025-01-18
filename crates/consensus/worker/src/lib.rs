@@ -12,7 +12,7 @@ mod worker;
 pub mod metrics;
 
 pub use crate::{
-    batch_provider::BlockProvider,
+    batch_provider::BatchProvider,
     worker::{Worker, CHANNEL_CAPACITY},
 };
 

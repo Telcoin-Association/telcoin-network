@@ -5,7 +5,7 @@ use std::{path::PathBuf, sync::Arc};
 use telcoin_network::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
 use tn_node::launch_node;
 use tn_test_utils::{default_test_execution_node, execution_outcome_for_tests, CommandParser};
-use tn_types::{TaskManager, TransactionSigned, WorkerBlock};
+use tn_types::{Batch, TaskManager, TransactionSigned};
 use tracing::error;
 
 pub static IT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -265,7 +265,7 @@ pub async fn get_contract_state_for_genesis(
 
     // execute batch
     let parent = chain.sealed_genesis_header();
-    let batch = WorkerBlock {
+    let batch = Batch {
         transactions: raw_txs_to_execute,
         parent_hash: parent.hash(),
         ..Default::default()

@@ -364,7 +364,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
 
     // NOW:
     // submit another tx from the account that just got dripped
-    // so the the worker's watch channel updates to a new block that doesn't have
+    // so the the worker's watch channel updates to a new batch that doesn't have
     // the faucet's address in the state
     //
     // this creates scenario for faucet to rely on provider.latest() for accuracy

@@ -3,7 +3,7 @@
 use anemo::PeerId;
 use std::time::Duration;
 use tn_network::{PrimaryToPrimaryRpc, WorkerRpc};
-use tn_network_types::{FetchCertificatesRequest, RequestBlocksRequest};
+use tn_network_types::{FetchCertificatesRequest, RequestBatchesRequest};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::cluster::Cluster;
 use tn_types::AuthorityIdentifier;
@@ -50,7 +50,7 @@ async fn test_server_authorizations() {
             .unwrap()
             .name
             .clone();
-        let request = anemo::Request::new(RequestBlocksRequest::default())
+        let request = anemo::Request::new(RequestBatchesRequest::default())
             .with_timeout(Duration::from_secs(5));
         worker_network.request_batches(&worker_target_name, request).await.unwrap();
     }
@@ -89,7 +89,7 @@ async fn test_server_authorizations() {
             .unwrap()
             .name
             .clone();
-        let request = anemo::Request::new(RequestBlocksRequest::default())
+        let request = anemo::Request::new(RequestBatchesRequest::default())
             .with_timeout(Duration::from_secs(5));
         // Removing the AllowedPeers RequireAuthorizationLayer for workers should make this succeed.
         assert!(worker_network.request_batches(&worker_target_name, request).await.is_err());

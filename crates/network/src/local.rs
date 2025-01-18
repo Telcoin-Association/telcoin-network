@@ -7,8 +7,8 @@ use anemo::{PeerId, Request};
 use parking_lot::RwLock;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tn_network_types::{
-    FetchBlocksRequest, FetchBlocksResponse, PrimaryToWorker, WorkerOthersBlockMessage,
-    WorkerOwnBlockMessage, WorkerSynchronizeMessage, WorkerToPrimary,
+    FetchBatchResponse, FetchBatchesRequest, PrimaryToWorker, WorkerOthersBatchMessage,
+    WorkerOwnBatchMessage, WorkerSynchronizeMessage, WorkerToPrimary,
 };
 use tn_types::{traits::KeyPair, NetworkKeypair, NetworkPublicKey};
 use tn_utils::sync::notify_once::NotifyOnce;
@@ -168,14 +168,14 @@ impl PrimaryToWorkerClient for LocalNetwork {
         }
     }
 
-    async fn fetch_blocks(
+    async fn fetch_batches(
         &self,
         worker_name: NetworkPublicKey,
-        request: FetchBlocksRequest,
-    ) -> Result<FetchBlocksResponse, LocalClientError> {
+        request: FetchBatchesRequest,
+    ) -> Result<FetchBatchResponse, LocalClientError> {
         let c = self.get_primary_to_worker_handler(PeerId(worker_name.0.into())).await?;
         select! {
-            resp = c.fetch_blocks(Request::new(request)) => {
+            resp = c.fetch_batches(Request::new(request)) => {
                 Ok(resp.map_err(|e| LocalClientError::Internal(format!("{e:?}")))?.into_inner())
             },
             () = self.shutdown_notify.wait() => {
@@ -186,13 +186,13 @@ impl PrimaryToWorkerClient for LocalNetwork {
 }
 
 impl WorkerToPrimaryClient for LocalNetwork {
-    async fn report_own_block(
+    async fn report_own_batch(
         &self,
-        request: WorkerOwnBlockMessage,
+        request: WorkerOwnBatchMessage,
     ) -> Result<(), LocalClientError> {
         let c = self.get_worker_to_primary_handler().await?;
         select! {
-            resp = c.report_own_block(Request::new(request)) => {
+            resp = c.report_own_batch(Request::new(request)) => {
                 resp.map_err(|e| LocalClientError::Internal(format!("{e:?}")))?;
                 Ok(())
             },
@@ -202,13 +202,13 @@ impl WorkerToPrimaryClient for LocalNetwork {
         }
     }
 
-    async fn report_others_block(
+    async fn report_others_batch(
         &self,
-        request: WorkerOthersBlockMessage,
+        request: WorkerOthersBatchMessage,
     ) -> Result<(), LocalClientError> {
         let c = self.get_worker_to_primary_handler().await?;
         select! {
-            resp = c.report_others_block(Request::new(request)) => {
+            resp = c.report_others_batch(Request::new(request)) => {
                 resp.map_err(|e| LocalClientError::Internal(format!("{e:?}")))?;
                 Ok(())
             },
