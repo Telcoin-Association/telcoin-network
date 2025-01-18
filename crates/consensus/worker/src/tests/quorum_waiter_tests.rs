@@ -28,8 +28,8 @@ async fn wait_for_quorum() {
     );
 
     // Make a batch.
-    let sealed_block = batch().seal_slow();
-    let message = WorkerBlockMessage { sealed_worker_block: sealed_block.clone() };
+    let sealed_batch = batch().seal_slow();
+    let message = WorkerBlockMessage { sealed_worker_block: sealed_batch.clone() };
 
     // Spawn enough listeners to acknowledge our batches.
     let mut listener_handles = Vec::new();
@@ -42,24 +42,24 @@ async fn wait_for_quorum() {
         network.connect(worker.info().worker_address.to_anemo_address().unwrap()).await.unwrap();
     }
 
-    // Forward the block along with the handlers to the `QuorumWaiter`.
-    let attest_handle = quorum_waiter.verify_block(sealed_block.clone(), Duration::from_secs(10));
+    // Forward the batch along with the handlers to the `QuorumWaiter`.
+    let attest_handle = quorum_waiter.verify_batch(sealed_batch.clone(), Duration::from_secs(10));
 
-    // Wait for the `QuorumWaiter` to gather enough acknowledgements and output the block.
+    // Wait for the `QuorumWaiter` to gather enough acknowledgements and output the batch.
     assert!(attest_handle.await.unwrap().is_ok());
 
-    // Send a second block.
-    let sealed_block2 = batch().seal_slow();
-    let message2 = WorkerBlockMessage { sealed_worker_block: sealed_block2.clone() };
+    // Send a second batch.
+    let sealed_batch2 = batch().seal_slow();
+    let message2 = WorkerBlockMessage { sealed_worker_block: sealed_batch2.clone() };
 
-    // Forward the block along with the handlers to the `QuorumWaiter`.
-    let attest2_handle = quorum_waiter.verify_block(sealed_block2.clone(), Duration::from_secs(10));
+    // Forward the batch along with the handlers to the `QuorumWaiter`.
+    let attest2_handle = quorum_waiter.verify_batch(sealed_batch2.clone(), Duration::from_secs(10));
 
-    // Wait for the `QuorumWaiter` to gather enough acknowledgements and output the block.
+    // Wait for the `QuorumWaiter` to gather enough acknowledgements and output the batch.
     //assert!(attest2_handle.await.unwrap().is_ok());
     attest2_handle.await.unwrap().unwrap();
 
-    // Ensure the other listeners correctly received the blocks.
+    // Ensure the other listeners correctly received the batches.
     for (mut handle, _network) in listener_handles {
         assert_eq!(handle.recv().await.unwrap(), message);
         assert_eq!(handle.recv().await.unwrap(), message2);

@@ -52,7 +52,7 @@ async fn test_server_authorizations() {
             .clone();
         let request = anemo::Request::new(RequestBlocksRequest::default())
             .with_timeout(Duration::from_secs(5));
-        worker_network.request_blocks(&worker_target_name, request).await.unwrap();
+        worker_network.request_batches(&worker_target_name, request).await.unwrap();
     }
 
     // Set up primaries and workers with a another committee.
@@ -92,6 +92,6 @@ async fn test_server_authorizations() {
         let request = anemo::Request::new(RequestBlocksRequest::default())
             .with_timeout(Duration::from_secs(5));
         // Removing the AllowedPeers RequireAuthorizationLayer for workers should make this succeed.
-        assert!(worker_network.request_blocks(&worker_target_name, request).await.is_err());
+        assert!(worker_network.request_batches(&worker_target_name, request).await.is_err());
     }
 }

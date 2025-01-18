@@ -33,7 +33,7 @@ async fn synchronize() {
     let mut mock_server = MockWorkerToWorker::new();
     let mock_batch_response = batch.clone();
     mock_server
-        .expect_request_blocks()
+        .expect_request_batches()
         .withf(move |request| request.body().block_digests == vec![digest])
         .return_once(move |_| {
             Ok(anemo::Response::new(RequestBlocksResponse {

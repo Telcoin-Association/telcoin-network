@@ -161,7 +161,7 @@ fn build_anemo_services(out_dir: &Path) {
         )
         .method(
             anemo_build::manual::Method::builder()
-                .name("request_blocks")
+                .name("request_batches")
                 .route_name("RequestBlocks")
                 .request_type("crate::RequestBlocksRequest")
                 .response_type("crate::RequestBlocksResponse")

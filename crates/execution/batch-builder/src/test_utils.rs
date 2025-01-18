@@ -1,6 +1,6 @@
 //! Types for testing only.
 
-use crate::{build_worker_block, BlockBuilderOutput};
+use crate::{build_batch, BlockBuilderOutput};
 use reth_primitives::{
     constants::MIN_PROTOCOL_BASE_FEE, Address, BlobTransactionSidecar, BlockBody,
     PooledTransactionsElement, SealedBlock, SealedHeader, TxHash,
@@ -25,22 +25,22 @@ use tokio::sync::mpsc::{self, Receiver};
 /// Attempt to update batch with accurate header information.
 ///
 /// NOTE: this is loosely based on reth's auto-seal consensus
-pub fn execute_test_worker_block(block: &mut WorkerBlock, parent: &SealedHeader) {
-    let pool = TestPool::new(block.transactions.clone());
+pub fn execute_test_batch(test_batch: &mut WorkerBlock, parent: &SealedHeader) {
+    let pool = TestPool::new(test_batch.transactions.clone());
 
     let parent_info = LastCanonicalUpdate {
         tip: SealedBlock::new(parent.clone(), BlockBody::default()),
-        pending_block_base_fee: block.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE),
+        pending_block_base_fee: test_batch.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE),
         pending_block_blob_fee: None,
     };
 
-    let block_config = PendingBlockConfig::new(block.beneficiary, parent_info);
-    let args = WorkerBlockBuilderArgs { pool, block_config };
-    let BlockBuilderOutput { worker_block, .. } = build_worker_block(args);
-    block.parent_hash = worker_block.parent_hash;
-    block.beneficiary = worker_block.beneficiary;
-    block.timestamp = worker_block.timestamp;
-    block.base_fee_per_gas = worker_block.base_fee_per_gas;
+    let batch_config = PendingBlockConfig::new(test_batch.beneficiary, parent_info);
+    let args = WorkerBlockBuilderArgs { pool, batch_config };
+    let BlockBuilderOutput { batch, .. } = build_batch(args);
+    test_batch.parent_hash = batch.parent_hash;
+    test_batch.beneficiary = batch.beneficiary;
+    test_batch.timestamp = batch.timestamp;
+    test_batch.base_fee_per_gas = batch.base_fee_per_gas;
 }
 
 /// A test pool that ensures every transaction is in the pending pool

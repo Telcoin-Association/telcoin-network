@@ -66,7 +66,7 @@ pub trait WorkerToPrimaryClient {
 }
 
 pub trait WorkerRpc {
-    fn request_blocks(
+    fn request_batches(
         &self,
         peer: &NetworkPublicKey,
         request: impl anemo::types::request::IntoRequest<RequestBlocksRequest> + Send,

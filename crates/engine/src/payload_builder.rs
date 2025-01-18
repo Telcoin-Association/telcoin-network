@@ -197,7 +197,7 @@ fn build_block_from_batch_payload<EvmConfig, Provider>(
     payload: TNPayload,
     provider: &Provider,
     chain_spec: Arc<ChainSpec>,
-    batch_block: WorkerBlock,
+    batch: WorkerBlock,
     consensus_header_hash: B256,
 ) -> EngineResult<SealedBlockWithSenders>
 where
@@ -260,7 +260,7 @@ where
 
     // TODO: parallelize tx recovery when it's worth it (see TransactionSigned::recover_signers())
 
-    for tx in batch_block.transactions {
+    for tx in batch.transactions {
         //txs {
         // // TODO: support blob gas with cancun genesis hardfork
         // //

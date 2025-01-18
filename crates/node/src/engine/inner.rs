@@ -37,7 +37,7 @@ use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, TransactionPool, TransactionValidationTaskExecutor,
 };
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
-use tn_block_builder::BlockBuilder;
+use tn_batch_builder::BlockBuilder;
 use tn_block_validator::BlockValidator;
 use tn_config::Config;
 use tn_engine::ExecutorEngine;
@@ -206,7 +206,7 @@ where
     }
 
     /// The worker's RPC, TX pool, and block builder
-    pub(super) async fn start_block_builder(
+    pub(super) async fn start_batch_builder(
         &mut self,
         worker_id: WorkerId,
         block_provider_sender: WorkerBlockSender,
@@ -310,7 +310,7 @@ where
             pending_block_blob_fee: tx_pool_latest.pending_blob_fee,
         };
 
-        let block_builder = BlockBuilder::new(
+        let batch_builder = BlockBuilder::new(
             self.blockchain_db.clone(),
             transaction_pool.clone(),
             self.blockchain_db.canonical_state_stream(),
@@ -325,7 +325,7 @@ where
             tokio::select!(
                 _ = &rx_shutdown => {
                 }
-                res = block_builder => {
+                res = batch_builder => {
                     info!(target: "tn::execution", ?res, "block builder task exited");
                 }
             )

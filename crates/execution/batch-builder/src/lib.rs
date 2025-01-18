@@ -22,7 +22,7 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-pub use block::{build_worker_block, BlockBuilderOutput};
+pub use block::{build_batch, BlockBuilderOutput};
 use error::{BlockBuilderError, BlockBuilderResult};
 use futures_util::{FutureExt, StreamExt};
 use reth_execution_types::ChangedAccount;
@@ -216,12 +216,11 @@ where
             let (ack, rx) = oneshot::channel();
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
-            let BlockBuilderOutput { worker_block, mined_transactions } =
-                build_worker_block(build_args);
+            let BlockBuilderOutput { batch, mined_transactions } = build_batch(build_args);
 
             // forward to worker and wait for ack that quorum was reached
-            if let Err(e) = to_worker.send((worker_block.seal_slow(), ack)).await {
-                error!(target: "worker::block_builder", ?e, "failed to send next block to worker");
+            if let Err(e) = to_worker.send((batch.seal_slow(), ack)).await {
+                error!(target: "worker::batch_builder", ?e, "failed to send next block to worker");
                 // try to return error if worker channel closed
                 let _ = result.send(Err(e.into()));
                 return;
@@ -235,11 +234,11 @@ where
                             debug!(target: "block-builder", ?res, "received ack");
                             // signal to Self that this task is complete
                             if let Err(e) = result.send(Ok(mined_transactions)) {
-                                error!(target: "worker::block_builder", ?e, "failed to send block builder result to block builder task");
+                                error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
                             }
                         }
                         Err(error) => {
-                            error!(target: "worker::block_builder", ?error, "error while sealing block");
+                            error!(target: "worker::batch_builder", ?error, "error while sealing block");
                             let converted = match error {
                                 BlockSealError::FatalDBFailure => {
                                     // fatal - return error
@@ -258,15 +257,15 @@ where
                             };
 
                             if let Err(e) = result.send(converted) {
-                                error!(target: "worker::block_builder", ?e, "failed to send block builder result to block builder task");
+                                error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    error!(target: "worker::block_builder", ?e, "quorum waiter failed ack failed");
+                    error!(target: "worker::batch_builder", ?e, "quorum waiter failed ack failed");
                     if let Err(e) = result.send(Err(e.into())) {
-                        error!(target: "worker::block_builder", ?e, "failed to send block builder result to block builder task");
+                        error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
                     }
                 }
             }
@@ -459,9 +458,9 @@ mod tests {
     #[derive(Clone, Debug)]
     struct TestMakeBlockQuorumWaiter();
     impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
-        fn verify_block(
+        fn verify_batch(
             &self,
-            _block: SealedWorkerBlock,
+            _batch: SealedWorkerBlock,
             _timeout: Duration,
         ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
             tokio::spawn(async move { Ok(()) })
@@ -535,12 +534,12 @@ mod tests {
         };
 
         // build execution block proposer
-        let block_builder = BlockBuilder::new(
+        let batch_builder = BlockBuilder::new(
             blockchain_db.clone(),
             txpool.clone(),
             blockchain_db.canonical_state_stream(),
             latest_canon_state,
-            block_provider.blocks_tx(),
+            block_provider.batches_tx(),
             address,
             Duration::from_secs(1),
         );
@@ -589,23 +588,23 @@ mod tests {
         let pending_pool_len = txpool.pool_size().pending;
         assert_eq!(pending_pool_len, 3);
 
-        // spawn block_builder once worker is ready
-        let _block_builder = tokio::spawn(Box::pin(block_builder));
+        // spawn batch_builder once worker is ready
+        let _batch_builder = tokio::spawn(Box::pin(batch_builder));
 
-        // wait for new block
-        let mut new_block = None;
+        // wait for new batch
+        let mut new_batch = None;
         for _ in 0..5 {
             let _ = tokio::time::sleep(Duration::from_secs(1)).await;
             // Ensure the block is stored
             if let Some((_, wb)) = store.iter::<WorkerBlocks>().next() {
-                new_block = Some(wb);
+                new_batch = Some(wb);
                 break;
             }
         }
-        let new_block = new_block.unwrap();
+        let new_batch = new_batch.unwrap();
 
         // number of transactions in the block
-        let block_txs = new_block.transactions();
+        let block_txs = new_batch.transactions();
 
         // check max tx for task matches num of transactions in block
         let num_block_txs = block_txs.len();
@@ -734,9 +733,9 @@ mod tests {
             get_test_tools();
         let TestExecutionComponents { blockchain_db, txpool, chain, .. } = execution_components;
         let address = Address::from(U160::from(33));
-        let (to_worker, mut from_block_builder) = tokio::sync::mpsc::channel(2);
+        let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
         // build execution block proposer
-        let block_builder = BlockBuilder::new(
+        let batch_builder = BlockBuilder::new(
             blockchain_db.clone(),
             txpool.clone(),
             blockchain_db.canonical_state_stream(),
@@ -791,8 +790,8 @@ mod tests {
         let pending_pool_len = txpool.pool_size().pending;
         assert_eq!(pending_pool_len, 3);
 
-        // spawn block_builder once worker is ready
-        let block_builder_task = tokio::spawn(Box::pin(block_builder));
+        // spawn batch_builder once worker is ready
+        let batch_builder_task = tokio::spawn(Box::pin(batch_builder));
 
         // plenty of time for block production
         let duration = std::time::Duration::from_secs(5);
@@ -812,7 +811,7 @@ mod tests {
         // non-fatal errors cause the loop to break and wait for txpool updates
         // submitting a new pending transaction is one of the ways this task wakes up
         for (subdag_index, error) in non_fatal_errors.into_iter().enumerate() {
-            let (sealed_block, ack) = timeout(duration, from_block_builder.recv())
+            let (sealed_block, ack) = timeout(duration, from_batch_builder.recv())
                 .await
                 .expect("block builder built another block after canonical update")
                 .expect("batch was built");
@@ -862,7 +861,7 @@ mod tests {
         }
 
         // wait for next block
-        let (sealed_block, ack) = timeout(duration, from_block_builder.recv())
+        let (sealed_block, ack) = timeout(duration, from_batch_builder.recv())
             .await
             .expect("block builder's sender didn't drop")
             .expect("batch was built");
@@ -874,7 +873,7 @@ mod tests {
         let _ = ack.send(Err(BlockSealError::FatalDBFailure));
 
         // ensure block builder shuts down from fatal error
-        let result = block_builder_task.await.expect("ack channel delivered result");
+        let result = batch_builder_task.await.expect("ack channel delivered result");
         assert!(result.is_err());
 
         // yield to try and give pool a chance to update
@@ -893,10 +892,10 @@ mod tests {
             get_test_tools();
         let TestExecutionComponents { blockchain_db, txpool, chain, .. } = execution_components;
         let address = Address::from(U160::from(33));
-        let (to_worker, mut from_block_builder) = tokio::sync::mpsc::channel(2);
+        let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
 
         // build execution block proposer
-        let block_builder = BlockBuilder::new(
+        let batch_builder = BlockBuilder::new(
             blockchain_db.clone(),
             txpool.clone(),
             blockchain_db.canonical_state_stream(),
@@ -951,14 +950,14 @@ mod tests {
         let pending_pool_len = txpool.pool_size().pending;
         assert_eq!(pending_pool_len, 3);
 
-        // spawn block_builder once worker is ready
-        let _block_builder_task = tokio::spawn(Box::pin(block_builder));
+        // spawn batch_builder once worker is ready
+        let _batch_builder_task = tokio::spawn(Box::pin(batch_builder));
 
         // plenty of time for block production
         let duration = std::time::Duration::from_secs(5);
 
         // receive proposed block with 3 transactions
-        let (sealed_block, ack) = timeout(duration, from_block_builder.recv())
+        let (sealed_block, ack) = timeout(duration, from_batch_builder.recv())
             .await
             .expect("block builder's sender didn't drop")
             .expect("batch was built");
@@ -985,7 +984,7 @@ mod tests {
         let _ = ack.send(Ok(()));
 
         // receive next block
-        let (sealed_block, ack) = timeout(duration, from_block_builder.recv())
+        let (sealed_block, ack) = timeout(duration, from_batch_builder.recv())
             .await
             .expect("block builder's sender didn't drop")
             .expect("batch was built");

@@ -85,7 +85,7 @@ where
     }
 
     /// Batch maker
-    pub async fn start_block_builder(
+    pub async fn start_batch_builder(
         &self,
         worker_id: WorkerId,
         block_provider_sender: WorkerBlockSender,
@@ -93,7 +93,7 @@ where
         rx_shutdown: Noticer,
     ) -> eyre::Result<()> {
         let mut guard = self.internal.write().await;
-        guard.start_block_builder(worker_id, block_provider_sender, task_manager, rx_shutdown).await
+        guard.start_batch_builder(worker_id, block_provider_sender, task_manager, rx_shutdown).await
     }
 
     /// Batch validator

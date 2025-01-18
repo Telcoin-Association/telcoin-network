@@ -1,6 +1,6 @@
 //! The receiving side of the execution layer's `BlockProvider`.
 //!
-//! Consensus `BlockProvider` takes a block from the EL, stores it,
+//! Consensus `BlockProvider` takes a batch from the EL, stores it,
 //! and sends it to the quorum waiter for broadcasting to peers.
 
 use crate::{metrics::WorkerMetrics, quorum_waiter::QuorumWaiterTrait};
@@ -12,24 +12,24 @@ use tn_types::{error::BlockSealError, SealedWorkerBlock, WorkerBlockSender, Work
 use tracing::error;
 
 #[cfg(test)]
-#[path = "tests/block_provider_tests.rs"]
-pub mod block_provider_tests;
+#[path = "tests/batch_provider_tests.rs"]
+pub mod batch_provider_tests;
 
-/// Process blocks from EL into sealed blocks for CL.
+/// Process batch from EL into sealed batches for CL.
 #[derive(Clone)]
 pub struct BlockProvider<DB, QW> {
     /// Our worker's id.
     id: WorkerId,
-    /// Use `QuorumWaiter` to attest to blocks.
+    /// Use `QuorumWaiter` to attest to batches.
     quorum_waiter: QW,
     /// Metrics handler
     node_metrics: Arc<WorkerMetrics>,
-    /// The network client to send our blocks to the primary.
+    /// The network client to send our batches to the primary.
     client: LocalNetwork,
-    /// The block store to store our own blocks.
+    /// The batch store to store our own batches.
     store: DB,
-    /// Channel sender for alternate block submision if not calling seal directly.
-    tx_blocks: WorkerBlockSender,
+    /// Channel sender for alternate batch submision if not calling seal directly.
+    tx_batches: WorkerBlockSender,
     /// The amount of time to wait on a reply from peer before timing out.
     timeout: Duration,
 }
@@ -49,43 +49,43 @@ impl<DB: Database, QW: QuorumWaiterTrait> BlockProvider<DB, QW> {
         store: DB,
         timeout: Duration,
     ) -> Self {
-        let (tx_blocks, mut rx_blocks) = tokio::sync::mpsc::channel(1000);
-        let this = Self { id, quorum_waiter, node_metrics, client, store, tx_blocks, timeout };
+        let (tx_batches, mut rx_batches) = tokio::sync::mpsc::channel(1000);
+        let this = Self { id, quorum_waiter, node_metrics, client, store, tx_batches, timeout };
         let this_clone = this.clone();
-        // Spawn a little task to accept blocks from a channel and seal them that way.
+        // Spawn a little task to accept batches from a channel and seal them that way.
         // Allows the engine to remain removed from the worker.
         tokio::spawn(async move {
-            while let Some((block, tx)) = rx_blocks.recv().await {
-                let res = this_clone.seal(block).await;
+            while let Some((batch, tx)) = rx_batches.recv().await {
+                let res = this_clone.seal(batch).await;
                 if tx.send(res).is_err() {
-                    error!(target: "worker::block_provider", "Error sending result to channel caller!  Channel closed.");
+                    error!(target: "worker::batch_provider", "Error sending result to channel caller!  Channel closed.");
                 }
             }
         });
         this
     }
 
-    pub fn blocks_tx(&self) -> WorkerBlockSender {
-        self.tx_blocks.clone()
+    pub fn batches_tx(&self) -> WorkerBlockSender {
+        self.tx_batches.clone()
     }
 
-    /// Seal and broadcast the current block.
-    pub async fn seal(&self, sealed_block: SealedWorkerBlock) -> Result<(), BlockSealError> {
-        let size = sealed_block.size();
+    /// Seal and broadcast the current batch.
+    pub async fn seal(&self, sealed_batch: SealedWorkerBlock) -> Result<(), BlockSealError> {
+        let size = sealed_batch.size();
 
         self.node_metrics
-            .created_block_size
-            .with_label_values(&["latest block size"])
+            .created_batch_size
+            .with_label_values(&["latest batch size"])
             .observe(size as f64);
 
-        let block_attest_handle =
-            self.quorum_waiter.verify_block(sealed_block.clone(), self.timeout);
+        let batch_attest_handle =
+            self.quorum_waiter.verify_batch(sealed_batch.clone(), self.timeout);
 
-        // Wait for our block to reach quorum or fail to do so.
-        match block_attest_handle.await {
+        // Wait for our batch to reach quorum or fail to do so.
+        match batch_attest_handle.await {
             Ok(res) => {
                 match res {
-                    Ok(_) => {} // Block reach quorum!
+                    Ok(_) => {} // batch reached quorum!
                     Err(e) => {
                         return Err(match e {
                             crate::quorum_waiter::QuorumWaiterError::QuorumRejected => {
@@ -106,26 +106,26 @@ impl<DB: Database, QW: QuorumWaiterTrait> BlockProvider<DB, QW> {
                 }
             }
             Err(e) => {
-                error!(target: "worker::block_provider", "Join error attempting block quorum! {e}");
+                error!(target: "worker::batch_provider", "Join error attempting batch quorum! {e}");
                 return Err(BlockSealError::FailedQuorum);
             }
         }
 
         // Now save it to disk
-        let (block, digest) = sealed_block.split();
+        let (batch, digest) = sealed_batch.split();
 
-        if let Err(e) = self.store.insert::<WorkerBlocks>(&digest, &block) {
-            error!(target: "worker::block_provider", "Store failed with error: {:?}", e);
+        if let Err(e) = self.store.insert::<WorkerBlocks>(&digest, &batch) {
+            error!(target: "worker::batch_provider", "Store failed with error: {:?}", e);
             return Err(BlockSealError::FatalDBFailure);
         }
 
-        // Send the block to the primary.
+        // Send the batch to the primary.
         let message =
-            WorkerOwnBlockMessage { worker_id: self.id, digest, timestamp: block.created_at() };
+            WorkerOwnBlockMessage { worker_id: self.id, digest, timestamp: batch.created_at() };
         if let Err(err) = self.client.report_own_block(message).await {
-            error!(target: "worker::block_provider", "Failed to report our block: {err:?}");
-            // Should we return an error here?  Doing so complicates some tests but also the block
-            // is sealed, etc. If we can not report our own block is this a
+            error!(target: "worker::batch_provider", "Failed to report our batch: {err:?}");
+            // Should we return an error here?  Doing so complicates some tests but also the batch
+            // is sealed, etc. If we can not report our own batch is this a
             // showstopper?
         }
 

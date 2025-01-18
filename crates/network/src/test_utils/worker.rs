@@ -46,7 +46,7 @@ impl WorkerToWorker for WorkerToWorkerMockServer {
         Ok(anemo::Response::new(()))
     }
 
-    async fn request_blocks(
+    async fn request_batches(
         &self,
         _request: anemo::Request<RequestBlocksRequest>,
     ) -> Result<anemo::Response<RequestBlocksResponse>, anemo::rpc::Status> {

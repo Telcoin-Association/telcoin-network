@@ -324,7 +324,7 @@ mod tests {
     use reth_provider::{BlockIdReader, BlockNumReader, BlockReader, TransactionVariant};
     use reth_tracing::init_test_tracing;
     use std::{collections::VecDeque, str::FromStr as _, sync::Arc, time::Duration};
-    use tn_block_builder::test_utils::execute_test_worker_block;
+    use tn_batch_builder::test_utils::execute_test_worker_block;
     use tn_test_utils::{default_test_execution_node, seeded_genesis_from_random_batches};
     use tn_types::{
         adiri_chain_spec_arc, adiri_genesis, max_worker_block_gas, now, BlockHash, Certificate,

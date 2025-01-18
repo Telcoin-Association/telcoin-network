@@ -55,7 +55,7 @@ use tracing::debug;
 #[derive(Clone, Debug)]
 struct TestChanQuorumWaiter(Sender<SealedWorkerBlock>);
 impl QuorumWaiterTrait for TestChanQuorumWaiter {
-    fn verify_block(
+    fn verify_batch(
         &self,
         block: SealedWorkerBlock,
         _timeout: Duration,
@@ -269,9 +269,9 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     let shutdown = Notifier::default();
     // start batch maker
     execution_node
-        .start_block_builder(
+        .start_batch_builder(
             worker_id,
-            block_provider.blocks_tx(),
+            block_provider.batches_tx(),
             &TaskManager::default(),
             shutdown.subscribe(),
         )
@@ -581,7 +581,7 @@ async fn test_faucet_transfers_stablecoin_with_google_kms() -> eyre::Result<()> 
     let worker_id = 0;
     let (to_worker, mut next_batch) = tokio::sync::mpsc::channel(2);
     execution_node
-        .start_block_builder(worker_id, to_worker, &TaskManager::default(), shutdown.subscribe())
+        .start_batch_builder(worker_id, to_worker, &TaskManager::default(), shutdown.subscribe())
         .await?;
 
     let user_address = Address::random();

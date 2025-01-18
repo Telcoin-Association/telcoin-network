@@ -34,9 +34,9 @@ pub trait QuorumWaiterTrait: Send + Sync + Clone + Unpin + 'static {
     /// If the future resolves to Ok then the block has reached quorum other wise examine the error.
     /// An error of QuorumWaiterError::QuorumRejected indicates the block will never be accepted
     /// otherwise it might be possible if the network improves.
-    fn verify_block(
+    fn verify_batch(
         &self,
-        block: SealedWorkerBlock,
+        batch: SealedWorkerBlock,
         timeout: Duration,
     ) -> JoinHandle<Result<(), QuorumWaiterError>>;
 }
@@ -108,9 +108,9 @@ impl QuorumWaiter {
 }
 
 impl QuorumWaiterTrait for QuorumWaiter {
-    fn verify_block(
+    fn verify_batch(
         &self,
-        sealed_worker_block: SealedWorkerBlock,
+        sealed_worker_batch: SealedWorkerBlock,
         timeout: Duration,
     ) -> JoinHandle<Result<(), QuorumWaiterError>> {
         let inner = self.inner.clone();
@@ -127,7 +127,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                 let (primary_names, worker_names): (Vec<_>, _) = workers.into_iter().unzip();
                 let message = WorkerBlockMessage { sealed_worker_block };
                 let handlers = inner.network.broadcast(worker_names, &message);
-                let _timer = inner.metrics.block_broadcast_quorum_latency.start_timer();
+                let _timer = inner.metrics.batch_broadcast_quorum_latency.start_timer();
 
                 // Collect all the handlers to receive acknowledgements.
                 let mut wait_for_quorum: FuturesUnordered<QMBoxFuture<Result<Stake, WaiterError>>> =

@@ -736,7 +736,7 @@ impl<DB: Database> Subscriber<DB> {
                 }
             };
             for (digest, block) in blocks {
-                self.record_fetched_block_metrics(&block, &digest);
+                self.record_fetched_batch_metrics(&block, &digest);
                 fetched_blocks.insert(digest, block);
             }
         }
@@ -744,8 +744,8 @@ impl<DB: Database> Subscriber<DB> {
         fetched_blocks
     }
 
-    fn record_fetched_block_metrics(&self, block: &WorkerBlock, digest: &BlockHash) {
-        if let Some(received_at) = block.received_at() {
+    fn record_fetched_batch_metrics(&self, batch: &WorkerBlock, digest: &BlockHash) {
+        if let Some(received_at) = batch.received_at() {
             let remote_duration = received_at.elapsed().as_secs_f64();
             debug!(
                 "Batch was fetched for execution after being received from another worker {}s ago.",
@@ -757,7 +757,7 @@ impl<DB: Database> Subscriber<DB> {
                 .with_label_values(&["other"])
                 .observe(remote_duration);
         } else {
-            let local_duration = block.created_at().elapsed().as_secs_f64();
+            let local_duration = batch.created_at().elapsed().as_secs_f64();
             debug!(
                 "Batch was fetched for execution after being created locally {}s ago.",
                 local_duration
@@ -769,7 +769,7 @@ impl<DB: Database> Subscriber<DB> {
                 .observe(local_duration);
         };
 
-        let block_fetch_duration = block.created_at().elapsed().as_secs_f64();
+        let block_fetch_duration = batch.created_at().elapsed().as_secs_f64();
         self.consensus_bus.executor_metrics().block_execution_latency.observe(block_fetch_duration);
         debug!(
             "Block {:?} took {} seconds since it has been created to when it has been fetched for execution",

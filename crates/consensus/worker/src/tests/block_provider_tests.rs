@@ -1,4 +1,4 @@
-//! Unit tests for the worker's block provider.
+//! Unit tests for the worker's batch provider.
 use super::*;
 use crate::quorum_waiter::QuorumWaiterError;
 use std::sync::Mutex;
@@ -16,21 +16,21 @@ impl TestMakeBlockQuorumWaiter {
     }
 }
 impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
-    fn verify_block(
+    fn verify_batch(
         &self,
-        block: SealedWorkerBlock,
+        batch: SealedWorkerBlock,
         _timeout: Duration,
     ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
         let data = self.0.clone();
         tokio::spawn(async move {
-            *data.lock().unwrap() = Some(block);
+            *data.lock().unwrap() = Some(batch);
             Ok(())
         })
     }
 }
 
 #[tokio::test]
-async fn make_block() {
+async fn make_batch() {
     let client = LocalNetwork::new_with_empty_id();
     let temp_dir = TempDir::new().unwrap();
     let store = open_db(temp_dir.path());
@@ -38,39 +38,39 @@ async fn make_block() {
 
     // Mock the primary client to always succeed.
     let mut mock_server = MockWorkerToPrimary::new();
-    mock_server.expect_report_own_block().returning(|_| Ok(anemo::Response::new(())));
+    mock_server.expect_report_own_batch().returning(|_| Ok(anemo::Response::new(())));
     client.set_worker_to_primary_local_handler(Arc::new(mock_server));
 
     // Spawn a `BlockProvider` instance.
     let id = 0;
     let qw = TestMakeBlockQuorumWaiter::new_test();
     let timeout = Duration::from_secs(5);
-    let block_provider =
+    let batch_provider =
         BlockProvider::new(id, qw.clone(), Arc::new(node_metrics), client, store.clone(), timeout);
 
-    // Send enough transactions to seal a block.
+    // Send enough transactions to seal a batch.
     let tx = transaction();
-    let new_block =
+    let new_batch =
         WorkerBlock { transactions: vec![tx.clone(), tx.clone()], ..Default::default() };
 
-    block_provider.seal(new_block.clone().seal_slow()).await.unwrap();
+    batch_provider.seal(new_batch.clone().seal_slow()).await.unwrap();
 
-    // Ensure the block is as expected.
-    let expected_block =
+    // Ensure the batch is as expected.
+    let expected_batch =
         WorkerBlock { transactions: vec![tx.clone(), tx.clone()], ..Default::default() };
 
     assert_eq!(
-        new_block.transactions(),
+        new_batch.transactions(),
         qw.0.lock()
             .unwrap()
             .as_ref()
             .expect("batch not sent to Quorum Waiter!")
-            .block()
+            .batch()
             .transactions()
     );
 
-    // Ensure the block is stored
-    assert!(store.get::<WorkerBlocks>(&expected_block.digest()).unwrap().is_some());
+    // Ensure the batch is stored
+    assert!(store.get::<WorkerBlocks>(&expected_batch.digest()).unwrap().is_some());
 }
 
 // #[tokio::test]

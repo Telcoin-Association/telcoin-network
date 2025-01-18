@@ -1,8 +1,8 @@
 //! The main worker type
 
 use crate::{
-    block_fetcher::WorkerBlockFetcher,
-    block_provider::BlockProvider,
+    batch_fetcher::WorkerBlockFetcher,
+    batch_provider::BlockProvider,
     metrics::{Metrics, WorkerMetrics},
     network::{PrimaryReceiverHandler, WorkerReceiverHandler},
     quorum_waiter::QuorumWaiter,
@@ -86,7 +86,7 @@ impl<DB: Database> Worker<DB> {
         // Receive incoming messages from other workers.
         let network = Self::start_network(id, &consensus_config, validator.clone(), &metrics);
 
-        let block_fetcher = WorkerBlockFetcher::new(
+        let batch_fetcher = WorkerBlockFetcher::new(
             worker_name,
             network.clone(),
             consensus_config.node_storage().batch_store.clone(),
@@ -101,7 +101,7 @@ impl<DB: Database> Worker<DB> {
                 store: consensus_config.database().clone(),
                 request_batches_timeout: consensus_config.parameters().sync_retry_delay,
                 network: Some(network.clone()),
-                batch_fetcher: Some(block_fetcher),
+                batch_fetcher: Some(batch_fetcher),
                 validator,
             }),
         );
@@ -165,7 +165,7 @@ impl<DB: Database> Worker<DB> {
             task_manager,
         );
 
-        let block_provider = Self::new_block_provider(
+        let batch_provider = Self::new_batch_provider(
             id,
             &consensus_config,
             node_metrics,
@@ -190,7 +190,7 @@ impl<DB: Database> Worker<DB> {
                 .transactions
         );
 
-        (Self { _id: id, _consensus_config: consensus_config, network }, block_provider)
+        (Self { _id: id, _consensus_config: consensus_config, network }, batch_provider)
     }
 
     /// Start the anemo network for the primary.
@@ -209,7 +209,7 @@ impl<DB: Database> Worker<DB> {
 
         // Apply rate limits from configuration as needed.
         if let Some(limit) = consensus_config.config().parameters.anemo.report_batch_rate_limit {
-            worker_service = worker_service.add_layer_for_report_block(InboundRequestLayer::new(
+            worker_service = worker_service.add_layer_for_report_batch(InboundRequestLayer::new(
                 rate_limit::RateLimitLayer::new(
                     governor::Quota::per_second(limit),
                     rate_limit::WaitMode::Block,
@@ -217,12 +217,12 @@ impl<DB: Database> Worker<DB> {
             ));
         }
         if let Some(limit) = consensus_config.config().parameters.anemo.request_batches_rate_limit {
-            worker_service = worker_service.add_layer_for_request_blocks(InboundRequestLayer::new(
-                rate_limit::RateLimitLayer::new(
+            worker_service = worker_service.add_layer_for_request_batches(
+                InboundRequestLayer::new(rate_limit::RateLimitLayer::new(
                     governor::Quota::per_second(limit),
                     rate_limit::WaitMode::Block,
-                ),
-            ));
+                )),
+            );
         }
 
         let address = Self::worker_address(&id, consensus_config);
@@ -334,8 +334,8 @@ impl<DB: Database> Worker<DB> {
         (peer_id, address)
     }
 
-    /// Builds a new block provider responsible for handling client transactions.
-    fn new_block_provider(
+    /// Builds a new batch provider responsible for handling client transactions.
+    fn new_batch_provider(
         id: WorkerId,
         consensus_config: &ConsensusConfig<DB>,
         node_metrics: Arc<WorkerMetrics>,
@@ -344,8 +344,8 @@ impl<DB: Database> Worker<DB> {
     ) -> BlockProvider<DB, QuorumWaiter> {
         info!(target: "worker::worker", "Starting handler for transactions");
 
-        // The `QuorumWaiter` waits for 2f authorities to acknowledge receiving the block
-        // before forwarding the block to the `Processor`
+        // The `QuorumWaiter` waits for 2f authorities to acknowledge receiving the batch
+        // before forwarding the batch to the `Processor`
         let quorum_waiter = QuorumWaiter::new(
             consensus_config.authority().clone(),
             id,
@@ -361,7 +361,7 @@ impl<DB: Database> Worker<DB> {
             node_metrics,
             client,
             consensus_config.database().clone(),
-            consensus_config.parameters().worker_block_vote_timeout,
+            consensus_config.parameters().worker_batch_vote_timeout,
         )
     }
 

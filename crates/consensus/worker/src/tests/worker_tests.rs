@@ -29,7 +29,7 @@ struct NilBatchValidator;
 impl BlockValidation for NilBatchValidator {
     type Error = eyre::Report;
 
-    async fn validate_block(&self, _txs: SealedWorkerBlock) -> Result<(), Self::Error> {
+    async fn validate_batch(&self, _txs: SealedWorkerBlock) -> Result<(), Self::Error> {
         eyre::bail!("Invalid batch");
     }
 }

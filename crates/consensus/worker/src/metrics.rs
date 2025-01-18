@@ -78,28 +78,28 @@ impl Default for Metrics {
 
 #[derive(Clone)]
 pub struct WorkerMetrics {
-    /// Number of created blocks from the block_maker
-    pub created_block_size: HistogramVec,
-    /// Time taken to create a block
-    pub created_block_latency: HistogramVec,
-    /// Latency of broadcasting blocks to a quorum in seconds.
-    pub block_broadcast_quorum_latency: Histogram,
-    /// Counter of remote/local block fetch statuses.
-    pub worker_block_fetch: IntCounterVec,
+    /// Number of created batches from the batch_maker
+    pub created_batch_size: HistogramVec,
+    /// Time taken to create a batch
+    pub created_batch_latency: HistogramVec,
+    /// Latency of broadcasting batches to a quorum in seconds.
+    pub batch_broadcast_quorum_latency: Histogram,
+    /// Counter of remote/local batch fetch statuses.
+    pub worker_batch_fetch: IntCounterVec,
     /// Time it takes to download a payload from local worker peer
     pub worker_local_fetch_latency: Histogram,
     /// Time it takes to download a payload from remote peer
     pub worker_remote_fetch_latency: Histogram,
-    /// The number of pending remote calls to request_blocks
-    pub pending_remote_request_blocks: IntGauge,
+    /// The number of pending remote calls to request_batches
+    pub pending_remote_request_batches: IntGauge,
 }
 
 impl WorkerMetrics {
     fn try_new(registry: &Registry) -> Result<Self, prometheus::Error> {
         Ok(Self {
-            created_block_size: register_histogram_vec_with_registry!(
-                "created_block_size",
-                "Size in bytes of the created blocks",
+            created_batch_size: register_histogram_vec_with_registry!(
+                "created_batch_size",
+                "Size in bytes of the created batches",
                 &["reason"],
                 // buckets with size in bytes
                 vec![
@@ -117,24 +117,24 @@ impl WorkerMetrics {
                 ],
                 registry
             )?,
-            created_block_latency: register_histogram_vec_with_registry!(
-                "created_block_latency",
-                "The latency of creating (sealing) a block",
+            created_batch_latency: register_histogram_vec_with_registry!(
+                "created_batch_latency",
+                "The latency of creating (sealing) a batch",
                 &["reason"],
                 // buckets in seconds
                 LATENCY_SEC_BUCKETS.to_vec(),
                 registry
             )?,
-            block_broadcast_quorum_latency: register_histogram_with_registry!(
-                "block_broadcast_quorum_latency",
-                "The latency of broadcasting blocks to a quorum in seconds",
+            batch_broadcast_quorum_latency: register_histogram_with_registry!(
+                "batch_broadcast_quorum_latency",
+                "The latency of broadcasting batches to a quorum in seconds",
                 // buckets in seconds
                 LATENCY_SEC_BUCKETS.to_vec(),
                 registry
             )?,
-            worker_block_fetch: register_int_counter_vec_with_registry!(
-                "worker_block_fetch",
-                "Counter of remote/local block fetch statuses",
+            worker_batch_fetch: register_int_counter_vec_with_registry!(
+                "worker_batch_fetch",
+                "Counter of remote/local batch fetch statuses",
                 &["source", "status"],
                 registry
             )?,
@@ -150,9 +150,9 @@ impl WorkerMetrics {
                 LATENCY_SEC_BUCKETS.to_vec(),
                 registry
             )?,
-            pending_remote_request_blocks: register_int_gauge_with_registry!(
-                "pending_remote_request_blocks",
-                "The number of pending remote calls to request_blocks",
+            pending_remote_request_batches: register_int_gauge_with_registry!(
+                "pending_remote_request_batches",
+                "The number of pending remote calls to request_batches",
                 registry
             )?,
         })
@@ -184,12 +184,12 @@ impl Default for WorkerMetrics {
 pub struct WorkerChannelMetrics {
     /// occupancy of the channel from the `worker::TxReceiverhandler` to the
     /// `worker::BlockProvider`
-    pub tx_block_maker: IntGauge,
+    pub tx_batch_maker: IntGauge,
     /// occupancy of the channel from the `worker::BlockProvider` to the `worker::QuorumWaiter`
     pub tx_quorum_waiter: IntGauge,
     /// total received from the channel from the `worker::TxReceiverhandler` to the
     /// `worker::BlockProvider`
-    pub tx_block_maker_total: IntCounter,
+    pub tx_batch_maker_total: IntCounter,
     /// total received from the channel from the `worker::BlockProvider` to the
     /// `worker::QuorumWaiter`
     pub tx_quorum_waiter_total: IntCounter,
@@ -198,8 +198,8 @@ pub struct WorkerChannelMetrics {
 impl WorkerChannelMetrics {
     fn try_new(registry: &Registry) -> Result<Self, prometheus::Error> {
         Ok(Self {
-            tx_block_maker: register_int_gauge_with_registry!(
-                "tx_block_maker",
+            tx_batch_maker: register_int_gauge_with_registry!(
+                "tx_batch_maker",
                 "occupancy of the channel from the `worker::TxReceiverhandler` to the `worker::BlockProvider`",
                 registry
             )?,
@@ -210,8 +210,8 @@ impl WorkerChannelMetrics {
             )?,
 
             // Totals:
-            tx_block_maker_total: register_int_counter_with_registry!(
-                "tx_block_maker_total",
+            tx_batch_maker_total: register_int_counter_with_registry!(
+                "tx_batch_maker_total",
                 "total received from the channel from the `worker::TxReceiverhandler` to the `worker::BlockProvider`",
                 registry
             )?,

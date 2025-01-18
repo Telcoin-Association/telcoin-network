@@ -92,7 +92,7 @@ impl ReliableNetwork<WorkerBlockMessage> for anemo::Network {
 }
 
 impl WorkerRpc for anemo::Network {
-    async fn request_blocks(
+    async fn request_batches(
         &self,
         peer: &NetworkPublicKey,
         request: impl anemo::types::request::IntoRequest<RequestBlocksRequest> + Send,
@@ -102,7 +102,7 @@ impl WorkerRpc for anemo::Network {
             .peer(peer_id)
             .ok_or_else(|| format_err!("Network has no connection with peer {peer_id}"))?;
         let response = WorkerToWorkerClient::new(peer)
-            .request_blocks(request)
+            .request_batches(request)
             .await
             .map_err(|e| format_err!("Network error {:?}", e))?;
         Ok(response.into_body())

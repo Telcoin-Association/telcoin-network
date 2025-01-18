@@ -30,10 +30,10 @@ pub struct FetchCertificatesResponse {
     pub certificates: Vec<Certificate>,
 }
 
-/// All blocks requested by the primary.
+/// All batches requested by the primary.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FetchBlocksResponse {
-    /// The missing blocks fetched from peers.
+    /// The missing batches fetched from peers.
     pub blocks: HashMap<BlockHash, WorkerBlock>,
 }
 
@@ -48,9 +48,9 @@ pub struct WorkerInfoResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RequestBlocksResponse {
-    /// Requested blocks.
-    pub blocks: Vec<WorkerBlock>,
-    /// If true, the primary should request the blocks from the workers again.
+    /// Requested batches.
+    pub batches: Vec<WorkerBlock>,
+    /// If true, the primary should request the batches from the workers again.
     /// This may not be something that can be trusted from a remote worker.
     pub is_size_limit_reached: bool,
 }

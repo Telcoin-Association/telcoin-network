@@ -1,6 +1,6 @@
-//! Block builder (EL) collects transactions and creates blocks.
+//! Block builder (EL) collects transactions and creates batches.
 //!
-//! Block builder (CL) receives the block from EL and forwards it to the Quorum Waiter for votes
+//! Block builder (CL) receives the batch from EL and forwards it to the Quorum Waiter for votes
 //! from peers.
 
 use assert_matches::assert_matches;
@@ -24,7 +24,7 @@ use reth_transaction_pool::{
 };
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tempfile::TempDir;
-use tn_block_builder::{test_utils::execute_test_worker_block, BlockBuilder};
+use tn_batch_builder::{test_utils::execute_test_worker_block, BlockBuilder};
 use tn_block_validator::BlockValidator;
 use tn_engine::execute_consensus_output;
 use tn_network::local::LocalNetwork;
@@ -47,9 +47,9 @@ use tracing::debug;
 #[derive(Clone, Debug)]
 struct TestMakeBlockQuorumWaiter();
 impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
-    fn verify_block(
+    fn verify_batch(
         &self,
-        _block: SealedWorkerBlock,
+        _batch: SealedWorkerBlock,
         _timeout: Duration,
     ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
         tokio::spawn(async move { Ok(()) })
@@ -57,9 +57,7 @@ impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
 }
 
 #[tokio::test]
-async fn test_make_block_el_to_cl() {
-    // reth_tracing::init_test_tracing();
-
+async fn test_make_batch_el_to_cl() {
     //
     //=== Consensus Layer
     //
@@ -71,12 +69,12 @@ async fn test_make_block_el_to_cl() {
 
     // Mock the primary client to always succeed.
     let mut mock_server = MockWorkerToPrimary::new();
-    mock_server.expect_report_own_block().returning(|_| Ok(anemo::Response::new(())));
+    mock_server.expect_report_own_batch().returning(|_| Ok(anemo::Response::new(())));
     network_client.set_worker_to_primary_local_handler(Arc::new(mock_server));
 
     let qw = TestMakeBlockQuorumWaiter();
     let timeout = Duration::from_secs(5);
-    let block_provider = BlockProvider::new(
+    let batch_provider = BlockProvider::new(
         0,
         qw.clone(),
         Arc::new(node_metrics),
@@ -138,13 +136,13 @@ async fn test_make_block_el_to_cl() {
         pending_block_blob_fee: tx_pool_latest.pending_blob_fee,
     };
 
-    // build execution block proposer
-    let block_builder = BlockBuilder::new(
+    // build execution batch proposer
+    let batch_builder = BlockBuilder::new(
         blockchain_db.clone(),
         txpool.clone(),
         blockchain_db.canonical_state_stream(),
         latest_canon_state,
-        block_provider.blocks_tx(),
+        batch_provider.batches_tx(),
         address,
         Duration::from_secs(1),
     );
@@ -198,8 +196,8 @@ async fn test_make_block_el_to_cl() {
     debug!("pool_size(): {:?}", txpool.pool_size());
     assert_eq!(pending_pool_len, 3);
 
-    // spawn block_builder once worker is ready
-    let _block_builder = tokio::spawn(Box::pin(block_builder));
+    // spawn batch_builder once worker is ready
+    let _batch_builder = tokio::spawn(Box::pin(batch_builder));
 
     //
     //=== Test block flow
@@ -258,7 +256,7 @@ async fn test_make_block_el_to_cl() {
 /// First 3 mined in first block.
 /// Before a canonical state change, mine the 4th transaction in the next block.
 #[tokio::test]
-async fn test_block_builder_produces_valid_blocks() {
+async fn test_batch_builder_produces_valid_blocks() {
     // reth_tracing::init_test_tracing();
     //
     //=== Execution Layer
@@ -312,10 +310,10 @@ async fn test_block_builder_produces_valid_blocks() {
         pending_block_blob_fee: tx_pool_latest.pending_blob_fee,
     };
 
-    let (to_worker, mut from_block_builder) = tokio::sync::mpsc::channel(2);
+    let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
 
     // build execution block proposer
-    let block_builder = BlockBuilder::new(
+    let batch_builder = BlockBuilder::new(
         blockchain_db.clone(),
         txpool.clone(),
         blockchain_db.canonical_state_stream(),
@@ -371,8 +369,8 @@ async fn test_block_builder_produces_valid_blocks() {
     debug!("pool_size(): {:?}", txpool.pool_size());
     assert_eq!(pending_pool_len, 3);
 
-    // spawn block_builder once worker is ready
-    let _block_builder = tokio::spawn(Box::pin(block_builder));
+    // spawn batch_builder once worker is ready
+    let _batch_builder = tokio::spawn(Box::pin(batch_builder));
 
     //
     //=== Test block flow
@@ -382,7 +380,7 @@ async fn test_block_builder_produces_valid_blocks() {
     let duration = std::time::Duration::from_secs(5);
 
     // receive next block
-    let (first_block, ack) = timeout(duration, from_block_builder.recv())
+    let (first_block, ack) = timeout(duration, from_batch_builder.recv())
         .await
         .expect("block builder's sender didn't drop")
         .expect("batch was built");
@@ -421,7 +419,7 @@ async fn test_block_builder_produces_valid_blocks() {
     assert_eq!(block_txs, expected_block.transactions());
 
     // receive next block
-    let (next_block, ack) = timeout(duration, from_block_builder.recv())
+    let (next_block, ack) = timeout(duration, from_batch_builder.recv())
         .await
         .expect("block builder's sender didn't drop")
         .expect("batch was built");
@@ -521,10 +519,10 @@ async fn test_canonical_notification_updates_pool() {
         pending_block_blob_fee: tx_pool_latest.pending_blob_fee,
     };
 
-    let (to_worker, mut from_block_builder) = tokio::sync::mpsc::channel(2);
+    let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
 
     // build execution block proposer
-    let block_builder = BlockBuilder::new(
+    let batch_builder = BlockBuilder::new(
         blockchain_db.clone(),
         txpool.clone(),
         blockchain_db.canonical_state_stream(),
@@ -580,8 +578,8 @@ async fn test_canonical_notification_updates_pool() {
     debug!("pool_size(): {:?}", txpool.pool_size());
     assert_eq!(pending_pool_len, 0);
 
-    // spawn block_builder once worker is ready
-    let _block_builder = tokio::spawn(Box::pin(block_builder));
+    // spawn batch_builder once worker is ready
+    let _batch_builder = tokio::spawn(Box::pin(batch_builder));
 
     //
     //=== Test block flow
@@ -621,7 +619,7 @@ async fn test_canonical_notification_updates_pool() {
             None,
         )
         .into(),
-        blocks: vec![vec![first_block]],
+        batches: vec![vec![first_block]],
         beneficiary: address,
         block_digests,
         parent_hash: ConsensusHeader::default().digest(),
@@ -645,7 +643,7 @@ async fn test_canonical_notification_updates_pool() {
     let duration = std::time::Duration::from_secs(5);
 
     // receive next block
-    let (first_block, ack) = timeout(duration, from_block_builder.recv())
+    let (first_block, ack) = timeout(duration, from_batch_builder.recv())
         .await
         .expect("block builder's sender didn't drop")
         .expect("batch was built");

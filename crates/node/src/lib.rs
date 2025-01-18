@@ -119,9 +119,9 @@ where
         .await?;
     // spawn block maker for worker
     engine
-        .start_block_builder(
+        .start_batch_builder(
             *worker_id,
-            block_provider.blocks_tx(),
+            block_provider.batches_tx(),
             &engine_task_manager,
             consensus_config.shutdown().subscribe(),
         )

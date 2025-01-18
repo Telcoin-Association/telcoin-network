@@ -19,9 +19,9 @@ use tracing::{debug, warn};
 /// Contains information needed to update the transaction pool.
 #[derive(Debug)]
 pub struct BlockBuilderOutput {
-    /// The block info for the worker to propose.
-    pub(crate) worker_block: WorkerBlock,
-    /// The transaction hashes mined in this worker's block.
+    /// The batch info for the worker to propose.
+    pub(crate) batch: WorkerBlock,
+    /// The transaction hashes mined in this worker's batch.
     ///
     /// NOTE: canonical changes update `ChangedAccount` and changed senders.
     /// Only the mined transactions are removed from the pool. Account nonce and state
@@ -44,14 +44,14 @@ pub struct BlockBuilderOutput {
 /// with very high gas limits. It's impossible to know the amount of gas a transaction
 /// will use without executing it, and the worker does not execute transactions.
 #[inline]
-pub fn build_worker_block<P>(args: WorkerBlockBuilderArgs<P>) -> BlockBuilderOutput
+pub fn build_batch<P>(args: WorkerBlockBuilderArgs<P>) -> BlockBuilderOutput
 where
     P: TransactionPool,
 {
-    let WorkerBlockBuilderArgs { pool, block_config } = args;
-    let gas_limit = max_worker_block_gas(block_config.parent_info.tip.timestamp);
-    let max_size = max_worker_block_size(block_config.parent_info.tip.timestamp);
-    let PendingBlockConfig { beneficiary, parent_info } = block_config;
+    let WorkerBlockBuilderArgs { pool, batch_config } = args;
+    let gas_limit = max_worker_block_gas(batch_config.parent_info.tip.timestamp);
+    let max_size = max_worker_block_size(batch_config.parent_info.tip.timestamp);
+    let PendingBlockConfig { beneficiary, parent_info } = batch_config;
 
     // NOTE: this obtains a `read` lock on the tx pool
     // pull best transactions and rely on watch channel to ensure basefee is current
@@ -79,7 +79,7 @@ where
             // current iteration  all dependents for this transaction are now considered invalid
             // before continuing loop
             best_txs.mark_invalid(&pool_tx);
-            debug!(target: "worker::block_builder", ?pool_tx, "marking tx invalid due to gas constraint");
+            debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to gas constraint");
             continue;
         }
 
@@ -95,7 +95,7 @@ where
             // current iteration  all dependents for this transaction are now considered invalid
             // before continuing loop
             best_txs.mark_invalid(&pool_tx);
-            debug!(target: "worker::block_builder", ?pool_tx, "marking tx invalid due to bytes constraint");
+            debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to bytes constraint");
             continue;
         }
 
@@ -116,12 +116,12 @@ where
     // TODO: check for this error at the quorum waiter level?
     let mut timestamp = now();
     if timestamp == parent_info.tip.timestamp {
-        warn!(target: "worker::block_builder", "new block timestamp same as parent - setting offset by 1sec");
+        warn!(target: "worker::batch_builder", "new block timestamp same as parent - setting offset by 1sec");
         timestamp = parent_info.tip.timestamp + 1;
     }
 
     // batch
-    let worker_block = WorkerBlock {
+    let batch = WorkerBlock {
         transactions,
         parent_hash,
         beneficiary,
@@ -131,5 +131,5 @@ where
     };
 
     // return output
-    BlockBuilderOutput { worker_block, mined_transactions }
+    BlockBuilderOutput { batch, mined_transactions }
 }
