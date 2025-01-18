@@ -6,7 +6,7 @@ use tn_storage::{mem_db::MemDatabase, open_db};
 use tn_test_utils::{batch, random_network, CommitteeFixture};
 
 use super::*;
-use tn_batch_validator::NoopBlockValidator;
+use tn_batch_validator::NoopBatchValidator;
 
 #[tokio::test]
 async fn synchronize() {
@@ -61,7 +61,7 @@ async fn synchronize() {
         request_batches_timeout: Duration::from_secs(999),
         network: Some(send_network),
         batch_fetcher: None,
-        validator: Arc::new(NoopBlockValidator),
+        validator: Arc::new(NoopBatchValidator),
     };
 
     // Verify the batch is not in store
@@ -99,7 +99,7 @@ async fn synchronize_when_batch_exists() {
         request_batches_timeout: Duration::from_secs(999),
         network: Some(send_network),
         batch_fetcher: None,
-        validator: Arc::new(NoopBlockValidator),
+        validator: Arc::new(NoopBatchValidator),
     };
 
     // Store the batch.

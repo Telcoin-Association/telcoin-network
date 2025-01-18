@@ -11,7 +11,7 @@ use fastcrypto::encoding::{Encoding, Hex};
 use prometheus::Registry;
 use std::time::Duration;
 use tempfile::TempDir;
-use tn_batch_validator::NoopBlockValidator;
+use tn_batch_validator::NoopBatchValidator;
 use tn_primary::{
     consensus::{LeaderSchedule, LeaderSwapTable},
     Primary,
@@ -69,7 +69,7 @@ async fn get_network_peers_from_admin_server() {
     let worker_1_parameters = config_1.config().parameters.clone();
 
     // Spawn a `Worker` instance for primary 1.
-    let _worker = Worker::spawn(worker_id, NoopBlockValidator, metrics_1.clone(), config_1.clone());
+    let _worker = Worker::spawn(worker_id, NoopBatchValidator, metrics_1.clone(), config_1.clone());
 
     let primary_1_peer_id =
         Hex::encode(authority_1.primary_network_keypair().copy().public().0.as_bytes());
@@ -133,7 +133,7 @@ async fn get_network_peers_from_admin_server() {
     let worker_2_parameters = config_2.config().parameters.clone();
 
     // Spawn a `Worker` instance for primary 2.
-    let _worker = Worker::spawn(worker_id, NoopBlockValidator, metrics_2.clone(), config_2.clone());
+    let _worker = Worker::spawn(worker_id, NoopBatchValidator, metrics_2.clone(), config_2.clone());
 
     // Wait for tasks to start. Sleeping longer here to ensure all primaries and workers
     // have  a chance to connect to each other.

@@ -13,7 +13,7 @@ type BlockValidationResult<T> = Result<T, BatchValidationError>;
 
 /// Block validator
 #[derive(Clone)]
-pub struct BlockValidator<DB>
+pub struct BatchValidator<DB>
 where
     DB: Database + Clone + 'static,
 {
@@ -22,7 +22,7 @@ where
 }
 
 #[async_trait::async_trait]
-impl<DB> BatchValidation for BlockValidator<DB>
+impl<DB> BatchValidation for BatchValidator<DB>
 where
     DB: Database + Sized + Clone + 'static,
 {
@@ -82,7 +82,7 @@ where
     }
 }
 
-impl<DB> BlockValidator<DB>
+impl<DB> BatchValidator<DB>
 where
     DB: Database + Clone,
 {
@@ -159,11 +159,11 @@ where
 /// Noop validation struct that validates any block.
 #[cfg(any(test, feature = "test-utils"))]
 #[derive(Default, Clone)]
-pub struct NoopBlockValidator;
+pub struct NoopBatchValidator;
 
 #[cfg(any(test, feature = "test-utils"))]
 #[async_trait::async_trait]
-impl BatchValidation for NoopBlockValidator {
+impl BatchValidation for NoopBatchValidator {
     fn validate_batch(&self, _batch: SealedBatch) -> Result<(), BatchValidationError> {
         Ok(())
     }
@@ -256,7 +256,7 @@ mod tests {
         /// The expected sealed batch.
         valid_batch: SealedBatch,
         /// Validator
-        validator: BlockValidator<Arc<TempDatabase<DatabaseEnv>>>,
+        validator: BatchValidator<Arc<TempDatabase<DatabaseEnv>>>,
     }
 
     /// Create an instance of block validator for tests.
@@ -294,7 +294,7 @@ mod tests {
             BlockchainProvider::new(provider_factory.clone(), blockchain_tree.clone())
                 .expect("blockchain db valid");
 
-        let validator = BlockValidator::new(blockchain_db);
+        let validator = BatchValidator::new(blockchain_db);
         let valid_batch = next_valid_sealed_batch();
 
         // block validator
@@ -304,14 +304,14 @@ mod tests {
     #[tokio::test]
     async fn test_valid_batch() {
         let TestTools { valid_batch, validator } = test_tools().await;
-        let result = validator.validate_block(valid_batch.clone());
+        let result = validator.validate_batch(valid_batch.clone());
         assert!(result.is_ok());
 
         // ensure non-serialized data does not affect validity
         let (mut batch, _) = valid_batch.split();
         batch.received_at = Some(tn_types::now());
         let different_block = batch.seal_slow();
-        let result = validator.validate_block(different_block);
+        let result = validator.validate_batch(different_block);
         assert!(result.is_ok());
     }
 
@@ -335,8 +335,8 @@ mod tests {
             received_at,
         };
         assert_matches!(
-            validator.validate_block(invalid_batch.seal_slow()),
-            Err(BatchValidationError::CanonicalChain { block_hash }) if batch_hash == wrong_parent_hash
+            validator.validate_batch(invalid_batch.seal_slow()),
+            Err(BatchValidationError::CanonicalChain { block_hash }) if block_hash == wrong_parent_hash
         );
     }
 
@@ -350,7 +350,7 @@ mod tests {
         batch.timestamp = wrong_timestamp;
 
         assert_matches!(
-            validator.validate_block(batch.clone().seal_slow()),
+            validator.validate_batch(batch.clone().seal_slow()),
             Err(BatchValidationError::TimestampIsInPast{parent_timestamp, timestamp}) if parent_timestamp == wrong_timestamp && timestamp == wrong_timestamp
         );
 
@@ -358,7 +358,7 @@ mod tests {
         batch.timestamp = wrong_timestamp - 1;
 
         assert_matches!(
-            validator.validate_block(batch.seal_slow()),
+            validator.validate_batch(batch.seal_slow()),
             Err(BatchValidationError::TimestampIsInPast{parent_timestamp, timestamp}) if parent_timestamp == wrong_timestamp && timestamp == wrong_timestamp - 1
         );
     }
@@ -461,7 +461,7 @@ mod tests {
         let invalid_batch = block.clone().seal_slow();
 
         assert_matches!(
-            validator.validate_block(invalid_batch),
+            validator.validate_batch(invalid_batch),
             Err(BatchValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == total_bytes
         );
 
@@ -490,7 +490,7 @@ mod tests {
         block.transactions = invalid_txs;
         let invalid_batch = block.seal_slow();
         assert_matches!(
-            validator.validate_block(invalid_batch),
+            validator.validate_batch(invalid_batch),
             Err(BatchValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == too_big
         );
     }

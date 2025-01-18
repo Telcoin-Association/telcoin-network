@@ -25,7 +25,7 @@ use reth_transaction_pool::{
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tn_batch_builder::{test_utils::execute_test_batch, BlockBuilder};
-use tn_batch_validator::BlockValidator;
+use tn_batch_validator::BatchValidator;
 use tn_engine::execute_consensus_output;
 use tn_network::local::LocalNetwork;
 use tn_network_types::MockWorkerToPrimary;
@@ -39,7 +39,7 @@ use tn_types::{
 use tn_worker::{
     metrics::WorkerMetrics,
     quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
-    BlockProvider,
+    BatchProvider,
 };
 use tokio::time::timeout;
 use tracing::debug;
@@ -74,7 +74,7 @@ async fn test_make_batch_el_to_cl() {
 
     let qw = TestMakeBlockQuorumWaiter();
     let timeout = Duration::from_secs(5);
-    let batch_provider = BlockProvider::new(
+    let batch_provider = BatchProvider::new(
         0,
         qw.clone(),
         Arc::new(node_metrics),
@@ -216,7 +216,7 @@ async fn test_make_batch_el_to_cl() {
     let sealed_batch = sealed_batch.unwrap();
 
     // ensure batch validator succeeds
-    let batch_validator = BlockValidator::new(blockchain_db.clone());
+    let batch_validator = BatchValidator::new(blockchain_db.clone());
 
     let valid_batch_result = batch_validator.validate_batch(sealed_batch.clone());
     assert!(valid_batch_result.is_ok());
@@ -404,9 +404,9 @@ async fn test_batch_builder_produces_valid_batchess() {
     let _ = ack.send(Ok(()));
 
     // validate first batch
-    let batch_validator = BlockValidator::new(blockchain_db.clone());
+    let batch_validator = BatchValidator::new(blockchain_db.clone());
 
-    let valid_batch_result = batch_validator.validate_block(first_batch.clone());
+    let valid_batch_result = batch_validator.validate_batch(first_batch.clone());
     assert!(valid_batch_result.is_ok());
 
     // ensure expected transaction is in batch
@@ -427,7 +427,7 @@ async fn test_batch_builder_produces_valid_batchess() {
     let _ = ack.send(Ok(()));
 
     // validate second block
-    let valid_batch_result = batch_validator.validate_block(next_batch.clone());
+    let valid_batch_result = batch_validator.validate_batch(next_batch.clone());
     assert!(valid_batch_result.is_ok());
 
     // assert only transaction in block
@@ -651,10 +651,10 @@ async fn test_canonical_notification_updates_pool() {
     // send ack to mine transaction
     let _ = ack.send(Ok(()));
 
-    // validate block
-    let batch_validator = BlockValidator::new(blockchain_db);
+    // validate batch
+    let batch_validator = BatchValidator::new(blockchain_db);
 
-    let valid_batch_result = batch_validator.validate_block(first_batch.clone());
+    let valid_batch_result = batch_validator.validate_batch(first_batch.clone());
     assert!(valid_batch_result.is_ok());
 
     // yield to try and give pool a chance to update

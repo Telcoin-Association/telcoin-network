@@ -577,7 +577,7 @@ mod tests {
             for digests_chunk in digests_chunks {
                 for digest in digests_chunk {
                     if let Some(batch) = self.data.get(&worker).unwrap().get(&digest) {
-                        if total_size < MAX_request_batches_RESPONSE_SIZE {
+                        if total_size < MAX_REQUEST_BATCHES_RESPONSE_SIZE {
                             batches.push(batch.clone());
                             total_size += batch.size();
                         } else {

@@ -592,8 +592,8 @@ mod tests {
 
         let missing_block = fixture_batch_with_transactions(3).seal_slow();
         let digests = vec![missing_block.digest()];
-        let batch_req = WorkerRequest::MissingBlocks { digests };
-        let batch_res = WorkerResponse::MissingBlocks { blocks: vec![missing_block] };
+        let batch_req = WorkerRequest::MissingBatches { digests };
+        let batch_res = WorkerResponse::MissingBatches { batches: vec![missing_block] };
 
         // dial peer2
         peer1.dial(peer2_id, peer2_addr).await?;
@@ -781,7 +781,7 @@ mod tests {
             assert_eq!(request, honest_req);
             // send response
             let block = fixture_batch_with_transactions(1).seal_slow();
-            let malicious_reply = WorkerResponse::MissingBlocks { blocks: vec![block] };
+            let malicious_reply = WorkerResponse::MissingBatches { batches: vec![block] };
             malicious_peer.send_response(malicious_reply, channel).await?;
         } else {
             panic!("unexpected network event received");

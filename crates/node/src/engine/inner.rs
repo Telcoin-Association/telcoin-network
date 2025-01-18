@@ -38,7 +38,7 @@ use reth_transaction_pool::{
 };
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tn_batch_builder::BlockBuilder;
-use tn_batch_validator::BlockValidator;
+use tn_batch_validator::BatchValidator;
 use tn_config::Config;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
@@ -390,7 +390,7 @@ where
     /// Create a new block validator.
     pub(super) fn new_batch_validator(&self) -> Arc<dyn BatchValidation> {
         // batch validator
-        Arc::new(BlockValidator::<DB>::new(self.blockchain_db.clone()))
+        Arc::new(BatchValidator::<DB>::new(self.blockchain_db.clone()))
     }
 
     /// Fetch the last executed state from the database.

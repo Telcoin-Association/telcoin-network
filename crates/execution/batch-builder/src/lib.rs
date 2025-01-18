@@ -450,7 +450,7 @@ mod tests {
     use tn_worker::{
         metrics::WorkerMetrics,
         quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
-        BlockProvider,
+        BatchProvider,
     };
     use tokio::time::timeout;
 
@@ -521,7 +521,7 @@ mod tests {
         let node_metrics = WorkerMetrics::default();
         let timeout = Duration::from_secs(5);
         let block_provider =
-            BlockProvider::new(0, qw, Arc::new(node_metrics), client, store.clone(), timeout);
+            BatchProvider::new(0, qw, Arc::new(node_metrics), client, store.clone(), timeout);
 
         let tx_pool_latest = txpool.block_info();
         let tip = SealedBlock::new(chain.sealed_genesis_header(), BlockBody::default());
@@ -810,13 +810,13 @@ mod tests {
         // non-fatal errors cause the loop to break and wait for txpool updates
         // submitting a new pending transaction is one of the ways this task wakes up
         for (subdag_index, error) in non_fatal_errors.into_iter().enumerate() {
-            let (sealed_block, ack) = timeout(duration, from_batch_builder.recv())
+            let (sealed_batch, ack) = timeout(duration, from_batch_builder.recv())
                 .await
                 .expect("block builder built another block after canonical update")
                 .expect("batch was built");
 
             // all 3 transactions present
-            assert_eq!(sealed_block.block().transactions().len(), 3 + subdag_index);
+            assert_eq!(sealed_batch.batch().transactions().len(), 3 + subdag_index);
 
             // send non-fatal error
             let _ = ack.send(Err(error));
@@ -860,13 +860,13 @@ mod tests {
         }
 
         // wait for next block
-        let (sealed_block, ack) = timeout(duration, from_batch_builder.recv())
+        let (sealed_batch, ack) = timeout(duration, from_batch_builder.recv())
             .await
             .expect("block builder's sender didn't drop")
             .expect("batch was built");
 
         // expect 7 transactions after loop added 4 more
-        assert_eq!(sealed_block.block().transactions().len(), 7);
+        assert_eq!(sealed_batch.batch().transactions().len(), 7);
 
         // now send fatal error
         let _ = ack.send(Err(BlockSealError::FatalDBFailure));
@@ -956,7 +956,7 @@ mod tests {
         let duration = std::time::Duration::from_secs(5);
 
         // receive proposed block with 3 transactions
-        let (sealed_block, ack) = timeout(duration, from_batch_builder.recv())
+        let (sealed_batch, ack) = timeout(duration, from_batch_builder.recv())
             .await
             .expect("block builder's sender didn't drop")
             .expect("batch was built");
@@ -973,7 +973,7 @@ mod tests {
             .await;
 
         // assert first 3 txs in block
-        assert_eq!(sealed_block.block().transactions().len(), 3);
+        assert_eq!(sealed_batch.batch().transactions().len(), 3);
 
         // assert all 4 txs in pending pool
         let pending_pool_len = txpool.pool_size().pending;
@@ -983,7 +983,7 @@ mod tests {
         let _ = ack.send(Ok(()));
 
         // receive next block
-        let (sealed_block, ack) = timeout(duration, from_batch_builder.recv())
+        let (sealed_batch, ack) = timeout(duration, from_batch_builder.recv())
             .await
             .expect("block builder's sender didn't drop")
             .expect("batch was built");
@@ -991,11 +991,11 @@ mod tests {
         let _ = ack.send(Ok(()));
 
         // assert only transaction in block
-        assert_eq!(sealed_block.block().transactions().len(), 1);
+        assert_eq!(sealed_batch.batch().transactions().len(), 1);
 
         // confirm 4th transaction hash matches one submitted
         let tx =
-            sealed_block.block().transactions().first().expect("block transactions length is one");
+            sealed_batch.batch().transactions().first().expect("block transactions length is one");
         assert_eq!(tx.hash(), expected_tx_hash);
 
         // yield to try and give pool a chance to update

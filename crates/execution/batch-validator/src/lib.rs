@@ -2,7 +2,7 @@
 //! Batch validation
 
 mod validator;
-pub use validator::BlockValidator;
+pub use validator::BatchValidator;
 
 #[cfg(any(test, feature = "test-utils"))]
-pub use validator::NoopBlockValidator;
+pub use validator::NoopBatchValidator;

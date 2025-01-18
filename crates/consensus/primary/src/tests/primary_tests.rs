@@ -20,7 +20,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tn_batch_validator::NoopBlockValidator;
+use tn_batch_validator::NoopBatchValidator;
 use tn_network_types::{
     FetchCertificatesRequest, MockPrimaryToWorker, PrimaryToPrimary, RequestVoteRequest,
 };
@@ -66,7 +66,7 @@ async fn test_get_network_peers_from_admin_server() {
     // Spawn a `Worker` instance for primary 1.
     let _ = Worker::spawn(
         worker_id,
-        Arc::new(NoopBlockValidator),
+        Arc::new(NoopBatchValidator),
         metrics_1,
         config_1.clone(),
         &TaskManager::default(),
