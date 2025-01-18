@@ -24,7 +24,7 @@ use reth_transaction_pool::{
 };
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tempfile::TempDir;
-use tn_batch_builder::{test_utils::execute_test_batch, BlockBuilder};
+use tn_batch_builder::{test_utils::execute_test_batch, BatchBuilder};
 use tn_batch_validator::BatchValidator;
 use tn_engine::execute_consensus_output;
 use tn_network::local::LocalNetwork;
@@ -137,7 +137,7 @@ async fn test_make_batch_el_to_cl() {
     };
 
     // build execution batch proposer
-    let batch_builder = BlockBuilder::new(
+    let batch_builder = BatchBuilder::new(
         blockchain_db.clone(),
         txpool.clone(),
         blockchain_db.canonical_state_stream(),
@@ -313,7 +313,7 @@ async fn test_batch_builder_produces_valid_batchess() {
     let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
 
     // build execution batch proposer
-    let batch_builder = BlockBuilder::new(
+    let batch_builder = BatchBuilder::new(
         blockchain_db.clone(),
         txpool.clone(),
         blockchain_db.canonical_state_stream(),
@@ -522,7 +522,7 @@ async fn test_canonical_notification_updates_pool() {
     let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
 
     // build execution block proposer
-    let batch_builder = BlockBuilder::new(
+    let batch_builder = BatchBuilder::new(
         blockchain_db.clone(),
         txpool.clone(),
         blockchain_db.canonical_state_stream(),

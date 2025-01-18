@@ -15,7 +15,7 @@ use tracing::{debug, warn};
 ///
 /// Contains information needed to update the transaction pool.
 #[derive(Debug)]
-pub struct BlockBuilderOutput {
+pub struct BatchBuilderOutput {
     /// The batch info for the worker to propose.
     pub(crate) batch: Batch,
     /// The transaction hashes mined in this worker's batch.
@@ -32,7 +32,7 @@ pub struct BlockBuilderOutput {
 
 /// Construct an TN batch using the best transactions from the pool.
 ///
-/// Returns the [`BlockBuilderOutput`] and cannot fail. The batch continues to add
+/// Returns the [`BatchBuilderOutput`] and cannot fail. The batch continues to add
 /// transactions to the proposed block until either:
 /// - accumulated transaction gas limit reached (measured by tx.gas_limit())
 /// - max byte size of transactions (measured by tx.size())
@@ -41,7 +41,7 @@ pub struct BlockBuilderOutput {
 /// with very high gas limits. It's impossible to know the amount of gas a transaction
 /// will use without executing it, and the worker does not execute transactions.
 #[inline]
-pub fn build_batch<P>(args: BatchBuilderArgs<P>) -> BlockBuilderOutput
+pub fn build_batch<P>(args: BatchBuilderArgs<P>) -> BatchBuilderOutput
 where
     P: TransactionPool,
 {
@@ -128,5 +128,5 @@ where
     };
 
     // return output
-    BlockBuilderOutput { batch, mined_transactions }
+    BatchBuilderOutput { batch, mined_transactions }
 }

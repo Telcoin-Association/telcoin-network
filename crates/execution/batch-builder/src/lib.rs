@@ -22,8 +22,8 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-pub use block::{build_batch, BlockBuilderOutput};
-use error::{BlockBuilderError, BlockBuilderResult};
+pub use batch::{build_batch, BatchBuilderOutput};
+use error::{BatchBuilderError, BatchBuilderResult};
 use futures_util::{FutureExt, StreamExt};
 use reth_execution_types::ChangedAccount;
 use reth_primitives::{constants::MIN_PROTOCOL_BASE_FEE, Address, TxHash};
@@ -42,13 +42,13 @@ use tn_types::{
 use tokio::{sync::oneshot, time::Interval};
 use tracing::{debug, error, trace, warn};
 
-mod block;
+mod batch;
 mod error;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
 /// Type alias for the blocking task that locks the tx pool and builds the next batch.
-type BuildResult = oneshot::Receiver<BlockBuilderResult<Vec<TxHash>>>;
+type BuildResult = oneshot::Receiver<BatchBuilderResult<Vec<TxHash>>>;
 
 /// The type that builds blocks for workers to propose.
 ///
@@ -58,7 +58,7 @@ type BuildResult = oneshot::Receiver<BlockBuilderResult<Vec<TxHash>>>;
 ///     - tries to build the next batch when there transactions are available
 /// -
 #[derive(Debug)]
-pub struct BlockBuilder<BT, Pool> {
+pub struct BatchBuilder<BT, Pool> {
     /// Single active future that executes consensus output on a blocking thread and then returns
     /// the result through a oneshot channel.
     pending_task: Option<BuildResult>,
@@ -99,7 +99,7 @@ pub struct BlockBuilder<BT, Pool> {
     max_delay_interval: Interval,
 }
 
-impl<BT, Pool> BlockBuilder<BT, Pool>
+impl<BT, Pool> BatchBuilder<BT, Pool>
 where
     Pool: TransactionPoolExt + 'static,
 {
@@ -215,7 +215,7 @@ where
             let (ack, rx) = oneshot::channel();
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
-            let BlockBuilderOutput { batch, mined_transactions } = build_batch(build_args);
+            let BatchBuilderOutput { batch, mined_transactions } = build_batch(build_args);
 
             // forward to worker and wait for ack that quorum was reached
             if let Err(e) = to_worker.send((batch.seal_slow(), ack)).await {
@@ -241,7 +241,7 @@ where
                             let converted = match error {
                                 BlockSealError::FatalDBFailure => {
                                     // fatal - return error
-                                    Err(BlockBuilderError::FatalDBFailure)
+                                    Err(BatchBuilderError::FatalDBFailure)
                                 }
                                 BlockSealError::QuorumRejected
                                 | BlockSealError::AntiQuorum
@@ -275,7 +275,7 @@ where
     }
 }
 
-/// The [BlockBuilder] is a future that loops through the following:
+/// The [BatchBuilder] is a future that loops through the following:
 /// - check/apply canonical state changes that affect the next build
 /// - poll any pending block building tasks
 /// - otherwise, build next block if pending transactions are available
@@ -285,12 +285,12 @@ where
 ///
 /// If the broadcast stream is closed, the engine will attempt to execute all remaining tasks and
 /// any output that is queued.
-impl<BT, Pool> Future for BlockBuilder<BT, Pool>
+impl<BT, Pool> Future for BatchBuilder<BT, Pool>
 where
     BT: Unpin,
     Pool: TransactionPool + TransactionPoolExt + Unpin + 'static,
 {
-    type Output = BlockBuilderResult<()>;
+    type Output = BatchBuilderResult<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -533,7 +533,7 @@ mod tests {
         };
 
         // build execution block proposer
-        let batch_builder = BlockBuilder::new(
+        let batch_builder = BatchBuilder::new(
             blockchain_db.clone(),
             txpool.clone(),
             blockchain_db.canonical_state_stream(),
@@ -734,7 +734,7 @@ mod tests {
         let address = Address::from(U160::from(33));
         let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
         // build execution block proposer
-        let batch_builder = BlockBuilder::new(
+        let batch_builder = BatchBuilder::new(
             blockchain_db.clone(),
             txpool.clone(),
             blockchain_db.canonical_state_stream(),
@@ -894,7 +894,7 @@ mod tests {
         let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
 
         // build execution block proposer
-        let batch_builder = BlockBuilder::new(
+        let batch_builder = BatchBuilder::new(
             blockchain_db.clone(),
             txpool.clone(),
             blockchain_db.canonical_state_stream(),

@@ -37,7 +37,7 @@ use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, TransactionPool, TransactionValidationTaskExecutor,
 };
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
-use tn_batch_builder::BlockBuilder;
+use tn_batch_builder::BatchBuilder;
 use tn_batch_validator::BatchValidator;
 use tn_config::Config;
 use tn_engine::ExecutorEngine;
@@ -310,7 +310,7 @@ where
             pending_block_blob_fee: tx_pool_latest.pending_blob_fee,
         };
 
-        let batch_builder = BlockBuilder::new(
+        let batch_builder = BatchBuilder::new(
             self.blockchain_db.clone(),
             transaction_pool.clone(),
             self.blockchain_db.canonical_state_stream(),

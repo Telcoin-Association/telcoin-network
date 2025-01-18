@@ -5,11 +5,11 @@ use tn_types::BatchConversionError;
 use tokio::sync::{mpsc, oneshot};
 
 /// Result alias for [`TNEngineError`].
-pub(crate) type BlockBuilderResult<T> = Result<T, BlockBuilderError>;
+pub(crate) type BatchBuilderResult<T> = Result<T, BatchBuilderError>;
 
 /// Core error variants when executing the output from consensus and extending the canonical block.
 #[derive(Debug, thiserror::Error)]
-pub enum BlockBuilderError {
+pub enum BatchBuilderError {
     /// Error from Reth
     #[error(transparent)]
     Reth(#[from] RethError),
@@ -39,13 +39,13 @@ pub enum BlockBuilderError {
     FatalDBFailure,
 }
 
-impl From<oneshot::error::RecvError> for BlockBuilderError {
+impl From<oneshot::error::RecvError> for BatchBuilderError {
     fn from(_: oneshot::error::RecvError) -> Self {
         Self::AckChannelClosed
     }
 }
 
-impl<T> From<mpsc::error::SendError<T>> for BlockBuilderError {
+impl<T> From<mpsc::error::SendError<T>> for BatchBuilderError {
     fn from(_: mpsc::error::SendError<T>) -> Self {
         Self::WorkerChannelClosed
     }

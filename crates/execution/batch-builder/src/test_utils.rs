@@ -1,6 +1,6 @@
 //! Types for testing only.
 
-use crate::{build_batch, BlockBuilderOutput};
+use crate::{build_batch, BatchBuilderOutput};
 use reth_primitives::{
     constants::MIN_PROTOCOL_BASE_FEE, Address, BlobTransactionSidecar, BlockBody,
     PooledTransactionsElement, SealedBlock, SealedHeader, TxHash,
@@ -36,7 +36,7 @@ pub fn execute_test_batch(test_batch: &mut Batch, parent: &SealedHeader) {
 
     let batch_config = PendingBlockConfig::new(test_batch.beneficiary, parent_info);
     let args = BatchBuilderArgs { pool, batch_config };
-    let BlockBuilderOutput { batch, .. } = build_batch(args);
+    let BatchBuilderOutput { batch, .. } = build_batch(args);
     test_batch.parent_hash = batch.parent_hash;
     test_batch.beneficiary = batch.beneficiary;
     test_batch.timestamp = batch.timestamp;
