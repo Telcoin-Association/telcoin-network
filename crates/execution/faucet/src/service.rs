@@ -120,7 +120,7 @@ pub(crate) struct FaucetService<Provider, Pool, Tasks> {
     ///
     /// The faucet service checks for the highest nonce in the transaction pool and if needd, in
     /// the database. However, the faucet also needs to nonce state for transactions that are
-    /// pending in worker blocks.
+    /// pending in batches.
     ///
     /// The account nonce read from the database returns the account's CURRENT nonce.
     pub(crate) next_nonce: u64,

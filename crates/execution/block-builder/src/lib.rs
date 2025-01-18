@@ -169,7 +169,7 @@ where
             mined_transactions,           // entire round of consensus
         };
 
-        // track latest update to apply worker blocks
+        // track latest update to apply batches
         let latest = LastCanonicalUpdate {
             tip: tip.block.clone(),
             pending_block_base_fee,

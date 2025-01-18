@@ -31,9 +31,9 @@ pub struct WorkerReceiverHandler<DB> {
     pub id: WorkerId,
     /// The interface for communicating with this worker's primary.
     pub client: LocalNetwork,
-    /// Database for storing worker blocks received from peers.
+    /// Database for storing batches received from peers.
     pub store: DB,
-    /// The type that validates worker blocks received from peers.
+    /// The type that validates batches received from peers.
     pub validator: Arc<dyn WorkerBlockValidation>,
 }
 

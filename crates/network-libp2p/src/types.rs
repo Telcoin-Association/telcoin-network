@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 /// The result for network operations.
 pub type NetworkResult<T> = Result<T, NetworkError>;
 
-/// The topic for NVVs to subscribe to for published worker blocks.
+/// The topic for NVVs to subscribe to for published batches.
 pub const WORKER_BLOCK_TOPIC: &str = "tn_worker_blocks";
 /// The topic for NVVs to subscribe to for published primary certificates.
 pub const PRIMARY_CERT_TOPIC: &str = "tn_certificates";

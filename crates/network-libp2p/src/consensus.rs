@@ -73,7 +73,7 @@ where
     Req: TNMessage,
     Res: TNMessage,
 {
-    /// The gossip network for flood publishing sealed worker blocks.
+    /// The gossip network for flood publishing sealed batches.
     swarm: Swarm<TNBehavior<TNCodec<Req, Res>>>,
     /// The subscribed gossip network topics.
     topics: Vec<IdentTopic>,

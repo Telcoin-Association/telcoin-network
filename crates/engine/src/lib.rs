@@ -471,7 +471,7 @@ mod tests {
         assert_eq!(expected_block.number, expected_block_height);
 
         // mix hash is xor bitwise with worker sealed block's hash and consensus output
-        // just use consensus output hash if no worker blocks in the round
+        // just use consensus output hash if no batches in the round
         let consensus_output_hash = B256::from(consensus_output.digest());
         assert_eq!(expected_block.mix_hash, consensus_output_hash);
         // bloom expected to be the same bc all proposed transactions should be good

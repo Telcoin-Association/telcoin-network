@@ -7,14 +7,14 @@ use tn_types::{BlockHash, NetworkPublicKey, WorkerBlock};
 /// Requests between Primary <-> Worker.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum InnerNodeRequest {
-    /// Request for missing worker blocks.
+    /// Request for missing batches.
     FetchBlocks(FetchBlocksRequest),
 }
 
 /// Responses between Primary <-> Worker.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum InnerNodeResponse {
-    /// Request for missing worker blocks.
+    /// Request for missing batches.
     FetchBlocks(FetchBlocksResponse),
 }
 

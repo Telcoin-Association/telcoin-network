@@ -128,27 +128,6 @@ impl ValidatorArgs {
         // add execution address
         config.update_execution_address(self.address)?;
 
-        // // secp keypair for execution
-        // let execution_keypair = self.generate_keypair_from_rng::<ExecutionKeypair>()?;
-        // self.write_keypair_to_file(&execution_keypair,
-        // &authority_key_path.join("execution.key"))?;
-        // config.update_execution_key(execution_keypair.public().clone())?;
-        // drop(execution_keypair); // calls zeroize() for OnceCell containing private key
-
-        // let workers_dir = authority_key_path.join("workers");
-        // for worker in 0..self.workers {
-        //     let worker_path = format!("worker-{worker}.key");
-
-        //     // network keypair for worker
-        //     let network_keypair = self.generate_keypair_from_rng::<NetworkKeypair>()?;
-        //     self.write_keypair_to_file(&network_keypair, &workers_dir.join(worker_path))?;
-        //     let worker_info =
-        //         WorkerInfo { name: network_keypair.public().clone(), ..Default::default() };
-        //     debug!(?worker_info);
-        //     config.workers.insert(worker, worker_info);
-        //     drop(network_keypair); // calls zeroize() for OnceCell containing private key
-        // }
-
         Ok(())
     }
 

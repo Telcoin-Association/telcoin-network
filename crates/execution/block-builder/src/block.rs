@@ -1,4 +1,4 @@
-//! The logic for building worker blocks.
+//! The logic for building batches.
 //!
 //! Transactions are pulled from the worker's pending pool and added to the block without being
 //! executed. Block size is measured in bytes and a transaction's max gas limit. The block is sealed
@@ -57,7 +57,7 @@ where
     // pull best transactions and rely on watch channel to ensure basefee is current
     let mut best_txs = pool.best_transactions();
 
-    // NOTE: worker blocks always build off the latest finalized block
+    // NOTE: batches always build off the latest finalized block
     let parent_hash = parent_info.tip.hash();
 
     // collect data for successful transactions
