@@ -23,7 +23,6 @@ use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_param
 use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicKey as PubKey};
 use reth_chainspec::ChainSpec;
 use reth_primitives::{public_key_to_address, Address, GenesisAccount, B256, U256};
-use reth_tracing::init_test_tracing;
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
 use tn_config::{test_fetch_file_content_relative_to_manifest, ContractStandardJson};

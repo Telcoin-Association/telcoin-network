@@ -1,16 +1,14 @@
-/// Network synchronize tests
+//! Network synchronize tests
+use super::*;
 use std::vec;
 use tempfile::TempDir;
+use tn_batch_validator::NoopBatchValidator;
 use tn_network_types::{MockWorkerToWorker, WorkerToWorkerServer};
 use tn_storage::{mem_db::MemDatabase, open_db};
 use tn_test_utils::{batch, random_network, CommitteeFixture};
 
-use super::*;
-use tn_batch_validator::NoopBatchValidator;
-
 #[tokio::test]
 async fn synchronize() {
-    reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();
@@ -77,8 +75,6 @@ async fn synchronize() {
 
 #[tokio::test]
 async fn synchronize_when_batch_exists() {
-    reth_tracing::init_test_tracing();
-
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();

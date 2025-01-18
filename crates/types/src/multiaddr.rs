@@ -223,7 +223,7 @@ mod test {
 
     #[test]
     fn test_to_socket_addr_unsupported_protocol() {
-        let multi_addr_dns = Multiaddr(multiaddr!(Dnsaddr("mysten.sui"), Tcp(10500u16)));
+        let multi_addr_dns = Multiaddr(multiaddr!(Dnsaddr("telcoin.network"), Tcp(10500u16)));
         let _ = multi_addr_dns.to_socket_addr().expect_err("DNS is unsupported");
     }
 
@@ -233,8 +233,8 @@ mod test {
         assert_eq!(Some("127.0.0.1".to_string()), multi_addr_ip4.hostname());
         assert_eq!(Some(10500u16), multi_addr_ip4.port());
 
-        let multi_addr_dns = Multiaddr(multiaddr!(Dns("mysten.sui"), Tcp(10501u16)));
-        assert_eq!(Some("mysten.sui".to_string()), multi_addr_dns.hostname());
+        let multi_addr_dns = Multiaddr(multiaddr!(Dns("telcoin.network"), Tcp(10501u16)));
+        assert_eq!(Some("telcoin.network".to_string()), multi_addr_dns.hostname());
         assert_eq!(Some(10501u16), multi_addr_dns.port());
     }
 }

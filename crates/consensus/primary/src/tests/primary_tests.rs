@@ -176,7 +176,6 @@ async fn test_get_network_peers_from_admin_server() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_request_vote_has_missing_execution_block() {
-    reth_tracing::init_test_tracing();
     const NUM_PARENTS: usize = 10;
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
@@ -254,7 +253,6 @@ async fn test_request_vote_has_missing_execution_block() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_request_vote_older_execution_block() {
-    reth_tracing::init_test_tracing();
     const NUM_PARENTS: usize = 10;
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
@@ -339,7 +337,6 @@ async fn test_request_vote_older_execution_block() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_request_vote_has_missing_parents() {
-    reth_tracing::init_test_tracing();
     const NUM_PARENTS: usize = 10;
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
@@ -433,7 +430,7 @@ async fn test_request_vote_has_missing_parents() {
 
     // TEST PHASE 3: Handler should return error if header is too old.
     // Increase round threshold.
-    let _ = cb.narwhal_round_updates().send(100);
+    let _ = cb.primary_round_updates().send(100);
     let mut request = anemo::Request::new(RequestVoteRequest {
         header: test_header.clone(),
         parents: Vec::new(),
@@ -455,7 +452,6 @@ async fn test_request_vote_has_missing_parents() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_request_vote_accept_missing_parents() {
-    reth_tracing::init_test_tracing();
     const NUM_PARENTS: usize = 10;
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
@@ -562,7 +558,6 @@ async fn test_request_vote_accept_missing_parents() {
 
 #[tokio::test]
 async fn test_request_vote_missing_batches() {
-    reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
         .committee_size(NonZeroUsize::new(4).unwrap())
@@ -658,7 +653,6 @@ async fn test_request_vote_missing_batches() {
 
 #[tokio::test]
 async fn test_request_vote_already_voted() {
-    reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
         .committee_size(NonZeroUsize::new(4).unwrap())
@@ -900,7 +894,6 @@ async fn test_fetch_certificates_handler() {
 
 #[tokio::test]
 async fn test_request_vote_created_at_in_future() {
-    reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
         .committee_size(NonZeroUsize::new(4).unwrap())

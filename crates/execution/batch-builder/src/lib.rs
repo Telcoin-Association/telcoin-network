@@ -468,7 +468,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_make_block_no_ack_txs_in_pool_still() {
-        // reth_tracing::init_test_tracing();
         let genesis = adiri_genesis();
         let mut tx_factory = TransactionFactory::new();
         let factory_address = tx_factory.address();
@@ -727,7 +726,6 @@ mod tests {
     /// Fatal error causes shutdown.
     #[tokio::test]
     async fn test_all_possible_error_outcomes() {
-        // reth_tracing::init_test_tracing();
         let TestTools { mut tx_factory, last_canonical_update, execution_components } =
             get_test_tools();
         let TestExecutionComponents { blockchain_db, txpool, chain, .. } = execution_components;
@@ -886,7 +884,6 @@ mod tests {
     /// Test transactions are mined from the pool.
     #[tokio::test]
     async fn test_pool_updates_after_txs_mined() {
-        // reth_tracing::init_test_tracing();
         let TestTools { mut tx_factory, last_canonical_update, execution_components } =
             get_test_tools();
         let TestExecutionComponents { blockchain_db, txpool, chain, .. } = execution_components;

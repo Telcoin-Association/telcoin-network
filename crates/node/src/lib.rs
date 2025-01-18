@@ -42,7 +42,7 @@ where
 
     info!(target: "telcoin::node", "execution engine created");
 
-    let narwhal_db_path = tn_datadir.narwhal_db_path();
+    let narwhal_db_path = tn_datadir.consensus_db_path();
 
     tracing::info!(target: "telcoin::cli", "opening node storage at {:?}", narwhal_db_path);
 

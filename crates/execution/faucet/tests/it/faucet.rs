@@ -24,7 +24,6 @@ use reth_primitives::{
     alloy_primitives::U160, public_key_to_address, Address, GenesisAccount, B256, U256,
 };
 use reth_provider::ExecutionOutcome;
-use reth_tracing::init_test_tracing;
 use reth_transaction_pool::TransactionPool;
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
@@ -70,8 +69,6 @@ impl QuorumWaiterTrait for TestChanQuorumWaiter {
 
 #[tokio::test]
 async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
-    init_test_tracing();
-
     // set application credentials for accessing Google KMS API
     std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", "./gcloud-credentials.json");
     // set Project ID for google_sdk
@@ -333,8 +330,6 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_faucet_transfers_stablecoin_with_google_kms() -> eyre::Result<()> {
-    init_test_tracing();
-
     // set application credentials for accessing Google KMS API
     std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", "./gcloud-credentials.json");
     // set Project ID for google_sdk

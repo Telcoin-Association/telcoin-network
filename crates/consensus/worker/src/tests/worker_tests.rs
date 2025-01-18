@@ -37,7 +37,6 @@ impl BlockValidation for NilBatchValidator {
 #[ignore]
 #[tokio::test]
 async fn get_network_peers_from_admin_server() {
-    // reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let committee = fixture.committee();
     let authority_1 = fixture.authorities().next().unwrap();

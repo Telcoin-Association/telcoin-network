@@ -40,7 +40,7 @@ impl TelcoinDirs for TelcoinTempDirs {
         self.genesis_path().join("genesis.json")
     }
 
-    fn narwhal_db_path(&self) -> PathBuf {
-        self.0.path().join("narwhal-db")
+    fn consensus_db_path(&self) -> PathBuf {
+        self.0.path().join("consensus-db")
     }
 }

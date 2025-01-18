@@ -492,7 +492,7 @@ impl<DB: Database> Proposer<DB> {
                 // late (or just joined the network).
                 self.round = round;
                 // broadcast new round
-                let _ = self.consensus_bus.narwhal_round_updates().send(self.round);
+                let _ = self.consensus_bus.primary_round_updates().send(self.round);
                 self.last_parents = parents;
                 // Reset advance flag.
                 self.advance_round = false;
@@ -662,11 +662,11 @@ impl<DB: Database> Proposer<DB> {
     fn propose_next_header(&mut self, reason: String) -> ProposerResult<PendingHeaderTask> {
         // Advance to the next round.
         self.round += 1;
-        let updated_round = *self.consensus_bus.narwhal_round_updates().borrow() + 1;
+        let updated_round = *self.consensus_bus.primary_round_updates().borrow() + 1;
         if updated_round > self.round {
             self.round = updated_round;
         }
-        let _ = self.consensus_bus.narwhal_round_updates().send(self.round);
+        let _ = self.consensus_bus.primary_round_updates().send(self.round);
 
         // Update the metrics
         self.consensus_bus.primary_metrics().node_metrics.current_round.set(self.round as i64);

@@ -7,7 +7,6 @@ use nix::{
 };
 use rand::{rngs::StdRng, SeedableRng};
 use reth_primitives::{alloy_primitives, keccak256, Address};
-use reth_tracing::init_test_tracing;
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::{value::RawValue, Value};
 use std::{
@@ -141,7 +140,6 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
 fn do_restarts(delay: u64) -> eyre::Result<()> {
     let _guard = IT_TEST_MUTEX.lock();
     info!(target: "restart-test", "do_restarts, delay: {delay}");
-    init_test_tracing();
     // the tmp dir should be removed once tmp_quard is dropped
     let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");
     // create temp path for test

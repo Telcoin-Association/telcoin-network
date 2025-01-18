@@ -150,14 +150,8 @@ struct BadHeader {
     pub id: OnceCell<HeaderDigest>,
 }
 
-/// Originally taken from fetch_certificates_v2_basic()
-///
-/// NOTE: original narwhal test ensured V1s would not be stored
-/// this section removed bc certificates are only v1 for now
-/// v2 for sui -> is v1 TN
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn fetch_certificates_v1_basic() {
-    reth_tracing::init_test_tracing();
+async fn fetch_certificates_basic() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let primary = fixture.authorities().next().unwrap();
     let id = primary.id();
@@ -415,24 +409,8 @@ async fn fetch_certificates_v1_basic() {
     sleep(Duration::from_secs(1)).await;
     verify_certificates_not_in_store(&certificate_store, &certificates[num_written..target_index]);
 
-    // NOTE: original narwhal test ensured V1s would not be stored
-    // this section removed bc certificates are only v1 for now
-    // v2 sui -> v1 TN
-    // Send out a batch of certificate V1s.
-    //
-    // let mut certs = Vec::new();
-    // for cert in certificates.iter().skip(num_written).take(204) {
-    //     certs.push(fixture.certificate(cert.header()));
-    // }
-    // tx_fetch_resp.try_send(FetchCertificatesResponse { certificates: certs }).unwrap();
-
-    // sleep(Duration::from_secs(1)).await;
-    // verify_certificates_not_in_store(&certificate_store,
-    // &certificates[num_written..target_index]);
-
     // Send out a batch of certificates with good signatures.
-    // The certificates 4 + 62 + 58 + 204 = 328 should become available in store eventually.let mut
-    // certs = Vec::new();
+    // The certificates 4 + 62 + 58 + 204 = 328 should become available in store eventually
     let mut certs = Vec::new();
     for cert in certificates.iter().skip(num_written).take(204) {
         certs.push(cert.clone());
@@ -447,8 +425,4 @@ async fn fetch_certificates_v1_basic() {
         56, //310, // to be verified indirectly (what's left in the range)
     )
     .await;
-
-    // Additional testcases cannot be added, because it seems impossible now to receive from
-    // the tx_fetch_resp channel after a certain number of messages.
-    // TODO: find the root cause of this issue.
 }

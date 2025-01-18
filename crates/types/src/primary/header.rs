@@ -40,7 +40,6 @@ pub enum SystemMessage {
 #[builder(pattern = "owned", build_fn(skip))]
 pub struct Header {
     /// Primary that created the header. Must be the same primary that broadcasted the header.
-    /// Validation is at: https://github.com/MystenLabs/sui/blob/f0b80d9eeef44edd9fbe606cee16717622b68651/narwhal/primary/src/primary.rs#L713-L719
     pub author: AuthorityIdentifier,
     /// The round for this header
     pub round: Round,

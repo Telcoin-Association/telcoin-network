@@ -134,7 +134,7 @@ impl TelcoinDirs for DataDirChainPath {
         self.genesis_path().join("genesis.json")
     }
 
-    fn narwhal_db_path(&self) -> PathBuf {
+    fn consensus_db_path(&self) -> PathBuf {
         self.0.as_ref().join("narwhal-db")
     }
 }

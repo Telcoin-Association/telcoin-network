@@ -33,7 +33,6 @@ tn-config = { workspace = true }
 tn-worker = { workspace = true }
 consensus-metrics = { workspace = true }
 tn-primary-metrics = { workspace = true }
-reth-tracing = { workspace = true }
 reth-chainspec = { workspace = true }
 reth-cli-commands = { workspace = true }
 secp256k1 = { workspace = true }

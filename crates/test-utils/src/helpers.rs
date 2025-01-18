@@ -10,7 +10,6 @@ use rand::{
     thread_rng, Rng, RngCore, SeedableRng,
 };
 use reth_primitives::{Address, BlockHash, Bytes, Header, TransactionSigned, U256};
-use reth_tracing::tracing_subscriber::EnvFilter;
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     ops::RangeInclusive,
@@ -669,17 +668,4 @@ pub fn mock_signed_certificate(
     }
     let cert = Certificate::new_unverified(committee, header, votes).unwrap();
     (cert.digest(), cert)
-}
-
-/// Setup tracing
-pub fn setup_test_tracing() {
-    let tracing_level = "debug";
-    let network_tracing_level = "info";
-
-    let log_filter = format!("{tracing_level},h2={network_tracing_level},tower={network_tracing_level},hyper={network_tracing_level},tonic::transport={network_tracing_level},quinn={network_tracing_level}");
-
-    let _ = reth_tracing::tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(log_filter.parse().unwrap()))
-        .with_writer(std::io::stderr)
-        .try_init();
 }

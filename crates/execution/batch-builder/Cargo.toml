@@ -37,7 +37,6 @@ reth = { workspace = true }
 assert_matches = { workspace = true }
 reth-blockchain-tree = { workspace = true }
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
-reth-tracing = { workspace = true }
 fastcrypto = { workspace = true }
 tempfile = { workspace = true }
 reth-provider = { workspace = true, features = ["test-utils"] }

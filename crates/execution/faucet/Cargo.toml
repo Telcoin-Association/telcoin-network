@@ -48,7 +48,6 @@ cfg-if = { workspace = true }
 tn-types = { workspace = true }
 
 [dev-dependencies]
-reth-tracing = { workspace = true }
 prometheus = { workspace = true }
 fastcrypto = { workspace = true }
 consensus-metrics = { workspace = true }

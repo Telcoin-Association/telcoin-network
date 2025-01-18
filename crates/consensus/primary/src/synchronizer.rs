@@ -658,7 +658,7 @@ impl<DB: Database> Inner<DB> {
                 // always abort their request at any point too), however if the extra resources
                 // used to attempt to synchronize batches for longer than strictly needed become
                 // problematic, this function could be augmented to also support cancellation based
-                // on narwhal round.
+                // on primary round.
                 Ok(()) = rx_consensus_round_updates.changed() => {
                     consensus_round = rx_consensus_round_updates.borrow().committed_round;
                     ensure!(

@@ -208,7 +208,6 @@ mod tests {
 
     use reth_primitives::{keccak256, public_key_to_address, Signature as RSignature, U256};
 
-    use reth_tracing::init_test_tracing;
     use secp256k1::{
         ecdsa::{RecoverableSignature, RecoveryId, Signature},
         Message, PublicKey, SECP256K1,
@@ -382,7 +381,6 @@ mod tests {
     #[tokio::test]
     async fn test_gcloud_sdk() {
         // Debug logging
-        init_test_tracing();
 
         std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", "./gcloud-credentials.json");
 

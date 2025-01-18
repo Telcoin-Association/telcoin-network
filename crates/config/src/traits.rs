@@ -117,8 +117,8 @@ pub trait TelcoinDirs: std::fmt::Debug + Send + Sync + 'static {
     fn worker_cache_path(&self) -> PathBuf;
     /// Return the path to the chain spec file.
     fn genesis_file_path(&self) -> PathBuf;
-    /// Return the path to narwhal's node storage.
-    fn narwhal_db_path(&self) -> PathBuf;
+    /// Return the path to consensus's node storage.
+    fn consensus_db_path(&self) -> PathBuf;
 }
 
 impl TelcoinDirs for PathBuf {
@@ -150,8 +150,8 @@ impl TelcoinDirs for PathBuf {
         self.genesis_path().join("genesis.json")
     }
 
-    fn narwhal_db_path(&self) -> PathBuf {
-        self.join("narwhal-db")
+    fn consensus_db_path(&self) -> PathBuf {
+        self.join("consensus-db")
     }
 }
 
@@ -184,8 +184,8 @@ impl TelcoinDirs for Path {
         self.genesis_path().join("genesis.json")
     }
 
-    fn narwhal_db_path(&self) -> PathBuf {
-        self.join("narwhal-db")
+    fn consensus_db_path(&self) -> PathBuf {
+        self.join("consensus-db")
     }
 }
 
@@ -218,7 +218,7 @@ impl TelcoinDirs for &'static Path {
         self.genesis_path().join("genesis.json")
     }
 
-    fn narwhal_db_path(&self) -> PathBuf {
-        self.join("narwhal-db")
+    fn consensus_db_path(&self) -> PathBuf {
+        self.join("consensus-db")
     }
 }

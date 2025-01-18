@@ -199,7 +199,7 @@ pub async fn can_cvv<DB: Database>(
         last_consensus_round,
         config.parameters().gc_depth,
     ));
-    let _ = consensus_bus.narwhal_round_updates().send(last_consensus_round);
+    let _ = consensus_bus.primary_round_updates().send(last_consensus_round);
 
     let mut clients: Vec<PrimaryToPrimaryClient<_>> = config
         .committee()
@@ -324,7 +324,7 @@ impl<DB: Database> Subscriber<DB> {
                             self.config.parameters().gc_depth,
                         ),
                     );
-                    let _ = self.consensus_bus.narwhal_round_updates().send(last_round);
+                    let _ = self.consensus_bus.primary_round_updates().send(last_round);
 
                     info!(target: "telcoin::subscriber", "executing previous consensus output for round {}, consensus_block {}", consensus_output.leader_round(), consensus_output.number);
                     if let Err(e) =
@@ -465,7 +465,7 @@ impl<DB: Database> Subscriber<DB> {
                             self.config.parameters().gc_depth,
                         ),
                     );
-                    let _ = self.consensus_bus.narwhal_round_updates().send(last_round);
+                    let _ = self.consensus_bus.primary_round_updates().send(last_round);
 
                     if let Err(e) =
                         self.consensus_bus.consensus_output().send(consensus_output).await

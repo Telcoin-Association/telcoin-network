@@ -125,7 +125,6 @@ secp256k1 = { version = "0.29", default-features = false, features = [
 reth = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 reth-config = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 reth-db-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
@@ -146,6 +145,7 @@ reth-rpc-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 reth-rpc-types-compat = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 reth-rpc-engine-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 reth-snapshot = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }
 reth-stages = { git = "https://github.com/paradigmxyz/reth", tag = "v1.0.6" }

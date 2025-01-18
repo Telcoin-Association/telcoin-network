@@ -257,7 +257,6 @@ async fn test_make_batch_el_to_cl() {
 /// Before a canonical state change, mine the 4th transaction in the next batch.
 #[tokio::test]
 async fn test_batch_builder_produces_valid_batchess() {
-    // reth_tracing::init_test_tracing();
     //
     //=== Execution Layer
     //
@@ -451,7 +450,6 @@ async fn test_batch_builder_produces_valid_batchess() {
 /// Before a canonical state change, mine the 4th transaction in the next block.
 #[tokio::test]
 async fn test_canonical_notification_updates_pool() {
-    // reth_tracing::init_test_tracing();
     //
     //=== Execution Layer
     //

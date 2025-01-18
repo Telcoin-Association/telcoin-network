@@ -369,11 +369,11 @@ impl<DB: Database> PrimaryReceiverHandler<DB> {
         let mut parent_digests = self.parent_digests.lock();
 
         // Check that the header is not too old.
-        let narwhal_round = *self.consensus_bus.narwhal_round_updates().borrow();
-        let limit_round = narwhal_round.saturating_sub(HEADER_AGE_LIMIT);
+        let primary_round = *self.consensus_bus.primary_round_updates().borrow();
+        let limit_round = primary_round.saturating_sub(HEADER_AGE_LIMIT);
         ensure!(
             limit_round <= header.round(),
-            DagError::TooOld(header.digest().into(), header.round(), narwhal_round)
+            DagError::TooOld(header.digest().into(), header.round(), primary_round)
         );
 
         // Drop old entries from parent_digests.

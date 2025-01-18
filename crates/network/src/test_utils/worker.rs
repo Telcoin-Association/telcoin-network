@@ -24,7 +24,7 @@ impl WorkerToWorkerMockServer {
 
         let routes = anemo::Router::new().add_rpc_service(service);
         let network = anemo::Network::bind(addr)
-            .server_name("narwhal")
+            .server_name("consensus-test")
             .private_key(keypair.private().0.to_bytes())
             .start(routes)
             .unwrap();

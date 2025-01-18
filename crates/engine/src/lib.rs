@@ -322,7 +322,6 @@ mod tests {
         Address, BlockHashOrNumber, Bloom, B256, EMPTY_OMMER_ROOT_HASH, U256,
     };
     use reth_provider::{BlockIdReader, BlockNumReader, BlockReader, TransactionVariant};
-    use reth_tracing::init_test_tracing;
     use std::{collections::VecDeque, str::FromStr as _, sync::Arc, time::Duration};
     use tn_batch_builder::test_utils::execute_test_batch;
     use tn_test_utils::{default_test_execution_node, seeded_genesis_from_random_batches};
@@ -338,7 +337,6 @@ mod tests {
     /// transactions.
     #[tokio::test]
     async fn test_empty_output_executes() -> eyre::Result<()> {
-        init_test_tracing();
         //=== Consensus
         //
         // create consensus output bc transactions in batches
@@ -512,7 +510,6 @@ mod tests {
     /// parents is currently valid.
     #[tokio::test]
     async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Result<()> {
-        init_test_tracing();
         // create batches for consensus output
         let mut batches_1 = tn_test_utils::batches(4); // create 4 batches
         let mut batches_2 = tn_test_utils::batches(4); // create 4 batches
@@ -814,7 +811,6 @@ mod tests {
     /// parents is currently valid.
     #[tokio::test]
     async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<()> {
-        init_test_tracing();
         // create batches for consensus output
         let mut batches_1 = tn_test_utils::batches(4); // create 4 batches
         let mut batches_2 = tn_test_utils::batches(4); // create 4 batches
@@ -1155,7 +1151,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_round_terminates_early() -> eyre::Result<()> {
-        init_test_tracing();
         // create batches for consensus output
         let mut batches_1 = tn_test_utils::batches(4); // create 4 batches
         let mut batches_2 = tn_test_utils::batches(4); // create 4 batches

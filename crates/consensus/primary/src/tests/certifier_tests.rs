@@ -12,7 +12,6 @@ use tn_types::{BlsKeypair, Notifier, SignatureVerificationState, TnSender};
 
 #[tokio::test(flavor = "current_thread")]
 async fn propose_header_and_form_certificate_v2() {
-    reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let committee = fixture.committee();
     let primary = fixture.authorities().last().unwrap();
@@ -87,7 +86,6 @@ async fn propose_header_and_form_certificate_v2() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn propose_header_failure() {
-    reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let committee = fixture.committee();
     let primary = fixture.authorities().last().unwrap();
@@ -150,7 +148,6 @@ async fn propose_header_failure() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn propose_header_scenario_with_bad_sigs() {
-    reth_tracing::init_test_tracing();
     // expect cert if less than 2 byzantines, otherwise no cert
     run_vote_aggregator_with_param(6, 0, true).await;
     run_vote_aggregator_with_param(6, 1, true).await;
@@ -254,7 +251,7 @@ async fn test_shutdown_core() {
 
     let own_address = committee.primary_by_id(&id).unwrap().to_anemo_address().unwrap();
     let network = anemo::Network::bind(own_address)
-        .server_name("narwhal")
+        .server_name("conensus-test")
         .private_key(network_key)
         .start(anemo::Router::new())
         .unwrap();
