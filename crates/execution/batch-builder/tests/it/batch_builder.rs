@@ -33,8 +33,8 @@ use tn_storage::{open_db, tables::WorkerBlocks, traits::Database};
 use tn_test_utils::{get_gas_price, test_genesis, TransactionFactory};
 use tn_types::{
     AutoSealConsensus, BuildArguments, Certificate, CommittedSubDag, Consensus, ConsensusHeader,
-    ConsensusOutput, LastCanonicalUpdate, ReputationScores, SealedWorkerBlock, WorkerBlock,
-    WorkerBlockValidation,
+    ConsensusOutput, LastCanonicalUpdate, ReputationScores, SealedWorkerBlock,
+    WorkerBatchValidation, WorkerBlock,
 };
 use tn_worker::{
     metrics::WorkerMetrics,

@@ -3,7 +3,7 @@ use anemo::{Network, PeerId};
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_storage::traits::Database as ConsensusDatabase;
-use tn_types::{TaskManager, WorkerBlockValidation, WorkerId};
+use tn_types::{TaskManager, WorkerBatchValidation, WorkerId};
 use tn_worker::{metrics::Metrics, quorum_waiter::QuorumWaiter, BlockProvider, Worker};
 use tokio::sync::RwLock;
 use tracing::instrument;
@@ -25,7 +25,7 @@ impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
     #[instrument(name = "worker", skip_all)]
     async fn start(
         &mut self,
-        validator: Arc<dyn WorkerBlockValidation>,
+        validator: Arc<dyn WorkerBatchValidation>,
     ) -> eyre::Result<(TaskManager, BlockProvider<CDB, QuorumWaiter>)> {
         let task_manager = TaskManager::new("Worker Task Manager");
         self.own_peer_id = Some(PeerId(
@@ -63,7 +63,7 @@ impl<CDB: ConsensusDatabase> WorkerNode<CDB> {
 
     pub async fn start(
         &self,
-        validator: Arc<dyn WorkerBlockValidation>,
+        validator: Arc<dyn WorkerBatchValidation>,
     ) -> eyre::Result<(TaskManager, BlockProvider<CDB, QuorumWaiter>)> {
         let mut guard = self.internal.write().await;
         guard.start(validator).await

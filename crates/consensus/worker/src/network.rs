@@ -17,7 +17,7 @@ use tn_storage::{
     tables::WorkerBlocks,
     traits::{Database, DbTxMut},
 };
-use tn_types::{now, Committee, SealedWorkerBlock, WorkerBlockValidation, WorkerCache, WorkerId};
+use tn_types::{now, Committee, SealedWorkerBlock, WorkerBatchValidation, WorkerCache, WorkerId};
 use tracing::{debug, trace};
 
 #[cfg(test)]
@@ -34,7 +34,7 @@ pub struct WorkerReceiverHandler<DB> {
     /// Database for storing batches received from peers.
     pub store: DB,
     /// The type that validates batches received from peers.
-    pub validator: Arc<dyn WorkerBlockValidation>,
+    pub validator: Arc<dyn WorkerBatchValidation>,
 }
 
 #[async_trait]
@@ -130,7 +130,7 @@ pub struct PrimaryReceiverHandler<DB> {
     /// Fetch certificate payloads from other workers.
     pub batch_fetcher: Option<WorkerBatchFetcher<DB>>,
     /// Validate incoming batches
-    pub validator: Arc<dyn WorkerBlockValidation>,
+    pub validator: Arc<dyn WorkerBatchValidation>,
 }
 
 #[async_trait]

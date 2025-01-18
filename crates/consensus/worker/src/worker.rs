@@ -32,7 +32,7 @@ use tn_network_types::WorkerToWorkerServer;
 use tn_storage::traits::Database;
 use tn_types::{
     traits::KeyPair as _, AuthorityIdentifier, Multiaddr, NetworkPublicKey, Noticer, Protocol,
-    TaskManager, WorkerBlockValidation, WorkerId,
+    TaskManager, WorkerBatchValidation, WorkerId,
 };
 use tower::ServiceBuilder;
 use tracing::{error, info};
@@ -72,7 +72,7 @@ impl<DB: Database> Worker<DB> {
     /// Create an instance of `Self` and start all tasks to participate in consensus.
     pub fn spawn(
         id: WorkerId,
-        validator: Arc<dyn WorkerBlockValidation>,
+        validator: Arc<dyn WorkerBatchValidation>,
         metrics: Metrics,
         consensus_config: ConsensusConfig<DB>,
         task_manager: &TaskManager,
@@ -197,7 +197,7 @@ impl<DB: Database> Worker<DB> {
     fn start_network(
         id: WorkerId,
         consensus_config: &ConsensusConfig<DB>,
-        validator: Arc<dyn WorkerBlockValidation>,
+        validator: Arc<dyn WorkerBatchValidation>,
         metrics: &Metrics,
     ) -> Network {
         let mut worker_service = WorkerToWorkerServer::new(WorkerReceiverHandler {

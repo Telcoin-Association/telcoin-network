@@ -45,7 +45,7 @@ use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
 use tn_rpc::{TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
     Consensus, ConsensusOutput, LastCanonicalUpdate, Noticer, TaskManager, WorkerBatchSender,
-    WorkerBlockValidation, WorkerId,
+    WorkerBatchValidation, WorkerId,
 };
 use tokio::sync::{broadcast, mpsc::unbounded_channel};
 use tokio_stream::wrappers::BroadcastStream;
@@ -388,7 +388,7 @@ where
     }
 
     /// Create a new block validator.
-    pub(super) fn new_batch_validator(&self) -> Arc<dyn WorkerBlockValidation> {
+    pub(super) fn new_batch_validator(&self) -> Arc<dyn WorkerBatchValidation> {
         // batch validator
         Arc::new(BlockValidator::<DB>::new(self.blockchain_db.clone()))
     }
