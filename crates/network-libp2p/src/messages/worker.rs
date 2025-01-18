@@ -11,7 +11,7 @@ impl TNMessage for WorkerResponse {}
 /// Requests between workers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkerRequest {
-    /// Broadcast a newly produced worker block.
+    /// Broadcast a newly produced batch.
     ///
     /// NOTE: expect no response
     /// TODO: gossip this instead?

@@ -64,7 +64,7 @@ async fn make_block() {
         qw.0.lock()
             .unwrap()
             .as_ref()
-            .expect("Worker block not sent to Quorum Waiter!")
+            .expect("batch not sent to Quorum Waiter!")
             .block()
             .transactions()
     );

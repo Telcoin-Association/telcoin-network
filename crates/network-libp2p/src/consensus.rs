@@ -873,7 +873,7 @@ mod tests {
         let _message_id = cvv.publish(correct_topic, expected_result.clone()).await?;
         let event = timeout(Duration::from_secs(2), nvv_network_events.recv())
             .await?
-            .expect("worker block received");
+            .expect("batch received");
 
         // assert gossip message
         if let NetworkEvent::Gossip(msg) = event {
@@ -958,7 +958,7 @@ mod tests {
         let _message_id = cvv.publish(correct_topic.clone(), expected_result.clone()).await?;
         let event = timeout(Duration::from_secs(2), nvv_network_events.recv())
             .await?
-            .expect("worker block received");
+            .expect("batch received");
 
         // assert gossip message
         if let NetworkEvent::Gossip(msg) = event {

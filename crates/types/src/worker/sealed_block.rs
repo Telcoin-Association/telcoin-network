@@ -17,7 +17,7 @@ use tokio::sync::oneshot;
 /// TODO: support propagating errors from the worker to the primary.
 pub type WorkerBlockResponse = oneshot::Sender<BlockHash>;
 
-/// Worker Block validation error types
+/// batch validation error types
 #[derive(Error, Debug, Clone)]
 pub enum WorkerBlockConversionError {
     /// Errors from BlockExecution
@@ -31,7 +31,7 @@ pub enum WorkerBlockConversionError {
 /// The block for workers to communicate for consensus.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct SealedWorkerBlock {
-    /// The immutable worker block fields.
+    /// The immutable batch fields.
     pub block: WorkerBlock,
     /// The immutable digest of the block.
     pub digest: BlockHash,
@@ -45,17 +45,17 @@ impl SealedWorkerBlock {
         Self { block, digest }
     }
 
-    /// Consume self to extract the worker block so it can be modified.
+    /// Consume self to extract the batch so it can be modified.
     pub fn unseal(self) -> WorkerBlock {
         self.block
     }
 
-    /// Return the sealed worker block fields.
+    /// Return the sealed batch fields.
     pub fn block(&self) -> &WorkerBlock {
         &self.block
     }
 
-    /// Return the digest of the sealed worker block.
+    /// Return the digest of the sealed batch.
     pub fn digest(&self) -> BlockHash {
         self.digest
     }
@@ -179,9 +179,9 @@ impl WorkerBlock {
         SealedWorkerBlock::new(self, digest)
     }
 
-    /// Seal the worker block.
+    /// Seal the batch.
     ///
-    /// Calculate the hash and seal the worker block so it can't be changed.
+    /// Calculate the hash and seal the batch so it can't be changed.
     ///
     /// NOTE: `WorkerBlock::received_at` is skipped during serialization and is excluded from the
     /// digest.
@@ -222,7 +222,7 @@ pub fn max_worker_block_gas(_timestamp: u64) -> u64 {
     30_000_000
 }
 
-/// Max worker block size in effect at a timestamp.  Measured in bytes.
+/// Max batch size in effect at a timestamp.  Measured in bytes.
 /// Currently allways 1,000,000 but can change in the future at a fork.
 pub fn max_worker_block_size(_timestamp: u64) -> usize {
     1_000_000
@@ -240,8 +240,8 @@ pub trait WorkerBlockValidation: Send + Sync {
 /// Block validation error types
 #[derive(Error, Debug)]
 pub enum WorkerBlockValidationError {
-    /// The sealed worker block hash does not match this worker's calculated digest.
-    #[error("Invalid digest for sealed worker block.")]
+    /// The sealed batch hash does not match this worker's calculated digest.
+    #[error("Invalid digest for sealed batch.")]
     InvalidDigest,
     /// Ensure proposed block is after parent.
     #[error("Peer's header proposed before parent block timestamp.")]

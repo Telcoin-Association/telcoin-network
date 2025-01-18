@@ -24,9 +24,9 @@ pub struct WorkerSynchronizeMessage {
 pub struct WorkerOwnBlockMessage {
     /// The worker's id.
     pub worker_id: WorkerId,
-    /// The digest for the worker block that reached quorum.
+    /// The digest for the batch that reached quorum.
     pub digest: BlockHash,
-    /// The timestamp for the worker block.
+    /// The timestamp for the batch.
     pub timestamp: TimestampSec,
 }
 

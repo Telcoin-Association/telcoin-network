@@ -385,7 +385,7 @@ async fn test_block_builder_produces_valid_blocks() {
     let (first_block, ack) = timeout(duration, from_block_builder.recv())
         .await
         .expect("block builder's sender didn't drop")
-        .expect("worker block was built");
+        .expect("batch was built");
 
     // submit new transaction before sending ack
     let expected_tx_hash = tx_factory
@@ -424,7 +424,7 @@ async fn test_block_builder_produces_valid_blocks() {
     let (next_block, ack) = timeout(duration, from_block_builder.recv())
         .await
         .expect("block builder's sender didn't drop")
-        .expect("worker block was built");
+        .expect("batch was built");
     // send ack to mine block
     let _ = ack.send(Ok(()));
 
@@ -610,7 +610,7 @@ async fn test_canonical_notification_updates_pool() {
 
     execute_test_worker_block(&mut first_block, &chain.sealed_genesis_header());
 
-    // execute worker block - create output for consistency
+    // execute batch - create output for consistency
     let block_digests = VecDeque::from([first_block.digest()]);
     let output = ConsensusOutput {
         sub_dag: CommittedSubDag::new(
@@ -648,7 +648,7 @@ async fn test_canonical_notification_updates_pool() {
     let (first_block, ack) = timeout(duration, from_block_builder.recv())
         .await
         .expect("block builder's sender didn't drop")
-        .expect("worker block was built");
+        .expect("batch was built");
 
     // send ack to mine transaction
     let _ = ack.send(Ok(()));

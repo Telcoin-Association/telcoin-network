@@ -280,7 +280,7 @@ pub struct OptionalTestBatchParams {
     pub base_fee_per_gas_opt: Option<u64>,
 }
 
-/// Test utility to execute worker block and return execution outcome.
+/// Test utility to execute batch and return execution outcome.
 ///
 /// This is useful for simulating execution results for account state changes.
 /// Currently only used by faucet tests to obtain faucet contract account info

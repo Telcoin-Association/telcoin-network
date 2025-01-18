@@ -35,7 +35,7 @@ pub enum BlockBuilderError {
     #[error("Fatal error: failed to send built block to worker.")]
     WorkerChannelClosed,
     /// Fatal db error with worker while trying to reach quorum.
-    #[error("Fatal error: worker block provider db error")]
+    #[error("Fatal error: batch provider db error")]
     FatalDBFailure,
 }
 

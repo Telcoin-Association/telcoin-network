@@ -26,11 +26,11 @@ impl<DB> WorkerBlockValidation for BlockValidator<DB>
 where
     DB: Database + Sized + Clone + 'static,
 {
-    /// Validate a peer's worker block.
+    /// Validate a peer's batch.
     ///
     /// Workers do not execute full blocks. This method validates the required information.
     fn validate_block(&self, sealed_block: SealedWorkerBlock) -> BlockValidationResult<()> {
-        // ensure digest matches worker block
+        // ensure digest matches batch
         let (block, digest) = sealed_block.split();
         let verified_hash = block.clone().seal_slow().digest();
         if digest != verified_hash {
@@ -193,7 +193,7 @@ mod tests {
     use tn_types::{adiri_genesis, max_worker_block_gas, Consensus, WorkerBlock};
     use tracing::debug;
 
-    /// Return the next valid sealed worker block
+    /// Return the next valid sealed batch
     fn next_valid_sealed_worker_block() -> SealedWorkerBlock {
         let timestamp = 1701790139;
         // create valid transactions
@@ -232,7 +232,7 @@ mod tests {
 
         let valid_txs = vec![transaction1, transaction2, transaction3];
 
-        // sealed worker block
+        // sealed batch
         //
         // intentionally used hard-coded values
         SealedWorkerBlock::new(
@@ -253,7 +253,7 @@ mod tests {
 
     /// Convenience type for creating test assets.
     struct TestTools {
-        /// The expected sealed worker block.
+        /// The expected sealed batch.
         valid_block: SealedWorkerBlock,
         /// Validator
         validator: BlockValidator<Arc<TempDatabase<DatabaseEnv>>>,

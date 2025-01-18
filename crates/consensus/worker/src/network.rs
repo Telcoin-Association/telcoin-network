@@ -52,7 +52,7 @@ impl<DB: Database> WorkerToWorker for WorkerReceiverHandler<DB> {
             return Err(anemo::rpc::Status::new_with_message(
                 StatusCode::BadRequest,
                 format!(
-                    "Invalid block from peer {:?}: {err}\nsealed_\nbad worker block:\n{:?}",
+                    "Invalid block from peer {:?}: {err}\nsealed_\nbad batch:\n{:?}",
                     peer_id, sealed_worker_block,
                 ),
             ));
@@ -209,7 +209,7 @@ impl<DB: Database> PrimaryToWorker for PrimaryReceiverHandler<DB> {
                 if let Err(err) = self.validator.validate_block(sealed_block.clone()) {
                     return Err(anemo::rpc::Status::new_with_message(
                         StatusCode::BadRequest,
-                        format!("Invalid worker block: {err}"),
+                        format!("Invalid batch: {err}"),
                     ));
                 }
             }

@@ -10,7 +10,7 @@
 //! broadcast to voting peers. Headers are stored in the `ProposerStore` before they are sent to the
 //! Certifier.
 //!
-//! The Proposer is also responsible for processing Worker block's that reach quorum.
+//! The Proposer is also responsible for processing batch's that reach quorum.
 //! Collections of batches that reach quorum are included in each header. If the Proposer's
 //! header fails to be committed, then block digests from the failed round are included in the next
 //! header once the Proposer's round advances.

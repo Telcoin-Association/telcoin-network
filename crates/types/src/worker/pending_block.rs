@@ -20,7 +20,7 @@ impl<Pool> WorkerBlockBuilderArgs<Pool> {
     }
 }
 
-/// The configuration to use for building the next worker block.
+/// The configuration to use for building the next batch.
 #[derive(Debug)]
 pub struct PendingBlockConfig {
     /// The worker primary's address.

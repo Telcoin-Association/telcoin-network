@@ -33,9 +33,9 @@ pub struct BlockBuilderOutput {
     pub(crate) mined_transactions: Vec<TxHash>,
 }
 
-/// Construct an TN worker block using the best transactions from the pool.
+/// Construct an TN batch using the best transactions from the pool.
 ///
-/// Returns the [`BlockBuilderOutput`] and cannot fail. The worker block continues to add
+/// Returns the [`BlockBuilderOutput`] and cannot fail. The batch continues to add
 /// transactions to the proposed block until either:
 /// - accumulated transaction gas limit reached (measured by tx.gas_limit())
 /// - max byte size of transactions (measured by tx.size())
@@ -108,9 +108,9 @@ where
         transactions.push(tx.into_signed());
     }
 
-    // TODO: use ms for worker block and sec for final block?
+    // TODO: use ms for batch and sec for final block?
     //
-    // sometimes worker block are produced too quickly in certain configs (<1s diff)
+    // sometimes batch are produced too quickly in certain configs (<1s diff)
     // resulting in batch timestamp == parent timestamp
     //
     // TODO: check for this error at the quorum waiter level?
@@ -120,7 +120,7 @@ where
         timestamp = parent_info.tip.timestamp + 1;
     }
 
-    // worker block
+    // batch
     let worker_block = WorkerBlock {
         transactions,
         parent_hash,

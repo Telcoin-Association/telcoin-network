@@ -48,7 +48,7 @@ mod error;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
-/// Type alias for the blocking task that locks the tx pool and builds the next worker block.
+/// Type alias for the blocking task that locks the tx pool and builds the next batch.
 type BuildResult = oneshot::Receiver<BlockBuilderResult<Vec<TxHash>>>;
 
 /// The type that builds blocks for workers to propose.
@@ -56,7 +56,7 @@ type BuildResult = oneshot::Receiver<BlockBuilderResult<Vec<TxHash>>>;
 /// This is a future that:
 /// - listens for canonical state changes and updates the tx pool
 /// - polls the transaction pool for pending transactions
-///     - tries to build the next worker block when there transactions are available
+///     - tries to build the next batch when there transactions are available
 /// -
 #[derive(Debug)]
 pub struct BlockBuilder<BT, Pool> {
@@ -91,7 +91,7 @@ pub struct BlockBuilder<BT, Pool> {
     /// which guarantees the worker will attempt to broadcast the new block until
     /// quorum is reached.
     to_worker: WorkerBlockSender,
-    /// The address for worker block's beneficiary.
+    /// The address for batch's beneficiary.
     address: Address,
     /// Maximum amount of time to wait before querying block builds.
     ///
@@ -185,7 +185,7 @@ where
         self.pool.on_canonical_state_change(update);
     }
 
-    /// Spawns a task to build the worker block and proposer to peers.
+    /// Spawns a task to build the batch and proposer to peers.
     ///
     /// This approach allows the block builder to yield back to the runtime while mining blocks.
     ///
@@ -346,7 +346,7 @@ where
                 // don't break so pending_task receiver gets polled
             }
 
-            // poll receiver that returns mined transactions once the worker block reaches quorum
+            // poll receiver that returns mined transactions once the batch reaches quorum
             if let Some(mut receiver) = this.pending_task.take() {
                 // poll here so waker is notified when ack received
                 match receiver.poll_unpin(cx) {
@@ -815,7 +815,7 @@ mod tests {
             let (sealed_block, ack) = timeout(duration, from_block_builder.recv())
                 .await
                 .expect("block builder built another block after canonical update")
-                .expect("worker block was built");
+                .expect("batch was built");
 
             // all 3 transactions present
             assert_eq!(sealed_block.block().transactions().len(), 3 + subdag_index);
@@ -865,7 +865,7 @@ mod tests {
         let (sealed_block, ack) = timeout(duration, from_block_builder.recv())
             .await
             .expect("block builder's sender didn't drop")
-            .expect("worker block was built");
+            .expect("batch was built");
 
         // expect 7 transactions after loop added 4 more
         assert_eq!(sealed_block.block().transactions().len(), 7);
@@ -961,7 +961,7 @@ mod tests {
         let (sealed_block, ack) = timeout(duration, from_block_builder.recv())
             .await
             .expect("block builder's sender didn't drop")
-            .expect("worker block was built");
+            .expect("batch was built");
 
         // submit new transaction before sending ack
         let expected_tx_hash = tx_factory
@@ -988,7 +988,7 @@ mod tests {
         let (sealed_block, ack) = timeout(duration, from_block_builder.recv())
             .await
             .expect("block builder's sender didn't drop")
-            .expect("worker block was built");
+            .expect("batch was built");
         // send ack to mine block
         let _ = ack.send(Ok(()));
 

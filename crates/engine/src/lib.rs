@@ -778,7 +778,7 @@ mod tests {
                 assert_ne!(block.number, 1);
             }
 
-            // mix hash is xor worker block's hash and consensus output digest
+            // mix hash is xor batch's hash and consensus output digest
             let expected_mix_hash = all_batches[idx].digest() ^ output_digest;
             assert_eq!(block.mix_hash, expected_mix_hash);
             // bloom expected to be the same bc all proposed transactions should be good
@@ -1128,7 +1128,7 @@ mod tests {
                 assert_eq!(block.parent_hash, expected_parent);
             }
 
-            // mix hash is xor worker block's hash and consensus output digest
+            // mix hash is xor batch's hash and consensus output digest
             let expected_mix_hash = all_batches[idx].digest() ^ output_digest;
             assert_eq!(block.mix_hash, expected_mix_hash);
             // bloom expected to be the same bc all proposed transactions should be good
