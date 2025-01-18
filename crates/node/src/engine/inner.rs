@@ -38,13 +38,13 @@ use reth_transaction_pool::{
 };
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tn_batch_builder::BlockBuilder;
-use tn_block_validator::BlockValidator;
+use tn_batch_validator::BlockValidator;
 use tn_config::Config;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
 use tn_rpc::{TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
-    Consensus, ConsensusOutput, LastCanonicalUpdate, Noticer, TaskManager, WorkerBlockSender,
+    Consensus, ConsensusOutput, LastCanonicalUpdate, Noticer, TaskManager, WorkerBatchSender,
     WorkerBlockValidation, WorkerId,
 };
 use tokio::sync::{broadcast, mpsc::unbounded_channel};
@@ -209,7 +209,7 @@ where
     pub(super) async fn start_batch_builder(
         &mut self,
         worker_id: WorkerId,
-        block_provider_sender: WorkerBlockSender,
+        block_provider_sender: WorkerBatchSender,
         task_manager: &TaskManager,
         rx_shutdown: Noticer,
     ) -> eyre::Result<()> {
@@ -388,7 +388,7 @@ where
     }
 
     /// Create a new block validator.
-    pub(super) fn new_block_validator(&self) -> Arc<dyn WorkerBlockValidation> {
+    pub(super) fn new_batch_validator(&self) -> Arc<dyn WorkerBlockValidation> {
         // batch validator
         Arc::new(BlockValidator::<DB>::new(self.blockchain_db.clone()))
     }
@@ -494,7 +494,7 @@ where
     }
 
     /// Return the node's evm-based block executor
-    pub(super) fn get_block_executor(&self) -> Evm {
+    pub(super) fn get_batch_executor(&self) -> Evm {
         self.evm_executor.clone()
     }
 

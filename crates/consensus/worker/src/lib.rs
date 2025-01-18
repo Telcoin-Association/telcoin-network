@@ -3,8 +3,8 @@
 
 #![warn(future_incompatible, nonstandard_style, rust_2018_idioms, rust_2021_compatibility)]
 
-mod block_fetcher;
-mod block_provider;
+mod batch_fetcher;
+mod batch_provider;
 mod network;
 pub mod quorum_waiter;
 mod worker;
@@ -12,7 +12,7 @@ mod worker;
 pub mod metrics;
 
 pub use crate::{
-    block_provider::BlockProvider,
+    batch_provider::BlockProvider,
     worker::{Worker, CHANNEL_CAPACITY},
 };
 

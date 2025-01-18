@@ -6,14 +6,14 @@ use reth_primitives::{Address, SealedBlock};
 
 /// The arguments passed to the worker's block builder.
 #[derive(Debug)]
-pub struct WorkerBlockBuilderArgs<Pool> {
+pub struct WorkerBatchBuilderArgs<Pool> {
     /// The transaction pool.
     pub pool: Pool,
     /// The attributes for the next block.
     pub batch_config: PendingBlockConfig,
 }
 
-impl<Pool> WorkerBlockBuilderArgs<Pool> {
+impl<Pool> WorkerBatchBuilderArgs<Pool> {
     /// Create a new instance of [Self].
     pub fn new(pool: Pool, batch_config: PendingBlockConfig) -> Self {
         Self { pool, batch_config }

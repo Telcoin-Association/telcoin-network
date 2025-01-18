@@ -1,7 +1,7 @@
 //! The main worker type
 
 use crate::{
-    batch_fetcher::WorkerBlockFetcher,
+    batch_fetcher::WorkerBatchFetcher,
     batch_provider::BlockProvider,
     metrics::{Metrics, WorkerMetrics},
     network::{PrimaryReceiverHandler, WorkerReceiverHandler},
@@ -86,7 +86,7 @@ impl<DB: Database> Worker<DB> {
         // Receive incoming messages from other workers.
         let network = Self::start_network(id, &consensus_config, validator.clone(), &metrics);
 
-        let batch_fetcher = WorkerBlockFetcher::new(
+        let batch_fetcher = WorkerBatchFetcher::new(
             worker_name,
             network.clone(),
             consensus_config.node_storage().batch_store.clone(),

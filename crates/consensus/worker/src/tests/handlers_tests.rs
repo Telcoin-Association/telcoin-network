@@ -6,7 +6,7 @@ use tn_storage::{mem_db::MemDatabase, open_db};
 use tn_test_utils::{batch, random_network, CommitteeFixture};
 
 use super::*;
-use tn_block_validator::NoopBlockValidator;
+use tn_batch_validator::NoopBlockValidator;
 
 #[tokio::test]
 async fn synchronize() {
@@ -34,10 +34,10 @@ async fn synchronize() {
     let mock_batch_response = batch.clone();
     mock_server
         .expect_request_batches()
-        .withf(move |request| request.body().block_digests == vec![digest])
+        .withf(move |request| request.body().batch_digests == vec![digest])
         .return_once(move |_| {
             Ok(anemo::Response::new(RequestBlocksResponse {
-                blocks: vec![mock_batch_response],
+                batches: vec![mock_batch_response],
                 is_size_limit_reached: false,
             }))
         });

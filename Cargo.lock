@@ -11117,7 +11117,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
-name = "tn-block-builder"
+name = "tn-batch-builder"
 version = "0.1.0"
 dependencies = [
  "alloy-rlp",
@@ -11146,8 +11146,8 @@ dependencies = [
  "reth-transaction-pool",
  "tempfile",
  "thiserror",
- "tn-block-builder",
- "tn-block-validator",
+ "tn-batch-builder",
+ "tn-batch-validator",
  "tn-engine",
  "tn-network",
  "tn-network-types",
@@ -11160,7 +11160,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tn-block-validator"
+name = "tn-batch-validator"
 version = "0.1.0"
 dependencies = [
  "alloy-rlp",
@@ -11233,7 +11233,7 @@ dependencies = [
  "reth-tracing",
  "reth-trie",
  "thiserror",
- "tn-block-builder",
+ "tn-batch-builder",
  "tn-test-utils",
  "tn-types",
  "tokio",
@@ -11443,8 +11443,8 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "thiserror",
- "tn-block-builder",
- "tn-block-validator",
+ "tn-batch-builder",
+ "tn-batch-validator",
  "tn-config",
  "tn-engine",
  "tn-executor",
@@ -11497,7 +11497,7 @@ dependencies = [
  "tap",
  "tempfile",
  "thiserror",
- "tn-block-validator",
+ "tn-batch-validator",
  "tn-config",
  "tn-executor",
  "tn-network",
@@ -11600,8 +11600,8 @@ dependencies = [
  "secp256k1 0.29.0",
  "telcoin-network",
  "tempfile",
- "tn-block-builder",
- "tn-block-validator",
+ "tn-batch-builder",
+ "tn-batch-validator",
  "tn-config",
  "tn-engine",
  "tn-faucet",
@@ -11698,7 +11698,7 @@ dependencies = [
  "tap",
  "tempfile",
  "thiserror",
- "tn-block-validator",
+ "tn-batch-validator",
  "tn-config",
  "tn-network",
  "tn-network-types",

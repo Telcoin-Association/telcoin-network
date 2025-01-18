@@ -9,8 +9,8 @@
 use reth_primitives::{IntoRecoveredTransaction, TxHash};
 use reth_transaction_pool::TransactionPool;
 use tn_types::{
-    max_worker_block_gas, max_worker_block_size, now, PendingBlockConfig, WorkerBlock,
-    WorkerBlockBuilderArgs,
+    max_worker_block_gas, max_worker_block_size, now, PendingBlockConfig, WorkerBatchBuilderArgs,
+    WorkerBlock,
 };
 use tracing::{debug, warn};
 
@@ -44,11 +44,11 @@ pub struct BlockBuilderOutput {
 /// with very high gas limits. It's impossible to know the amount of gas a transaction
 /// will use without executing it, and the worker does not execute transactions.
 #[inline]
-pub fn build_batch<P>(args: WorkerBlockBuilderArgs<P>) -> BlockBuilderOutput
+pub fn build_batch<P>(args: WorkerBatchBuilderArgs<P>) -> BlockBuilderOutput
 where
     P: TransactionPool,
 {
-    let WorkerBlockBuilderArgs { pool, batch_config } = args;
+    let WorkerBatchBuilderArgs { pool, batch_config } = args;
     let gas_limit = max_worker_block_gas(batch_config.parent_info.tip.timestamp);
     let max_size = max_worker_block_size(batch_config.parent_info.tip.timestamp);
     let PendingBlockConfig { beneficiary, parent_info } = batch_config;

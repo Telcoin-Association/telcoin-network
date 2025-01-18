@@ -57,12 +57,12 @@ struct TestChanQuorumWaiter(Sender<SealedWorkerBlock>);
 impl QuorumWaiterTrait for TestChanQuorumWaiter {
     fn verify_batch(
         &self,
-        block: SealedWorkerBlock,
+        batch: SealedWorkerBlock,
         _timeout: Duration,
     ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
         let chan = self.0.clone();
         tokio::spawn(async move {
-            chan.send(block).await.unwrap();
+            chan.send(batch).await.unwrap();
             Ok(())
         })
     }
@@ -263,7 +263,7 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     let qw = TestChanQuorumWaiter(to_worker);
     let node_metrics = WorkerMetrics::default();
     let timeout = Duration::from_secs(5);
-    let block_provider =
+    let batch_provider =
         BlockProvider::new(0, qw.clone(), Arc::new(node_metrics), client, store.clone(), timeout);
 
     let shutdown = Notifier::default();
@@ -271,7 +271,7 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     execution_node
         .start_batch_builder(
             worker_id,
-            block_provider.batches_tx(),
+            batch_provider.batches_tx(),
             &TaskManager::default(),
             shutdown.subscribe(),
         )
@@ -293,10 +293,10 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     let duration = Duration::from_secs(15);
 
     // wait for canon event or timeout
-    let new_block: SealedWorkerBlock =
+    let new_batch: SealedWorkerBlock =
         time::timeout(duration, next_batch.recv()).await?.expect("batch received");
 
-    let batch_txs = new_block.block().transactions();
+    let batch_txs = new_batch.batch().transactions();
     let tx = batch_txs.first().expect("first batch tx from faucet");
 
     // assert recovered transaction
@@ -318,7 +318,7 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     // at this point:
     // - no pending txs in pool
     // - batch is not final (stored in db)
-    // - faucet must obtain correct nonce from worker's pending block watch channel
+    // - faucet must obtain correct nonce from worker's pending batch watch channel
     //
     // NOTE: new batch won't come bc tx is not in pending pool due to nonce gap
     // so query the tx pool directly
@@ -598,16 +598,16 @@ async fn test_faucet_transfers_stablecoin_with_google_kms() -> eyre::Result<()> 
     let tx_hash: String =
         client.request("faucet_transfer", rpc_params![user_address, contract_address]).await?;
 
-    // more than enough time for the next block
+    // more than enough time for the next batch
     let duration = Duration::from_secs(15);
 
     // wait for canon event or timeout
-    let (new_block, ack): (SealedWorkerBlock, oneshot::Sender<Result<(), BlockSealError>>) =
+    let (new_batch, ack): (SealedWorkerBlock, oneshot::Sender<Result<(), BlockSealError>>) =
         time::timeout(duration, next_batch.recv()).await?.expect("batch received");
 
     // send ack
     let _ = ack.send(Ok(()));
-    let batch_txs = new_block.block().transactions();
+    let batch_txs = new_batch.batch().transactions();
     let tx = batch_txs.first().expect("first batch tx from faucet");
 
     let contract_params: Vec<u8> = Drip::abi_encode_params(&(&contract_address, &user_address));
@@ -766,7 +766,7 @@ async fn get_contract_state_for_genesis(
     // create execution components
     let execution_node = default_test_execution_node(Some(chain.clone()), None)?;
     let provider = execution_node.get_provider().await;
-    let block_executor = execution_node.get_block_executor().await;
+    let batch_executor = execution_node.get_batch_executor().await;
 
     // execute batch
     let parent = chain.sealed_genesis_header();
@@ -776,7 +776,7 @@ async fn get_contract_state_for_genesis(
         ..Default::default()
     };
     let execution_outcome =
-        execution_outcome_for_tests(&batch, &parent, &provider, &block_executor);
+        execution_outcome_for_tests(&batch, &parent, &provider, &batch_executor);
 
     Ok(execution_outcome)
 }

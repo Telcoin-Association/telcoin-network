@@ -7,7 +7,7 @@ use eyre::{format_err, Result};
 use std::time::Duration;
 use tn_network_types::{
     FetchCertificatesRequest, FetchCertificatesResponse, PrimaryToPrimaryClient,
-    RequestBlocksRequest, RequestBlocksResponse, WorkerBlockMessage, WorkerToWorkerClient,
+    RequestBlocksRequest, RequestBlocksResponse, WorkerBatchMessage, WorkerToWorkerClient,
 };
 use tn_types::NetworkPublicKey;
 
@@ -73,12 +73,12 @@ impl PrimaryToPrimaryRpc for anemo::Network {
     }
 }
 
-impl ReliableNetwork<WorkerBlockMessage> for anemo::Network {
+impl ReliableNetwork<WorkerBatchMessage> for anemo::Network {
     type Response = ();
     fn send(
         &self,
         peer: NetworkPublicKey,
-        message: &WorkerBlockMessage,
+        message: &WorkerBatchMessage,
     ) -> CancelOnDropHandler<Result<anemo::Response<()>>> {
         let message = message.to_owned();
         let f = move |peer| {

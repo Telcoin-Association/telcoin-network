@@ -46,8 +46,8 @@ eyre = { workspace = true }
 reth-node-ethereum = { workspace = true }
 reth-stages = { workspace = true }
 reth-primitives = { workspace = true }
-tn-block-builder = { workspace = true }
-tn-block-validator = { workspace = true }
+tn-batch-builder = { workspace = true }
+tn-batch-validator = { workspace = true }
 tn-engine = { workspace = true }
 reth = { workspace = true }
 reth-db = { workspace = true, features = ["test-utils"] }

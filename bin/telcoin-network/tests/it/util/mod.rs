@@ -261,7 +261,7 @@ pub async fn get_contract_state_for_genesis(
 ) -> eyre::Result<ExecutionOutcome> {
     let execution_node = default_test_execution_node(Some(chain.clone()), None)?;
     let provider = execution_node.get_provider().await;
-    let block_executor = execution_node.get_block_executor().await;
+    let batch_executor = execution_node.get_batch_executor().await;
 
     // execute batch
     let parent = chain.sealed_genesis_header();
@@ -271,7 +271,7 @@ pub async fn get_contract_state_for_genesis(
         ..Default::default()
     };
     let execution_outcome =
-        execution_outcome_for_tests(&batch, &parent, &provider, &block_executor);
+        execution_outcome_for_tests(&batch, &parent, &provider, &batch_executor);
 
     Ok(execution_outcome)
 }

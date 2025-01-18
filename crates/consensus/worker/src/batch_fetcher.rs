@@ -1,4 +1,4 @@
-//! Fetch blocks from peers
+//! Fetch batches from peers
 
 use crate::metrics::WorkerMetrics;
 use anemo::Network;
@@ -28,14 +28,14 @@ use tracing::debug;
 const REMOTE_PARALLEL_FETCH_INTERVAL: Duration = Duration::from_secs(2);
 const WORKER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
-pub struct WorkerBlockFetcher<DB> {
+pub struct WorkerBatchFetcher<DB> {
     name: NetworkPublicKey,
     network: Arc<dyn RequestBlocksNetwork>,
     batch_store: DB,
     metrics: Arc<WorkerMetrics>,
 }
 
-impl<DB: Database> WorkerBlockFetcher<DB> {
+impl<DB: Database> WorkerBatchFetcher<DB> {
     pub fn new(
         name: NetworkPublicKey,
         network: Network,
@@ -46,7 +46,7 @@ impl<DB: Database> WorkerBlockFetcher<DB> {
     }
 
     /// Bulk fetches payload from local storage and remote workers.
-    /// This function performs infinite retries and blocks until all blocks are available.
+    /// This function performs infinite retries and batchs until all batches are available.
     pub async fn fetch(
         &self,
         digests: HashSet<BlockHash>,
@@ -59,22 +59,22 @@ impl<DB: Database> WorkerBlockFetcher<DB> {
         );
 
         let mut remaining_digests = digests;
-        let mut fetched_blocks = HashMap::new();
+        let mut fetched_batches = HashMap::new();
         // TODO: verify known_workers meets quorum threshold, or just use all other workers.
         let known_workers =
             known_workers.into_iter().filter(|worker| worker != &self.name).collect_vec();
 
         loop {
             if remaining_digests.is_empty() {
-                return fetched_blocks;
+                return fetched_batches;
             }
 
             // Fetch from local storage.
             let _timer = self.metrics.worker_local_fetch_latency.start_timer();
-            fetched_blocks.extend(self.fetch_local(remaining_digests.clone()).await);
-            remaining_digests.retain(|d| !fetched_blocks.contains_key(d));
+            fetched_batches.extend(self.fetch_local(remaining_digests.clone()).await);
+            remaining_digests.retain(|d| !fetched_batches.contains_key(d));
             if remaining_digests.is_empty() {
-                return fetched_blocks;
+                return fetched_batches;
             }
             drop(_timer);
 
@@ -101,30 +101,30 @@ impl<DB: Database> WorkerBlockFetcher<DB> {
                 let mut interval = Box::pin(sleep(stagger));
                 select! {
                     result = futures.next() => {
-                        if let Some(remote_blocks) = result {
-                            let new_blocks: HashMap<_, _> = remote_blocks.iter().filter(|(d, _)| remaining_digests.remove(*d)).collect();
+                        if let Some(remote_batches) = result {
+                            let new_batches: HashMap<_, _> = remote_batches.iter().filter(|(d, _)| remaining_digests.remove(*d)).collect();
 
-                            // Set received_at timestamp for remote blocks.
-                            let mut updated_new_blocks = HashMap::new();
+                            // Set received_at timestamp for remote batches.
+                            let mut updated_new_batches = HashMap::new();
                             let mut txn = self.batch_store.write_txn().expect("unable to create DB transaction!");
-                            for (digest, block) in new_blocks {
-                                let mut block = (*block).clone();
-                                block.set_received_at(now());
-                                updated_new_blocks.insert(*digest, block.clone());
-                                // Also persist the blocks, so they are available after restarts.
-                                if let Err(e) = txn.insert::<WorkerBlocks>(digest, &block) {
-                                    tracing::error!("failed to insert block! We can not continue.. {e}");
-                                    panic!("failed to insert block! We can not continue.. {e}");
+                            for (digest, batch) in new_batches {
+                                let mut batch = (*batch).clone();
+                                batch.set_received_at(now());
+                                updated_new_batches.insert(*digest, batch.clone());
+                                // Also persist the batches, so they are available after restarts.
+                                if let Err(e) = txn.insert::<WorkerBlocks>(digest, &batch) {
+                                    tracing::error!("failed to insert batch! We can not continue.. {e}");
+                                    panic!("failed to insert batch! We can not continue.. {e}");
                                 }
                             }
                             if let Err(e) = txn.commit() {
-                                tracing::error!("failed to commit block! We can not continue.. {e}");
-                                panic!("failed to commit block! We can not continue.. {e}");
+                                tracing::error!("failed to commit batch! We can not continue.. {e}");
+                                panic!("failed to commit batch! We can not continue.. {e}");
                             }
-                            fetched_blocks.extend(updated_new_blocks.iter().map(|(d, b)| (*d, (*b).clone())));
+                            fetched_batches.extend(updated_new_batches.iter().map(|(d, b)| (*d, (*b).clone())));
 
                             if remaining_digests.is_empty() {
-                                return fetched_blocks;
+                                return fetched_batches;
                             }
                         }
                     }
@@ -140,26 +140,26 @@ impl<DB: Database> WorkerBlockFetcher<DB> {
     }
 
     async fn fetch_local(&self, digests: HashSet<BlockHash>) -> HashMap<BlockHash, WorkerBlock> {
-        let mut fetched_blocks = HashMap::new();
+        let mut fetched_batches = HashMap::new();
         if digests.is_empty() {
-            return fetched_blocks;
+            return fetched_batches;
         }
 
         // Continue to bulk request from local worker until no remaining digests
         // are available.
         debug!("Local attempt to fetch {} digests", digests.len());
-        if let Ok(local_blocks) = self.batch_store.multi_get::<WorkerBlocks>(digests.iter()) {
-            for (digest, block) in digests.into_iter().zip(local_blocks.into_iter()) {
-                if let Some(block) = block {
+        if let Ok(local_batches) = self.batch_store.multi_get::<WorkerBlocks>(digests.iter()) {
+            for (digest, batch) in digests.into_iter().zip(local_batches.into_iter()) {
+                if let Some(batch) = batch {
                     self.metrics.worker_batch_fetch.with_label_values(&["local", "success"]).inc();
-                    fetched_blocks.insert(digest, block);
+                    fetched_batches.insert(digest, batch);
                 } else {
                     self.metrics.worker_batch_fetch.with_label_values(&["local", "missing"]).inc();
                 }
             }
         }
 
-        fetched_blocks
+        fetched_batches
     }
 
     /// This future performs a fetch from a given remote worker
@@ -184,10 +184,10 @@ impl<DB: Database> WorkerBlockFetcher<DB> {
                 self.safe_request_batches(digests.clone(), worker.clone(), timeout).await;
             drop(request_guard);
             match response {
-                Ok(remote_blocks) => {
+                Ok(remote_batches) => {
                     self.metrics.worker_batch_fetch.with_label_values(&["remote", "success"]).inc();
-                    debug!("Found {} blocks remotely", remote_blocks.len());
-                    return remote_blocks;
+                    debug!("Found {} batches remotely", remote_batches.len());
+                    return remote_batches;
                 }
                 Err(err) => {
                     if err.to_string().contains("Timeout") {
@@ -228,12 +228,12 @@ impl<DB: Database> WorkerBlockFetcher<DB> {
         worker: NetworkPublicKey,
         timeout: Duration,
     ) -> eyre::Result<HashMap<BlockHash, WorkerBlock>> {
-        let mut fetched_blocks = HashMap::new();
+        let mut fetched_batches = HashMap::new();
         if digests_to_fetch.is_empty() {
-            return Ok(fetched_blocks);
+            return Ok(fetched_batches);
         }
 
-        let RequestBlocksResponse { blocks, is_size_limit_reached: _ } = self
+        let RequestBlocksResponse { batches, is_size_limit_reached: _ } = self
             .network
             .request_batches(
                 digests_to_fetch.clone().into_iter().collect(),
@@ -241,19 +241,19 @@ impl<DB: Database> WorkerBlockFetcher<DB> {
                 timeout,
             )
             .await?;
-        for block in blocks {
-            let block_digest = block.digest();
-            if !digests_to_fetch.contains(&block_digest) {
+        for batch in batches {
+            let batch_digest = batch.digest();
+            if !digests_to_fetch.contains(&batch_digest) {
                 eyre::bail!(
-                    "[Protocol violation] Worker {worker} returned block with digest \
-                    {block_digest} which is not part of the requested digests: {digests_to_fetch:?}"
+                    "[Protocol violation] Worker {worker} returned batch with digest \
+                    {batch_digest} which is not part of the requested digests: {digests_to_fetch:?}"
                 );
             }
-            // This block is part of a certificate, so no need to validate it.
-            fetched_blocks.insert(block_digest, block);
+            // This batch is part of a certificate, so no need to validate it.
+            fetched_batches.insert(batch_digest, batch);
         }
 
-        Ok(fetched_blocks)
+        Ok(fetched_batches)
     }
 }
 
@@ -281,7 +281,7 @@ impl Drop for PendingGuard<'_> {
 pub trait RequestBlocksNetwork: Send + Sync {
     async fn request_batches(
         &self,
-        block_digests: Vec<BlockHash>,
+        batch_digests: Vec<BlockHash>,
         worker: NetworkPublicKey,
         timeout: Duration,
     ) -> eyre::Result<RequestBlocksResponse>;
@@ -295,12 +295,12 @@ struct RequestBlocksNetworkImpl {
 impl RequestBlocksNetwork for RequestBlocksNetworkImpl {
     async fn request_batches(
         &self,
-        block_digests: Vec<BlockHash>,
+        batch_digests: Vec<BlockHash>,
         worker: NetworkPublicKey,
         timeout: Duration,
     ) -> eyre::Result<RequestBlocksResponse> {
         let request =
-            anemo::Request::new(RequestBlocksRequest { block_digests }).with_timeout(timeout);
+            anemo::Request::new(RequestBlocksRequest { batch_digests }).with_timeout(timeout);
         self.network.request_batches(&worker, request).await
     }
 }
@@ -328,27 +328,27 @@ mod tests {
         );
         network.put(&[1, 2], batch1.clone());
         network.put(&[2, 3], batch2.clone());
-        let fetcher = WorkerBlockFetcher {
+        let fetcher = WorkerBatchFetcher {
             name: test_pk(0),
             network: Arc::new(network.clone()),
             batch_store: batch_store.clone(),
             metrics: Arc::new(WorkerMetrics::default()),
         };
-        let mut expected_blocks = HashMap::from_iter(vec![
+        let mut expected_batches = HashMap::from_iter(vec![
             (batch1.digest(), batch1.clone()),
             (batch2.digest(), batch2.clone()),
         ]);
-        let mut fetched_blocks = fetcher.fetch(digests, known_workers).await;
-        // Reset metadata from the fetched and expected blocks
-        for block in fetched_blocks.values_mut() {
+        let mut fetched_batches = fetcher.fetch(digests, known_workers).await;
+        // Reset metadata from the fetched and expected batches
+        for batch in fetched_batches.values_mut() {
             // assert received_at was set to some value before resetting.
-            assert!(block.received_at().is_some());
-            block.set_received_at(0);
+            assert!(batch.received_at().is_some());
+            batch.set_received_at(0);
         }
-        for block in expected_blocks.values_mut() {
-            block.set_received_at(0);
+        for batch in expected_batches.values_mut() {
+            batch.set_received_at(0);
         }
-        assert_eq!(fetched_blocks, expected_blocks);
+        assert_eq!(fetched_batches, expected_batches);
         assert_eq!(
             batch_store.get::<WorkerBlocks>(&batch1.digest()).unwrap().unwrap().digest(),
             batch1.digest()
@@ -361,8 +361,8 @@ mod tests {
 
     #[tokio::test]
     pub async fn test_fetcher_locally_with_remaining() {
-        // Limit is set to two blocks in test request_batches(). Request 3 blocks
-        // and ensure another request is sent to get the remaining blocks.
+        // Limit is set to two batches in test request_batches(). Request 3 batches
+        // and ensure another request is sent to get the remaining batches.
         let mut network = TestRequestBlocksNetwork::new();
         let temp_dir = TempDir::new().unwrap();
         let batch_store = open_db(temp_dir.path());
@@ -373,31 +373,31 @@ mod tests {
             HashSet::from_iter(vec![batch1.digest(), batch2.digest(), batch3.digest()]),
             HashSet::from_iter(test_pks(&[1, 2, 3])),
         );
-        for block in &[&batch1, &batch2, &batch3] {
-            batch_store.insert::<WorkerBlocks>(&block.digest(), block).unwrap();
+        for batch in &[&batch1, &batch2, &batch3] {
+            batch_store.insert::<WorkerBlocks>(&batch.digest(), batch).unwrap();
         }
         network.put(&[1, 2], batch1.clone());
         network.put(&[2, 3], batch2.clone());
         network.put(&[3, 4], batch3.clone());
-        let fetcher = WorkerBlockFetcher {
+        let fetcher = WorkerBatchFetcher {
             name: test_pk(0),
             network: Arc::new(network.clone()),
             batch_store,
             metrics: Arc::new(WorkerMetrics::default()),
         };
-        let expected_blocks = HashMap::from_iter(vec![
+        let expected_batches = HashMap::from_iter(vec![
             (batch1.digest(), batch1.clone()),
             (batch2.digest(), batch2.clone()),
             (batch3.digest(), batch3.clone()),
         ]);
-        let fetched_blocks = fetcher.fetch(digests, known_workers).await;
-        assert_eq!(fetched_blocks, expected_blocks);
+        let fetched_batches = fetcher.fetch(digests, known_workers).await;
+        assert_eq!(fetched_batches, expected_batches);
     }
 
     #[tokio::test]
     pub async fn test_fetcher_remote_with_remaining() {
-        // Limit is set to two blocks in test request_batches(). Request 3 blocks
-        // and ensure another request is sent to get the remaining blocks.
+        // Limit is set to two batches in test request_batches(). Request 3 batches
+        // and ensure another request is sent to get the remaining batches.
         let mut network = TestRequestBlocksNetwork::new();
         let temp_dir = TempDir::new().unwrap();
         let batch_store = open_db(temp_dir.path());
@@ -411,30 +411,30 @@ mod tests {
         network.put(&[3, 4], batch1.clone());
         network.put(&[2, 3], batch2.clone());
         network.put(&[2, 3, 4], batch3.clone());
-        let fetcher = WorkerBlockFetcher {
+        let fetcher = WorkerBatchFetcher {
             name: test_pk(0),
             network: Arc::new(network.clone()),
             batch_store,
             metrics: Arc::new(WorkerMetrics::default()),
         };
-        let mut expected_blocks = HashMap::from_iter(vec![
+        let mut expected_batches = HashMap::from_iter(vec![
             (batch1.digest(), batch1.clone()),
             (batch2.digest(), batch2.clone()),
             (batch3.digest(), batch3.clone()),
         ]);
-        let mut fetched_blocks = fetcher.fetch(digests, known_workers).await;
+        let mut fetched_batches = fetcher.fetch(digests, known_workers).await;
 
-        // Reset metadata from the fetched and expected blocks
-        for block in fetched_blocks.values_mut() {
+        // Reset metadata from the fetched and expected batches
+        for batch in fetched_batches.values_mut() {
             // assert received_at was set to some value before resetting.
-            assert!(block.received_at().is_some());
-            block.set_received_at(0);
+            assert!(batch.received_at().is_some());
+            batch.set_received_at(0);
         }
-        for block in expected_blocks.values_mut() {
-            block.set_received_at(0);
+        for batch in expected_batches.values_mut() {
+            batch.set_received_at(0);
         }
 
-        assert_eq!(fetched_blocks, expected_blocks);
+        assert_eq!(fetched_batches, expected_batches);
     }
 
     #[tokio::test]
@@ -453,34 +453,34 @@ mod tests {
         network.put(&[1, 2, 3], batch1.clone());
         network.put(&[2, 3, 4], batch2.clone());
         network.put(&[1, 4], batch3.clone());
-        let fetcher = WorkerBlockFetcher {
+        let fetcher = WorkerBatchFetcher {
             name: test_pk(0),
             network: Arc::new(network.clone()),
             batch_store,
             metrics: Arc::new(WorkerMetrics::default()),
         };
-        let mut expected_blocks = HashMap::from_iter(vec![
+        let mut expected_batches = HashMap::from_iter(vec![
             (batch1.digest(), batch1.clone()),
             (batch2.digest(), batch2.clone()),
             (batch3.digest(), batch3.clone()),
         ]);
-        let mut fetched_blocks = fetcher.fetch(digests, known_workers).await;
+        let mut fetched_batches = fetcher.fetch(digests, known_workers).await;
 
-        // Reset metadata from the fetched and expected remote blocks
-        for block in fetched_blocks.values_mut() {
-            if block.digest() != batch1.digest() {
-                // assert received_at was set to some value for remote blocks before resetting.
-                assert!(block.received_at().is_some());
-                block.set_received_at(0);
+        // Reset metadata from the fetched and expected remote batches
+        for batch in fetched_batches.values_mut() {
+            if batch.digest() != batch1.digest() {
+                // assert received_at was set to some value for remote batches before resetting.
+                assert!(batch.received_at().is_some());
+                batch.set_received_at(0);
             }
         }
-        for block in expected_blocks.values_mut() {
-            if block.digest() != batch1.digest() {
-                block.set_received_at(0);
+        for batch in expected_batches.values_mut() {
+            if batch.digest() != batch1.digest() {
+                batch.set_received_at(0);
             }
         }
 
-        assert_eq!(fetched_blocks, expected_blocks);
+        assert_eq!(fetched_batches, expected_batches);
     }
 
     #[tokio::test]
@@ -491,7 +491,7 @@ mod tests {
         let num_digests = 12;
         let mut expected_batches = Vec::new();
         let mut local_digests = Vec::new();
-        // 6 blocks available locally with response size limit of 2
+        // 6 batches available locally with response size limit of 2
         for _i in 0..num_digests / 2 {
             let batch = WorkerBlock { transactions: vec![transaction()], ..Default::default() };
             local_digests.push(batch.digest());
@@ -513,7 +513,7 @@ mod tests {
             HashSet::from_iter(expected_batches.clone().into_keys()),
             HashSet::from_iter(test_pks(&[1, 2, 3])),
         );
-        let fetcher = WorkerBlockFetcher {
+        let fetcher = WorkerBatchFetcher {
             name: test_pk(0),
             network: Arc::new(network.clone()),
             batch_store,

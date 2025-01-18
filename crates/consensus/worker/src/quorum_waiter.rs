@@ -12,7 +12,7 @@ use std::{
 };
 use thiserror::Error;
 use tn_network::{CancelOnDropHandler, ReliableNetwork};
-use tn_network_types::WorkerBlockMessage;
+use tn_network_types::WorkerBatchMessage;
 use tn_types::{Authority, Committee, SealedWorkerBlock, Stake, WorkerCache, WorkerId};
 use tokio::task::JoinHandle;
 
@@ -22,17 +22,17 @@ pub mod quorum_waiter_tests;
 
 /// Interface to QuorumWaiter, exists primarily for tests.
 pub trait QuorumWaiterTrait: Send + Sync + Clone + Unpin + 'static {
-    /// Send a block to committee peers in an attempt to get quorum on it's validity.
+    /// Send a batch to committee peers in an attempt to get quorum on it's validity.
     ///
     /// Returns a JoinHandle to a future that will timeout.  Each peer attempt can:
-    /// - Accept the block and it's stake to quorum
-    /// - Reject the block explicitly in which case it's stake will never be added to quorum (can
-    ///   cause total block rejection)
+    /// - Accept the batch and it's stake to quorum
+    /// - Reject the batch explicitly in which case it's stake will never be added to quorum (can
+    ///   cause total batch rejection)
     /// - Have an error of some type stopping it's stake from adding to quorum but possibly not
     ///   forever
     ///
-    /// If the future resolves to Ok then the block has reached quorum other wise examine the error.
-    /// An error of QuorumWaiterError::QuorumRejected indicates the block will never be accepted
+    /// If the future resolves to Ok then the batch has reached quorum other wise examine the error.
+    /// An error of QuorumWaiterError::QuorumRejected indicates the batch will never be accepted
     /// otherwise it might be possible if the network improves.
     fn verify_batch(
         &self,
@@ -125,7 +125,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                     .map(|(name, info)| (name, info.name))
                     .collect();
                 let (primary_names, worker_names): (Vec<_>, _) = workers.into_iter().unzip();
-                let message = WorkerBlockMessage { sealed_worker_block };
+                let message = WorkerBatchMessage { sealed_worker_batch };
                 let handlers = inner.network.broadcast(worker_names, &message);
                 let _timer = inner.metrics.batch_broadcast_quorum_latency.start_timer();
 
@@ -135,7 +135,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                 // Total stake available for the entire committee.
                 // Can use this to determine anti-quorum more quickly.
                 let mut available_stake = 0;
-                // Stake from a committee member that has rejected this block.
+                // Stake from a committee member that has rejected this batch.
                 let mut rejected_stake = 0;
                 primary_names
                     .into_iter()
@@ -147,16 +147,16 @@ impl QuorumWaiterTrait for QuorumWaiter {
                     })
                     .for_each(|f| wait_for_quorum.push(f));
 
-                // Wait for the first 2f nodes to send back an Ack. Then we consider the block
+                // Wait for the first 2f nodes to send back an Ack. Then we consider the batch
                 // delivered and we send its digest to the primary (that will include it into
                 // the dag). This should reduce the amount of syncing.
                 let threshold = inner.committee.quorum_threshold();
                 let mut total_stake = inner.authority.stake();
-                // If more stake than this is rejected then the block will never be accepted.
+                // If more stake than this is rejected then the batch will never be accepted.
                 let max_rejected_stake = available_stake - threshold;
 
                 // Wait on the peer responses and produce an Ok(()) for quorum (2/3 stake confirmed
-                // block) or Error if quorum not reached.
+                // batch) or Error if quorum not reached.
                 loop {
                     if let Some(res) = wait_for_quorum.next().await {
                         match res {
@@ -199,7 +199,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                         break Err(QuorumWaiterError::AntiQuorum);
                     }
                     if rejected_stake > max_rejected_stake {
-                        // Can no longer reach quorum because our block was explicitly rejected by
+                        // Can no longer reach quorum because our batch was explicitly rejected by
                         // to much stack.
                         break Err(QuorumWaiterError::QuorumRejected);
                     }
@@ -226,7 +226,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
 pub enum QuorumWaiterError {
     #[error("Block was rejected by enough peers to never reach quorum")]
     QuorumRejected,
-    #[error("Anti quorum reached for block (note this may not be permanent)")]
+    #[error("Anti quorum reached for batch (note this may not be permanent)")]
     AntiQuorum,
     #[error("Timed out waiting for quorum")]
     Timeout,

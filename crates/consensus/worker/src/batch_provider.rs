@@ -8,7 +8,7 @@ use std::{sync::Arc, time::Duration};
 use tn_network::{local::LocalNetwork, WorkerToPrimaryClient as _};
 use tn_network_types::WorkerOwnBlockMessage;
 use tn_storage::{tables::WorkerBlocks, traits::Database};
-use tn_types::{error::BlockSealError, SealedWorkerBlock, WorkerBlockSender, WorkerId};
+use tn_types::{error::BlockSealError, SealedWorkerBlock, WorkerBatchSender, WorkerId};
 use tracing::error;
 
 #[cfg(test)]
@@ -29,7 +29,7 @@ pub struct BlockProvider<DB, QW> {
     /// The batch store to store our own batches.
     store: DB,
     /// Channel sender for alternate batch submision if not calling seal directly.
-    tx_batches: WorkerBlockSender,
+    tx_batches: WorkerBatchSender,
     /// The amount of time to wait on a reply from peer before timing out.
     timeout: Duration,
 }
@@ -65,7 +65,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> BlockProvider<DB, QW> {
         this
     }
 
-    pub fn batches_tx(&self) -> WorkerBlockSender {
+    pub fn batches_tx(&self) -> WorkerBatchSender {
         self.tx_batches.clone()
     }
 
@@ -122,7 +122,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> BlockProvider<DB, QW> {
         // Send the batch to the primary.
         let message =
             WorkerOwnBlockMessage { worker_id: self.id, digest, timestamp: batch.created_at() };
-        if let Err(err) = self.client.report_own_block(message).await {
+        if let Err(err) = self.client.report_own_batch(message).await {
             error!(target: "worker::batch_provider", "Failed to report our batch: {err:?}");
             // Should we return an error here?  Doing so complicates some tests but also the batch
             // is sealed, etc. If we can not report our own batch is this a

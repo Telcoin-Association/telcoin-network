@@ -20,7 +20,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tn_block_validator::NoopBlockValidator;
+use tn_batch_validator::NoopBlockValidator;
 use tn_network_types::{
     FetchCertificatesRequest, MockPrimaryToWorker, PrimaryToPrimary, RequestVoteRequest,
 };

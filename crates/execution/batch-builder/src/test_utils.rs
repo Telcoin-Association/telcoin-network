@@ -18,7 +18,7 @@ use std::{
     time::Instant,
 };
 use tn_types::{
-    LastCanonicalUpdate, PendingBlockConfig, TransactionSigned, WorkerBlock, WorkerBlockBuilderArgs,
+    LastCanonicalUpdate, PendingBlockConfig, TransactionSigned, WorkerBatchBuilderArgs, WorkerBlock,
 };
 use tokio::sync::mpsc::{self, Receiver};
 
@@ -35,7 +35,7 @@ pub fn execute_test_batch(test_batch: &mut WorkerBlock, parent: &SealedHeader) {
     };
 
     let batch_config = PendingBlockConfig::new(test_batch.beneficiary, parent_info);
-    let args = WorkerBlockBuilderArgs { pool, batch_config };
+    let args = WorkerBatchBuilderArgs { pool, batch_config };
     let BlockBuilderOutput { batch, .. } = build_batch(args);
     test_batch.parent_hash = batch.parent_hash;
     test_batch.beneficiary = batch.beneficiary;

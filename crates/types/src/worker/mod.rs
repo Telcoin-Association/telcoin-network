@@ -16,7 +16,7 @@ pub use pending_block::*;
 /// that extends the canonical tip.
 ///
 /// The receiving half (CL) broadcasts to peers and tries to reach quorum.
-pub type WorkerBlockSender =
+pub type WorkerBatchSender =
     Sender<(SealedWorkerBlock, oneshot::Sender<Result<(), BlockSealError>>)>;
 
 pub const DEFAULT_WORKER_PORT: u16 = 44895;

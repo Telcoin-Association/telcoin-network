@@ -37,8 +37,8 @@ use std::{
     time::Duration,
 };
 use tn_types::{
-    error::BlockSealError, LastCanonicalUpdate, PendingBlockConfig, WorkerBlockBuilderArgs,
-    WorkerBlockSender,
+    error::BlockSealError, LastCanonicalUpdate, PendingBlockConfig, WorkerBatchBuilderArgs,
+    WorkerBatchSender,
 };
 use tokio::{sync::oneshot, time::Interval};
 use tracing::{debug, error, trace, warn};
@@ -90,7 +90,7 @@ pub struct BlockBuilder<BT, Pool> {
     /// The worker's block maker sends an ack once the block has been stored in db
     /// which guarantees the worker will attempt to broadcast the new block until
     /// quorum is reached.
-    to_worker: WorkerBlockSender,
+    to_worker: WorkerBatchSender,
     /// The address for batch's beneficiary.
     address: Address,
     /// Maximum amount of time to wait before querying block builds.
@@ -110,7 +110,7 @@ where
         pool: Pool,
         canonical_state_stream: CanonStateNotificationStream,
         latest_canon_state: LastCanonicalUpdate,
-        to_worker: WorkerBlockSender,
+        to_worker: WorkerBatchSender,
         address: Address,
         max_delay: Duration,
     ) -> Self {
@@ -203,7 +203,7 @@ where
 
         // configure params for next block to build
         let config = PendingBlockConfig::new(self.address, self.latest_canon_state.clone());
-        let build_args = WorkerBlockBuilderArgs::new(pool.clone(), config);
+        let build_args = WorkerBatchBuilderArgs::new(pool.clone(), config);
         let (result, done) = oneshot::channel();
 
         // spawn block building task and forward to worker

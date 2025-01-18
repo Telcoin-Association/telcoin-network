@@ -41,9 +41,9 @@ pub struct WorkerOthersBlockMessage {
 
 /// Used by workers to send a new batch to peers.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkerBlockMessage {
+pub struct WorkerBatchMessage {
     /// The sending worker's batch.
-    pub sealed_worker_block: SealedWorkerBlock,
+    pub sealed_worker_batch: SealedWorkerBlock,
 }
 
 /// Engine to primary when canonical tip is updated.

@@ -25,14 +25,14 @@ pub struct ConsensusOutput {
     /// Matches certificates in the `sub_dag` one-to-one.
     ///
     /// This field is not included in [Self] digest. To validate,
-    /// hash these blocks and compare to [Self::block_digests].
-    pub blocks: Vec<Vec<WorkerBlock>>,
+    /// hash these batches and compare to [Self::batch_digests].
+    pub batches: Vec<Vec<WorkerBlock>>,
     /// The beneficiary for block rewards.
     pub beneficiary: Address,
     /// The ordered set of [BlockHash].
     ///
     /// This value is included in [Self] digest.
-    pub block_digests: VecDeque<BlockHash>,
+    pub batch_digests: VecDeque<BlockHash>,
 
     // These fields are used to construct the ConsensusHeader.
     /// The hash of the previous ConsesusHeader in the chain.
@@ -69,15 +69,15 @@ impl ConsensusOutput {
     pub fn beneficiary(&self) -> Address {
         self.beneficiary
     }
-    /// Pop the next block digest.
+    /// Pop the next batch digest.
     ///
     /// This method is used when executing [Self].
-    pub fn next_block_digest(&mut self) -> Option<BlockHash> {
-        self.block_digests.pop_front()
+    pub fn next_batch_digest(&mut self) -> Option<BlockHash> {
+        self.batch_digests.pop_front()
     }
 
-    pub fn flatten_worker_blocks(&self) -> Vec<WorkerBlock> {
-        self.blocks.iter().flat_map(|blocks| blocks.iter().cloned()).collect()
+    pub fn flatten_worker_batches(&self) -> Vec<WorkerBlock> {
+        self.batches.iter().flat_map(|batches| batches.iter().cloned()).collect()
     }
 
     /// Build a new ConsensusHeader frome this output.
@@ -105,7 +105,7 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for ConsensusOutput {
         // hash beneficiary
         hasher.update(self.beneficiary);
         // hash block digests in order
-        self.block_digests.iter().for_each(|digest| {
+        self.batch_digests.iter().for_each(|digest| {
             hasher.update(digest);
         });
         // finalize
@@ -171,7 +171,7 @@ impl CommittedSubDag {
         self.len() == 0
     }
 
-    pub fn num_blocks(&self) -> usize {
+    pub fn num_primary_blocks(&self) -> usize {
         self.certificates.iter().map(|x| x.header().payload().len()).sum()
     }
 

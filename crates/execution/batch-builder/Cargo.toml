@@ -1,5 +1,5 @@
 [package]
-name = "tn-block-builder"
+name = "tn-batch-builder"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -49,12 +49,12 @@ tn-worker = { workspace = true }
 tn-network = { workspace = true }
 tn-network-types = { workspace = true }
 tn-storage = { workspace = true }
-tn-block-validator = { workspace = true }
+tn-batch-validator = { workspace = true }
 reth-chainspec = { workspace = true }
 reth-db = { workspace = true }
 reth-db-common = { workspace = true }
 tn-engine = { workspace = true }
-tn-block-builder = { workspace = true, features = ["test-utils"] }
+tn-batch-builder = { workspace = true, features = ["test-utils"] }
 
 # TODO: only used for canon it test
 reth-prune = { workspace = true }

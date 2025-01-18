@@ -154,7 +154,7 @@ fn build_anemo_services(out_dir: &Path) {
             anemo_build::manual::Method::builder()
                 .name("report_block")
                 .route_name("ReportBlock")
-                .request_type("crate::WorkerBlockMessage")
+                .request_type("crate::WorkerBatchMessage")
                 .response_type("()")
                 .codec_path(codec_path)
                 .build(),

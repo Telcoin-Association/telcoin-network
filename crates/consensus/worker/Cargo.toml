@@ -39,7 +39,7 @@ anemo = { workspace = true }
 anemo-tower = { workspace = true }
 eyre = { workspace = true }
 anyhow = { workspace = true }
-tn-block-validator = { workspace = true }
+tn-batch-validator = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

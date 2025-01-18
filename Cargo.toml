@@ -21,8 +21,8 @@ members = [
     "crates/consensus/primary-metrics",
 
     # execution
-    "crates/execution/block-builder",
-    "crates/execution/block-validator",
+    "crates/execution/batch-builder",
+    "crates/execution/batch-validator",
     "crates/execution/faucet",
     "crates/execution/tn-rpc",
 ]
@@ -189,11 +189,11 @@ revm-primitives = { version = "9.0", features = [
 alloy = { version = "0.3.6", features = ["full"] }
 alloy-rlp = "0.3.4"
 
-tn-block-validator = { path = "crates/execution/block-validator" }
+tn-batch-validator = { path = "crates/execution/batch-validator" }
 tn-engine = { path = "crates/engine" }
 
-# block maker
-tn-block-builder = { path = "crates/execution/block-builder" }
+# batch maker
+tn-batch-builder = { path = "crates/execution/batch-builder" }
 futures-util = "0.3.25"
 jsonrpsee = { version = "0.24" }
 jsonrpsee-types = { version = "0.24" }

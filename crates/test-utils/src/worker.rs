@@ -43,7 +43,7 @@ impl<DB: Database> WorkerNodeDetails<DB> {
 
         info!(target: "cluster::worker", "starting worker-{} for authority {}", self.id, self.name);
 
-        self.node.start(execution_node.new_block_validator().await).await?;
+        self.node.start(execution_node.new_batch_validator().await).await?;
 
         self.store_path = store_path;
 

@@ -11,7 +11,7 @@ use fastcrypto::encoding::{Encoding, Hex};
 use prometheus::Registry;
 use std::time::Duration;
 use tempfile::TempDir;
-use tn_block_validator::NoopBlockValidator;
+use tn_batch_validator::NoopBlockValidator;
 use tn_primary::{
     consensus::{LeaderSchedule, LeaderSwapTable},
     Primary,

@@ -105,7 +105,7 @@ where
     // start the primary
     let mut primary_task_manager = primary.start().await?;
 
-    let validator = engine.new_block_validator().await;
+    let validator = engine.new_batch_validator().await;
     // start the worker
     let (mut worker_task_manager, block_provider) = worker.start(validator).await?;
 
