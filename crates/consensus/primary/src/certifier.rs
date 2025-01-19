@@ -182,7 +182,7 @@ impl<DB: Database> Certifier<DB> {
                     let response = response.into_body();
                     debug!(target: "primary::certifier", ?authority, ?response, "Ok response received after request vote");
                     if response.vote.is_some() {
-                        break response.vote.unwrap();
+                        break response.vote.expect("response vote is_some");
                     }
                     missing_parents = response.missing;
                 }

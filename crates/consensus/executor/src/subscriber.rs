@@ -397,8 +397,9 @@ impl<DB: Database> Subscriber<DB> {
                         loop {
                             // stop trying at some point?
                             // rotate through clients attempting to get the headers.
-                            let client =
-                                clients.get_mut((number as usize + try_num) % clients_len).unwrap();
+                            let client = clients
+                                .get_mut((number as usize + try_num) % clients_len)
+                                .expect("client found by index");
                             let req = ConsensusOutputRequest { number: Some(number), hash: None };
                             match client.request_consensus(req).await {
                                 Ok(res) => break res.into_body().output,
@@ -622,7 +623,7 @@ impl<DB: Database> Subscriber<DB> {
                         self.inner
                             .committee
                             .authority(&self.inner.authority_id)
-                            .unwrap()
+                            .expect("own workers in worker cache")
                             .protocol_key(),
                         worker_id,
                     )

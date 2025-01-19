@@ -94,7 +94,10 @@ impl<DB: Database> Primary<DB> {
         // (peer count from admin server)
         //
         // Add my workers
-        for worker in config.worker_cache().our_workers(config.authority().protocol_key()).unwrap()
+        for worker in config
+            .worker_cache()
+            .our_workers(config.authority().protocol_key())
+            .expect("own workers in worker cache")
         {
             let (peer_id, address) =
                 Self::add_peer_in_network(&network, worker.name, &worker.worker_address);
@@ -199,7 +202,7 @@ impl<DB: Database> Primary<DB> {
         // Spawn the network receiver listening to messages from the other primaries.
         let address = config.authority().primary_network_address();
         let address =
-            address.replace(0, |_protocol| Some(Protocol::Ip4(Ipv4Addr::UNSPECIFIED))).unwrap();
+            address.replace(0, |_protocol| Some(Protocol::Ip4(Ipv4Addr::UNSPECIFIED))).expect("");
         let mut primary_service = PrimaryToPrimaryServer::new(PrimaryReceiverHandler::new(
             config.clone(),
             synchronizer,

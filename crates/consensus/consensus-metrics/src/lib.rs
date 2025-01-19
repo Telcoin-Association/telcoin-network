@@ -252,7 +252,9 @@ pub fn start_prometheus_server(addr: SocketAddr) {
     let app = Router::new().route(METRICS_ROUTE, get(metrics));
 
     tokio::spawn(async move {
-        axum::Server::bind(&addr).serve(app.into_make_service()).await.unwrap();
+        if let Err(e) = axum::Server::bind(&addr).serve(app.into_make_service()).await {
+            tracing::error!(target: "prometheus", ?e, "server returned error");
+        }
     });
 }
 

@@ -108,7 +108,7 @@ impl ConsensusState {
         info!("Recreating dag from last GC round: {}", gc_round);
 
         // get all certificates at rounds > gc_round
-        let certificates = cert_store.after_round(gc_round + 1).unwrap();
+        let certificates = cert_store.after_round(gc_round + 1).expect("database available");
 
         let mut num_certs = 0;
         for cert in &certificates {
@@ -421,8 +421,11 @@ impl<DB: Database> Consensus<DB> {
             if !committed_certificates.is_empty() {
                 // Highest committed certificate round is the leader round / commit round
                 // expected by primary.
-                let leader_commit_round =
-                    committed_certificates.iter().map(|c| c.round()).max().unwrap();
+                let leader_commit_round = committed_certificates
+                    .iter()
+                    .map(|c| c.round())
+                    .max()
+                    .expect("committed_certificates isn't empty");
 
                 self.consensus_bus
                     .committed_certificates()
