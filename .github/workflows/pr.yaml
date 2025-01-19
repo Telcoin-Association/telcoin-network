@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
       - id: check
         run: |
-          MAINTAINERS=("grantkee" "sstanfield" "robriks")
+          MAINTAINERS=("sstanfield" "robriks")
           if [[ " ${MAINTAINERS[@]} " =~ " ${{ github.event.pull_request.user.login }} " ]]; then
             echo "is_maintainer=true" >> $GITHUB_OUTPUT
           else
