@@ -201,8 +201,6 @@ impl<DB: Database> Primary<DB> {
     ) -> Network {
         // Spawn the network receiver listening to messages from the other primaries.
         let address = config.authority().primary_network_address();
-        let address =
-            address.replace(0, |_protocol| Some(Protocol::Ip4(Ipv4Addr::UNSPECIFIED))).expect("");
         let mut primary_service = PrimaryToPrimaryServer::new(PrimaryReceiverHandler::new(
             config.clone(),
             synchronizer,
