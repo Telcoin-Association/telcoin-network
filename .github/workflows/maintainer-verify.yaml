@@ -1,13 +1,14 @@
 name: Maintainer Verify
 on:
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, review_requested, ready_for_review]
+  workflow_run:
+    workflows: ["Pull Request Checks"]
+    types:
+      - completed
 
 # TODO: use environments after repo is public with "required reviewers"
 jobs:
   verify-on-chain:
-    if: github.event.pull_request.draft == false
+    if: github.event.pull_request.draft == false && ${{ github.event.workflow_run.conclusion == 'success' }}
     environment: merge-into-main
     runs-on: ${{ matrix.os }}
     strategy:
