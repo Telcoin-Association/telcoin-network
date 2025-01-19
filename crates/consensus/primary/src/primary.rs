@@ -24,7 +24,7 @@ use anemo_tower::{
 };
 use consensus_metrics::monitored_future;
 use fastcrypto::traits::KeyPair as _;
-use std::{collections::HashMap, net::Ipv4Addr, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 use tn_config::ConsensusConfig;
 use tn_network::{
     epoch_filter::{AllowedEpoch, EPOCH_HEADER_KEY},
@@ -33,7 +33,7 @@ use tn_network::{
 };
 use tn_network_types::PrimaryToPrimaryServer;
 use tn_storage::traits::Database;
-use tn_types::{traits::EncodeDecodeBase64, Multiaddr, NetworkPublicKey, Protocol, TaskManager};
+use tn_types::{traits::EncodeDecodeBase64, Multiaddr, NetworkPublicKey, TaskManager};
 use tower::ServiceBuilder;
 use tracing::info;
 
