@@ -9,7 +9,7 @@ Please reach out on [telcoin-network discord channel](https://discord.com/channe
 
 ### Code of Conduct
 
-The Telcoin Network project adheres to the [Rust Code of Conduct][https://www.rust-lang.org/policies/code-of-conduct].
+The Telcoin Network project adheres to the [Rust Code of Conduct](https://www.rust-lang.org/policies/code-of-conduct).
 Contributers should reference this code of conduct to ensure they're following the _minimum_ expected behavior in this repo.
 
 Any violation of this Code of Conduct can be reported by emailing [devs@telcoin.org](mailto:devs@telcoin.org).
@@ -98,20 +98,7 @@ We ask that you only provide reviews with the explicit goal of bettering the pro
 If you believe a PR should not be merged, take the time to explain your concerns in great detail so others can understand.
 
 Please be open to feedback and considering different perspectives on solving problems.
-
-Reviews that are disrespectful to the contributor or any other review directly breach the [Code of Conduct]()
-
-**Any Reth community member is welcome to review any pull request**.
-
-All contributors who choose to review and provide feedback on pull requests have a responsibility to both the project
-and individual making the contribution. Reviews and feedback must be helpful, insightful, and geared towards improving
-the contribution as opposed to simply blocking it. If there are reasons why you feel the PR should not be merged,
-explain what those are. Do not expect to be able to block a PR from advancing simply because you say "no" without giving
-an explanation. Be open to having your mind changed. Be open to working _with_ the contributor to make the pull request
-better.
-
-Reviews that are dismissive or disrespectful of the contributor or any other reviewers are strictly counter to
-the [Code of Conduct][https://www.rust-lang.org/policies/code-of-conduct].
+Reviews that are disrespectful to the contributor or any other review directly breach the [Code of Conduct](https://www.rust-lang.org/policies/code-of-conduct).
 
 The goal is to work together as an open-source community to develop the best protocol possible.
 
