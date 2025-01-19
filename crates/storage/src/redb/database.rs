@@ -234,7 +234,7 @@ impl Database for ReDB {
                     Box::new(
                         table.iter().expect("Unable to get a DB iter").filter(|r| r.is_ok()).map(
                             |r| {
-                                let (k, v) = r.unwrap();
+                                let (k, v) = r.expect("row is okay");
                                 (k.value().clone(), v.value().clone())
                             },
                         ),
@@ -266,7 +266,7 @@ impl Database for ReDB {
                             .expect("Unable to get a DB iter")
                             .filter(|r| r.is_ok())
                             .map(|r| {
-                                let (k, v) = r.unwrap();
+                                let (k, v) = r.expect("row is okay");
                                 (k.value().clone(), v.value().clone())
                             })
                             .skip_while(move |(k, _)| k < &key),
@@ -298,7 +298,7 @@ impl Database for ReDB {
                             .rev()
                             .filter(|r| r.is_ok())
                             .map(|r| {
-                                let (k, v) = r.unwrap();
+                                let (k, v) = r.expect("row is okay");
                                 (k.value().clone(), v.value().clone())
                             }),
                     )

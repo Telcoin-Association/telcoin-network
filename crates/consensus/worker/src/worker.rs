@@ -152,7 +152,7 @@ impl<DB: Database> Worker<DB> {
             .network_admin_server
             .worker_network_admin_server_base_port
             .checked_add(id)
-            .unwrap();
+            .expect("only 1 worker for now, so 0 added to valid admin server port");
         info!(target: "worker::worker",
             "Worker {} listening to network admin messages on 127.0.0.1:{}",
             id, network_admin_server_base_port
@@ -226,7 +226,7 @@ impl<DB: Database> Worker<DB> {
         }
 
         let address = Self::worker_address(&id, consensus_config);
-        let addr = address.to_anemo_address().unwrap();
+        let addr = address.to_anemo_address().expect("worker uses valid anemo address");
         let epoch_string: String = consensus_config.committee().epoch().to_string();
         let worker_peer_ids = consensus_config
             .worker_cache()
@@ -251,7 +251,7 @@ impl<DB: Database> Worker<DB> {
             )))
             .layer(CallbackLayer::new(FailpointsMakeCallbackHandler::new()))
             .layer(SetResponseHeaderLayer::overriding(
-                EPOCH_HEADER_KEY.parse().unwrap(),
+                EPOCH_HEADER_KEY.parse().expect("epoch header key parses"),
                 epoch_string.clone(),
             ))
             .service(routes);
@@ -268,7 +268,7 @@ impl<DB: Database> Worker<DB> {
             )))
             .layer(CallbackLayer::new(FailpointsMakeCallbackHandler::new()))
             .layer(SetRequestHeaderLayer::overriding(
-                EPOCH_HEADER_KEY.parse().unwrap(),
+                EPOCH_HEADER_KEY.parse().expect("epoch header key parses"),
                 epoch_string,
             ))
             .into_inner();
@@ -323,7 +323,7 @@ impl<DB: Database> Worker<DB> {
         address: &Multiaddr,
     ) -> (PeerId, Address) {
         let peer_id = PeerId(peer_name.0.to_bytes());
-        let address = address.to_anemo_address().unwrap();
+        let address = address.to_anemo_address().expect("worker uses valid anemo address");
         let peer_info = PeerInfo {
             peer_id,
             affinity: anemo::types::PeerAffinity::High,

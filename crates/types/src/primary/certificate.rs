@@ -80,10 +80,9 @@ impl Certificate {
     fn new_unsafe(
         committee: &Committee,
         header: Header,
-        votes: Vec<(AuthorityIdentifier, BlsSignature)>,
+        mut votes: Vec<(AuthorityIdentifier, BlsSignature)>,
         check_stake: bool,
     ) -> DagResult<Certificate> {
-        let mut votes = votes;
         votes.sort_by_key(|(pk, _)| *pk);
         let mut votes: VecDeque<_> = votes.into_iter().collect();
 
@@ -94,12 +93,16 @@ impl Certificate {
             .authorities()
             .enumerate()
             .filter(|(_, authority)| {
-                if !votes.is_empty() && authority.id() == votes.front().unwrap().0 {
-                    sigs.push(votes.pop_front().unwrap());
+                if !votes.is_empty() && authority.id() == votes.front().expect("votes not empty").0
+                {
+                    sigs.push(votes.pop_front().expect("votes not empty"));
                     weight += authority.stake();
                     // If there are repeats, also remove them
-                    while !votes.is_empty() && votes.front().unwrap() == sigs.last().unwrap() {
-                        votes.pop_front().unwrap();
+                    while !votes.is_empty()
+                        && votes.front().expect("votes not empty")
+                            == sigs.last().expect("votes not empty")
+                    {
+                        votes.pop_front().expect("votes not empty");
                     }
                     return true;
                 }
@@ -111,7 +114,10 @@ impl Certificate {
             .map_err(|_| DagError::InvalidBitmap("Failed to convert votes into a bitmap of authority keys. Something is likely very wrong...".to_string()))?;
 
         // Ensure that all authorities in the set of votes are known
-        ensure!(votes.is_empty(), DagError::UnknownAuthority(votes.front().unwrap().0.to_string()));
+        ensure!(
+            votes.is_empty(),
+            DagError::UnknownAuthority(votes.front().expect("votes not empty").0.to_string())
+        );
 
         // Ensure that the authorities have enough weight
         ensure!(

@@ -90,7 +90,7 @@ impl Header {
             latest_execution_block_num: latest_execution_block.number,
         };
         let digest = Hash::digest(&header);
-        header.digest.set(digest).unwrap();
+        header.digest.set(digest).expect("digest oncecell empty for new header");
         header
     }
 
@@ -125,7 +125,13 @@ impl Header {
         // Ensure all worker ids are correct.
         for (worker_id, _) in self.payload.values() {
             worker_cache
-                .worker(committee.authority(&self.author).unwrap().protocol_key(), worker_id)
+                .worker(
+                    committee
+                        .authority(&self.author)
+                        .expect("own worker in worker cache")
+                        .protocol_key(),
+                    worker_id,
+                )
                 .map_err(|_| DagError::HeaderHasBadWorkerIds(self.digest()))?;
         }
 
@@ -236,20 +242,20 @@ impl HeaderBuilder {
     /// need to be visited.
     pub fn build(self) -> Result<Header, fastcrypto::error::FastCryptoError> {
         let h = Header {
-            author: self.author.unwrap(),
-            round: self.round.unwrap(),
-            epoch: self.epoch.unwrap(),
+            author: self.author.expect("author set for header builder"),
+            round: self.round.expect("round set for header builder"),
+            epoch: self.epoch.expect("epoch set for header builder"),
             created_at: self.created_at.unwrap_or(0),
-            payload: self.payload.unwrap(),
+            payload: self.payload.expect("payload set for header builder"),
             system_messages: self.system_messages.unwrap_or_default(),
-            parents: self.parents.unwrap(),
+            parents: self.parents.expect("parents set for header builder"),
             digest: OnceCell::default(),
             latest_execution_block: self.latest_execution_block.unwrap_or_default(),
             latest_execution_block_num: self.latest_execution_block_num.unwrap_or_default(),
         };
 
         // TODO: return error here
-        h.digest.set(Hash::digest(&h)).unwrap();
+        h.digest.set(Hash::digest(&h)).expect("digest oncecell empty for new header");
 
         Ok(h)
     }
