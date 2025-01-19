@@ -1,0 +1,25 @@
+name: Maintainer Verify
+on:
+  workflow_dispatch:
+
+# TODO: use environments after repo is public with "required reviewers"
+jobs:
+  verify-on-chain:
+    if: github.event.pull_request.draft == false
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest] # macos-latest?
+    steps:
+      # checkout repo to use `verify_commit_hash.sh`
+      - name: checkout repo
+        uses: actions/checkout@v4
+      # install foundry toolchain for casting txs
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+      # query adiri for commit hash
+      - name: verify commit hash on adiri
+        env:
+          COMMIT_HASH: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/verify_commit_hash.sh
