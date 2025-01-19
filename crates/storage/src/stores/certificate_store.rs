@@ -71,7 +71,7 @@ impl<DB: Database> CertificateStore<DB> {
 
     /// Inserts a certificate to the store
     pub fn write(&self, certificate: Certificate) -> StoreResult<()> {
-        fail_point!("narwhal-store-before-write");
+        fail_point!("certificate-store-before-write");
         let mut txn = self.db.write_txn()?;
 
         let id = certificate.digest();
@@ -79,7 +79,7 @@ impl<DB: Database> CertificateStore<DB> {
         self.save_cert(&mut txn, id, certificate)?;
 
         txn.commit()?;
-        fail_point!("narwhal-store-after-write");
+        fail_point!("certificate-store-after-write");
         self.gc_rounds(round)?;
         Ok(())
     }
@@ -91,7 +91,7 @@ impl<DB: Database> CertificateStore<DB> {
         &self,
         certificates: impl IntoIterator<Item = Certificate>,
     ) -> StoreResult<()> {
-        fail_point!("narwhal-store-before-write");
+        fail_point!("certificate-store-before-write");
 
         let mut txn = self.db.write_txn()?;
         let mut round = 0;
@@ -106,7 +106,7 @@ impl<DB: Database> CertificateStore<DB> {
 
         txn.commit()?;
         self.gc_rounds(round)?;
-        fail_point!("narwhal-store-after-write");
+        fail_point!("certificate-store-after-write");
         Ok(())
     }
 
@@ -172,7 +172,7 @@ impl<DB: Database> CertificateStore<DB> {
 
     /// Deletes a single certificate by its digest.
     pub fn delete(&self, id: CertificateDigest) -> StoreResult<()> {
-        fail_point!("narwhal-store-before-write");
+        fail_point!("certificate-store-before-write");
         let mut txn = self.db.write_txn()?;
         // first read the certificate to get the round - we'll need in order
         // to delete the secondary index
@@ -190,13 +190,13 @@ impl<DB: Database> CertificateStore<DB> {
         txn.remove::<CertificateDigestByRound>(&key)?;
 
         txn.commit()?;
-        fail_point!("narwhal-store-after-write");
+        fail_point!("certificate-store-after-write");
         Ok(())
     }
 
     /// Deletes multiple certificates in an atomic way.
     pub fn delete_all(&self, ids: impl IntoIterator<Item = CertificateDigest>) -> StoreResult<()> {
-        fail_point!("narwhal-store-before-write");
+        fail_point!("certificate-store-before-write");
         let mut txn = self.db.write_txn()?;
 
         for id in ids {
@@ -215,7 +215,7 @@ impl<DB: Database> CertificateStore<DB> {
         }
 
         txn.commit()?;
-        fail_point!("narwhal-store-after-write");
+        fail_point!("certificate-store-after-write");
         Ok(())
     }
 
@@ -392,7 +392,7 @@ impl<DB: Database> CertificateStore<DB> {
 
     /// Clears both the main storage of the certificates and the secondary index
     pub fn clear(&self) -> StoreResult<()> {
-        fail_point!("narwhal-store-before-write");
+        fail_point!("certificate-store-before-write");
         let mut txn = self.db.write_txn()?;
 
         txn.clear_table::<Certificates>()?;
@@ -400,7 +400,7 @@ impl<DB: Database> CertificateStore<DB> {
         txn.clear_table::<CertificateDigestByOrigin>()?;
 
         txn.commit()?;
-        fail_point!("narwhal-store-after-write");
+        fail_point!("certificate-store-after-write");
         Ok(())
     }
 

@@ -22,12 +22,12 @@ impl<DB: Database> PayloadStore<DB> {
     }
 
     pub fn write(&self, digest: &BlockHash, worker_id: &WorkerId) -> eyre::Result<()> {
-        fail_point!("narwhal-store-before-write");
+        fail_point!("payload-store-before-write");
 
         self.store.insert::<Payload>(&(*digest, *worker_id), &0u8)?;
         self.notify_subscribers.notify(&(*digest, *worker_id), &());
 
-        fail_point!("narwhal-store-after-write");
+        fail_point!("payload-store-after-write");
         Ok(())
     }
 
@@ -37,7 +37,7 @@ impl<DB: Database> PayloadStore<DB> {
         &self,
         keys: impl IntoIterator<Item = (BlockHash, WorkerId)> + Clone,
     ) -> eyre::Result<()> {
-        fail_point!("narwhal-store-before-write");
+        fail_point!("payload-store-before-write");
         let mut txn = self.store.write_txn()?;
         for (digest, worker_id) in keys {
             txn.insert::<Payload>(&(digest, worker_id), &0u8)?;
@@ -45,7 +45,7 @@ impl<DB: Database> PayloadStore<DB> {
         }
 
         txn.commit()?;
-        fail_point!("narwhal-store-after-write");
+        fail_point!("payload-store-after-write");
         Ok(())
     }
 
@@ -93,7 +93,7 @@ impl<DB: Database> PayloadStore<DB> {
         &self,
         keys: impl IntoIterator<Item = (BlockHash, WorkerId)>,
     ) -> eyre::Result<()> {
-        fail_point!("narwhal-store-before-write");
+        fail_point!("payload-store-before-write");
         let mut txn = self.store.write_txn()?;
 
         for key in keys.into_iter() {
@@ -101,7 +101,7 @@ impl<DB: Database> PayloadStore<DB> {
         }
 
         txn.commit()?;
-        fail_point!("narwhal-store-after-write");
+        fail_point!("payload-store-after-write");
         Ok(())
     }
 }

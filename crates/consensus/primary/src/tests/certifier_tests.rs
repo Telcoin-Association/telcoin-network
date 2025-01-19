@@ -98,7 +98,7 @@ async fn propose_header_failure() {
     // Set up network.
     let own_address = committee.primary_by_id(&authority_id).unwrap().to_anemo_address().unwrap();
     let network = anemo::Network::bind(own_address)
-        .server_name("narwhal")
+        .server_name("tn-test")
         .private_key(network_key)
         .start(anemo::Router::new())
         .unwrap();

@@ -135,7 +135,7 @@ impl TelcoinDirs for DataDirChainPath {
     }
 
     fn consensus_db_path(&self) -> PathBuf {
-        self.0.as_ref().join("narwhal-db")
+        self.0.as_ref().join("consensus-db")
     }
 }
 

@@ -42,14 +42,14 @@ where
 
     info!(target: "telcoin::node", "execution engine created");
 
-    let narwhal_db_path = tn_datadir.consensus_db_path();
+    let consensus_db_path = tn_datadir.consensus_db_path();
 
-    tracing::info!(target: "telcoin::cli", "opening node storage at {:?}", narwhal_db_path);
+    tracing::info!(target: "telcoin::cli", "opening node storage at {:?}", consensus_db_path);
 
     // open storage for consensus
     // In case the DB dir does not yet exist.
-    let _ = std::fs::create_dir_all(&narwhal_db_path);
-    let db = open_db(&narwhal_db_path);
+    let _ = std::fs::create_dir_all(&consensus_db_path);
+    let db = open_db(&consensus_db_path);
     let node_storage = NodeStorage::reopen(db);
     tracing::info!(target: "telcoin::cli", "node storage open");
     let key_config = KeyConfig::new(&tn_datadir)?;

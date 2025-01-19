@@ -99,7 +99,7 @@ pub fn test_network(keypair: NetworkKeypair, address: &Multiaddr) -> anemo::Netw
     let address = address.to_anemo_address().unwrap();
     let network_key = keypair.private().0.to_bytes();
     anemo::Network::bind(address)
-        .server_name("narwhal")
+        .server_name("tn-test")
         .private_key(network_key)
         .start(anemo::Router::new())
         .unwrap()

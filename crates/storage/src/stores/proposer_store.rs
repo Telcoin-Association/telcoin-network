@@ -21,11 +21,11 @@ impl<DB: Database> ProposerStore<DB> {
     /// Inserts a proposed header into the store
     #[allow(clippy::let_and_return)]
     pub fn write_last_proposed(&self, header: &Header) -> StoreResult<()> {
-        fail_point!("narwhal-store-before-write");
+        fail_point!("proposer-store-before-write");
 
         let result = self.last_proposed.insert::<LastProposed>(&LAST_PROPOSAL_KEY, header);
 
-        fail_point!("narwhal-store-after-write");
+        fail_point!("proposer-store-after-write");
         result
     }
 

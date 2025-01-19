@@ -269,7 +269,7 @@ impl<DB: Database> AuthorityFixture<DB> {
     /// Create a new anemo network for consensus.
     pub fn new_network(&self, router: anemo::Router) -> anemo::Network {
         anemo::Network::bind(self.authority.primary_network_address().to_anemo_address().unwrap())
-            .server_name("narwhal")
+            .server_name("tn-test")
             .private_key(self.primary_network_keypair().private().0.to_bytes())
             .start(router)
             .unwrap()

@@ -77,7 +77,7 @@ impl WorkerFixture {
 
     pub fn new_network(&self, router: anemo::Router) -> anemo::Network {
         anemo::Network::bind(self.info().worker_address.to_anemo_address().unwrap())
-            .server_name("narwhal")
+            .server_name("tn-test")
             .private_key(self.keypair().private().0.to_bytes())
             .start(router)
             .unwrap()

@@ -180,7 +180,7 @@ async fn fetch_certificates_basic() {
             response: Arc::new(Mutex::new(rx_fetch_resp)),
         }));
     let fake_server_network = anemo::Network::bind(fake_primary_addr.clone())
-        .server_name("narwhal")
+        .server_name("tn-test")
         .private_key(fake_primary.primary_network_keypair().copy().private().0.to_bytes())
         .start(fake_route)
         .unwrap();
