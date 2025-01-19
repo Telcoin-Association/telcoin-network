@@ -633,7 +633,6 @@ async fn test_canonical_notification_updates_pool() {
 
     // assert 4th transaction demoted to queued pool
     let pool_size = txpool.pool_size();
-    println!("poolsize: {pool_size:?}");
     assert_eq!(pool_size.queued, 0);
     assert_eq!(pool_size.pending, 1);
 

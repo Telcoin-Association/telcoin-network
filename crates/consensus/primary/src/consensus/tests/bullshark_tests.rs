@@ -90,8 +90,7 @@ async fn commit_one_with_leader_schedule_change() {
     ];
 
     for mut test_case in test_cases {
-        println!("Running test case \"{}\"", test_case.description);
-
+        tracing::debug!("Running test case \"{}\"", test_case.description);
         // GIVEN
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let committee = fixture.committee();

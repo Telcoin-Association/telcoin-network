@@ -586,36 +586,3 @@ where
         .expect("latest header is some for gas price");
     header.next_block_base_fee(BaseFeeParams::ethereum()).unwrap_or_default().into()
 }
-
-#[cfg(test)]
-mod tests {
-
-    use super::*;
-    #[test]
-    fn test_print_key_info() {
-        // let mut rng = StdRng::from_seed([0; 32]);
-        // let keypair = ExecutionKeypair::generate(&mut rng);
-
-        let secp = Secp256k1::new();
-        let (secret_key, _public_key) = secp.generate_keypair(&mut rand::thread_rng());
-        let keypair = ExecutionKeypair::from_secret_key(&secp, &secret_key);
-
-        // let private = base64::encode(keypair.secret.as_bytes());
-        let _secret = keypair.secret_bytes();
-        // println!("secret: {:?}", hex::encode(secret));
-        let _pubkey = keypair.public_key().serialize();
-        // println!("public: {:?}", hex::encode(pubkey));
-
-        // 9bf49a6a0755f953811fce125f2683d50429c3bb49e074147e0089a52eae155f
-        // println!("{:?}", hex::encode(bytes));
-        // public key hex [0; 32]
-        // 029bef8d556d80e43ae7e0becb3a7e6838b95defe45896ed6075bb9035d06c9964
-        //
-        // let pkey = secp256k1::PublicKey::from_str(
-        //     "029bef8d556d80e43ae7e0becb3a7e6838b95defe45896ed6075bb9035d06c9964",
-        // )
-        // .unwrap();
-        // println!("{:?}", public_key_to_address(pkey));
-        // println!("pkey: {pkey:?}");
-    }
-}

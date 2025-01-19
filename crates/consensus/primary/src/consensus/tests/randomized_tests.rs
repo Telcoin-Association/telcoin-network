@@ -314,11 +314,6 @@ pub fn make_certificates_with_parameters(
             .collect()
     };
 
-    println!(
-        "Slow nodes: {:?}",
-        slow_nodes.iter().map(|(a, _)| a.id()).collect::<Vec<AuthorityIdentifier>>()
-    );
-
     let mut certificates = VecDeque::new();
     let mut parents = initial_parents;
     let mut next_parents = Vec::new();
@@ -470,15 +465,6 @@ fn generate_and_run_execution_plans<DB: Database>(
     modes: FailureModes,
     store: Arc<ConsensusStore<DB>>,
 ) {
-    println!(
-        "Running execution plans for run_id {} for rounds={}, committee={}, gc_depth={}, modes={:?}",
-        run_id,
-        dag_rounds,
-        committee.size(),
-        gc_depth,
-        modes
-    );
-
     let mut executed_plans = HashSet::new();
     let mut committed_certificates = Vec::new();
 
@@ -489,7 +475,6 @@ fn generate_and_run_execution_plans<DB: Database>(
 
         let hash = plan.hash();
         if !executed_plans.insert(hash) {
-            println!("Skipping plan with seed {}, same executed already", seed);
             continue;
         }
 
@@ -545,8 +530,6 @@ fn generate_and_run_execution_plans<DB: Database>(
             );
         }
     }
-
-    println!("Successfully run {}", run_id);
 }
 
 /// This method is accepting a list of certificates that have been created to represent a valid
