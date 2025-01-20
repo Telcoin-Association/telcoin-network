@@ -1,8 +1,16 @@
 services:
-  setup1:
+  # build image once
+  telcoin-base:
+    image: local-telcoin-network:latest
     build:
       context: ../
       dockerfile: etc/Dockerfile
+
+  # use built image for all 4 services
+  setup1:
+    image: local-telcoin-network:latest
+    depends_on:
+      - telcoin-base
     environment:
       - NARWHAL_HOST=10.10.0.21
       - EXECUTION_ADDRESS=0x1111111111111111111111111111111111111111
@@ -14,9 +22,9 @@ services:
       - ./setup_validator.sh:/setup_validator.sh
       - validator1-data:/home/nonroot/data
   setup2:
-    build:
-      context: ../
-      dockerfile: etc/Dockerfile
+    image: local-telcoin-network:latest
+    depends_on:
+      - telcoin-base
     environment:
       - NARWHAL_HOST=10.10.0.22
       - EXECUTION_ADDRESS=0x2222222222222222222222222222222222222222
@@ -28,9 +36,9 @@ services:
       - ./setup_validator.sh:/setup_validator.sh
       - validator2-data:/home/nonroot/data
   setup3:
-    build:
-      context: ../
-      dockerfile: etc/Dockerfile
+    image: local-telcoin-network:latest
+    depends_on:
+      - telcoin-base
     environment:
       - NARWHAL_HOST=10.10.0.23
       - EXECUTION_ADDRESS=0x3333333333333333333333333333333333333333
@@ -42,9 +50,9 @@ services:
       - ./setup_validator.sh:/setup_validator.sh
       - validator3-data:/home/nonroot/data
   setup4:
-    build:
-      context: ../
-      dockerfile: etc/Dockerfile
+    image: local-telcoin-network:latest
+    depends_on:
+      - telcoin-base
     environment:
       - NARWHAL_HOST=10.10.0.24
       - EXECUTION_ADDRESS=0x4444444444444444444444444444444444444444
@@ -56,10 +64,9 @@ services:
       - ./setup_validator.sh:/setup_validator.sh
       - validator4-data:/home/nonroot/data
 
+  # create and distribute committee / worker cache files
   comittee:
-    build:
-      context: ../
-      dockerfile: etc/Dockerfile
+    image: local-telcoin-network:latest
     user: "root"
     command: >
       bash -c "
@@ -84,59 +91,80 @@ services:
       - validator3-data:/home/nonroot/data/validator-3
       - validator4-data:/home/nonroot/data/validator-4
 
+  # start nodes
   validator1:
-    build:
-      context: ../
-      dockerfile: etc/Dockerfile
+    image: local-telcoin-network:latest
     depends_on:
       - comittee
     environment:
       - RUST_LOG=info,execution=debug
-    command: /usr/local/bin/telcoin node --datadir /home/nonroot/data --dev --chain adiri --http.addr 0.0.0.0 --public-key 0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99 
+    command: >
+      /usr/local/bin/telcoin node
+      --datadir /home/nonroot/data
+      --dev
+      --chain adiri
+      --http.addr 0.0.0.0
+      --http.port 8545
+      --public-key 0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99
     ports:
-      - 8544:8544
+      - 8545:8545
     volumes:
       - validator1-data:/home/nonroot/data
     networks:
       validators:
         ipv4_address: 10.10.0.21
   validator2:
-    build:
-      context: ../
-      dockerfile: etc/Dockerfile
+    image: local-telcoin-network:latest
     depends_on:
       - comittee
-    command: /usr/local/bin/telcoin node --datadir /home/nonroot/data --dev --chain adiri --http.addr 0.0.0.0 --public-key 0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99 
+    command: >
+      /usr/local/bin/telcoin node
+      --datadir /home/nonroot/data
+      --dev
+      --chain adiri
+      --http.addr 0.0.0.0
+      --http.port 8545
+      --public-key 0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99
     ports:
-      - 8545:8544
+      - 8544:8545
     volumes:
       - validator2-data:/home/nonroot/data
     networks:
       validators:
         ipv4_address: 10.10.0.22
   validator3:
-    build:
-      context: ../
-      dockerfile: etc/Dockerfile
+    image: local-telcoin-network:latest
     depends_on:
       - comittee
-    command: /usr/local/bin/telcoin node --datadir /home/nonroot/data --dev --chain adiri --http.addr 0.0.0.0 --public-key 0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99 
+    command: >
+      /usr/local/bin/telcoin node
+      --datadir /home/nonroot/data
+      --dev
+      --chain adiri
+      --http.addr 0.0.0.0
+      --http.port 8545
+      --public-key 0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99
     ports:
-      - 8546:8544
+      - 8543:8545
     volumes:
       - validator3-data:/home/nonroot/data
     networks:
       validators:
         ipv4_address: 10.10.0.23
   validator4:
-    build:
-      context: ../
-      dockerfile: etc/Dockerfile
+    image: local-telcoin-network:latest
     depends_on:
       - comittee
-    command: /usr/local/bin/telcoin node --datadir /home/nonroot/data --dev --chain adiri --http.addr 0.0.0.0 --public-key 0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99
+    command: >
+      /usr/local/bin/telcoin node
+      --datadir /home/nonroot/data
+      --dev
+      --chain adiri
+      --http.addr 0.0.0.0
+      --http.port 8545
+      --public-key 0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99
     ports:
-      - 8547:8544
+      - 8542:8545
     volumes:
       - validator4-data:/home/nonroot/data
     networks:
