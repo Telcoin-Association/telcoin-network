@@ -46,7 +46,7 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
-      - name: Install nightly toolchain
+      - name: Install nightly toolchain # pin nightly version
         run: |
           rustup toolchain install nightly-2025-01-19 --component rust-src clippy
           rustup default nightly-2025-01-19
@@ -62,14 +62,14 @@ jobs:
       - name: Check formatting
         run: |
           rustc --version
-          cargo +nightly version
-          cargo +nightly fmt --verbose -- --check
+          cargo +nightly-2025-01-19 version
+          cargo +nightly-2025-01-19 fmt --verbose -- --check
       - name: Run clippy
         run: |
           rustc --version
-          cargo +nightly version
-          cargo +nightly clippy --version
-          cargo +nightly clippy --verbose --all --all-features -- -D warnings
+          cargo +nightly-2025-01-19 version
+          cargo +nightly-2025-01-19 clippy --version
+          cargo +nightly-2025-01-19 clippy --verbose --all --all-features -- -D warnings
       - name: Run tests
         if: matrix.os == 'ubuntu-latest' || github.event_name == 'push'
         run: cargo test --workspace --exclude tn-faucet -- --quiet
