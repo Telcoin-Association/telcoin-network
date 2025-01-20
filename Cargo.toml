@@ -39,7 +39,12 @@ rust-version = "1.81"
 license = "MIT OR Apache-2.0"
 homepage = "https://telcoin.network"
 repository = "https://github.com/telcoin/telcoin-network"
-authors = ["Grant Kee", "Steve Stanfield", "Markus Osterlund"]
+authors = [
+    "Grant Kee <grant@telcoin.org>",
+    "Steve Stanfield <steve@telcoin.org>",
+    "Markus Osterlund <markus@telcoin.org>",
+    "Telcoin Association <devs@telconi.org>",
+]
 description = "Telcoin Network protocol."
 exclude = [".github/"]
 
