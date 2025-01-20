@@ -5,6 +5,38 @@ Execution layer (EL) produces EVM blocks compatible with Ethereum.
 
 Requires Rust 1.81
 
+
+## Quick Start
+
+Check out the repo and update the submodules:
+```make init-submodules``` or ```git submodule update --init --recursive```
+
+Run the test network script to start four local validators and begin advancing the chain:
+```etc/local-testnet.sh --start --dev-funds 0xADDRESS```
+Note: the script will compile a release build, which may take a few minutes.
+This configures and create genesis for a new network and starts it.  See the output for the RPC endpoints.
+0xADDRESS above should be a valid address prepended with 0x.  Make sure you have the key for this address,
+it will be funded with 1billion TEL on your test network.  After configuration you can run the script with
+just the --start option (--dev-funds is only used when configuring and CAN NOT be used later to fund
+an account).  Nodes run in the backgound and should be killed with the ```kill``` or ```killall``` commands.
+
+The best docs for running a test network will currently be this script.  It is short and pretty basic,
+it configures each node, brings together the configs to create genesis and then shares this with each node.
+This is the same basic procedure used to create nodes on diffent machines (NOTE- do not use the instance
+option if not running on the same machine, it is to avoid port conflicts).
+
+Note that network operation is under heavy dev and somewhat rough right now but it should be possible to
+bring up a reliable test network.
+
+Once started you can use the RPC endpoint for any node with you favorate Ethereum tooling to test.
+You will have test funds in your dev funds account set during config.  The network can be restarted
+by shutting down, ```killall telcoin-network``` is good for this, deleting ./local-validators/ and
+rerunning the script.
+
+The defaults should build a block roughly every 10 seconds, see comments on the script if you want to
+speed this up for testing.
+
+
 ## CLI Usage
 
 The CLI is used to create validator information, join a committee, and start the network.
