@@ -1,4 +1,4 @@
-.PHONY: help attest udeps check test test-faucet fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators
+.PHONY: help attest udeps check test test-faucet fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators init-submodules update-tn-contracts revert-submodule
 
 # full path for the Makefile
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -127,3 +127,10 @@ init-submodules:
 # update tn-contracts submodule
 update-tn-contracts:
 	git submodule update --remote ;
+
+# revert submodule - useful for excluding updates on a particular branch
+revert-submodule:
+	@echo "Reverting submodule pointer in tn-contracts..."
+	$(eval COMMIT_SHA := $(shell git ls-tree HEAD tn-contracts | awk '{print $$3}'))
+	@echo "Checking out $(COMMIT_SHA)"
+	cd tn-contracts && git checkout $(COMMIT_SHA)
