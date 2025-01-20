@@ -36,40 +36,71 @@ jobs:
       matrix:
         os: [ubuntu-latest]
     steps:
+      # exit immediately for drafts
       - name: Check if draft PR
         run: |
           if [[ "${{ github.event.pull_request.draft }}" == "true" ]]; then
             echo "Draft PR detected, exiting the workflow"
             exit 1
           fi
-      - uses: actions/checkout@v4
+
+      # checkout repo
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0
+          fetch-depth: 1 # Shallow clone
+
+      # cache toolchain installation
+      - name: cache rust toolchain
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.rustup/update-hashes
+            ~/.rustup/settings.toml
+          key: rust-toolchain-${{ runner.os }}-nightly-2025-01-19
+
       - name: Install nightly toolchain # pin nightly version
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
         run: |
           rustup toolchain install nightly-2025-01-19 --component rust-src clippy
           rustup default nightly-2025-01-19
+
+      # Enhanced dependency caching
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@9bdad043e88c75890e36ad3bbc8d27f0090dd609
+        with:
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: shared-cache-key
+          cache-directories: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+            target
+
       - name: Cache deps
         uses: Swatinem/rust-cache@9bdad043e88c75890e36ad3bbc8d27f0090dd609
         with:
           key: ${{ env.RUST_CHANNEL }}
+
+      # split cargo check and build for better caching
+      - name: Cargo check
+        run: cargo check --locked --all-targets
+
       - name: Compile tests
         run: cargo test --no-run --locked
+
       - name: Compile workspace
         if: matrix.os == 'ubuntu-latest'
         run: cargo build --quiet
-      - name: Check formatting
+
+        # Combine format and clippy checks
+      - name: run format and clippy checks
         run: |
-          rustc --version
-          cargo +nightly-2025-01-19 version
           cargo +nightly-2025-01-19 fmt --verbose -- --check
-      - name: Run clippy
-        run: |
-          rustc --version
-          cargo +nightly-2025-01-19 version
-          cargo +nightly-2025-01-19 clippy --version
           cargo +nightly-2025-01-19 clippy --verbose --all --all-features -- -D warnings
+
       - name: Run tests
         if: matrix.os == 'ubuntu-latest' || github.event_name == 'push'
         run: cargo test --workspace --exclude tn-faucet -- --quiet
