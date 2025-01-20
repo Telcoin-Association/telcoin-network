@@ -73,8 +73,8 @@ We recommend looking through existing tests as a helpful guide to creating new o
 
 **make test**: Used by maintainers with credentials to cloud infrastructure.
 **make open-test**: All workspace tests that don't require cloud credentials. This is useful for contributers.
-**make fmt**: Preffered lint checks using nightly rust.
-**make clippy**: Prefferred clippy lint check using nightly rust.
+**make fmt**: Preffered format checks using nightly rust.
+**make clippy**: Prefferred lint check using nightly rust.
 
 #### Commits
 
