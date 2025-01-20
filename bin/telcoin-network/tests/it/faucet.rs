@@ -522,8 +522,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
                             expected_tel_balance,
                         ),
                     )
-                    .await
-                    .expect("inside check account balances for {address:?}")
+                    .await?
                     .expect("expected balance random account timeout");
                 }
             })

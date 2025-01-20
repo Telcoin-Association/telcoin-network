@@ -224,7 +224,7 @@ async fn synchronizer_recover_partial_certs() {
     // Send 1 certificate.
     let certificates: Vec<Certificate> =
         fixture.headers().iter().take(3).map(|h| fixture.certificate(h)).collect();
-    let last_cert = certificates.clone().into_iter().last().unwrap();
+    let last_cert = certificates.clone().into_iter().next_back().unwrap();
     synchronizer.try_accept_certificate(last_cert).await.unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
 

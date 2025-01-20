@@ -159,7 +159,7 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
     let mut rpc_ports: [u16; 4] = [0, 0, 0, 0];
     for (i, child) in children.iter_mut().enumerate() {
         let rpc_port = get_available_tcp_port("127.0.0.1")
-            .expect("Failed to get an ephemeral rpc port for child {i}!");
+            .expect("Failed to get an ephemeral rpc port for child!");
         rpc_ports[i] = rpc_port;
         client_urls[i].push_str(&format!(":{rpc_port}"));
         *child = Some(start_validator(i, &exe_path, &temp_path, rpc_port));

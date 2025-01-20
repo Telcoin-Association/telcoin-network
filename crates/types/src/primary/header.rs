@@ -226,7 +226,7 @@ impl Header {
 
     /// The nonce this header.
     pub fn nonce(&self) -> u64 {
-        (self.epoch as u64) << 32 | self.round as u64
+        ((self.epoch as u64) << 32) | self.round as u64
     }
 }
 
