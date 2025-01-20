@@ -14,9 +14,9 @@ Finally, validator services are launched to start the network.
 
 RPCs can be reached at:
 - validator 1: 127.0.0.1:8545
-- validator 2: 127.0.0.1:8546
-- validator 3: 127.0.0.1:8547
-- validator 4: 127.0.0.1:8548
+- validator 2: 127.0.0.1:8544
+- validator 3: 127.0.0.1:8543
+- validator 4: 127.0.0.1:8542
 
 ## Scripts
 A different approach to create all the necessary information to run a local testnet is `local-testnet.sh`.

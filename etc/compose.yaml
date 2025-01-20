@@ -64,6 +64,7 @@ services:
       - ./setup_validator.sh:/setup_validator.sh
       - validator4-data:/home/nonroot/data
 
+  # create and distribute committee / worker cache files
   comittee:
     image: local-telcoin-network:latest
     user: "root"
@@ -90,6 +91,7 @@ services:
       - validator3-data:/home/nonroot/data/validator-3
       - validator4-data:/home/nonroot/data/validator-4
 
+  # start nodes
   validator1:
     image: local-telcoin-network:latest
     depends_on:
@@ -124,7 +126,7 @@ services:
       --http.port 8545
       --public-key 0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99
     ports:
-      - 8546:8545
+      - 8544:8545
     volumes:
       - validator2-data:/home/nonroot/data
     networks:
@@ -143,7 +145,7 @@ services:
       --http.port 8545
       --public-key 0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99
     ports:
-      - 8547:8545
+      - 8543:8545
     volumes:
       - validator3-data:/home/nonroot/data
     networks:
@@ -162,7 +164,7 @@ services:
       --http.port 8545
       --public-key 0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99
     ports:
-      - 8548:8545
+      - 8542:8545
     volumes:
       - validator4-data:/home/nonroot/data
     networks:
