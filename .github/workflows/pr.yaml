@@ -64,7 +64,7 @@ jobs:
       - name: Install nightly toolchain # pin nightly version
         if: steps.toolchain-cache.outputs.cache-hit != 'true'
         run: |
-          rustup toolchain install nightly-2025-01-19 --component rust-src clippy
+          rustup toolchain install nightly-2025-01-19 --component rustfmt rust-src clippy
           rustup default nightly-2025-01-19
 
       # Enhanced dependency caching
