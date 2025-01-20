@@ -48,11 +48,8 @@ jobs:
           fetch-depth: 0
       - name: Install nightly toolchain
         run: |
-          rustup toolchain install nightly-2025-01-19 --component rustfmt rust-src clippy
-          rustup default nightly-2024-01-20
-          # rustup update --no-self-update nightly
-          # rustup default nightly-2025-01-19
-          # rustup component add --toolchain nightly rustfmt rust-src clippy
+          rustup toolchain install nightly-2025-01-19 --component rust-src clippy
+          rustup default nightly-2025-01-19
       - name: Cache deps
         uses: Swatinem/rust-cache@9bdad043e88c75890e36ad3bbc8d27f0090dd609
         with:
