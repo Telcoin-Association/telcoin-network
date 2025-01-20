@@ -28,7 +28,7 @@ jobs:
             echo "is_maintainer=false" >> $GITHUB_OUTPUT
           fi
   fmt-clippy-and-public-tests:
-    needs: check-author
+    needs: skip-maintainers
     if: needs.check-author.outputs.is_maintainer == 'false' && github.event.pull_request.draft == false
     runs-on: ${{ matrix.os }}
     strategy:
