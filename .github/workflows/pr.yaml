@@ -29,7 +29,7 @@ jobs:
           fi
   fmt-clippy-and-public-tests:
     needs: skip-maintainers
-    if: needs.check-author.outputs.is_maintainer == 'false' && github.event.pull_request.draft == false
+    if: needs.skip-maintainers.outputs.is_maintainer == 'false'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
