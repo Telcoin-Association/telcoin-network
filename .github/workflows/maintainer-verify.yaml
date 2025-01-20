@@ -8,7 +8,7 @@ on:
 # TODO: use environments after repo is public with "required reviewers"
 jobs:
   verify-on-chain:
-    if: github.event.pull_request.draft == false && ${{ github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     environment: merge-into-main
     runs-on: ${{ matrix.os }}
     strategy:
