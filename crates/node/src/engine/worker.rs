@@ -173,9 +173,10 @@ impl PeersInfo for WorkerNetwork {
         NodeRecord::new(self.local_addr(), PeerId::random())
     }
 
+    // TODO: this is not supported
     fn local_enr(&self) -> Enr<SecretKey> {
-        let sk = SecretKey::from_slice(&[0xcd; 32]).unwrap();
-        Enr::builder().build(&sk).unwrap()
+        let sk = SecretKey::from_slice(&[0xcd; 32]).expect("secret key derived from static slice");
+        Enr::builder().build(&sk).expect("ENR builds from key")
     }
 }
 

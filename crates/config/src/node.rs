@@ -284,14 +284,16 @@ impl AnemoParameters {
     ///
     /// By default, at most 20 certificates can be sent concurrently to a peer.
     pub fn send_certificate_rate_limit(&self) -> u32 {
-        self.send_certificate_rate_limit.unwrap_or(NonZeroU32::new(20).unwrap()).get()
+        self.send_certificate_rate_limit
+            .unwrap_or(NonZeroU32::new(20).expect("20 cast as u32"))
+            .get()
     }
 
     /// Set the limit for the amount of batches that can be broadcast concurrently.
     ///
     /// By default, at most 100 batches can be broadcasted concurrently.
     pub fn report_batch_rate_limit(&self) -> u32 {
-        self.report_batch_rate_limit.unwrap_or(NonZeroU32::new(200).unwrap()).get()
+        self.report_batch_rate_limit.unwrap_or(NonZeroU32::new(200).expect("200 cast as u32")).get()
     }
 
     /// Set the limit for amount of requests to send a peer for batches.
@@ -299,7 +301,9 @@ impl AnemoParameters {
     /// As of 11/02/2023, when one worker is actively fetching, each peer receives
     /// 20~30 requests per second.
     pub fn request_batches_rate_limit(&self) -> u32 {
-        self.request_batches_rate_limit.unwrap_or(NonZeroU32::new(100).unwrap()).get()
+        self.request_batches_rate_limit
+            .unwrap_or(NonZeroU32::new(100).expect("100 cast as u32"))
+            .get()
     }
 
     /// Set the limit for excessive message size.
@@ -328,7 +332,7 @@ impl Default for PrometheusMetricsParameters {
                     .expect("os has available TCP port for default prometheus metrics")
             )
             .parse()
-            .unwrap(),
+            .expect("default prometheus metrics to parse available socket addr on localhost"),
         }
     }
 }

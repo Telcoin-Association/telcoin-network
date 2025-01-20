@@ -306,18 +306,18 @@ async fn test_certificate_store_after_round() {
     // create certificates for 50 rounds
     let now = Instant::now();
 
-    println!("Generating certificates");
+    tracing::debug!("Generating certificates");
 
     let certs = certificates(total_rounds);
-    println!("Created certificates: {} seconds", now.elapsed().as_secs_f32());
+    tracing::debug!("Created certificates: {} seconds", now.elapsed().as_secs_f32());
 
     let now = Instant::now();
-    println!("Storing certificates");
+    tracing::debug!("Storing certificates");
 
     // store them in both main and secondary index
     store.write_all(certs.clone()).unwrap();
 
-    println!("Stored certificates: {} seconds", now.elapsed().as_secs_f32());
+    tracing::debug!("Stored certificates: {} seconds", now.elapsed().as_secs_f32());
 
     // Large enough to avoid certificate store GC.
     let round_cutoff: Round = 41;
@@ -329,11 +329,11 @@ async fn test_certificate_store_after_round() {
         .collect::<HashSet<_>>();
 
     // WHEN
-    println!("Access after round {round_cutoff}, before {total_rounds}");
+    tracing::debug!("Access after round {round_cutoff}, before {total_rounds}");
     let now = Instant::now();
     let result = store.after_round(round_cutoff).expect("Error returned while reading after_round");
 
-    println!("Total time: {} seconds", now.elapsed().as_secs_f32());
+    tracing::debug!("Total time: {} seconds", now.elapsed().as_secs_f32());
 
     // THEN
     let certs_per_round = 4;

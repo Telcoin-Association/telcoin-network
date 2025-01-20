@@ -168,10 +168,13 @@ impl<DB: Database> PrimaryToWorker for PrimaryReceiverHandler<DB> {
             return Ok(anemo::Response::new(()));
         }
 
-        let worker_name = match self
-            .worker_cache
-            .worker(self.committee.authority(&message.target).unwrap().protocol_key(), &self.id)
-        {
+        let worker_name = match self.worker_cache.worker(
+            self.committee
+                .authority(&message.target)
+                .expect("own workers in worker cache")
+                .protocol_key(),
+            &self.id,
+        ) {
             Ok(worker_info) => worker_info.name,
             Err(e) => {
                 return Err(anemo::rpc::Status::internal(format!(

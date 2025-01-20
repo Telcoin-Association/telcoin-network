@@ -134,7 +134,7 @@ where
     engine_task_manager.update_tasks();
     task_manager.add_task_manager(engine_task_manager);
 
-    println!("TASKS\n{task_manager}");
+    info!(target:"tn", tasks=?task_manager, "TASKS");
 
     task_manager.join_until_exit(consensus_config.shutdown().clone()).await;
     Ok(())

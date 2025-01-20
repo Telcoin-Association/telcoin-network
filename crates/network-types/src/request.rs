@@ -82,7 +82,9 @@ impl FetchCertificatesRequest {
                     .map(|v| v - gc_round)
                     .collect::<RoaringBitmap>()
                     .serialize_into(&mut serialized)
-                    .unwrap();
+                    .expect(
+                        "rounds serialize into roaring bitmap for FetchCertificatesRequest bounds",
+                    );
                 (k, serialized)
             })
             .collect();

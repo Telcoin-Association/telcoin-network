@@ -47,7 +47,6 @@ async fn propose_header_and_form_certificate_v2() {
         );
         let routes = anemo::Router::new().add_rpc_service(PrimaryToPrimaryServer::new(mock_server));
         peer_networks.push(peer.new_network(routes));
-        println!("New primary added: {:?}", address);
 
         let address = address.to_anemo_address().unwrap();
         let peer_id = anemo::PeerId(peer.primary_network_keypair().public().0.to_bytes());
@@ -115,7 +114,6 @@ async fn propose_header_failure() {
         });
         let routes = anemo::Router::new().add_rpc_service(PrimaryToPrimaryServer::new(mock_server));
         primary_networks.push(primary.new_network(routes));
-        println!("New primary added: {:?}", address);
 
         let address = address.to_anemo_address().unwrap();
         let peer_id = anemo::PeerId(primary.primary_network_keypair().public().0.to_bytes());
@@ -203,7 +201,6 @@ async fn run_vote_aggregator_with_param(
         );
         let routes = anemo::Router::new().add_rpc_service(PrimaryToPrimaryServer::new(mock_server));
         peer_networks.push(peer.new_network(routes));
-        println!("New primary added: {:?}", address);
 
         let address = address.to_anemo_address().unwrap();
         let peer_id = anemo::PeerId(peer.primary_network_keypair().public().0.to_bytes());

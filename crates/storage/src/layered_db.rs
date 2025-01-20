@@ -163,8 +163,12 @@ impl<DB: Database> Drop for LayeredDatabase<DB> {
                 tracing::error!("Error while trying to send shutdown to layered DB thread {e}");
                 return; // The thread may not shutdown so don't try to join...
             }
-            // We can not be here without a thread handle so unwraps OK.
-            if let Err(e) = Arc::into_inner(self.thread.take().unwrap()).unwrap().join() {
+            // We can not be here without a thread handle
+            if let Err(e) =
+                Arc::into_inner(self.thread.take().expect("thread handle required to be here"))
+                    .expect("only one strong `Arc` reference")
+                    .join()
+            {
                 tracing::error!("Error while waiting for shutdown of layered DB thread {e:?}");
             } else {
                 tracing::info!("LayeredDatabase Dropped, DB thread is shutdown");

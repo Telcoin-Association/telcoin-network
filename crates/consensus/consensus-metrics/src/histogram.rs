@@ -111,12 +111,13 @@ impl HistogramVec {
     ) -> Self {
         let sum_name = format!("{}_sum", name);
         let count_name = format!("{}_count", name);
-        let sum =
-            register_int_counter_vec_with_registry!(sum_name, desc, labels, registry).unwrap();
-        let count =
-            register_int_counter_vec_with_registry!(count_name, desc, labels, registry).unwrap();
+        let sum = register_int_counter_vec_with_registry!(sum_name, desc, labels, registry)
+            .expect("sum register int counter vec with registry works");
+        let count = register_int_counter_vec_with_registry!(count_name, desc, labels, registry)
+            .expect("count register int counter vec with registry works");
         let labels: Vec<_> = labels.iter().cloned().chain(["pct"]).collect();
-        let gauge = register_int_gauge_vec_with_registry!(name, desc, &labels, registry).unwrap();
+        let gauge = register_int_gauge_vec_with_registry!(name, desc, &labels, registry)
+            .expect("gauge register int counter vec with registry works");
         Self::new(gauge, sum, count, percentiles, name)
     }
 
@@ -260,7 +261,7 @@ impl HistogramReporter {
             data.sort_unstable();
             for pct1000 in self.percentiles.iter() {
                 let index = Self::pct1000_index(data.len(), *pct1000);
-                let point = *data.get(index).unwrap();
+                let point = *data.get(index).expect("point in data vec");
                 let pct_str = Self::format_pct1000(*pct1000);
                 let labels = Self::gauge_labels(&label, &pct_str);
                 let metric = self.gauge.with_label_values(&labels);
