@@ -43,7 +43,7 @@ authors = [
     "Grant Kee <grant@telcoin.org>",
     "Steve Stanfield <steve@telcoin.org>",
     "Markus Osterlund <markus@telcoin.org>",
-    "Telcoin Association <devs@telconi.org>",
+    "Telcoin Association <devs@telcoin.org>",
 ]
 description = "Telcoin Network protocol."
 exclude = [".github/"]
