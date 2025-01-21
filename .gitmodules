@@ -1,3 +1,4 @@
 [submodule "tn-contracts"]
 	path = tn-contracts
 	url = git@github.com:Telcoin-Association/tn-contracts.git
+	branch = master

@@ -68,6 +68,7 @@ impl QuorumWaiterTrait for TestChanQuorumWaiter {
 }
 
 #[tokio::test]
+#[ignore = "should not run with a default cargo test"]
 async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
     // set application credentials for accessing Google KMS API
     std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", "./gcloud-credentials.json");
@@ -329,6 +330,7 @@ async fn test_faucet_transfers_tel_with_google_kms() -> eyre::Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "should not run with a default cargo test"]
 async fn test_faucet_transfers_stablecoin_with_google_kms() -> eyre::Result<()> {
     // set application credentials for accessing Google KMS API
     std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", "./gcloud-credentials.json");

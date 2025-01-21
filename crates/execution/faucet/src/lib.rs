@@ -255,6 +255,7 @@ mod tests {
     ///     kms_client.get().get_public_key(tonic::Request::new(GetPublicKeyRequest { name })).await?;
     /// ```
     #[test]
+    #[ignore = "should not run with a default cargo test"]
     fn test_google_kms_signature() {
         // validator 1 kms
         // asymmetric_sign for SHA256 digest (keccak)
@@ -379,6 +380,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "should not run with a default cargo test"]
     async fn test_gcloud_sdk() {
         // Debug logging
 

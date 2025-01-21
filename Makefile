@@ -126,7 +126,7 @@ init-submodules:
 
 # update tn-contracts submodule
 update-tn-contracts:
-	git submodule update --remote ;
+	git submodule update --remote tn-contracts;
 
 # revert submodule - useful for excluding updates on a particular branch
 revert-submodule:
