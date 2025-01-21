@@ -111,14 +111,18 @@ impl Initialize {
 /// with similiar functionality in the test client to allow easy testing using simple strings
 /// for accounts.
 fn account_from_word(key_word: &str) -> reth_primitives::alloy_primitives::Address {
-    let seed = keccak256(key_word.as_bytes());
-    let mut rand = <StdRng as SeedableRng>::from_seed(seed.0);
-    let secp = Secp256k1::new();
-    let (_, public_key) = secp.generate_keypair(&mut rand);
-    // strip out the first byte because that should be the SECP256K1_TAG_PUBKEY_UNCOMPRESSED
-    // tag returned by libsecp's uncompressed pubkey serialization
-    let hash = keccak256(&public_key.serialize_uncompressed()[1..]);
-    Address::from_slice(&hash[12..])
+    if key_word.starts_with("0x") {
+        key_word.parse().expect("not a valid account!")
+    } else {
+        let seed = keccak256(key_word.as_bytes());
+        let mut rand = <StdRng as SeedableRng>::from_seed(seed.0);
+        let secp = Secp256k1::new();
+        let (_, public_key) = secp.generate_keypair(&mut rand);
+        // strip out the first byte because that should be the SECP256K1_TAG_PUBKEY_UNCOMPRESSED
+        // tag returned by libsecp's uncompressed pubkey serialization
+        let hash = keccak256(&public_key.serialize_uncompressed()[1..]);
+        Address::from_slice(&hash[12..])
+    }
 }
 
 impl GenesisArgs {

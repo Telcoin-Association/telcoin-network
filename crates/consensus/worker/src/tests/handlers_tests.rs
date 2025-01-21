@@ -1,20 +1,14 @@
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
+//! Network synchronize tests
+use super::*;
 use std::vec;
 use tempfile::TempDir;
+use tn_batch_validator::NoopBatchValidator;
 use tn_network_types::{MockWorkerToWorker, WorkerToWorkerServer};
 use tn_storage::{mem_db::MemDatabase, open_db};
 use tn_test_utils::{batch, random_network, CommitteeFixture};
 
-use super::*;
-use tn_block_validator::NoopBlockValidator;
-
 #[tokio::test]
 async fn synchronize() {
-    reth_tracing::init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();
@@ -37,11 +31,11 @@ async fn synchronize() {
     let mut mock_server = MockWorkerToWorker::new();
     let mock_batch_response = batch.clone();
     mock_server
-        .expect_request_blocks()
-        .withf(move |request| request.body().block_digests == vec![digest])
+        .expect_request_batches()
+        .withf(move |request| request.body().batch_digests == vec![digest])
         .return_once(move |_| {
-            Ok(anemo::Response::new(RequestBlocksResponse {
-                blocks: vec![mock_batch_response],
+            Ok(anemo::Response::new(RequestBatchesResponse {
+                batches: vec![mock_batch_response],
                 is_size_limit_reached: false,
             }))
         });
@@ -65,24 +59,22 @@ async fn synchronize() {
         request_batches_timeout: Duration::from_secs(999),
         network: Some(send_network),
         batch_fetcher: None,
-        validator: Arc::new(NoopBlockValidator),
+        validator: Arc::new(NoopBatchValidator),
     };
 
     // Verify the batch is not in store
-    assert!(store.get::<WorkerBlocks>(&digest).unwrap().is_none());
+    assert!(store.get::<Batches>(&digest).unwrap().is_none());
 
     // Send a sync request.
     let request = anemo::Request::new(message);
     handler.synchronize(request).await.unwrap();
 
     // Verify it is now stored
-    assert!(store.get::<WorkerBlocks>(&digest).unwrap().is_some());
+    assert!(store.get::<Batches>(&digest).unwrap().is_some());
 }
 
 #[tokio::test]
 async fn synchronize_when_batch_exists() {
-    reth_tracing::init_test_tracing();
-
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();
@@ -103,14 +95,14 @@ async fn synchronize_when_batch_exists() {
         request_batches_timeout: Duration::from_secs(999),
         network: Some(send_network),
         batch_fetcher: None,
-        validator: Arc::new(NoopBlockValidator),
+        validator: Arc::new(NoopBatchValidator),
     };
 
     // Store the batch.
     let batch = batch();
     let batch_id = batch.digest();
     let missing = vec![batch_id];
-    store.insert::<WorkerBlocks>(&batch_id, &batch).unwrap();
+    store.insert::<Batches>(&batch_id, &batch).unwrap();
 
     // Send a sync request.
     let target_primary = fixture.authorities().nth(1).unwrap();

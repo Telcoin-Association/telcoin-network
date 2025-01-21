@@ -1,8 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-//
-
 // TODO: uint crate needs to be refactored for this nightly clippy
 #![allow(clippy::assign_op_pattern)]
 

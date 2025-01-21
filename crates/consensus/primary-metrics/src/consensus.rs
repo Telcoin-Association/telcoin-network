@@ -1,6 +1,4 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Metrics for consensus.
 
 use consensus_metrics::histogram::Histogram as MystenHistogram;
 use prometheus::{

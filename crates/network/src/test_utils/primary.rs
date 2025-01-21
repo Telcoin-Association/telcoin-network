@@ -2,7 +2,7 @@
 use anemo::async_trait;
 use std::collections::HashMap;
 use tn_network_types::{
-    ConsensusOutputRequest, ConsensusOutputResponse, FetchBlocksRequest, FetchBlocksResponse,
+    ConsensusOutputRequest, ConsensusOutputResponse, FetchBatchResponse, FetchBatchesRequest,
     FetchCertificatesRequest, FetchCertificatesResponse, PrimaryToPrimary, PrimaryToPrimaryServer,
     PrimaryToWorker, PrimaryToWorkerServer, RequestVoteRequest, RequestVoteResponse,
     SendCertificateRequest, SendCertificateResponse, WorkerSynchronizeMessage,
@@ -28,7 +28,7 @@ impl PrimaryToPrimaryMockServer {
 
         let routes = anemo::Router::new().add_rpc_service(service);
         let network = anemo::Network::bind(addr)
-            .server_name("narwhal")
+            .server_name("tn-test")
             .private_key(network_keypair.private().0.to_bytes())
             .start(routes)
             .unwrap();
@@ -88,7 +88,7 @@ impl PrimaryToWorkerMockServer {
 
         let routes = anemo::Router::new().add_rpc_service(service);
         let network = anemo::Network::bind(addr)
-            .server_name("narwhal")
+            .server_name("tn-test")
             .private_key(keypair.private().0.to_bytes())
             .start(routes)
             .unwrap();
@@ -108,10 +108,10 @@ impl PrimaryToWorker for PrimaryToWorkerMockServer {
         Ok(anemo::Response::new(()))
     }
 
-    async fn fetch_blocks(
+    async fn fetch_batches(
         &self,
-        _request: anemo::Request<FetchBlocksRequest>,
-    ) -> Result<anemo::Response<FetchBlocksResponse>, anemo::rpc::Status> {
-        Ok(anemo::Response::new(FetchBlocksResponse { blocks: HashMap::new() }))
+        _request: anemo::Request<FetchBatchesRequest>,
+    ) -> Result<anemo::Response<FetchBatchResponse>, anemo::rpc::Status> {
+        Ok(anemo::Response::new(FetchBatchResponse { batches: HashMap::new() }))
     }
 }

@@ -1,6 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 mod authority;
@@ -26,13 +23,15 @@ pub use execution::{
 pub mod helpers;
 pub use helpers::*;
 
-mod telcoin_temp_dirs;
-pub use telcoin_temp_dirs::*;
+mod temp_dirs;
+pub use temp_dirs::*;
 
 mod tracing;
 pub use tracing::init_test_tracing;
 
 #[cfg(test)]
+#[path = "tests/output_tests.rs"]
 mod output_tests;
 #[cfg(test)]
+#[path = "tests/storage_tests.rs"]
 mod storage_tests;

@@ -1,3 +1,9 @@
+use crate::{
+    crypto, encode,
+    error::{DagError, DagResult, HeaderError, HeaderResult},
+    now, AuthorityIdentifier, Batch, CertificateDigest, Committee, Epoch, Round, TimestampSec,
+    VoteDigest, WorkerCache, WorkerId,
+};
 use alloy_rlp::MaxEncodedLenAssoc;
 use base64::{engine::general_purpose, Engine};
 use derive_builder::Builder;
@@ -9,13 +15,6 @@ use reth_primitives::{BlockHash, BlockNumber};
 use reth_rpc_types::BlockNumHash;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt};
-
-use crate::{
-    crypto, encode,
-    error::{DagError, DagResult, HeaderError, HeaderResult},
-    now, AuthorityIdentifier, CertificateDigest, Committee, Epoch, Round, TimestampSec, VoteDigest,
-    WorkerBlock, WorkerCache, WorkerId,
-};
 
 /// Messages generated internally by Narwhal that are included in headers for sequencing.
 #[allow(clippy::large_enum_variant)]
@@ -41,7 +40,6 @@ pub enum SystemMessage {
 #[builder(pattern = "owned", build_fn(skip))]
 pub struct Header {
     /// Primary that created the header. Must be the same primary that broadcasted the header.
-    /// Validation is at: https://github.com/MystenLabs/sui/blob/f0b80d9eeef44edd9fbe606cee16717622b68651/narwhal/primary/src/primary.rs#L713-L719
     pub author: AuthorityIdentifier,
     /// The round for this header
     pub round: Round,
@@ -92,7 +90,7 @@ impl Header {
             latest_execution_block_num: latest_execution_block.number,
         };
         let digest = Hash::digest(&header);
-        header.digest.set(digest).unwrap();
+        header.digest.set(digest).expect("digest oncecell empty for new header");
         header
     }
 
@@ -225,6 +223,11 @@ impl Header {
     pub fn latest_execution_block_num_hash(&self) -> BlockNumHash {
         BlockNumHash { hash: self.latest_execution_block, number: self.latest_execution_block_num }
     }
+
+    /// The nonce this header.
+    pub fn nonce(&self) -> u64 {
+        ((self.epoch as u64) << 32) | self.round as u64
+    }
 }
 
 impl From<Header> for CertificateDigest {
@@ -239,20 +242,20 @@ impl HeaderBuilder {
     /// need to be visited.
     pub fn build(self) -> Result<Header, fastcrypto::error::FastCryptoError> {
         let h = Header {
-            author: self.author.unwrap(),
-            round: self.round.unwrap(),
-            epoch: self.epoch.unwrap(),
+            author: self.author.expect("author set for header builder"),
+            round: self.round.expect("round set for header builder"),
+            epoch: self.epoch.expect("epoch set for header builder"),
             created_at: self.created_at.unwrap_or(0),
-            payload: self.payload.unwrap(),
+            payload: self.payload.expect("payload set for header builder"),
             system_messages: self.system_messages.unwrap_or_default(),
-            parents: self.parents.unwrap(),
+            parents: self.parents.expect("parents set for header builder"),
             digest: OnceCell::default(),
             latest_execution_block: self.latest_execution_block.unwrap_or_default(),
             latest_execution_block_num: self.latest_execution_block_num.unwrap_or_default(),
         };
 
         // TODO: return error here
-        h.digest.set(Hash::digest(&h)).unwrap();
+        h.digest.set(Hash::digest(&h)).expect("digest oncecell empty for new header");
 
         Ok(h)
     }
@@ -260,7 +263,7 @@ impl HeaderBuilder {
     /// Helper method to directly set values of the payload
     pub fn with_payload_batch(
         mut self,
-        worker_block: WorkerBlock,
+        batch: Batch,
         worker_id: WorkerId,
         created_at: TimestampSec,
     ) -> Self {
@@ -269,7 +272,7 @@ impl HeaderBuilder {
         }
         let payload = self.payload.as_mut().unwrap();
 
-        payload.insert(worker_block.digest(), (worker_id, created_at));
+        payload.insert(batch.digest(), (worker_id, created_at));
 
         self
     }

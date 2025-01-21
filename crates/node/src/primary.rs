@@ -1,7 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Hierarchical type to hold tasks spawned for a worker in the network.
 use anemo::Network;
 use fastcrypto::traits::VerifyingKey;
@@ -31,7 +27,7 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
     /// The window where the schedule change takes place in consensus. It represents number
     /// of committed sub dags.
     /// TODO: move this to node properties
-    const CONSENSUS_SCHEDULE_CHANGE_SUB_DAGS: u64 = 300;
+    const CONSENSUS_SCHEDULE_CHANGE_SUB_DAGS: u32 = 300;
 
     /// Starts the primary node with the provided info. If the node is already running then this
     /// method will return an error instead.
@@ -136,7 +132,8 @@ pub struct PrimaryNode<CDB> {
 
 impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
     pub fn new(consensus_config: ConsensusConfig<CDB>) -> PrimaryNode<CDB> {
-        let consensus_bus = ConsensusBus::new();
+        let consensus_bus =
+            ConsensusBus::new_with_recent_blocks(consensus_config.config().parameters.gc_depth);
         let primary = Primary::new(consensus_config.clone(), &consensus_bus);
 
         let inner = PrimaryNodeInner { consensus_config, consensus_bus, primary };

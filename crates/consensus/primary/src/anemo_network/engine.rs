@@ -1,8 +1,6 @@
 //! Engine communication.
 //!
 //! Implementation logic for processing inner-node messages from this primary's engine.
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
 
 use anemo::async_trait;
 use reth_primitives::SealedHeader;

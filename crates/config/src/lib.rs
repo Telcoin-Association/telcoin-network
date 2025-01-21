@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT or Apache-2.0
 //! Crate for configuring a node.
 //!
 //! Node-specific and network-wide configurations.

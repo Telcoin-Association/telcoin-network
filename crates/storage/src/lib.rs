@@ -1,7 +1,5 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT or Apache-2.0
+//! Persistent storage types
 
 #![warn(future_incompatible, nonstandard_style, rust_2018_idioms, rust_2021_compatibility)]
 
@@ -16,9 +14,8 @@ pub use redb::database::ReDB;
 #[cfg(feature = "rocksdb")]
 use rocks::database::RocksDatabase;
 use tables::{
-    CertificateDigestByOrigin, CertificateDigestByRound, Certificates, CommittedSubDag,
-    ConsensusBlockNumbersByDigest, ConsensusBlocks, LastCommitted, LastProposed, Payload, Votes,
-    WorkerBlocks,
+    Batches, CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
+    ConsensusBlockNumbersByDigest, ConsensusBlocks, LastProposed, Payload, Votes,
 };
 // Always build redb, we use it as the default for persistant consensus data.
 pub mod layered_db;
@@ -41,7 +38,7 @@ pub type StoreResult<T> = eyre::Result<T>;
 
 /// The number of rounds of certificates and sub dags to save before garbage collecting them out of
 /// the DB.
-pub const ROUNDS_TO_KEEP: u64 = 64;
+pub const ROUNDS_TO_KEEP: u32 = 64;
 
 /// The datastore column family names.
 const LAST_PROPOSED_CF: &str = "last_proposed";
@@ -51,9 +48,6 @@ const CERTIFICATE_DIGEST_BY_ROUND_CF: &str = "certificate_digest_by_round";
 const CERTIFICATE_DIGEST_BY_ORIGIN_CF: &str = "certificate_digest_by_origin";
 const PAYLOAD_CF: &str = "payload";
 const BATCHES_CF: &str = "batches";
-const LAST_COMMITTED_CF: &str = "last_committed";
-const COMMITTED_SUB_DAG_INDEX_CF: &str = "committed_sub_dag";
-const SUB_DAG_CF: &str = "sub_dag";
 const CONSENSUS_BLOCK_CF: &str = "consensus_block";
 const CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF: &str = "consensus_block_number_by_digest";
 
@@ -75,9 +69,8 @@ macro_rules! tables {
 pub mod tables {
     use super::{PayloadToken, ProposerKey};
     use tn_types::{
-        AuthorityIdentifier, BlockHash, Certificate, CertificateDigest, CommittedSubDag as SubDag,
-        ConsensusCommit, ConsensusHeader, Header, Round, SequenceNumber, VoteInfo, WorkerBlock,
-        WorkerId,
+        AuthorityIdentifier, Batch, BlockHash, Certificate, CertificateDigest, ConsensusHeader,
+        Header, Round, VoteInfo, WorkerId,
     };
 
     tables!(
@@ -87,11 +80,8 @@ pub mod tables {
         CertificateDigestByRound;crate::CERTIFICATE_DIGEST_BY_ROUND_CF;<(Round, AuthorityIdentifier), CertificateDigest>,
         CertificateDigestByOrigin;crate::CERTIFICATE_DIGEST_BY_ORIGIN_CF;<(AuthorityIdentifier, Round), CertificateDigest>,
         Payload;crate::PAYLOAD_CF;<(BlockHash, WorkerId), PayloadToken>,
-        LastCommitted;crate::LAST_COMMITTED_CF;<AuthorityIdentifier, Round>,
-        CommittedSubDag;crate::COMMITTED_SUB_DAG_INDEX_CF;<SequenceNumber, ConsensusCommit>,
-        SubDags;crate::SUB_DAG_CF;<SequenceNumber, SubDag>,
         // Table is used for "normal" consensus as well as for the consensus chain.
-        WorkerBlocks;crate::BATCHES_CF;<BlockHash, WorkerBlock>,
+        Batches;crate::BATCHES_CF;<BlockHash, Batch>,
         // These tables are for the consensus chain not the normal consensus.
         ConsensusBlocks;crate::CONSENSUS_BLOCK_CF;<u64, ConsensusHeader>,
         ConsensusBlockNumbersByDigest;crate::CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF;<BlockHash, u64>
@@ -134,9 +124,7 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
     db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
     db.open_table::<Payload>().expect("failed to open table!");
-    db.open_table::<WorkerBlocks>().expect("failed to open table!");
-    db.open_table::<LastCommitted>().expect("failed to open table!");
-    db.open_table::<CommittedSubDag>().expect("failed to open table!");
+    db.open_table::<Batches>().expect("failed to open table!");
     db.open_table::<ConsensusBlocks>().expect("failed to open table!");
     db.open_table::<ConsensusBlockNumbersByDigest>().expect("failed to open table!");
 
@@ -147,9 +135,7 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<CertificateDigestByRound>();
     db.open_table::<CertificateDigestByOrigin>();
     db.open_table::<Payload>();
-    db.open_table::<WorkerBlocks>();
-    db.open_table::<LastCommitted>();
-    db.open_table::<CommittedSubDag>();
+    db.open_table::<Batches>();
     db.open_table::<ConsensusBlocks>();
     db.open_table::<ConsensusBlockNumbersByDigest>();
     db
@@ -166,9 +152,7 @@ fn _open_rocks<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDataba
     db.open_table::<CertificateDigestByRound>();
     db.open_table::<CertificateDigestByOrigin>();
     db.open_table::<Payload>();
-    db.open_table::<WorkerBlocks>();
-    db.open_table::<LastCommitted>();
-    db.open_table::<CommittedSubDag>();
+    db.open_table::<Batches>();
     db.open_table::<ConsensusBlocks>();
     db.open_table::<ConsensusBlockNumbersByDigest>();
     db
@@ -184,9 +168,7 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
     db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
     db.open_table::<Payload>().expect("failed to open table!");
-    db.open_table::<WorkerBlocks>().expect("failed to open table!");
-    db.open_table::<LastCommitted>().expect("failed to open table!");
-    db.open_table::<CommittedSubDag>().expect("failed to open table!");
+    db.open_table::<Batches>().expect("failed to open table!");
     db.open_table::<ConsensusBlocks>().expect("failed to open table!");
     db.open_table::<ConsensusBlockNumbersByDigest>().expect("failed to open table!");
 
@@ -197,9 +179,7 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<CertificateDigestByRound>();
     db.open_table::<CertificateDigestByOrigin>();
     db.open_table::<Payload>();
-    db.open_table::<WorkerBlocks>();
-    db.open_table::<LastCommitted>();
-    db.open_table::<CommittedSubDag>();
+    db.open_table::<Batches>();
     db.open_table::<ConsensusBlocks>();
     db.open_table::<ConsensusBlockNumbersByDigest>();
     db

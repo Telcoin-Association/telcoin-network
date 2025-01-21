@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT or Apache-2.0
 //! Faucet components needed for the faucet to run.
 //!
 //! Includes config and cache for bridging rpc and faucet service.
@@ -207,7 +208,6 @@ mod tests {
 
     use reth_primitives::{keccak256, public_key_to_address, Signature as RSignature, U256};
 
-    use reth_tracing::init_test_tracing;
     use secp256k1::{
         ecdsa::{RecoverableSignature, RecoveryId, Signature},
         Message, PublicKey, SECP256K1,
@@ -255,6 +255,7 @@ mod tests {
     ///     kms_client.get().get_public_key(tonic::Request::new(GetPublicKeyRequest { name })).await?;
     /// ```
     #[test]
+    #[ignore = "should not run with a default cargo test"]
     fn test_google_kms_signature() {
         // validator 1 kms
         // asymmetric_sign for SHA256 digest (keccak)
@@ -379,9 +380,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "should not run with a default cargo test"]
     async fn test_gcloud_sdk() {
         // Debug logging
-        init_test_tracing();
 
         std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", "./gcloud-credentials.json");
 

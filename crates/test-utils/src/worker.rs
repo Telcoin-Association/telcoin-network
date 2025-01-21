@@ -1,9 +1,6 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
-
 //! Worker fixture for the cluster
 
-use crate::temp_dir;
+use crate::{temp_dir, TestExecutionNode};
 use anemo::Network;
 use fastcrypto::traits::KeyPair as _;
 use std::path::PathBuf;
@@ -12,8 +9,6 @@ use tn_node::worker::WorkerNode;
 use tn_storage::traits::Database;
 use tn_types::{AuthorityIdentifier, Multiaddr, NetworkKeypair, WorkerId, WorkerInfo};
 use tracing::info;
-
-use crate::TestExecutionNode;
 
 #[derive(Clone)]
 pub struct WorkerNodeDetails<DB> {
@@ -48,7 +43,7 @@ impl<DB: Database> WorkerNodeDetails<DB> {
 
         info!(target: "cluster::worker", "starting worker-{} for authority {}", self.id, self.name);
 
-        self.node.start(execution_node.new_block_validator().await).await?;
+        self.node.start(execution_node.new_batch_validator().await).await?;
 
         self.store_path = store_path;
 
@@ -82,7 +77,7 @@ impl WorkerFixture {
 
     pub fn new_network(&self, router: anemo::Router) -> anemo::Network {
         anemo::Network::bind(self.info().worker_address.to_anemo_address().unwrap())
-            .server_name("narwhal")
+            .server_name("tn-test")
             .private_key(self.keypair().private().0.to_bytes())
             .start(router)
             .unwrap()

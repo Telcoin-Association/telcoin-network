@@ -1,8 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 use parking_lot::{Mutex, MutexGuard};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},

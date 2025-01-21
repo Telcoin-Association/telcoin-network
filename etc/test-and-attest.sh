@@ -101,6 +101,7 @@ echo "default tests and specific faucet it test passing"
 output=$(cast send --private-key ${PRIVATE_KEY} \
     --rpc-url ${RPC_ENDPOINT} \
     --chain "2017" \
+    --gas-limit 1000000 \
     ${CONTRACT_ADDRESS} \
     "${ATTEST_CALL}" "${COMMIT_HASH}" "true")
 

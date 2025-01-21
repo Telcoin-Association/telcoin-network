@@ -70,7 +70,7 @@ where
     Req: TNMessage,
     Res: TNMessage,
 {
-    /// The gossip network for flood publishing sealed worker blocks.
+    /// The gossip network for flood publishing sealed batches.
     swarm: Swarm<TNBehavior<TNCodec<Req, Res>>>,
     /// The subscribed gossip network topics.
     topics: Vec<IdentTopic>,
@@ -542,7 +542,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils::{fixture_batch_with_transactions, CommitteeFixture};
-    use tn_types::{BlockHash, Certificate, CertificateDigest, Header, SealedWorkerBlock, Vote};
+    use tn_types::{BlockHash, Certificate, CertificateDigest, Header, SealedBatch, Vote};
     use tokio::time::timeout;
 
     // TODO: consolidate these to be common for all unit tests
@@ -557,9 +557,9 @@ mod tests {
         ///
         /// NOTE: expect no response
         /// TODO: gossip this instead?
-        NewBlock(SealedWorkerBlock),
+        NewBatch(SealedBatch),
         /// The collection of missing [BlockHash]es for this peer.
-        MissingBlocks(Vec<BlockHash>),
+        MissingBatches(Vec<BlockHash>),
     }
 
     /// Response to worker requests.
@@ -569,9 +569,9 @@ mod tests {
         ///
         /// TODO: anemo included `size_limit_reached: bool` field
         /// but this should be trustless. See `RequestBlocksResponse` message.
-        MissingBlocks {
+        MissingBatches {
             /// The collection of requested blocks.
-            blocks: Vec<SealedWorkerBlock>,
+            batches: Vec<SealedBatch>,
         },
     }
 
@@ -631,31 +631,32 @@ mod tests {
 
         let missing_block = fixture_batch_with_transactions(3).seal_slow();
         let digests = vec![missing_block.digest()];
-        let worker_block_req = WorkerRequest::MissingBlocks(digests);
-        let worker_block_res = WorkerResponse::MissingBlocks { blocks: vec![missing_block] };
+        let batch_req = WorkerRequest::MissingBatches(digests);
+        let batch_res = WorkerResponse::MissingBatches { batches: vec![missing_block] };
 
         // dial peer2
         peer1.dial(peer2_id, peer2_addr).await?;
 
         // send request and wait for response
         let max_time = Duration::from_secs(5);
-        let network_res = peer1.send_request(worker_block_req.clone(), peer2_id).await?;
+        let network_res = peer1.send_request(batch_req.clone(), peer2_id).await?;
         let event = timeout(max_time, network_events_2.recv())
             .await?
             .expect("first network event received");
 
         // expect network event
         if let NetworkEvent::Request { request, channel, .. } = event {
-            assert_eq!(request, worker_block_req);
+            assert_eq!(request, batch_req);
+
             // send response
-            peer2.send_response(worker_block_res.clone(), channel).await?;
+            peer2.send_response(batch_res.clone(), channel).await?;
         } else {
             panic!("unexpected network event received");
         }
 
         // expect response
         let response = timeout(max_time, network_res).await?.expect("outbound id recv")?;
-        assert_eq!(response, worker_block_res);
+        assert_eq!(response, batch_res);
 
         Ok(())
     }
@@ -791,7 +792,7 @@ mod tests {
             assert_eq!(request, honest_req);
             // send response
             let block = fixture_batch_with_transactions(1).seal_slow();
-            let malicious_reply = WorkerResponse::MissingBlocks { blocks: vec![block] };
+            let malicious_reply = WorkerResponse::MissingBatches { batches: vec![block] };
             malicious_peer.send_response(malicious_reply, channel).await?;
         } else {
             panic!("unexpected network event received");
@@ -864,7 +865,7 @@ mod tests {
         let _message_id = cvv.publish(correct_topic, expected_result.clone()).await?;
         let event = timeout(Duration::from_secs(2), nvv_network_events.recv())
             .await?
-            .expect("worker block received");
+            .expect("batch received");
 
         // assert gossip message
         if let NetworkEvent::Gossip(msg) = event {
@@ -936,7 +937,7 @@ mod tests {
         let _message_id = cvv.publish(correct_topic.clone(), expected_result.clone()).await?;
         let event = timeout(Duration::from_secs(2), nvv_network_events.recv())
             .await?
-            .expect("worker block received");
+            .expect("batch received");
 
         // assert gossip message
         if let NetworkEvent::Gossip(msg) = event {

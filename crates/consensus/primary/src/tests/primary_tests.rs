@@ -1,6 +1,5 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Primary tests
+
 use super::{Primary, PrimaryReceiverHandler};
 use crate::{
     consensus::{LeaderSchedule, LeaderSwapTable},
@@ -21,7 +20,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tn_block_validator::NoopBlockValidator;
+use tn_batch_validator::NoopBatchValidator;
 use tn_network_types::{
     FetchCertificatesRequest, MockPrimaryToWorker, PrimaryToPrimary, RequestVoteRequest,
 };
@@ -67,7 +66,7 @@ async fn test_get_network_peers_from_admin_server() {
     // Spawn a `Worker` instance for primary 1.
     let _ = Worker::spawn(
         worker_id,
-        Arc::new(NoopBlockValidator),
+        Arc::new(NoopBatchValidator),
         metrics_1,
         config_1.clone(),
         &TaskManager::default(),
@@ -431,7 +430,7 @@ async fn test_request_vote_has_missing_parents() {
 
     // TEST PHASE 3: Handler should return error if header is too old.
     // Increase round threshold.
-    let _ = cb.narwhal_round_updates().send(100);
+    let _ = cb.primary_round_updates().send(100);
     let mut request = anemo::Request::new(RequestVoteRequest {
         header: test_header.clone(),
         parents: Vec::new(),
@@ -863,7 +862,7 @@ async fn test_fetch_certificates_handler() {
     // Each test case contains (lower bound round, skip rounds, max items, expected output).
     let test_cases = vec![
         (0, vec![vec![], vec![], vec![], vec![]], 20, vec![1, 1, 1, 1, 2, 2, 2, 3, 3, 4]),
-        (0, vec![vec![1u64], vec![1], vec![], vec![]], 20, vec![1, 1, 2, 2, 2, 3, 3, 4]),
+        (0, vec![vec![1u32], vec![1], vec![], vec![]], 20, vec![1, 1, 2, 2, 2, 3, 3, 4]),
         (0, vec![vec![], vec![], vec![1], vec![1]], 20, vec![1, 1, 2, 2, 2, 3, 3, 4]),
         (1, vec![vec![], vec![], vec![2], vec![2]], 4, vec![2, 3, 3, 4]),
         (1, vec![vec![], vec![], vec![2], vec![2]], 2, vec![2, 3]),

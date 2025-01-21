@@ -1,9 +1,5 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Wrapper around mpsc channel that also captures useful metrics.
 
-// TODO: complete tests - This kinda sorta facades the whole tokio::mpsc::{Sender, Receiver}:
-// without tests, this will be fragile to maintain.
 use futures::{FutureExt, Stream, TryFutureExt};
 use parking_lot::{Mutex, MutexGuard};
 use prometheus::{IntCounter, IntGauge};

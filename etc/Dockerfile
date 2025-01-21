@@ -10,6 +10,7 @@ RUN apt-get update \
 COPY Cargo* ./
 COPY bin/ ./bin/
 COPY crates/ ./crates/
+COPY tn-contracts/ ./tn-contracts/
 
 # must move the resulting binary out of the cache for subsequent build steps
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

@@ -1,9 +1,6 @@
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-use super::*;
+//! Certifier tests
 
+use super::*;
 use crate::ConsensusBus;
 use fastcrypto::traits::KeyPair;
 use rand::{rngs::StdRng, SeedableRng};
@@ -50,7 +47,6 @@ async fn propose_header_to_form_certificate() {
         );
         let routes = anemo::Router::new().add_rpc_service(PrimaryToPrimaryServer::new(mock_server));
         peer_networks.push(peer.new_network(routes));
-        println!("New primary added: {:?}", address);
 
         let address = address.to_anemo_address().unwrap();
         let peer_id = anemo::PeerId(peer.primary_network_keypair().public().0.to_bytes());
@@ -101,7 +97,7 @@ async fn propose_header_failure() {
     // Set up network.
     let own_address = committee.primary_by_id(&authority_id).unwrap().to_anemo_address().unwrap();
     let network = anemo::Network::bind(own_address)
-        .server_name("narwhal")
+        .server_name("tn-test")
         .private_key(network_key)
         .start(anemo::Router::new())
         .unwrap();
@@ -118,7 +114,6 @@ async fn propose_header_failure() {
         });
         let routes = anemo::Router::new().add_rpc_service(PrimaryToPrimaryServer::new(mock_server));
         primary_networks.push(primary.new_network(routes));
-        println!("New primary added: {:?}", address);
 
         let address = address.to_anemo_address().unwrap();
         let peer_id = anemo::PeerId(primary.primary_network_keypair().public().0.to_bytes());
@@ -206,7 +201,6 @@ async fn run_vote_aggregator_with_param(
         );
         let routes = anemo::Router::new().add_rpc_service(PrimaryToPrimaryServer::new(mock_server));
         peer_networks.push(peer.new_network(routes));
-        println!("New primary added: {:?}", address);
 
         let address = address.to_anemo_address().unwrap();
         let peer_id = anemo::PeerId(peer.primary_network_keypair().public().0.to_bytes());
@@ -254,7 +248,7 @@ async fn test_shutdown_core() {
 
     let own_address = committee.primary_by_id(&id).unwrap().to_anemo_address().unwrap();
     let network = anemo::Network::bind(own_address)
-        .server_name("narwhal")
+        .server_name("conensus-test")
         .private_key(network_key)
         .start(anemo::Router::new())
         .unwrap();

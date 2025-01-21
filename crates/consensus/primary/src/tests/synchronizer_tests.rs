@@ -1,6 +1,4 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Synchronizer tests
 
 use crate::{
     certificate_fetcher::CertificateFetcherCommand,
@@ -244,7 +242,7 @@ async fn synchronizer_recover_partial_certs() {
     // Send 1 certificate.
     let certificates: Vec<Certificate> =
         fixture.headers().iter().take(3).map(|h| fixture.certificate(h)).collect();
-    let last_cert = certificates.clone().into_iter().last().unwrap();
+    let last_cert = certificates.clone().into_iter().next_back().unwrap();
     synchronizer.try_accept_certificate(last_cert).await.unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -426,8 +424,8 @@ async fn sanitize_fetched_certificates() {
     let (verified_certificates, _next_parents) =
         make_optimal_signed_certificates(1..=60, &genesis, &committee, &keys);
 
-    const VERIFICATION_ROUND: u64 = 50;
-    const LEAF_ROUND: u64 = 60;
+    const VERIFICATION_ROUND: Round = 50;
+    const LEAF_ROUND: Round = 60;
 
     // Able to verify a batch of certificates with good signatures.
     synchronizer

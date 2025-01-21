@@ -156,7 +156,7 @@ impl<Req, Res> Default for TNCodec<Req, Res> {
 
 /// Max request size in bytes
 ///
-/// Worker blocks are capped at 1MB worth of transactions.
+/// batches are capped at 1MB worth of transactions.
 /// This should be more than enough for snappy-compressed messages.
 ///
 /// TODO: add the message overhead as the max request size
@@ -317,7 +317,7 @@ mod tests {
         //
         // test requests first
         //
-        // sanity check that block within bounds works
+        // sanity check
         let mut encoded = Vec::new();
 
         // this is 208 bytes uncompressed (max chunk size)

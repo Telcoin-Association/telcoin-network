@@ -1,20 +1,11 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
-use std::{
-    collections::{BTreeSet, HashMap},
-    num::NonZeroUsize,
-    sync::Arc,
-};
-use tempfile::TempDir;
-use tn_storage::{mem_db::MemDatabase, open_db, ConsensusStore};
-use tn_types::AuthorityIdentifier;
-
-use tn_test_utils::{mock_certificate, CommitteeFixture};
-use tn_types::{Certificate, CommittedSubDag, ReputationScores, Round};
+//! Leader schedule tests
 
 use crate::consensus::{Dag, LeaderSchedule, LeaderSwapTable};
+use std::{collections::BTreeSet, num::NonZeroUsize, sync::Arc};
+use tempfile::TempDir;
+use tn_storage::{mem_db::MemDatabase, open_db, ConsensusStore};
+use tn_test_utils::{mock_certificate, CommitteeFixture};
+use tn_types::{AuthorityIdentifier, Certificate, CommittedSubDag, ReputationScores, Round};
 
 #[tokio::test]
 async fn test_leader_swap_table() {
@@ -183,7 +174,7 @@ async fn test_leader_schedule_from_store() {
 
     let sub_dag = CommittedSubDag::new(vec![], Certificate::default(), 0, scores, None);
 
-    store.write_consensus_state(&HashMap::new(), &sub_dag).unwrap();
+    store.write_subdag_for_test(0, sub_dag);
 
     // WHEN
     let schedule = LeaderSchedule::from_store(committee, store, 33);

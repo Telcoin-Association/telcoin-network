@@ -1,8 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Primary Receiver Handler is the entrypoint for peer network requests.
 //!
 //! This module includes implementations for when the primary receives network
@@ -14,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::PrimaryReceiverHandler;
 use anemo::{async_trait, types::response::StatusCode};
 use consensus_metrics::monitored_scope;
 use tn_network_types::{
@@ -30,8 +26,6 @@ use tn_types::{
     validate_received_certificate_version, ConsensusHeader,
 };
 use tracing::{debug, instrument, warn};
-
-use super::PrimaryReceiverHandler;
 
 /// Maximum duration to fetch certificates from local storage.
 const FETCH_CERTIFICATES_MAX_HANDLER_TIME: Duration = Duration::from_secs(10);

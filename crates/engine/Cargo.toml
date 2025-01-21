@@ -37,5 +37,4 @@ reth-trie = { workspace = true }
 # unit tests
 eyre = { workspace = true }
 tn-test-utils = { workspace = true }
-reth-tracing = { workspace = true }
-tn-block-builder = { workspace = true, features = ["test-utils"] }
+tn-batch-builder = { workspace = true, features = ["test-utils"] }

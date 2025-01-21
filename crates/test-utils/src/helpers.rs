@@ -1,7 +1,6 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
-
 //! Helper methods for creating useful structs during tests.
+
+use crate::execution::TransactionFactory;
 use fastcrypto::{hash::Hash, traits::KeyPair as _};
 use indexmap::IndexMap;
 use rand::{
@@ -11,18 +10,15 @@ use rand::{
     thread_rng, Rng, RngCore, SeedableRng,
 };
 use reth_primitives::{Address, BlockHash, Bytes, Header, TransactionSigned, U256};
-use reth_tracing::tracing_subscriber::EnvFilter;
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     ops::RangeInclusive,
 };
 use tn_types::{
-    adiri_chain_spec_arc, to_intent_message, AuthorityIdentifier, BlsKeypair, BlsSignature,
+    adiri_chain_spec_arc, to_intent_message, AuthorityIdentifier, Batch, BlsKeypair, BlsSignature,
     Certificate, CertificateDigest, Committee, Epoch, HeaderBuilder, Multiaddr, NetworkKeypair,
-    ProtocolSignature, Round, Stake, TimestampSec, WorkerBlock, WorkerId,
+    ProtocolSignature, Round, Stake, TimestampSec, WorkerId,
 };
-
-use crate::execution::TransactionFactory;
 
 pub const VOTES_CF: &str = "votes";
 pub const HEADERS_CF: &str = "headers";
@@ -103,7 +99,7 @@ pub fn test_network(keypair: NetworkKeypair, address: &Multiaddr) -> anemo::Netw
     let address = address.to_anemo_address().unwrap();
     let network_key = keypair.private().0.to_bytes();
     anemo::Network::bind(address)
-        .server_name("narwhal")
+        .server_name("tn-test")
         .private_key(network_key)
         .start(anemo::Router::new())
         .unwrap()
@@ -140,11 +136,11 @@ pub fn fixture_payload(number_of_batches: u8) -> IndexMap<BlockHash, (WorkerId, 
 
 /// will create a batch with randomly formed transactions
 /// dictated by the parameter number_of_transactions
-pub fn fixture_batch_with_transactions(number_of_transactions: u32) -> WorkerBlock {
+pub fn fixture_batch_with_transactions(number_of_transactions: u32) -> Batch {
     let transactions = (0..number_of_transactions).map(|_v| transaction()).collect();
 
     // Put some random bytes in the header so that tests will have unique headers.
-    WorkerBlock { transactions, beneficiary: Address::random(), ..Default::default() }
+    Batch { transactions, beneficiary: Address::random(), ..Default::default() }
 }
 
 pub fn fixture_payload_with_rand<R: Rng + ?Sized>(
@@ -174,8 +170,8 @@ pub fn transaction_with_rand<R: Rng + ?Sized>(rand: &mut R) -> TransactionSigned
     tx_factory.create_eip1559(chain, None, gas_price, Some(Address::ZERO), value, Bytes::new())
 }
 
-pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R) -> WorkerBlock {
-    WorkerBlock::new_for_test(
+pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Batch {
+    Batch::new_for_test(
         vec![transaction_with_rand(rand), transaction_with_rand(rand)],
         Header::default(),
     )
@@ -210,14 +206,14 @@ pub fn transaction() -> TransactionSigned {
 ////////////////////////////////////////////////////////////////
 
 // Fixture
-pub fn batch() -> WorkerBlock {
+pub fn batch() -> Batch {
     let transactions = vec![transaction(), transaction()];
-    WorkerBlock { transactions, ..Default::default() }
+    Batch { transactions, ..Default::default() }
 }
 
 /// generate multiple fixture batches. The number of generated batches
 /// are dictated by the parameter num_of_batches.
-pub fn batches(num_of_batches: usize) -> Vec<WorkerBlock> {
+pub fn batches(num_of_batches: usize) -> Vec<Batch> {
     let mut batches = Vec::new();
 
     for i in 1..num_of_batches + 1 {
@@ -227,14 +223,14 @@ pub fn batches(num_of_batches: usize) -> Vec<WorkerBlock> {
     batches
 }
 
-pub fn batch_with_transactions(num_of_transactions: usize) -> WorkerBlock {
+pub fn batch_with_transactions(num_of_transactions: usize) -> Batch {
     let mut transactions = Vec::new();
 
     for _ in 0..num_of_transactions {
         transactions.push(transaction());
     }
 
-    WorkerBlock::new_for_test(transactions, Header::default())
+    Batch::new_for_test(transactions, Header::default())
 }
 
 /// Creates one certificate per authority starting and finishing at the specified rounds
@@ -672,17 +668,4 @@ pub fn mock_signed_certificate(
     }
     let cert = Certificate::new_unverified(committee, header, votes).unwrap();
     (cert.digest(), cert)
-}
-
-/// Setup tracing
-pub fn setup_test_tracing() {
-    let tracing_level = "debug";
-    let network_tracing_level = "info";
-
-    let log_filter = format!("{tracing_level},h2={network_tracing_level},tower={network_tracing_level},hyper={network_tracing_level},tonic::transport={network_tracing_level},quinn={network_tracing_level}");
-
-    let _ = reth_tracing::tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(log_filter.parse().unwrap()))
-        .with_writer(std::io::stderr)
-        .try_init();
 }

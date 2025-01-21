@@ -33,7 +33,6 @@ tn-config = { workspace = true }
 tn-worker = { workspace = true }
 consensus-metrics = { workspace = true }
 tn-primary-metrics = { workspace = true }
-reth-tracing = { workspace = true }
 reth-chainspec = { workspace = true }
 reth-cli-commands = { workspace = true }
 secp256k1 = { workspace = true }
@@ -46,8 +45,8 @@ eyre = { workspace = true }
 reth-node-ethereum = { workspace = true }
 reth-stages = { workspace = true }
 reth-primitives = { workspace = true }
-tn-block-builder = { workspace = true }
-tn-block-validator = { workspace = true }
+tn-batch-builder = { workspace = true }
+tn-batch-validator = { workspace = true }
 tn-engine = { workspace = true }
 reth = { workspace = true }
 reth-db = { workspace = true, features = ["test-utils"] }
@@ -68,11 +67,3 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 futures.workspace = true
-
-[[bench]]
-name = "batch_digest"
-harness = false
-
-[[bench]]
-name = "verify_certificate"
-harness = false

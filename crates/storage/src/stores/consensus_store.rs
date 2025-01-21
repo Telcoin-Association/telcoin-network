@@ -1,16 +1,12 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 //! NOTE: tests for this module are in test-utils storage_tests.rs to avoid circular dependancies.
 
 use crate::{
-    tables::{CommittedSubDag as CommittedSubDagTable, LastCommitted},
+    tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
     traits::{Database, DbTxMut},
-    StoreResult, ROUNDS_TO_KEEP,
+    StoreResult,
 };
-use std::collections::HashMap;
-use tn_types::{AuthorityIdentifier, CommittedSubDag, ConsensusCommit, Round, SequenceNumber};
+use std::{cmp::max, collections::HashMap};
+use tn_types::{AuthorityIdentifier, CommittedSubDag, ConsensusHeader, Round, SequenceNumber};
 use tracing::debug;
 
 /// The persistent storage of the sequencer.
@@ -28,102 +24,81 @@ impl<DB: Database> ConsensusStore<DB> {
         Self { db }
     }
 
-    /// Clear the store.
-    pub fn clear(&self) -> StoreResult<()> {
-        let mut txn = self.db.write_txn()?;
-        txn.clear_table::<LastCommitted>()?;
-        txn.clear_table::<CommittedSubDagTable>()?;
-        txn.commit()?;
-        Ok(())
+    /// Persist the sub dag to the consensus chain for some storage tests.
+    /// This uses garbage parent hash and number and is ONLY for testing.
+    /// As a test only function this will panic if unable to write the sub dag
+    /// to the consensus chain
+    pub fn write_subdag_for_test(&self, number: u64, sub_dag: CommittedSubDag) {
+        let header = ConsensusHeader { number, sub_dag, ..Default::default() };
+        let mut txn = self.db.write_txn().expect("failed to get DB txn");
+        txn.insert::<ConsensusBlocks>(&header.number, &header)
+            .expect("error saving a consensus header to persistant storage!");
+        txn.insert::<ConsensusBlockNumbersByDigest>(&header.digest(), &header.number)
+            .expect("error saving a consensus header to persistant storage!");
+        txn.commit().expect("error saving a consensus header to persistant storage!");
     }
 
-    /// Persist the consensus state.
-    pub fn write_consensus_state(
-        &self,
-        last_committed: &HashMap<AuthorityIdentifier, Round>,
-        sub_dag: &CommittedSubDag,
-    ) -> eyre::Result<()> {
-        let mut txn = self.db.write_txn()?;
-        let commit = ConsensusCommit::from_sub_dag(sub_dag);
+    /// Clear the consesus chain, ONLY for testing.
+    /// Will panic on an error.
+    pub fn clear_consensus_chain_for_test(&self) {
+        let mut txn = self.db.write_txn().expect("failed to get txn");
 
-        for (id, round) in last_committed.iter() {
-            txn.insert::<LastCommitted>(id, round)?;
-        }
-        txn.insert::<CommittedSubDagTable>(&sub_dag.sub_dag_index, &commit)?;
-        txn.commit()?;
-        self.gc_rounds(sub_dag.sub_dag_index)?;
-        Ok(())
-    }
+        txn.clear_table::<ConsensusBlocks>().expect("failed to clear consensus blocks");
+        txn.clear_table::<ConsensusBlockNumbersByDigest>()
+            .expect("failed to clear consensus block indexes");
 
-    /// Deletes all sub dags for a seq number before target_seq.
-    fn gc_rounds(&self, target_seq: SequenceNumber) -> StoreResult<()> {
-        if target_seq <= ROUNDS_TO_KEEP {
-            return Ok(());
-        }
-        let target_seq = target_seq - ROUNDS_TO_KEEP;
-        let mut dags = Vec::new();
-        for (seq, _) in self.db.iter::<CommittedSubDagTable>() {
-            if seq < target_seq {
-                dags.push(seq);
-            } else {
-                // We are done, all following seq will be greater.
-                break;
-            }
-        }
-        let mut txn = self.db.write_txn()?;
-        for seq in dags {
-            txn.remove::<CommittedSubDagTable>(&seq)?;
-        }
-        txn.commit()?;
-        Ok(())
+        txn.commit().expect("failed to clear consensus blocks");
     }
 
     /// Load the last committed round of each validator.
     pub fn read_last_committed(&self) -> HashMap<AuthorityIdentifier, Round> {
-        self.db.iter::<LastCommitted>().collect()
+        let mut res = HashMap::new();
+        for (id, round, certs) in
+            self.db.reverse_iter::<ConsensusBlocks>().take(50).map(|(_, block)| {
+                (
+                    block.sub_dag.leader.origin(),
+                    block.sub_dag.leader_round(),
+                    block.sub_dag.certificates,
+                )
+            })
+        {
+            res.entry(id).and_modify(|r| *r = max(*r, round)).or_insert_with(|| round);
+            for c in &certs {
+                res.entry(c.origin())
+                    .and_modify(|r| *r = max(*r, c.round()))
+                    .or_insert_with(|| c.round());
+            }
+        }
+        res
     }
 
-    /// Gets the latest sub dag index from the store
-    pub fn get_latest_sub_dag_index(&self) -> SequenceNumber {
-        self.db.last_record::<CommittedSubDagTable>().map(|(seq, _)| seq).unwrap_or_default()
-    }
-
-    /// Returns thet latest subdag committed. If none is committed yet, then
+    /// Returns the latest subdag committed. If none is committed yet, then
     /// None is returned instead.
-    pub fn get_latest_sub_dag(&self) -> Option<ConsensusCommit> {
-        self.db.last_record::<CommittedSubDagTable>().map(|(_, sub_dag)| sub_dag)
+    pub fn get_latest_sub_dag(&self) -> Option<CommittedSubDag> {
+        self.db.last_record::<ConsensusBlocks>().map(|(_, block)| block.sub_dag)
     }
 
     /// Load all the sub dags committed with sequence number of at least `from`.
     pub fn read_committed_sub_dags_from(
         &self,
         from: &SequenceNumber,
-    ) -> StoreResult<Vec<ConsensusCommit>> {
+    ) -> StoreResult<Vec<CommittedSubDag>> {
         Ok(self
             .db
-            .skip_to::<CommittedSubDagTable>(from)?
-            .map(|(_, sub_dag)| sub_dag)
-            .collect::<Vec<ConsensusCommit>>())
-    }
-
-    /// Load consensus commit with a given sequence number.
-    pub fn read_consensus_commit(
-        &self,
-        seq: &SequenceNumber,
-    ) -> StoreResult<Option<ConsensusCommit>> {
-        self.db.get::<CommittedSubDagTable>(seq)
+            .skip_to::<ConsensusBlocks>(from)?
+            .map(|(_, block)| block.sub_dag)
+            .collect::<Vec<CommittedSubDag>>())
     }
 
     /// Reads from storage the latest commit sub dag where its ReputationScores are marked as
     /// "final". If none exists yet then this method will return None.
-    pub fn read_latest_commit_with_final_reputation_scores(&self) -> Option<ConsensusCommit> {
-        for commit in self.db.reverse_iter::<CommittedSubDagTable>().map(|(_, sub_dag)| sub_dag) {
+    pub fn read_latest_commit_with_final_reputation_scores(&self) -> Option<CommittedSubDag> {
+        for commit in self.db.reverse_iter::<ConsensusBlocks>().map(|(_, block)| block.sub_dag) {
             // found a final of schedule score, so we'll return that
-            if commit.reputation_score().final_of_schedule {
+            if commit.reputation_score.final_of_schedule {
                 debug!(
-                    "Found latest final reputation scores: {:?} from commit {:?}",
-                    commit.reputation_score(),
-                    commit.sub_dag_index()
+                    "Found latest final reputation scores: {:?} from commit",
+                    commit.reputation_score,
                 );
                 return Some(commit);
             }

@@ -11,8 +11,8 @@ use std::{
     time::Duration,
 };
 use tn_types::{
-    adiri_genesis, get_available_tcp_port, BlsPublicKey, BlsSignature, Multiaddr, NetworkPublicKey,
-    WorkerIndex,
+    adiri_genesis, get_available_tcp_port, get_available_udp_port, BlsPublicKey, BlsSignature,
+    Multiaddr, NetworkPublicKey, WorkerIndex,
 };
 use tracing::info;
 
@@ -151,7 +151,7 @@ pub struct Parameters {
 
     /// The depth of the garbage collection (Denominated in number of rounds).
     #[serde(default = "Parameters::default_gc_depth")]
-    pub gc_depth: u64,
+    pub gc_depth: u32,
     /// The delay after which the synchronizer retries to send sync requests. Denominated in ms.
     #[serde(with = "humantime_serde", default = "Parameters::default_sync_retry_delay")]
     pub sync_retry_delay: Duration,
@@ -161,8 +161,8 @@ pub struct Parameters {
     pub sync_retry_nodes: usize,
     /// The delay after which the workers seal a batch of transactions, even if `max_batch_size`
     /// is not reached.
-    #[serde(with = "humantime_serde", default = "Parameters::default_max_worker_block_delay")]
-    pub max_worker_block_delay: Duration,
+    #[serde(with = "humantime_serde", default = "Parameters::default_max_batch_delay")]
+    pub max_batch_delay: Duration,
     /// The maximum number of concurrent requests for messages accepted from an un-trusted entity
     #[serde(default = "Parameters::default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
@@ -176,8 +176,8 @@ pub struct Parameters {
     #[serde(default = "AnemoParameters::default")]
     pub anemo: AnemoParameters,
     /// Worker timeout when request vote from peers.
-    #[serde(default = "Parameters::default_worker_block_vote_timeout")]
-    pub worker_block_vote_timeout: Duration,
+    #[serde(default = "Parameters::default_batch_vote_timeout")]
+    pub batch_vote_timeout: Duration,
 }
 
 impl Parameters {
@@ -197,7 +197,7 @@ impl Parameters {
         Duration::from_secs(5)
     }
 
-    fn default_gc_depth() -> u64 {
+    pub fn default_gc_depth() -> u32 {
         50
     }
 
@@ -209,7 +209,7 @@ impl Parameters {
         3
     }
 
-    fn default_max_worker_block_delay() -> Duration {
+    fn default_max_batch_delay() -> Duration {
         Duration::from_secs(1)
     }
 
@@ -217,7 +217,7 @@ impl Parameters {
         500_000
     }
 
-    fn default_worker_block_vote_timeout() -> Duration {
+    fn default_batch_vote_timeout() -> Duration {
         Duration::from_secs(10)
     }
 }
@@ -235,8 +235,10 @@ impl Default for NetworkAdminServerParameters {
     fn default() -> Self {
         let host = "127.0.0.1";
         Self {
-            primary_network_admin_server_port: get_available_tcp_port(host).unwrap_or_default(),
-            worker_network_admin_server_base_port: get_available_tcp_port(host).unwrap_or_default(),
+            primary_network_admin_server_port: get_available_udp_port(host)
+                .expect("udp port is available for primary"),
+            worker_network_admin_server_base_port: get_available_udp_port(host)
+                .expect("udp port is available for worker admin server"),
         }
     }
 }
@@ -282,14 +284,16 @@ impl AnemoParameters {
     ///
     /// By default, at most 20 certificates can be sent concurrently to a peer.
     pub fn send_certificate_rate_limit(&self) -> u32 {
-        self.send_certificate_rate_limit.unwrap_or(NonZeroU32::new(20).unwrap()).get()
+        self.send_certificate_rate_limit
+            .unwrap_or(NonZeroU32::new(20).expect("20 cast as u32"))
+            .get()
     }
 
     /// Set the limit for the amount of batches that can be broadcast concurrently.
     ///
     /// By default, at most 100 batches can be broadcasted concurrently.
     pub fn report_batch_rate_limit(&self) -> u32 {
-        self.report_batch_rate_limit.unwrap_or(NonZeroU32::new(200).unwrap()).get()
+        self.report_batch_rate_limit.unwrap_or(NonZeroU32::new(200).expect("200 cast as u32")).get()
     }
 
     /// Set the limit for amount of requests to send a peer for batches.
@@ -297,7 +301,9 @@ impl AnemoParameters {
     /// As of 11/02/2023, when one worker is actively fetching, each peer receives
     /// 20~30 requests per second.
     pub fn request_batches_rate_limit(&self) -> u32 {
-        self.request_batches_rate_limit.unwrap_or(NonZeroU32::new(100).unwrap()).get()
+        self.request_batches_rate_limit
+            .unwrap_or(NonZeroU32::new(100).expect("100 cast as u32"))
+            .get()
     }
 
     /// Set the limit for excessive message size.
@@ -322,10 +328,11 @@ impl Default for PrometheusMetricsParameters {
             socket_addr: format!(
                 "/ip4/{}/tcp/{}/http",
                 host,
-                get_available_tcp_port(host).unwrap_or_default()
+                get_available_tcp_port(host)
+                    .expect("os has available TCP port for default prometheus metrics")
             )
             .parse()
-            .unwrap(),
+            .expect("default prometheus metrics to parse available socket addr on localhost"),
         }
     }
 }
@@ -349,12 +356,12 @@ impl Default for Parameters {
             gc_depth: Parameters::default_gc_depth(),
             sync_retry_delay: Parameters::default_sync_retry_delay(),
             sync_retry_nodes: Parameters::default_sync_retry_nodes(),
-            max_worker_block_delay: Parameters::default_max_worker_block_delay(),
+            max_batch_delay: Parameters::default_max_batch_delay(),
             max_concurrent_requests: Parameters::default_max_concurrent_requests(),
             prometheus_metrics: PrometheusMetricsParameters::default(),
             network_admin_server: NetworkAdminServerParameters::default(),
             anemo: AnemoParameters::default(),
-            worker_block_vote_timeout: Parameters::default_worker_block_vote_timeout(),
+            batch_vote_timeout: Parameters::default_batch_vote_timeout(),
         }
     }
 }
@@ -378,7 +385,7 @@ impl Parameters {
         info!("Garbage collection depth set to {} rounds", self.gc_depth);
         info!("Sync retry delay set to {} ms", self.sync_retry_delay.as_millis());
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
-        info!("Max batch delay set to {} ms", self.max_worker_block_delay.as_millis());
+        info!("Max batch delay set to {} ms", self.max_batch_delay.as_millis());
         info!("Max concurrent requests set to {}", self.max_concurrent_requests);
         info!("Prometheus metrics server will run on {}", self.prometheus_metrics.socket_addr);
         info!(

@@ -1,6 +1,4 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Database traits for compatibility.
 
 use serde::{de::DeserializeOwned, Serialize};
 use std::{borrow::Borrow, fmt::Debug};

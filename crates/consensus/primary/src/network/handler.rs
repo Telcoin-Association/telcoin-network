@@ -368,7 +368,7 @@ where
         // ensure header is not too old
         let limit = self
             .consensus_bus
-            .narwhal_round_updates()
+            .primary_round_updates()
             .borrow()
             .saturating_sub(MAX_HEADER_AGE_LIMIT);
         ensure!(limit <= header.round(), HeaderError::TooOld(header.round(), limit));

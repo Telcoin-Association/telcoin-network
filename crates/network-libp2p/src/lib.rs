@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT or Apache-2.0
 //! Peer-to-peer network interface for Telcoin Network built using libp2p.
 
 mod codec;

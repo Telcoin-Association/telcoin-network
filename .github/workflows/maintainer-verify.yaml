@@ -1,0 +1,26 @@
+name: Maintainer Verify
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, review_requested, ready_for_review]
+
+jobs:
+  verify-on-chain:
+    environment: merge-into-main
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      # checkout repo to use `verify_commit_hash.sh`
+      - name: checkout repo
+        uses: actions/checkout@v4
+      # install foundry toolchain for casting txs
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+      # query adiri for commit hash
+      - name: verify commit hash on adiri
+        env:
+          COMMIT_HASH: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/verify_commit_hash.sh

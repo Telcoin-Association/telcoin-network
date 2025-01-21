@@ -1,7 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 use crate::{tables::Votes, traits::Database};
 use tn_types::{AuthorityIdentifier, Vote, VoteInfo};
 use tn_utils::fail_point;
@@ -21,11 +17,11 @@ impl<DB: Database> VoteDigestStore<DB> {
     /// header author key.
     #[allow(clippy::let_and_return)]
     pub fn write(&self, vote: &Vote) -> eyre::Result<()> {
-        fail_point!("narwhal-store-before-write");
+        fail_point!("vote-digest-store-before-write");
 
         let result = self.store.insert::<Votes>(&vote.origin(), &vote.into());
 
-        fail_point!("narwhal-store-after-write");
+        fail_point!("vote-digest-store-after-write");
         result
     }
 

@@ -6,30 +6,30 @@ use reth_primitives::{Address, SealedBlock};
 
 /// The arguments passed to the worker's block builder.
 #[derive(Debug)]
-pub struct WorkerBlockBuilderArgs<Pool> {
+pub struct BatchBuilderArgs<Pool> {
     /// The transaction pool.
     pub pool: Pool,
     /// The attributes for the next block.
-    pub block_config: PendingBlockConfig,
+    pub batch_config: PendingBlockConfig,
 }
 
-impl<Pool> WorkerBlockBuilderArgs<Pool> {
+impl<Pool> BatchBuilderArgs<Pool> {
     /// Create a new instance of [Self].
-    pub fn new(pool: Pool, block_config: PendingBlockConfig) -> Self {
-        Self { pool, block_config }
+    pub fn new(pool: Pool, batch_config: PendingBlockConfig) -> Self {
+        Self { pool, batch_config }
     }
 }
 
-/// The configuration to use for building the next worker block.
+/// The configuration to use for building the next batch.
 #[derive(Debug)]
 pub struct PendingBlockConfig {
     /// The worker primary's address.
     pub beneficiary: Address,
-    /// The current information from canonical tip and finalized block.
+    /// The current information from canonical tip and finalized batch.
     ///
-    /// The block builder always extends the canonical tip. This struct
+    /// The batch builder always extends the canonical tip. This struct
     /// is updated with rounds of consensus and used by the worker to
-    /// build the next block.
+    /// build the next batch.
     pub parent_info: LastCanonicalUpdate,
 }
 

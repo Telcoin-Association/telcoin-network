@@ -1,9 +1,12 @@
 use crate::util::{config_local_testnet, IT_TEST_MUTEX};
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
+use nix::{
+    sys::signal::{self, Signal},
+    unistd::Pid,
+};
 use rand::{rngs::StdRng, SeedableRng};
 use reth_primitives::{alloy_primitives, keccak256, Address};
-use reth_tracing::init_test_tracing;
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::{value::RawValue, Value};
 use std::{
@@ -14,14 +17,18 @@ use std::{
 };
 use tn_types::get_available_tcp_port;
 use tokio::runtime::Runtime;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 /// One unit of TEL (10^18) measured in wei.
 const WEI_PER_TEL: u128 = 1_000_000_000_000_000_000;
 
 /// Helper function to shutdown child processes and log errors.
 fn kill_child(child: &mut Child) {
-    if let Err(e) = child.kill() {
+    // The code below will send SIGKILL without the use of nix.
+    //if let Err(e) = child.kill() {
+    //    error!(target: "restart-test", ?e, "error killing child");
+    //}
+    if let Err(e) = signal::kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM) {
         error!(target: "restart-test", ?e, "error killing child");
     }
 
@@ -51,7 +58,7 @@ fn run_restart_tests1(
 
     // sleep
     std::thread::sleep(Duration::from_millis(1000));
-    debug!(target: "restart-test", "calling get_positive_balance_with_retry in tests1...");
+    info!(target: "restart-test", "calling get_positive_balance_with_retry in tests1...");
 
     // get positive bal and kill child2 if error
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
@@ -66,9 +73,9 @@ fn run_restart_tests1(
         return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 10 * WEI_PER_TEL)));
     }
 
-    debug!(target: "restart-test", "killing child2...");
+    info!(target: "restart-test", "killing child2...");
     kill_child(child2);
-    debug!(target: "restart-test", "child2 dead :D sleeping...");
+    info!(target: "restart-test", "child2 dead :D sleeping...");
     std::thread::sleep(Duration::from_secs(delay_secs));
 
     // This validator should be down now, confirm.
@@ -77,7 +84,7 @@ fn run_restart_tests1(
         return Err(Report::msg("Validator not down!".to_string()));
     }
 
-    debug!(target: "restart-test", "restarting child2...");
+    info!(target: "restart-test", "restarting child2...");
     // Restart
     let mut child2 = start_validator(2, exe_path, temp_path, rpc_port2);
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
@@ -126,12 +133,13 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
     if 30 * WEI_PER_TEL != bal {
         return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 30 * WEI_PER_TEL)));
     }
+    test_blocks_same(client_urls)?;
     Ok(())
 }
 
 fn do_restarts(delay: u64) -> eyre::Result<()> {
     let _guard = IT_TEST_MUTEX.lock();
-    init_test_tracing();
+    info!(target: "restart-test", "do_restarts, delay: {delay}");
     // the tmp dir should be removed once tmp_quard is dropped
     let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");
     // create temp path for test
@@ -151,7 +159,7 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
     let mut rpc_ports: [u16; 4] = [0, 0, 0, 0];
     for (i, child) in children.iter_mut().enumerate() {
         let rpc_port = get_available_tcp_port("127.0.0.1")
-            .expect("Failed to get an ephemeral rpc port for child {i}!");
+            .expect("Failed to get an ephemeral rpc port for child!");
         rpc_ports[i] = rpc_port;
         client_urls[i].push_str(&format!(":{rpc_port}"));
         *child = Some(start_validator(i, &exe_path, &temp_path, rpc_port));
@@ -160,9 +168,11 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
     // pass &mut to `run_restart_tests1` to shutdown child in case of error
     let mut child2 = children[2].take().expect("missing child 2");
 
+    info!(target: "restart-test", "Running restart tests 1");
     // run restart tests1
     let res1 =
         run_restart_tests1(&client_urls, &mut child2, &exe_path, &temp_path, rpc_ports[2], delay);
+    info!(target: "restart-test", "Ran restart tests 1: {res1:?}");
     let is_ok = res1.is_ok();
 
     // kill new child2 if successfully restarted
@@ -184,7 +194,7 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
         if i != 2 {
             let child = child.as_mut().expect("missing a child");
             kill_child(child);
-            debug!(target: "restart-test", "kill and wait on child{i} complete");
+            info!(target: "restart-test", "kill and wait on child{i} complete");
         }
     }
 
@@ -201,25 +211,23 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
         *child = Some(start_validator(i, &exe_path, &temp_path, rpc_ports[i]));
     }
 
+    info!(target: "restart-test", "Running restart tests 2");
     let res2 = run_restart_tests2(&client_urls);
-
-    // test blocks are the same if res2 is okay - otherwise use error from res2
-    let final_result = if res2.is_ok() { test_blocks_same(&client_urls) } else { res2 };
+    info!(target: "restart-test", "Ran restart tests 2: {res2:?}");
 
     // kill children before returnin final_result
     for child in children.iter_mut() {
         let child = child.as_mut().expect("missing a child");
         kill_child(child);
-        debug!(target: "restart-test", "kill and wait on child complete for final result");
+        info!(target: "restart-test", "kill and wait on child complete for final result");
     }
 
-    // contains res2 if failure
-    final_result
+    res2
 }
 
 /// Test a restart case with a short delay, the stopped node should rejoin consensus.
 #[test]
-fn test_restarts() -> eyre::Result<()> {
+fn test_restartstt() -> eyre::Result<()> {
     do_restarts(2)
 }
 
@@ -267,7 +275,10 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
     let number = u64::from_str_radix(&block["number"].as_str().unwrap_or_default()[2..], 16)?;
     let block = get_block(&client_urls[2], Some(number))?;
     if block0["hash"] != block["hash"] {
-        return Err(Report::msg("Blocks between validators not the same!".to_string()));
+        return Err(Report::msg(format!(
+            "Blocks between validators not the same! block0: {:?} - block: {:?}",
+            block0["hash"], block["hash"]
+        )));
     }
     let number = u64::from_str_radix(&block["number"].as_str().unwrap_or_default()[2..], 16)?;
     let block = get_block(&client_urls[3], Some(number))?;
@@ -285,7 +296,7 @@ fn get_balance(node: &str, address: &str, retries: usize) -> eyre::Result<u128> 
     let res_str = call_rpc(node, "eth_getBalance", Some(&params), retries)?;
     info!(target: "restart-test", "get_balance for {node}: parsing string {res_str}");
     let tel = u128::from_str_radix(&res_str[2..], 16)?;
-    debug!(target: "restart-test", "get_balance for {node}: {tel:?}");
+    info!(target: "restart-test", "get_balance for {node}: {tel:?}");
     Ok(tel)
 }
 
@@ -396,7 +407,7 @@ fn send_tel(
     let transaction_bytes = new_transaction.sign(&ecdsa);
     let params = RawValue::from_string(format!("[\"{}\"]", const_hex::encode(transaction_bytes)))?;
     let res_str = call_rpc(node, "eth_sendRawTransaction", Some(&params), 5)?;
-    debug!(target: "restart-test", "Submitted TEL transfer from {from_account} to {to_account} for {amount}: {res_str}");
+    info!(target: "restart-test", "Submitted TEL transfer from {from_account} to {to_account} for {amount}: {res_str}");
     Ok(())
 }
 

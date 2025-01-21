@@ -47,6 +47,7 @@ tn-network = { workspace = true }
 consensus-metrics = { workspace = true }
 tn-faucet = { workspace = true, optional = true }
 alloy = { workspace = true }
+reth-tracing = { workspace = true }
 
 # config
 tn-config = { workspace = true }
@@ -54,7 +55,6 @@ serde_yaml = { workspace = true }
 reth = { workspace = true }
 reth-config = { workspace = true }
 reth-primitives = { workspace = true }
-reth-tracing = { workspace = true }
 reth-metrics = { workspace = true }
 reth-db = { workspace = true }
 reth-node-core = { workspace = true }
@@ -85,6 +85,7 @@ jsonrpsee = { workspace = true }
 k256 = "0.13.3"
 tn-test-utils = { workspace = true }
 tonic = { workspace = true }
+nix = { version = "0.29", features = ["signal"] }
 
 [features]
 default = []

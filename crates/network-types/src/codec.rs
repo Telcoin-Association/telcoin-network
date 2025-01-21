@@ -1,7 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 use bytes::{Buf, BufMut};
 use std::{io::Read, marker::PhantomData};
 use tonic::{

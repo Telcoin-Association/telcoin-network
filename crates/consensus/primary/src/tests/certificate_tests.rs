@@ -1,8 +1,4 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
-// This test file tests the validity of the 'certificates' implementation.
+//! Certificate tests
 
 use fastcrypto::traits::KeyPair as _;
 use rand::{

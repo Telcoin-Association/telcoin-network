@@ -23,7 +23,6 @@ use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_param
 use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicKey as PubKey};
 use reth_chainspec::ChainSpec;
 use reth_primitives::{public_key_to_address, Address, GenesisAccount, B256, U256};
-use reth_tracing::init_test_tracing;
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
 use tn_config::{test_fetch_file_content_relative_to_manifest, ContractStandardJson};
@@ -35,7 +34,6 @@ use tracing::{debug, info};
 #[tokio::test]
 async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result<()> {
     let _guard = IT_TEST_MUTEX.lock();
-    init_test_tracing();
 
     // create google env and temp chain spec for state initialization
     let (tmp_chain, kms_address) = prepare_google_kms_env().await?;
@@ -364,7 +362,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
 
     // NOW:
     // submit another tx from the account that just got dripped
-    // so the the worker's watch channel updates to a new block that doesn't have
+    // so the the worker's watch channel updates to a new batch that doesn't have
     // the faucet's address in the state
     //
     // this creates scenario for faucet to rely on provider.latest() for accuracy
@@ -500,9 +498,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
         })
         .collect();
 
-    // let mut results = Vec::new();
     while let Some(res) = requests.next().await {
-        // results.push(res?);
         assert!(res.is_ok());
     }
 
@@ -513,12 +509,6 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
             tokio::spawn({
                 let client = client.clone();
                 async move {
-                    // client
-                    //     .clone()
-                    //     .request::<String, _>("faucet_transfer", rpc_params![address])
-                    //     .await
-                    //     .expect("request successful")
-
                     // ensure account balance increased
                     //
                     // account balance is only updates on final execution
@@ -533,7 +523,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
                         ),
                     )
                     .await
-                    .expect("inside check account balances for {address:?}")
+                    .expect("account balance okay")
                     .expect("expected balance random account timeout");
                 }
             })

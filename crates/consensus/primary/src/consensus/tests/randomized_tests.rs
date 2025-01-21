@@ -1,10 +1,8 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Randomized tests
 
 use crate::consensus::{
-    make_consensus_store, Bullshark, ConsensusMetrics, ConsensusState, LeaderSchedule,
-    LeaderSwapTable,
+    consensus_utils::make_consensus_store, Bullshark, ConsensusMetrics, ConsensusState,
+    LeaderSchedule, LeaderSwapTable,
 };
 use fastcrypto::hash::{Hash, HashFunction};
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -21,11 +19,10 @@ use std::{
     sync::Arc,
 };
 use tn_storage::{mem_db::MemDatabase, open_db, traits::Database, ConsensusStore};
-use tn_types::{Authority, AuthorityIdentifier, Committee, Stake};
-
 use tn_test_utils::{mock_certificate_with_rand, CommitteeFixture};
-use tn_types::{Certificate, CertificateDigest, Round};
-#[allow(unused_imports)]
+use tn_types::{
+    Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Round, Stake,
+};
 use tokio::sync::mpsc::channel;
 
 #[derive(Copy, Clone, Debug)]
@@ -72,6 +69,7 @@ impl ExecutionPlan {
 
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+/// TODO: this tests runs forever
 async fn bullshark_randomised_tests() {
     // Configuration regarding the randomized tests. The tests will run for different values
     // on the below parameters to increase the different cases we can generate.
@@ -316,11 +314,6 @@ pub fn make_certificates_with_parameters(
             .collect()
     };
 
-    println!(
-        "Slow nodes: {:?}",
-        slow_nodes.iter().map(|(a, _)| a.id()).collect::<Vec<AuthorityIdentifier>>()
-    );
-
     let mut certificates = VecDeque::new();
     let mut parents = initial_parents;
     let mut next_parents = Vec::new();
@@ -472,15 +465,6 @@ fn generate_and_run_execution_plans<DB: Database>(
     modes: FailureModes,
     store: Arc<ConsensusStore<DB>>,
 ) {
-    println!(
-        "Running execution plans for run_id {} for rounds={}, committee={}, gc_depth={}, modes={:?}",
-        run_id,
-        dag_rounds,
-        committee.size(),
-        gc_depth,
-        modes
-    );
-
     let mut executed_plans = HashSet::new();
     let mut committed_certificates = Vec::new();
 
@@ -491,14 +475,13 @@ fn generate_and_run_execution_plans<DB: Database>(
 
         let hash = plan.hash();
         if !executed_plans.insert(hash) {
-            println!("Skipping plan with seed {}, same executed already", seed);
             continue;
         }
 
         // Now create a new Bullshark engine
         let metrics = Arc::new(ConsensusMetrics::default());
         let mut state = ConsensusState::new(metrics.clone(), gc_depth);
-        const SUB_DAGS_PER_SCHEDULE: u64 = 5;
+        const SUB_DAGS_PER_SCHEDULE: u32 = 5;
         let bad_nodes_stake_threshold = 0;
         let mut bullshark = Bullshark::new(
             committee.clone(),
@@ -547,8 +530,6 @@ fn generate_and_run_execution_plans<DB: Database>(
             );
         }
     }
-
-    println!("Successfully run {}", run_id);
 }
 
 /// This method is accepting a list of certificates that have been created to represent a valid

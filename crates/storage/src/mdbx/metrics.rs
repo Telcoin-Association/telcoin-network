@@ -1,3 +1,5 @@
+//! mdbx metrics
+
 use prometheus::{default_registry, register_int_gauge_with_registry, IntGauge, Registry};
 
 #[derive(Debug)]

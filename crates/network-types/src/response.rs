@@ -2,8 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use tn_types::{
-    BlockHash, Certificate, CertificateDigest, ConsensusHeader, Vote, WorkerBlock, WorkerId,
-    WorkerInfo,
+    Batch, BlockHash, Certificate, CertificateDigest, ConsensusHeader, Vote, WorkerId, WorkerInfo,
 };
 
 /// Response from peers after receiving a certificate.
@@ -30,11 +29,11 @@ pub struct FetchCertificatesResponse {
     pub certificates: Vec<Certificate>,
 }
 
-/// All blocks requested by the primary.
+/// All batches requested by the primary.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct FetchBlocksResponse {
-    /// The missing blocks fetched from peers.
-    pub blocks: HashMap<BlockHash, WorkerBlock>,
+pub struct FetchBatchResponse {
+    /// The missing batches fetched from peers.
+    pub batches: HashMap<BlockHash, Batch>,
 }
 
 /// Information for the workers.
@@ -47,10 +46,10 @@ pub struct WorkerInfoResponse {
 //=== Worker
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RequestBlocksResponse {
-    /// Requested blocks.
-    pub blocks: Vec<WorkerBlock>,
-    /// If true, the primary should request the blocks from the workers again.
+pub struct RequestBatchesResponse {
+    /// Requested batches.
+    pub batches: Vec<Batch>,
+    /// If true, the primary should request the batches from the workers again.
     /// This may not be something that can be trusted from a remote worker.
     pub is_size_limit_reached: bool,
 }

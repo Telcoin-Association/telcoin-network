@@ -1,5 +1,4 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
+//! Cryptographic keys used by the node.
 
 use crate::{
     read_validator_keypair_from_file, TelcoinDirs, BLS_KEYFILE, PRIMARY_NETWORK_KEYFILE,

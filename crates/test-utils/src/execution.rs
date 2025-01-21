@@ -36,7 +36,7 @@ use tempfile::tempdir;
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
 use tn_node::engine::{ExecutionNode, TnBuilder};
-use tn_types::{adiri_genesis, now, ExecutionKeypair, TaskManager, TimestampSec, WorkerBlock};
+use tn_types::{adiri_genesis, now, Batch, ExecutionKeypair, TaskManager, TimestampSec};
 use tracing::debug;
 
 /// Convnenience type for testing Execution Node.
@@ -211,7 +211,7 @@ pub fn adiri_genesis_seeded(accounts: Vec<Address>) -> Genesis {
 /// Helper function to seed an instance of Genesis with accounts from a random batch.
 pub fn seeded_genesis_from_random_batch(
     genesis: Genesis,
-    batch: &WorkerBlock,
+    batch: &Batch,
 ) -> (Genesis, Vec<TransactionSigned>, Vec<Address>) {
     let mut senders = vec![];
     let mut accounts_to_seed = Vec::new();
@@ -240,7 +240,7 @@ pub fn seeded_genesis_from_random_batch(
 /// further use it testing.
 pub fn seeded_genesis_from_random_batches<'a>(
     mut genesis: Genesis,
-    batches: impl IntoIterator<Item = &'a WorkerBlock>,
+    batches: impl IntoIterator<Item = &'a Batch>,
 ) -> (Genesis, Vec<Vec<TransactionSigned>>, Vec<Vec<Address>>) {
     let mut txs = vec![];
     let mut senders = vec![];
@@ -280,13 +280,13 @@ pub struct OptionalTestBatchParams {
     pub base_fee_per_gas_opt: Option<u64>,
 }
 
-/// Test utility to execute worker block and return execution outcome.
+/// Test utility to execute batch and return execution outcome.
 ///
 /// This is useful for simulating execution results for account state changes.
 /// Currently only used by faucet tests to obtain faucet contract account info
 /// by simulating deploying proxy contract. The results are then put into genesis.
 pub fn execution_outcome_for_tests<P, E>(
-    worker_block: &WorkerBlock,
+    batch: &Batch,
     parent: &SealedHeader,
     provider: &P,
     executor: &E,
@@ -322,13 +322,13 @@ where
 
     // decode batch transactions
     let mut txs = vec![];
-    for tx in worker_block.transactions() {
+    for tx in batch.transactions() {
         let tx_signed = tx.clone();
         txs.push(tx_signed);
     }
 
     // update header's transactions root
-    header.transactions_root = if worker_block.transactions().is_empty() {
+    header.transactions_root = if batch.transactions().is_empty() {
         EMPTY_TRANSACTIONS
     } else {
         proofs::calculate_transaction_root(&txs)
@@ -585,37 +585,4 @@ where
         .expect("latest header from provider for gas price")
         .expect("latest header is some for gas price");
     header.next_block_base_fee(BaseFeeParams::ethereum()).unwrap_or_default().into()
-}
-
-#[cfg(test)]
-mod tests {
-
-    use super::*;
-    #[test]
-    fn test_print_key_info() {
-        // let mut rng = StdRng::from_seed([0; 32]);
-        // let keypair = ExecutionKeypair::generate(&mut rng);
-
-        let secp = Secp256k1::new();
-        let (secret_key, _public_key) = secp.generate_keypair(&mut rand::thread_rng());
-        let keypair = ExecutionKeypair::from_secret_key(&secp, &secret_key);
-
-        // let private = base64::encode(keypair.secret.as_bytes());
-        let _secret = keypair.secret_bytes();
-        // println!("secret: {:?}", hex::encode(secret));
-        let _pubkey = keypair.public_key().serialize();
-        // println!("public: {:?}", hex::encode(pubkey));
-
-        // 9bf49a6a0755f953811fce125f2683d50429c3bb49e074147e0089a52eae155f
-        // println!("{:?}", hex::encode(bytes));
-        // public key hex [0; 32]
-        // 029bef8d556d80e43ae7e0becb3a7e6838b95defe45896ed6075bb9035d06c9964
-        //
-        // let pkey = secp256k1::PublicKey::from_str(
-        //     "029bef8d556d80e43ae7e0becb3a7e6838b95defe45896ed6075bb9035d06c9964",
-        // )
-        // .unwrap();
-        // println!("{:?}", public_key_to_address(pkey));
-        // println!("pkey: {pkey:?}");
-    }
 }

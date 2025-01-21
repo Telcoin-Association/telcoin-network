@@ -1,20 +1,16 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! IT tests
+
 use fastcrypto::hash::Hash;
+use reth_primitives::{Header, B256};
+use std::{collections::BTreeSet, sync::Arc};
 use tn_executor::get_restored_consensus_output;
 use tn_primary::{
     consensus::{Bullshark, Consensus, ConsensusMetrics, LeaderSchedule, LeaderSwapTable},
     ConsensusBus,
 };
-
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{TaskManager, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
-
-use std::{collections::BTreeSet, sync::Arc};
-
-use tn_types::{Certificate, TnReceiver, TnSender};
+use tn_types::{Certificate, TaskManager, TnReceiver, TnSender, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
 
 #[tokio::test]
 async fn test_recovery() {
@@ -39,7 +35,7 @@ async fn test_recovery() {
     let (_, certificate) = tn_test_utils::mock_certificate(&committee, ids[1], 5, next_parents);
     certificates.push_back(certificate);
 
-    const NUM_SUB_DAGS_PER_SCHEDULE: u64 = 100;
+    const NUM_SUB_DAGS_PER_SCHEDULE: u32 = 100;
     let metrics = Arc::new(ConsensusMetrics::default());
     let bullshark = Bullshark::new(
         committee.clone(),
@@ -53,8 +49,10 @@ async fn test_recovery() {
     let cb = ConsensusBus::new();
     let cb_clone = cb.clone();
     let mut rx_output = cb.sequence().subscribe();
+    let dummy_parent = Header::default().seal(B256::default());
+    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     // pretend we are synced and ready to go so test can run...
-    cb.node_mode().send(tn_primary::NodeMode::Cvv).unwrap();
+    cb.node_mode().send(tn_primary::NodeMode::CvvActive).unwrap();
     Consensus::spawn(config_1, &cb, bullshark, &TaskManager::default());
     tokio::spawn(async move {
         let mut rx_primary = cb_clone.committed_certificates().subscribe();
@@ -73,7 +71,8 @@ async fn test_recovery() {
     let expected_committed_sub_dags = 2;
     for i in 1..=expected_committed_sub_dags {
         let sub_dag = rx_output.recv().await.unwrap();
-        assert_eq!(sub_dag.sub_dag_index, i);
+        assert_eq!(sub_dag.leader.round(), i * 2);
+        consensus_store.write_subdag_for_test(i as u64 * 2, sub_dag);
     }
 
     // Now assume that we want to recover from a crash. We are testing all the recovery cases
@@ -81,9 +80,9 @@ async fn test_recovery() {
     for last_executed_certificate_index in 0..=expected_committed_sub_dags {
         let consensus_output = get_restored_consensus_output(
             consensus_store.clone(),
-            certificate_store.clone(),
-            // &execution_state,
-            last_executed_certificate_index,
+            last_executed_certificate_index as u64 * 2, /* Note when we have more that epoc 0
+                                                         * this
+                                                         * may break... */
         )
         .await
         .expect("consensus output is restored from storage");
@@ -91,68 +90,3 @@ async fn test_recovery() {
         assert_eq!(consensus_output.len(), (2 - last_executed_certificate_index) as usize);
     }
 }
-
-// TODO: this needs to work again
-// #[tokio::test]
-// async fn test_internal_consensus_output() {
-//     // Enabled debug tracing so we can easily observe the
-//     // nodes logs.
-//     let _guard = setup_test_tracing();
-
-// let manager = TaskManager::current();
-// let executor = manager.executor();
-//     let mut cluster = Cluster::new(None, executor);
-
-//     // start the cluster
-//     cluster.start(Some(4), Some(1), None).await;
-
-//     // get a client to send transactions
-//     let worker_id = 0;
-
-//     let authority = cluster.authority(0);
-//     // let mut client = authority.new_transactions_client(&worker_id).await;
-
-//     // Subscribe to the transaction confirmation channel
-//     let mut receiver = authority.primary().await.tx_transaction_confirmation.subscribe();
-
-//     // Create arbitrary transactions
-//     // let mut transactions = Vec::new();
-
-//     const NUM_OF_TRANSACTIONS: u32 = 10;
-//     // for i in 0..NUM_OF_TRANSACTIONS {
-//     //     let tx = string_transaction(i);
-
-//     //     // serialise and send
-//     //     let tr = bcs::to_bytes(&tx).unwrap();
-//     //     let txn = TransactionProto { transaction: Bytes::from(tr) };
-//     //     client.submit_transaction(txn).await.unwrap();
-
-//     //     transactions.push(tx);
-//     // }
-
-//     // wait for transactions to complete
-//     loop {
-//         let result = receiver.recv().await.unwrap();
-
-//         // deserialise transaction
-//         let output_transaction = bcs::from_bytes::<String>(&result).unwrap();
-
-//         // we always remove the first transaction and check with the one
-//         // sequenced. We want the transactions to be sequenced in the
-//         // same order as we post them.
-//         let expected_transaction = transactions.remove(0);
-
-//         assert_eq!(
-//             expected_transaction, output_transaction,
-//             "Expected to have received transaction with same id. Ordering is important"
-//         );
-
-//         if transactions.is_empty() {
-//             break;
-//         }
-//     }
-// }
-
-// // fn string_transaction(id: u32) -> String {
-// //     format!("test transaction:{id}")
-// // }

@@ -39,18 +39,14 @@ anemo = { workspace = true }
 anemo-tower = { workspace = true }
 eyre = { workspace = true }
 anyhow = { workspace = true }
-tn-block-validator = { workspace = true }
+tn-batch-validator = { workspace = true }
 
 [dev-dependencies]
+tn-batch-validator = { workspace = true, features = ["test-utils"] }
 rand = { workspace = true }
 tempfile = { workspace = true }
 tn-test-utils = { workspace = true }
 tn-node = { workspace = true }
 tn-primary = { workspace = true }
-reth-tracing = { workspace = true }
 tn-network = { workspace = true, features = ["test-utils"] }
 bytes = { workspace = true }
-
-[features]
-benchmark = []
-trace_transaction = []

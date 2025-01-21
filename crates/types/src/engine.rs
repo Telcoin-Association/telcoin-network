@@ -119,7 +119,7 @@ impl TNPayload {
 
         // create block environment to re-execute worker's block
         let block_env = BlockEnv {
-            // the block's number should come from the canonical tip, NOT the worker block's number
+            // the block's number should come from the canonical tip, NOT the batch's number
             number: U256::from(self.attributes.parent_header.number + 1),
             coinbase: self.suggested_fee_recipient(),
             timestamp: U256::from(self.timestamp()),

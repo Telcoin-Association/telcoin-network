@@ -1,20 +1,15 @@
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-#![allow(clippy::mutable_key_type)]
+//! Bullshark tests
 
 use super::*;
-
 use crate::{
-    consensus::{make_consensus_store, Consensus, NUM_SUB_DAGS_PER_SCHEDULE},
+    consensus::{
+        consensus_utils::{make_consensus_store, NUM_SUB_DAGS_PER_SCHEDULE},
+        Consensus,
+    },
     ConsensusBus,
 };
-#[allow(unused_imports)]
-use fastcrypto::traits::KeyPair;
-#[cfg(test)]
-use std::collections::BTreeSet;
-use std::collections::HashMap;
+use reth_primitives::{Header, B256};
+use std::collections::{BTreeSet, HashMap};
 use tn_config::ConsensusConfig;
 use tn_storage::{mem_db::MemDatabase, open_db};
 use tn_test_utils::{CommitteeFixture, TelcoinTempDirs};
@@ -22,8 +17,6 @@ use tn_types::{
     AuthorityIdentifier, Notifier, TaskManager, TnReceiver, TnSender,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
-#[allow(unused_imports)]
-use tokio::sync::mpsc::channel;
 use tracing::info;
 
 #[tokio::test]
@@ -97,8 +90,7 @@ async fn commit_one_with_leader_schedule_change() {
     ];
 
     for mut test_case in test_cases {
-        println!("Running test case \"{}\"", test_case.description);
-
+        tracing::debug!("Running test case \"{}\"", test_case.description);
         // GIVEN
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let committee = fixture.committee();
@@ -455,6 +447,8 @@ async fn commit_one() {
     let mut rx_output = cb.sequence().subscribe();
     Consensus::spawn(config, &cb, bullshark, &TaskManager::default());
     let cb_clone = cb.clone();
+    let dummy_parent = Header::default().seal(B256::default());
+    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     tokio::spawn(async move {
         let mut rx_primary = cb_clone.committed_certificates().subscribe();
         while rx_primary.recv().await.is_some() {}
@@ -515,6 +509,8 @@ async fn dead_node() {
     );
 
     let cb = ConsensusBus::new();
+    let dummy_parent = Header::default().seal(B256::default());
+    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     let mut rx_output = cb.sequence().subscribe();
     Consensus::spawn(config, &cb, bullshark, &TaskManager::default());
     let cb_clone = cb.clone();
@@ -543,7 +539,7 @@ async fn dead_node() {
     let mut sequence = committed.into_iter();
     for i in 1..=27 {
         let output = sequence.next().unwrap();
-        let expected = ((i - 1) / ids.len() as u64) + 1;
+        let expected = ((i - 1) / ids.len() as u32) + 1;
         assert_eq!(output.round(), expected);
     }
     let output = sequence.next().unwrap();
@@ -653,6 +649,8 @@ async fn not_enough_support() {
     );
 
     let cb = ConsensusBus::new();
+    let dummy_parent = Header::default().seal(B256::default());
+    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     let mut rx_output = cb.sequence().subscribe();
     Consensus::spawn(config, &cb, bullshark, &TaskManager::default());
     let cb_clone = cb.clone();
@@ -753,6 +751,8 @@ async fn missing_leader() {
     );
 
     let cb = ConsensusBus::new();
+    let dummy_parent = Header::default().seal(B256::default());
+    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     let mut rx_output = cb.sequence().subscribe();
     Consensus::spawn(config, &cb, bullshark, &TaskManager::default());
     let cb_clone = cb.clone();
@@ -821,6 +821,8 @@ async fn committed_round_after_restart() {
         );
 
         let cb = ConsensusBus::new();
+        let dummy_parent = Header::default().seal(B256::default());
+        cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
         let mut rx_primary = cb.committed_certificates().subscribe();
         let mut rx_output = cb.sequence().subscribe();
         let mut task_manager = TaskManager::default();
@@ -831,7 +833,7 @@ async fn committed_round_after_restart() {
         // be 2 * r.
 
         let last_committed_round = cb.consensus_round_updates().borrow().committed_round as usize;
-        assert_eq!(last_committed_round, input_round.saturating_sub(3),);
+        assert_eq!(last_committed_round, input_round.saturating_sub(3));
         info!("Consensus started at last_committed_round={last_committed_round}");
 
         // Feed certificates from two rounds into consensus.
@@ -847,6 +849,7 @@ async fn committed_round_after_restart() {
         if input_round > 1 {
             let committed = rx_output.recv().await.unwrap();
             info!("Received output from consensus, committed_round={}", committed.leader.round());
+            store.write_subdag_for_test(input_round as u64, committed);
             let (round, _certs) = rx_primary.recv().await.unwrap();
             info!("Received committed certificates from consensus, committed_round={round}",);
         }
@@ -916,7 +919,7 @@ async fn delayed_certificates_are_rejected() {
 
 #[tokio::test]
 async fn submitting_equivocating_certificate_should_error() {
-    const NUM_SUB_DAGS_PER_SCHEDULE: u64 = 100;
+    const NUM_SUB_DAGS_PER_SCHEDULE: u32 = 100;
 
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
@@ -972,7 +975,7 @@ async fn submitting_equivocating_certificate_should_error() {
 /// Advance the DAG for 50 rounds, while we change "schedule" for every 5 subdag commits.
 #[tokio::test]
 async fn reset_consensus_scores_on_every_schedule_change() {
-    const NUM_SUB_DAGS_PER_SCHEDULE: u64 = 5;
+    const NUM_SUB_DAGS_PER_SCHEDULE: u32 = 5;
 
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
@@ -1009,29 +1012,26 @@ async fn reset_consensus_scores_on_every_schedule_change() {
     // ensure the leaders of rounds 2 and 4 have been committed
     let mut current_score = 0;
     for sub_dag in all_subdags {
-        // The first commit has all zero scores
-        if sub_dag.sub_dag_index == 1 {
-            assert!(sub_dag.reputation_score.all_zero());
-        } else if sub_dag.sub_dag_index % NUM_SUB_DAGS_PER_SCHEDULE == 0 {
+        if (sub_dag.leader.round() / 2) % NUM_SUB_DAGS_PER_SCHEDULE == 0 {
             // On every 5th commit we reset the scores and count from the beginning with
             // scores updated to 1, as we expect now every node to have voted for the previous
             // leader.
             for score in sub_dag.reputation_score.scores_per_authority.values() {
                 assert_eq!(*score as usize, 1);
             }
-            current_score = 1;
+            current_score = 2;
         } else {
-            // On every other commit the scores get calculated incrementally with +1 score
-            // for every commit.
-            current_score += 1;
-
             for score in sub_dag.reputation_score.scores_per_authority.values() {
                 assert_eq!(*score, current_score);
             }
 
-            if (sub_dag.sub_dag_index + 1) % NUM_SUB_DAGS_PER_SCHEDULE == 0 {
+            // On every other commit the scores get calculated incrementally with +1 score
+            // for every commit.
+            current_score += 1;
+
+            if ((sub_dag.leader.round() / 2) + 1) % NUM_SUB_DAGS_PER_SCHEDULE == 0 {
                 // if this is going to be the last score update for the current schedule, then
-                // make sure that the `fina_of_schedule` will be true
+                // make sure that the `final_of_schedule` will be true
                 assert!(sub_dag.reputation_score.final_of_schedule);
             } else {
                 assert!(!sub_dag.reputation_score.final_of_schedule);
@@ -1061,7 +1061,6 @@ async fn restart_with_new_committee() {
         )
         .unwrap();
         let store = config.node_storage().consensus_store.clone();
-        store.clear().unwrap();
         config.node_storage().certificate_store.clear().unwrap();
         let metrics = Arc::new(ConsensusMetrics::default());
         let bullshark = Bullshark::new(
@@ -1074,6 +1073,8 @@ async fn restart_with_new_committee() {
         );
 
         let cb = ConsensusBus::new();
+        let dummy_parent = Header::default().seal(B256::default());
+        cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
         let mut rx_output = cb.sequence().subscribe();
         let mut task_manager = TaskManager::default();
         Consensus::spawn(config.clone(), &cb, bullshark, &task_manager);
@@ -1193,7 +1194,7 @@ async fn garbage_collection_basic() {
             // collection has run. In this case no certificate of round 1 should exist.
             if sub_dag.leader.round() == 6 {
                 assert_eq!(
-                    state.dag.iter().filter(|(round, _)| **round <= 2_u64).count(),
+                    state.dag.iter().filter(|(round, _)| **round <= 2).count(),
                     0,
                     "Didn't expect to still have certificates from round 1 and 2"
                 );
@@ -1279,7 +1280,7 @@ async fn slow_node() {
 
     // We expect everything to have been cleaned up by standard gc until round 2 (included)
     assert_eq!(
-        state.dag.iter().filter(|(round, _)| **round <= 2_u64).count(),
+        state.dag.iter().filter(|(round, _)| **round <= 2).count(),
         0,
         "Didn't expect to still have certificates from round 1 and 2"
     );

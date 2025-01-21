@@ -1,13 +1,8 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
-
 //! The ouput from consensus (bullshark)
 //! See test_utils output_tests.rs for this modules tests.
 
-use crate::{
-    crypto, encode, Certificate, CertificateDigest, ReputationScores, Round, TimestampSec,
-    WorkerBlock,
-};
+use super::ConsensusHeader;
+use crate::{crypto, encode, Batch, Certificate, ReputationScores, Round, TimestampSec};
 use fastcrypto::hash::{Digest, Hash, HashFunction};
 use reth_primitives::{Address, BlockHash, B256};
 use serde::{Deserialize, Serialize};
@@ -18,8 +13,6 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tracing::warn;
-
-use super::ConsensusHeader;
 
 /// A global sequence number assigned to every CommittedSubDag.
 pub type SequenceNumber = u64;
@@ -32,14 +25,14 @@ pub struct ConsensusOutput {
     /// Matches certificates in the `sub_dag` one-to-one.
     ///
     /// This field is not included in [Self] digest. To validate,
-    /// hash these blocks and compare to [Self::block_digests].
-    pub blocks: Vec<Vec<WorkerBlock>>,
+    /// hash these batches and compare to [Self::batch_digests].
+    pub batches: Vec<Vec<Batch>>,
     /// The beneficiary for block rewards.
     pub beneficiary: Address,
     /// The ordered set of [BlockHash].
     ///
     /// This value is included in [Self] digest.
-    pub block_digests: VecDeque<BlockHash>,
+    pub batch_digests: VecDeque<BlockHash>,
 
     // These fields are used to construct the ConsensusHeader.
     /// The hash of the previous ConsesusHeader in the chain.
@@ -67,7 +60,7 @@ impl ConsensusOutput {
     }
     /// The subdag index (`SequenceNumber`).
     pub fn nonce(&self) -> SequenceNumber {
-        self.sub_dag.sub_dag_index
+        self.sub_dag.leader.nonce()
     }
     /// Execution address of the leader for the round.
     ///
@@ -76,15 +69,15 @@ impl ConsensusOutput {
     pub fn beneficiary(&self) -> Address {
         self.beneficiary
     }
-    /// Pop the next block digest.
+    /// Pop the next batch digest.
     ///
     /// This method is used when executing [Self].
-    pub fn next_block_digest(&mut self) -> Option<BlockHash> {
-        self.block_digests.pop_front()
+    pub fn next_batch_digest(&mut self) -> Option<BlockHash> {
+        self.batch_digests.pop_front()
     }
 
-    pub fn flatten_worker_blocks(&self) -> Vec<WorkerBlock> {
-        self.blocks.iter().flat_map(|blocks| blocks.iter().cloned()).collect()
+    pub fn flatten_batches(&self) -> Vec<Batch> {
+        self.batches.iter().flat_map(|batches| batches.iter().cloned()).collect()
     }
 
     /// Build a new ConsensusHeader frome this output.
@@ -112,7 +105,7 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for ConsensusOutput {
         // hash beneficiary
         hasher.update(self.beneficiary);
         // hash block digests in order
-        self.block_digests.iter().for_each(|digest| {
+        self.batch_digests.iter().for_each(|digest| {
             hasher.update(digest);
         });
         // finalize
@@ -124,9 +117,9 @@ impl Display for ConsensusOutput {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ConsensusOutput(round={:?}, sub_dag_index={:?}, timestamp={:?}, digest={:?})",
-            self.sub_dag.leader_round(),
-            self.sub_dag.sub_dag_index,
+            "ConsensusOutput(epoch={:?}, round={:?}, timestamp={:?}, digest={:?})",
+            self.sub_dag.leader.epoch(),
+            self.sub_dag.leader.round(),
             self.sub_dag.commit_timestamp(),
             self.digest()
         )
@@ -139,8 +132,6 @@ pub struct CommittedSubDag {
     pub certificates: Vec<Certificate>,
     /// The leader certificate responsible of committing this sub-dag.
     pub leader: Certificate,
-    /// The index associated with this CommittedSubDag
-    pub sub_dag_index: SequenceNumber,
     /// The so far calculated reputation score for nodes
     pub reputation_score: ReputationScores,
     /// The timestamp that should identify this commit. This is guaranteed to be monotonically
@@ -169,21 +160,7 @@ impl CommittedSubDag {
             leader.header().created_at(), previous_sub_dag_ts, commit_timestamp);
         }
 
-        Self { certificates, leader, sub_dag_index, reputation_score, commit_timestamp }
-    }
-
-    pub fn from_commit(
-        commit: ConsensusCommit,
-        certificates: Vec<Certificate>,
-        leader: Certificate,
-    ) -> Self {
-        Self {
-            certificates,
-            leader,
-            sub_dag_index: commit.sub_dag_index(),
-            reputation_score: commit.reputation_score(),
-            commit_timestamp: commit.commit_timestamp(),
-        }
+        Self { certificates, leader, reputation_score, commit_timestamp }
     }
 
     pub fn len(&self) -> usize {
@@ -194,7 +171,7 @@ impl CommittedSubDag {
         self.len() == 0
     }
 
-    pub fn num_blocks(&self) -> usize {
+    pub fn num_primary_blocks(&self) -> usize {
         self.certificates.iter().map(|x| x.header().payload().len()).sum()
     }
 
@@ -229,7 +206,6 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for CommittedSubDag {
             hasher.update(cert.digest());
         }
         hasher.update(self.leader.digest());
-        hasher.update(encode(&self.sub_dag_index));
         // skip reputation for stable hashes
         hasher.update(encode(&self.commit_timestamp));
         ConsensusOutputDigest(hasher.finalize().into())
@@ -241,60 +217,6 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for CommittedSubDag {
 impl From<ConsensusOutputDigest> for B256 {
     fn from(value: ConsensusOutputDigest) -> Self {
         B256::from_slice(value.as_ref())
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ConsensusCommit {
-    /// The sequence of committed certificates' digests.
-    pub certificates: Vec<CertificateDigest>,
-    /// The leader certificate's digest responsible of committing this sub-dag.
-    pub leader: CertificateDigest,
-    /// The round of the leader
-    pub leader_round: Round,
-    /// Sequence number of the CommittedSubDag
-    pub sub_dag_index: SequenceNumber,
-    /// The so far calculated reputation score for nodes
-    pub reputation_score: ReputationScores,
-    /// The timestamp that should identify this commit. This is guaranteed to be monotonically
-    /// incremented
-    pub commit_timestamp: TimestampSec,
-}
-
-impl ConsensusCommit {
-    pub fn from_sub_dag(sub_dag: &CommittedSubDag) -> Self {
-        Self {
-            certificates: sub_dag.certificates.iter().map(|x| x.digest()).collect(),
-            leader: sub_dag.leader.digest(),
-            leader_round: sub_dag.leader.round(),
-            sub_dag_index: sub_dag.sub_dag_index,
-            reputation_score: sub_dag.reputation_score.clone(),
-            commit_timestamp: sub_dag.commit_timestamp,
-        }
-    }
-
-    pub fn certificates(&self) -> Vec<CertificateDigest> {
-        self.certificates.clone()
-    }
-
-    pub fn leader(&self) -> CertificateDigest {
-        self.leader
-    }
-
-    pub fn leader_round(&self) -> Round {
-        self.leader_round
-    }
-
-    pub fn sub_dag_index(&self) -> SequenceNumber {
-        self.sub_dag_index
-    }
-
-    pub fn reputation_score(&self) -> ReputationScores {
-        self.reputation_score.clone()
-    }
-
-    pub fn commit_timestamp(&self) -> TimestampSec {
-        self.commit_timestamp
     }
 }
 

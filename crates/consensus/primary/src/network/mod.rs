@@ -1,7 +1,9 @@
-// Copyright (c) Telcoin, LLC
-//! Network contains logic for type that sends and receives messages between other primaries.
+//! Primary Receiver Handler is the entrypoint for peer network requests.
+//!
+//! This module includes implementations for when the primary receives network
+//! requests from it's own workers and other primaries.
 
-use crate::{anemo_network::PrimaryReceiverHandler, synchronizer::Synchronizer, ConsensusBus};
+use crate::{synchronizer::Synchronizer, ConsensusBus};
 use fastcrypto::hash::Hash;
 use handler::RequestHandler;
 pub use message::{PrimaryRequest, PrimaryResponse};

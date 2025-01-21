@@ -2,26 +2,26 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use tn_types::{BlockHash, NetworkPublicKey, WorkerBlock};
+use tn_types::{Batch, BlockHash, NetworkPublicKey};
 
 /// Requests between Primary <-> Worker.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum InnerNodeRequest {
-    /// Request for missing worker blocks.
-    FetchBlocks(FetchBlocksRequest),
+    /// Request for missing batches.
+    FetchBlocks(FetchBatchesRequest),
 }
 
 /// Responses between Primary <-> Worker.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum InnerNodeResponse {
-    /// Request for missing worker blocks.
-    FetchBlocks(FetchBlocksResponse),
+    /// Request for missing batches.
+    FetchBlocks(FetchBatchResponse),
 }
 
 /// Used by the primary to request that the worker fetch the missing blocks and reply
 /// with all of the content.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct FetchBlocksRequest {
+pub struct FetchBatchesRequest {
     /// Missing block digests to fetch from peers.
     pub digests: HashSet<BlockHash>,
     /// The network public key of the peers.
@@ -33,12 +33,12 @@ pub struct FetchBlocksRequest {
 
 /// All blocks requested by the primary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct FetchBlocksResponse {
-    /// The missing blocks fetched from peers.
+pub struct FetchBatchResponse {
+    /// The missing batches fetched from peers.
     ///
-    /// TODO: should this be `SealedWorkerBlocks`?
+    /// TODO: should this be `SealedBatches`?
     /// Depends on how they're verified - primary should still
-    /// verify blocks match requested hashes. Could be easier to
-    /// match blocks to requested hash if they are sealed.
-    pub blocks: HashMap<BlockHash, WorkerBlock>,
+    /// verify batches match requested hashes. Could be easier to
+    /// match batches to requested hash if they are sealed.
+    pub batches: HashMap<BlockHash, Batch>,
 }

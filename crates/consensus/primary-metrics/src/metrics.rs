@@ -1,8 +1,4 @@
-use std::sync::Arc;
-
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Metrics for the primary node.
 
 use prometheus::{
     default_registry, linear_buckets, register_histogram_vec_with_registry,
@@ -11,6 +7,7 @@ use prometheus::{
     register_int_gauge_with_registry, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
     IntGaugeVec, Registry,
 };
+use std::sync::Arc;
 use tn_network::metrics::{NetworkConnectionMetrics, NetworkMetrics};
 
 const LATENCY_SEC_BUCKETS: &[f64] = &[

@@ -1,6 +1,5 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Metrics for the executor.
+
 use prometheus::{
     default_registry, register_histogram_vec_with_registry, register_histogram_with_registry,
     register_int_counter_with_registry, register_int_gauge_with_registry, Histogram, HistogramVec,

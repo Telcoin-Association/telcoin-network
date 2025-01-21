@@ -5,10 +5,6 @@
 //! told to give up.
 //!
 //! See https://github.com/MystenLabs/anemo/issues/4 for issue.
-
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
 use anemo::{
     codegen::{BoxError, BoxFuture, Service},
     types::PeerEvent,

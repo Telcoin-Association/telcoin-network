@@ -1,11 +1,4 @@
 //! Vote implementation for consensus
-use base64::{engine::general_purpose, Engine};
-use fastcrypto::{
-    hash::{Digest, Hash},
-    traits::{Signer, VerifyingKey},
-};
-use serde::{Deserialize, Serialize};
-use std::fmt;
 
 use crate::{
     crypto::{
@@ -13,6 +6,13 @@ use crate::{
     },
     encode, AuthorityIdentifier, BlsSigner, Epoch, Header, HeaderDigest, Round,
 };
+use base64::{engine::general_purpose, Engine};
+use fastcrypto::{
+    hash::{Digest, Hash},
+    traits::{Signer, VerifyingKey},
+};
+use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// A Vote on a Header is a claim by the voting authority that all payloads and the full history
 /// of Certificates included in the Header are available.

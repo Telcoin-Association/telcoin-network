@@ -1,6 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
-
 //! Authority fixture for the cluster
 
 use crate::{
@@ -46,7 +43,6 @@ struct AuthorityDetailsInternal<DB> {
     execution: TestExecutionNode,
 }
 
-#[allow(clippy::arc_with_non_send_sync, clippy::too_many_arguments)]
 impl<DB: Database> AuthorityDetails<DB> {
     pub fn new(
         id: usize,
@@ -273,7 +269,7 @@ impl<DB: Database> AuthorityFixture<DB> {
     /// Create a new anemo network for consensus.
     pub fn new_network(&self, router: anemo::Router) -> anemo::Network {
         anemo::Network::bind(self.authority.primary_network_address().to_anemo_address().unwrap())
-            .server_name("narwhal")
+            .server_name("tn-test")
             .private_key(self.primary_network_keypair().private().0.to_bytes())
             .start(router)
             .unwrap()

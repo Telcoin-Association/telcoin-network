@@ -71,18 +71,5 @@ tn-worker = { workspace = true }
 tn-storage = { workspace = true }
 reqwest = { workspace = true }
 bytes = { workspace = true }
-tn-block-validator = { workspace = true, features = ["test-utils"] }
+tn-batch-validator = { workspace = true, features = ["test-utils"] }
 reth = { workspace = true }
-
-[features]
-default = []
-benchmark = []
-test-utils = []
-
-[lib]
-bench = false
-
-[[bench]]
-name = "process_certificates"
-harness = false
-required-features = ["benchmark"]

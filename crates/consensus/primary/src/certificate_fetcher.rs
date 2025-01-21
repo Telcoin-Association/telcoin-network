@@ -1,7 +1,5 @@
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Fetch missing certificates from peers and verify them.
+
 use crate::{synchronizer::Synchronizer, ConsensusBus};
 use anemo::Request;
 use consensus_metrics::{monitored_future, monitored_scope};
@@ -13,16 +11,13 @@ use std::{
     time::Duration,
 };
 use tn_network::PrimaryToPrimaryRpc;
+use tn_network_types::{FetchCertificatesRequest, FetchCertificatesResponse};
 use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::{traits::Database, CertificateStore};
 use tn_types::{
-    AuthorityIdentifier, Committee, NetworkPublicKey, Noticer, TaskManager, TnReceiver, TnSender,
-};
-
-use tn_network_types::{FetchCertificatesRequest, FetchCertificatesResponse};
-use tn_types::{
     error::{DagError, DagResult},
-    validate_received_certificate_version, Certificate, Round,
+    validate_received_certificate_version, AuthorityIdentifier, Certificate, Committee,
+    NetworkPublicKey, Noticer, Round, TaskManager, TnReceiver, TnSender,
 };
 use tokio::{
     task::JoinSet,
@@ -353,7 +348,8 @@ async fn fetch_certificates_helper(
         .map(|(_, _, network_key)| network_key)
         .collect();
     peers.shuffle(&mut ThreadRng::default());
-    let fetch_timeout = PARALLEL_FETCH_REQUEST_INTERVAL_SECS * peers.len().try_into().unwrap()
+    let fetch_timeout = PARALLEL_FETCH_REQUEST_INTERVAL_SECS
+        * peers.len().try_into().expect("usize into secs duration")
         + PARALLEL_FETCH_REQUEST_ADDITIONAL_TIMEOUT;
     let fetch_callback = async move {
         debug!(target: "primary::cert_fetcher", "Starting to fetch certificates");

@@ -1,7 +1,6 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Leader schedule for identifying the next leader for the round.
 
+use super::Dag;
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 use std::{
@@ -10,12 +9,10 @@ use std::{
     sync::Arc,
 };
 use tn_storage::{traits::Database, ConsensusStore};
-use tn_types::{Authority, AuthorityIdentifier, Committee, Stake};
-
-use tn_types::{Certificate, ReputationScores, Round};
+use tn_types::{
+    Authority, AuthorityIdentifier, Certificate, Committee, ReputationScores, Round, Stake,
+};
 use tracing::{debug, trace};
-
-use super::Dag;
 
 #[cfg(test)]
 #[path = "tests/leader_schedule_tests.rs"]
@@ -89,7 +86,10 @@ impl LeaderSwapTable {
                 "Good node on round {}: {} -> {}",
                 round,
                 good_node.hostname(),
-                reputation_scores.scores_per_authority.get(&good_node.id()).unwrap()
+                reputation_scores
+                    .scores_per_authority
+                    .get(&good_node.id())
+                    .expect("good node in scores per authority")
             );
         });
 
@@ -98,7 +98,10 @@ impl LeaderSwapTable {
                 "Bad node on round {}: {} -> {}",
                 round,
                 bad_node.hostname(),
-                reputation_scores.scores_per_authority.get(&bad_node.id()).unwrap()
+                reputation_scores
+                    .scores_per_authority
+                    .get(&bad_node.id())
+                    .expect("bad node in scores by authority")
             );
         });
 
@@ -119,7 +122,7 @@ impl LeaderSwapTable {
     pub fn swap(&self, leader: &AuthorityIdentifier, leader_round: Round) -> Option<Authority> {
         if self.bad_nodes.contains_key(leader) {
             let mut seed_bytes = [0u8; 32];
-            seed_bytes[32 - 8..].copy_from_slice(&leader_round.to_le_bytes());
+            seed_bytes[32 - 8..].copy_from_slice(&(leader_round as u64).to_le_bytes());
             let mut rng = StdRng::from_seed(seed_bytes);
 
             let good_node = self
@@ -197,7 +200,7 @@ impl LeaderSchedule {
                 LeaderSwapTable::new(
                     &committee,
                     commit.leader_round(),
-                    &commit.reputation_score(),
+                    &commit.reputation_score,
                     bad_nodes_stake_threshold,
                 )
             },
@@ -229,7 +232,7 @@ impl LeaderSchedule {
                 // we can always divide by 2 to get a monotonically incremented sequence,
                 // 2/2 = 1, 4/2 = 2, 6/2 = 3, 8/2 = 4  etc, and then do minus 1 so we can always
                 // start with base zero 0.
-                let next_leader = (round/2 + self.committee.size() as u64 - 1) as usize % self.committee.size();
+                let next_leader = (round as u64 / 2 + self.committee.size() as u64 - 1) as usize % self.committee.size();
 
                 let leader: Authority = self.committee.authorities().nth(next_leader).expect("authority out of bounds!").clone();
                 let table = self.leader_swap_table.read();
@@ -237,7 +240,7 @@ impl LeaderSchedule {
                 table.swap(&leader.id(), round).unwrap_or(leader)
             } else {
                 // Elect the leader in a stake-weighted choice seeded by the round
-                let leader = self.committee.leader(round);
+                let leader = self.committee.leader(round as u64);
 
                 let table = self.leader_swap_table.read();
                 table.swap(&leader.id(), round).unwrap_or(leader)

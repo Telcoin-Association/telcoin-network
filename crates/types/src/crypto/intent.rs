@@ -1,9 +1,5 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Intent message types to protect replay attacks on signatures.
+
 use crate::try_decode;
 use eyre::eyre;
 use fastcrypto::encoding::decode_bytes_hex;

@@ -1,8 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Primary Receiver Handler is the entrypoint for peer network requests.
 //!
 //! This module includes implementations for when the primary receives network
@@ -11,7 +6,7 @@
 use super::WorkerReceiverHandler;
 use crate::proposer::OurDigestMessage;
 use anemo::async_trait;
-use tn_network_types::{WorkerOthersBlockMessage, WorkerOwnBlockMessage, WorkerToPrimary};
+use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimary};
 use tn_storage::traits::Database;
 use tn_types::TnSender;
 use tokio::sync::oneshot;
@@ -19,9 +14,9 @@ use tokio::sync::oneshot;
 // TODO: anemo still uses async_trait
 #[async_trait]
 impl<DB: Database> WorkerToPrimary for WorkerReceiverHandler<DB> {
-    async fn report_own_block(
+    async fn report_own_batch(
         &self,
-        request: anemo::Request<WorkerOwnBlockMessage>,
+        request: anemo::Request<WorkerOwnBatchMessage>,
     ) -> Result<anemo::Response<()>, anemo::rpc::Status> {
         let message = request.into_body();
 
@@ -45,9 +40,9 @@ impl<DB: Database> WorkerToPrimary for WorkerReceiverHandler<DB> {
         Ok(response)
     }
 
-    async fn report_others_block(
+    async fn report_others_batch(
         &self,
-        request: anemo::Request<WorkerOthersBlockMessage>,
+        request: anemo::Request<WorkerOthersBatchMessage>,
     ) -> Result<anemo::Response<()>, anemo::rpc::Status> {
         let message = request.into_body();
         self.payload_store

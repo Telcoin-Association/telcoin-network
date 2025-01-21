@@ -1,8 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright(C) Facebook, Inc. and its affiliates.
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 //! The Proposer is responsible for proposing the primary's next header when certain conditions are
 //! met.
 //!
@@ -15,8 +10,8 @@
 //! broadcast to voting peers. Headers are stored in the `ProposerStore` before they are sent to the
 //! Certifier.
 //!
-//! The Proposer is also responsible for processing Worker block's that reach quorum.
-//! Collections of worker blocks that reach quorum are included in each header. If the Proposer's
+//! The Proposer is also responsible for processing batch's that reach quorum.
+//! Collections of batches that reach quorum are included in each header. If the Proposer's
 //! header fails to be committed, then block digests from the failed round are included in the next
 //! header once the Proposer's round advances.
 
@@ -346,12 +341,6 @@ impl<DB: Database> Proposer<DB> {
             .write_last_proposed(header)
             .map_err(|e| ProposerError::StoreError(e.to_string()))?;
 
-        #[cfg(feature = "benchmark")]
-        for digest in header.payload().keys() {
-            // NOTE: This log entry is used to compute performance.
-            tracing::info!(target: "primary::proposer", "Created {} -> {:?}", header, digest);
-        }
-
         // Send the new header to the `Certifier` that will broadcast and certify it.
         let result = consensus_bus.headers().send(header.clone()).await.map_err(|e| e.into());
         let num_digests = header.payload().len();
@@ -403,7 +392,8 @@ impl<DB: Database> Proposer<DB> {
         // NOTE: committee size is asserted >1 during Committee::load()
         if (next_round % 2 == 0
             && self.leader_schedule.leader(next_round).id() == self.authority_id)
-            || (next_round % 2 != 0 && self.committee.leader(next_round).id() == self.authority_id)
+            || (next_round % 2 != 0
+                && self.committee.leader(next_round as u64).id() == self.authority_id)
         {
             Duration::ZERO
         } else {
@@ -502,7 +492,7 @@ impl<DB: Database> Proposer<DB> {
                 // late (or just joined the network).
                 self.round = round;
                 // broadcast new round
-                let _ = self.consensus_bus.narwhal_round_updates().send(self.round);
+                let _ = self.consensus_bus.primary_round_updates().send(self.round);
                 self.last_parents = parents;
                 // Reset advance flag.
                 self.advance_round = false;
@@ -581,7 +571,7 @@ impl<DB: Database> Proposer<DB> {
     /// removed after adding the expired header's proposed block digests and system messages to
     /// the beginning of the queue.
     ///
-    /// This method ensures worker blocks that were previously proposed but weren't committed are
+    /// This method ensures batches that were previously proposed but weren't committed are
     /// added back to the queue so their transactions are included in the next proposal.
     fn process_committed_headers(&mut self, commit_round: Round, committed_headers: Vec<Round>) {
         // remove committed headers from pending
@@ -645,7 +635,7 @@ impl<DB: Database> Proposer<DB> {
             // TODO: observe this warning and possibly reduce it to a debug
             warn!(
                 target: "primary::proposer",
-                "Repropose {num_digests_to_resend} worker blocks and {num_system_messages_to_resend} system messages in undelivered headers {retransmit_rounds:?} at commit round {commit_round:?}, remaining headers {}",
+                "Repropose {num_digests_to_resend} batches and {num_system_messages_to_resend} system messages in undelivered headers {retransmit_rounds:?} at commit round {commit_round:?}, remaining headers {}",
                 self.proposed_headers.len()
             );
 
@@ -672,11 +662,11 @@ impl<DB: Database> Proposer<DB> {
     fn propose_next_header(&mut self, reason: String) -> ProposerResult<PendingHeaderTask> {
         // Advance to the next round.
         self.round += 1;
-        let updated_round = *self.consensus_bus.narwhal_round_updates().borrow() + 1;
+        let updated_round = *self.consensus_bus.primary_round_updates().borrow() + 1;
         if updated_round > self.round {
             self.round = updated_round;
         }
-        let _ = self.consensus_bus.narwhal_round_updates().send(self.round);
+        let _ = self.consensus_bus.primary_round_updates().send(self.round);
 
         // Update the metrics
         self.consensus_bus.primary_metrics().node_metrics.current_round.set(self.round as i64);
@@ -839,6 +829,13 @@ where
             if pin!(&this.rx_shutdown).poll(cx).is_ready() {
                 warn!(target: "primary::proposer", authority=?this.authority_id, round=this.round, "received shutdown signal...");
                 return Poll::Ready(Ok(()));
+            }
+
+            if !this.consensus_bus.node_mode().borrow().is_active_cvv() {
+                // TODO Note this will need to become smarter...
+                // We will not be able to go back to active mode since only shutdown polled.
+                // Fixing this ASAP.
+                return Poll::Pending;
             }
 
             // check for new digests from workers and send ack back to worker

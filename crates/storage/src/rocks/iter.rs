@@ -1,19 +1,13 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
-use std::{marker::PhantomData, sync::Arc};
-
-use prometheus::{Histogram, HistogramTimer};
-use rocksdb::Direction;
-use tn_types::{decode, encode_key, try_decode_key};
-
 use super::{
     errors::TypedStoreError,
     metrics::{DBMetrics, RocksDBPerfContext},
     RocksDBRawIter,
 };
+use prometheus::{Histogram, HistogramTimer};
+use rocksdb::Direction;
 use serde::{de::DeserializeOwned, Serialize};
+use std::{marker::PhantomData, sync::Arc};
+use tn_types::{decode, encode_key, try_decode_key};
 
 /// An iterator over all key-value pairs in a data map.
 pub struct Iter<'a, K, V> {

@@ -1,31 +1,79 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//! Helpers for starting a node
 
-use std::net::TcpListener;
+use std::net::{TcpListener, UdpSocket};
 
-/// Return an ephemeral, available port.
-///
-/// On unix systems, the port returned will be in the
-/// TIME_WAIT state ensuring that the OS won't hand out this port for some grace period.
-/// Callers should be able to bind to this port given they use SO_REUSEADDR.
-/// TODO: Track ports we have used as an extra check?  Had to remove the old connect code- it was
-/// broken on OSX at least.
-pub fn get_available_tcp_port(host: &str) -> Option<u16> {
-    const MAX_PORT_RETRIES: u32 = 1000;
+const MAX_RETRIES: u32 = 1000;
 
-    for _ in 0..MAX_PORT_RETRIES {
-        if let Ok(port) = get_ephemeral_port(host) {
-            return Some(port);
-        }
-    }
-
-    panic!("Error: could not find an available port on host: {}\n", host);
+/// Represents the type of socket to create
+#[derive(Debug, Clone, Copy)]
+pub enum SocketType {
+    Tcp,
+    Udp,
 }
 
-fn get_ephemeral_port(host: &str) -> std::io::Result<u16> {
-    // Request a random available port from the OS
-    let listener = TcpListener::bind((host, 0))?;
-    let addr = listener.local_addr()?;
-    Ok(addr.port())
+/// Configuration for port discovery
+#[derive(Debug, Clone)]
+pub struct PortConfig {
+    pub host: String,
+    pub socket_type: SocketType,
+    pub max_retries: u32,
+}
+
+/// Error types for port operations
+#[derive(Debug)]
+pub enum PortError {
+    IoError(std::io::Error),
+    NoPortsAvailable,
+}
+
+/// Get an available port with the specified configuration
+pub fn get_available_port(config: &PortConfig) -> Result<u16, PortError> {
+    for _ in 0..config.max_retries {
+        if let Ok(port) = get_ephemeral_port(&config.host, config.socket_type) {
+            return Ok(port);
+        }
+    }
+    Err(PortError::NoPortsAvailable)
+}
+
+impl From<std::io::Error> for PortError {
+    fn from(error: std::io::Error) -> Self {
+        PortError::IoError(error)
+    }
+}
+
+/// Get an ephemeral port for the specified socket type
+fn get_ephemeral_port(host: &str, socket_type: SocketType) -> std::io::Result<u16> {
+    match socket_type {
+        SocketType::Tcp => {
+            let listener = TcpListener::bind((host, 0))?;
+            Ok(listener.local_addr()?.port())
+        }
+        SocketType::Udp => {
+            let socket = UdpSocket::bind((host, 0))?;
+            Ok(socket.local_addr()?.port())
+        }
+    }
+}
+
+/// Convenience function for getting a TCP port
+pub fn get_available_tcp_port(host: &str) -> Option<u16> {
+    let config = PortConfig {
+        host: host.to_string(),
+        socket_type: SocketType::Tcp,
+        max_retries: MAX_RETRIES,
+    };
+
+    get_available_port(&config).ok()
+}
+
+/// Convenience function for getting a UDP port
+pub fn get_available_udp_port(host: &str) -> Option<u16> {
+    let config = PortConfig {
+        host: host.to_string(),
+        socket_type: SocketType::Udp,
+        max_retries: MAX_RETRIES,
+    };
+
+    get_available_port(&config).ok()
 }

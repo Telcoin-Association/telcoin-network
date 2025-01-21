@@ -1970,6 +1970,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
+name = "cfg_aliases"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
+
+[[package]]
 name = "chrono"
 version = "0.4.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5737,6 +5743,18 @@ checksum = "fa52e972a9a719cecb6864fb88568781eb706bac2cd1d4f04a648542dbf78069"
 dependencies = [
  "bitflags 1.3.2",
  "cfg-if",
+ "libc",
+]
+
+[[package]]
+name = "nix"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.6.0",
+ "cfg-if",
+ "cfg_aliases",
  "libc",
 ]
 
@@ -9734,7 +9752,7 @@ dependencies = [
  "log",
  "netlink-packet-route",
  "netlink-proto",
- "nix",
+ "nix 0.24.3",
  "thiserror",
  "tokio",
 ]
@@ -10886,6 +10904,7 @@ dependencies = [
  "metrics-exporter-prometheus 0.12.2",
  "metrics-process 1.2.1",
  "metrics-util 0.15.0",
+ "nix 0.29.0",
  "pin-project 1.1.5",
  "prometheus",
  "rand 0.8.5",
@@ -11098,7 +11117,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
-name = "tn-block-builder"
+name = "tn-batch-builder"
 version = "0.1.0"
 dependencies = [
  "alloy-rlp",
@@ -11123,12 +11142,11 @@ dependencies = [
  "reth-prune",
  "reth-stages",
  "reth-tasks",
- "reth-tracing",
  "reth-transaction-pool",
  "tempfile",
  "thiserror",
- "tn-block-builder",
- "tn-block-validator",
+ "tn-batch-builder",
+ "tn-batch-validator",
  "tn-engine",
  "tn-network",
  "tn-network-types",
@@ -11141,7 +11159,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tn-block-validator"
+name = "tn-batch-validator"
 version = "0.1.0"
 dependencies = [
  "alloy-rlp",
@@ -11161,7 +11179,6 @@ dependencies = [
  "reth-provider",
  "reth-prune",
  "reth-revm",
- "reth-tracing",
  "reth-trie",
  "thiserror",
  "tn-test-utils",
@@ -11212,10 +11229,9 @@ dependencies = [
  "reth-primitives",
  "reth-provider",
  "reth-revm",
- "reth-tracing",
  "reth-trie",
  "thiserror",
- "tn-block-builder",
+ "tn-batch-builder",
  "tn-test-utils",
  "tn-types",
  "tokio",
@@ -11280,7 +11296,6 @@ dependencies = [
  "reth-provider",
  "reth-rpc",
  "reth-tasks",
- "reth-tracing",
  "reth-transaction-pool",
  "secp256k1 0.29.0",
  "serde",
@@ -11417,14 +11432,13 @@ dependencies = [
  "reth-rpc-types",
  "reth-stages",
  "reth-static-file",
- "reth-tracing",
  "reth-transaction-pool",
  "serde-reflection",
  "serde_yaml",
  "tempfile",
  "thiserror",
- "tn-block-builder",
- "tn-block-validator",
+ "tn-batch-builder",
+ "tn-batch-validator",
  "tn-config",
  "tn-engine",
  "tn-executor",
@@ -11478,7 +11492,7 @@ dependencies = [
  "tap",
  "tempfile",
  "thiserror",
- "tn-block-validator",
+ "tn-batch-validator",
  "tn-config",
  "tn-executor",
  "tn-network",
@@ -11577,13 +11591,12 @@ dependencies = [
  "reth-primitives",
  "reth-stages",
  "reth-tasks",
- "reth-tracing",
  "reth-transaction-pool",
  "secp256k1 0.29.0",
  "telcoin-network",
  "tempfile",
- "tn-block-builder",
- "tn-block-validator",
+ "tn-batch-builder",
+ "tn-batch-validator",
  "tn-config",
  "tn-engine",
  "tn-faucet",
@@ -11676,11 +11689,10 @@ dependencies = [
  "itertools 0.10.5",
  "prometheus",
  "rand 0.8.5",
- "reth-tracing",
  "tap",
  "tempfile",
  "thiserror",
- "tn-block-validator",
+ "tn-batch-validator",
  "tn-config",
  "tn-network",
  "tn-network-types",

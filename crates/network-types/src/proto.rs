@@ -1,7 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 /// The module responsible for generating anemo network utilities.
 ///
 /// The `build.rs` file in this crate defines the services and their

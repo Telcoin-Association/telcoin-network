@@ -37,8 +37,8 @@ pub trait IntoRpcError<E> {
     fn into_error(error: E) -> Self;
 }
 
-/// The topic for NVVs to subscribe to for published worker blocks.
-pub const WORKER_BLOCK_TOPIC: &str = "tn_worker_blocks";
+/// The topic for NVVs to subscribe to for published worker batches.
+pub const WORKER_BATCH_TOPIC: &str = "tn_batches";
 /// The topic for NVVs to subscribe to for published primary certificates.
 pub const PRIMARY_CERT_TOPIC: &str = "tn_certificates";
 /// The topic for NVVs to subscribe to for published consensus chain.
@@ -219,8 +219,8 @@ where
     pub async fn dial(&self, peer_id: PeerId, peer_addr: Multiaddr) -> NetworkResult<()> {
         let (reply, ack) = oneshot::channel();
         self.sender.send(NetworkCommand::Dial { peer_id, peer_addr, reply }).await?;
-        let res = ack.await?;
-        res.map_err(Into::into)
+
+        ack.await?
     }
 
     /// Get local peer id.

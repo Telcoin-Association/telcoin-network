@@ -26,9 +26,7 @@ mod worker;
 use self::inner::ExecutionNodeInner;
 use reth_provider::providers::BlockchainProvider;
 use tn_faucet::FaucetArgs;
-use tn_types::{
-    ConsensusOutput, Noticer, TaskManager, WorkerBlockSender, WorkerBlockValidation, WorkerId,
-};
+use tn_types::{BatchSender, BatchValidation, ConsensusOutput, Noticer, TaskManager, WorkerId};
 use tokio::sync::{broadcast, RwLock};
 pub use worker::*;
 
@@ -85,21 +83,21 @@ where
     }
 
     /// Batch maker
-    pub async fn start_block_builder(
+    pub async fn start_batch_builder(
         &self,
         worker_id: WorkerId,
-        block_provider_sender: WorkerBlockSender,
+        block_provider_sender: BatchSender,
         task_manager: &TaskManager,
         rx_shutdown: Noticer,
     ) -> eyre::Result<()> {
         let mut guard = self.internal.write().await;
-        guard.start_block_builder(worker_id, block_provider_sender, task_manager, rx_shutdown).await
+        guard.start_batch_builder(worker_id, block_provider_sender, task_manager, rx_shutdown).await
     }
 
     /// Batch validator
-    pub async fn new_block_validator(&self) -> Arc<dyn WorkerBlockValidation> {
+    pub async fn new_batch_validator(&self) -> Arc<dyn BatchValidation> {
         let guard = self.internal.read().await;
-        guard.new_block_validator()
+        guard.new_batch_validator()
     }
 
     /// Retrieve the last executed block from the database to restore consensus.
@@ -137,9 +135,9 @@ where
 
     //Evm: BlockExecutorProvider + Clone + 'static,
     /// Return the node's evm-based block executor.
-    pub async fn get_block_executor(&self) -> impl BlockExecutorProvider {
+    pub async fn get_batch_executor(&self) -> impl BlockExecutorProvider {
         let guard = self.internal.read().await;
-        guard.get_block_executor()
+        guard.get_batch_executor()
     }
 
     /// Return an HTTP client for submitting transactions to the RPC.

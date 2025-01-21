@@ -1,5 +1,5 @@
 //! Primary information for peers.
-use crate::{crypto::NetworkPublicKey, get_available_tcp_port, Multiaddr, WorkerIndex};
+use crate::{crypto::NetworkPublicKey, get_available_udp_port, Multiaddr, WorkerIndex};
 use fastcrypto::traits::InsecureDefault;
 use serde::{Deserialize, Serialize};
 
@@ -43,8 +43,7 @@ impl PrimaryInfo {
 impl Default for PrimaryInfo {
     fn default() -> Self {
         let host = std::env::var("NARWHAL_HOST").unwrap_or("127.0.0.1".to_string());
-        let primary_udp_port = get_available_tcp_port(&host).unwrap_or(49590).to_string();
-        // let primary_udp_port = std::env::var("PRIMARY_UDP_PORT").unwrap_or("49590".to_string());
+        let primary_udp_port = get_available_udp_port(&host).unwrap_or(49590).to_string();
 
         Self {
             network_key: NetworkPublicKey::insecure_default(),

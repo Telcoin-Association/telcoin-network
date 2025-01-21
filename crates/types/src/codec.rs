@@ -1,6 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// SPDX-License-Identifier: Apache-2.0
-
 //! This contains the encode/decode (serialize/deserialize) functions.
 //!
 //! These should be used to

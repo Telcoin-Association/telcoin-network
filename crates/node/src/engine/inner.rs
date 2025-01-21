@@ -37,15 +37,15 @@ use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, TransactionPool, TransactionValidationTaskExecutor,
 };
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
-use tn_block_builder::BlockBuilder;
-use tn_block_validator::BlockValidator;
+use tn_batch_builder::BatchBuilder;
+use tn_batch_validator::BatchValidator;
 use tn_config::Config;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
 use tn_rpc::{TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
-    Consensus, ConsensusOutput, LastCanonicalUpdate, Noticer, TaskManager, WorkerBlockSender,
-    WorkerBlockValidation, WorkerId,
+    BatchSender, BatchValidation, Consensus, ConsensusOutput, LastCanonicalUpdate, Noticer,
+    TaskManager, WorkerId,
 };
 use tokio::sync::{broadcast, mpsc::unbounded_channel};
 use tokio_stream::wrappers::BroadcastStream;
@@ -206,10 +206,10 @@ where
     }
 
     /// The worker's RPC, TX pool, and block builder
-    pub(super) async fn start_block_builder(
+    pub(super) async fn start_batch_builder(
         &mut self,
         worker_id: WorkerId,
-        block_provider_sender: WorkerBlockSender,
+        block_provider_sender: BatchSender,
         task_manager: &TaskManager,
         rx_shutdown: Noticer,
     ) -> eyre::Result<()> {
@@ -310,42 +310,26 @@ where
             pending_block_blob_fee: tx_pool_latest.pending_blob_fee,
         };
 
-        let block_builder = BlockBuilder::new(
+        let batch_builder = BatchBuilder::new(
             self.blockchain_db.clone(),
             transaction_pool.clone(),
             self.blockchain_db.canonical_state_stream(),
             latest_canon_state,
             block_provider_sender,
             self.address,
-            self.tn_config.parameters.max_worker_block_delay,
+            self.tn_config.parameters.max_batch_delay,
         );
 
         // spawn block builder task
-        task_manager.spawn_task("block builder", async move {
+        task_manager.spawn_task("batch builder", async move {
             tokio::select!(
                 _ = &rx_shutdown => {
                 }
-                res = block_builder => {
-                    info!(target: "tn::execution", ?res, "block builder task exited");
+                res = batch_builder => {
+                    info!(target: "tn::execution", ?res, "batch builder task exited");
                 }
             )
         });
-
-        // let mut hooks = EngineHooks::new();
-
-        // let static_file_producer = StaticFileProducer::new(
-        //     provider_factory.clone(),
-        //     provider_factory.static_file_provider(),
-        //     prune.node_config.clone().unwrap_or_default().segments,
-        // );
-        // let static_file_producer_events = static_file_producer.lock().events();
-        // hooks.add(StaticFileHook::new(static_file_producer.clone(), Box::new(executor.clone())));
-        // info!(target: "tn::batch_maker", "StaticFileProducer initialized");
-
-        // TODO: adjust instance ports?
-        //
-        //.node_config.adjust_instance_ports();
-        //
 
         // spawn RPC
         let rpc_builder = RpcModuleBuilder::default()
@@ -404,9 +388,9 @@ where
     }
 
     /// Create a new block validator.
-    pub(super) fn new_block_validator(&self) -> Arc<dyn WorkerBlockValidation> {
+    pub(super) fn new_batch_validator(&self) -> Arc<dyn BatchValidation> {
         // batch validator
-        Arc::new(BlockValidator::<DB>::new(self.blockchain_db.clone()))
+        Arc::new(BatchValidator::<DB>::new(self.blockchain_db.clone()))
     }
 
     /// Fetch the last executed state from the database.
@@ -510,7 +494,7 @@ where
     }
 
     /// Return the node's evm-based block executor
-    pub(super) fn get_block_executor(&self) -> Evm {
+    pub(super) fn get_batch_executor(&self) -> Evm {
         self.evm_executor.clone()
     }
 

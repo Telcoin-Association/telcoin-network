@@ -1,0 +1,108 @@
+name: Pull Request Checks
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, review_requested, ready_for_review]
+
+env:
+  CARGO_INCREMENTAL: 0 # disable incremental compilation
+  RUSTFLAGS: "-D warnings -D unused_extern_crates"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  # maintainers test and attest locally
+  skip-maintainers:
+    runs-on: ubuntu-latest
+    outputs:
+      is_maintainer: ${{ steps.check.outputs.is_maintainer }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          MAINTAINERS=("grantkee" "sstanfield" "robriks")
+          if [[ " ${MAINTAINERS[@]} " =~ " ${{ github.event.pull_request.user.login }} " ]]; then
+            echo "is_maintainer=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_maintainer=false" >> $GITHUB_OUTPUT
+          fi
+  fmt-clippy-and-public-tests:
+    needs: skip-maintainers
+    if: needs.skip-maintainers.outputs.is_maintainer == 'false'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      # exit immediately for drafts
+      - name: Check if draft PR
+        run: |
+          if [[ "${{ github.event.pull_request.draft }}" == "true" ]]; then
+            echo "Draft PR detected, exiting the workflow"
+            exit 1
+          fi
+
+      # checkout repo and submodule
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1 # Shallow clone
+
+      # cache toolchain installation
+      - name: cache rust toolchain
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.rustup/update-hashes
+            ~/.rustup/settings.toml
+          key: rust-toolchain-${{ runner.os }}-nightly-2025-01-19
+
+      # install rust
+      - name: Install nightly toolchain # pin nightly version
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
+        run: |
+          rustup toolchain install nightly-2025-01-19 --component rustfmt rust-src clippy
+          rustup default nightly-2025-01-19
+
+      # v2.7.7 - cahe deps for faster reruns
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: shared-cache-key
+          cache-directories: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+            target
+
+      # v2.7.7 - cahe deps for faster reruns
+      - name: Cache deps
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          key: ${{ env.RUST_CHANNEL }}
+
+      # split cargo check and build for better caching
+      - name: Cargo check
+        run: cargo check --locked --all-targets
+
+      - name: Compile tests
+        run: cargo test --no-run --locked
+
+      - name: Compile workspace
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build --quiet
+
+        # Combine format and clippy checks
+      - name: run format and clippy checks
+        run: |
+          cargo +nightly-2025-01-19 fmt --verbose -- --check
+          cargo +nightly-2025-01-19 clippy --verbose --all --all-features -- -D warnings
+
+      - name: Run tests
+        if: matrix.os == 'ubuntu-latest' || github.event_name == 'push'
+        run: cargo test --workspace --exclude tn-faucet -- --quiet

@@ -1,6 +1,5 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//! Consensus metrics are used throughout consensus to capture metrics while using async channels.
 
 use axum::{http::StatusCode, routing::get, Router};
 use std::{
@@ -23,7 +22,6 @@ pub use scopeguard;
 mod guards;
 pub mod histogram;
 pub mod metered_channel;
-mod prometheus_closure;
 pub use guards::*;
 
 pub const TX_TYPE_SINGLE_WRITER_TX: &str = "single_writer";
@@ -237,31 +235,6 @@ impl<F: Future> Future for MonitoredScopeFuture<F> {
     }
 }
 
-/// Create a metric that measures the uptime from when this metric was constructed.
-///
-/// The metric is labeled with the provided 'version' label (this should generally be of the
-/// format: 'semver-gitrevision') and the provided 'chain_identifier' label.
-pub fn uptime_metric(
-    version: &'static str,
-    chain_identifier: &str,
-) -> Box<dyn prometheus::core::Collector> {
-    let opts = prometheus::opts!("uptime", "uptime of the node service in seconds")
-        .variable_label("version")
-        .variable_label("chain_identifier");
-
-    let start_time = std::time::Instant::now();
-    let uptime = move || start_time.elapsed().as_secs();
-    let metric = prometheus_closure::ClosureMetric::new(
-        opts,
-        prometheus_closure::ValueType::Counter,
-        uptime,
-        &[version, chain_identifier],
-    )
-    .unwrap();
-
-    Box::new(metric)
-}
-
 pub const METRICS_ROUTE: &str = "/metrics";
 
 // Creates a new http server that has as a sole purpose to expose
@@ -279,7 +252,9 @@ pub fn start_prometheus_server(addr: SocketAddr) {
     let app = Router::new().route(METRICS_ROUTE, get(metrics));
 
     tokio::spawn(async move {
-        axum::Server::bind(&addr).serve(app.into_make_service()).await.unwrap();
+        if let Err(e) = axum::Server::bind(&addr).serve(app.into_make_service()).await {
+            tracing::error!(target: "prometheus", ?e, "server returned error");
+        }
     });
 }
 

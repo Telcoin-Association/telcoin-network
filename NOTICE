@@ -1,0 +1,28 @@
+# NOTICE
+
+Telcoin Network
+Copyright (c) 2025 Telcoin Association
+
+Licensed under the [Apache License, Version 2.0](./LICENSE-APACHE) or [MIT](./LICENSE-MIT).
+
+This software contains code derived from the Sui project:
+Copyright (c) 2021, Facebook, Inc. and its affiliates (Apache)
+Copyright (c) 2021, Mysten Labs, Inc. (Apache)
+
+The following packages include code from Sui:
+- [tn-network](./crates/network)
+- [tn-network-types](./crates/network-types)
+- [tn-primary](./crates/consensus/primary)
+- [tn-primary-metrics](./crates/consensus/primary-metrics)
+- [tn-storage](./crates/storage)
+- [tn-test-utils](./crates/test-utils)
+- [tn-types](./crates/types)
+- [tn-utils](./crates/tn-utils)
+- [tn-worker](./crates/consensus/worker)
+
+The Sui code is licensed under the Apache License, Version 2.0.
+
+Other portions of this project are derived from work by:
+- Reth Contributors (c) 2022-2025 (Apache/MIT)
+
+If you have questions or comments regarding the licensed software, please contact `compliance@telcoin.org` so we can help.

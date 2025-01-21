@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT or Apache-2.0
 //! RPC request handle for state sync requests from peers.
 
 mod error;

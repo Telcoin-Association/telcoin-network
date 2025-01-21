@@ -1,3 +1,5 @@
+//! Compatibility wrapper for redb
+
 use redb::{Key, TypeName, Value};
 use std::{fmt::Debug, marker::PhantomData};
 

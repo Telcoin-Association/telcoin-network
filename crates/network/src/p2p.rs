@@ -1,7 +1,3 @@
-// Copyright (c) Telcoin, LLC
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 use crate::{
     traits::{PrimaryToPrimaryRpc, ReliableNetwork, WorkerRpc},
     CancelOnDropHandler, RetryConfig,
@@ -10,8 +6,8 @@ use anemo::PeerId;
 use eyre::{format_err, Result};
 use std::time::Duration;
 use tn_network_types::{
-    FetchCertificatesRequest, FetchCertificatesResponse, PrimaryToPrimaryClient,
-    RequestBlocksRequest, RequestBlocksResponse, WorkerBlockMessage, WorkerToWorkerClient,
+    BatchMessage, FetchCertificatesRequest, FetchCertificatesResponse, PrimaryToPrimaryClient,
+    RequestBatchesRequest, RequestBatchesResponse, WorkerToWorkerClient,
 };
 use tn_types::NetworkPublicKey;
 
@@ -77,18 +73,18 @@ impl PrimaryToPrimaryRpc for anemo::Network {
     }
 }
 
-impl ReliableNetwork<WorkerBlockMessage> for anemo::Network {
+impl ReliableNetwork<BatchMessage> for anemo::Network {
     type Response = ();
     fn send(
         &self,
         peer: NetworkPublicKey,
-        message: &WorkerBlockMessage,
+        message: &BatchMessage,
     ) -> CancelOnDropHandler<Result<anemo::Response<()>>> {
         let message = message.to_owned();
         let f = move |peer| {
             // Timeout will be retried in send().
             let req = anemo::Request::new(message.clone()).with_timeout(Duration::from_secs(15));
-            async move { WorkerToWorkerClient::new(peer).report_block(req).await }
+            async move { WorkerToWorkerClient::new(peer).report_batch(req).await }
         };
 
         send(self.clone(), peer, f)
@@ -96,17 +92,17 @@ impl ReliableNetwork<WorkerBlockMessage> for anemo::Network {
 }
 
 impl WorkerRpc for anemo::Network {
-    async fn request_blocks(
+    async fn request_batches(
         &self,
         peer: &NetworkPublicKey,
-        request: impl anemo::types::request::IntoRequest<RequestBlocksRequest> + Send,
-    ) -> Result<RequestBlocksResponse> {
+        request: impl anemo::types::request::IntoRequest<RequestBatchesRequest> + Send,
+    ) -> Result<RequestBatchesResponse> {
         let peer_id = PeerId(peer.0.to_bytes());
         let peer = self
             .peer(peer_id)
             .ok_or_else(|| format_err!("Network has no connection with peer {peer_id}"))?;
         let response = WorkerToWorkerClient::new(peer)
-            .request_blocks(request)
+            .request_batches(request)
             .await
             .map_err(|e| format_err!("Network error {:?}", e))?;
         Ok(response.into_body())
