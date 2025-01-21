@@ -481,42 +481,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_vote_succeeds() -> eyre::Result<()> {
-        // let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
-        // let primary0 = fixture.authorities().next().expect("4 authorities in committee fixture");
-        // let config = primary0.consensus_config();
-        // let certificate_store = config.node_storage().certificate_store.clone();
-        // let cb = ConsensusBus::new();
-        // // Make a synchronizer.
-        // let synchronizer = Arc::new(Synchronizer::new(config.clone(), &cb));
-        // let task_manager = TaskManager::default();
-        // synchronizer.spawn(&task_manager);
-
-        // // create primary network
-        // let (wan, network_events) = mpsc::channel(1);
-        // let (network_handle_tx, network_commands) = mpsc::channel(1);
-        // let network_handle = NetworkHandle::new(network_handle_tx);
-        // let request_handler = RequestHandler::new(config.clone(), cb, synchronizer);
-        // let mut primary_network =
-        //     PrimaryNetwork::new(network_events, network_handle, request_handler);
-
-        // // spawn primary network
-        // task_manager.spawn_task("primary-test-network", primary_network.spawn());
-
-        // // simulate vote request from last peer in committee fixture
-        // let primary_peer =
-        //     fixture.authorities().last().expect("4 authorities in committee fixture");
-        // let header = fixture.header_from_last_authority();
-        // // sanity check
-        // assert_eq!(primary_peer.id(), header.author());
-        // let parents = vec![];
-        // let request = PrimaryRequest::Vote { header, parents };
-        // let peer_network_key = primary_peer.primary_network_public_key();
-        // let peer_id = config
-        //     .ed25519_fastcrypto_to_libp2p(&peer_network_key)
-        //     .expect("fastcrypto to libp2p PeerId");
-        // // let response_channel = ResponseChannel::new();
-        // let _ = wan.send(NetworkEvent::Request { peer: peer_id, request, channel: todo!() }).await;
-
+        // common types
         let TestTypes { fixture, handler, config, cb } = create_test_types();
 
         // create header proposed by last peer in the committee for round 1
