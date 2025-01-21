@@ -1,9 +1,8 @@
 name: Maintainer Verify
 on:
-  workflow_run:
-    workflows: ["Pull Request Checks"]
-    types:
-      - completed
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, review_requested, ready_for_review]
 
 jobs:
   verify-on-chain:
@@ -11,9 +10,9 @@ jobs:
     environment: merge-into-main
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
-        os: [ubuntu-latest] # macos-latest?
+        os: [ubuntu-latest]
     steps:
       # checkout repo to use `verify_commit_hash.sh`
       - name: checkout repo
