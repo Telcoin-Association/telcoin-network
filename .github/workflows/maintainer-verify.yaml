@@ -6,7 +6,6 @@ on:
 
 jobs:
   verify-on-chain:
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     environment: merge-into-main
     runs-on: ${{ matrix.os }}
     strategy:
