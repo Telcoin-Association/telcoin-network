@@ -44,7 +44,7 @@ jobs:
             exit 1
           fi
 
-      # checkout repo
+      # checkout repo and submodule
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -61,15 +61,16 @@ jobs:
             ~/.rustup/settings.toml
           key: rust-toolchain-${{ runner.os }}-nightly-2025-01-19
 
+      # install rust
       - name: Install nightly toolchain # pin nightly version
         if: steps.toolchain-cache.outputs.cache-hit != 'true'
         run: |
           rustup toolchain install nightly-2025-01-19 --component rustfmt rust-src clippy
           rustup default nightly-2025-01-19
 
-      # Enhanced dependency caching
+      # v2.7.7 - cahe deps for faster reruns
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@9bdad043e88c75890e36ad3bbc8d27f0090dd609
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           shared-key: shared-cache-key
@@ -79,8 +80,9 @@ jobs:
             ~/.cargo/git
             target
 
+      # v2.7.7 - cahe deps for faster reruns
       - name: Cache deps
-        uses: Swatinem/rust-cache@9bdad043e88c75890e36ad3bbc8d27f0090dd609
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
           key: ${{ env.RUST_CHANNEL }}
 
