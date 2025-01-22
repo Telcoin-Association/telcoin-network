@@ -58,7 +58,7 @@ impl<DB: Database> CommitteeFixture<DB> {
     ///
     /// NOTE: it is the caller's responsibility to handle errors.
     pub fn authority_fixture_by_idx(&self, idx: usize) -> Option<&AuthorityFixture<DB>> {
-        self.authorities.iter().nth(idx)
+        self.authorities.get(idx)
     }
 
     /// Return a reference to the last authority in the committee.

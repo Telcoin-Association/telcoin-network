@@ -1,6 +1,6 @@
 use crate::{
     crypto, encode,
-    error::{DagError, DagResult, HeaderError, HeaderResult},
+    error::{HeaderError, HeaderResult},
     now, AuthorityIdentifier, Batch, CertificateDigest, Committee, Epoch, Round, TimestampSec,
     VoteDigest, WorkerCache, WorkerId,
 };

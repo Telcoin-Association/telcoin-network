@@ -3,31 +3,15 @@
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
 
-use crate::{synchronizer::Synchronizer, ConsensusBus};
-use fastcrypto::hash::Hash;
 use handler::RequestHandler;
 pub use message::{PrimaryRequest, PrimaryResponse};
-use parking_lot::Mutex;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-    time::Duration,
-};
-use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
-    types::{IntoResponse as _, NetworkEvent, NetworkHandle, NetworkResult},
-    ConsensusNetwork, PeerId, ResponseChannel,
+    types::{IntoResponse as _, NetworkEvent, NetworkHandle},
+    PeerId, ResponseChannel,
 };
-use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::traits::Database;
-use tn_types::{
-    ensure,
-    error::{CertificateError, HeaderError, HeaderResult},
-    now, AuthorityIdentifier, Certificate, CertificateDigest, Header, Round,
-    SignatureVerificationState, Vote,
-};
+use tn_types::{Certificate, Header};
 use tokio::sync::mpsc;
-use tracing::{debug, error, warn};
 mod handler;
 mod message;
 

@@ -7,7 +7,7 @@ use crate::{
     ConsensusBus,
 };
 use fastcrypto::{hash::Hash, traits::KeyPair};
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::StreamExt;
 use itertools::Itertools;
 use std::{
     collections::{BTreeSet, HashMap},
@@ -21,7 +21,7 @@ use tn_test_utils::{
     CommitteeFixture,
 };
 use tn_types::{
-    error::{CertificateError, DagError, HeaderError},
+    error::{CertificateError, HeaderError},
     BlsAggregateSignatureBytes, Certificate, Committee, Round, SignatureVerificationState,
     TaskManager, TnReceiver, TnSender,
 };

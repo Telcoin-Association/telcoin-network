@@ -1075,7 +1075,6 @@ impl<DB: Database> Synchronizer<DB> {
     /// TODO:
     /// old NOTE: when making changes to this function, check if the same change needs to be made to
     /// try_accept_fetched_certificates() which is the batched version.
-    ///
     async fn process_certificate_internal(
         &self,
         mut certificate: Certificate,

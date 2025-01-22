@@ -34,7 +34,7 @@ use tn_network::{
 use tn_network_libp2p::{types::NetworkHandle, ConsensusNetwork};
 use tn_network_types::PrimaryToPrimaryServer;
 use tn_storage::traits::Database;
-use tn_types::{traits::EncodeDecodeBase64, Multiaddr, NetworkPublicKey, Protocol, TaskManager};
+use tn_types::{traits::EncodeDecodeBase64, Multiaddr, NetworkPublicKey, TaskManager};
 use tokio::sync::mpsc;
 use tower::ServiceBuilder;
 use tracing::info;

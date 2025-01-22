@@ -1,6 +1,6 @@
 //! Handle specific request types received from the network.
 use super::PrimaryResponse;
-use crate::{anemo_network::PrimaryReceiverHandler, synchronizer::Synchronizer, ConsensusBus};
+use crate::{synchronizer::Synchronizer, ConsensusBus};
 use fastcrypto::hash::Hash;
 use parking_lot::Mutex;
 use std::{
@@ -9,11 +9,7 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::{
-    types::{IntoResponse as _, NetworkEvent, NetworkHandle, NetworkResult},
-    ConsensusNetwork, PeerId, ResponseChannel,
-};
-use tn_primary_metrics::PrimaryMetrics;
+use tn_network_libp2p::PeerId;
 use tn_storage::traits::Database;
 use tn_types::{
     ensure,
@@ -21,7 +17,6 @@ use tn_types::{
     now, AuthorityIdentifier, Certificate, CertificateDigest, Header, Round,
     SignatureVerificationState, Vote,
 };
-use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
 /// The maximum number of rounds that a proposed header can be behind.
@@ -79,7 +74,7 @@ where
         let committee = self.consensus_config.committee();
 
         // validate header
-        header.validate(committee, &self.consensus_config.worker_cache())?;
+        header.validate(committee, self.consensus_config.worker_cache())?;
 
         // validate parents
         let num_parents = parents.len();
@@ -390,8 +385,8 @@ where
         // filter out parents that were already requested and new ones
         unknown_certs.retain(|digest| {
             let key = (header.round() - 1, *digest);
-            if !current_requests.contains_key(&key) {
-                current_requests.insert(key, header.author());
+            if let std::collections::btree_map::Entry::Vacant(e) = current_requests.entry(key) {
+                e.insert(header.author());
                 true
             } else {
                 false
@@ -436,18 +431,18 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{
-        network::{PrimaryNetwork, PrimaryRequest, RequestHandler},
+        network::RequestHandler,
         synchronizer::Synchronizer,
         ConsensusBus, RecentBlocks,
     };
     use reth_primitives::SealedHeader;
     use std::sync::Arc;
     use tn_config::ConsensusConfig;
-    use tn_network_libp2p::types::{NetworkEvent, NetworkHandle};
+    
     use tn_storage::mem_db::MemDatabase;
-    use tn_test_utils::{AuthorityFixture, CommitteeFixture};
+    use tn_test_utils::CommitteeFixture;
     use tn_types::{TaskManager, TnSender as _};
-    use tokio::sync::mpsc;
+    
 
     /// The type for holding testng components.
     struct TestTypes<DB = MemDatabase> {
@@ -463,7 +458,8 @@ mod tests {
         cb: ConsensusBus,
     }
 
-    /// Helper function to create an instance of [RequestHandler] for the first authority in the committee.
+    /// Helper function to create an instance of [RequestHandler] for the first authority in the
+    /// committee.
     fn create_test_types() -> TestTypes {
         let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
         let authority = fixture.first_authority();

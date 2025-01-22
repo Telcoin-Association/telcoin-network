@@ -135,9 +135,7 @@ pub enum PrimaryResponse {
 
 impl IntoRpcError<HeaderError> for PrimaryResponse {
     fn into_error(error: HeaderError) -> Self {
-        match error {
-            _ => Self::Error(PrimaryRPCError::HeaderInvalid(error.to_string())),
-        }
+        Self::Error(PrimaryRPCError::HeaderInvalid(error.to_string()))
     }
 }
 

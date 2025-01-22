@@ -8,7 +8,6 @@ use reth_primitives::BlockHash;
 use std::sync::Arc;
 use thiserror::Error;
 use tn_utils::sync::notify_once::NotifyOnce;
-use tokio::sync::{mpsc, oneshot};
 
 /// Return an error if the condition is false.
 #[macro_export(local_inner_macros)]
