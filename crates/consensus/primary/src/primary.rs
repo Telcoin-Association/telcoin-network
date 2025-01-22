@@ -23,9 +23,8 @@ use anemo_tower::{
     set_header::{SetRequestHeaderLayer, SetResponseHeaderLayer},
     trace::{DefaultMakeSpan, DefaultOnFailure, TraceLayer},
 };
-use consensus_metrics::monitored_future;
 use fastcrypto::traits::KeyPair as _;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_network::{
     epoch_filter::{AllowedEpoch, EPOCH_HEADER_KEY},
@@ -187,13 +186,13 @@ impl<DB: Database> Primary<DB> {
             task_manager,
         );
 
-        // When the `Synchronizer` collects enough parent certificates, the `Proposer` generates
-        // a new header with new block digests from our workers and sends it to the `Certifier`.
-        let proposer = Proposer::new(config.clone(), consensus_bus.clone(), None, leader_schedule);
-
         // Only run the proposer task if we are a CVV.
         if consensus_bus.node_mode().borrow().is_cvv() {
-            task_manager.spawn_task("proposer task", monitored_future!(proposer, "ProposerTask"));
+            // When the `Synchronizer` collects enough parent certificates, the `Proposer` generates
+            // a new header with new block digests from our workers and sends it to the `Certifier`.
+            let proposer = Proposer::new(config.clone(), consensus_bus.clone(), leader_schedule);
+
+            proposer.spawn(task_manager);
         }
 
         // Keeps track of the latest consensus round and allows other tasks to clean up their their
@@ -300,15 +299,29 @@ impl<DB: Database> Primary<DB> {
             .into_inner();
 
         let anemo_config = config.anemo_config();
-        let network = anemo::Network::bind(addr.clone())
-            .server_name("telcoin-network")
-            .private_key(
-                config.key_config().primary_network_keypair().copy().private().0.to_bytes(),
-            )
-            .config(anemo_config.clone())
-            .outbound_request_layer(outbound_layer.clone())
-            .start(service.clone())
-            .unwrap_or_else(|_| panic!("primary network bind: {addr}"));
+        let mut tries = 0;
+        let network = loop {
+            match anemo::Network::bind(addr.clone())
+                .server_name("telcoin-network")
+                .private_key(
+                    config.key_config().primary_network_keypair().copy().private().0.to_bytes(),
+                )
+                .config(anemo_config.clone())
+                .outbound_request_layer(outbound_layer.clone())
+                .start(service.clone())
+            {
+                Ok(network) => break network,
+                Err(e) => {
+                    // In case we are starting quickly (like in a test) allow three tries to bind to
+                    // our address.
+                    tries += 1;
+                    if tries > 3 {
+                        panic!("primary network bind to {addr} {e}");
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+        };
 
         info!("Primary {} listening on {}", config.authority().id(), address);
         network

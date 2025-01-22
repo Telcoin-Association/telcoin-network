@@ -164,7 +164,7 @@ pub trait TnSender<T>: Unpin + Clone {
 
     /// Get a reciever for this TnSender.
     /// For an MPSC or other limited channel this may panic if called more than once.
-    fn subscribe(&self) -> impl TnReceiver<T>;
+    fn subscribe(&self) -> impl TnReceiver<T> + 'static;
 
     /// Borrow a reciever for this TnSender.
     /// This should try to return a receiver that once dropped can be reused.
@@ -173,7 +173,7 @@ pub trait TnSender<T>: Unpin + Clone {
     fn borrow_subscriber(&self) -> impl TnReceiver<T>;
 }
 
-impl<T: Send + Clone> TnSender<T> for broadcast::Sender<T> {
+impl<T: Send + Clone + 'static> TnSender<T> for broadcast::Sender<T> {
     async fn send(&self, value: T) -> Result<(), SendError<T>> {
         Ok(self.send(value).map(|_| ())?)
     }
@@ -182,7 +182,7 @@ impl<T: Send + Clone> TnSender<T> for broadcast::Sender<T> {
         Ok(self.send(message).map(|_| ())?)
     }
 
-    fn subscribe(&self) -> impl TnReceiver<T> {
+    fn subscribe(&self) -> impl TnReceiver<T> + 'static {
         self.subscribe()
     }
 

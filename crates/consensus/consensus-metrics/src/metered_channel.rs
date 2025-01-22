@@ -129,7 +129,7 @@ impl<T> MeteredMpscChannel<T> {
     }
 }
 
-impl<T: Send> TnSender<T> for MeteredMpscChannel<T> {
+impl<T: Send + 'static> TnSender<T> for MeteredMpscChannel<T> {
     /// Sends a value, waiting until there is capacity.
     /// Increments the gauge in case of a successful `send`.
     fn send(
@@ -151,7 +151,7 @@ impl<T: Send> TnSender<T> for MeteredMpscChannel<T> {
             })?)
     }
 
-    fn subscribe(&self) -> impl TnReceiver<T> {
+    fn subscribe(&self) -> impl TnReceiver<T> + 'static {
         self.receiver.lock().take().expect("No receiver to subscribe, can only subscribe once!")
     }
 

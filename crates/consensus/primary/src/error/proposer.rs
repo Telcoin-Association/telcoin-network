@@ -1,6 +1,5 @@
 //! Error types for primary's Proposer task.
 
-use std::time::Duration;
 use tn_types::Header;
 use tokio::sync::{oneshot, watch};
 
@@ -27,10 +26,6 @@ pub enum ProposerError {
     /// Error writing to the proposer store.
     #[error("Failed to write new header to proposer store: {0}")]
     StoreError(String),
-    /// The fatal header timeout expired. This can only happen if the send channel to Certifier
-    /// hangs for longer than specified duration.
-    #[error("Fatal: proposed header still pending after {0:?}")]
-    FatalHeaderTimeout(Duration),
 }
 
 impl From<watch::error::RecvError> for ProposerError {

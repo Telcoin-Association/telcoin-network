@@ -86,6 +86,8 @@ echo "clippy for workspace: default and all features passed"
 #
 # default features
 cargo test --workspace --no-fail-fast -- --show-output
+# Run tests that require credentials.
+cargo test test_with_creds -- --ignored
 # faucet it test
 cargo test -p telcoin-network --test it --features faucet --no-fail-fast -- faucet --show-output
 

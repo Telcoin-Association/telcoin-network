@@ -256,7 +256,7 @@ mod tests {
     /// ```
     #[test]
     #[ignore = "should not run with a default cargo test"]
-    fn test_google_kms_signature() {
+    fn test_with_creds_google_kms_signature() {
         // validator 1 kms
         // asymmetric_sign for SHA256 digest (keccak)
         let response = vec![
@@ -381,7 +381,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "should not run with a default cargo test"]
-    async fn test_gcloud_sdk() {
+    async fn test_with_creds_gcloud_sdk() {
         // Debug logging
 
         std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", "./gcloud-credentials.json");

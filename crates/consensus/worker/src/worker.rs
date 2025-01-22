@@ -20,7 +20,7 @@ use anemo_tower::{
     trace::{DefaultMakeSpan, DefaultOnFailure, TraceLayer},
 };
 use consensus_metrics::monitored_future;
-use std::{collections::HashMap, net::Ipv4Addr, sync::Arc};
+use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_network::{
     epoch_filter::{AllowedEpoch, EPOCH_HEADER_KEY},
@@ -275,21 +275,35 @@ impl<DB: Database> Worker<DB> {
 
         let anemo_config = consensus_config.anemo_config();
 
-        let network = anemo::Network::bind(addr.clone())
-            .server_name("telcoin-network")
-            .private_key(
-                consensus_config
-                    .key_config()
-                    .worker_network_keypair()
-                    .copy()
-                    .private()
-                    .0
-                    .to_bytes(),
-            )
-            .config(anemo_config.clone())
-            .outbound_request_layer(outbound_layer.clone())
-            .start(service.clone())
-            .expect("worker network bind");
+        let mut tries = 0;
+        let network = loop {
+            match anemo::Network::bind(addr.clone())
+                .server_name("telcoin-network")
+                .private_key(
+                    consensus_config
+                        .key_config()
+                        .worker_network_keypair()
+                        .copy()
+                        .private()
+                        .0
+                        .to_bytes(),
+                )
+                .config(anemo_config.clone())
+                .outbound_request_layer(outbound_layer.clone())
+                .start(service.clone())
+            {
+                Ok(network) => break network,
+                Err(e) => {
+                    // In case we are starting quickly (like in a test) allow three tries to bind to
+                    // our address.
+                    tries += 1;
+                    if tries > 3 {
+                        panic!("primary network bind to {addr} {e}");
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+        };
 
         info!(target: "worker::worker", "Worker {} listening to worker messages on {}", id, address);
         network
