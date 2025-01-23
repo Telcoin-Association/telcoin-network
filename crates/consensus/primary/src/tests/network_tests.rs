@@ -2,16 +2,15 @@
 
 use crate::{network::RequestHandler, synchronizer::Synchronizer, ConsensusBus, RecentBlocks};
 use assert_matches::assert_matches;
-use fastcrypto::{hash::Hash as _, traits::KeyPair as _};
+use fastcrypto::hash::Hash as _;
 use reth_primitives::SealedHeader;
 use std::{collections::BTreeSet, sync::Arc};
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::PeerId;
 use tn_storage::mem_db::MemDatabase;
-use tn_test_utils::{mock_signed_certificate, CommitteeFixture};
+use tn_test_utils::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, traits::InsecureDefault, AuthorityIdentifier, BlockHash, Certificate,
-    CertificateDigest, Header, TaskManager,
+    CertificateDigest, TaskManager,
 };
 use tracing::debug;
 
@@ -25,8 +24,6 @@ struct TestTypes<DB = MemDatabase> {
     handler: RequestHandler<DB>,
     /// Consensus config for the authority receiving requests.
     config: ConsensusConfig<DB>,
-    /// Consensus bus for the authority receiving parents.
-    cb: ConsensusBus,
     /// The parent execution result for all primary headers.
     ///
     /// num: 0
@@ -58,7 +55,7 @@ fn create_test_types() -> TestTypes {
         .expect("watch channel updates for default parent in primary handler tests");
 
     let handler = RequestHandler::new(config.clone(), cb.clone(), synchronizer);
-    TestTypes { committee, handler, config, cb, parent }
+    TestTypes { committee, handler, config, parent }
 }
 
 #[tokio::test]
