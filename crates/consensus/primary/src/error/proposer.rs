@@ -8,7 +8,7 @@ pub(crate) type ProposerResult<T> = Result<T, ProposerError>;
 
 /// Core error variants when executing the output from consensus and extending the canonical block.
 #[derive(Debug, thiserror::Error)]
-pub enum ProposerError {
+pub(crate) enum ProposerError {
     /// The watch channel that receives the result from executing output on a blocking thread.
     #[error(
         "The watch channel sender for primary's proposer dropped while building the next header."

@@ -1,6 +1,7 @@
 //! Handle specific request types received from the network.
+
 use super::PrimaryResponse;
-use crate::{synchronizer::Synchronizer, ConsensusBus};
+use crate::{error::PrimaryNetworkResult, synchronizer::Synchronizer, ConsensusBus};
 use fastcrypto::hash::Hash;
 use parking_lot::Mutex;
 use std::{
@@ -428,7 +429,9 @@ where
     }
 
     /// Process gossip from the committee.
-    pub(super) async fn process_gossip(&self, msg: Vec<u8>) -> HeaderResult<()> {
+    pub(super) async fn process_gossip(&self, msg: Vec<u8>) -> PrimaryNetworkResult<()> {
+        // TODO: should this use the same TNCodec as request_response?
+
         todo!()
     }
 }
