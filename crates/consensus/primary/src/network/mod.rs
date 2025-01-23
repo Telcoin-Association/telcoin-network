@@ -52,27 +52,36 @@ where
         tokio::select! {
             event = self.network_events.recv() => {
                 match event {
-                    Some(e) => match e {
-                        NetworkEvent::Request { peer, request, channel } => {
-                            // match request and send to actor
-                            // - mpsc::Sender<_>::send(request, oneshot);
-                            // let res = oneshot.await?;
-                            // self.network_handle.send_response(res, channel).await?;
-                            match request {
-                                PrimaryRequest::NewCertificate { certificate } => todo!(),
-                                PrimaryRequest::Vote { header, parents } => {
-                                    self.process_vote_request(peer, header, parents, channel);
-                                },
-                                PrimaryRequest::MissingCertificates { inner } => todo!(),
-                            }
-                        }
-                        NetworkEvent::Gossip(bytes) => {
-                            // match gossip and send to actor
-                            todo!()
-                        }
-                    },
+                    Some(e) => self.process_network_event(e),
                     None => todo!(),
                 }
+            }
+        }
+    }
+
+    /// Handle events concurrently.
+    fn process_network_event(&self, event: NetworkEvent<Req, Res>) {
+        // clone for spawned tasks
+        let request_handler = self.request_handler.clone();
+        let network_handle = self.network_handle.clone();
+
+        // match event
+        match event {
+            NetworkEvent::Request { peer, request, channel } => match request {
+                PrimaryRequest::Vote { header, parents } => {
+                    self.process_vote_request(
+                        request_handler,
+                        network_handle,
+                        peer,
+                        header,
+                        parents,
+                        channel,
+                    );
+                }
+                PrimaryRequest::MissingCertificates { inner } => todo!(),
+            },
+            NetworkEvent::Gossip(msg) => {
+                self.process_gossip(request_handler, network_handle, msg);
             }
         }
     }
@@ -82,16 +91,33 @@ where
     /// Spawn a task to evaluate a peer's proposed header and return a response.
     fn process_vote_request(
         &self,
+        request_handler: RequestHandler<DB>,
+        network_handle: NetworkHandle<Req, Res>,
         peer: PeerId,
         header: Header,
         parents: Vec<Certificate>,
         channel: ResponseChannel<PrimaryResponse>,
     ) {
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
         tokio::spawn(async move {
             let response = request_handler.vote(peer, header, parents).await.into_response();
             let _ = network_handle.send_response(response, channel).await;
+        });
+    }
+
+    /// Process gossip from committee.
+    fn process_gossip(
+        &self,
+        request_handler: RequestHandler<DB>,
+        network_handle: NetworkHandle<Req, Res>,
+        msg: Vec<u8>,
+    ) {
+        tokio::spawn(async move {
+            if let Err(e) = request_handler.process_gossip(msg).await {
+                // network_handle.set_application_score(peer_id, new_score).await;
+
+                // match on error to lower peer score
+                todo!();
+            }
         });
     }
 }

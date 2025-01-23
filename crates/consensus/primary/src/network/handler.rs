@@ -426,4 +426,9 @@ where
 
         Ok(())
     }
+
+    /// Process gossip from the committee.
+    pub(super) async fn process_gossip(&self, msg: Vec<u8>) -> HeaderResult<()> {
+        todo!()
+    }
 }

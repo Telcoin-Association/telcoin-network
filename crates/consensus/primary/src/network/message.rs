@@ -12,6 +12,13 @@ use tn_types::{
     error::HeaderError, AuthorityIdentifier, Certificate, CertificateDigest, Header, Round, Vote,
 };
 
+/// Primary messages on the gossip network.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum PrimaryGossip {
+    /// A new certificate broadcast from peer.
+    Certificate(Certificate),
+}
+
 // impl TNMessage trait for types
 impl TNMessage for PrimaryRequest {}
 impl TNMessage for PrimaryResponse {}
@@ -19,14 +26,6 @@ impl TNMessage for PrimaryResponse {}
 /// Requests from Primary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PrimaryRequest {
-    /// A new certificate broadcast from peer.
-    ///
-    /// NOTE: expect no response
-    /// TODO: gossip this instead
-    NewCertificate {
-        /// The certificate from this peer.
-        certificate: Certificate,
-    },
     /// Primary request for vote on new header.
     Vote {
         /// This primary's header for the round.
