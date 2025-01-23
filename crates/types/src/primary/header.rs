@@ -105,10 +105,7 @@ impl Header {
     pub fn validate(&self, committee: &Committee, worker_cache: &WorkerCache) -> HeaderResult<()> {
         // Ensure the header is from the correct epoch.
         if self.epoch != committee.epoch() {
-            return Err(HeaderError::InvalidEpoch {
-                expected: committee.epoch(),
-                received: self.epoch,
-            });
+            return Err(HeaderError::InvalidEpoch(self.epoch, committee.epoch()));
         }
 
         // Ensure the header digest is well formed.
@@ -246,7 +243,7 @@ impl HeaderBuilder {
             round: self.round.expect("round set for header builder"),
             epoch: self.epoch.expect("epoch set for header builder"),
             created_at: self.created_at.unwrap_or(0),
-            payload: self.payload.expect("payload set for header builder"),
+            payload: self.payload.unwrap_or_default(),
             system_messages: self.system_messages.unwrap_or_default(),
             parents: self.parents.expect("parents set for header builder"),
             digest: OnceCell::default(),
@@ -333,12 +330,14 @@ impl fmt::Debug for Header {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         write!(
             f,
-            "{}: B{}(v{}, e{}, {}wbs)",
+            "{}: B{}(v{}, e{}, {}wbs, exec: {} - {})",
             self.digest(),
             self.round(),
             self.author(),
             self.epoch(),
             self.payload().len() * BlockHash::LEN,
+            self.latest_execution_block_num,
+            self.latest_execution_block,
         )
     }
 }

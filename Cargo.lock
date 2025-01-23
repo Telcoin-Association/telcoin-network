@@ -11464,6 +11464,7 @@ version = "0.1.0"
 dependencies = [
  "anemo",
  "anemo-tower",
+ "assert_matches",
  "async-trait",
  "backoff",
  "bytes",
@@ -11631,6 +11632,7 @@ dependencies = [
  "fastcrypto-tbls",
  "futures",
  "indexmap 2.5.0",
+ "libp2p",
  "match_opt",
  "multiaddr",
  "once_cell",

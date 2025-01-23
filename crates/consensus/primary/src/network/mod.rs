@@ -15,6 +15,10 @@ use tokio::sync::mpsc;
 mod handler;
 mod message;
 
+#[cfg(test)]
+#[path = "../tests/network_tests.rs"]
+mod network_tests;
+
 /// Convenience type for Primary network.
 type Req = PrimaryRequest;
 /// Convenience type for Primary network.

@@ -4,6 +4,7 @@ use crate::{
     crypto, CertificateDigest, Epoch, HeaderDigest, Round, TimestampSec, VoteDigest, WorkerId,
 };
 use fastcrypto::{error::FastCryptoError, hash::Digest};
+use libp2p::PeerId;
 use reth_primitives::BlockHash;
 use std::sync::Arc;
 use thiserror::Error;
@@ -205,8 +206,8 @@ pub type HeaderResult<T> = Result<T, HeaderError>;
 #[derive(Debug, Error)]
 pub enum HeaderError {
     /// Invalid header request
-    #[error("Invalid epoch (expected {expected}, received {received})")]
-    InvalidEpoch { expected: Epoch, received: Epoch },
+    #[error("Invalid epoch. Peer proposed epoch {0}, but expected {1})")]
+    InvalidEpoch(Epoch, Epoch),
     /// The expected digest does not match the peer's sealed header.
     #[error("Invalid header digest")]
     InvalidHeaderDigest,
@@ -220,8 +221,8 @@ pub enum HeaderError {
     #[error("Too many parents in vote request: {0} > {1}")]
     TooManyParents(usize, usize),
     /// Authority network key is missing from committee.
-    #[error("Failed to find author in committee by network key.")]
-    AuthorityByNetworkKey,
+    #[error("Failed to find author in committee by network key: {0}")]
+    UnknownNetworkKey(PeerId),
     /// The header wasn't proposed by the author.
     #[error("The proposing peer is not the author.")]
     PeerNotAuthor,

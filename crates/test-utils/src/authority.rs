@@ -297,7 +297,7 @@ impl<DB: Database> AuthorityFixture<DB> {
 
     /// Create a [Header] with a default payload based on the [Committee] argument.
     pub fn header(&self, committee: &Committee) -> Header {
-        self.header_builder(committee).payload(Default::default()).build().unwrap()
+        self.header_builder(committee).build().unwrap()
     }
 
     /// Create a [Header] with a default payload based on the [Committee] and [Round] arguments.

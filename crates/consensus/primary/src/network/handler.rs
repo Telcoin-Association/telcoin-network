@@ -96,7 +96,7 @@ where
         // ensure request for vote came from the header's author
         let committee_peer = committee
             .authority_by_network_key(&converted_network_key)
-            .ok_or(HeaderError::AuthorityByNetworkKey)?;
+            .ok_or(HeaderError::UnknownNetworkKey(peer))?;
         ensure!(header.author() == committee_peer.id(), HeaderError::PeerNotAuthor);
 
         // TODO: ensure peer's header isn't too far in the past
@@ -297,7 +297,7 @@ where
         if let Some(vote_info) = previous_vote {
             ensure!(
                 header.epoch() == vote_info.epoch(),
-                HeaderError::InvalidEpoch { expected: header.epoch(), received: vote_info.epoch() }
+                HeaderError::InvalidEpoch(header.epoch(), vote_info.epoch())
             );
             ensure!(
                 header.round() >= vote_info.round(),
@@ -424,78 +424,6 @@ where
                 .map_err(|e| HeaderError::InvalidParent(e.to_string()))?;
         }
 
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{
-        network::RequestHandler,
-        synchronizer::Synchronizer,
-        ConsensusBus, RecentBlocks,
-    };
-    use reth_primitives::SealedHeader;
-    use std::sync::Arc;
-    use tn_config::ConsensusConfig;
-    
-    use tn_storage::mem_db::MemDatabase;
-    use tn_test_utils::CommitteeFixture;
-    use tn_types::{TaskManager, TnSender as _};
-    
-
-    /// The type for holding testng components.
-    struct TestTypes<DB = MemDatabase> {
-        /// Committee fixture with authorities that vote.
-        fixture: CommitteeFixture<DB>,
-        // /// The authority that receives messages.
-        // authority: &'a AuthorityFixture<DB>,
-        /// The handler for requests.
-        handler: RequestHandler<DB>,
-        /// Consensus config for the authority receiving requests.
-        config: ConsensusConfig<DB>,
-        /// Consensus bus for the authority receiving parents.
-        cb: ConsensusBus,
-    }
-
-    /// Helper function to create an instance of [RequestHandler] for the first authority in the
-    /// committee.
-    fn create_test_types() -> TestTypes {
-        let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
-        let authority = fixture.first_authority();
-        let config = authority.consensus_config();
-        let cb = ConsensusBus::new();
-
-        // spawn the synchronizer
-        let synchronizer = Arc::new(Synchronizer::new(config.clone(), &cb));
-        let task_manager = TaskManager::default();
-        synchronizer.spawn(&task_manager);
-
-        let handler = RequestHandler::new(config.clone(), cb.clone(), synchronizer);
-        TestTypes { fixture, handler, config, cb }
-    }
-
-    #[tokio::test]
-    async fn test_vote_succeeds() -> eyre::Result<()> {
-        // common types
-        let TestTypes { fixture, handler, config, cb } = create_test_types();
-
-        // create header proposed by last peer in the committee for round 1
-        let header = fixture.header_from_last_authority();
-        let parents = vec![];
-        let peer_id = config
-            .ed25519_fastcrypto_to_libp2p(&fixture.last_authority().primary_network_public_key())
-            .expect("valid peer id for last authority");
-
-        // set the latest execution result to genesis - header is proposed for round 1
-        let mut recent = RecentBlocks::new(1);
-        recent.push_latest(SealedHeader::default());
-        cb.recent_blocks().send(recent)?;
-
-        // process vote
-        let res = handler.vote(peer_id, header, parents).await;
-        println!("res?: {res:?}");
-        assert!(res.is_ok());
         Ok(())
     }
 }

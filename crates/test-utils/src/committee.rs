@@ -66,6 +66,13 @@ impl<DB: Database> CommitteeFixture<DB> {
         self.authorities.last().expect("4 nodes in committee fixture")
     }
 
+    /// Return a [HeaderBuilder] from the last authority in the committee.
+    ///
+    /// See [AuthorityFixture::header_builder()] for more information.
+    pub fn header_builder_last_authority(&self) -> HeaderBuilder {
+        self.last_authority().header_builder(&self.committee())
+    }
+
     /// Return a header from the last authority in the committee.
     ///
     /// See [AuthorityFixture::header()] for more information.
