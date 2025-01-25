@@ -4,10 +4,10 @@ use alloy::{
     hex::{self, FromHex},
     primitives::FixedBytes,
 };
+use alloy::{keccak256, Address, GenesisAccount};
 use eyre::Context;
 use fastcrypto::traits::{InsecureDefault, Signer, ToFromBytes};
 use reth_chainspec::ChainSpec;
-use reth_primitives::{keccak256, Address, GenesisAccount};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -549,9 +549,9 @@ mod tests {
         ValidatorInfo,
     };
     use alloy::hex::{self, FromHex};
+    use alloy::primitives::Address;
     use fastcrypto::traits::KeyPair;
     use rand::{rngs::StdRng, SeedableRng};
-    use reth_primitives::Address;
     use std::collections::BTreeMap;
     use tempfile::tempdir;
     use tn_types::{

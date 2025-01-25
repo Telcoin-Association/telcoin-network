@@ -1,13 +1,13 @@
 //! Subscriber handles consensus output.
 
 use crate::{errors::SubscriberResult, SubscriberError};
+use alloy::{Address, B256};
 use consensus_metrics::monitored_future;
 use fastcrypto::hash::Hash;
 use futures::{
     stream::{FuturesOrdered, FuturesUnordered},
     StreamExt,
 };
-use reth_primitives::{Address, B256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,

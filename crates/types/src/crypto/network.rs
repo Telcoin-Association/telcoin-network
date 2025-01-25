@@ -5,11 +5,11 @@ use super::{
     ProtocolSignature,
 };
 use crate::encode;
+use alloy::genesis::Genesis;
 use fastcrypto::{
     error::FastCryptoError,
     traits::{KeyPair as _, Signer, ToFromBytes as _, VerifyingKey as _},
 };
-use reth_primitives::Genesis;
 use serde::Serialize;
 
 impl ProtocolSignature for NetworkSignature {

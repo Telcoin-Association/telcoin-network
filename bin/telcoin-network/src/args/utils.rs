@@ -1,8 +1,8 @@
 //! Utilities for parsing args
 
+use alloy::primitives::Address;
 use reth::{args::utils::chain_value_parser, dirs::MaybePlatformPath};
 use reth_chainspec::ChainSpec;
-use reth_primitives::Address;
 use std::{str::FromStr, sync::Arc};
 use tn_node::dirs::DataDirPath;
 use tn_types::adiri_chain_spec_arc;

@@ -3,14 +3,13 @@
 use crate::{
     crypto::{BlsPublicKey, BlsPublicKeyBytes, NetworkPublicKey},
     error::{CommitteeUpdateError, ConfigError},
-    Multiaddr,
+    Address, Multiaddr,
 };
 use fastcrypto::{
     serde_helpers::ToFromByteArray,
     traits::{EncodeDecodeBase64, ToFromBytes},
 };
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
-use reth_primitives::Address;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -597,9 +596,9 @@ impl CommitteeBuilder {
 #[cfg(test)]
 mod tests {
     use crate::{Authority, BlsKeypair, BlsPublicKey, Committee, Multiaddr, NetworkKeypair};
+    use alloy::primitives::Address;
     use fastcrypto::traits::KeyPair as _;
     use rand::thread_rng;
-    use reth_primitives::Address;
     use std::collections::BTreeMap;
 
     #[test]

@@ -6,7 +6,7 @@
 //!
 //! The mined transactions are returned with the built block so the worker can update the pool.
 
-use reth_primitives::{IntoRecoveredTransaction, TxHash};
+use alloy::{IntoRecoveredTransaction, TxHash};
 use reth_transaction_pool::TransactionPool;
 use tn_types::{max_batch_gas, max_batch_size, now, Batch, BatchBuilderArgs, PendingBlockConfig};
 use tracing::{debug, warn};

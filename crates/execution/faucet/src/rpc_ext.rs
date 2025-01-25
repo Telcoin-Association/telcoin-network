@@ -2,9 +2,9 @@
 
 use super::Faucet;
 use crate::FaucetConfig;
+use alloy::{Address, TxHash};
 use jsonrpsee::proc_macros::rpc;
 use reth::rpc::server_types::eth::EthResult;
-use reth_primitives::{Address, TxHash};
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_transaction_pool::TransactionPool;
 

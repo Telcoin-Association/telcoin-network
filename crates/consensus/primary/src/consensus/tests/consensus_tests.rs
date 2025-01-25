@@ -4,8 +4,8 @@ use crate::{
     consensus::{Bullshark, Consensus, ConsensusMetrics, LeaderSchedule, LeaderSwapTable},
     ConsensusBus,
 };
+use alloy::{Header, B256};
 use fastcrypto::hash::Hash;
-use reth_primitives::{Header, B256};
 use std::{collections::BTreeSet, sync::Arc};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;

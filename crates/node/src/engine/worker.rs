@@ -30,7 +30,6 @@ use reth_node_builder::{
 };
 use reth_node_ethereum::EthEngineTypes;
 use reth_provider::providers::BlockchainProvider;
-use reth_rpc_types::admin::EthProtocolInfo;
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool, TransactionPool};
 use std::{
     marker::PhantomData,

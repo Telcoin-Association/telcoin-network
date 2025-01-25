@@ -1,7 +1,7 @@
 //! IT tests
 
+use alloy::{Header, B256};
 use fastcrypto::hash::Hash;
-use reth_primitives::{Header, B256};
 use std::{collections::BTreeSet, sync::Arc};
 use tn_executor::get_restored_consensus_output;
 use tn_primary::{

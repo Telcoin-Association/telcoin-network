@@ -10,13 +10,13 @@
 //!
 //! WARNING: DO NOT ENABLE THIS FEATURE ON MAINNET.
 
+use alloy::{Address, TxHash};
 use gcloud_sdk::{
     google::cloud::kms::v1::key_management_service_client::KeyManagementServiceClient, GoogleApi,
     GoogleAuthMiddleware,
 };
 use lru_time_cache::LruCache;
 use reth::rpc::server_types::eth::{EthApiError, EthResult};
-use reth_primitives::{Address, TxHash};
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use reth_transaction_pool::TransactionPool;
@@ -206,7 +206,7 @@ mod tests {
     };
     use k256::PublicKey as PubKey;
 
-    use reth_primitives::{keccak256, public_key_to_address, Signature as RSignature, U256};
+    use alloy::{keccak256, public_key_to_address, Signature as RSignature, U256};
 
     use secp256k1::{
         ecdsa::{RecoverableSignature, RecoveryId, Signature},

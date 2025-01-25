@@ -22,11 +22,11 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+use alloy::{constants::MIN_PROTOCOL_BASE_FEE, Address, TxHash};
 pub use batch::{build_batch, BatchBuilderOutput};
 use error::{BatchBuilderError, BatchBuilderResult};
 use futures_util::{FutureExt, StreamExt};
 use reth_execution_types::ChangedAccount;
-use reth_primitives::{constants::MIN_PROTOCOL_BASE_FEE, Address, TxHash};
 use reth_provider::{CanonStateNotification, CanonStateNotificationStream, Chain};
 use reth_transaction_pool::{CanonicalStateUpdate, TransactionPool, TransactionPoolExt};
 use std::{
@@ -412,6 +412,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::{alloy_primitives::U160, BlockBody, Bytes, GenesisAccount, SealedBlock, U256};
     use assert_matches::assert_matches;
     use reth::tasks::TaskManager;
     use reth_blockchain_tree::{
@@ -425,9 +426,6 @@ mod tests {
     };
     use reth_db_common::init::init_genesis;
     use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
-    use reth_primitives::{
-        alloy_primitives::U160, BlockBody, Bytes, GenesisAccount, SealedBlock, U256,
-    };
     use reth_provider::{
         providers::{BlockchainProvider, StaticFileProvider},
         CanonStateSubscriptions as _, ProviderFactory,

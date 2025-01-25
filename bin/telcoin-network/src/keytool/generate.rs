@@ -1,13 +1,13 @@
 //! Generate subcommand
 
 use crate::args::{clap_address_parser, clap_genesis_parser};
+use alloy::primitives::Address;
 use clap::{value_parser, Args, Subcommand};
 use fastcrypto::traits::KeyPair as KeyPairTraits;
 use rand::prelude::*;
 use rand_chacha::ChaCha20Rng;
 use reth::dirs::MaybePlatformPath;
 use reth_chainspec::ChainSpec;
-use reth_primitives::Address;
 use std::{path::Path, sync::Arc};
 use tn_config::{Config, BLS_KEYFILE, PRIMARY_NETWORK_KEYFILE, WORKER_NETWORK_KEYFILE};
 use tn_node::dirs::DataDirPath;

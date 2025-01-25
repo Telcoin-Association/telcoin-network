@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::consensus::LeaderSwapTable;
-use reth_primitives::B256;
+use alloy::B256;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
 

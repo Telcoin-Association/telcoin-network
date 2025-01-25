@@ -3,17 +3,17 @@
 //! This approach heavily inspired by reth's `default_ethereum_payload_builder`.
 
 use crate::error::{EngineResult, TnEngineError};
+use alloy::{
+    constants::{EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS},
+    Block, Header, Receipt, SealedBlockWithSenders, SealedHeader, Withdrawals, B256,
+    EMPTY_OMMER_ROOT_HASH, U256,
+};
 use fastcrypto::hash::Hash as _;
 use reth_blockchain_tree::{BlockValidationKind, BlockchainTreeEngine};
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
 use reth_execution_types::ExecutionOutcome;
 use reth_payload_builder::database::CachedReads;
-use reth_primitives::{
-    constants::{EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS},
-    Block, Header, Receipt, SealedBlockWithSenders, SealedHeader, Withdrawals, B256,
-    EMPTY_OMMER_ROOT_HASH, U256,
-};
 use reth_provider::{CanonChainTracker, ChainSpecProvider, StateProviderFactory};
 use reth_revm::{
     database::StateProviderDatabase,

@@ -1,9 +1,9 @@
 //! Configurations for the Telcoin Network.
 
 use crate::{ConfigTrait, ValidatorInfo};
+use alloy::{Address, Genesis};
 use fastcrypto::traits::KeyPair as KeyPairTrait;
 use reth_chainspec::ChainSpec;
-use reth_primitives::{Address, Genesis};
 use serde::{Deserialize, Serialize};
 use std::{
     num::NonZeroU32,

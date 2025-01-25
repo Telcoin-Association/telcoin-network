@@ -1,18 +1,15 @@
 use crate::{
     crypto, encode,
     error::{DagError, DagResult},
-    now, AuthorityIdentifier, Batch, CertificateDigest, Committee, Epoch, Round, TimestampSec,
-    VoteDigest, WorkerCache, WorkerId,
+    now, AuthorityIdentifier, Batch, BlockHash, BlockNumHash, BlockNumber, CertificateDigest,
+    Committee, Epoch, Round, TimestampSec, VoteDigest, WorkerCache, WorkerId,
 };
-use alloy_rlp::MaxEncodedLenAssoc;
 use base64::{engine::general_purpose, Engine};
 use derive_builder::Builder;
 use fastcrypto::hash::{Digest, Hash, HashFunction};
 use fastcrypto_tbls::{tbls::ThresholdBls, types::ThresholdBls12381MinSig};
 use indexmap::IndexMap;
 use once_cell::sync::OnceCell;
-use reth_primitives::{BlockHash, BlockNumber};
-use reth_rpc_types::BlockNumHash;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt};
 
@@ -338,7 +335,7 @@ impl fmt::Debug for Header {
             self.round(),
             self.author(),
             self.epoch(),
-            self.payload().len() * BlockHash::LEN,
+            self.payload().len(),
         )
     }
 }

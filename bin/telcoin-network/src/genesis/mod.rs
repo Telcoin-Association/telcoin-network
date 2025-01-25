@@ -9,12 +9,11 @@ use self::{
     add_validator::AddValidator, create_committee::CreateCommitteeArgs, validate::ValidateArgs,
 };
 use crate::args::clap_genesis_parser;
+use alloy::primitives::Address;
 use clap::{Args, Subcommand};
-
 use rand::{rngs::StdRng, SeedableRng};
 use reth::dirs::MaybePlatformPath;
 use reth_chainspec::ChainSpec;
-use reth_primitives::{keccak256, Address, GenesisAccount, U256};
 use secp256k1::Secp256k1;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tn_config::{Config, ConfigFmt, ConfigTrait, NetworkGenesis, TelcoinDirs as _};
@@ -110,7 +109,7 @@ impl Initialize {
 /// Take a string and return the deterministic account derived from it.  This is be used
 /// with similiar functionality in the test client to allow easy testing using simple strings
 /// for accounts.
-fn account_from_word(key_word: &str) -> reth_primitives::alloy_primitives::Address {
+fn account_from_word(key_word: &str) -> Address {
     if key_word.starts_with("0x") {
         key_word.parse().expect("not a valid account!")
     } else {

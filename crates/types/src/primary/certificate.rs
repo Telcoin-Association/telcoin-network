@@ -12,14 +12,14 @@ use crate::{
     error::{DagError, DagResult},
     now,
     serde::CertificateSignatures,
-    AuthorityIdentifier, Committee, Epoch, Header, Round, Stake, TimestampSec, WorkerCache,
+    AuthorityIdentifier, BlockHash, Committee, Epoch, Header, Round, Stake, TimestampSec,
+    WorkerCache,
 };
 use base64::{engine::general_purpose, Engine};
 use fastcrypto::{
     hash::{Digest, Hash},
     traits::AggregateAuthenticator,
 };
-use reth_primitives::BlockHash;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::{collections::VecDeque, fmt};

@@ -20,6 +20,7 @@
 
 mod error;
 mod payload_builder;
+use alloy::SealedHeader;
 use error::{EngineResult, TnEngineError};
 use futures::{Future, StreamExt};
 use futures_util::FutureExt;
@@ -27,7 +28,6 @@ pub use payload_builder::execute_consensus_output;
 use reth_blockchain_tree::BlockchainTreeEngine;
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
-use reth_primitives::SealedHeader;
 use reth_provider::{
     BlockIdReader, BlockReader, CanonChainTracker, ChainSpecProvider, StageCheckpointReader,
     StateProviderFactory,
@@ -314,13 +314,13 @@ impl<BT, CE> std::fmt::Debug for ExecutorEngine<BT, CE> {
 #[cfg(test)]
 mod tests {
     use crate::ExecutorEngine;
-    use fastcrypto::hash::Hash as _;
-    use reth_blockchain_tree::BlockchainTreeViewer;
-    use reth_chainspec::ChainSpec;
-    use reth_primitives::{
+    use alloy::{
         constants::{EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE},
         Address, BlockHashOrNumber, Bloom, B256, EMPTY_OMMER_ROOT_HASH, U256,
     };
+    use fastcrypto::hash::Hash as _;
+    use reth_blockchain_tree::BlockchainTreeViewer;
+    use reth_chainspec::ChainSpec;
     use reth_provider::{BlockIdReader, BlockNumReader, BlockReader, TransactionVariant};
     use std::{collections::VecDeque, str::FromStr as _, sync::Arc, time::Duration};
     use tn_batch_builder::test_utils::execute_test_batch;

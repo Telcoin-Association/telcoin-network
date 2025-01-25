@@ -8,7 +8,7 @@ use crate::{
     },
     ConsensusBus,
 };
-use reth_primitives::{Header, B256};
+use alloy::{Header, B256};
 use std::collections::{BTreeSet, HashMap};
 use tn_config::ConsensusConfig;
 use tn_storage::{mem_db::MemDatabase, open_db};

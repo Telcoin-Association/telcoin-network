@@ -3,11 +3,12 @@
 //! Batches hold transactions and other data. This type is used to represent worker proposals that
 //! have reached quorum.
 
-use crate::{adiri_chain_spec, crypto, encode, now, TimestampSec};
-use fastcrypto::hash::HashFunction;
-use reth_primitives::{
-    constants::MIN_PROTOCOL_BASE_FEE, Address, BlockHash, Header, SealedBlock, TransactionSigned,
+use crate::{
+    adiri_chain_spec, crypto, encode, now, Address, BlockHash, ExecHeader, TimestampSec,
+    TransactionTrait as _, MIN_PROTOCOL_BASE_FEE,
 };
+use fastcrypto::hash::HashFunction;
+use reth_primitives::{SealedBlock, TransactionSigned};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use thiserror::Error;
@@ -101,7 +102,7 @@ impl Batch {
     /// Create a new batch for testing only!
     ///
     /// This is NOT a valid batch for consensus.
-    pub fn new_for_test(transactions: Vec<TransactionSigned>, header: Header) -> Self {
+    pub fn new_for_test(transactions: Vec<TransactionSigned>, header: ExecHeader) -> Self {
         Self {
             transactions,
             parent_hash: header.parent_hash,

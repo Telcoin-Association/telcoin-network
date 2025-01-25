@@ -1,13 +1,10 @@
 //! Recreated `AutoSealConsensus` to reduce the amount of imports from reth.
 
-use crate::ConsensusOutput;
+use crate::{Address, ConsensusOutput, Withdrawals, B256, U256};
 use reth_chainspec::ChainSpec;
 use reth_consensus::PostExecutionInput;
 pub use reth_consensus::{Consensus, ConsensusError};
-use reth_evm_ethereum::revm_spec_by_timestamp_after_merge;
-use reth_primitives::{
-    Address, BlockWithSenders, Header, SealedBlock, SealedHeader, Withdrawals, B256, U256,
-};
+use reth_primitives::{BlockWithSenders, SealedBlock, SealedHeader};
 use reth_revm::primitives::{BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg};
 use std::sync::Arc;
 
@@ -109,7 +106,7 @@ impl TNPayload {
         let spec_id = revm_spec_by_timestamp_after_merge(chain_spec, self.timestamp());
 
         // use the blob excess gas and price set by the worker during batch creation
-        let blob_excess_gas_and_price = Some(BlobExcessGasAndPrice::new(0));
+        let blob_excess_gas_and_price = Some(BlobExcessGasAndPrice::new(0, false));
 
         // use the basefee set by the worker during batch creation
         let basefee = U256::from(self.attributes.base_fee_per_gas);

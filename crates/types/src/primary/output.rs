@@ -2,9 +2,11 @@
 //! See test_utils output_tests.rs for this modules tests.
 
 use super::ConsensusHeader;
-use crate::{crypto, encode, Batch, Certificate, ReputationScores, Round, TimestampSec};
+use crate::{
+    crypto, encode, Address, Batch, BlockHash, Certificate, ReputationScores, Round, TimestampSec,
+    B256,
+};
 use fastcrypto::hash::{Digest, Hash, HashFunction};
-use reth_primitives::{Address, BlockHash, B256};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,

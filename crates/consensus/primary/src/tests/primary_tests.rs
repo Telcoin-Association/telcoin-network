@@ -6,6 +6,7 @@ use crate::{
     synchronizer::Synchronizer,
     ConsensusBus,
 };
+use alloy::Header;
 use fastcrypto::{
     encoding::{Encoding, Hex},
     hash::Hash,
@@ -13,7 +14,6 @@ use fastcrypto::{
 };
 use itertools::Itertools;
 use prometheus::Registry;
-use reth_primitives::Header;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     num::NonZeroUsize,

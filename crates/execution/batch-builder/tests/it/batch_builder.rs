@@ -3,6 +3,7 @@
 //! Batch builder (CL) receives the batch from EL and forwards it to the Quorum Waiter for votes
 //! from peers.
 
+use alloy::{alloy_primitives::U160, Address, BlockBody, Bytes, SealedBlock, U256};
 use assert_matches::assert_matches;
 use reth_blockchain_tree::{
     noop::NoopBlockchainTree, BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree,
@@ -12,7 +13,6 @@ use reth_chainspec::ChainSpec;
 use reth_db::test_utils::{create_test_rw_db, tempdir_path};
 use reth_db_common::init::init_genesis;
 use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
-use reth_primitives::{alloy_primitives::U160, Address, BlockBody, Bytes, SealedBlock, U256};
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     CanonStateSubscriptions, ProviderFactory,

@@ -2,7 +2,8 @@
 //!
 //! This is an experimental approach to supporting pending blocks for workers.
 
-use reth_primitives::{Address, SealedBlock};
+use alloy::primitives::Address;
+use reth_primitives::SealedBlock;
 
 /// The arguments passed to the worker's block builder.
 #[derive(Debug)]

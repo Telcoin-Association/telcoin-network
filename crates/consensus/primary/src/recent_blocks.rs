@@ -1,6 +1,6 @@
 //! Track the most recent execution blocks for the consensus layer.
 
-use reth_primitives::{BlockNumHash, SealedHeader};
+use alloy::{BlockNumHash, SealedHeader};
 use std::collections::VecDeque;
 use tn_types::BlockHash;
 

@@ -2,7 +2,7 @@
 //!
 //! These errors are returned by the RPC for public requests to the `tn` namespace.
 
-use reth_primitives::hex::encode_prefixed;
+use alloy::hex::encode_prefixed;
 use thiserror::Error;
 
 /// The result type for TN RPC namespace.

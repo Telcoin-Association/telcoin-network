@@ -1,7 +1,7 @@
 //! Types for testing only.
 
 use crate::{build_batch, BatchBuilderOutput};
-use reth_primitives::{
+use alloy::{
     constants::MIN_PROTOCOL_BASE_FEE, Address, BlobTransactionSidecar, BlockBody,
     PooledTransactionsElement, SealedBlock, SealedHeader, TxHash,
 };

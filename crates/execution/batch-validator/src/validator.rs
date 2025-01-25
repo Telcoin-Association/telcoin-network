@@ -1,7 +1,7 @@
 //! Block validator
 
+use alloy::Header;
 use reth_db::database::Database;
-use reth_primitives::Header;
 use reth_provider::{providers::BlockchainProvider, BlockIdReader, HeaderProvider};
 use tn_types::{
     max_batch_gas, max_batch_size, BatchValidation, BatchValidationError, SealedBatch,
@@ -172,6 +172,9 @@ impl BatchValidation for NoopBatchValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::{
+        constants::MIN_PROTOCOL_BASE_FEE, hex, Address, Bytes, GenesisAccount, B256, U256,
+    };
     use assert_matches::assert_matches;
     use reth_beacon_consensus::EthBeaconConsensus;
     use reth_blockchain_tree::{
@@ -183,9 +186,6 @@ mod tests {
         DatabaseEnv,
     };
     use reth_db_common::init::init_genesis;
-    use reth_primitives::{
-        constants::MIN_PROTOCOL_BASE_FEE, hex, Address, Bytes, GenesisAccount, B256, U256,
-    };
     use reth_provider::{providers::StaticFileProvider, ProviderFactory};
     use reth_prune::PruneModes;
     use std::{str::FromStr, sync::Arc};
