@@ -31,12 +31,22 @@ pub use worker::*;
 
 // re-exports for easier maintainability
 pub use alloy::{
-    consensus::{Header as ExecHeader, Transaction as TransactionTrait},
-    eips::{eip1559::MIN_PROTOCOL_BASE_FEE, BlockNumHash},
-    genesis::Genesis,
-    primitives::{Address, BlockHash, BlockNumber, TxHash, B256, U160, U256},
+    consensus::{
+        constants::{EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS},
+        Header as ExecHeader, Transaction as TransactionTrait,
+    },
+    eips::{
+        eip1559::{ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE},
+        eip4844::{BlobAndProofV1, BlobTransactionSidecar},
+        BlockNumHash,
+    },
+    genesis::{Genesis, GenesisAccount},
+    hex::{self, FromHex},
+    primitives::{keccak256, Address, BlockHash, BlockNumber, TxHash, B256, U160, U256},
     rpc::types::Withdrawals,
+    // signers::utils::public_key_to_address,
 };
 pub use reth_primitives::{
-    BlockWithSenders, NodePrimitives, SealedBlock, SealedHeader, TransactionSigned,
+    public_key_to_address, Block, BlockBody, BlockWithSenders, NodePrimitives, Receipt,
+    RecoveredTx, SealedBlock, SealedBlockWithSenders, SealedHeader, TransactionSigned,
 };

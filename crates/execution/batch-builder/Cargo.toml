@@ -17,7 +17,7 @@ futures-util = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
 
-reth-primitives = { workspace = true }
+reth-primitives-traits = { workspace = true }
 reth-errors = { workspace = true }
 reth-stages = { workspace = true }
 reth-provider = { workspace = true }

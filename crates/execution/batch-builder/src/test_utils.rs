@@ -1,16 +1,14 @@
 //! Types for testing only.
 
 use crate::{build_batch, BatchBuilderOutput};
-use alloy::{
-    constants::MIN_PROTOCOL_BASE_FEE, Address, BlobTransactionSidecar, BlockBody,
-    PooledTransactionsElement, SealedBlock, SealedHeader, TxHash,
-};
 use reth_transaction_pool::{
+    error::InvalidPoolTransactionError,
     identifier::{SenderIdentifiers, TransactionId},
     AllPoolTransactions, AllTransactionsEvents, BestTransactions, BestTransactionsAttributes,
     BlobStoreError, BlockInfo, EthPooledTransaction, GetPooledTransactionLimit, NewBlobSidecar,
-    NewTransactionEvent, PoolResult, PoolSize, PropagatedTransactions, TransactionEvents,
-    TransactionListenerKind, TransactionOrigin, TransactionPool, ValidPoolTransaction,
+    NewTransactionEvent, PoolResult, PoolSize, PoolTransaction, PropagatedTransactions,
+    TransactionEvents, TransactionListenerKind, TransactionOrigin, TransactionPool,
+    ValidPoolTransaction,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -18,7 +16,9 @@ use std::{
     time::Instant,
 };
 use tn_types::{
-    Batch, BatchBuilderArgs, LastCanonicalUpdate, PendingBlockConfig, TransactionSigned,
+    Address, Batch, BatchBuilderArgs, BlobAndProofV1, BlobTransactionSidecar, BlockBody,
+    LastCanonicalUpdate, PendingBlockConfig, RecoveredTx, SealedBlock, SealedHeader,
+    TransactionSigned, TxHash, B256, ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE,
 };
 use tokio::sync::mpsc::{self, Receiver};
 
@@ -191,14 +191,14 @@ impl TransactionPool for TestPool {
         &self,
         _tx_hashes: Vec<TxHash>,
         _limit: GetPooledTransactionLimit,
-    ) -> Vec<PooledTransactionsElement> {
+    ) -> Vec<<Self::Transaction as PoolTransaction>::Pooled> {
         vec![]
     }
 
     fn get_pooled_transaction_element(
         &self,
         _tx_hash: TxHash,
-    ) -> Option<PooledTransactionsElement> {
+    ) -> Option<RecoveredTx<<Self::Transaction as PoolTransaction>::Pooled>> {
         None
     }
 
@@ -289,21 +289,24 @@ impl TransactionPool for TestPool {
         Default::default()
     }
 
-    fn get_blob(&self, _tx_hash: TxHash) -> Result<Option<BlobTransactionSidecar>, BlobStoreError> {
+    fn get_blob(
+        &self,
+        _tx_hash: TxHash,
+    ) -> Result<Option<Arc<BlobTransactionSidecar>>, BlobStoreError> {
         Ok(None)
     }
 
     fn get_all_blobs(
         &self,
         _tx_hashes: Vec<TxHash>,
-    ) -> Result<Vec<(TxHash, BlobTransactionSidecar)>, BlobStoreError> {
+    ) -> Result<Vec<(TxHash, Arc<BlobTransactionSidecar>)>, BlobStoreError> {
         Ok(vec![])
     }
 
     fn get_all_blobs_exact(
         &self,
         tx_hashes: Vec<TxHash>,
-    ) -> Result<Vec<BlobTransactionSidecar>, BlobStoreError> {
+    ) -> Result<Vec<Arc<BlobTransactionSidecar>>, BlobStoreError> {
         if tx_hashes.is_empty() {
             return Ok(vec![]);
         }
@@ -416,7 +419,7 @@ impl BestTestTransactions {
 }
 
 impl BestTransactions for BestTestTransactions {
-    fn mark_invalid(&mut self, tx: &Self::Item) {
+    fn mark_invalid(&mut self, tx: &Self::Item, _kind: InvalidPoolTransactionError) {
         Self::mark_invalid(self, tx)
     }
 

@@ -1,8 +1,7 @@
 //! Track the most recent execution blocks for the consensus layer.
 
-use alloy::{BlockNumHash, SealedHeader};
 use std::collections::VecDeque;
-use tn_types::BlockHash;
+use tn_types::{BlockHash, BlockNumHash, SealedHeader};
 
 /// Tracks 'num_blocks' most recently executed block hashes and numbers.
 #[derive(Clone, Debug)]

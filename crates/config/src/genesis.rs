@@ -1,11 +1,5 @@
 //! Genesis information used when configuring a node.
 use crate::{Config, ConfigFmt, ConfigTrait, TelcoinDirs};
-use alloy::{
-    hex::{self, FromHex},
-    keccak256,
-    primitives::FixedBytes,
-    Address, GenesisAccount,
-};
 use eyre::Context;
 use fastcrypto::traits::{InsecureDefault, Signer, ToFromBytes};
 use reth_chainspec::ChainSpec;
@@ -18,9 +12,10 @@ use std::{
     path::{Path, PathBuf},
 };
 use tn_types::{
-    adiri_genesis, verify_proof_of_possession_bls, BlsPublicKey, BlsSignature, Committee,
-    CommitteeBuilder, Epoch, Intent, IntentMessage, Multiaddr, NetworkPublicKey, PrimaryInfo,
-    ProtocolSignature, WorkerCache, WorkerIndex,
+    adiri_genesis, hex, keccak256, verify_proof_of_possession_bls, Address, BlsPublicKey,
+    BlsSignature, Committee, CommitteeBuilder, Epoch, FromHex as _, GenesisAccount, Intent,
+    IntentMessage, Multiaddr, NetworkPublicKey, PrimaryInfo, ProtocolSignature, WorkerCache,
+    WorkerIndex, B256,
 };
 use tracing::{info, warn};
 /// The validators directory used to create genesis.
@@ -94,11 +89,10 @@ impl NetworkGenesis {
         };
         let registry_storage_cfg: BTreeMap<String, String> =
             serde_yaml::from_str(&registry_storage_yaml).expect("yaml parsing failure");
-        let mut registry_storage_cfg: BTreeMap<FixedBytes<32>, FixedBytes<32>> =
-            registry_storage_cfg
-                .into_iter()
-                .map(|(k, v)| (k.parse().expect("Invalid key"), v.parse().expect("Invalid val")))
-                .collect();
+        let mut registry_storage_cfg: BTreeMap<B256, B256> = registry_storage_cfg
+            .into_iter()
+            .map(|(k, v)| (k.parse().expect("Invalid key"), v.parse().expect("Invalid val")))
+            .collect();
 
         let pubkey_flags = PubkeyFlags::new(self.validators.len());
         // iterate over BTreeMap to conditionally overwrite flagged values with pubkeys that are now
@@ -185,56 +179,6 @@ impl NetworkGenesis {
         };
 
         Ok(network_genesis)
-
-        // // Load Signatures ? - this seems unnecessary
-        // // - validators already include proof-of-possession
-        // let mut signatures = BTreeMap::new();
-        // for entry in fs::read_dir(path.join(GENESIS_SIGNATURES_DIR))? {
-        //     let entry = entry?;
-        //     let path = entry.path();
-
-        //     // Check if it's a file and has the .yaml extension and does not start with '.'
-        //     if path.is_file()
-        //         && path.extension().and_then(OsStr::to_str) == Some("yaml")
-        //         && path.file_name().and_then(OsStr::to_str).map_or(true, |s| !s.starts_with('.'))
-        // {
-
-        //         info!(target: "genesis::ceremony", "reading validator signatures from {}",
-        // path.display());
-
-        //         let signature_bytes = fs::read(path)?;
-        //         // TODO: use rlp encode
-        //         let sigs: ValidatorSignatureInfo = bcs::from_bytes(&signature_bytes)
-        //             .with_context(|| format!("failed to load validator signature info"))?;
-        //         signatures.insert(sigs.authority.clone(), sigs);
-        //     } else {
-        //         warn!("skipping dir: {}\ndirs should not be in signatures", path.display());
-        //     }
-        // }
-
-        // let unsigned_genesis_file = path.join(GENESIS_BUILDER_UNSIGNED_GENESIS_FILE);
-        // if unsigned_genesis_file.exists() {
-        //     let unsigned_genesis_bytes = fs::read(unsigned_genesis_file)?;
-        //     let loaded_genesis: UnsignedGenesis = bcs::from_bytes(&unsigned_genesis_bytes)?;
-
-        //     // If we have a built genesis, then we must have a token_distribution_schedule
-        // present     // as well.
-        //     assert!(
-        //         builder.token_distribution_schedule.is_some(),
-        //         "If a built genesis is present, then there must also be a
-        // token-distribution-schedule present"     );
-
-        //     // Verify loaded genesis matches one build from the constituent parts
-        //     let built = builder.build_unsigned_genesis_checkpoint();
-        //     loaded_genesis.checkpoint_contents.digest(); // cache digest before compare
-        //     assert_eq!(
-        //         built, loaded_genesis,
-        //         "loaded genesis does not match built genesis"
-        //     );
-
-        //     // Just to double check that its set after building above
-        //     assert!(builder.unsigned_genesis_checkpoint().is_some());
-        // }
     }
 
     /// Write [NetworkGenesis] to path (genesis directory) as individual validator files.
@@ -247,37 +191,15 @@ impl NetworkGenesis {
 
         fs::create_dir_all(path)?;
 
-        // // Write Signatures?
-        // // Are signature necessary?
-        // // The validator info already includes a signature over chainspec/genesis
-        //
-        // let signature_dir = path.join(GENESIS_SIGNATURES_DIR);
-        // fs::create_dir_all(&signature_dir)?;
-        // for (pubkey, sigs) in self.signatures {
-        //     let sig_bytes = bcs::to_bytes(&sigs)?;
-        //     // hash validator pubkey
-        //     fs::write(signature_dir.join(&file_name), sig_bytes)?;
-        // }
-
         // Write validator infos
         let committee_dir = path.join(GENESIS_VALIDATORS_DIR);
         fs::create_dir_all(&committee_dir)?;
 
         for (pubkey, validator) in self.validators {
             let validator_info = serde_yaml::to_string(&validator)?;
-            let file_name = format!("{}.yaml", keccak256(pubkey)); //.to_string();
+            let file_name = format!("{}.yaml", keccak256(pubkey));
             fs::write(committee_dir.join(file_name), validator_info)?;
         }
-
-        // TODO: probably remove this concept
-        //
-        // if let Some(genesis) = &self.built_genesis {
-        //     let genesis_bytes = bcs::to_bytes(&genesis)?;
-        //     fs::write(
-        //         path.join(GENESIS_BUILDER_UNSIGNED_GENESIS_FILE),
-        //         genesis_bytes,
-        //     )?;
-        // }
 
         Ok(())
     }
@@ -461,11 +383,11 @@ impl PartialEq for ValidatorSignatureInfo {
 }
 
 struct PubkeyFlags {
-    bls_a: FixedBytes<32>,
-    bls_b: FixedBytes<32>,
-    bls_c: FixedBytes<32>,
-    ed25519: FixedBytes<32>,
-    ecdsa: FixedBytes<32>,
+    bls_a: B256,
+    bls_b: B256,
+    bls_c: B256,
+    ed25519: B256,
+    ecdsa: B256,
 }
 
 impl PubkeyFlags {
@@ -485,11 +407,7 @@ impl PubkeyFlags {
     /// Conditionally overwrites flagged placeholder values with the intended pubkey within
     /// `validator_infos` This only occurs if `val` is found to match a collision-resistant hash
     /// within `flags`
-    fn overwrite_if_flag(
-        val: &mut FixedBytes<32>,
-        flags: &[PubkeyFlags],
-        validator_infos: &[ValidatorInfo],
-    ) {
+    fn overwrite_if_flag(val: &mut B256, flags: &[PubkeyFlags], validator_infos: &[ValidatorInfo]) {
         for (i, flag) in flags.iter().enumerate() {
             if *val == flag.bls_a {
                 // overwrite using first 32 bytes of bls pubkey
@@ -510,7 +428,7 @@ impl PubkeyFlags {
                 *val = validator_infos[i].execution_address.into_word();
                 return;
             } else if *val == flag.ed25519 {
-                *val = FixedBytes::from_slice(validator_infos[i].primary_network_key().as_bytes());
+                *val = B256::from_slice(validator_infos[i].primary_network_key().as_bytes());
                 return;
             }
         }
@@ -549,17 +467,13 @@ mod tests {
         genesis::ContractStandardJson, test_fetch_file_content_relative_to_manifest, TelcoinDirs,
         ValidatorInfo,
     };
-    use alloy::{
-        hex::{self, FromHex},
-        primitives::Address,
-    };
     use fastcrypto::traits::KeyPair;
     use rand::{rngs::StdRng, SeedableRng};
     use std::collections::BTreeMap;
     use tempfile::tempdir;
     use tn_types::{
-        adiri_chain_spec, generate_proof_of_possession_bls, BlsKeypair, Multiaddr, NetworkKeypair,
-        PrimaryInfo, WorkerIndex, WorkerInfo,
+        adiri_chain_spec, generate_proof_of_possession_bls, hex, Address, BlsKeypair, FromHex as _,
+        Multiaddr, NetworkKeypair, PrimaryInfo, WorkerIndex, WorkerInfo,
     };
 
     #[test]

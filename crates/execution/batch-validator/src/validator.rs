@@ -1,10 +1,9 @@
 //! Block validator
 
-use alloy::Header;
 use reth_db::database::Database;
 use reth_provider::{providers::BlockchainProvider, BlockIdReader, HeaderProvider};
 use tn_types::{
-    max_batch_gas, max_batch_size, BatchValidation, BatchValidationError, SealedBatch,
+    max_batch_gas, max_batch_size, BatchValidation, BatchValidationError, Header, SealedBatch,
     TransactionSigned,
 };
 

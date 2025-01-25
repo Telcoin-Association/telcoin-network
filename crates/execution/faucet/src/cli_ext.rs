@@ -4,7 +4,6 @@
 //! The only extension supported right now is the `faucet` for testnet.
 
 use crate::{FaucetConfig, FaucetRpcExt, FaucetWallet};
-use alloy::{public_key_to_address, Address, U256};
 use clap::Args;
 use ecdsa::elliptic_curve::{pkcs8::DecodePublicKey as _, sec1::ToEncodedPoint};
 use eyre::ContextCompat;
@@ -14,6 +13,7 @@ use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_transaction_pool::TransactionPool;
 use secp256k1::PublicKey;
 use std::{str::FromStr, time::Duration};
+use tn_types::{public_key_to_address, Address, U256};
 use tracing::{info, warn};
 
 /// Args for running the faucet.

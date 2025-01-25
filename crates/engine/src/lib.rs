@@ -20,7 +20,6 @@
 
 mod error;
 mod payload_builder;
-use alloy::SealedHeader;
 use error::{EngineResult, TnEngineError};
 use futures::{Future, StreamExt};
 use futures_util::FutureExt;
@@ -37,7 +36,7 @@ use std::{
     pin::{pin, Pin},
     task::{Context, Poll},
 };
-use tn_types::{BuildArguments, ConsensusOutput, Noticer};
+use tn_types::{BuildArguments, ConsensusOutput, Noticer, SealedHeader};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{error, info, trace, warn};
@@ -277,7 +276,7 @@ where
 
                         // check max_round
                         if this.max_round.is_some()
-                            && this.has_reached_max_round(this.parent_header.nonce)
+                            && this.has_reached_max_round(this.parent_header.nonce.into())
                         {
                             // immediately terminate if the specified max consensus round is reached
                             return Poll::Ready(Ok(()));

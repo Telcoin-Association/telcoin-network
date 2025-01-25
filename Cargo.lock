@@ -12137,7 +12137,7 @@ dependencies = [
  "reth-fs-util",
  "reth-metrics",
  "reth-node-ethereum",
- "reth-primitives",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-prune",
  "reth-stages",
@@ -12191,7 +12191,6 @@ dependencies = [
 name = "tn-config"
 version = "0.1.0"
 dependencies = [
- "alloy",
  "anemo",
  "eyre",
  "fastcrypto",
@@ -12199,7 +12198,6 @@ dependencies = [
  "parking_lot",
  "rand",
  "reth-chainspec",
- "reth-primitives",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -12225,7 +12223,6 @@ dependencies = [
  "reth-evm",
  "reth-execution-types",
  "reth-payload-builder",
- "reth-primitives",
  "reth-provider",
  "reth-revm",
  "reth-trie",

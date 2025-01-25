@@ -38,8 +38,8 @@ use std::{
     time::Duration,
 };
 use tn_types::{
-    error::BlockSealError, BatchBuilderArgs, BatchSender, LastCanonicalUpdate, PendingBlockConfig,
-    TxHash,
+    error::BlockSealError, Address, BatchBuilderArgs, BatchSender, LastCanonicalUpdate,
+    PendingBlockConfig, TxHash, MIN_PROTOCOL_BASE_FEE,
 };
 use tokio::{sync::oneshot, time::Interval};
 use tracing::{debug, error, trace, warn};

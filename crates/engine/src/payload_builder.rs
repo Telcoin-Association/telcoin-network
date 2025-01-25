@@ -3,19 +3,14 @@
 //! This approach heavily inspired by reth's `default_ethereum_payload_builder`.
 
 use crate::error::{EngineResult, TnEngineError};
-use alloy::{
-    constants::{EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS},
-    Block, Header, Receipt, SealedBlockWithSenders, SealedHeader, Withdrawals, B256,
-    EMPTY_OMMER_ROOT_HASH, U256,
-};
 use fastcrypto::hash::Hash as _;
 use reth_blockchain_tree::{BlockValidationKind, BlockchainTreeEngine};
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
 use reth_execution_types::ExecutionOutcome;
-use reth_payload_builder::database::CachedReads;
 use reth_provider::{CanonChainTracker, ChainSpecProvider, StateProviderFactory};
 use reth_revm::{
+    cached::CachedReads,
     database::StateProviderDatabase,
     db::states::bundle_state::BundleRetention,
     primitives::{EVMError, EnvWithHandlerCfg, ResultAndState},
@@ -23,7 +18,11 @@ use reth_revm::{
 };
 use reth_trie::HashedPostState;
 use std::sync::Arc;
-use tn_types::{max_batch_gas, Batch, BuildArguments, TNPayload, TNPayloadAttributes};
+use tn_types::{
+    max_batch_gas, Batch, Block, BuildArguments, ExecHeader, Receipt, SealedBlockWithSenders,
+    SealedHeader, TNPayload, TNPayloadAttributes, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH,
+    EMPTY_WITHDRAWALS, U256,
+};
 use tracing::{debug, error, info, warn};
 
 /// Execute output from consensus to extend the canonical chain.
@@ -387,7 +386,7 @@ where
     };
 
     // create the block header
-    let transactions_root = reth_primitives::proofs::calculate_transaction_root(&executed_txs);
+    let transactions_root = calculate_transaction_root(&executed_txs);
 
     // // initialize empty blob sidecars at first. If cancun is active then this will
     // let mut blob_sidecars = Vec::new();
@@ -414,7 +413,7 @@ where
     //     blob_gas_used = Some(sum_blob_gas_used);
     // }
 
-    let header = Header {
+    let header = ExecHeader {
         parent_hash: payload.parent(),
         ommers_hash: EMPTY_OMMER_ROOT_HASH,
         beneficiary: block_env.coinbase,
