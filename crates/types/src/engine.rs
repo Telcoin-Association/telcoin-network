@@ -1,10 +1,11 @@
 //! Recreated `AutoSealConsensus` to reduce the amount of imports from reth.
 
-use crate::{Address, ConsensusOutput, Withdrawals, B256, U256};
+use crate::{
+    Address, BlockWithSenders, ConsensusOutput, SealedBlock, SealedHeader, Withdrawals, B256, U256,
+};
 use reth_chainspec::ChainSpec;
 use reth_consensus::PostExecutionInput;
 pub use reth_consensus::{Consensus, ConsensusError};
-use reth_primitives::{BlockWithSenders, SealedBlock, SealedHeader};
 use reth_revm::primitives::{BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg};
 use std::sync::Arc;
 

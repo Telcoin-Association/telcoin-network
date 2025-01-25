@@ -4,11 +4,10 @@
 //! have reached quorum.
 
 use crate::{
-    adiri_chain_spec, crypto, encode, now, Address, BlockHash, ExecHeader, TimestampSec,
-    TransactionTrait as _, MIN_PROTOCOL_BASE_FEE,
+    adiri_chain_spec, crypto, encode, now, Address, BlockHash, ExecHeader, SealedBlock,
+    TimestampSec, TransactionSigned, TransactionTrait as _, MIN_PROTOCOL_BASE_FEE,
 };
 use fastcrypto::hash::HashFunction;
-use reth_primitives::{SealedBlock, TransactionSigned};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use thiserror::Error;

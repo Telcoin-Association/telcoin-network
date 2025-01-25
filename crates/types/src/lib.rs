@@ -25,7 +25,6 @@ pub use helpers::*;
 pub use multiaddr::*;
 pub use notifier::*;
 pub use primary::*;
-pub use reth_primitives::TransactionSigned;
 pub use sync::*;
 pub use task_manager::*;
 pub use worker::*;
@@ -38,3 +37,4 @@ pub use alloy::{
     primitives::{Address, BlockHash, BlockNumber, B256, U256},
     rpc::types::Withdrawals,
 };
+pub use reth_primitives::{BlockWithSenders, SealedBlock, SealedHeader, TransactionSigned};

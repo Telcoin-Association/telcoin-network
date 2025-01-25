@@ -7,10 +7,9 @@
 //! wallet within the time period.
 
 use crate::{Drip, FaucetWallet, GoogleKMSClient, Secp256k1PubKeyBytes};
-use alloy::sol_types::SolType;
 use alloy::{
-    Address, Signature as EthSignature, Transaction, TransactionSigned, TxEip1559, TxHash, TxKind,
-    B256, U256,
+    sol_types::SolType, Address, Signature as EthSignature, Transaction, TransactionSigned,
+    TxEip1559, TxHash, TxKind, B256, U256,
 };
 use futures::StreamExt;
 use gcloud_sdk::{

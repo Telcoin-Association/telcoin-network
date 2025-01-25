@@ -2,9 +2,10 @@
 use crate::{Config, ConfigFmt, ConfigTrait, TelcoinDirs};
 use alloy::{
     hex::{self, FromHex},
+    keccak256,
     primitives::FixedBytes,
+    Address, GenesisAccount,
 };
-use alloy::{keccak256, Address, GenesisAccount};
 use eyre::Context;
 use fastcrypto::traits::{InsecureDefault, Signer, ToFromBytes};
 use reth_chainspec::ChainSpec;
@@ -548,8 +549,10 @@ mod tests {
         genesis::ContractStandardJson, test_fetch_file_content_relative_to_manifest, TelcoinDirs,
         ValidatorInfo,
     };
-    use alloy::hex::{self, FromHex};
-    use alloy::primitives::Address;
+    use alloy::{
+        hex::{self, FromHex},
+        primitives::Address,
+    };
     use fastcrypto::traits::KeyPair;
     use rand::{rngs::StdRng, SeedableRng};
     use std::collections::BTreeMap;

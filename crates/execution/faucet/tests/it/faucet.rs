@@ -7,10 +7,11 @@
 //! signature to be EVM compatible. The faucet service does all of this and
 //! then submits the transaction to the RPC Transaction Pool for the next batch.
 
-use alloy::{alloy_primitives::U160, public_key_to_address, Address, GenesisAccount, B256, U256};
 use alloy::{
-    hex, sol,
+    alloy_primitives::U160,
+    hex, public_key_to_address, sol,
     sol_types::{SolType, SolValue},
+    Address, GenesisAccount, B256, U256,
 };
 use gcloud_sdk::{
     google::cloud::kms::v1::{
