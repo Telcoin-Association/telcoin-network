@@ -165,6 +165,7 @@ reth-node-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5
 reth-node-core = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
 reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
 reth-node-events = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
+reth-node-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
 reth-discv4 = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
 reth-ethereum-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
 reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }

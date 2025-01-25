@@ -1,9 +1,12 @@
 //! Block validator
 
-use reth_db::database::Database;
-use reth_provider::{providers::BlockchainProvider, BlockIdReader, HeaderProvider};
+use reth_primitives_traits::InMemorySize as _;
+use reth_provider::{
+    providers::{BlockchainProvider, ProviderNodeTypes, TreeNodeTypes},
+    BlockIdReader, HeaderProvider,
+};
 use tn_types::{
-    max_batch_gas, max_batch_size, BatchValidation, BatchValidationError, Header, SealedBatch,
+    max_batch_gas, max_batch_size, BatchValidation, BatchValidationError, ExecHeader, SealedBatch,
     TransactionSigned,
 };
 
@@ -14,7 +17,7 @@ type BlockValidationResult<T> = Result<T, BatchValidationError>;
 #[derive(Clone)]
 pub struct BatchValidator<DB>
 where
-    DB: Database + Clone + 'static,
+    DB: ProviderNodeTypes + TreeNodeTypes + Clone + 'static,
 {
     /// Database provider to encompass tree and provider factory.
     blockchain_db: BlockchainProvider<DB>,
@@ -23,7 +26,7 @@ where
 #[async_trait::async_trait]
 impl<DB> BatchValidation for BatchValidator<DB>
 where
-    DB: Database + Sized + Clone + 'static,
+    DB: ProviderNodeTypes + TreeNodeTypes + Sized + Clone + 'static,
 {
     /// Validate a peer's batch.
     ///
@@ -58,7 +61,7 @@ where
                             .unwrap_or_default()
                             .unwrap_or_default()
                     } else {
-                        Header::default()
+                        ExecHeader::default()
                     }
                 },
             );
@@ -83,7 +86,7 @@ where
 
 impl<DB> BatchValidator<DB>
 where
-    DB: Database + Clone,
+    DB: ProviderNodeTypes + TreeNodeTypes + Clone,
 {
     /// Create a new instance of [Self]
     pub fn new(blockchain_db: BlockchainProvider<DB>) -> Self {
@@ -95,7 +98,7 @@ where
     fn validate_against_parent_timestamp(
         &self,
         timestamp: u64,
-        parent: &Header,
+        parent: &ExecHeader,
     ) -> BlockValidationResult<()> {
         if timestamp <= parent.timestamp {
             return Err(BatchValidationError::TimestampIsInPast {

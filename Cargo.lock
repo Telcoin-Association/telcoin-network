@@ -12176,6 +12176,7 @@ dependencies = [
  "reth-node-core",
  "reth-node-ethereum",
  "reth-primitives",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-prune",
  "reth-revm",
