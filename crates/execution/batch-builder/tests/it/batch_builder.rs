@@ -105,7 +105,7 @@ async fn test_make_batch_el_to_cl() {
             .expect("static file provider read write created with tempdir path"),
     );
 
-    let genesis_hash = init_genesis(factory.clone()).expect("init genesis");
+    let genesis_hash = init_genesis(&factory).expect("init genesis");
     let blockchain_db = BlockchainProvider::new(factory, Arc::new(NoopBlockchainTree::default()))
         .expect("test blockchain provider");
 
@@ -278,7 +278,7 @@ async fn test_batch_builder_produces_valid_batchess() {
             .expect("static file provider read write created with tempdir path"),
     );
 
-    let genesis_hash = init_genesis(factory.clone()).expect("init genesis");
+    let genesis_hash = init_genesis(&factory).expect("init genesis");
     let blockchain_db = BlockchainProvider::new(factory, Arc::new(NoopBlockchainTree::default()))
         .expect("test blockchain provider");
 
@@ -473,7 +473,7 @@ async fn test_canonical_notification_updates_pool() {
             .expect("static file provider read write created with tempdir path"),
     );
 
-    let genesis_hash = init_genesis(factory.clone()).expect("init genesis");
+    let genesis_hash = init_genesis(&factory).expect("init genesis");
 
     // TODO: figure out a better way to ensure this matches engine::inner::new
     let evm_config = EthEvmConfig::default();
@@ -482,8 +482,7 @@ async fn test_canonical_notification_updates_pool() {
     let tree_config = BlockchainTreeConfig::default();
     let tree_externals =
         TreeExternals::new(factory.clone(), auto_consensus.clone(), executor.clone());
-    let tree = BlockchainTree::new(tree_externals, tree_config, PruneModes::none())
-        .expect("new blockchain tree");
+    let tree = BlockchainTree::new(tree_externals, tree_config).expect("new blockchain tree");
 
     let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
 

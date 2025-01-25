@@ -6,7 +6,6 @@
 //!
 //! The mined transactions are returned with the built block so the worker can update the pool.
 
-use alloy::{IntoRecoveredTransaction, TxHash};
 use reth_transaction_pool::TransactionPool;
 use tn_types::{max_batch_gas, max_batch_size, now, Batch, BatchBuilderArgs, PendingBlockConfig};
 use tracing::{debug, warn};
@@ -75,7 +74,10 @@ where
             // marking as invalid within the context of the `BestTransactions` pulled in this
             // current iteration  all dependents for this transaction are now considered invalid
             // before continuing loop
-            best_txs.mark_invalid(&pool_tx);
+            best_txs.mark_invalid(
+                &pool_tx,
+                InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), gas_limit),
+            );
             debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to gas constraint");
             continue;
         }

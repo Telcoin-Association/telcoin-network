@@ -22,13 +22,14 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-use alloy::{constants::MIN_PROTOCOL_BASE_FEE, Address, TxHash};
 pub use batch::{build_batch, BatchBuilderOutput};
 use error::{BatchBuilderError, BatchBuilderResult};
 use futures_util::{FutureExt, StreamExt};
 use reth_execution_types::ChangedAccount;
 use reth_provider::{CanonStateNotification, CanonStateNotificationStream, Chain};
-use reth_transaction_pool::{CanonicalStateUpdate, TransactionPool, TransactionPoolExt};
+use reth_transaction_pool::{
+    CanonicalStateUpdate, PoolUpdateKind, TransactionPool, TransactionPoolExt,
+};
 use std::{
     future::Future,
     pin::Pin,
@@ -38,6 +39,7 @@ use std::{
 };
 use tn_types::{
     error::BlockSealError, BatchBuilderArgs, BatchSender, LastCanonicalUpdate, PendingBlockConfig,
+    TxHash,
 };
 use tokio::{sync::oneshot, time::Interval};
 use tracing::{debug, error, trace, warn};
@@ -166,6 +168,7 @@ where
             pending_block_blob_fee: None, // current blob fee for worker (network-wide)
             changed_accounts,             // entire round of consensus
             mined_transactions,           // entire round of consensus
+            update_kind: PoolUpdateKind::Commit,
         };
 
         // track latest update to apply batches
@@ -373,6 +376,7 @@ where
                             pending_block_blob_fee,
                             changed_accounts: vec![], // only updated by engine updates
                             mined_transactions,
+                            update_kind: PoolUpdateKind::Commit,
                         };
 
                         debug!(target: "block-builder", ?update, "applying block builder's update");
@@ -491,7 +495,7 @@ mod tests {
             StaticFileProvider::read_write(tempdir_path())
                 .expect("static file provider read write created with tempdir path"),
         );
-        let _genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
+        let _genesis_hash = init_genesis(&provider_factory).expect("init genesis");
 
         let blockchain_db =
             BlockchainProvider::new(provider_factory, Arc::new(NoopBlockchainTree::default()))
@@ -673,7 +677,7 @@ mod tests {
             StaticFileProvider::read_write(tempdir_path())
                 .expect("static file provider read write created with tempdir path"),
         );
-        let _genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
+        let _genesis_hash = init_genesis(&provider_factory).expect("init genesis");
 
         // TODO: figure out a better way to ensure this matches engine::inner::new
         let evm_config = EthEvmConfig::default();
@@ -683,8 +687,7 @@ mod tests {
         let tree_config = BlockchainTreeConfig::default();
         let tree_externals =
             TreeExternals::new(provider_factory.clone(), auto_consensus.clone(), executor.clone());
-        let tree = BlockchainTree::new(tree_externals, tree_config, PruneModes::none())
-            .expect("new blockchain tree");
+        let tree = BlockchainTree::new(tree_externals, tree_config).expect("new blockchain tree");
 
         let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
 

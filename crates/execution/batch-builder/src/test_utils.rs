@@ -98,6 +98,7 @@ impl TransactionPool for TestPool {
             last_seen_block_number: 0,
             pending_basefee: 0,
             pending_blob_fee: None,
+            block_gas_limit: ETHEREUM_BLOCK_GAS_LIMIT,
         }
     }
 
@@ -224,13 +225,6 @@ impl TransactionPool for TestPool {
         })
     }
 
-    fn best_transactions_with_base_fee(
-        &self,
-        _: u64,
-    ) -> Box<dyn BestTransactions<Item = Arc<ValidPoolTransaction<Self::Transaction>>>> {
-        Box::new(std::iter::empty())
-    }
-
     fn best_transactions_with_attributes(
         &self,
         _: BestTransactionsAttributes,
@@ -257,11 +251,7 @@ impl TransactionPool for TestPool {
         vec![]
     }
 
-    fn retain_unknown<A>(&self, _announcement: &mut A)
-    //where
-    // A: HandleMempoolData,
-    {
-    }
+    fn retain_unknown<A>(&self, _announcement: &mut A) {}
 
     fn get(&self, _tx_hash: &TxHash) -> Option<Arc<ValidPoolTransaction<Self::Transaction>>> {
         None
@@ -325,6 +315,72 @@ impl TransactionPool for TestPool {
         _origin: TransactionOrigin,
     ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
         vec![]
+    }
+
+    fn pending_transactions_max(
+        &self,
+        max: usize,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        vec![]
+    }
+
+    fn remove_transactions_and_descendants(
+        &self,
+        hashes: Vec<TxHash>,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        vec![]
+    }
+
+    fn remove_transactions_by_sender(
+        &self,
+        sender: Address,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        vec![]
+    }
+
+    #[doc = " Returns all pending transactions filtered by predicate"]
+    fn get_pending_transactions_with_predicate(
+        &self,
+        predicate: impl FnMut(&ValidPoolTransaction<Self::Transaction>) -> bool,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        vec![]
+    }
+
+    fn get_pending_transactions_by_sender(
+        &self,
+        sender: Address,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        vec![]
+    }
+
+    fn get_queued_transactions_by_sender(
+        &self,
+        sender: Address,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        vec![]
+    }
+
+    fn get_highest_transaction_by_sender(
+        &self,
+        sender: Address,
+    ) -> Option<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        None
+    }
+
+    fn get_highest_consecutive_transaction_by_sender(
+        &self,
+        sender: Address,
+        on_chain_nonce: u64,
+    ) -> Option<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        None
+    }
+
+    #[doc = " Return the [`BlobTransactionSidecar`]s for a list of blob versioned hashes."]
+    fn get_blobs_for_versioned_hashes(
+        &self,
+        versioned_hashes: &[B256],
+    ) -> Result<Vec<Option<BlobAndProofV1>>, BlobStoreError> {
+        Ok(vec![None; versioned_hashes.len()])
     }
 }
 

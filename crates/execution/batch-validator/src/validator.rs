@@ -272,7 +272,7 @@ mod tests {
             StaticFileProvider::read_write(tempdir_path())
                 .expect("static file provider read write created with tempdir path"),
         );
-        let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
+        let genesis_hash = init_genesis(&provider_factory).expect("init genesis");
         debug!("genesis hash: {genesis_hash:?}");
 
         // configure blockchain tree
@@ -284,8 +284,8 @@ mod tests {
             reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
         );
         let tree_config = BlockchainTreeConfig::default();
-        let tree = BlockchainTree::new(tree_externals, tree_config, PruneModes::none())
-            .expect("blockchain tree is valid");
+        let tree =
+            BlockchainTree::new(tree_externals, tree_config).expect("blockchain tree is valid");
 
         let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
 

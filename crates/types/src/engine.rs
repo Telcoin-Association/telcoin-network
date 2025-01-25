@@ -1,12 +1,15 @@
 //! Recreated `AutoSealConsensus` to reduce the amount of imports from reth.
 
 use crate::{
-    Address, BlockWithSenders, ConsensusOutput, SealedBlock, SealedHeader, Withdrawals, B256, U256,
+    Address, BlockWithSenders, ConsensusOutput, NodePrimitives, SealedBlock, SealedHeader,
+    Withdrawals, B256, U256,
 };
 use reth_chainspec::ChainSpec;
-use reth_consensus::PostExecutionInput;
 pub use reth_consensus::{Consensus, ConsensusError};
-use reth_revm::primitives::{BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg};
+use reth_consensus::{FullConsensus, HeaderValidator, PostExecutionInput};
+use reth_revm::primitives::{
+    BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, SpecId,
+};
 use std::sync::Arc;
 
 /// A consensus implementation that validates everything.
@@ -14,13 +17,13 @@ use std::sync::Arc;
 /// Taken from reth's `AutoSealConsensus`.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub struct AutoSealConsensus {
+pub struct TNExecution {
     /// Configuration
     chain_spec: Arc<ChainSpec>,
 }
 
-impl AutoSealConsensus {
-    /// Create a new instance of [AutoSealConsensus]
+impl TNExecution {
+    /// Create a new instance of [TNExecution]
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
         Self { chain_spec }
     }
@@ -31,35 +34,50 @@ impl AutoSealConsensus {
     }
 }
 
-impl Consensus for AutoSealConsensus {
-    fn validate_header(&self, _header: &SealedHeader) -> Result<(), ConsensusError> {
+impl<H> HeaderValidator<H> for TNExecution {
+    fn validate_header(&self, _header: &SealedHeader<H>) -> Result<(), ConsensusError> {
         Ok(())
     }
 
     fn validate_header_against_parent(
         &self,
-        _header: &SealedHeader,
-        _parent: &SealedHeader,
+        _header: &SealedHeader<H>,
+        _parent: &SealedHeader<H>,
     ) -> Result<(), ConsensusError> {
         Ok(())
     }
 
     fn validate_header_with_total_difficulty(
         &self,
-        _header: &Header,
+        _header: &H,
         _total_difficulty: U256,
     ) -> Result<(), ConsensusError> {
         Ok(())
     }
+}
 
-    fn validate_block_pre_execution(&self, _block: &SealedBlock) -> Result<(), ConsensusError> {
+impl<H, B> Consensus<H, B> for TNExecution {
+    fn validate_body_against_header(
+        &self,
+        _body: &B,
+        _header: &SealedHeader<H>,
+    ) -> Result<(), ConsensusError> {
         Ok(())
     }
 
+    fn validate_block_pre_execution(
+        &self,
+        _block: &SealedBlock<H, B>,
+    ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+}
+
+impl<N: NodePrimitives> FullConsensus<N> for TNExecution {
     fn validate_block_post_execution(
         &self,
-        _block: &BlockWithSenders,
-        _input: PostExecutionInput<'_>,
+        _block: &BlockWithSenders<N::Block>,
+        _input: PostExecutionInput<'_, N::Receipt>,
     ) -> Result<(), ConsensusError> {
         Ok(())
     }
@@ -104,7 +122,7 @@ impl TNPayload {
         let cfg = CfgEnv::default().with_chain_id(chain_spec.chain().id());
 
         // ensure we're not missing any timestamp based hardforks
-        let spec_id = revm_spec_by_timestamp_after_merge(chain_spec, self.timestamp());
+        let spec_id = SpecId::SHANGHAI;
 
         // use the blob excess gas and price set by the worker during batch creation
         let blob_excess_gas_and_price = Some(BlobExcessGasAndPrice::new(0, false));

@@ -118,7 +118,7 @@ where
 
         debug!(target: "tn::execution", chain=%node_config.chain.chain, genesis=?node_config.chain.genesis_hash(), "Initializing genesis");
 
-        let genesis_hash = init_genesis(provider_factory.clone())?;
+        let genesis_hash = init_genesis(&provider_factory)?;
 
         info!(target: "tn::execution",  ?genesis_hash);
         info!(target: "tn::execution", "\n{}", node_config.chain.display_hardforks());
@@ -139,12 +139,8 @@ where
             auto_consensus.clone(),
             evm_executor.clone(),
         );
-        let tree = BlockchainTree::new(
-            tree_externals,
-            tree_config,
-            prune_config.map(|config| config.segments.clone()).unwrap_or_else(PruneModes::none),
-        )?
-        .with_sync_metrics_tx(sync_metrics_tx.clone());
+        let tree = BlockchainTree::new(tree_externals, tree_config)?
+            .with_sync_metrics_tx(sync_metrics_tx.clone());
 
         let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
         debug!(target: "tn::execution", "configured blockchain tree");
@@ -176,7 +172,7 @@ where
         task_manager: &TaskManager,
         rx_shutdown: Noticer,
     ) -> eyre::Result<()> {
-        let head = self.node_config.lookup_head(self.provider_factory.clone())?;
+        let head = self.node_config.lookup_head(&self.provider_factory)?;
 
         // TODO: call hooks?
 
@@ -212,7 +208,7 @@ where
         task_manager: &TaskManager,
         rx_shutdown: Noticer,
     ) -> eyre::Result<()> {
-        let head = self.node_config.lookup_head(self.provider_factory.clone())?;
+        let head = self.node_config.lookup_head(&self.provider_factory)?;
 
         // inspired by reth's default eth tx pool:
         // - `EthereumPoolBuilder::default()`

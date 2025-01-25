@@ -34,7 +34,9 @@ pub use alloy::{
     consensus::{Header as ExecHeader, Transaction as TransactionTrait},
     eips::{eip1559::MIN_PROTOCOL_BASE_FEE, BlockNumHash},
     genesis::Genesis,
-    primitives::{Address, BlockHash, BlockNumber, B256, U256},
+    primitives::{Address, BlockHash, BlockNumber, TxHash, B256, U160, U256},
     rpc::types::Withdrawals,
 };
-pub use reth_primitives::{BlockWithSenders, SealedBlock, SealedHeader, TransactionSigned};
+pub use reth_primitives::{
+    BlockWithSenders, NodePrimitives, SealedBlock, SealedHeader, TransactionSigned,
+};
