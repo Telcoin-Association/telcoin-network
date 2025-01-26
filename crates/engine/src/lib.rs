@@ -36,7 +36,9 @@ use std::{
     pin::{pin, Pin},
     task::{Context, Poll},
 };
-use tn_types::{BuildArguments, ConsensusOutput, Noticer, SealedHeader};
+use tn_types::{
+    BuildArguments, ConsensusOutput, ExecHeader, Noticer, SealedHeader, TransactionSigned,
+};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{error, info, trace, warn};
@@ -90,7 +92,7 @@ where
         + StageCheckpointReader
         + ChainSpecProvider
         + 'static,
-    CE: ConfigureEvm,
+    CE: ConfigureEvm<Transaction = TransactionSigned>,
 {
     /// Create a new instance of the [`ExecutorEngine`] using the given channel to configure
     /// the [`ConsensusOutput`] communication channel.
@@ -128,7 +130,7 @@ where
         BT: StateProviderFactory
             + ChainSpecProvider<ChainSpec = ChainSpec>
             + BlockchainTreeEngine
-            + CanonChainTracker
+            + CanonChainTracker<Header = ExecHeader>
             + Clone,
     {
         let (tx, rx) = oneshot::channel();
@@ -195,14 +197,14 @@ where
     BT: BlockchainTreeEngine
         + BlockReader
         + BlockIdReader
-        + CanonChainTracker
+        + CanonChainTracker<Header = ExecHeader>
         + StageCheckpointReader
         + StateProviderFactory
         + ChainSpecProvider<ChainSpec = ChainSpec>
         + Clone
         + Unpin
         + 'static,
-    CE: ConfigureEvm,
+    CE: ConfigureEvm<Transaction = TransactionSigned>,
 {
     type Output = EngineResult<()>;
 

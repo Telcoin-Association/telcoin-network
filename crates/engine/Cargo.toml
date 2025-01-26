@@ -31,6 +31,7 @@ reth-payload-builder = { workspace = true }
 reth-provider = { workspace = true }
 reth-revm = { workspace = true }
 reth-trie = { workspace = true }
+reth-primitives-traits = { workspace = true }
 
 [dev-dependencies]
 # unit tests

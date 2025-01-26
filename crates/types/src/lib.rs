@@ -32,7 +32,8 @@ pub use worker::*;
 // re-exports for easier maintainability
 pub use alloy::{
     consensus::{
-        constants::{EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS},
+        constants::{EMPTY_OMMER_ROOT_HASH, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS},
+        proofs::calculate_transaction_root,
         Header as ExecHeader, Transaction as TransactionTrait, TxEip1559,
     },
     eips::{
@@ -48,6 +49,6 @@ pub use alloy::{
     sol_types::SolType,
 };
 pub use reth_primitives::{
-    public_key_to_address, Block, BlockBody, BlockWithSenders, NodePrimitives, Receipt,
+    public_key_to_address, Block, BlockBody, BlockExt, BlockWithSenders, NodePrimitives, Receipt,
     RecoveredTx, SealedBlock, SealedBlockWithSenders, SealedHeader, Transaction, TransactionSigned,
 };
