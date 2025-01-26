@@ -6,6 +6,7 @@
 //!
 //! The mined transactions are returned with the built block so the worker can update the pool.
 
+use crate::error::BatchBuilderError;
 use reth_primitives_traits::InMemorySize as _;
 use reth_transaction_pool::{error::InvalidPoolTransactionError, PoolTransaction, TransactionPool};
 use tn_types::{
@@ -13,8 +14,6 @@ use tn_types::{
     TransactionSigned, TransactionTrait as _, TxHash,
 };
 use tracing::{debug, warn};
-
-use crate::error::BatchBuilderError;
 
 /// The output from building the next block.
 ///
@@ -49,6 +48,7 @@ pub struct BatchBuilderOutput {
 pub fn build_batch<P>(args: BatchBuilderArgs<P>) -> BatchBuilderOutput
 where
     P: TransactionPool,
+    P::Transaction: PoolTransaction<Consensus = TransactionSigned>,
 {
     let BatchBuilderArgs { pool, batch_config } = args;
     let gas_limit = max_batch_gas(batch_config.parent_info.tip.timestamp);
@@ -116,7 +116,7 @@ where
 
         // append transaction to the list of executed transactions
         mined_transactions.push(*pool_tx.hash());
-        transactions.push(tx);
+        transactions.push(tx.into_tx());
     }
 
     // TODO: use ms for batch and sec for final block?

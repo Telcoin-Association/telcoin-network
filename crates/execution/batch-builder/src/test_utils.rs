@@ -18,7 +18,8 @@ use std::{
 use tn_types::{
     Address, Batch, BatchBuilderArgs, BlobAndProofV1, BlobTransactionSidecar, BlockBody,
     LastCanonicalUpdate, PendingBlockConfig, RecoveredTx, SealedBlock, SealedHeader,
-    TransactionSigned, TxHash, B256, ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE,
+    TransactionSigned, TransactionTrait as _, TxHash, B256, ETHEREUM_BLOCK_GAS_LIMIT,
+    MIN_PROTOCOL_BASE_FEE,
 };
 use tokio::sync::mpsc::{self, Receiver};
 
@@ -59,7 +60,7 @@ impl TestPool {
         let transactions = txs
             .into_iter()
             .map(|tx| {
-                let ecrecovered = tx.try_into_ecrecovered().expect("tx into ecrecovered");
+                let ecrecovered = tx.into_ecrecovered().expect("tx into ecrecovered");
                 let nonce = ecrecovered.nonce();
                 // add to sender ids
                 let id = sender_ids.sender_id_or_create(ecrecovered.signer());
@@ -322,21 +323,21 @@ impl TransactionPool for TestPool {
 
     fn pending_transactions_max(
         &self,
-        max: usize,
+        _max: usize,
     ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
         vec![]
     }
 
     fn remove_transactions_and_descendants(
         &self,
-        hashes: Vec<TxHash>,
+        _hashes: Vec<TxHash>,
     ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
         vec![]
     }
 
     fn remove_transactions_by_sender(
         &self,
-        sender: Address,
+        _sender: Address,
     ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
         vec![]
     }
@@ -344,36 +345,36 @@ impl TransactionPool for TestPool {
     #[doc = " Returns all pending transactions filtered by predicate"]
     fn get_pending_transactions_with_predicate(
         &self,
-        predicate: impl FnMut(&ValidPoolTransaction<Self::Transaction>) -> bool,
+        _predicate: impl FnMut(&ValidPoolTransaction<Self::Transaction>) -> bool,
     ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
         vec![]
     }
 
     fn get_pending_transactions_by_sender(
         &self,
-        sender: Address,
+        _sender: Address,
     ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
         vec![]
     }
 
     fn get_queued_transactions_by_sender(
         &self,
-        sender: Address,
+        _sender: Address,
     ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
         vec![]
     }
 
     fn get_highest_transaction_by_sender(
         &self,
-        sender: Address,
+        _sender: Address,
     ) -> Option<Arc<ValidPoolTransaction<Self::Transaction>>> {
         None
     }
 
     fn get_highest_consecutive_transaction_by_sender(
         &self,
-        sender: Address,
-        on_chain_nonce: u64,
+        _sender: Address,
+        _on_chain_nonce: u64,
     ) -> Option<Arc<ValidPoolTransaction<Self::Transaction>>> {
         None
     }

@@ -28,7 +28,7 @@ use futures_util::{FutureExt, StreamExt};
 use reth_execution_types::ChangedAccount;
 use reth_provider::{CanonStateNotification, CanonStateNotificationStream, Chain};
 use reth_transaction_pool::{
-    CanonicalStateUpdate, PoolUpdateKind, TransactionPool, TransactionPoolExt,
+    CanonicalStateUpdate, PoolTransaction, PoolUpdateKind, TransactionPool, TransactionPoolExt,
 };
 use std::{
     future::Future,
@@ -39,7 +39,7 @@ use std::{
 };
 use tn_types::{
     error::BlockSealError, Address, BatchBuilderArgs, BatchSender, LastCanonicalUpdate,
-    PendingBlockConfig, TxHash, MIN_PROTOCOL_BASE_FEE,
+    PendingBlockConfig, TransactionSigned, TxHash, MIN_PROTOCOL_BASE_FEE,
 };
 use tokio::{sync::oneshot, time::Interval};
 use tracing::{debug, error, trace, warn};
@@ -104,6 +104,7 @@ pub struct BatchBuilder<BT, Pool> {
 impl<BT, Pool> BatchBuilder<BT, Pool>
 where
     Pool: TransactionPoolExt + 'static,
+    Pool::Transaction: PoolTransaction<Consensus = TransactionSigned>,
 {
     /// Create a new instance of [Self].
     pub fn new(
@@ -292,6 +293,7 @@ impl<BT, Pool> Future for BatchBuilder<BT, Pool>
 where
     BT: Unpin,
     Pool: TransactionPool + TransactionPoolExt + Unpin + 'static,
+    Pool::Transaction: PoolTransaction<Consensus = TransactionSigned>,
 {
     type Output = BatchBuilderResult<()>;
 
