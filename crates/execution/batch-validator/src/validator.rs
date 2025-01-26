@@ -23,7 +23,6 @@ where
     blockchain_db: BlockchainProvider<DB>,
 }
 
-#[async_trait::async_trait]
 impl<DB> BatchValidation for BatchValidator<DB>
 where
     DB: ProviderNodeTypes + TreeNodeTypes + Sized + Clone + 'static,
@@ -164,7 +163,6 @@ where
 pub struct NoopBatchValidator;
 
 #[cfg(any(test, feature = "test-utils"))]
-#[async_trait::async_trait]
 impl BatchValidation for NoopBatchValidator {
     fn validate_batch(&self, _batch: SealedBatch) -> Result<(), BatchValidationError> {
         Ok(())

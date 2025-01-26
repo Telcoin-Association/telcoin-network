@@ -13,7 +13,6 @@ edition = "2021"
 [dependencies]
 eyre = { workspace = true }
 backoff = { workspace = true }
-reth-primitives = { workspace = true }
 cfg-if = { workspace = true }
 futures = { workspace = true }
 governor = { workspace = true }

@@ -33,7 +33,7 @@ serde_with = { workspace = true }
 serde_json = { workspace = true }
 serde_repr = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "signal"] }
 tracing = { workspace = true }
 eyre = { workspace = true }
 fastcrypto = { workspace = true, features = ["copy_key"] }

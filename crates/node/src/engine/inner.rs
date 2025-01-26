@@ -21,10 +21,6 @@ use reth_db_common::init::init_genesis;
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
 use reth_node_builder::{NodeConfig, RethTransactionPoolConfig};
 use reth_node_ethereum::EthEvmConfig;
-use reth_primitives::{
-    constants::MIN_PROTOCOL_BASE_FEE, Address, BlockBody, Header, SealedBlock,
-    SealedBlockWithSenders, B256,
-};
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     BlockIdReader, BlockReader, CanonStateSubscriptions as _, ChainSpecProvider,

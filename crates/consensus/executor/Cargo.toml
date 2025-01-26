@@ -12,7 +12,6 @@ publish = false
 
 [dependencies]
 async-trait.workspace = true
-reth-primitives = { workspace = true }
 fastcrypto.workspace = true
 futures.workspace = true
 serde.workspace = true

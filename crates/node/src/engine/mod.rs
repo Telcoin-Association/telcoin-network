@@ -17,7 +17,6 @@ use reth_db::{
 use reth_evm::execute::BlockExecutorProvider;
 use reth_node_builder::NodeConfig;
 use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
-use reth_primitives::{Header, B256};
 use std::{net::SocketAddr, sync::Arc};
 use tn_config::Config;
 mod inner;
