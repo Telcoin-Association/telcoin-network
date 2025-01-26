@@ -2,8 +2,8 @@
 //!
 //! These errors are returned by the RPC for public requests to the `tn` namespace.
 
-use alloy::hex::encode_prefixed;
 use thiserror::Error;
+use tn_types::hex::encode_prefixed;
 
 /// The result type for TN RPC namespace.
 pub type TelcoinNetworkRpcResult<T> = Result<T, TNRpcError>;
