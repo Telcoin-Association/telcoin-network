@@ -10,7 +10,6 @@
 //!
 //! WARNING: DO NOT ENABLE THIS FEATURE ON MAINNET.
 
-use alloy::{Address, TxHash};
 use gcloud_sdk::{
     google::cloud::kms::v1::key_management_service_client::KeyManagementServiceClient, GoogleApi,
     GoogleAuthMiddleware,
@@ -22,6 +21,7 @@ use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use reth_transaction_pool::TransactionPool;
 use secp256k1::constants::PUBLIC_KEY_SIZE;
 use std::time::Duration;
+use tn_types::{Address, TxHash};
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedSender},
     oneshot,

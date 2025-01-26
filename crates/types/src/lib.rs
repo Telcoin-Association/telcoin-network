@@ -33,7 +33,7 @@ pub use worker::*;
 pub use alloy::{
     consensus::{
         constants::{EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS},
-        Header as ExecHeader, Transaction as TransactionTrait,
+        Header as ExecHeader, Transaction as TransactionTrait, TxEip1559,
     },
     eips::{
         eip1559::{ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE},
@@ -42,11 +42,12 @@ pub use alloy::{
     },
     genesis::{Genesis, GenesisAccount},
     hex::{self, FromHex},
-    primitives::{keccak256, Address, BlockHash, BlockNumber, TxHash, B256, U160, U256},
+    primitives::{keccak256, Address, BlockHash, BlockNumber, TxHash, TxKind, B256, U160, U256},
     rpc::types::Withdrawals,
-    // signers::utils::public_key_to_address,
+    signers::Signature as EthSignature,
+    sol_types::SolType,
 };
 pub use reth_primitives::{
     public_key_to_address, Block, BlockBody, BlockWithSenders, NodePrimitives, Receipt,
-    RecoveredTx, SealedBlock, SealedBlockWithSenders, SealedHeader, TransactionSigned,
+    RecoveredTx, SealedBlock, SealedBlockWithSenders, SealedHeader, Transaction, TransactionSigned,
 };

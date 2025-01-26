@@ -7,10 +7,6 @@
 //! wallet within the time period.
 
 use crate::{Drip, FaucetWallet, GoogleKMSClient, Secp256k1PubKeyBytes};
-use alloy::{
-    sol_types::SolType, Address, Signature as EthSignature, Transaction, TransactionSigned,
-    TxEip1559, TxHash, TxKind, B256, U256,
-};
 use futures::StreamExt;
 use gcloud_sdk::{
     google::cloud::kms::v1::{
@@ -36,6 +32,10 @@ use std::{
     pin::Pin,
     task::{ready, Context, Poll},
     time::{Duration, SystemTime},
+};
+use tn_types::{
+    Address, EthSignature, SolType, Transaction, TransactionSigned, TransactionTrait as _,
+    TxEip1559, TxHash, TxKind, B256, U256,
 };
 use tokio::sync::{
     mpsc::{UnboundedReceiver, UnboundedSender},
@@ -264,7 +264,7 @@ where
 
         // lookup account nonce in db and compare it last known tx nonce mined by worker
         let state = self.provider.latest()?;
-        let db_account_nonce = state.account_nonce(address)?.unwrap_or_default();
+        let db_account_nonce = state.account_nonce(&address)?.unwrap_or_default();
         debug!(target: "faucet", ?db_account_nonce, tracked_nonce=?self.next_nonce, "comparing faucet nonces");
         let highest_nonce = std::cmp::max(db_account_nonce, self.next_nonce);
 
@@ -322,14 +322,15 @@ where
         // retrieve r, s, and v values for EthSignature
         let compact = signature.serialize_compact();
 
-        // calculate `v` for eth signature's `odd_y_parity`
-        let odd_y_parity = Self::calculate_v(&message, chain_id, &compact, &public_key_bytes)?;
+        // calculate `v` for eth signature's `y_parity`
+        let y_parity = Self::calculate_v(&message, chain_id, &compact, &public_key_bytes)?;
 
         // r and s are 32 bytes each
         let (r, s) = compact.split_at(32);
 
-        let eth_signature =
-            EthSignature { r: U256::from_be_slice(r), s: U256::from_be_slice(s), odd_y_parity };
+        let r = U256::from_be_slice(r);
+        let s = U256::from_be_slice(s);
+        let eth_signature = EthSignature::new(r, s, y_parity);
 
         Ok(eth_signature)
     }
