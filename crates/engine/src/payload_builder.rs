@@ -17,7 +17,6 @@ use reth_revm::{
     primitives::{EVMError, EnvWithHandlerCfg, ResultAndState, TxEnv},
     DatabaseCommit, State,
 };
-use reth_trie::HashedPostState;
 use std::sync::Arc;
 use tn_types::{
     calculate_transaction_root, max_batch_gas, Batch, Block, BlockBody, BlockExt as _,
@@ -208,7 +207,7 @@ where
     let state_provider = provider.state_by_block_hash(payload.attributes.parent_header.hash())?;
     let state = StateProviderDatabase::new(state_provider);
 
-    // TODO: using same apprach as reth here bc I can't find the State::builder()'s methods
+    // TODO: using same approach as reth here bc I can't find the State::builder()'s methods
     // I'm not sure what `with_bundle_update` does, and using `CachedReads` is the only way
     // I can get the state root section below to compile using `db.commit(state)`.
     //
@@ -219,7 +218,6 @@ where
 
     debug!(target: "payload_builder", parent_hash = ?payload.attributes.parent_header.hash(), parent_number = payload.attributes.parent_header.number, "building new payload");
     // collect these totals to report at the end
-    let _total_gas_used = 0; // TODO: include blobs
     let mut cumulative_gas_used = 0;
     let mut total_fees = U256::ZERO;
     let mut executed_txs = Vec::new();
@@ -303,18 +301,6 @@ where
         // commit changes
         evm.db_mut().commit(state);
 
-        // // add to the total blob gas used if the transaction successfully executed
-        // if let Some(blob_tx) = tx.transaction.as_eip4844() {
-        //     let tx_blob_gas = blob_tx.blob_gas();
-        //     sum_blob_gas_used += tx_blob_gas;
-
-        //     // TODO: this is important for worker's batch payload builder
-        //     // // if we've reached the max data gas per block, we can skip blob txs entirely
-        //     // if sum_blob_gas_used == MAX_DATA_GAS_PER_BLOCK {
-        //     //     best_txs.skip_blobs();
-        //     // }
-        // }
-
         let gas_used = result.gas_used();
 
         // add gas used by the transaction to cumulative gas used, before creating the receipt
@@ -360,7 +346,6 @@ where
     let receipts_root =
         execution_outcome.ethereum_receipts_root(block_number).expect("Number is in range");
     let logs_bloom = execution_outcome.block_logs_bloom(block_number).expect("Number is in range");
-    // let hashed_state = db.database.db.hashed_post_state(execution_outcome.state());
 
     // calculate the state root
     let hashed_state = db.database.db.hashed_post_state(execution_outcome.state());
@@ -438,9 +423,9 @@ where
             );
             err
         })?;
-
+    let mut cached_reads = CachedReads::default();
     let mut db = State::builder()
-        .with_database(StateProviderDatabase::new(state))
+        .with_database(cached_reads.as_db_mut(StateProviderDatabase::new(state)))
         .with_bundle_update()
         .build();
 
@@ -455,15 +440,18 @@ where
 
     // calculate the state root
     let bundle_state = db.take_bundle();
-    let hashed_state = HashedPostState::from_bundle_state(&bundle_state.state);
-    let state_root = db.database.state_root(hashed_state).map_err(|err| {
-        warn!(target: "engine",
-            parent_hash=%payload.attributes.parent_header.hash(),
-            %err,
-            "failed to calculate state root for empty output"
-        );
-        err
-    })?;
+
+    // calculate the state root
+    let hashed_state = db.database.db.hashed_post_state(&bundle_state);
+    let (state_root, _trie_output) = {
+        db.database.inner().state_root_with_updates(hashed_state.clone()).inspect_err(|err| {
+            error!(target: "payload_builder",
+                parent_hash=%payload.attributes.parent_header.hash(),
+                %err,
+                "failed to calculate state root for payload"
+            );
+        })?
+    };
 
     let header = ExecHeader {
         parent_hash: payload.parent(),
