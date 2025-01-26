@@ -18,10 +18,10 @@ use lru_time_cache::LruCache;
 use reth::rpc::server_types::eth::{EthApiError, EthResult};
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
-use reth_transaction_pool::TransactionPool;
+use reth_transaction_pool::{PoolTransaction, TransactionPool};
 use secp256k1::constants::PUBLIC_KEY_SIZE;
 use std::time::Duration;
-use tn_types::{Address, TxHash};
+use tn_types::{Address, TransactionSigned, TxHash};
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedSender},
     oneshot,
@@ -156,6 +156,7 @@ impl Faucet {
     where
         Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
         Pool: TransactionPool + Unpin + Clone + 'static,
+        Pool::Transaction: PoolTransaction<Pooled = TransactionSigned>,
     {
         Self::spawn_with(provider, pool, config, TokioTaskExecutor::default())
     }
@@ -173,6 +174,7 @@ impl Faucet {
     where
         Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
         Pool: TransactionPool + Unpin + Clone + 'static,
+        Pool::Transaction: PoolTransaction<Pooled = TransactionSigned>,
         Tasks: TaskSpawner + Clone + 'static,
     {
         let (this, service) = Self::create(provider, pool, executor.clone(), config);

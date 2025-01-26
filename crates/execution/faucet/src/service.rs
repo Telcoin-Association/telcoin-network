@@ -129,6 +129,7 @@ impl<Provider, Pool, Tasks> FaucetService<Provider, Pool, Tasks>
 where
     Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
     Pool: TransactionPool + Unpin + Clone + 'static,
+    Pool::Transaction: PoolTransaction<Pooled = TransactionSigned>,
     Tasks: TaskSpawner + Clone + 'static,
 {
     /// Calculate when the wait period is over
@@ -174,8 +175,7 @@ where
             // submit tx to pool
             match response {
                 Ok(signature) => {
-                    let tx_for_pool =
-                        TransactionSigned::from_transaction_and_signature(transaction, signature);
+                    let tx_for_pool = TransactionSigned::new_unhashed(transaction, signature);
                     let res =
                         submit_transaction(pool, tx_for_pool, add_to_success_cache, user, contract)
                             .await;
@@ -411,6 +411,7 @@ impl<Provider, Pool, Tasks> Future for FaucetService<Provider, Pool, Tasks>
 where
     Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
     Pool: TransactionPool + Unpin + Clone + 'static,
+    Pool::Transaction: PoolTransaction<Pooled = TransactionSigned>,
     Tasks: TaskSpawner + Clone + 'static,
 {
     type Output = ();
@@ -512,12 +513,15 @@ async fn submit_transaction<Pool>(
 ) -> EthResult<TxHash>
 where
     Pool: TransactionPool + Clone + 'static,
+    Pool::Transaction: PoolTransaction<Pooled = TransactionSigned>,
 {
-    let recovered = tx.try_into_ecrecovered().or(Err(EthApiError::InvalidTransactionSignature))?;
-    let pool_transaction = match recovered.try_into() {
-        Ok(converted) => <Pool::Transaction>::from_pooled(converted),
-        Err(_) => return Err(EthApiError::TransactionConversionError),
-    };
+    let recovered = tx.into_ecrecovered().ok_or(EthApiError::InvalidTransactionSignature)?;
+    // let pool_transaction = match recovered.try_into() {
+    //     Ok(converted) => <Pool::Transaction>::from_pooled(converted),
+    //     Err(_) => return Err(EthApiError::TransactionConversionError),
+    // };
+    let pool_transaction = Pool::Transaction::from_pooled(recovered);
+    // recovered.try_into_pooled().map_err(|_| EthApiError::TransactionConversionError)?;
 
     // submit tx and subscribe to events
     let mut tx_events =

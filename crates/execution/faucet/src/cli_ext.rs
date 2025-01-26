@@ -10,10 +10,10 @@ use eyre::ContextCompat;
 use k256::PublicKey as PubKey;
 use reth_cli_util::parse_duration_from_secs;
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
-use reth_transaction_pool::TransactionPool;
+use reth_transaction_pool::{PoolTransaction, TransactionPool};
 use secp256k1::PublicKey;
 use std::{str::FromStr, time::Duration};
-use tn_types::{public_key_to_address, Address, U256};
+use tn_types::{public_key_to_address, Address, TransactionSigned, U256};
 use tracing::{info, warn};
 
 /// Args for running the faucet.
@@ -103,6 +103,7 @@ impl FaucetArgs {
     where
         Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
         Pool: TransactionPool + Unpin + Clone + 'static,
+        Pool::Transaction: PoolTransaction<Pooled = TransactionSigned>,
     {
         // only support google kms for now
         if self.google_kms {
