@@ -1,10 +1,11 @@
 //! Request message types
 
-use reth_primitives::SealedHeader;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use tn_types::{AuthorityIdentifier, BlockHash, Certificate, Header, NetworkPublicKey, Round};
+use tn_types::{
+    AuthorityIdentifier, BlockHash, Certificate, Header, NetworkPublicKey, Round, SealedHeader,
+};
 use tracing::warn;
 
 /// Request for broadcasting certificates to peers.

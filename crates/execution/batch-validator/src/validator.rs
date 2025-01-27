@@ -1,10 +1,13 @@
 //! Block validator
 
-use reth_db::database::Database;
-use reth_primitives::Header;
-use reth_provider::{providers::BlockchainProvider, BlockIdReader, HeaderProvider};
+use reth_node_types::NodeTypesWithDB;
+use reth_primitives_traits::InMemorySize as _;
+use reth_provider::{
+    providers::{BlockchainProvider, TreeNodeTypes},
+    BlockIdReader, HeaderProvider,
+};
 use tn_types::{
-    max_batch_gas, max_batch_size, BatchValidation, BatchValidationError, SealedBatch,
+    max_batch_gas, max_batch_size, BatchValidation, BatchValidationError, ExecHeader, SealedBatch,
     TransactionSigned,
 };
 
@@ -13,18 +16,17 @@ type BlockValidationResult<T> = Result<T, BatchValidationError>;
 
 /// Block validator
 #[derive(Clone)]
-pub struct BatchValidator<DB>
+pub struct BatchValidator<N>
 where
-    DB: Database + Clone + 'static,
+    N: TreeNodeTypes + NodeTypesWithDB,
 {
     /// Database provider to encompass tree and provider factory.
-    blockchain_db: BlockchainProvider<DB>,
+    blockchain_db: BlockchainProvider<N>,
 }
 
-#[async_trait::async_trait]
-impl<DB> BatchValidation for BatchValidator<DB>
+impl<N> BatchValidation for BatchValidator<N>
 where
-    DB: Database + Sized + Clone + 'static,
+    N: TreeNodeTypes + NodeTypesWithDB,
 {
     /// Validate a peer's batch.
     ///
@@ -59,7 +61,7 @@ where
                             .unwrap_or_default()
                             .unwrap_or_default()
                     } else {
-                        Header::default()
+                        ExecHeader::default()
                     }
                 },
             );
@@ -82,12 +84,12 @@ where
     }
 }
 
-impl<DB> BatchValidator<DB>
+impl<N> BatchValidator<N>
 where
-    DB: Database + Clone,
+    N: TreeNodeTypes + NodeTypesWithDB,
 {
     /// Create a new instance of [Self]
-    pub fn new(blockchain_db: BlockchainProvider<DB>) -> Self {
+    pub fn new(blockchain_db: BlockchainProvider<N>) -> Self {
         Self { blockchain_db }
     }
 
@@ -96,7 +98,7 @@ where
     fn validate_against_parent_timestamp(
         &self,
         timestamp: u64,
-        parent: &Header,
+        parent: &ExecHeader,
     ) -> BlockValidationResult<()> {
         if timestamp <= parent.timestamp {
             return Err(BatchValidationError::TimestampIsInPast {
@@ -162,7 +164,6 @@ where
 pub struct NoopBatchValidator;
 
 #[cfg(any(test, feature = "test-utils"))]
-#[async_trait::async_trait]
 impl BatchValidation for NoopBatchValidator {
     fn validate_batch(&self, _batch: SealedBatch) -> Result<(), BatchValidationError> {
         Ok(())
@@ -173,24 +174,25 @@ impl BatchValidation for NoopBatchValidator {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
-    use reth_beacon_consensus::EthBeaconConsensus;
     use reth_blockchain_tree::{
         BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
     };
     use reth_chainspec::ChainSpec;
+    use reth_consensus::FullConsensus;
     use reth_db::{
         test_utils::{create_test_rw_db, tempdir_path, TempDatabase},
         DatabaseEnv,
     };
     use reth_db_common::init::init_genesis;
-    use reth_primitives::{
-        constants::MIN_PROTOCOL_BASE_FEE, hex, Address, Bytes, GenesisAccount, B256, U256,
-    };
+    use reth_node_types::NodeTypesWithDBAdapter;
     use reth_provider::{providers::StaticFileProvider, ProviderFactory};
-    use reth_prune::PruneModes;
     use std::{str::FromStr, sync::Arc};
+    use tn_node_traits::{TNExecution, TelcoinNode};
     use tn_test_utils::{test_genesis, TransactionFactory};
-    use tn_types::{adiri_genesis, max_batch_gas, Batch, Consensus};
+    use tn_types::{
+        adiri_genesis, hex_literal::hex, max_batch_gas, Address, Batch, Bytes, GenesisAccount,
+        B256, MIN_PROTOCOL_BASE_FEE, U256,
+    };
     use tracing::debug;
 
     /// Return the next valid sealed batch
@@ -231,32 +233,36 @@ mod tests {
         );
 
         let valid_txs = vec![transaction1, transaction2, transaction3];
+        let batch = Batch {
+            transactions: valid_txs,
+            parent_hash: hex!("a0673579c1a31037ee29a7e3cb7b1495a020bf21d958269ea8291a64326667c5")
+                .into(),
+            beneficiary: Address::ZERO,
+            timestamp,
+            base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
+            received_at: None,
+        };
 
         // sealed batch
         //
         // intentionally used hard-coded values
         SealedBatch::new(
-            Batch {
-                transactions: valid_txs,
-                parent_hash: hex!(
-                    "a0673579c1a31037ee29a7e3cb7b1495a020bf21d958269ea8291a64326667c5"
-                )
-                .into(),
-                beneficiary: Address::ZERO,
-                timestamp,
-                base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
-                received_at: None,
-            },
-            hex!("3db9ad782b190874867d04f3c26a88546a06be445c9544697499659944210593").into(),
+            batch,
+            hex!("c86c3bf24b98a87f19d204dc00a91f9d0a25e22c60f5f91fd864d31d534a06f5").into(),
         )
     }
+
+    type TestProvider = NodeTypesWithDBAdapter<
+        TelcoinNode<Arc<TempDatabase<DatabaseEnv>>>,
+        Arc<TempDatabase<DatabaseEnv>>,
+    >;
 
     /// Convenience type for creating test assets.
     struct TestTools {
         /// The expected sealed batch.
         valid_batch: SealedBatch,
         /// Validator
-        validator: BatchValidator<Arc<TempDatabase<DatabaseEnv>>>,
+        validator: BatchValidator<TestProvider>,
     }
 
     /// Create an instance of block validator for tests.
@@ -272,11 +278,11 @@ mod tests {
             StaticFileProvider::read_write(tempdir_path())
                 .expect("static file provider read write created with tempdir path"),
         );
-        let genesis_hash = init_genesis(provider_factory.clone()).expect("init genesis");
+        let genesis_hash = init_genesis(&provider_factory).expect("init genesis");
         debug!("genesis hash: {genesis_hash:?}");
 
         // configure blockchain tree
-        let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
+        let consensus: Arc<dyn FullConsensus> = Arc::new(TNExecution);
 
         let tree_externals = TreeExternals::new(
             provider_factory.clone(),
@@ -284,8 +290,8 @@ mod tests {
             reth_node_ethereum::EthExecutorProvider::ethereum(chain.clone()),
         );
         let tree_config = BlockchainTreeConfig::default();
-        let tree = BlockchainTree::new(tree_externals, tree_config, PruneModes::none())
-            .expect("blockchain tree is valid");
+        let tree =
+            BlockchainTree::new(tree_externals, tree_config).expect("blockchain tree is valid");
 
         let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
 

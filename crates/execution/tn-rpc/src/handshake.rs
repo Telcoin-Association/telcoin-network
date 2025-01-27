@@ -1,10 +1,9 @@
 //! RPC types for handshake.
 
-use reth_primitives::Genesis;
 use serde::{Deserialize, Serialize};
 use tn_types::{
     generate_proof_of_possession_network, traits::KeyPair, verify_proof_of_possession_network,
-    Multiaddr, NetworkKeypair, NetworkPublicKey, NetworkSignature,
+    Genesis, Multiaddr, NetworkKeypair, NetworkPublicKey, NetworkSignature,
 };
 
 /// The struct containing the necessary information for peer handshake.

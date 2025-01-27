@@ -1,6 +1,7 @@
 //! Error types for Telcoin Network Block Builder.
 
 use reth_errors::{CanonicalError, ProviderError, RethError};
+use reth_transaction_pool::error::PoolTransactionError;
 use tn_types::BatchConversionError;
 use tokio::sync::{mpsc, oneshot};
 
@@ -37,6 +38,12 @@ pub enum BatchBuilderError {
     /// Fatal db error with worker while trying to reach quorum.
     #[error("Fatal error: batch provider db error")]
     FatalDBFailure,
+    /// Error building batch because this transaction would case the batch to exceed max size (in
+    /// bytes).
+    #[error(
+        "The transaction was not included becuase it would exceed the max batch size. Tx size: {0} bytes - max size: {1} bytes."
+    )]
+    MaxBatchSize(usize, usize),
 }
 
 impl From<oneshot::error::RecvError> for BatchBuilderError {
@@ -48,5 +55,12 @@ impl From<oneshot::error::RecvError> for BatchBuilderError {
 impl<T> From<mpsc::error::SendError<T>> for BatchBuilderError {
     fn from(_: mpsc::error::SendError<T>) -> Self {
         Self::WorkerChannelClosed
+    }
+}
+
+impl PoolTransactionError for BatchBuilderError {
+    fn is_bad_transaction(&self) -> bool {
+        // no peer penalty
+        false
     }
 }

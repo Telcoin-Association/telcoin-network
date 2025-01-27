@@ -2,12 +2,12 @@
 
 use indexmap::IndexMap;
 use rand::{rngs::OsRng, seq::SliceRandom};
-use reth_primitives::BlockNumHash;
 use std::{collections::BTreeSet, num::NonZeroUsize};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
-    AuthorityIdentifier, BlsPublicKey, BlsSignature, Certificate, Committee, Header, Stake, Vote,
+    AuthorityIdentifier, BlockNumHash, BlsPublicKey, BlsSignature, Certificate, Committee, Header,
+    Stake, Vote,
 };
 
 #[tokio::test]

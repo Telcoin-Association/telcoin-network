@@ -4,9 +4,9 @@ use super::Faucet;
 use crate::FaucetConfig;
 use jsonrpsee::proc_macros::rpc;
 use reth::rpc::server_types::eth::EthResult;
-use reth_primitives::{Address, TxHash};
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
-use reth_transaction_pool::TransactionPool;
+use reth_transaction_pool::{EthPooledTransaction, TransactionPool};
+use tn_types::{Address, TxHash};
 
 /// Faucet that disperses 1 TEL every 24hours per requesting address.
 #[rpc(server, namespace = "faucet")]
@@ -41,7 +41,7 @@ impl FaucetRpcExt {
     pub fn new<Provider, Pool>(provider: Provider, pool: Pool, config: FaucetConfig) -> Self
     where
         Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
-        Pool: TransactionPool + Unpin + Clone + 'static,
+        Pool: TransactionPool<Transaction = EthPooledTransaction> + Unpin + Clone + 'static,
     {
         let faucet = Faucet::spawn(provider, pool, config);
 

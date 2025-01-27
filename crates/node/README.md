@@ -51,21 +51,3 @@ The primary does not need a payload builder. It simply executes all transactions
 The worker needs the RPC for receiving transactions and responding to blockchain inquiries.
 
 The primary only facilitates consensus and does not need access to the RPC server.
-
-###### Network
-
-The worker uses it's own network of peers, controlled on the consensus layer.
-
-The primary needs the concept of "network" to run the beacon engine until custom consensus is supported.
-
-###### Pipeline
-
-The worker only needs access to the canonical tip for producing new batches and the db for validating batches.
-
-The primary needs the concept of "pipeline" to run the beacon engine until custom consensus is supported.
-
-###### Beacon Engine
-
-The worker uses a different type of engine to execute state on-top of the canonical tip.
-
-The primary needs the concept of "beacon engine" to run the beacon engine until custom consensus is supported.

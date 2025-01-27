@@ -13,8 +13,6 @@ authors = [
 ]
 
 [dependencies]
-async-trait = { workspace = true }
-reth-primitives = { workspace = true }
 cfg-if = { workspace = true }
 futures = { workspace = true }
 rand = { workspace = true }
@@ -31,6 +29,7 @@ enr = { workspace = true, default-features = false, features = [
 
 fastcrypto = { workspace = true }
 tn-executor = { workspace = true }
+tn-node-traits = { workspace = true }
 tn-network = { workspace = true }
 tn-primary = { workspace = true }
 prometheus = { workspace = true }
@@ -51,15 +50,14 @@ dirs-next = "2.0.0"
 
 # engine
 reth = { workspace = true }
-reth-auto-seal-consensus = { workspace = true }
 reth-beacon-consensus = { workspace = true }
 reth-blockchain-tree = { workspace = true }
 reth-config = { workspace = true }
-reth-db = { workspace = true, features = ["test-utils"] }
+reth-db = { workspace = true }
 reth-db-common = { workspace = true }
+reth-trie-db = { workspace = true }
 reth-evm = { workspace = true }
 reth-provider = { workspace = true }
-reth-rpc-types = { workspace = true }
 reth-stages = { workspace = true }
 reth-exex = { workspace = true }
 reth-node-events = { workspace = true }
@@ -76,7 +74,6 @@ fdlimit = { workspace = true }
 reth-basic-payload-builder = { workspace = true }
 reth-network = { workspace = true }
 reth-network-peers = { workspace = true }
-reth-prune = { workspace = true }
 reth-chainspec = { workspace = true }
 reth-node-builder = { workspace = true }
 reth-payload-builder = { workspace = true }

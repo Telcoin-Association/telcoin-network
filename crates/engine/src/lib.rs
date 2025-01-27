@@ -27,7 +27,6 @@ pub use payload_builder::execute_consensus_output;
 use reth_blockchain_tree::BlockchainTreeEngine;
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
-use reth_primitives::SealedHeader;
 use reth_provider::{
     BlockIdReader, BlockReader, CanonChainTracker, ChainSpecProvider, StageCheckpointReader,
     StateProviderFactory,
@@ -37,7 +36,8 @@ use std::{
     pin::{pin, Pin},
     task::{Context, Poll},
 };
-use tn_types::{BuildArguments, ConsensusOutput, Noticer};
+use tn_node_traits::BuildArguments;
+use tn_types::{ConsensusOutput, ExecHeader, Noticer, SealedHeader, TransactionSigned};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{error, info, trace, warn};
@@ -91,7 +91,7 @@ where
         + StageCheckpointReader
         + ChainSpecProvider
         + 'static,
-    CE: ConfigureEvm,
+    CE: ConfigureEvm<Transaction = TransactionSigned>,
 {
     /// Create a new instance of the [`ExecutorEngine`] using the given channel to configure
     /// the [`ConsensusOutput`] communication channel.
@@ -129,7 +129,7 @@ where
         BT: StateProviderFactory
             + ChainSpecProvider<ChainSpec = ChainSpec>
             + BlockchainTreeEngine
-            + CanonChainTracker
+            + CanonChainTracker<Header = ExecHeader>
             + Clone,
     {
         let (tx, rx) = oneshot::channel();
@@ -142,10 +142,10 @@ where
             let build_args = BuildArguments::new(provider, output, parent);
 
             // spawn blocking task and return future
-            tokio::task::spawn_blocking(|| {
+            tokio::task::spawn_blocking(move || {
                 // this is safe to call on blocking thread without a semaphore bc it's held in
                 // Self::pending_tesk as a single `Option`
-                let result = execute_consensus_output(evm_config, build_args);
+                let result = execute_consensus_output(&evm_config, build_args);
                 match tx.send(result) {
                     Ok(()) => (),
                     Err(e) => {
@@ -196,14 +196,14 @@ where
     BT: BlockchainTreeEngine
         + BlockReader
         + BlockIdReader
-        + CanonChainTracker
+        + CanonChainTracker<Header = ExecHeader>
         + StageCheckpointReader
         + StateProviderFactory
         + ChainSpecProvider<ChainSpec = ChainSpec>
         + Clone
         + Unpin
         + 'static,
-    CE: ConfigureEvm,
+    CE: ConfigureEvm<Transaction = TransactionSigned>,
 {
     type Output = EngineResult<()>;
 
@@ -277,7 +277,7 @@ where
 
                         // check max_round
                         if this.max_round.is_some()
-                            && this.has_reached_max_round(this.parent_header.nonce)
+                            && this.has_reached_max_round(this.parent_header.nonce.into())
                         {
                             // immediately terminate if the specified max consensus round is reached
                             return Poll::Ready(Ok(()));
@@ -317,17 +317,16 @@ mod tests {
     use fastcrypto::hash::Hash as _;
     use reth_blockchain_tree::BlockchainTreeViewer;
     use reth_chainspec::ChainSpec;
-    use reth_primitives::{
-        constants::{EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE},
-        Address, BlockHashOrNumber, Bloom, B256, EMPTY_OMMER_ROOT_HASH, U256,
-    };
     use reth_provider::{BlockIdReader, BlockNumReader, BlockReader, TransactionVariant};
+    use reth_revm::primitives::FixedBytes;
     use std::{collections::VecDeque, str::FromStr as _, sync::Arc, time::Duration};
     use tn_batch_builder::test_utils::execute_test_batch;
     use tn_test_utils::{default_test_execution_node, seeded_genesis_from_random_batches};
     use tn_types::{
-        adiri_chain_spec_arc, adiri_genesis, max_batch_gas, now, BlockHash, Certificate,
-        CommittedSubDag, ConsensusHeader, ConsensusOutput, Notifier, ReputationScores, TaskManager,
+        adiri_chain_spec_arc, adiri_genesis, max_batch_gas, now, Address, BlockHash,
+        BlockHashOrNumber, Bloom, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput,
+        Notifier, ReputationScores, TaskManager, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS,
+        MIN_PROTOCOL_BASE_FEE, U256,
     };
     use tokio::{sync::oneshot, time::timeout};
     use tokio_stream::wrappers::BroadcastStream;
@@ -442,15 +441,18 @@ mod tests {
 
         // assert blocks are executed as expected
         assert!(expected_block.senders.is_empty());
-        assert!(expected_block.body.is_empty());
+        assert!(expected_block.body.transactions.is_empty());
 
         // assert basefee is same as worker's block
         assert_eq!(expected_block.base_fee_per_gas, Some(expected_base_fee));
         // beneficiary overwritten
         assert_eq!(expected_block.beneficiary, beneficiary);
         // nonce matches subdag index and method all match
-        assert_eq!(expected_block.nonce, sub_dag_index);
-        assert_eq!(expected_block.nonce, consensus_output.nonce());
+        assert_eq!(<FixedBytes<8> as Into<u64>>::into(expected_block.nonce), sub_dag_index);
+        assert_eq!(
+            <FixedBytes<8> as Into<u64>>::into(expected_block.nonce),
+            consensus_output.nonce()
+        );
 
         // ommers root
         assert_eq!(expected_block.header.ommers_hash, EMPTY_OMMER_ROOT_HASH,);
@@ -722,7 +724,7 @@ mod tests {
             let block = &executed_blocks[idx];
             let signers = &signers_by_block[idx];
             assert_eq!(&block.senders, signers);
-            assert_eq!(&block.body, txs);
+            assert_eq!(&block.body.transactions, txs);
 
             // basefee was increased for each batch
             expected_base_fee += idx as u64;
@@ -752,8 +754,8 @@ mod tests {
             // beneficiary overwritten
             assert_eq!(&block.beneficiary, expected_beneficiary);
             // nonce matches subdag index and method all match
-            assert_eq!(&block.nonce, expected_subdag_index);
-            assert_eq!(block.nonce, expected_output.nonce());
+            assert_eq!(<FixedBytes<8> as Into<u64>>::into(block.nonce), *expected_subdag_index);
+            assert_eq!(<FixedBytes<8> as Into<u64>>::into(block.nonce), expected_output.nonce());
 
             // timestamp
             assert_eq!(block.timestamp, expected_output.committed_at());
@@ -1066,14 +1068,14 @@ mod tests {
                 || idx == expected_duplicate_block_num_round_2 - 1
             {
                 assert!(block.senders.is_empty());
-                assert!(block.body.is_empty());
+                assert!(block.body.transactions.is_empty());
                 // gas used should NOT be the same as bc duplicate transaction are ignored
                 assert_ne!(block.gas_used, max_batch_gas(block.number));
                 // gas used should be zero bc all transactions were duplicates
                 assert_eq!(block.gas_used, 0);
             } else {
                 assert_eq!(&block.senders, signers);
-                assert_eq!(&block.body, txs);
+                assert_eq!(&block.body.transactions, txs);
             }
 
             // basefee was increased for each batch
@@ -1105,8 +1107,8 @@ mod tests {
             // beneficiary overwritten
             assert_eq!(&block.beneficiary, expected_beneficiary);
             // nonce matches subdag index and method all match
-            assert_eq!(&block.nonce, expected_subdag_index);
-            assert_eq!(block.nonce, expected_output.nonce());
+            assert_eq!(<FixedBytes<8> as Into<u64>>::into(block.nonce), *expected_subdag_index);
+            assert_eq!(<FixedBytes<8> as Into<u64>>::into(block.nonce), expected_output.nonce());
 
             // timestamp
             assert_eq!(block.timestamp, expected_output.committed_at());

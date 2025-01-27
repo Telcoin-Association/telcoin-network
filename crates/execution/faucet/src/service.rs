@@ -7,7 +7,6 @@
 //! wallet within the time period.
 
 use crate::{Drip, FaucetWallet, GoogleKMSClient, Secp256k1PubKeyBytes};
-use alloy::sol_types::SolType;
 use futures::StreamExt;
 use gcloud_sdk::{
     google::cloud::kms::v1::{
@@ -19,14 +18,11 @@ use gcloud_sdk::{
 use humantime::format_duration;
 use lru_time_cache::LruCache;
 use reth::rpc::server_types::eth::{EthApiError, EthResult, RpcInvalidTransactionError};
-use reth_primitives::{
-    Address, Signature as EthSignature, Transaction, TransactionSigned, TxEip1559, TxHash, TxKind,
-    B256, U256,
-};
+use reth_primitives::transaction::SignedTransactionIntoRecoveredExt;
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_tasks::TaskSpawner;
 use reth_transaction_pool::{
-    PoolTransaction, TransactionEvent, TransactionOrigin, TransactionPool,
+    EthPooledTransaction, PoolTransaction, TransactionEvent, TransactionOrigin, TransactionPool,
 };
 use secp256k1::{
     ecdsa::{RecoverableSignature, RecoveryId, Signature},
@@ -37,6 +33,10 @@ use std::{
     pin::Pin,
     task::{ready, Context, Poll},
     time::{Duration, SystemTime},
+};
+use tn_types::{
+    Address, EthSignature, SolType, Transaction, TransactionSigned, TransactionTrait as _,
+    TxEip1559, TxHash, TxKind, B256, U256,
 };
 use tokio::sync::{
     mpsc::{UnboundedReceiver, UnboundedSender},
@@ -129,7 +129,7 @@ pub(crate) struct FaucetService<Provider, Pool, Tasks> {
 impl<Provider, Pool, Tasks> FaucetService<Provider, Pool, Tasks>
 where
     Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
-    Pool: TransactionPool + Unpin + Clone + 'static,
+    Pool: TransactionPool<Transaction = EthPooledTransaction> + Unpin + Clone + 'static,
     Tasks: TaskSpawner + Clone + 'static,
 {
     /// Calculate when the wait period is over
@@ -175,8 +175,7 @@ where
             // submit tx to pool
             match response {
                 Ok(signature) => {
-                    let tx_for_pool =
-                        TransactionSigned::from_transaction_and_signature(transaction, signature);
+                    let tx_for_pool = TransactionSigned::new_unhashed(transaction, signature);
                     let res =
                         submit_transaction(pool, tx_for_pool, add_to_success_cache, user, contract)
                             .await;
@@ -265,7 +264,7 @@ where
 
         // lookup account nonce in db and compare it last known tx nonce mined by worker
         let state = self.provider.latest()?;
-        let db_account_nonce = state.account_nonce(address)?.unwrap_or_default();
+        let db_account_nonce = state.account_nonce(&address)?.unwrap_or_default();
         debug!(target: "faucet", ?db_account_nonce, tracked_nonce=?self.next_nonce, "comparing faucet nonces");
         let highest_nonce = std::cmp::max(db_account_nonce, self.next_nonce);
 
@@ -323,14 +322,15 @@ where
         // retrieve r, s, and v values for EthSignature
         let compact = signature.serialize_compact();
 
-        // calculate `v` for eth signature's `odd_y_parity`
-        let odd_y_parity = Self::calculate_v(&message, chain_id, &compact, &public_key_bytes)?;
+        // calculate `v` for eth signature's `y_parity`
+        let y_parity = Self::calculate_v(&message, chain_id, &compact, &public_key_bytes)?;
 
         // r and s are 32 bytes each
         let (r, s) = compact.split_at(32);
 
-        let eth_signature =
-            EthSignature { r: U256::from_be_slice(r), s: U256::from_be_slice(s), odd_y_parity };
+        let r = U256::from_be_slice(r);
+        let s = U256::from_be_slice(s);
+        let eth_signature = EthSignature::new(r, s, y_parity);
 
         Ok(eth_signature)
     }
@@ -410,7 +410,7 @@ where
 impl<Provider, Pool, Tasks> Future for FaucetService<Provider, Pool, Tasks>
 where
     Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
-    Pool: TransactionPool + Unpin + Clone + 'static,
+    Pool: TransactionPool<Transaction = EthPooledTransaction> + Unpin + Clone + 'static,
     Tasks: TaskSpawner + Clone + 'static,
 {
     type Output = ();
@@ -511,17 +511,14 @@ async fn submit_transaction<Pool>(
     contract: Address,
 ) -> EthResult<TxHash>
 where
-    Pool: TransactionPool + Clone + 'static,
+    Pool: TransactionPool<Transaction = EthPooledTransaction>,
 {
-    let recovered = tx.try_into_ecrecovered().or(Err(EthApiError::InvalidTransactionSignature))?;
-    let pool_transaction = match recovered.try_into() {
-        Ok(converted) => <Pool::Transaction>::from_pooled(converted),
-        Err(_) => return Err(EthApiError::TransactionConversionError),
-    };
-
+    let pool_tx = tx.try_into_pooled().map_err(|_| EthApiError::TransactionConversionError)?;
+    let recovered =
+        pool_tx.try_into_ecrecovered().map_err(|_| EthApiError::InvalidTransactionSignature)?;
     // submit tx and subscribe to events
     let mut tx_events =
-        pool.add_transaction_and_subscribe(TransactionOrigin::Local, pool_transaction).await?;
+        pool.add_transaction_and_subscribe(TransactionOrigin::Local, recovered.into()).await?;
 
     let tx_hash = tx_events.hash();
     let mined_tx_info = MinedTxInfo::new(user, contract);

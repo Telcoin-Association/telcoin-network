@@ -7,7 +7,6 @@ use futures::{
     stream::{FuturesOrdered, FuturesUnordered},
     StreamExt,
 };
-use reth_primitives::{Address, B256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
@@ -27,9 +26,9 @@ use tn_storage::{
     traits::{Database, DbTxMut},
 };
 use tn_types::{
-    AuthorityIdentifier, Batch, BlockHash, Certificate, CommittedSubDag, Committee,
+    Address, AuthorityIdentifier, Batch, BlockHash, Certificate, CommittedSubDag, Committee,
     ConsensusHeader, ConsensusOutput, Epoch, NetworkPublicKey, Noticer, Round, TaskManager,
-    Timestamp, TnReceiver, TnSender, WorkerCache, WorkerId,
+    Timestamp, TnReceiver, TnSender, WorkerCache, WorkerId, B256,
 };
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};

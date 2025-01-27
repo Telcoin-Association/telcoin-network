@@ -2,7 +2,6 @@
 
 use eyre::ErrReport;
 use reth_beacon_consensus::BeaconForkChoiceUpdateError;
-use reth_db_common::init::InitDatabaseError;
 use reth_provider::ProviderError;
 use thiserror::Error;
 use tn_executor::SubscriberError;
@@ -25,10 +24,6 @@ pub enum NodeError {
 /// Error types when spawning the ExecutionNode
 #[derive(Debug, Error)]
 pub enum ExecutionError {
-    /// Error from init genesis
-    #[error(transparent)]
-    InitGenesis(#[from] InitDatabaseError),
-
     /// Error creating temp db
     #[error(transparent)]
     Tempdb(#[from] std::io::Error),

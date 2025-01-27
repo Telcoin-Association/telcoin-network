@@ -25,9 +25,7 @@ parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 serde_json = { workspace = true }
-alloy = { workspace = true }
 reth-chainspec = { workspace = true }
-reth-primitives = { workspace = true }
 humantime-serde = { workspace = true }
 anemo = { workspace = true }
 libp2p = { workspace = true }

@@ -54,7 +54,6 @@ tn-config = { workspace = true }
 serde_yaml = { workspace = true }
 reth = { workspace = true }
 reth-config = { workspace = true }
-reth-primitives = { workspace = true }
 reth-metrics = { workspace = true }
 reth-db = { workspace = true }
 reth-node-core = { workspace = true }

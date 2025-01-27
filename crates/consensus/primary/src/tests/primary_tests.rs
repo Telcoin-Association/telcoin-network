@@ -13,7 +13,6 @@ use fastcrypto::{
 };
 use itertools::Itertools;
 use prometheus::Registry;
-use reth_primitives::Header;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     num::NonZeroUsize,
@@ -30,8 +29,8 @@ use tn_test_utils::{
     CommitteeFixture,
 };
 use tn_types::{
-    now, AuthorityIdentifier, BlockHash, Certificate, Committee, SignatureVerificationState,
-    TaskManager,
+    now, AuthorityIdentifier, BlockHash, Certificate, Committee, ExecHeader, SealedHeader,
+    SignatureVerificationState, TaskManager,
 };
 use tn_worker::{metrics::Metrics, Worker};
 use tokio::time::timeout;
@@ -191,7 +190,7 @@ async fn test_request_vote_has_missing_execution_block() {
 
     let cb = ConsensusBus::new();
     // Need a dummy parent so we can request a vote.
-    let dummy_parent = Header::default().seal_slow();
+    let dummy_parent = SealedHeader::seal(ExecHeader::default());
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     let synchronizer = Arc::new(Synchronizer::new(target.consensus_config(), &cb));
     let task_manager = TaskManager::default();
@@ -268,15 +267,15 @@ async fn test_request_vote_older_execution_block() {
 
     let cb = ConsensusBus::new();
     // Need a dummy parent so we can request a vote.
-    let dummy_parent = Header::default().seal_slow();
+    let dummy_parent = SealedHeader::seal(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     // This will be an "older" execution block, test this still works.
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    let mut dummy = Header { nonce: 110, ..Default::default() };
-    dummy.nonce = 110;
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy.seal_slow()));
-    dummy = Header { nonce: 120, ..Default::default() };
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy.seal_slow()));
+    let mut dummy = ExecHeader { nonce: 110_u64.into(), ..Default::default() };
+    dummy.nonce = 110_u64.into();
+    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(SealedHeader::seal(dummy)));
+    dummy = ExecHeader { nonce: 120_u64.into(), ..Default::default() };
+    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(SealedHeader::seal(dummy)));
     let synchronizer = Arc::new(Synchronizer::new(target.consensus_config(), &cb));
     let task_manager = TaskManager::default();
     synchronizer.spawn(&task_manager);
@@ -352,7 +351,7 @@ async fn test_request_vote_has_missing_parents() {
 
     let cb = ConsensusBus::new();
     // Need a dummy parent so we can request a vote.
-    let dummy_parent = Header::default().seal_slow();
+    let dummy_parent = SealedHeader::seal(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     let synchronizer = Arc::new(Synchronizer::new(target.consensus_config(), &cb));
@@ -467,7 +466,7 @@ async fn test_request_vote_accept_missing_parents() {
 
     let cb = ConsensusBus::new();
     // Need a dummy parent so we can request a vote.
-    let dummy_parent = Header::default().seal_slow();
+    let dummy_parent = SealedHeader::seal(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     let synchronizer = Arc::new(Synchronizer::new(target.consensus_config(), &cb));
@@ -573,7 +572,7 @@ async fn test_request_vote_missing_batches() {
 
     let cb = ConsensusBus::new();
     // Need a dummy parent so we can request a vote.
-    let dummy_parent = Header::default().seal_slow();
+    let dummy_parent = SealedHeader::seal(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     let synchronizer = Arc::new(Synchronizer::new(primary.consensus_config(), &cb));
@@ -668,7 +667,7 @@ async fn test_request_vote_already_voted() {
 
     let cb = ConsensusBus::new();
     // Need a dummy parent so we can request a vote.
-    let dummy_parent = Header::default().seal_slow();
+    let dummy_parent = SealedHeader::seal(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     let synchronizer = Arc::new(Synchronizer::new(primary.consensus_config(), &cb));
@@ -909,7 +908,7 @@ async fn test_request_vote_created_at_in_future() {
 
     let cb = ConsensusBus::new();
     // Need a dummy parent so we can request a vote.
-    let dummy_parent = Header::default().seal_slow();
+    let dummy_parent = SealedHeader::seal(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     let synchronizer = Arc::new(Synchronizer::new(primary.consensus_config(), &cb));

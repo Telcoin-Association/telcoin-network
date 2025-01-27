@@ -7,10 +7,6 @@
 //! signature to be EVM compatible. The faucet service does all of this and
 //! then submits the transaction to the RPC Transaction Pool for the next batch.
 
-use alloy::{
-    hex, sol,
-    sol_types::{SolType, SolValue},
-};
 use gcloud_sdk::{
     google::cloud::kms::v1::{
         key_management_service_client::KeyManagementServiceClient, GetPublicKeyRequest,
@@ -19,10 +15,8 @@ use gcloud_sdk::{
 };
 use jsonrpsee::{core::client::ClientT, rpc_params};
 use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicKey as PubKey};
+use reth::core::primitives::SignedTransaction;
 use reth_chainspec::ChainSpec;
-use reth_primitives::{
-    alloy_primitives::U160, public_key_to_address, Address, GenesisAccount, B256, U256,
-};
 use reth_provider::ExecutionOutcome;
 use reth_transaction_pool::TransactionPool;
 use secp256k1::PublicKey;
@@ -37,8 +31,9 @@ use tn_test_utils::{
     TransactionFactory,
 };
 use tn_types::{
-    adiri_genesis, error::BlockSealError, Batch, Notifier, SealedBatch, TaskManager,
-    TransactionSigned,
+    adiri_genesis, error::BlockSealError, hex, public_key_to_address, sol, Address, Batch,
+    GenesisAccount, Notifier, SealedBatch, SolType, SolValue, TaskManager, TransactionSigned,
+    TransactionTrait as _, B256, U160, U256,
 };
 use tn_worker::{
     metrics::WorkerMetrics,
@@ -298,7 +293,7 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
     let tx = batch_txs.first().expect("first batch tx from faucet");
 
     // assert recovered transaction
-    assert_eq!(tx_hash, tx.hash_ref().to_string());
+    assert_eq!(tx_hash, tx.tx_hash().to_string());
     assert_eq!(tx.transaction.to(), Some(faucet_proxy_address));
 
     // ensure duplicate request is error
@@ -323,7 +318,7 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
     let tx_pool = execution_node.get_worker_transaction_pool(&worker_id).await?;
     let pool_tx = tx_pool.get(&tx_hash).expect("tx in pool");
     let recovered = pool_tx.transaction.transaction();
-    assert_eq!(&tx_hash, recovered.hash_ref());
+    assert_eq!(&tx_hash, recovered.tx_hash());
     assert_eq!(recovered.transaction.to(), Some(faucet_proxy_address));
     assert_eq!(recovered.transaction.nonce(), 1);
     Ok(())
@@ -614,7 +609,7 @@ async fn test_with_creds_faucet_transfers_stablecoin_with_google_kms() -> eyre::
     let expected_input = [&selector, &contract_params[..]].concat();
 
     // assert recovered transaction
-    let expected_tx_hash = tx.hash_ref().to_string();
+    let expected_tx_hash = tx.tx_hash().to_string();
     assert_eq!(tx_hash, expected_tx_hash);
     assert_eq!(tx.transaction.input(), &expected_input);
 

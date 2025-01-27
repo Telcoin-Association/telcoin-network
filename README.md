@@ -3,7 +3,7 @@
 Consensus layer (CL) is an implementation of Narwhal and Bullshark.
 Execution layer (EL) produces EVM blocks compatible with Ethereum.
 
-Requires Rust 1.81
+Requires Rust 1.82
 
 ### Supported Platforms
 

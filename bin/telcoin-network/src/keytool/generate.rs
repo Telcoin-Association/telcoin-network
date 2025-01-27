@@ -7,11 +7,10 @@ use rand::prelude::*;
 use rand_chacha::ChaCha20Rng;
 use reth::dirs::MaybePlatformPath;
 use reth_chainspec::ChainSpec;
-use reth_primitives::Address;
 use std::{path::Path, sync::Arc};
 use tn_config::{Config, BLS_KEYFILE, PRIMARY_NETWORK_KEYFILE, WORKER_NETWORK_KEYFILE};
 use tn_node::dirs::DataDirPath;
-use tn_types::{generate_proof_of_possession_bls, BlsKeypair, NetworkKeypair};
+use tn_types::{generate_proof_of_possession_bls, Address, BlsKeypair, NetworkKeypair};
 use tracing::info;
 
 /// Generate keypairs and save them to a file.

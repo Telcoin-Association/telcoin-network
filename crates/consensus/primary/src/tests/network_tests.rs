@@ -3,7 +3,6 @@
 use crate::{network::RequestHandler, synchronizer::Synchronizer, ConsensusBus, RecentBlocks};
 use assert_matches::assert_matches;
 use fastcrypto::hash::Hash as _;
-use reth_primitives::SealedHeader;
 use std::{collections::BTreeSet, sync::Arc};
 use tn_config::ConsensusConfig;
 use tn_storage::mem_db::MemDatabase;
@@ -12,6 +11,7 @@ use tn_types::{
     error::HeaderError, now, traits::InsecureDefault, AuthorityIdentifier, BlockHash, Certificate,
     CertificateDigest, TaskManager,
 };
+use tn_types::{ExecHeader, SealedHeader};
 use tracing::debug;
 
 /// The type for holding testng components.
@@ -45,7 +45,7 @@ fn create_test_types() -> TestTypes {
     synchronizer.spawn(&task_manager);
 
     // last execution result
-    let parent = SealedHeader::default();
+    let parent = SealedHeader::seal(ExecHeader::default());
 
     // set the latest execution result to genesis - test headers are proposed for round 1
     let mut recent = RecentBlocks::new(1);

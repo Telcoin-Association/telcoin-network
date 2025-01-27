@@ -5,8 +5,8 @@
 //!
 //! adiri is the current name for multi-node testnet.
 
+use crate::{Genesis, MIN_PROTOCOL_BASE_FEE};
 use reth_chainspec::ChainSpec;
-use reth_primitives::{constants::MIN_PROTOCOL_BASE_FEE, Genesis};
 use std::sync::Arc;
 
 /// adiri genesis

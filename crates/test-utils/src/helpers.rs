@@ -9,15 +9,15 @@ use rand::{
     rngs::{OsRng, StdRng},
     thread_rng, Rng, RngCore, SeedableRng,
 };
-use reth_primitives::{Address, BlockHash, Bytes, Header, TransactionSigned, U256};
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     ops::RangeInclusive,
 };
 use tn_types::{
-    adiri_chain_spec_arc, to_intent_message, AuthorityIdentifier, Batch, BlsKeypair, BlsSignature,
-    Certificate, CertificateDigest, Committee, Epoch, HeaderBuilder, Multiaddr, NetworkKeypair,
-    ProtocolSignature, Round, Stake, TimestampSec, WorkerId,
+    adiri_chain_spec_arc, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash,
+    BlsKeypair, BlsSignature, Bytes, Certificate, CertificateDigest, Committee, Epoch, ExecHeader,
+    HeaderBuilder, Multiaddr, NetworkKeypair, ProtocolSignature, Round, Stake, TimestampSec,
+    TransactionSigned, WorkerId, U256,
 };
 
 pub const VOTES_CF: &str = "votes";
@@ -173,7 +173,7 @@ pub fn transaction_with_rand<R: Rng + ?Sized>(rand: &mut R) -> TransactionSigned
 pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Batch {
     Batch::new_for_test(
         vec![transaction_with_rand(rand), transaction_with_rand(rand)],
-        Header::default(),
+        ExecHeader::default(),
     )
 }
 
@@ -230,7 +230,7 @@ pub fn batch_with_transactions(num_of_transactions: usize) -> Batch {
         transactions.push(transaction());
     }
 
-    Batch::new_for_test(transactions, Header::default())
+    Batch::new_for_test(transactions, ExecHeader::default())
 }
 
 /// Creates one certificate per authority starting and finishing at the specified rounds

@@ -6,9 +6,13 @@
 //!
 //! The mined transactions are returned with the built block so the worker can update the pool.
 
-use reth_primitives::{IntoRecoveredTransaction, TxHash};
-use reth_transaction_pool::TransactionPool;
-use tn_types::{max_batch_gas, max_batch_size, now, Batch, BatchBuilderArgs, PendingBlockConfig};
+use crate::error::BatchBuilderError;
+use reth_primitives_traits::InMemorySize as _;
+use reth_transaction_pool::{error::InvalidPoolTransactionError, PoolTransaction, TransactionPool};
+use tn_types::{
+    max_batch_gas, max_batch_size, now, Batch, BatchBuilderArgs, PendingBlockConfig,
+    TransactionSigned, TransactionTrait as _, TxHash,
+};
 use tracing::{debug, warn};
 
 /// The output from building the next block.
@@ -44,6 +48,7 @@ pub struct BatchBuilderOutput {
 pub fn build_batch<P>(args: BatchBuilderArgs<P>) -> BatchBuilderOutput
 where
     P: TransactionPool,
+    P::Transaction: PoolTransaction<Consensus = TransactionSigned>,
 {
     let BatchBuilderArgs { pool, batch_config } = args;
     let gas_limit = max_batch_gas(batch_config.parent_info.tip.timestamp);
@@ -75,7 +80,10 @@ where
             // marking as invalid within the context of the `BestTransactions` pulled in this
             // current iteration  all dependents for this transaction are now considered invalid
             // before continuing loop
-            best_txs.mark_invalid(&pool_tx);
+            best_txs.mark_invalid(
+                &pool_tx,
+                InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), gas_limit),
+            );
             debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to gas constraint");
             continue;
         }
@@ -83,7 +91,7 @@ where
         // convert tx to a signed transaction
         //
         // NOTE: `ValidPoolTransaction::size()` is private
-        let tx = pool_tx.to_recovered_transaction();
+        let tx = pool_tx.to_consensus();
 
         // ensure block has capacity (in bytes) for this transaction
         if total_bytes_size + tx.size() > max_size {
@@ -91,7 +99,13 @@ where
             // marking as invalid within the context of the `BestTransactions` pulled in this
             // current iteration  all dependents for this transaction are now considered invalid
             // before continuing loop
-            best_txs.mark_invalid(&pool_tx);
+            best_txs.mark_invalid(
+                &pool_tx,
+                InvalidPoolTransactionError::Other(Box::new(BatchBuilderError::MaxBatchSize(
+                    tx.size(),
+                    max_size,
+                ))),
+            );
             debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to bytes constraint");
             continue;
         }
@@ -101,8 +115,8 @@ where
         total_bytes_size += tx.size();
 
         // append transaction to the list of executed transactions
-        mined_transactions.push(tx.hash());
-        transactions.push(tx.into_signed());
+        mined_transactions.push(*pool_tx.hash());
+        transactions.push(tx.into_tx());
     }
 
     // TODO: use ms for batch and sec for final block?

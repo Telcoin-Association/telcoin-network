@@ -2,7 +2,7 @@
 //!
 //! This is an experimental approach to supporting pending blocks for workers.
 
-use reth_primitives::{Address, SealedBlock};
+use crate::{Address, SealedBlock};
 
 /// The arguments passed to the worker's block builder.
 #[derive(Debug)]

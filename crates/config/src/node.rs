@@ -3,7 +3,6 @@
 use crate::{ConfigTrait, ValidatorInfo};
 use fastcrypto::traits::KeyPair as KeyPairTrait;
 use reth_chainspec::ChainSpec;
-use reth_primitives::{Address, Genesis};
 use serde::{Deserialize, Serialize};
 use std::{
     num::NonZeroU32,
@@ -11,8 +10,8 @@ use std::{
     time::Duration,
 };
 use tn_types::{
-    adiri_genesis, get_available_tcp_port, get_available_udp_port, BlsPublicKey, BlsSignature,
-    Multiaddr, NetworkPublicKey, WorkerIndex,
+    adiri_genesis, get_available_tcp_port, get_available_udp_port, Address, BlsPublicKey,
+    BlsSignature, Genesis, Multiaddr, NetworkPublicKey, WorkerIndex,
 };
 use tracing::info;
 

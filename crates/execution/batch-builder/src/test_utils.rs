@@ -1,16 +1,14 @@
 //! Types for testing only.
 
 use crate::{build_batch, BatchBuilderOutput};
-use reth_primitives::{
-    constants::MIN_PROTOCOL_BASE_FEE, Address, BlobTransactionSidecar, BlockBody,
-    PooledTransactionsElement, SealedBlock, SealedHeader, TxHash,
-};
 use reth_transaction_pool::{
+    error::InvalidPoolTransactionError,
     identifier::{SenderIdentifiers, TransactionId},
     AllPoolTransactions, AllTransactionsEvents, BestTransactions, BestTransactionsAttributes,
     BlobStoreError, BlockInfo, EthPooledTransaction, GetPooledTransactionLimit, NewBlobSidecar,
-    NewTransactionEvent, PoolResult, PoolSize, PropagatedTransactions, TransactionEvents,
-    TransactionListenerKind, TransactionOrigin, TransactionPool, ValidPoolTransaction,
+    NewTransactionEvent, PoolResult, PoolSize, PoolTransaction, PropagatedTransactions,
+    TransactionEvents, TransactionListenerKind, TransactionOrigin, TransactionPool,
+    ValidPoolTransaction,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -18,7 +16,10 @@ use std::{
     time::Instant,
 };
 use tn_types::{
-    Batch, BatchBuilderArgs, LastCanonicalUpdate, PendingBlockConfig, TransactionSigned,
+    Address, Batch, BatchBuilderArgs, BlobAndProofV1, BlobTransactionSidecar, BlockBody,
+    LastCanonicalUpdate, PendingBlockConfig, RecoveredTx, SealedBlock, SealedHeader,
+    TransactionSigned, TransactionTrait as _, TxHash, B256, ETHEREUM_BLOCK_GAS_LIMIT,
+    MIN_PROTOCOL_BASE_FEE,
 };
 use tokio::sync::mpsc::{self, Receiver};
 
@@ -59,7 +60,7 @@ impl TestPool {
         let transactions = txs
             .into_iter()
             .map(|tx| {
-                let ecrecovered = tx.try_into_ecrecovered().expect("tx into ecrecovered");
+                let ecrecovered = tx.into_ecrecovered().expect("tx into ecrecovered");
                 let nonce = ecrecovered.nonce();
                 // add to sender ids
                 let id = sender_ids.sender_id_or_create(ecrecovered.signer());
@@ -98,6 +99,7 @@ impl TransactionPool for TestPool {
             last_seen_block_number: 0,
             pending_basefee: 0,
             pending_blob_fee: None,
+            block_gas_limit: ETHEREUM_BLOCK_GAS_LIMIT,
         }
     }
 
@@ -190,14 +192,14 @@ impl TransactionPool for TestPool {
         &self,
         _tx_hashes: Vec<TxHash>,
         _limit: GetPooledTransactionLimit,
-    ) -> Vec<PooledTransactionsElement> {
+    ) -> Vec<<Self::Transaction as PoolTransaction>::Pooled> {
         vec![]
     }
 
     fn get_pooled_transaction_element(
         &self,
         _tx_hash: TxHash,
-    ) -> Option<PooledTransactionsElement> {
+    ) -> Option<RecoveredTx<<Self::Transaction as PoolTransaction>::Pooled>> {
         None
     }
 
@@ -222,13 +224,6 @@ impl TransactionPool for TestPool {
             invalid: Default::default(),
             skip_blobs: true,
         })
-    }
-
-    fn best_transactions_with_base_fee(
-        &self,
-        _: u64,
-    ) -> Box<dyn BestTransactions<Item = Arc<ValidPoolTransaction<Self::Transaction>>>> {
-        Box::new(std::iter::empty())
     }
 
     fn best_transactions_with_attributes(
@@ -257,11 +252,7 @@ impl TransactionPool for TestPool {
         vec![]
     }
 
-    fn retain_unknown<A>(&self, _announcement: &mut A)
-    //where
-    // A: HandleMempoolData,
-    {
-    }
+    fn retain_unknown<A>(&self, _announcement: &mut A) {}
 
     fn get(&self, _tx_hash: &TxHash) -> Option<Arc<ValidPoolTransaction<Self::Transaction>>> {
         None
@@ -299,21 +290,24 @@ impl TransactionPool for TestPool {
         Default::default()
     }
 
-    fn get_blob(&self, _tx_hash: TxHash) -> Result<Option<BlobTransactionSidecar>, BlobStoreError> {
+    fn get_blob(
+        &self,
+        _tx_hash: TxHash,
+    ) -> Result<Option<Arc<BlobTransactionSidecar>>, BlobStoreError> {
         Ok(None)
     }
 
     fn get_all_blobs(
         &self,
         _tx_hashes: Vec<TxHash>,
-    ) -> Result<Vec<(TxHash, BlobTransactionSidecar)>, BlobStoreError> {
+    ) -> Result<Vec<(TxHash, Arc<BlobTransactionSidecar>)>, BlobStoreError> {
         Ok(vec![])
     }
 
     fn get_all_blobs_exact(
         &self,
         tx_hashes: Vec<TxHash>,
-    ) -> Result<Vec<BlobTransactionSidecar>, BlobStoreError> {
+    ) -> Result<Vec<Arc<BlobTransactionSidecar>>, BlobStoreError> {
         if tx_hashes.is_empty() {
             return Ok(vec![]);
         }
@@ -325,6 +319,72 @@ impl TransactionPool for TestPool {
         _origin: TransactionOrigin,
     ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
         vec![]
+    }
+
+    fn pending_transactions_max(
+        &self,
+        _max: usize,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        vec![]
+    }
+
+    fn remove_transactions_and_descendants(
+        &self,
+        _hashes: Vec<TxHash>,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        vec![]
+    }
+
+    fn remove_transactions_by_sender(
+        &self,
+        _sender: Address,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        vec![]
+    }
+
+    #[doc = " Returns all pending transactions filtered by predicate"]
+    fn get_pending_transactions_with_predicate(
+        &self,
+        _predicate: impl FnMut(&ValidPoolTransaction<Self::Transaction>) -> bool,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        vec![]
+    }
+
+    fn get_pending_transactions_by_sender(
+        &self,
+        _sender: Address,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        vec![]
+    }
+
+    fn get_queued_transactions_by_sender(
+        &self,
+        _sender: Address,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        vec![]
+    }
+
+    fn get_highest_transaction_by_sender(
+        &self,
+        _sender: Address,
+    ) -> Option<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        None
+    }
+
+    fn get_highest_consecutive_transaction_by_sender(
+        &self,
+        _sender: Address,
+        _on_chain_nonce: u64,
+    ) -> Option<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        None
+    }
+
+    #[doc = " Return the [`BlobTransactionSidecar`]s for a list of blob versioned hashes."]
+    fn get_blobs_for_versioned_hashes(
+        &self,
+        versioned_hashes: &[B256],
+    ) -> Result<Vec<Option<BlobAndProofV1>>, BlobStoreError> {
+        Ok(vec![None; versioned_hashes.len()])
     }
 }
 
@@ -360,7 +420,7 @@ impl BestTestTransactions {
 }
 
 impl BestTransactions for BestTestTransactions {
-    fn mark_invalid(&mut self, tx: &Self::Item) {
+    fn mark_invalid(&mut self, tx: &Self::Item, _kind: InvalidPoolTransactionError) {
         Self::mark_invalid(self, tx)
     }
 

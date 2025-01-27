@@ -1,11 +1,10 @@
 //! Utilities for parsing args
 
-use reth::{args::utils::chain_value_parser, dirs::MaybePlatformPath};
+use reth::{chainspec::chain_value_parser, dirs::MaybePlatformPath};
 use reth_chainspec::ChainSpec;
-use reth_primitives::Address;
 use std::{str::FromStr, sync::Arc};
 use tn_node::dirs::DataDirPath;
-use tn_types::adiri_chain_spec_arc;
+use tn_types::{adiri_chain_spec_arc, Address};
 
 /// Create a default path for the node.
 pub fn tn_platform_path(value: &str) -> eyre::Result<MaybePlatformPath<DataDirPath>> {

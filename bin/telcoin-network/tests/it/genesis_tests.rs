@@ -2,22 +2,21 @@
 mod tests {
     use crate::util::{get_contract_state_for_genesis, spawn_local_testnet};
     use alloy::{
-        hex,
         network::EthereumWallet,
         primitives::{FixedBytes, Uint},
         providers::ProviderBuilder,
-        sol,
-        sol_types::SolValue,
     };
     use fastcrypto::traits::{KeyPair, ToFromBytes};
     use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
     use rand::{rngs::StdRng, SeedableRng};
-    use reth::primitives::{Address, Bytes, GenesisAccount, U256};
     use reth_chainspec::ChainSpec;
     use std::{sync::Arc, time::Duration};
     use tn_config::{test_fetch_file_content_relative_to_manifest, ContractStandardJson};
     use tn_test_utils::TransactionFactory;
-    use tn_types::{adiri_genesis, BlsKeypair, NetworkKeypair};
+    use tn_types::{
+        adiri_genesis, hex, sol, Address, BlsKeypair, Bytes, GenesisAccount, NetworkKeypair,
+        SolValue, U256,
+    };
 
     #[tokio::test]
     async fn test_genesis_with_consensus_registry() {

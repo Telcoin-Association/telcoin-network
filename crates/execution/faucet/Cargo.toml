@@ -29,7 +29,6 @@ clap = { workspace = true, features = ["env"] }
 eyre = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }
 lru_time_cache = { version = "0.11.11" }
-alloy = { workspace = true }
 jsonrpsee = { workspace = true, features = ["macros"] }
 serde = { workspace = true }
 # still needed for jsonrpsee 0.24.3

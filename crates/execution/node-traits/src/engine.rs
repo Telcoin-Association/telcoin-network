@@ -1,69 +1,88 @@
-//! Recreated `AutoSealConsensus` to reduce the amount of imports from reth.
+//! Compatibility with reth's API for engine types.
 
-use crate::ConsensusOutput;
 use reth_chainspec::ChainSpec;
-use reth_consensus::PostExecutionInput;
 pub use reth_consensus::{Consensus, ConsensusError};
-use reth_evm_ethereum::revm_spec_by_timestamp_after_merge;
-use reth_primitives::{
-    Address, BlockWithSenders, Header, SealedBlock, SealedHeader, Withdrawals, B256, U256,
+use reth_consensus::{FullConsensus, HeaderValidator, PostExecutionInput};
+use reth_engine_primitives::PayloadValidator;
+use reth_revm::primitives::{
+    BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, SpecId,
 };
-use reth_revm::primitives::{BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg};
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+use tn_types::{
+    Address, BlockExt as _, BlockWithSenders, ConsensusOutput, NodePrimitives, SealedBlock,
+    SealedHeader, Withdrawals, B256, U256,
+};
 
-/// A consensus implementation that validates everything.
+/// Compatibility type to easily integrate with reth.
 ///
-/// Taken from reth's `AutoSealConsensus`.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct AutoSealConsensus {
-    /// Configuration
-    chain_spec: Arc<ChainSpec>,
-}
+/// This type is used to noop verify all data. It is not used by Telcoin Network, but is required to
+/// integrate with reth for convenience. TN is mostly EVM/Ethereum types, but with a different
+/// consensus. The traits impl on this type are only used beacon engine, which is not used by TN.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TNExecution;
 
-impl AutoSealConsensus {
-    /// Create a new instance of [AutoSealConsensus]
-    pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { chain_spec }
-    }
-
-    /// Clone copy of `ChainSpec`.
-    pub fn chain_spec(&self) -> &Arc<ChainSpec> {
-        &self.chain_spec
-    }
-}
-
-impl Consensus for AutoSealConsensus {
-    fn validate_header(&self, _header: &SealedHeader) -> Result<(), ConsensusError> {
+impl<H> HeaderValidator<H> for TNExecution {
+    fn validate_header(&self, _header: &SealedHeader<H>) -> Result<(), ConsensusError> {
         Ok(())
     }
 
     fn validate_header_against_parent(
         &self,
-        _header: &SealedHeader,
-        _parent: &SealedHeader,
+        _header: &SealedHeader<H>,
+        _parent: &SealedHeader<H>,
     ) -> Result<(), ConsensusError> {
         Ok(())
     }
 
     fn validate_header_with_total_difficulty(
         &self,
-        _header: &Header,
+        _header: &H,
         _total_difficulty: U256,
     ) -> Result<(), ConsensusError> {
         Ok(())
     }
+}
 
-    fn validate_block_pre_execution(&self, _block: &SealedBlock) -> Result<(), ConsensusError> {
+impl<H, B> Consensus<H, B> for TNExecution {
+    fn validate_body_against_header(
+        &self,
+        _body: &B,
+        _header: &SealedHeader<H>,
+    ) -> Result<(), ConsensusError> {
         Ok(())
     }
 
-    fn validate_block_post_execution(
+    fn validate_block_pre_execution(
         &self,
-        _block: &BlockWithSenders,
-        _input: PostExecutionInput<'_>,
+        _block: &SealedBlock<H, B>,
     ) -> Result<(), ConsensusError> {
         Ok(())
+    }
+}
+
+impl<N: NodePrimitives> FullConsensus<N> for TNExecution {
+    fn validate_block_post_execution(
+        &self,
+        _block: &BlockWithSenders<N::Block>,
+        _input: PostExecutionInput<'_, N::Receipt>,
+    ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+}
+
+// Compatibility noop trait impl.
+// This is for the reth rpc build method.
+// NOTE: this should never be called because there is no beacon API
+impl PayloadValidator for TNExecution {
+    type Block = tn_types::Block;
+
+    fn ensure_well_formed_payload(
+        &self,
+        payload: alloy::rpc::types::engine::ExecutionPayload,
+        sidecar: alloy::rpc::types::engine::ExecutionPayloadSidecar,
+    ) -> Result<reth_primitives::SealedBlockFor<Self::Block>, alloy::rpc::types::engine::PayloadError>
+    {
+        Ok(payload.try_into_block_with_sidecar(&sidecar)?.seal_slow())
     }
 }
 
@@ -106,10 +125,10 @@ impl TNPayload {
         let cfg = CfgEnv::default().with_chain_id(chain_spec.chain().id());
 
         // ensure we're not missing any timestamp based hardforks
-        let spec_id = revm_spec_by_timestamp_after_merge(chain_spec, self.timestamp());
+        let spec_id = SpecId::SHANGHAI;
 
         // use the blob excess gas and price set by the worker during batch creation
-        let blob_excess_gas_and_price = Some(BlobExcessGasAndPrice::new(0));
+        let blob_excess_gas_and_price = Some(BlobExcessGasAndPrice::new(0, false));
 
         // use the basefee set by the worker during batch creation
         let basefee = U256::from(self.attributes.base_fee_per_gas);

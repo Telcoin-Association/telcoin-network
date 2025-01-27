@@ -17,7 +17,7 @@ futures-util = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
 
-reth-primitives = { workspace = true }
+reth-primitives-traits = { workspace = true }
 reth-errors = { workspace = true }
 reth-stages = { workspace = true }
 reth-provider = { workspace = true }
@@ -32,14 +32,15 @@ alloy-rlp = { workspace = true }
 
 [dev-dependencies]
 # unit tests
+tn-node-traits = { workspace = true }
 tn-test-utils = { workspace = true }
-reth = { workspace = true }
 assert_matches = { workspace = true }
 reth-blockchain-tree = { workspace = true }
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
 fastcrypto = { workspace = true }
 tempfile = { workspace = true }
 reth-provider = { workspace = true, features = ["test-utils"] }
+reth-consensus = { workspace = true }
 
 # integration tests
 anemo = { workspace = true }
@@ -56,7 +57,6 @@ tn-engine = { workspace = true }
 tn-batch-builder = { workspace = true, features = ["test-utils"] }
 
 # TODO: only used for canon it test
-reth-prune = { workspace = true }
 reth-node-ethereum = { workspace = true }
 
 [features]

@@ -1,7 +1,6 @@
 //! IT tests
 
 use fastcrypto::hash::Hash;
-use reth_primitives::{Header, B256};
 use std::{collections::BTreeSet, sync::Arc};
 use tn_executor::get_restored_consensus_output;
 use tn_primary::{
@@ -10,7 +9,10 @@ use tn_primary::{
 };
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{Certificate, TaskManager, TnReceiver, TnSender, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
+use tn_types::{
+    Certificate, ExecHeader, SealedHeader, TaskManager, TnReceiver, TnSender, B256,
+    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+};
 
 #[tokio::test]
 async fn test_recovery() {
@@ -49,7 +51,7 @@ async fn test_recovery() {
     let cb = ConsensusBus::new();
     let cb_clone = cb.clone();
     let mut rx_output = cb.sequence().subscribe();
-    let dummy_parent = Header::default().seal(B256::default());
+    let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     // pretend we are synced and ready to go so test can run...
     cb.node_mode().send(tn_primary::NodeMode::CvvActive).unwrap();

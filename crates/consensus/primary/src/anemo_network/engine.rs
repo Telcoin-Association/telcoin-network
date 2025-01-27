@@ -3,8 +3,8 @@
 //! Implementation logic for processing inner-node messages from this primary's engine.
 
 use anemo::async_trait;
-use reth_primitives::SealedHeader;
 use tn_network_types::{CanonicalUpdateMessage, EngineToPrimary};
+use tn_types::SealedHeader;
 use tokio::sync::watch;
 
 #[allow(dead_code)]

@@ -8,22 +8,22 @@ use reth_blockchain_tree::{BlockValidationKind, BlockchainTreeEngine};
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
 use reth_execution_types::ExecutionOutcome;
-use reth_payload_builder::database::CachedReads;
-use reth_primitives::{
-    constants::{EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS},
-    Block, Header, Receipt, SealedBlockWithSenders, SealedHeader, Withdrawals, B256,
-    EMPTY_OMMER_ROOT_HASH, U256,
-};
+use reth_primitives_traits::SignedTransaction as _;
 use reth_provider::{CanonChainTracker, ChainSpecProvider, StateProviderFactory};
 use reth_revm::{
+    cached::CachedReads,
     database::StateProviderDatabase,
     db::states::bundle_state::BundleRetention,
-    primitives::{EVMError, EnvWithHandlerCfg, ResultAndState},
+    primitives::{EVMError, EnvWithHandlerCfg, FixedBytes, ResultAndState, TxEnv},
     DatabaseCommit, State,
 };
-use reth_trie::HashedPostState;
 use std::sync::Arc;
-use tn_types::{max_batch_gas, Batch, BuildArguments, TNPayload, TNPayloadAttributes};
+use tn_node_traits::{BuildArguments, TNPayload, TNPayloadAttributes};
+use tn_types::{
+    calculate_transaction_root, max_batch_gas, Batch, Block, BlockBody, BlockExt as _, ExecHeader,
+    Receipt, SealedBlockWithSenders, SealedHeader, TransactionSigned, Withdrawals, B256,
+    EMPTY_OMMER_ROOT_HASH, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, U256,
+};
 use tracing::{debug, error, info, warn};
 
 /// Execute output from consensus to extend the canonical chain.
@@ -31,15 +31,15 @@ use tracing::{debug, error, info, warn};
 /// The function handles all types of output, included multiple blocks and empty blocks.
 #[inline]
 pub fn execute_consensus_output<EvmConfig, Provider>(
-    evm_config: EvmConfig,
+    evm_config: &EvmConfig,
     args: BuildArguments<Provider>,
 ) -> EngineResult<SealedHeader>
 where
-    EvmConfig: ConfigureEvm,
+    EvmConfig: ConfigureEvm<Transaction = TransactionSigned>,
     Provider: StateProviderFactory
         + ChainSpecProvider<ChainSpec = ChainSpec>
         + BlockchainTreeEngine
-        + CanonChainTracker,
+        + CanonChainTracker<Header = ExecHeader>,
 {
     let BuildArguments { provider, mut output, parent_header } = args;
     debug!(target: "engine", ?output, "executing output");
@@ -131,7 +131,7 @@ where
 
             // execute
             let next_canonical_block = build_block_from_batch_payload(
-                &evm_config,
+                evm_config,
                 payload,
                 &provider,
                 provider.chain_spec(),
@@ -173,7 +173,7 @@ where
     //
     // see: reth/crates/consensus/beacon/src/engine/mod.rs:update_canon_chain
     provider.set_canonical_head(canonical_header.clone());
-    info!(target: "engine", "canonical head for round {:?}: {:?} - {:?}", canonical_header.nonce, canonical_header.number, canonical_header.hash());
+    info!(target: "engine", "canonical head for round {:?}: {:?} - {:?}", <FixedBytes<8> as Into<u64>>::into(canonical_header.nonce), canonical_header.number, canonical_header.hash());
 
     // finalize the last block executed from consensus output and update chain info
     //
@@ -201,24 +201,23 @@ fn build_block_from_batch_payload<EvmConfig, Provider>(
     consensus_header_hash: B256,
 ) -> EngineResult<SealedBlockWithSenders>
 where
-    EvmConfig: ConfigureEvm,
+    EvmConfig: ConfigureEvm<Transaction = TransactionSigned>,
     Provider: StateProviderFactory,
 {
     let state_provider = provider.state_by_block_hash(payload.attributes.parent_header.hash())?;
     let state = StateProviderDatabase::new(state_provider);
 
-    // TODO: using same apprach as reth here bc I can't find the State::builder()'s methods
+    // TODO: using same approach as reth here bc I can't find the State::builder()'s methods
     // I'm not sure what `with_bundle_update` does, and using `CachedReads` is the only way
     // I can get the state root section below to compile using `db.commit(state)`.
     //
     // TODO: create `CachedReads` during batch validation?
     let mut cached_reads = CachedReads::default();
     let mut db =
-        State::builder().with_database_ref(cached_reads.as_db(state)).with_bundle_update().build();
+        State::builder().with_database(cached_reads.as_db_mut(state)).with_bundle_update().build();
 
     debug!(target: "payload_builder", parent_hash = ?payload.attributes.parent_header.hash(), parent_number = payload.attributes.parent_header.number, "building new payload");
     // collect these totals to report at the end
-    let _total_gas_used = 0; // TODO: include blobs
     let mut cumulative_gas_used = 0;
     let mut total_fees = U256::ZERO;
     let mut executed_txs = Vec::new();
@@ -260,39 +259,19 @@ where
 
     // TODO: parallelize tx recovery when it's worth it (see TransactionSigned::recover_signers())
 
-    for tx in batch.transactions {
-        //txs {
-        // // TODO: support blob gas with cancun genesis hardfork
-        // //
-        // // There's only limited amount of blob space available per block, so we need to check if
-        // // the EIP-4844 can still fit in the block
-        // //
-        // // note: this should never be a problem
-        // if let Some(blob_tx) = tx.as_eip4844() {
-        //     let tx_blob_gas = blob_tx.blob_gas();
-        //     if sum_blob_gas_used + tx_blob_gas > MAX_DATA_GAS_PER_BLOCK {
-        //         // this should never happen and is considered an error
-        //         error!(target: "payload_builder", tx=?tx.hash, ?sum_blob_gas_used, ?tx_blob_gas,
-        // "skipping blob transaction because it would exceed the max data gas per block");
-        //         // TODO: should this break the process?
-        //         continue;
-        //     }
-        // }
+    let env = EnvWithHandlerCfg::new_with_cfg_env(cfg.clone(), block_env.clone(), TxEnv::default());
+    let mut evm = evm_config.evm_with_env(&mut db, env);
 
-        let tx = if let Some(signer) = tx.recover_signer() {
+    for tx in batch.transactions {
+        let recovered = if let Some(signer) = tx.recover_signer() {
             tx.with_signer(signer)
         } else {
             error!(target: "engine", "Could not recover signer for {tx:?}");
             return Err(TnEngineError::MissingSigner);
         };
-        let env = EnvWithHandlerCfg::new_with_cfg_env(
-            cfg.clone(),
-            block_env.clone(),
-            evm_config.tx_env(&tx),
-        );
 
-        // Configure the environment for the block.
-        let mut evm = evm_config.evm_with_env(&mut db, env);
+        // Configure the environment for the tx.
+        *evm.tx_mut() = evm_config.tx_env(recovered.tx(), recovered.signer());
 
         let ResultAndState { result, state } = match evm.transact() {
             Ok(res) => res,
@@ -302,7 +281,7 @@ where
                     //
                     // it's possible that another worker's batch included this transaction
                     EVMError::Transaction(err) => {
-                        warn!(target: "engine", tx_hash=?tx.hash(), ?err);
+                        warn!(target: "engine", tx_hash=?recovered.hash(), ?err);
 
                         // TODO: collect metrics here
 
@@ -319,22 +298,8 @@ where
             }
         };
 
-        // drop evm so db is released.
-        drop(evm);
         // commit changes
-        db.commit(state);
-
-        // // add to the total blob gas used if the transaction successfully executed
-        // if let Some(blob_tx) = tx.transaction.as_eip4844() {
-        //     let tx_blob_gas = blob_tx.blob_gas();
-        //     sum_blob_gas_used += tx_blob_gas;
-
-        //     // TODO: this is important for worker's batch payload builder
-        //     // // if we've reached the max data gas per block, we can skip blob txs entirely
-        //     // if sum_blob_gas_used == MAX_DATA_GAS_PER_BLOCK {
-        //     //     best_txs.skip_blobs();
-        //     // }
-        // }
+        evm.db_mut().commit(state);
 
         let gas_used = result.gas_used();
 
@@ -343,22 +308,25 @@ where
 
         // Push transaction changeset and calculate header bloom filter for receipt.
         receipts.push(Some(Receipt {
-            tx_type: tx.tx_type(),
+            tx_type: recovered.tx_type(),
             success: result.is_success(),
             cumulative_gas_used,
             logs: result.into_logs().into_iter().collect(),
         }));
 
         // update add to total fees
-        let miner_fee = tx
+        let miner_fee = recovered
             .effective_tip_per_gas(Some(base_fee))
             .expect("fee is always valid; execution succeeded");
         total_fees += U256::from(miner_fee) * U256::from(gas_used);
 
         // append transaction to the list of executed transactions and keep signers
-        senders.push(tx.signer());
-        executed_txs.push(tx.into_signed());
+        senders.push(recovered.signer());
+        executed_txs.push(recovered.into_tx());
     }
+
+    // Release db
+    drop(evm);
 
     // TODO: logic for withdrawals
     //
@@ -376,45 +344,25 @@ where
         vec![], // TODO: support requests
     );
     let receipts_root =
-        execution_outcome.receipts_root_slow(block_number).expect("Number is in range");
+        execution_outcome.ethereum_receipts_root(block_number).expect("Number is in range");
     let logs_bloom = execution_outcome.block_logs_bloom(block_number).expect("Number is in range");
-    let hashed_state = HashedPostState::from_bundle_state(&execution_outcome.state().state);
 
     // calculate the state root
-    let state_root = {
-        let state_provider = db.database.0.inner.borrow_mut();
-        state_provider.db.state_root(hashed_state)?
+    let hashed_state = db.database.db.hashed_post_state(execution_outcome.state());
+    let (state_root, _trie_output) = {
+        db.database.inner().state_root_with_updates(hashed_state.clone()).inspect_err(|err| {
+            error!(target: "payload_builder",
+                parent_hash=%payload.attributes.parent_header.hash(),
+                %err,
+                "failed to calculate state root for payload"
+            );
+        })?
     };
 
     // create the block header
-    let transactions_root = reth_primitives::proofs::calculate_transaction_root(&executed_txs);
+    let transactions_root = calculate_transaction_root(&executed_txs);
 
-    // // initialize empty blob sidecars at first. If cancun is active then this will
-    // let mut blob_sidecars = Vec::new();
-    // let mut excess_blob_gas = None;
-    // let mut blob_gas_used = None;
-
-    // // only determine cancun fields when active
-    // if chain_spec.is_cancun_active_at_timestamp(payload.attributes.timestamp) {
-    //     // grab the blob sidecars from the executed txs
-    //     blob_sidecars = pool.get_all_blobs_exact(
-    //         executed_txs.iter().filter(|tx| tx.is_eip4844()).map(|tx| tx.hash).collect(),
-    //     )?;
-
-    //     excess_blob_gas = if chain_spec.is_cancun_active_at_timestamp(parent_header.timestamp) {
-    //         let parent_excess_blob_gas = parent_header.excess_blob_gas.unwrap_or_default();
-    //         let parent_blob_gas_used = parent_header.blob_gas_used.unwrap_or_default();
-    //         Some(calculate_excess_blob_gas(parent_excess_blob_gas, parent_blob_gas_used))
-    //     } else {
-    //         // for the first post-fork block, both parent.blob_gas_used and
-    //         // parent.excess_blob_gas are evaluated as 0
-    //         Some(calculate_excess_blob_gas(0, 0))
-    //     };
-
-    //     blob_gas_used = Some(sum_blob_gas_used);
-    // }
-
-    let header = Header {
+    let header = ExecHeader {
         parent_hash: payload.parent(),
         ommers_hash: EMPTY_OMMER_ROOT_HASH,
         beneficiary: block_env.coinbase,
@@ -425,7 +373,7 @@ where
         logs_bloom,
         timestamp: payload.timestamp(),
         mix_hash: payload.prev_randao(),
-        nonce: payload.attributes.nonce,
+        nonce: payload.attributes.nonce.into(),
         base_fee_per_gas: Some(base_fee),
         number: payload.attributes.parent_header.number + 1, // ensure this matches the block env
         gas_limit: block_gas_limit,
@@ -435,12 +383,17 @@ where
         parent_beacon_block_root: Some(consensus_header_hash),
         blob_gas_used: None,   // TODO: support blobs
         excess_blob_gas: None, // TODO: support blobs
-        requests_root: None,
+        requests_hash: None,
     };
 
     // seal the block
     let withdrawals = Some(payload.withdrawals().clone());
-    let block = Block { header, body: executed_txs, ommers: vec![], withdrawals, requests: None };
+
+    // seal the block
+    let block = Block {
+        header,
+        body: BlockBody { transactions: executed_txs, ommers: vec![], withdrawals },
+    };
 
     let sealed_block = block.seal_slow();
     let sealed_block_with_senders = SealedBlockWithSenders::new(sealed_block, senders)
@@ -470,9 +423,9 @@ where
             );
             err
         })?;
-
+    let mut cached_reads = CachedReads::default();
     let mut db = State::builder()
-        .with_database(StateProviderDatabase::new(state))
+        .with_database(cached_reads.as_db_mut(StateProviderDatabase::new(state)))
         .with_bundle_update()
         .build();
 
@@ -487,17 +440,20 @@ where
 
     // calculate the state root
     let bundle_state = db.take_bundle();
-    let hashed_state = HashedPostState::from_bundle_state(&bundle_state.state);
-    let state_root = db.database.state_root(hashed_state).map_err(|err| {
-        warn!(target: "engine",
-            parent_hash=%payload.attributes.parent_header.hash(),
-            %err,
-            "failed to calculate state root for empty output"
-        );
-        err
-    })?;
 
-    let header = Header {
+    // calculate the state root
+    let hashed_state = db.database.db.hashed_post_state(&bundle_state);
+    let (state_root, _trie_output) = {
+        db.database.inner().state_root_with_updates(hashed_state.clone()).inspect_err(|err| {
+            error!(target: "payload_builder",
+                parent_hash=%payload.attributes.parent_header.hash(),
+                %err,
+                "failed to calculate state root for payload"
+            );
+        })?
+    };
+
+    let header = ExecHeader {
         parent_hash: payload.parent(),
         ommers_hash: EMPTY_OMMER_ROOT_HASH,
         beneficiary: block_env.coinbase,
@@ -508,7 +464,7 @@ where
         logs_bloom: Default::default(),
         timestamp: payload.timestamp(),
         mix_hash: payload.prev_randao(),
-        nonce: payload.attributes.nonce,
+        nonce: payload.attributes.nonce.into(),
         base_fee_per_gas: Some(payload.attributes.base_fee_per_gas),
         number: payload.attributes.parent_header.number + 1, // ensure this matches the block env
         gas_limit: payload.attributes.gas_limit,
@@ -518,12 +474,15 @@ where
         parent_beacon_block_root: Some(consensus_header_digest),
         blob_gas_used: None,   // TODO: support blobs
         excess_blob_gas: None, // TODO: support blobs
-        requests_root: None,
+        requests_hash: None,
     };
 
     // seal the block
     let withdrawals = Some(payload.withdrawals().clone());
-    let block = Block { header, body: vec![], ommers: vec![], withdrawals, requests: None };
+
+    // seal the block
+    let block =
+        Block { header, body: BlockBody { transactions: vec![], ommers: vec![], withdrawals } };
 
     let sealed_block = block.seal_slow();
 

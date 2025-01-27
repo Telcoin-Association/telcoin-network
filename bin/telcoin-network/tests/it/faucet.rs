@@ -11,7 +11,7 @@ use crate::util::{
     ensure_account_balance_infinite_loop, get_contract_state_for_genesis, spawn_local_testnet,
     IT_TEST_MUTEX,
 };
-use alloy::{hex, network::EthereumWallet, providers::ProviderBuilder, sol, sol_types::SolValue};
+use alloy::{eips::eip2718::Encodable2718, network::EthereumWallet, providers::ProviderBuilder};
 use futures::{stream::FuturesUnordered, StreamExt};
 use gcloud_sdk::{
     google::cloud::kms::v1::{
@@ -22,12 +22,13 @@ use gcloud_sdk::{
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
 use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicKey as PubKey};
 use reth_chainspec::ChainSpec;
-use reth_primitives::{public_key_to_address, Address, GenesisAccount, B256, U256};
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
 use tn_config::{test_fetch_file_content_relative_to_manifest, ContractStandardJson};
 use tn_test_utils::TransactionFactory;
-use tn_types::adiri_genesis;
+use tn_types::{
+    adiri_genesis, hex, public_key_to_address, sol, Address, GenesisAccount, SolValue, B256, U256,
+};
 use tokio::{task::JoinHandle, time::timeout};
 use tracing::{debug, info};
 
@@ -378,7 +379,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
     info!(target: "faucet-test", ?tx, "submitting new tx to clear worker's watch channel...");
 
     // submit tx through rpc
-    let tx_bytes = tx.envelope_encoded();
+    let tx_bytes = tx.encoded_2718();
     let tx_hash: String = client.request("eth_sendRawTransaction", rpc_params![tx_bytes]).await?;
     info!(target: "faucet-test", ?tx_hash, "tx submitted :D");
 

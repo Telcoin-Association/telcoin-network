@@ -2,9 +2,8 @@
 //!
 //! These messages are passed as unreliable send and
 //! don't expect a response.
-use reth_primitives::SealedHeader;
 use serde::{Deserialize, Serialize};
-use tn_types::{AuthorityIdentifier, BlockHash, SealedBatch, TimestampSec, WorkerId};
+use tn_types::{AuthorityIdentifier, BlockHash, SealedBatch, SealedHeader, TimestampSec, WorkerId};
 
 /// Used by the primary to request that the worker sync the target missing batches.
 #[derive(Clone, Debug, Serialize, Deserialize)]

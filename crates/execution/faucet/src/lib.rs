@@ -16,12 +16,12 @@ use gcloud_sdk::{
 };
 use lru_time_cache::LruCache;
 use reth::rpc::server_types::eth::{EthApiError, EthResult};
-use reth_primitives::{Address, TxHash};
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
-use reth_transaction_pool::TransactionPool;
+use reth_transaction_pool::{EthPooledTransaction, TransactionPool};
 use secp256k1::constants::PUBLIC_KEY_SIZE;
 use std::time::Duration;
+use tn_types::{Address, TxHash};
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedSender},
     oneshot,
@@ -41,7 +41,7 @@ pub type Secp256k1PubKeyBytes = [u8; PUBLIC_KEY_SIZE];
 /// The abi encoded type parameters for the drip method
 /// of the faucet contract deployed at contract address.
 /// pub for integration test
-pub type Drip = alloy::sol! { (address, address) };
+pub type Drip = tn_types::sol! { (address, address) };
 
 /// Configure the faucet with a wait period between transfers and the amount of TEL to transfer.
 pub struct FaucetConfig {
@@ -155,7 +155,7 @@ impl Faucet {
     ) -> Self
     where
         Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
-        Pool: TransactionPool + Unpin + Clone + 'static,
+        Pool: TransactionPool<Transaction = EthPooledTransaction> + Unpin + Clone + 'static,
     {
         Self::spawn_with(provider, pool, config, TokioTaskExecutor::default())
     }
@@ -172,7 +172,7 @@ impl Faucet {
     ) -> Self
     where
         Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
-        Pool: TransactionPool + Unpin + Clone + 'static,
+        Pool: TransactionPool<Transaction = EthPooledTransaction> + Unpin + Clone + 'static,
         Tasks: TaskSpawner + Clone + 'static,
     {
         let (this, service) = Self::create(provider, pool, executor.clone(), config);
@@ -195,7 +195,6 @@ impl Faucet {
 
 #[cfg(test)]
 mod tests {
-
     use ecdsa::elliptic_curve::{pkcs8::DecodePublicKey as _, sec1::ToEncodedPoint};
     use gcloud_sdk::{
         google::cloud::kms::v1::{
@@ -205,14 +204,11 @@ mod tests {
         GoogleApi, GoogleAuthMiddleware, GoogleEnvironment,
     };
     use k256::PublicKey as PubKey;
-
-    use reth_primitives::{keccak256, public_key_to_address, Signature as RSignature, U256};
-
     use secp256k1::{
         ecdsa::{RecoverableSignature, RecoveryId, Signature},
         Message, PublicKey, SECP256K1,
     };
-
+    use tn_types::{keccak256, public_key_to_address, EthSignature, U256};
     use tokio::sync::oneshot;
     use tracing::debug;
 
@@ -369,12 +365,13 @@ mod tests {
             }
         }
 
-        let odd_y_parity = rx.blocking_recv().expect("y odd parity");
+        let y_parity = rx.blocking_recv().expect("y odd parity");
 
-        let eth_sig =
-            RSignature { r: U256::from_be_slice(r), s: U256::from_be_slice(s), odd_y_parity };
+        let r = U256::from_be_slice(r);
+        let s = U256::from_be_slice(s);
+        let eth_signature = EthSignature::new(r, s, y_parity);
 
-        let signer = eth_sig.recover_signer(data).expect("signer recoverable");
+        let signer = eth_signature.recover_address_from_prehash(&data).expect("signer recoverable");
 
         assert_eq!(signer, wallet_address);
     }

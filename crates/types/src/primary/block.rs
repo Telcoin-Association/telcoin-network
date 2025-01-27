@@ -7,9 +7,8 @@
 //! if not directly participating in consesus.
 
 use super::{CommittedSubDag, ConsensusOutput};
-use crate::{crypto, Certificate};
+use crate::{crypto, BlockHash, Certificate, B256};
 use fastcrypto::hash::{Hash, HashFunction};
-use reth_primitives::{BlockHash, B256};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
