@@ -69,12 +69,6 @@ where
 {
     /// Create a new instance of `Self`.
     pub fn new(tn_builder: TnBuilder<N::DB>, task_manager: &TaskManager) -> eyre::Result<Self> {
-        // let evm_config = EthEvmConfig::new(Arc::clone(&tn_builder.node_config.chain));
-        // let executor = EthExecutorProvider::ethereum(Arc::clone(&tn_builder.node_config.chain));
-        // let inner = ExecutionNodeInner::new(tn_builder, executor, evm_config, task_manager)?;
-
-        // Ok(ExecutionNode { internal: Arc::new(RwLock::new(inner)) })
-
         let inner = ExecutionNodeBuilder::new(tn_builder)
             .init_evm_components()
             .init_provider_factory()?
@@ -150,9 +144,7 @@ where
         guard.get_evm_config()
     }
 
-    //Evm: BlockExecutorProvider + Clone + 'static,
     /// Return the node's evm-based block executor.
-    // pub async fn get_batch_executor(&self) -> N::Executor {
     pub async fn get_batch_executor(
         &self,
     ) -> BasicBlockExecutorProvider<EthExecutionStrategyFactory> {

@@ -311,7 +311,6 @@ mod tests {
     async fn test_valid_batch() {
         let TestTools { valid_batch, validator } = test_tools().await;
         let result = validator.validate_batch(valid_batch.clone());
-        println!("result? {result:?}");
         assert!(result.is_ok());
 
         // ensure non-serialized data does not affect validity

@@ -19,7 +19,6 @@ use tn_types::{
 /// integrate with reth for convenience. TN is mostly EVM/Ethereum types, but with a different
 /// consensus. The traits impl on this type are only used beacon engine, which is not used by TN.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct TNExecution;
 
 impl<H> HeaderValidator<H> for TNExecution {
