@@ -19,10 +19,6 @@ use reth_db::{
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
     Database, DatabaseEnv,
 };
-use reth_evm::{
-    execute::{BasicBlockExecutor, BlockExecutorProvider},
-    ConfigureEvm,
-};
 use reth_node_builder::{NodeConfig, NodeTypes, NodeTypesWithDB, NodeTypesWithEngine};
 use reth_node_ethereum::{
     BasicBlockExecutorProvider, EthEngineTypes, EthEvmConfig, EthExecutionStrategyFactory,
@@ -33,14 +29,13 @@ use reth_provider::{
     BlockIdReader, BlockReader, CanonChainTracker, ChainSpecProvider, EthStorage,
     StageCheckpointReader,
 };
-use reth_trie_db::MerklePatriciaTrie;
 use std::{marker::PhantomData, net::SocketAddr, sync::Arc};
 use tn_config::Config;
 use tn_engine::ExecutorEngine;
 use tn_faucet::FaucetArgs;
 use tn_types::{
     BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, SealedHeader, TNExecution,
-    TaskManager, TransactionSigned, WorkerId, B256,
+    TaskManager, TelcoinNode, TelcoinNodeTypes, TransactionSigned, WorkerId, B256,
 };
 use tokio::sync::{broadcast, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
@@ -48,65 +43,6 @@ pub use worker::*;
 mod builder;
 mod inner;
 mod worker;
-
-/// Telcoin Network specific node types for reth compatibility.
-pub(super) trait TelcoinNodeTypes: NodeTypesWithEngine + NodeTypesWithDB {
-    /// The EVM executor type
-    type Executor: BlockExecutorProvider<Primitives = EthPrimitives>;
-
-    /// The EVM configuration type
-    type EvmConfig: ConfigureEvm<Transaction = TransactionSigned, Header = ExecHeader>;
-
-    /// The block-building engine.
-    type BlockEngine;
-
-    // Add factory methods to create generic components
-    fn create_evm_config(chain: Arc<ChainSpec>) -> Self::EvmConfig;
-    fn create_executor(chain: Arc<ChainSpec>) -> Self::Executor;
-}
-
-#[derive(Clone)]
-pub struct TelcoinNode<DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static>
-{
-    _phantom: PhantomData<DB>,
-}
-
-impl<DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static> NodeTypes
-    for TelcoinNode<DB>
-{
-    type Primitives = EthPrimitives;
-    type ChainSpec = ChainSpec;
-    type StateCommitment = MerklePatriciaTrie;
-    type Storage = EthStorage;
-}
-
-impl<DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static>
-    NodeTypesWithEngine for TelcoinNode<DB>
-{
-    type Engine = EthEngineTypes;
-}
-
-impl<DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static> NodeTypesWithDB
-    for TelcoinNode<DB>
-{
-    type DB = DB;
-}
-
-impl<DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static> TelcoinNodeTypes
-    for TelcoinNode<DB>
-{
-    type Executor = BasicBlockExecutorProvider<EthExecutionStrategyFactory>;
-    type EvmConfig = EthEvmConfig;
-    type BlockEngine = ExecutorEngine<Self, Self::EvmConfig>;
-
-    fn create_evm_config(chain: Arc<ChainSpec>) -> Self::EvmConfig {
-        EthEvmConfig::new(chain)
-    }
-
-    fn create_executor(chain: Arc<ChainSpec>) -> Self::Executor {
-        EthExecutorProvider::ethereum(chain)
-    }
-}
 
 /// The struct used to build the execution nodes.
 ///
