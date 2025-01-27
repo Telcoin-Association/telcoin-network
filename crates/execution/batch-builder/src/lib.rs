@@ -435,7 +435,6 @@ mod tests {
         providers::{BlockchainProvider, StaticFileProvider},
         CanonStateSubscriptions as _, ProviderFactory,
     };
-    use reth_prune::PruneModes;
     use reth_transaction_pool::{
         blobstore::InMemoryBlobStore, CoinbaseTipOrdering, EthPooledTransaction,
         EthTransactionValidator, Pool, PoolConfig, TransactionValidationTaskExecutor,
@@ -447,9 +446,8 @@ mod tests {
     use tn_storage::{open_db, tables::Batches, traits::Database};
     use tn_test_utils::{adiri_genesis_seeded, get_gas_price, TransactionFactory};
     use tn_types::{
-        adiri_genesis, AutoSealConsensus, BlockBody, BuildArguments, Bytes, CommittedSubDag,
-        Consensus, ConsensusHeader, ConsensusOutput, GenesisAccount, SealedBatch, SealedBlock,
-        U160, U256,
+        adiri_genesis, BlockBody, BuildArguments, Bytes, CommittedSubDag, Consensus,
+        ConsensusHeader, ConsensusOutput, GenesisAccount, SealedBatch, SealedBlock, U160, U256,
     };
     use tn_worker::{
         metrics::WorkerMetrics,

@@ -39,17 +39,18 @@ pub use alloy::{
     eips::{
         eip1559::{ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE},
         eip4844::{env_settings::EnvKzgSettings, BlobAndProofV1, BlobTransactionSidecar},
-        BlockNumHash,
+        BlockHashOrNumber, BlockNumHash,
     },
     genesis::{Genesis, GenesisAccount},
     hex::{self, FromHex},
     primitives::{
-        keccak256, Address, BlockHash, BlockNumber, Bytes, Sealable, TxHash, TxKind, B256, U160,
-        U256,
+        hex_literal, keccak256, Address, BlockHash, BlockNumber, Bloom, Bytes, Sealable, TxHash,
+        TxKind, B256, U160, U256,
     },
     rpc::types::{AccessList, Withdrawals},
     signers::Signature as EthSignature,
-    sol_types::SolType,
+    sol,
+    sol_types::{SolType, SolValue},
 };
 pub use reth_primitives::{
     public_key_to_address, transaction::SignedTransactionIntoRecoveredExt, Block, BlockBody,

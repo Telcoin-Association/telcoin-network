@@ -56,7 +56,6 @@ tn-engine = { workspace = true }
 tn-batch-builder = { workspace = true, features = ["test-utils"] }
 
 # TODO: only used for canon it test
-reth-prune = { workspace = true }
 reth-node-ethereum = { workspace = true }
 
 [features]

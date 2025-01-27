@@ -41,7 +41,7 @@ pub type Secp256k1PubKeyBytes = [u8; PUBLIC_KEY_SIZE];
 /// The abi encoded type parameters for the drip method
 /// of the faucet contract deployed at contract address.
 /// pub for integration test
-pub type Drip = alloy::sol! { (address, address) };
+pub type Drip = tn_types::sol! { (address, address) };
 
 /// Configure the faucet with a wait period between transfers and the amount of TEL to transfer.
 pub struct FaucetConfig {
@@ -371,7 +371,7 @@ mod tests {
         let s = U256::from_be_slice(s);
         let eth_signature = EthSignature::new(r, s, y_parity);
 
-        let signer = eth_signature.recover_signer(data).expect("signer recoverable");
+        let signer = eth_signature.recover_address_from_prehash(&data).expect("signer recoverable");
 
         assert_eq!(signer, wallet_address);
     }

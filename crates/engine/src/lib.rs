@@ -323,11 +323,10 @@ mod tests {
     use tn_batch_builder::test_utils::execute_test_batch;
     use tn_test_utils::{default_test_execution_node, seeded_genesis_from_random_batches};
     use tn_types::{
-        adiri_chain_spec_arc, adiri_genesis,
-        constants::{EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE},
-        max_batch_gas, now, Address, BlockHash, BlockHashOrNumber, Bloom, Certificate,
-        CommittedSubDag, ConsensusHeader, ConsensusOutput, Notifier, ReputationScores, TaskManager,
-        B256, EMPTY_OMMER_ROOT_HASH, U256,
+        adiri_chain_spec_arc, adiri_genesis, max_batch_gas, now, Address, BlockHash,
+        BlockHashOrNumber, Bloom, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput,
+        Notifier, ReputationScores, TaskManager, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS,
+        MIN_PROTOCOL_BASE_FEE, U256,
     };
     use tokio::{sync::oneshot, time::timeout};
     use tokio_stream::wrappers::BroadcastStream;
@@ -442,15 +441,15 @@ mod tests {
 
         // assert blocks are executed as expected
         assert!(expected_block.senders.is_empty());
-        assert!(expected_block.body.is_empty());
+        assert!(expected_block.body.transactions.is_empty());
 
         // assert basefee is same as worker's block
         assert_eq!(expected_block.base_fee_per_gas, Some(expected_base_fee));
         // beneficiary overwritten
         assert_eq!(expected_block.beneficiary, beneficiary);
         // nonce matches subdag index and method all match
-        assert_eq!(expected_block.nonce, sub_dag_index);
-        assert_eq!(expected_block.nonce, consensus_output.nonce());
+        assert_eq!(expected_block.nonce.into(), sub_dag_index);
+        assert_eq!(expected_block.nonce.into(), consensus_output.nonce());
 
         // ommers root
         assert_eq!(expected_block.header.ommers_hash, EMPTY_OMMER_ROOT_HASH,);
@@ -722,7 +721,7 @@ mod tests {
             let block = &executed_blocks[idx];
             let signers = &signers_by_block[idx];
             assert_eq!(&block.senders, signers);
-            assert_eq!(&block.body, txs);
+            assert_eq!(&block.body.transactions, txs);
 
             // basefee was increased for each batch
             expected_base_fee += idx as u64;
@@ -752,7 +751,7 @@ mod tests {
             // beneficiary overwritten
             assert_eq!(&block.beneficiary, expected_beneficiary);
             // nonce matches subdag index and method all match
-            assert_eq!(&block.nonce, expected_subdag_index);
+            assert_eq!(block.nonce.into(), *expected_subdag_index);
             assert_eq!(block.nonce, expected_output.nonce());
 
             // timestamp
@@ -1066,14 +1065,14 @@ mod tests {
                 || idx == expected_duplicate_block_num_round_2 - 1
             {
                 assert!(block.senders.is_empty());
-                assert!(block.body.is_empty());
+                assert!(block.body.transactions.is_empty());
                 // gas used should NOT be the same as bc duplicate transaction are ignored
                 assert_ne!(block.gas_used, max_batch_gas(block.number));
                 // gas used should be zero bc all transactions were duplicates
                 assert_eq!(block.gas_used, 0);
             } else {
                 assert_eq!(&block.senders, signers);
-                assert_eq!(&block.body, txs);
+                assert_eq!(&block.body.transactions, txs);
             }
 
             // basefee was increased for each batch
@@ -1105,8 +1104,8 @@ mod tests {
             // beneficiary overwritten
             assert_eq!(&block.beneficiary, expected_beneficiary);
             // nonce matches subdag index and method all match
-            assert_eq!(&block.nonce, expected_subdag_index);
-            assert_eq!(block.nonce, expected_output.nonce());
+            assert_eq!(block.nonce.into(), *expected_subdag_index);
+            assert_eq!(block.nonce.into(), expected_output.nonce());
 
             // timestamp
             assert_eq!(block.timestamp, expected_output.committed_at());

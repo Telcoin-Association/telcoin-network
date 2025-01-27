@@ -1,5 +1,6 @@
 //! Block validator
 
+use reth_node_types::NodeTypesWithDB;
 use reth_primitives_traits::InMemorySize as _;
 use reth_provider::{
     providers::{BlockchainProvider, TreeNodeTypes},
@@ -17,7 +18,7 @@ type BlockValidationResult<T> = Result<T, BatchValidationError>;
 #[derive(Clone)]
 pub struct BatchValidator<N>
 where
-    N: TreeNodeTypes,
+    N: TreeNodeTypes + NodeTypesWithDB,
 {
     /// Database provider to encompass tree and provider factory.
     blockchain_db: BlockchainProvider<N>,
@@ -25,7 +26,7 @@ where
 
 impl<N> BatchValidation for BatchValidator<N>
 where
-    N: TreeNodeTypes,
+    N: TreeNodeTypes + NodeTypesWithDB,
 {
     /// Validate a peer's batch.
     ///
@@ -85,7 +86,7 @@ where
 
 impl<N> BatchValidator<N>
 where
-    N: TreeNodeTypes,
+    N: TreeNodeTypes + NodeTypesWithDB,
 {
     /// Create a new instance of [Self]
     pub fn new(blockchain_db: BlockchainProvider<N>) -> Self {
@@ -178,18 +179,20 @@ mod tests {
         BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
     };
     use reth_chainspec::ChainSpec;
+    use reth_consensus::FullConsensus;
     use reth_db::{
         test_utils::{create_test_rw_db, tempdir_path, TempDatabase},
         DatabaseEnv,
     };
     use reth_db_common::init::init_genesis;
+    use reth_node_ethereum::EthereumNode;
+    use reth_node_types::NodeTypesWithDBAdapter;
     use reth_provider::{providers::StaticFileProvider, ProviderFactory};
-    use reth_prune::PruneModes;
     use std::{str::FromStr, sync::Arc};
     use tn_test_utils::{test_genesis, TransactionFactory};
     use tn_types::{
-        adiri_genesis, constants::MIN_PROTOCOL_BASE_FEE, hex, max_batch_gas, Address, Batch, Bytes,
-        Consensus, GenesisAccount, B256, U256,
+        adiri_genesis, hex_literal::hex, max_batch_gas, Address, Batch, Bytes, Consensus,
+        GenesisAccount, TNExecution, B256, MIN_PROTOCOL_BASE_FEE, U256,
     };
     use tracing::debug;
 
@@ -231,23 +234,22 @@ mod tests {
         );
 
         let valid_txs = vec![transaction1, transaction2, transaction3];
+        let batch = Batch {
+            transactions: valid_txs,
+            parent_hash: hex!("a0673579c1a31037ee29a7e3cb7b1495a020bf21d958269ea8291a64326667c5")
+                .into(),
+            beneficiary: Address::ZERO,
+            timestamp,
+            base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
+            received_at: None,
+        };
 
         // sealed batch
         //
         // intentionally used hard-coded values
         SealedBatch::new(
-            Batch {
-                transactions: valid_txs,
-                parent_hash: hex!(
-                    "a0673579c1a31037ee29a7e3cb7b1495a020bf21d958269ea8291a64326667c5"
-                )
-                .into(),
-                beneficiary: Address::ZERO,
-                timestamp,
-                base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
-                received_at: None,
-            },
-            hex!("3db9ad782b190874867d04f3c26a88546a06be445c9544697499659944210593").into(),
+            batch,
+            hex!("c86c3bf24b98a87f19d204dc00a91f9d0a25e22c60f5f91fd864d31d534a06f5").into(),
         )
     }
 
@@ -256,7 +258,8 @@ mod tests {
         /// The expected sealed batch.
         valid_batch: SealedBatch,
         /// Validator
-        validator: BatchValidator<Arc<TempDatabase<DatabaseEnv>>>,
+        validator:
+            BatchValidator<NodeTypesWithDBAdapter<EthereumNode, Arc<TempDatabase<DatabaseEnv>>>>,
     }
 
     /// Create an instance of block validator for tests.
@@ -276,7 +279,7 @@ mod tests {
         debug!("genesis hash: {genesis_hash:?}");
 
         // configure blockchain tree
-        let consensus: Arc<dyn Consensus> = Arc::new(EthBeaconConsensus::new(chain.clone()));
+        let consensus: Arc<dyn FullConsensus> = Arc::new(TNExecution);
 
         let tree_externals = TreeExternals::new(
             provider_factory.clone(),
@@ -305,6 +308,7 @@ mod tests {
     async fn test_valid_batch() {
         let TestTools { valid_batch, validator } = test_tools().await;
         let result = validator.validate_batch(valid_batch.clone());
+        println!("result? {result:?}");
         assert!(result.is_ok());
 
         // ensure non-serialized data does not affect validity

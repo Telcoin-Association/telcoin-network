@@ -12138,7 +12138,6 @@ dependencies = [
  "reth-node-ethereum",
  "reth-primitives-traits",
  "reth-provider",
- "reth-prune",
  "reth-stages",
  "reth-tasks",
  "reth-transaction-pool",
@@ -12163,11 +12162,13 @@ version = "0.1.0"
 dependencies = [
  "assert_matches",
  "reth-beacon-consensus",
+ "reth-blockchain-tree",
+ "reth-chainspec",
  "reth-consensus",
  "reth-db",
  "reth-db-common",
- "reth-node-core",
  "reth-node-ethereum",
+ "reth-node-types",
  "reth-primitives-traits",
  "reth-provider",
  "tn-test-utils",
@@ -12257,7 +12258,6 @@ dependencies = [
 name = "tn-faucet"
 version = "0.1.0"
 dependencies = [
- "alloy",
  "async-trait",
  "cfg-if",
  "clap",
@@ -12600,7 +12600,6 @@ dependencies = [
  "alloy",
  "alloy-rlp",
  "anemo",
- "async-trait",
  "base64 0.21.7",
  "bcs",
  "bincode",
