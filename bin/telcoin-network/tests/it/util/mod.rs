@@ -234,14 +234,14 @@ use std::str::FromStr as _;
 #[cfg(feature = "faucet")]
 pub async fn ensure_account_balance_infinite_loop(
     client: &jsonrpsee::http_client::HttpClient,
-    address: reth_primitives::Address,
-    expected_bal: reth_primitives::U256,
-) -> eyre::Result<reth_primitives::U256> {
+    address: Address,
+    expected_bal: U256,
+) -> eyre::Result<U256> {
     while let Ok(bal) =
         client.request::<String, _>("eth_getBalance", jsonrpsee::rpc_params!(address)).await
     {
         tracing::debug!(target: "faucet-test", "{address} bal: {bal:?}");
-        let balance = reth_primitives::U256::from_str(&bal)?;
+        let balance = U256::from_str(&bal)?;
 
         // return Ok if expected bal
         if balance == expected_bal {
@@ -251,7 +251,7 @@ pub async fn ensure_account_balance_infinite_loop(
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 
-    Ok(reth_primitives::U256::ZERO)
+    Ok(U256::ZERO)
 }
 
 /// Test utility to get desired state changes from a temporary genesis for a subsequent one.

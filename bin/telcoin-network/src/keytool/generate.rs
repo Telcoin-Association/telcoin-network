@@ -1,7 +1,6 @@
 //! Generate subcommand
 
 use crate::args::{clap_address_parser, clap_genesis_parser};
-use alloy::primitives::Address;
 use clap::{value_parser, Args, Subcommand};
 use fastcrypto::traits::KeyPair as KeyPairTraits;
 use rand::prelude::*;
@@ -11,7 +10,7 @@ use reth_chainspec::ChainSpec;
 use std::{path::Path, sync::Arc};
 use tn_config::{Config, BLS_KEYFILE, PRIMARY_NETWORK_KEYFILE, WORKER_NETWORK_KEYFILE};
 use tn_node::dirs::DataDirPath;
-use tn_types::{generate_proof_of_possession_bls, BlsKeypair, NetworkKeypair};
+use tn_types::{generate_proof_of_possession_bls, Address, BlsKeypair, NetworkKeypair};
 use tracing::info;
 
 /// Generate keypairs and save them to a file.

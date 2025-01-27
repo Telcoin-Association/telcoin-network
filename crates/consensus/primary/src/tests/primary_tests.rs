@@ -6,7 +6,6 @@ use crate::{
     synchronizer::Synchronizer,
     ConsensusBus,
 };
-use alloy::Header;
 use fastcrypto::{
     encoding::{Encoding, Hex},
     hash::Hash,
@@ -30,8 +29,8 @@ use tn_test_utils::{
     CommitteeFixture,
 };
 use tn_types::{
-    now, AuthorityIdentifier, BlockHash, Certificate, Committee, SignatureVerificationState,
-    TaskManager,
+    now, AuthorityIdentifier, BlockHash, Certificate, Committee, Header,
+    SignatureVerificationState, TaskManager,
 };
 use tn_worker::{metrics::Metrics, Worker};
 use tokio::time::timeout;

@@ -4,8 +4,7 @@ use super::{
     Intent, IntentMessage, IntentScope, NetworkKeypair, NetworkPublicKey, NetworkSignature,
     ProtocolSignature,
 };
-use crate::encode;
-use alloy::genesis::Genesis;
+use crate::{encode, Genesis};
 use fastcrypto::{
     error::FastCryptoError,
     traits::{KeyPair as _, Signer, ToFromBytes as _, VerifyingKey as _},

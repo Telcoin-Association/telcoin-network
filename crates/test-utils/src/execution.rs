@@ -1,22 +1,12 @@
 //! Test-utilities for execution/engine node.
 
-use alloy::{
-    eips::eip1559::MIN_PROTOCOL_BASE_FEE,
-    signers::{k256::FieldBytes, local::PrivateKeySigner},
-};
+use alloy::signers::{k256::FieldBytes, local::PrivateKeySigner};
 use clap::{Args, Parser};
 use core::fmt;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use reth::{
     args::DatadirArgs,
     builder::NodeConfig,
-    primitives::{
-        constants::{EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT},
-        proofs, public_key_to_address, sign_message, Address, Block, Bytes, Genesis,
-        GenesisAccount, Header, PooledTransactionsElement, SealedHeader, Signature, Transaction,
-        TransactionSigned, TxEip1559, TxHash, TxKind, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH,
-        U256,
-    },
     providers::{BlockReaderIdExt, ExecutionOutcome, StateProviderFactory},
     revm::database::StateProviderDatabase,
     rpc::types::AccessList,
@@ -36,7 +26,7 @@ use tempfile::tempdir;
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
 use tn_node::engine::{ExecutionNode, TnBuilder};
-use tn_types::{adiri_genesis, now, Batch, ExecutionKeypair, TaskManager, TimestampSec};
+use tn_types::{adiri_genesis, now, Address, Batch, ExecutionKeypair, TaskManager, TimestampSec};
 use tracing::debug;
 
 /// Convnenience type for testing Execution Node.

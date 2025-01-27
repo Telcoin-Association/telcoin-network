@@ -8,13 +8,12 @@ use crate::{
     },
     ConsensusBus,
 };
-use alloy::{Header, B256};
 use std::collections::{BTreeSet, HashMap};
 use tn_config::ConsensusConfig;
 use tn_storage::{mem_db::MemDatabase, open_db};
 use tn_test_utils::{CommitteeFixture, TelcoinTempDirs};
 use tn_types::{
-    AuthorityIdentifier, Notifier, TaskManager, TnReceiver, TnSender,
+    AuthorityIdentifier, Header, Notifier, TaskManager, TnReceiver, TnSender, B256,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tracing::info;

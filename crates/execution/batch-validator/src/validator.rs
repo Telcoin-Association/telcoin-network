@@ -172,9 +172,6 @@ impl BatchValidation for NoopBatchValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::{
-        constants::MIN_PROTOCOL_BASE_FEE, hex, Address, Bytes, GenesisAccount, B256, U256,
-    };
     use assert_matches::assert_matches;
     use reth_beacon_consensus::EthBeaconConsensus;
     use reth_blockchain_tree::{
@@ -190,7 +187,10 @@ mod tests {
     use reth_prune::PruneModes;
     use std::{str::FromStr, sync::Arc};
     use tn_test_utils::{test_genesis, TransactionFactory};
-    use tn_types::{adiri_genesis, max_batch_gas, Batch, Consensus};
+    use tn_types::{
+        adiri_genesis, constants::MIN_PROTOCOL_BASE_FEE, hex, max_batch_gas, Address, Batch, Bytes,
+        Consensus, GenesisAccount, B256, U256,
+    };
     use tracing::debug;
 
     /// Return the next valid sealed batch

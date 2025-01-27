@@ -9,15 +9,15 @@ use rand::{
     rngs::{OsRng, StdRng},
     thread_rng, Rng, RngCore, SeedableRng,
 };
-use reth_primitives::{Address, BlockHash, Bytes, Header, TransactionSigned, U256};
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     ops::RangeInclusive,
 };
 use tn_types::{
-    adiri_chain_spec_arc, to_intent_message, AuthorityIdentifier, Batch, BlsKeypair, BlsSignature,
-    Certificate, CertificateDigest, Committee, Epoch, HeaderBuilder, Multiaddr, NetworkKeypair,
-    ProtocolSignature, Round, Stake, TimestampSec, WorkerId,
+    adiri_chain_spec_arc, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash,
+    BlsKeypair, BlsSignature, Bytes, Certificate, CertificateDigest, Committee, Epoch, Header,
+    HeaderBuilder, Multiaddr, NetworkKeypair, ProtocolSignature, Round, Stake, TimestampSec,
+    TransactionSigned, WorkerId, U256,
 };
 
 pub const VOTES_CF: &str = "votes";

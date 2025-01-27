@@ -2,8 +2,7 @@
 //!
 //! This is an experimental approach to supporting pending blocks for workers.
 
-use crate::SealedBlock;
-use alloy::primitives::Address;
+use crate::{Address, SealedBlock};
 
 /// The arguments passed to the worker's block builder.
 #[derive(Debug)]

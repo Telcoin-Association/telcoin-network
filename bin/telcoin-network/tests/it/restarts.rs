@@ -6,7 +6,6 @@ use nix::{
     unistd::Pid,
 };
 use rand::{rngs::StdRng, SeedableRng};
-use reth_primitives::{alloy_primitives, keccak256, Address};
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::{value::RawValue, Value};
 use std::{
@@ -15,7 +14,7 @@ use std::{
     process::{Child, Command},
     time::Duration,
 };
-use tn_types::get_available_tcp_port;
+use tn_types::{get_available_tcp_port, keccak256, Address};
 use tokio::runtime::Runtime;
 use tracing::{error, info};
 
@@ -363,15 +362,15 @@ fn address_from_word(key_word: &str) -> Address {
 
 /// Return the (account, public key, secret key) generated from key_word.
 fn account_from_word(key_word: &str) -> (String, String, String) {
-    let seed = alloy_primitives::keccak256(key_word.as_bytes());
+    let seed = keccak256(key_word.as_bytes());
     let mut rand = rand::rngs::StdRng::from_seed(seed.0);
     let secp = Secp256k1::new();
     let (secret_key, public_key) = secp.generate_keypair(&mut rand);
     let keypair = Keypair::from_secret_key(&secp, &secret_key);
     // strip out the first byte because that should be the SECP256K1_TAG_PUBKEY_UNCOMPRESSED
     // tag returned by libsecp's uncompressed pubkey serialization
-    let hash = alloy_primitives::keccak256(&public_key.serialize_uncompressed()[1..]);
-    let address = alloy_primitives::Address::from_slice(&hash[12..]);
+    let hash = keccak256(&public_key.serialize_uncompressed()[1..]);
+    let address = Address::from_slice(&hash[12..]);
     let pubkey = keypair.public_key().serialize();
     let secret = keypair.secret_bytes();
     (address.to_string(), const_hex::encode(pubkey), const_hex::encode(secret))
@@ -424,9 +423,8 @@ fn decode_key(key: &str) -> eyre::Result<(String, String, String)> {
                     // strip out the first byte because that should be the
                     // SECP256K1_TAG_PUBKEY_UNCOMPRESSED tag returned by
                     // libsecp's uncompressed pubkey serialization
-                    let hash =
-                        alloy_primitives::keccak256(&public_key.serialize_uncompressed()[1..]);
-                    let address = alloy_primitives::Address::from_slice(&hash[12..]);
+                    let hash = keccak256(&public_key.serialize_uncompressed()[1..]);
+                    let address = Address::from_slice(&hash[12..]);
                     Ok((
                         address.to_string(),
                         const_hex::encode(public_key.serialize()),

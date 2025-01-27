@@ -195,7 +195,6 @@ impl Faucet {
 
 #[cfg(test)]
 mod tests {
-
     use ecdsa::elliptic_curve::{pkcs8::DecodePublicKey as _, sec1::ToEncodedPoint};
     use gcloud_sdk::{
         google::cloud::kms::v1::{
@@ -205,14 +204,11 @@ mod tests {
         GoogleApi, GoogleAuthMiddleware, GoogleEnvironment,
     };
     use k256::PublicKey as PubKey;
-
-    use alloy::{keccak256, public_key_to_address, Signature as RSignature, U256};
-
     use secp256k1::{
         ecdsa::{RecoverableSignature, RecoveryId, Signature},
         Message, PublicKey, SECP256K1,
     };
-
+    use tn_types::{keccak256, public_key_to_address, EthSignature as RSignature, U256};
     use tokio::sync::oneshot;
     use tracing::debug;
 

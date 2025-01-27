@@ -1,14 +1,13 @@
 //! Recreated `AutoSealConsensus` to reduce the amount of imports from reth.
 
 use crate::{
-    Address, BlockWithSenders, ConsensusOutput, NodePrimitives, SealedBlock, SealedHeader,
-    Withdrawals, B256, U256,
+    Address, BlockExt as _, BlockWithSenders, ConsensusOutput, NodePrimitives, SealedBlock,
+    SealedHeader, Withdrawals, B256, U256,
 };
 use reth_chainspec::ChainSpec;
 pub use reth_consensus::{Consensus, ConsensusError};
 use reth_consensus::{FullConsensus, HeaderValidator, PostExecutionInput};
 use reth_engine_primitives::{EngineTypes, PayloadTypes, PayloadValidator};
-use reth_primitives::BlockExt as _;
 use reth_revm::primitives::{
     BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, SpecId,
 };
@@ -76,7 +75,7 @@ impl<N: NodePrimitives> FullConsensus<N> for TNExecution {
 // This is for the reth rpc build method.
 // NOTE: this should never be called because there is no beacon API
 impl PayloadValidator for TNExecution {
-    type Block = reth_primitives::Block;
+    type Block = crate::Block;
 
     fn ensure_well_formed_payload(
         &self,

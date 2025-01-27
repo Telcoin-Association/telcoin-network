@@ -418,7 +418,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::{alloy_primitives::U160, BlockBody, Bytes, GenesisAccount, SealedBlock, U256};
     use assert_matches::assert_matches;
     use reth::tasks::TaskManager;
     use reth_blockchain_tree::{
@@ -448,8 +447,9 @@ mod tests {
     use tn_storage::{open_db, tables::Batches, traits::Database};
     use tn_test_utils::{adiri_genesis_seeded, get_gas_price, TransactionFactory};
     use tn_types::{
-        adiri_genesis, AutoSealConsensus, BuildArguments, CommittedSubDag, Consensus,
-        ConsensusHeader, ConsensusOutput, SealedBatch,
+        adiri_genesis, AutoSealConsensus, BlockBody, BuildArguments, Bytes, CommittedSubDag,
+        Consensus, ConsensusHeader, ConsensusOutput, GenesisAccount, SealedBatch, SealedBlock,
+        U160, U256,
     };
     use tn_worker::{
         metrics::WorkerMetrics,

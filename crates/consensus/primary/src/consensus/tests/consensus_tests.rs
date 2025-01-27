@@ -4,13 +4,12 @@ use crate::{
     consensus::{Bullshark, Consensus, ConsensusMetrics, LeaderSchedule, LeaderSwapTable},
     ConsensusBus,
 };
-use alloy::{Header, B256};
 use fastcrypto::hash::Hash;
 use std::{collections::BTreeSet, sync::Arc};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
 use tn_types::{
-    Certificate, ReputationScores, TaskManager, TnReceiver, TnSender,
+    Certificate, Header, ReputationScores, TaskManager, TnReceiver, TnSender, B256,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 

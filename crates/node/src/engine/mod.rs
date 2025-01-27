@@ -51,6 +51,7 @@ mod worker;
 
 /// Convenince type for reth compatibility.
 pub trait RethDB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static {}
+impl RethDB for Arc<reth_db::DatabaseEnv> {}
 
 /// Telcoin Network specific node types for reth compatibility.
 pub(super) trait TelcoinNodeTypes: NodeTypesWithEngine + NodeTypesWithDB {

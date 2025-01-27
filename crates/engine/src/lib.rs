@@ -315,10 +315,6 @@ impl<BT, CE> std::fmt::Debug for ExecutorEngine<BT, CE> {
 #[cfg(test)]
 mod tests {
     use crate::ExecutorEngine;
-    use alloy::{
-        constants::{EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE},
-        Address, BlockHashOrNumber, Bloom, B256, EMPTY_OMMER_ROOT_HASH, U256,
-    };
     use fastcrypto::hash::Hash as _;
     use reth_blockchain_tree::BlockchainTreeViewer;
     use reth_chainspec::ChainSpec;
@@ -327,8 +323,11 @@ mod tests {
     use tn_batch_builder::test_utils::execute_test_batch;
     use tn_test_utils::{default_test_execution_node, seeded_genesis_from_random_batches};
     use tn_types::{
-        adiri_chain_spec_arc, adiri_genesis, max_batch_gas, now, BlockHash, Certificate,
+        adiri_chain_spec_arc, adiri_genesis,
+        constants::{EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE},
+        max_batch_gas, now, Address, BlockHash, BlockHashOrNumber, Bloom, Certificate,
         CommittedSubDag, ConsensusHeader, ConsensusOutput, Notifier, ReputationScores, TaskManager,
+        B256, EMPTY_OMMER_ROOT_HASH, U256,
     };
     use tokio::{sync::oneshot, time::timeout};
     use tokio_stream::wrappers::BroadcastStream;

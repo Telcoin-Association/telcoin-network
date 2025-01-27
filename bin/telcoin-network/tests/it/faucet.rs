@@ -11,7 +11,7 @@ use crate::util::{
     ensure_account_balance_infinite_loop, get_contract_state_for_genesis, spawn_local_testnet,
     IT_TEST_MUTEX,
 };
-use alloy::{hex, network::EthereumWallet, providers::ProviderBuilder, sol, sol_types::SolValue};
+use alloy::{network::EthereumWallet, providers::ProviderBuilder};
 use futures::{stream::FuturesUnordered, StreamExt};
 use gcloud_sdk::{
     google::cloud::kms::v1::{
@@ -26,7 +26,7 @@ use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
 use tn_config::{test_fetch_file_content_relative_to_manifest, ContractStandardJson};
 use tn_test_utils::TransactionFactory;
-use tn_types::adiri_genesis;
+use tn_types::{adiri_genesis, hex, sol, sol_types::SolValue};
 use tokio::{task::JoinHandle, time::timeout};
 use tracing::{debug, info};
 

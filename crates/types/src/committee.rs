@@ -595,8 +595,9 @@ impl CommitteeBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Authority, BlsKeypair, BlsPublicKey, Committee, Multiaddr, NetworkKeypair};
-    use alloy::primitives::Address;
+    use crate::{
+        Address, Authority, BlsKeypair, BlsPublicKey, Committee, Multiaddr, NetworkKeypair,
+    };
     use fastcrypto::traits::KeyPair as _;
     use rand::thread_rng;
     use std::collections::BTreeMap;

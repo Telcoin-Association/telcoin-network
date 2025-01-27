@@ -7,12 +7,7 @@
 //! signature to be EVM compatible. The faucet service does all of this and
 //! then submits the transaction to the RPC Transaction Pool for the next batch.
 
-use alloy::{
-    alloy_primitives::U160,
-    hex, public_key_to_address, sol,
-    sol_types::{SolType, SolValue},
-    Address, GenesisAccount, B256, U256,
-};
+use alloy::{sol, sol_types::SolValue};
 use gcloud_sdk::{
     google::cloud::kms::v1::{
         key_management_service_client::KeyManagementServiceClient, GetPublicKeyRequest,
@@ -36,8 +31,8 @@ use tn_test_utils::{
     TransactionFactory,
 };
 use tn_types::{
-    adiri_genesis, error::BlockSealError, Batch, Notifier, SealedBatch, TaskManager,
-    TransactionSigned,
+    adiri_genesis, error::BlockSealError, hex, public_key_to_address, sol_types::SolType, Address,
+    Batch, GenesisAccount, Notifier, SealedBatch, TaskManager, TransactionSigned, B256, U160, U256,
 };
 use tn_worker::{
     metrics::WorkerMetrics,

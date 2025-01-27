@@ -3,7 +3,6 @@
 //! Batch builder (CL) receives the batch from EL and forwards it to the Quorum Waiter for votes
 //! from peers.
 
-use alloy::{alloy_primitives::U160, Address, BlockBody, Bytes, SealedBlock, U256};
 use assert_matches::assert_matches;
 use reth_blockchain_tree::{
     noop::NoopBlockchainTree, BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree,
@@ -32,9 +31,9 @@ use tn_network_types::MockWorkerToPrimary;
 use tn_storage::{open_db, tables::Batches, traits::Database};
 use tn_test_utils::{get_gas_price, test_genesis, TransactionFactory};
 use tn_types::{
-    AutoSealConsensus, Batch, BatchValidation, BuildArguments, Certificate, CommittedSubDag,
-    Consensus, ConsensusHeader, ConsensusOutput, LastCanonicalUpdate, ReputationScores,
-    SealedBatch,
+    Address, AutoSealConsensus, Batch, BatchValidation, BlockBody, BuildArguments, Bytes,
+    Certificate, CommittedSubDag, Consensus, ConsensusHeader, ConsensusOutput, LastCanonicalUpdate,
+    ReputationScores, SealedBatch, SealedBlock, U160, U256,
 };
 use tn_worker::{
     metrics::WorkerMetrics,

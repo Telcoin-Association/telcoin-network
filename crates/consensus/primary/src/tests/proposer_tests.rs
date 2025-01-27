@@ -2,9 +2,9 @@
 
 use super::*;
 use crate::consensus::LeaderSwapTable;
-use alloy::B256;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
+use tn_types::B256;
 
 #[tokio::test]
 async fn test_empty_proposal() {

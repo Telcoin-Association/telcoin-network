@@ -51,7 +51,7 @@ pub use alloy::{
     sol_types::SolType,
 };
 pub use reth_primitives::{
-    public_key_to_address, Block, BlockBody, BlockExt, BlockWithSenders, NodePrimitives,
-    PooledTransaction, Receipt, RecoveredTx, SealedBlock, SealedBlockWithSenders, SealedHeader,
-    Transaction, TransactionSigned,
+    public_key_to_address, transaction::SignedTransactionIntoRecoveredExt, Block, BlockBody,
+    BlockExt, BlockWithSenders, NodePrimitives, PooledTransaction, Receipt, RecoveredTx,
+    SealedBlock, SealedBlockWithSenders, SealedHeader, Transaction, TransactionSigned,
 };
