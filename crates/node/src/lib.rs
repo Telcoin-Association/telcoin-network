@@ -2,7 +2,7 @@
 //! Library for managing all components used by a full-node in a single process.
 
 use crate::{primary::PrimaryNode, worker::WorkerNode};
-use engine::{ExecutionNode, TnBuilder};
+use engine::{ExecutionNode, RethDB, TelcoinNode, TnBuilder};
 use futures::StreamExt;
 use reth_db::{
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
@@ -32,7 +32,7 @@ pub mod worker;
 #[instrument(level = "info", skip_all)]
 pub async fn launch_node<DB, P>(mut builder: TnBuilder<DB>, tn_datadir: P) -> eyre::Result<()>
 where
-    DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
+    DB: RethDB,
     P: TelcoinDirs + 'static,
 {
     // config for validator keys
@@ -41,7 +41,7 @@ where
     builder.node_config.adjust_instance_ports();
     let mut task_manager = TaskManager::new("Task Manager");
     let mut engine_task_manager = TaskManager::new("Engine Task Manager");
-    let engine = ExecutionNode::new(builder, &engine_task_manager)?;
+    let engine = ExecutionNode::<TelcoinNode<DB>>::new(builder, &engine_task_manager)?;
 
     info!(target: "telcoin::node", "execution engine created");
 
@@ -68,7 +68,7 @@ where
     // Prime the recent_blocks watch with latest executed blocks.
     let block_capacity = eng_bus.recent_blocks().borrow().block_capacity();
     for recent_block in engine.last_executed_output_blocks(block_capacity).await? {
-        eng_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(recent_block.seal_slow()));
+        eng_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(recent_block));
     }
 
     if tn_executor::subscriber::can_cvv(

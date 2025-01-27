@@ -13,6 +13,7 @@
 use self::inner::ExecutionNodeInner;
 use builder::ExecutionNodeBuilder;
 use reth::primitives::EthPrimitives;
+use reth_blockchain_tree::BlockchainTreeEngine;
 use reth_chainspec::ChainSpec;
 use reth_db::{
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
@@ -29,27 +30,27 @@ use reth_node_ethereum::{
 };
 use reth_provider::{
     providers::{BlockchainProvider, TreeNodeTypes},
-    EthStorage,
+    BlockIdReader, BlockReader, CanonChainTracker, ChainSpecProvider, EthStorage,
+    StageCheckpointReader,
 };
 use reth_trie_db::MerklePatriciaTrie;
 use std::{marker::PhantomData, net::SocketAddr, sync::Arc};
 use tn_config::Config;
+use tn_engine::ExecutorEngine;
 use tn_faucet::FaucetArgs;
 use tn_types::{
-    BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, TNExecution, TaskManager,
-    TransactionSigned, WorkerId, B256,
+    BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, SealedHeader, TNExecution,
+    TaskManager, TransactionSigned, WorkerId, B256,
 };
 use tokio::sync::{broadcast, RwLock};
+use tokio_stream::wrappers::BroadcastStream;
 pub use worker::*;
 mod builder;
 mod inner;
 mod worker;
 
 /// Convenince type for reth compatibility.
-pub(super) trait RethDB:
-    Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static
-{
-}
+pub trait RethDB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static {}
 
 /// Telcoin Network specific node types for reth compatibility.
 pub(super) trait TelcoinNodeTypes: NodeTypesWithEngine + NodeTypesWithDB {
@@ -58,6 +59,9 @@ pub(super) trait TelcoinNodeTypes: NodeTypesWithEngine + NodeTypesWithDB {
 
     /// The EVM configuration type
     type EvmConfig: ConfigureEvm<Transaction = TransactionSigned, Header = ExecHeader>;
+
+    /// The block-building engine.
+    type BlockEngine;
 
     // Add factory methods to create generic components
     fn create_evm_config(chain: Arc<ChainSpec>) -> Self::EvmConfig;
@@ -85,6 +89,7 @@ impl<DB: RethDB> NodeTypesWithDB for TelcoinNode<DB> {
 impl<DB: RethDB> TelcoinNodeTypes for TelcoinNode<DB> {
     type Executor = BasicBlockExecutorProvider<EthExecutionStrategyFactory>;
     type EvmConfig = EthEvmConfig;
+    type BlockEngine = ExecutorEngine<Self, Self::EvmConfig>;
 
     fn create_evm_config(chain: Arc<ChainSpec>) -> Self::EvmConfig {
         EthEvmConfig::new(chain)
@@ -189,7 +194,10 @@ where
     /// Return a vector of the last 'number' executed block headers.
     /// These are the execution blocks finalized after consensus output, i.e. it
     /// skips all the "intermediate" blocks and is just the final block from a consensus output.
-    pub async fn last_executed_output_blocks(&self, number: u64) -> eyre::Result<Vec<ExecHeader>> {
+    pub async fn last_executed_output_blocks(
+        &self,
+        number: u64,
+    ) -> eyre::Result<Vec<SealedHeader>> {
         let guard = self.internal.read().await;
         guard.last_executed_output_blocks(number)
     }
@@ -202,14 +210,18 @@ where
 
     /// Return the node's EVM config.
     /// Used for tests.
-    pub async fn get_evm_config(&self) -> N::EvmConfig {
+    // pub async fn get_evm_config(&self) -> N::EvmConfig {
+    pub async fn get_evm_config(&self) -> EthEvmConfig {
         let guard = self.internal.read().await;
         guard.get_evm_config()
     }
 
     //Evm: BlockExecutorProvider + Clone + 'static,
     /// Return the node's evm-based block executor.
-    pub async fn get_batch_executor(&self) -> N::Executor {
+    // pub async fn get_batch_executor(&self) -> N::Executor {
+    pub async fn get_batch_executor(
+        &self,
+    ) -> BasicBlockExecutorProvider<EthExecutionStrategyFactory> {
         let guard = self.internal.read().await;
         guard.get_batch_executor()
     }
@@ -227,7 +239,7 @@ where
     pub async fn get_worker_transaction_pool(
         &self,
         worker_id: &WorkerId,
-    ) -> eyre::Result<WorkerTxPool<N>> {
+    ) -> eyre::Result<WorkerTxPool<TelcoinNode<N::DB>>> {
         let guard = self.internal.read().await;
         guard.get_worker_transaction_pool(worker_id)
     }

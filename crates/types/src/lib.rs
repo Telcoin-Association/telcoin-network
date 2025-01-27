@@ -43,7 +43,9 @@ pub use alloy::{
     },
     genesis::{Genesis, GenesisAccount},
     hex::{self, FromHex},
-    primitives::{keccak256, Address, BlockHash, BlockNumber, TxHash, TxKind, B256, U160, U256},
+    primitives::{
+        keccak256, Address, BlockHash, BlockNumber, Sealable, TxHash, TxKind, B256, U160, U256,
+    },
     rpc::types::Withdrawals,
     signers::Signature as EthSignature,
     sol_types::SolType,

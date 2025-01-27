@@ -22,7 +22,7 @@ use reth_network_peers::{NodeRecord, PeerId};
 use reth_node_builder::{
     components::NetworkBuilder,
     node::{FullNodeTypes, NodeTypes},
-    BuilderContext,
+    BuilderContext, NodeTypesWithDB,
 };
 use reth_node_ethereum::EthEngineTypes;
 use reth_provider::providers::{BlockchainProvider, TreeNodeTypes};
@@ -30,6 +30,7 @@ use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool, Tr
 use std::{
     marker::PhantomData,
     net::{IpAddr, SocketAddr},
+    sync::Arc,
 };
 use tn_types::adiri_chain_spec;
 
@@ -37,14 +38,20 @@ use tn_types::adiri_chain_spec;
 pub type WorkerTxPool<DB> = EthTransactionPool<BlockchainProvider<DB>, DiskFileBlobStore>;
 
 /// Execution components on a per-worker basis.
-pub(super) struct WorkerComponents<DB> {
+pub(super) struct WorkerComponents<DB>
+where
+    DB: NodeTypesWithDB,
+{
     /// The RPC handle.
     rpc_handle: RpcServerHandle,
     /// The worker's transaction pool.
     pool: WorkerTxPool<DB>,
 }
 
-impl<DB> WorkerComponents<DB> {
+impl<DB> WorkerComponents<DB>
+where
+    DB: NodeTypesWithDB,
+{
     /// Create a new instance of [Self].
     pub fn new(rpc_handle: RpcServerHandle, pool: WorkerTxPool<DB>) -> Self {
         Self { rpc_handle, pool }
@@ -61,67 +68,22 @@ impl<DB> WorkerComponents<DB> {
     }
 }
 
-/// Type configuration for a regular worker node.
-#[derive(Debug, Default, Clone, Copy)]
-#[non_exhaustive]
-pub struct WorkerNode<DB, Evm> {
-    db: PhantomData<DB>,
-    evm: PhantomData<Evm>,
-}
-
-impl<DB, Evm> NodeTypes for WorkerNode<DB, Evm>
-where
-    DB: Send + Sync + Unpin + 'static,
-    Evm: Send + Sync + Unpin + 'static,
-{
-    type Primitives = ();
-    type Engine = EthEngineTypes;
-    type ChainSpec = ChainSpec;
-}
-
-impl<DB, Evm> FullNodeTypes for WorkerNode<DB, Evm>
-where
-    DB: TreeNodeTypes,
-    Evm: BlockExecutorProvider + Clone + 'static,
-{
-    type DB = DB;
-
-    type Provider = BlockchainProvider<DB>;
-}
-
-/// A builder for the worker's "network".
-///
-/// Primarily used for RPC information.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct WorkerNetworkBuilder {
-    // TODO add closure to modify network
-}
-
-impl<Node, Pool> NetworkBuilder<Node, Pool> for WorkerNetworkBuilder
-where
-    Node: FullNodeTypes,
-    Pool: TransactionPool + Unpin + 'static,
-{
-    async fn build_network(
-        self,
-        _ctx: &BuilderContext<Node>,
-        _pool: Pool,
-    ) -> eyre::Result<NetworkHandle> {
-        // let network = ctx.network_builder().await?;
-        // let handle = ctx.start_network(network, pool);
-
-        // Ok(handle)
-        todo!()
-    }
-}
-
 /// A type that implements all network trait that does nothing.
 ///
 /// Intended for testing purposes where network is not used.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-#[derive(Default)]
-pub struct WorkerNetwork;
+pub struct WorkerNetwork {
+    /// Chainspec
+    chain_spec: Arc<ChainSpec>,
+}
+
+impl WorkerNetwork {
+    /// Create a new instance of self.
+    pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
+        Self { chain_spec }
+    }
+}
 
 impl NetworkInfo for WorkerNetwork {
     fn local_addr(&self) -> SocketAddr {
@@ -129,25 +91,21 @@ impl NetworkInfo for WorkerNetwork {
     }
 
     async fn network_status(&self) -> Result<NetworkStatus, NetworkError> {
-        let chain_spec = adiri_chain_spec();
         Ok(NetworkStatus {
-            client_version: "adiri".to_string(),
+            client_version: "v0.0.1".to_string(),
             protocol_version: 1,
             eth_protocol_info: EthProtocolInfo {
                 difficulty: Default::default(),
-                network: 2017,
-                // TODO: update chain spec with genesis hash so this doesn't `hash_slow()` everytime
-                //
-                // genesis.into() explicitly sets this to `None` for some reason
-                genesis: chain_spec.genesis_hash(),
+                network: self.chain_id(),
+                genesis: self.chain_spec.genesis_hash(),
                 head: Default::default(),
-                config: chain_spec.genesis().config.clone(),
+                config: self.chain_spec.genesis().config.clone(),
             },
         })
     }
 
     fn chain_id(&self) -> u64 {
-        2017
+        self.chain_spec.chain().id()
     }
 
     fn is_syncing(&self) -> bool {

@@ -49,8 +49,8 @@ use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
 use tn_rpc::{TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
     Address, BatchSender, BatchValidation, BlockBody, Consensus, ConsensusOutput, EnvKzgSettings,
-    ExecHeader, LastCanonicalUpdate, Noticer, SealedBlock, SealedBlockWithSenders, TNExecution,
-    TaskManager, TransactionSigned, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
+    ExecHeader, LastCanonicalUpdate, Noticer, SealedBlock, SealedBlockWithSenders, SealedHeader,
+    TNExecution, TaskManager, TransactionSigned, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tokio::sync::{broadcast, mpsc::unbounded_channel};
 use tokio_stream::wrappers::BroadcastStream;
@@ -93,76 +93,9 @@ where
 
 impl<N> ExecutionNodeInner<N>
 where
-    // N: TelcoinNodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives, Storage = EthStorage>,
-    N: TelcoinNodeTypes,
+    N: TelcoinNodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives, Storage = EthStorage>,
     N::DB: RethDB,
 {
-    // /// Create a new instance of `Self`.
-    // pub(super) fn new(
-    //     tn_builder: TnBuilder<N::DB>,
-    //     evm_executor: N::Executor,
-    //     evm_config: N::EvmConfig,
-    //     reth_task_executor: &TaskManager,
-    // ) -> eyre::Result<Self> {
-    //     // deconstruct the builder
-    //     let TnBuilder { database, node_config, tn_config, opt_faucet_args } = tn_builder;
-
-    //     // resolve the node's datadir
-    //     let datadir = node_config.datadir();
-
-    //     // Raise the fd limit of the process.
-    //     // Does not do anything on windows.
-    //     let _ = fdlimit::raise_fd_limit();
-
-    //     let provider_factory = ProviderFactory::new(
-    //         database.clone(),
-    //         Arc::clone(&node_config.chain),
-    //         StaticFileProvider::read_write(datadir.static_files())?,
-    //     )
-    //     .with_static_files_metrics();
-
-    //     debug!(target: "tn::execution", chain=%node_config.chain.chain, genesis=?node_config.chain.genesis_hash(), "Initializing genesis");
-
-    //     let genesis_hash = init_genesis(&provider_factory)?;
-
-    //     info!(target: "tn::execution",  ?genesis_hash);
-    //     info!(target: "tn::execution", "\n{}", node_config.chain.display_hardforks());
-
-    //     let tn_execution: Arc<dyn FullConsensus> = Arc::new(TNExecution {});
-
-    //     debug!(target: "tn::cli", "Spawning stages metrics listener task");
-    //     let (sync_metrics_tx, sync_metrics_rx) = unbounded_channel();
-    //     let sync_metrics_listener = reth_stages::MetricsListener::new(sync_metrics_rx);
-    //     reth_task_executor.spawn_task("stages metrics listener task", sync_metrics_listener);
-
-    //     // get config from file
-    //     let prune_config = node_config.prune_config(); //.or(reth_config.prune.clone());
-    //     let tree_config = BlockchainTreeConfig::default();
-    //     let tree_externals =
-    //         TreeExternals::new(provider_factory.clone(), tn_execution, evm_executor.clone());
-    //     let tree = BlockchainTree::new(tree_externals, tree_config)?
-    //         .with_sync_metrics_tx(sync_metrics_tx.clone());
-
-    //     let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
-    //     debug!(target: "tn::execution", "configured blockchain tree");
-
-    //     // setup the blockchain provider
-    //     let blockchain_db = BlockchainProvider::new(provider_factory.clone(), blockchain_tree)?;
-    //     let address = *tn_config.execution_address();
-
-    //     Ok(Self {
-    //         address,
-    //         node_config,
-    //         blockchain_db,
-    //         provider_factory,
-    //         evm_config,
-    //         evm_executor,
-    //         opt_faucet_args,
-    //         tn_config,
-    //         workers: HashMap::default(),
-    //     })
-    // }
-
     /// Spawn tasks associated with executing output from consensus.
     ///
     /// The method is consumed by [PrimaryNodeInner::start].
@@ -262,7 +195,7 @@ where
         };
 
         // TODO: WorkerNetwork is basically noop and missing some functionality
-        let network = WorkerNetwork::default();
+        let network = WorkerNetwork::new(self.node_config.chain.clone());
         use reth_transaction_pool::TransactionPoolExt as _;
         let mut tx_pool_latest = transaction_pool.block_info();
         tx_pool_latest.pending_basefee = MIN_PROTOCOL_BASE_FEE;
@@ -445,7 +378,10 @@ where
     /// Return a vector of the last 'number' executed block headers.
     /// These are the execution blocks finalized after consensus output, i.e. it
     /// skips all the "intermediate" blocks and is just the final block from a consensus output.
-    pub(super) fn last_executed_output_blocks(&self, number: u64) -> eyre::Result<Vec<ExecHeader>> {
+    pub(super) fn last_executed_output_blocks(
+        &self,
+        number: u64,
+    ) -> eyre::Result<Vec<SealedHeader>> {
         let finalized_block_num =
             self.blockchain_db.database_provider_ro()?.last_finalized_block_number()?.unwrap_or(0);
         let mut result = Vec::with_capacity(number as usize);
@@ -453,7 +389,7 @@ where
             let mut block_num = finalized_block_num;
             let mut last_nonce;
             if let Some(header) =
-                self.blockchain_db.database_provider_ro()?.header_by_number(block_num)?
+                self.blockchain_db.database_provider_ro()?.sealed_header(block_num)?
             {
                 last_nonce = header.nonce;
                 result.push(header);
@@ -467,7 +403,7 @@ where
                 }
                 block_num -= 1;
                 if let Some(header) =
-                    self.blockchain_db.database_provider_ro()?.header_by_number(block_num)?
+                    self.blockchain_db.database_provider_ro()?.sealed_header(block_num)?
                 {
                     if header.nonce != last_nonce {
                         last_nonce = header.nonce;
