@@ -18,10 +18,11 @@ use gcloud_sdk::{
 use humantime::format_duration;
 use lru_time_cache::LruCache;
 use reth::rpc::server_types::eth::{EthApiError, EthResult, RpcInvalidTransactionError};
+use reth_primitives::transaction::SignedTransactionIntoRecoveredExt;
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_tasks::TaskSpawner;
 use reth_transaction_pool::{
-    PoolTransaction, TransactionEvent, TransactionOrigin, TransactionPool,
+    EthPooledTransaction, PoolTransaction, TransactionEvent, TransactionOrigin, TransactionPool,
 };
 use secp256k1::{
     ecdsa::{RecoverableSignature, RecoveryId, Signature},
@@ -34,8 +35,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tn_types::{
-    Address, EthSignature, SolType, Transaction, TransactionSigned, TransactionTrait as _,
-    TxEip1559, TxHash, TxKind, B256, U256,
+    Address, EthSignature, PooledTransaction, SolType, Transaction, TransactionSigned,
+    TransactionTrait as _, TxEip1559, TxHash, TxKind, B256, U256,
 };
 use tokio::sync::{
     mpsc::{UnboundedReceiver, UnboundedSender},
@@ -128,8 +129,7 @@ pub(crate) struct FaucetService<Provider, Pool, Tasks> {
 impl<Provider, Pool, Tasks> FaucetService<Provider, Pool, Tasks>
 where
     Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
-    Pool: TransactionPool + Unpin + Clone + 'static,
-    Pool::Transaction: PoolTransaction<Pooled = TransactionSigned>,
+    Pool: TransactionPool<Transaction = EthPooledTransaction> + Unpin + Clone + 'static,
     Tasks: TaskSpawner + Clone + 'static,
 {
     /// Calculate when the wait period is over
@@ -410,8 +410,7 @@ where
 impl<Provider, Pool, Tasks> Future for FaucetService<Provider, Pool, Tasks>
 where
     Provider: BlockReaderIdExt + StateProviderFactory + Unpin + Clone + 'static,
-    Pool: TransactionPool + Unpin + Clone + 'static,
-    Pool::Transaction: PoolTransaction<Pooled = TransactionSigned>,
+    Pool: TransactionPool<Transaction = EthPooledTransaction> + Unpin + Clone + 'static,
     Tasks: TaskSpawner + Clone + 'static,
 {
     type Output = ();
@@ -512,20 +511,22 @@ async fn submit_transaction<Pool>(
     contract: Address,
 ) -> EthResult<TxHash>
 where
-    Pool: TransactionPool + Clone + 'static,
-    Pool::Transaction: PoolTransaction<Pooled = TransactionSigned>,
+    Pool: TransactionPool<Transaction = EthPooledTransaction>,
 {
-    let recovered = tx.into_ecrecovered().ok_or(EthApiError::InvalidTransactionSignature)?;
+    // let recovered = tx.into_ecrecovered().ok_or(EthApiError::InvalidTransactionSignature)?;
     // let pool_transaction = match recovered.try_into() {
     //     Ok(converted) => <Pool::Transaction>::from_pooled(converted),
     //     Err(_) => return Err(EthApiError::TransactionConversionError),
     // };
-    let pool_transaction = Pool::Transaction::from_pooled(recovered);
+    // let pool_transaction = EthPooledTransaction::try_from(recovered).expect("turtle");
     // recovered.try_into_pooled().map_err(|_| EthApiError::TransactionConversionError)?;
 
+    let pool_tx = tx.try_into_pooled().map_err(|_| EthApiError::TransactionConversionError)?;
+    let recovered =
+        pool_tx.try_into_ecrecovered().map_err(|_| EthApiError::InvalidTransactionSignature)?;
     // submit tx and subscribe to events
     let mut tx_events =
-        pool.add_transaction_and_subscribe(TransactionOrigin::Local, pool_transaction).await?;
+        pool.add_transaction_and_subscribe(TransactionOrigin::Local, recovered.into()).await?;
 
     let tx_hash = tx_events.hash();
     let mined_tx_info = MinedTxInfo::new(user, contract);

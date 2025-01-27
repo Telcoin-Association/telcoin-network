@@ -5,10 +5,13 @@ use crate::{primary::PrimaryNode, worker::WorkerNode};
 use engine::{ExecutionNode, TnBuilder};
 use futures::StreamExt;
 use reth_db::{
-    database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
+    Database,
 };
-use reth_provider::CanonStateSubscriptions;
+use reth_provider::{
+    providers::{ProviderNodeTypes, TreeNodeTypes},
+    CanonStateSubscriptions,
+};
 use tn_config::{ConsensusConfig, KeyConfig, TelcoinDirs};
 use tn_primary::NodeMode;
 use tn_storage::open_db;
@@ -29,7 +32,7 @@ pub mod worker;
 #[instrument(level = "info", skip_all)]
 pub async fn launch_node<DB, P>(mut builder: TnBuilder<DB>, tn_datadir: P) -> eyre::Result<()>
 where
-    DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
+    DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
     P: TelcoinDirs + 'static,
 {
     // config for validator keys

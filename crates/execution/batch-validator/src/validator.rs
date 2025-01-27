@@ -2,7 +2,7 @@
 
 use reth_primitives_traits::InMemorySize as _;
 use reth_provider::{
-    providers::{BlockchainProvider, ProviderNodeTypes, TreeNodeTypes},
+    providers::{BlockchainProvider, TreeNodeTypes},
     BlockIdReader, HeaderProvider,
 };
 use tn_types::{
@@ -15,17 +15,17 @@ type BlockValidationResult<T> = Result<T, BatchValidationError>;
 
 /// Block validator
 #[derive(Clone)]
-pub struct BatchValidator<DB>
+pub struct BatchValidator<N>
 where
-    DB: ProviderNodeTypes + TreeNodeTypes + Clone + 'static,
+    N: TreeNodeTypes,
 {
     /// Database provider to encompass tree and provider factory.
-    blockchain_db: BlockchainProvider<DB>,
+    blockchain_db: BlockchainProvider<N>,
 }
 
-impl<DB> BatchValidation for BatchValidator<DB>
+impl<N> BatchValidation for BatchValidator<N>
 where
-    DB: ProviderNodeTypes + TreeNodeTypes + Sized + Clone + 'static,
+    N: TreeNodeTypes,
 {
     /// Validate a peer's batch.
     ///
@@ -83,12 +83,12 @@ where
     }
 }
 
-impl<DB> BatchValidator<DB>
+impl<N> BatchValidator<N>
 where
-    DB: ProviderNodeTypes + TreeNodeTypes + Clone,
+    N: TreeNodeTypes,
 {
     /// Create a new instance of [Self]
-    pub fn new(blockchain_db: BlockchainProvider<DB>) -> Self {
+    pub fn new(blockchain_db: BlockchainProvider<N>) -> Self {
         Self { blockchain_db }
     }
 

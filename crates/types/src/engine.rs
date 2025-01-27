@@ -7,14 +7,18 @@ use crate::{
 use reth_chainspec::ChainSpec;
 pub use reth_consensus::{Consensus, ConsensusError};
 use reth_consensus::{FullConsensus, HeaderValidator, PostExecutionInput};
+use reth_engine_primitives::PayloadValidator;
+use reth_primitives::BlockExt as _;
 use reth_revm::primitives::{
     BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, SpecId,
 };
 use std::sync::Arc;
 
-/// A consensus implementation that validates everything.
+/// Compatibility type to easily integrate with reth.
 ///
-/// Taken from reth's `AutoSealConsensus`.
+/// This type is used to noop verify all data. It is not used by Telcoin Network, but is required to
+/// integrate with reth for convenience. TN is mostly EVM/Ethereum types, but with a different
+/// consensus. The traits impl on this type are only used beacon engine, which is not used by TN.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct TNExecution {
@@ -80,6 +84,22 @@ impl<N: NodePrimitives> FullConsensus<N> for TNExecution {
         _input: PostExecutionInput<'_, N::Receipt>,
     ) -> Result<(), ConsensusError> {
         Ok(())
+    }
+}
+
+// Compatibility noop trait impl.
+// This is for the reth rpc build method.
+// NOTE: this should never be called because there is no beacon API
+impl PayloadValidator for TNExecution {
+    type Block = reth_primitives::Block;
+
+    fn ensure_well_formed_payload(
+        &self,
+        payload: alloy::rpc::types::engine::ExecutionPayload,
+        sidecar: alloy::rpc::types::engine::ExecutionPayloadSidecar,
+    ) -> Result<reth_primitives::SealedBlockFor<Self::Block>, alloy::rpc::types::engine::PayloadError>
+    {
+        Ok(payload.try_into_block_with_sidecar(&sidecar)?.seal_slow())
     }
 }
 

@@ -10,17 +10,13 @@
 use enr::{secp256k1::SecretKey, Enr};
 use reth::rpc::builder::RpcServerHandle;
 use reth_chainspec::ChainSpec;
-use reth_db::{
-    database::Database,
-    database_metrics::{DatabaseMetadata, DatabaseMetrics},
-};
 use reth_discv4::DEFAULT_DISCOVERY_PORT;
 use reth_eth_wire::DisconnectReason;
 use reth_evm::execute::BlockExecutorProvider;
 use reth_network::NetworkHandle;
 use reth_network_api::{
-    NetworkError, NetworkInfo, NetworkStatus, PeerInfo, PeerKind, Peers, PeersInfo, Reputation,
-    ReputationChangeKind,
+    EthProtocolInfo, NetworkError, NetworkInfo, NetworkStatus, PeerInfo, PeerKind, Peers,
+    PeersInfo, Reputation, ReputationChangeKind,
 };
 use reth_network_peers::{NodeRecord, PeerId};
 use reth_node_builder::{
@@ -29,7 +25,7 @@ use reth_node_builder::{
     BuilderContext,
 };
 use reth_node_ethereum::EthEngineTypes;
-use reth_provider::providers::BlockchainProvider;
+use reth_provider::providers::{BlockchainProvider, TreeNodeTypes};
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool, TransactionPool};
 use std::{
     marker::PhantomData,
@@ -85,7 +81,7 @@ where
 
 impl<DB, Evm> FullNodeTypes for WorkerNode<DB, Evm>
 where
-    DB: Database + DatabaseMetadata + DatabaseMetrics + Unpin + Clone + 'static,
+    DB: TreeNodeTypes,
     Evm: BlockExecutorProvider + Clone + 'static,
 {
     type DB = DB;

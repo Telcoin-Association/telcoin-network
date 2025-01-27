@@ -6,28 +6,37 @@ use super::{TnBuilder, WorkerComponents, WorkerTxPool};
 use crate::{engine::WorkerNetwork, error::ExecutionError};
 use eyre::eyre;
 use jsonrpsee::http_client::HttpClient;
-use reth::rpc::{
-    builder::{config::RethRpcServerConfig, RpcModuleBuilder, RpcServerHandle},
-    eth::EthApi,
+use reth::{
+    consensus::FullConsensus,
+    primitives::EthPrimitives,
+    rpc::{
+        builder::{config::RethRpcServerConfig, RpcModuleBuilder, RpcServerHandle},
+        eth::EthApi,
+    },
 };
 use reth_blockchain_tree::{
     BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
 };
+use reth_chainspec::{ChainSpec, EthereumHardforks};
 use reth_db::{
-    database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
+    Database,
 };
 use reth_db_common::init::init_genesis;
-use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
-use reth_node_builder::{NodeConfig, RethTransactionPoolConfig};
+use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm, ConfigureEvmEnv};
+use reth_node_builder::{
+    NodeConfig, NodeTypes, NodeTypesWithDB, NodeTypesWithEngine, RethTransactionPoolConfig,
+};
 use reth_node_ethereum::EthEvmConfig;
 use reth_provider::{
-    providers::{BlockchainProvider, StaticFileProvider},
+    providers::{
+        BlockchainProvider, NodeTypesForProvider, ProviderNodeTypes, StaticFileProvider,
+        TreeNodeTypes,
+    },
     BlockIdReader, BlockReader, CanonStateSubscriptions as _, ChainSpecProvider,
-    DatabaseProviderFactory, FinalizedBlockReader, HeaderProvider, ProviderFactory,
+    ChainStateBlockReader, DatabaseProviderFactory, EthStorage, HeaderProvider, ProviderFactory,
     TransactionVariant,
 };
-use reth_prune::PruneModes;
 use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, TransactionPool, TransactionValidationTaskExecutor,
 };
@@ -39,19 +48,52 @@ use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
 use tn_rpc::{TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
-    BatchSender, BatchValidation, Consensus, ConsensusOutput, LastCanonicalUpdate, Noticer,
-    TaskManager, WorkerId,
+    Address, BatchSender, BatchValidation, BlockBody, Consensus, ConsensusOutput, EnvKzgSettings,
+    ExecHeader, LastCanonicalUpdate, Noticer, SealedBlock, SealedBlockWithSenders, TNExecution,
+    TaskManager, TransactionSigned, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tokio::sync::{broadcast, mpsc::unbounded_channel};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info};
 
+/// Telcoin Network specific node types for reth compatibility.
+pub trait TelcoinNodeTypes: NodeTypesWithEngine + NodeTypesWithDB {
+    // /// The database backend
+    // type T: NodeTypesWithDB;
+
+    // type DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static;
+
+    /// The EVM executor type
+    type Executor: BlockExecutorProvider<Primitives = EthPrimitives>;
+
+    /// The EVM configuration type
+    type EvmConfig: ConfigureEvm<Transaction = TransactionSigned, Header = ExecHeader>;
+}
+
+// pub struct TelcoinNode;
+
+// impl NodeTypes for TelcoinNode {
+//     type Primitives = EthPrimitives;
+//     type ChainSpec = ChainSpec; // This is Reth's ChainSpec
+//     type StateCommitment = B256;
+//     type Storage = YourStorageType;
+// }
+
+// impl NodeTypesWithEngine for TelcoinNode {
+//     type Engine = EthereumConsensusEngine;
+// }
+
+// impl TelcoinNodeTypes for TelcoinNode {
+//     type DB = YourDatabaseType;
+//     type Executor = BasicBlockExecutorProvider<EthExecutionStrategyFactory>;
+//     type EvmConfig = EthEvmConfig;
+// }
+
 /// Inner type for holding execution layer types.
-pub(super) struct ExecutionNodeInner<DB, Evm, CE>
+pub(super) struct ExecutionNodeInner<N>
 where
-    DB: Database + Clone + Unpin + 'static,
-    Evm: BlockExecutorProvider + 'static,
-    CE: ConfigureEvm,
+    N: TelcoinNodeTypes,
+    N::DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
 {
     /// The [Address] for the authority used as the suggested beneficiary.
     ///
@@ -64,35 +106,34 @@ where
     ///
     /// The [NodeConfig] is reth-specific and holds many helper functions that
     /// help TN stay in-sync with the Ethereum community.
-    node_config: NodeConfig,
+    node_config: NodeConfig<N::ChainSpec>,
     /// Type that fetches data from the database.
-    blockchain_db: BlockchainProvider<DB>,
+    blockchain_db: BlockchainProvider<N>,
     /// Provider factory is held by the blockchain db, but there isn't a publicly
     /// available way to get a cloned copy.
     /// TODO: add a method to `BlockchainProvider` in upstream reth
-    provider_factory: ProviderFactory<DB>,
-    /// The type to configure the EVM for execution.
-    evm_config: CE,
+    provider_factory: ProviderFactory<N>,
     /// The Evm configuration type.
-    evm_executor: Evm,
+    evm_executor: N::Executor,
+    /// The type to configure the EVM for execution.
+    evm_config: N::EvmConfig,
     /// TODO: temporary solution until upstream reth supports public rpc hooks
     opt_faucet_args: Option<FaucetArgs>,
     /// Collection of execution components by worker.
-    workers: HashMap<WorkerId, WorkerComponents<DB>>,
+    workers: HashMap<WorkerId, WorkerComponents<N>>,
     // TODO: add Pool to self.workers for direct access (tests)
 }
 
-impl<DB, Evm, CE> ExecutionNodeInner<DB, Evm, CE>
+impl<N> ExecutionNodeInner<N>
 where
-    DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
-    Evm: BlockExecutorProvider + 'static,
-    CE: ConfigureEvm,
+    N: TelcoinNodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives, Storage = EthStorage>,
+    N::DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
 {
     /// Create a new instance of `Self`.
     pub(super) fn new(
-        tn_builder: TnBuilder<DB>,
-        evm_executor: Evm,
-        evm_config: CE,
+        tn_builder: TnBuilder<N::DB>,
+        evm_executor: N::Executor,
+        evm_config: N::EvmConfig,
         reth_task_executor: &TaskManager,
     ) -> eyre::Result<Self> {
         // deconstruct the builder
@@ -119,8 +160,8 @@ where
         info!(target: "tn::execution",  ?genesis_hash);
         info!(target: "tn::execution", "\n{}", node_config.chain.display_hardforks());
 
-        let auto_consensus: Arc<dyn Consensus> =
-            Arc::new(AutoSealConsensus::new(Arc::clone(&node_config.chain)));
+        let tn_execution: Arc<dyn FullConsensus> =
+            Arc::new(TNExecution::new(Arc::clone(&node_config.chain)));
 
         debug!(target: "tn::cli", "Spawning stages metrics listener task");
         let (sync_metrics_tx, sync_metrics_rx) = unbounded_channel();
@@ -130,11 +171,8 @@ where
         // get config from file
         let prune_config = node_config.prune_config(); //.or(reth_config.prune.clone());
         let tree_config = BlockchainTreeConfig::default();
-        let tree_externals = TreeExternals::new(
-            provider_factory.clone(),
-            auto_consensus.clone(),
-            evm_executor.clone(),
-        );
+        let tree_externals =
+            TreeExternals::new(provider_factory.clone(), tn_execution, evm_executor.clone());
         let tree = BlockchainTree::new(tree_externals, tree_config)?
             .with_sync_metrics_tx(sync_metrics_tx.clone());
 
@@ -217,7 +255,7 @@ where
             let validator =
                 TransactionValidationTaskExecutor::eth_builder(self.blockchain_db.chain_spec())
                     .with_head_timestamp(head.timestamp)
-                    .kzg_settings(reth_primitives::revm_primitives::EnvKzgSettings::Default)
+                    .kzg_settings(EnvKzgSettings::Default)
                     .with_local_transactions_config(pool_config.local_transactions_config.clone())
                     .with_additional_tasks(self.node_config.txpool.additional_validation_tasks)
                     .build_with_tasks(
@@ -323,17 +361,21 @@ where
         });
 
         // spawn RPC
+        let tn_execution = Arc::new(TNExecution::new(Arc::clone(&self.node_config.chain)));
         let rpc_builder = RpcModuleBuilder::default()
             .with_provider(self.blockchain_db.clone())
             .with_pool(transaction_pool.clone())
             .with_network(network)
             .with_executor(task_manager.get_spawner())
-            .with_evm_config(EthEvmConfig::default()) // TODO: this should come from self
-            .with_events(self.blockchain_db.clone());
+            .with_evm_config(self.evm_config.clone())
+            .with_events(self.blockchain_db.clone())
+            .with_block_executor(self.evm_executor.clone())
+            .with_consensus(tn_execution.clone());
 
         //.node_configure namespaces
         let modules_config = self.node_config.rpc.transport_rpc_module_config();
-        let mut server = rpc_builder.build(modules_config, Box::new(EthApi::with_spawner));
+        let mut server =
+            rpc_builder.build(modules_config, Box::new(EthApi::with_spawner), tn_execution);
 
         // TODO: rpc hook here
         // server.merge.node_configured(rpc_ext)?;
@@ -381,7 +423,7 @@ where
     /// Create a new block validator.
     pub(super) fn new_batch_validator(&self) -> Arc<dyn BatchValidation> {
         // batch validator
-        Arc::new(BatchValidator::<DB>::new(self.blockchain_db.clone()))
+        Arc::new(BatchValidator::<N>::new(self.blockchain_db.clone()))
     }
 
     /// Fetch the last executed state from the database.
@@ -415,7 +457,7 @@ where
     }
 
     /// Return a vector of the last 'number' executed block headers.
-    pub(super) fn last_executed_blocks(&self, number: u64) -> eyre::Result<Vec<Header>> {
+    pub(super) fn last_executed_blocks(&self, number: u64) -> eyre::Result<Vec<ExecHeader>> {
         let finalized_block_num =
             self.blockchain_db.database_provider_ro()?.last_finalized_block_number()?.unwrap_or(0);
         let start_num = finalized_block_num.saturating_sub(number);
@@ -436,7 +478,7 @@ where
     /// Return a vector of the last 'number' executed block headers.
     /// These are the execution blocks finalized after consensus output, i.e. it
     /// skips all the "intermediate" blocks and is just the final block from a consensus output.
-    pub(super) fn last_executed_output_blocks(&self, number: u64) -> eyre::Result<Vec<Header>> {
+    pub(super) fn last_executed_output_blocks(&self, number: u64) -> eyre::Result<Vec<ExecHeader>> {
         let finalized_block_num =
             self.blockchain_db.database_provider_ro()?.last_finalized_block_number()?.unwrap_or(0);
         let mut result = Vec::with_capacity(number as usize);
@@ -475,17 +517,17 @@ where
     }
 
     /// Return an database provider.
-    pub(super) fn get_provider(&self) -> BlockchainProvider<DB> {
+    pub(super) fn get_provider(&self) -> BlockchainProvider<N> {
         self.blockchain_db.clone()
     }
 
     /// Return the node's evm-based block executor
-    pub(super) fn get_evm_config(&self) -> CE {
+    pub(super) fn get_evm_config(&self) -> N::EvmConfig {
         self.evm_config.clone()
     }
 
     /// Return the node's evm-based block executor
-    pub(super) fn get_batch_executor(&self) -> Evm {
+    pub(super) fn get_batch_executor(&self) -> N::Executor {
         self.evm_executor.clone()
     }
 
@@ -512,7 +554,7 @@ where
     pub(super) fn get_worker_transaction_pool(
         &self,
         worker_id: &WorkerId,
-    ) -> eyre::Result<WorkerTxPool<DB>> {
+    ) -> eyre::Result<WorkerTxPool<N>> {
         let tx_pool = self
             .workers
             .get(worker_id)

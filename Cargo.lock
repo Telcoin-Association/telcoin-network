@@ -12375,7 +12375,6 @@ version = "0.1.0"
 dependencies = [
  "anemo",
  "assert_matches",
- "async-trait",
  "axum",
  "cfg-if",
  "clap",
@@ -12411,7 +12410,6 @@ dependencies = [
  "reth-node-events",
  "reth-payload-builder",
  "reth-provider",
- "reth-prune",
  "reth-stages",
  "reth-static-file",
  "reth-transaction-pool",
@@ -12617,6 +12615,7 @@ dependencies = [
  "rand",
  "reth-chainspec",
  "reth-consensus",
+ "reth-engine-primitives",
  "reth-evm-ethereum",
  "reth-payload-primitives",
  "reth-primitives",

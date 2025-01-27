@@ -10,24 +10,28 @@
 //!
 //! The methods in this module are thread-safe wrappers for the inner type that contains logic.
 
+use self::inner::ExecutionNodeInner;
+use reth_chainspec::ChainSpec;
 use reth_db::{
-    database::Database,
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
+    Database,
 };
-use reth_evm::execute::BlockExecutorProvider;
+use reth_evm::execute::{BasicBlockExecutor, BlockExecutorProvider};
 use reth_node_builder::NodeConfig;
-use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
+use reth_node_ethereum::{
+    BasicBlockExecutorProvider, EthEvmConfig, EthExecutionStrategyFactory, EthExecutorProvider,
+};
+use reth_provider::providers::{BlockchainProvider, TreeNodeTypes};
 use std::{net::SocketAddr, sync::Arc};
 use tn_config::Config;
-mod inner;
-mod worker;
-
-use self::inner::ExecutionNodeInner;
-use reth_provider::providers::BlockchainProvider;
 use tn_faucet::FaucetArgs;
-use tn_types::{BatchSender, BatchValidation, ConsensusOutput, Noticer, TaskManager, WorkerId};
+use tn_types::{
+    BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, TaskManager, WorkerId, B256,
+};
 use tokio::sync::{broadcast, RwLock};
 pub use worker::*;
+mod inner;
+mod worker;
 
 /// The struct used to build the execution nodes.
 ///
@@ -37,7 +41,7 @@ pub struct TnBuilder<DB> {
     /// The database environment where all execution data is stored.
     pub database: DB,
     /// The node configuration.
-    pub node_config: NodeConfig,
+    pub node_config: NodeConfig<ChainSpec>,
     /// Telcoin Network config.
     ///
     /// TODO: consolidate configs
@@ -49,22 +53,31 @@ pub struct TnBuilder<DB> {
 
 /// Wrapper for the inner execution node components.
 #[derive(Clone)]
-pub struct ExecutionNode<DB>
+pub struct ExecutionNode<N>
 where
-    DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
+    N: TreeNodeTypes<ChainSpec = ChainSpec>,
+    N::DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
 {
-    internal: Arc<RwLock<ExecutionNodeInner<DB, EthExecutorProvider, EthEvmConfig>>>,
+    internal: Arc<
+        RwLock<
+            ExecutionNodeInner<
+                N,
+                BasicBlockExecutorProvider<EthExecutionStrategyFactory>,
+                EthEvmConfig,
+            >,
+        >,
+    >,
 }
 
-impl<DB> ExecutionNode<DB>
+impl<N> ExecutionNode<N>
 where
-    DB: Database + DatabaseMetadata + DatabaseMetrics + Clone + Unpin + 'static,
+    N: TreeNodeTypes<ChainSpec = ChainSpec>,
+    N::DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
 {
     /// Create a new instance of `Self`.
-    pub fn new(tn_builder: TnBuilder<DB>, task_manager: &TaskManager) -> eyre::Result<Self> {
-        let evm_config = EthEvmConfig::default();
-        let executor =
-            EthExecutorProvider::new(Arc::clone(&tn_builder.node_config.chain), evm_config);
+    pub fn new(tn_builder: TnBuilder<N::DB>, task_manager: &TaskManager) -> eyre::Result<Self> {
+        let evm_config = EthEvmConfig::new(Arc::clone(&tn_builder.node_config.chain));
+        let executor = EthExecutorProvider::ethereum(Arc::clone(&tn_builder.node_config.chain));
         let inner = ExecutionNodeInner::new(tn_builder, executor, evm_config, task_manager)?;
 
         Ok(ExecutionNode { internal: Arc::new(RwLock::new(inner)) })
@@ -106,7 +119,7 @@ where
     }
 
     /// Return a vector of the last 'number' executed block headers.
-    pub async fn last_executed_blocks(&self, number: u64) -> eyre::Result<Vec<Header>> {
+    pub async fn last_executed_blocks(&self, number: u64) -> eyre::Result<Vec<ExecHeader>> {
         let guard = self.internal.read().await;
         guard.last_executed_blocks(number)
     }
@@ -114,7 +127,7 @@ where
     /// Return a vector of the last 'number' executed block headers.
     /// These are the execution blocks finalized after consensus output, i.e. it
     /// skips all the "intermediate" blocks and is just the final block from a consensus output.
-    pub async fn last_executed_output_blocks(&self, number: u64) -> eyre::Result<Vec<Header>> {
+    pub async fn last_executed_output_blocks(&self, number: u64) -> eyre::Result<Vec<ExecHeader>> {
         let guard = self.internal.read().await;
         guard.last_executed_output_blocks(number)
     }

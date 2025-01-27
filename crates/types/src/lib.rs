@@ -38,7 +38,7 @@ pub use alloy::{
     },
     eips::{
         eip1559::{ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE},
-        eip4844::{BlobAndProofV1, BlobTransactionSidecar},
+        eip4844::{env_settings::EnvKzgSettings, BlobAndProofV1, BlobTransactionSidecar},
         BlockNumHash,
     },
     genesis::{Genesis, GenesisAccount},
@@ -49,6 +49,7 @@ pub use alloy::{
     sol_types::SolType,
 };
 pub use reth_primitives::{
-    public_key_to_address, Block, BlockBody, BlockExt, BlockWithSenders, NodePrimitives, Receipt,
-    RecoveredTx, SealedBlock, SealedBlockWithSenders, SealedHeader, Transaction, TransactionSigned,
+    public_key_to_address, Block, BlockBody, BlockExt, BlockWithSenders, NodePrimitives,
+    PooledTransaction, Receipt, RecoveredTx, SealedBlock, SealedBlockWithSenders, SealedHeader,
+    Transaction, TransactionSigned,
 };
