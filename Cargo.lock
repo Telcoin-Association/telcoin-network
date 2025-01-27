@@ -12413,6 +12413,7 @@ dependencies = [
  "reth-stages",
  "reth-static-file",
  "reth-transaction-pool",
+ "reth-trie-db",
  "serde-reflection",
  "serde_yaml",
  "tempfile",

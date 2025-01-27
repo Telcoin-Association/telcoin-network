@@ -54,6 +54,7 @@ reth-blockchain-tree = { workspace = true }
 reth-config = { workspace = true }
 reth-db = { workspace = true }
 reth-db-common = { workspace = true }
+reth-trie-db = { workspace = true }
 reth-evm = { workspace = true }
 reth-provider = { workspace = true }
 reth-stages = { workspace = true }

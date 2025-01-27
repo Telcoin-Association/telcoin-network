@@ -7,36 +7,21 @@ use crate::{
 use reth_chainspec::ChainSpec;
 pub use reth_consensus::{Consensus, ConsensusError};
 use reth_consensus::{FullConsensus, HeaderValidator, PostExecutionInput};
-use reth_engine_primitives::PayloadValidator;
+use reth_engine_primitives::{EngineTypes, PayloadTypes, PayloadValidator};
 use reth_primitives::BlockExt as _;
 use reth_revm::primitives::{
     BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, SpecId,
 };
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 
 /// Compatibility type to easily integrate with reth.
 ///
 /// This type is used to noop verify all data. It is not used by Telcoin Network, but is required to
 /// integrate with reth for convenience. TN is mostly EVM/Ethereum types, but with a different
 /// consensus. The traits impl on this type are only used beacon engine, which is not used by TN.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
-pub struct TNExecution {
-    /// Configuration
-    chain_spec: Arc<ChainSpec>,
-}
-
-impl TNExecution {
-    /// Create a new instance of [TNExecution]
-    pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { chain_spec }
-    }
-
-    /// Clone copy of `ChainSpec`.
-    pub fn chain_spec(&self) -> &Arc<ChainSpec> {
-        &self.chain_spec
-    }
-}
+pub struct TNExecution;
 
 impl<H> HeaderValidator<H> for TNExecution {
     fn validate_header(&self, _header: &SealedHeader<H>) -> Result<(), ConsensusError> {

@@ -11,27 +11,89 @@
 //! The methods in this module are thread-safe wrappers for the inner type that contains logic.
 
 use self::inner::ExecutionNodeInner;
+use builder::ExecutionNodeBuilder;
+use reth::primitives::EthPrimitives;
 use reth_chainspec::ChainSpec;
 use reth_db::{
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
-    Database,
+    Database, DatabaseEnv,
 };
-use reth_evm::execute::{BasicBlockExecutor, BlockExecutorProvider};
-use reth_node_builder::NodeConfig;
+use reth_evm::{
+    execute::{BasicBlockExecutor, BlockExecutorProvider},
+    ConfigureEvm,
+};
+use reth_node_builder::{NodeConfig, NodeTypes, NodeTypesWithDB, NodeTypesWithEngine};
 use reth_node_ethereum::{
-    BasicBlockExecutorProvider, EthEvmConfig, EthExecutionStrategyFactory, EthExecutorProvider,
+    BasicBlockExecutorProvider, EthEngineTypes, EthEvmConfig, EthExecutionStrategyFactory,
+    EthExecutorProvider,
 };
-use reth_provider::providers::{BlockchainProvider, TreeNodeTypes};
-use std::{net::SocketAddr, sync::Arc};
+use reth_provider::{
+    providers::{BlockchainProvider, TreeNodeTypes},
+    EthStorage,
+};
+use reth_trie_db::MerklePatriciaTrie;
+use std::{marker::PhantomData, net::SocketAddr, sync::Arc};
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
 use tn_types::{
-    BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, TaskManager, WorkerId, B256,
+    BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, TNExecution, TaskManager,
+    TransactionSigned, WorkerId, B256,
 };
 use tokio::sync::{broadcast, RwLock};
 pub use worker::*;
+mod builder;
 mod inner;
 mod worker;
+
+/// Convenince type for reth compatibility.
+pub(super) trait RethDB:
+    Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static
+{
+}
+
+/// Telcoin Network specific node types for reth compatibility.
+pub(super) trait TelcoinNodeTypes: NodeTypesWithEngine + NodeTypesWithDB {
+    /// The EVM executor type
+    type Executor: BlockExecutorProvider<Primitives = EthPrimitives>;
+
+    /// The EVM configuration type
+    type EvmConfig: ConfigureEvm<Transaction = TransactionSigned, Header = ExecHeader>;
+
+    // Add factory methods to create generic components
+    fn create_evm_config(chain: Arc<ChainSpec>) -> Self::EvmConfig;
+    fn create_executor(chain: Arc<ChainSpec>) -> Self::Executor;
+}
+pub struct TelcoinNode<DB: RethDB> {
+    _phantom: PhantomData<DB>,
+}
+
+impl<DB: RethDB> NodeTypes for TelcoinNode<DB> {
+    type Primitives = EthPrimitives;
+    type ChainSpec = ChainSpec;
+    type StateCommitment = MerklePatriciaTrie;
+    type Storage = EthStorage;
+}
+
+impl<DB: RethDB> NodeTypesWithEngine for TelcoinNode<DB> {
+    type Engine = EthEngineTypes;
+}
+
+impl<DB: RethDB> NodeTypesWithDB for TelcoinNode<DB> {
+    type DB = DB;
+}
+
+impl<DB: RethDB> TelcoinNodeTypes for TelcoinNode<DB> {
+    type Executor = BasicBlockExecutorProvider<EthExecutionStrategyFactory>;
+    type EvmConfig = EthEvmConfig;
+
+    fn create_evm_config(chain: Arc<ChainSpec>) -> Self::EvmConfig {
+        EthEvmConfig::new(chain)
+    }
+
+    fn create_executor(chain: Arc<ChainSpec>) -> Self::Executor {
+        EthExecutorProvider::ethereum(chain)
+    }
+}
 
 /// The struct used to build the execution nodes.
 ///
@@ -55,30 +117,30 @@ pub struct TnBuilder<DB> {
 #[derive(Clone)]
 pub struct ExecutionNode<N>
 where
-    N: TreeNodeTypes<ChainSpec = ChainSpec>,
-    N::DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
+    N: TelcoinNodeTypes,
+    N::DB: RethDB,
 {
-    internal: Arc<
-        RwLock<
-            ExecutionNodeInner<
-                N,
-                BasicBlockExecutorProvider<EthExecutionStrategyFactory>,
-                EthEvmConfig,
-            >,
-        >,
-    >,
+    internal: Arc<RwLock<ExecutionNodeInner<TelcoinNode<N::DB>>>>,
 }
 
 impl<N> ExecutionNode<N>
 where
-    N: TreeNodeTypes<ChainSpec = ChainSpec>,
-    N::DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
+    N: TelcoinNodeTypes,
+    N::DB: RethDB,
 {
     /// Create a new instance of `Self`.
     pub fn new(tn_builder: TnBuilder<N::DB>, task_manager: &TaskManager) -> eyre::Result<Self> {
-        let evm_config = EthEvmConfig::new(Arc::clone(&tn_builder.node_config.chain));
-        let executor = EthExecutorProvider::ethereum(Arc::clone(&tn_builder.node_config.chain));
-        let inner = ExecutionNodeInner::new(tn_builder, executor, evm_config, task_manager)?;
+        // let evm_config = EthEvmConfig::new(Arc::clone(&tn_builder.node_config.chain));
+        // let executor = EthExecutorProvider::ethereum(Arc::clone(&tn_builder.node_config.chain));
+        // let inner = ExecutionNodeInner::new(tn_builder, executor, evm_config, task_manager)?;
+
+        // Ok(ExecutionNode { internal: Arc::new(RwLock::new(inner)) })
+
+        let inner = ExecutionNodeBuilder::new(tn_builder)
+            .init_evm_components()
+            .init_provider_factory()?
+            .init_blockchain_provider(task_manager)?
+            .build()?;
 
         Ok(ExecutionNode { internal: Arc::new(RwLock::new(inner)) })
     }
@@ -133,21 +195,21 @@ where
     }
 
     /// Return an database provider.
-    pub async fn get_provider(&self) -> BlockchainProvider<DB> {
+    pub async fn get_provider(&self) -> BlockchainProvider<TelcoinNode<N::DB>> {
         let guard = self.internal.read().await;
         guard.get_provider()
     }
 
     /// Return the node's EVM config.
     /// Used for tests.
-    pub async fn get_evm_config(&self) -> EthEvmConfig {
+    pub async fn get_evm_config(&self) -> N::EvmConfig {
         let guard = self.internal.read().await;
         guard.get_evm_config()
     }
 
     //Evm: BlockExecutorProvider + Clone + 'static,
     /// Return the node's evm-based block executor.
-    pub async fn get_batch_executor(&self) -> impl BlockExecutorProvider {
+    pub async fn get_batch_executor(&self) -> N::Executor {
         let guard = self.internal.read().await;
         guard.get_batch_executor()
     }
@@ -165,7 +227,7 @@ where
     pub async fn get_worker_transaction_pool(
         &self,
         worker_id: &WorkerId,
-    ) -> eyre::Result<WorkerTxPool<DB>> {
+    ) -> eyre::Result<WorkerTxPool<N>> {
         let guard = self.internal.read().await;
         guard.get_worker_transaction_pool(worker_id)
     }

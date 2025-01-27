@@ -135,6 +135,7 @@ reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
 reth-db-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
 reth-downloaders = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
 reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
+reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
 reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
 reth-evm-config = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
 reth-network = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
@@ -178,6 +179,7 @@ reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag 
 reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
 reth-libmdbx = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
 reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
+reth-trie-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
 reth-execution-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
 reth-fs-util = { git = "https://github.com/paradigmxyz/reth", tag = "v1.1.5" }
 

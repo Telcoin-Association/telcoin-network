@@ -2,7 +2,7 @@
 //!
 //! This module contains the logic for execution.
 
-use super::{TnBuilder, WorkerComponents, WorkerTxPool};
+use super::{RethDB, TelcoinNode, TelcoinNodeTypes, TnBuilder, WorkerComponents, WorkerTxPool};
 use crate::{engine::WorkerNetwork, error::ExecutionError};
 use eyre::eyre;
 use jsonrpsee::http_client::HttpClient;
@@ -56,145 +56,112 @@ use tokio::sync::{broadcast, mpsc::unbounded_channel};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info};
 
-/// Telcoin Network specific node types for reth compatibility.
-pub trait TelcoinNodeTypes: NodeTypesWithEngine + NodeTypesWithDB {
-    // /// The database backend
-    // type T: NodeTypesWithDB;
-
-    // type DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static;
-
-    /// The EVM executor type
-    type Executor: BlockExecutorProvider<Primitives = EthPrimitives>;
-
-    /// The EVM configuration type
-    type EvmConfig: ConfigureEvm<Transaction = TransactionSigned, Header = ExecHeader>;
-}
-
-// pub struct TelcoinNode;
-
-// impl NodeTypes for TelcoinNode {
-//     type Primitives = EthPrimitives;
-//     type ChainSpec = ChainSpec; // This is Reth's ChainSpec
-//     type StateCommitment = B256;
-//     type Storage = YourStorageType;
-// }
-
-// impl NodeTypesWithEngine for TelcoinNode {
-//     type Engine = EthereumConsensusEngine;
-// }
-
-// impl TelcoinNodeTypes for TelcoinNode {
-//     type DB = YourDatabaseType;
-//     type Executor = BasicBlockExecutorProvider<EthExecutionStrategyFactory>;
-//     type EvmConfig = EthEvmConfig;
-// }
-
 /// Inner type for holding execution layer types.
 pub(super) struct ExecutionNodeInner<N>
 where
     N: TelcoinNodeTypes,
-    N::DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
+    N::DB: RethDB,
 {
     /// The [Address] for the authority used as the suggested beneficiary.
     ///
     /// The address refers to the execution layer's address
     /// based on the authority's secp256k1 public key.
-    address: Address,
+    pub(super) address: Address,
     /// The validator node config.
-    tn_config: Config,
+    pub(super) tn_config: Config,
     /// The type that holds all information needed to launch the node's engine.
     ///
     /// The [NodeConfig] is reth-specific and holds many helper functions that
     /// help TN stay in-sync with the Ethereum community.
-    node_config: NodeConfig<N::ChainSpec>,
+    pub(super) node_config: NodeConfig<N::ChainSpec>,
     /// Type that fetches data from the database.
-    blockchain_db: BlockchainProvider<N>,
+    pub(super) blockchain_db: BlockchainProvider<N>,
     /// Provider factory is held by the blockchain db, but there isn't a publicly
     /// available way to get a cloned copy.
     /// TODO: add a method to `BlockchainProvider` in upstream reth
-    provider_factory: ProviderFactory<N>,
+    pub(super) provider_factory: ProviderFactory<N>,
     /// The Evm configuration type.
-    evm_executor: N::Executor,
+    pub(super) evm_executor: N::Executor,
     /// The type to configure the EVM for execution.
-    evm_config: N::EvmConfig,
+    pub(super) evm_config: N::EvmConfig,
     /// TODO: temporary solution until upstream reth supports public rpc hooks
-    opt_faucet_args: Option<FaucetArgs>,
+    pub(super) opt_faucet_args: Option<FaucetArgs>,
     /// Collection of execution components by worker.
-    workers: HashMap<WorkerId, WorkerComponents<N>>,
+    pub(super) workers: HashMap<WorkerId, WorkerComponents<N>>,
     // TODO: add Pool to self.workers for direct access (tests)
 }
 
 impl<N> ExecutionNodeInner<N>
 where
-    N: TelcoinNodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives, Storage = EthStorage>,
-    N::DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
+    // N: TelcoinNodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives, Storage = EthStorage>,
+    N: TelcoinNodeTypes,
+    N::DB: RethDB,
 {
-    /// Create a new instance of `Self`.
-    pub(super) fn new(
-        tn_builder: TnBuilder<N::DB>,
-        evm_executor: N::Executor,
-        evm_config: N::EvmConfig,
-        reth_task_executor: &TaskManager,
-    ) -> eyre::Result<Self> {
-        // deconstruct the builder
-        let TnBuilder { database, node_config, tn_config, opt_faucet_args } = tn_builder;
+    // /// Create a new instance of `Self`.
+    // pub(super) fn new(
+    //     tn_builder: TnBuilder<N::DB>,
+    //     evm_executor: N::Executor,
+    //     evm_config: N::EvmConfig,
+    //     reth_task_executor: &TaskManager,
+    // ) -> eyre::Result<Self> {
+    //     // deconstruct the builder
+    //     let TnBuilder { database, node_config, tn_config, opt_faucet_args } = tn_builder;
 
-        // resolve the node's datadir
-        let datadir = node_config.datadir();
+    //     // resolve the node's datadir
+    //     let datadir = node_config.datadir();
 
-        // Raise the fd limit of the process.
-        // Does not do anything on windows.
-        let _ = fdlimit::raise_fd_limit();
+    //     // Raise the fd limit of the process.
+    //     // Does not do anything on windows.
+    //     let _ = fdlimit::raise_fd_limit();
 
-        let provider_factory = ProviderFactory::new(
-            database.clone(),
-            Arc::clone(&node_config.chain),
-            StaticFileProvider::read_write(datadir.static_files())?,
-        )
-        .with_static_files_metrics();
+    //     let provider_factory = ProviderFactory::new(
+    //         database.clone(),
+    //         Arc::clone(&node_config.chain),
+    //         StaticFileProvider::read_write(datadir.static_files())?,
+    //     )
+    //     .with_static_files_metrics();
 
-        debug!(target: "tn::execution", chain=%node_config.chain.chain, genesis=?node_config.chain.genesis_hash(), "Initializing genesis");
+    //     debug!(target: "tn::execution", chain=%node_config.chain.chain, genesis=?node_config.chain.genesis_hash(), "Initializing genesis");
 
-        let genesis_hash = init_genesis(&provider_factory)?;
+    //     let genesis_hash = init_genesis(&provider_factory)?;
 
-        info!(target: "tn::execution",  ?genesis_hash);
-        info!(target: "tn::execution", "\n{}", node_config.chain.display_hardforks());
+    //     info!(target: "tn::execution",  ?genesis_hash);
+    //     info!(target: "tn::execution", "\n{}", node_config.chain.display_hardforks());
 
-        let tn_execution: Arc<dyn FullConsensus> =
-            Arc::new(TNExecution::new(Arc::clone(&node_config.chain)));
+    //     let tn_execution: Arc<dyn FullConsensus> = Arc::new(TNExecution {});
 
-        debug!(target: "tn::cli", "Spawning stages metrics listener task");
-        let (sync_metrics_tx, sync_metrics_rx) = unbounded_channel();
-        let sync_metrics_listener = reth_stages::MetricsListener::new(sync_metrics_rx);
-        reth_task_executor.spawn_task("stages metrics listener task", sync_metrics_listener);
+    //     debug!(target: "tn::cli", "Spawning stages metrics listener task");
+    //     let (sync_metrics_tx, sync_metrics_rx) = unbounded_channel();
+    //     let sync_metrics_listener = reth_stages::MetricsListener::new(sync_metrics_rx);
+    //     reth_task_executor.spawn_task("stages metrics listener task", sync_metrics_listener);
 
-        // get config from file
-        let prune_config = node_config.prune_config(); //.or(reth_config.prune.clone());
-        let tree_config = BlockchainTreeConfig::default();
-        let tree_externals =
-            TreeExternals::new(provider_factory.clone(), tn_execution, evm_executor.clone());
-        let tree = BlockchainTree::new(tree_externals, tree_config)?
-            .with_sync_metrics_tx(sync_metrics_tx.clone());
+    //     // get config from file
+    //     let prune_config = node_config.prune_config(); //.or(reth_config.prune.clone());
+    //     let tree_config = BlockchainTreeConfig::default();
+    //     let tree_externals =
+    //         TreeExternals::new(provider_factory.clone(), tn_execution, evm_executor.clone());
+    //     let tree = BlockchainTree::new(tree_externals, tree_config)?
+    //         .with_sync_metrics_tx(sync_metrics_tx.clone());
 
-        let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
-        debug!(target: "tn::execution", "configured blockchain tree");
+    //     let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
+    //     debug!(target: "tn::execution", "configured blockchain tree");
 
-        // setup the blockchain provider
-        let blockchain_db = BlockchainProvider::new(provider_factory.clone(), blockchain_tree)?;
-        let address = *tn_config.execution_address();
+    //     // setup the blockchain provider
+    //     let blockchain_db = BlockchainProvider::new(provider_factory.clone(), blockchain_tree)?;
+    //     let address = *tn_config.execution_address();
 
-        Ok(Self {
-            address,
-            node_config,
-            blockchain_db,
-            provider_factory,
-            evm_config,
-            evm_executor,
-            opt_faucet_args,
-            tn_config,
-            workers: HashMap::default(),
-        })
-    }
+    //     Ok(Self {
+    //         address,
+    //         node_config,
+    //         blockchain_db,
+    //         provider_factory,
+    //         evm_config,
+    //         evm_executor,
+    //         opt_faucet_args,
+    //         tn_config,
+    //         workers: HashMap::default(),
+    //     })
+    // }
 
     /// Spawn tasks associated with executing output from consensus.
     ///
@@ -361,7 +328,7 @@ where
         });
 
         // spawn RPC
-        let tn_execution = Arc::new(TNExecution::new(Arc::clone(&self.node_config.chain)));
+        let tn_execution = Arc::new(TNExecution {});
         let rpc_builder = RpcModuleBuilder::default()
             .with_provider(self.blockchain_db.clone())
             .with_pool(transaction_pool.clone())
