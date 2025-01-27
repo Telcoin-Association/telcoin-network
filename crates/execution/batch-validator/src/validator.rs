@@ -191,8 +191,8 @@ mod tests {
     use std::{str::FromStr, sync::Arc};
     use tn_test_utils::{test_genesis, TransactionFactory};
     use tn_types::{
-        adiri_genesis, hex_literal::hex, max_batch_gas, Address, Batch, Bytes, Consensus,
-        GenesisAccount, TNExecution, B256, MIN_PROTOCOL_BASE_FEE, U256,
+        adiri_genesis, hex_literal::hex, max_batch_gas, Address, Batch, Bytes, GenesisAccount,
+        TNExecution, TelcoinNode, B256, MIN_PROTOCOL_BASE_FEE, U256,
     };
     use tracing::debug;
 
@@ -258,8 +258,12 @@ mod tests {
         /// The expected sealed batch.
         valid_batch: SealedBatch,
         /// Validator
-        validator:
-            BatchValidator<NodeTypesWithDBAdapter<EthereumNode, Arc<TempDatabase<DatabaseEnv>>>>,
+        validator: BatchValidator<
+            NodeTypesWithDBAdapter<
+                TelcoinNode<Arc<TempDatabase<DatabaseEnv>>>,
+                Arc<TempDatabase<DatabaseEnv>>,
+            >,
+        >,
     }
 
     /// Create an instance of block validator for tests.

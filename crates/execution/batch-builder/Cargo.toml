@@ -33,13 +33,13 @@ alloy-rlp = { workspace = true }
 [dev-dependencies]
 # unit tests
 tn-test-utils = { workspace = true }
-reth = { workspace = true }
 assert_matches = { workspace = true }
 reth-blockchain-tree = { workspace = true }
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
 fastcrypto = { workspace = true }
 tempfile = { workspace = true }
 reth-provider = { workspace = true, features = ["test-utils"] }
+reth-consensus = { workspace = true }
 
 # integration tests
 anemo = { workspace = true }

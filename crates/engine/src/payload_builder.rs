@@ -31,7 +31,7 @@ use tracing::{debug, error, info, warn};
 /// The function handles all types of output, included multiple blocks and empty blocks.
 #[inline]
 pub fn execute_consensus_output<EvmConfig, Provider>(
-    evm_config: EvmConfig,
+    evm_config: &EvmConfig,
     args: BuildArguments<Provider>,
 ) -> EngineResult<SealedHeader>
 where
@@ -131,7 +131,7 @@ where
 
             // execute
             let next_canonical_block = build_block_from_batch_payload(
-                &evm_config,
+                evm_config,
                 payload,
                 &provider,
                 provider.chain_spec(),

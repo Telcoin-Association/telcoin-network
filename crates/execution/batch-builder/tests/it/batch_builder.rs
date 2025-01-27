@@ -9,6 +9,7 @@ use reth_blockchain_tree::{
     TreeExternals,
 };
 use reth_chainspec::ChainSpec;
+use reth_consensus::FullConsensus;
 use reth_db::test_utils::{create_test_rw_db, tempdir_path};
 use reth_db_common::init::init_genesis;
 use reth_node_ethereum::{EthEvmConfig, EthExecutorProvider};
@@ -16,7 +17,6 @@ use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     CanonStateSubscriptions, ProviderFactory,
 };
-use reth_prune::PruneModes;
 use reth_tasks::TaskManager;
 use reth_transaction_pool::{
     blobstore::InMemoryBlobStore, PoolConfig, TransactionPool, TransactionValidationTaskExecutor,
@@ -31,9 +31,9 @@ use tn_network_types::MockWorkerToPrimary;
 use tn_storage::{open_db, tables::Batches, traits::Database};
 use tn_test_utils::{get_gas_price, test_genesis, TransactionFactory};
 use tn_types::{
-    Address, AutoSealConsensus, Batch, BatchValidation, BlockBody, BuildArguments, Bytes,
-    Certificate, CommittedSubDag, Consensus, ConsensusHeader, ConsensusOutput, LastCanonicalUpdate,
-    ReputationScores, SealedBatch, SealedBlock, U160, U256,
+    Address, Batch, BatchValidation, BlockBody, BuildArguments, Bytes, Certificate,
+    CommittedSubDag, ConsensusHeader, ConsensusOutput, LastCanonicalUpdate, ReputationScores,
+    SealedBatch, SealedBlock, TNExecution, TelcoinNode, U160, U256,
 };
 use tn_worker::{
     metrics::WorkerMetrics,
@@ -105,8 +105,9 @@ async fn test_make_batch_el_to_cl() {
     );
 
     let genesis_hash = init_genesis(&factory).expect("init genesis");
-    let blockchain_db = BlockchainProvider::new(factory, Arc::new(NoopBlockchainTree::default()))
-        .expect("test blockchain provider");
+    let blockchain_db: BlockchainProvider<TelcoinNode<_>> =
+        BlockchainProvider::new(factory, Arc::new(NoopBlockchainTree::default()))
+            .expect("test blockchain provider");
 
     debug!("genesis hash: {genesis_hash:?}");
 
@@ -278,8 +279,9 @@ async fn test_batch_builder_produces_valid_batchess() {
     );
 
     let genesis_hash = init_genesis(&factory).expect("init genesis");
-    let blockchain_db = BlockchainProvider::new(factory, Arc::new(NoopBlockchainTree::default()))
-        .expect("test blockchain provider");
+    let blockchain_db: BlockchainProvider<TelcoinNode<_>> =
+        BlockchainProvider::new(factory, Arc::new(NoopBlockchainTree::default()))
+            .expect("test blockchain provider");
 
     debug!("genesis hash: {genesis_hash:?}");
 
@@ -475,9 +477,9 @@ async fn test_canonical_notification_updates_pool() {
     let genesis_hash = init_genesis(&factory).expect("init genesis");
 
     // TODO: figure out a better way to ensure this matches engine::inner::new
-    let evm_config = EthEvmConfig::default();
-    let executor = EthExecutorProvider::new(Arc::clone(&chain), evm_config);
-    let auto_consensus: Arc<dyn Consensus> = Arc::new(AutoSealConsensus::new(Arc::clone(&chain)));
+    let evm_config = EthEvmConfig::new(chain.clone());
+    let executor = EthExecutorProvider::ethereum(Arc::clone(&chain));
+    let auto_consensus: Arc<dyn FullConsensus> = Arc::new(TNExecution);
     let tree_config = BlockchainTreeConfig::default();
     let tree_externals =
         TreeExternals::new(factory.clone(), auto_consensus.clone(), executor.clone());
@@ -485,7 +487,7 @@ async fn test_canonical_notification_updates_pool() {
 
     let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
 
-    let blockchain_db =
+    let blockchain_db: BlockchainProvider<TelcoinNode<_>> =
         BlockchainProvider::new(factory, blockchain_tree).expect("test blockchain provider");
 
     debug!("genesis hash: {genesis_hash:?}");
@@ -560,15 +562,6 @@ async fn test_canonical_notification_updates_pool() {
         Bytes::new(),
     );
 
-    // let added_result = tx_factory.submit_tx_to_pool(transaction1.clone(), txpool.clone()).await;
-    // assert_matches!(added_result, hash if hash == transaction1.hash());
-
-    // let added_result = tx_factory.submit_tx_to_pool(transaction2.clone(), txpool.clone()).await;
-    // assert_matches!(added_result, hash if hash == transaction2.hash());
-
-    // let added_result = tx_factory.submit_tx_to_pool(transaction3.clone(), txpool.clone()).await;
-    // assert_matches!(added_result, hash if hash == transaction3.hash());
-
     // txpool size
     let pending_pool_len = txpool.pool_size().pending;
     debug!("pool_size(): {:?}", txpool.pool_size());
@@ -624,7 +617,7 @@ async fn test_canonical_notification_updates_pool() {
 
     // execute output to trigger canonical update
     let args = BuildArguments::new(blockchain_db.clone(), output, chain.sealed_genesis_header());
-    let _final_header = execute_consensus_output(evm_config, args).expect("output executed");
+    let _final_header = execute_consensus_output(&evm_config, args).expect("output executed");
 
     // sleep to ensure canonical update received before ack
     let _ = tokio::time::sleep(Duration::from_secs(1)).await;

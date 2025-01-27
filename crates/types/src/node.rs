@@ -1,5 +1,4 @@
 //! Compatibility types for Telcoin Node and reth.
-use std::{marker::PhantomData, sync::Arc};
 
 use crate::{ExecHeader, TransactionSigned};
 use reth_chainspec::ChainSpec;
@@ -16,6 +15,7 @@ use reth_node_ethereum::{
 use reth_primitives::EthPrimitives;
 use reth_provider::EthStorage;
 use reth_trie_db::MerklePatriciaTrie;
+use std::{marker::PhantomData, sync::Arc};
 
 /// Telcoin Network specific node types for reth compatibility.
 pub trait TelcoinNodeTypes: NodeTypesWithEngine + NodeTypesWithDB {

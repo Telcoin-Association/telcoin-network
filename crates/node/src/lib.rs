@@ -2,7 +2,7 @@
 //! Library for managing all components used by a full-node in a single process.
 
 use crate::{primary::PrimaryNode, worker::WorkerNode};
-use engine::{ExecutionNode, TelcoinNode, TnBuilder};
+use engine::{ExecutionNode, TnBuilder};
 use futures::StreamExt;
 use reth_db::{
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
@@ -16,7 +16,7 @@ use tn_config::{ConsensusConfig, KeyConfig, TelcoinDirs};
 use tn_primary::NodeMode;
 use tn_storage::open_db;
 pub use tn_storage::NodeStorage;
-use tn_types::{BlockExt as _, TaskManager};
+use tn_types::{BlockExt as _, TaskManager, TelcoinNode};
 use tracing::{info, instrument};
 
 pub mod dirs;

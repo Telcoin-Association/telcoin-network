@@ -146,7 +146,8 @@ where
             tokio::task::spawn_blocking(|| {
                 // this is safe to call on blocking thread without a semaphore bc it's held in
                 // Self::pending_tesk as a single `Option`
-                let result = execute_consensus_output(evm_config, build_args);
+                let evm_config = evm_config;
+                let result = execute_consensus_output(&evm_config, build_args);
                 match tx.send(result) {
                     Ok(()) => (),
                     Err(e) => {

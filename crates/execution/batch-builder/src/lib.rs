@@ -419,12 +419,12 @@ where
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
-    use reth::tasks::TaskManager;
     use reth_blockchain_tree::{
         noop::NoopBlockchainTree, BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree,
         TreeExternals,
     };
     use reth_chainspec::ChainSpec;
+    use reth_consensus::FullConsensus;
     use reth_db::{
         test_utils::{create_test_rw_db, tempdir_path, TempDatabase},
         DatabaseEnv,
@@ -447,7 +447,8 @@ mod tests {
     use tn_test_utils::{adiri_genesis_seeded, get_gas_price, TransactionFactory};
     use tn_types::{
         adiri_genesis, BlockBody, BuildArguments, Bytes, CommittedSubDag, Consensus,
-        ConsensusHeader, ConsensusOutput, GenesisAccount, SealedBatch, SealedBlock, U160, U256,
+        ConsensusHeader, ConsensusOutput, GenesisAccount, SealedBatch, SealedBlock, TNExecution,
+        TaskManager, TelcoinNode, U160, U256,
     };
     use tn_worker::{
         metrics::WorkerMetrics,
@@ -497,20 +498,23 @@ mod tests {
         );
         let _genesis_hash = init_genesis(&provider_factory).expect("init genesis");
 
-        let blockchain_db =
+        let blockchain_db: BlockchainProvider<TelcoinNode<_>> =
             BlockchainProvider::new(provider_factory, Arc::new(NoopBlockchainTree::default()))
                 .expect("test blockchain provider");
 
         // task manger
-        let manager = TaskManager::current();
-        let executor = manager.executor();
+        let task_manager = TaskManager::new("Test Task Manager");
 
         // txpool
         let blob_store = InMemoryBlobStore::default();
         let validator = TransactionValidationTaskExecutor::eth_builder(Arc::clone(&chain))
             .with_head_timestamp(head_timestamp)
             .with_additional_tasks(1)
-            .build_with_tasks(blockchain_db.clone(), executor, blob_store.clone());
+            .build_with_tasks(
+                blockchain_db.clone(),
+                task_manager.get_spawner(),
+                blob_store.clone(),
+            );
 
         let txpool =
             reth_transaction_pool::Pool::eth_pool(validator, blob_store, PoolConfig::default());
@@ -640,7 +644,7 @@ mod tests {
     type TestPool = Pool<
         TransactionValidationTaskExecutor<
             EthTransactionValidator<
-                BlockchainProvider<Arc<TempDatabase<DatabaseEnv>>>,
+                BlockchainProvider<TelcoinNode<Arc<TempDatabase<DatabaseEnv>>>>,
                 EthPooledTransaction,
             >,
         >,
@@ -651,7 +655,7 @@ mod tests {
     /// Convenience type for holding execution components.
     struct TestExecutionComponents {
         /// The database client.
-        blockchain_db: BlockchainProvider<Arc<TempDatabase<DatabaseEnv>>>,
+        blockchain_db: BlockchainProvider<TelcoinNode<Arc<TempDatabase<DatabaseEnv>>>>,
         /// The transaction pool for the block builder.
         txpool: TestPool,
         /// The chainspec with seeded genesis.
@@ -680,10 +684,9 @@ mod tests {
         let _genesis_hash = init_genesis(&provider_factory).expect("init genesis");
 
         // TODO: figure out a better way to ensure this matches engine::inner::new
-        let evm_config = EthEvmConfig::default();
-        let executor = EthExecutorProvider::new(Arc::clone(&chain), evm_config);
-        let auto_consensus: Arc<dyn Consensus> =
-            Arc::new(AutoSealConsensus::new(Arc::clone(&chain)));
+        let evm_config = EthEvmConfig::new(chain.clone());
+        let executor = EthExecutorProvider::ethereum(Arc::clone(&chain));
+        let auto_consensus: Arc<dyn FullConsensus> = Arc::new(TNExecution);
         let tree_config = BlockchainTreeConfig::default();
         let tree_externals =
             TreeExternals::new(provider_factory.clone(), auto_consensus.clone(), executor.clone());
@@ -695,15 +698,18 @@ mod tests {
             .expect("test blockchain provider");
 
         // task manger
-        let _manager = TaskManager::current();
-        let executor = _manager.executor();
+        let task_manager = TaskManager::new("Test Task Manager");
 
         // txpool
         let blob_store = InMemoryBlobStore::default();
         let validator = TransactionValidationTaskExecutor::eth_builder(Arc::clone(&chain))
             .with_head_timestamp(head_timestamp)
             .with_additional_tasks(1)
-            .build_with_tasks(blockchain_db.clone(), executor, blob_store.clone());
+            .build_with_tasks(
+                blockchain_db.clone(),
+                task_manager.get_spawner(),
+                blob_store.clone(),
+            );
 
         let txpool =
             reth_transaction_pool::Pool::eth_pool(validator, blob_store, PoolConfig::default());
@@ -717,7 +723,7 @@ mod tests {
         };
 
         let execution_components =
-            TestExecutionComponents { blockchain_db, txpool, chain, _manager };
+            TestExecutionComponents { blockchain_db, txpool, chain, _manager: task_manager };
         TestTools { tx_factory, last_canonical_update, execution_components }
     }
 
@@ -795,7 +801,7 @@ mod tests {
         let duration = std::time::Duration::from_secs(5);
 
         // simulate engine to create canonical blocks from empty rounds
-        let evm_config = EthEvmConfig::default();
+        let evm_config = EthEvmConfig::new(chain.clone());
         let mut parent = chain.sealed_genesis_header();
 
         let non_fatal_errors = vec![
@@ -849,7 +855,8 @@ mod tests {
             };
             // execute output to trigger canonical update
             let args = BuildArguments::new(blockchain_db.clone(), output, parent);
-            let final_header = execute_consensus_output(evm_config, args).expect("output executed");
+            let final_header =
+                execute_consensus_output(&evm_config, args).expect("output executed");
 
             // update values for next loop
             parent = final_header;
