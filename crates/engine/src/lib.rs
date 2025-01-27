@@ -36,9 +36,8 @@ use std::{
     pin::{pin, Pin},
     task::{Context, Poll},
 };
-use tn_types::{
-    BuildArguments, ConsensusOutput, ExecHeader, Noticer, SealedHeader, TransactionSigned,
-};
+use tn_node_traits::BuildArguments;
+use tn_types::{ConsensusOutput, ExecHeader, Noticer, SealedHeader, TransactionSigned};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{error, info, trace, warn};

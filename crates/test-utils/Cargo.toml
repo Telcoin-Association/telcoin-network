@@ -48,6 +48,7 @@ reth-provider = { workspace = true }
 reth-node-ethereum = { workspace = true }
 reth-primitives-traits = { workspace = true }
 reth-stages = { workspace = true }
+tn-node-traits = { workspace = true }
 tn-batch-builder = { workspace = true }
 tn-batch-validator = { workspace = true }
 tn-engine = { workspace = true }

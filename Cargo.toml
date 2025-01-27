@@ -25,6 +25,7 @@ members = [
     "crates/execution/batch-validator",
     "crates/execution/faucet",
     "crates/execution/tn-rpc",
+    "crates/execution/node-traits",
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
@@ -209,6 +210,7 @@ assert_matches = { version = "1.5.0" }
 # common
 tn-types = { path = "./crates/types" }
 tn-node = { path = "./crates/node" }
+tn-node-traits = { path = "./crates/execution/node-traits" }
 tn-config = { path = "./crates/config" }
 tn-network = { path = "./crates/network" }
 tn-network-libp2p = { path = "./crates/network-libp2p" }

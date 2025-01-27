@@ -21,6 +21,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 # unit tests
 tokio = { workspace = true, features = ["sync", "time"] }
+tn-node-traits = { workspace = true }
 tn-test-utils = { workspace = true }
 reth-blockchain-tree = { workspace = true }
 reth-chainspec = { workspace = true }

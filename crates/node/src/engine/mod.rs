@@ -23,9 +23,10 @@ use reth_provider::providers::BlockchainProvider;
 use std::{net::SocketAddr, sync::Arc};
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
+use tn_node_traits::{TelcoinNode, TelcoinNodeTypes};
 use tn_types::{
     BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, SealedHeader, TaskManager,
-    TelcoinNode, TelcoinNodeTypes, WorkerId, B256,
+    WorkerId, B256,
 };
 use tokio::sync::{broadcast, RwLock};
 pub use worker::*;

@@ -1,6 +1,8 @@
 //! Compatibility types for Telcoin Node and reth.
+//!
+//! These are used to spawn execution components for the node and maintain compatibility with reth's
+//! API.
 
-use crate::{ExecHeader, TransactionSigned};
 use reth_chainspec::ChainSpec;
 use reth_db::{
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
@@ -12,10 +14,10 @@ use reth_node_builder::{NodeTypes, NodeTypesWithDB, NodeTypesWithEngine};
 use reth_node_ethereum::{
     BasicBlockExecutorProvider, EthEngineTypes, EthExecutionStrategyFactory, EthExecutorProvider,
 };
-use reth_primitives::EthPrimitives;
 use reth_provider::EthStorage;
 use reth_trie_db::MerklePatriciaTrie;
 use std::{marker::PhantomData, sync::Arc};
+use tn_types::{EthPrimitives, ExecHeader, TransactionSigned};
 
 /// Telcoin Network specific node types for reth compatibility.
 pub trait TelcoinNodeTypes: NodeTypesWithEngine + NodeTypesWithDB {

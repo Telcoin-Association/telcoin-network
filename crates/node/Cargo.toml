@@ -29,6 +29,7 @@ enr = { workspace = true, default-features = false, features = [
 
 fastcrypto = { workspace = true }
 tn-executor = { workspace = true }
+tn-node-traits = { workspace = true }
 tn-network = { workspace = true }
 tn-primary = { workspace = true }
 prometheus = { workspace = true }

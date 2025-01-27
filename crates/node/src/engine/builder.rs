@@ -19,7 +19,8 @@ use reth_provider::{
 use std::{collections::HashMap, sync::Arc};
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
-use tn_types::{TNExecution, TaskManager};
+use tn_node_traits::TNExecution;
+use tn_types::TaskManager;
 use tokio::sync::mpsc::unbounded_channel;
 use tracing::debug;
 

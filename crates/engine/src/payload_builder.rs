@@ -18,11 +18,11 @@ use reth_revm::{
     DatabaseCommit, State,
 };
 use std::sync::Arc;
+use tn_node_traits::{BuildArguments, TNPayload, TNPayloadAttributes};
 use tn_types::{
-    calculate_transaction_root, max_batch_gas, Batch, Block, BlockBody, BlockExt as _,
-    BuildArguments, ExecHeader, Receipt, SealedBlockWithSenders, SealedHeader, TNPayload,
-    TNPayloadAttributes, TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH,
-    EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, U256,
+    calculate_transaction_root, max_batch_gas, Batch, Block, BlockBody, BlockExt as _, ExecHeader,
+    Receipt, SealedBlockWithSenders, SealedHeader, TransactionSigned, Withdrawals, B256,
+    EMPTY_OMMER_ROOT_HASH, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, U256,
 };
 use tracing::{debug, error, info, warn};
 

@@ -10,10 +10,11 @@ use reth_db::{
 };
 use reth_provider::CanonStateSubscriptions;
 use tn_config::{ConsensusConfig, KeyConfig, TelcoinDirs};
+use tn_node_traits::TelcoinNode;
 use tn_primary::NodeMode;
 use tn_storage::open_db;
 pub use tn_storage::NodeStorage;
-use tn_types::{TaskManager, TelcoinNode};
+use tn_types::TaskManager;
 use tracing::{info, instrument};
 
 pub mod dirs;

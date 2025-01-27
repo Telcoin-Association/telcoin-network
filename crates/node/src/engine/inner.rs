@@ -2,7 +2,7 @@
 //!
 //! This module contains the logic for execution.
 
-use super::{TelcoinNodeTypes, WorkerComponents, WorkerTxPool};
+use super::{WorkerComponents, WorkerTxPool};
 use crate::{engine::WorkerNetwork, error::ExecutionError};
 use eyre::eyre;
 use jsonrpsee::http_client::HttpClient;
@@ -33,11 +33,12 @@ use tn_batch_validator::BatchValidator;
 use tn_config::Config;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
+use tn_node_traits::{TNExecution, TelcoinNodeTypes};
 use tn_rpc::{TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
     Address, BatchSender, BatchValidation, BlockBody, ConsensusOutput, EnvKzgSettings, ExecHeader,
-    LastCanonicalUpdate, Noticer, SealedBlock, SealedBlockWithSenders, SealedHeader, TNExecution,
-    TaskManager, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
+    LastCanonicalUpdate, Noticer, SealedBlock, SealedBlockWithSenders, SealedHeader, TaskManager,
+    WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;

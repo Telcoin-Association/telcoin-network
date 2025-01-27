@@ -174,7 +174,6 @@ impl BatchValidation for NoopBatchValidator {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
-
     use reth_blockchain_tree::{
         BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
     };
@@ -185,14 +184,14 @@ mod tests {
         DatabaseEnv,
     };
     use reth_db_common::init::init_genesis;
-
     use reth_node_types::NodeTypesWithDBAdapter;
     use reth_provider::{providers::StaticFileProvider, ProviderFactory};
     use std::{str::FromStr, sync::Arc};
+    use tn_node_traits::{TNExecution, TelcoinNode};
     use tn_test_utils::{test_genesis, TransactionFactory};
     use tn_types::{
         adiri_genesis, hex_literal::hex, max_batch_gas, Address, Batch, Bytes, GenesisAccount,
-        TNExecution, TelcoinNode, B256, MIN_PROTOCOL_BASE_FEE, U256,
+        B256, MIN_PROTOCOL_BASE_FEE, U256,
     };
     use tracing::debug;
 

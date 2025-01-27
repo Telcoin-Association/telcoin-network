@@ -443,12 +443,12 @@ mod tests {
     use tempfile::TempDir;
     use tn_engine::execute_consensus_output;
     use tn_network::local::LocalNetwork;
+    use tn_node_traits::{BuildArguments, TNExecution, TelcoinNode};
     use tn_storage::{open_db, tables::Batches, traits::Database};
     use tn_test_utils::{adiri_genesis_seeded, get_gas_price, TransactionFactory};
     use tn_types::{
-        adiri_genesis, BlockBody, BuildArguments, Bytes, CommittedSubDag, ConsensusHeader,
-        ConsensusOutput, GenesisAccount, SealedBatch, SealedBlock, TNExecution, TaskManager,
-        TelcoinNode, U160, U256,
+        adiri_genesis, BlockBody, Bytes, CommittedSubDag, ConsensusHeader, ConsensusOutput,
+        GenesisAccount, SealedBatch, SealedBlock, TaskManager, U160, U256,
     };
     use tn_worker::{
         metrics::WorkerMetrics,
