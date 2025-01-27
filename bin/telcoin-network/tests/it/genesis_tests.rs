@@ -13,8 +13,10 @@ mod tests {
     use std::{sync::Arc, time::Duration};
     use tn_config::{test_fetch_file_content_relative_to_manifest, ContractStandardJson};
     use tn_test_utils::TransactionFactory;
-    use tn_types::{adiri_genesis, hex, sol, BlsKeypair, NetworkKeypair, SolValue};
-    use tn_types::{Address, Bytes, GenesisAccount, U256};
+    use tn_types::{
+        adiri_genesis, hex, sol, Address, BlsKeypair, Bytes, GenesisAccount, NetworkKeypair,
+        SolValue, U256,
+    };
 
     #[tokio::test]
     async fn test_genesis_with_consensus_registry() {

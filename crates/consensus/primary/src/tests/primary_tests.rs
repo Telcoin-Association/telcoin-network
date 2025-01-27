@@ -29,7 +29,7 @@ use tn_test_utils::{
     CommitteeFixture,
 };
 use tn_types::{
-    now, AuthorityIdentifier, BlockHash, Certificate, Committee, ExecHeader, Header, SealedHeader,
+    now, AuthorityIdentifier, BlockHash, Certificate, Committee, ExecHeader, SealedHeader,
     SignatureVerificationState, TaskManager,
 };
 use tn_worker::{metrics::Metrics, Worker};

@@ -18,10 +18,10 @@ use lru_time_cache::LruCache;
 use reth::rpc::server_types::eth::{EthApiError, EthResult};
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
-use reth_transaction_pool::{EthPooledTransaction, PoolTransaction, TransactionPool};
+use reth_transaction_pool::{EthPooledTransaction, TransactionPool};
 use secp256k1::constants::PUBLIC_KEY_SIZE;
 use std::time::Duration;
-use tn_types::{Address, TransactionSigned, TxHash};
+use tn_types::{Address, TxHash};
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedSender},
     oneshot,

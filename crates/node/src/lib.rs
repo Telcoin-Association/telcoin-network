@@ -8,15 +8,12 @@ use reth_db::{
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
     Database,
 };
-use reth_provider::{
-    providers::{ProviderNodeTypes, TreeNodeTypes},
-    CanonStateSubscriptions,
-};
+use reth_provider::CanonStateSubscriptions;
 use tn_config::{ConsensusConfig, KeyConfig, TelcoinDirs};
 use tn_primary::NodeMode;
 use tn_storage::open_db;
 pub use tn_storage::NodeStorage;
-use tn_types::{BlockExt as _, TaskManager, TelcoinNode};
+use tn_types::{TaskManager, TelcoinNode};
 use tracing::{info, instrument};
 
 pub mod dirs;

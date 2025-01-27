@@ -12,27 +12,18 @@ use reth::rpc::builder::RpcServerHandle;
 use reth_chainspec::ChainSpec;
 use reth_discv4::DEFAULT_DISCOVERY_PORT;
 use reth_eth_wire::DisconnectReason;
-use reth_evm::execute::BlockExecutorProvider;
-use reth_network::NetworkHandle;
 use reth_network_api::{
     EthProtocolInfo, NetworkError, NetworkInfo, NetworkStatus, PeerInfo, PeerKind, Peers,
     PeersInfo, Reputation, ReputationChangeKind,
 };
 use reth_network_peers::{NodeRecord, PeerId};
-use reth_node_builder::{
-    components::NetworkBuilder,
-    node::{FullNodeTypes, NodeTypes},
-    BuilderContext, NodeTypesWithDB,
-};
-use reth_node_ethereum::EthEngineTypes;
-use reth_provider::providers::{BlockchainProvider, TreeNodeTypes};
-use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool, TransactionPool};
+use reth_node_builder::NodeTypesWithDB;
+use reth_provider::providers::BlockchainProvider;
+use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
 use std::{
-    marker::PhantomData,
     net::{IpAddr, SocketAddr},
     sync::Arc,
 };
-use tn_types::adiri_chain_spec;
 
 /// The explicit type for the worker's transaction pool.
 pub type WorkerTxPool<DB> = EthTransactionPool<BlockchainProvider<DB>, DiskFileBlobStore>;
@@ -90,12 +81,13 @@ impl NetworkInfo for WorkerNetwork {
         (IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED), DEFAULT_DISCOVERY_PORT).into()
     }
 
+    #[allow(deprecated, reason = "EthProtocolInfo::difficulty is deprecated")]
     async fn network_status(&self) -> Result<NetworkStatus, NetworkError> {
         Ok(NetworkStatus {
             client_version: "v0.0.1".to_string(),
             protocol_version: 1,
             eth_protocol_info: EthProtocolInfo {
-                difficulty: Default::default(),
+                difficulty: None,
                 network: self.chain_id(),
                 genesis: self.chain_spec.genesis_hash(),
                 head: Default::default(),

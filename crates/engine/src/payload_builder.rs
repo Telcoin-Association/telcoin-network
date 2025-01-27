@@ -14,7 +14,7 @@ use reth_revm::{
     cached::CachedReads,
     database::StateProviderDatabase,
     db::states::bundle_state::BundleRetention,
-    primitives::{EVMError, EnvWithHandlerCfg, ResultAndState, TxEnv},
+    primitives::{EVMError, EnvWithHandlerCfg, FixedBytes, ResultAndState, TxEnv},
     DatabaseCommit, State,
 };
 use std::sync::Arc;
@@ -173,7 +173,7 @@ where
     //
     // see: reth/crates/consensus/beacon/src/engine/mod.rs:update_canon_chain
     provider.set_canonical_head(canonical_header.clone());
-    info!(target: "engine", "canonical head for round {:?}: {:?} - {:?}", canonical_header.nonce, canonical_header.number, canonical_header.hash());
+    info!(target: "engine", "canonical head for round {:?}: {:?} - {:?}", <FixedBytes<8> as Into<u64>>::into(canonical_header.nonce), canonical_header.number, canonical_header.hash());
 
     // finalize the last block executed from consensus output and update chain info
     //

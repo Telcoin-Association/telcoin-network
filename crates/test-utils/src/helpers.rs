@@ -16,8 +16,8 @@ use std::{
 use tn_types::{
     adiri_chain_spec_arc, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash,
     BlsKeypair, BlsSignature, Bytes, Certificate, CertificateDigest, Committee, Epoch, ExecHeader,
-    Header, HeaderBuilder, Multiaddr, NetworkKeypair, ProtocolSignature, Round, Stake,
-    TimestampSec, TransactionSigned, WorkerId, U256,
+    HeaderBuilder, Multiaddr, NetworkKeypair, ProtocolSignature, Round, Stake, TimestampSec,
+    TransactionSigned, WorkerId, U256,
 };
 
 pub const VOTES_CF: &str = "votes";

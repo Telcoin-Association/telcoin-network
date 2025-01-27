@@ -1,61 +1,27 @@
 //! Builder for engine to mantain generics.
 
-use super::{
-    inner::ExecutionNodeInner, TelcoinNode, TelcoinNodeTypes, TnBuilder, WorkerComponents,
-    WorkerTxPool,
-};
-use crate::{engine::WorkerNetwork, error::ExecutionError};
-use eyre::eyre;
-use jsonrpsee::http_client::HttpClient;
-use reth::{
-    consensus::FullConsensus,
-    primitives::EthPrimitives,
-    rpc::{
-        builder::{config::RethRpcServerConfig, RpcModuleBuilder, RpcServerHandle},
-        eth::EthApi,
-    },
-};
+use super::{inner::ExecutionNodeInner, TelcoinNodeTypes, TnBuilder};
+use reth::{consensus::FullConsensus, primitives::EthPrimitives};
 use reth_blockchain_tree::{
     BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
 };
-use reth_chainspec::{ChainSpec, EthereumHardforks};
+use reth_chainspec::ChainSpec;
 use reth_db::{
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
     Database,
 };
 use reth_db_common::init::init_genesis;
-use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm, ConfigureEvmEnv};
-use reth_node_builder::{
-    NodeConfig, NodeTypes, NodeTypesWithDB, NodeTypesWithEngine, RethTransactionPoolConfig,
-};
-use reth_node_ethereum::{BasicBlockExecutorProvider, EthEvmConfig, EthExecutorProvider};
+use reth_node_builder::NodeConfig;
 use reth_provider::{
-    providers::{
-        BlockchainProvider, NodeTypesForProvider, ProviderNodeTypes, StaticFileProvider,
-        TreeNodeTypes,
-    },
-    BlockIdReader, BlockReader, CanonStateSubscriptions as _, ChainSpecProvider,
-    ChainStateBlockReader, DatabaseProviderFactory, EthStorage, HeaderProvider, ProviderFactory,
-    TransactionVariant,
+    providers::{BlockchainProvider, StaticFileProvider},
+    EthStorage, ProviderFactory,
 };
-use reth_transaction_pool::{
-    blobstore::DiskFileBlobStore, TransactionPool, TransactionValidationTaskExecutor,
-};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
-use tn_batch_builder::BatchBuilder;
-use tn_batch_validator::BatchValidator;
+use std::{collections::HashMap, sync::Arc};
 use tn_config::Config;
-use tn_engine::ExecutorEngine;
-use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
-use tn_rpc::{TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
-use tn_types::{
-    Address, BatchSender, BatchValidation, BlockBody, Consensus, ConsensusOutput, EnvKzgSettings,
-    ExecHeader, LastCanonicalUpdate, Noticer, SealedBlock, SealedBlockWithSenders, TNExecution,
-    TaskManager, TransactionSigned, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
-};
-use tokio::sync::{broadcast, mpsc::unbounded_channel};
-use tokio_stream::wrappers::BroadcastStream;
-use tracing::{debug, error, info};
+use tn_faucet::FaucetArgs;
+use tn_types::{TNExecution, TaskManager};
+use tokio::sync::mpsc::unbounded_channel;
+use tracing::debug;
 
 /// A builder that handles component initialization for the execution node.
 /// Separates initialization concerns from runtime behavior.

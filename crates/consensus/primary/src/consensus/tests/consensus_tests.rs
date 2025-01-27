@@ -9,8 +9,8 @@ use std::{collections::BTreeSet, sync::Arc};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
 use tn_types::{
-    Certificate, ExecHeader, Header, ReputationScores, SealedHeader, TaskManager, TnReceiver,
-    TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    Certificate, ExecHeader, ReputationScores, SealedHeader, TaskManager, TnReceiver, TnSender,
+    B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 
 /// This test is trying to compare the output of the Consensus algorithm when:

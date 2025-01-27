@@ -174,7 +174,7 @@ impl BatchValidation for NoopBatchValidator {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
-    use reth_beacon_consensus::EthBeaconConsensus;
+
     use reth_blockchain_tree::{
         BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
     };
@@ -185,7 +185,7 @@ mod tests {
         DatabaseEnv,
     };
     use reth_db_common::init::init_genesis;
-    use reth_node_ethereum::EthereumNode;
+
     use reth_node_types::NodeTypesWithDBAdapter;
     use reth_provider::{providers::StaticFileProvider, ProviderFactory};
     use std::{str::FromStr, sync::Arc};
@@ -253,17 +253,17 @@ mod tests {
         )
     }
 
+    type TestProvider = NodeTypesWithDBAdapter<
+        TelcoinNode<Arc<TempDatabase<DatabaseEnv>>>,
+        Arc<TempDatabase<DatabaseEnv>>,
+    >;
+
     /// Convenience type for creating test assets.
     struct TestTools {
         /// The expected sealed batch.
         valid_batch: SealedBatch,
         /// Validator
-        validator: BatchValidator<
-            NodeTypesWithDBAdapter<
-                TelcoinNode<Arc<TempDatabase<DatabaseEnv>>>,
-                Arc<TempDatabase<DatabaseEnv>>,
-            >,
-        >,
+        validator: BatchValidator<TestProvider>,
     }
 
     /// Create an instance of block validator for tests.

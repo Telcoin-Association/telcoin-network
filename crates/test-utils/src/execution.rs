@@ -15,9 +15,7 @@ use reth_node_core::{args::DatadirArgs, node_config::NodeConfig};
 use reth_primitives_traits::{crypto::secp256k1::sign_message, SignedTransaction as _};
 use reth_provider::{BlockReaderIdExt, ExecutionOutcome, StateProviderFactory};
 use reth_revm::database::StateProviderDatabase;
-use reth_transaction_pool::{
-    EthPooledTransaction, PoolTransaction, TransactionOrigin, TransactionPool,
-};
+use reth_transaction_pool::{EthPooledTransaction, TransactionOrigin, TransactionPool};
 use secp256k1::Secp256k1;
 use std::{str::FromStr, sync::Arc};
 use telcoin_network::node::NodeCommand;
@@ -28,7 +26,7 @@ use tn_node::engine::{ExecutionNode, TnBuilder};
 use tn_types::{
     adiri_genesis, calculate_transaction_root, now, public_key_to_address, AccessList, Address,
     Batch, Block, BlockBody, BlockExt as _, BlockHeader as _, Bytes, EthPrimitives, EthSignature,
-    ExecHeader, ExecutionKeypair, Genesis, GenesisAccount, Header, SealedHeader,
+    ExecHeader, ExecutionKeypair, Genesis, GenesisAccount, SealedHeader,
     SignedTransactionIntoRecoveredExt as _, TaskManager, TelcoinNode, TimestampSec, Transaction,
     TransactionSigned, TxEip1559, TxHash, TxKind, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH,
     EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE, U256,

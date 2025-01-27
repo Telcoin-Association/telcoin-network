@@ -2,40 +2,27 @@
 //!
 //! This module contains the logic for execution.
 
-use super::{TelcoinNode, TelcoinNodeTypes, TnBuilder, WorkerComponents, WorkerTxPool};
+use super::{TelcoinNodeTypes, WorkerComponents, WorkerTxPool};
 use crate::{engine::WorkerNetwork, error::ExecutionError};
 use eyre::eyre;
 use jsonrpsee::http_client::HttpClient;
 use reth::{
-    consensus::FullConsensus,
     primitives::EthPrimitives,
     rpc::{
         builder::{config::RethRpcServerConfig, RpcModuleBuilder, RpcServerHandle},
         eth::EthApi,
     },
 };
-use reth_blockchain_tree::{
-    BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
-};
-use reth_chainspec::{ChainSpec, EthereumHardforks};
+use reth_chainspec::ChainSpec;
 use reth_db::{
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
     Database,
 };
-use reth_db_common::init::init_genesis;
-use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm, ConfigureEvmEnv};
-use reth_node_builder::{
-    NodeConfig, NodeTypes, NodeTypesWithDB, NodeTypesWithEngine, RethTransactionPoolConfig,
-};
-use reth_node_ethereum::EthEvmConfig;
+use reth_node_builder::{NodeConfig, RethTransactionPoolConfig};
 use reth_provider::{
-    providers::{
-        BlockchainProvider, NodeTypesForProvider, ProviderNodeTypes, StaticFileProvider,
-        TreeNodeTypes,
-    },
-    BlockIdReader, BlockReader, CanonStateSubscriptions as _, ChainSpecProvider,
-    ChainStateBlockReader, DatabaseProviderFactory, EthStorage, HeaderProvider, ProviderFactory,
-    TransactionVariant,
+    providers::BlockchainProvider, BlockIdReader, BlockReader, CanonStateSubscriptions as _,
+    ChainSpecProvider, ChainStateBlockReader, DatabaseProviderFactory, EthStorage, HeaderProvider,
+    ProviderFactory, TransactionVariant,
 };
 use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, TransactionPool, TransactionValidationTaskExecutor,
@@ -48,13 +35,13 @@ use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
 use tn_rpc::{TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
-    Address, BatchSender, BatchValidation, BlockBody, Consensus, ConsensusOutput, EnvKzgSettings,
-    ExecHeader, LastCanonicalUpdate, Noticer, SealedBlock, SealedBlockWithSenders, SealedHeader,
-    TNExecution, TaskManager, TransactionSigned, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
+    Address, BatchSender, BatchValidation, BlockBody, ConsensusOutput, EnvKzgSettings, ExecHeader,
+    LastCanonicalUpdate, Noticer, SealedBlock, SealedBlockWithSenders, SealedHeader, TNExecution,
+    TaskManager, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
 };
-use tokio::sync::{broadcast, mpsc::unbounded_channel};
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 /// Inner type for holding execution layer types.
 pub(super) struct ExecutionNodeInner<N>

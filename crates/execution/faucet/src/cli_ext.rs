@@ -10,10 +10,10 @@ use eyre::ContextCompat;
 use k256::PublicKey as PubKey;
 use reth_cli_util::parse_duration_from_secs;
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
-use reth_transaction_pool::{EthPooledTransaction, PoolTransaction, TransactionPool};
+use reth_transaction_pool::{EthPooledTransaction, TransactionPool};
 use secp256k1::PublicKey;
 use std::{str::FromStr, time::Duration};
-use tn_types::{public_key_to_address, Address, PooledTransaction, TransactionSigned, U256};
+use tn_types::{public_key_to_address, Address, U256};
 use tracing::{info, warn};
 
 /// Args for running the faucet.

@@ -446,9 +446,9 @@ mod tests {
     use tn_storage::{open_db, tables::Batches, traits::Database};
     use tn_test_utils::{adiri_genesis_seeded, get_gas_price, TransactionFactory};
     use tn_types::{
-        adiri_genesis, BlockBody, BuildArguments, Bytes, CommittedSubDag, Consensus,
-        ConsensusHeader, ConsensusOutput, GenesisAccount, SealedBatch, SealedBlock, TNExecution,
-        TaskManager, TelcoinNode, U160, U256,
+        adiri_genesis, BlockBody, BuildArguments, Bytes, CommittedSubDag, ConsensusHeader,
+        ConsensusOutput, GenesisAccount, SealedBatch, SealedBlock, TNExecution, TaskManager,
+        TelcoinNode, U160, U256,
     };
     use tn_worker::{
         metrics::WorkerMetrics,
@@ -683,8 +683,6 @@ mod tests {
         );
         let _genesis_hash = init_genesis(&provider_factory).expect("init genesis");
 
-        // TODO: figure out a better way to ensure this matches engine::inner::new
-        let evm_config = EthEvmConfig::new(chain.clone());
         let executor = EthExecutorProvider::ethereum(Arc::clone(&chain));
         let auto_consensus: Arc<dyn FullConsensus> = Arc::new(TNExecution);
         let tree_config = BlockchainTreeConfig::default();

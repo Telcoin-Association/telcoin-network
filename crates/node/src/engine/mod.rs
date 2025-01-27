@@ -12,33 +12,22 @@
 
 use self::inner::ExecutionNodeInner;
 use builder::ExecutionNodeBuilder;
-use reth::primitives::EthPrimitives;
-use reth_blockchain_tree::BlockchainTreeEngine;
 use reth_chainspec::ChainSpec;
 use reth_db::{
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
-    Database, DatabaseEnv,
+    Database,
 };
-use reth_node_builder::{NodeConfig, NodeTypes, NodeTypesWithDB, NodeTypesWithEngine};
-use reth_node_ethereum::{
-    BasicBlockExecutorProvider, EthEngineTypes, EthEvmConfig, EthExecutionStrategyFactory,
-    EthExecutorProvider,
-};
-use reth_provider::{
-    providers::{BlockchainProvider, TreeNodeTypes},
-    BlockIdReader, BlockReader, CanonChainTracker, ChainSpecProvider, EthStorage,
-    StageCheckpointReader,
-};
-use std::{marker::PhantomData, net::SocketAddr, sync::Arc};
+use reth_node_builder::NodeConfig;
+use reth_node_ethereum::{BasicBlockExecutorProvider, EthEvmConfig, EthExecutionStrategyFactory};
+use reth_provider::providers::BlockchainProvider;
+use std::{net::SocketAddr, sync::Arc};
 use tn_config::Config;
-use tn_engine::ExecutorEngine;
 use tn_faucet::FaucetArgs;
 use tn_types::{
-    BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, SealedHeader, TNExecution,
-    TaskManager, TelcoinNode, TelcoinNodeTypes, TransactionSigned, WorkerId, B256,
+    BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, SealedHeader, TaskManager,
+    TelcoinNode, TelcoinNodeTypes, WorkerId, B256,
 };
 use tokio::sync::{broadcast, RwLock};
-use tokio_stream::wrappers::BroadcastStream;
 pub use worker::*;
 mod builder;
 mod inner;

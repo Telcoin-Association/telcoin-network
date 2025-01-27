@@ -35,8 +35,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tn_types::{
-    Address, EthSignature, PooledTransaction, SolType, Transaction, TransactionSigned,
-    TransactionTrait as _, TxEip1559, TxHash, TxKind, B256, U256,
+    Address, EthSignature, SolType, Transaction, TransactionSigned, TransactionTrait as _,
+    TxEip1559, TxHash, TxKind, B256, U256,
 };
 use tokio::sync::{
     mpsc::{UnboundedReceiver, UnboundedSender},
