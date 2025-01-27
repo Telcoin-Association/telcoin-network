@@ -49,10 +49,6 @@ mod builder;
 mod inner;
 mod worker;
 
-/// Convenince type for reth compatibility.
-pub trait RethDB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static {}
-impl RethDB for Arc<reth_db::DatabaseEnv> {}
-
 /// Telcoin Network specific node types for reth compatibility.
 pub(super) trait TelcoinNodeTypes: NodeTypesWithEngine + NodeTypesWithDB {
     /// The EVM executor type
@@ -68,26 +64,37 @@ pub(super) trait TelcoinNodeTypes: NodeTypesWithEngine + NodeTypesWithDB {
     fn create_evm_config(chain: Arc<ChainSpec>) -> Self::EvmConfig;
     fn create_executor(chain: Arc<ChainSpec>) -> Self::Executor;
 }
-pub struct TelcoinNode<DB: RethDB> {
+
+#[derive(Clone)]
+pub struct TelcoinNode<DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static>
+{
     _phantom: PhantomData<DB>,
 }
 
-impl<DB: RethDB> NodeTypes for TelcoinNode<DB> {
+impl<DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static> NodeTypes
+    for TelcoinNode<DB>
+{
     type Primitives = EthPrimitives;
     type ChainSpec = ChainSpec;
     type StateCommitment = MerklePatriciaTrie;
     type Storage = EthStorage;
 }
 
-impl<DB: RethDB> NodeTypesWithEngine for TelcoinNode<DB> {
+impl<DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static>
+    NodeTypesWithEngine for TelcoinNode<DB>
+{
     type Engine = EthEngineTypes;
 }
 
-impl<DB: RethDB> NodeTypesWithDB for TelcoinNode<DB> {
+impl<DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static> NodeTypesWithDB
+    for TelcoinNode<DB>
+{
     type DB = DB;
 }
 
-impl<DB: RethDB> TelcoinNodeTypes for TelcoinNode<DB> {
+impl<DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static> TelcoinNodeTypes
+    for TelcoinNode<DB>
+{
     type Executor = BasicBlockExecutorProvider<EthExecutionStrategyFactory>;
     type EvmConfig = EthEvmConfig;
     type BlockEngine = ExecutorEngine<Self, Self::EvmConfig>;
@@ -124,7 +131,7 @@ pub struct TnBuilder<DB> {
 pub struct ExecutionNode<N>
 where
     N: TelcoinNodeTypes,
-    N::DB: RethDB,
+    N::DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
 {
     internal: Arc<RwLock<ExecutionNodeInner<TelcoinNode<N::DB>>>>,
 }
@@ -132,7 +139,7 @@ where
 impl<N> ExecutionNode<N>
 where
     N: TelcoinNodeTypes,
-    N::DB: RethDB,
+    N::DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
 {
     /// Create a new instance of `Self`.
     pub fn new(tn_builder: TnBuilder<N::DB>, task_manager: &TaskManager) -> eyre::Result<Self> {

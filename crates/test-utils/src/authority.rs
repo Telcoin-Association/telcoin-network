@@ -7,11 +7,11 @@ use crate::{
 use anemo::Network;
 use fastcrypto::{hash::Hash, traits::KeyPair as _};
 use jsonrpsee::http_client::HttpClient;
-use reth::primitives::Address;
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
 use tn_config::{Config, ConsensusConfig, KeyConfig};
 use tn_network::local::LocalNetwork;
 use tn_storage::traits::Database;
+use tn_types::Address;
 use tn_types::{
     Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, Certificate, Committee, Header,
     HeaderBuilder, Multiaddr, NetworkKeypair, NetworkPublicKey, Round, Vote, WorkerCache, WorkerId,

@@ -513,14 +513,6 @@ async fn submit_transaction<Pool>(
 where
     Pool: TransactionPool<Transaction = EthPooledTransaction>,
 {
-    // let recovered = tx.into_ecrecovered().ok_or(EthApiError::InvalidTransactionSignature)?;
-    // let pool_transaction = match recovered.try_into() {
-    //     Ok(converted) => <Pool::Transaction>::from_pooled(converted),
-    //     Err(_) => return Err(EthApiError::TransactionConversionError),
-    // };
-    // let pool_transaction = EthPooledTransaction::try_from(recovered).expect("turtle");
-    // recovered.try_into_pooled().map_err(|_| EthApiError::TransactionConversionError)?;
-
     let pool_tx = tx.try_into_pooled().map_err(|_| EthApiError::TransactionConversionError)?;
     let recovered =
         pool_tx.try_into_ecrecovered().map_err(|_| EthApiError::InvalidTransactionSignature)?;

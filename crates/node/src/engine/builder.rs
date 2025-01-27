@@ -1,7 +1,7 @@
 //! Builder for engine to mantain generics.
 
 use super::{
-    inner::ExecutionNodeInner, RethDB, TelcoinNode, TelcoinNodeTypes, TnBuilder, WorkerComponents,
+    inner::ExecutionNodeInner, TelcoinNode, TelcoinNodeTypes, TnBuilder, WorkerComponents,
     WorkerTxPool,
 };
 use crate::{engine::WorkerNetwork, error::ExecutionError};
@@ -62,7 +62,7 @@ use tracing::{debug, error, info};
 pub struct ExecutionNodeBuilder<N>
 where
     N: TelcoinNodeTypes,
-    N::DB: RethDB,
+    N::DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
 {
     // Node configurations that drive component initialization
     node_config: NodeConfig<N::ChainSpec>,
@@ -84,7 +84,7 @@ where
 impl<N> ExecutionNodeBuilder<N>
 where
     N: TelcoinNodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives, Storage = EthStorage>,
-    N::DB: RethDB,
+    N::DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
 {
     /// Start the builder with required components
     pub fn new(tn_builder: TnBuilder<N::DB>) -> Self {

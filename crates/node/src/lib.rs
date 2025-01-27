@@ -2,7 +2,7 @@
 //! Library for managing all components used by a full-node in a single process.
 
 use crate::{primary::PrimaryNode, worker::WorkerNode};
-use engine::{ExecutionNode, RethDB, TelcoinNode, TnBuilder};
+use engine::{ExecutionNode, TelcoinNode, TnBuilder};
 use futures::StreamExt;
 use reth_db::{
     database_metrics::{DatabaseMetadata, DatabaseMetrics},
@@ -32,7 +32,7 @@ pub mod worker;
 #[instrument(level = "info", skip_all)]
 pub async fn launch_node<DB, P>(mut builder: TnBuilder<DB>, tn_datadir: P) -> eyre::Result<()>
 where
-    DB: RethDB,
+    DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
     P: TelcoinDirs + 'static,
 {
     // config for validator keys

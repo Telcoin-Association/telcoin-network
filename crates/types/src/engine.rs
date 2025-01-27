@@ -7,7 +7,7 @@ use crate::{
 use reth_chainspec::ChainSpec;
 pub use reth_consensus::{Consensus, ConsensusError};
 use reth_consensus::{FullConsensus, HeaderValidator, PostExecutionInput};
-use reth_engine_primitives::{EngineTypes, PayloadTypes, PayloadValidator};
+use reth_engine_primitives::PayloadValidator;
 use reth_revm::primitives::{
     BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, SpecId,
 };

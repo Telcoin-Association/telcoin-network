@@ -15,9 +15,9 @@ use std::{
 };
 use tn_types::{
     adiri_chain_spec_arc, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash,
-    BlsKeypair, BlsSignature, Bytes, Certificate, CertificateDigest, Committee, Epoch, Header,
-    HeaderBuilder, Multiaddr, NetworkKeypair, ProtocolSignature, Round, Stake, TimestampSec,
-    TransactionSigned, WorkerId, U256,
+    BlsKeypair, BlsSignature, Bytes, Certificate, CertificateDigest, Committee, Epoch, ExecHeader,
+    Header, HeaderBuilder, Multiaddr, NetworkKeypair, ProtocolSignature, Round, Stake,
+    TimestampSec, TransactionSigned, WorkerId, U256,
 };
 
 pub const VOTES_CF: &str = "votes";
@@ -173,7 +173,7 @@ pub fn transaction_with_rand<R: Rng + ?Sized>(rand: &mut R) -> TransactionSigned
 pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Batch {
     Batch::new_for_test(
         vec![transaction_with_rand(rand), transaction_with_rand(rand)],
-        Header::default(),
+        ExecHeader::default(),
     )
 }
 
@@ -230,7 +230,7 @@ pub fn batch_with_transactions(num_of_transactions: usize) -> Batch {
         transactions.push(transaction());
     }
 
-    Batch::new_for_test(transactions, Header::default())
+    Batch::new_for_test(transactions, ExecHeader::default())
 }
 
 /// Creates one certificate per authority starting and finishing at the specified rounds

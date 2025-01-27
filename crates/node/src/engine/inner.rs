@@ -2,7 +2,7 @@
 //!
 //! This module contains the logic for execution.
 
-use super::{RethDB, TelcoinNode, TelcoinNodeTypes, TnBuilder, WorkerComponents, WorkerTxPool};
+use super::{TelcoinNode, TelcoinNodeTypes, TnBuilder, WorkerComponents, WorkerTxPool};
 use crate::{engine::WorkerNetwork, error::ExecutionError};
 use eyre::eyre;
 use jsonrpsee::http_client::HttpClient;
@@ -60,7 +60,7 @@ use tracing::{debug, error, info};
 pub(super) struct ExecutionNodeInner<N>
 where
     N: TelcoinNodeTypes,
-    N::DB: RethDB,
+    N::DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
 {
     /// The [Address] for the authority used as the suggested beneficiary.
     ///
@@ -94,7 +94,7 @@ where
 impl<N> ExecutionNodeInner<N>
 where
     N: TelcoinNodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives, Storage = EthStorage>,
-    N::DB: RethDB,
+    N::DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
 {
     /// Spawn tasks associated with executing output from consensus.
     ///

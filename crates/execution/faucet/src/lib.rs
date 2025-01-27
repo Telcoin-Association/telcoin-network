@@ -208,7 +208,7 @@ mod tests {
         ecdsa::{RecoverableSignature, RecoveryId, Signature},
         Message, PublicKey, SECP256K1,
     };
-    use tn_types::{keccak256, public_key_to_address, EthSignature as RSignature, U256};
+    use tn_types::{keccak256, public_key_to_address, EthSignature, U256};
     use tokio::sync::oneshot;
     use tracing::debug;
 
@@ -365,12 +365,13 @@ mod tests {
             }
         }
 
-        let odd_y_parity = rx.blocking_recv().expect("y odd parity");
+        let y_parity = rx.blocking_recv().expect("y odd parity");
 
-        let eth_sig =
-            RSignature { r: U256::from_be_slice(r), s: U256::from_be_slice(s), odd_y_parity };
+        let r = U256::from_be_slice(r);
+        let s = U256::from_be_slice(s);
+        let eth_signature = EthSignature::new(r, s, y_parity);
 
-        let signer = eth_sig.recover_signer(data).expect("signer recoverable");
+        let signer = eth_signature.recover_signer(data).expect("signer recoverable");
 
         assert_eq!(signer, wallet_address);
     }

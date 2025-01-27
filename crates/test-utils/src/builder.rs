@@ -5,7 +5,6 @@ use rand::{
     rngs::{OsRng, StdRng},
     SeedableRng,
 };
-use reth::primitives::Address;
 use std::{
     collections::{BTreeMap, VecDeque},
     marker::PhantomData,
@@ -13,6 +12,7 @@ use std::{
 };
 use tn_config::KeyConfig;
 use tn_storage::traits::Database;
+use tn_types::Address;
 use tn_types::{
     get_available_udp_port, traits::KeyPair, Authority, BlsKeypair, Committee, Epoch, Multiaddr,
     Stake, WorkerCache, WorkerIndex, DEFAULT_PRIMARY_PORT, DEFAULT_WORKER_PORT,

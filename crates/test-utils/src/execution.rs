@@ -4,13 +4,6 @@ use alloy::signers::{k256::FieldBytes, local::PrivateKeySigner};
 use clap::{Args, Parser};
 use core::fmt;
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use reth::{
-    args::DatadirArgs,
-    builder::NodeConfig,
-    providers::{BlockReaderIdExt, ExecutionOutcome, StateProviderFactory},
-    revm::database::StateProviderDatabase,
-    rpc::types::AccessList,
-};
 use reth_chainspec::{BaseFeeParams, ChainSpec};
 use reth_cli_commands::node::NoArgs;
 use reth_db::{
@@ -18,19 +11,32 @@ use reth_db::{
     DatabaseEnv,
 };
 use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, Executor as _};
-use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool};
+use reth_node_core::{args::DatadirArgs, node_config::NodeConfig};
+use reth_primitives_traits::{crypto::secp256k1::sign_message, SignedTransaction as _};
+use reth_provider::{BlockReaderIdExt, ExecutionOutcome, StateProviderFactory};
+use reth_revm::database::StateProviderDatabase;
+use reth_transaction_pool::{
+    EthPooledTransaction, PoolTransaction, TransactionOrigin, TransactionPool,
+};
 use secp256k1::Secp256k1;
 use std::{str::FromStr, sync::Arc};
 use telcoin_network::node::NodeCommand;
 use tempfile::tempdir;
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
-use tn_node::engine::{ExecutionNode, TnBuilder};
-use tn_types::{adiri_genesis, now, Address, Batch, ExecutionKeypair, TaskManager, TimestampSec};
+use tn_node::engine::{ExecutionNode, TelcoinNode, TnBuilder};
+use tn_types::{
+    adiri_genesis, calculate_transaction_root, now, public_key_to_address, AccessList, Address,
+    Batch, Block, BlockBody, BlockExt as _, BlockHeader as _, Bytes, EthPrimitives, EthSignature,
+    ExecHeader, ExecutionKeypair, Genesis, GenesisAccount, Header, SealedHeader,
+    SignedTransactionIntoRecoveredExt as _, TaskManager, TimestampSec, Transaction,
+    TransactionSigned, TxEip1559, TxHash, TxKind, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH,
+    EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE, U256,
+};
 use tracing::debug;
 
 /// Convnenience type for testing Execution Node.
-pub type TestExecutionNode = ExecutionNode<Arc<TempDatabase<DatabaseEnv>>>;
+pub type TestExecutionNode = ExecutionNode<TelcoinNode<Arc<TempDatabase<DatabaseEnv>>>>;
 
 /// A helper type to parse Args more easily.
 #[derive(Parser, Debug)]
@@ -283,10 +289,10 @@ pub fn execution_outcome_for_tests<P, E>(
 ) -> ExecutionOutcome
 where
     P: StateProviderFactory + BlockReaderIdExt,
-    E: BlockExecutorProvider,
+    E: BlockExecutorProvider<Primitives = EthPrimitives>,
 {
     // create "empty" header with default values
-    let mut header = Header {
+    let mut header = ExecHeader {
         parent_hash: parent.hash(),
         ommers_hash: EMPTY_OMMER_ROOT_HASH,
         beneficiary: Address::ZERO,
@@ -301,13 +307,13 @@ where
         gas_used: 0,
         timestamp: now(),
         mix_hash: B256::random(),
-        nonce: 0,
+        nonce: 0_u64.into(),
         base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
         blob_gas_used: None,
         excess_blob_gas: None,
         extra_data: Default::default(),
         parent_beacon_block_root: None,
-        requests_root: None,
+        requests_hash: None,
     };
 
     // decode batch transactions
@@ -321,16 +327,17 @@ where
     header.transactions_root = if batch.transactions().is_empty() {
         EMPTY_TRANSACTIONS
     } else {
-        proofs::calculate_transaction_root(&txs)
+        calculate_transaction_root(&txs)
     };
 
     // recover senders from block
     let block = Block {
         header,
-        body: txs,
-        ommers: vec![],
-        withdrawals: Some(Default::default()),
-        requests: None,
+        body: BlockBody {
+            transactions: txs,
+            ommers: vec![],
+            withdrawals: Some(Default::default()),
+        },
     }
     .with_recovered_senders()
     .expect("unable to recover senders while executing test batch");
@@ -346,7 +353,7 @@ where
     // execute the block
     let BlockExecutionOutput { state, receipts, .. } = executor
         .executor(&mut db)
-        .execute((&block, U256::ZERO).into())
+        .execute(&block)
         .expect("executor can execute test batch transactions");
     ExecutionOutcome::new(state, receipts.into(), block_number, vec![])
 }
@@ -446,7 +453,7 @@ impl TransactionFactory {
         // increase nonce for next tx
         self.inc_nonce();
 
-        TransactionSigned::from_transaction_and_signature(transaction, signature)
+        TransactionSigned::new_unhashed(transaction, signature)
     }
 
     /// Create and sign an EIP1559 transaction with all possible parameters passed.
@@ -502,11 +509,11 @@ impl TransactionFactory {
         // increase nonce for self
         self.inc_nonce();
 
-        TransactionSigned::from_transaction_and_signature(transaction, signature)
+        TransactionSigned::new_unhashed(transaction, signature)
     }
 
     /// Sign the transaction hash with the key in memory
-    fn sign_hash(&self, hash: B256) -> Signature {
+    fn sign_hash(&self, hash: B256) -> EthSignature {
         // let env = std::env::var("WALLET_SECRET_KEY")
         //     .expect("Wallet address is set through environment variable");
         // let secret: B256 = env.parse().expect("WALLET_SECRET_KEY must start with 0x");
@@ -534,15 +541,13 @@ impl TransactionFactory {
         pool: Pool,
     ) -> TxHash
     where
-        Pool: TransactionPool,
+        Pool: TransactionPool<Transaction = EthPooledTransaction>,
     {
         let tx = self.create_eip1559(chain, None, gas_price, Some(to), value, Bytes::new());
-        let pooled_tx =
-            PooledTransactionsElement::try_from_broadcast(tx).expect("tx valid for pool");
+        let pooled_tx = tx.try_into_pooled().expect("tx valid for pool");
         let recovered = pooled_tx.try_into_ecrecovered().expect("tx is recovered");
-        let transaction = <Pool::Transaction>::from_pooled(recovered);
 
-        pool.add_transaction(TransactionOrigin::Local, transaction)
+        pool.add_transaction(TransactionOrigin::Local, recovered.into())
             .await
             .expect("recovered tx added to pool")
     }
@@ -550,16 +555,14 @@ impl TransactionFactory {
     /// Submit a transaction to the provided pool.
     pub async fn submit_tx_to_pool<Pool>(&self, tx: TransactionSigned, pool: Pool) -> TxHash
     where
-        Pool: TransactionPool,
+        Pool: TransactionPool<Transaction = EthPooledTransaction>,
     {
-        let pooled_tx =
-            PooledTransactionsElement::try_from_broadcast(tx).expect("tx valid for pool");
+        let pooled_tx = tx.try_into_pooled().expect("tx valid for pool");
         let recovered = pooled_tx.try_into_ecrecovered().expect("tx is recovered");
-        let transaction = <Pool::Transaction>::from_pooled(recovered);
 
-        debug!("transaction: \n{transaction:?}\n");
+        debug!("transaction: \n{recovered:?}\n");
 
-        pool.add_transaction(TransactionOrigin::Local, transaction)
+        pool.add_transaction(TransactionOrigin::Local, recovered.into())
             .await
             .expect("recovered tx added to pool")
     }
