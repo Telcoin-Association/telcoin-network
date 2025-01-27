@@ -142,10 +142,9 @@ where
             let build_args = BuildArguments::new(provider, output, parent);
 
             // spawn blocking task and return future
-            tokio::task::spawn_blocking(|| {
+            tokio::task::spawn_blocking(move || {
                 // this is safe to call on blocking thread without a semaphore bc it's held in
                 // Self::pending_tesk as a single `Option`
-                let evm_config = evm_config;
                 let result = execute_consensus_output(&evm_config, build_args);
                 match tx.send(result) {
                     Ok(()) => (),
