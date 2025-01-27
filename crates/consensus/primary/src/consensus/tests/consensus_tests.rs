@@ -9,8 +9,8 @@ use std::{collections::BTreeSet, sync::Arc};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
 use tn_types::{
-    Certificate, Header, ReputationScores, TaskManager, TnReceiver, TnSender, B256,
-    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    Certificate, ExecHeader, Header, ReputationScores, SealedHeader, TaskManager, TnReceiver,
+    TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 
 /// This test is trying to compare the output of the Consensus algorithm when:
@@ -60,7 +60,7 @@ async fn test_consensus_recovery_with_bullshark() {
     );
 
     let cb = ConsensusBus::new();
-    let dummy_parent = Header::default().seal(B256::default());
+    let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     let mut rx_output = cb.sequence().subscribe();
     let task_manager = TaskManager::default();
@@ -145,7 +145,7 @@ async fn test_consensus_recovery_with_bullshark() {
     );
 
     let cb = ConsensusBus::new();
-    let dummy_parent = Header::default().seal(B256::default());
+    let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     let mut rx_output = cb.sequence().subscribe();
     let task_manager = TaskManager::default();
@@ -203,7 +203,7 @@ async fn test_consensus_recovery_with_bullshark() {
     );
 
     let cb = ConsensusBus::new();
-    let dummy_parent = Header::default().seal(B256::default());
+    let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     let mut rx_output = cb.sequence().subscribe();
     Consensus::spawn(config, &cb, bullshark, &TaskManager::default());

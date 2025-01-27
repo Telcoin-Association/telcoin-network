@@ -320,6 +320,7 @@ mod tests {
     use reth_blockchain_tree::BlockchainTreeViewer;
     use reth_chainspec::ChainSpec;
     use reth_provider::{BlockIdReader, BlockNumReader, BlockReader, TransactionVariant};
+    use reth_revm::primitives::FixedBytes;
     use std::{collections::VecDeque, str::FromStr as _, sync::Arc, time::Duration};
     use tn_batch_builder::test_utils::execute_test_batch;
     use tn_test_utils::{default_test_execution_node, seeded_genesis_from_random_batches};
@@ -449,8 +450,11 @@ mod tests {
         // beneficiary overwritten
         assert_eq!(expected_block.beneficiary, beneficiary);
         // nonce matches subdag index and method all match
-        assert_eq!(expected_block.nonce.into(), sub_dag_index);
-        assert_eq!(expected_block.nonce.into(), consensus_output.nonce());
+        assert_eq!(<FixedBytes<8> as Into<u64>>::into(expected_block.nonce), sub_dag_index);
+        assert_eq!(
+            <FixedBytes<8> as Into<u64>>::into(expected_block.nonce),
+            consensus_output.nonce()
+        );
 
         // ommers root
         assert_eq!(expected_block.header.ommers_hash, EMPTY_OMMER_ROOT_HASH,);
@@ -752,8 +756,8 @@ mod tests {
             // beneficiary overwritten
             assert_eq!(&block.beneficiary, expected_beneficiary);
             // nonce matches subdag index and method all match
-            assert_eq!(block.nonce.into(), *expected_subdag_index);
-            assert_eq!(block.nonce, expected_output.nonce());
+            assert_eq!(<FixedBytes<8> as Into<u64>>::into(block.nonce), *expected_subdag_index);
+            assert_eq!(<FixedBytes<8> as Into<u64>>::into(block.nonce), expected_output.nonce());
 
             // timestamp
             assert_eq!(block.timestamp, expected_output.committed_at());
@@ -1105,8 +1109,8 @@ mod tests {
             // beneficiary overwritten
             assert_eq!(&block.beneficiary, expected_beneficiary);
             // nonce matches subdag index and method all match
-            assert_eq!(block.nonce.into(), *expected_subdag_index);
-            assert_eq!(block.nonce.into(), expected_output.nonce());
+            assert_eq!(<FixedBytes<8> as Into<u64>>::into(block.nonce), *expected_subdag_index);
+            assert_eq!(<FixedBytes<8> as Into<u64>>::into(block.nonce), expected_output.nonce());
 
             // timestamp
             assert_eq!(block.timestamp, expected_output.committed_at());
