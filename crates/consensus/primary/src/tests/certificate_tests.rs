@@ -8,7 +8,10 @@ use rand::{
 use std::num::NonZeroUsize;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{AuthorityIdentifier, BlsKeypair, Certificate, SignatureVerificationState, Vote};
+use tn_types::{
+    AuthorityIdentifier, BlsKeypair, Certificate, CertificateDigest, SignatureVerificationState,
+    Vote,
+};
 
 #[test]
 fn test_empty_certificate_verification() {
@@ -24,32 +27,8 @@ fn test_empty_certificate_verification() {
     assert!(certificate.verify(&committee, &fixture.worker_cache()).is_err());
 }
 
-// #[test]
-// fn test_valid_certificate_v1_verification() {
-//     let fixture = CommitteeFixture::builder().build();
-//     let cert_v1_protocol_config = get_protocol_config(28);
-//     let committee = fixture.committee();
-//     let header = fixture.header(&cert_v1_protocol_config);
-
-//     let mut signatures = Vec::new();
-
-//     // 3 Signers satisfies the 2F + 1 signed stake requirement
-//     for authority in fixture.authorities().take(3) {
-//         let vote = authority.vote(&header);
-//         signatures.push((vote.author(), vote.signature().clone()));
-//     }
-
-//     let certificate =
-//         Certificate::new_unverified(&cert_v1_protocol_config, &committee, header, signatures)
-//             .unwrap();
-
-//     assert!(certificate
-//         .verify(&committee, &fixture.worker_cache())
-//         .is_ok());
-// }
-
-#[test]
-fn test_valid_certificate_v2_verification() {
+#[tokio::test]
+async fn test_valid_certificate_verification() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
     let header = fixture.header_from_last_authority();
@@ -63,6 +42,13 @@ fn test_valid_certificate_v2_verification() {
     }
 
     let certificate = Certificate::new_unverified(&committee, header, signatures).unwrap();
+
+    let mut codec = tn_network_libp2p::TNCodec::<CertificateDigest, Certificate>::new(1_000_000);
+    let mut io = Vec::new();
+    codec.encode_message(&mut io, certificate.clone()).await.expect("certificate encoded");
+
+    let bytes = tn_types::encode(&certificate);
+    println!("certificate size: {:?}\n{:?}", bytes.len(), bytes);
 
     let verified_certificate = certificate.verify(&committee, &fixture.worker_cache());
 

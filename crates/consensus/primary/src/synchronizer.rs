@@ -291,7 +291,7 @@ impl<DB: Database> Inner<DB> {
     }
 
     /// Long running task to perform garbage collection on DAG.
-    /// This will run a task managed by the task manager.
+    // This will run a task managed by the task manager.
     async fn garbage_collection(&self) {
         const FETCH_TRIGGER_TIMEOUT: Duration = Duration::from_secs(30);
         let mut rx_consensus_round_updates =

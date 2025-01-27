@@ -14,6 +14,8 @@ use std::{
 /// Convenience type for all traits implemented for messages used for TN request-response codec.
 pub trait TNMessage: Send + Serialize + DeserializeOwned + Clone + fmt::Debug + 'static {}
 
+impl TNMessage for tn_types::Certificate {}
+
 /// The Telcoin Network request/response codec for consensus messages between peers.
 ///
 /// The codec reuses pre-allocated buffers to asynchronously read messages per the libp2p [Codec]
@@ -57,7 +59,7 @@ impl<Req, Res> TNCodec<Req, Res> {
     ///
     /// This method is used to read requests and responses from peers.
     #[inline]
-    async fn decode_message<T, M>(&mut self, io: &mut T) -> std::io::Result<M>
+    pub async fn decode_message<T, M>(&mut self, io: &mut T) -> std::io::Result<M>
     where
         T: AsyncRead + Unpin + Send,
         M: TNMessage,
@@ -107,7 +109,7 @@ impl<Req, Res> TNCodec<Req, Res> {
     ///
     /// This method is used to write requests and responses from peers.
     #[inline]
-    async fn encode_message<T, M>(&mut self, io: &mut T, msg: M) -> std::io::Result<()>
+    pub async fn encode_message<T, M>(&mut self, io: &mut T, msg: M) -> std::io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
         M: TNMessage,
@@ -122,6 +124,8 @@ impl<Req, Res> TNCodec<Req, Res> {
             std::io::Error::new(std::io::ErrorKind::Other, error)
         })?;
 
+        println!("uncompressed: {:?}", self.decode_buffer.len());
+
         // ensure encoded bytes are within bounds
         if self.decode_buffer.len() > self.max_chunk_size {
             return Err(std::io::Error::new(
@@ -134,12 +138,15 @@ impl<Req, Res> TNCodec<Req, Res> {
         //
         // NOTE: 32bit max 4,294,967,295
         let prefix = (self.decode_buffer.len() as u32).to_le_bytes();
+        println!("uncompressed: {:?}", prefix);
         io.write_all(&prefix).await?;
 
         // compress data using allocated buffer
         let mut encoder = snap::write::FrameEncoder::new(&mut self.compressed_buffer);
         encoder.write_all(&self.decode_buffer)?;
         encoder.flush()?;
+
+        println!("compressed? {:?}", encoder.get_ref().len());
 
         // add compressed bytes to prefix
         io.write_all(encoder.get_ref()).await?;

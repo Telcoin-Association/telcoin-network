@@ -13,6 +13,7 @@ mod network;
 mod primary;
 mod proposer;
 mod state_handler;
+mod state_sync;
 mod synchronizer;
 
 #[cfg(test)]

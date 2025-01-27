@@ -429,8 +429,14 @@ where
     }
 
     /// Process gossip from the committee.
+    ///
+    /// Peers gossip the CertificateDigest so peers can request the Certificate. This waits until
+    /// the certificate can be retrieved and timesout after some time. It's important to give up
+    /// after enough time to limit the DoS attack surface. Peers who timeout must lose reputation.
     pub(super) async fn process_gossip(&self, msg: Vec<u8>) -> PrimaryNetworkResult<()> {
         // TODO: should this use the same TNCodec as request_response?
+        //
+        //
 
         todo!()
     }
