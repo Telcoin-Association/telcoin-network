@@ -10,7 +10,9 @@ use crate::{
 };
 use futures::StreamExt as _;
 use libp2p::{
-    gossipsub::{self, Event as GossipEvent, IdentTopic, MessageAcceptance},
+    gossipsub::{
+        self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance,
+    },
     multiaddr::Protocol,
     request_response::{self, Codec, Event as ReqResEvent, OutboundRequestId, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
@@ -217,94 +219,8 @@ where
     ) -> NetworkResult<()> {
         match event {
             SwarmEvent::Behaviour(behavior) => match behavior {
-                TNBehaviorEvent::Gossipsub(gossip) => match gossip {
-                    GossipEvent::Message { propagation_source, message_id, message } => {
-                        trace!(target: "network", topic=?self.topics, ?propagation_source, ?message_id, ?message, "message received from publisher");
-                        // verify message was published by authorized node
-                        let msg_acceptance = self.verify_gossip(&message);
-
-                        if msg_acceptance.is_accepted() {
-                            // forward gossip to handler
-                            if let Err(e) =
-                                self.event_stream.try_send(NetworkEvent::Gossip(message.data))
-                            {
-                                error!(target: "network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
-                                // fatal - unable to process gossip messages
-                                return Err(e.into());
-                            }
-                        }
-                        trace!(target: "network", ?msg_acceptance, "gossip message verification status");
-
-                        // report message validation results
-                        if let Err(e) =
-                            self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
-                                &message_id,
-                                &propagation_source,
-                                msg_acceptance.into(),
-                            )
-                        {
-                            error!(target: "network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "error reporting message validation result");
-                        }
-                    }
-                    GossipEvent::Subscribed { peer_id, topic } => {
-                        trace!(target: "network", topics=?self.topics, ?peer_id, ?topic, "gossipsub event - subscribed")
-                    }
-                    GossipEvent::Unsubscribed { peer_id, topic } => {
-                        trace!(target: "network", topics=?self.topics, ?peer_id, ?topic, "gossipsub event - unsubscribed")
-                    }
-                    GossipEvent::GossipsubNotSupported { peer_id } => {
-                        // TODO: remove peer at self point?
-                        trace!(target: "network", topics=?self.topics, ?peer_id, "gossipsub event - not supported")
-                    }
-                },
-                TNBehaviorEvent::ReqRes(rpc) => match rpc {
-                    ReqResEvent::Message { peer, message } => {
-                        trace!(target: "network",  ?peer, ?message, "req/res MESSAGE event");
-
-                        match message {
-                            request_response::Message::Request { request_id, request, channel } => {
-                                // forward request to handler without blocking other events
-                                if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
-                                    peer,
-                                    request,
-                                    channel,
-                                }) {
-                                    error!(target: "network", topics=?self.topics, ?request_id, ?e, "failed to forward request!");
-                                    // fatal - unable to process requests
-                                    return Err(e.into());
-                                }
-                            }
-                            request_response::Message::Response { request_id, response } => {
-                                // try to forward response to original caller
-                                let _ = self
-                                    .pending_requests
-                                    .remove(&request_id)
-                                    .ok_or(NetworkError::PendingRequestChannelLost)?
-                                    .send(Ok(response));
-                            }
-                        }
-                    }
-                    ReqResEvent::OutboundFailure { peer, request_id, error } => {
-                        error!(target: "network", ?peer, ?error, "outbound failure");
-                        // try to forward error to original caller
-                        let _ = self
-                            .pending_requests
-                            .remove(&request_id)
-                            .ok_or(NetworkError::PendingRequestChannelLost)?
-                            .send(Err(error.into()));
-                    }
-                    ReqResEvent::InboundFailure { peer, request_id, error } => {
-                        // TODO: how to handle these failures?
-                        // - connection closed: do nothing
-                        // - response ommitted: do nothing
-                        // - inbound timeout: do nothing
-                        // - inbound stream failed: malicious encoding? report peer?
-                        error!(target: "network", ?peer, ?request_id, ?error, "inbound failure");
-                    }
-                    ReqResEvent::ResponseSent { peer, request_id } => {
-                        trace!(target: "network",  ?peer, ?request_id, "response sent")
-                    }
-                },
+                TNBehaviorEvent::Gossipsub(event) => self.process_gossip_event(event)?,
+                TNBehaviorEvent::ReqRes(event) => self.process_reqres_event(event)?,
             },
             SwarmEvent::ConnectionEstablished {
                 peer_id,
@@ -530,10 +446,108 @@ where
         }
     }
 
+    /// Process gossip events.
+    fn process_gossip_event(&mut self, event: GossipEvent) -> NetworkResult<()> {
+        match event {
+            GossipEvent::Message { propagation_source, message_id, message } => {
+                trace!(target: "network", topic=?self.topics, ?propagation_source, ?message_id, ?message, "message received from publisher");
+                // verify message was published by authorized node
+                let msg_acceptance = self.verify_gossip(&message);
+
+                if msg_acceptance.is_accepted() {
+                    // forward gossip to handler
+                    if let Err(e) = self.event_stream.try_send(NetworkEvent::Gossip(message.data)) {
+                        error!(target: "network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
+                        // fatal - unable to process gossip messages
+                        return Err(e.into());
+                    }
+                }
+                trace!(target: "network", ?msg_acceptance, "gossip message verification status");
+
+                // report message validation results
+                if let Err(e) =
+                    self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                        &message_id,
+                        &propagation_source,
+                        msg_acceptance.into(),
+                    )
+                {
+                    error!(target: "network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "error reporting message validation result");
+                }
+            }
+            GossipEvent::Subscribed { peer_id, topic } => {
+                trace!(target: "network", topics=?self.topics, ?peer_id, ?topic, "gossipsub event - subscribed")
+            }
+            GossipEvent::Unsubscribed { peer_id, topic } => {
+                trace!(target: "network", topics=?self.topics, ?peer_id, ?topic, "gossipsub event - unsubscribed")
+            }
+            GossipEvent::GossipsubNotSupported { peer_id } => {
+                // TODO: remove peer at self point?
+                trace!(target: "network", topics=?self.topics, ?peer_id, "gossipsub event - not supported")
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Process req/res events.
+    fn process_reqres_event(&mut self, event: ReqResEvent<Req, Res>) -> NetworkResult<()> {
+        match event {
+            ReqResEvent::Message { peer, message } => {
+                trace!(target: "network",  ?peer, ?message, "req/res MESSAGE event");
+
+                match message {
+                    request_response::Message::Request { request_id, request, channel } => {
+                        // forward request to handler without blocking other events
+                        if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
+                            peer,
+                            request,
+                            channel,
+                        }) {
+                            error!(target: "network", topics=?self.topics, ?request_id, ?e, "failed to forward request!");
+                            // fatal - unable to process requests
+                            return Err(e.into());
+                        }
+                    }
+                    request_response::Message::Response { request_id, response } => {
+                        // try to forward response to original caller
+                        let _ = self
+                            .pending_requests
+                            .remove(&request_id)
+                            .ok_or(NetworkError::PendingRequestChannelLost)?
+                            .send(Ok(response));
+                    }
+                }
+            }
+            ReqResEvent::OutboundFailure { peer, request_id, error } => {
+                error!(target: "network", ?peer, ?error, "outbound failure");
+                // try to forward error to original caller
+                let _ = self
+                    .pending_requests
+                    .remove(&request_id)
+                    .ok_or(NetworkError::PendingRequestChannelLost)?
+                    .send(Err(error.into()));
+            }
+            ReqResEvent::InboundFailure { peer, request_id, error } => {
+                // TODO: how to handle these failures?
+                // - connection closed: do nothing
+                // - response ommitted: do nothing
+                // - inbound timeout: do nothing
+                // - inbound stream failed: malicious encoding? report peer?
+                error!(target: "network", ?peer, ?request_id, ?error, "inbound failure");
+            }
+            ReqResEvent::ResponseSent { peer, request_id } => {
+                trace!(target: "network",  ?peer, ?request_id, "response sent")
+            }
+        }
+
+        Ok(())
+    }
+
     /// Specific logic to accept gossip messages.
     ///
     /// Messages are only published by current committee nodes and must be within max size.
-    fn verify_gossip(&self, gossip: &libp2p::gossipsub::Message) -> GossipAcceptance {
+    fn verify_gossip(&self, gossip: &GossipMessage) -> GossipAcceptance {
         // verify message size
         if gossip.data.len() > MAX_GOSSIP_SIZE {
             return GossipAcceptance::Reject;
@@ -551,15 +565,13 @@ where
 /// Enum if the received gossip is initially accepted for further processing.
 ///
 /// This is necessary because libp2p does not impl `PartialEq` on [MessageAcceptance].
+/// This impl does not map to `MessageAcceptance::Ignore`.
 #[derive(Debug, PartialEq)]
 enum GossipAcceptance {
     /// The message is considered valid, and it should be delivered and forwarded to the network.
     Accept,
     /// The message is considered invalid, and it should be rejected and trigger the P₄ penalty.
     Reject,
-    /// The message is neither delivered nor forwarded to the network, but the router does not
-    /// trigger the P₄ penalty.
-    Ignore,
 }
 
 impl GossipAcceptance {
@@ -574,7 +586,6 @@ impl From<GossipAcceptance> for MessageAcceptance {
         match value {
             GossipAcceptance::Accept => MessageAcceptance::Accept,
             GossipAcceptance::Reject => MessageAcceptance::Reject,
-            GossipAcceptance::Ignore => MessageAcceptance::Ignore,
         }
     }
 }
