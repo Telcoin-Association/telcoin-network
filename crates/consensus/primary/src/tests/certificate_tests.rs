@@ -42,14 +42,6 @@ async fn test_valid_certificate_verification() {
     }
 
     let certificate = Certificate::new_unverified(&committee, header, signatures).unwrap();
-
-    let mut codec = tn_network_libp2p::TNCodec::<CertificateDigest, Certificate>::new(1_000_000);
-    let mut io = Vec::new();
-    codec.encode_message(&mut io, certificate.clone()).await.expect("certificate encoded");
-
-    let bytes = tn_types::encode(&certificate);
-    println!("certificate size: {:?}\n{:?}", bytes.len(), bytes);
-
     let verified_certificate = certificate.verify(&committee, &fixture.worker_cache());
 
     assert!(verified_certificate.is_ok());

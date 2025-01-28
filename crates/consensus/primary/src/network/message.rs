@@ -16,6 +16,12 @@ use tn_types::{
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PrimaryGossip {
     /// A new certificate broadcast from peer.
+    ///
+    /// Certificates are small and okay to gossip uncompressed:
+    /// -  3 signatures ~= 0.3kb
+    /// - 99 signatures ~= 3.5kb
+    ///
+    /// NOTE: compression was slightly larger for all benchmarks.
     Certificate(Certificate),
 }
 
