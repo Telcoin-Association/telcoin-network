@@ -24,7 +24,7 @@ pub enum IntentVersion {
 impl TryFrom<u8> for IntentVersion {
     type Error = eyre::Report;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        try_decode(&[value])
+        Ok(try_decode(&[value])?)
     }
 }
 
@@ -44,7 +44,7 @@ pub enum AppId {
 impl TryFrom<u8> for AppId {
     type Error = eyre::Report;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        try_decode(&[value])
+        Ok(try_decode(&[value])?)
     }
 }
 
@@ -71,7 +71,7 @@ pub enum IntentScope {
 impl TryFrom<u8> for IntentScope {
     type Error = eyre::Report;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        try_decode(&[value])
+        Ok(try_decode(&[value])?)
     }
 }
 

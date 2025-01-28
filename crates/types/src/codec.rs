@@ -47,7 +47,7 @@ pub fn encode_key<T: Serialize>(obj: &T) -> Vec<u8> {
         .expect("Can not serialize!")
 }
 
-/// Decode bytes to a type for a DB key.
+/// Decode bytes to a type.
 ///
 /// This version will panic on failure, use with data that should be valid.
 /// This version will be optimized without regard to binary sort order.
@@ -55,11 +55,11 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> T {
     bcs::from_bytes(bytes).expect("Invalid bytes!")
 }
 
-/// Decode bytes to a type for a DB key.
+/// Decode bytes to a type.
 ///
 /// This version will be optimized without regard to binary sort order.
-pub fn try_decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> eyre::Result<T> {
-    Ok(bcs::from_bytes(bytes)?)
+pub fn try_decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> bcs::Result<T> {
+    bcs::from_bytes(bytes)
 }
 
 /// Encode an object to a byte vector.
