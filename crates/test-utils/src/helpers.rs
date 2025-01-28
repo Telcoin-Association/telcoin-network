@@ -583,8 +583,7 @@ pub fn make_signed_certificates(
     failure_probability: f64,
 ) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>) {
     let ids = keys.iter().map(|(authority, _)| *authority).collect::<Vec<_>>();
-    let generator =
-        |pk, round, parents| mock_signed_certificate(keys, pk, round, parents, committee);
+    let generator = |pk, round, parents| signed_cert_for_test(keys, pk, round, parents, committee);
 
     rounds_of_certificates(range, initial_parents, &ids[..], failure_probability, generator)
 }
@@ -643,29 +642,32 @@ pub fn mock_certificate_with_epoch(
 }
 
 /// Creates one signed certificate from a set of signers - the signers must include the origin
-pub fn mock_signed_certificate(
+pub fn signed_cert_for_test(
     signers: &[(AuthorityIdentifier, BlsKeypair)],
     origin: AuthorityIdentifier,
     round: Round,
     parents: BTreeSet<CertificateDigest>,
     committee: &Committee,
 ) -> (CertificateDigest, Certificate) {
-    let header_builder = HeaderBuilder::default()
+    let header = HeaderBuilder::default()
         .author(origin)
         .payload(fixture_payload(1))
         .round(round)
         .epoch(0)
-        .parents(parents);
+        .parents(parents)
+        .build()
+        .expect("valid header built for test certificate");
 
-    let header = header_builder.build().unwrap();
+    let cert = Certificate::new_unsigned(committee, header.clone(), Vec::new())
+        .expect("new unsigned cert for tests");
 
-    let cert = Certificate::new_unsigned(committee, header.clone(), Vec::new()).unwrap();
+    let votes = signers
+        .iter()
+        .map(|(name, signer)| {
+            (*name, BlsSignature::new_secure(&to_intent_message(cert.header().digest()), signer))
+        })
+        .collect();
 
-    let mut votes = Vec::new();
-    for (name, signer) in signers {
-        let sig = BlsSignature::new_secure(&to_intent_message(cert.header().digest()), signer);
-        votes.push((*name, sig))
-    }
     let cert = Certificate::new_unverified(committee, header, votes).unwrap();
     (cert.digest(), cert)
 }

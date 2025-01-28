@@ -226,13 +226,21 @@ impl Certificate {
         // Verify the signatures
         let certificate_digest = self.digest();
         BlsAggregateSignature::try_from(aggregrate_signature_bytes)?
-            // .map_err(|e| CertificateError::InvalidSignature(e))?
             .verify_secure(&to_intent_message(certificate_digest), &pks[..])?;
-        // .map_err(|e| CertificateError::InvalidSignature(e))?;
 
         self.signature_verification_state =
             SignatureVerificationState::VerifiedDirectly(aggregrate_signature_bytes.clone());
 
+        Ok(self)
+    }
+
+    /// Validate certificate was received and ready for verification.
+    pub fn validate_received(mut self) -> CertificateResult<Self> {
+        self.set_signature_verification_state(SignatureVerificationState::Unverified(
+            self.aggregated_signature()
+                .ok_or(CertificateError::RecoverBlsAggregateSignatureBytes)?
+                .clone(),
+        ));
         Ok(self)
     }
 
@@ -365,17 +373,17 @@ impl Default for SignatureVerificationState {
     }
 }
 
-// Certificate version is validated against network protocol version. If CertificateV1
-// is being used then the cert will also be marked as Unverifed as this certificate
-// is assumed to be received from the network. This SignatureVerificationState is
-// why the modified certificate is being returned.
-pub fn validate_received_certificate_version(
+/// Process certificate received by setting the verification state.
+///
+/// Recover signature bytes from the aggregated signature and set the signature verification state to unverified.
+pub fn validate_received_certificate(
     mut certificate: Certificate,
-) -> eyre::Result<Certificate> {
-    // CertificateV1 was received from the network so we need to mark
-    // certificate aggregated signature state as unverified.
+) -> CertificateResult<Certificate> {
     certificate.set_signature_verification_state(SignatureVerificationState::Unverified(
-        certificate.aggregated_signature().ok_or(eyre::eyre!("Invalid signature"))?.clone(),
+        certificate
+            .aggregated_signature()
+            .ok_or(CertificateError::RecoverBlsAggregateSignatureBytes)?
+            .clone(),
     ));
     Ok(certificate)
 }

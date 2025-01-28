@@ -443,11 +443,12 @@ where
         // only one type of gossip for now
         let PrimaryGossip::Certificate(cert) = msg;
 
-        // set verification state to unverified
-        cert.set_signature_verification_state(SignatureVerificationState::Unverified(
-            cert.aggregated_signature().ok_or(eyre::eyre!("Invalid signature"))?.clone(),
-        ));
+        // process certificate
+        //
+        // TODO: quick unit test that digest is different when cert is unverified/verified_directly
+        let valid_cert = cert.validate_received()?;
+        self.synchronizer.try_accept_certificate(valid_cert).await?;
 
-        todo!()
+        Ok(())
     }
 }

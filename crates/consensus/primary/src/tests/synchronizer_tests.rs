@@ -17,7 +17,7 @@ use std::{
 };
 use tn_storage::{mem_db::MemDatabase, traits::Database};
 use tn_test_utils::{
-    fixture_batch_with_transactions, make_optimal_signed_certificates, mock_signed_certificate,
+    fixture_batch_with_transactions, make_optimal_signed_certificates, signed_cert_for_test,
     CommitteeFixture,
 };
 use tn_types::{
@@ -153,7 +153,7 @@ async fn accept_suspended_certificates() {
     }
 
     // Create a certificate > 1000 rounds above the highest local round.
-    let (_digest, cert) = mock_signed_certificate(
+    let (_digest, cert) = signed_cert_for_test(
         keys.as_slice(),
         certificates.last().cloned().unwrap().origin(),
         2000,

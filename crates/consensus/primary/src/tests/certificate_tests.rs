@@ -1,6 +1,6 @@
 //! Certificate tests
 
-use fastcrypto::traits::KeyPair as _;
+use fastcrypto::{hash::Hash as _, traits::KeyPair as _};
 use rand::{
     rngs::{OsRng, StdRng},
     SeedableRng,
@@ -8,22 +8,42 @@ use rand::{
 use std::num::NonZeroUsize;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{
-    AuthorityIdentifier, BlsKeypair, Certificate, CertificateDigest, SignatureVerificationState,
-    Vote,
-};
+use tn_types::{AuthorityIdentifier, BlsKeypair, Certificate, SignatureVerificationState, Vote};
+
+#[test]
+fn test_certificate_signature_status() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let header = fixture.header_from_last_authority();
+    let unverified = Certificate::new_unverified(&committee, header.clone(), Vec::new())
+        .expect("new unverified cert");
+    let mut verified = unverified.clone();
+    verified.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+        verified.aggregated_signature().expect("aggregate signature").clone(),
+    ));
+
+    let unverified_digest = unverified.digest();
+    let verified_digest = verified.digest();
+
+    assert_ne!(unverified, verified);
+    assert_ne!(unverified_digest, verified_digest);
+}
 
 #[test]
 fn test_empty_certificate_verification() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-
     let committee = fixture.committee();
     let header = fixture.header_from_last_authority();
-    // You should not be allowed to create a certificate that does not satisfying quorum
-    // requirements
-    assert!(Certificate::new_unverified(&committee, header.clone(), Vec::new()).is_err());
 
-    let certificate = Certificate::new_unsigned(&committee, header, Vec::new()).unwrap();
+    // 3 Signers satisfies the 2F + 1 signed stake requirement
+    let votes = fixture
+        .authorities()
+        .take(3)
+        .map(|a| (a.id(), a.vote(&header).signature().clone()))
+        .collect();
+
+    let certificate =
+        Certificate::new_unsigned(&committee, header, votes).expect("new unsigned cert");
     assert!(certificate.verify(&committee, &fixture.worker_cache()).is_err());
 }
 

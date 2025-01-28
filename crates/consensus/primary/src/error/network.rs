@@ -1,6 +1,9 @@
 //! Error types for primary's network task.
 
-use tn_types::{error::HeaderError, BcsError};
+use tn_types::{
+    error::{CertificateError, HeaderError},
+    BcsError,
+};
 
 /// Result alias for results that possibly return [`PrimaryNetworkError`].
 pub(crate) type PrimaryNetworkResult<T> = Result<T, PrimaryNetworkError>;
@@ -14,4 +17,7 @@ pub(crate) enum PrimaryNetworkError {
     /// Error decoding with bcs.
     #[error("Failed to decode gossip message: {0}")]
     Decode(#[from] BcsError),
+    /// Error processing certificate.
+    #[error("Failed to process certificate: {0}")]
+    Certificate(#[from] CertificateError),
 }

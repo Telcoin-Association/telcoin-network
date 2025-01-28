@@ -8,6 +8,7 @@
 //! non keys.  BCS encoding however does not meet the sorting requirements for DB keys so we have
 //! both encodings.  This can be experimented with by changing these functions.
 
+pub use bcs::Error as BcsError;
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 

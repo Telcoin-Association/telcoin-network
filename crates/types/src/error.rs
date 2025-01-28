@@ -298,6 +298,9 @@ pub enum CertificateError {
     /// Oneshot channel dropped while processing the certificate.
     #[error("Failed to process certificate - oneshot sender error")]
     ResChannelClosed(String),
+    /// Certificate signature verification state returned `Genesis`
+    #[error("Failed to recover BlsAggregateSignatureBytes from certificate signature")]
+    RecoverBlsAggregateSignatureBytes,
 
     /// TODO: DELETE THIS - only used to debug notify and suspend
     #[error("Certificate suspended: {0}")]
