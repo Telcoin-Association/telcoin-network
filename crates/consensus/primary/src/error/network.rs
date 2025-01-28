@@ -1,6 +1,6 @@
 //! Error types for primary's network task.
 
-use tn_types::error::HeaderError;
+use tn_types::{error::HeaderError, BcsError};
 
 /// Result alias for results that possibly return [`PrimaryNetworkError`].
 pub(crate) type PrimaryNetworkResult<T> = Result<T, PrimaryNetworkError>;
@@ -11,4 +11,7 @@ pub(crate) enum PrimaryNetworkError {
     /// Error while processing a peer's request for vote.
     #[error("Error processing header vote request: {0}")]
     InvalidHeader(#[from] HeaderError),
+    /// Error decoding with bcs.
+    #[error("Failed to decode gossip message: {0}")]
+    Decode(#[from] BcsError),
 }

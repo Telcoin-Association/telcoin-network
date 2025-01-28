@@ -16,8 +16,8 @@ use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::{traits::Database, CertificateStore};
 use tn_types::{
     error::{DagError, DagResult},
-    validate_received_certificate_version, AuthorityIdentifier, Certificate, Committee,
-    NetworkPublicKey, Noticer, Round, TaskManager, TnReceiver, TnSender,
+    validate_received_certificate, AuthorityIdentifier, Certificate, Committee, NetworkPublicKey,
+    Noticer, Round, TaskManager, TnReceiver, TnSender,
 };
 use tokio::{
     task::JoinSet,
@@ -428,7 +428,7 @@ async fn process_certificates_helper<DB: Database>(
         .certificates
         .into_iter()
         .map(|cert| {
-            validate_received_certificate_version(cert).map_err(|err| {
+            validate_received_certificate(cert).map_err(|err| {
                 error!(target: "primary::cert_fetcher", "fetched certficate processing error: {err}");
                 DagError::InvalidCertificateVersion
             })

@@ -1,7 +1,10 @@
 //! Handle specific request types received from the network.
 
 use super::PrimaryResponse;
-use crate::{error::PrimaryNetworkResult, synchronizer::Synchronizer, ConsensusBus};
+use crate::{
+    error::PrimaryNetworkResult, network::message::PrimaryGossip, synchronizer::Synchronizer,
+    ConsensusBus,
+};
 use fastcrypto::hash::Hash;
 use parking_lot::Mutex;
 use std::{
@@ -15,7 +18,7 @@ use tn_storage::traits::Database;
 use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
-    now, AuthorityIdentifier, Certificate, CertificateDigest, Header, Round,
+    now, try_decode, AuthorityIdentifier, Certificate, CertificateDigest, Header, Round,
     SignatureVerificationState, Vote,
 };
 use tracing::{debug, error, warn};
@@ -44,8 +47,6 @@ pub(super) struct RequestHandler<DB> {
     /// header with these parents. The node keeps track of requested Certificates to prevent
     /// unsolicited certificate attacks.
     requested_parents: Arc<Mutex<BTreeMap<(Round, CertificateDigest), AuthorityIdentifier>>>,
-    /// The fixed-size buffer for decoding gossip.
-    decode_buffer: Vec<u8>,
 }
 
 impl<DB> RequestHandler<DB>
@@ -58,15 +59,11 @@ where
         consensus_bus: ConsensusBus,
         synchronizer: Arc<Synchronizer<DB>>,
     ) -> Self {
-        // allocate capacity for decoding max gossip message size
-        let decode_buffer = Vec::with_capacity(MAX_GOSSIP_SIZE);
-
         Self {
             consensus_config,
             consensus_bus,
             synchronizer,
             requested_parents: Default::default(),
-            decode_buffer,
         }
     }
 
@@ -439,9 +436,17 @@ where
     /// Peers gossip the CertificateDigest so peers can request the Certificate. This waits until
     /// the certificate can be retrieved and timesout after some time. It's important to give up
     /// after enough time to limit the DoS attack surface. Peers who timeout must lose reputation.
-    pub(super) async fn process_gossip(&self, msg: Vec<u8>) -> PrimaryNetworkResult<()> {
+    pub(super) async fn process_gossip(&self, bytes: Vec<u8>) -> PrimaryNetworkResult<()> {
         // gossip is uncompressed
-        let length = msg.len();
+        let msg = try_decode(&bytes)?;
+
+        // only one type of gossip for now
+        let PrimaryGossip::Certificate(cert) = msg;
+
+        // set verification state to unverified
+        cert.set_signature_verification_state(SignatureVerificationState::Unverified(
+            cert.aggregated_signature().ok_or(eyre::eyre!("Invalid signature"))?.clone(),
+        ));
 
         todo!()
     }

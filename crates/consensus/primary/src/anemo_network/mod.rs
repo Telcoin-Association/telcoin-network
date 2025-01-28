@@ -24,8 +24,8 @@ use tn_types::{
     error::{DagError, DagResult},
     now,
     traits::ToFromBytes as _,
-    validate_received_certificate_version, AuthorityIdentifier, Certificate, CertificateDigest,
-    Header, NetworkPublicKey, Round, Vote,
+    validate_received_certificate, AuthorityIdentifier, Certificate, CertificateDigest, Header,
+    NetworkPublicKey, Round, Vote,
 };
 use tracing::{debug, error, warn};
 mod engine;
@@ -187,12 +187,12 @@ impl<DB: Database> PrimaryReceiverHandler<DB> {
         } else {
             let mut validated_received_parents = vec![];
             for parent in parents {
-                validated_received_parents.push(
-                    validate_received_certificate_version(parent).map_err(|err| {
+                validated_received_parents.push(validate_received_certificate(parent).map_err(
+                    |err| {
                         error!("request vote parents processing error: {err}");
                         DagError::InvalidCertificateVersion
-                    })?,
-                );
+                    },
+                )?);
             }
             // If requester has provided parent certificates, try to accept them.
             // It is ok to not check for additional unknown digests, because certificates can

@@ -23,7 +23,7 @@ use tn_storage::{
 };
 use tn_types::{
     error::{CertificateError, DagError},
-    validate_received_certificate_version, ConsensusHeader,
+    validate_received_certificate, ConsensusHeader,
 };
 use tracing::{debug, instrument, warn};
 
@@ -38,8 +38,8 @@ impl<DB: Database> PrimaryToPrimary for PrimaryReceiverHandler<DB> {
         request: anemo::Request<SendCertificateRequest>,
     ) -> Result<anemo::Response<SendCertificateResponse>, anemo::rpc::Status> {
         let _scope = monitored_scope("PrimaryReceiverHandler::send_certificate");
-        let certificate = validate_received_certificate_version(request.into_body().certificate)
-            .map_err(|err| {
+        let certificate =
+            validate_received_certificate(request.into_body().certificate).map_err(|err| {
                 anemo::rpc::Status::new_with_message(
                     StatusCode::BadRequest,
                     format!("Invalid certifcate: {err}"),
