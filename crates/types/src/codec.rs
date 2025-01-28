@@ -68,3 +68,12 @@ pub fn try_decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> eyre::Result<T> {
 pub fn encode<T: Serialize>(obj: &T) -> Vec<u8> {
     bcs::to_bytes(obj).unwrap_or_else(|_| panic!("Serialization should not fail"))
 }
+
+/// Encode into a provided buffer.
+pub fn encode_into_buffer<W, T>(write: &mut W, value: &T) -> bcs::Result<()>
+where
+    W: ?Sized + std::io::Write,
+    T: ?Sized + Serialize,
+{
+    bcs::serialize_into(write, value)
+}

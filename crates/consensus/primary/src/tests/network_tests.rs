@@ -9,9 +9,8 @@ use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, traits::InsecureDefault, AuthorityIdentifier, BlockHash, Certificate,
-    CertificateDigest, TaskManager,
+    CertificateDigest, ExecHeader, SealedHeader, TaskManager,
 };
-use tn_types::{ExecHeader, SealedHeader};
 use tracing::debug;
 
 /// The type for holding testng components.

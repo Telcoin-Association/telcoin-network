@@ -18,10 +18,10 @@ pub enum PrimaryGossip {
     /// A new certificate broadcast from peer.
     ///
     /// Certificates are small and okay to gossip uncompressed:
-    /// -  3 signatures ~= 0.3kb
+    /// - 3 signatures ~= 0.3kb
     /// - 99 signatures ~= 3.5kb
     ///
-    /// NOTE: compression was slightly larger for all benchmarks.
+    /// NOTE: `snappy` is slightly larger than uncompressed.
     Certificate(Certificate),
 }
 

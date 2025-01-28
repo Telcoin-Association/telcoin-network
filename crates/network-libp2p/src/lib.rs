@@ -8,7 +8,7 @@ mod messages;
 pub mod types;
 
 // export types
-pub use codec::{TNCodec, TNMessage};
+pub use codec::{TNCodec, TNMessage, MAX_GOSSIP_SIZE, MAX_REQUEST_SIZE};
 pub use consensus::ConsensusNetwork;
 pub use messages::{WorkerRequest, WorkerResponse};
 

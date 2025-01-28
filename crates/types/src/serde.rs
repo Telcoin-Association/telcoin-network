@@ -6,8 +6,7 @@ use serde::{
 };
 use serde_with::{Bytes, DeserializeAs, SerializeAs};
 
-// Serializes a bitmap according to the roaring bitmap on-disk standard.
-/// https://github.com/RoaringBitmap/RoaringFormatSpec
+/// Serialized BLS signatures into a bitmap according to the roaring bitmap on-disk standard.
 pub struct CertificateSignatures;
 
 impl SerializeAs<roaring::RoaringBitmap> for CertificateSignatures {

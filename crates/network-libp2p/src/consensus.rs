@@ -6,6 +6,7 @@ use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
     types::{NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
+    MAX_GOSSIP_SIZE,
 };
 use futures::StreamExt as _;
 use libp2p::{
@@ -220,11 +221,10 @@ where
                     GossipEvent::Message { propagation_source, message_id, message } => {
                         trace!(target: "network", topic=?self.topics, ?propagation_source, ?message_id, ?message, "message received from publisher");
                         // verify message was published by authorized node
-                        let msg_acceptance = if message
-                            .source
-                            .is_some_and(|id| self.authorized_publishers.contains(&id))
-                        {
-                            // forward message to handler
+                        let msg_acceptance = self.verify_gossip(&message);
+
+                        if msg_acceptance.is_accepted() {
+                            // forward gossip to handler
                             if let Err(e) =
                                 self.event_stream.try_send(NetworkEvent::Gossip(message.data))
                             {
@@ -232,12 +232,7 @@ where
                                 // fatal - unable to process gossip messages
                                 return Err(e.into());
                             }
-
-                            MessageAcceptance::Accept
-                        } else {
-                            MessageAcceptance::Reject
-                        };
-
+                        }
                         trace!(target: "network", ?msg_acceptance, "gossip message verification status");
 
                         // report message validation results
@@ -245,7 +240,7 @@ where
                             self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
                                 &message_id,
                                 &propagation_source,
-                                msg_acceptance,
+                                msg_acceptance.into(),
                             )
                         {
                             error!(target: "network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "error reporting message validation result");
@@ -532,6 +527,54 @@ where
                     error!(target: "network", ?e, "SendResponse command failed");
                 }
             }
+        }
+    }
+
+    /// Specific logic to accept gossip messages.
+    ///
+    /// Messages are only published by current committee nodes and must be within max size.
+    fn verify_gossip(&self, gossip: &libp2p::gossipsub::Message) -> GossipAcceptance {
+        // verify message size
+        if gossip.data.len() > MAX_GOSSIP_SIZE {
+            return GossipAcceptance::Reject;
+        }
+
+        // ensure publisher is authorized
+        if gossip.source.is_some_and(|id| self.authorized_publishers.contains(&id)) {
+            GossipAcceptance::Accept
+        } else {
+            GossipAcceptance::Reject
+        }
+    }
+}
+
+/// Enum if the received gossip is initially accepted for further processing.
+///
+/// This is necessary because libp2p does not impl `PartialEq` on [MessageAcceptance].
+#[derive(Debug, PartialEq)]
+enum GossipAcceptance {
+    /// The message is considered valid, and it should be delivered and forwarded to the network.
+    Accept,
+    /// The message is considered invalid, and it should be rejected and trigger the P₄ penalty.
+    Reject,
+    /// The message is neither delivered nor forwarded to the network, but the router does not
+    /// trigger the P₄ penalty.
+    Ignore,
+}
+
+impl GossipAcceptance {
+    /// Helper method indicating if the gossip message was accepted.
+    fn is_accepted(&self) -> bool {
+        *self == GossipAcceptance::Accept
+    }
+}
+
+impl From<GossipAcceptance> for MessageAcceptance {
+    fn from(value: GossipAcceptance) -> Self {
+        match value {
+            GossipAcceptance::Accept => MessageAcceptance::Accept,
+            GossipAcceptance::Reject => MessageAcceptance::Reject,
+            GossipAcceptance::Ignore => MessageAcceptance::Ignore,
         }
     }
 }

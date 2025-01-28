@@ -10,6 +10,7 @@ use std::{
     io::{Read as _, Write as _},
     marker::PhantomData,
 };
+use tn_types::encode_into_buffer;
 
 /// Convenience type for all traits implemented for messages used for TN request-response codec.
 pub trait TNMessage: Send + Serialize + DeserializeOwned + Clone + fmt::Debug + 'static {}
@@ -119,12 +120,10 @@ impl<Req, Res> TNCodec<Req, Res> {
         self.decode_buffer.clear();
 
         // encode into allocated buffer
-        bcs::serialize_into(&mut self.decode_buffer, &msg).map_err(|e| {
-            let error = format!("bcs serialization: {}", e);
+        encode_into_buffer(&mut self.decode_buffer, &msg).map_err(|e| {
+            let error = format!("encode into buffer: {}", e);
             std::io::Error::new(std::io::ErrorKind::Other, error)
         })?;
-
-        println!("uncompressed: {:?}", self.decode_buffer.len());
 
         // ensure encoded bytes are within bounds
         if self.decode_buffer.len() > self.max_chunk_size {
@@ -138,15 +137,12 @@ impl<Req, Res> TNCodec<Req, Res> {
         //
         // NOTE: 32bit max 4,294,967,295
         let prefix = (self.decode_buffer.len() as u32).to_le_bytes();
-        println!("uncompressed: {:?}", prefix);
         io.write_all(&prefix).await?;
 
         // compress data using allocated buffer
         let mut encoder = snap::write::FrameEncoder::new(&mut self.compressed_buffer);
         encoder.write_all(&self.decode_buffer)?;
         encoder.flush()?;
-
-        println!("compressed? {:?}", encoder.get_ref().len());
 
         // add compressed bytes to prefix
         io.write_all(encoder.get_ref()).await?;
@@ -167,7 +163,19 @@ impl<Req, Res> Default for TNCodec<Req, Res> {
 /// This should be more than enough for snappy-compressed messages.
 ///
 /// TODO: add the message overhead as the max request size
-const MAX_REQUEST_SIZE: usize = 1024 * 1024;
+pub const MAX_REQUEST_SIZE: usize = 1024 * 1024;
+
+/// Max gossip size in bytes.
+///
+/// Gossip messages must be small because peers are likely to receive the same message multiple times.
+/// The protocol is optimized for latency, not throughput.
+/// See github discussion for more info: https://github.com/libp2p/specs/issues/118#issuecomment-499688869
+///
+/// The max is based on `Certificate` sizes. Certificate signatures are encoded as roaring bitmaps.
+/// Certificates are small and okay to gossip uncompressed:
+/// - 3 signatures ~= 0.3kb
+/// - 99 signatures ~= 3.5kb
+pub const MAX_GOSSIP_SIZE: usize = 4000;
 
 #[async_trait]
 impl<Req, Res> Codec for TNCodec<Req, Res>

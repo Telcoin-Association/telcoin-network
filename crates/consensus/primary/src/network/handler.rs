@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::PeerId;
+use tn_network_libp2p::{PeerId, MAX_GOSSIP_SIZE};
 use tn_storage::traits::Database;
 use tn_types::{
     ensure,
@@ -44,6 +44,8 @@ pub(super) struct RequestHandler<DB> {
     /// header with these parents. The node keeps track of requested Certificates to prevent
     /// unsolicited certificate attacks.
     requested_parents: Arc<Mutex<BTreeMap<(Round, CertificateDigest), AuthorityIdentifier>>>,
+    /// The fixed-size buffer for decoding gossip.
+    decode_buffer: Vec<u8>,
 }
 
 impl<DB> RequestHandler<DB>
@@ -56,11 +58,15 @@ where
         consensus_bus: ConsensusBus,
         synchronizer: Arc<Synchronizer<DB>>,
     ) -> Self {
+        // allocate capacity for decoding max gossip message size
+        let decode_buffer = Vec::with_capacity(MAX_GOSSIP_SIZE);
+
         Self {
             consensus_config,
             consensus_bus,
             synchronizer,
             requested_parents: Default::default(),
+            decode_buffer,
         }
     }
 
@@ -434,9 +440,8 @@ where
     /// the certificate can be retrieved and timesout after some time. It's important to give up
     /// after enough time to limit the DoS attack surface. Peers who timeout must lose reputation.
     pub(super) async fn process_gossip(&self, msg: Vec<u8>) -> PrimaryNetworkResult<()> {
-        // TODO: should this use the same TNCodec as request_response?
-        //
-        //
+        // gossip is uncompressed
+        let length = msg.len();
 
         todo!()
     }
