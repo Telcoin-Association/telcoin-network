@@ -342,11 +342,25 @@ impl From<&Certificate> for Vec<u8> {
     }
 }
 
-// Holds BlsAggregateSignatureBytes but with the added layer to specify the
-// signatures verification state. This will be used to take advantage of the
+// This will be used to take advantage of the
 // certificate chain that is formed via the DAG by only verifying the
 // leaves of the certificate chain when they are fetched from validators
 // during catchup.
+/// SignatureVerificationState stores both the verification status and signature bytes together.
+/// While this creates some data redundancy with signed_authorities, keeping them coupled provides
+/// important benefits:
+/// - atomic state updates: changes to verification status are guaranteed to reference the exact
+///    signature bytes that were verified. this prevents state/signature mismatches that could occur
+///    if stored separately.
+///
+/// - verification integrity: the verification status can only transition while operating on the
+///    specific signature bytes that were validated. this maintains a clear chain of trust through
+///    the verification process.
+///
+/// - impossible to have invalid states like:
+///    - `VerifiedDirectly` status with different signature bytes than what was actually verified
+///    - an unsigned state containing signature bytes
+///    - a verified state with missing/corrupted signature bytes
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum SignatureVerificationState {
     // This state occurs when the certificate has not yet received a quorum of

@@ -1095,7 +1095,7 @@ impl<DB: Database> Synchronizer<DB> {
 
         // scrutinize certificates received from peers
         if external {
-            if let Some(notify) = self.inner.state.lock().await.check_suspended(&digest) {
+            if let Some(_notify) = self.inner.state.lock().await.check_suspended(&digest) {
                 trace!(target: "primary::synchronizer", ?digest, "certificate is still suspended - returning suspended error...");
                 self.inner
                     .consensus_bus

@@ -25,6 +25,7 @@ fn test_certificate_signature_status() {
     let unverified_digest = unverified.digest();
     let verified_digest = verified.digest();
 
+    // peers sign certificate digest
     assert_ne!(unverified, verified);
     assert_ne!(unverified_digest, verified_digest);
 }

@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::{PeerId, MAX_GOSSIP_SIZE};
+use tn_network_libp2p::PeerId;
 use tn_storage::traits::Database;
 use tn_types::{
     ensure,
@@ -438,14 +438,11 @@ where
     /// after enough time to limit the DoS attack surface. Peers who timeout must lose reputation.
     pub(super) async fn process_gossip(&self, bytes: Vec<u8>) -> PrimaryNetworkResult<()> {
         // gossip is uncompressed
-        let msg = try_decode(&bytes)?;
-
+        //
         // only one type of gossip for now
-        let PrimaryGossip::Certificate(cert) = msg;
+        let PrimaryGossip::Certificate(cert) = try_decode(&bytes)?;
 
         // process certificate
-        //
-        // TODO: quick unit test that digest is different when cert is unverified/verified_directly
         let valid_cert = cert.validate_received()?;
         self.synchronizer.try_accept_certificate(valid_cert).await?;
 
