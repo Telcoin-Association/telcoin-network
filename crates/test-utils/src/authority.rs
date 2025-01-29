@@ -1,8 +1,7 @@
 //! Authority fixture for the cluster
 
 use crate::{
-    primary::PrimaryNodeDetails, worker::WorkerNodeDetails, TelcoinTempDirs, TestExecutionNode,
-    WorkerFixture,
+    primary::PrimaryNodeDetails, worker::WorkerNodeDetails, TestExecutionNode, WorkerFixture,
 };
 use anemo::Network;
 use fastcrypto::{hash::Hash, traits::KeyPair as _};
@@ -353,11 +352,9 @@ impl<DB: Database> AuthorityFixture<DB> {
         config.validator_info.primary_info.network_address =
             authority.primary_network_address().clone();
 
-        let tn_datadirs = TelcoinTempDirs::default();
         let node_config = tn_node::NodeStorage::reopen(db);
         let consensus_config = ConsensusConfig::new_with_committee(
             config,
-            tn_datadirs,
             node_config,
             key_config.clone(),
             committee,

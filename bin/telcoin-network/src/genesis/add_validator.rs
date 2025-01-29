@@ -65,7 +65,7 @@ impl AddValidator {
     /// - TODO: load validator information keys (assume safe for now)
     /// - add validator to network genesis
     /// - save NetworkGenesis as files in genesis dir again
-    pub async fn execute(&self) -> eyre::Result<()> {
+    pub fn execute(&self) -> eyre::Result<()> {
         info!(target: "genesis::add-validator", "Adding validator to committee");
 
         // add network name to data dir

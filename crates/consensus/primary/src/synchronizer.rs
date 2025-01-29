@@ -833,9 +833,7 @@ impl<DB: Database> Synchronizer<DB> {
         }
 
         let _scope = monitored_scope("Synchronizer::try_accept_fetched_certificates");
-
         let certificates = self.sanitize_fetched_certificates(certificates).await?;
-
         let highest_round = certificates.iter().map(|c| c.round()).max().unwrap();
         let certificate_source = "other";
         let highest_received_round = self
@@ -904,7 +902,7 @@ impl<DB: Database> Synchronizer<DB> {
         let (sender, receiver) = oneshot::channel();
         self.inner
             .tx_certificate_acceptor
-            .send((certificates, sender, false))
+            .send((certificates, sender, true))
             .await
             .expect("Synchronizer should shut down before certificate acceptor task.");
         receiver.await.expect("Synchronizer should shut down before certificate acceptor task.")?;
@@ -1183,6 +1181,14 @@ impl<DB: Database> Synchronizer<DB> {
 
         res.await.map_err(|e| CertificateError::ResChannelClosed(e.to_string()))??;
 
+        // TODO: remove before merge - noting this is from Steve's PR
+        //
+        // match res.await {
+        //     Ok(r) => r?,
+        //     Err(_) => {
+        //         warn!(target: "primary::synchronizer", "Synchronizer should shut down before certificate acceptor task.")
+        //     }
+        // }
         Ok(())
     }
 
@@ -1193,17 +1199,6 @@ impl<DB: Database> Synchronizer<DB> {
     pub async fn sync_header_batches(&self, header: &Header, max_age: Round) -> HeaderResult<()> {
         self.inner.sync_batches_internal(header, max_age, false).await
     }
-
-    // TODO: Add batching support to synchronizer and use this call from executor.
-    // pub async fn sync_certificate_batches(
-    //     &self,
-    //     header: &Header,
-    //     network: anemo::Network,
-    //     max_age: Round,
-    // ) -> DagResult<()> {
-    //     Synchronizer::sync_batches_internal(self.inner.clone(), header, max_age, true)
-    //         .await
-    // }
 
     /// Returns the parent certificates of the given header, waits for availability if needed.
     pub async fn notify_read_parent_certificates(

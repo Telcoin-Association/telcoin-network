@@ -69,7 +69,7 @@ impl StateHandler {
 
     async fn run(mut self) {
         info!(target: "primary::state_handler", "StateHandler on node {} has started successfully.", self.authority_id);
-        // This clone inso a variable is D-U-M, subscribe should return an owned object but here we
+        // This clone into a variable is D-U-M, subscribe should return an owned object but here we
         // are.
         let committed_certificates = self.consensus_bus.committed_certificates().clone();
         let mut rx_committed_certificates = committed_certificates.subscribe();

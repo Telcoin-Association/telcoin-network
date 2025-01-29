@@ -210,7 +210,6 @@ mod tests {
         let chain: Arc<ChainSpec> = Arc::new(genesis.into());
 
         spawn_local_testnet(chain, "0x0000000000000000000000000000000000000000")
-            .await
             .expect("failed to spawn testnet");
         // allow time for nodes to start
         tokio::time::sleep(Duration::from_secs(10)).await;

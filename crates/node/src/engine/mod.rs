@@ -50,6 +50,10 @@ pub struct TnBuilder<DB> {
     /// TODO: temporary solution until upstream reth
     /// rpc hooks are publicly available.
     pub opt_faucet_args: Option<FaucetArgs>,
+    /// Enable Prometheus consensus metrics.
+    ///
+    /// The metrics will be served at the given interface and port.
+    pub consensus_metrics: Option<SocketAddr>,
 }
 
 /// Wrapper for the inner execution node components.
@@ -68,7 +72,7 @@ where
     N::DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
 {
     /// Create a new instance of `Self`.
-    pub fn new(tn_builder: TnBuilder<N::DB>, task_manager: &TaskManager) -> eyre::Result<Self> {
+    pub fn new(tn_builder: &TnBuilder<N::DB>, task_manager: &TaskManager) -> eyre::Result<Self> {
         let inner = ExecutionNodeBuilder::new(tn_builder)
             .init_evm_components()
             .init_provider_factory()?

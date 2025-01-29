@@ -340,3 +340,10 @@ libp2p = { version = "0.54", features = [] }
 
 # [patch.crates-io]
 # alloy-sol-type-parser = { git = "https://github.com/alloy-rs/core", commit = "6bd4aeddc899c7649c2ce9be383fd5a3d4c0b691" }
+
+# On a panic, end entire app not just a thread.
+[profile.release]
+panic = 'abort'
+
+[profile.dev]
+panic = 'abort'

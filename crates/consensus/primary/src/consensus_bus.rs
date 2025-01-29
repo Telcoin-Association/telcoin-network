@@ -7,7 +7,7 @@ use crate::{
     proposer::OurDigestMessage, RecentBlocks,
 };
 use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc};
 use tn_config::Parameters;
 use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
 use tn_types::{
@@ -106,6 +106,9 @@ struct ConsensusBusInner {
     channel_metrics: Arc<ChannelMetrics>,
     /// Hold onto the executor metrics.
     executor_metrics: Arc<ExecutorMetrics>,
+
+    /// Flag to indicate a node should restart after a shutdown.
+    restart: AtomicBool,
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +220,7 @@ impl ConsensusBus {
                 primary_metrics,
                 channel_metrics,
                 executor_metrics,
+                restart: AtomicBool::new(false),
             }),
         }
     }
@@ -332,5 +336,20 @@ impl ConsensusBus {
     /// Hold onto the executor metrics
     pub fn executor_metrics(&self) -> &ExecutorMetrics {
         &self.inner.executor_metrics
+    }
+
+    /// Set the restart flag to indicate node restart after shutdown.
+    pub fn set_restart(&self) {
+        self.inner.restart.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Clear the restart flag to indicate node NOT restart after shutdown.
+    pub fn clear_restart(&self) {
+        self.inner.restart.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// True if the node should restart after shutdown.
+    pub fn restart(&self) -> bool {
+        self.inner.restart.load(std::sync::atomic::Ordering::SeqCst)
     }
 }

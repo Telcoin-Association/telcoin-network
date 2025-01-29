@@ -143,7 +143,9 @@ impl<DB: Database> Primary<DB> {
         let multiaddr = config.authority().primary_network_address().inner();
         network_handle.start_listening(multiaddr).await.expect("network listening");
 
-        self.synchronizer.spawn(task_manager);
+        if consensus_bus.node_mode().borrow().is_active_cvv() {
+            self.synchronizer.spawn(task_manager);
+        }
         let _ = tn_network::connectivity::ConnectionMonitor::spawn(
             self.network.downgrade(),
             consensus_bus.primary_metrics().network_connection_metrics.clone(),

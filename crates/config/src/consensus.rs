@@ -13,7 +13,6 @@ use crate::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, Parameters, TelcoinD
 struct ConsensusConfigInner<DB> {
     config: Config,
     committee: Committee,
-    tn_datadir: Arc<dyn TelcoinDirs>,
     node_storage: NodeStorage<DB>,
     key_config: KeyConfig,
     authority: Authority,
@@ -34,7 +33,7 @@ where
 {
     pub fn new<TND: TelcoinDirs + 'static>(
         config: Config,
-        tn_datadir: TND,
+        tn_datadir: &TND,
         node_storage: NodeStorage<DB>,
         key_config: KeyConfig,
     ) -> eyre::Result<Self> {
@@ -64,23 +63,15 @@ where
         );
 
         tracing::info!(target: "telcoin::consensus_config", "worker cache loaded");
-        Self::new_with_committee(
-            config,
-            tn_datadir,
-            node_storage,
-            key_config,
-            committee,
-            Some(worker_cache),
-        )
+        Self::new_with_committee(config, node_storage, key_config, committee, Some(worker_cache))
     }
 
     /// Create a new config with a committe.
     ///
     /// This should only be called by `Self::new`.
     /// The method is exposed publicly for testing ONLY.
-    pub fn new_with_committee<TND: TelcoinDirs + 'static>(
+    pub fn new_with_committee(
         config: Config,
-        tn_datadir: TND,
         node_storage: NodeStorage<DB>,
         key_config: KeyConfig,
         committee: Committee,
@@ -97,7 +88,6 @@ where
             })
             .clone();
 
-        let tn_datadir = Arc::new(tn_datadir);
         let worker_cache = worker_cache.take().map(Arc::new);
         let shutdown = Notifier::new();
         let anemo_config = Self::create_anemo_config();
@@ -105,7 +95,6 @@ where
             inner: Arc::new(ConsensusConfigInner {
                 config,
                 committee,
-                tn_datadir,
                 node_storage,
                 key_config,
                 authority,
@@ -173,10 +162,6 @@ where
     pub fn set_worker_cache(&mut self, worker_cache: WorkerCache) {
         assert!(self.worker_cache.is_none(), "Can not change the working cache on a config!");
         self.worker_cache = Some(Arc::new(worker_cache));
-    }
-
-    pub fn tn_datadir(&self) -> Arc<dyn TelcoinDirs> {
-        self.inner.tn_datadir.clone()
     }
 
     pub fn node_storage(&self) -> &NodeStorage<DB> {

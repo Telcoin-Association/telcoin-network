@@ -91,11 +91,7 @@ pub struct ValidatorArgs {
 
 impl ValidatorArgs {
     /// Create all necessary information needed for validator and save to file.
-    pub async fn execute(
-        &self,
-        authority_key_path: &Path,
-        config: &mut Config,
-    ) -> eyre::Result<()> {
+    pub fn execute(&self, authority_key_path: &Path, config: &mut Config) -> eyre::Result<()> {
         info!(target: "tn::generate_keys", "generating keys for full validator node");
 
         // bls keypair for consensus - drop after write to zeroize memory

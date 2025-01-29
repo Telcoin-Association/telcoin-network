@@ -120,7 +120,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                         fetch_certificates_task: JoinSet::new(),
                     }
                     .run()
-                    .await;
+                    .await
                 },
                 "CertificateFetcherTask"
             ),

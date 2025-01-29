@@ -14,7 +14,6 @@ DEV_FUNDS=""
 
 #
 while [ "$1" != "" ]; do
-echo "opt: $1"
     case $1 in
         --start )
                 START=true
@@ -22,7 +21,6 @@ echo "opt: $1"
         --dev-funds )
                 shift
                 DEV_FUNDS=$1
-                echo "df: $DEV_FUNDS"
                 ;;
         * )     echo "Invalid option: $1"
                 exit 1
@@ -83,12 +81,14 @@ else
 
         echo "creating datadir for ${VALIDATOR}"
         target/${RELEASE}/telcoin-network genesis init --datadir "${DATADIR}" \
-            --dev-funded-account $DEV_FUNDS
-            # You can add the arguments below to the genesis init command above to build
-            # blocks much faster than default.
+            --dev-funded-account $DEV_FUNDS \
+            --max-header-delay-ms 1000 \
+            --min-header-delay-ms 1000
+			# The min|max_header_delay_ms options above cause blocks to be generated
+			# faster for testing.  Remove then to build blocks at "default" speed.
+			# With these blocks are built every couple seconds, without them every ten seconds.
+			# This is just to make local testing faster.
             # NOTE: this has to happen at genesis to have any effect.
-            #--max-header-delay-ms 1000
-            #--min-header-delay-ms 1000
 
         echo "creating validator keys"
         target/${RELEASE}/telcoin-network keytool generate validator \

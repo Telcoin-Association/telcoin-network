@@ -68,7 +68,7 @@ impl CreateCommitteeArgs {
     /// - write WorkerCache to file
     ///
     /// TODO: `validate` only verifies proof of possession for now
-    pub async fn execute(&self) -> eyre::Result<()> {
+    pub fn execute(&self) -> eyre::Result<()> {
         info!(target: "genesis::add-validator", "Adding validator to committee");
 
         // load network genesis

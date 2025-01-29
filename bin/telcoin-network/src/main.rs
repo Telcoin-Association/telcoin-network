@@ -13,24 +13,21 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[non_exhaustive]
 pub struct NoArgs;
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() {
+fn main() {
     #[cfg(not(feature = "faucet"))]
     if let Err(err) = telcoin_network::cli::Cli::<NoArgs>::parse()
-        .run(|builder, _, tn_datadir| async move { launch_node(builder, tn_datadir).await })
-        .await
+        .run(|builder, _, tn_datadir| launch_node(builder, tn_datadir))
     {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
     }
 
     #[cfg(feature = "faucet")]
-    if let Err(err) = telcoin_network::cli::Cli::<FaucetArgs>::parse()
-        .run(|mut builder, faucet, tn_datadir| async move {
+    if let Err(err) =
+        telcoin_network::cli::Cli::<FaucetArgs>::parse().run(|mut builder, faucet, tn_datadir| {
             builder.opt_faucet_args = Some(faucet);
-            launch_node(builder, tn_datadir).await
+            launch_node(builder, tn_datadir)
         })
-        .await
     {
         eprintln!("Error: {err:?}");
         std::process::exit(1);

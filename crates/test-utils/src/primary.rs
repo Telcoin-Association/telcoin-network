@@ -4,7 +4,7 @@ use anemo::Network;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_node::primary::PrimaryNode;
-use tn_primary::consensus::ConsensusMetrics;
+use tn_primary::{consensus::ConsensusMetrics, ConsensusBus};
 use tn_storage::traits::Database;
 use tn_types::AuthorityIdentifier;
 
@@ -21,7 +21,9 @@ impl<DB: Database> PrimaryNodeDetails<DB> {
         name: AuthorityIdentifier,
         consensus_config: ConsensusConfig<DB>,
     ) -> Self {
-        let node = PrimaryNode::new(consensus_config);
+        let consensus_bus =
+            ConsensusBus::new_with_recent_blocks(consensus_config.config().parameters.gc_depth);
+        let node = PrimaryNode::new(consensus_config, consensus_bus);
 
         Self { id, name, node }
     }

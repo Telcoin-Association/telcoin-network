@@ -5,13 +5,13 @@ use std::{path::PathBuf, sync::Arc};
 use telcoin_network::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
 use tn_node::launch_node;
 use tn_test_utils::{default_test_execution_node, execution_outcome_for_tests, CommandParser};
-use tn_types::{Batch, TaskManager, TransactionSigned};
+use tn_types::{Batch, TransactionSigned};
 use tracing::error;
 
 pub static IT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Execute genesis ceremony inside tempdir
-pub async fn create_validator_info(datadir: &str, address: &str) -> eyre::Result<()> {
+pub fn create_validator_info(datadir: &str, address: &str) -> eyre::Result<()> {
     // init genesis
     // Note, we speed up block times for tests.
     let init_command = CommandParser::<GenesisArgs>::parse_from([
@@ -26,7 +26,7 @@ pub async fn create_validator_info(datadir: &str, address: &str) -> eyre::Result
         "--min-header-delay-ms",
         "1000",
     ]);
-    init_command.args.execute().await?;
+    init_command.args.execute()?;
 
     // keytool
     let keys_command = CommandParser::<KeyArgs>::parse_from([
@@ -38,12 +38,12 @@ pub async fn create_validator_info(datadir: &str, address: &str) -> eyre::Result
         "--address",
         address,
     ]);
-    keys_command.args.execute().await?;
+    keys_command.args.execute()?;
 
     // add validator
     let add_validator_command =
         CommandParser::<GenesisArgs>::parse_from(["tn", "add-validator", "--datadir", datadir]);
-    add_validator_command.args.execute().await
+    add_validator_command.args.execute()
 }
 
 /// Create validator info, genesis ceremony, and spawn node command with faucet active.
@@ -65,7 +65,7 @@ pub async fn config_local_testnet(temp_path: PathBuf) -> eyre::Result<()> {
         let dir = temp_path.join(v);
         let datadir = dir.to_str().expect("validator temp dir");
         // init genesis ceremony to create committee / worker_cache files
-        create_validator_info(datadir, addr).await?;
+        create_validator_info(datadir, addr)?;
 
         // copy to shared genesis dir
         let copy = dir.join("genesis/validators");
@@ -82,7 +82,7 @@ pub async fn config_local_testnet(temp_path: PathBuf) -> eyre::Result<()> {
         "--datadir",
         shared_genesis_dir.to_str().expect("shared genesis dir"),
     ]);
-    create_committee_command.args.execute().await?;
+    create_committee_command.args.execute()?;
 
     for (v, _addr) in validators.into_iter() {
         let dir = temp_path.join(v);
@@ -101,10 +101,7 @@ pub async fn config_local_testnet(temp_path: PathBuf) -> eyre::Result<()> {
 }
 
 /// Create validator info, genesis ceremony, and spawn node command with faucet active.
-pub async fn spawn_local_testnet(
-    chain: Arc<ChainSpec>,
-    contract_address: &str,
-) -> eyre::Result<()> {
+pub fn spawn_local_testnet(chain: Arc<ChainSpec>, contract_address: &str) -> eyre::Result<()> {
     // create temp path for test
     let temp_path = tempfile::TempDir::new().expect("tempdir is okay").into_path();
 
@@ -120,7 +117,7 @@ pub async fn spawn_local_testnet(
         let dir = temp_path.join(v);
         let datadir = dir.to_str().expect("validator temp dir");
         // init genesis ceremony to create committee / worker_cache files
-        create_validator_info(datadir, "0").await?;
+        create_validator_info(datadir, "0")?;
 
         // copy to shared genesis dir
         let copy = dir.join("genesis/validators");
@@ -137,9 +134,8 @@ pub async fn spawn_local_testnet(
         "--datadir",
         shared_genesis_dir.to_str().expect("shared genesis dir"),
     ]);
-    create_committee_command.args.execute().await?;
+    create_committee_command.args.execute()?;
 
-    let task_executor = TaskManager::default();
     for v in validators.into_iter() {
         let dir = temp_path.join(v);
         let datadir = dir.to_str().expect("validator temp dir");
@@ -205,16 +201,14 @@ pub async fn spawn_local_testnet(
         // update genesis with seeded accounts
         command.chain = chain.clone();
 
-        task_executor.spawn_task(v, async move {
-            let err = command
-                .execute(
-                    false, // don't overwrite chain with the default
-                    |mut builder, faucet_args, tn_datadir| async move {
-                        builder.opt_faucet_args = Some(faucet_args);
-                        launch_node(builder, tn_datadir).await
-                    },
-                )
-                .await;
+        std::thread::spawn(|| {
+            let err = command.execute(
+                false, // don't overwrite chain with the default
+                |mut builder, faucet_args, tn_datadir| {
+                    builder.opt_faucet_args = Some(faucet_args);
+                    launch_node(builder, tn_datadir)
+                },
+            );
             error!("{:?}", err);
         });
     }

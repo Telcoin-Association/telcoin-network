@@ -209,6 +209,25 @@ impl LeaderSchedule {
         Self::new(committee, table)
     }
 
+    pub fn reload_from_store<DB: Database>(
+        &self,
+        store: Arc<ConsensusStore<DB>>,
+        bad_nodes_stake_threshold: u64,
+    ) {
+        let table = store.read_latest_commit_with_final_reputation_scores().map_or(
+            LeaderSwapTable::default(),
+            |commit| {
+                LeaderSwapTable::new(
+                    &self.committee,
+                    commit.leader_round(),
+                    &commit.reputation_score,
+                    bad_nodes_stake_threshold,
+                )
+            },
+        );
+        *self.leader_swap_table.write() = table;
+    }
+
     /// Atomically updates the leader swap table with the new provided one. Any leader queried from
     /// now on will get calculated according to this swap table until a new one is provided again.
     pub fn update_leader_swap_table(&self, table: LeaderSwapTable) {

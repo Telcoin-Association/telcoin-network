@@ -54,18 +54,19 @@ where
     N::DB: Database + DatabaseMetrics + DatabaseMetadata + Clone + Unpin + 'static,
 {
     /// Start the builder with required components
-    pub fn new(tn_builder: TnBuilder<N::DB>) -> Self {
-        let TnBuilder { database, node_config, tn_config, opt_faucet_args } = tn_builder;
+    pub fn new(tn_builder: &TnBuilder<N::DB>) -> Self {
+        let TnBuilder { database, node_config, tn_config, opt_faucet_args, consensus_metrics: _ } =
+            tn_builder;
 
         Self {
-            node_config,
-            tn_config,
-            database,
+            node_config: node_config.clone(),
+            tn_config: tn_config.clone(),
+            database: database.clone(),
             provider_factory: None,
             blockchain_db: None,
             evm_executor: None,
             evm_config: None,
-            opt_faucet_args,
+            opt_faucet_args: opt_faucet_args.clone(),
         }
     }
 

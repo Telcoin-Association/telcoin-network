@@ -70,25 +70,6 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
     where
         BlsPublicKey: VerifyingKey,
     {
-        // TODO: this may need to be adjusted depending on how TN executes output
-        //
-        // if executor engine executes-per-batch:
-        //  - executing consensus output per batch ~> 1 batch == 1 block
-        //  - use nonce or mixed hash or difficulty to track the output's "last committed subdag"
-        //  - how to handle restart mid-execution?
-        //      - only some of the batches completed
-        //      - so, don't use `last_executed_sub_dag_index + 1`
-        //          - use just `last_executed_sub_dag_index` and re-execute the output again
-        //          - less efficient, but ensures correctness
-        //          - maybe there's a way to optimize this like only re-execute if the
-        //            blocks/batches don't match the output batch count?
-        //              - but this is probably unlikely to happen anyway
-        //                  - ie) crashes/restarts at a clean execution boundary
-        //
-        // for now, all batches are contained within a single block, (ie 1 consensus output = 1
-        // executed block) so use block number for restored consensus output
-        // since block number == last_executed_sub_dag_index
-
         let leader_schedule = LeaderSchedule::from_store(
             self.consensus_config.committee().clone(),
             self.consensus_config.node_storage().consensus_store.clone(),
@@ -131,9 +112,10 @@ pub struct PrimaryNode<CDB> {
 }
 
 impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
-    pub fn new(consensus_config: ConsensusConfig<CDB>) -> PrimaryNode<CDB> {
-        let consensus_bus =
-            ConsensusBus::new_with_recent_blocks(consensus_config.config().parameters.gc_depth);
+    pub fn new(
+        consensus_config: ConsensusConfig<CDB>,
+        consensus_bus: ConsensusBus,
+    ) -> PrimaryNode<CDB> {
         let primary = Primary::new(consensus_config.clone(), &consensus_bus);
 
         let inner = PrimaryNodeInner { consensus_config, consensus_bus, primary };

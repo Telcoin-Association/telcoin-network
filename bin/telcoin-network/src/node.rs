@@ -3,10 +3,8 @@
 //! Starts the client
 use crate::{args::clap_genesis_parser, version::SHORT_VERSION};
 use clap::{value_parser, Parser};
-use consensus_metrics::start_prometheus_server;
 use core::fmt;
 use fdlimit::raise_fd_limit;
-use futures::Future;
 use reth::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, NetworkArgs, PayloadBuilderArgs,
@@ -138,15 +136,14 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
 impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
     /// Execute `node` command
     #[instrument(level = "info", skip_all)]
-    pub async fn execute<L, Fut>(
+    pub fn execute<L>(
         mut self,
         load_config: bool, /* If false will not attempt to load a previously saved config-
                             * useful for testing. */
         launcher: L,
     ) -> eyre::Result<()>
     where
-        L: FnOnce(TnBuilder<Arc<DatabaseEnv>>, Ext, DataDirChainPath) -> Fut,
-        Fut: Future<Output = eyre::Result<()>>,
+        L: FnOnce(TnBuilder<Arc<DatabaseEnv>>, Ext, DataDirChainPath) -> eyre::Result<()>,
     {
         info!(target: "tn::cli", "telcoin-network {} starting", SHORT_VERSION);
 
@@ -234,12 +231,14 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             Arc::new(init_db(db_path.clone(), node_config.db.database_args())?.with_metrics());
 
         // TODO: temporary solution until upstream reth supports public rpc hooks
-        let builder = TnBuilder { database, node_config, tn_config, opt_faucet_args: None };
+        let builder = TnBuilder {
+            database,
+            node_config,
+            tn_config,
+            opt_faucet_args: None,
+            consensus_metrics: self.consensus_metrics,
+        };
 
-        if let Some(metrics_socket) = self.consensus_metrics {
-            start_prometheus_server(metrics_socket);
-        }
-
-        launcher(builder, ext, tn_datadir).await
+        launcher(builder, ext, tn_datadir)
     }
 }
