@@ -30,7 +30,7 @@ use tokio::{
     },
     task::JoinHandle,
 };
-use tracing::{error, info, trace};
+use tracing::{error, info, instrument, trace};
 
 /// Custom network libp2p behaviour type for Telcoin Network.
 ///
@@ -213,6 +213,7 @@ where
     }
 
     /// Process events from the swarm.
+    #[instrument(target = "network::events", skip(self), fields(topics = ?self.topics))]
     async fn process_event(
         &mut self,
         event: SwarmEvent<TNBehaviorEvent<TNCodec<Req, Res>>>,
@@ -230,7 +231,6 @@ where
                 concurrent_dial_errors,
                 established_in,
             } => {
-                trace!(target: "network", topics=?self.topics, ?peer_id, ?connection_id, ?endpoint, ?num_established, ?concurrent_dial_errors, ?established_in, "connection established");
                 if endpoint.is_dialer() {
                     if let Some(sender) = self.pending_dials.remove(&peer_id) {
                         if let Err(e) = sender.send(Ok(())) {
@@ -245,35 +245,15 @@ where
                 endpoint,
                 num_established,
                 cause,
-            } => trace!(
-                target: "network",
-                topics=?self.topics,
-                ?peer_id,
-                ?connection_id,
-                ?endpoint,
-                ?num_established,
-                ?cause,
-                "connection closed"
-            ),
-            SwarmEvent::IncomingConnection { connection_id, local_addr, send_back_addr } => {
-                trace!(target: "network", topics=?self.topics, ?connection_id, ?local_addr, ?send_back_addr, "incoming connection")
-            }
+            } => {}
+            SwarmEvent::IncomingConnection { connection_id, local_addr, send_back_addr } => {}
             SwarmEvent::IncomingConnectionError {
                 connection_id,
                 local_addr,
                 send_back_addr,
                 error,
-            } => trace!(
-                target: "network",
-                topics=?self.topics,
-                ?connection_id,
-                ?local_addr,
-                ?send_back_addr,
-                ?error,
-                "incoming connection error"
-            ),
+            } => {}
             SwarmEvent::OutgoingConnectionError { connection_id, peer_id, error } => {
-                trace!(target: "network", topics=?self.topics, ?connection_id, ?peer_id, ?error, "outgoing connection error");
                 if let Some(peer_id) = peer_id {
                     if let Some(sender) = self.pending_dials.remove(&peer_id) {
                         if let Err(e) = sender.send(Err(error.into())) {
@@ -282,9 +262,7 @@ where
                     }
                 }
             }
-            SwarmEvent::NewListenAddr { listener_id, address } => {
-                trace!(target: "network", topics=?self.topics, ?listener_id, ?address, "new listener addr")
-            }
+            SwarmEvent::NewListenAddr { listener_id, address } => {}
             SwarmEvent::ExpiredListenAddr { address, .. } => {
                 // log listening addr
                 info!(
@@ -293,30 +271,14 @@ where
                     "network listening"
                 );
             }
-            SwarmEvent::ListenerClosed { listener_id, addresses, reason } => {
-                trace!(target: "network", topics=?self.topics, ?listener_id, ?addresses, ?reason, "listener closed")
-            }
-            SwarmEvent::ListenerError { listener_id, error } => {
-                trace!(target: "network", topics=?self.topics, ?listener_id, ?error, "listener error")
-            }
-            SwarmEvent::Dialing { peer_id, connection_id } => {
-                trace!(target: "network", topics=?self.topics, ? peer_id, ?connection_id, "dialing")
-            }
-            SwarmEvent::NewExternalAddrCandidate { address } => {
-                trace!(target: "network", topics=?self.topics, ?address, "new external addr candidate")
-            }
-            SwarmEvent::ExternalAddrConfirmed { address } => {
-                trace!(target: "network", topics=?self.topics, ?address, "external addr confirmed")
-            }
-            SwarmEvent::ExternalAddrExpired { address } => {
-                trace!(target: "network", topics=?self.topics, ?address, "external addr expired")
-            }
-            SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => {
-                trace!(target: "network", topics=?self.topics, ?peer_id, ?address, "new external addr of peer")
-            }
-            _e => {
-                trace!(target: "network", topics=?self.topics, ?_e, "non-exhaustive event match")
-            }
+            SwarmEvent::ListenerClosed { listener_id, addresses, reason } => {}
+            SwarmEvent::ListenerError { listener_id, error } => {}
+            SwarmEvent::Dialing { peer_id, connection_id } => {}
+            SwarmEvent::NewExternalAddrCandidate { address } => {}
+            SwarmEvent::ExternalAddrConfirmed { address } => {}
+            SwarmEvent::ExternalAddrExpired { address } => {}
+            SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => {}
+            _e => {}
         }
         Ok(())
     }
@@ -494,8 +456,6 @@ where
     fn process_reqres_event(&mut self, event: ReqResEvent<Req, Res>) -> NetworkResult<()> {
         match event {
             ReqResEvent::Message { peer, message } => {
-                trace!(target: "network",  ?peer, ?message, "req/res MESSAGE event");
-
                 match message {
                     request_response::Message::Request { request_id, request, channel } => {
                         // forward request to handler without blocking other events
@@ -536,9 +496,7 @@ where
                 // - inbound stream failed: malicious encoding? report peer?
                 error!(target: "network", ?peer, ?request_id, ?error, "inbound failure");
             }
-            ReqResEvent::ResponseSent { peer, request_id } => {
-                trace!(target: "network",  ?peer, ?request_id, "response sent")
-            }
+            ReqResEvent::ResponseSent { peer, request_id } => {}
         }
 
         Ok(())
@@ -650,6 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_valid_req_res() -> eyre::Result<()> {
+        tn_test_utils::init_test_tracing();
         let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
         let mut authorities = all_nodes.authorities();
         let authority_1 = authorities.next().expect("first authority");
