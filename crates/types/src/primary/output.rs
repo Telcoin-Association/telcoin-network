@@ -47,8 +47,6 @@ pub struct ConsensusOutput {
 
 impl ConsensusOutput {
     /// The leader for the round
-    ///
-    /// TODO: need the address for the authority
     pub fn leader(&self) -> &Certificate {
         &self.sub_dag.leader
     }

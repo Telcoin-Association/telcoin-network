@@ -477,23 +477,34 @@ where
         // start timing the request processing
         let start_time = tokio::time::Instant::now();
 
-        // validate request parameters
-        self.validate_missing_certs_request(&request)?;
+        // ensure request size is within bounds
+        ensure!(
+            request.max_items > 0 && request.max_items <= MAX_NUM_MISSING_CERTS,
+            PrimaryNetworkError::InvalidRequest("Request for certs out of bounds".into())
+        );
+
+        // initialize vec for certificates
+        let mut certificates = Vec::with_capacity(request.max_items);
 
         // get the round bounds and skip set
         let (lower_bound, skip_rounds) = request.get_bounds()?;
+
         debug!(
+            target: "primary::network",
             "Processing certificate request from peer {:?} - lower bound: {}, authorities: {}",
             peer,
             lower_bound,
             skip_rounds.len()
         );
 
-        // initialize vec for certificates
-        let mut certificates = Vec::with_capacity(request.max_items);
-
         // process each authority's certificates efficiently
         for (authority, skip_set) in skip_rounds {
+            // ensure skip rounds are within bounds
+            ensure!(
+                skip_set.len() < MAX_NUM_SKIP_ROUNDS,
+                PrimaryNetworkError::InvalidRequest("Request for rounds out of bounds".into())
+            );
+
             // check time limit frequently
             if start_time.elapsed() >= FETCH_CERTIFICATES_MAX_HANDLER_TIME {
                 debug!(target: "primary::network", "Request processing timeout after {} certificates", certificates.len());
@@ -527,35 +538,6 @@ where
         );
 
         Ok(PrimaryResponse::RequestedCertificates(certificates))
-    }
-
-    /// Validate a missing certs request from peer.
-    fn validate_missing_certs_request(
-        &self,
-        request: &MissingCertificatesRequest,
-    ) -> PrimaryNetworkResult<()> {
-        // ensure request size is within bounds
-        ensure!(
-            request.max_items > 0 && request.max_items <= MAX_NUM_MISSING_CERTS,
-            PrimaryNetworkError::InvalidRequest("Request for certs out of bounds".into())
-        );
-
-        // ensure skip rounds are within bounds
-        for (_, rounds) in request.get_bounds() {
-            ensure!(
-                rounds.len() > MAX_NUM_SKIP_ROUNDS,
-                PrimaryNetworkError::InvalidRequest("Request for rounds out of bounds".into())
-            )
-        }
-
-        // ensure there's a reasonable number of authorities
-        // - skip_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>>
-        ensure!(
-            request.skip_rounds.len() <= self.consensus_config.committee().size(),
-            PrimaryNetworkError::InvalidRequest("Too many authorities".into())
-        );
-
-        Ok(())
     }
 
     /// Retrieve certificates for a single authority efficiently

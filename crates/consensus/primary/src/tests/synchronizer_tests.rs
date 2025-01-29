@@ -7,7 +7,6 @@ use crate::{
     ConsensusBus,
 };
 use fastcrypto::{hash::Hash, traits::KeyPair};
-use futures::StreamExt;
 use itertools::Itertools;
 use std::{
     collections::{BTreeSet, HashMap},

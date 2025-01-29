@@ -124,7 +124,7 @@ impl<DB: Database> Primary<DB> {
     }
 
     /// Spawns the primary.
-    pub async fn spawn(
+    pub fn spawn(
         &mut self,
         config: ConsensusConfig<DB>,
         consensus_bus: &ConsensusBus,
@@ -132,16 +132,19 @@ impl<DB: Database> Primary<DB> {
         task_manager: &TaskManager,
     ) {
         // TODO: use the channel buffer constant
-        let (event_stream, event_receiver) = mpsc::channel(10_000);
-        let network_libp2p =
-            ConsensusNetwork::new_for_primary(&config, event_stream).expect("primary network");
-        let network_handle = network_libp2p.network_handle();
+        // let (event_stream, event_receiver) = mpsc::channel(10_000);
+        // let network_libp2p =
+        //     ConsensusNetwork::new_for_primary(&config, event_stream).expect("primary network");
+        // let network_handle = network_libp2p.network_handle();
 
-        // spawn network and start listening
-        task_manager.spawn_task("primary-network", async move { network_libp2p.run() });
-        // TODO: fix this type - only temp - DO NOT MERGE
-        let multiaddr = config.authority().primary_network_address().inner();
-        network_handle.start_listening(multiaddr).await.expect("network listening");
+        // // spawn network and start listening
+        // let multiaddr = config.authority().primary_network_address().inner();
+        // let handle = network_handle.clone();
+        // task_manager.spawn_task("primary-network", async move {
+        //     let _ = network_libp2p.run();
+        //     // TODO: fix this type - only temp - DO NOT MERGE
+        //     // handle.start_listening(multiaddr).await.expect("network listening");
+        // });
 
         if consensus_bus.node_mode().borrow().is_active_cvv() {
             self.synchronizer.spawn(task_manager);
@@ -207,8 +210,8 @@ impl<DB: Database> Primary<DB> {
             task_manager,
         );
 
-        // store handle to network
-        self.network_handle = Some(network_handle);
+        // // store handle to network
+        // self.network_handle = Some(network_handle);
 
         // NOTE: This log entry is used to compute performance.
         info!(
