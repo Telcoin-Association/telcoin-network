@@ -4,13 +4,12 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
-use tn_network_libp2p::{
-    types::{IntoRpcError, NetworkResult},
-    TNMessage,
-};
+use tn_network_libp2p::{types::IntoRpcError, TNMessage};
 use tn_types::{
     error::HeaderError, AuthorityIdentifier, Certificate, CertificateDigest, Header, Round, Vote,
 };
+
+use crate::error::{PrimaryNetworkError, PrimaryNetworkResult};
 
 /// Primary messages on the gossip network.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -66,7 +65,7 @@ impl MissingCertificatesRequest {
     /// lower boundary and their GC round.
     pub fn get_bounds(
         &self,
-    ) -> NetworkResult<(Round, BTreeMap<AuthorityIdentifier, BTreeSet<Round>>)> {
+    ) -> PrimaryNetworkResult<(Round, BTreeMap<AuthorityIdentifier, BTreeSet<Round>>)> {
         let skip_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>> = self
             .skip_rounds
             .iter()
@@ -77,7 +76,7 @@ impl MissingCertificatesRequest {
                     .collect::<BTreeSet<Round>>();
                 Ok((*k, rounds))
             })
-            .collect::<NetworkResult<BTreeMap<_, _>>>()?;
+            .collect::<PrimaryNetworkResult<BTreeMap<_, _>>>()?;
         Ok((self.exclusive_lower_bound, skip_rounds))
     }
 
@@ -88,7 +87,7 @@ impl MissingCertificatesRequest {
         mut self,
         gc_round: Round,
         skip_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>>,
-    ) -> NetworkResult<Self> {
+    ) -> PrimaryNetworkResult<Self> {
         self.exclusive_lower_bound = gc_round;
         self.skip_rounds = skip_rounds
             .into_iter()
@@ -102,7 +101,7 @@ impl MissingCertificatesRequest {
 
                 Ok((k, serialized))
             })
-            .collect::<NetworkResult<Vec<_>>>()?;
+            .collect::<PrimaryNetworkResult<Vec<_>>>()?;
 
         Ok(self)
     }
@@ -140,6 +139,13 @@ pub enum PrimaryResponse {
 
 impl IntoRpcError<HeaderError> for PrimaryResponse {
     fn into_error(error: HeaderError) -> Self {
+        Self::Error(PrimaryRPCError::HeaderInvalid(error.to_string()))
+    }
+}
+
+// TODO: !!!!! Fix this
+impl IntoRpcError<PrimaryNetworkError> for PrimaryResponse {
+    fn into_error(error: PrimaryNetworkError) -> Self {
         Self::Error(PrimaryRPCError::HeaderInvalid(error.to_string()))
     }
 }

@@ -1,5 +1,6 @@
 //! Error types for primary's network task.
 
+use tn_storage::StoreError;
 use tn_types::{
     error::{CertificateError, HeaderError},
     BcsError,
@@ -20,4 +21,13 @@ pub(crate) enum PrimaryNetworkError {
     /// Error processing certificate.
     #[error("Failed to process certificate: {0}")]
     Certificate(#[from] CertificateError),
+    /// Error conversion from [std::io::Error]
+    #[error(transparent)]
+    StdIo(#[from] std::io::Error),
+    /// Error retrieving value from storage.
+    #[error("Storage failure: {0}")]
+    Storage(#[from] StoreError),
+    /// The peer's request is invalid.
+    #[error("{0}")]
+    InvalidRequest(String),
 }

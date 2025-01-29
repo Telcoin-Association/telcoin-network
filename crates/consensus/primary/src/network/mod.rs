@@ -4,6 +4,7 @@
 //! requests from it's own workers and other primaries.
 
 use handler::RequestHandler;
+use message::MissingCertificatesRequest;
 pub use message::{PrimaryRequest, PrimaryResponse};
 use tn_network_libp2p::{
     types::{IntoResponse as _, NetworkEvent, NetworkHandle},
@@ -78,7 +79,14 @@ where
                         channel,
                     );
                 }
-                PrimaryRequest::MissingCertificates { inner } => todo!(),
+                PrimaryRequest::MissingCertificates { inner } => self
+                    .process_request_for_missing_certs(
+                        request_handler,
+                        network_handle,
+                        peer,
+                        inner,
+                        channel,
+                    ),
             },
             NetworkEvent::Gossip(msg) => {
                 self.process_gossip(request_handler, network_handle, msg);
@@ -100,6 +108,24 @@ where
     ) {
         tokio::spawn(async move {
             let response = request_handler.vote(peer, header, parents).await.into_response();
+            let _ = network_handle.send_response(response, channel).await;
+        });
+    }
+
+    /// Attempt to retrieve certificates for a peer that's missing them.
+    fn process_request_for_missing_certs(
+        &self,
+        request_handler: RequestHandler<DB>,
+        network_handle: NetworkHandle<Req, Res>,
+        peer: PeerId,
+        request: MissingCertificatesRequest,
+        channel: ResponseChannel<PrimaryResponse>,
+    ) {
+        tokio::spawn(async move {
+            let response = request_handler
+                .process_request_for_missing_certs(peer, request)
+                .await
+                .into_response();
             let _ = network_handle.send_response(response, channel).await;
         });
     }
