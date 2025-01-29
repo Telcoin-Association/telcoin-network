@@ -5,6 +5,7 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
+    reply_or_log_error,
     types::{NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
     MAX_GOSSIP_SIZE,
 };
@@ -238,6 +239,16 @@ where
                         }
                     }
                 }
+                // Log successful connection establishment
+                info!(
+                    target: "network::events",
+                    ?peer_id,
+                    ?connection_id,
+                    ?num_established,
+                    ?established_in,
+                    ?concurrent_dial_errors,
+                    "new connection established"
+                );
             }
             SwarmEvent::ConnectionClosed {
                 peer_id,
@@ -245,7 +256,39 @@ where
                 endpoint,
                 num_established,
                 cause,
-            } => {}
+            } => {
+                tracing::debug!(target: "network::events", pending=?self.pending_requests);
+                // Log connection closure with cause
+                info!(
+                    target: "network",
+                    ?peer_id,
+                    ?connection_id,
+                    ?cause,
+                    remaining = num_established,
+                    "connection closed"
+                );
+
+                // Handle complete peer disconnect
+                if num_established == 0 {
+                    // Clean up any pending requests/state for this peer
+                    self.pending_requests.retain(
+                        |_, sender| {
+                            if sender.is_closed() {
+                                false
+                            } else {
+                                true
+                            }
+                        },
+                    );
+
+                    tracing::debug!(target: "network::events", pending=?self.pending_requests);
+
+                    // Consider initiating reconnection if peer is important
+                    if self.authorized_publishers.contains(&peer_id) {
+                        // Schedule reconnection attempt
+                    }
+                }
+            }
             SwarmEvent::IncomingConnection { connection_id, local_addr, send_back_addr } => {}
             SwarmEvent::IncomingConnectionError {
                 connection_id,
@@ -288,21 +331,15 @@ where
         match command {
             NetworkCommand::UpdateAuthorizedPublishers { authorities, reply } => {
                 self.authorized_publishers = authorities;
-                if let Err(e) = reply.send(Ok(())) {
-                    error!(target: "network", ?e, "UpdateAuthorizedPublishers failed to send result");
-                }
+                reply_or_log_error!(reply, Ok(()), "UpdateAuthorizedPublishers");
             }
             NetworkCommand::StartListening { multiaddr, reply } => {
                 let res = self.swarm.listen_on(multiaddr);
-                if let Err(e) = reply.send(res) {
-                    error!(target: "network", ?e, "StartListening failed to send result");
-                }
+                reply_or_log_error!(reply, res, "StartListening");
             }
             NetworkCommand::GetListener { reply } => {
                 let addrs = self.swarm.listeners().cloned().collect();
-                if let Err(e) = reply.send(addrs) {
-                    error!(target: "network", ?e, "GetListeners command failed");
-                }
+                reply_or_log_error!(reply, addrs, "GetListeners");
             }
             NetworkCommand::AddExplicitPeer { peer_id, addr } => {
                 self.swarm.add_peer_address(peer_id, addr);
@@ -315,9 +352,12 @@ where
                             entry.insert(reply);
                         }
                         Err(e) => {
-                            if let Err(e) = reply.send(Err(e.into())) {
-                                error!(target: "network", ?e, "AddExplicitPeer oneshot dropped");
-                            }
+                            reply_or_log_error!(
+                                reply,
+                                Err(e.into()),
+                                "AddExplicitPeer",
+                                peer = peer_id,
+                            );
                         }
                     }
                 } else {
@@ -325,47 +365,33 @@ where
                     //
                     // may be necessary to update entry in future, but for now assume only one dial
                     // attempt
-                    if let Err(e) = reply.send(Err(NetworkError::RedialAttempt)) {
-                        error!(target: "network", ?e, "AddExplicitPeer oneshot dropped");
-                    }
+                    reply_or_log_error!(reply, Err(NetworkError::RedialAttempt), "AddExplicitPeer");
                 }
             }
             NetworkCommand::LocalPeerId { reply } => {
                 let peer_id = *self.swarm.local_peer_id();
-                if let Err(e) = reply.send(peer_id) {
-                    error!(target: "network", ?e, "LocalPeerId command failed");
-                }
+                reply_or_log_error!(reply, peer_id, "LocalPeerId");
             }
             NetworkCommand::Publish { topic, msg, reply } => {
                 let res = self.swarm.behaviour_mut().gossipsub.publish(topic, msg);
-                if let Err(e) = reply.send(res) {
-                    error!(target: "network", ?e, "Publish command failed");
-                }
+                reply_or_log_error!(reply, res, "Publish");
             }
             NetworkCommand::Subscribe { topic, reply } => {
                 let res = self.swarm.behaviour_mut().gossipsub.subscribe(&topic);
-                if let Err(e) = reply.send(res) {
-                    error!(target: "network", ?e, "Subscribe command failed");
-                }
+                reply_or_log_error!(reply, res, "Subscribe");
             }
             NetworkCommand::ConnectedPeers { reply } => {
                 let res = self.swarm.connected_peers().cloned().collect();
-                if let Err(e) = reply.send(res) {
-                    error!(target: "network", ?e, "ConnectedPeers command failed");
-                }
+                reply_or_log_error!(reply, res, "ConnectedPeers");
             }
             NetworkCommand::PeerScore { peer_id, reply } => {
                 let opt_score = self.swarm.behaviour_mut().gossipsub.peer_score(&peer_id);
-                if let Err(e) = reply.send(opt_score) {
-                    error!(target: "network", ?e, "PeerScore command failed");
-                }
+                reply_or_log_error!(reply, opt_score, "PeerScore");
             }
             NetworkCommand::SetApplicationScore { peer_id, new_score, reply } => {
                 let bool =
                     self.swarm.behaviour_mut().gossipsub.set_application_score(&peer_id, new_score);
-                if let Err(e) = reply.send(bool) {
-                    error!(target: "network", ?e, "SetApplicationScore command failed");
-                }
+                reply_or_log_error!(reply, bool, "SetApplicationScore");
             }
             NetworkCommand::AllPeers { reply } => {
                 let collection = self
@@ -376,23 +402,17 @@ where
                     .map(|(peer_id, vec)| (*peer_id, vec.into_iter().cloned().collect()))
                     .collect();
 
-                if let Err(e) = reply.send(collection) {
-                    error!(target: "network", ?e, "AllPeers command failed");
-                }
+                reply_or_log_error!(reply, collection, "AllPeers");
             }
             NetworkCommand::AllMeshPeers { reply } => {
                 let collection =
                     self.swarm.behaviour_mut().gossipsub.all_mesh_peers().cloned().collect();
-                if let Err(e) = reply.send(collection) {
-                    error!(target: "network", ?e, "AllMeshPeers command failed");
-                }
+                reply_or_log_error!(reply, collection, "AllMeshPeers");
             }
             NetworkCommand::MeshPeers { topic, reply } => {
                 let collection =
                     self.swarm.behaviour_mut().gossipsub.mesh_peers(&topic).cloned().collect();
-                if let Err(e) = reply.send(collection) {
-                    error!(target: "network", ?e, "MeshPeers command failed");
-                }
+                reply_or_log_error!(reply, collection, "MeshPeers");
             }
             NetworkCommand::SendRequest { peer, request, reply } => {
                 tracing::debug!("inside NetworkCommand send request");
@@ -401,9 +421,11 @@ where
             }
             NetworkCommand::SendResponse { response, channel, reply } => {
                 let res = self.swarm.behaviour_mut().req_res.send_response(channel, response);
-                if let Err(e) = reply.send(res) {
-                    error!(target: "network", ?e, "SendResponse command failed");
-                }
+                reply_or_log_error!(reply, res, "SendResponse");
+            }
+            NetworkCommand::PendingRequestCount { reply } => {
+                let count = self.pending_requests.len();
+                reply_or_log_error!(reply, count, "SendResponse");
             }
         }
     }
@@ -608,6 +630,73 @@ mod tests {
 
     #[tokio::test]
     async fn test_valid_req_res() -> eyre::Result<()> {
+        let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+        let mut authorities = all_nodes.authorities();
+        let authority_1 = authorities.next().expect("first authority");
+        let authority_2 = authorities.next().expect("second authority");
+        let config_1 = authority_1.consensus_config();
+        let config_2 = authority_2.consensus_config();
+        let (tx1, _network_events_1) = mpsc::channel(1);
+        let (tx2, mut network_events_2) = mpsc::channel(1);
+        let topics = vec![IdentTopic::new("test-topic")];
+
+        // honest peer1
+        let peer1_network =
+            ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(&config_1, tx1, topics.clone())?;
+
+        // honest peer2
+        let peer2_network =
+            ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(&config_2, tx2, topics.clone())?;
+
+        // spawn tasks
+        let peer1 = peer1_network.network_handle();
+        peer1_network.run();
+
+        let peer2 = peer2_network.network_handle();
+        peer2_network.run();
+
+        // start swarm listening on default any address
+        let listen_on_1 = config_1.authority().primary_network_address().inner();
+        peer1.start_listening(listen_on_1).await?;
+        let listen_on_2 = config_2.authority().primary_network_address().inner();
+        peer2.start_listening(listen_on_2).await?;
+        let peer2_id = peer2.local_peer_id().await?;
+        let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
+
+        let missing_block = fixture_batch_with_transactions(3).seal_slow();
+        let digests = vec![missing_block.digest()];
+        let batch_req = WorkerRequest::MissingBatches(digests);
+        let batch_res = WorkerResponse::MissingBatches { batches: vec![missing_block] };
+
+        // dial peer2
+        peer1.dial(peer2_id, peer2_addr).await?;
+
+        // send request and wait for response
+        let max_time = Duration::from_secs(5);
+        let network_res = peer1.send_request(batch_req.clone(), peer2_id).await?;
+        let event = timeout(max_time, network_events_2.recv())
+            .await?
+            .expect("first network event received");
+
+        // expect network event
+        if let NetworkEvent::Request { request, channel, .. } = event {
+            assert_eq!(request, batch_req);
+
+            // send response
+            peer2.send_response(batch_res.clone(), channel).await?;
+        } else {
+            panic!("unexpected network event received");
+        }
+
+        // expect response
+        let response = timeout(max_time, network_res).await?.expect("outbound id recv")?;
+        assert_eq!(response, batch_res);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
         tn_test_utils::init_test_tracing();
         let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
         let mut authorities = all_nodes.authorities();
@@ -653,6 +742,9 @@ mod tests {
         // send request and wait for response
         let max_time = Duration::from_secs(5);
         let network_res = peer1.send_request(batch_req.clone(), peer2_id).await?;
+
+        // peer1 has a pending_request now
+
         let event = timeout(max_time, network_events_2.recv())
             .await?
             .expect("first network event received");

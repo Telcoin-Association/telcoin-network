@@ -152,6 +152,8 @@ where
     ///
     /// Peer's application score is P₅ of the peer scoring system.
     SetApplicationScore { peer_id: PeerId, new_score: f64, reply: oneshot::Sender<bool> },
+    /// Return the number of pending outbound requests.
+    PendingRequestCount { reply: oneshot::Sender<usize> },
 }
 
 /// Network handle.
@@ -320,4 +322,37 @@ where
         self.sender.send(NetworkCommand::SendResponse { response, channel, reply }).await?;
         res.await?.map_err(|_| NetworkError::SendResponse)
     }
+
+    /// Return the number of pending requests.
+    ///
+    /// Mostly helpful for testing, but could be useful for managing outbound requests.
+    pub async fn get_pending_request_count(&self) -> NetworkResult<usize> {
+        let (reply, count) = oneshot::channel();
+        self.sender.send(NetworkCommand::PendingRequestCount { reply }).await?;
+        count.await.map_err(Into::into)
+    }
+}
+
+/// Helper macro for sending replies and logging errors consistently
+///
+/// The arguments are:
+/// 1) oneshot::Sender
+/// 2) value to send through oneshot channel
+/// 3) string error message
+/// 4) `key = value` for additional logging (Optional)
+#[macro_export]
+macro_rules! reply_or_log_error {
+    // Basic case: Takes a result expression and an error message string
+    ($reply:expr, $result:expr, $error_msg:expr) => {
+        if let Err(e) = $reply.send($result) {
+            error!(target: "network", ?e, $error_msg);
+        }
+    };
+
+    // Optional case that allows specifying additional error context
+    ($reply:expr, $result:expr, $error_msg:expr, $($field:ident = $value:expr),+ $(,)?) => {
+        if let Err(e) = $reply.send($result) {
+            error!(target: "network", ?e, $($field = ?$value,)+ $error_msg);
+        }
+    };
 }
