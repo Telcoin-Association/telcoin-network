@@ -167,8 +167,8 @@ pub const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 
 /// Max gossip size in bytes.
 ///
-/// Gossip messages must be small because peers are likely to receive the same message multiple times.
-/// The protocol is optimized for latency, not throughput.
+/// Gossip messages must be small because peers are likely to receive the same message multiple
+/// times. The protocol is optimized for latency, not throughput.
 /// See github discussion for more info: https://github.com/libp2p/specs/issues/118#issuecomment-499688869
 ///
 /// The max is based on `Certificate` sizes. Certificate signatures are encoded as roaring bitmaps.

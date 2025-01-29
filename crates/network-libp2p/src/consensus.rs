@@ -5,7 +5,7 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
-    reply_or_log_error,
+    send_or_log_error,
     types::{NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
     MAX_GOSSIP_SIZE,
 };
@@ -15,7 +15,10 @@ use libp2p::{
         self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance,
     },
     multiaddr::Protocol,
-    request_response::{self, Codec, Event as ReqResEvent, OutboundRequestId, ProtocolSupport},
+    request_response::{
+        self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
+        OutboundRequestId, ProtocolSupport,
+    },
     swarm::{NetworkBehaviour, SwarmEvent},
     PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
@@ -31,7 +34,7 @@ use tokio::{
     },
     task::JoinHandle,
 };
-use tracing::{error, info, instrument, trace};
+use tracing::{error, info, instrument, trace, warn};
 
 /// Custom network libp2p behaviour type for Telcoin Network.
 ///
@@ -214,7 +217,7 @@ where
     }
 
     /// Process events from the swarm.
-    #[instrument(target = "network::events", skip(self), fields(topics = ?self.topics))]
+    #[instrument(level = "trace", target = "network::events", skip(self), fields(topics = ?self.topics))]
     async fn process_event(
         &mut self,
         event: SwarmEvent<TNBehaviorEvent<TNCodec<Req, Res>>>,
@@ -234,11 +237,10 @@ where
             } => {
                 if endpoint.is_dialer() {
                     if let Some(sender) = self.pending_dials.remove(&peer_id) {
-                        if let Err(e) = sender.send(Ok(())) {
-                            error!(target: "network", ?e, "failed to report dial success - oneshot dropped");
-                        }
+                        send_or_log_error!(sender, Ok(()), "ConnectionEstablished", peer = peer_id);
                     }
                 }
+
                 // Log successful connection establishment
                 info!(
                     target: "network::events",
@@ -249,6 +251,18 @@ where
                     ?concurrent_dial_errors,
                     "new connection established"
                 );
+
+                // TODO: manage connnections?
+                // - better to manage after `IncomingConnection` event?
+                // if num_established > MAX_CONNECTIONS_PER_PEER {
+                //     warn!(
+                //         target: "network",
+                //         ?peer_id,
+                //         connections = num_established,
+                //         "excessive connections from peer"
+                //     );
+                //     // close excess connections
+                // }
             }
             SwarmEvent::ConnectionClosed {
                 peer_id,
@@ -257,7 +271,6 @@ where
                 num_established,
                 cause,
             } => {
-                tracing::debug!(target: "network::events", pending=?self.pending_requests);
                 // Log connection closure with cause
                 info!(
                     target: "network",
@@ -268,9 +281,15 @@ where
                     "connection closed"
                 );
 
-                // Handle complete peer disconnect
+                // handle complete peer disconnect
                 if num_established == 0 {
-                    // Clean up any pending requests/state for this peer
+                    tracing::debug!(target:"network::events", pending=?self.pending_requests.len());
+                    // clean up any pending requests for this peer
+                    //
+                    // NOTE: self.pending_requests are removed by `OutboundFailure`
+                    // but only if the Option<PeerId> is included. This is mostly a
+                    // sanity check to prevent the HashMap from growing indefinitely when peers
+                    // disconnect after a request is made
                     self.pending_requests.retain(
                         |_, sender| {
                             if sender.is_closed() {
@@ -281,11 +300,9 @@ where
                         },
                     );
 
-                    tracing::debug!(target: "network::events", pending=?self.pending_requests);
-
-                    // Consider initiating reconnection if peer is important
+                    // TODO: schedule reconnection attempt?
                     if self.authorized_publishers.contains(&peer_id) {
-                        // Schedule reconnection attempt
+                        warn!(target: "network::events", ?peer_id, "authorized peer disconnected");
                     }
                 }
             }
@@ -299,9 +316,7 @@ where
             SwarmEvent::OutgoingConnectionError { connection_id, peer_id, error } => {
                 if let Some(peer_id) = peer_id {
                     if let Some(sender) = self.pending_dials.remove(&peer_id) {
-                        if let Err(e) = sender.send(Err(error.into())) {
-                            error!(target: "network", ?e, "failed to report dial failure - oneshot dropped");
-                        }
+                        send_or_log_error!(sender, Err(error.into()), "OutgoingConnectionError");
                     }
                 }
             }
@@ -315,7 +330,15 @@ where
                 );
             }
             SwarmEvent::ListenerClosed { listener_id, addresses, reason } => {}
-            SwarmEvent::ListenerError { listener_id, error } => {}
+            SwarmEvent::ListenerError { listener_id, error } => {
+                // Log listener errors
+                error!(
+                    target: "network::events",
+                    ?listener_id,
+                    ?error,
+                    "listener error"
+                );
+            }
             SwarmEvent::Dialing { peer_id, connection_id } => {}
             SwarmEvent::NewExternalAddrCandidate { address } => {}
             SwarmEvent::ExternalAddrConfirmed { address } => {}
@@ -331,15 +354,15 @@ where
         match command {
             NetworkCommand::UpdateAuthorizedPublishers { authorities, reply } => {
                 self.authorized_publishers = authorities;
-                reply_or_log_error!(reply, Ok(()), "UpdateAuthorizedPublishers");
+                send_or_log_error!(reply, Ok(()), "UpdateAuthorizedPublishers");
             }
             NetworkCommand::StartListening { multiaddr, reply } => {
                 let res = self.swarm.listen_on(multiaddr);
-                reply_or_log_error!(reply, res, "StartListening");
+                send_or_log_error!(reply, res, "StartListening");
             }
             NetworkCommand::GetListener { reply } => {
                 let addrs = self.swarm.listeners().cloned().collect();
-                reply_or_log_error!(reply, addrs, "GetListeners");
+                send_or_log_error!(reply, addrs, "GetListeners");
             }
             NetworkCommand::AddExplicitPeer { peer_id, addr } => {
                 self.swarm.add_peer_address(peer_id, addr);
@@ -352,7 +375,7 @@ where
                             entry.insert(reply);
                         }
                         Err(e) => {
-                            reply_or_log_error!(
+                            send_or_log_error!(
                                 reply,
                                 Err(e.into()),
                                 "AddExplicitPeer",
@@ -365,33 +388,33 @@ where
                     //
                     // may be necessary to update entry in future, but for now assume only one dial
                     // attempt
-                    reply_or_log_error!(reply, Err(NetworkError::RedialAttempt), "AddExplicitPeer");
+                    send_or_log_error!(reply, Err(NetworkError::RedialAttempt), "AddExplicitPeer");
                 }
             }
             NetworkCommand::LocalPeerId { reply } => {
                 let peer_id = *self.swarm.local_peer_id();
-                reply_or_log_error!(reply, peer_id, "LocalPeerId");
+                send_or_log_error!(reply, peer_id, "LocalPeerId");
             }
             NetworkCommand::Publish { topic, msg, reply } => {
                 let res = self.swarm.behaviour_mut().gossipsub.publish(topic, msg);
-                reply_or_log_error!(reply, res, "Publish");
+                send_or_log_error!(reply, res, "Publish");
             }
             NetworkCommand::Subscribe { topic, reply } => {
                 let res = self.swarm.behaviour_mut().gossipsub.subscribe(&topic);
-                reply_or_log_error!(reply, res, "Subscribe");
+                send_or_log_error!(reply, res, "Subscribe");
             }
             NetworkCommand::ConnectedPeers { reply } => {
                 let res = self.swarm.connected_peers().cloned().collect();
-                reply_or_log_error!(reply, res, "ConnectedPeers");
+                send_or_log_error!(reply, res, "ConnectedPeers");
             }
             NetworkCommand::PeerScore { peer_id, reply } => {
                 let opt_score = self.swarm.behaviour_mut().gossipsub.peer_score(&peer_id);
-                reply_or_log_error!(reply, opt_score, "PeerScore");
+                send_or_log_error!(reply, opt_score, "PeerScore");
             }
             NetworkCommand::SetApplicationScore { peer_id, new_score, reply } => {
                 let bool =
                     self.swarm.behaviour_mut().gossipsub.set_application_score(&peer_id, new_score);
-                reply_or_log_error!(reply, bool, "SetApplicationScore");
+                send_or_log_error!(reply, bool, "SetApplicationScore");
             }
             NetworkCommand::AllPeers { reply } => {
                 let collection = self
@@ -402,30 +425,29 @@ where
                     .map(|(peer_id, vec)| (*peer_id, vec.into_iter().cloned().collect()))
                     .collect();
 
-                reply_or_log_error!(reply, collection, "AllPeers");
+                send_or_log_error!(reply, collection, "AllPeers");
             }
             NetworkCommand::AllMeshPeers { reply } => {
                 let collection =
                     self.swarm.behaviour_mut().gossipsub.all_mesh_peers().cloned().collect();
-                reply_or_log_error!(reply, collection, "AllMeshPeers");
+                send_or_log_error!(reply, collection, "AllMeshPeers");
             }
             NetworkCommand::MeshPeers { topic, reply } => {
                 let collection =
                     self.swarm.behaviour_mut().gossipsub.mesh_peers(&topic).cloned().collect();
-                reply_or_log_error!(reply, collection, "MeshPeers");
+                send_or_log_error!(reply, collection, "MeshPeers");
             }
             NetworkCommand::SendRequest { peer, request, reply } => {
-                tracing::debug!("inside NetworkCommand send request");
                 let request_id = self.swarm.behaviour_mut().req_res.send_request(&peer, request);
                 self.pending_requests.insert(request_id, reply);
             }
             NetworkCommand::SendResponse { response, channel, reply } => {
                 let res = self.swarm.behaviour_mut().req_res.send_response(channel, response);
-                reply_or_log_error!(reply, res, "SendResponse");
+                send_or_log_error!(reply, res, "SendResponse");
             }
             NetworkCommand::PendingRequestCount { reply } => {
                 let count = self.pending_requests.len();
-                reply_or_log_error!(reply, count, "SendResponse");
+                send_or_log_error!(reply, count, "SendResponse");
             }
         }
     }
@@ -480,6 +502,9 @@ where
             ReqResEvent::Message { peer, message } => {
                 match message {
                     request_response::Message::Request { request_id, request, channel } => {
+                        // TODO: create hashmap for inbound requests to track max requests
+                        // process if channel dropped for inbound failures
+
                         // forward request to handler without blocking other events
                         if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
                             peer,
@@ -511,12 +536,16 @@ where
                     .send(Err(error.into()));
             }
             ReqResEvent::InboundFailure { peer, request_id, error } => {
-                // TODO: how to handle these failures?
-                // - connection closed: do nothing
-                // - response ommitted: do nothing
-                // - inbound timeout: do nothing
-                // - inbound stream failed: malicious encoding? report peer?
-                error!(target: "network", ?peer, ?request_id, ?error, "inbound failure");
+                match error {
+                    ReqResInboundFailure::Io(e) => {
+                        // TODO: update peer score - could be malicious
+                        warn!(target: "network", ?e, ?peer, ?request_id, "inbound IO failure");
+                    }
+                    ReqResInboundFailure::UnsupportedProtocols => {
+                        warn!(target: "network", ?peer, ?request_id, ?error, "inbound failure: unsupported protocol");
+                    }
+                    _ => { /* ignore timeout, connection closed, and response ommission */ }
+                }
             }
             ReqResEvent::ResponseSent { peer, request_id } => {}
         }
@@ -573,6 +602,7 @@ impl From<GossipAcceptance> for MessageAcceptance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert_matches::assert_matches;
     use serde::{Deserialize, Serialize};
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils::{fixture_batch_with_transactions, CommitteeFixture};
@@ -583,6 +613,8 @@ mod tests {
     // impl TNMessage trait for types
     impl TNMessage for WorkerRequest {}
     impl TNMessage for WorkerResponse {}
+    impl TNMessage for PrimaryRequest {}
+    impl TNMessage for PrimaryResponse {}
 
     /// Requests between workers.
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -590,7 +622,6 @@ mod tests {
         /// Broadcast a newly produced worker block.
         ///
         /// NOTE: expect no response
-        /// TODO: gossip this instead?
         NewBatch(SealedBatch),
         /// The collection of missing [BlockHash]es for this peer.
         MissingBatches(Vec<BlockHash>),
@@ -609,10 +640,6 @@ mod tests {
         },
     }
 
-    // impl TNMessage trait for test types
-    impl TNMessage for PrimaryRequest {}
-    impl TNMessage for PrimaryResponse {}
-
     /// Requests from Primary.
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     enum PrimaryRequest {
@@ -628,38 +655,95 @@ mod tests {
         MissingParents(Vec<CertificateDigest>),
     }
 
-    #[tokio::test]
-    async fn test_valid_req_res() -> eyre::Result<()> {
+    /// A peer on TN
+    struct NetworkPeer<DB, Req, Res>
+    where
+        Req: TNMessage,
+        Res: TNMessage,
+    {
+        /// Peer's node config.
+        config: ConsensusConfig<DB>,
+        /// Receiver for network events.
+        network_events: mpsc::Receiver<NetworkEvent<Req, Res>>,
+        /// Network handle to send commands.
+        network_handle: NetworkHandle<Req, Res>,
+        /// The network task.
+        network: ConsensusNetwork<Req, Res>,
+    }
+
+    /// The type for holding testng components.
+    struct TestTypes<Req, Res, DB = MemDatabase>
+    where
+        Req: TNMessage,
+        Res: TNMessage,
+    {
+        /// The first authority in the committee.
+        peer1: NetworkPeer<DB, Req, Res>,
+        /// The second authority in the committee.
+        peer2: NetworkPeer<DB, Req, Res>,
+    }
+
+    /// Helper function to create an instance of [RequestHandler] for the first authority in the
+    /// committee.
+    fn create_test_types<Req, Res>() -> TestTypes<Req, Res>
+    where
+        Req: TNMessage,
+        Res: TNMessage,
+    {
         let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
         let mut authorities = all_nodes.authorities();
         let authority_1 = authorities.next().expect("first authority");
         let authority_2 = authorities.next().expect("second authority");
         let config_1 = authority_1.consensus_config();
         let config_2 = authority_2.consensus_config();
-        let (tx1, _network_events_1) = mpsc::channel(1);
-        let (tx2, mut network_events_2) = mpsc::channel(1);
+        let (tx1, network_events_1) = mpsc::channel(1);
+        let (tx2, network_events_2) = mpsc::channel(1);
         let topics = vec![IdentTopic::new("test-topic")];
 
-        // honest peer1
-        let peer1_network =
-            ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(&config_1, tx1, topics.clone())?;
+        // peer1
+        let peer1_network = ConsensusNetwork::<Req, Res>::new(&config_1, tx1, topics.clone())
+            .expect("peer1 network created");
+        let network_handle_1 = peer1_network.network_handle();
+        let peer1 = NetworkPeer {
+            config: config_1,
+            network_events: network_events_1,
+            network_handle: network_handle_1,
+            network: peer1_network,
+        };
 
-        // honest peer2
-        let peer2_network =
-            ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(&config_2, tx2, topics.clone())?;
+        // peer2
+        let peer2_network = ConsensusNetwork::<Req, Res>::new(&config_2, tx2, topics.clone())
+            .expect("peer2 network created");
+        let network_handle_2 = peer2_network.network_handle();
+        let peer2 = NetworkPeer {
+            config: config_2,
+            network_events: network_events_2,
+            network_handle: network_handle_2,
+            network: peer2_network,
+        };
 
-        // spawn tasks
-        let peer1 = peer1_network.network_handle();
-        peer1_network.run();
+        TestTypes { peer1, peer2 }
+    }
 
-        let peer2 = peer2_network.network_handle();
-        peer2_network.run();
+    #[tokio::test]
+    async fn test_valid_req_res() -> eyre::Result<()> {
+        // start honest peer1 network
+        let TestTypes { peer1, peer2 } = create_test_types::<WorkerRequest, WorkerResponse>();
+        let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
+        network.run();
+
+        // start honest peer2 network
+        let NetworkPeer {
+            config: config_2,
+            network_handle: peer2,
+            network_events: mut network_events_2,
+            network,
+        } = peer2;
+        network.run();
 
         // start swarm listening on default any address
-        let listen_on_1 = config_1.authority().primary_network_address().inner();
-        peer1.start_listening(listen_on_1).await?;
-        let listen_on_2 = config_2.authority().primary_network_address().inner();
-        peer2.start_listening(listen_on_2).await?;
+        peer1.start_listening(config_1.authority().primary_network_address().inner()).await?;
+        peer2.start_listening(config_2.authority().primary_network_address().inner()).await?;
         let peer2_id = peer2.local_peer_id().await?;
         let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
 
@@ -673,7 +757,7 @@ mod tests {
 
         // send request and wait for response
         let max_time = Duration::from_secs(5);
-        let network_res = peer1.send_request(batch_req.clone(), peer2_id).await?;
+        let response_from_peer = peer1.send_request(batch_req.clone(), peer2_id).await?;
         let event = timeout(max_time, network_events_2.recv())
             .await?
             .expect("first network event received");
@@ -689,7 +773,7 @@ mod tests {
         }
 
         // expect response
-        let response = timeout(max_time, network_res).await?.expect("outbound id recv")?;
+        let response = timeout(max_time, response_from_peer).await?.expect("outbound id recv")?;
         assert_eq!(response, batch_res);
 
         Ok(())
@@ -697,113 +781,157 @@ mod tests {
 
     #[tokio::test]
     async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
-        tn_test_utils::init_test_tracing();
-        let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
-        let mut authorities = all_nodes.authorities();
-        let authority_1 = authorities.next().expect("first authority");
-        let authority_2 = authorities.next().expect("second authority");
-        let config_1 = authority_1.consensus_config();
-        let config_2 = authority_2.consensus_config();
-        let (tx1, _network_events_1) = mpsc::channel(1);
-        let (tx2, mut network_events_2) = mpsc::channel(1);
-        let topics = vec![IdentTopic::new("test-topic")];
+        // start honest peer1 network
+        let TestTypes { peer1, peer2 } = create_test_types::<WorkerRequest, WorkerResponse>();
+        let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
+        network.run();
 
-        // honest peer1
-        let peer1_network =
-            ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(&config_1, tx1, topics.clone())?;
-
-        // honest peer2
-        let peer2_network =
-            ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(&config_2, tx2, topics.clone())?;
-
-        // spawn tasks
-        let peer1 = peer1_network.network_handle();
-        peer1_network.run();
-
-        let peer2 = peer2_network.network_handle();
-        peer2_network.run();
+        // start honest peer2 network
+        let NetworkPeer { config: config_2, network_handle: peer2, network, .. } = peer2;
+        let peer2_network_task = network.run();
 
         // start swarm listening on default any address
-        let listen_on_1 = config_1.authority().primary_network_address().inner();
-        peer1.start_listening(listen_on_1).await?;
-        let listen_on_2 = config_2.authority().primary_network_address().inner();
-        peer2.start_listening(listen_on_2).await?;
+        peer1.start_listening(config_1.authority().primary_network_address().inner()).await?;
+        peer2.start_listening(config_2.authority().primary_network_address().inner()).await?;
         let peer2_id = peer2.local_peer_id().await?;
         let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
 
         let missing_block = fixture_batch_with_transactions(3).seal_slow();
         let digests = vec![missing_block.digest()];
         let batch_req = WorkerRequest::MissingBatches(digests);
-        let batch_res = WorkerResponse::MissingBatches { batches: vec![missing_block] };
 
         // dial peer2
         peer1.dial(peer2_id, peer2_addr).await?;
 
+        // expect no pending requests yet
+        let count = peer1.get_pending_request_count().await?;
+        assert_eq!(count, 0);
+
         // send request and wait for response
-        let max_time = Duration::from_secs(5);
-        let network_res = peer1.send_request(batch_req.clone(), peer2_id).await?;
+        let _ = peer1.send_request(batch_req.clone(), peer2_id).await?;
 
         // peer1 has a pending_request now
+        let count = peer1.get_pending_request_count().await?;
+        assert_eq!(count, 1);
 
-        let event = timeout(max_time, network_events_2.recv())
-            .await?
-            .expect("first network event received");
+        // another sanity check
+        let connected_peers = peer1.connected_peers().await?;
+        assert_eq!(connected_peers.len(), 1);
 
-        // expect network event
-        if let NetworkEvent::Request { request, channel, .. } = event {
-            assert_eq!(request, batch_req);
+        // simulate crashed peer 2
+        peer2_network_task.abort();
+        assert!(peer2_network_task.await.unwrap_err().is_cancelled());
 
-            // send response
-            peer2.send_response(batch_res.clone(), channel).await?;
-        } else {
-            panic!("unexpected network event received");
-        }
+        // allow peer1 to process disconnect
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // expect response
-        let response = timeout(max_time, network_res).await?.expect("outbound id recv")?;
-        assert_eq!(response, batch_res);
+        // assert peer is disconnected
+        let connected_peers = peer1.connected_peers().await?;
+        assert_eq!(connected_peers.len(), 0);
+
+        // peer1 removes pending requests
+        let count = peer1.get_pending_request_count().await?;
+        assert_eq!(count, 0);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
-        let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
-        let mut authorities = all_nodes.authorities();
-        let authority_1 = authorities.next().expect("first authority");
-        let authority_2 = authorities.next().expect("second authority");
-        let config_1 = authority_1.consensus_config();
-        let config_2 = authority_2.consensus_config();
-        let (tx1, _network_events_1) = mpsc::channel(1);
-        let (tx2, _network_events_2) = mpsc::channel(1);
-        let topics = vec![IdentTopic::new("test-topic")];
+    async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
+        tn_test_utils::init_test_tracing();
+        // start honest peer1 network
+        let TestTypes { peer1, peer2 } = create_test_types::<WorkerRequest, WorkerResponse>();
+        let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
 
-        // malicious peer1
-        //
-        // although these are honest req/res types, they are incorrect for the honest peer's
-        // "worker" network
-        let peer1_network = ConsensusNetwork::<PrimaryRequest, PrimaryResponse>::new(
-            &config_1,
-            tx1,
-            topics.clone(),
-        )?;
+        let peer1_network_task = network.run();
 
-        // honest peer2
-        let peer2_network =
-            ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(&config_2, tx2, topics.clone())?;
-
-        // spawn tasks
-        let malicious_peer = peer1_network.network_handle();
-        peer1_network.run();
-
-        let honest_peer = peer2_network.network_handle();
-        peer2_network.run();
+        // start honest peer2 network
+        let NetworkPeer {
+            config: config_2,
+            network_handle: peer2,
+            network_events: mut network_events_2,
+            network,
+        } = peer2;
+        network.run();
 
         // start swarm listening on default any address
-        let listen_on_1 = config_1.authority().primary_network_address().inner();
-        let listen_on_2 = config_2.authority().primary_network_address().inner();
-        malicious_peer.start_listening(listen_on_1).await?;
-        honest_peer.start_listening(listen_on_2).await?;
+        peer1.start_listening(config_1.authority().primary_network_address().inner()).await?;
+        peer2.start_listening(config_2.authority().primary_network_address().inner()).await?;
+        let peer2_id = peer2.local_peer_id().await?;
+        let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
+
+        let missing_block = fixture_batch_with_transactions(3).seal_slow();
+        let digests = vec![missing_block.digest()];
+        let batch_req = WorkerRequest::MissingBatches(digests);
+
+        // dial peer2
+        peer1.dial(peer2_id, peer2_addr).await?;
+
+        // expect no pending requests yet
+        let count = peer1.get_pending_request_count().await?;
+        assert_eq!(count, 0);
+
+        // send request and wait for response
+        let max_time = Duration::from_secs(5);
+        let response_from_peer = peer1.send_request(batch_req.clone(), peer2_id).await?;
+
+        // peer1 has a pending_request now
+        let count = peer1.get_pending_request_count().await?;
+        assert_eq!(count, 1);
+
+        // another sanity check
+        let connected_peers = peer1.connected_peers().await?;
+        assert_eq!(connected_peers.len(), 1);
+
+        // wait for peer2 to receive req
+        let event = timeout(max_time, network_events_2.recv())
+            .await?
+            .expect("first network event received");
+
+        // expect network event
+        if let NetworkEvent::Request { request, .. } = event {
+            assert_eq!(request, batch_req);
+
+            // peer 1 crashes after making request
+            peer1_network_task.abort();
+            assert!(peer1_network_task.await.unwrap_err().is_cancelled());
+
+            tokio::task::yield_now().await;
+        } else {
+            panic!("unexpected network event received");
+        }
+
+        let res = timeout(Duration::from_secs(2), response_from_peer)
+            .await?
+            .expect("first network event received");
+
+        println!("res: {res:?}");
+
+        // InboundFailure::Io(Kind(UnexpectedEof))
+        assert_matches!(res, Err(NetworkError::Outbound(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
+        // start malicious peer1 network
+        //
+        // although these are valid req/res types, they are incorrect for the honest peer's
+        // "worker" network
+        let TestTypes { peer1, .. } = create_test_types::<PrimaryRequest, PrimaryResponse>();
+        let NetworkPeer { config: config_1, network_handle: malicious_peer, network, .. } = peer1;
+        network.run();
+
+        // start honest peer2 network
+        let TestTypes { peer2, .. } = create_test_types::<WorkerRequest, WorkerResponse>();
+        let NetworkPeer { config: config_2, network_handle: honest_peer, network, .. } = peer2;
+        network.run();
+
+        // start swarm listening on default any address
+        malicious_peer
+            .start_listening(config_1.authority().primary_network_address().inner())
+            .await?;
+        honest_peer.start_listening(config_2.authority().primary_network_address().inner()).await?;
 
         let honest_peer_id = honest_peer.local_peer_id().await?;
         let honest_peer_addr =
@@ -821,59 +949,44 @@ mod tests {
         // honest peer returns `OutboundFailure` error
         //
         // TODO: this should affect malicious peer's local score
-        // - how can honest peer liimit malicious requests?
-        let network_res = malicious_peer.send_request(malicious_msg, honest_peer_id).await?;
-        let res = timeout(Duration::from_secs(2), network_res)
+        // - how can honest peer limit malicious requests?
+        let response_from_peer = malicious_peer.send_request(malicious_msg, honest_peer_id).await?;
+        let res = timeout(Duration::from_secs(2), response_from_peer)
             .await?
             .expect("first network event received");
 
-        assert!(res.is_err());
+        // OutboundFailure::Io(Kind(UnexpectedEof))
+        assert_matches!(res, Err(NetworkError::Outbound(_)));
 
         Ok(())
     }
 
     #[tokio::test]
     async fn test_outbound_failure_malicious_response() -> eyre::Result<()> {
-        let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
-        let mut authorities = all_nodes.authorities();
-        let authority_1 = authorities.next().expect("first authority");
-        let authority_2 = authorities.next().expect("second authority");
-        let config_1 = authority_1.consensus_config();
-        let config_2 = authority_2.consensus_config();
-        let (tx1, _network_events_1) = mpsc::channel(1);
-        let (tx2, mut network_events_2) = mpsc::channel(1);
-        let topics = vec![IdentTopic::new("test-topic")];
-
-        // honest peer1
-        let peer1_network = ConsensusNetwork::<PrimaryRequest, PrimaryResponse>::new(
-            &config_1,
-            tx1,
-            topics.clone(),
-        )?;
+        // honest peer 1
+        let TestTypes { peer1, .. } = create_test_types::<PrimaryRequest, PrimaryResponse>();
+        let NetworkPeer { config: config_1, network_handle: honest_peer, network, .. } = peer1;
+        network.run();
 
         // malicious peer2
         //
         // although these are honest req/res types, they are incorrect for the honest peer's
         // "primary" network this allows the network to receive "correct" messages and
         // respond with bad messages
-        let peer2_network = ConsensusNetwork::<PrimaryRequest, WorkerResponse>::new(
-            &config_2,
-            tx2,
-            topics.clone(),
-        )?;
-
-        // spawn tasks
-        let honest_peer = peer1_network.network_handle();
-        peer1_network.run();
-
-        let malicious_peer = peer2_network.network_handle();
-        peer2_network.run();
+        let TestTypes { peer2, .. } = create_test_types::<PrimaryRequest, WorkerResponse>();
+        let NetworkPeer {
+            config: config_2,
+            network_handle: malicious_peer,
+            network,
+            network_events: mut network_events_2,
+        } = peer2;
+        network.run();
 
         // start swarm listening on default any address
-        let listen_on_1 = config_1.authority().primary_network_address().inner();
-        let listen_on_2 = config_2.authority().primary_network_address().inner();
-        honest_peer.start_listening(listen_on_1).await?;
-        malicious_peer.start_listening(listen_on_2).await?;
+        honest_peer.start_listening(config_1.authority().primary_network_address().inner()).await?;
+        malicious_peer
+            .start_listening(config_2.authority().primary_network_address().inner())
+            .await?;
         let malicious_peer_id = malicious_peer.local_peer_id().await?;
         let malicious_peer_addr =
             malicious_peer.listeners().await?.first().expect("malicious_peer listen addr").clone();
@@ -887,7 +1000,8 @@ mod tests {
             header: Header::default(),
             parents: vec![Certificate::default()],
         };
-        let network_res = honest_peer.send_request(honest_req.clone(), malicious_peer_id).await?;
+        let response_from_peer =
+            honest_peer.send_request(honest_req.clone(), malicious_peer_id).await?;
         let event = timeout(max_time, network_events_2.recv())
             .await?
             .expect("first network event received");
@@ -904,51 +1018,43 @@ mod tests {
         }
 
         // expect response
-        let response =
-            timeout(max_time, network_res).await?.expect("response received within time");
-        assert!(response.is_err());
+        let res =
+            timeout(max_time, response_from_peer).await?.expect("response received within time");
+
+        // OutboundFailure::Io(Custom { kind: Other, error: Custom("Invalid value was given to the
+        // function") })
+        assert_matches!(res, Err(NetworkError::Outbound(_)));
 
         Ok(())
     }
 
     #[tokio::test]
     async fn test_publish_to_one_peer() -> eyre::Result<()> {
-        let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
-        let mut authorities = all_nodes.authorities();
-        let authority_1 = authorities.next().expect("first authority");
-        let authority_2 = authorities.next().expect("second authority");
-        let config_1 = authority_1.consensus_config();
-        let config_2 = authority_2.consensus_config();
-        let (tx1, _network_events_1) = mpsc::channel(1);
-        let (tx2, mut nvv_network_events) = mpsc::channel(1);
-        let correct_topic = IdentTopic::new("test-topic");
-        let topics = vec![correct_topic.clone()];
+        // start honest cvv network
+        let TestTypes { peer1, peer2 } = create_test_types::<WorkerRequest, WorkerResponse>();
+        let NetworkPeer { config: config_1, network_handle: cvv, network, .. } = peer1;
+        network.run();
 
-        // honest cvv
-        let cvv_network =
-            ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(&config_1, tx1, topics.clone())?;
-
-        // honest nvv
-        let nvv_network =
-            ConsensusNetwork::<WorkerRequest, WorkerResponse>::new(&config_2, tx2, topics.clone())?;
-
-        // spawn tasks
-        let cvv = cvv_network.network_handle();
-        cvv_network.run();
-
-        let nvv = nvv_network.network_handle();
-        nvv_network.run();
+        // start honest nvv network
+        let NetworkPeer {
+            config: config_2,
+            network_handle: nvv,
+            network_events: mut nvv_network_events,
+            network,
+        } = peer2;
+        network.run();
 
         // start swarm listening on default any address
-        let listen_on_cvv = config_1.authority().primary_network_address().inner();
-        let listen_on_nvv = config_2.authority().primary_network_address().inner();
-        cvv.start_listening(listen_on_cvv).await?;
-        nvv.start_listening(listen_on_nvv).await?;
+        cvv.start_listening(config_1.authority().primary_network_address().inner()).await?;
+        nvv.start_listening(config_2.authority().primary_network_address().inner()).await?;
         let cvv_id = cvv.local_peer_id().await?;
         let cvv_addr = cvv.listeners().await?.first().expect("peer2 listen addr").clone();
 
+        // topics for pubsub
+        let test_topic = IdentTopic::new("test-topic");
+
         // subscribe
-        nvv.subscribe(correct_topic.clone()).await?;
+        nvv.subscribe(test_topic.clone()).await?;
 
         // dial cvv
         nvv.dial(cvv_id, cvv_addr).await?;
@@ -967,7 +1073,7 @@ mod tests {
         assert!(expected_failure.is_err());
 
         // publish correct message and wait to receive
-        let _message_id = cvv.publish(correct_topic, expected_result.clone()).await?;
+        let _message_id = cvv.publish(test_topic, expected_result.clone()).await?;
         let event = timeout(Duration::from_secs(2), nvv_network_events.recv())
             .await?
             .expect("batch received");
@@ -984,48 +1090,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<()> {
-        let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
-        let mut authorities = all_nodes.authorities();
-        let authority_1 = authorities.next().expect("first authority");
-        let authority_2 = authorities.next().expect("second authority");
-        let config_1 = authority_1.consensus_config();
-        let config_2 = authority_2.consensus_config();
-        let (tx1, _network_events_1) = mpsc::channel(1);
-        let (tx2, mut nvv_network_events) = mpsc::channel(1);
-        let correct_topic = IdentTopic::new("test-topic");
-        let topics = vec![correct_topic.clone()];
+        // start honest cvv network
+        let TestTypes { peer1, peer2 } = create_test_types::<WorkerRequest, WorkerResponse>();
+        let NetworkPeer { config: config_1, network_handle: cvv, network, .. } = peer1;
+        network.run();
 
-        // honest cvv
-        let cvv_network = ConsensusNetwork::<PrimaryRequest, PrimaryResponse>::new(
-            &config_1,
-            tx1,
-            topics.clone(),
-        )?;
-
-        // honest nvv
-        let nvv_network = ConsensusNetwork::<PrimaryRequest, PrimaryResponse>::new(
-            &config_2,
-            tx2,
-            topics.clone(),
-        )?;
-
-        // spawn tasks
-        let cvv = cvv_network.network_handle();
-        cvv_network.run();
-
-        let nvv = nvv_network.network_handle();
-        nvv_network.run();
+        // start honest nvv network
+        let NetworkPeer {
+            config: config_2,
+            network_handle: nvv,
+            network_events: mut nvv_network_events,
+            network,
+        } = peer2;
+        network.run();
 
         // start swarm listening on default any address
-        let listen_on_cvv = config_1.authority().primary_network_address().inner();
-        let listen_on_nvv = config_2.authority().primary_network_address().inner();
-        cvv.start_listening(listen_on_cvv).await?;
-        nvv.start_listening(listen_on_nvv).await?;
+        cvv.start_listening(config_1.authority().primary_network_address().inner()).await?;
+        nvv.start_listening(config_2.authority().primary_network_address().inner()).await?;
         let cvv_id = cvv.local_peer_id().await?;
         let cvv_addr = cvv.listeners().await?.first().expect("peer2 listen addr").clone();
 
+        // topics for pubsub
+        let test_topic = IdentTopic::new("test-topic");
+
         // subscribe
-        nvv.subscribe(correct_topic.clone()).await?;
+        nvv.subscribe(test_topic.clone()).await?;
 
         // dial cvv
         nvv.dial(cvv_id, cvv_addr).await?;
@@ -1039,7 +1128,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // publish correct message and wait to receive
-        let _message_id = cvv.publish(correct_topic.clone(), expected_result.clone()).await?;
+        let _message_id = cvv.publish(test_topic.clone(), expected_result.clone()).await?;
         let event = timeout(Duration::from_secs(2), nvv_network_events.recv())
             .await?
             .expect("batch received");
@@ -1057,7 +1146,7 @@ mod tests {
         let random_block = fixture_batch_with_transactions(10);
         let sealed_block = random_block.seal_slow();
         let expected_result = Vec::from(&sealed_block);
-        let _message_id = cvv.publish(correct_topic, expected_result.clone()).await?;
+        let _message_id = cvv.publish(test_topic, expected_result.clone()).await?;
 
         // message should never be forwarded
         let timeout = timeout(Duration::from_secs(2), nvv_network_events.recv()).await;

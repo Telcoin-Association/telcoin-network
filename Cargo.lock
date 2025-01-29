@@ -12335,6 +12335,7 @@ dependencies = [
 name = "tn-network-libp2p"
 version = "0.1.0"
 dependencies = [
+ "assert_matches",
  "async-trait",
  "bcs",
  "eyre",

@@ -350,12 +350,12 @@ impl From<&Certificate> for Vec<u8> {
 /// While this creates some data redundancy with signed_authorities, keeping them coupled provides
 /// important benefits:
 /// - atomic state updates: changes to verification status are guaranteed to reference the exact
-///    signature bytes that were verified. this prevents state/signature mismatches that could occur
-///    if stored separately.
+///   signature bytes that were verified. this prevents state/signature mismatches that could occur
+///   if stored separately.
 ///
 /// - verification integrity: the verification status can only transition while operating on the
-///    specific signature bytes that were validated. this maintains a clear chain of trust through
-///    the verification process.
+///   specific signature bytes that were validated. this maintains a clear chain of trust through
+///   the verification process.
 ///
 /// - impossible to have invalid states like:
 ///    - `VerifiedDirectly` status with different signature bytes than what was actually verified
@@ -389,7 +389,8 @@ impl Default for SignatureVerificationState {
 
 /// Process certificate received by setting the verification state.
 ///
-/// Recover signature bytes from the aggregated signature and set the signature verification state to unverified.
+/// Recover signature bytes from the aggregated signature and set the signature verification state
+/// to unverified.
 pub fn validate_received_certificate(
     mut certificate: Certificate,
 ) -> CertificateResult<Certificate> {

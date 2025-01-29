@@ -7,6 +7,7 @@ use tracing_subscriber::EnvFilter;
 pub fn init_test_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::ACTIVE)
         .with_writer(std::io::stderr)
         .try_init();
 }
