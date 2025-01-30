@@ -2,8 +2,11 @@
 
 use super::{message::MissingCertificatesRequest, PrimaryResponse};
 use crate::{
-    error::PrimaryNetworkResult, network::message::PrimaryGossip, state_sync::CertificateCollector,
-    synchronizer::Synchronizer, ConsensusBus,
+    error::{PrimaryNetworkError, PrimaryNetworkResult},
+    network::message::PrimaryGossip,
+    state_sync::CertificateCollector,
+    synchronizer::Synchronizer,
+    ConsensusBus,
 };
 use fastcrypto::hash::Hash;
 use parking_lot::Mutex;
@@ -14,12 +17,15 @@ use std::{
 };
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::PeerId;
-use tn_storage::traits::Database;
+use tn_storage::{
+    tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
+    traits::Database,
+};
 use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
-    now, try_decode, AuthorityIdentifier, Certificate, CertificateDigest, Header, Round,
-    SignatureVerificationState, Vote,
+    now, try_decode, AuthorityIdentifier, BlockHash, Certificate, CertificateDigest,
+    ConsensusHeader, Header, Round, SignatureVerificationState, Vote,
 };
 use tracing::{debug, error, warn};
 
@@ -470,8 +476,7 @@ where
     /// - limiting total processing time
     /// - processing certificates in chunks
     /// - validating request parameters
-    /// - early termination if resource limits are reached
-    pub(super) async fn process_request_for_missing_certs(
+    pub(super) async fn retrieve_missing_certs(
         &self,
         peer: PeerId,
         request: MissingCertificatesRequest,
@@ -499,5 +504,60 @@ where
         );
 
         Ok(PrimaryResponse::RequestedCertificates(missing))
+    }
+
+    /// Process a request from a peer for missing certificates.
+    ///
+    /// This method efficiently retrieves certificates that the requesting peer is missing while
+    /// protecting against malicious requests through:
+    /// - limiting total processing time
+    /// - processing certificates in chunks
+    /// - validating request parameters
+    /// - early termination if resource limits are reached
+    pub(super) async fn retrieve_consensus_header(
+        &self,
+        peer: PeerId,
+        number: Option<u64>,
+        hash: Option<BlockHash>,
+    ) -> PrimaryNetworkResult<PrimaryResponse> {
+        let header = match (number, hash) {
+            (_, Some(hash)) => self.get_header_by_hash(hash)?,
+            (Some(number), _) => self.get_header_by_number(number)?,
+            (None, None) => self.get_latest_output()?,
+        };
+
+        Ok(PrimaryResponse::ConsensusHeader(header))
+    }
+
+    /// Retrieve the consensus header by number.
+    fn get_header_by_number(&self, number: u64) -> PrimaryNetworkResult<ConsensusHeader> {
+        match self.consensus_config.database().get::<ConsensusBlocks>(&number)? {
+            Some(header) => Ok(header),
+            None => {
+                Err(PrimaryNetworkError::InvalidRequest("consensus header unknown".to_string()))
+            }
+        }
+    }
+
+    /// Retrieve the consensus header by hash
+    fn get_header_by_hash(&self, hash: BlockHash) -> PrimaryNetworkResult<ConsensusHeader> {
+        // get the block number from the hash
+        let number = self
+            .consensus_config
+            .database()
+            .get::<ConsensusBlockNumbersByDigest>(&hash)?
+            .ok_or(PrimaryNetworkError::UnknowConsensusHeaderDigest(hash))?;
+
+        // then get the header using the block number
+        self.get_header_by_number(number)
+    }
+
+    /// Retrieve the last record in consensus blocks table.
+    fn get_latest_output(&self) -> PrimaryNetworkResult<ConsensusHeader> {
+        self.consensus_config
+            .database()
+            .last_record::<ConsensusBlocks>()
+            .map(|(_, header)| header)
+            .ok_or(PrimaryNetworkError::InvalidRequest("Consensus headers unavailable".to_string()))
     }
 }

@@ -10,7 +10,7 @@ use tn_network_libp2p::{
     PeerId, ResponseChannel,
 };
 use tn_storage::traits::Database;
-use tn_types::{Certificate, Header};
+use tn_types::{BlockHash, Certificate, Header};
 use tokio::sync::mpsc;
 mod handler;
 mod message;
@@ -55,40 +55,28 @@ where
                     Some(e) => self.process_network_event(e),
                     None => todo!(),
                 }
+                // notify shutdown
             }
         }
     }
 
     /// Handle events concurrently.
     fn process_network_event(&self, event: NetworkEvent<Req, Res>) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-
         // match event
         match event {
             NetworkEvent::Request { peer, request, channel } => match request {
                 PrimaryRequest::Vote { header, parents } => {
-                    self.process_vote_request(
-                        request_handler,
-                        network_handle,
-                        peer,
-                        header,
-                        parents,
-                        channel,
-                    );
+                    self.process_vote_request(peer, header, parents, channel);
                 }
-                PrimaryRequest::MissingCertificates { inner } => self
-                    .process_request_for_missing_certs(
-                        request_handler,
-                        network_handle,
-                        peer,
-                        inner,
-                        channel,
-                    ),
+                PrimaryRequest::MissingCertificates { inner } => {
+                    self.process_request_for_missing_certs(peer, inner, channel)
+                }
+                PrimaryRequest::ConsensusHeader { number, hash } => {
+                    self.process_consensus_output_request(peer, number, hash, channel)
+                }
             },
             NetworkEvent::Gossip(msg) => {
-                self.process_gossip(request_handler, network_handle, msg);
+                self.process_gossip(msg);
             }
         }
     }
@@ -98,13 +86,14 @@ where
     /// Spawn a task to evaluate a peer's proposed header and return a response.
     fn process_vote_request(
         &self,
-        request_handler: RequestHandler<DB>,
-        network_handle: NetworkHandle<Req, Res>,
         peer: PeerId,
         header: Header,
         parents: Vec<Certificate>,
         channel: ResponseChannel<PrimaryResponse>,
     ) {
+        // clone for spawned tasks
+        let request_handler = self.request_handler.clone();
+        let network_handle = self.network_handle.clone();
         tokio::spawn(async move {
             let response = request_handler.vote(peer, header, parents).await.into_response();
             let _ = network_handle.send_response(response, channel).await;
@@ -114,17 +103,34 @@ where
     /// Attempt to retrieve certificates for a peer that's missing them.
     fn process_request_for_missing_certs(
         &self,
-        request_handler: RequestHandler<DB>,
-        network_handle: NetworkHandle<Req, Res>,
         peer: PeerId,
         request: MissingCertificatesRequest,
         channel: ResponseChannel<PrimaryResponse>,
     ) {
+        // clone for spawned tasks
+        let request_handler = self.request_handler.clone();
+        let network_handle = self.network_handle.clone();
         tokio::spawn(async move {
-            let response = request_handler
-                .process_request_for_missing_certs(peer, request)
-                .await
-                .into_response();
+            let response =
+                request_handler.retrieve_missing_certs(peer, request).await.into_response();
+            let _ = network_handle.send_response(response, channel).await;
+        });
+    }
+
+    /// Attempt to retrieve consensus chain header from the database.
+    fn process_consensus_output_request(
+        &self,
+        peer: PeerId,
+        number: Option<u64>,
+        hash: Option<BlockHash>,
+        channel: ResponseChannel<PrimaryResponse>,
+    ) {
+        // clone for spawned tasks
+        let request_handler = self.request_handler.clone();
+        let network_handle = self.network_handle.clone();
+        tokio::spawn(async move {
+            let response =
+                request_handler.retrieve_consensus_header(peer, number, hash).await.into_response();
             let _ = network_handle.send_response(response, channel).await;
         });
     }
@@ -133,10 +139,11 @@ where
     fn process_gossip(
         &self,
         // peerId: PeerId,
-        request_handler: RequestHandler<DB>,
-        network_handle: NetworkHandle<Req, Res>,
         msg: Vec<u8>,
     ) {
+        // clone for spawned tasks
+        let request_handler = self.request_handler.clone();
+        let network_handle = self.network_handle.clone();
         tokio::spawn(async move {
             if let Err(e) = request_handler.process_gossip(msg).await {
                 // network_handle.set_application_score(peer_id, new_score).await;

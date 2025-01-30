@@ -3,7 +3,7 @@
 use tn_storage::StoreError;
 use tn_types::{
     error::{CertificateError, HeaderError},
-    BcsError,
+    BcsError, BlockHash,
 };
 
 /// Result alias for results that possibly return [`PrimaryNetworkError`].
@@ -33,4 +33,10 @@ pub(crate) enum PrimaryNetworkError {
     /// Internal error occurred.
     #[error("Internal error: {0}")]
     Internal(String),
+    /// Unknown consensus header.
+    #[error("Unknown consensus header: {0}")]
+    UnknowConsensusHeaderNumber(u64),
+    /// Unknown consensus header.
+    #[error("Unknown consensus header: {0}")]
+    UnknowConsensusHeaderDigest(BlockHash),
 }

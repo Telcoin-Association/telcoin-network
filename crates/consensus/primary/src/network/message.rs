@@ -8,8 +8,8 @@ use thiserror::Error;
 use tn_network_libp2p::{types::IntoRpcError, TNMessage};
 use tn_network_types::FetchCertificatesRequest;
 use tn_types::{
-    error::HeaderError, AuthorityIdentifier, Certificate, CertificateDigest, ConsensusHeader,
-    Header, Round, Vote,
+    error::HeaderError, AuthorityIdentifier, BlockHash, Certificate, CertificateDigest,
+    ConsensusHeader, Header, Round, Vote,
 };
 
 /// Primary messages on the gossip network.
@@ -46,6 +46,16 @@ pub enum PrimaryRequest {
     MissingCertificates {
         /// Inner type with specific helper methods for requesting missing certificates.
         inner: MissingCertificatesRequest,
+    },
+    /// Request a consensus chain header with consensus output.
+    ///
+    /// If both number and hash are set they should match (no need to set them both).
+    /// If neither number or hash are set then will return the latest consensus chain header.
+    ConsensusHeader {
+        /// Block number requesting if not None.
+        number: Option<u64>,
+        /// Block hash requesting if not None.
+        hash: Option<BlockHash>,
     },
 }
 
@@ -142,6 +152,8 @@ pub enum PrimaryResponse {
     /// If the peer was unable to verify parents for a proposed header, they respond requesting
     /// the missing certificate by digest.
     MissingParents(Vec<CertificateDigest>),
+    /// The requested consensus header.
+    ConsensusHeader(ConsensusHeader),
     /// RPC error while handling request.
     ///
     /// This is an application-layer error response.
