@@ -7,7 +7,9 @@ use tn_types::{
     traits::ToFromBytes, Authority, Committee, NetworkPublicKey, Notifier, WorkerCache,
 };
 
-use crate::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, Parameters, TelcoinDirs};
+use crate::{
+    Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, Parameters, TelcoinDirs,
+};
 
 #[derive(Debug)]
 struct ConsensusConfigInner<DB> {
@@ -18,6 +20,7 @@ struct ConsensusConfigInner<DB> {
     authority: Authority,
     local_network: LocalNetwork,
     anemo_config: AnemoConfig,
+    network_config: NetworkConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +94,8 @@ where
         let worker_cache = worker_cache.take().map(Arc::new);
         let shutdown = Notifier::new();
         let anemo_config = Self::create_anemo_config();
+        let network_config = NetworkConfig::default();
+
         Ok(Self {
             inner: Arc::new(ConsensusConfigInner {
                 config,
@@ -100,6 +105,7 @@ where
                 authority,
                 local_network,
                 anemo_config,
+                network_config,
             }),
             worker_cache,
             shutdown,
@@ -190,6 +196,10 @@ where
 
     pub fn anemo_config(&self) -> &AnemoConfig {
         &self.inner.anemo_config
+    }
+
+    pub fn network_config(&self) -> &NetworkConfig {
+        &self.inner.network_config
     }
 
     /// Authorized publishers for gossip messages.
