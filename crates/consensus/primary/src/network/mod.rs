@@ -132,6 +132,7 @@ where
     /// Process gossip from committee.
     fn process_gossip(
         &self,
+        // peerId: PeerId,
         request_handler: RequestHandler<DB>,
         network_handle: NetworkHandle<Req, Res>,
         msg: Vec<u8>,
@@ -139,6 +140,9 @@ where
         tokio::spawn(async move {
             if let Err(e) = request_handler.process_gossip(msg).await {
                 // network_handle.set_application_score(peer_id, new_score).await;
+                //
+                //
+                // This should pass the entire gossip message, not just the data
 
                 // match on error to lower peer score
                 todo!();

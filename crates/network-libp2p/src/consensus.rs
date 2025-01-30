@@ -306,13 +306,6 @@ where
                     }
                 }
             }
-            SwarmEvent::IncomingConnection { connection_id, local_addr, send_back_addr } => {}
-            SwarmEvent::IncomingConnectionError {
-                connection_id,
-                local_addr,
-                send_back_addr,
-                error,
-            } => {}
             SwarmEvent::OutgoingConnectionError { connection_id, peer_id, error } => {
                 if let Some(peer_id) = peer_id {
                     if let Some(sender) = self.pending_dials.remove(&peer_id) {
@@ -320,7 +313,6 @@ where
                     }
                 }
             }
-            SwarmEvent::NewListenAddr { listener_id, address } => {}
             SwarmEvent::ExpiredListenAddr { address, .. } => {
                 // log listening addr
                 info!(
@@ -329,7 +321,6 @@ where
                     "network listening"
                 );
             }
-            SwarmEvent::ListenerClosed { listener_id, addresses, reason } => {}
             SwarmEvent::ListenerError { listener_id, error } => {
                 // Log listener errors
                 error!(
@@ -339,11 +330,16 @@ where
                     "listener error"
                 );
             }
-            SwarmEvent::Dialing { peer_id, connection_id } => {}
-            SwarmEvent::NewExternalAddrCandidate { address } => {}
-            SwarmEvent::ExternalAddrConfirmed { address } => {}
-            SwarmEvent::ExternalAddrExpired { address } => {}
-            SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => {}
+            // These events are included here because they will likely become useful in near-future PRs
+            SwarmEvent::IncomingConnection { .. }
+            | SwarmEvent::IncomingConnectionError { .. }
+            | SwarmEvent::NewListenAddr { .. }
+            | SwarmEvent::ListenerClosed { .. }
+            | SwarmEvent::Dialing { .. }
+            | SwarmEvent::NewExternalAddrCandidate { .. }
+            | SwarmEvent::ExternalAddrConfirmed { .. }
+            | SwarmEvent::ExternalAddrExpired { .. }
+            | SwarmEvent::NewExternalAddrOfPeer { .. } => {}
             _e => {}
         }
         Ok(())
