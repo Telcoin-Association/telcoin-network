@@ -1,15 +1,16 @@
 //! Messages exchanged between primaries.
 
+use crate::error::{PrimaryNetworkError, PrimaryNetworkResult};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use tn_network_libp2p::{types::IntoRpcError, TNMessage};
+use tn_network_types::FetchCertificatesRequest;
 use tn_types::{
-    error::HeaderError, AuthorityIdentifier, Certificate, CertificateDigest, Header, Round, Vote,
+    error::HeaderError, AuthorityIdentifier, Certificate, CertificateDigest, ConsensusHeader,
+    Header, Round, Vote,
 };
-
-use crate::error::{PrimaryNetworkError, PrimaryNetworkResult};
 
 /// Primary messages on the gossip network.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -22,6 +23,8 @@ pub enum PrimaryGossip {
     ///
     /// NOTE: `snappy` is slightly larger than uncompressed.
     Certificate(Certificate),
+    /// Consensus chain.
+    Consensus(ConsensusHeader),
 }
 
 // impl TNMessage trait for types
@@ -44,6 +47,14 @@ pub enum PrimaryRequest {
         /// Inner type with specific helper methods for requesting missing certificates.
         inner: MissingCertificatesRequest,
     },
+}
+
+// DELETE THISSS
+impl From<FetchCertificatesRequest> for MissingCertificatesRequest {
+    fn from(value: FetchCertificatesRequest) -> Self {
+        let FetchCertificatesRequest { exclusive_lower_bound, skip_rounds, max_items } = value;
+        MissingCertificatesRequest { exclusive_lower_bound, skip_rounds, max_items }
+    }
 }
 
 /// Used by the primary to fetch certificates from other primaries.

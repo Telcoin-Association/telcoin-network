@@ -37,6 +37,7 @@ use tokio::time::timeout;
 
 #[tokio::test]
 async fn test_get_network_peers_from_admin_server() {
+    tn_test_utils::init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let committee = fixture.committee();
     let authority_1 = fixture.authorities().next().unwrap();
@@ -175,6 +176,7 @@ async fn test_get_network_peers_from_admin_server() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_request_vote_has_missing_execution_block() {
+    tn_test_utils::init_test_tracing();
     const NUM_PARENTS: usize = 10;
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
@@ -252,6 +254,7 @@ async fn test_request_vote_has_missing_execution_block() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_request_vote_older_execution_block() {
+    tn_test_utils::init_test_tracing();
     const NUM_PARENTS: usize = 10;
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
@@ -336,6 +339,7 @@ async fn test_request_vote_older_execution_block() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_request_vote_has_missing_parents() {
+    tn_test_utils::init_test_tracing();
     const NUM_PARENTS: usize = 10;
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
@@ -451,6 +455,7 @@ async fn test_request_vote_has_missing_parents() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_request_vote_accept_missing_parents() {
+    tn_test_utils::init_test_tracing();
     const NUM_PARENTS: usize = 10;
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
@@ -557,6 +562,7 @@ async fn test_request_vote_accept_missing_parents() {
 
 #[tokio::test]
 async fn test_request_vote_missing_batches() {
+    tn_test_utils::init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
         .committee_size(NonZeroUsize::new(4).unwrap())
@@ -652,6 +658,7 @@ async fn test_request_vote_missing_batches() {
 
 #[tokio::test]
 async fn test_request_vote_already_voted() {
+    tn_test_utils::init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
         .committee_size(NonZeroUsize::new(4).unwrap())
@@ -782,8 +789,10 @@ async fn test_request_vote_already_voted() {
     );
 }
 
+// NOTE: this is unit tested in primary::state_sync
 #[tokio::test]
 async fn test_fetch_certificates_handler() {
+    tn_test_utils::init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
         .committee_size(NonZeroUsize::new(4).unwrap())
@@ -893,6 +902,7 @@ async fn test_fetch_certificates_handler() {
 
 #[tokio::test]
 async fn test_request_vote_created_at_in_future() {
+    tn_test_utils::init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
         .committee_size(NonZeroUsize::new(4).unwrap())

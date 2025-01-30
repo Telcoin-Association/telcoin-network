@@ -16,7 +16,7 @@ use std::sync::Arc;
 ///
 /// The consensus chain records consensus output used to extend the execution chain.
 /// All hashes are Keccak 256.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(PartialEq, Serialize, Deserialize, Clone, Debug)]
 pub struct ConsensusHeader {
     /// The hash of the previous ConsesusHeader in the chain.
     pub parent_hash: B256,

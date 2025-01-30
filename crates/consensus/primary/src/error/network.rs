@@ -30,4 +30,7 @@ pub(crate) enum PrimaryNetworkError {
     /// The peer's request is invalid.
     #[error("{0}")]
     InvalidRequest(String),
+    /// Internal error occurred.
+    #[error("Internal error: {0}")]
+    Internal(String),
 }

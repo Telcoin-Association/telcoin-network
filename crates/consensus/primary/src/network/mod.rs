@@ -4,8 +4,7 @@
 //! requests from it's own workers and other primaries.
 
 use handler::RequestHandler;
-use message::MissingCertificatesRequest;
-pub use message::{PrimaryRequest, PrimaryResponse};
+pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
 use tn_network_libp2p::{
     types::{IntoResponse as _, NetworkEvent, NetworkHandle},
     PeerId, ResponseChannel,
@@ -40,7 +39,7 @@ where
     DB: Database,
 {
     /// Create a new instance of Self.
-    pub fn new(
+    pub(crate) fn new(
         network_events: mpsc::Receiver<NetworkEvent<Req, Res>>,
         network_handle: NetworkHandle<Req, Res>,
         request_handler: RequestHandler<DB>,

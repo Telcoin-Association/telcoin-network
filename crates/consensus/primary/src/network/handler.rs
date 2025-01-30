@@ -2,16 +2,13 @@
 
 use super::{message::MissingCertificatesRequest, PrimaryResponse};
 use crate::{
-    error::{PrimaryNetworkError, PrimaryNetworkResult},
-    network::message::PrimaryGossip,
-    synchronizer::Synchronizer,
-    ConsensusBus,
+    error::PrimaryNetworkResult, network::message::PrimaryGossip, state_sync::CertificateCollector,
+    synchronizer::Synchronizer, ConsensusBus,
 };
 use fastcrypto::hash::Hash;
 use parking_lot::Mutex;
 use std::{
-    cmp::Reverse,
-    collections::{BTreeMap, BTreeSet, BinaryHeap},
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
     time::Duration,
 };
@@ -86,13 +83,18 @@ where
     /// after enough time to limit the DoS attack surface. Peers who timeout must lose reputation.
     pub(super) async fn process_gossip(&self, bytes: Vec<u8>) -> PrimaryNetworkResult<()> {
         // gossip is uncompressed
-        //
-        // only one type of gossip for now
-        let PrimaryGossip::Certificate(cert) = try_decode(&bytes)?;
+        let msg = try_decode(&bytes)?;
 
-        // process certificate
-        let valid_cert = cert.validate_received()?;
-        self.synchronizer.try_accept_certificate(valid_cert).await?;
+        match msg {
+            PrimaryGossip::Certificate(cert) => {
+                // process certificate
+                let valid_cert = cert.validate_received()?;
+                self.synchronizer.try_accept_certificate(valid_cert).await?;
+            }
+            PrimaryGossip::Consensus(header) => {
+                todo!()
+            }
+        }
 
         Ok(())
     }
@@ -474,129 +476,28 @@ where
         peer: PeerId,
         request: MissingCertificatesRequest,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
-        // start timing the request processing
-        let start_time = tokio::time::Instant::now();
+        // Create a time-bounded iter for collecting certificates
+        let mut missing = Vec::with_capacity(request.max_items);
+        let mut collector =
+            CertificateCollector::new(request.into(), self.consensus_config.clone())?;
 
-        // ensure request size is within bounds
-        ensure!(
-            request.max_items > 0 && request.max_items <= MAX_NUM_MISSING_CERTS,
-            PrimaryNetworkError::InvalidRequest("Request for certs out of bounds".into())
-        );
+        // Collect certificates from the stream
+        while let Some(cert) = collector.next() {
+            missing.push(cert?);
 
-        // initialize vec for certificates
-        let mut certificates = Vec::with_capacity(request.max_items);
-
-        // get the round bounds and skip set
-        let (lower_bound, skip_rounds) = request.get_bounds()?;
-
-        debug!(
-            target: "primary::network",
-            "Processing certificate request from peer {:?} - lower bound: {}, authorities: {}",
-            peer,
-            lower_bound,
-            skip_rounds.len()
-        );
-
-        // process each authority's certificates efficiently
-        for (authority, skip_set) in skip_rounds {
-            // ensure skip rounds are within bounds
-            ensure!(
-                skip_set.len() < MAX_NUM_SKIP_ROUNDS,
-                PrimaryNetworkError::InvalidRequest("Request for rounds out of bounds".into())
-            );
-
-            // check time limit frequently
-            if start_time.elapsed() >= FETCH_CERTIFICATES_MAX_HANDLER_TIME {
-                debug!(target: "primary::network", "Request processing timeout after {} certificates", certificates.len());
-                break;
-            }
-
-            // Get certificates for this authority
-            let auth_certs = self
-                .get_authority_certificates(
-                    authority,
-                    lower_bound,
-                    &skip_set,
-                    request.max_items - certificates.len(),
-                    start_time,
-                )
-                .await?;
-
-            certificates.extend(auth_certs);
-
-            // Check if we've hit the maximum
-            if certificates.len() >= request.max_items {
-                break;
-            }
-        }
-
-        debug!(
-            target: "primary::network",
-            "Completed certificate request processing: found {} certificates in {}ms",
-            certificates.len(),
-            start_time.elapsed().as_millis()
-        );
-
-        Ok(PrimaryResponse::RequestedCertificates(certificates))
-    }
-
-    /// Retrieve certificates for a single authority efficiently
-    async fn get_authority_certificates(
-        &self,
-        authority: AuthorityIdentifier,
-        lower_bound: Round,
-        skip_set: &BTreeSet<Round>,
-        max_certs: usize,
-        start_time: tokio::time::Instant,
-    ) -> PrimaryNetworkResult<Vec<Certificate>> {
-        let mut certificates = Vec::new();
-        let mut current_round = lower_bound;
-        let mut processed_count = 0;
-
-        while certificates.len() < max_certs {
-            // process in batches to avoid blocking
-            if processed_count >= MAX_NUM_MISSING_CERTS {
-                // allow handler to be stopped after timeout
+            // allow the request handler to be stopped after network timeout
+            if missing.len() % 10 == 0 {
                 tokio::task::yield_now().await;
-                processed_count = 0;
-
-                // Check time limit after each batch
-                if start_time.elapsed() >= FETCH_CERTIFICATES_MAX_HANDLER_TIME {
-                    break;
-                }
-            }
-
-            // get the next available round
-            match self
-                .consensus_config
-                .node_storage()
-                .certificate_store
-                .next_round_number(authority, current_round)?
-            {
-                Some(round) => {
-                    // skip rounds we already have
-                    if skip_set.contains(&round) {
-                        current_round = round;
-                        continue;
-                    }
-
-                    // retrieve the certificate
-                    if let Some(cert) = self
-                        .consensus_config
-                        .node_storage()
-                        .certificate_store
-                        .read_by_index(authority, round)?
-                    {
-                        certificates.push(cert);
-                    }
-
-                    current_round = round;
-                    processed_count += 1;
-                }
-                None => break,
             }
         }
 
-        Ok(certificates)
+        debug!(
+            target: "fetch_certs",
+            "Collected {} certificates in {}ms",
+            missing.len(),
+            collector.start_time().elapsed().as_millis(),
+        );
+
+        Ok(PrimaryResponse::RequestedCertificates(missing))
     }
 }
