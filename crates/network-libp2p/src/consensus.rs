@@ -92,12 +92,12 @@ where
     authorized_publishers: HashSet<PeerId>,
     /// The collection of pending dials.
     pending_dials: HashMap<PeerId, oneshot::Sender<NetworkResult<()>>>,
-    /// The collection of pending requests.
+    /// The collection of pending outbound requests.
     ///
     /// Callers include a oneshot channel for the network to return response. The caller is
     /// responsible for decoding message bytes and reporting peers who return bad data. Peers that
     /// send messages that fail to decode must receive an application score penalty.
-    pending_requests: HashMap<OutboundRequestId, oneshot::Sender<NetworkResult<Res>>>,
+    outbound_requests: HashMap<OutboundRequestId, oneshot::Sender<NetworkResult<Res>>>,
     /// The configurables for the libp2p consensus network implementation.
     config: LibP2pConfig,
 }
@@ -196,7 +196,7 @@ where
             event_stream,
             authorized_publishers,
             pending_dials: Default::default(),
-            pending_requests: Default::default(),
+            outbound_requests: Default::default(),
             config,
         })
     }
@@ -287,14 +287,14 @@ where
 
                 // handle complete peer disconnect
                 if num_established == 0 {
-                    tracing::debug!(target:"network::events", pending=?self.pending_requests.len());
+                    tracing::debug!(target:"network::events", pending=?self.outbound_requests.len());
                     // clean up any pending requests for this peer
                     //
-                    // NOTE: self.pending_requests are removed by `OutboundFailure`
+                    // NOTE: self.outbound_requests are removed by `OutboundFailure`
                     // but only if the Option<PeerId> is included. This is a
                     // sanity check to prevent the HashMap from growing indefinitely when peers
                     // disconnect after a request is made and the PeerId is lost.
-                    self.pending_requests.retain(|_, sender| !sender.is_closed());
+                    self.outbound_requests.retain(|_, sender| !sender.is_closed());
 
                     // TODO: schedule reconnection attempt?
                     if self.authorized_publishers.contains(&peer_id) {
@@ -430,14 +430,14 @@ where
             }
             NetworkCommand::SendRequest { peer, request, reply } => {
                 let request_id = self.swarm.behaviour_mut().req_res.send_request(&peer, request);
-                self.pending_requests.insert(request_id, reply);
+                self.outbound_requests.insert(request_id, reply);
             }
             NetworkCommand::SendResponse { response, channel, reply } => {
                 let res = self.swarm.behaviour_mut().req_res.send_response(channel, response);
                 send_or_log_error!(reply, res, "SendResponse");
             }
             NetworkCommand::PendingRequestCount { reply } => {
-                let count = self.pending_requests.len();
+                let count = self.outbound_requests.len();
                 send_or_log_error!(reply, count, "SendResponse");
             }
         }
@@ -510,7 +510,7 @@ where
                     request_response::Message::Response { request_id, response } => {
                         // try to forward response to original caller
                         let _ = self
-                            .pending_requests
+                            .outbound_requests
                             .remove(&request_id)
                             .ok_or(NetworkError::PendingRequestChannelLost)?
                             .send(Ok(response));
@@ -521,7 +521,7 @@ where
                 error!(target: "network", ?peer, ?error, "outbound failure");
                 // try to forward error to original caller
                 let _ = self
-                    .pending_requests
+                    .outbound_requests
                     .remove(&request_id)
                     .ok_or(NetworkError::PendingRequestChannelLost)?
                     .send(Err(error.into()));

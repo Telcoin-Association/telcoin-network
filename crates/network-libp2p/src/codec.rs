@@ -24,9 +24,6 @@ pub trait TNMessage: Send + Serialize + DeserializeOwned + Clone + fmt::Debug + 
 /// The codec reuses pre-allocated buffers to asynchronously read messages per the libp2p [Codec]
 /// trait. All messages include a 4-byte prefix that indicates the message's uncompressed length.
 /// Peers use this prefix to safely decompress and decode messages from peers.
-///
-/// TODO:
-/// - handle peer scores when messages are malicious
 #[derive(Clone, Debug)]
 pub struct TNCodec<Req, Res> {
     /// The fixed-size buffer for compressed messages.
