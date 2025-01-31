@@ -259,7 +259,7 @@ impl Committee {
         // If N = 3f + 1 + k (0 <= k < 3)
         // then (N + 2) / 3 = f + 1 + k/3 = f + 1
         let total_votes: Stake = self.total_stake();
-        NonZeroU64::new((total_votes + 2) / 3).unwrap_or(NonZeroU64::new(1).expect("1 is NOT 0!"))
+        NonZeroU64::new(total_votes.div_ceil(3)).unwrap_or(NonZeroU64::new(1).expect("1 is NOT 0!"))
     }
 
     /// Updates the committee internal secondary indexes.

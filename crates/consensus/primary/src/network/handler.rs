@@ -448,15 +448,17 @@ where
         mut parents: Vec<Certificate>,
     ) -> PrimaryNetworkResult<()> {
         // sanitize request
-        let requested_parents = self.requested_parents.lock();
-        parents.retain(|cert| {
-            let req = (cert.round(), cert.digest());
-            if let Some(authority) = requested_parents.get(&req) {
-                *authority == header.author()
-            } else {
-                false
-            }
-        });
+        {
+            let requested_parents = self.requested_parents.lock();
+            parents.retain(|cert| {
+                let req = (cert.round(), cert.digest());
+                if let Some(authority) = requested_parents.get(&req) {
+                    *authority == header.author()
+                } else {
+                    false
+                }
+            });
+        }
 
         // try to accept
         for parent in parents {
@@ -481,8 +483,7 @@ where
         let mut missing = Vec::with_capacity(request.max_items);
 
         // validates request is within limits
-        let mut collector =
-            CertificateCollector::new(request, self.consensus_config.clone())?;
+        let mut collector = CertificateCollector::new(request, self.consensus_config.clone())?;
 
         // Collect certificates from the stream
         for cert in collector.by_ref() {

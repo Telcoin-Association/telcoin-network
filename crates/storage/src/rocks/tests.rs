@@ -1,5 +1,5 @@
 // TODO: uint crate needs to be refactored for this nightly clippy
-#![allow(clippy::assign_op_pattern)]
+#![allow(clippy::manual_div_ceil)]
 
 use super::*;
 use crate::test::*;

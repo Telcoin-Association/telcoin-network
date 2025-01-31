@@ -294,11 +294,7 @@ where
                     // but only if the Option<PeerId> is included. This is a
                     // sanity check to prevent the HashMap from growing indefinitely when peers
                     // disconnect after a request is made and the PeerId is lost.
-                    self.pending_requests.retain(
-                        |_, sender| {
-                            !sender.is_closed()
-                        },
-                    );
+                    self.pending_requests.retain(|_, sender| !sender.is_closed());
 
                     // TODO: schedule reconnection attempt?
                     if self.authorized_publishers.contains(&peer_id) {
@@ -306,11 +302,9 @@ where
                     }
                 }
             }
-            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                if let Some(peer_id) = peer_id {
-                    if let Some(sender) = self.pending_dials.remove(&peer_id) {
-                        send_or_log_error!(sender, Err(error.into()), "OutgoingConnectionError");
-                    }
+            SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } => {
+                if let Some(sender) = self.pending_dials.remove(&peer_id) {
+                    send_or_log_error!(sender, Err(error.into()), "OutgoingConnectionError");
                 }
             }
             SwarmEvent::ExpiredListenAddr { address, .. } => {

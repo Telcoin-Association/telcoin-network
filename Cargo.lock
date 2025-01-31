@@ -12566,7 +12566,7 @@ dependencies = [
  "tn-utils",
  "tokio",
  "tracing",
- "uint 0.9.5",
+ "uint 0.10.0",
 ]
 
 [[package]]
