@@ -33,8 +33,8 @@ impl NetworkConfig {
         &self,
         fastcrypto: &NetworkPublicKey,
     ) -> Option<libp2p::PeerId> {
-        let mut bytes = fastcrypto.as_ref().to_vec();
-        let ed_public_key = libp2p::identity::ed25519::PublicKey::try_from_bytes(&mut bytes).ok();
+        let bytes = fastcrypto.as_ref().to_vec();
+        let ed_public_key = libp2p::identity::ed25519::PublicKey::try_from_bytes(&bytes).ok();
         ed_public_key.map(|k| libp2p::PeerId::from_public_key(&k.into()))
     }
 

@@ -1,5 +1,6 @@
 //! Fixtures used in multiple tests.
 
+use crate::TNMessage;
 use serde::{Deserialize, Serialize};
 use tn_types::{BlockHash, Certificate, CertificateDigest, Header, SealedBatch, Vote};
 

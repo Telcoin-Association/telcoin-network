@@ -1,8 +1,11 @@
 //! TNCodec tests used by the consensus network libp2p req/res protocol.
 
-use super::*;
+mod common;
 use common::{TestPrimaryRequest, TestPrimaryResponse};
+use libp2p::{request_response::Codec as _, StreamProtocol};
 use tn_types::{Certificate, CertificateDigest, Header};
+
+use crate::TNCodec;
 
 #[tokio::test]
 async fn test_encode_decode_same_message() {
