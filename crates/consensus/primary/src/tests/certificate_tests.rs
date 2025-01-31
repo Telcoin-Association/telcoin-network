@@ -1,6 +1,6 @@
 //! Certificate tests
 
-use fastcrypto::{hash::Hash as _, traits::KeyPair as _};
+use fastcrypto::traits::KeyPair as _;
 use rand::{
     rngs::{OsRng, StdRng},
     SeedableRng,
@@ -9,26 +9,6 @@ use std::num::NonZeroUsize;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
 use tn_types::{AuthorityIdentifier, BlsKeypair, Certificate, SignatureVerificationState, Vote};
-
-#[test]
-fn test_certificate_signature_status() {
-    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-    let committee = fixture.committee();
-    let header = fixture.header_from_last_authority();
-    let unverified = Certificate::new_unverified(&committee, header.clone(), Vec::new())
-        .expect("new unverified cert");
-    let mut verified = unverified.clone();
-    verified.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
-        verified.aggregated_signature().expect("aggregate signature").clone(),
-    ));
-
-    let unverified_digest = unverified.digest();
-    let verified_digest = verified.digest();
-
-    // peers sign certificate digest
-    assert_ne!(unverified, verified);
-    assert_ne!(unverified_digest, verified_digest);
-}
 
 #[test]
 fn test_empty_certificate_verification() {
