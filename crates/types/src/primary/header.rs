@@ -102,7 +102,7 @@ impl Header {
     pub fn validate(&self, committee: &Committee, worker_cache: &WorkerCache) -> HeaderResult<()> {
         // Ensure the header is from the correct epoch.
         if self.epoch != committee.epoch() {
-            return Err(HeaderError::InvalidEpoch(self.epoch, committee.epoch()));
+            return Err(HeaderError::InvalidEpoch { theirs: self.epoch, ours: committee.epoch() });
         }
 
         // Ensure the header digest is well formed.

@@ -1,6 +1,7 @@
 //! Test for Primary <-> Primary handler.
 
 use crate::{
+    error::PrimaryNetworkError,
     network::{MissingCertificatesRequest, RequestHandler},
     synchronizer::Synchronizer,
     ConsensusBus, RecentBlocks,
@@ -137,7 +138,7 @@ async fn test_vote_fails_too_many_parents() -> eyre::Result<()> {
     // process vote
     let res = handler.vote(peer_id, header, too_many_parents).await;
     debug!(target: "primary::handler_tests", ?res);
-    assert_matches!(res, Err(HeaderError::TooManyParents(received, expected)) if received == 5 && expected == 4 );
+    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::TooManyParents(received, expected))) if received == 5 && expected == 4 );
     Ok(())
 }
 
@@ -165,7 +166,7 @@ async fn test_vote_fails_wrong_authority_network_key() -> eyre::Result<()> {
     // process vote
     let res = handler.vote(random_peer_id, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
-    assert_matches!(res, Err(HeaderError::UnknownNetworkKey(peer_id)) if peer_id == random_peer_id);
+    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownNetworkKey(peer_id))) if peer_id == random_peer_id);
     Ok(())
 }
 
@@ -199,7 +200,7 @@ async fn test_vote_fails_invalid_genesis_parent() -> eyre::Result<()> {
     // process vote
     let res = handler.vote(peer_id, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
-    assert_matches!(res, Err(HeaderError::InvalidGenesisParent(wrong)) if wrong == extra_parent);
+    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidGenesisParent(wrong))) if wrong == extra_parent);
     Ok(())
 }
 
@@ -219,7 +220,7 @@ async fn test_vote_fails_unknown_execution_result() -> eyre::Result<()> {
     // process vote
     let res = handler.vote(peer_id, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
-    assert_matches!(res, Err(HeaderError::UnknownExecutionResult(wrong_num, wrong_hash)) if wrong_num == 0 && wrong_hash == BlockHash::ZERO);
+    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownExecutionResult(wrong_num, wrong_hash))) if wrong_num == 0 && wrong_hash == BlockHash::ZERO);
     Ok(())
 }
 
@@ -241,7 +242,7 @@ async fn test_vote_fails_invalid_header_digest() -> eyre::Result<()> {
 
     // process vote
     let res = handler.vote(peer_id, header, parents).await;
-    assert_matches!(res, Err(HeaderError::InvalidHeaderDigest));
+    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidHeaderDigest)));
     Ok(())
 }
 
@@ -268,7 +269,7 @@ async fn test_vote_fails_invalid_timestamp() -> eyre::Result<()> {
     // process vote
     let res = handler.vote(peer_id, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
-    assert_matches!(res, Err(HeaderError::InvalidTimestamp(wrong, _)) if wrong == wrong_time);
+    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp{created: wrong, ..})) if wrong == wrong_time);
     Ok(())
 }
 
@@ -296,7 +297,7 @@ async fn test_vote_fails_wrong_epoch() -> eyre::Result<()> {
     // process vote
     let res = handler.vote(peer_id, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
-    assert_matches!(res, Err(HeaderError::InvalidEpoch(wrong, correct)) if wrong == wrong_epoch && correct == 0 );
+    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidEpoch{ theirs: wrong, ours: correct })) if wrong == wrong_epoch && correct == 0 );
     Ok(())
 }
 
@@ -324,6 +325,6 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
     // process vote
     let res = handler.vote(peer_id, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
-    assert_matches!(res, Err(HeaderError::UnknownAuthority(wrong)) if wrong == wrong_authority.to_string());
+    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(wrong))) if wrong == wrong_authority.to_string());
     Ok(())
 }

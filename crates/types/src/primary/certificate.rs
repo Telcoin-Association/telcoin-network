@@ -192,7 +192,10 @@ impl Certificate {
         // ensure the header is from the correct epoch
         ensure!(
             self.epoch() == committee.epoch(),
-            CertificateError::from(HeaderError::InvalidEpoch(self.epoch(), committee.epoch()))
+            CertificateError::from(HeaderError::InvalidEpoch {
+                theirs: self.epoch(),
+                ours: committee.epoch()
+            })
         );
 
         // Genesis certificates are always valid.

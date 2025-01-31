@@ -4,11 +4,10 @@ use crate::error::{PrimaryNetworkError, PrimaryNetworkResult};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use thiserror::Error;
 use tn_network_libp2p::{types::IntoRpcError, TNMessage};
 use tn_types::{
-    error::HeaderError, AuthorityIdentifier, BlockHash, Certificate, CertificateDigest,
-    ConsensusHeader, Header, Round, Vote,
+    AuthorityIdentifier, BlockHash, Certificate, CertificateDigest, ConsensusHeader, Header, Round,
+    Vote,
 };
 
 /// Primary messages on the gossip network.
@@ -157,23 +156,18 @@ impl PrimaryResponse {
     }
 }
 
-impl IntoRpcError<HeaderError> for PrimaryResponse {
-    fn into_error(error: HeaderError) -> Self {
-        Self::Error(PrimaryRPCError::HeaderInvalid(error.to_string()))
+impl IntoRpcError<PrimaryNetworkError> for PrimaryResponse {
+    fn into_error(error: PrimaryNetworkError) -> Self {
+        Self::Error(PrimaryRPCError(error.to_string()))
     }
 }
 
-// TODO: !!!!! Fix this
-impl IntoRpcError<PrimaryNetworkError> for PrimaryResponse {
-    fn into_error(error: PrimaryNetworkError) -> Self {
-        Self::Error(PrimaryRPCError::HeaderInvalid(error.to_string()))
+impl From<PrimaryRPCError> for PrimaryResponse {
+    fn from(value: PrimaryRPCError) -> Self {
+        Self::Error(value)
     }
 }
 
 /// Application-specific error type while handling Primary request.
-#[derive(Error, Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub enum PrimaryRPCError {
-    /// Header invalid.
-    #[error("Header invalid: {0}")]
-    HeaderInvalid(String),
-}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PrimaryRPCError(String);

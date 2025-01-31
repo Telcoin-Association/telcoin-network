@@ -111,7 +111,7 @@ where
         peer: PeerId,
         header: Header,
         parents: Vec<Certificate>,
-    ) -> HeaderResult<PrimaryResponse> {
+    ) -> PrimaryNetworkResult<PrimaryResponse> {
         // current committee
         let committee = self.consensus_config.committee();
 
@@ -122,7 +122,7 @@ where
         let num_parents = parents.len();
         ensure!(
             num_parents <= committee.size(),
-            HeaderError::TooManyParents(num_parents, committee.size())
+            HeaderError::TooManyParents(num_parents, committee.size()).into()
         );
         self.consensus_bus
             .primary_metrics()
@@ -134,7 +134,7 @@ where
             .consensus_config
             .authority_for_peer_id(&peer)
             .ok_or(HeaderError::UnknownNetworkKey(peer))?;
-        ensure!(header.author() == committee_peer, HeaderError::PeerNotAuthor);
+        ensure!(header.author() == committee_peer, HeaderError::PeerNotAuthor.into());
 
         // TODO: ensure peer's header isn't too far in the past
         //  - peer can't propose a block from round 1 when this node is on 100
@@ -187,7 +187,8 @@ where
             return Err(HeaderError::UnknownExecutionResult(
                 header.latest_execution_block_num,
                 header.latest_execution_block,
-            ));
+            )
+            .into());
         }
 
         debug!(target: "primary", ?header, round = header.round(), "Processing vote request from peer");
@@ -244,12 +245,7 @@ where
         let mut parent_authorities = BTreeSet::new();
         let mut stake = 0;
         for parent in parents.iter() {
-            ensure!(
-                parent.round() + 1 == header.round(),
-                HeaderError::InvalidParent(
-                    "Certificate is not from the previous round".to_string()
-                )
-            );
+            ensure!(parent.round() + 1 == header.round(), HeaderError::InvalidParentRound.into());
 
             // @Steve - can you double check me here?
             //
@@ -262,26 +258,23 @@ where
             //   is a goal
             ensure!(
                 header.created_at() > parent.header().created_at(),
-                HeaderError::InvalidParent(format!(
-                    "Header was not created after parent. Header timestamp: {0} - parent timestamp: {1}",
-                    header.created_at(),
-                    parent.header.created_at()
-                ))
+                HeaderError::InvalidParentTimestamp {
+                    header: *header.created_at(),
+                    parent: *parent.created_at()
+                }
+                .into()
             );
 
             ensure!(
                 parent_authorities.insert(parent.header().author()),
-                HeaderError::InvalidParent("Parent authors are not unique".to_string())
+                HeaderError::DuplicateParents.into()
             );
 
             stake += committee.stake_by_id(parent.origin());
         }
 
         // verify aggregate signatures form quorum
-        ensure!(
-            stake >= committee.quorum_threshold(),
-            HeaderError::InvalidParent(CertificateError::Inquorate.to_string())
-        );
+        ensure!(stake >= committee.quorum_threshold(), CertificateError::Inquorate.into());
 
         // parents valid - now verify batches
         //
@@ -306,7 +299,11 @@ where
                     *header.created_at()
                 );
 
-                return Err(HeaderError::InvalidTimestamp(*header.created_at(), now));
+                return Err(HeaderError::InvalidTimestamp {
+                    created: *header.created_at(),
+                    received: now,
+                }
+                .into());
             }
         }
 
@@ -334,11 +331,16 @@ where
         if let Some(vote_info) = previous_vote {
             ensure!(
                 header.epoch() == vote_info.epoch(),
-                HeaderError::InvalidEpoch(header.epoch(), vote_info.epoch())
+                HeaderError::InvalidEpoch { theirs: header.epoch(), ours: vote_info.epoch() }
+                    .into()
             );
             ensure!(
                 header.round() >= vote_info.round(),
-                HeaderError::AlreadyVotedForLaterRound(header.round(), vote_info.round(),)
+                HeaderError::AlreadyVotedForLaterRound {
+                    theirs: header.round(),
+                    ours: vote_info.round()
+                }
+                .into()
             );
             if header.round() == vote_info.round() {
                 // Make sure we don't vote twice for the same authority in the same epoch/round.
@@ -362,7 +364,7 @@ where
                         .votes_dropped_equivocation_protection
                         .inc();
 
-                    return Err(HeaderError::AlreadyVoted(header.digest(), header.round()));
+                    return Err(HeaderError::AlreadyVoted(header.digest(), header.round()).into());
                 }
 
                 debug!("Resending vote {vote:?} for {} at round {}", header, header.round());
@@ -441,7 +443,7 @@ where
         &self,
         header: &Header,
         mut parents: Vec<Certificate>,
-    ) -> HeaderResult<()> {
+    ) -> PrimaryNetworkResult<()> {
         // sanitize request
         let requested_parents = self.requested_parents.lock();
         parents.retain(|cert| {
@@ -455,10 +457,7 @@ where
 
         // try to accept
         for parent in parents {
-            self.synchronizer
-                .try_accept_certificate(parent)
-                .await
-                .map_err(|e| HeaderError::InvalidParent(e.to_string()))?;
+            self.synchronizer.try_accept_certificate(parent).await?;
         }
 
         Ok(())

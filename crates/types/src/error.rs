@@ -206,8 +206,8 @@ pub type HeaderResult<T> = Result<T, HeaderError>;
 #[derive(Debug, Error)]
 pub enum HeaderError {
     /// Invalid header request
-    #[error("Invalid epoch. Peer proposed epoch {0}, but expected {1})")]
-    InvalidEpoch(Epoch, Epoch),
+    #[error("Invalid epoch. Peer proposed epoch {theirs}, but expected {ours})")]
+    InvalidEpoch { theirs: Epoch, ours: Epoch },
     /// The expected digest does not match the peer's sealed header.
     #[error("Invalid header digest")]
     InvalidHeaderDigest,
@@ -244,22 +244,30 @@ pub enum HeaderError {
     /// The header contains a parent with an invalid aggregate BLS signature.
     #[error("Header's parent missing aggregate BLS signature")]
     ParentMissingSignature,
+    /// A parent is not from the previous round.
+    #[error("Parent not from previous round.")]
+    InvalidParentRound,
     /// A parent certificate is invalid.
-    #[error("Invalid parent: {0}")]
-    InvalidParent(String),
+    #[error(
+        "Invalid parent timestamp: header created at {header:?} and parent created at {parent:?}"
+    )]
+    InvalidParentTimestamp { header: TimestampSec, parent: TimestampSec },
+    /// The header's parents must be unique.
+    #[error("Duplicate authors for parent headers. Authorities must be unique.")]
+    DuplicateParents,
     /// Error syncing batches
     #[error("{0}")]
     SyncBatches(String),
     /// The header's timestamp is too far in the future
-    #[error("Invalid timestamp. Created at: {0}, received at {1})")]
-    InvalidTimestamp(TimestampSec, TimestampSec),
+    #[error("Invalid timestamp. Created at: {created}, received {received})")]
+    InvalidTimestamp { created: TimestampSec, received: TimestampSec },
     /// Already voted for this header.
     #[error("Already voted for header {0} at round {1}")]
     AlreadyVoted(HeaderDigest, Round),
     /// The proposed header is older than the node's last vote for a proposed header from this
     /// peer.
-    #[error("Already voted for a header in a later round for this peer. This header's round: {0}. Last voted for round: {1}.")]
-    AlreadyVotedForLaterRound(Round, Round),
+    #[error("Already voted for a header in a later round for this peer. This header's round: {theirs}. Last voted for round: {ours}.")]
+    AlreadyVotedForLaterRound { theirs: Round, ours: Round },
 
     /// TODO: this is temporary
     ///
