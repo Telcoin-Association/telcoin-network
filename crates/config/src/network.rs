@@ -27,8 +27,6 @@ impl NetworkConfig {
     }
 
     /// Helper method to convert fastcrypto -> libp2p ed25519.
-    ///
-    /// TODO: consolidate key libraries
     pub fn ed25519_fastcrypto_to_libp2p(
         &self,
         fastcrypto: &NetworkPublicKey,
@@ -39,10 +37,6 @@ impl NetworkConfig {
     }
 
     /// Helper method to convert libp2p -> fastcrypto ed25519.
-    ///
-    /// TODO: consolidate key libraries
-    ///
-    /// NOTE: this sporadically fails when used with `PeerId::random()`.
     pub fn ed25519_libp2p_to_fastcrypto(
         &self,
         peer_id: &libp2p::PeerId,
