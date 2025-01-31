@@ -505,14 +505,7 @@ where
         Ok(PrimaryResponse::RequestedCertificates(missing))
     }
 
-    /// Process a request from a peer for missing certificates.
-    ///
-    /// This method efficiently retrieves certificates that the requesting peer is missing while
-    /// protecting against malicious requests through:
-    /// - limiting total processing time
-    /// - processing certificates in chunks
-    /// - validating request parameters
-    /// - early termination if resource limits are reached
+    /// Retrieve a consensus header from local storage.
     pub(super) async fn retrieve_consensus_header(
         &self,
         number: Option<u64>,
