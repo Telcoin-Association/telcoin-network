@@ -11,4 +11,6 @@ pub use codec::{TNCodec, TNMessage, MAX_GOSSIP_SIZE, MAX_REQUEST_SIZE};
 pub use consensus::ConsensusNetwork;
 
 // re-export specific libp2p types
-pub use libp2p::{identity::PeerId, request_response::ResponseChannel};
+pub use libp2p::{
+    gossipsub::Message as GossipMessage, identity::PeerId, request_response::ResponseChannel,
+};

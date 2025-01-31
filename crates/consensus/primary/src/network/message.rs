@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use tn_network_libp2p::{types::IntoRpcError, TNMessage};
-use tn_network_types::FetchCertificatesRequest;
 use tn_types::{
     error::HeaderError, AuthorityIdentifier, BlockHash, Certificate, CertificateDigest,
     ConsensusHeader, Header, Round, Vote,
@@ -23,8 +22,6 @@ pub enum PrimaryGossip {
     ///
     /// NOTE: `snappy` is slightly larger than uncompressed.
     Certificate(Certificate),
-    /// Consensus chain.
-    Consensus(ConsensusHeader),
 }
 
 // impl TNMessage trait for types
@@ -59,14 +56,7 @@ pub enum PrimaryRequest {
     },
 }
 
-// DELETE THISSS
-impl From<FetchCertificatesRequest> for MissingCertificatesRequest {
-    fn from(value: FetchCertificatesRequest) -> Self {
-        let FetchCertificatesRequest { exclusive_lower_bound, skip_rounds, max_items } = value;
-        MissingCertificatesRequest { exclusive_lower_bound, skip_rounds, max_items }
-    }
-}
-
+// unit test for this struct in primary::src::tests::network_tests::test_missing_certs_request
 /// Used by the primary to fetch certificates from other primaries.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissingCertificatesRequest {
@@ -160,6 +150,13 @@ pub enum PrimaryResponse {
     Error(PrimaryRPCError),
 }
 
+impl PrimaryResponse {
+    /// Helper method if the response is an error.
+    pub fn is_err(&self) -> bool {
+        matches!(self, PrimaryResponse::Error(_))
+    }
+}
+
 impl IntoRpcError<HeaderError> for PrimaryResponse {
     fn into_error(error: HeaderError) -> Self {
         Self::Error(PrimaryRPCError::HeaderInvalid(error.to_string()))
@@ -179,29 +176,4 @@ pub enum PrimaryRPCError {
     /// Header invalid.
     #[error("Header invalid: {0}")]
     HeaderInvalid(String),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_missing_certs_request() {
-        let max = 10;
-        let expected_gc_round = 3;
-        let expected_skip_rounds: BTreeMap<_, _> = [
-            (AuthorityIdentifier(0), BTreeSet::from([4, 5, 6, 7])),
-            (AuthorityIdentifier(2), BTreeSet::from([6, 7, 8])),
-        ]
-        .into_iter()
-        .collect();
-        let missing_req = MissingCertificatesRequest::default()
-            .set_bounds(expected_gc_round, expected_skip_rounds.clone())
-            .expect("boundary set")
-            .set_max_items(max);
-        let (decoded_gc_round, decoded_skip_rounds) =
-            missing_req.get_bounds().expect("decode missing bounds");
-        assert_eq!(expected_gc_round, decoded_gc_round);
-        assert_eq!(expected_skip_rounds, decoded_skip_rounds);
-    }
 }

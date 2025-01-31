@@ -1,9 +1,16 @@
 //! Test for Primary <-> Primary handler.
 
-use crate::{network::RequestHandler, synchronizer::Synchronizer, ConsensusBus, RecentBlocks};
+use crate::{
+    network::{MissingCertificatesRequest, RequestHandler},
+    synchronizer::Synchronizer,
+    ConsensusBus, RecentBlocks,
+};
 use assert_matches::assert_matches;
 use fastcrypto::hash::Hash as _;
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 use tn_config::ConsensusConfig;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
@@ -12,6 +19,27 @@ use tn_types::{
     CertificateDigest, ExecHeader, SealedHeader, TaskManager,
 };
 use tracing::debug;
+
+#[test]
+// for primary::network::message
+fn test_missing_certs_request() {
+    let max = 10;
+    let expected_gc_round = 3;
+    let expected_skip_rounds: BTreeMap<_, _> = [
+        (AuthorityIdentifier(0), BTreeSet::from([4, 5, 6, 7])),
+        (AuthorityIdentifier(2), BTreeSet::from([6, 7, 8])),
+    ]
+    .into_iter()
+    .collect();
+    let missing_req = MissingCertificatesRequest::default()
+        .set_bounds(expected_gc_round, expected_skip_rounds.clone())
+        .expect("boundary set")
+        .set_max_items(max);
+    let (decoded_gc_round, decoded_skip_rounds) =
+        missing_req.get_bounds().expect("decode missing bounds");
+    assert_eq!(expected_gc_round, decoded_gc_round);
+    assert_eq!(expected_skip_rounds, decoded_skip_rounds);
+}
 
 /// The type for holding testng components.
 struct TestTypes<DB = MemDatabase> {

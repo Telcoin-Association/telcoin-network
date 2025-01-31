@@ -1,6 +1,6 @@
 //! Constants and trait implementations for network compatibility.
 
-use crate::{codec::TNMessage, error::NetworkError};
+use crate::{codec::TNMessage, error::NetworkError, GossipMessage};
 use libp2p::{
     core::transport::ListenerId,
     gossipsub::{IdentTopic, MessageId, PublishError, SubscriptionError, TopicHash},
@@ -57,7 +57,7 @@ pub enum NetworkEvent<Req, Res> {
         channel: ResponseChannel<Res>,
     },
     /// Gossip message received.
-    Gossip(Vec<u8>),
+    Gossip(GossipMessage),
 }
 
 /// Commands for the swarm.

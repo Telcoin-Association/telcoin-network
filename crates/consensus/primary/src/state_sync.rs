@@ -56,7 +56,7 @@ where
             if rounds.len()
                 > config.network_config().sync_config().max_skip_rounds_for_missing_certs
             {
-                warn!(target: "cert_collector", "{} has sent {} rounds to skip", origin, rounds.len());
+                warn!(target: "cert-collector", "{} has sent {} rounds to skip", origin, rounds.len());
 
                 return Err(PrimaryNetworkError::InvalidRequest(
                     "Request for rounds out of bounds".into(),
@@ -69,13 +69,13 @@ where
                 lower_bound,
                 &rounds,
             )? {
-                debug!(target: "cert_collector", ?next_round, ?origin, "found next round!");
+                debug!(target: "cert-collector", ?next_round, ?origin, "found next round!");
                 fetch_queue.push(Reverse((next_round, *origin)));
             }
         }
 
         debug!(
-            target: "cert_collector",
+            target: "cert-collector",
             "Initialized origins and rounds to fetch, elapsed = {}ms",
             start_time.elapsed().as_millis(),
         );
@@ -152,19 +152,19 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         // check if any limits have been reached
         if self.max_limits_reached() {
-            debug!(target: "cert_collector", "timeout / max items hit! returning None");
+            debug!(target: "cert-collector", "timeout / max items hit! returning None");
             return None;
         }
 
         // try to fetch the next certificate
         match self.next_certificate() {
             Ok(Some(cert)) => {
-                debug!(target: "cert_collector", ?cert, "next cert Ok(Some)");
+                debug!(target: "cert-collector", ?cert, "next cert Ok(Some)");
                 self.items_returned += 1;
                 Some(Ok(cert))
             }
             Ok(None) => {
-                debug!(target: "cert_collector", "next cert Ok(None)");
+                debug!(target: "cert-collector", "next cert Ok(None)");
                 None
             }
             Err(e) => Some(Err(e)),

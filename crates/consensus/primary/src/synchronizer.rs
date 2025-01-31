@@ -1522,7 +1522,7 @@ mod tests {
         });
 
         // Tasks that read the counter
-        let readers: Vec<_> = (0..5)
+        let _readers: Vec<_> = (0..5)
             .map(|_| {
                 let counter_reader = std::sync::Arc::clone(&counter);
                 tokio::spawn(async move {

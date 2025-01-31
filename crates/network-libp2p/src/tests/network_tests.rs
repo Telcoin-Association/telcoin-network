@@ -430,7 +430,7 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
 
     // assert gossip message
     if let NetworkEvent::Gossip(msg) = event {
-        assert_eq!(msg, expected_result);
+        assert_eq!(msg.data, expected_result);
     } else {
         panic!("unexpected network event received");
     }
@@ -484,7 +484,7 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
 
     // assert gossip message
     if let NetworkEvent::Gossip(msg) = event {
-        assert_eq!(msg, expected_result);
+        assert_eq!(msg.data, expected_result);
     } else {
         panic!("unexpected network event received");
     }

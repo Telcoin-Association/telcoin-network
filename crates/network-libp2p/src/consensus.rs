@@ -459,7 +459,7 @@ where
 
                 if msg_acceptance.is_accepted() {
                     // forward gossip to handler
-                    if let Err(e) = self.event_stream.try_send(NetworkEvent::Gossip(message.data)) {
+                    if let Err(e) = self.event_stream.try_send(NetworkEvent::Gossip(message)) {
                         error!(target: "network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
                         // fatal - unable to process gossip messages
                         return Err(e.into());

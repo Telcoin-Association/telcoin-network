@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::PeerId;
+use tn_network_libp2p::{GossipMessage, PeerId};
 use tn_storage::{
     tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
     traits::Database,
@@ -87,18 +87,18 @@ where
     /// Peers gossip the CertificateDigest so peers can request the Certificate. This waits until
     /// the certificate can be retrieved and timesout after some time. It's important to give up
     /// after enough time to limit the DoS attack surface. Peers who timeout must lose reputation.
-    pub(super) async fn process_gossip(&self, bytes: Vec<u8>) -> PrimaryNetworkResult<()> {
-        // gossip is uncompressed
-        let msg = try_decode(&bytes)?;
+    pub(super) async fn process_gossip(&self, msg: &GossipMessage) -> PrimaryNetworkResult<()> {
+        // deconstruct message
+        let GossipMessage { data, .. } = msg;
 
-        match msg {
+        // gossip is uncompressed
+        let gossip = try_decode(data)?;
+
+        match gossip {
             PrimaryGossip::Certificate(cert) => {
                 // process certificate
                 let valid_cert = cert.validate_received()?;
                 self.synchronizer.try_accept_certificate(valid_cert).await?;
-            }
-            PrimaryGossip::Consensus(header) => {
-                todo!()
             }
         }
 
@@ -130,19 +130,11 @@ where
             .certificates_in_votes
             .inc_by(num_parents as u64);
 
-        // TODO: DO NOT MERGE - remove this once config updated
-        let converted_network_key = self
+        let committee_peer = self
             .consensus_config
-            .network_config()
-            .ed25519_libp2p_to_fastcrypto(&peer)
-            .ok_or(HeaderError::PeerId)?;
-        // !!^^^^^^end
-
-        // ensure request for vote came from the header's author
-        let committee_peer = committee
-            .authority_by_network_key(&converted_network_key)
+            .authority_for_peer_id(&peer)
             .ok_or(HeaderError::UnknownNetworkKey(peer))?;
-        ensure!(header.author() == committee_peer.id(), HeaderError::PeerNotAuthor);
+        ensure!(header.author() == committee_peer, HeaderError::PeerNotAuthor);
 
         // TODO: ensure peer's header isn't too far in the past
         //  - peer can't propose a block from round 1 when this node is on 100
@@ -481,11 +473,12 @@ where
     /// - validating request parameters
     pub(super) async fn retrieve_missing_certs(
         &self,
-        peer: PeerId,
         request: MissingCertificatesRequest,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         // Create a time-bounded iter for collecting certificates
         let mut missing = Vec::with_capacity(request.max_items);
+
+        // validates request is within limits
         let mut collector =
             CertificateCollector::new(request.into(), self.consensus_config.clone())?;
 
@@ -493,14 +486,14 @@ where
         while let Some(cert) = collector.next() {
             missing.push(cert?);
 
-            // allow the request handler to be stopped after network timeout
+            // yield occassionally to allow the request handler shutdown during network timeout
             if missing.len() % 10 == 0 {
                 tokio::task::yield_now().await;
             }
         }
 
         debug!(
-            target: "fetch_certs",
+            target: "cert-collector",
             "Collected {} certificates in {}ms",
             missing.len(),
             collector.start_time().elapsed().as_millis(),
@@ -519,7 +512,6 @@ where
     /// - early termination if resource limits are reached
     pub(super) async fn retrieve_consensus_header(
         &self,
-        peer: PeerId,
         number: Option<u64>,
         hash: Option<BlockHash>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
