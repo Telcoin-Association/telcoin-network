@@ -231,7 +231,7 @@ async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
 
     // send request and wait for response
     let max_time = Duration::from_secs(5);
-    let _response_from_peer = peer1.send_request(batch_req.clone(), peer2_id).await?;
+    let _response = peer1.send_request(batch_req.clone(), peer2_id).await?;
 
     // peer1 has a pending_request now
     let count = peer1.get_pending_request_count().await?;
@@ -246,7 +246,7 @@ async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
         timeout(max_time, network_events_2.recv()).await?.expect("first network event received");
 
     // expect network event
-    if let NetworkEvent::Request { request, .. } = event {
+    if let NetworkEvent::Request { request, cancel, .. } = event {
         assert_eq!(request, batch_req);
 
         // peer 1 crashes after making request
@@ -254,19 +254,13 @@ async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
         assert!(peer1_network_task.await.unwrap_err().is_cancelled());
 
         tokio::task::yield_now().await;
+        timeout(Duration::from_secs(2), cancel).await?.expect("first network event received");
+        assert_matches!((), ());
     } else {
         panic!("unexpected network event received");
     }
 
-    // TODO: fix inbound request errors
-    // let res = timeout(Duration::from_secs(2), response_from_peer)
-    //     .await?
-    //     .expect("first network event received");
-
-    // println!("res: {res:?}");
-
-    // // InboundFailure::Io(Kind(UnexpectedEof))
-    // assert_matches!(res, Err(NetworkError::Outbound(_)));
+    // InboundFailure::Io(Kind(UnexpectedEof))
     Ok(())
 }
 

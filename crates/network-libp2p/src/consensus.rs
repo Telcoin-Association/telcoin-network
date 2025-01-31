@@ -16,7 +16,7 @@ use libp2p::{
     multiaddr::Protocol,
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
-        OutboundRequestId,
+        InboundRequestId, OutboundRequestId,
     },
     swarm::{NetworkBehaviour, SwarmEvent},
     PeerId, Swarm, SwarmBuilder,
@@ -98,6 +98,13 @@ where
     /// responsible for decoding message bytes and reporting peers who return bad data. Peers that
     /// send messages that fail to decode must receive an application score penalty.
     outbound_requests: HashMap<OutboundRequestId, oneshot::Sender<NetworkResult<Res>>>,
+    /// The collection of pending inbound requests.
+    ///
+    /// Callers include a oneshot channel for the network to return a cancellation notice. The
+    /// caller is responsible for decoding message bytes and reporting peers who return bad
+    /// data. Peers that send messages that fail to decode must receive an application score
+    /// penalty.
+    inbound_requests: HashMap<InboundRequestId, oneshot::Sender<()>>,
     /// The configurables for the libp2p consensus network implementation.
     config: LibP2pConfig,
 }
@@ -197,6 +204,7 @@ where
             authorized_publishers,
             pending_dials: Default::default(),
             outbound_requests: Default::default(),
+            inbound_requests: Default::default(),
             config,
         })
     }
@@ -493,19 +501,20 @@ where
             ReqResEvent::Message { peer, message } => {
                 match message {
                     request_response::Message::Request { request_id, request, channel } => {
-                        // TODO: create hashmap for inbound requests to track max requests
-                        // process if channel dropped for inbound failures
-
+                        let (notify, cancel) = oneshot::channel();
                         // forward request to handler without blocking other events
                         if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
                             peer,
                             request,
                             channel,
+                            cancel,
                         }) {
                             error!(target: "network", topics=?self.topics, ?request_id, ?e, "failed to forward request!");
                             // fatal - unable to process requests
                             return Err(e.into());
                         }
+
+                        self.inbound_requests.insert(request_id, notify);
                     }
                     request_response::Message::Response { request_id, response } => {
                         // try to forward response to original caller
@@ -537,6 +546,13 @@ where
                     }
                     _ => { /* ignore timeout, connection closed, and response ommission */ }
                 }
+
+                // forward cancelation to handler
+                let _ = self
+                    .inbound_requests
+                    .remove(&request_id)
+                    .ok_or(NetworkError::PendingRequestChannelLost)?
+                    .send(());
             }
             ReqResEvent::ResponseSent { .. } => {}
         }

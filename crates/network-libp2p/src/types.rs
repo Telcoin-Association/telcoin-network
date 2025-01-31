@@ -55,6 +55,8 @@ pub enum NetworkEvent<Req, Res> {
         request: Req,
         /// The network response channel.
         channel: ResponseChannel<Res>,
+        /// The oneshot channel if the request gets cancelled at the network level.
+        cancel: oneshot::Receiver<()>,
     },
     /// Gossip message received.
     Gossip(GossipMessage),

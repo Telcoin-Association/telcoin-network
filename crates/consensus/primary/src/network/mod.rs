@@ -14,7 +14,7 @@ use tn_network_libp2p::{
 };
 use tn_storage::traits::Database;
 use tn_types::{BlockHash, Certificate, Header, Noticer};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, warn};
 mod handler;
 mod message;
@@ -76,15 +76,15 @@ where
     fn process_network_event(&self, event: NetworkEvent<Req, Res>) {
         // match event
         match event {
-            NetworkEvent::Request { peer, request, channel } => match request {
+            NetworkEvent::Request { peer, request, channel, cancel } => match request {
                 PrimaryRequest::Vote { header, parents } => {
-                    self.process_vote_request(peer, header, parents, channel);
+                    self.process_vote_request(peer, header, parents, channel, cancel);
                 }
                 PrimaryRequest::MissingCertificates { inner } => {
-                    self.process_request_for_missing_certs(peer, inner, channel)
+                    self.process_request_for_missing_certs(peer, inner, channel, cancel)
                 }
                 PrimaryRequest::ConsensusHeader { number, hash } => {
-                    self.process_consensus_output_request(peer, number, hash, channel)
+                    self.process_consensus_output_request(peer, number, hash, channel, cancel)
                 }
             },
             NetworkEvent::Gossip(msg) => {
@@ -102,13 +102,20 @@ where
         header: Header,
         parents: Vec<Certificate>,
         channel: ResponseChannel<PrimaryResponse>,
+        cancel: oneshot::Receiver<()>,
     ) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
         tokio::spawn(async move {
-            let response = request_handler.vote(peer, header, parents).await.into_response();
-            let _ = network_handle.send_response(response, channel).await;
+            tokio::select! {
+                vote = request_handler.vote(peer, header, parents) => {
+                    let response = vote.into_response();
+                    let _ = network_handle.send_response(response, channel).await;
+                }
+                // cancel notification from network layer
+                _ = cancel => (),
+            }
         });
     }
 
@@ -118,17 +125,24 @@ where
         _peer: PeerId,
         request: MissingCertificatesRequest,
         channel: ResponseChannel<PrimaryResponse>,
+        cancel: oneshot::Receiver<()>,
     ) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
         tokio::spawn(async move {
-            let response = request_handler.retrieve_missing_certs(request).await.into_response();
+            tokio::select! {
+                certs = request_handler.retrieve_missing_certs(request) => {
+                    let response = certs.into_response();
 
-            // TODO: penalize peer's reputation for bad request
-            // if response.is_err() { }
+                    // TODO: penalize peer's reputation for bad request
+                    // if response.is_err() { }
 
-            let _ = network_handle.send_response(response, channel).await;
+                    let _ = network_handle.send_response(response, channel).await;
+                }
+                // cancel notification from network layer
+                _ = cancel => (),
+            }
         });
     }
 
@@ -139,18 +153,23 @@ where
         number: Option<u64>,
         hash: Option<BlockHash>,
         channel: ResponseChannel<PrimaryResponse>,
+        cancel: oneshot::Receiver<()>,
     ) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
         tokio::spawn(async move {
-            let response =
-                request_handler.retrieve_consensus_header(number, hash).await.into_response();
-
-            // TODO: penalize peer's reputation for bad request
-            // if response.is_err() { }
-
-            let _ = network_handle.send_response(response, channel).await;
+            tokio::select! {
+                header =
+                    request_handler.retrieve_consensus_header(number, hash) => {
+                        let response = header.into_response();
+                        // TODO: penalize peer's reputation for bad request
+                        // if response.is_err() { }
+                        let _ = network_handle.send_response(response, channel).await;
+                    }
+                // cancel notification from network layer
+                _ = cancel => (),
+            }
         });
     }
 
