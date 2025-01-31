@@ -17,10 +17,10 @@ use libp2p::{
     multiaddr::Protocol,
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
-        OutboundRequestId, ProtocolSupport,
+        OutboundRequestId,
     },
     swarm::{NetworkBehaviour, SwarmEvent},
-    PeerId, StreamProtocol, Swarm, SwarmBuilder,
+    PeerId, Swarm, SwarmBuilder,
 };
 use std::{
     collections::{hash_map, HashMap, HashSet},
@@ -38,8 +38,7 @@ use tracing::{error, info, instrument, trace, warn};
 
 /// Custom network libp2p behaviour type for Telcoin Network.
 ///
-/// The behavior includes gossipsub, request-response, and identify.
-/// TODO: possibly KAD?
+/// The behavior includes gossipsub and request-response.
 #[derive(NetworkBehaviour)]
 pub struct TNBehavior<C>
 where
@@ -68,10 +67,6 @@ where
 /// - prevent a surge in one network message type from overwhelming all network traffic
 /// - provide more granular control over resource allocation
 /// - allow specific network configurations based on worker/primary needs
-///
-/// TODO: Primaries gossip signatures of final execution state at epoch boundaries and workers
-/// gossip transactions? Publishers usually broadcast to several peers, so this may not be efficient
-/// (multiple txs submitted).
 pub struct ConsensusNetwork<Req, Res>
 where
     Req: TNMessage,
@@ -116,7 +111,21 @@ where
         DB: tn_storage::traits::Database,
     {
         let topics = vec![IdentTopic::new("tn-primary")];
-        Self::new(config, event_stream, topics)
+        let network_key = config.key_config().primary_network_keypair().as_ref().to_vec();
+        Self::new(config, event_stream, topics, network_key)
+    }
+
+    /// Convenience method for spawning a worker network instance.
+    pub fn new_for_worker<DB>(
+        config: &ConsensusConfig<DB>,
+        event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
+    ) -> NetworkResult<Self>
+    where
+        DB: tn_storage::traits::Database,
+    {
+        let topics = vec![IdentTopic::new("tn-primary")];
+        let network_key = config.key_config().worker_network_keypair().as_ref().to_vec();
+        Self::new(config, event_stream, topics, network_key)
     }
 
     /// Create a new instance of Self.
@@ -124,17 +133,14 @@ where
         config: &ConsensusConfig<DB>,
         event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
         topics: Vec<IdentTopic>,
+        mut ed25519_private_key_bytes: Vec<u8>,
     ) -> NetworkResult<Self>
     where
-        // TODO: need to import tn-storage just for this trait?
         DB: tn_storage::traits::Database,
     {
-        // TODO: pass keypair as arg so this function stays agnostic to primary/worker
-        // - don't put helper method on key config bc that is TN-specific, and this is required by
-        //   libp2p
-        // - need to separate worker/primary network signatures
-        let mut key_bytes = config.key_config().primary_network_keypair().as_ref().to_vec();
-        let keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut key_bytes)?;
+        // create libp2p keypair from ed25519 secret bytes
+        let keypair =
+            libp2p::identity::Keypair::ed25519_from_bytes(&mut ed25519_private_key_bytes)?;
 
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             // explicitly set default
@@ -143,7 +149,7 @@ where
             .validation_mode(gossipsub::ValidationMode::Strict)
             // support peer exchange
             .do_px()
-            // TN specific: filter against authorized_publishers
+            // TN specific: filter against authorized_publishers for certain topics
             .validate_messages()
             .build()?;
         let gossipsub = gossipsub::Behaviour::new(
@@ -152,15 +158,12 @@ where
         )
         .map_err(NetworkError::GossipBehavior)?;
 
-        // TODO: use const as default and read from config
-        let tn_codec = TNCodec::<Req, Res>::new(1024 * 1024); // 1mb
+        let tn_codec =
+            TNCodec::<Req, Res>::new(config.network_config().libp2p_config().max_rpc_message_size);
 
-        // TODO: take this from configuration through CLI
-        // - ex) "/telcoin-network/mainnet/0.0.1"
-        let protocols = [(StreamProtocol::new("/telcoin-network/0.0.0"), ProtocolSupport::Full)];
         let req_res = request_response::Behaviour::with_codec(
             tn_codec,
-            protocols,
+            config.network_config().libp2p_config().supported_req_res_protocols.clone(),
             request_response::Config::default(),
         );
 
@@ -177,7 +180,7 @@ where
             .build();
 
         let (handle, commands) = tokio::sync::mpsc::channel(100);
-        let authorized_publishers = config.authorized_publishers();
+        let authorized_publishers = config.committee_peer_ids();
 
         Ok(Self {
             swarm,
@@ -192,8 +195,6 @@ where
     }
 
     /// Return a [NetworkHandle] to send commands to this network.
-    ///
-    /// TODO: this should just be `NetworkHandle`
     pub fn network_handle(&self) -> NetworkHandle<Req, Res> {
         NetworkHandle::new(self.handle.clone())
     }
@@ -265,11 +266,7 @@ where
                 // }
             }
             SwarmEvent::ConnectionClosed {
-                peer_id,
-                connection_id,
-                endpoint,
-                num_established,
-                cause,
+                peer_id, connection_id, num_established, cause, ..
             } => {
                 // Log connection closure with cause
                 info!(
@@ -287,9 +284,9 @@ where
                     // clean up any pending requests for this peer
                     //
                     // NOTE: self.pending_requests are removed by `OutboundFailure`
-                    // but only if the Option<PeerId> is included. This is mostly a
+                    // but only if the Option<PeerId> is included. This is a
                     // sanity check to prevent the HashMap from growing indefinitely when peers
-                    // disconnect after a request is made
+                    // disconnect after a request is made and the PeerId is lost.
                     self.pending_requests.retain(
                         |_, sender| {
                             if sender.is_closed() {
@@ -306,7 +303,7 @@ where
                     }
                 }
             }
-            SwarmEvent::OutgoingConnectionError { connection_id, peer_id, error } => {
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 if let Some(peer_id) = peer_id {
                     if let Some(sender) = self.pending_dials.remove(&peer_id) {
                         send_or_log_error!(sender, Err(error.into()), "OutgoingConnectionError");
@@ -543,7 +540,7 @@ where
                     _ => { /* ignore timeout, connection closed, and response ommission */ }
                 }
             }
-            ReqResEvent::ResponseSent { peer, request_id } => {}
+            ReqResEvent::ResponseSent { .. } => {}
         }
 
         Ok(())
@@ -697,8 +694,10 @@ mod tests {
         let topics = vec![IdentTopic::new("test-topic")];
 
         // peer1
-        let peer1_network = ConsensusNetwork::<Req, Res>::new(&config_1, tx1, topics.clone())
-            .expect("peer1 network created");
+        let network_key_1 = config_1.key_config().primary_network_keypair().as_ref().to_vec();
+        let peer1_network =
+            ConsensusNetwork::<Req, Res>::new(&config_1, tx1, topics.clone(), network_key_1)
+                .expect("peer1 network created");
         let network_handle_1 = peer1_network.network_handle();
         let peer1 = NetworkPeer {
             config: config_1,
@@ -708,8 +707,10 @@ mod tests {
         };
 
         // peer2
-        let peer2_network = ConsensusNetwork::<Req, Res>::new(&config_2, tx2, topics.clone())
-            .expect("peer2 network created");
+        let network_key_2 = config_2.key_config().primary_network_keypair().as_ref().to_vec();
+        let peer2_network =
+            ConsensusNetwork::<Req, Res>::new(&config_2, tx2, topics.clone(), network_key_2)
+                .expect("peer2 network created");
         let network_handle_2 = peer2_network.network_handle();
         let peer2 = NetworkPeer {
             config: config_2,
@@ -1161,12 +1162,15 @@ mod tests {
         let config = authority.consensus_config();
 
         // converts fastcrypto -> libp2p or panics
-        let fastcrypto_to_libp2p = config.authorized_publishers();
+        let fastcrypto_to_libp2p = config.committee_peer_ids();
         // assert libp2p -> fastcrypto works
         for key in fastcrypto_to_libp2p.iter() {
-            let fc_key =
-                config.ed25519_libp2p_to_fastcrypto(key).expect("libp2p to fastcrypto ed25519 key");
+            let fc_key = config
+                .network_config()
+                .ed25519_libp2p_to_fastcrypto(key)
+                .expect("libp2p to fastcrypto ed25519 key");
             let libp2p_key_again = config
+                .network_config()
                 .ed25519_fastcrypto_to_libp2p(&fc_key)
                 .expect("fastcrypto to libp2p ed25519 key");
             // sanity check - cast back to original type

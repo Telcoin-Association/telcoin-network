@@ -64,6 +64,7 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
 
     let parents = Vec::with_capacity(0);
     let peer_id = config
+        .network_config()
         .ed25519_fastcrypto_to_libp2p(&committee.last_authority().primary_network_public_key())
         .expect("valid peer id for last authority");
 
@@ -88,6 +89,7 @@ async fn test_vote_fails_too_many_parents() -> eyre::Result<()> {
     let TestTypes { committee, handler, config, parent, .. } = create_test_types();
 
     let peer_id = config
+        .network_config()
         .ed25519_fastcrypto_to_libp2p(&committee.last_authority().primary_network_public_key())
         .expect("valid peer id for last authority");
 
@@ -119,8 +121,10 @@ async fn test_vote_fails_wrong_authority_network_key() -> eyre::Result<()> {
     let parents = Vec::with_capacity(0);
     // workaround until anemo/fastcrypto replaced
     let default = fastcrypto::ed25519::Ed25519PublicKey::insecure_default();
-    let random_peer_id =
-        config.ed25519_fastcrypto_to_libp2p(&default).expect("fastcrypto to libp2p");
+    let random_peer_id = config
+        .network_config()
+        .ed25519_fastcrypto_to_libp2p(&default)
+        .expect("fastcrypto to libp2p");
 
     // create valid header proposed by last peer in the committee for round 1
     let header = committee
@@ -144,6 +148,7 @@ async fn test_vote_fails_invalid_genesis_parent() -> eyre::Result<()> {
 
     let parents = Vec::with_capacity(0);
     let peer_id = config
+        .network_config()
         .ed25519_fastcrypto_to_libp2p(&committee.last_authority().primary_network_public_key())
         .expect("valid peer id for last authority");
 
@@ -179,6 +184,7 @@ async fn test_vote_fails_unknown_execution_result() -> eyre::Result<()> {
     let header = committee.header_from_last_authority();
     let parents = Vec::with_capacity(0);
     let peer_id = config
+        .network_config()
         .ed25519_fastcrypto_to_libp2p(&committee.last_authority().primary_network_public_key())
         .expect("valid peer id for last authority");
 
@@ -196,6 +202,7 @@ async fn test_vote_fails_invalid_header_digest() -> eyre::Result<()> {
 
     let parents = Vec::with_capacity(0);
     let peer_id = config
+        .network_config()
         .ed25519_fastcrypto_to_libp2p(&committee.last_authority().primary_network_public_key())
         .expect("valid peer id for last authority");
 
@@ -217,6 +224,7 @@ async fn test_vote_fails_invalid_timestamp() -> eyre::Result<()> {
 
     let parents = Vec::with_capacity(0);
     let peer_id = config
+        .network_config()
         .ed25519_fastcrypto_to_libp2p(&committee.last_authority().primary_network_public_key())
         .expect("valid peer id for last authority");
 
@@ -243,6 +251,7 @@ async fn test_vote_fails_wrong_epoch() -> eyre::Result<()> {
 
     let parents = Vec::with_capacity(0);
     let peer_id = config
+        .network_config()
         .ed25519_fastcrypto_to_libp2p(&committee.last_authority().primary_network_public_key())
         .expect("valid peer id for last authority");
 
@@ -270,6 +279,7 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
 
     let parents = Vec::with_capacity(0);
     let peer_id = config
+        .network_config()
         .ed25519_fastcrypto_to_libp2p(&committee.last_authority().primary_network_public_key())
         .expect("valid peer id for last authority");
 

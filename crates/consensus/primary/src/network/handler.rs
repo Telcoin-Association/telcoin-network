@@ -131,8 +131,11 @@ where
             .inc_by(num_parents as u64);
 
         // TODO: DO NOT MERGE - remove this once config updated
-        let converted_network_key =
-            self.consensus_config.ed25519_libp2p_to_fastcrypto(&peer).ok_or(HeaderError::PeerId)?;
+        let converted_network_key = self
+            .consensus_config
+            .network_config()
+            .ed25519_libp2p_to_fastcrypto(&peer)
+            .ok_or(HeaderError::PeerId)?;
         // !!^^^^^^end
 
         // ensure request for vote came from the header's author
