@@ -7,7 +7,6 @@ use crate::{
     error::NetworkError,
     send_or_log_error,
     types::{NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
-    MAX_GOSSIP_SIZE,
 };
 use futures::StreamExt as _;
 use libp2p::{
@@ -26,7 +25,7 @@ use std::{
     collections::{hash_map, HashMap, HashSet},
     time::Duration,
 };
-use tn_config::ConsensusConfig;
+use tn_config::{ConsensusConfig, LibP2pConfig};
 use tokio::{
     sync::{
         mpsc::{self, Receiver, Sender},
@@ -99,6 +98,8 @@ where
     /// responsible for decoding message bytes and reporting peers who return bad data. Peers that
     /// send messages that fail to decode must receive an application score penalty.
     pending_requests: HashMap<OutboundRequestId, oneshot::Sender<NetworkResult<Res>>>,
+    /// The configurables for the libp2p consensus network implementation.
+    config: LibP2pConfig,
 }
 
 impl<Req, Res> ConsensusNetwork<Req, Res>
@@ -185,6 +186,7 @@ where
 
         let (handle, commands) = tokio::sync::mpsc::channel(100);
         let authorized_publishers = config.committee_peer_ids();
+        let config = config.network_config().libp2p_config().clone();
 
         Ok(Self {
             swarm,
@@ -195,6 +197,7 @@ where
             authorized_publishers,
             pending_dials: Default::default(),
             pending_requests: Default::default(),
+            config,
         })
     }
 
@@ -331,7 +334,8 @@ where
                     "listener error"
                 );
             }
-            // These events are included here because they will likely become useful in near-future PRs
+            // These events are included here because they will likely become useful in near-future
+            // PRs
             SwarmEvent::IncomingConnection { .. }
             | SwarmEvent::IncomingConnectionError { .. }
             | SwarmEvent::NewListenAddr { .. }
@@ -555,11 +559,13 @@ where
     /// Messages are only published by current committee nodes and must be within max size.
     fn verify_gossip(&self, gossip: &GossipMessage) -> GossipAcceptance {
         // verify message size
-        if gossip.data.len() > MAX_GOSSIP_SIZE {
+        if gossip.data.len() > self.config.max_gossip_message_size {
             return GossipAcceptance::Reject;
         }
 
         // ensure publisher is authorized
+        //
+        // NOTE: expand on this based on gossip::topic - not all topics need to be permissioned
         if gossip.source.is_some_and(|id| self.authorized_publishers.contains(&id)) {
             GossipAcceptance::Accept
         } else {

@@ -153,42 +153,6 @@ impl<Req, Res> TNCodec<Req, Res> {
     }
 }
 
-impl<Req, Res> Default for TNCodec<Req, Res> {
-    fn default() -> Self {
-        Self::new(MAX_REQUEST_SIZE)
-    }
-}
-
-/// Max request size in bytes
-///
-/// batches are capped at 1MB worth of transactions.
-/// This should be more than enough for snappy-compressed messages.
-///
-/// TODO: add the message overhead as the max request size
-pub const MAX_REQUEST_SIZE: usize = 1024 * 1024;
-
-/// Max gossip size in bytes.
-///
-/// Gossip messages must be small because peers are likely to receive the same message multiple
-/// times. The protocol is optimized for latency, not throughput.
-/// See github discussion for more info: https://github.com/libp2p/specs/issues/118#issuecomment-499688869
-///
-/// The max is based on `Certificate` sizes. Certificate signatures are encoded as roaring bitmaps.
-/// Certificates are small and okay to gossip uncompressed:
-/// - 3 signatures ~= 0.3kb
-/// - 99 signatures ~= 3.5kb
-///
-/// The max is based on `ConsensusHeader`.
-///
-/// Consensus headers are created based on subdag commits which can be several rounds deep.
-/// More benchmarking is needed, but this should be a safe number for a 4-member committee.
-/// - 6 round max commit
-/// - 4 certificate max per round
-/// - 300 bytes size per empty certificate
-/// - 5 batch digests max per certificate (32 bytes)
-/// - (6 * 4)(300 + (5 * 32)) = 11,040
-pub const MAX_GOSSIP_SIZE: usize = 12_000;
-
 #[async_trait]
 impl<Req, Res> Codec for TNCodec<Req, Res>
 where

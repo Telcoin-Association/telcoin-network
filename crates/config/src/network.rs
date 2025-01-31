@@ -57,13 +57,25 @@ impl NetworkConfig {
 }
 
 /// Configurations for libp2p library.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LibP2pConfig {
     /// The supported inbound/outbound protocols for request/response behavior.
     /// - ex) "/telcoin-network/mainnet/0.0.1"
     pub supported_req_res_protocols: Vec<(StreamProtocol, ProtocolSupport)>,
     /// Maximum message size between request/response network messages in bytes.
     pub max_rpc_message_size: usize,
+    /// Maximum message size for gossipped messages request/response network messages in bytes.
+    ///
+    /// The largest gossip message is the `ConsensusHeader`, which influenced the default max.
+    ///
+    /// Consensus headers are created based on subdag commits which can be several rounds deep.
+    /// More benchmarking is needed, but this should be a safe number for a 4-member committee.
+    /// - 6 round max between commits
+    /// - 4 certificate max per round
+    /// - ~300 bytes size per empty certificate
+    /// - 5 batch digests max per certificate (32 bytes each)
+    /// - (6 * 4)(300 + (5 * 32)) = 11,040
+    pub max_gossip_message_size: usize,
 }
 
 impl Default for LibP2pConfig {
@@ -74,6 +86,7 @@ impl Default for LibP2pConfig {
                 ProtocolSupport::Full,
             )],
             max_rpc_message_size: 1024 * 1024, // 1 MiB
+            max_gossip_message_size: 12_000,   // 12kb
         }
     }
 }
@@ -81,7 +94,8 @@ impl Default for LibP2pConfig {
 /// Configuration for state syncing operations.
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
-    /// Maximum number of rounds that can be skipped for a single authority when requesting missing certificates.
+    /// Maximum number of rounds that can be skipped for a single authority when requesting missing
+    /// certificates.
     pub max_skip_rounds_for_missing_certs: usize,
     /// Maximum time to spend collecting certificates from the local storage.
     pub max_cert_collection_duration: Duration,

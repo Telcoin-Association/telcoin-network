@@ -129,34 +129,6 @@ impl Header {
                 .map_err(|_| HeaderError::UnkownWorkerId)?;
         }
 
-        // // Ensure system messages are valid.
-        // let mut has_dkg_message = false;
-        // let mut has_dkg_confirmation = false;
-        // for m in self.system_messages.iter() {
-        //     match m {
-        //         SystemMessage::DkgMessage(msg) => {
-        //             if msg.sender != self.author.0 {
-        //                 return Err(DagError::InvalidSystemMessage);
-        //             }
-        //             // A header must have no more than one DkgMessage.
-        //             if has_dkg_message {
-        //                 return Err(DagError::DuplicateSystemMessage);
-        //             }
-        //             has_dkg_message = true;
-        //         }
-        //         SystemMessage::DkgConfirmation(conf) => {
-        //             if conf.sender != self.author.0 {
-        //                 return Err(DagError::InvalidSystemMessage);
-        //             }
-        //             // A header must have no more than one DkgConfirmation.
-        //             if has_dkg_confirmation {
-        //                 return Err(DagError::DuplicateSystemMessage);
-        //             }
-        //             has_dkg_confirmation = true;
-        //         }
-        //     }
-        // }
-
         Ok(())
     }
 

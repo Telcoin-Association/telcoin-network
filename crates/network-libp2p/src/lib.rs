@@ -7,7 +7,7 @@ pub mod error;
 pub mod types;
 
 // export types
-pub use codec::{TNCodec, TNMessage, MAX_GOSSIP_SIZE, MAX_REQUEST_SIZE};
+pub use codec::{TNCodec, TNMessage};
 pub use consensus::ConsensusNetwork;
 
 // re-export specific libp2p types
