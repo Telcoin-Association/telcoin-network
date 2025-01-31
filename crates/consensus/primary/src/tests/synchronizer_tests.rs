@@ -162,7 +162,7 @@ async fn accept_suspended_certificates() {
     // The certificate should not be accepted or suspended.
     match synchronizer.try_accept_certificate(cert.clone()).await {
         Ok(()) => panic!("Unexpected success!"),
-        Err(CertificateError::TooNew(_, _)) => {}
+        Err(CertificateError::TooNew(_, _, _)) => {}
         Err(e) => panic!("Unexpected error {e}!"),
     }
 }
@@ -536,7 +536,7 @@ async fn sync_batches_drops_old() {
         let _ = cb.consensus_round_updates().send(ConsensusRound::new(30, 0));
     });
     match synchronizer.sync_header_batches(&test_header, 10).await {
-        Err(HeaderError::TooOld(_, _)) => (),
+        Err(HeaderError::TooOld(_, _, _)) => (),
         result => panic!("unexpected result {result:?}"),
     }
 }

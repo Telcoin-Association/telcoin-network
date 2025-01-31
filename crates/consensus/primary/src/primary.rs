@@ -71,8 +71,6 @@ impl<DB: Database> Primary<DB> {
             .set_worker_to_primary_local_handler(Arc::new(worker_receiver_handler));
 
         let synchronizer = Arc::new(Synchronizer::new(config.clone(), consensus_bus));
-
-        // TODO: REMOVE THIS
         let network = Self::start_network(&config, synchronizer.clone(), consensus_bus);
 
         let mut peer_types = HashMap::new();
@@ -187,9 +185,6 @@ impl<DB: Database> Primary<DB> {
             self.network.clone(),
             task_manager,
         );
-
-        // // store handle to network
-        // self.network_handle = Some(network_handle);
 
         // NOTE: This log entry is used to compute performance.
         info!(

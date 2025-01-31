@@ -19,8 +19,6 @@ mod codec_tests;
 /// Convenience type for all traits implemented for messages used for TN request-response codec.
 pub trait TNMessage: Send + Serialize + DeserializeOwned + Clone + fmt::Debug + 'static {}
 
-impl TNMessage for tn_types::Certificate {}
-
 /// The Telcoin Network request/response codec for consensus messages between peers.
 ///
 /// The codec reuses pre-allocated buffers to asynchronously read messages per the libp2p [Codec]
@@ -64,7 +62,7 @@ impl<Req, Res> TNCodec<Req, Res> {
     ///
     /// This method is used to read requests and responses from peers.
     #[inline]
-    pub async fn decode_message<T, M>(&mut self, io: &mut T) -> std::io::Result<M>
+    async fn decode_message<T, M>(&mut self, io: &mut T) -> std::io::Result<M>
     where
         T: AsyncRead + Unpin + Send,
         M: TNMessage,
@@ -114,7 +112,7 @@ impl<Req, Res> TNCodec<Req, Res> {
     ///
     /// This method is used to write requests and responses from peers.
     #[inline]
-    pub async fn encode_message<T, M>(&mut self, io: &mut T, msg: M) -> std::io::Result<()>
+    async fn encode_message<T, M>(&mut self, io: &mut T, msg: M) -> std::io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
         M: TNMessage,

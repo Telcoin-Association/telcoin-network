@@ -48,8 +48,8 @@ fn test_empty_certificate_verification() {
     assert!(certificate.verify(&committee, &fixture.worker_cache()).is_err());
 }
 
-#[tokio::test]
-async fn test_valid_certificate_verification() {
+#[test]
+fn test_valid_certificate_verification() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
     let header = fixture.header_from_last_authority();

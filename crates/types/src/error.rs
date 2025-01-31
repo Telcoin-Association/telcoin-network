@@ -239,8 +239,8 @@ pub enum HeaderError {
     #[error("Storage failure: {0}")]
     Storage(#[from] StoreError),
     /// The proposed header's round is too far behind.
-    #[error("Header round {0} is too old for GC round {1}")]
-    TooOld(Round, Round),
+    #[error("Header {0} for round {1} is too old for GC round {2}")]
+    TooOld(HeaderDigest, Round, Round),
     /// The header contains a parent with an invalid aggregate BLS signature.
     #[error("Header's parent missing aggregate BLS signature")]
     ParentMissingSignature,
@@ -300,9 +300,12 @@ pub enum CertificateError {
     /// mpsc sender dropped while processig the certificate
     #[error("Failed to process certificate - TN sender error")]
     TNSend,
+    /// The certificates's round is too far behind.
+    #[error("Certificate {0} for round {1} is too old for GC round {2}")]
+    TooOld(CertificateDigest, Round, Round),
     /// The certificate is too far in the future for this node.
-    #[error("Certificate for round {0} is too new for this primary at round {1}")]
-    TooNew(Round, Round),
+    #[error("Certificate {0} for round {1} is too new for this primary at round {2}")]
+    TooNew(CertificateDigest, Round, Round),
     /// Oneshot channel dropped while processing the certificate.
     #[error("Failed to process certificate - oneshot sender error")]
     ResChannelClosed(String),
@@ -310,7 +313,7 @@ pub enum CertificateError {
     #[error("Failed to recover BlsAggregateSignatureBytes from certificate signature")]
     RecoverBlsAggregateSignatureBytes,
 
-    /// TODO: DELETE THIS - only used to debug notify and suspend
+    /// TODO: Refactor this out - only used to debug notify and suspend
     #[error("Certificate suspended: {0}")]
-    DeleteThisOne(String),
+    DebugSuspend(String),
 }

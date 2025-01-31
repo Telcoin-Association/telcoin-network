@@ -28,7 +28,6 @@ use tn_types::{
     NetworkPublicKey, Round, Vote,
 };
 use tracing::{debug, error, warn};
-mod engine;
 mod primary;
 mod worker;
 

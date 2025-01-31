@@ -405,7 +405,10 @@ where
             .primary_round_updates()
             .borrow()
             .saturating_sub(MAX_HEADER_AGE_LIMIT);
-        ensure!(limit <= header.round(), HeaderError::TooOld(header.round(), limit));
+        ensure!(
+            limit <= header.round(),
+            HeaderError::TooOld(header.digest(), header.round(), limit)
+        );
 
         // lock to ensure consistency between limit_round and where parent_digests are gc'ed
         let mut current_requests = self.requested_parents.lock();

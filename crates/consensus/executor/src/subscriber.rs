@@ -245,33 +245,6 @@ impl<DB: Database> Subscriber<DB> {
         match self.config.database().write_txn() {
             Ok(mut txn) => {
                 let header: ConsensusHeader = consensus_output.into();
-
-                let bytes = tn_types::encode(&header);
-
-                let mut total_batches = 0;
-                for c in header.sub_dag.certificates.iter() {
-                    let batches = c.header().payload().len();
-                    total_batches += batches;
-                }
-                println!(
-                    "ConsensusHeader: {:?}c - {:?}b - {:?}bytes",
-                    header.sub_dag.certificates.len(),
-                    total_batches,
-                    bytes.len()
-                );
-
-                // 8c 0b - 2330
-                //    1c = 291.25
-                // 7c 0b - 2060
-                //    1c = 294.29
-                // 8c 1b - 2405
-                //    1b = 75
-                // 7c 2b - 2082
-                //
-                //  7c  1b - 2146
-                // 14c 1b - 3801
-                //     1c = 271.5
-
                 if let Err(e) = txn.insert::<ConsensusBlocks>(&header.number, &header) {
                     tracing::error!(target: "engine", ?e, "error saving a consensus header to persistant storage!");
                     return Err(e.into());
@@ -810,3 +783,5 @@ impl<DB: Database> Subscriber<DB> {
         );
     }
 }
+
+// TODO: add a unit test
