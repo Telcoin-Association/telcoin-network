@@ -5,7 +5,6 @@ use crate::{
     certificate_fetcher::CertificateFetcher,
     certifier::Certifier,
     consensus::LeaderSchedule,
-    network::{PrimaryRequest, PrimaryResponse},
     proposer::Proposer,
     state_handler::StateHandler,
     synchronizer::Synchronizer,
@@ -31,11 +30,9 @@ use tn_network::{
     failpoints::FailpointsMakeCallbackHandler,
     metrics::MetricsMakeCallbackHandler,
 };
-use tn_network_libp2p::{types::NetworkHandle, ConsensusNetwork};
 use tn_network_types::PrimaryToPrimaryServer;
 use tn_storage::traits::Database;
 use tn_types::{traits::EncodeDecodeBase64, Multiaddr, NetworkPublicKey, TaskManager};
-use tokio::sync::mpsc;
 use tower::ServiceBuilder;
 use tracing::info;
 
@@ -46,10 +43,6 @@ pub mod primary_tests;
 pub struct Primary<DB> {
     /// The Primary's network.
     network: Network,
-    /// The handle to the primary's network, if the network has started.
-    ///
-    /// The `Option` is filled after `Self::spawn` is called.
-    network_handle: Option<NetworkHandle<PrimaryRequest, PrimaryResponse>>,
     synchronizer: Arc<Synchronizer<DB>>,
     peer_types: Option<HashMap<PeerId, String>>,
 }
@@ -120,7 +113,7 @@ impl<DB: Database> Primary<DB> {
             peer_types.insert(peer_id, "other_worker".to_string());
             info!("Adding others worker with peer id {} and address {}", peer_id, address);
         }
-        Self { network, network_handle: None, synchronizer, peer_types: Some(peer_types) }
+        Self { network, synchronizer, peer_types: Some(peer_types) }
     }
 
     /// Spawns the primary.
@@ -131,21 +124,6 @@ impl<DB: Database> Primary<DB> {
         leader_schedule: LeaderSchedule,
         task_manager: &TaskManager,
     ) {
-        // TODO: use the channel buffer constant
-        // let (event_stream, event_receiver) = mpsc::channel(10_000);
-        // let network_libp2p =
-        //     ConsensusNetwork::new_for_primary(&config, event_stream).expect("primary network");
-        // let network_handle = network_libp2p.network_handle();
-
-        // // spawn network and start listening
-        // let multiaddr = config.authority().primary_network_address().inner();
-        // let handle = network_handle.clone();
-        // task_manager.spawn_task("primary-network", async move {
-        //     let _ = network_libp2p.run();
-        //     // TODO: fix this type - only temp - DO NOT MERGE
-        //     // handle.start_listening(multiaddr).await.expect("network listening");
-        // });
-
         if consensus_bus.node_mode().borrow().is_active_cvv() {
             self.synchronizer.spawn(task_manager);
         }

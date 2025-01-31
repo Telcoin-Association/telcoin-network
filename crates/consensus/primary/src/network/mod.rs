@@ -3,14 +3,17 @@
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
 
+use crate::{synchronizer::Synchronizer, ConsensusBus};
 use handler::RequestHandler;
 pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
+use std::sync::Arc;
+use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     types::{IntoResponse as _, NetworkEvent, NetworkHandle},
     PeerId, ResponseChannel,
 };
 use tn_storage::traits::Database;
-use tn_types::{BlockHash, Certificate, Header};
+use tn_types::{BlockHash, Certificate, Header, Noticer};
 use tokio::sync::mpsc;
 mod handler;
 mod message;
@@ -32,6 +35,8 @@ pub struct PrimaryNetwork<DB> {
     network_handle: NetworkHandle<Req, Res>,
     /// Request handler to process requests and return responses.
     request_handler: RequestHandler<DB>,
+    /// Shutdown notification.
+    shutdown_rx: Noticer,
 }
 
 impl<DB> PrimaryNetwork<DB>
@@ -42,20 +47,26 @@ where
     pub(crate) fn new(
         network_events: mpsc::Receiver<NetworkEvent<Req, Res>>,
         network_handle: NetworkHandle<Req, Res>,
-        request_handler: RequestHandler<DB>,
+        consensus_config: ConsensusConfig<DB>,
+        consensus_bus: ConsensusBus,
+        synchronizer: Arc<Synchronizer<DB>>,
     ) -> Self {
-        Self { network_events, network_handle, request_handler }
+        let shutdown_rx = consensus_config.shutdown().subscribe();
+        let request_handler = RequestHandler::new(consensus_config, consensus_bus, synchronizer);
+        Self { network_events, network_handle, request_handler, shutdown_rx }
     }
 
     /// Run the network.
     async fn spawn(mut self) {
-        tokio::select! {
-            event = self.network_events.recv() => {
-                match event {
-                    Some(e) => self.process_network_event(e),
-                    None => todo!(),
+        loop {
+            tokio::select! {
+                event = self.network_events.recv() => {
+                    match event {
+                        Some(e) => self.process_network_event(e),
+                        None => todo!(),
+                    }
                 }
-                // notify shutdown
+                _ = &self.shutdown_rx => break,
             }
         }
     }
@@ -146,6 +157,7 @@ where
         let network_handle = self.network_handle.clone();
         tokio::spawn(async move {
             if let Err(e) = request_handler.process_gossip(msg).await {
+                // TODO: this doesn't do anything yet
                 // network_handle.set_application_score(peer_id, new_score).await;
                 //
                 //

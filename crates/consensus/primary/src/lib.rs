@@ -2,6 +2,8 @@
 //! Primary actors
 
 #![warn(future_incompatible, nonstandard_style, rust_2018_idioms, rust_2021_compatibility)]
+// TEMPORARY UNTIL LIBP2P INTEGRATED
+#![allow(dead_code)]
 
 mod aggregators;
 mod anemo_network;

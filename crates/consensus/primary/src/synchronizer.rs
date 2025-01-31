@@ -488,7 +488,7 @@ impl<DB: Database> Inner<DB> {
             if early_suspend {
                 // Re-check if the certificate has been suspended, which can happen before the lock
                 // is acquired.
-                if let Some(notify) = state.check_suspended(&digest) {
+                if let Some(_notify) = state.check_suspended(&digest) {
                     trace!(target: "primary::synchronizer", "Certificate {digest:?} is still suspended. Skip processing.");
                     self.consensus_bus
                         .primary_metrics()
@@ -517,7 +517,7 @@ impl<DB: Database> Inner<DB> {
                     // There is no upper round limit to suspended certificates. Currently there is
                     // no memory usage issue and this will speed up catching up.
                     // But we can revisit later.
-                    let notify = state.insert(certificate, missing_parents, !early_suspend);
+                    let _notify = state.insert(certificate, missing_parents, !early_suspend);
                     self.consensus_bus
                         .primary_metrics()
                         .node_metrics
@@ -926,7 +926,7 @@ impl<DB: Database> Synchronizer<DB> {
             // }
             // TODO: double check this
             Err(e) => {
-                error!(target: "primary::synchronizer", ?authority, ?certificate, "failed to process certificate internally - PANIC");
+                error!(target: "primary::synchronizer",?e, ?authority, ?certificate, "failed to process certificate internally - PANIC");
                 return Err(DagError::ShuttingDown);
             }
         };
