@@ -67,7 +67,7 @@ where
                 &config.node_storage().certificate_store,
                 *origin,
                 lower_bound,
-                &rounds,
+                rounds,
             )? {
                 debug!(target: "cert-collector", ?next_round, ?origin, "found next round!");
                 fetch_queue.push(Reverse((next_round, *origin)));

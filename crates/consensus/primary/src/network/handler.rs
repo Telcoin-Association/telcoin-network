@@ -482,10 +482,10 @@ where
 
         // validates request is within limits
         let mut collector =
-            CertificateCollector::new(request.into(), self.consensus_config.clone())?;
+            CertificateCollector::new(request, self.consensus_config.clone())?;
 
         // Collect certificates from the stream
-        while let Some(cert) = collector.next() {
+        for cert in collector.by_ref() {
             missing.push(cert?);
 
             // yield occassionally to allow the request handler shutdown during network timeout

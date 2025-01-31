@@ -166,7 +166,7 @@ async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
     assert_eq!(count, 0);
 
     // send request and wait for response
-    let _ = peer1.send_request(batch_req.clone(), peer2_id).await?;
+    let _reply = peer1.send_request(batch_req.clone(), peer2_id).await?;
 
     // peer1 has a pending_request now
     let count = peer1.get_pending_request_count().await?;

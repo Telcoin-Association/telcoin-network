@@ -296,11 +296,7 @@ where
                     // disconnect after a request is made and the PeerId is lost.
                     self.pending_requests.retain(
                         |_, sender| {
-                            if sender.is_closed() {
-                                false
-                            } else {
-                                true
-                            }
+                            !sender.is_closed()
                         },
                     );
 

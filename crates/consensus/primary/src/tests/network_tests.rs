@@ -185,7 +185,7 @@ async fn test_vote_fails_invalid_genesis_parent() -> eyre::Result<()> {
     let mut expected_parents: Vec<_> =
         Certificate::genesis(&committee.committee()).iter().map(|x| x.digest()).collect();
     let extra_parent = CertificateDigest::new(BlockHash::random().0);
-    expected_parents.push(extra_parent.clone());
+    expected_parents.push(extra_parent);
     let wrong_genesis: BTreeSet<_> = expected_parents.into_iter().collect();
 
     // create header proposed by last peer in the committee for round 1

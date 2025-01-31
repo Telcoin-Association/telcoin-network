@@ -102,11 +102,11 @@ fn test_certificate_iterator() {
 
         // collect from database
         let mut missing = Vec::with_capacity(req.max_items);
-        let mut collector = CertificateCollector::new(req, consensus_config.clone())
+        let collector = CertificateCollector::new(req, consensus_config.clone())
             .expect("certificate collector process valid request");
 
         // Collect certificates from iterator
-        while let Some(certs) = collector.next() {
+        for certs in collector {
             missing.push(certs.expect("cert recovered correctly"));
         }
 

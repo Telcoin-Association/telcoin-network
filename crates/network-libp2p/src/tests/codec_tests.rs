@@ -1,6 +1,5 @@
 //! TNCodec tests used by the consensus network libp2p req/res protocol.
 
-mod common;
 use super::*;
 use common::{TestPrimaryRequest, TestPrimaryResponse};
 use tn_types::{Certificate, CertificateDigest, Header};
