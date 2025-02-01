@@ -253,7 +253,8 @@ impl ConsensusRound {
         Self { committed_round, gc_round: atomic_gc_round }
     }
 
-    /// Calculates the latest CommittedRound by providing a new committed round and the gc_depth by comparing the existing committed round against the new.
+    /// Calculates the latest CommittedRound by providing a new committed round and the gc_depth by
+    /// comparing the existing committed round against the new.
     fn update(&mut self, new_committed_round: Round, gc_depth: Round) {
         let last_committed_round = max(self.committed_round, new_committed_round);
         let last_gc_round = gc_round(last_committed_round, gc_depth);
