@@ -93,6 +93,11 @@ pub struct SyncConfig {
     pub max_skip_rounds_for_missing_certs: usize,
     /// Maximum time to spend collecting certificates from the local storage.
     pub max_cert_collection_duration: Duration,
+    /// Maximum duration for a round to update before the GC requests certificates from peers.
+    ///
+    /// On the happy path, this duration should never be reached. It is a safety measure for the node
+    /// to try and recover after enough parents weren't received for a round within time.
+    pub max_consenus_round_timeout: Duration,
 }
 
 impl Default for SyncConfig {
@@ -100,6 +105,7 @@ impl Default for SyncConfig {
         Self {
             max_skip_rounds_for_missing_certs: 1000,
             max_cert_collection_duration: Duration::from_secs(10),
+            max_consenus_round_timeout: Duration::from_secs(30),
         }
     }
 }

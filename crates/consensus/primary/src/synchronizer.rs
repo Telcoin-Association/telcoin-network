@@ -70,9 +70,9 @@ struct Inner<DB> {
     /// age is sent over.
     tx_batch_tasks: MeteredMpscChannel<(Header, Round)>,
     /// Aggregates certificates to use as parents for new headers.
-    certificates_aggregators: Mutex<BTreeMap<Round, Box<CertificatesAggregator>>>,
+    certificates_aggregators: Arc<Mutex<BTreeMap<Round, Box<CertificatesAggregator>>>>,
     /// State for tracking suspended certificates and when they can be accepted.
-    state: tokio::sync::Mutex<State>,
+    state: Arc<tokio::sync::Mutex<State>>,
 }
 
 impl<DB: Database> Inner<DB> {
@@ -716,8 +716,8 @@ impl<DB: Database> Synchronizer<DB> {
             consensus_bus: consensus_bus.clone(),
             genesis,
             tx_batch_tasks,
-            certificates_aggregators: Mutex::new(BTreeMap::new()),
-            state: tokio::sync::Mutex::new(State::default()),
+            certificates_aggregators: Arc::new(Mutex::new(BTreeMap::new())),
+            state: Arc::new(tokio::sync::Mutex::new(State::default())),
         });
 
         Self { inner }

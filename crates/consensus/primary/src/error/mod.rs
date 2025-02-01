@@ -4,3 +4,5 @@ mod proposer;
 pub(crate) use proposer::{ProposerError, ProposerResult};
 mod network;
 pub(crate) use network::{PrimaryNetworkError, PrimaryNetworkResult};
+mod gc;
+pub(crate) use gc::{GarbageCollectorError, GarbageCollectorResult};

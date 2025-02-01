@@ -11,6 +11,7 @@ mod certificate_fetcher;
 mod certifier;
 pub mod consensus;
 mod error;
+mod gc;
 mod network;
 mod primary;
 mod proposer;

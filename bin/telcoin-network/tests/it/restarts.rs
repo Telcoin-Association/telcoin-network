@@ -227,6 +227,7 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
 /// Test a restart case with a short delay, the stopped node should rejoin consensus.
 #[test]
 fn test_restartstt() -> eyre::Result<()> {
+    tn_test_utils::init_test_tracing();
     do_restarts(2)
 }
 
@@ -448,6 +449,7 @@ fn call_rpc(
     params: Option<&RawValue>,
     retries: usize,
 ) -> eyre::Result<String> {
+    tracing::debug!(target: "restart-test", ?node, ?command, "call rpc");
     match jsonrpc::simple_http::SimpleHttpTransport::builder().url(node) {
         Ok(trans) => {
             let client = jsonrpc::Client::with_transport(trans.build());
