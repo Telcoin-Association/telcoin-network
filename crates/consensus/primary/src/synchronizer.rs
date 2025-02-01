@@ -54,8 +54,6 @@ const NEW_CERTIFICATE_ROUND_LIMIT: Round = 1000;
 struct Inner<DB> {
     /// Node config.
     consensus_config: ConsensusConfig<DB>,
-    /// Highest round that has been GC'ed.
-    gc_round: AtomicU32,
     /// Highest round of certificate accepted into the certificate store.
     highest_processed_round: AtomicU32,
     /// Highest round of verfied certificate that has been received.
@@ -81,7 +79,7 @@ impl<DB: Database> Inner<DB> {
     /// Checks if the certificate is valid and can potentially be accepted into the DAG.
     fn sanitize_certificate(&self, certificate: Certificate) -> CertificateResult<Certificate> {
         // Ok to drop old certificate, because it will never be included into the consensus dag.
-        let gc_round = self.gc_round.load(Ordering::Acquire);
+        let gc_round = self.consensus_bus.atomic_gc_round();
         ensure!(
             gc_round < certificate.round(),
             CertificateError::TooOld(certificate.digest(), certificate.round(), gc_round)
@@ -137,7 +135,7 @@ impl<DB: Database> Inner<DB> {
 
         // Validate that certificates are accepted in causal order.
         // This should be relatively cheap because of certificate store caching.
-        if certificate.round() > self.gc_round.load(Ordering::Acquire) + 1 {
+        if certificate.round() > self.consensus_bus.atomic_gc_round() + 1 {
             let existence = self
                 .consensus_config
                 .node_storage()
@@ -325,9 +323,7 @@ impl<DB: Database> Inner<DB> {
             }
 
             let _scope = monitored_scope("Synchronizer::gc_iteration");
-            let gc_round = rx_consensus_round_updates.borrow().gc_round;
-            // this is the only task updating gc_round
-            self.gc_round.store(gc_round, Ordering::Release);
+            let gc_round = rx_consensus_round_updates.borrow().gc_round.load();
             self.certificates_aggregators.lock().retain(|k, _| k > &gc_round);
             // Accept certificates at and below gc round, if there is any.
             let mut state = self.state.lock().await;
@@ -504,7 +500,7 @@ impl<DB: Database> Inner<DB> {
             // Ensure either we have all the ancestors of this certificate, or the parents have been
             // garbage collected. If we don't, the synchronizer will start fetching
             // missing certificates.
-            if certificate.round() > self.gc_round.load(Ordering::Acquire) + 1 {
+            if certificate.round() > self.consensus_bus.atomic_gc_round() + 1 {
                 let missing_parents = self.get_missing_parents(&certificate).await?;
                 if !missing_parents.is_empty() {
                     debug!("Processing certificate {:?} suspended: missing ancestors", certificate);
@@ -701,7 +697,6 @@ impl<DB: Database> Synchronizer<DB> {
         let genesis = Self::make_genesis(committee);
         let node_store = consensus_config.node_storage();
         let highest_processed_round = node_store.certificate_store.highest_round_number();
-        let gc_round = consensus_bus.consensus_round_updates().borrow().gc_round;
         let tx_certificate_acceptor = channel_with_total_sender(
             CHANNEL_CAPACITY,
             &primary_channel_metrics.tx_certificate_acceptor,
@@ -716,7 +711,6 @@ impl<DB: Database> Synchronizer<DB> {
 
         let inner = Arc::new(Inner {
             consensus_config,
-            gc_round: AtomicU32::new(gc_round),
             highest_processed_round: AtomicU32::new(highest_processed_round),
             highest_received_round: AtomicU32::new(0),
             tx_certificate_acceptor,

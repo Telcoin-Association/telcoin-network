@@ -10,7 +10,7 @@ use std::{
     cmp::{max, Ordering},
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Debug,
-    sync::Arc,
+    sync::{atomic::AtomicU32, Arc},
 };
 use tn_config::ConsensusConfig;
 use tn_storage::{traits::Database, CertificateStore};
@@ -72,7 +72,7 @@ impl ConsensusState {
         let dag = Self::construct_dag_from_cert_store(
             &cert_store,
             &recovered_last_committed,
-            last_round.gc_round,
+            last_round.gc_round.load(),
         )
         .expect("error when recovering DAG from store");
         metrics.recovered_consensus_state.inc();
@@ -127,7 +127,7 @@ impl ConsensusState {
         Self::try_insert_in_dag(
             &mut self.dag,
             &self.last_committed,
-            self.last_round.gc_round,
+            self.last_round.gc_round.load(),
             certificate,
             true,
         )
@@ -178,7 +178,7 @@ impl ConsensusState {
             .entry(certificate.origin())
             .and_modify(|r| *r = max(*r, certificate.round()))
             .or_insert_with(|| certificate.round());
-        self.last_round = self.last_round.update(certificate.round(), self.gc_depth);
+        self.last_round.update(certificate.round(), self.gc_depth);
 
         self.metrics
             .last_committed_round
@@ -198,7 +198,7 @@ impl ConsensusState {
         );
 
         // Purge all certificates past the gc depth.
-        self.dag.retain(|r, _| *r > self.last_round.gc_round);
+        self.dag.retain(|r, _| *r > self.last_round.gc_round.load());
     }
 
     // Checks that the provided certificate's parents exist return an error if they do not.
@@ -234,31 +234,76 @@ impl ConsensusState {
 /// When a certificate gets committed then
 /// the corresponding certificate's round is considered a "committed" round. It bears both the
 /// committed round and the corresponding garbage collection round.
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct ConsensusRound {
     pub committed_round: Round,
-    pub gc_round: Round,
+    pub gc_round: AtomicRound,
 }
 
 impl ConsensusRound {
     pub fn new(committed_round: Round, gc_round: Round) -> Self {
-        Self { committed_round, gc_round }
+        let atomic_gc_round = AtomicRound::new(gc_round);
+        Self { committed_round, gc_round: atomic_gc_round }
     }
 
     pub fn new_with_gc_depth(committed_round: Round, gc_depth: Round) -> Self {
         let gc_round = gc_round(committed_round, gc_depth);
+        let atomic_gc_round = AtomicRound::new(gc_round);
 
-        Self { committed_round, gc_round }
+        Self { committed_round, gc_round: atomic_gc_round }
     }
 
-    /// Calculates the latest CommittedRound by providing a new committed round and the gc_depth.
-    /// The method will compare against the existing committed round and return
-    /// the updated instance.
-    fn update(&self, new_committed_round: Round, gc_depth: Round) -> Self {
+    /// Calculates the latest CommittedRound by providing a new committed round and the gc_depth by comparing the existing committed round against the new.
+    fn update(&mut self, new_committed_round: Round, gc_depth: Round) {
         let last_committed_round = max(self.committed_round, new_committed_round);
         let last_gc_round = gc_round(last_committed_round, gc_depth);
 
-        ConsensusRound { committed_round: last_committed_round, gc_round: last_gc_round }
+        // update self
+        self.committed_round = last_committed_round;
+        self.gc_round.store(last_gc_round);
+    }
+}
+
+/// Holds the atomic gc round for the node.
+#[derive(Clone)]
+pub struct AtomicRound {
+    /// The inner type.
+    inner: Arc<InnerAtomicRound>,
+}
+
+/// The inner type for [AtomicRound]
+struct InnerAtomicRound {
+    /// The atomic gc round.
+    atomic: AtomicU32,
+}
+
+impl AtomicRound {
+    /// Create a new instance of Self.
+    pub fn new(num: u32) -> Self {
+        Self { inner: Arc::new(InnerAtomicRound { atomic: AtomicU32::new(num) }) }
+    }
+
+    /// Store the new gc round.
+    ///
+    /// Only [ConsensusRound] can call this.
+    fn store(&mut self, new: u32) {
+        self.inner.atomic.store(new, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Load the gc round.
+    pub fn load(&self) -> u32 {
+        self.inner.atomic.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl std::fmt::Debug for AtomicRound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.inner.atomic)
+    }
+}
+impl std::default::Default for AtomicRound {
+    fn default() -> Self {
+        Self { inner: Arc::new(InnerAtomicRound { atomic: AtomicU32::new(0) }) }
     }
 }
 
@@ -324,7 +369,7 @@ impl<DB: Database> Consensus<DB> {
 
         consensus_bus
             .consensus_round_updates()
-            .send(state.last_round)
+            .send(state.last_round.clone())
             .expect("Failed to send last_committed_round on initialization!");
 
         let s = Self {
@@ -445,7 +490,7 @@ impl<DB: Database> Consensus<DB> {
 
                 self.consensus_bus
                     .consensus_round_updates()
-                    .send(self.state.last_round)
+                    .send(self.state.last_round.clone())
                     .map_err(|_| ConsensusError::ShuttingDown)?;
             }
 

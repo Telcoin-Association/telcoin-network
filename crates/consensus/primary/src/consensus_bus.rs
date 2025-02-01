@@ -282,6 +282,11 @@ impl ConsensusBus {
         &self.inner.tx_consensus_round_updates
     }
 
+    /// Load the atomic GC round for consensus.
+    pub fn atomic_gc_round(&self) -> u32 {
+        self.consensus_round_updates().borrow().gc_round.load()
+    }
+
     /// Signals a new round
     pub fn primary_round_updates(&self) -> &watch::Sender<Round> {
         &self.inner.tx_primary_round_updates
