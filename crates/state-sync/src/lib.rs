@@ -42,7 +42,7 @@ pub async fn can_cvv<DB: Database>(
     // TODO- replace 0 with the epoch once we have them..
     let last_consensus_epoch = last_executed_block.sub_dag.leader.epoch();
     let last_consensus_round = last_executed_block.sub_dag.leader_round();
-    let _ = consensus_bus.consensus_round_updates().send(ConsensusRound::new_with_gc_depth(
+    let _ = consensus_bus.update_consensus_rounds(ConsensusRound::new_with_gc_depth(
         last_consensus_round,
         config.parameters().gc_depth,
     ));

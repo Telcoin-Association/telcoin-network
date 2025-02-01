@@ -831,7 +831,7 @@ async fn committed_round_after_restart() {
         // and the expected commit round after sending in certificates up to `input_round` would
         // be 2 * r.
 
-        let last_committed_round = cb.consensus_round_updates().borrow().committed_round as usize;
+        let last_committed_round = *cb.committed_round_updates().borrow() as usize;
         assert_eq!(last_committed_round, input_round.saturating_sub(3));
         info!("Consensus started at last_committed_round={last_committed_round}");
 
@@ -855,10 +855,7 @@ async fn committed_round_after_restart() {
 
         // After sending inputs up to round 2 * r + 1 to consensus, round 2 * r should have been
         // committed.
-        assert_eq!(
-            cb.consensus_round_updates().borrow().committed_round as usize,
-            input_round.saturating_sub(1),
-        );
+        assert_eq!(*cb.committed_round_updates().borrow() as usize, input_round.saturating_sub(1),);
         info!("Committed round adanced to {}", input_round.saturating_sub(1));
 
         // Shutdown consensus and wait for it to stop.

@@ -369,8 +369,7 @@ impl<DB: Database> Consensus<DB> {
         );
 
         consensus_bus
-            .consensus_round_updates()
-            .send(state.last_round.clone())
+            .update_consensus_rounds(state.last_round.clone())
             .expect("Failed to send last_committed_round on initialization!");
 
         let s = Self {
@@ -490,8 +489,7 @@ impl<DB: Database> Consensus<DB> {
                 assert_eq!(self.state.last_round.committed_round, leader_commit_round);
 
                 self.consensus_bus
-                    .consensus_round_updates()
-                    .send(self.state.last_round.clone())
+                    .update_consensus_rounds(self.state.last_round.clone())
                     .map_err(|_| ConsensusError::ShuttingDown)?;
             }
 
