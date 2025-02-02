@@ -102,6 +102,10 @@ pub struct PrimaryChannelMetrics {
     pub tx_certificate_acceptor: IntGauge,
     /// Occupancy of the channel synchronizing batches for provided headers & certificates.
     pub tx_batch_tasks: IntGauge,
+    /// Occupancy of the channel to manage pending certificates with missing parents.
+    pub tx_pending_cert_commands: IntGauge,
+    /// Number of verified certificates sent to acceptor.
+    pub tx_verified_certificates: IntGauge,
 
     // totals
     /// total received on channel from the `primary::WorkerReceiverHandler` to the
@@ -133,6 +137,8 @@ pub struct PrimaryChannelMetrics {
     pub tx_certificate_acceptor_total: IntCounter,
     /// Total received the channel to synchronize missing batches
     pub tx_batch_tasks_total: IntCounter,
+    /// Total received by the channel to manage pending certificates with missing parents.
+    pub tx_pending_cert_commands_total: IntCounter,
 }
 
 impl PrimaryChannelMetrics {
@@ -216,6 +222,17 @@ impl PrimaryChannelMetrics {
                 "Occupancy of the channel synchronizing batches for provided headers & certificates",
                 registry
             )?,
+            tx_pending_cert_commands: register_int_gauge_with_registry!(
+                "tx_pending_cert_commands",
+                "occupancy of the channel managing pending certificates with missing parents",
+                registry
+            )?,
+            tx_verified_certificates: register_int_gauge_with_registry!(
+                "tx_verified_certs",
+                "total of the channel sending verified certificates to be written to storage",
+                registry
+            )?,
+
 
             // totals
             tx_others_digests_total: register_int_counter_with_registry!(
@@ -276,6 +293,11 @@ impl PrimaryChannelMetrics {
             tx_batch_tasks_total: register_int_counter_with_registry!(
                 "tx_batch_tasks_total",
                 "total received on the channel synchronizing batches for provided headers & certificates",
+                registry
+            )?,
+            tx_pending_cert_commands_total: register_int_counter_with_registry!(
+                "tx_pending_cert_commands_total",
+                "total received on the channel managing pending certificates with missing parents",
                 registry
             )?,
         })

@@ -390,7 +390,7 @@ where
 
     /// Helper method to retrieve parents for header.
     ///
-    /// Certificates are considered "known" if they are in local storage, suspended, or already
+    /// Certificates are considered "known" if they are in local storage, pending, or already
     /// requested from a peer.
     async fn check_for_missing_parents(
         &self,

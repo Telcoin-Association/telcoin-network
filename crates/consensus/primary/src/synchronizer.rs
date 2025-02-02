@@ -50,6 +50,10 @@ pub mod synchronizer_tests;
 /// 330MB.
 const NEW_CERTIFICATE_ROUND_LIMIT: Round = 1000;
 
+/// Convenience type for channels that process new unverified certificates.
+pub(crate) type VerifiedCertificatesMessage =
+    (Vec<Certificate>, oneshot::Sender<CertificateResult<()>>, bool);
+
 struct Inner<DB> {
     /// Node config.
     consensus_config: ConsensusConfig<DB>,
@@ -62,8 +66,7 @@ struct Inner<DB> {
     /// Send certificates to be accepted into a separate task that runs
     /// `process_certificates_with_lock()` in a loop.
     /// See comment above `process_certificates_with_lock()` for why this is necessary.
-    tx_certificate_acceptor:
-        MeteredMpscChannel<(Vec<Certificate>, oneshot::Sender<CertificateResult<()>>, bool)>,
+    tx_certificate_acceptor: MeteredMpscChannel<VerifiedCertificatesMessage>,
     consensus_bus: ConsensusBus,
     /// Genesis digests and contents.
     genesis: HashMap<CertificateDigest, Certificate>,
@@ -235,17 +238,16 @@ impl<DB: Database> Inner<DB> {
     async fn get_missing_parents(
         &self,
         certificate: &Certificate,
-    ) -> CertificateResult<Vec<CertificateDigest>> {
+    ) -> CertificateResult<HashSet<CertificateDigest>> {
         let _scope = monitored_scope("Synchronizer::get_missing_parents");
 
-        let mut result = Vec::new();
         if certificate.round() == 1 {
             for digest in certificate.header().parents() {
                 if !self.genesis.contains_key(digest) {
                     return Err(CertificateError::from(HeaderError::InvalidGenesisParent(*digest)));
                 }
             }
-            return Ok(result);
+            return Ok(HashSet::with_capacity(0));
         }
 
         let existence = self
@@ -253,19 +255,24 @@ impl<DB: Database> Inner<DB> {
             .node_storage()
             .certificate_store
             .multi_contains(certificate.header().parents().iter())?;
-        for (digest, exists) in certificate.header().parents().iter().zip(existence.iter()) {
-            if !*exists {
-                result.push(*digest);
-            }
-        }
-        if !result.is_empty() {
+
+        let missing_parents: HashSet<_> = certificate
+            .header()
+            .parents()
+            .iter()
+            .zip(existence.iter())
+            .filter(|(_, exists)| !*exists)
+            .map(|(digest, _)| *digest)
+            .collect();
+
+        if !missing_parents.is_empty() {
             self.consensus_bus
                 .certificate_fetcher()
                 .send(CertificateFetcherCommand::Ancestors(certificate.clone()))
-                .await
-                .map_err(|_| CertificateError::TNSend)?;
+                .await?;
         }
-        Ok(result)
+
+        Ok(missing_parents)
     }
 
     #[cfg(test)]
@@ -500,6 +507,7 @@ impl<DB: Database> Inner<DB> {
                     // no memory usage issue and this will speed up catching up.
                     // But we can revisit later.
                     let _notify = state.insert(certificate, missing_parents, !early_suspend);
+
                     self.consensus_bus
                         .primary_metrics()
                         .node_metrics
@@ -1121,12 +1129,7 @@ impl<DB: Database> Synchronizer<DB> {
         // This allows the proposer not to fire proposals at rounds strictly below the certificate
         // we witnessed.
         let minimal_round_for_parents = certificate.round().saturating_sub(1);
-        self.inner
-            .consensus_bus
-            .parents()
-            .send((vec![], minimal_round_for_parents))
-            .await
-            .map_err(|_| CertificateError::TNSend)?;
+        self.inner.consensus_bus.parents().send((vec![], minimal_round_for_parents)).await?;
 
         // Instruct workers to download any missing batches referenced in this certificate.
         // Since this header got certified, we are sure that all the data it refers to (ie. its
@@ -1134,11 +1137,7 @@ impl<DB: Database> Synchronizer<DB> {
         // the certificate without blocking on block synchronization.
         let header = certificate.header().clone();
         let max_age = self.inner.consensus_config.parameters().gc_depth.saturating_sub(1);
-        self.inner
-            .tx_batch_tasks
-            .send((header.clone(), max_age))
-            .await
-            .map_err(|_| CertificateError::TNSend)?;
+        self.inner.tx_batch_tasks.send((header.clone(), max_age)).await?;
 
         let highest_processed_round = self.inner.highest_processed_round.load(Ordering::Acquire);
         if highest_processed_round + NEW_CERTIFICATE_ROUND_LIMIT < certificate.round() {
@@ -1146,8 +1145,7 @@ impl<DB: Database> Synchronizer<DB> {
                 .consensus_bus
                 .certificate_fetcher()
                 .send(CertificateFetcherCommand::Ancestors(certificate.clone()))
-                .await
-                .map_err(|_| CertificateError::TNSend)?;
+                .await?;
 
             error!(target: "primary::synchronizer", "processed certificate that is too new");
 
@@ -1159,11 +1157,7 @@ impl<DB: Database> Synchronizer<DB> {
         }
 
         let (sender, res) = oneshot::channel();
-        self.inner
-            .tx_certificate_acceptor
-            .send((vec![certificate], sender, external))
-            .await
-            .map_err(|_| CertificateError::TNSend)?;
+        self.inner.tx_certificate_acceptor.send((vec![certificate], sender, external)).await?;
 
         res.await.map_err(|e| CertificateError::ResChannelClosed(e.to_string()))??;
         Ok(())
@@ -1225,7 +1219,7 @@ impl<DB: Database> Synchronizer<DB> {
     pub(crate) async fn get_missing_parents(
         &self,
         certificate: &Certificate,
-    ) -> DagResult<Vec<CertificateDigest>> {
+    ) -> DagResult<HashSet<CertificateDigest>> {
         self.inner.get_missing_parents(certificate).await.map_err(Into::into)
     }
 
@@ -1266,8 +1260,11 @@ impl Drop for SuspendedCertificate {
 ///
 /// Synchronizer should access this struct via its methods, to avoid making inconsistent changes.
 #[derive(Default)]
+
 struct State {
     // Maps digests of suspended certificates to details including the certificate itself.
+    //
+    /// Tried to accept a certificate that was received from a peer, but this node is missing the certificate's parents.
     suspended: HashMap<CertificateDigest, SuspendedCertificate>,
     // Maps digests of certificates that are not yet in the DAG, to digests of certificates that
     // include them as parents. Keys are prefixed by round number to allow GC.
@@ -1287,18 +1284,17 @@ impl State {
     fn insert(
         &mut self,
         certificate: Certificate,
-        missing_parents: Vec<CertificateDigest>,
+        missing_parents: HashSet<CertificateDigest>,
         allow_reinsert: bool,
     ) -> AcceptNotification {
         let digest = certificate.digest();
         let missing_round = certificate.round() - 1;
-        let missing_parents_map: HashSet<_> = missing_parents.iter().cloned().collect();
         if allow_reinsert {
             if let Some(suspended_cert) = self.suspended.get(&digest) {
                 assert_eq!(
-                    suspended_cert.missing_parents, missing_parents_map,
+                    suspended_cert.missing_parents, missing_parents,
                     "Inconsistent missing parents! {:?} vs {:?}",
-                    suspended_cert.missing_parents, missing_parents_map
+                    suspended_cert.missing_parents, missing_parents
                 );
                 return suspended_cert.notify.clone();
             }
@@ -1310,8 +1306,8 @@ impl State {
                 digest,
                 SuspendedCertificate {
                     certificate,
-                    missing_parents: missing_parents_map,
-                    notify: notify.clone(),
+                    missing_parents: missing_parents.clone(),
+                    notify: notify.clone()
                 }
             )
             .is_none());

@@ -1,23 +1,38 @@
-//! Synchronize state between primaries.
-//!
-//! This module primarily deals with Certificate synchronization.
+//! Collect certificates from storage for peers who are missing them.
 
 use crate::{
+    aggregators::CertificatesAggregatorManager,
+    certificate_fetcher::CertificateFetcherCommand,
     error::{PrimaryNetworkError, PrimaryNetworkResult},
     network::MissingCertificatesRequest,
+    ConsensusBus,
 };
+use consensus_metrics::monitored_scope;
+use fastcrypto::hash::Hash as _;
+use futures::FutureExt;
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BTreeSet, BinaryHeap},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque},
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
 };
 use tn_config::ConsensusConfig;
 use tn_storage::{traits::Database, CertificateStore};
-use tn_types::{AuthorityIdentifier, Certificate, Round};
+use tn_types::{
+    error::{AcceptNotification, CertificateError, CertificateResult, HeaderError},
+    AuthorityIdentifier, Certificate, CertificateDigest, Noticer, Round, TnReceiver, TnSender as _,
+};
+use tn_utils::sync::notify_once::NotifyOnce;
 use tokio::time::Instant;
-use tracing::{debug, warn};
+use tracing::{debug, error, trace, warn};
 
 #[cfg(test)]
-#[path = "tests/state_sync_tests.rs"]
+#[path = "../tests/cert_collector_tests.rs"]
 pub mod state_sync_tests;
 
 /// Time-bounded iterator to retrieve certificates from the database.

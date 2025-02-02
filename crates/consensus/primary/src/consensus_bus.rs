@@ -4,18 +4,19 @@
 
 use crate::{
     certificate_fetcher::CertificateFetcherCommand, consensus::ConsensusRound,
-    proposer::OurDigestMessage, RecentBlocks,
+    proposer::OurDigestMessage, state_sync::PendingCertCommand,
+    synchronizer::VerifiedCertificatesMessage, RecentBlocks,
 };
 use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
 use std::sync::{atomic::AtomicBool, Arc};
 use tn_config::Parameters;
 use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
 use tn_types::{
-    Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, Header, Round, TnSender,
-    CHANNEL_CAPACITY,
+    error::CertificateResult, Certificate, CertificateDigest, CommittedSubDag, ConsensusHeader,
+    ConsensusOutput, Header, Round, TnSender, CHANNEL_CAPACITY,
 };
 use tokio::sync::{
-    broadcast,
+    broadcast, oneshot,
     watch::{self},
 };
 
@@ -87,6 +88,19 @@ struct ConsensusBusInner {
 
     /// Outputs the sequence of ordered certificates to the application layer.
     sequence: MeteredMpscChannel<CommittedSubDag>,
+
+    /// Commands to the `PendingCertificateManager` that tracks pending certificates and their missing parents.
+    pending_cert_commands: MeteredMpscChannel<PendingCertCommand>,
+    /// Process new certificates.
+    accept_verified_certificates: MeteredMpscChannel<VerifiedCertificatesMessage>,
+    /// Synchronize missing batches.
+    sync_missing_batches: MeteredMpscChannel<(Header, Round)>,
+    /// Store verified certificates
+    verified_certificates: MeteredMpscChannel<(
+        Certificate,
+        CertificateDigest,
+        oneshot::Sender<CertificateResult<()>>,
+    )>,
 
     /// Signals a new round
     tx_primary_round_updates: watch::Sender<Round>,
@@ -206,6 +220,29 @@ impl ConsensusBus {
             &primary_metrics.primary_channel_metrics.tx_committed_own_headers_total,
         );
 
+        let pending_cert_commands = channel_with_total_sender(
+            CHANNEL_CAPACITY,
+            &primary_metrics.primary_channel_metrics.tx_pending_cert_commands,
+            &primary_metrics.primary_channel_metrics.tx_pending_cert_commands_total,
+        );
+
+        let accept_verified_certificates = channel_with_total_sender(
+            CHANNEL_CAPACITY,
+            &primary_metrics.primary_channel_metrics.tx_certificate_acceptor,
+            &primary_metrics.primary_channel_metrics.tx_certificate_acceptor_total,
+        );
+
+        let sync_missing_batches = channel_with_total_sender(
+            CHANNEL_CAPACITY,
+            &primary_metrics.primary_channel_metrics.tx_batch_tasks,
+            &primary_metrics.primary_channel_metrics.tx_batch_tasks_total,
+        );
+
+        let verified_certificates = metered_channel::channel_sender(
+            CHANNEL_CAPACITY,
+            &primary_metrics.primary_channel_metrics.tx_verified_certificates,
+        );
+
         let (tx_primary_round_updates, _rx_primary_round_updates) = watch::channel(0u32);
         let (tx_last_consensus_header, _rx_last_consensus_header) =
             watch::channel(ConsensusHeader::default());
@@ -234,6 +271,10 @@ impl ConsensusBus {
                 headers,
                 committed_own_headers,
                 sequence,
+                pending_cert_commands,
+                accept_verified_certificates,
+                sync_missing_batches,
+                verified_certificates,
 
                 tx_primary_round_updates,
                 _rx_primary_round_updates,
@@ -329,6 +370,40 @@ impl ConsensusBus {
     /// Can only be subscribed to once.
     pub fn sequence(&self) -> &impl TnSender<CommittedSubDag> {
         &self.inner.sequence
+    }
+
+    /// Verified certificates that are ready to be accepted into storage.
+    ///
+    /// Can only be subscribed to once.
+    // TODO: delete this - redundant from `accept_verified_certificates`
+    pub fn verified_certificates(
+        &self,
+    ) -> &impl TnSender<(Certificate, CertificateDigest, oneshot::Sender<CertificateResult<()>>)>
+    {
+        &self.inner.verified_certificates
+    }
+
+    /// Commands to update pending certificate state.
+    ///
+    /// These channels are used to notifiy the PendingCertificateManager about new pending certificates with missing parents and when garbge collection rounds change.
+    /// Can only be subscribed to once.
+    pub fn pending_cert_commands(&self) -> &impl TnSender<PendingCertCommand> {
+        &self.inner.pending_cert_commands
+    }
+
+    /// Channel for forwarding newly received certificates for verification.
+    ///
+    /// These channels are used to notifiy the PendingCertificateManager about new pending certificates.
+    /// Can only be subscribed to once.
+    pub fn accept_verified_certificates(&self) -> &impl TnSender<VerifiedCertificatesMessage> {
+        &self.inner.accept_verified_certificates
+    }
+
+    /// Channel for forwarding information for syncing missing batches.
+    ///
+    /// Can only be subscribed to once.
+    pub fn sync_missing_batches(&self) -> &impl TnSender<(Header, Round)> {
+        &self.inner.sync_missing_batches
     }
 
     /// Track recent blocks.
