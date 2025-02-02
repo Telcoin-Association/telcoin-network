@@ -148,10 +148,10 @@ impl<DB: Database> Subscriber<DB> {
 
         // We aren't doing consensus now but still need to update these watches before
         // we send the consensus output.
-        let _ = self
-            .consensus_bus
-            .consensus_round_updates()
-            .send(ConsensusRound::new_with_gc_depth(last_round, self.config.parameters().gc_depth));
+        let _ = self.consensus_bus.update_consensus_rounds(ConsensusRound::new_with_gc_depth(
+            last_round,
+            self.config.parameters().gc_depth,
+        ));
         let _ = self.consensus_bus.primary_round_updates().send(last_round);
 
         if let Err(e) = self.consensus_bus.consensus_output().send(consensus_output).await {

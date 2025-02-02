@@ -292,11 +292,9 @@ impl<DB: Database> Inner<DB> {
     // This will run a task managed by the task manager.
     async fn garbage_collection(&self) {
         const FETCH_TRIGGER_TIMEOUT: Duration = Duration::from_secs(30);
-        let mut rx_consensus_round_updates =
-            self.consensus_bus.consensus_round_updates().subscribe();
+        let mut rx_gc_round_updates = self.consensus_bus.gc_round_updates().subscribe();
         loop {
-            let Ok(result) =
-                timeout(FETCH_TRIGGER_TIMEOUT, rx_consensus_round_updates.changed()).await
+            let Ok(result) = timeout(FETCH_TRIGGER_TIMEOUT, rx_gc_round_updates.changed()).await
             else {
                 // When consensus commit has not happened for 30s, it is possible that no
                 // new certificate is received by this primary or
@@ -323,7 +321,7 @@ impl<DB: Database> Inner<DB> {
             }
 
             let _scope = monitored_scope("Synchronizer::gc_iteration");
-            let gc_round = rx_consensus_round_updates.borrow().gc_round.load();
+            let gc_round = rx_gc_round_updates.borrow().load();
             self.certificates_aggregators.lock().retain(|k, _| k > &gc_round);
             // Accept certificates at and below gc round, if there is any.
             let mut state = self.state.lock().await;
@@ -565,15 +563,16 @@ impl<DB: Database> Inner<DB> {
 
         // Clone the round updates channel so we can get update notifications specific to
         // this RPC handler.
-        let mut rx_consensus_round_updates =
-            self.consensus_bus.consensus_round_updates().subscribe();
-        let mut consensus_round = rx_consensus_round_updates.borrow().committed_round;
+        let mut rx_committed_round_updates =
+            self.consensus_bus.committed_round_updates().subscribe();
+
+        let mut committed_round = *rx_committed_round_updates.borrow();
         ensure!(
-            header.round() >= consensus_round.saturating_sub(max_age),
+            header.round() >= committed_round.saturating_sub(max_age),
             HeaderError::TooOld(
                 header.digest(),
                 header.round(),
-                consensus_round.saturating_sub(max_age)
+                committed_round.saturating_sub(max_age)
             )
         );
 
@@ -660,14 +659,14 @@ impl<DB: Database> Inner<DB> {
                 // used to attempt to synchronize batches for longer than strictly needed become
                 // problematic, this function could be augmented to also support cancellation based
                 // on primary round.
-                Ok(()) = rx_consensus_round_updates.changed() => {
-                    consensus_round = rx_consensus_round_updates.borrow().committed_round;
+                Ok(()) = rx_committed_round_updates.changed() => {
+                    committed_round = *rx_committed_round_updates.borrow();
                     ensure!(
-                        header.round() >= consensus_round.saturating_sub(max_age),
+                        header.round() >= committed_round.saturating_sub(max_age),
                         HeaderError::TooOld(
                             header.digest(),
                             header.round(),
-                            consensus_round.saturating_sub(max_age),
+                            committed_round.saturating_sub(max_age),
                         )
                     );
                 },

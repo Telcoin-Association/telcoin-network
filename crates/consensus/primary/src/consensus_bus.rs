@@ -3,8 +3,10 @@
 //! arguments.
 
 use crate::{
-    certificate_fetcher::CertificateFetcherCommand, consensus::ConsensusRound,
-    proposer::OurDigestMessage, RecentBlocks,
+    certificate_fetcher::CertificateFetcherCommand,
+    consensus::{AtomicRound, ConsensusRound},
+    proposer::OurDigestMessage,
+    RecentBlocks,
 };
 use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
 use std::sync::{atomic::AtomicBool, Arc};
@@ -14,7 +16,10 @@ use tn_types::{
     Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, Header, Round, TnSender,
     CHANNEL_CAPACITY,
 };
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{
+    broadcast,
+    watch::{self},
+};
 
 /// Has sync completed?
 #[derive(Copy, Clone, Debug, Default)]
@@ -55,10 +60,16 @@ struct ConsensusBusInner {
     new_certificates: MeteredMpscChannel<Certificate>,
     /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
     committed_certificates: MeteredMpscChannel<(Round, Vec<Certificate>)>,
+
     /// Outputs the highest committed round & corresponding gc_round in the consensus.
-    tx_consensus_round_updates: watch::Sender<ConsensusRound>,
+    tx_committed_round_updates: watch::Sender<Round>,
     /// Hold onto a receiver to keep it "open".
-    _rx_consensus_round_updates: watch::Receiver<ConsensusRound>,
+    _rx_committed_round_updates: watch::Receiver<Round>,
+
+    /// Outputs the highest gc_round from the consensus.
+    tx_gc_round_updates: watch::Sender<AtomicRound>,
+    /// Hold onto a receiver to keep it "open".
+    _rx_gc_round_updates: watch::Receiver<AtomicRound>,
 
     /// Sends missing certificates to the `CertificateFetcher`.
     /// Receives certificates with missing parents from the `Synchronizer`.
@@ -166,8 +177,9 @@ impl ConsensusBus {
             &primary_metrics.primary_channel_metrics.tx_committed_certificates,
         );
 
-        let (tx_consensus_round_updates, _rx_consensus_round_updates) =
-            watch::channel(ConsensusRound::new(0, 0));
+        let (tx_committed_round_updates, _rx_committed_round_updates) = watch::channel(0);
+
+        let (tx_gc_round_updates, _rx_gc_round_updates) = watch::channel(AtomicRound::default());
 
         let our_digests = channel_with_total_sender(
             CHANNEL_CAPACITY,
@@ -213,8 +225,10 @@ impl ConsensusBus {
             inner: Arc::new(ConsensusBusInner {
                 new_certificates,
                 committed_certificates,
-                tx_consensus_round_updates,
-                _rx_consensus_round_updates,
+                tx_committed_round_updates,
+                _rx_committed_round_updates,
+                tx_gc_round_updates,
+                _rx_gc_round_updates,
                 certificate_fetcher,
                 parents,
                 our_digests,
@@ -277,14 +291,27 @@ impl ConsensusBus {
         &self.inner.parents
     }
 
+    /// Update consensus round watch channels.
+    pub fn update_consensus_rounds(&self, update: ConsensusRound) -> eyre::Result<()> {
+        let ConsensusRound { committed_round, gc_round } = update;
+        self.gc_round_updates().send(gc_round)?;
+        self.committed_round_updates().send(committed_round)?;
+        Ok(())
+    }
+
     /// Contains the highest committed round & corresponding gc_round for consensus.
-    pub fn consensus_round_updates(&self) -> &watch::Sender<ConsensusRound> {
-        &self.inner.tx_consensus_round_updates
+    pub fn committed_round_updates(&self) -> &watch::Sender<Round> {
+        &self.inner.tx_committed_round_updates
+    }
+
+    /// Contains the highest gc_round for consensus.
+    pub fn gc_round_updates(&self) -> &watch::Sender<AtomicRound> {
+        &self.inner.tx_gc_round_updates
     }
 
     /// Load the atomic GC round for consensus.
-    pub fn atomic_gc_round(&self) -> u32 {
-        self.consensus_round_updates().borrow().gc_round.load()
+    pub fn atomic_gc_round(&self) -> Round {
+        self.gc_round_updates().borrow().load()
     }
 
     /// Signals a new round

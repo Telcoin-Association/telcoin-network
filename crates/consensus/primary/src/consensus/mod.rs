@@ -10,7 +10,7 @@ mod utils;
 pub use crate::consensus::{
     bullshark::Bullshark,
     leader_schedule::{LeaderSchedule, LeaderSwapTable},
-    state::{Consensus, ConsensusRound, ConsensusState, Dag},
+    state::{AtomicRound, Consensus, ConsensusRound, ConsensusState, Dag},
     utils::gc_round,
 };
 use thiserror::Error;
