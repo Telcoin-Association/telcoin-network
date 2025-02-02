@@ -533,7 +533,8 @@ async fn sync_batches_drops_old() {
 
     tokio::task::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let _ = cb.consensus_round_updates().send(ConsensusRound::new(30, 0));
+        cb.update_consensus_rounds(ConsensusRound::new(30, 0))
+            .expect("consensus round watch channels updated");
     });
     match synchronizer.sync_header_batches(&test_header, 10).await {
         Err(HeaderError::TooOld(_, _, _)) => (),
@@ -617,7 +618,8 @@ async fn gc_suspended_certificates() {
     );
 
     // At commit round 8, round 3 becomes the GC round.
-    let _ = cb.consensus_round_updates().send(ConsensusRound::new(8, gc_round(8, GC_DEPTH)));
+    cb.update_consensus_rounds(ConsensusRound::new(8, gc_round(8, GC_DEPTH)))
+        .expect("consensus round watch channels updated");
 
     // more than enough time
     let max_timeout = Duration::from_secs(5);

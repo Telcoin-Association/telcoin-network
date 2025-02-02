@@ -14,7 +14,10 @@ use tn_types::{
     Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, Header, Round, TnSender,
     CHANNEL_CAPACITY,
 };
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{
+    broadcast,
+    watch::{self},
+};
 
 /// Has sync completed?
 #[derive(Copy, Clone, Debug, Default)]
@@ -55,10 +58,16 @@ struct ConsensusBusInner {
     new_certificates: MeteredMpscChannel<Certificate>,
     /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
     committed_certificates: MeteredMpscChannel<(Round, Vec<Certificate>)>,
+
     /// Outputs the highest committed round & corresponding gc_round in the consensus.
-    tx_consensus_round_updates: watch::Sender<ConsensusRound>,
+    tx_committed_round_updates: watch::Sender<Round>,
     /// Hold onto a receiver to keep it "open".
-    _rx_consensus_round_updates: watch::Receiver<ConsensusRound>,
+    _rx_committed_round_updates: watch::Receiver<Round>,
+
+    /// Outputs the highest gc_round from the consensus.
+    tx_gc_round_updates: watch::Sender<Round>,
+    /// Hold onto a receiver to keep it "open".
+    _rx_gc_round_updates: watch::Receiver<Round>,
 
     /// Sends missing certificates to the `CertificateFetcher`.
     /// Receives certificates with missing parents from the `Synchronizer`.
@@ -166,8 +175,10 @@ impl ConsensusBus {
             &primary_metrics.primary_channel_metrics.tx_committed_certificates,
         );
 
-        let (tx_consensus_round_updates, _rx_consensus_round_updates) =
-            watch::channel(ConsensusRound::new(0, 0));
+        let (tx_committed_round_updates, _rx_committed_round_updates) =
+            watch::channel(Round::default());
+
+        let (tx_gc_round_updates, _rx_gc_round_updates) = watch::channel(Round::default());
 
         let our_digests = channel_with_total_sender(
             CHANNEL_CAPACITY,
@@ -213,8 +224,10 @@ impl ConsensusBus {
             inner: Arc::new(ConsensusBusInner {
                 new_certificates,
                 committed_certificates,
-                tx_consensus_round_updates,
-                _rx_consensus_round_updates,
+                tx_committed_round_updates,
+                _rx_committed_round_updates,
+                tx_gc_round_updates,
+                _rx_gc_round_updates,
                 certificate_fetcher,
                 parents,
                 our_digests,
@@ -278,8 +291,13 @@ impl ConsensusBus {
     }
 
     /// Contains the highest committed round & corresponding gc_round for consensus.
-    pub fn consensus_round_updates(&self) -> &watch::Sender<ConsensusRound> {
-        &self.inner.tx_consensus_round_updates
+    pub fn committed_round_updates(&self) -> &watch::Sender<Round> {
+        &self.inner.tx_committed_round_updates
+    }
+
+    /// Contains the highest gc_round for consensus.
+    pub fn gc_round_updates(&self) -> &watch::Sender<Round> {
+        &self.inner.tx_gc_round_updates
     }
 
     /// Signals a new round
@@ -380,5 +398,16 @@ impl ConsensusBus {
     /// True if the node should restart after shutdown.
     pub fn restart(&self) -> bool {
         self.inner.restart.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Update consensus round watch channels.
+    ///
+    /// This sends both the gc round and the committed round to the respective watch channels after
+    /// consensus updates.
+    pub fn update_consensus_rounds(&self, update: ConsensusRound) -> eyre::Result<()> {
+        let ConsensusRound { committed_round, gc_round } = update;
+        self.gc_round_updates().send(gc_round)?;
+        self.committed_round_updates().send(committed_round)?;
+        Ok(())
     }
 }

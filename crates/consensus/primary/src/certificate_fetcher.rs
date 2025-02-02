@@ -297,7 +297,7 @@ impl<DB: Database> CertificateFetcher<DB> {
     }
 
     fn gc_round(&self) -> Round {
-        self.consensus_bus.consensus_round_updates().borrow().gc_round
+        *self.consensus_bus.gc_round_updates().borrow()
     }
 }
 

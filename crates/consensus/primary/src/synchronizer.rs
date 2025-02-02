@@ -294,11 +294,9 @@ impl<DB: Database> Inner<DB> {
     // This will run a task managed by the task manager.
     async fn garbage_collection(&self) {
         const FETCH_TRIGGER_TIMEOUT: Duration = Duration::from_secs(30);
-        let mut rx_consensus_round_updates =
-            self.consensus_bus.consensus_round_updates().subscribe();
+        let mut rx_gc_round_updates = self.consensus_bus.gc_round_updates().subscribe();
         loop {
-            let Ok(result) =
-                timeout(FETCH_TRIGGER_TIMEOUT, rx_consensus_round_updates.changed()).await
+            let Ok(result) = timeout(FETCH_TRIGGER_TIMEOUT, rx_gc_round_updates.changed()).await
             else {
                 // When consensus commit has not happened for 30s, it is possible that no
                 // new certificate is received by this primary or
@@ -320,12 +318,12 @@ impl<DB: Database> Inner<DB> {
             };
 
             if let Err(e) = result {
-                error!(target: "primary::synchronizer::gc", ?e, "failed to received rx_consensus_round_updates - shutting down...");
+                error!(target: "primary::synchronizer::gc", ?e, "failed to received rx_gc_round_updates - shutting down...");
                 return;
             }
 
             let _scope = monitored_scope("Synchronizer::gc_iteration");
-            let gc_round = rx_consensus_round_updates.borrow().gc_round;
+            let gc_round = *rx_gc_round_updates.borrow_and_update();
             // this is the only task updating gc_round
             self.gc_round.store(gc_round, Ordering::Release);
             self.certificates_aggregators.lock().retain(|k, _| k > &gc_round);
@@ -569,15 +567,15 @@ impl<DB: Database> Inner<DB> {
 
         // Clone the round updates channel so we can get update notifications specific to
         // this RPC handler.
-        let mut rx_consensus_round_updates =
-            self.consensus_bus.consensus_round_updates().subscribe();
-        let mut consensus_round = rx_consensus_round_updates.borrow().committed_round;
+        let mut rx_committed_round_updates =
+            self.consensus_bus.committed_round_updates().subscribe();
+        let mut committed_round = *rx_committed_round_updates.borrow();
         ensure!(
-            header.round() >= consensus_round.saturating_sub(max_age),
+            header.round() >= committed_round.saturating_sub(max_age),
             HeaderError::TooOld(
                 header.digest(),
                 header.round(),
-                consensus_round.saturating_sub(max_age)
+                committed_round.saturating_sub(max_age)
             )
         );
 
@@ -664,14 +662,14 @@ impl<DB: Database> Inner<DB> {
                 // used to attempt to synchronize batches for longer than strictly needed become
                 // problematic, this function could be augmented to also support cancellation based
                 // on primary round.
-                Ok(()) = rx_consensus_round_updates.changed() => {
-                    consensus_round = rx_consensus_round_updates.borrow().committed_round;
+                Ok(()) = rx_committed_round_updates.changed() => {
+                    committed_round = *rx_committed_round_updates.borrow_and_update();
                     ensure!(
-                        header.round() >= consensus_round.saturating_sub(max_age),
+                        header.round() >= committed_round.saturating_sub(max_age),
                         HeaderError::TooOld(
                             header.digest(),
                             header.round(),
-                            consensus_round.saturating_sub(max_age),
+                            committed_round.saturating_sub(max_age),
                         )
                     );
                 },
@@ -701,7 +699,7 @@ impl<DB: Database> Synchronizer<DB> {
         let genesis = Self::make_genesis(committee);
         let node_store = consensus_config.node_storage();
         let highest_processed_round = node_store.certificate_store.highest_round_number();
-        let gc_round = consensus_bus.consensus_round_updates().borrow().gc_round;
+        let gc_round = *consensus_bus.gc_round_updates().borrow();
         let tx_certificate_acceptor = channel_with_total_sender(
             CHANNEL_CAPACITY,
             &primary_channel_metrics.tx_certificate_acceptor,
