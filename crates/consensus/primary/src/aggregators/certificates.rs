@@ -2,7 +2,10 @@
 
 use crate::ConsensusBus;
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 use tn_types::{
     error::{CertificateError, CertificateResult},
     AuthorityIdentifier, Certificate, Committee, Round, Stake, TnSender as _,
@@ -10,9 +13,10 @@ use tn_types::{
 use tracing::trace;
 
 /// Manage certificates as they aggregate through rounds.
+#[derive(Debug, Clone)]
 pub(crate) struct CertificatesAggregatorManager {
     /// Collection of [CertificatesAggregator]s.
-    aggregators: Mutex<BTreeMap<Round, Box<CertificatesAggregator>>>,
+    aggregators: Arc<Mutex<BTreeMap<Round, Box<CertificatesAggregator>>>>,
     /// Consensus bus to forward parents for a round to the proposer.
     consensus_bus: ConsensusBus,
 }
@@ -20,7 +24,7 @@ pub(crate) struct CertificatesAggregatorManager {
 impl CertificatesAggregatorManager {
     /// Create a new instance of self with allocation for the max gc-depth.
     pub(crate) fn new(consensus_bus: ConsensusBus) -> Self {
-        Self { aggregators: Mutex::new(BTreeMap::new()), consensus_bus }
+        Self { aggregators: Arc::new(Mutex::new(BTreeMap::new())), consensus_bus }
     }
 
     /// Append a certificate by round and alert proposer if quorum is reached (2f+1).
@@ -58,6 +62,7 @@ impl CertificatesAggregatorManager {
 }
 
 /// Aggregate certificates until quorum is reached
+#[derive(Debug, Clone)]
 struct CertificatesAggregator {
     /// The accumulated amount of voting power in favor of a proposed header.
     ///

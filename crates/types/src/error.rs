@@ -1,8 +1,8 @@
 //! Error types whenn validating types during consensus.
 
 use crate::{
-    crypto, BlockHash, CertificateDigest, Epoch, HeaderDigest, Round, TimestampSec, VoteDigest,
-    WorkerId,
+    crypto, BlockHash, CertificateDigest, Epoch, HeaderDigest, Round, SendError, TimestampSec,
+    VoteDigest, WorkerId,
 };
 use fastcrypto::{error::FastCryptoError, hash::Digest};
 use libp2p::PeerId;
@@ -268,6 +268,12 @@ pub enum HeaderError {
     /// peer.
     #[error("Already voted for a header in a later round for this peer. This header's round: {theirs}. Last voted for round: {ours}.")]
     AlreadyVotedForLaterRound { theirs: Round, ours: Round },
+    /// mpsc sender dropped while processig the certificate
+    #[error("Failed to process header - TN sender error")]
+    TNSend,
+    /// Oneshot channel dropped for pending certificate result.
+    #[error("Failed to return pending certificate manager result.")]
+    PendingCertificateOneshot,
 
     /// TODO: this is temporary
     ///
@@ -282,9 +288,12 @@ pub type CertificateResult<T> = Result<T, CertificateError>;
 /// Core error variants when verifying and processing a Certificate.
 #[derive(Debug, Error)]
 pub enum CertificateError {
-    /// Processing was suspended to retrieve parent certificates.
-    #[error("Processing was suspended to retrieve parent certificates")]
+    /// TODO: REMOVE THIS
+    #[error("The certificate is suspended until missing parents recovered.")]
     Suspended,
+    /// The certificate is pending acceptance due to missing parents.
+    #[error("The certificate {0} is pending acceptance due to missing parents.")]
+    Pending(CertificateDigest),
     /// Error retrieving value from storage.
     #[error("Storage failure: {0}")]
     Storage(#[from] StoreError),
@@ -312,8 +321,32 @@ pub enum CertificateError {
     /// Certificate signature verification state returned `Genesis`
     #[error("Failed to recover BlsAggregateSignatureBytes from certificate signature")]
     RecoverBlsAggregateSignatureBytes,
+    /// The certificate's signature verification state is unverified.
+    #[error("Unverified signature verification state {0}")]
+    UnverifiedSignature(CertificateDigest),
+    /// The parent was not found.
+    #[error("Error accepting certificate. Parent not found: {0}")]
+    MissingParent(CertificateDigest),
+    /// Oneshot channel dropped for certificate acceptor.
+    #[error("Failed to return certificate acceptor result.")]
+    CertificateAcceptorOneshot,
+    /// The pending certificate is unexpectedly missing. This should not happen.
+    #[error("Pending certificate not found by digest: {0}")]
+    PendingCertificateNotFound(CertificateDigest),
 
     /// TODO: Refactor this out - only used to debug notify and suspend
     #[error("Certificate suspended: {0}")]
     DebugSuspend(String),
+}
+
+impl<T> From<SendError<T>> for CertificateError {
+    fn from(_: SendError<T>) -> Self {
+        Self::TNSend
+    }
+}
+
+impl<T> From<SendError<T>> for HeaderError {
+    fn from(_: SendError<T>) -> Self {
+        Self::TNSend
+    }
 }

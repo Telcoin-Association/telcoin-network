@@ -93,13 +93,32 @@ pub struct SyncConfig {
     pub max_skip_rounds_for_missing_certs: usize,
     /// Maximum time to spend collecting certificates from the local storage.
     pub max_cert_collection_duration: Duration,
+    /// Controls how far ahead of the local node's progress external certificates are allowed to be.
+    /// When a certificate arrives from another node, its round number is compared against the highest
+    /// round that this node has processed locally. If the difference exceeds this limit, the
+    /// certificate is rejected to prevent memory exhaustion from storing too many future certificates.
+    ///
+    /// For example, if the local node has processed up to round 1000 and this limit is set to 500,
+    /// certificates from round 1501 or higher will be rejected. This creates a sliding window of
+    /// acceptable rounds that moves forward as the node processes more certificates.
+    ///
+    /// Memory Impact:
+    /// The memory footprint scales with the number of validators (N), this limit (L), and the
+    /// certificate size (S). The approximate maximum memory usage is: N * L * S.
+    /// With typical values:
+    ///   - 100 validators
+    ///   - 1000 round limit
+    ///   - 3.3KB per certificate
+    /// The maximum memory usage would be: 100 * 1000 * 3.3KB = 330MB
+    pub max_diff_between_external_cert_round_and_highest_local_round: u32,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
-            max_skip_rounds_for_missing_certs: 1000,
+            max_skip_rounds_for_missing_certs: 1_000,
             max_cert_collection_duration: Duration::from_secs(10),
+            max_diff_between_external_cert_round_and_highest_local_round: 1_000,
         }
     }
 }
