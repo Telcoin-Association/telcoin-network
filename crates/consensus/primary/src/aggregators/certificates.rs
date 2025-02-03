@@ -1,11 +1,64 @@
 //! Aggregate certificates for the round.
 
-use std::collections::HashSet;
-use tn_types::{AuthorityIdentifier, Certificate, Committee, Stake};
+use crate::ConsensusBus;
+use parking_lot::Mutex;
+use std::collections::{BTreeMap, HashSet};
+use tn_types::{
+    error::{CertificateError, CertificateResult},
+    AuthorityIdentifier, Certificate, Committee, Round, Stake, TnSender as _,
+};
 use tracing::trace;
 
+/// Manage certificates as they aggregate through rounds.
+pub(crate) struct CertificatesAggregatorManager {
+    /// Collection of [CertificatesAggregator]s.
+    aggregators: Mutex<BTreeMap<Round, Box<CertificatesAggregator>>>,
+    /// Consensus bus to forward parents for a round to the proposer.
+    consensus_bus: ConsensusBus,
+}
+
+impl CertificatesAggregatorManager {
+    /// Create a new instance of self with allocation for the max gc-depth.
+    pub(crate) fn new(consensus_bus: ConsensusBus) -> Self {
+        Self { aggregators: Mutex::new(BTreeMap::new()), consensus_bus }
+    }
+
+    /// Append a certificate by round and alert proposer if quorum is reached (2f+1).
+    pub(crate) async fn append_certificate(
+        &self,
+        certificate: Certificate,
+        committee: &Committee,
+    ) -> CertificateResult<()> {
+        let round = certificate.round();
+
+        // append certificate
+        let quorum = self
+            .aggregators
+            .lock()
+            .entry(round)
+            .or_insert_with(|| Box::new(CertificatesAggregator::new()))
+            .append(certificate, committee);
+
+        // forward to proposer if enough parents to advance the round (2f+1)
+        if let Some(parents) = quorum {
+            self.consensus_bus
+                .parents()
+                .send((parents, round))
+                .await
+                .map_err(|_| CertificateError::TNSend)?;
+        }
+
+        Ok(())
+    }
+
+    /// Process the next gc round and remove old parents that can never be accepted in the DAG.
+    pub(crate) fn garbage_collect(&self, gc_round: &Round) {
+        self.aggregators.lock().retain(|k, _| k > gc_round);
+    }
+}
+
 /// Aggregate certificates until quorum is reached
-pub struct CertificatesAggregator {
+struct CertificatesAggregator {
     /// The accumulated amount of voting power in favor of a proposed header.
     ///
     /// This amount is used to verify enough voting power to reach quorum within the committee.
@@ -18,7 +71,7 @@ pub struct CertificatesAggregator {
 
 impl CertificatesAggregator {
     /// Create a new instance of `Self`.
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self { weight: 0, certificates: Vec::new(), authorities_seen: HashSet::new() }
     }
 
@@ -26,7 +79,7 @@ impl CertificatesAggregator {
     ///
     /// This method protects against equivocation by keeping track of peers that have already issued
     /// certificates.
-    pub(crate) fn append(
+    fn append(
         &mut self,
         certificate: Certificate,
         committee: &Committee,

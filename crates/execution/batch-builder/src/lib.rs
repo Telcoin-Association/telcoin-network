@@ -211,10 +211,6 @@ where
 
         // spawn block building task and forward to worker
         tokio::spawn(async move {
-            // arc dashmap/hashset rwlock for txhashes for this worker by round
-            // canon updates clear set
-            // successful proposals add mined txs to set
-
             // ack once worker reaches quorum
             let (ack, rx) = oneshot::channel();
 

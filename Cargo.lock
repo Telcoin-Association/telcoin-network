@@ -2404,7 +2404,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
- "dashmap 6.1.0",
  "eyre",
  "futures",
  "once_cell",
@@ -12497,7 +12496,6 @@ dependencies = [
  "cfg-if",
  "consensus-metrics",
  "criterion",
- "dashmap 6.1.0",
  "eyre",
  "fastcrypto",
  "fastcrypto-tbls",

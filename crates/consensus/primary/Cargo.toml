@@ -53,7 +53,6 @@ roaring = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
-dashmap = { workspace = true }
 async-trait = { workspace = true }
 criterion = { workspace = true }
 futures = { workspace = true }
