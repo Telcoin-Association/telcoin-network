@@ -20,10 +20,12 @@ use std::{
     time::Duration,
 };
 use tn_batch_validator::NoopBatchValidator;
+use tn_config::ConsensusConfig;
+use tn_network_libp2p::ConsensusNetwork;
 use tn_network_types::{
     FetchCertificatesRequest, MockPrimaryToWorker, PrimaryToPrimary, RequestVoteRequest,
 };
-use tn_storage::mem_db::MemDatabase;
+use tn_storage::{mem_db::MemDatabase, traits::Database};
 use tn_test_utils::{
     fixture_batch_with_transactions, make_optimal_signed_certificates, test_network,
     CommitteeFixture,
@@ -33,7 +35,18 @@ use tn_types::{
     SignatureVerificationState, TaskManager,
 };
 use tn_worker::{metrics::Metrics, Worker};
-use tokio::time::timeout;
+use tokio::{sync::mpsc, time::timeout};
+
+fn get_bus_and_primary<DB: Database>(config: ConsensusConfig<DB>) -> (ConsensusBus, Primary<DB>) {
+    let (event_stream, rx_event_stream) = mpsc::channel(1000);
+    let consensus_bus = ConsensusBus::new_with_args(config.config().parameters.gc_depth);
+    let consensus_network = ConsensusNetwork::new_for_primary(&config, event_stream)
+        .expect("p2p network create failed!");
+    let consensus_network_handle = consensus_network.network_handle();
+
+    let primary = Primary::new(config, &consensus_bus, consensus_network_handle, rx_event_stream);
+    (consensus_bus, primary)
+}
 
 #[tokio::test]
 async fn test_get_network_peers_from_admin_server() {
@@ -46,8 +59,7 @@ async fn test_get_network_peers_from_admin_server() {
     let worker_id = 0;
     let worker_1_keypair = authority_1.worker().keypair().copy();
 
-    let cb_1 = ConsensusBus::new();
-    let mut primary_1 = Primary::new(config_1.clone(), &cb_1);
+    let (cb_1, mut primary_1) = get_bus_and_primary(config_1.clone());
     // Spawn Primary 1
     primary_1.spawn(
         config_1.clone(),
@@ -117,9 +129,8 @@ async fn test_get_network_peers_from_admin_server() {
     let config_2 = authority_2.consensus_config();
     let primary_2_parameters = config_2.config().parameters.clone();
 
-    let cb_2 = ConsensusBus::new();
     // Spawn Primary 2
-    let mut primary_2 = Primary::new(config_2.clone(), &cb_2);
+    let (cb_2, mut primary_2) = get_bus_and_primary(config_2.clone());
     primary_2.spawn(
         config_2,
         &cb_2,

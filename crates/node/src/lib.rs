@@ -11,12 +11,13 @@ use reth_db::{
 };
 use reth_provider::CanonStateSubscriptions;
 use tn_config::{ConsensusConfig, KeyConfig, TelcoinDirs};
+use tn_network_libp2p::ConsensusNetwork;
 use tn_node_traits::TelcoinNode;
 use tn_primary::{ConsensusBus, NodeMode};
 pub use tn_storage::NodeStorage;
 use tn_storage::{open_db, tables::ConsensusBlocks, traits::Database as _, DatabaseType};
 use tn_types::{ConsensusHeader, TaskManager};
-use tokio::runtime::Builder;
+use tokio::{runtime::Builder, sync::mpsc};
 use tracing::{info, instrument};
 
 pub mod dirs;
@@ -74,9 +75,34 @@ where
 
         let (worker_id, _worker_info) = consensus_config.config().workers().first_worker()?;
         let worker = WorkerNode::new(*worker_id, consensus_config.clone());
+        let (event_stream, rx_event_stream) = mpsc::channel(1000);
         let consensus_bus =
-            ConsensusBus::new_with_recent_blocks(consensus_config.config().parameters.gc_depth);
-        let primary = PrimaryNode::new(consensus_config.clone(), consensus_bus.clone());
+            ConsensusBus::new_with_args(consensus_config.config().parameters.gc_depth);
+        let consensus_network = ConsensusNetwork::new_for_primary(&consensus_config, event_stream)
+            .expect("p2p network create failed!");
+        let consensus_network_handle = consensus_network.network_handle();
+        let rx_shutdown = consensus_config.shutdown().subscribe();
+        task_manager.spawn_task("consensus network run loop", async move {
+            tokio::select!(
+                _ = &rx_shutdown => {
+                    Ok(())
+                }
+                res = consensus_network.run() => {
+                    res
+                }
+            )
+        });
+        /* Need to replace anemo before we can take over the address...
+        let my_authority = consensus_config.authority();
+        consensus_network_handle.start_listening(my_authority.primary_network_address().inner()).await?;
+        for authority in consensus_config.committee().authorities() {
+            if my_authority.id() != authority.id() {
+                let peer_id = consensus_config.peer_id_for_authority(&authority.id()).expect("missing peer id!");
+                consensus_network_handle.dial(peer_id, authority.primary_network_address().inner()).await?;
+            }
+        }
+        */
+        let primary = PrimaryNode::new(consensus_config.clone(), consensus_bus.clone(), consensus_network_handle, rx_event_stream);
 
         let mut engine_state = engine.get_provider().await.canonical_state_stream();
 

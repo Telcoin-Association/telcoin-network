@@ -1,7 +1,7 @@
 //! Wrapper around mpsc channel that also captures useful metrics.
 
 use futures::{FutureExt, Stream, TryFutureExt};
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::Mutex;
 use prometheus::{IntCounter, IntGauge};
 use std::{
     sync::Arc,
@@ -30,25 +30,6 @@ impl<T> Clone for MeteredMpscChannel<T> {
             gauge: self.gauge.clone(),
             receiver: self.receiver.clone(),
         }
-    }
-}
-
-#[derive(Debug)]
-pub struct BorrowedReceiver<'a, T> {
-    guard: MutexGuard<'a, Option<Receiver<T>>>,
-}
-
-impl<T: Send> TnReceiver<T> for BorrowedReceiver<'_, T> {
-    async fn recv(&mut self) -> Option<T> {
-        self.guard.as_mut().expect("receiver has been taken!").recv().await
-    }
-
-    fn try_recv(&mut self) -> Result<T, tn_types::TryRecvError> {
-        self.guard.as_mut().expect("receiver has been taken!").try_recv()
-    }
-
-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        self.guard.as_mut().expect("receiver has been taken!").poll_recv(cx)
     }
 }
 
@@ -153,10 +134,6 @@ impl<T: Send + 'static> TnSender<T> for MeteredMpscChannel<T> {
 
     fn subscribe(&self) -> impl TnReceiver<T> + 'static {
         self.receiver.lock().take().expect("No receiver to subscribe, can only subscribe once!")
-    }
-
-    fn borrow_subscriber(&self) -> impl TnReceiver<T> {
-        BorrowedReceiver { guard: self.receiver.lock() }
     }
 }
 

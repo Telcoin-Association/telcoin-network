@@ -4,14 +4,16 @@ use fastcrypto::traits::VerifyingKey;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_executor::{Executor, SubscriberResult};
+use tn_network_libp2p::types::{NetworkEvent, NetworkHandle};
 use tn_primary::{
     consensus::{Bullshark, Consensus, ConsensusMetrics, LeaderSchedule},
+    network::{PrimaryRequest, PrimaryResponse},
     ConsensusBus, Primary,
 };
 use tn_primary_metrics::Metrics;
 use tn_storage::traits::Database as ConsensusDatabase;
 use tn_types::{BlsPublicKey, TaskManager, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tracing::instrument;
 
 struct PrimaryNodeInner<CDB> {
@@ -110,8 +112,15 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
     pub fn new(
         consensus_config: ConsensusConfig<CDB>,
         consensus_bus: ConsensusBus,
+        network_p2p_handle: NetworkHandle<PrimaryRequest, PrimaryResponse>,
+        network_event_stream: mpsc::Receiver<NetworkEvent<PrimaryRequest, PrimaryResponse>>,
     ) -> PrimaryNode<CDB> {
-        let primary = Primary::new(consensus_config.clone(), &consensus_bus);
+        let primary = Primary::new(
+            consensus_config.clone(),
+            &consensus_bus,
+            network_p2p_handle,
+            network_event_stream,
+        );
 
         let inner = PrimaryNodeInner { consensus_config, consensus_bus, primary };
 
@@ -149,5 +158,10 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
     /// Return the WAN if the primary is runnig.
     pub async fn network(&self) -> Network {
         self.internal.read().await.primary.network().clone()
+    }
+
+    /// Return the WAN handke if the primary p2p is runnig.
+    pub async fn network_handle(&self) -> NetworkHandle<PrimaryRequest, PrimaryResponse> {
+        self.internal.read().await.primary.network_p2p().clone()
     }
 }

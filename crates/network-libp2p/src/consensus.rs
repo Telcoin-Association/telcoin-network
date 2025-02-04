@@ -26,12 +26,9 @@ use std::{
     time::Duration,
 };
 use tn_config::{ConsensusConfig, LibP2pConfig};
-use tokio::{
-    sync::{
-        mpsc::{self, Receiver, Sender},
-        oneshot,
-    },
-    task::JoinHandle,
+use tokio::sync::{
+    mpsc::{self, Receiver, Sender},
+    oneshot,
 };
 use tracing::{error, info, instrument, trace, warn};
 
@@ -80,7 +77,7 @@ where
     /// The subscribed gossip network topics.
     topics: Vec<IdentTopic>,
     /// The stream for forwarding network events.
-    event_stream: Sender<NetworkEvent<Req, Res>>,
+    event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
     /// The sender for network handles.
     handle: Sender<NetworkCommand<Req, Res>>,
     /// The receiver for processing network handle requests.
@@ -215,21 +212,19 @@ where
     }
 
     /// Run the network loop to process incoming gossip.
-    pub fn run(mut self) -> JoinHandle<NetworkResult<()>> {
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    event = self.swarm.select_next_some() => self.process_event(event).await?,
-                    command = self.commands.recv() => match command {
-                        Some(c) => self.process_command(c),
-                        None => {
-                            info!(target: "network", topics=?self.topics, "subscriber shutting down...");
-                            return Ok(())
-                        }
+    pub async fn run(mut self) -> NetworkResult<()> {
+        loop {
+            tokio::select! {
+                event = self.swarm.select_next_some() => self.process_event(event).await?,
+                command = self.commands.recv() => match command {
+                    Some(c) => self.process_command(c),
+                    None => {
+                        info!(target: "network", topics=?self.topics, "subscriber shutting down...");
+                        return Ok(())
                     }
                 }
             }
-        })
+        }
     }
 
     /// Process events from the swarm.
