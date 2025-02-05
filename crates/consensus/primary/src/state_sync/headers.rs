@@ -1,9 +1,12 @@
 //! State management methods for [StateSynchronizer] for primary headers.
 
-use super::{PendingCertCommand, StateSynchronizer};
+use super::PendingCertCommand;
+use crate::ConsensusBus;
 use consensus_metrics::monitored_scope;
+use fastcrypto::hash::Hash as _;
 use futures::{stream::FuturesOrdered, StreamExt as _};
 use std::collections::HashMap;
+use tn_config::ConsensusConfig;
 use tn_network::{PrimaryToWorkerClient as _, RetryConfig};
 use tn_network_types::WorkerSynchronizeMessage;
 use tn_storage::traits::Database;
@@ -14,10 +17,31 @@ use tn_types::{
 use tokio::sync::oneshot;
 use tracing::debug;
 
-impl<DB> StateSynchronizer<DB>
+/// Validate header vote requests from peers.
+#[derive(Debug, Clone)]
+pub struct HeaderValidator<DB> {
+    /// Consensus channels.
+    consensus_bus: ConsensusBus,
+    /// The configuration for consensus.
+    config: ConsensusConfig<DB>,
+    /// Genesis digests and contents.
+    genesis: HashMap<CertificateDigest, Certificate>,
+}
+
+impl<DB> HeaderValidator<DB>
 where
     DB: Database,
 {
+    /// Create a new instance of Self.
+    pub fn new(config: ConsensusConfig<DB>, consensus_bus: ConsensusBus) -> Self {
+        let genesis = Certificate::genesis(config.committee())
+            .into_iter()
+            .map(|cert| (cert.digest(), cert))
+            .collect();
+
+        Self { consensus_bus, config, genesis }
+    }
+
     /// Returns the parent certificates of the given header, waits for availability if needed.
     pub async fn notify_read_parent_certificates(
         &self,
@@ -161,13 +185,14 @@ where
 
     /// Filter parent digests that do not exist in storage or pending state.
     ///
-    /// Returns a collection of missing parents.
-    pub async fn identify_unkown_parent_digests(
+    /// Returns a collection of missing parent digests.
+    pub async fn identify_unkown_parents(
         &self,
         header: &Header,
     ) -> HeaderResult<Vec<CertificateDigest>> {
-        let _scope = monitored_scope("Synchronizer::get_unknown_parent_digests");
+        let _scope = monitored_scope("vote::get_unknown_parent_digests");
 
+        // handle genesis
         if header.round() == 1 {
             for digest in header.parents() {
                 if !self.genesis.contains_key(digest) {
@@ -177,6 +202,7 @@ where
             return Ok(Vec::new());
         }
 
+        // check database
         let existence =
             self.config.node_storage().certificate_store.multi_contains(header.parents().iter())?;
         let unknown: Vec<_> = header
@@ -185,6 +211,8 @@ where
             .zip(existence.iter())
             .filter_map(|(digest, exists)| if *exists { None } else { Some(*digest) })
             .collect();
+
+        // check pending certificates
         let (reply, filtered) = oneshot::channel();
         self.consensus_bus
             .pending_cert_commands()

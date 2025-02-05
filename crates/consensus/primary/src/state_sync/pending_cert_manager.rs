@@ -3,35 +3,16 @@
 //! Pending certificates are waiting to be accepted due to missing parents.
 //! This mod manages and tracks pending certificates for rounds of consensus.
 
-use crate::{
-    aggregators::CertificatesAggregatorManager,
-    certificate_fetcher::CertificateFetcherCommand,
-    error::{PrimaryNetworkError, PrimaryNetworkResult},
-    network::MissingCertificatesRequest,
-    ConsensusBus,
-};
-use consensus_metrics::monitored_scope;
+use crate::ConsensusBus;
 use fastcrypto::hash::Hash as _;
-use futures::FutureExt;
-use std::{
-    cmp::Reverse,
-    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque},
-    future::Future,
-    pin::Pin,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
-    task::{Context, Poll},
-};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use tn_config::ConsensusConfig;
-use tn_storage::{traits::Database, CertificateStore};
+use tn_storage::traits::Database;
 use tn_types::{
-    error::{AcceptNotification, CertificateError, CertificateResult, HeaderError},
-    AuthorityIdentifier, Certificate, CertificateDigest, Noticer, Round, TnReceiver, TnSender as _,
+    error::{CertificateError, CertificateResult, HeaderError},
+    Certificate, CertificateDigest, Noticer, Round, TnReceiver, TnSender as _,
 };
-use tn_utils::sync::notify_once::NotifyOnce;
-use tokio::{sync::oneshot, time::Instant};
+use tokio::sync::oneshot;
 use tracing::{debug, error, trace, warn};
 
 /// A certificate that is missing parents and pending approval.
@@ -64,6 +45,7 @@ impl PendingCertificate {
 ///
 /// Certificates are only accepted after their parents. If a certificate's parents are missing,
 /// the certificate is kept here until its parents become available.
+#[derive(Debug)]
 pub struct PendingCertificateManager<DB> {
     /// Each certificate entry tracks both the certificate itself and its dependency state
     ///
@@ -279,10 +261,6 @@ where
         // manage pending certificate state until shutdown
         loop {
             tokio::select! {
-                // try to accept new unverified certificate
-                Some(unverified_cert) = new_unverified_cert.recv() => {
-                    todo!()
-                }
 
                 // update state
                 Some(command) = pending_cert_commands_rx.recv() => {
@@ -290,8 +268,9 @@ where
                         PendingCertCommand::MissingParents { certificate, missing_parents } => {
                             self.insert_pending(certificate, missing_parents)?;
                         },
-                        PendingCertCommand::ProcessVerifiedCertificate { certificate } => {
-                            self.process_accepted_certificate(certificate).await?;
+                        PendingCertCommand::ProcessVerifiedCertificate { certificate, reply } => {
+                            let res = self.process_accepted_certificate(certificate).await;
+                            let _ = reply.send(res);
                         },
                         PendingCertCommand::NewGCRound { round, reply } => {
                             let ready = self.garbage_collect(round)?;
@@ -331,6 +310,8 @@ pub enum PendingCertCommand {
         ///
         /// Compare this certificate against any pending certificates and process certificates that become unblocked.
         certificate: Certificate,
+        /// Return the result to the certificate validator.
+        reply: oneshot::Sender<CertificateResult<()>>,
     },
     /// Process new garbage collection round.
     NewGCRound { round: Round, reply: oneshot::Sender<()> },

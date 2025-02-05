@@ -12510,7 +12510,6 @@ dependencies = [
  "proptest",
  "rand",
  "reqwest 0.12.12",
- "reth",
  "roaring",
  "serde",
  "tap",

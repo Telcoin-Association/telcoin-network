@@ -282,12 +282,12 @@ where
             // no missing parents - update pending state and try to process an ready certs
             // let unlocked_pending_certs =
             //     self.process_accepted_certificate(certificate.round(), digest)?;
-            self.consensus_bus
-                .pending_cert_commands()
-                .send(PendingCertCommand::ProcessVerifiedCertificate {
-                    certificate: certificate.clone(),
-                })
-                .await?;
+            // self.consensus_bus
+            //     .pending_cert_commands()
+            //     .send(PendingCertCommand::ProcessVerifiedCertificate {
+            //         certificate: certificate.clone(),
+            //     })
+            //     .await?;
 
             // accept in causal order
             self.try_accept_certificate(certificate, digest).await?;

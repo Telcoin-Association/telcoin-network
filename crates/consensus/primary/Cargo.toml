@@ -70,5 +70,4 @@ tn-storage = { workspace = true }
 reqwest = { workspace = true }
 bytes = { workspace = true }
 tn-batch-validator = { workspace = true, features = ["test-utils"] }
-reth = { workspace = true }
 assert_matches = { workspace = true }

@@ -4,14 +4,14 @@ use super::{message::MissingCertificatesRequest, PrimaryResponse};
 use crate::{
     error::{PrimaryNetworkError, PrimaryNetworkResult},
     network::message::PrimaryGossip,
-    state_sync::CertificateCollector,
+    state_sync::{CertificateCollector, HeaderValidator},
     synchronizer::Synchronizer,
     ConsensusBus,
 };
 use fastcrypto::hash::Hash;
 use parking_lot::Mutex;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
     time::Duration,
 };
@@ -25,8 +25,9 @@ use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, try_decode, AuthorityIdentifier, BlockHash, Certificate, CertificateDigest,
-    ConsensusHeader, Header, Round, SignatureVerificationState, Vote,
+    ConsensusHeader, Header, Round, SignatureVerificationState, TnSender as _, Vote,
 };
+use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 
 /// The maximum number of rounds that a proposed header can be behind.
@@ -53,6 +54,8 @@ pub(super) struct RequestHandler<DB> {
     consensus_config: ConsensusConfig<DB>,
     /// Inner-processs channel bus.
     consensus_bus: ConsensusBus,
+    /// The type to handle vote requests and validate headers.
+    header_validator: HeaderValidator<DB>,
     /// Synchronizer has ability to fetch missing data from peers.
     synchronizer: Arc<Synchronizer<DB>>,
     /// The digests of parents that are currently being requested from peers.
@@ -74,9 +77,13 @@ where
         consensus_bus: ConsensusBus,
         synchronizer: Arc<Synchronizer<DB>>,
     ) -> Self {
+        let header_validator =
+            HeaderValidator::new(consensus_config.clone(), consensus_bus.clone());
+
         Self {
             consensus_config,
             consensus_bus,
+            header_validator,
             synchronizer,
             requested_parents: Default::default(),
         }
@@ -396,8 +403,8 @@ where
         &self,
         header: &Header,
     ) -> HeaderResult<Vec<CertificateDigest>> {
-        // check synchronizer state for parents
-        let mut unknown_certs = self.synchronizer.get_unknown_parent_digests(header).await?;
+        // identify parents that are neither in storage nor pending
+        let mut unknown_certs = self.header_validator.identify_unkown_parents(header).await?;
 
         // ensure header is not too old
         let limit = self
