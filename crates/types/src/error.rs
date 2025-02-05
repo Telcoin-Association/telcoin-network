@@ -307,8 +307,8 @@ pub enum CertificateError {
     #[error("Invalid aggregate signature")]
     InvalidSignature(#[from] FastCryptoError),
     /// mpsc sender dropped while processig the certificate
-    #[error("Failed to process certificate - TN sender error")]
-    TNSend,
+    #[error("Failed to process certificate - TN sender error: {0}")]
+    TNSend(String),
     /// The certificates's round is too far behind.
     #[error("Certificate {0} for round {1} is too old for GC round {2}")]
     TooOld(CertificateDigest, Round, Round),
@@ -333,15 +333,25 @@ pub enum CertificateError {
     /// The pending certificate is unexpectedly missing. This should not happen.
     #[error("Pending certificate not found by digest: {0}")]
     PendingCertificateNotFound(CertificateDigest),
+    /// The certificate was verified, accepted, and stored in storage.
+    /// However, an error occurred adding it to the collection of parents.
+    /// This is the only way to advance the round and is fatal.
+    #[error("Fatal error: failed to append accepted certs to parents.")]
+    FatalAppendParent,
+    /// The certificate was verified, accepted, and stored in storage.
+    /// However, an error occured forwarding the certificate to bullshark consensus.
+    /// This results in inconsistent state between consensus DAG and consensus store and is fatal.
+    #[error("Fatal error: failed to forward accepted cert to consensus.")]
+    FatalForwardAcceptedCertificate,
 
     /// TODO: Refactor this out - only used to debug notify and suspend
     #[error("Certificate suspended: {0}")]
     DebugSuspend(String),
 }
 
-impl<T> From<SendError<T>> for CertificateError {
-    fn from(_: SendError<T>) -> Self {
-        Self::TNSend
+impl<T: std::fmt::Debug> From<SendError<T>> for CertificateError {
+    fn from(e: SendError<T>) -> Self {
+        Self::TNSend(e.to_string())
     }
 }
 

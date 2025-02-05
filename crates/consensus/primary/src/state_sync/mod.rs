@@ -22,6 +22,7 @@ mod cert_validator;
 mod headers;
 mod pending_cert_manager;
 pub(crate) use cert_collector::CertificateCollector;
+pub(crate) use cert_manager::CertificateManagerCommand;
 pub(crate) use headers::HeaderValidator;
 pub(crate) use pending_cert_manager::PendingCertCommand;
 

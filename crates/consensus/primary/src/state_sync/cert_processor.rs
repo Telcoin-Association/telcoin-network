@@ -175,13 +175,13 @@ where
         }
 
         // send to certificate acceptor
-        let (sender, res) = oneshot::channel();
-        self.consensus_bus
-            .accept_verified_certificates()
-            .send((vec![certificate], sender, external))
-            .await?;
+        // let (sender, res) = oneshot::channel();
+        // self.consensus_bus
+        //     .certificate_manager()
+        //     .send((vec![certificate], sender, external))
+        //     .await?;
 
-        res.await.map_err(|_| CertificateError::CertificateAcceptorOneshot)?;
+        // res.await.map_err(|_| CertificateError::CertificateAcceptorOneshot)?;
 
         Ok(())
     }

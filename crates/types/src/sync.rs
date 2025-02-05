@@ -62,17 +62,23 @@ impl From<broadcast::error::TryRecvError> for TryRecvError {
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub struct SendError<T>(pub T);
 
-impl<T> Error for SendError<T> {}
+impl<T: std::fmt::Debug> Error for SendError<T> {}
 
-impl<T> Display for SendError<T> {
+impl<T> Display for SendError<T>
+where
+    T: std::fmt::Debug,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "send error")
+        write!(f, "send error: {:?}", self.0)
     }
 }
 
-impl<T> std::fmt::Debug for SendError<T> {
+impl<T> std::fmt::Debug for SendError<T>
+where
+    T: std::fmt::Debug,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SendError!")
+        write!(f, "SendError!: {:?}", self.0)
     }
 }
 

@@ -2,7 +2,8 @@
 
 use super::AtomicRound;
 use crate::{
-    certificate_fetcher::CertificateFetcherCommand, state_sync::PendingCertCommand, ConsensusBus,
+    certificate_fetcher::CertificateFetcherCommand, state_sync::CertificateManagerCommand,
+    ConsensusBus,
 };
 use fastcrypto::hash::Hash as _;
 use std::collections::HashMap;
@@ -22,8 +23,6 @@ pub struct CertificateValidator<DB> {
     consensus_bus: ConsensusBus,
     /// The configuration for consensus.
     config: ConsensusConfig<DB>,
-    // /// Collection of parents to advance the round.
-    // parents: CertificatesAggregatorManager,
     /// Genesis digests and contents.
     genesis: HashMap<CertificateDigest, Certificate>,
     /// Highest garbage collection round.
@@ -137,7 +136,7 @@ where
             error!(target: "primary::state-sync", "processed certificate that is too new");
 
             return Err(CertificateError::TooNew(
-                certificate.digest(),
+                digest,
                 certificate.round(),
                 highest_processed_round,
             ));
@@ -146,8 +145,11 @@ where
         // forward to certificate manager to check for pending parents and accept
         let (reply, res) = oneshot::channel();
         self.consensus_bus
-            .pending_cert_commands()
-            .send(PendingCertCommand::ProcessVerifiedCertificate { certificate, reply })
+            .certificate_manager()
+            .send(CertificateManagerCommand::ProcessVerifiedCertificates {
+                certificates: vec![certificate],
+                reply,
+            })
             .await?;
 
         // TODO: rename this error

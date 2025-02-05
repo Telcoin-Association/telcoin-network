@@ -3,9 +3,12 @@
 //! arguments.
 
 use crate::{
-    certificate_fetcher::CertificateFetcherCommand, consensus::ConsensusRound,
-    proposer::OurDigestMessage, state_sync::PendingCertCommand,
-    synchronizer::VerifiedCertificatesMessage, RecentBlocks,
+    certificate_fetcher::CertificateFetcherCommand,
+    consensus::ConsensusRound,
+    proposer::OurDigestMessage,
+    state_sync::{CertificateManagerCommand, PendingCertCommand},
+    synchronizer::VerifiedCertificatesMessage,
+    RecentBlocks,
 };
 use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
 use std::sync::{atomic::AtomicBool, Arc};
@@ -91,8 +94,8 @@ struct ConsensusBusInner {
 
     /// Commands to the `PendingCertificateManager` that tracks pending certificates and their missing parents.
     pending_cert_commands: MeteredMpscChannel<PendingCertCommand>,
-    /// Process new certificates.
-    accept_verified_certificates: MeteredMpscChannel<VerifiedCertificatesMessage>,
+    /// Messages to the Certificate Manager.
+    certificate_manager: MeteredMpscChannel<CertificateManagerCommand>,
     /// Synchronize missing batches.
     sync_missing_batches: MeteredMpscChannel<(Header, Round)>,
     /// Store verified certificates
@@ -226,7 +229,8 @@ impl ConsensusBus {
             &primary_metrics.primary_channel_metrics.tx_pending_cert_commands_total,
         );
 
-        let accept_verified_certificates = channel_with_total_sender(
+        // TODO: these metrics don't make sense
+        let certificate_manager = channel_with_total_sender(
             CHANNEL_CAPACITY,
             &primary_metrics.primary_channel_metrics.tx_certificate_acceptor,
             &primary_metrics.primary_channel_metrics.tx_certificate_acceptor_total,
@@ -272,7 +276,7 @@ impl ConsensusBus {
                 committed_own_headers,
                 sequence,
                 pending_cert_commands,
-                accept_verified_certificates,
+                certificate_manager,
                 sync_missing_batches,
                 verified_certificates,
 
@@ -395,8 +399,8 @@ impl ConsensusBus {
     ///
     /// These channels are used to notifiy the PendingCertificateManager about new pending certificates.
     /// Can only be subscribed to once.
-    pub fn accept_verified_certificates(&self) -> &impl TnSender<VerifiedCertificatesMessage> {
-        &self.inner.accept_verified_certificates
+    pub fn certificate_manager(&self) -> &impl TnSender<CertificateManagerCommand> {
+        &self.inner.certificate_manager
     }
 
     /// Channel for forwarding information for syncing missing batches.

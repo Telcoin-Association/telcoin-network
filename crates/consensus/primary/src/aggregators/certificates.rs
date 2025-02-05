@@ -49,7 +49,7 @@ impl CertificatesAggregatorManager {
                 .parents()
                 .send((parents, round))
                 .await
-                .map_err(|_| CertificateError::TNSend)?;
+                .map_err(|e| CertificateError::TNSend(e.to_string()))?;
         }
 
         Ok(())

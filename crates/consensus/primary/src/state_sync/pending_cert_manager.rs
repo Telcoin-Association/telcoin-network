@@ -118,18 +118,22 @@ where
     }
 
     /// When a certificate is accepted, returns all of its children that are now ready to be verified.
-    fn update_pending(
+    // TODO: better method name? returns "unlocked" certs
+    pub(super) fn update_pending(
         &mut self,
         round: Round,
         digest: CertificateDigest,
-    ) -> CertificateResult<Vec<Certificate>> {
-        // return error if parent is still pending
-        if self.pending.remove(&digest).is_some() {
-            error!(target: "primary::pending-certificate", ?digest, "parent still pending");
-            return Err(CertificateError::PendingCertificateNotFound(digest));
-        }
+    ) -> CertificateResult<VecDeque<Certificate>> {
+        // // return error if parent is still pending
+        //
+        // this checked in cert manager
+        //
+        // if self.pending.remove(&digest).is_some() {
+        //     error!(target: "primary::pending-certificate", ?digest, "parent still pending");
+        //     return Err(CertificateError::PendingCertificateNotFound(digest));
+        // }
 
-        let mut ready_certificates = Vec::new();
+        let mut ready_certificates = VecDeque::new();
         let mut certificates_to_process = VecDeque::new();
         certificates_to_process.push_back((round, digest));
 
@@ -165,7 +169,7 @@ where
                     certificates_to_process.push_back((ready.certificate.round(), *pending_digest));
 
                     // return this certificate as ready for verification
-                    ready_certificates.push(ready.certificate);
+                    ready_certificates.push_back(ready.certificate);
                 }
             }
         }
@@ -227,15 +231,15 @@ where
             self.missing_parent_to_child.remove(&(round, digest));
 
             // try to accept this certificate and any of its children that become ready
-            let mut ready = self.update_pending(round, digest)?;
-            ready_certificates.append(&mut ready);
+            let ready = self.update_pending(round, digest)?;
+            ready_certificates.append(&mut ready.into());
         }
 
         Ok(ready_certificates)
     }
 
     /// Returns whether a certificate is being tracked
-    fn is_pending(&self, digest: &CertificateDigest) -> bool {
+    pub(super) fn is_pending(&self, digest: &CertificateDigest) -> bool {
         // self.pending.values().any(|pending| pending.missing_parent_digests.contains(digest))
         self.pending.get(digest).is_some()
     }
@@ -256,7 +260,7 @@ where
 
         let shutdown_rx = self.config.shutdown().subscribe();
         let mut pending_cert_commands_rx = self.consensus_bus.pending_cert_commands().subscribe();
-        let mut new_unverified_cert = self.consensus_bus.accept_verified_certificates().subscribe();
+        // let mut new_unverified_cert = self.consensus_bus.accept_verified_certificates().subscribe();
 
         // manage pending certificate state until shutdown
         loop {

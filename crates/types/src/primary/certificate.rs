@@ -238,7 +238,9 @@ impl Certificate {
         Ok(verified_cert)
     }
 
+    /// Check the verification state and try to verify directly.
     fn verify_signature(mut self, pks: Vec<BlsPublicKey>) -> CertificateResult<Certificate> {
+        // get signature from verification state
         let aggregrate_signature_bytes = match self.signature_verification_state {
             SignatureVerificationState::VerifiedIndirectly(_)
             | SignatureVerificationState::VerifiedDirectly(_)
