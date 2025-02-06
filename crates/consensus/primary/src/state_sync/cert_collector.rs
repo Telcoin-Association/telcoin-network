@@ -154,7 +154,11 @@ where
     fn max_limits_reached(&self) -> bool {
         self.items_returned >= self.max_items
             || self.start_time.elapsed()
-                >= self.config.network_config().sync_config().max_cert_collection_duration
+                >= self
+                    .config
+                    .network_config()
+                    .sync_config()
+                    .max_db_read_time_for_fetching_certificates
     }
 }
 

@@ -30,23 +30,6 @@ use tn_types::{
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 
-/// The maximum number of rounds that a proposed header can be behind.
-const MAX_HEADER_AGE_LIMIT: Round = 3;
-
-/// The tolerable amount of time to wait if a header is proposed before the current time. This
-/// accounts for small drifts in time keeping between nodes. The timestamp for headers is currently
-/// measured in secs.
-const MAX_HEADER_TIME_DRIFT_TOLERANCE: u64 = 1;
-
-/// Maximum duration to fetch certificates from local storage.
-const FETCH_CERTIFICATES_MAX_HANDLER_TIME: Duration = Duration::from_secs(10);
-
-/// Maximum number of certificates to process in a single batch before yielding.
-const MAX_NUM_MISSING_CERTS: usize = 50;
-
-/// Maximum number of rounds to skip per authority.
-const MAX_NUM_SKIP_ROUNDS: usize = 1000;
-
 /// The type that handles requests from peers.
 #[derive(Clone)]
 pub(super) struct RequestHandler<DB> {
@@ -300,7 +283,13 @@ where
         let now = now();
         if &now < header.created_at() {
             // wait if the difference is small enough
-            if *header.created_at() - now <= MAX_HEADER_TIME_DRIFT_TOLERANCE {
+            if *header.created_at() - now
+                <= self
+                    .consensus_config
+                    .network_config()
+                    .sync_config()
+                    .max_header_time_drift_tolerance
+            {
                 tokio::time::sleep(Duration::from_secs(*header.created_at() - now)).await;
             } else {
                 // created_at is too far in the future
@@ -411,11 +400,9 @@ where
         let mut unknown_certs = self.header_validator.identify_unkown_parents(header).await?;
 
         // ensure header is not too old
-        let limit = self
-            .consensus_bus
-            .primary_round_updates()
-            .borrow()
-            .saturating_sub(MAX_HEADER_AGE_LIMIT);
+        let limit = self.consensus_bus.primary_round_updates().borrow().saturating_sub(
+            self.consensus_config.network_config().sync_config().max_proposed_header_age_limit,
+        );
         ensure!(
             limit <= header.round(),
             HeaderError::TooOld(header.digest(), header.round(), limit)

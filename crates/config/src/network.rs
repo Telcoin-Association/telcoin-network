@@ -2,7 +2,7 @@
 
 use libp2p::{request_response::ProtocolSupport, StreamProtocol};
 use std::time::Duration;
-use tn_types::{traits::ToFromBytes as _, NetworkPublicKey};
+use tn_types::{traits::ToFromBytes as _, NetworkPublicKey, Round};
 
 /// The container for all network configurations.
 #[derive(Debug, Default)]
@@ -92,7 +92,7 @@ pub struct SyncConfig {
     /// certificates.
     pub max_skip_rounds_for_missing_certs: usize,
     /// Maximum time to spend collecting certificates from the local storage.
-    pub max_cert_collection_duration: Duration,
+    pub max_db_read_time_for_fetching_certificates: Duration,
     /// Controls how far ahead of the local node's progress external certificates are allowed to
     /// be. When a certificate arrives from another node, its round number is compared against
     /// the highest round that this node has processed locally. If the difference exceeds this
@@ -117,15 +117,29 @@ pub struct SyncConfig {
     /// On the happy path, this duration should never be reached. It is a safety measure for the
     /// node to try and recover after enough parents weren't received for a round within time.
     pub max_consenus_round_timeout: Duration,
+    /// The maximum number of rounds that a proposed header can be behind the node's local round.
+    pub max_proposed_header_age_limit: Round,
+    /// The tolerable amount of time to wait if a header is proposed before the current time.
+    ///
+    /// This accounts for small drifts in time keeping between nodes. The timestamp for headers is currently
+    /// measured in secs.
+    pub max_header_time_drift_tolerance: u64,
+    /// The maximum number of missing certificates a CVV peer can request within GC window.
+    ///
+    /// NOTE: this DOES NOT affect nodes that are syncing full state.
+    pub max_num_missing_certs_within_gc_round: usize,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             max_skip_rounds_for_missing_certs: 1_000,
-            max_cert_collection_duration: Duration::from_secs(10),
+            max_db_read_time_for_fetching_certificates: Duration::from_secs(10),
             max_diff_between_external_cert_round_and_highest_local_round: 1_000,
             max_consenus_round_timeout: Duration::from_secs(30),
+            max_proposed_header_age_limit: 3,
+            max_header_time_drift_tolerance: 1,
+            max_num_missing_certs_within_gc_round: 50,
         }
     }
 }
