@@ -1,8 +1,7 @@
 //! Modules for synchronizing state between nodes.
 
-use crate::{aggregators::CertificatesAggregatorManager, ConsensusBus};
+use crate::ConsensusBus;
 use fastcrypto::hash::Hash as _;
-use pending_cert_manager::PendingCertificateManager;
 use std::{
     collections::HashMap,
     sync::{
@@ -13,11 +12,8 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_storage::traits::Database;
 use tn_types::{Certificate, CertificateDigest};
-
-mod cert_acceptor;
 mod cert_collector;
 mod cert_manager;
-mod cert_processor;
 mod cert_validator;
 mod gc;
 mod headers;
@@ -25,7 +21,6 @@ mod pending_cert_manager;
 pub(crate) use cert_collector::CertificateCollector;
 pub(crate) use cert_manager::CertificateManagerCommand;
 pub(crate) use headers::HeaderValidator;
-pub(crate) use pending_cert_manager::PendingCertCommand;
 
 /// Process unverified headers and certificates.
 #[derive(Debug, Clone)]
@@ -52,7 +47,7 @@ where
     pub fn new(
         config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
-        parents: CertificatesAggregatorManager,
+        // parents: CertificatesAggregatorManager,
         gc_round: AtomicRound,
         highest_processed_round: AtomicRound,
         highest_received_round: AtomicRound,

@@ -102,8 +102,6 @@ pub struct PrimaryChannelMetrics {
     pub tx_certificate_acceptor: IntGauge,
     /// Occupancy of the channel synchronizing batches for provided headers & certificates.
     pub tx_batch_tasks: IntGauge,
-    /// Occupancy of the channel to manage pending certificates with missing parents.
-    pub tx_pending_cert_commands: IntGauge,
     /// Number of verified certificates sent to acceptor.
     pub tx_verified_certificates: IntGauge,
 
@@ -220,11 +218,6 @@ impl PrimaryChannelMetrics {
             tx_batch_tasks: register_int_gauge_with_registry!(
                 "tx_batch_tasks",
                 "Occupancy of the channel synchronizing batches for provided headers & certificates",
-                registry
-            )?,
-            tx_pending_cert_commands: register_int_gauge_with_registry!(
-                "tx_pending_cert_commands",
-                "occupancy of the channel managing pending certificates with missing parents",
                 registry
             )?,
             tx_verified_certificates: register_int_gauge_with_registry!(

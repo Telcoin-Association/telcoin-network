@@ -1,4 +1,4 @@
-//! Process standalone validated certificates.
+//! Process standalone validated and verified certificates.
 //!
 //! This module is responsible for checking certificate parents, managing pending certificates, and
 //! accepting certificates that become unlocked.
@@ -22,7 +22,7 @@ use tracing::{debug, error};
 
 /// Process validated certificates.
 ///
-/// Long-running task to anage pending certificate requests and accept verified certificates.
+/// Long-running task to manage pending certificate requests and accept verified certificates.
 #[derive(Debug)]
 pub struct CertificateManager<DB> {
     /// Consensus channels.
@@ -51,31 +51,7 @@ impl<DB> CertificateManager<DB>
 where
     DB: Database,
 {
-    /// TODO: delete this - only copied to review easily
-    /// Validate certificate.
-    // note: this should not need mut reference to self - only validate cert
-    pub fn validate_certificate(&self) -> CertificateResult<()> {
-        // validate certificate standalone and forward to CertificateManager
-        // - try_accept_certificate
-        // - accept_own_certificate
-        //
-        // synchronizer::process_certificate_internal
-        // - check node storage for certificate already exists
-        // + ignore pending state -> let next step do this
-        // - sanitize certificate
-        // + ignore sync batches request (L1140) - duplicate from PrimaryNetwork
-        //      - confirm this is duplicate and remove from PrimaryNetwork handler
-        // - sync ancestors if too new? Or let pending do this?
-        //      - confirm certificate fetcher command is redundant here
-        // - forward to certificate manager to check for pending
-        //      - return/await oneshot reply
-        todo!()
-    }
-
-    /// Process validated certificate.
-    // note: certs should also be verified by now!
-    //
-    //
+    // TODO: remove this
     // from synchronizer::process_certificate_internal:
     // - immediately check if certificate is already pending and return error to caller through
     //   oneshot
@@ -95,6 +71,9 @@ where
     // - check for missing parents
     // - accept cert and accept_children in that order
 
+    /// Process verified certificate.
+    ///
+    /// Returns an error if a certificate is unverified. This will accept certificate or mark it as pending if parents are missing.
     async fn process_verified_certificates(
         &mut self,
         certs: Vec<Certificate>,
@@ -104,6 +83,12 @@ where
         // these can be single, fetched from certificate fetcher or unlocked pending
         for cert in certs {
             let digest = cert.digest();
+
+            // guarantee certificate is verified before storing in pending
+            // NOTE: this is the only time this is checked
+            if !cert.signature_verification_state().is_verified() {
+                return Err(CertificateError::UnverifiedSignature(digest));
+            }
 
             // check pending status
             if self.pending.is_pending(&digest) {
@@ -186,6 +171,8 @@ where
     ///
     /// The certificate's state must be verified. This method writes to storage and returns the
     /// result to caller.
+    ///
+    /// NOTE: `self::process_verified_certificates` checks the verification status, so all certificates managed here are verified.
     // synchronizer::accept_certificate_internal
     async fn accept_verified_certificates(
         &self,
@@ -193,13 +180,6 @@ where
     ) -> CertificateResult<()> {
         let _scope = monitored_scope("primary::state-sync::accept_certificate");
         debug!(target: "primary::state-sync", ?certificates, "accepting {:?} certificates", certificates.len());
-        // TODO: ensure this isn't necessary after certificates become unlocked from pending
-        // or through `fetch certificates`
-        //
-        // check verification status
-        // if !certificates.signature_verification_state().is_verified() {
-        //     return Err(CertificateError::UnverifiedSignature(digest));
-        // }
 
         // write certificates to storage
         self.config.node_storage().certificate_store.write_all(certificates.clone())?;
@@ -223,11 +203,10 @@ where
                 .with_label_values(&[certificate_source])
                 .inc();
 
+            // NOTE: these next two steps are considered critical
             //
-            // NOTE: these next two steps must complete or else shutdown
+            // any error must be treated as fatal to avoid inconsistent state between DAG and certificate store
             //
-            // TODO: check error comments are consistent with synchronizer comments
-
             // append parent for round
             self.parents
                 .append_certificate(cert.clone(), self.config.committee())
@@ -248,20 +227,14 @@ where
 
     /// Update state with new GC round.
     ///
-    /// Always read from atomic round to ensure consistency.
-    /// We can safely accept certificates at gc_round + 1 whose parents were at gc_round.
-    ///
-    /// This method removes parents at the gc_round and tries to accept certificates that dependent on them.
-    /// This is safe because:
-    /// 1. Certificates at gc_round have been permanently removed from the DAG
-    /// 2. Parents at the gc_round will never be received because they were garbage collected
+    /// This method checks missing parents for the GC round. If a parent is garbage collected, the
+    /// pending collection is updated to collect any dependents that become unlocked (ie - no more
+    /// missing parents).
     async fn process_gc_round(&mut self) -> CertificateResult<()> {
-        // load latest round
+        // load latest gc round
         let gc_round = self.gc_round.load();
 
-        // loop through pending to process unlocked certificates whose missing parents were just gc'd
-        //
-        // important that this maintains causal order
+        // iterate one round at a time to preserver causal order
         while let Some((round, digest)) = self.pending.next_for_gc_round(gc_round) {
             let unlocked = self.pending.update_pending(round, digest)?;
             self.accept_verified_certificates(unlocked).await?;
@@ -270,18 +243,10 @@ where
         Ok(())
     }
 
-    // listen for verified certificate
-    // check for pending parents during vote requests
-    // garbage collect
+    /// Long running task to manage verified certificates.
+    ///
+    /// Certificate signature states are first verified, then parents are checked. If certificate parents are missing, the manager tracks them as pending. As parents become available or are removed through garbage collection, the certificate manager will update pending state and try to accept all known certificates.
     pub async fn run(mut self) -> CertificateResult<()> {
-        // TODO: use this instead of tokio mutex. tokio::select! for shutdown or command on mpsc
-        // receiver
-        // - receive gc updates
-        // - receive certificates for pending
-        // - state-sync::process_certificate_with_lock
-        // - try accept susupended parents
-        //
-
         let shutdown_rx = self.config.shutdown().subscribe();
         let mut certificate_manager_rx = self.consensus_bus.certificate_manager().subscribe();
 
@@ -301,16 +266,20 @@ where
                                     error!(target: "primary::state-sync", ?result, "fatal error. shutting down...");
                                     return result;
                                 }
-                                // otherwise return result to caller
-                                _ => {
-                                    let _ = reply.send(result);
+
+                                non_fatal_results => {
+                                    let _ = reply.send(non_fatal_results);
                                 }
                             }
                         }
                         CertificateManagerCommand::NewGCRound => {
                             self.process_gc_round().await?;
                         }
-                        _ => (),
+
+                        CertificateManagerCommand::FilterUnkownDigests { mut unknown, reply } => {
+                            self.pending.filter_unknown_digests(&mut unknown);
+                            let _ = reply.send(unknown);
+                        },
                     }
                 }
 
@@ -336,21 +305,14 @@ pub enum CertificateManagerCommand {
         /// Return the result to the certificate validator.
         reply: oneshot::Sender<CertificateResult<()>>,
     },
-    /// Process new garbage collection round.
+    /// Message from GarbageCollector that the gc round has advanced.
     NewGCRound,
-    // /// Check if a digest is pending.
-    // CheckPendingStatus {
-    //     /// Digest
-    //     digest: CertificateDigest,
-    //     /// Bool indicating if the certificate is currently pending.
-    //     reply: oneshot::Sender<bool>,
-    // },
     /// Filter certificate digests that are not in local storage.
     ///
     /// Remove digests that are already tracked by `Pending`.
     /// This is used to vote on headers.
     FilterUnkownDigests {
-        unknown: Box<Vec<CertificateDigest>>,
-        reply: oneshot::Sender<Box<Vec<CertificateDigest>>>,
+        unknown: Vec<CertificateDigest>,
+        reply: oneshot::Sender<Vec<CertificateDigest>>,
     },
 }

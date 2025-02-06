@@ -39,10 +39,20 @@ impl<DB> CertificateValidator<DB>
 where
     DB: Database,
 {
+    /// Process a certificate produced by the this node.
+    pub async fn process_own_certificate(&self, certificate: Certificate) -> CertificateResult<()> {
+        self.process_certificate(certificate, false).await
+    }
+
+    /// Process a certificate received from a peer.
+    pub async fn process_peer_certificate(
+        &self,
+        certificate: Certificate,
+    ) -> CertificateResult<()> {
+        self.process_certificate(certificate, true).await
+    }
+
     /// Validate certificate.
-    // note: this should not need mut reference to self - only validate cert
-    //
-    // api: process_own / process_external/peer
     async fn process_certificate(
         &self,
         mut certificate: Certificate,
@@ -154,8 +164,8 @@ where
             })
             .await?;
 
-        // TODO: rename this error
-        res.await.map_err(|_| CertificateError::CertificateAcceptorOneshot)?
+        // await response from certificate manager
+        res.await.map_err(|_| CertificateError::CertificateManagerOneshot)?
     }
 
     /// Validate and verify the certificate.

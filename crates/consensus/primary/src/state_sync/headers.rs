@@ -1,6 +1,6 @@
 //! State management methods for [StateSynchronizer] for primary headers.
 
-use super::PendingCertCommand;
+use super::CertificateManagerCommand;
 use crate::ConsensusBus;
 use consensus_metrics::monitored_scope;
 use fastcrypto::hash::Hash as _;
@@ -215,10 +215,10 @@ where
         // check pending certificates
         let (reply, filtered) = oneshot::channel();
         self.consensus_bus
-            .pending_cert_commands()
-            .send(PendingCertCommand::FilterUnkownDigests { unknown: Box::new(unknown), reply })
+            .certificate_manager()
+            .send(CertificateManagerCommand::FilterUnkownDigests { unknown, reply })
             .await?;
         let unknown = filtered.await.map_err(|_| HeaderError::PendingCertificateOneshot)?;
-        Ok(*unknown)
+        Ok(unknown)
     }
 }

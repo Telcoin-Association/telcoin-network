@@ -2,23 +2,18 @@
 
 use super::{AtomicRound, CertificateManagerCommand};
 use crate::{
-    aggregators::CertificatesAggregatorManager,
     certificate_fetcher::CertificateFetcherCommand,
     error::{GarbageCollectorError, GarbageCollectorResult},
     ConsensusBus,
 };
 use consensus_metrics::monitored_scope;
-use parking_lot::Mutex;
-use std::{
-    collections::BTreeMap,
-    sync::{atomic::AtomicU32, Arc},
-};
 use tn_config::ConsensusConfig;
 use tn_storage::traits::Database;
-use tn_types::{Round, TnSender as _};
+use tn_types::TnSender as _;
 use tokio::{sync::watch, time::interval};
 use tracing::{error, warn};
 
+// NOTE: this is implemented here to ensure no other actors can update the atomic round.
 impl AtomicRound {
     /// Store the new atomic round.
     ///
@@ -28,6 +23,10 @@ impl AtomicRound {
     }
 }
 
+/// Long running task that manages the garbage collection events from consensus.
+///
+/// When the DAG advances the GC round, this task updates the [AtomicRound] and notifies
+/// subscribers.
 pub struct GarbageCollector<DB> {
     /// The consensus configuration.
     config: ConsensusConfig<DB>,
@@ -37,7 +36,7 @@ pub struct GarbageCollector<DB> {
     rx_gc_round_updates: watch::Receiver<u32>,
     /// The atomic gc round.
     ///
-    /// This managed by `Self` and is read by CertificateValidator and CertificateManager.
+    /// This is managed by `Self` and is read by CertificateValidator and CertificateManager.
     gc_round: AtomicRound,
 }
 
@@ -79,7 +78,7 @@ where
                 // round update watch channel
                 update = self.rx_gc_round_updates.changed() => {
                     // ensure change notification isn't an error
-                    update.map_err(|e| GarbageCollectorError::ConsensusRoundWatchChannel(e)).inspect_err(|e| {
+                    update.map_err(GarbageCollectorError::ConsensusRoundWatchChannel).inspect_err(|e| {
                         error!(target: "primary::gc", ?e, "rx_consensus_round_updates watch error. shutting down...");
                     })?;
 

@@ -3,12 +3,8 @@
 //! arguments.
 
 use crate::{
-    certificate_fetcher::CertificateFetcherCommand,
-    consensus::ConsensusRound,
-    proposer::OurDigestMessage,
-    state_sync::{CertificateManagerCommand, PendingCertCommand},
-    synchronizer::VerifiedCertificatesMessage,
-    RecentBlocks,
+    certificate_fetcher::CertificateFetcherCommand, consensus::ConsensusRound,
+    proposer::OurDigestMessage, state_sync::CertificateManagerCommand, RecentBlocks,
 };
 use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
 use std::sync::{atomic::AtomicBool, Arc};
@@ -93,9 +89,6 @@ struct ConsensusBusInner {
     /// Outputs the sequence of ordered certificates to the application layer.
     sequence: MeteredMpscChannel<CommittedSubDag>,
 
-    /// Commands to the `PendingCertificateManager` that tracks pending certificates and their
-    /// missing parents.
-    pending_cert_commands: MeteredMpscChannel<PendingCertCommand>,
     /// Messages to the Certificate Manager.
     certificate_manager: MeteredMpscChannel<CertificateManagerCommand>,
     /// Synchronize missing batches.
@@ -229,12 +222,6 @@ impl ConsensusBus {
             &primary_metrics.primary_channel_metrics.tx_committed_own_headers_total,
         );
 
-        let pending_cert_commands = channel_with_total_sender(
-            CHANNEL_CAPACITY,
-            &primary_metrics.primary_channel_metrics.tx_pending_cert_commands,
-            &primary_metrics.primary_channel_metrics.tx_pending_cert_commands_total,
-        );
-
         // TODO: these metrics don't make sense
         let certificate_manager = channel_with_total_sender(
             CHANNEL_CAPACITY,
@@ -284,7 +271,6 @@ impl ConsensusBus {
                 headers,
                 committed_own_headers,
                 sequence,
-                pending_cert_commands,
                 certificate_manager,
                 sync_missing_batches,
                 verified_certificates,
@@ -398,19 +384,10 @@ impl ConsensusBus {
         &self.inner.verified_certificates
     }
 
-    /// Commands to update pending certificate state.
-    ///
-    /// These channels are used to notifiy the PendingCertificateManager about new pending
-    /// certificates with missing parents and when garbge collection rounds change. Can only be
-    /// subscribed to once.
-    pub fn pending_cert_commands(&self) -> &impl TnSender<PendingCertCommand> {
-        &self.inner.pending_cert_commands
-    }
-
     /// Channel for forwarding newly received certificates for verification.
     ///
-    /// These channels are used to notifiy the PendingCertificateManager about new pending
-    /// certificates. Can only be subscribed to once.
+    /// These channels are used to communicate with the long-running CertificateManager task.
+    /// Can only be subscribed to once.
     pub fn certificate_manager(&self) -> &impl TnSender<CertificateManagerCommand> {
         &self.inner.certificate_manager
     }

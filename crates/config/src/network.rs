@@ -110,6 +110,7 @@ pub struct SyncConfig {
     ///   - 100 validators
     ///   - 1000 round limit
     ///   - 3.3KB per certificate
+    ///
     /// The maximum memory usage would be: 100 * 1000 * 3.3KB = 330MB
     pub max_diff_between_external_cert_round_and_highest_local_round: u32,
     /// Maximum duration for a round to update before the GC requests certificates from peers.
@@ -121,8 +122,8 @@ pub struct SyncConfig {
     pub max_proposed_header_age_limit: Round,
     /// The tolerable amount of time to wait if a header is proposed before the current time.
     ///
-    /// This accounts for small drifts in time keeping between nodes. The timestamp for headers is currently
-    /// measured in secs.
+    /// This accounts for small drifts in time keeping between nodes. The timestamp for headers is
+    /// currently measured in secs.
     pub max_header_time_drift_tolerance: u64,
     /// The maximum number of missing certificates a CVV peer can request within GC window.
     ///

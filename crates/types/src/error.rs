@@ -294,6 +294,9 @@ pub enum CertificateError {
     /// The certificate is pending acceptance due to missing parents.
     #[error("The certificate {0} is pending acceptance due to missing parents.")]
     Pending(CertificateDigest),
+    /// A duplicate certificate was received but it has different missing parents.
+    #[error("The certificate {0} was already pending, but now it has different missing parents.")]
+    PendingParentsMismatch(CertificateDigest),
     /// Error retrieving value from storage.
     #[error("Storage failure: {0}")]
     Storage(#[from] StoreError),
@@ -327,9 +330,9 @@ pub enum CertificateError {
     /// The parent was not found.
     #[error("Error accepting certificate. Parent not found: {0}")]
     MissingParent(CertificateDigest),
-    /// Oneshot channel dropped for certificate acceptor.
-    #[error("Failed to return certificate acceptor result.")]
-    CertificateAcceptorOneshot,
+    /// Oneshot channel dropped for certificate manager.
+    #[error("Failed to return certificate manager's result.")]
+    CertificateManagerOneshot,
     /// The pending certificate is unexpectedly missing. This should not happen.
     #[error("Pending certificate not found by digest: {0}")]
     PendingCertificateNotFound(CertificateDigest),

@@ -11,7 +11,7 @@ use crate::{
 use fastcrypto::hash::Hash;
 use parking_lot::Mutex;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
     time::Duration,
 };
@@ -27,7 +27,6 @@ use tn_types::{
     now, try_decode, AuthorityIdentifier, BlockHash, Certificate, CertificateDigest,
     ConsensusHeader, Header, Round, SignatureVerificationState, TnSender as _, Vote,
 };
-use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 
 /// The type that handles requests from peers.
