@@ -187,17 +187,17 @@ impl Certificate {
     ///
     /// The method returns a certificate with verified signature state.
     ///
-    /// [SignatureVerificationState] stores both the verification status and signature bytes together.
-    /// While this creates some data redundancy with signed_authorities, keeping them coupled provides
-    /// important benefits:
+    /// [SignatureVerificationState] stores both the verification status and signature bytes
+    /// together. While this creates some data redundancy with signed_authorities, keeping them
+    /// coupled provides important benefits:
     ///
-    /// 1. Atomic State Updates - Changes to verification status are guaranteed to reference the exact
-    ///    signature bytes that were verified. This prevents state/signature mismatches that could occur
-    ///    if stored separately.
+    /// 1. Atomic State Updates - Changes to verification status are guaranteed to reference the
+    ///    exact signature bytes that were verified. This prevents state/signature mismatches that
+    ///    could occur if stored separately.
     ///
-    /// 2. Verification Integrity - The verification status can only transition while operating on the
-    ///    specific signature bytes that were validated. This maintains a clear chain of trust through
-    ///    the verification process.
+    /// 2. Verification Integrity - The verification status can only transition while operating on
+    ///    the specific signature bytes that were validated. This maintains a clear chain of trust
+    ///    through the verification process.
     ///
     /// 3. Invariant Preservation - Makes it impossible to have invalid states like:
     ///    - VerifiedDirectly status with different signature bytes than what was actually verified
@@ -205,8 +205,8 @@ impl Certificate {
     ///    - A Verified state with missing/corrupted signature bytes
     ///
     /// While storing signatures in both places uses more memory, the strong correctness guarantees
-    /// outweigh the storage cost for certificate verification where maintaining cryptographic integrity
-    /// is critical.
+    /// outweigh the storage cost for certificate verification where maintaining cryptographic
+    /// integrity is critical.
     pub fn verify(
         self,
         committee: &Committee,

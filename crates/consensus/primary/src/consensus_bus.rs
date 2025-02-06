@@ -92,7 +92,8 @@ struct ConsensusBusInner {
     /// Outputs the sequence of ordered certificates to the application layer.
     sequence: MeteredMpscChannel<CommittedSubDag>,
 
-    /// Commands to the `PendingCertificateManager` that tracks pending certificates and their missing parents.
+    /// Commands to the `PendingCertificateManager` that tracks pending certificates and their
+    /// missing parents.
     pending_cert_commands: MeteredMpscChannel<PendingCertCommand>,
     /// Messages to the Certificate Manager.
     certificate_manager: MeteredMpscChannel<CertificateManagerCommand>,
@@ -389,16 +390,17 @@ impl ConsensusBus {
 
     /// Commands to update pending certificate state.
     ///
-    /// These channels are used to notifiy the PendingCertificateManager about new pending certificates with missing parents and when garbge collection rounds change.
-    /// Can only be subscribed to once.
+    /// These channels are used to notifiy the PendingCertificateManager about new pending
+    /// certificates with missing parents and when garbge collection rounds change. Can only be
+    /// subscribed to once.
     pub fn pending_cert_commands(&self) -> &impl TnSender<PendingCertCommand> {
         &self.inner.pending_cert_commands
     }
 
     /// Channel for forwarding newly received certificates for verification.
     ///
-    /// These channels are used to notifiy the PendingCertificateManager about new pending certificates.
-    /// Can only be subscribed to once.
+    /// These channels are used to notifiy the PendingCertificateManager about new pending
+    /// certificates. Can only be subscribed to once.
     pub fn certificate_manager(&self) -> &impl TnSender<CertificateManagerCommand> {
         &self.inner.certificate_manager
     }

@@ -57,8 +57,8 @@ where
 
     /// Spawn the garbage collection task to update the gc round for all consensus tasks.
     ///
-    /// The GC is a loop that tries to fetch certificates if the consensus round doesn't update within
-    /// `max_timeout_sync_certificates`
+    /// The GC is a loop that tries to fetch certificates if the consensus round doesn't update
+    /// within `max_timeout_sync_certificates`
     pub async fn run(&mut self) -> GarbageCollectorResult<()> {
         let mut max_round_timeout =
             interval(self.config.network_config().sync_config().max_consenus_round_timeout);
@@ -116,8 +116,9 @@ where
 
     /// Request the certificate fetcher to request certificates from peers.
     ///
-    /// This method is called after the node hasn't received enough parents from the previous round to advance.
-    /// The fallback timer is used to attempt to recover by requesting certificates from peers.
+    /// This method is called after the node hasn't received enough parents from the previous round
+    /// to advance. The fallback timer is used to attempt to recover by requesting certificates
+    /// from peers.
     async fn process_max_round_timeout(&self) -> GarbageCollectorResult<()> {
         if let Err(e) =
             self.consensus_bus.certificate_fetcher().send(CertificateFetcherCommand::Kick).await

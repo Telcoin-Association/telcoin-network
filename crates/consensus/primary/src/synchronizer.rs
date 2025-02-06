@@ -1263,8 +1263,8 @@ impl Drop for SuspendedCertificate {
 
 struct State {
     // Maps digests of suspended certificates to details including the certificate itself.
-    //
-    /// Tried to accept a certificate that was received from a peer, but this node is missing the certificate's parents.
+    /// Tried to accept a certificate that was received from a peer, but this node is missing the
+    /// certificate's parents.
     suspended: HashMap<CertificateDigest, SuspendedCertificate>,
     // Maps digests of certificates that are not yet in the DAG, to digests of certificates that
     // include them as parents. Keys are prefixed by round number to allow GC.

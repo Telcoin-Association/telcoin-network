@@ -93,10 +93,11 @@ pub struct SyncConfig {
     pub max_skip_rounds_for_missing_certs: usize,
     /// Maximum time to spend collecting certificates from the local storage.
     pub max_cert_collection_duration: Duration,
-    /// Controls how far ahead of the local node's progress external certificates are allowed to be.
-    /// When a certificate arrives from another node, its round number is compared against the highest
-    /// round that this node has processed locally. If the difference exceeds this limit, the
-    /// certificate is rejected to prevent memory exhaustion from storing too many future certificates.
+    /// Controls how far ahead of the local node's progress external certificates are allowed to
+    /// be. When a certificate arrives from another node, its round number is compared against
+    /// the highest round that this node has processed locally. If the difference exceeds this
+    /// limit, the certificate is rejected to prevent memory exhaustion from storing too many
+    /// future certificates.
     ///
     /// For example, if the local node has processed up to round 1000 and this limit is set to 500,
     /// certificates from round 1501 or higher will be rejected. This creates a sliding window of
@@ -113,8 +114,8 @@ pub struct SyncConfig {
     pub max_diff_between_external_cert_round_and_highest_local_round: u32,
     /// Maximum duration for a round to update before the GC requests certificates from peers.
     ///
-    /// On the happy path, this duration should never be reached. It is a safety measure for the node
-    /// to try and recover after enough parents weren't received for a round within time.
+    /// On the happy path, this duration should never be reached. It is a safety measure for the
+    /// node to try and recover after enough parents weren't received for a round within time.
     pub max_consenus_round_timeout: Duration,
 }
 

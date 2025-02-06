@@ -1,6 +1,7 @@
 //! Main actor processing certificates.
 //!
-//! This module orchestrates all other certificate components, such as garbage collection, pending certs, and accepting new certificates.
+//! This module orchestrates all other certificate components, such as garbage collection, pending
+//! certs, and accepting new certificates.
 
 use super::{AtomicRound, StateSynchronizer};
 use crate::{
@@ -59,7 +60,8 @@ where
 
     /// Process a new, unverified certificate.
     ///
-    /// Try to validate the certificate and add it to the DAG if there are no missing parents. If the certificate contains unkown parents, then return an error and try to fetch them.
+    /// Try to validate the certificate and add it to the DAG if there are no missing parents. If
+    /// the certificate contains unkown parents, then return an error and try to fetch them.
     fn process_external_certificate(&mut self, certificate: Certificate) -> CertificateResult<()> {
         let _scope = monitored_scope("state-sync::try_accept_certificate");
         todo!()
@@ -322,7 +324,8 @@ where
     ///
     /// This method returns a collection of unlocked certificates to accept.
 
-    /// Check that certificate's parents are in storage. Returns the digests of any parents that are missing.
+    /// Check that certificate's parents are in storage. Returns the digests of any parents that are
+    /// missing.
     async fn get_missing_parents(
         &self,
         certificate: &Certificate,

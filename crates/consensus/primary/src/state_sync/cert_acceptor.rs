@@ -42,7 +42,8 @@ where
 
     /// Try to accept the verified certificate.
     ///
-    /// The certificate's state must be verified. This method writes to storage and returns the result to caller.
+    /// The certificate's state must be verified. This method writes to storage and returns the
+    /// result to caller.
     // synchronizer::accept_certificate_internal
     async fn try_accept_verified_certificate(
         &self,

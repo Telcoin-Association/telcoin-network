@@ -1,6 +1,7 @@
 //! Process standalone validated certificates.
 //!
-//! This module is responsible for checking certificate parents, managing pending certificates, and accepting certificates that become unlocked.
+//! This module is responsible for checking certificate parents, managing pending certificates, and
+//! accepting certificates that become unlocked.
 
 use super::{pending_cert_manager::PendingCertificateManager, AtomicRound};
 use crate::{
@@ -14,10 +15,10 @@ use tn_config::ConsensusConfig;
 use tn_storage::traits::Database;
 use tn_types::{
     error::{CertificateError, CertificateResult, HeaderError},
-    Certificate, CertificateDigest, Round, TnReceiver as _, TnSender as _,
+    Certificate, CertificateDigest, TnReceiver as _, TnSender as _,
 };
 use tokio::sync::oneshot;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 /// Process validated certificates.
 ///
@@ -76,7 +77,8 @@ where
     //
     //
     // from synchronizer::process_certificate_internal:
-    // - immediately check if certificate is already pending and return error to caller through oneshot
+    // - immediately check if certificate is already pending and return error to caller through
+    //   oneshot
     //
     // from synchronizer::accept_certificate
     // - check every cert verification state
@@ -136,7 +138,8 @@ where
         Ok(())
     }
 
-    /// Check that certificate's parents are in storage. Returns the digests of any parents that are missing.
+    /// Check that certificate's parents are in storage. Returns the digests of any parents that are
+    /// missing.
     async fn get_missing_parents(
         &self,
         certificate: &Certificate,
@@ -181,7 +184,8 @@ where
 
     /// Try to accept the verified certificate.
     ///
-    /// The certificate's state must be verified. This method writes to storage and returns the result to caller.
+    /// The certificate's state must be verified. This method writes to storage and returns the
+    /// result to caller.
     // synchronizer::accept_certificate_internal
     async fn accept_verified_certificates(
         &self,
@@ -245,23 +249,33 @@ where
     /// Update state with new GC round.
     ///
     /// Always read from atomic round to ensure consistency.
-    fn process_gc_round(&mut self) -> CertificateResult<()> {
+    /// We can safely accept certificates at gc_round + 1 whose parents were at gc_round.
+    ///
+    /// This method removes parents at the gc_round and tries to accept certificates that dependent on them.
+    /// This is safe because:
+    /// 1. Certificates at gc_round have been permanently removed from the DAG
+    /// 2. Parents at the gc_round will never be received because they were garbage collected
+    async fn process_gc_round(&mut self) -> CertificateResult<()> {
         // load latest round
         let gc_round = self.gc_round.load();
 
-        // update pending state
+        // loop through pending to process unlocked certificates whose missing parents were just gc'd
         //
-        // certificates can be unlocked if a missing parent is garbage collected
-        let unlocked = self.pending.garbage_collect(gc_round)?;
+        // important that this maintains causal order
+        while let Some((round, digest)) = self.pending.next_for_gc_round(gc_round) {
+            let unlocked = self.pending.update_pending(round, digest)?;
+            self.accept_verified_certificates(unlocked).await?;
+        }
 
-        todo!()
+        Ok(())
     }
 
     // listen for verified certificate
     // check for pending parents during vote requests
     // garbage collect
     pub async fn run(mut self) -> CertificateResult<()> {
-        // TODO: use this instead of tokio mutex. tokio::select! for shutdown or command on mpsc receiver
+        // TODO: use this instead of tokio mutex. tokio::select! for shutdown or command on mpsc
+        // receiver
         // - receive gc updates
         // - receive certificates for pending
         // - state-sync::process_certificate_with_lock
@@ -294,7 +308,7 @@ where
                             }
                         }
                         CertificateManagerCommand::NewGCRound => {
-                            self.process_gc_round()?;
+                            self.process_gc_round().await?;
                         }
                         _ => (),
                     }
@@ -316,7 +330,8 @@ pub enum CertificateManagerCommand {
     ProcessVerifiedCertificates {
         /// The certificate that was verified.
         ///
-        /// Try to accept this certificate. If it has missing parents, track the certificate as pending and return an error.
+        /// Try to accept this certificate. If it has missing parents, track the certificate as
+        /// pending and return an error.
         certificates: Vec<Certificate>,
         /// Return the result to the certificate validator.
         reply: oneshot::Sender<CertificateResult<()>>,

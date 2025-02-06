@@ -20,7 +20,8 @@ use tracing::{debug, error, trace, warn};
 struct PendingCertificate {
     /// The pending certificate.
     certificate: Certificate,
-    /// The certificate's missing parents that must be retrieved before the pending certificate is accepted.
+    /// The certificate's missing parents that must be retrieved before the pending certificate is
+    /// accepted.
     missing_parent_digests: HashSet<CertificateDigest>,
 }
 
@@ -30,12 +31,14 @@ impl PendingCertificate {
         Self { certificate, missing_parent_digests: missing_parents }
     }
 
-    /// Helper method if pending certificate should be validated again after all missing parents obtained.
+    /// Helper method if pending certificate should be validated again after all missing parents
+    /// obtained.
     fn is_ready(&self) -> bool {
         self.missing_parent_digests.is_empty()
     }
 
-    /// Remove a missing parent, either due to gc round or because missing parent was successfully retrieved.
+    /// Remove a missing parent, either due to gc round or because missing parent was successfully
+    /// retrieved.
     fn remove_parent(&mut self, parent_digest: &CertificateDigest) {
         self.missing_parent_digests.remove(parent_digest);
     }
@@ -51,10 +54,10 @@ pub struct PendingCertificateManager<DB> {
     ///
     /// Pending certificates that cannot be accepted yet.
     pending: HashMap<CertificateDigest, PendingCertificate>,
-    /// Map of a parent digest to the digests of pending certificates.
+    /// Map of a the missing certificate digests and the pending certificates that are blocked by them.
     ///
     /// The keys are (round, digest) to enable garbage collection by round.
-    missing_parent_to_child: BTreeMap<(Round, CertificateDigest), HashSet<CertificateDigest>>,
+    missing_for_pending: BTreeMap<(Round, CertificateDigest), HashSet<CertificateDigest>>,
 
     /// The configuration for consensus.
     config: ConsensusConfig<DB>,
@@ -71,7 +74,7 @@ where
     pub fn new(config: ConsensusConfig<DB>, consensus_bus: ConsensusBus) -> Self {
         Self {
             pending: Default::default(),
-            missing_parent_to_child: Default::default(),
+            missing_for_pending: Default::default(),
             config,
             consensus_bus,
         }
@@ -105,7 +108,7 @@ where
 
         // insert missing parents
         for parent in missing_parents {
-            self.missing_parent_to_child.entry((parent_round, parent)).or_default().insert(digest);
+            self.missing_for_pending.entry((parent_round, parent)).or_default().insert(digest);
         }
 
         self.consensus_bus
@@ -117,8 +120,10 @@ where
         Ok(())
     }
 
-    /// When a certificate is accepted, returns all of its children that are now ready to be verified.
+    /// When a certificate is accepted, returns all of its children that are now ready to be
+    /// verified.
     // TODO: better method name? returns "unlocked" certs
+    // synchronizer::state::accept_children
     pub(super) fn update_pending(
         &mut self,
         round: Round,
@@ -140,8 +145,7 @@ where
         // Process certificates in a cascading manner
         while let Some((next_round, next_digest)) = certificates_to_process.pop_front() {
             // get pending certificates with missing parents
-            let Some(pending_digests) =
-                self.missing_parent_to_child.remove(&(next_round, next_digest))
+            let Some(pending_digests) = self.missing_for_pending.remove(&(next_round, next_digest))
             else {
                 continue;
             };
@@ -177,7 +181,8 @@ where
         Ok(ready_certificates)
     }
 
-    /// Use the newly verified certificate to update pending state. Forward this certificate and any unlocked certificates to the CertificateAcceptor.
+    /// Use the newly verified certificate to update pending state. Forward this certificate and any
+    /// unlocked certificates to the CertificateAcceptor.
     async fn process_accepted_certificate(
         &mut self,
         certificate: Certificate,
@@ -213,25 +218,77 @@ where
         result.await.map_err(|_| CertificateError::CertificateAcceptorOneshot)?
     }
 
+    /// Return the first key/value in the pending BTreeMap (sorted) that matches the gc round.
+    ///
+    /// This is useful for iterating through all missing certificates that are blocking pending certificates from being accepted.
+    pub(super) fn next_for_gc_round(
+        &mut self,
+        gc_round: Round,
+    ) -> Option<(Round, CertificateDigest)> {
+        let (round, digest) = self
+            .missing_for_pending
+            .first_key_value()
+            .map(|((round, digest), _children)| ((*round, *digest)))?;
+
+        // check if all gc rounds are processed
+        if round > gc_round {
+            return None;
+        }
+
+        // remove missing parents from gc round
+        //
+        // scenario:
+        // - this certificate is blocking other certificates because its parents are missing
+        // - it's parents were just gcd, so remove them
+        //
+        // NOTE: this digest is returned and will be used to update pending by caller
+        if let Some(pending) = self.pending.get_mut(&digest) {
+            pending.missing_parent_digests.clear();
+        }
+
+        Some((round, digest))
+    }
+
     /// Performs garbage collection up to and including the specified round.
+    ///
+    /// This method checks missing parents for the GC round. If a parent is garbage collected, the
+    /// pending collection is updated to collect any dependents that become unlocked (ie - no more
+    /// missing parents).
+    ///
+    /// TODO: The unlocked certificates are then processed.
+    ///
+    /// NOTE: this can only iterate one round at a time because the unlocked pending certificates need to be processed in causal order.
+    /// `causal order`: parent certificates must be accepted before its dependents
+    ///
+    /// order matters
     pub(super) fn garbage_collect(
         &mut self,
         gc_round: Round,
     ) -> CertificateResult<Vec<Certificate>> {
         let mut ready_certificates = Vec::new();
 
+        // L331
+        // and
+        // L1365
+
         // find all certificates at or below gc_round
-        while let Some(((round, digest), _children)) = self
-            .missing_parent_to_child
+        //
+        // NOTE: BTreeMap is sorted
+        while let Some((round, digest)) = self
+            .missing_for_pending
             .first_key_value()
-            .map(|((round, digest), children)| ((*round, *digest), children.clone()))
+            .map(|((round, digest), _children)| ((*round, *digest)))
         {
+            // check if all gc rounds are processed
             if round > gc_round {
                 break;
             }
 
             // remove this entry since it's being garbage collected
-            self.missing_parent_to_child.remove(&(round, digest));
+            if let Some(mut pending) = self.pending.remove(&digest) {
+                // clear missing parents
+                pending.missing_parent_digests.clear();
+            }
 
             // try to accept this certificate and any of its children that become ready
             let ready = self.update_pending(round, digest)?;
@@ -254,7 +311,8 @@ where
 
     /// Listen for incoming message and update pending certificate state.
     pub async fn run(mut self) -> CertificateResult<()> {
-        // TODO: use this instead of tokio mutex. tokio::select! for shutdown or command on mpsc receiver
+        // TODO: use this instead of tokio mutex. tokio::select! for shutdown or command on mpsc
+        // receiver
         // - receive gc updates
         // - receive certificates for pending
         // - state-sync::process_certificate_with_lock
@@ -263,7 +321,8 @@ where
 
         let shutdown_rx = self.config.shutdown().subscribe();
         let mut pending_cert_commands_rx = self.consensus_bus.pending_cert_commands().subscribe();
-        // let mut new_unverified_cert = self.consensus_bus.accept_verified_certificates().subscribe();
+        // let mut new_unverified_cert =
+        // self.consensus_bus.accept_verified_certificates().subscribe();
 
         // manage pending certificate state until shutdown
         loop {
@@ -315,7 +374,8 @@ pub enum PendingCertCommand {
     ProcessVerifiedCertificate {
         /// The certificate that was verified.
         ///
-        /// Compare this certificate against any pending certificates and process certificates that become unblocked.
+        /// Compare this certificate against any pending certificates and process certificates that
+        /// become unblocked.
         certificate: Certificate,
         /// Return the result to the certificate validator.
         reply: oneshot::Sender<CertificateResult<()>>,
