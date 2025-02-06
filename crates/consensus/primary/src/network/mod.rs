@@ -13,7 +13,7 @@ use tn_network_libp2p::{
     GossipMessage, PeerId, ResponseChannel,
 };
 use tn_storage::traits::Database;
-use tn_types::{BlockHash, Certificate, Header, Noticer};
+use tn_types::{BlockHash, Certificate, Header, Noticer, TaskManager};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, warn};
 mod handler;
@@ -58,18 +58,20 @@ where
     }
 
     /// Run the network.
-    async fn spawn(mut self) {
-        loop {
-            tokio::select! {
-                event = self.network_events.recv() => {
-                    match event {
-                        Some(e) => self.process_network_event(e),
-                        None => todo!(),
+    pub(crate) fn spawn(mut self, task_manager: &TaskManager) {
+        task_manager.spawn_task("latest block", async move {
+            loop {
+                tokio::select!(
+                    _ = &self.shutdown_rx => break,
+                    event = self.network_events.recv() => {
+                        match event {
+                            Some(e) => self.process_network_event(e),
+                            None => break,
+                        }
                     }
-                }
-                _ = &self.shutdown_rx => break,
+                )
             }
-        }
+        });
     }
 
     /// Handle events concurrently.
@@ -191,7 +193,7 @@ where
                 }
 
                 // match on error to lower peer score
-                todo!();
+                //todo!();
             }
         });
     }

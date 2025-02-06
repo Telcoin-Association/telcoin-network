@@ -9,7 +9,7 @@ use libp2p::{
 };
 use std::io;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 /// Networking error type.
 #[derive(Debug, Error)]
@@ -31,7 +31,7 @@ pub enum NetworkError {
     MpscTrySend(String),
     /// mpsc receiver dropped.
     #[error("mpsc error: {0}")]
-    MpscSender(String),
+    ChannelSender(String),
     /// oneshot sender dropped.
     #[error("oneshot error: {0}")]
     AckChannelClosed(String),
@@ -78,7 +78,13 @@ impl From<oneshot::error::RecvError> for NetworkError {
 
 impl<T> From<mpsc::error::SendError<T>> for NetworkError {
     fn from(e: mpsc::error::SendError<T>) -> Self {
-        Self::MpscSender(e.to_string())
+        Self::ChannelSender(e.to_string())
+    }
+}
+
+impl<T> From<broadcast::error::SendError<T>> for NetworkError {
+    fn from(e: broadcast::error::SendError<T>) -> Self {
+        Self::ChannelSender(e.to_string())
     }
 }
 

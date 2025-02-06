@@ -89,7 +89,9 @@ async fn test_valid_req_res() -> eyre::Result<()> {
     // start honest peer1 network
     let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
-    network.run();
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
 
     // start honest peer2 network
     let NetworkPeer {
@@ -98,7 +100,9 @@ async fn test_valid_req_res() -> eyre::Result<()> {
         network_events: mut network_events_2,
         network,
     } = peer2;
-    network.run();
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
 
     // start swarm listening on default any address
     peer1.start_listening(config_1.authority().primary_network_address().inner()).await?;
@@ -142,11 +146,15 @@ async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
     // start honest peer1 network
     let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
-    network.run();
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
 
     // start honest peer2 network
     let NetworkPeer { config: config_2, network_handle: peer2, network, .. } = peer2;
-    let peer2_network_task = network.run();
+    let peer2_network_task = tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
 
     // start swarm listening on default any address
     peer1.start_listening(config_1.authority().primary_network_address().inner()).await?;
@@ -201,7 +209,9 @@ async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
     let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
 
-    let peer1_network_task = network.run();
+    let peer1_network_task = tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
 
     // start honest peer2 network
     let NetworkPeer {
@@ -210,7 +220,9 @@ async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
         network_events: mut network_events_2,
         network,
     } = peer2;
-    network.run();
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
 
     // start swarm listening on default any address
     peer1.start_listening(config_1.authority().primary_network_address().inner()).await?;
@@ -272,12 +284,16 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
     // "worker" network
     let TestTypes { peer1, .. } = create_test_types::<TestPrimaryRequest, TestPrimaryResponse>();
     let NetworkPeer { config: config_1, network_handle: malicious_peer, network, .. } = peer1;
-    network.run();
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
 
     // start honest peer2 network
     let TestTypes { peer2, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let NetworkPeer { config: config_2, network_handle: honest_peer, network, .. } = peer2;
-    network.run();
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
 
     // start swarm listening on default any address
     malicious_peer.start_listening(config_1.authority().primary_network_address().inner()).await?;
@@ -316,7 +332,9 @@ async fn test_outbound_failure_malicious_response() -> eyre::Result<()> {
     // honest peer 1
     let TestTypes { peer1, .. } = create_test_types::<TestPrimaryRequest, TestPrimaryResponse>();
     let NetworkPeer { config: config_1, network_handle: honest_peer, network, .. } = peer1;
-    network.run();
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
 
     // malicious peer2
     //
@@ -330,7 +348,9 @@ async fn test_outbound_failure_malicious_response() -> eyre::Result<()> {
         network,
         network_events: mut network_events_2,
     } = peer2;
-    network.run();
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
 
     // start swarm listening on default any address
     honest_peer.start_listening(config_1.authority().primary_network_address().inner()).await?;
@@ -379,7 +399,9 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
     // start honest cvv network
     let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let NetworkPeer { config: config_1, network_handle: cvv, network, .. } = peer1;
-    network.run();
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
 
     // start honest nvv network
     let NetworkPeer {
@@ -388,7 +410,9 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
         network_events: mut nvv_network_events,
         network,
     } = peer2;
-    network.run();
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
 
     // start swarm listening on default any address
     cvv.start_listening(config_1.authority().primary_network_address().inner()).await?;
@@ -438,7 +462,9 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     // start honest cvv network
     let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let NetworkPeer { config: config_1, network_handle: cvv, network, .. } = peer1;
-    network.run();
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
 
     // start honest nvv network
     let NetworkPeer {
@@ -447,7 +473,9 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
         network_events: mut nvv_network_events,
         network,
     } = peer2;
-    network.run();
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
 
     // start swarm listening on default any address
     cvv.start_listening(config_1.authority().primary_network_address().inner()).await?;

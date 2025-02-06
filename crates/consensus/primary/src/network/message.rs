@@ -73,7 +73,7 @@ pub struct MissingCertificatesRequest {
 impl MissingCertificatesRequest {
     /// Deserialize the [RoaringBitmap] representing the difference between the requesting peer's
     /// lower boundary and their GC round.
-    pub fn get_bounds(
+    pub(crate) fn get_bounds(
         &self,
     ) -> PrimaryNetworkResult<(Round, BTreeMap<AuthorityIdentifier, BTreeSet<Round>>)> {
         let skip_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>> = self
@@ -93,7 +93,7 @@ impl MissingCertificatesRequest {
     /// Set the bounds for requesting missing certificates based on the current GC round.
     ///
     /// This method specifies which rounds should be skipped because they are already in storage.
-    pub fn set_bounds(
+    pub(crate) fn set_bounds(
         mut self,
         gc_round: Round,
         skip_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>>,

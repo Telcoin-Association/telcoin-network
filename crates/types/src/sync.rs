@@ -171,12 +171,6 @@ pub trait TnSender<T>: Unpin + Clone {
     /// Get a reciever for this TnSender.
     /// For an MPSC or other limited channel this may panic if called more than once.
     fn subscribe(&self) -> impl TnReceiver<T> + 'static;
-
-    /// Borrow a reciever for this TnSender.
-    /// This should try to return a receiver that once dropped can be reused.
-    /// This is in contrast to subscribe which may give out the only receiver
-    /// for some channel types (MPSC for instance).
-    fn borrow_subscriber(&self) -> impl TnReceiver<T>;
 }
 
 impl<T: Send + Clone + 'static> TnSender<T> for broadcast::Sender<T> {
@@ -189,10 +183,6 @@ impl<T: Send + Clone + 'static> TnSender<T> for broadcast::Sender<T> {
     }
 
     fn subscribe(&self) -> impl TnReceiver<T> + 'static {
-        self.subscribe()
-    }
-
-    fn borrow_subscriber(&self) -> impl TnReceiver<T> {
         self.subscribe()
     }
 }
@@ -208,5 +198,19 @@ impl<T: Send + Clone> TnReceiver<T> for broadcast::Receiver<T> {
 
     fn poll_recv(&mut self, _cx: &mut Context<'_>) -> Poll<Option<T>> {
         panic!("poll_recv not implemented for tokio broadcast channels!")
+    }
+}
+
+impl<T: Send> TnReceiver<T> for mpsc::Receiver<T> {
+    async fn recv(&mut self) -> Option<T> {
+        mpsc::Receiver::recv(self).await
+    }
+
+    fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        Ok(mpsc::Receiver::try_recv(self)?)
+    }
+
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        mpsc::Receiver::poll_recv(self, cx)
     }
 }

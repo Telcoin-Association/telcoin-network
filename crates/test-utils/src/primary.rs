@@ -3,10 +3,12 @@
 use anemo::Network;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
+use tn_network_libp2p::ConsensusNetwork;
 use tn_node::primary::PrimaryNode;
 use tn_primary::{consensus::ConsensusMetrics, ConsensusBus};
 use tn_storage::traits::Database;
 use tn_types::AuthorityIdentifier;
+use tokio::sync::mpsc;
 
 #[derive(Clone)]
 pub struct PrimaryNodeDetails<DB> {
@@ -21,9 +23,18 @@ impl<DB: Database> PrimaryNodeDetails<DB> {
         name: AuthorityIdentifier,
         consensus_config: ConsensusConfig<DB>,
     ) -> Self {
+        let (event_stream, rx_event_stream) = mpsc::channel(1000);
         let consensus_bus =
-            ConsensusBus::new_with_recent_blocks(consensus_config.config().parameters.gc_depth);
-        let node = PrimaryNode::new(consensus_config, consensus_bus);
+            ConsensusBus::new_with_args(consensus_config.config().parameters.gc_depth);
+        let consensus_network = ConsensusNetwork::new_for_primary(&consensus_config, event_stream)
+            .expect("p2p network create failed!");
+        let consensus_network_handle = consensus_network.network_handle();
+        let node = PrimaryNode::new(
+            consensus_config,
+            consensus_bus,
+            consensus_network_handle,
+            rx_event_stream,
+        );
 
         Self { id, name, node }
     }

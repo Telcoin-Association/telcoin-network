@@ -5,6 +5,7 @@ use crate::{
     certificate_fetcher::CertificateFetcher,
     certifier::Certifier,
     consensus::LeaderSchedule,
+    network::{PrimaryNetwork, PrimaryRequest, PrimaryResponse},
     proposer::Proposer,
     state_handler::StateHandler,
     synchronizer::Synchronizer,
@@ -30,9 +31,11 @@ use tn_network::{
     failpoints::FailpointsMakeCallbackHandler,
     metrics::MetricsMakeCallbackHandler,
 };
+use tn_network_libp2p::types::{NetworkEvent, NetworkHandle};
 use tn_network_types::PrimaryToPrimaryServer;
 use tn_storage::traits::Database;
 use tn_types::{traits::EncodeDecodeBase64, Multiaddr, NetworkPublicKey, TaskManager};
+use tokio::sync::mpsc;
 use tower::ServiceBuilder;
 use tracing::info;
 
@@ -43,12 +46,20 @@ pub mod primary_tests;
 pub struct Primary<DB> {
     /// The Primary's network.
     network: Network,
+    network_p2p_handle: NetworkHandle<PrimaryRequest, PrimaryResponse>,
     synchronizer: Arc<Synchronizer<DB>>,
     peer_types: Option<HashMap<PeerId, String>>,
+    // Hold onto the network event stream until spawn "takes" it.
+    primary_network: Option<PrimaryNetwork<DB>>,
 }
 
 impl<DB: Database> Primary<DB> {
-    pub fn new(config: ConsensusConfig<DB>, consensus_bus: &ConsensusBus) -> Self {
+    pub fn new(
+        config: ConsensusConfig<DB>,
+        consensus_bus: &ConsensusBus,
+        network_p2p_handle: NetworkHandle<PrimaryRequest, PrimaryResponse>,
+        network_event_stream: mpsc::Receiver<NetworkEvent<PrimaryRequest, PrimaryResponse>>,
+    ) -> Self {
         // Write the parameters to the logs.
         config.parameters().tracing();
 
@@ -72,6 +83,13 @@ impl<DB: Database> Primary<DB> {
 
         let synchronizer = Arc::new(Synchronizer::new(config.clone(), consensus_bus));
         let network = Self::start_network(&config, synchronizer.clone(), consensus_bus);
+        let primary_network = PrimaryNetwork::new(
+            network_event_stream,
+            network_p2p_handle.clone(),
+            config.clone(),
+            consensus_bus.clone(),
+            synchronizer.clone(),
+        );
 
         let mut peer_types = HashMap::new();
 
@@ -111,7 +129,13 @@ impl<DB: Database> Primary<DB> {
             peer_types.insert(peer_id, "other_worker".to_string());
             info!("Adding others worker with peer id {} and address {}", peer_id, address);
         }
-        Self { network, synchronizer, peer_types: Some(peer_types) }
+        Self {
+            network,
+            network_p2p_handle,
+            synchronizer,
+            peer_types: Some(peer_types),
+            primary_network: Some(primary_network),
+        }
     }
 
     /// Spawns the primary.
@@ -185,6 +209,8 @@ impl<DB: Database> Primary<DB> {
             self.network.clone(),
             task_manager,
         );
+        let primary_network = self.primary_network.take().expect("no network event stream!");
+        primary_network.spawn(task_manager);
 
         // NOTE: This log entry is used to compute performance.
         info!(
@@ -325,5 +351,10 @@ impl<DB: Database> Primary<DB> {
     /// Return a reference to the Primary's network.
     pub fn network(&self) -> &Network {
         &self.network
+    }
+
+    /// Return a reference to the Primary's network.
+    pub fn network_p2p(&self) -> &NetworkHandle<PrimaryRequest, PrimaryResponse> {
+        &self.network_p2p_handle
     }
 }
