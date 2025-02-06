@@ -26,6 +26,8 @@ pub struct CertificateValidator<DB> {
     /// Genesis digests and contents.
     genesis: HashMap<CertificateDigest, Certificate>,
     /// Highest garbage collection round.
+    ///
+    /// This is managed by GarbageCollector and shared with CertificateValidator.
     gc_round: AtomicRound,
     /// Highest round of certificate accepted into the certificate store.
     highest_processed_round: AtomicRound,

@@ -111,6 +111,11 @@ pub struct SyncConfig {
     ///   - 3.3KB per certificate
     /// The maximum memory usage would be: 100 * 1000 * 3.3KB = 330MB
     pub max_diff_between_external_cert_round_and_highest_local_round: u32,
+    /// Maximum duration for a round to update before the GC requests certificates from peers.
+    ///
+    /// On the happy path, this duration should never be reached. It is a safety measure for the node
+    /// to try and recover after enough parents weren't received for a round within time.
+    pub max_consenus_round_timeout: Duration,
 }
 
 impl Default for SyncConfig {
@@ -119,6 +124,7 @@ impl Default for SyncConfig {
             max_skip_rounds_for_missing_certs: 1_000,
             max_cert_collection_duration: Duration::from_secs(10),
             max_diff_between_external_cert_round_and_highest_local_round: 1_000,
+            max_consenus_round_timeout: Duration::from_secs(30),
         }
     }
 }

@@ -31,10 +31,14 @@ pub struct CertificateManager<DB> {
     /// State for pending certificate.
     pending: PendingCertificateManager<DB>,
     /// Collection of parents to advance the round.
+    ///
+    /// This is shared with the `GarbageCollector`.
     parents: CertificatesAggregatorManager,
     /// Genesis digests and contents.
     genesis: HashMap<CertificateDigest, Certificate>,
     /// Highest garbage collection round.
+    ///
+    /// This is managed by GarbageCollector and shared with CertificateValidator.
     gc_round: AtomicRound,
     /// Highest round of certificate accepted into the certificate store.
     highest_processed_round: AtomicRound,
@@ -238,6 +242,21 @@ where
         Ok(())
     }
 
+    /// Update state with new GC round.
+    ///
+    /// Always read from atomic round to ensure consistency.
+    fn process_gc_round(&mut self) -> CertificateResult<()> {
+        // load latest round
+        let gc_round = self.gc_round.load();
+
+        // update pending state
+        //
+        // certificates can be unlocked if a missing parent is garbage collected
+        let unlocked = self.pending.garbage_collect(gc_round)?;
+
+        todo!()
+    }
+
     // listen for verified certificate
     // check for pending parents during vote requests
     // garbage collect
@@ -274,6 +293,9 @@ where
                                 }
                             }
                         }
+                        CertificateManagerCommand::NewGCRound => {
+                            self.process_gc_round()?;
+                        }
                         _ => (),
                     }
                 }
@@ -300,12 +322,7 @@ pub enum CertificateManagerCommand {
         reply: oneshot::Sender<CertificateResult<()>>,
     },
     /// Process new garbage collection round.
-    NewGCRound {
-        /// The latest garbage collection round.
-        round: Round,
-        /// Reply to acknowledge receipt?
-        reply: oneshot::Sender<()>,
-    },
+    NewGCRound,
     // /// Check if a digest is pending.
     // CheckPendingStatus {
     //     /// Digest

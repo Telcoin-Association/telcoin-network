@@ -269,8 +269,8 @@ pub enum HeaderError {
     #[error("Already voted for a header in a later round for this peer. This header's round: {theirs}. Last voted for round: {ours}.")]
     AlreadyVotedForLaterRound { theirs: Round, ours: Round },
     /// mpsc sender dropped while processig the certificate
-    #[error("Failed to process header - TN sender error")]
-    TNSend,
+    #[error("Failed to process header - TN sender error: {0}")]
+    TNSend(String),
     /// Oneshot channel dropped for pending certificate result.
     #[error("Failed to return pending certificate manager result.")]
     PendingCertificateOneshot,
@@ -355,8 +355,8 @@ impl<T: std::fmt::Debug> From<SendError<T>> for CertificateError {
     }
 }
 
-impl<T> From<SendError<T>> for HeaderError {
-    fn from(_: SendError<T>) -> Self {
-        Self::TNSend
+impl<T: std::fmt::Debug> From<SendError<T>> for HeaderError {
+    fn from(e: SendError<T>) -> Self {
+        Self::TNSend(e.to_string())
     }
 }

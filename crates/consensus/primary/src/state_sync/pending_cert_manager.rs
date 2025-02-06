@@ -214,7 +214,10 @@ where
     }
 
     /// Performs garbage collection up to and including the specified round.
-    fn garbage_collect(&mut self, gc_round: Round) -> CertificateResult<Vec<Certificate>> {
+    pub(super) fn garbage_collect(
+        &mut self,
+        gc_round: Round,
+    ) -> CertificateResult<Vec<Certificate>> {
         let mut ready_certificates = Vec::new();
 
         // find all certificates at or below gc_round

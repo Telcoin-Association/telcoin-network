@@ -19,6 +19,7 @@ mod cert_collector;
 mod cert_manager;
 mod cert_processor;
 mod cert_validator;
+mod gc;
 mod headers;
 mod pending_cert_manager;
 pub(crate) use cert_collector::CertificateCollector;
@@ -92,20 +93,13 @@ impl AtomicRound {
         Self { inner: Arc::new(InnerAtomicRound { atomic: AtomicU32::new(num) }) }
     }
 
-    /// Store the new gc round.
-    ///
-    /// Only [ConsensusRound] can call this.
-    fn store(&mut self, new: u32) {
-        self.inner.atomic.store(new, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Load the gc round.
-    pub fn load(&self) -> u32 {
+    /// Load the atomic round.
+    pub(crate) fn load(&self) -> u32 {
         self.inner.atomic.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Fetch the max.
-    pub fn fetch_max(&self, val: u32) -> u32 {
+    pub(crate) fn fetch_max(&self, val: u32) -> u32 {
         self.inner.atomic.fetch_max(val, Ordering::AcqRel)
     }
 }
