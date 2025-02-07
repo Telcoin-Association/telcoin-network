@@ -346,6 +346,9 @@ pub enum CertificateError {
     /// This results in inconsistent state between consensus DAG and consensus store and is fatal.
     #[error("Fatal error: failed to forward accepted cert to consensus.")]
     FatalForwardAcceptedCertificate,
+    /// JoinError for spawned blocking task when verifying many fetched certs.
+    #[error("Failed to join blocking certificate verification task.")]
+    JoinError,
 
     /// TODO: Refactor this out - only used to debug notify and suspend
     #[error("Certificate suspended: {0}")]

@@ -129,6 +129,14 @@ pub struct SyncConfig {
     ///
     /// NOTE: this DOES NOT affect nodes that are syncing full state.
     pub max_num_missing_certs_within_gc_round: usize,
+    /// The periodic interval between rounds to directly verify certificates when verifying bulk sync transfers.
+    ///
+    /// This value is used by `CertificateValidator::requires_direct_verification`
+    pub certificate_verification_round_interval: Round,
+    /// The number of certificates to verify within each partitioned chunk.
+    ///
+    /// This value is used by `CertificateValidator::requires_direct_verification`
+    pub certificate_verification_chunk_size: usize,
 }
 
 impl Default for SyncConfig {
@@ -141,6 +149,8 @@ impl Default for SyncConfig {
             max_proposed_header_age_limit: 3,
             max_header_time_drift_tolerance: 1,
             max_num_missing_certs_within_gc_round: 50,
+            certificate_verification_round_interval: 50,
+            certificate_verification_chunk_size: 50,
         }
     }
 }
