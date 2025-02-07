@@ -312,7 +312,9 @@ pub enum CertificateManagerCommand {
     /// Remove digests that are already tracked by `Pending`.
     /// This is used to vote on headers.
     FilterUnkownDigests {
+        /// The collection of digests not found in local storage.
         unknown: Vec<CertificateDigest>,
+        /// Return the result to the header validator.
         reply: oneshot::Sender<Vec<CertificateDigest>>,
     },
 }

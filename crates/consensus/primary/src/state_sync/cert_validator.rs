@@ -1,6 +1,6 @@
 //! Validate certificates received from peers.
 
-use super::AtomicRound;
+use super::{AtomicRound, HeaderValidator};
 use crate::{
     certificate_fetcher::CertificateFetcherCommand, state_sync::CertificateManagerCommand,
     ConsensusBus,
@@ -73,18 +73,9 @@ where
         //      - return missing
         // + ignore pending state -> let next step do this
         // - sanitize certificate
-        //
-        //
-        //
-        //
-        // TODO STILLLLLL!!!!!!!!!
-        // + ignore sync batches request (L1140) - duplicate from PrimaryNetwork
+        // - ignore sync batches request (L1140) - duplicate from PrimaryNetwork
         //      - confirm this is duplicate and remove from PrimaryNetwork handler
         //      - NOTE: this is never subscribed????
-        //
-        //
-        //
-        //
         // - sync ancestors if too new? Or let pending do this?
         //      - confirm certificate fetcher command is redundant here
         // - forward to certificate manager to check for pending
@@ -178,8 +169,37 @@ where
         //
         // trigger certificate fetching
         let highest_processed_round = self.highest_processed_round.load();
-
         for cert in &certificates {
+            // Initiate asynchronous batch downloads for any payloads referenced in this certificate
+            // that are not yet available locally. This step is critical for maintaining data
+            // availability across the network.
+            //
+            // The certificate's existence proves these batches must be available somewhere in the
+            // network - the certificate could only have been created after enough validators had
+            // access to examine and vote on these batches. This availability guarantee allows the
+            // protocol to proceed with certificate processing immediately, without waiting for the
+            // batch downloads to complete.
+            //
+            // The max_age parameter, derived from the garbage collection depth, ensures the protocol
+            // only attempts to synchronize reasonably recent batches that haven't been cleaned up
+            // by garbage collection on other nodes.
+            let header = cert.header().clone();
+            let max_age = self.config.parameters().gc_depth.saturating_sub(1);
+            let config = self.config.clone();
+            let bus = self.consensus_bus.clone();
+
+            // spawn task to synchronize batches for this header
+            //
+            // NOTE: this should be okay bc header is already certified by quorum of signatures
+            tokio::task::spawn(async move {
+                let sync_header = HeaderValidator::new(config, bus);
+                let res = sync_header.sync_header_batches(&header, true, max_age).await;
+                if let Err(e) = res {
+                    error!(target: "primary::state-sync", ?e, ?header, "error synching batches for certified header");
+                }
+            });
+
+            // trigger certificate fetching if cert is too far ahead of this node
             if highest_processed_round
                 + self
                     .config
