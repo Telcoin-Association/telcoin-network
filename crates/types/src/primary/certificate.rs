@@ -334,6 +334,16 @@ impl Certificate {
         &self.signed_authorities
     }
 
+    /// Helper method if the certificate's verification state is verified.
+    pub fn is_verified(&self) -> bool {
+        matches!(
+            self.signature_verification_state,
+            SignatureVerificationState::VerifiedDirectly(_)
+                | SignatureVerificationState::VerifiedIndirectly(_)
+                | SignatureVerificationState::Genesis
+        )
+    }
+
     // Used for testing.
 
     /// Change the certificate's header.
@@ -407,15 +417,6 @@ pub enum SignatureVerificationState {
     // This state occurs only for genesis certificates which always has valid
     // signatures bytes but the bytes are garbage so we don't mark them as verified.
     Genesis,
-}
-
-impl SignatureVerificationState {
-    /// Helper method if the verification state is verified.
-    pub fn is_verified(&self) -> bool {
-        matches!(self, SignatureVerificationState::VerifiedDirectly(_))
-            || matches!(self, SignatureVerificationState::VerifiedIndirectly(_))
-            || matches!(self, SignatureVerificationState::Genesis)
-    }
 }
 
 impl Default for SignatureVerificationState {

@@ -1,4 +1,6 @@
 //! Collect certificates from storage for peers who are missing them.
+//!
+//! This module is used when retrieving certificates from local storage for peers.
 
 use crate::{
     error::{PrimaryNetworkError, PrimaryNetworkResult},
@@ -16,7 +18,7 @@ use tracing::{debug, warn};
 
 #[cfg(test)]
 #[path = "../tests/cert_collector_tests.rs"]
-pub mod state_sync_tests;
+mod cert_collector;
 
 /// Time-bounded iterator to retrieve certificates from the database.
 pub(crate) struct CertificateCollector<DB> {

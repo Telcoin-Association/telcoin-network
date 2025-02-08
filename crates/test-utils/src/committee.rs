@@ -20,6 +20,11 @@ pub struct CommitteeFixture<DB> {
 }
 
 impl<DB: Database> CommitteeFixture<DB> {
+    /// Return an the number of authorities
+    pub fn num_authorities(&self) -> usize {
+        self.authorities.len()
+    }
+
     /// Return an Iterator for [AuthorityFixture] references.
     pub fn authorities(&self) -> impl Iterator<Item = &AuthorityFixture<DB>> {
         self.authorities.iter()
@@ -155,6 +160,13 @@ impl<DB: Database> CommitteeFixture<DB> {
         let votes: Vec<_> =
             self.votes(header).into_iter().map(|x| (x.author(), x.signature().clone())).collect();
         Certificate::new_unverified(&committee, header.clone(), votes).unwrap()
+    }
+
+    /// Create an unverified certificate for the last authority.
+    /// This certificate is signed entire committee.
+    pub fn unverified_cert_from_last_authority(&self) -> Certificate {
+        let header = self.header_from_last_authority();
+        self.certificate(&header)
     }
 
     pub fn update_committee(&mut self, committee: Committee) {

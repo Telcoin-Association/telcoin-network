@@ -20,6 +20,10 @@ use tn_types::{
 use tokio::sync::oneshot;
 use tracing::{debug, error};
 
+#[cfg(test)]
+#[path = "../tests/cert_manager_tests.rs"]
+mod cert_manager;
+
 /// Process validated certificates.
 ///
 /// Long-running task to manage pending certificate requests and accept verified certificates.
@@ -71,6 +75,29 @@ where
     // - check for missing parents
     // - accept cert and accept_children in that order
 
+    /// Create a new instance of Self.
+    pub fn new(
+        config: ConsensusConfig<DB>,
+        consensus_bus: ConsensusBus,
+        genesis: HashMap<CertificateDigest, Certificate>,
+        gc_round: AtomicRound,
+        highest_processed_round: AtomicRound,
+        highest_received_round: AtomicRound,
+    ) -> Self {
+        let parents = CertificatesAggregatorManager::new(consensus_bus.clone());
+        let pending = PendingCertificateManager::new(config.clone(), consensus_bus.clone());
+        Self {
+            consensus_bus,
+            config,
+            pending,
+            parents,
+            genesis,
+            gc_round,
+            highest_processed_round,
+            highest_received_round,
+        }
+    }
+
     /// Process verified certificate.
     ///
     /// Returns an error if a certificate is unverified. This will accept certificate or mark it as pending if parents are missing.
@@ -78,15 +105,20 @@ where
         &mut self,
         certs: Vec<Certificate>,
     ) -> CertificateResult<()> {
-        // process collection of certificates
+        // process entire collection of certificates
         //
         // these can be single, fetched from certificate fetcher or unlocked pending
+        // if any are pending, return the pending error
+        let mut result = Ok(());
+
+        // collect results
         for cert in certs {
             let digest = cert.digest();
 
             // guarantee certificate is verified before storing in pending
             // NOTE: this is the only time this is checked
-            if !cert.signature_verification_state().is_verified() {
+            if !cert.is_verified() {
+                // stop processing certs if unverified
                 return Err(CertificateError::UnverifiedSignature(digest));
             }
 
@@ -100,16 +132,32 @@ where
                     .with_label_values(&["dedup_locked"])
                     .inc();
 
-                return Err(CertificateError::Pending(digest));
+                // track error for caller that at least one cert is pending
+                // and continue processing other certs
+                result = Err(CertificateError::Pending(digest));
+                continue;
             }
 
             // ensure no missing parents (either pending or garbage collected)
             // check parents are either accounted for or garbage collected
+            //
+            // NOTE: this also ensures certificates are accepted in causal order
+            // which is a strict requirement for consensus to build the DAG correctly
             if cert.round() > self.gc_round.load() + 1 {
                 let missing_parents = self.get_missing_parents(&cert).await?;
                 if !missing_parents.is_empty() {
                     self.pending.insert_pending(cert, missing_parents)?;
-                    return Err(CertificateError::Pending(digest));
+                    // metrics
+                    self.consensus_bus
+                        .primary_metrics()
+                        .node_metrics
+                        .certificates_currently_suspended
+                        .set(self.pending.num_pending() as i64);
+
+                    // track error for caller that at least one cert is pending
+                    // and continue processing other certs
+                    result = Err(CertificateError::Pending(digest));
+                    continue;
                 }
             }
 
@@ -120,7 +168,7 @@ where
             self.accept_verified_certificates(unlocked).await?;
         }
 
-        Ok(())
+        result
     }
 
     /// Check that certificate's parents are in storage. Returns the digests of any parents that are
@@ -133,6 +181,7 @@ where
 
         // handle genesis cert
         if certificate.round() == 1 {
+            debug!(target: "primary::cert_manager", ?certificate, "cert round 1");
             for digest in certificate.header().parents() {
                 if !self.genesis.contains_key(digest) {
                     return Err(CertificateError::from(HeaderError::InvalidGenesisParent(*digest)));
@@ -158,6 +207,16 @@ where
 
         // send request to start fetching parents
         if !missing_parents.is_empty() {
+            debug!(target: "primary::state-sync", ?certificate, "missing {} parents", missing_parents.len());
+            // metrics
+            self.consensus_bus
+                .primary_metrics()
+                .node_metrics
+                .certificates_suspended
+                .with_label_values(&["missing_parents"])
+                .inc();
+
+            // start fetching parents
             self.consensus_bus
                 .certificate_fetcher()
                 .send(CertificateFetcherCommand::Ancestors(certificate.clone()))
@@ -246,7 +305,7 @@ where
     /// Long running task to manage verified certificates.
     ///
     /// Certificate signature states are first verified, then parents are checked. If certificate parents are missing, the manager tracks them as pending. As parents become available or are removed through garbage collection, the certificate manager will update pending state and try to accept all known certificates.
-    pub async fn run(mut self) -> CertificateResult<()> {
+    pub(crate) async fn run(mut self) -> CertificateResult<()> {
         let shutdown_rx = self.config.shutdown().subscribe();
         let mut certificate_manager_rx = self.consensus_bus.certificate_manager().subscribe();
 
@@ -292,7 +351,7 @@ where
     }
 }
 
-/// Commands for the [CertficateManagerCommand].
+/// Commands for the [CertficateManager].
 #[derive(Debug)]
 pub enum CertificateManagerCommand {
     /// Message from CertificateValidator.

@@ -208,6 +208,11 @@ where
         self.pending.contains_key(digest)
     }
 
+    /// Returns the number of pending certificates.
+    pub(super) fn num_pending(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Filter parents that are pending in place.
     ///
     /// This is used when voting for headers.

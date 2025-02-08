@@ -22,6 +22,11 @@ pub(crate) use cert_collector::CertificateCollector;
 pub(crate) use cert_manager::CertificateManagerCommand;
 pub(crate) use headers::HeaderValidator;
 
+#[cfg(test)]
+#[path = "../tests/certificate_processing_tests.rs"]
+/// Test the entire certificate flow.
+mod cert_flow;
+
 /// Process unverified headers and certificates.
 #[derive(Debug, Clone)]
 pub struct StateSynchronizer<DB> {

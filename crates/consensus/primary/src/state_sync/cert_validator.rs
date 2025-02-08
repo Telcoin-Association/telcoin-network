@@ -20,6 +20,10 @@ use tn_types::{
 use tokio::sync::oneshot;
 use tracing::{debug, error, trace};
 
+#[cfg(test)]
+#[path = "../tests/cert_validator_tests.rs"]
+mod cert_validator;
+
 /// Process unverified headers and certificates.
 #[derive(Debug, Clone)]
 pub struct CertificateValidator<DB> {
@@ -43,6 +47,25 @@ impl<DB> CertificateValidator<DB>
 where
     DB: Database,
 {
+    /// Create a new instance of Self.
+    pub fn new(
+        config: ConsensusConfig<DB>,
+        consensus_bus: ConsensusBus,
+        genesis: HashMap<CertificateDigest, Certificate>,
+        gc_round: AtomicRound,
+        highest_processed_round: AtomicRound,
+        highest_received_round: AtomicRound,
+    ) -> Self {
+        Self {
+            consensus_bus,
+            config,
+            genesis,
+            gc_round,
+            highest_processed_round,
+            highest_received_round,
+        }
+    }
+
     /// Process a certificate produced by the this node.
     pub async fn process_own_certificate(&self, certificate: Certificate) -> CertificateResult<()> {
         self.process_certificate(certificate, false).await
