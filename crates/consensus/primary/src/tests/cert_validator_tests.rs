@@ -33,15 +33,10 @@ fn create_test_types() -> TestTypes<MemDatabase> {
     let gc_round = AtomicRound::new(0);
     let highest_processed_round = AtomicRound::new(0);
     let highest_received_round = AtomicRound::new(0);
-    let genesis = Certificate::genesis(config.committee())
-        .into_iter()
-        .map(|cert| (cert.digest(), cert))
-        .collect();
 
     let validator = CertificateValidator::new(
         config,
         cb.clone(),
-        genesis,
         gc_round,
         highest_processed_round,
         highest_received_round,

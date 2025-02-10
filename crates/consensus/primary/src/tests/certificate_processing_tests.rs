@@ -3,10 +3,7 @@
 //! Certificates are validated and sent to the [CertificateManager].
 //! The [CertificateManager] tracks pending certificates and accepts certificates that are complete.
 
-use super::{
-    cert_manager::CertificateManager, cert_validator::CertificateValidator, gc::GarbageCollector,
-    AtomicRound,
-};
+use super::{cert_manager::CertificateManager, cert_validator::CertificateValidator, AtomicRound};
 use crate::{
     consensus::{gc_round, ConsensusRound},
     error::CertManagerError,
@@ -14,10 +11,7 @@ use crate::{
 };
 use assert_matches::assert_matches;
 use fastcrypto::{hash::Hash as _, traits::KeyPair};
-use std::{
-    collections::{BTreeSet, HashMap},
-    time::Duration,
-};
+use std::{collections::BTreeSet, time::Duration};
 use tn_storage::{mem_db::MemDatabase, traits::Database};
 use tn_test_utils::{
     make_optimal_signed_certificates, signed_cert_for_test, AuthorityFixture, CommitteeFixture,
@@ -59,16 +53,11 @@ fn create_core_test_types<DB: Database>(
     let gc_round = AtomicRound::new(0);
     let highest_processed_round = AtomicRound::new(0);
     let highest_received_round = AtomicRound::new(0);
-    let genesis: HashMap<CertificateDigest, Certificate> = Certificate::genesis(config.committee())
-        .into_iter()
-        .map(|cert| (cert.digest(), cert))
-        .collect();
 
     // manager
     let manager = CertificateManager::new(
         config.clone(),
         cb.clone(),
-        genesis.clone(),
         gc_round.clone(),
         highest_processed_round.clone(),
         highest_received_round.clone(),
@@ -78,7 +67,6 @@ fn create_core_test_types<DB: Database>(
     let validator = CertificateValidator::new(
         config.clone(),
         cb.clone(),
-        genesis,
         gc_round.clone(),
         highest_processed_round,
         highest_received_round,
@@ -367,4 +355,9 @@ async fn test_node_restart_syncs_state() -> eyre::Result<()> {
     assert_eq!(round, 1);
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_sync_batches_drops_old() -> eyre::Result<()> {
+    todo!()
 }

@@ -11,11 +11,11 @@ mod cert_collector;
 mod cert_manager;
 mod cert_validator;
 mod gc;
-mod headers;
+mod header_validator;
 mod pending_cert_manager;
 pub(crate) use cert_collector::CertificateCollector;
 pub(crate) use cert_manager::CertificateManagerCommand;
-pub(crate) use headers::HeaderValidator;
+pub(crate) use header_validator::HeaderValidator;
 
 #[cfg(test)]
 #[path = "../tests/certificate_processing_tests.rs"]

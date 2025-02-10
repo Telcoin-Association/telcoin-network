@@ -9,10 +9,7 @@ use crate::{
 };
 use consensus_metrics::monitored_scope;
 use fastcrypto::hash::Hash as _;
-use std::{
-    collections::{HashMap, HashSet},
-    time::Instant,
-};
+use std::{collections::HashSet, time::Instant};
 use tn_config::ConsensusConfig;
 use tn_storage::traits::Database;
 use tn_types::{
@@ -33,8 +30,6 @@ pub struct CertificateValidator<DB> {
     consensus_bus: ConsensusBus,
     /// The configuration for consensus.
     config: ConsensusConfig<DB>,
-    /// Genesis digests and contents.
-    genesis: HashMap<CertificateDigest, Certificate>,
     /// Highest garbage collection round.
     ///
     /// This is managed by GarbageCollector and shared with CertificateValidator.
@@ -53,19 +48,11 @@ where
     pub fn new(
         config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
-        genesis: HashMap<CertificateDigest, Certificate>,
         gc_round: AtomicRound,
         highest_processed_round: AtomicRound,
         highest_received_round: AtomicRound,
     ) -> Self {
-        Self {
-            consensus_bus,
-            config,
-            genesis,
-            gc_round,
-            highest_processed_round,
-            highest_received_round,
-        }
+        Self { consensus_bus, config, gc_round, highest_processed_round, highest_received_round }
     }
 
     /// Process a certificate produced by the this node.
@@ -208,9 +195,9 @@ where
             // protocol to proceed with certificate processing immediately, without waiting for the
             // batch downloads to complete.
             //
-            // The max_age parameter, derived from the garbage collection depth, ensures the protocol
-            // only attempts to synchronize reasonably recent batches that haven't been cleaned up
-            // by garbage collection on other nodes.
+            // The max_age parameter, derived from the garbage collection depth, ensures the
+            // protocol only attempts to synchronize reasonably recent batches that
+            // haven't been cleaned up by garbage collection on other nodes.
             let header = cert.header().clone();
             let max_age = self.config.parameters().gc_depth.saturating_sub(1);
             let config = self.config.clone();
@@ -340,7 +327,9 @@ where
 
     /// Determines if a certificate requires direct verification.
     ///
-    /// Certificates require direct verification if no other certificates depend on them (ie - not a parent). This method also periodically verifies certificates between intevals if the round % 50 is 0.
+    /// Certificates require direct verification if no other certificates depend on them (ie - not a
+    /// parent). This method also periodically verifies certificates between intevals if the round %
+    /// 50 is 0.
     fn requires_direct_verification(
         &self,
         cert: &Certificate,

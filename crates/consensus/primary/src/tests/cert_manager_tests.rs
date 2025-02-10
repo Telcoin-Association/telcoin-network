@@ -1,20 +1,13 @@
 //! Tests for the cert manager.
 
 use super::CertificateManager;
-use crate::{
-    error::CertManagerError,
-    state_sync::{AtomicRound, CertificateManagerCommand},
-    ConsensusBus,
-};
+use crate::{error::CertManagerError, state_sync::AtomicRound, ConsensusBus};
 use assert_matches::assert_matches;
 use fastcrypto::{hash::Hash as _, traits::KeyPair};
 use std::collections::BTreeSet;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{make_optimal_signed_certificates, CommitteeFixture};
-use tn_types::{
-    keccak256, BlsAggregateSignatureBytes, Certificate, Round, SignatureVerificationState,
-    TnReceiver as _, TnSender,
-};
+use tn_types::{Certificate, SignatureVerificationState};
 use tracing::debug;
 
 struct TestTypes<DB = MemDatabase> {
@@ -36,15 +29,10 @@ fn create_test_types() -> TestTypes<MemDatabase> {
     let gc_round = AtomicRound::new(0);
     let highest_processed_round = AtomicRound::new(0);
     let highest_received_round = AtomicRound::new(0);
-    let genesis = Certificate::genesis(config.committee())
-        .into_iter()
-        .map(|cert| (cert.digest(), cert))
-        .collect();
 
     let manager = CertificateManager::new(
         config,
         cb.clone(),
-        genesis,
         gc_round,
         highest_processed_round,
         highest_received_round,
@@ -76,7 +64,7 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
     let genesis =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
     let keys: Vec<_> = fixture.authorities().map(|a| (a.id(), a.keypair().copy())).collect();
-    let (certificates, next_parents) =
+    let (certificates, _) =
         make_optimal_signed_certificates(1..=5, &genesis, &committee, keys.as_slice());
 
     // all certs
@@ -92,7 +80,7 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
 
     // separate first round (4 certs) and later rounds
     let mut first_round = certs; // for readability
-    let later_rounds = first_round.split_off(4);
+    let later_rounds = first_round.split_off(num_authorities);
     let expected_pending_len = later_rounds.len();
 
     // try to process certs - all should be pending

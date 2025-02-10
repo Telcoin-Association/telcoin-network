@@ -88,7 +88,8 @@ where
     ///
     /// Upon a successful commit, updates the atomic gc round for all consensus tasks.
     ///
-    /// A non-fatal error is returned for timeouts. In a follow-up PR, the manager should handle certificate fetching.
+    /// A non-fatal error is returned for timeouts. In a follow-up PR, the manager should handle
+    /// certificate fetching.
     pub(super) async fn ready(&mut self) -> GarbageCollectorResult<()> {
         let mut max_round_timeout =
             interval(self.config.network_config().sync_config().max_consenus_round_timeout);

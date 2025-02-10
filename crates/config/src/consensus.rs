@@ -1,5 +1,9 @@
 //! Configuration for consensus network (primary and worker).
+use crate::{
+    Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, Parameters, TelcoinDirs,
+};
 use anemo::Config as AnemoConfig;
+use fastcrypto::hash::Hash as _;
 use libp2p::PeerId;
 use std::{
     collections::{HashMap, HashSet},
@@ -7,10 +11,9 @@ use std::{
 };
 use tn_network::local::LocalNetwork;
 use tn_storage::{traits::Database, NodeStorage};
-use tn_types::{Authority, AuthorityIdentifier, Committee, Notifier, WorkerCache};
-
-use crate::{
-    Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, Parameters, TelcoinDirs,
+use tn_types::{
+    Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Notifier,
+    WorkerCache,
 };
 
 #[derive(Debug)]
@@ -24,6 +27,7 @@ struct ConsensusConfigInner<DB> {
     anemo_config: AnemoConfig,
     network_config: NetworkConfig,
     authority_map: AuthorityMapping,
+    genesis: HashMap<CertificateDigest, Certificate>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +103,10 @@ where
         let anemo_config = Self::create_anemo_config();
         let network_config = NetworkConfig::default();
         let authority_map = AuthorityMapping::new(&committee, &network_config);
+        let genesis = Certificate::genesis(&committee)
+            .into_iter()
+            .map(|cert| (cert.digest(), cert))
+            .collect();
 
         Ok(Self {
             inner: Arc::new(ConsensusConfigInner {
@@ -111,6 +119,7 @@ where
                 anemo_config,
                 network_config,
                 authority_map,
+                genesis,
             }),
             worker_cache,
             shutdown,
@@ -160,6 +169,10 @@ where
 
     pub fn config(&self) -> &Config {
         &self.inner.config
+    }
+
+    pub fn genesis(&self) -> &HashMap<CertificateDigest, Certificate> {
+        &self.inner.genesis
     }
 
     pub fn committee(&self) -> &Committee {

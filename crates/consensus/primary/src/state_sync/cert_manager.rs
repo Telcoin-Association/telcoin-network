@@ -12,7 +12,7 @@ use crate::{
 };
 use consensus_metrics::monitored_scope;
 use fastcrypto::hash::Hash as _;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use tn_config::ConsensusConfig;
 use tn_storage::traits::Database;
 use tn_types::{
@@ -41,8 +41,6 @@ pub struct CertificateManager<DB> {
     ///
     /// This is shared with the `GarbageCollector`.
     parents: CertificatesAggregatorManager,
-    /// Genesis digests and contents.
-    genesis: HashMap<CertificateDigest, Certificate>,
     /// The task responsible for managing garbage collection.
     garbage_collector: GarbageCollector<DB>,
     /// Highest garbage collection round.
@@ -83,7 +81,6 @@ where
     pub fn new(
         config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
-        genesis: HashMap<CertificateDigest, Certificate>,
         gc_round: AtomicRound,
         highest_processed_round: AtomicRound,
         highest_received_round: AtomicRound,
@@ -98,7 +95,6 @@ where
             config,
             pending,
             parents,
-            genesis,
             garbage_collector,
             gc_round,
             highest_processed_round,
@@ -108,7 +104,8 @@ where
 
     /// Process verified certificate.
     ///
-    /// Returns an error if a certificate is unverified. This will accept certificate or mark it as pending if parents are missing.
+    /// Returns an error if a certificate is unverified. This will accept certificate or mark it as
+    /// pending if parents are missing.
     async fn process_verified_certificates(
         &mut self,
         certs: Vec<Certificate>,
@@ -191,7 +188,7 @@ where
         if certificate.round() == 1 {
             debug!(target: "primary::cert_manager", ?certificate, "cert round 1");
             for digest in certificate.header().parents() {
-                if !self.genesis.contains_key(digest) {
+                if !self.config.genesis().contains_key(digest) {
                     return Err(
                         CertificateError::from(HeaderError::InvalidGenesisParent(*digest)).into()
                     );
@@ -241,7 +238,8 @@ where
     /// The certificate's state must be verified. This method writes to storage and returns the
     /// result to caller.
     ///
-    /// NOTE: `self::process_verified_certificates` checks the verification status, so all certificates managed here are verified.
+    /// NOTE: `self::process_verified_certificates` checks the verification status, so all
+    /// certificates managed here are verified.
     // synchronizer::accept_certificate_internal
     async fn accept_verified_certificates(
         &self,
@@ -274,7 +272,8 @@ where
 
             // NOTE: these next two steps are considered critical
             //
-            // any error must be treated as fatal to avoid inconsistent state between DAG and certificate store
+            // any error must be treated as fatal to avoid inconsistent state between DAG and
+            // certificate store
             //
             // append parent for round
             self.parents
@@ -332,7 +331,10 @@ where
 
     /// Long running task to manage verified certificates.
     ///
-    /// Certificate signature states are first verified, then parents are checked. If certificate parents are missing, the manager tracks them as pending. As parents become available or are removed through garbage collection, the certificate manager will update pending state and try to accept all known certificates.
+    /// Certificate signature states are first verified, then parents are checked. If certificate
+    /// parents are missing, the manager tracks them as pending. As parents become available or are
+    /// removed through garbage collection, the certificate manager will update pending state and
+    /// try to accept all known certificates.
     pub(crate) async fn run(mut self) -> CertManagerResult<()> {
         let shutdown_rx = self.config.shutdown().subscribe();
         let mut certificate_manager_rx = self.consensus_bus.certificate_manager().subscribe();

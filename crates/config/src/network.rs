@@ -129,7 +129,8 @@ pub struct SyncConfig {
     ///
     /// NOTE: this DOES NOT affect nodes that are syncing full state.
     pub max_num_missing_certs_within_gc_round: usize,
-    /// The periodic interval between rounds to directly verify certificates when verifying bulk sync transfers.
+    /// The periodic interval between rounds to directly verify certificates when verifying bulk
+    /// sync transfers.
     ///
     /// This value is used by `CertificateValidator::requires_direct_verification`
     pub certificate_verification_round_interval: Round,
