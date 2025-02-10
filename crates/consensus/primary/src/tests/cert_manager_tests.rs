@@ -8,7 +8,6 @@ use std::collections::BTreeSet;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{make_optimal_signed_certificates, CommitteeFixture};
 use tn_types::{Certificate, SignatureVerificationState};
-use tracing::debug;
 
 struct TestTypes<DB = MemDatabase> {
     /// The CertificateManager
@@ -89,8 +88,5 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
 
     // later_rounds should be pending
     assert_eq!(expected_pending_len, manager.pending.num_pending());
-
-    debug!(?res, "res");
-
     Ok(())
 }

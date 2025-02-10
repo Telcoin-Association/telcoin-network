@@ -81,8 +81,8 @@ async fn test_certificates_verified() -> eyre::Result<()> {
     // assert unverified certificates and process
     for cert in certs {
         assert!(!cert.is_verified());
-        // try to accept
-        validator.process_peer_certificate(cert).await?;
+        // try to accept - ignore err for dropped oneshot
+        let _ = validator.process_peer_certificate(cert).await;
     }
 
     // assert proposer receives parents

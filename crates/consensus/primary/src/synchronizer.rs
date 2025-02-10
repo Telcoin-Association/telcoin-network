@@ -1,8 +1,8 @@
 //! Synchronize data between peers and workers
 
 use crate::{
-    aggregators::CertificatesAggregatorManager, certificate_fetcher::CertificateFetcherCommand,
-    ConsensusBus,
+    aggregators::sync::CertificatesAggregatorManager,
+    certificate_fetcher::CertificateFetcherCommand, ConsensusBus,
 };
 use consensus_metrics::{
     metered_channel::{channel_with_total_sender, MeteredMpscChannel},

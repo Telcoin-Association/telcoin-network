@@ -5,7 +5,7 @@
 
 use super::{gc::GarbageCollector, pending_cert_manager::PendingCertificateManager, AtomicRound};
 use crate::{
-    aggregators::CertificatesAggregatorManager,
+    aggregators::certificates::CertificatesAggregatorManager,
     certificate_fetcher::CertificateFetcherCommand,
     error::{CertManagerError, CertManagerResult, GarbageCollectorError},
     ConsensusBus,
@@ -242,7 +242,7 @@ where
     /// certificates managed here are verified.
     // synchronizer::accept_certificate_internal
     async fn accept_verified_certificates(
-        &self,
+        &mut self,
         certificates: VecDeque<Certificate>,
     ) -> CertManagerResult<()> {
         let _scope = monitored_scope("primary::state-sync::accept_certificate");
@@ -312,7 +312,7 @@ where
     }
 
     /// Startup tasks to synchronize state for primary.
-    async fn recover_state(&self) -> CertManagerResult<()> {
+    async fn recover_state(&mut self) -> CertManagerResult<()> {
         // send last round to proposer
         let last_round_certificates = self
             .config
