@@ -3,9 +3,11 @@
 //! This module is responsible for checking certificate parents, managing pending certificates, and
 //! accepting certificates that become unlocked.
 
-use super::{pending_cert_manager::PendingCertificateManager, AtomicRound};
+use super::{gc::GarbageCollector, pending_cert_manager::PendingCertificateManager, AtomicRound};
 use crate::{
-    aggregators::CertificatesAggregatorManager, certificate_fetcher::CertificateFetcherCommand,
+    aggregators::CertificatesAggregatorManager,
+    certificate_fetcher::CertificateFetcherCommand,
+    error::{CertManagerError, CertManagerResult, GarbageCollectorError},
     ConsensusBus,
 };
 use consensus_metrics::monitored_scope;
@@ -14,7 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use tn_config::ConsensusConfig;
 use tn_storage::traits::Database;
 use tn_types::{
-    error::{CertificateError, CertificateResult, HeaderError},
+    error::{CertificateError, HeaderError},
     Certificate, CertificateDigest, TnReceiver as _, TnSender as _,
 };
 use tokio::sync::oneshot;
@@ -41,6 +43,8 @@ pub struct CertificateManager<DB> {
     parents: CertificatesAggregatorManager,
     /// Genesis digests and contents.
     genesis: HashMap<CertificateDigest, Certificate>,
+    /// The task responsible for managing garbage collection.
+    garbage_collector: GarbageCollector<DB>,
     /// Highest garbage collection round.
     ///
     /// This is managed by GarbageCollector and shared with CertificateValidator.
@@ -86,6 +90,8 @@ where
     ) -> Self {
         let parents = CertificatesAggregatorManager::new(consensus_bus.clone());
         let pending = PendingCertificateManager::new(config.clone(), consensus_bus.clone());
+        let garbage_collector =
+            GarbageCollector::new(config.clone(), consensus_bus.clone(), gc_round.clone());
 
         Self {
             consensus_bus,
@@ -93,6 +99,7 @@ where
             pending,
             parents,
             genesis,
+            garbage_collector,
             gc_round,
             highest_processed_round,
             highest_received_round,
@@ -105,7 +112,7 @@ where
     async fn process_verified_certificates(
         &mut self,
         certs: Vec<Certificate>,
-    ) -> CertificateResult<()> {
+    ) -> CertManagerResult<()> {
         // process entire collection of certificates
         //
         // these can be single, fetched from certificate fetcher or unlocked pending
@@ -120,7 +127,7 @@ where
             // NOTE: this is the only time this is checked
             if !cert.is_verified() {
                 // stop processing certs if unverified
-                return Err(CertificateError::UnverifiedSignature(digest));
+                return Err(CertManagerError::UnverifiedSignature(digest));
             }
 
             // check pending status
@@ -135,7 +142,7 @@ where
 
                 // track error for caller that at least one cert is pending
                 // and continue processing other certs
-                result = Err(CertificateError::Pending(digest));
+                result = Err(CertManagerError::Pending(digest));
                 continue;
             }
 
@@ -157,7 +164,7 @@ where
 
                     // track error for caller that at least one cert is pending
                     // and continue processing other certs
-                    result = Err(CertificateError::Pending(digest));
+                    result = Err(CertManagerError::Pending(digest));
                     continue;
                 }
             }
@@ -177,7 +184,7 @@ where
     async fn get_missing_parents(
         &self,
         certificate: &Certificate,
-    ) -> CertificateResult<HashSet<CertificateDigest>> {
+    ) -> CertManagerResult<HashSet<CertificateDigest>> {
         let _scope = monitored_scope("primary::state-sync::get_missing_parents");
 
         // handle genesis cert
@@ -185,7 +192,9 @@ where
             debug!(target: "primary::cert_manager", ?certificate, "cert round 1");
             for digest in certificate.header().parents() {
                 if !self.genesis.contains_key(digest) {
-                    return Err(CertificateError::from(HeaderError::InvalidGenesisParent(*digest)));
+                    return Err(
+                        CertificateError::from(HeaderError::InvalidGenesisParent(*digest)).into()
+                    );
                 }
             }
             return Ok(HashSet::with_capacity(0));
@@ -237,7 +246,7 @@ where
     async fn accept_verified_certificates(
         &self,
         certificates: VecDeque<Certificate>,
-    ) -> CertificateResult<()> {
+    ) -> CertManagerResult<()> {
         let _scope = monitored_scope("primary::state-sync::accept_certificate");
         debug!(target: "primary::state-sync", ?certificates, "accepting {:?} certificates", certificates.len());
 
@@ -274,12 +283,12 @@ where
                 .inspect_err(|e| {
                     error!(target: "primary::state-sync", ?e, "failed to append cert");
                 })
-                .map_err(|_| CertificateError::FatalAppendParent)?;
+                .map_err(|_| CertManagerError::FatalAppendParent)?;
 
             // send to consensus for processing into the DAG
             self.consensus_bus.new_certificates().send(cert).await.inspect_err(|e| {
                 error!(target: "primary::state-sync", ?e, "failed to forward accepted certificate to consensus");
-            }).map_err(|_| CertificateError::FatalForwardAcceptedCertificate)?;
+            }).map_err(|_| CertManagerError::FatalForwardAcceptedCertificate)?;
         }
 
         Ok(())
@@ -290,7 +299,7 @@ where
     /// This method checks missing parents for the GC round. If a parent is garbage collected, the
     /// pending collection is updated to collect any dependents that become unlocked (ie - no more
     /// missing parents).
-    async fn process_gc_round(&mut self) -> CertificateResult<()> {
+    async fn process_gc_round(&mut self) -> CertManagerResult<()> {
         // load latest gc round
         let gc_round = self.gc_round.load();
 
@@ -304,7 +313,7 @@ where
     }
 
     /// Startup tasks to synchronize state for primary.
-    async fn recover_state(&self) -> CertificateResult<()> {
+    async fn recover_state(&self) -> CertManagerResult<()> {
         // send last round to proposer
         let last_round_certificates = self
             .config
@@ -324,7 +333,7 @@ where
     /// Long running task to manage verified certificates.
     ///
     /// Certificate signature states are first verified, then parents are checked. If certificate parents are missing, the manager tracks them as pending. As parents become available or are removed through garbage collection, the certificate manager will update pending state and try to accept all known certificates.
-    pub(crate) async fn run(mut self) -> CertificateResult<()> {
+    pub(crate) async fn run(mut self) -> CertManagerResult<()> {
         let shutdown_rx = self.config.shutdown().subscribe();
         let mut certificate_manager_rx = self.consensus_bus.certificate_manager().subscribe();
 
@@ -342,8 +351,8 @@ where
 
                             match result{
                                 // return fatal errors immediately to force shutdown
-                                Err(CertificateError::FatalAppendParent)
-                                | Err(CertificateError::FatalForwardAcceptedCertificate) => {
+                                Err(CertManagerError::FatalAppendParent)
+                                | Err(CertManagerError::FatalForwardAcceptedCertificate) => {
                                     error!(target: "primary::state-sync", ?result, "fatal error. shutting down...");
                                     return result;
                                 }
@@ -353,14 +362,19 @@ where
                                 }
                             }
                         }
-                        CertificateManagerCommand::NewGCRound => {
-                            self.process_gc_round().await?;
-                        }
 
                         CertificateManagerCommand::FilterUnkownDigests { mut unknown, reply } => {
                             self.pending.filter_unknown_digests(&mut unknown);
                             let _ = reply.send(unknown);
                         },
+                    }
+                }
+
+                result = self.garbage_collector.ready() => {
+                    match result {
+                        Ok(()) => self.process_gc_round().await?,
+                        Err(GarbageCollectorError::Timeout) => (), // ignore non-fatal
+                        _ => result? // return fatal error
                     }
                 }
 
@@ -375,7 +389,7 @@ where
 
 /// Commands for the [CertficateManager].
 #[derive(Debug)]
-pub enum CertificateManagerCommand {
+pub(crate) enum CertificateManagerCommand {
     /// Message from CertificateValidator.
     ProcessVerifiedCertificates {
         /// The certificate that was verified.
@@ -384,10 +398,8 @@ pub enum CertificateManagerCommand {
         /// pending and return an error.
         certificates: Vec<Certificate>,
         /// Return the result to the certificate validator.
-        reply: oneshot::Sender<CertificateResult<()>>,
+        reply: oneshot::Sender<CertManagerResult<()>>,
     },
-    /// Message from GarbageCollector that the gc round has advanced.
-    NewGCRound,
     /// Filter certificate digests that are not in local storage.
     ///
     /// Remove digests that are already tracked by `Pending`.

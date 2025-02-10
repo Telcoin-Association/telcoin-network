@@ -3,15 +3,15 @@
 //! Pending certificates are waiting to be accepted due to missing parents.
 //! This mod manages and tracks pending certificates for rounds of consensus.
 
-use crate::ConsensusBus;
+use crate::{
+    error::{CertManagerError, CertManagerResult},
+    ConsensusBus,
+};
 use fastcrypto::hash::Hash as _;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use tn_config::ConsensusConfig;
 use tn_storage::traits::Database;
-use tn_types::{
-    error::{CertificateError, CertificateResult},
-    Certificate, CertificateDigest, Round,
-};
+use tn_types::{Certificate, CertificateDigest, Round};
 use tracing::debug;
 
 /// A certificate that is missing parents and pending approval.
@@ -89,7 +89,7 @@ where
         &mut self,
         certificate: Certificate,
         missing_parents: HashSet<CertificateDigest>,
-    ) -> CertificateResult<()> {
+    ) -> CertManagerResult<()> {
         let digest = certificate.digest();
         let parent_round = certificate.round() - 1;
         debug!(target: "primary::state-sync::pending", ?digest, "Processing certificate with missing parents");
@@ -105,7 +105,7 @@ where
         let pending = PendingCertificate::new(certificate, missing_parents.clone());
         if let Some(existing) = self.pending.insert(digest, pending) {
             if existing.missing_parent_digests != missing_parents {
-                return Err(CertificateError::PendingParentsMismatch(digest));
+                return Err(CertManagerError::PendingParentsMismatch(digest));
             }
         }
 
@@ -131,7 +131,7 @@ where
         &mut self,
         round: Round,
         digest: CertificateDigest,
-    ) -> CertificateResult<VecDeque<Certificate>> {
+    ) -> CertManagerResult<VecDeque<Certificate>> {
         let mut ready_certificates = VecDeque::new();
         let mut certificates_to_process = VecDeque::new();
         certificates_to_process.push_back((round, digest));
@@ -150,7 +150,7 @@ where
                 let pending_cert = self
                     .pending
                     .get_mut(pending_digest)
-                    .ok_or(CertificateError::PendingCertificateNotFound(*pending_digest))?;
+                    .ok_or(CertManagerError::PendingCertificateNotFound(*pending_digest))?;
 
                 // remove parent
                 pending_cert.missing_parent_digests.remove(&next_digest);
@@ -161,7 +161,7 @@ where
                     let ready = self
                         .pending
                         .remove(pending_digest)
-                        .ok_or(CertificateError::PendingCertificateNotFound(*pending_digest))?;
+                        .ok_or(CertManagerError::PendingCertificateNotFound(*pending_digest))?;
 
                     // update any pending certificates waiting for this certificate
                     certificates_to_process.push_back((ready.certificate.round(), *pending_digest));

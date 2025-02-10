@@ -388,7 +388,7 @@ impl ConsensusBus {
     ///
     /// These channels are used to communicate with the long-running CertificateManager task.
     /// Can only be subscribed to once.
-    pub fn certificate_manager(&self) -> &impl TnSender<CertificateManagerCommand> {
+    pub(crate) fn certificate_manager(&self) -> &impl TnSender<CertificateManagerCommand> {
         &self.inner.certificate_manager
     }
 

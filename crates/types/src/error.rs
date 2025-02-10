@@ -291,12 +291,6 @@ pub enum CertificateError {
     /// TODO: REMOVE THIS
     #[error("The certificate is suspended until missing parents recovered.")]
     Suspended,
-    /// The certificate is pending acceptance due to missing parents.
-    #[error("The certificate {0} is pending acceptance due to missing parents.")]
-    Pending(CertificateDigest),
-    /// A duplicate certificate was received but it has different missing parents.
-    #[error("The certificate {0} was already pending, but now it has different missing parents.")]
-    PendingParentsMismatch(CertificateDigest),
     /// Error retrieving value from storage.
     #[error("Storage failure: {0}")]
     Storage(#[from] StoreError),
@@ -309,9 +303,6 @@ pub enum CertificateError {
     /// The BLS aggregate signature is invalid
     #[error("Invalid aggregate signature")]
     InvalidSignature(#[from] FastCryptoError),
-    /// mpsc sender dropped while processig the certificate
-    #[error("Failed to process certificate - TN sender error: {0}")]
-    TNSend(String),
     /// The certificates's round is too far behind.
     #[error("Certificate {0} for round {1} is too old for GC round {2}")]
     TooOld(CertificateDigest, Round, Round),
@@ -324,41 +315,10 @@ pub enum CertificateError {
     /// Certificate signature verification state returned `Genesis`
     #[error("Failed to recover BlsAggregateSignatureBytes from certificate signature")]
     RecoverBlsAggregateSignatureBytes,
-    /// The certificate's signature verification state is unverified.
-    #[error("Unverified signature verification state {0}")]
-    UnverifiedSignature(CertificateDigest),
-    /// The parent was not found.
-    #[error("Error accepting certificate. Parent not found: {0}")]
-    MissingParent(CertificateDigest),
-    /// Oneshot channel dropped for certificate manager.
-    #[error("Failed to return certificate manager's result.")]
-    CertificateManagerOneshot,
-    /// The pending certificate is unexpectedly missing. This should not happen.
-    #[error("Pending certificate not found by digest: {0}")]
-    PendingCertificateNotFound(CertificateDigest),
-    /// The certificate was verified, accepted, and stored in storage.
-    /// However, an error occurred adding it to the collection of parents.
-    /// This is the only way to advance the round and is fatal.
-    #[error("Fatal error: failed to append accepted certs to parents.")]
-    FatalAppendParent,
-    /// The certificate was verified, accepted, and stored in storage.
-    /// However, an error occured forwarding the certificate to bullshark consensus.
-    /// This results in inconsistent state between consensus DAG and consensus store and is fatal.
-    #[error("Fatal error: failed to forward accepted cert to consensus.")]
-    FatalForwardAcceptedCertificate,
-    /// JoinError for spawned blocking task when verifying many fetched certs.
-    #[error("Failed to join blocking certificate verification task.")]
-    JoinError,
 
     /// TODO: Refactor this out - only used to debug notify and suspend
     #[error("Certificate suspended: {0}")]
     DebugSuspend(String),
-}
-
-impl<T: std::fmt::Debug> From<SendError<T>> for CertificateError {
-    fn from(e: SendError<T>) -> Self {
-        Self::TNSend(e.to_string())
-    }
 }
 
 impl<T: std::fmt::Debug> From<SendError<T>> for HeaderError {

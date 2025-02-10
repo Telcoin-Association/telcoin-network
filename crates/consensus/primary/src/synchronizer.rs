@@ -269,7 +269,10 @@ impl<DB: Database> Inner<DB> {
             self.consensus_bus
                 .certificate_fetcher()
                 .send(CertificateFetcherCommand::Ancestors(certificate.clone()))
-                .await?;
+                .await
+                .map_err(|_| {
+                    CertificateError::DebugSuspend("failed to send to cert fetcher".into())
+                })?;
         }
 
         Ok(missing_parents)
@@ -1129,7 +1132,12 @@ impl<DB: Database> Synchronizer<DB> {
         // This allows the proposer not to fire proposals at rounds strictly below the certificate
         // we witnessed.
         let minimal_round_for_parents = certificate.round().saturating_sub(1);
-        self.inner.consensus_bus.parents().send((vec![], minimal_round_for_parents)).await?;
+        self.inner
+            .consensus_bus
+            .parents()
+            .send((vec![], minimal_round_for_parents))
+            .await
+            .map_err(|_| CertificateError::DebugSuspend("failed to send to parents".into()))?;
 
         // Instruct workers to download any missing batches referenced in this certificate.
         // Since this header got certified, we are sure that all the data it refers to (ie. its
@@ -1137,7 +1145,11 @@ impl<DB: Database> Synchronizer<DB> {
         // the certificate without blocking on block synchronization.
         let header = certificate.header().clone();
         let max_age = self.inner.consensus_config.parameters().gc_depth.saturating_sub(1);
-        self.inner.tx_batch_tasks.send((header.clone(), max_age)).await?;
+        self.inner
+            .tx_batch_tasks
+            .send((header.clone(), max_age))
+            .await
+            .map_err(|_| CertificateError::DebugSuspend("failed to send to batch tasks".into()))?;
 
         let highest_processed_round = self.inner.highest_processed_round.load(Ordering::Acquire);
         if highest_processed_round + NEW_CERTIFICATE_ROUND_LIMIT < certificate.round() {
@@ -1145,7 +1157,12 @@ impl<DB: Database> Synchronizer<DB> {
                 .consensus_bus
                 .certificate_fetcher()
                 .send(CertificateFetcherCommand::Ancestors(certificate.clone()))
-                .await?;
+                .await
+                .map_err(|_| {
+                    CertificateError::DebugSuspend(
+                        "failed to send to cert fetcher ancestors".into(),
+                    )
+                })?;
 
             error!(target: "primary::synchronizer", "processed certificate that is too new");
 
@@ -1157,7 +1174,13 @@ impl<DB: Database> Synchronizer<DB> {
         }
 
         let (sender, res) = oneshot::channel();
-        self.inner.tx_certificate_acceptor.send((vec![certificate], sender, external)).await?;
+        self.inner
+            .tx_certificate_acceptor
+            .send((vec![certificate], sender, external))
+            .await
+            .map_err(|_| {
+                CertificateError::DebugSuspend("failed to send to cert acceptor".into())
+            })?;
 
         res.await.map_err(|e| CertificateError::ResChannelClosed(e.to_string()))??;
         Ok(())

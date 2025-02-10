@@ -14,6 +14,11 @@ pub(crate) enum GarbageCollectorError {
     /// The watch channel for consensus rounds returned an error.
     #[error("The watch channel for consensus rounds returned an error instead of a change notification.")]
     ConsensusRoundWatchChannel(#[from] watch::error::RecvError),
+    /// The max time between garbage collection rounds expired.
+    ///
+    /// This is non-fatal.
+    #[error("Failed to advance round within max time allowed. Triggering certificate fetching.")]
+    Timeout,
 }
 
 impl<T: std::fmt::Debug> From<SendError<T>> for GarbageCollectorError {

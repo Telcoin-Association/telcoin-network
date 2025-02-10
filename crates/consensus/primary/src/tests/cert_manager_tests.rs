@@ -2,6 +2,7 @@
 
 use super::CertificateManager;
 use crate::{
+    error::CertManagerError,
     state_sync::{AtomicRound, CertificateManagerCommand},
     ConsensusBus,
 };
@@ -11,8 +12,8 @@ use std::collections::BTreeSet;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{make_optimal_signed_certificates, CommitteeFixture};
 use tn_types::{
-    error::CertificateError, keccak256, BlsAggregateSignatureBytes, Certificate, Round,
-    SignatureVerificationState, TnReceiver as _, TnSender,
+    keccak256, BlsAggregateSignatureBytes, Certificate, Round, SignatureVerificationState,
+    TnReceiver as _, TnSender,
 };
 use tracing::debug;
 
@@ -99,7 +100,7 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
     let res = manager.process_verified_certificates(later_rounds).await;
 
     // expect all certs to process and error to reference last digest processed
-    assert_matches!(res, Err(CertificateError::Pending(digest)) if digest == expected_last_digest);
+    assert_matches!(res, Err(CertManagerError::Pending(digest)) if digest == expected_last_digest);
 
     // later_rounds should be pending
     assert_eq!(expected_pending_len, manager.pending.num_pending());

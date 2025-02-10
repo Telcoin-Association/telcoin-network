@@ -2,7 +2,9 @@
 
 use super::{AtomicRound, HeaderValidator};
 use crate::{
-    certificate_fetcher::CertificateFetcherCommand, state_sync::CertificateManagerCommand,
+    certificate_fetcher::CertificateFetcherCommand,
+    error::{CertManagerError, CertManagerResult},
+    state_sync::CertificateManagerCommand,
     ConsensusBus,
 };
 use consensus_metrics::monitored_scope;
@@ -14,8 +16,8 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_storage::traits::Database;
 use tn_types::{
-    error::{CertificateError, CertificateResult},
-    Certificate, CertificateDigest, Round, SignatureVerificationState, TnSender as _,
+    error::CertificateError, Certificate, CertificateDigest, Round, SignatureVerificationState,
+    TnSender as _,
 };
 use tokio::sync::oneshot;
 use tracing::{debug, error, trace};
@@ -67,7 +69,7 @@ where
     }
 
     /// Process a certificate produced by the this node.
-    pub async fn process_own_certificate(&self, certificate: Certificate) -> CertificateResult<()> {
+    pub async fn process_own_certificate(&self, certificate: Certificate) -> CertManagerResult<()> {
         self.process_certificate(certificate, false).await
     }
 
@@ -75,7 +77,7 @@ where
     pub async fn process_peer_certificate(
         &self,
         certificate: Certificate,
-    ) -> CertificateResult<()> {
+    ) -> CertManagerResult<()> {
         self.process_certificate(certificate, true).await
     }
 
@@ -84,7 +86,7 @@ where
         &self,
         mut certificate: Certificate,
         external: bool,
-    ) -> CertificateResult<()> {
+    ) -> CertManagerResult<()> {
         // validate certificate standalone and forward to CertificateManager
         // - try_accept_certificate
         // - accept_own_certificate
@@ -134,7 +136,7 @@ where
     /// Validate and verify the certificate.
     ///
     /// This method validates the certificate and verifies signatures.
-    fn validate_and_verify(&self, certificate: Certificate) -> CertificateResult<Certificate> {
+    fn validate_and_verify(&self, certificate: Certificate) -> CertManagerResult<Certificate> {
         // certificates outside gc can never be included in the DAG
         let gc_round = self.gc_round.load();
 
@@ -143,12 +145,15 @@ where
                 certificate.digest(),
                 certificate.round(),
                 gc_round,
-            ));
+            )
+            .into());
         }
 
         // validate certificate and verify signatures
         // TODO: rename this method too
-        certificate.verify(self.config.committee(), self.config.worker_cache())
+        let verified_cert =
+            certificate.verify(self.config.committee(), self.config.worker_cache())?;
+        Ok(verified_cert)
     }
 
     /// Update metrics and send to Certificate Manager for final processing.
@@ -157,7 +162,7 @@ where
         certificate_source: &str,
         highest_round: Round,
         certificates: Vec<Certificate>,
-    ) -> CertificateResult<()> {
+    ) -> CertManagerResult<()> {
         let highest_received_round =
             self.highest_received_round.fetch_max(highest_round).max(highest_round);
 
@@ -218,7 +223,7 @@ where
                 let sync_header = HeaderValidator::new(config, bus);
                 let res = sync_header.sync_header_batches(&header, true, max_age).await;
                 if let Err(e) = res {
-                    error!(target: "primary::state-sync", ?e, ?header, "error synching batches for certified header");
+                    error!(target: "primary::state-sync", ?e, ?header, ?max_age, "error syncing batches for certified header");
                 }
             });
 
@@ -242,7 +247,8 @@ where
                     cert.digest(),
                     cert.round(),
                     highest_processed_round,
-                ));
+                )
+                .into());
             }
         }
 
@@ -254,7 +260,7 @@ where
             .await?;
 
         // await response from certificate manager
-        res.await.map_err(|_| CertificateError::CertificateManagerOneshot)?
+        res.await.map_err(|_| CertManagerError::CertificateManagerOneshot)?
     }
 
     //
@@ -267,7 +273,7 @@ where
     pub async fn process_fetched_certificates_in_parallel(
         &self,
         certificates: Vec<Certificate>,
-    ) -> CertificateResult<()> {
+    ) -> CertManagerResult<()> {
         let _scope = monitored_scope("primary::cert_validator");
         let certificates = self.verify_collection(certificates).await?;
 
@@ -280,7 +286,7 @@ where
     async fn verify_collection(
         &self,
         mut certificates: Vec<Certificate>,
-    ) -> CertificateResult<Vec<Certificate>> {
+    ) -> CertManagerResult<Vec<Certificate>> {
         // Early return for empty input
         if certificates.is_empty() {
             return Ok(certificates);
@@ -309,7 +315,7 @@ where
     fn classify_certificates_for_verification(
         &self,
         certificates: &mut Vec<Certificate>,
-    ) -> CertificateResult<Vec<(usize, Certificate)>> {
+    ) -> CertManagerResult<Vec<(usize, Certificate)>> {
         // Build certificate relationship maps to identify leaf certificates
         let mut all_digests = HashSet::new();
         let mut all_parents = HashSet::new();
@@ -349,7 +355,7 @@ where
     /// Marks a certificate as indirectly verified.
     ///
     /// These chunks are verified through parents being verified.
-    fn mark_verified_indirectly(&self, cert: &mut Certificate) -> CertificateResult<()> {
+    fn mark_verified_indirectly(&self, cert: &mut Certificate) -> CertManagerResult<()> {
         cert.set_signature_verification_state(SignatureVerificationState::VerifiedIndirectly(
             cert.aggregated_signature()
                 .ok_or(CertificateError::RecoverBlsAggregateSignatureBytes)?
@@ -363,7 +369,7 @@ where
     async fn verify_certificate_chunk(
         &self,
         certs_for_verification: Vec<(usize, Certificate)>,
-    ) -> CertificateResult<Vec<(usize, Certificate)>> {
+    ) -> CertManagerResult<Vec<(usize, Certificate)>> {
         let verify_tasks: Vec<_> = certs_for_verification
             .chunks(self.config.network_config().sync_config().certificate_verification_chunk_size)
             .map(|chunk| self.spawn_verification_task(chunk.to_vec()))
@@ -373,7 +379,7 @@ where
         for task in verify_tasks {
             let group_result = task.await.map_err(|e| {
                 error!(target: "primary::state-sync", ?e, "group verify certs task failed");
-                CertificateError::JoinError
+                CertManagerError::JoinError
             })??;
             verified_certs.extend(group_result);
         }
@@ -384,7 +390,7 @@ where
     fn spawn_verification_task(
         &self,
         certs: Vec<(usize, Certificate)>,
-    ) -> tokio::task::JoinHandle<CertificateResult<Vec<(usize, Certificate)>>> {
+    ) -> tokio::task::JoinHandle<CertManagerResult<Vec<(usize, Certificate)>>> {
         let validator = self.clone();
         tokio::task::spawn_blocking(move || {
             let now = Instant::now();

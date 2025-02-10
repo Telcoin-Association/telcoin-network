@@ -1,15 +1,12 @@
 //! Aggregate certificates for the round.
 
-use crate::ConsensusBus;
+use crate::{error::CertManagerResult, ConsensusBus};
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, HashSet},
     sync::Arc,
 };
-use tn_types::{
-    error::{CertificateError, CertificateResult},
-    AuthorityIdentifier, Certificate, Committee, Round, Stake, TnSender as _,
-};
+use tn_types::{AuthorityIdentifier, Certificate, Committee, Round, Stake, TnSender as _};
 use tracing::trace;
 
 /// Manage certificates as they aggregate through rounds.
@@ -32,7 +29,7 @@ impl CertificatesAggregatorManager {
         &self,
         certificate: Certificate,
         committee: &Committee,
-    ) -> CertificateResult<()> {
+    ) -> CertManagerResult<()> {
         let round = certificate.round();
 
         // append certificate
@@ -45,11 +42,7 @@ impl CertificatesAggregatorManager {
 
         // forward to proposer if enough parents to advance the round (2f+1)
         if let Some(parents) = quorum {
-            self.consensus_bus
-                .parents()
-                .send((parents, round))
-                .await
-                .map_err(|e| CertificateError::TNSend(e.to_string()))?;
+            self.consensus_bus.parents().send((parents, round)).await?;
         }
 
         Ok(())

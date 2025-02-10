@@ -191,8 +191,9 @@ where
                 // attempts.
                 Ok(()) = rx_committed_round_updates.changed() => {
                     committed_round = *rx_committed_round_updates.borrow_and_update();
+                    debug!(target: "primary::state-sync::header_batches", ?committed_round, "committed round update");
 
-                    if header.round < committed_round {
+                    if header.round < committed_round.saturating_sub(max_age) {
                         return Err(HeaderError::TooOld(header.digest(), header.round(), committed_round));
                     }
                 },
