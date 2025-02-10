@@ -118,7 +118,7 @@ async fn test_process_fetched_certificates_in_parallel() -> eyre::Result<()> {
     const VERIFICATION_ROUND: Round = 50;
     const LEAF_ROUND: Round = 60;
 
-    let _ = tokio::task::spawn(async move {
+    let _task = tokio::task::spawn(async move {
         loop {
             // receive cert
             let command = certificate_manager_rx.recv().await.unwrap();

@@ -537,7 +537,7 @@ async fn sync_batches_drops_old() {
             .expect("consensus round watch channels updated");
     });
     match synchronizer.sync_header_batches(&test_header, 10).await {
-        Err(HeaderError::TooOld(_, _, _)) => (),
+        Err(HeaderError::TooOld { .. }) => (),
         result => panic!("unexpected result {result:?}"),
     }
 }

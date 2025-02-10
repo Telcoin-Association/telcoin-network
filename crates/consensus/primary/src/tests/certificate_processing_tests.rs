@@ -7,6 +7,7 @@ use super::{cert_manager::CertificateManager, cert_validator::CertificateValidat
 use crate::{
     consensus::{gc_round, ConsensusRound},
     error::CertManagerError,
+    state_sync::HeaderValidator,
     ConsensusBus,
 };
 use assert_matches::assert_matches;
@@ -38,7 +39,7 @@ struct TestTypes<DB = MemDatabase> {
 fn create_all_test_types() -> TestTypes<MemDatabase> {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let primary = fixture.authorities().last().unwrap();
-    let (manager, validator, cb) = create_core_test_types(&primary);
+    let (manager, validator, cb) = create_core_test_types(primary);
     let task_manager = TaskManager::default();
 
     TestTypes { manager, validator, cb, fixture, task_manager }
@@ -73,6 +74,11 @@ fn create_core_test_types<DB: Database>(
     );
 
     (manager, validator, cb)
+}
+
+/// Helper to sort certificates by digest
+fn sort_by_digest(a: &CertificateDigest, b: &CertificateDigest) -> core::cmp::Ordering {
+    a.cmp(b)
 }
 
 #[tokio::test]
@@ -198,8 +204,6 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_gc_pending_certs() -> eyre::Result<()> {
-    // TODO: delete this
-    tn_test_utils::init_test_tracing();
     const GC_DEPTH: Round = 5;
 
     // create test types
@@ -304,7 +308,7 @@ async fn test_node_restart_syncs_state() -> eyre::Result<()> {
     //
 
     let (manager_first_recovery, validator_first_recovery, cb_first_recovery) =
-        create_core_test_types(&primary);
+        create_core_test_types(primary);
 
     task_manager.spawn_task("recovered manager", manager_first_recovery.run());
 
@@ -332,32 +336,90 @@ async fn test_node_restart_syncs_state() -> eyre::Result<()> {
     // reached to advance the round before crash
     //
 
-    let (manager_second_recovery, _validator, cb_second_recovery) =
-        create_core_test_types(&primary);
+    let (manager_second_recovery, _validator, cb_second_recovery) = create_core_test_types(primary);
 
     task_manager.spawn_task("recovered manager", manager_second_recovery.run());
 
     // assert proposer receives parents for round after recovery
     let mut rx_parents_second_recovery = cb_second_recovery.parents().subscribe();
 
-    fn sort_by_digest(a: &Certificate, b: &Certificate) -> core::cmp::Ordering {
-        let a = a.digest();
-        let b = b.digest();
-        a.cmp(&b)
-    }
-
     let (mut received_certs, round) = rx_parents_second_recovery.recv().await.unwrap();
 
     // sort certs to ensure consistent order
-    let received = received_certs.sort_by(|a, b| sort_by_digest(a, b));
-    let expected = certs.sort_by(|a, b| sort_by_digest(a, b));
-    assert_eq!(received, expected);
+    received_certs.sort_by(|a, b| {
+        let a = a.digest();
+        let b = b.digest();
+        sort_by_digest(&a, &b)
+    });
+    certs.sort_by(|a, b| {
+        let a = a.digest();
+        let b = b.digest();
+        sort_by_digest(&a, &b)
+    });
     assert_eq!(round, 1);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_sync_batches_drops_old() -> eyre::Result<()> {
-    todo!()
+async fn test_filter_unknown_parents() -> eyre::Result<()> {
+    let TestTypes { validator, manager, cb, fixture, task_manager, .. } = create_all_test_types();
+
+    // test types uses last authority for config
+    let primary = fixture.authorities().last().unwrap();
+
+    // spawn manager task
+    task_manager.spawn_task("manager", manager.run());
+
+    let committee = fixture.committee();
+    let num_authorities = fixture.num_authorities();
+
+    // make certs
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let keys: Vec<_> = fixture.authorities().map(|a| (a.id(), a.keypair().copy())).collect();
+    let (all_certificates, _next_parents) =
+        make_optimal_signed_certificates(1..=5, &genesis, &committee, keys.as_slice());
+
+    // separate first round (4 certs) and later rounds
+    let mut first_round = all_certificates.clone(); // rename for readability
+    let later_rounds = first_round.split_off(num_authorities);
+
+    let header_validator = HeaderValidator::new(primary.consensus_config(), cb.clone());
+
+    // assert all unknown
+    let round5_cert = later_rounds.back().expect("header for round 2");
+    // only round 4 should be unknown
+    let mut expected: Vec<_> = all_certificates
+        .iter()
+        .filter_map(|c| if c.header().round() == 4 { Some(c.digest()) } else { None })
+        .collect();
+    expected.sort_by(sort_by_digest);
+    // report unknown
+    let mut unknown = header_validator.identify_unkown_parents(round5_cert.header()).await?;
+    unknown.sort_by(sort_by_digest);
+
+    assert_eq!(expected, unknown);
+
+    // try to process certs for rounds 2..5 before round 1
+    // assert pending
+    for cert in later_rounds.clone() {
+        let expected = cert.digest();
+        let err = validator.process_peer_certificate(cert).await;
+        assert_matches!(err, Err(CertManagerError::Pending(digest)) if digest == expected);
+    }
+
+    // round 4 should no longer be "missing"
+    let unknown = header_validator.identify_unkown_parents(round5_cert.header()).await?;
+    assert!(unknown.is_empty());
+
+    // assert pending aren't unknown
+    let round2_cert = later_rounds.front().expect("header for round 2");
+    let mut unknown = header_validator.identify_unkown_parents(round2_cert.header()).await?;
+    unknown.sort_by(sort_by_digest);
+    let mut expected: Vec<_> = first_round.iter().map(|c| c.digest()).collect();
+    expected.sort_by(sort_by_digest);
+    assert_eq!(expected, unknown);
+
+    Ok(())
 }

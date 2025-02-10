@@ -567,11 +567,11 @@ impl<DB: Database> Inner<DB> {
         let mut committed_round = *rx_committed_round_updates.borrow();
         ensure!(
             header.round() >= committed_round.saturating_sub(max_age),
-            HeaderError::TooOld(
-                header.digest(),
-                header.round(),
-                committed_round.saturating_sub(max_age)
-            )
+            HeaderError::TooOld {
+                digest: header.digest(),
+                header_round: header.round(),
+                max_round: committed_round.saturating_sub(max_age)
+            }
         );
 
         let mut missing = HashMap::new();
@@ -661,11 +661,11 @@ impl<DB: Database> Inner<DB> {
                     committed_round = *rx_committed_round_updates.borrow_and_update();
                     ensure!(
                         header.round() >= committed_round.saturating_sub(max_age),
-                        HeaderError::TooOld(
-                            header.digest(),
-                            header.round(),
-                            committed_round.saturating_sub(max_age),
-                        )
+                        HeaderError::TooOld {
+                            digest: header.digest(),
+                            header_round: header.round(),
+                            max_round: committed_round.saturating_sub(max_age)
+                        }
                     );
                 },
             }

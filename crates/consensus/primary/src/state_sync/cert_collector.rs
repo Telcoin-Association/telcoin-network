@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 
 #[cfg(test)]
 #[path = "../tests/cert_collector_tests.rs"]
-mod cert_collector;
+mod cert_collector_tests;
 
 /// Time-bounded iterator to retrieve certificates from the database.
 pub(crate) struct CertificateCollector<DB> {

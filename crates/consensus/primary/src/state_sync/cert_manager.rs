@@ -24,7 +24,7 @@ use tracing::{debug, error};
 
 #[cfg(test)]
 #[path = "../tests/cert_manager_tests.rs"]
-mod cert_manager;
+mod cert_manager_tests;
 
 /// Process validated certificates.
 ///

@@ -404,7 +404,11 @@ where
         );
         ensure!(
             limit <= header.round(),
-            HeaderError::TooOld(header.digest(), header.round(), limit)
+            HeaderError::TooOld {
+                digest: header.digest(),
+                header_round: header.round(),
+                max_round: limit,
+            }
         );
 
         // lock to ensure consistency between limit_round and where parent_digests are gc'ed

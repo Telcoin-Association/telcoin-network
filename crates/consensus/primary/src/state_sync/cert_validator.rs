@@ -21,7 +21,7 @@ use tracing::{debug, error, trace};
 
 #[cfg(test)]
 #[path = "../tests/cert_validator_tests.rs"]
-mod cert_validator;
+mod cert_validator_tests;
 
 /// Process unverified headers and certificates.
 #[derive(Debug, Clone)]
@@ -301,7 +301,7 @@ where
     /// those that can be verified indirectly through their relationships with other certificates.
     fn classify_certificates_for_verification(
         &self,
-        certificates: &mut Vec<Certificate>,
+        certificates: &mut [Certificate],
     ) -> CertManagerResult<Vec<(usize, Certificate)>> {
         // Build certificate relationship maps to identify leaf certificates
         let mut all_digests = HashSet::new();

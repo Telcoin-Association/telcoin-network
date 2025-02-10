@@ -239,8 +239,8 @@ pub enum HeaderError {
     #[error("Storage failure: {0}")]
     Storage(#[from] StoreError),
     /// The proposed header's round is too far behind.
-    #[error("Header {0} for round {1} is too old for GC round {2}")]
-    TooOld(HeaderDigest, Round, Round),
+    #[error("Header {digest} for round {header_round} is too old for max round {max_round}")]
+    TooOld { digest: HeaderDigest, header_round: Round, max_round: Round },
     /// The header contains a parent with an invalid aggregate BLS signature.
     #[error("Header's parent missing aggregate BLS signature")]
     ParentMissingSignature,
