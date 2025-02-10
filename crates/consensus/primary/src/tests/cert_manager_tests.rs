@@ -53,9 +53,6 @@ async fn test_unverified_certificate_fails() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_accept_pending_certs() -> eyre::Result<()> {
-    // TODO: remove this
-    tn_test_utils::init_test_tracing();
-
     let TestTypes { mut manager, fixture, .. } = create_test_types();
     let committee = fixture.committee();
     let num_authorities = fixture.num_authorities();

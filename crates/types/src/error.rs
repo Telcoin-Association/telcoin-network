@@ -274,12 +274,6 @@ pub enum HeaderError {
     /// Oneshot channel dropped for pending certificate result.
     #[error("Failed to return pending certificate manager result.")]
     PendingCertificateOneshot,
-
-    /// TODO: this is temporary
-    ///
-    /// Failed to convert libp2p::PeerId to fastcrypto::ed25519
-    #[error("Failed to convert libp2p::PeerId into fastcrypto::ed25519")]
-    PeerId,
 }
 
 /// Result alias for [`CertificateError`].

@@ -91,8 +91,6 @@ struct ConsensusBusInner {
 
     /// Messages to the Certificate Manager.
     certificate_manager: MeteredMpscChannel<CertificateManagerCommand>,
-    /// Synchronize missing batches.
-    sync_missing_batches: MeteredMpscChannel<(Header, Round)>,
     /// Store verified certificates
     verified_certificates: MeteredMpscChannel<(
         Certificate,
@@ -222,17 +220,10 @@ impl ConsensusBus {
             &primary_metrics.primary_channel_metrics.tx_committed_own_headers_total,
         );
 
-        // TODO: these metrics don't make sense
         let certificate_manager = channel_with_total_sender(
             CHANNEL_CAPACITY,
             &primary_metrics.primary_channel_metrics.tx_certificate_acceptor,
             &primary_metrics.primary_channel_metrics.tx_certificate_acceptor_total,
-        );
-
-        let sync_missing_batches = channel_with_total_sender(
-            CHANNEL_CAPACITY,
-            &primary_metrics.primary_channel_metrics.tx_batch_tasks,
-            &primary_metrics.primary_channel_metrics.tx_batch_tasks_total,
         );
 
         let verified_certificates = metered_channel::channel_sender(
@@ -272,7 +263,6 @@ impl ConsensusBus {
                 committed_own_headers,
                 sequence,
                 certificate_manager,
-                sync_missing_batches,
                 verified_certificates,
 
                 tx_primary_round_updates,
@@ -373,30 +363,12 @@ impl ConsensusBus {
         &self.inner.sequence
     }
 
-    /// Verified certificates that are ready to be accepted into storage.
-    ///
-    /// Can only be subscribed to once.
-    // TODO: delete this - redundant from `accept_verified_certificates`
-    pub fn verified_certificates(
-        &self,
-    ) -> &impl TnSender<(Certificate, CertificateDigest, oneshot::Sender<CertificateResult<()>>)>
-    {
-        &self.inner.verified_certificates
-    }
-
     /// Channel for forwarding newly received certificates for verification.
     ///
     /// These channels are used to communicate with the long-running CertificateManager task.
     /// Can only be subscribed to once.
     pub(crate) fn certificate_manager(&self) -> &impl TnSender<CertificateManagerCommand> {
         &self.inner.certificate_manager
-    }
-
-    /// Channel for forwarding information for syncing missing batches.
-    ///
-    /// Can only be subscribed to once.
-    pub fn sync_missing_batches(&self) -> &impl TnSender<(Header, Round)> {
-        &self.inner.sync_missing_batches
     }
 
     /// Track recent blocks.
