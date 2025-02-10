@@ -86,6 +86,7 @@ where
     ) -> Self {
         let parents = CertificatesAggregatorManager::new(consensus_bus.clone());
         let pending = PendingCertificateManager::new(config.clone(), consensus_bus.clone());
+
         Self {
             consensus_bus,
             config,
@@ -302,12 +303,33 @@ where
         Ok(())
     }
 
+    /// Startup tasks to synchronize state for primary.
+    async fn recover_state(&self) -> CertificateResult<()> {
+        // send last round to proposer
+        let last_round_certificates = self
+            .config
+            .node_storage()
+            .certificate_store
+            .last_two_rounds_certs()
+            .expect("Failed recovering certificates in primary core");
+
+        // update parents
+        for certificate in last_round_certificates {
+            self.parents.append_certificate(certificate, self.config.committee()).await?;
+        }
+
+        Ok(())
+    }
+
     /// Long running task to manage verified certificates.
     ///
     /// Certificate signature states are first verified, then parents are checked. If certificate parents are missing, the manager tracks them as pending. As parents become available or are removed through garbage collection, the certificate manager will update pending state and try to accept all known certificates.
     pub(crate) async fn run(mut self) -> CertificateResult<()> {
         let shutdown_rx = self.config.shutdown().subscribe();
         let mut certificate_manager_rx = self.consensus_bus.certificate_manager().subscribe();
+
+        // recover state
+        self.recover_state().await?;
 
         // process certificates until shutdown
         loop {

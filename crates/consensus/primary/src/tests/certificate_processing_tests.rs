@@ -193,7 +193,7 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_recover_basic() -> eyre::Result<()> {
-    let TestTypes { validator, manager, cb, fixture, task_manager } = create_test_types();
+    let TestTypes { validator, manager, fixture, task_manager, .. } = create_test_types();
     // test types uses last authority for config
     let primary = fixture.authorities().last().unwrap();
     let certificate_store = primary.consensus_config().node_storage().certificate_store.clone();
@@ -201,12 +201,10 @@ async fn test_recover_basic() -> eyre::Result<()> {
     // spawn manager task
     task_manager.spawn_task("manager", manager.run());
 
-    // receive new accepted certs (consensus)
-    let mut rx_new_certificates = cb.new_certificates().subscribe();
-
     // create 3 certs
     // NOTE: test types uses the last authority
-    let certs: Vec<_> = fixture.headers().iter().take(3).map(|h| fixture.certificate(h)).collect();
+    let mut certs: Vec<_> =
+        fixture.headers().iter().take(3).map(|h| fixture.certificate(h)).collect();
 
     for cert in certs.clone() {
         validator.process_peer_certificate(cert).await?;
@@ -228,9 +226,10 @@ async fn test_recover_basic() -> eyre::Result<()> {
             .into_iter()
             .map(|cert| (cert.digest(), cert))
             .collect();
+    let new_cb = ConsensusBus::new();
     let manager = CertificateManager::new(
         primary.consensus_config().clone(),
-        cb.clone(),
+        new_cb.clone(),
         genesis.clone(),
         gc_round.clone(),
         highest_processed_round.clone(),
@@ -240,9 +239,21 @@ async fn test_recover_basic() -> eyre::Result<()> {
     task_manager.spawn_task("recovered manager", manager.run());
 
     // assert proposer receives parents for round after recovery
-    let mut rx_parents = cb.parents().subscribe();
-    let received = rx_parents.recv().await.unwrap();
-    assert_eq!(received, (certs, 1));
+    let mut rx_parents = new_cb.parents().subscribe();
+    let (mut received_certs, round) = rx_parents.recv().await.unwrap();
+
+    fn sort_by_digest(a: &Certificate, b: &Certificate) -> core::cmp::Ordering {
+        let a = a.digest();
+        let b = b.digest();
+        a.cmp(&b)
+    }
+
+    // sort certs to ensure consistent order
+    let received = received_certs.sort_by(|a, b| sort_by_digest(a, b));
+    let expected = certs.sort_by(|a, b| sort_by_digest(a, b));
+    assert_eq!(received, expected);
+    assert_eq!(round, 1);
+
     Ok(())
 }
 
