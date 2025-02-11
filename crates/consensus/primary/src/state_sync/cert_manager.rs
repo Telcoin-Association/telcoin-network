@@ -214,7 +214,7 @@ where
 
         // send request to start fetching parents
         if !missing_parents.is_empty() {
-            debug!(target: "primary::state-sync", ?certificate, "missing {} parents", missing_parents.len());
+            debug!(target: "primary::cert_manager", ?certificate, "missing {} parents", missing_parents.len());
             // metrics
             self.consensus_bus
                 .primary_metrics()
@@ -245,8 +245,8 @@ where
         &mut self,
         certificates: VecDeque<Certificate>,
     ) -> CertManagerResult<()> {
-        let _scope = monitored_scope("primary::state-sync::accept_certificate");
-        debug!(target: "primary::state-sync", ?certificates, "accepting {:?} certificates", certificates.len());
+        let _scope = monitored_scope("primary::cert_manager::accept_certificate");
+        debug!(target: "primary::cert_manager", ?certificates, "accepting {:?} certificates", certificates.len());
 
         // write certificates to storage
         self.config.node_storage().certificate_store.write_all(certificates.clone())?;
@@ -280,13 +280,13 @@ where
                 .append_certificate(cert.clone(), self.config.committee())
                 .await
                 .inspect_err(|e| {
-                    error!(target: "primary::state-sync", ?e, "failed to append cert");
+                    error!(target: "primary::cert_manager", ?e, "failed to append cert");
                 })
                 .map_err(|_| CertManagerError::FatalAppendParent)?;
 
             // send to consensus for processing into the DAG
             self.consensus_bus.new_certificates().send(cert).await.inspect_err(|e| {
-                error!(target: "primary::state-sync", ?e, "failed to forward accepted certificate to consensus");
+                error!(target: "primary::cert_manager", ?e, "failed to forward accepted certificate to consensus");
             }).map_err(|_| CertManagerError::FatalForwardAcceptedCertificate)?;
         }
 
@@ -355,7 +355,7 @@ where
                                 // return fatal errors immediately to force shutdown
                                 Err(CertManagerError::FatalAppendParent)
                                 | Err(CertManagerError::FatalForwardAcceptedCertificate) => {
-                                    error!(target: "primary::state-sync", ?result, "fatal error. shutting down...");
+                                    error!(target: "primary::cert_manager", ?result, "fatal error. shutting down...");
                                     return result;
                                 }
 

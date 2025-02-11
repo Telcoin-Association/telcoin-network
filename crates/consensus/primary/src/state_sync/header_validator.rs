@@ -75,7 +75,7 @@ where
         // skip batch sync for own workers
         let authority_id = self.config.authority().id();
         if header.author() == authority_id {
-            debug!(target: "primary::synchronizer", "skipping sync_batches for header - no need to sync payload from own workers");
+            debug!(target: "primary::header_validator", "skipping sync_batches for header - no need to sync payload from own workers");
             return Ok(());
         }
 
@@ -189,7 +189,7 @@ where
                 // attempts.
                 Ok(()) = rx_committed_round_updates.changed() => {
                     committed_round = *rx_committed_round_updates.borrow_and_update();
-                    debug!(target: "primary::state-sync::header_batches", ?committed_round, "committed round update");
+                    debug!(target: "primary::header_validator", ?committed_round, "committed round update");
 
                     if header.round < committed_round.saturating_sub(max_age) {
                         return Err(HeaderError::TooOld{

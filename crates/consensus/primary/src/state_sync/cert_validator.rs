@@ -113,7 +113,7 @@ where
         // see if certificate already processed
         let digest = certificate.digest();
         if self.config.node_storage().certificate_store.contains(&digest)? {
-            trace!(target: "primary::state-sync", "Certificate {digest:?} has already been processed. Skip processing.");
+            trace!(target: "primary::cert_validator", "Certificate {digest:?} has already been processed. Skip processing.");
             self.consensus_bus
                 .primary_metrics()
                 .node_metrics
@@ -129,7 +129,7 @@ where
         }
 
         // update metrics
-        debug!(target: "primary::state-sync", round=certificate.round(), ?certificate, "processing certificate");
+        debug!(target: "primary::cert_validator", round=certificate.round(), ?certificate, "processing certificate");
 
         let certificate_source =
             if self.config.authority().id().eq(&certificate.origin()) { "own" } else { "other" };
@@ -227,7 +227,7 @@ where
                 let sync_header = HeaderValidator::new(config, bus);
                 let res = sync_header.sync_header_batches(&header, true, max_age).await;
                 if let Err(e) = res {
-                    error!(target: "primary::state-sync", ?e, ?header, ?max_age, "error syncing batches for certified header");
+                    error!(target: "primary::cert_validator", ?e, ?header, ?max_age, "error syncing batches for certified header");
                 }
             });
 
@@ -245,7 +245,7 @@ where
                     .send(CertificateFetcherCommand::Ancestors(cert.clone()))
                     .await?;
 
-                error!(target: "primary::state-sync", "processed certificate that is too new");
+                error!(target: "primary::cert_validator", "processed certificate that is too new");
 
                 return Err(CertificateError::TooNew(
                     cert.digest(),
@@ -384,7 +384,7 @@ where
         let mut verified_certs = Vec::new();
         for task in verify_tasks {
             let group_result = task.await.map_err(|e| {
-                error!(target: "primary::state-sync", ?e, "group verify certs task failed");
+                error!(target: "primary::cert_validator", ?e, "group verify certs task failed");
                 CertManagerError::JoinError
             })??;
             verified_certs.extend(group_result);
