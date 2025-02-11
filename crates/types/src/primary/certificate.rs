@@ -231,7 +231,8 @@ impl Certificate {
 
         let (weight, pks) = self.signed_by(committee);
 
-        ensure!(weight >= committee.quorum_threshold(), CertificateError::Inquorate);
+        let threshold = committee.quorum_threshold();
+        ensure!(weight >= threshold, CertificateError::Inquorate { stake: weight, threshold });
 
         let verified_cert = self.verify_signature(pks)?;
 
@@ -247,7 +248,7 @@ impl Certificate {
             | SignatureVerificationState::Genesis => return Ok(self),
             SignatureVerificationState::Unverified(ref bytes) => bytes,
             SignatureVerificationState::Unsigned(_) => {
-                return Err(CertificateError::Inquorate);
+                return Err(CertificateError::Unsigned);
             }
         };
 

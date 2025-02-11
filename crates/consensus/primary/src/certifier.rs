@@ -1,6 +1,6 @@
 //! Certifier broadcasts headers and certificates for this primary.
 
-use crate::{aggregators::VotesAggregator, synchronizer::Synchronizer, ConsensusBus};
+use crate::{aggregators::VotesAggregator, state_sync::StateSynchronizer, ConsensusBus};
 use anemo::{rpc::Status, Request, Response};
 use consensus_metrics::monitored_future;
 use futures::{
@@ -41,7 +41,8 @@ pub struct Certifier<DB> {
     /// The persistent storage keyed to certificates.
     certificate_store: CertificateStore<DB>,
     /// Handles synchronization with other nodes and our workers.
-    synchronizer: Arc<Synchronizer<DB>>,
+    state_sync: StateSynchronizer<DB>,
+    // synchronizer: Arc<Synchronizer<DB>>,
     /// Service to sign headers.
     signature_service: KeyConfig,
     /// Receiver for shutdown.
@@ -60,7 +61,7 @@ impl<DB: Database> Certifier<DB> {
     pub fn spawn(
         config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
-        synchronizer: Arc<Synchronizer<DB>>,
+        state_sync: StateSynchronizer<DB>,
         primary_network: anemo::Network,
         task_manager: &TaskManager,
     ) {
@@ -116,7 +117,7 @@ impl<DB: Database> Certifier<DB> {
                     authority_id: config.authority().id(),
                     committee: config.committee().clone(),
                     certificate_store: config.node_storage().certificate_store.clone(),
-                    synchronizer,
+                    state_sync,
                     signature_service: config.key_config().clone(),
                     rx_shutdown,
                     consensus_bus,
@@ -435,10 +436,10 @@ impl<DB: Database> Certifier<DB> {
 
                     match self.propose_header(header, &mut rx_headers).await {
                         Ok(certificate) => {
-                            let synchronizer = self.synchronizer.clone();
+                            let state_sync = self.state_sync.clone();
                             let tx_own_certificate_broadcast = self.tx_own_certificate_broadcast.clone();
-                            // pass to synchronizer for internal processing
-                            if let Err(e) = synchronizer.accept_own_certificate(certificate.clone()).await {
+                            // pass to state_sync for internal processing
+                            if let Err(e) = state_sync.process_own_certificate(certificate.clone()).await {
                                 error!(target: "primary::certifier", "error accepting own certificate: {e}");
                                 return;
                             }

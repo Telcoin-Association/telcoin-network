@@ -3,10 +3,9 @@
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
 
-use crate::{synchronizer::Synchronizer, ConsensusBus};
+use crate::{state_sync::StateSynchronizer, ConsensusBus};
 use handler::RequestHandler;
 pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
-use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     types::{IntoResponse as _, NetworkEvent, NetworkHandle},
@@ -50,10 +49,10 @@ where
         network_handle: NetworkHandle<Req, Res>,
         consensus_config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
-        synchronizer: Arc<Synchronizer<DB>>,
+        state_sync: StateSynchronizer<DB>,
     ) -> Self {
         let shutdown_rx = consensus_config.shutdown().subscribe();
-        let request_handler = RequestHandler::new(consensus_config, consensus_bus, synchronizer);
+        let request_handler = RequestHandler::new(consensus_config, consensus_bus, state_sync);
         Self { network_events, network_handle, request_handler, shutdown_rx }
     }
 

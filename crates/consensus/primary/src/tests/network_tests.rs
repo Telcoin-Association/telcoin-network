@@ -3,15 +3,12 @@
 use crate::{
     error::PrimaryNetworkError,
     network::{MissingCertificatesRequest, RequestHandler},
-    synchronizer::Synchronizer,
+    state_sync::StateSynchronizer,
     ConsensusBus, RecentBlocks,
 };
 use assert_matches::assert_matches;
 use fastcrypto::hash::Hash as _;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::collections::{BTreeMap, BTreeSet};
 use tn_config::ConsensusConfig;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
@@ -68,7 +65,7 @@ fn create_test_types() -> TestTypes {
     let cb = ConsensusBus::new();
 
     // spawn the synchronizer
-    let synchronizer = Arc::new(Synchronizer::new(config.clone(), &cb));
+    let synchronizer = StateSynchronizer::new(config.clone(), cb.clone());
     let task_manager = TaskManager::default();
     synchronizer.spawn(&task_manager);
 

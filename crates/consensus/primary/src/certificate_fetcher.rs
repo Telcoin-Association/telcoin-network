@@ -1,6 +1,10 @@
 //! Fetch missing certificates from peers and verify them.
 
-use crate::{synchronizer::Synchronizer, ConsensusBus};
+use crate::{
+    error::{CertManagerError, CertManagerResult},
+    state_sync::StateSynchronizer,
+    ConsensusBus,
+};
 use anemo::Request;
 use consensus_metrics::{monitored_future, monitored_scope};
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -15,7 +19,6 @@ use tn_network_types::{FetchCertificatesRequest, FetchCertificatesResponse};
 use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::{traits::Database, CertificateStore};
 use tn_types::{
-    error::{DagError, DagResult},
     validate_received_certificate, AuthorityIdentifier, Certificate, Committee, NetworkPublicKey,
     Noticer, Round, TaskManager, TnReceiver, TnSender,
 };
@@ -82,7 +85,7 @@ struct CertificateFetcherState<DB> {
     /// Network client to fetch certificates from other primaries.
     network: anemo::Network,
     /// Accepts Certificates into local storage.
-    synchronizer: Arc<Synchronizer<DB>>,
+    state_sync: StateSynchronizer<DB>,
     /// The metrics handler
     metrics: Arc<PrimaryMetrics>,
 }
@@ -96,13 +99,13 @@ impl<DB: Database> CertificateFetcher<DB> {
         certificate_store: CertificateStore<DB>,
         consensus_bus: ConsensusBus,
         rx_shutdown: Noticer,
-        synchronizer: Arc<Synchronizer<DB>>,
+        state_sync: StateSynchronizer<DB>,
         task_manager: &TaskManager,
     ) {
         let state = Arc::new(CertificateFetcherState {
             authority_id,
             network,
-            synchronizer,
+            state_sync,
             metrics: consensus_bus.primary_metrics().node_metrics.clone(),
         });
 
@@ -308,7 +311,7 @@ async fn run_fetch_task<DB: Database>(
     committee: Committee,
     gc_round: Round,
     written_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>>,
-) -> DagResult<()> {
+) -> CertManagerResult<()> {
     // Send request to fetch certificates.
     let request = FetchCertificatesRequest::default()
         .set_bounds(gc_round, written_rounds)
@@ -317,12 +320,12 @@ async fn run_fetch_task<DB: Database>(
         fetch_certificates_helper(state.authority_id, &state.network, &committee, request).await
     else {
         error!(target: "primary::cert_fetcher", "error awaiting fetch_certificates_helper");
-        return Err(DagError::NoCertificateFetched);
+        return Err(CertManagerError::NoCertificateFetched);
     };
 
     // Process and store fetched certificates.
     let num_certs_fetched = response.certificates.len();
-    process_certificates_helper(response, &state.synchronizer, state.metrics.clone()).await?;
+    process_certificates_helper(response, &state.state_sync, state.metrics.clone()).await?;
     state.metrics.certificate_fetcher_num_certificates_processed.inc_by(num_certs_fetched as u64);
 
     debug!(target: "primary::cert_fetcher", "Successfully fetched and processed {num_certs_fetched} certificates");
@@ -410,15 +413,15 @@ async fn fetch_certificates_helper(
 #[instrument(level = "debug", skip_all)]
 async fn process_certificates_helper<DB: Database>(
     response: FetchCertificatesResponse,
-    synchronizer: &Synchronizer<DB>,
+    state_sync: &StateSynchronizer<DB>,
     _metrics: Arc<PrimaryMetrics>,
-) -> DagResult<()> {
+) -> CertManagerResult<()> {
     trace!(target: "primary::cert_fetcher", "Start sending fetched certificates to processing");
     if response.certificates.len() > MAX_CERTIFICATES_TO_FETCH {
-        return Err(DagError::TooManyFetchedCertificatesReturned(
-            response.certificates.len(),
-            MAX_CERTIFICATES_TO_FETCH,
-        ));
+        return Err(CertManagerError::TooManyFetchedCertificatesReturned {
+            response: response.certificates.len(),
+            request: MAX_CERTIFICATES_TO_FETCH,
+        });
     }
 
     // We should not be getting mixed versions of certificates from a
@@ -428,19 +431,19 @@ async fn process_certificates_helper<DB: Database>(
         .certificates
         .into_iter()
         .map(|cert| {
-            validate_received_certificate(cert).map_err(|err| {
+            let res = validate_received_certificate(cert).inspect_err(|err| {
                 error!(target: "primary::cert_fetcher", "fetched certficate processing error: {err}");
-                DagError::InvalidCertificateVersion
-            })
+            });
+            Ok(res?)
         })
-        .collect::<DagResult<Vec<Certificate>>>()?;
+        .collect::<CertManagerResult<Vec<Certificate>>>()?;
 
     // In PrimaryReceiverHandler, certificates already in storage are ignored.
     // The check is unnecessary here, because there is no concurrent processing of older
     // certificates. For byzantine failures, the check will not be effective anyway.
     let _scope = monitored_scope("ProcessingFetchedCertificates");
 
-    synchronizer.try_accept_fetched_certificates(certificates).await?;
+    state_sync.process_fetched_certificates_in_parallel(certificates).await?;
 
     trace!(target: "primary::cert_fetcher", "Fetched certificates have been processed");
 

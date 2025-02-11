@@ -2,10 +2,9 @@
 
 use super::{message::MissingCertificatesRequest, PrimaryResponse};
 use crate::{
-    error::{PrimaryNetworkError, PrimaryNetworkResult},
+    error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
     network::message::PrimaryGossip,
-    state_sync::{CertificateCollector, HeaderValidator},
-    synchronizer::Synchronizer,
+    state_sync::{CertificateCollector, StateSynchronizer},
     ConsensusBus,
 };
 use fastcrypto::hash::Hash;
@@ -36,10 +35,8 @@ pub(super) struct RequestHandler<DB> {
     consensus_config: ConsensusConfig<DB>,
     /// Inner-processs channel bus.
     consensus_bus: ConsensusBus,
-    /// The type to handle vote requests and validate headers.
-    header_validator: HeaderValidator<DB>,
-    /// Synchronizer has ability to fetch missing data from peers.
-    synchronizer: Arc<Synchronizer<DB>>,
+    /// Synchronize state between peers.
+    state_sync: StateSynchronizer<DB>,
     /// The digests of parents that are currently being requested from peers.
     ///
     /// Missing parents are requested from peers. This is a local map to track in-flight requests
@@ -57,18 +54,9 @@ where
     pub fn new(
         consensus_config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
-        synchronizer: Arc<Synchronizer<DB>>,
+        state_sync: StateSynchronizer<DB>,
     ) -> Self {
-        let header_validator =
-            HeaderValidator::new(consensus_config.clone(), consensus_bus.clone());
-
-        Self {
-            consensus_config,
-            consensus_bus,
-            header_validator,
-            synchronizer,
-            requested_parents: Default::default(),
-        }
+        Self { consensus_config, consensus_bus, state_sync, requested_parents: Default::default() }
     }
 
     /// Process gossip from the committee.
@@ -87,8 +75,8 @@ where
         match gossip {
             PrimaryGossip::Certificate(cert) => {
                 // process certificate
-                let valid_cert = cert.validate_received()?;
-                self.synchronizer.try_accept_certificate(valid_cert).await?;
+                let unverified_cert = cert.validate_received().map_err(CertManagerError::from)?;
+                self.state_sync.process_peer_certificate(unverified_cert).await?;
             }
         }
         // Send the raw gossip out to whoever else might need it.
@@ -228,7 +216,7 @@ where
         // that never arrive.
         //
         // NOTE: this check is necessary for correctness.
-        let parents = self.synchronizer.notify_read_parent_certificates(&header).await?;
+        let parents = self.state_sync.notify_read_parent_certificates(&header).await?;
 
         // Verify parent certs. Ensure the parents:
         // - are from the previous round
@@ -267,16 +255,15 @@ where
         }
 
         // verify aggregate signatures form quorum
-        ensure!(stake >= committee.quorum_threshold(), CertificateError::Inquorate.into());
+        let threshold = committee.quorum_threshold();
+        ensure!(
+            stake >= threshold,
+            CertManagerError::from(CertificateError::Inquorate { stake, threshold }).into()
+        );
 
         // parents valid - now verify batches
-        //
-        // TODO: can this be parallelized?
-        // Need to ensure an invalid parent attack shuts down batch sync
-        //
-        // TODO: this is called during Synchronizer::process_certificate_internal
-        // - does this need to be called again?
-        self.synchronizer.sync_header_batches(&header, 0).await?;
+        // NOTE: this blocks until batches become available
+        self.state_sync.sync_header_batches(&header, false, 0).await?;
 
         // verify header was created in the past
         let now = now();
@@ -396,7 +383,7 @@ where
         header: &Header,
     ) -> HeaderResult<Vec<CertificateDigest>> {
         // identify parents that are neither in storage nor pending
-        let mut unknown_certs = self.header_validator.identify_unkown_parents(header).await?;
+        let mut unknown_certs = self.state_sync.identify_unkown_parents(header).await?;
 
         // ensure header is not too old
         let limit = self.consensus_bus.primary_round_updates().borrow().saturating_sub(
@@ -463,7 +450,7 @@ where
 
         // try to accept
         for parent in parents {
-            self.synchronizer.try_accept_certificate(parent).await?;
+            self.state_sync.process_peer_certificate(parent).await?;
         }
 
         Ok(())

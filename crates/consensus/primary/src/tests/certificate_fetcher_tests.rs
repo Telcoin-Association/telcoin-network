@@ -1,7 +1,11 @@
 //! Certificate fetcher tests
 
-use crate::{certificate_fetcher::CertificateFetcher, synchronizer::Synchronizer, ConsensusBus};
+use crate::{
+    certificate_fetcher::CertificateFetcher, error::CertManagerError,
+    state_sync::StateSynchronizer, ConsensusBus,
+};
 use anemo::async_trait;
+use assert_matches::assert_matches;
 use eyre::Result;
 use fastcrypto::{hash::Hash, traits::KeyPair};
 use indexmap::IndexMap;
@@ -169,7 +173,7 @@ async fn fetch_certificates_basic() {
 
     let cb = ConsensusBus::new();
     // Make a synchronizer for certificates.
-    let synchronizer = Arc::new(Synchronizer::new(primary.consensus_config(), &cb));
+    let synchronizer = StateSynchronizer::new(primary.consensus_config(), cb.clone());
     let task_manager = TaskManager::default();
     synchronizer.spawn(&task_manager);
 
@@ -233,7 +237,8 @@ async fn fetch_certificates_basic() {
     assert_eq!(certificates.len(), total_certificates); // note genesis is not included
     assert_eq!(400, total_certificates);
 
-    for cert in certificates.iter_mut().take(4) {
+    let mut num_written = 4;
+    for cert in certificates.iter_mut().take(num_written) {
         // Manually writing the certificates to store so we can consider them verified
         // directly
         cert.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
@@ -241,16 +246,13 @@ async fn fetch_certificates_basic() {
         ));
         certificate_store.write(cert.clone()).expect("Writing certificate to store failed");
     }
-    let mut num_written = 4;
 
     // Send a primary message for a certificate with parents that do not exist locally, to trigger
     // fetching.
     let target_index = 123;
-    assert!(!synchronizer
-        .get_missing_parents(&certificates[target_index].clone())
-        .await
-        .unwrap()
-        .is_empty());
+    let expected_digest = certificates[target_index].digest();
+    let error = synchronizer.process_peer_certificate(certificates[target_index].clone()).await;
+    assert_matches!(error, Err(CertManagerError::Pending(digest)) if digest == expected_digest);
 
     // Verify the fetch request.
     let mut req = rx_fetch_req.recv().await.unwrap();
@@ -350,11 +352,9 @@ async fn fetch_certificates_basic() {
     }
 
     let target_index = num_written + 204;
-    assert!(!synchronizer
-        .get_missing_parents(&certificates[target_index].clone())
-        .await
-        .unwrap()
-        .is_empty());
+    let expected_digest = certificates[target_index].digest();
+    let error = synchronizer.process_peer_certificate(certificates[target_index].clone()).await;
+    assert_matches!(error, Err(CertManagerError::Pending(digest)) if digest == expected_digest);
 
     // Verify the fetch request.
     let req = rx_fetch_req.recv().await.unwrap();

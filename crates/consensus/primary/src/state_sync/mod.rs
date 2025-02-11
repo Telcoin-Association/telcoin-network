@@ -1,12 +1,12 @@
 //! Modules for synchronizing state between nodes.
 
-use crate::ConsensusBus;
-use fastcrypto::hash::Hash as _;
+use crate::{error::CertManagerResult, ConsensusBus};
+use cert_validator::CertificateValidator;
 use gc::AtomicRound;
-use std::collections::HashMap;
+use header_validator::HeaderValidator;
 use tn_config::ConsensusConfig;
 use tn_storage::traits::Database;
-use tn_types::{Certificate, CertificateDigest};
+use tn_types::{error::HeaderResult, Certificate, CertificateDigest, Header, Round, TaskManager};
 mod cert_collector;
 mod cert_manager;
 mod cert_validator;
@@ -15,7 +15,6 @@ mod header_validator;
 mod pending_cert_manager;
 pub(crate) use cert_collector::CertificateCollector;
 pub(crate) use cert_manager::CertificateManagerCommand;
-pub(crate) use header_validator::HeaderValidator;
 
 #[cfg(test)]
 #[path = "../tests/certificate_processing_tests.rs"]
@@ -25,18 +24,10 @@ mod cert_flow;
 /// Process unverified headers and certificates.
 #[derive(Debug, Clone)]
 pub struct StateSynchronizer<DB> {
-    /// Consensus channels.
-    consensus_bus: ConsensusBus,
-    /// The configuration for consensus.
-    config: ConsensusConfig<DB>,
-    /// Genesis digests and contents.
-    genesis: HashMap<CertificateDigest, Certificate>,
-    /// Highest garbage collection round.
-    gc_round: AtomicRound,
-    /// Highest round of certificate accepted into the certificate store.
-    highest_processed_round: AtomicRound,
-    /// Highest round of verfied certificate that has been received.
-    highest_received_round: AtomicRound,
+    /// The type to validate certificates.
+    certificate_validator: CertificateValidator<DB>,
+    /// The type to validate headers.
+    header_validator: HeaderValidator<DB>,
 }
 
 impl<DB> StateSynchronizer<DB>
@@ -44,27 +35,83 @@ where
     DB: Database,
 {
     /// Create a new instance of Self.
-    pub fn new(
-        config: ConsensusConfig<DB>,
-        consensus_bus: ConsensusBus,
-        // parents: CertificatesAggregatorManager,
-        gc_round: AtomicRound,
-        highest_processed_round: AtomicRound,
-        highest_received_round: AtomicRound,
-    ) -> Self {
-        let genesis = Certificate::genesis(config.committee())
-            .into_iter()
-            .map(|cert| (cert.digest(), cert))
-            .collect();
-
-        Self {
-            consensus_bus,
+    pub(crate) fn new(config: ConsensusConfig<DB>, consensus_bus: ConsensusBus) -> Self {
+        let header_validator = HeaderValidator::new(config.clone(), consensus_bus.clone());
+        let certificate_validator = CertificateValidator::new(
             config,
-            // parents,
-            genesis,
-            gc_round,
-            highest_processed_round,
-            highest_received_round,
-        }
+            consensus_bus,
+            AtomicRound::new(0),
+            AtomicRound::new(0),
+            AtomicRound::new(0),
+        );
+        Self { certificate_validator, header_validator }
+    }
+
+    /// Spawn the certificate manager and synchronize state between peers.
+    pub(crate) fn spawn(&self, task_manager: &TaskManager) {
+        let certificate_manager = self.certificate_validator.new_cert_manager();
+        task_manager.spawn_task("certificate-manager", certificate_manager.run());
+    }
+
+    //
+    //=== Certificate API
+    //
+
+    /// Process a certificate produced by the this node.
+    pub(crate) async fn process_own_certificate(
+        &self,
+        certificate: Certificate,
+    ) -> CertManagerResult<()> {
+        self.certificate_validator.process_own_certificate(certificate).await
+    }
+
+    /// Process a certificate received from a peer.
+    pub(crate) async fn process_peer_certificate(
+        &self,
+        certificate: Certificate,
+    ) -> CertManagerResult<()> {
+        self.certificate_validator.process_peer_certificate(certificate).await
+    }
+
+    /// Process a large collection of certificates downloaded from peers.
+    ///
+    /// This partitions the collection to verify certificates in chunks.
+    pub(crate) async fn process_fetched_certificates_in_parallel(
+        &self,
+        certificates: Vec<Certificate>,
+    ) -> CertManagerResult<()> {
+        self.certificate_validator.process_fetched_certificates_in_parallel(certificates).await
+    }
+
+    //
+    //=== Header API
+    //
+
+    /// Returns the parent certificates of the given header, waits for availability if needed.
+    pub(crate) async fn notify_read_parent_certificates(
+        &self,
+        header: &Header,
+    ) -> HeaderResult<Vec<Certificate>> {
+        self.header_validator.notify_read_parent_certificates(header).await
+    }
+
+    /// Synchronize batches.
+    pub(crate) async fn sync_header_batches(
+        &self,
+        header: &Header,
+        is_certified: bool,
+        max_age: Round,
+    ) -> HeaderResult<()> {
+        self.header_validator.sync_header_batches(header, is_certified, max_age).await
+    }
+
+    /// Filter parent digests that do not exist in storage or pending state.
+    ///
+    /// Returns a collection of missing parent digests.
+    pub(crate) async fn identify_unkown_parents(
+        &self,
+        header: &Header,
+    ) -> HeaderResult<Vec<CertificateDigest>> {
+        self.header_validator.identify_unkown_parents(header).await
     }
 }

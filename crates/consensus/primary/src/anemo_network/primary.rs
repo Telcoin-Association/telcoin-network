@@ -9,6 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::error::CertManagerError;
+
 use super::PrimaryReceiverHandler;
 use anemo::{async_trait, types::response::StatusCode};
 use consensus_metrics::monitored_scope;
@@ -21,10 +23,7 @@ use tn_storage::{
     tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
     traits::Database,
 };
-use tn_types::{
-    error::{CertificateError, DagError},
-    validate_received_certificate, ConsensusHeader,
-};
+use tn_types::{error::DagError, validate_received_certificate, ConsensusHeader};
 use tracing::{debug, instrument, warn};
 
 /// Maximum duration to fetch certificates from local storage.
@@ -46,9 +45,9 @@ impl<DB: Database> PrimaryToPrimary for PrimaryReceiverHandler<DB> {
                 )
             })?;
 
-        match self.synchronizer.try_accept_certificate(certificate).await.map_err(Into::into) {
+        match self.synchronizer.process_peer_certificate(certificate).await {
             Ok(()) => Ok(anemo::Response::new(SendCertificateResponse { accepted: true })),
-            Err(DagError::Certificate(CertificateError::Suspended)) => {
+            Err(CertManagerError::Pending(_)) => {
                 Ok(anemo::Response::new(SendCertificateResponse { accepted: false }))
             }
             Err(e) => Err(anemo::rpc::Status::internal(e.to_string())),

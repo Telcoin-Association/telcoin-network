@@ -1,6 +1,6 @@
 //! Validate certificates received from peers.
 
-use super::{AtomicRound, HeaderValidator};
+use super::{cert_manager::CertificateManager, AtomicRound, HeaderValidator};
 use crate::{
     certificate_fetcher::CertificateFetcherCommand,
     error::{CertManagerError, CertManagerResult},
@@ -25,7 +25,7 @@ mod cert_validator_tests;
 
 /// Process unverified headers and certificates.
 #[derive(Debug, Clone)]
-pub struct CertificateValidator<DB> {
+pub(super) struct CertificateValidator<DB> {
     /// Consensus channels.
     consensus_bus: ConsensusBus,
     /// The configuration for consensus.
@@ -45,7 +45,7 @@ where
     DB: Database,
 {
     /// Create a new instance of Self.
-    pub fn new(
+    pub(super) fn new(
         config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
         gc_round: AtomicRound,
@@ -55,13 +55,30 @@ where
         Self { consensus_bus, config, gc_round, highest_processed_round, highest_received_round }
     }
 
+    /// Convenience method for obtaining a new [CertificateManager].
+    ///
+    /// This is useful so the primary can handle new/spawn methods separately.
+    /// The cert manager only needs to run during `spawn`.
+    pub(super) fn new_cert_manager(&self) -> CertificateManager<DB> {
+        CertificateManager::new(
+            self.config.clone(),
+            self.consensus_bus.clone(),
+            self.gc_round.clone(),
+            self.highest_processed_round.clone(),
+            self.highest_received_round.clone(),
+        )
+    }
+
     /// Process a certificate produced by the this node.
-    pub async fn process_own_certificate(&self, certificate: Certificate) -> CertManagerResult<()> {
+    pub(super) async fn process_own_certificate(
+        &self,
+        certificate: Certificate,
+    ) -> CertManagerResult<()> {
         self.process_certificate(certificate, false).await
     }
 
     /// Process a certificate received from a peer.
-    pub async fn process_peer_certificate(
+    pub(super) async fn process_peer_certificate(
         &self,
         certificate: Certificate,
     ) -> CertManagerResult<()> {
@@ -257,7 +274,7 @@ where
     /// Process a large collection of certificates downloaded from peers.
     ///
     /// This partitions the collection to verify certificates in chunks.
-    pub async fn process_fetched_certificates_in_parallel(
+    pub(super) async fn process_fetched_certificates_in_parallel(
         &self,
         certificates: Vec<Certificate>,
     ) -> CertManagerResult<()> {
