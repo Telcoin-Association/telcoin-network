@@ -133,7 +133,6 @@ impl<DB: Database> Primary<DB> {
         Self {
             network,
             network_p2p_handle,
-            // synchronizer,
             peer_types: Some(peer_types),
             primary_network: Some(primary_network),
             state_sync,

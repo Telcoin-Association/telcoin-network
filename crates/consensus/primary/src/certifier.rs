@@ -42,7 +42,6 @@ pub struct Certifier<DB> {
     certificate_store: CertificateStore<DB>,
     /// Handles synchronization with other nodes and our workers.
     state_sync: StateSynchronizer<DB>,
-    // synchronizer: Arc<Synchronizer<DB>>,
     /// Service to sign headers.
     signature_service: KeyConfig,
     /// Receiver for shutdown.
