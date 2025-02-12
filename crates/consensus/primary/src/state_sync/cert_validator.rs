@@ -1,6 +1,6 @@
 //! Validate certificates received from peers.
 
-use super::{AtomicRound, HeaderValidator};
+use super::{cert_manager::CertificateManager, AtomicRound, HeaderValidator};
 use crate::{
     certificate_fetcher::CertificateFetcherCommand,
     error::{CertManagerError, CertManagerResult},
@@ -25,7 +25,7 @@ mod cert_validator_tests;
 
 /// Process unverified headers and certificates.
 #[derive(Debug, Clone)]
-pub struct CertificateValidator<DB> {
+pub(super) struct CertificateValidator<DB> {
     /// Consensus channels.
     consensus_bus: ConsensusBus,
     /// The configuration for consensus.
@@ -45,7 +45,7 @@ where
     DB: Database,
 {
     /// Create a new instance of Self.
-    pub fn new(
+    pub(super) fn new(
         config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
         gc_round: AtomicRound,
@@ -55,13 +55,30 @@ where
         Self { consensus_bus, config, gc_round, highest_processed_round, highest_received_round }
     }
 
+    /// Convenience method for obtaining a new [CertificateManager].
+    ///
+    /// This is useful so the primary can handle new/spawn methods separately.
+    /// The cert manager only needs to run during `spawn`.
+    pub(super) fn new_cert_manager(&self) -> CertificateManager<DB> {
+        CertificateManager::new(
+            self.config.clone(),
+            self.consensus_bus.clone(),
+            self.gc_round.clone(),
+            self.highest_processed_round.clone(),
+            self.highest_received_round.clone(),
+        )
+    }
+
     /// Process a certificate produced by the this node.
-    pub async fn process_own_certificate(&self, certificate: Certificate) -> CertManagerResult<()> {
+    pub(super) async fn process_own_certificate(
+        &self,
+        certificate: Certificate,
+    ) -> CertManagerResult<()> {
         self.process_certificate(certificate, false).await
     }
 
     /// Process a certificate received from a peer.
-    pub async fn process_peer_certificate(
+    pub(super) async fn process_peer_certificate(
         &self,
         certificate: Certificate,
     ) -> CertManagerResult<()> {
@@ -96,7 +113,7 @@ where
         // see if certificate already processed
         let digest = certificate.digest();
         if self.config.node_storage().certificate_store.contains(&digest)? {
-            trace!(target: "primary::state-sync", "Certificate {digest:?} has already been processed. Skip processing.");
+            trace!(target: "primary::cert_validator", "Certificate {digest:?} has already been processed. Skip processing.");
             self.consensus_bus
                 .primary_metrics()
                 .node_metrics
@@ -112,7 +129,7 @@ where
         }
 
         // update metrics
-        debug!(target: "primary::state-sync", round=certificate.round(), ?certificate, "processing certificate");
+        debug!(target: "primary::cert_validator", round=certificate.round(), ?certificate, "processing certificate");
 
         let certificate_source =
             if self.config.authority().id().eq(&certificate.origin()) { "own" } else { "other" };
@@ -210,7 +227,7 @@ where
                 let sync_header = HeaderValidator::new(config, bus);
                 let res = sync_header.sync_header_batches(&header, true, max_age).await;
                 if let Err(e) = res {
-                    error!(target: "primary::state-sync", ?e, ?header, ?max_age, "error syncing batches for certified header");
+                    error!(target: "primary::cert_validator", ?e, ?header, ?max_age, "error syncing batches for certified header");
                 }
             });
 
@@ -228,7 +245,7 @@ where
                     .send(CertificateFetcherCommand::Ancestors(cert.clone()))
                     .await?;
 
-                error!(target: "primary::state-sync", "processed certificate that is too new");
+                error!(target: "primary::cert_validator", "processed certificate that is too new");
 
                 return Err(CertificateError::TooNew(
                     cert.digest(),
@@ -257,7 +274,7 @@ where
     /// Process a large collection of certificates downloaded from peers.
     ///
     /// This partitions the collection to verify certificates in chunks.
-    pub async fn process_fetched_certificates_in_parallel(
+    pub(super) async fn process_fetched_certificates_in_parallel(
         &self,
         certificates: Vec<Certificate>,
     ) -> CertManagerResult<()> {
@@ -367,7 +384,7 @@ where
         let mut verified_certs = Vec::new();
         for task in verify_tasks {
             let group_result = task.await.map_err(|e| {
-                error!(target: "primary::state-sync", ?e, "group verify certs task failed");
+                error!(target: "primary::cert_validator", ?e, "group verify certs task failed");
                 CertManagerError::JoinError
             })??;
             verified_certs.extend(group_result);

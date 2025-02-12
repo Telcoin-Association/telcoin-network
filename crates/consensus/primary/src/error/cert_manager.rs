@@ -56,6 +56,13 @@ pub(crate) enum CertManagerError {
     /// mpsc sender dropped while processig the certificate
     #[error("Failed to process certificate - TN sender error: {0}")]
     TNSend(String),
+
+    /// Response from peer included too many certificates for fetch request.
+    #[error("Too many certificates in the FetchCertificatesResponse {response} > {request}")]
+    TooManyFetchedCertificatesReturned { response: usize, request: usize },
+    /// Fetch certificates failed.
+    #[error("No peer can be reached for fetching certificates! Check if network is healthy.")]
+    NoCertificateFetched,
 }
 
 impl<T: std::fmt::Debug> From<SendError<T>> for CertManagerError {

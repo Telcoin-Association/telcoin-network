@@ -22,7 +22,7 @@ mod header_validator_tests;
 
 /// Validate header vote requests from peers.
 #[derive(Debug, Clone)]
-pub(crate) struct HeaderValidator<DB> {
+pub(super) struct HeaderValidator<DB> {
     /// Consensus channels.
     consensus_bus: ConsensusBus,
     /// The configuration for consensus.
@@ -34,12 +34,12 @@ where
     DB: Database,
 {
     /// Create a new instance of Self.
-    pub(crate) fn new(config: ConsensusConfig<DB>, consensus_bus: ConsensusBus) -> Self {
+    pub(super) fn new(config: ConsensusConfig<DB>, consensus_bus: ConsensusBus) -> Self {
         Self { consensus_bus, config }
     }
 
     /// Returns the parent certificates of the given header, waits for availability if needed.
-    pub(crate) async fn notify_read_parent_certificates(
+    pub(super) async fn notify_read_parent_certificates(
         &self,
         header: &Header,
     ) -> HeaderResult<Vec<Certificate>> {
@@ -66,18 +66,16 @@ where
     }
 
     /// Synchronize batches.
-    pub(crate) async fn sync_header_batches(
+    pub(super) async fn sync_header_batches(
         &self,
         header: &Header,
         is_certified: bool,
         max_age: Round,
     ) -> HeaderResult<()> {
+        // skip batch sync for own workers
         let authority_id = self.config.authority().id();
-
-        // TODO: this is already checked during vote,
-        // but what about long running task to sync blocks?
         if header.author() == authority_id {
-            debug!(target: "primary::synchronizer", "skipping sync_batches for header - no need to sync payload from own workers");
+            debug!(target: "primary::header_validator", "skipping sync_batches for header - no need to sync payload from own workers");
             return Ok(());
         }
 
@@ -191,7 +189,7 @@ where
                 // attempts.
                 Ok(()) = rx_committed_round_updates.changed() => {
                     committed_round = *rx_committed_round_updates.borrow_and_update();
-                    debug!(target: "primary::state-sync::header_batches", ?committed_round, "committed round update");
+                    debug!(target: "primary::header_validator", ?committed_round, "committed round update");
 
                     if header.round < committed_round.saturating_sub(max_age) {
                         return Err(HeaderError::TooOld{
@@ -208,7 +206,7 @@ where
     /// Filter parent digests that do not exist in storage or pending state.
     ///
     /// Returns a collection of missing parent digests.
-    pub(crate) async fn identify_unkown_parents(
+    pub(super) async fn identify_unkown_parents(
         &self,
         header: &Header,
     ) -> HeaderResult<Vec<CertificateDigest>> {

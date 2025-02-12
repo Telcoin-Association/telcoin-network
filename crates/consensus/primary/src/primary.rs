@@ -8,7 +8,7 @@ use crate::{
     network::{PrimaryNetwork, PrimaryRequest, PrimaryResponse},
     proposer::Proposer,
     state_handler::StateHandler,
-    synchronizer::Synchronizer,
+    state_sync::StateSynchronizer,
     ConsensusBus,
 };
 use anemo::{
@@ -47,10 +47,10 @@ pub struct Primary<DB> {
     /// The Primary's network.
     network: Network,
     network_p2p_handle: NetworkHandle<PrimaryRequest, PrimaryResponse>,
-    synchronizer: Arc<Synchronizer<DB>>,
     peer_types: Option<HashMap<PeerId, String>>,
     // Hold onto the network event stream until spawn "takes" it.
     primary_network: Option<PrimaryNetwork<DB>>,
+    state_sync: StateSynchronizer<DB>,
 }
 
 impl<DB: Database> Primary<DB> {
@@ -81,14 +81,14 @@ impl<DB: Database> Primary<DB> {
             .local_network()
             .set_worker_to_primary_local_handler(Arc::new(worker_receiver_handler));
 
-        let synchronizer = Arc::new(Synchronizer::new(config.clone(), consensus_bus));
-        let network = Self::start_network(&config, synchronizer.clone(), consensus_bus);
+        let state_sync = StateSynchronizer::new(config.clone(), consensus_bus.clone());
+        let network = Self::start_network(&config, state_sync.clone(), consensus_bus);
         let primary_network = PrimaryNetwork::new(
             network_event_stream,
             network_p2p_handle.clone(),
             config.clone(),
             consensus_bus.clone(),
-            synchronizer.clone(),
+            state_sync.clone(),
         );
 
         let mut peer_types = HashMap::new();
@@ -129,12 +129,13 @@ impl<DB: Database> Primary<DB> {
             peer_types.insert(peer_id, "other_worker".to_string());
             info!("Adding others worker with peer id {} and address {}", peer_id, address);
         }
+
         Self {
             network,
             network_p2p_handle,
-            synchronizer,
             peer_types: Some(peer_types),
             primary_network: Some(primary_network),
+            state_sync,
         }
     }
 
@@ -147,7 +148,7 @@ impl<DB: Database> Primary<DB> {
         task_manager: &TaskManager,
     ) {
         if consensus_bus.node_mode().borrow().is_active_cvv() {
-            self.synchronizer.spawn(task_manager);
+            self.state_sync.spawn(task_manager);
         }
         let _ = tn_network::connectivity::ConnectionMonitor::spawn(
             self.network.downgrade(),
@@ -173,7 +174,7 @@ impl<DB: Database> Primary<DB> {
         Certifier::spawn(
             config.clone(),
             consensus_bus.clone(),
-            self.synchronizer.clone(),
+            self.state_sync.clone(),
             self.network.clone(),
             task_manager,
         );
@@ -187,7 +188,7 @@ impl<DB: Database> Primary<DB> {
             config.node_storage().certificate_store.clone(),
             consensus_bus.clone(),
             config.shutdown().subscribe(),
-            self.synchronizer.clone(),
+            self.state_sync.clone(),
             task_manager,
         );
 
@@ -223,7 +224,7 @@ impl<DB: Database> Primary<DB> {
     /// Start the anemo network for the primary.
     fn start_network(
         config: &ConsensusConfig<DB>,
-        synchronizer: Arc<Synchronizer<DB>>,
+        synchronizer: StateSynchronizer<DB>,
         consensus_bus: &ConsensusBus,
     ) -> Network {
         // Spawn the network receiver listening to messages from the other primaries.

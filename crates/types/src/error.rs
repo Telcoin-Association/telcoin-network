@@ -146,6 +146,9 @@ pub enum DagError {
 
     #[error("Operation was canceled")]
     Canceled,
+
+    #[error("{0}")]
+    CertManager(String),
 }
 
 impl<T> From<tokio::sync::mpsc::error::TrySendError<T>> for DagError {
@@ -292,8 +295,8 @@ pub enum CertificateError {
     #[error(transparent)]
     Header(#[from] HeaderError),
     /// The weight of the certificate's signatures does not reach quorum (2f + 1)
-    #[error("The weight of the aggregate signatures fails to reach quorum.")]
-    Inquorate,
+    #[error("The weight of the aggregate signatures fails to reach quorum. Stake: {stake} - threshold: {threshold}")]
+    Inquorate { stake: u64, threshold: u64 },
     /// The BLS aggregate signature is invalid
     #[error("Invalid aggregate signature")]
     InvalidSignature(#[from] FastCryptoError),
@@ -309,6 +312,9 @@ pub enum CertificateError {
     /// Certificate signature verification state returned `Genesis`
     #[error("Failed to recover BlsAggregateSignatureBytes from certificate signature")]
     RecoverBlsAggregateSignatureBytes,
+    /// Certificate is unsigned.
+    #[error("Certificate verification state is unsigned")]
+    Unsigned,
 
     /// TODO: Refactor this out - only used to debug notify and suspend
     #[error("Certificate suspended: {0}")]

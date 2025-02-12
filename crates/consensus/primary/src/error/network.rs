@@ -1,10 +1,8 @@
 //! Error types for primary's network task.
 
+use super::CertManagerError;
 use tn_storage::StoreError;
-use tn_types::{
-    error::{CertificateError, HeaderError},
-    BcsError, BlockHash,
-};
+use tn_types::{error::HeaderError, BcsError, BlockHash};
 
 /// Result alias for results that possibly return [`PrimaryNetworkError`].
 pub(crate) type PrimaryNetworkResult<T> = Result<T, PrimaryNetworkError>;
@@ -20,7 +18,7 @@ pub(crate) enum PrimaryNetworkError {
     Decode(#[from] BcsError),
     /// Error processing certificate.
     #[error("Failed to process certificate: {0}")]
-    Certificate(#[from] CertificateError),
+    Certificate(#[from] CertManagerError),
     /// Error conversion from [std::io::Error]
     #[error(transparent)]
     StdIo(#[from] std::io::Error),

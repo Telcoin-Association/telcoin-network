@@ -7,7 +7,7 @@
 //!
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
-use crate::{synchronizer::Synchronizer, ConsensusBus};
+use crate::{state_sync::StateSynchronizer, ConsensusBus};
 use fastcrypto::hash::Hash;
 use parking_lot::Mutex;
 use std::{
@@ -50,7 +50,7 @@ impl<DB: Database> WorkerReceiverHandler<DB> {
 pub(super) struct PrimaryReceiverHandler<DB> {
     consensus_config: ConsensusConfig<DB>,
     consensus_bus: ConsensusBus,
-    synchronizer: Arc<Synchronizer<DB>>,
+    synchronizer: StateSynchronizer<DB>,
     /// Known parent digests that are being fetched from header proposers.
     /// Values are where the digests are first known from.
     /// TODO: consider limiting maximum number of digests from one authority, allow timeout
@@ -64,7 +64,7 @@ impl<DB: Database> PrimaryReceiverHandler<DB> {
     /// Create a new instance of Self.
     pub fn new(
         consensus_config: ConsensusConfig<DB>,
-        synchronizer: Arc<Synchronizer<DB>>,
+        synchronizer: StateSynchronizer<DB>,
         consensus_bus: ConsensusBus,
         parent_digests: Arc<Mutex<BTreeMap<(Round, CertificateDigest), AuthorityIdentifier>>>,
     ) -> Self {
@@ -232,7 +232,7 @@ impl<DB: Database> PrimaryReceiverHandler<DB> {
         );
 
         // Synchronize all batches referenced in the header.
-        self.synchronizer.sync_header_batches(header, /* max_age */ 0).await?;
+        self.synchronizer.sync_header_batches(header, false, 0).await?;
 
         // Check that the time of the header is smaller than the current time. If not but the
         // difference is small, just wait. Otherwise reject with an error.
@@ -348,7 +348,10 @@ impl<DB: Database> PrimaryReceiverHandler<DB> {
             });
         }
         for parent in parents {
-            self.synchronizer.try_accept_certificate(parent).await?;
+            self.synchronizer
+                .process_peer_certificate(parent)
+                .await
+                .map_err(|e| DagError::CertManager(e.to_string()))?;
         }
         Ok(())
     }
@@ -361,7 +364,7 @@ impl<DB: Database> PrimaryReceiverHandler<DB> {
         header: &Header,
     ) -> DagResult<Vec<CertificateDigest>> {
         // Get digests not known by the synchronizer, in storage or among suspended certificates.
-        let mut digests = self.synchronizer.get_unknown_parent_digests(header).await?;
+        let mut digests = self.synchronizer.identify_unkown_parents(header).await?;
 
         // Maximum header age is chosen to strike a balance between allowing for slightly older
         // certificates to still have a chance to be included in the DAG while not wasting

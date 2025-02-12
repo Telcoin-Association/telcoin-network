@@ -92,7 +92,7 @@ where
     ) -> CertManagerResult<()> {
         let digest = certificate.digest();
         let parent_round = certificate.round() - 1;
-        debug!(target: "primary::state-sync::pending", ?digest, "Processing certificate with missing parents");
+        debug!(target: "primary::pending_certs", ?digest, "Processing certificate with missing parents");
 
         self.consensus_bus
             .primary_metrics()
