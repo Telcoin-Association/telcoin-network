@@ -123,7 +123,7 @@ where
 
 /// Holds the atomic round.
 #[derive(Clone)]
-pub struct AtomicRound {
+pub(super) struct AtomicRound {
     /// The inner type.
     inner: Arc<InnerAtomicRound>,
 }
@@ -141,12 +141,12 @@ impl AtomicRound {
     }
 
     /// Load the atomic round.
-    pub(crate) fn load(&self) -> u32 {
+    pub(super) fn load(&self) -> u32 {
         self.inner.atomic.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Fetch the max.
-    pub(crate) fn fetch_max(&self, val: u32) -> u32 {
+    pub(super) fn fetch_max(&self, val: u32) -> u32 {
         self.inner.atomic.fetch_max(val, Ordering::AcqRel)
     }
 
@@ -163,6 +163,7 @@ impl std::fmt::Debug for AtomicRound {
         write!(f, "{:?}", self.inner.atomic)
     }
 }
+
 impl std::default::Default for AtomicRound {
     fn default() -> Self {
         Self { inner: Arc::new(InnerAtomicRound { atomic: AtomicU32::new(0) }) }

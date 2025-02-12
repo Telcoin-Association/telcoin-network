@@ -57,26 +57,6 @@ impl<DB> CertificateManager<DB>
 where
     DB: Database,
 {
-    // TODO: remove this
-    // from synchronizer::process_certificate_internal:
-    // - immediately check if certificate is already pending and return error to caller through
-    //   oneshot
-    //
-    // from synchronizer::accept_certificate
-    // - check every cert verification state
-    //
-    // from synchronizer::process_certificates_with_lock
-    // + need to check db again for certificate?
-    //   - I don't think so bc checked in verification stage
-    //   - this should be the only task to manage certificate acceptance
-    //   - as long as every cert request goes through here, we don't need to re-check the DB
-    //
-    // for each cert:
-    // - check if certificate is already pending
-    // - ensure within gc round
-    // - check for missing parents
-    // - accept cert and accept_children in that order
-
     /// Create a new instance of Self.
     pub fn new(
         config: ConsensusConfig<DB>,

@@ -12,11 +12,11 @@ use tn_config::Parameters;
 use tn_network_libp2p::GossipMessage;
 use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
 use tn_types::{
-    error::CertificateResult, Certificate, CertificateDigest, CommittedSubDag, ConsensusHeader,
-    ConsensusOutput, Header, Round, TnSender, CHANNEL_CAPACITY,
+    Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, Header, Round, TnSender,
+    CHANNEL_CAPACITY,
 };
 use tokio::sync::{
-    broadcast, oneshot,
+    broadcast,
     watch::{self},
 };
 
@@ -91,12 +91,6 @@ struct ConsensusBusInner {
 
     /// Messages to the Certificate Manager.
     certificate_manager: MeteredMpscChannel<CertificateManagerCommand>,
-    /// Store verified certificates
-    verified_certificates: MeteredMpscChannel<(
-        Certificate,
-        CertificateDigest,
-        oneshot::Sender<CertificateResult<()>>,
-    )>,
 
     /// Signals a new round
     tx_primary_round_updates: watch::Sender<Round>,
@@ -226,11 +220,6 @@ impl ConsensusBus {
             &primary_metrics.primary_channel_metrics.tx_certificate_acceptor_total,
         );
 
-        let verified_certificates = metered_channel::channel_sender(
-            CHANNEL_CAPACITY,
-            &primary_metrics.primary_channel_metrics.tx_verified_certificates,
-        );
-
         let (tx_primary_round_updates, _rx_primary_round_updates) = watch::channel(0u32);
         let (tx_last_consensus_header, _rx_last_consensus_header) =
             watch::channel(ConsensusHeader::default());
@@ -263,7 +252,6 @@ impl ConsensusBus {
                 committed_own_headers,
                 sequence,
                 certificate_manager,
-                verified_certificates,
 
                 tx_primary_round_updates,
                 _rx_primary_round_updates,
