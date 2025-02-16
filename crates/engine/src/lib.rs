@@ -269,9 +269,6 @@ where
                 match receiver.poll_unpin(cx) {
                     Poll::Ready(res) => {
                         let finalized_header = res.map_err(Into::into).and_then(|res| res)?;
-                        // TODO: broadcast engine event
-                        // this.pipeline_events = events;
-                        //
                         // store last executed header in memory
                         this.parent_header = finalized_header;
 
@@ -342,10 +339,6 @@ mod tests {
         // are randomly generated
         //
         // for each tx, seed address with funds in genesis
-        //
-        // TODO: this does not use a "real" `ConsensusOutput` certificate
-        //
-        // refactor with valid data once test util helpers are in place
         let mut leader = Certificate::default();
         let sub_dag_index = 0;
         leader.header.round = sub_dag_index as u32;
@@ -480,8 +473,6 @@ mod tests {
         // TODO: randomly generate contract transactions as well!!!
         assert_eq!(expected_block.logs_bloom, genesis_header.logs_bloom);
         // gas limit should come from parent for empty execution
-        //
-        // TODO: ensure batch validation prevents peer workers from changing this value
         assert_eq!(expected_block.gas_limit, genesis_header.gas_limit);
         // no gas should be used - no txs
         assert_eq!(expected_block.gas_used, 0);
@@ -491,7 +482,7 @@ mod tests {
         assert_eq!(expected_block.extra_data.as_ref(), &[0; 32]);
         // assert withdrawals are empty
         //
-        // TODO: this is currently always empty
+        // NOTE: this is currently always empty
         assert_eq!(expected_block.withdrawals_root, genesis_header.withdrawals_root);
 
         Ok(())
@@ -575,8 +566,6 @@ mod tests {
         // are randomly generated
         //
         // for each tx, seed address with funds in genesis
-        //
-        // TODO: this does not use a "real" `ConsensusOutput` certificate
         let timestamp = now();
         let mut leader_1 = Certificate::default();
         // update timestamp
@@ -768,8 +757,6 @@ mod tests {
                 // expect header number 1 for batch bc of genesis
                 assert_eq!(block.number, 1);
             } else {
-                // TODO: this is inefficient
-                //
                 // assert parents executed in order (sanity check)
                 let expected_parent = executed_blocks[idx - 1].header.hash_slow();
                 assert_eq!(block.parent_hash, expected_parent);
@@ -786,8 +773,6 @@ mod tests {
             // TODO: randomly generate contract transactions as well!!!
             assert_eq!(block.logs_bloom, Bloom::default());
             // gas limit should come from batch
-            //
-            // TODO: ensure batch validation prevents peer workers from changing this value
             assert_eq!(block.gas_limit, max_batch_gas(block.number));
             // difficulty should match the batch's index within consensus output
             assert_eq!(block.difficulty, U256::from(expected_batch_index));
@@ -795,7 +780,7 @@ mod tests {
             assert_eq!(&block.extra_data, all_batch_digests[idx].as_slice());
             // assert batch's withdrawals match
             //
-            // TODO: this is currently always empty
+            // NOTE: this is currently always empty
             assert_eq!(block.withdrawals_root, Some(EMPTY_WITHDRAWALS));
         }
 
@@ -905,8 +890,6 @@ mod tests {
         // are randomly generated
         //
         // for each tx, seed address with funds in genesis
-        //
-        // TODO: this does not use a "real" `ConsensusOutput`
         let timestamp = now();
         let mut leader_1 = Certificate::default();
         // update timestamp
@@ -1119,8 +1102,6 @@ mod tests {
                 // first block's parent is expected to be genesis
                 assert_eq!(block.parent_hash, chain.genesis_hash());
             } else {
-                // TODO: this is inefficient
-                //
                 // assert parents executed in order (sanity check)
                 let expected_parent = executed_blocks[idx - 1].header.hash_slow();
                 assert_eq!(block.parent_hash, expected_parent);
@@ -1135,8 +1116,6 @@ mod tests {
             // TODO: this doesn't actually test anything bc there are no contract txs
             assert_eq!(block.logs_bloom, Bloom::default());
             // gas limit should come from batch
-            //
-            // TODO: ensure batch validation prevents peer workers from changing this value
             assert_eq!(block.gas_limit, max_batch_gas(block.number));
             // difficulty should match the batch's index within consensus output
             assert_eq!(block.difficulty, U256::from(expected_batch_index));
@@ -1144,7 +1123,7 @@ mod tests {
             assert_eq!(&block.extra_data, all_batch_digests[idx].as_slice());
             // assert batch's withdrawals match
             //
-            // TODO: this is currently always empty
+            // NOTE: this is currently always empty
             assert_eq!(block.withdrawals_root, Some(EMPTY_WITHDRAWALS));
         }
 
@@ -1213,8 +1192,6 @@ mod tests {
         // are randomly generated
         //
         // for each tx, seed address with funds in genesis
-        //
-        // TODO: this does not use a "real" `ConsensusOutput` certificate
         let timestamp = now();
         let mut leader_1 = Certificate::default();
         // update timestamp

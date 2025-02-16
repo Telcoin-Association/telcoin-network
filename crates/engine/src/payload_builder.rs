@@ -43,11 +43,8 @@ where
 {
     let BuildArguments { provider, mut output, parent_header } = args;
     debug!(target: "engine", ?output, "executing output");
-    // TODO: create "sealed consensus" type that contains hash and output
-    //
-    // create ommers while converting Batch to SealedBlockWithSenders
 
-    // capture values from consensus output for full execution
+    // output digest returns the `ConsensusHeader` digest
     let output_digest: B256 = output.digest().into();
     let batches = output.flatten_batches();
 
@@ -157,9 +154,6 @@ where
     // ensure this value is updated before making the round canonical
     // because pool maintenance task needs the protocol's new base fee
     // before it can accurately process the canon_state_notification update
-    //
-    // TODO: actually impl this
-    // basefee_watch.send(new_base_fee);
 
     // NOTE: this makes all blocks canonical, commits them to the database,
     // and broadcasts new chain on `canon_state_notification_sender`
@@ -207,11 +201,11 @@ where
     let state_provider = provider.state_by_block_hash(payload.attributes.parent_header.hash())?;
     let state = StateProviderDatabase::new(state_provider);
 
-    // TODO: using same approach as reth here bc I can't find the State::builder()'s methods
+    // NOTE: using same approach as reth here bc I can't find the State::builder()'s methods
     // I'm not sure what `with_bundle_update` does, and using `CachedReads` is the only way
     // I can get the state root section below to compile using `db.commit(state)`.
     //
-    // TODO: create `CachedReads` during batch validation?
+    // consider creating `CachedReads` during batch validation?
     let mut cached_reads = CachedReads::default();
     let mut db =
         State::builder().with_database(cached_reads.as_db_mut(state)).with_bundle_update().build();
@@ -230,8 +224,6 @@ where
     // note the sealed header below is more or less junk but payload trait requires it.
     let (cfg, block_env) = payload.cfg_and_block_env(chain_spec.as_ref());
 
-    // TODO: better to get these from payload attributes?
-    // - more efficient, but harder to maintain?
     let block_gas_limit: u64 = block_env.gas_limit.try_into().unwrap_or(u64::MAX);
     let base_fee = block_env.basefee.to::<u64>();
     let block_number = block_env.number.to::<u64>();
@@ -246,7 +238,6 @@ where
     //     &attributes,
     // )?;
 
-    // // TODO: TN needs to support this
     // // apply eip-2935 blockhashes update
     // apply_blockhashes_update(
     //     &mut db,
@@ -282,9 +273,6 @@ where
                     // it's possible that another worker's batch included this transaction
                     EVMError::Transaction(err) => {
                         warn!(target: "engine", tx_hash=?recovered.hash(), ?err);
-
-                        // TODO: collect metrics here
-
                         continue;
                     }
                     err => {

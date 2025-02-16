@@ -210,9 +210,6 @@ pub struct TNPayloadAttributes {
     /// Value for the `extra_data` field in the new block.
     pub batch_digest: B256,
     /// Hash value for [ConsensusOutput]. Used as the executed block's "parent_beacon_block_root".
-    ///
-    /// TODO: ensure optimized hashing of output:
-    /// - don't rehash batches, just hash their hashes?
     pub consensus_output_digest: B256,
     /// The base fee per gas used to construct this block.
     /// The value comes from the proposed batch.

@@ -78,7 +78,6 @@ where
         // validate beneficiary?
         // no - tips would go to someone else
 
-        // TODO: validate basefee doesn't actually do anything yet
         self.validate_basefee()?;
         Ok(())
     }
@@ -153,7 +152,6 @@ where
 
     /// TODO: Validate the block's basefee
     fn validate_basefee(&self) -> BlockValidationResult<()> {
-        // TODO: validate basefee by consensus round
         Ok(())
     }
 }
@@ -416,7 +414,6 @@ mod tests {
     async fn test_invalid_batch_wrong_size_in_bytes() {
         let TestTools { valid_batch, validator } = test_tools().await;
         // create enough transactions to exceed 1MB
-        // TODO: clean this up - taken from `test_types` fn
         // because validator uses provided with same genesis
         // and tx_factory needs funds
         let genesis = adiri_genesis();
@@ -500,7 +497,4 @@ mod tests {
             Err(BatchValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == too_big
         );
     }
-
-    // // TODO:
-    // // - basefee
 }

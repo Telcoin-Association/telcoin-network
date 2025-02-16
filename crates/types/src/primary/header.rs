@@ -190,7 +190,7 @@ impl Header {
         BlockNumHash { hash: self.latest_execution_block, number: self.latest_execution_block_num }
     }
 
-    /// The nonce this header.
+    /// The nonce of this header used during execution.
     pub fn nonce(&self) -> u64 {
         ((self.epoch as u64) << 32) | self.round as u64
     }

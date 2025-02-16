@@ -19,9 +19,9 @@ use tracing::warn;
 /// A global sequence number assigned to every CommittedSubDag.
 pub type SequenceNumber = u64;
 
-#[derive(Clone, Debug)]
 /// The output of Consensus, which includes all the blocks for each certificate in the sub dag
 /// It is sent to the the ExecutionState handle_consensus_transaction
+#[derive(Clone, Debug)]
 pub struct ConsensusOutput {
     pub sub_dag: Arc<CommittedSubDag>,
     /// Matches certificates in the `sub_dag` one-to-one.
@@ -35,11 +35,9 @@ pub struct ConsensusOutput {
     ///
     /// This value is included in [Self] digest.
     pub batch_digests: VecDeque<BlockHash>,
-
     // These fields are used to construct the ConsensusHeader.
     /// The hash of the previous ConsesusHeader in the chain.
     pub parent_hash: B256,
-
     /// A scalar value equal to the number of ancestor blocks. The genesis block has a number of
     /// zero.
     pub number: u64,
@@ -50,18 +48,22 @@ impl ConsensusOutput {
     pub fn leader(&self) -> &Certificate {
         &self.sub_dag.leader
     }
+
     /// The round for the [CommittedSubDag].
     pub fn leader_round(&self) -> Round {
         self.sub_dag.leader_round()
     }
+
     /// Timestamp for when the subdag was committed.
     pub fn committed_at(&self) -> TimestampSec {
         self.sub_dag.commit_timestamp()
     }
-    /// The subdag index (`SequenceNumber`).
+
+    /// The leader's `nonce`.
     pub fn nonce(&self) -> SequenceNumber {
         self.sub_dag.leader.nonce()
     }
+
     /// Execution address of the leader for the round.
     ///
     /// The address is used in the executed block as the
@@ -69,6 +71,7 @@ impl ConsensusOutput {
     pub fn beneficiary(&self) -> Address {
         self.beneficiary
     }
+
     /// Pop the next batch digest.
     ///
     /// This method is used when executing [Self].
@@ -76,6 +79,7 @@ impl ConsensusOutput {
         self.batch_digests.pop_front()
     }
 
+    /// Flatten sequenced batches.
     pub fn flatten_batches(&self) -> Vec<Batch> {
         self.batches.iter().flat_map(|batches| batches.iter().cloned()).collect()
     }
@@ -96,20 +100,11 @@ impl ConsensusOutput {
 }
 
 impl Hash<{ crypto::DIGEST_LENGTH }> for ConsensusOutput {
-    type TypedDigest = ConsensusOutputDigest;
+    type TypedDigest = ConsensusDigest;
 
-    fn digest(&self) -> ConsensusOutputDigest {
-        let mut hasher = crypto::DefaultHashFunction::new();
-        // hash subdag
-        hasher.update(self.sub_dag.digest());
-        // hash beneficiary
-        hasher.update(self.beneficiary);
-        // hash block digests in order
-        self.batch_digests.iter().for_each(|digest| {
-            hasher.update(digest);
-        });
-        // finalize
-        ConsensusOutputDigest(hasher.finalize().into())
+    /// The digest of the corresponding [ConsensusHeader] that produced this output.
+    fn digest(&self) -> ConsensusDigest {
+        ConsensusDigest(self.consensus_header_hash().into())
     }
 }
 
@@ -196,9 +191,9 @@ impl CommittedSubDag {
 }
 
 impl Hash<{ crypto::DIGEST_LENGTH }> for CommittedSubDag {
-    type TypedDigest = ConsensusOutputDigest;
+    type TypedDigest = ConsensusDigest;
 
-    fn digest(&self) -> ConsensusOutputDigest {
+    fn digest(&self) -> ConsensusDigest {
         let mut hasher = crypto::DefaultHashFunction::new();
         // Instead of hashing serialized CommittedSubDag, hash the certificate digests instead.
         // Signatures in the certificates are not part of the commitment.
@@ -208,14 +203,14 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for CommittedSubDag {
         hasher.update(self.leader.digest());
         // skip reputation for stable hashes
         hasher.update(encode(&self.commit_timestamp));
-        ConsensusOutputDigest(hasher.finalize().into())
+        ConsensusDigest(hasher.finalize().into())
     }
 }
 
-// Convenience function for casting `ConsensusOutputDigest` into EL B256.
+// Convenience function for casting `ConsensusDigest` into EL B256.
 // note: these are both 32-bytes
-impl From<ConsensusOutputDigest> for B256 {
-    fn from(value: ConsensusOutputDigest) -> Self {
+impl From<ConsensusDigest> for B256 {
+    fn from(value: ConsensusDigest) -> Self {
         B256::from_slice(value.as_ref())
     }
 }
@@ -225,27 +220,27 @@ pub type ShutdownToken = mpsc::Sender<()>;
 
 // Digest of ConsususOutput and CommittedSubDag
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ConsensusOutputDigest([u8; crypto::DIGEST_LENGTH]);
+pub struct ConsensusDigest([u8; crypto::DIGEST_LENGTH]);
 
-impl AsRef<[u8]> for ConsensusOutputDigest {
+impl AsRef<[u8]> for ConsensusDigest {
     fn as_ref(&self) -> &[u8] {
         &self.0
     }
 }
 
-impl From<ConsensusOutputDigest> for Digest<{ crypto::DIGEST_LENGTH }> {
-    fn from(d: ConsensusOutputDigest) -> Self {
+impl From<ConsensusDigest> for Digest<{ crypto::DIGEST_LENGTH }> {
+    fn from(d: ConsensusDigest) -> Self {
         Digest::new(d.0)
     }
 }
 
-impl fmt::Debug for ConsensusOutputDigest {
+impl fmt::Debug for ConsensusDigest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         write!(f, "{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, self.0))
     }
 }
 
-impl fmt::Display for ConsensusOutputDigest {
+impl fmt::Display for ConsensusDigest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         write!(
             f,
