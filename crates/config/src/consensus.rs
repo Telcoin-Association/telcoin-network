@@ -13,7 +13,7 @@ use tn_network::local::LocalNetwork;
 use tn_storage::{NodeStorage};
 use tn_types::{
     Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Notifier,
-    WorkerCache, database_traits::Database
+    WorkerCache, Database
 };
 
 #[derive(Debug)]
