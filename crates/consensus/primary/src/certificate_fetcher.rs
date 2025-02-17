@@ -17,9 +17,9 @@ use std::{
 use tn_network::PrimaryToPrimaryRpc;
 use tn_network_types::{FetchCertificatesRequest, FetchCertificatesResponse};
 use tn_primary_metrics::PrimaryMetrics;
-use tn_storage::{CertificateStore};
+use tn_storage::CertificateStore;
 use tn_types::{
-    validate_received_certificate, AuthorityIdentifier, Certificate, Committee, Database, 
+    validate_received_certificate, AuthorityIdentifier, Certificate, Committee, Database,
     NetworkPublicKey, Noticer, Round, TaskManager, TnReceiver, TnSender,
 };
 use tokio::{

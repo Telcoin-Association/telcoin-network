@@ -5,7 +5,9 @@ use crate::{
     StoreResult,
 };
 use std::{cmp::max, collections::HashMap};
-use tn_types::{AuthorityIdentifier, CommittedSubDag, ConsensusHeader, Database, DbTxMut, Round, SequenceNumber};
+use tn_types::{
+    AuthorityIdentifier, CommittedSubDag, ConsensusHeader, Database, DbTxMut, Round, SequenceNumber,
+};
 use tracing::debug;
 
 /// The persistent storage of the sequencer.

@@ -11,8 +11,8 @@ use tn_config::{Config, ConsensusConfig, KeyConfig};
 use tn_network::local::LocalNetwork;
 use tn_types::{
     Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, Certificate, Committee,
-    Database, Header, HeaderBuilder, Multiaddr, NetworkKeypair, NetworkPublicKey, Round, Vote, WorkerCache,
-    WorkerId,
+    Database, Header, HeaderBuilder, Multiaddr, NetworkKeypair, NetworkPublicKey, Round, Vote,
+    WorkerCache, WorkerId,
 };
 use tokio::sync::RwLock;
 

@@ -13,7 +13,7 @@ use std::{
     sync::Arc,
 };
 use tn_config::ConsensusConfig;
-use tn_storage::{CertificateStore};
+use tn_storage::CertificateStore;
 use tn_types::{
     AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Committee, Database,
     Noticer, Round, TaskManager, Timestamp, TnReceiver, TnSender,

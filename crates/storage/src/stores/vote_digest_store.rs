@@ -1,4 +1,4 @@
-use crate::{tables::Votes};
+use crate::tables::Votes;
 use tn_types::{AuthorityIdentifier, Database, Vote, VoteInfo};
 use tn_utils::fail_point;
 

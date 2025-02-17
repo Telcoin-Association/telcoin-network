@@ -14,12 +14,12 @@ use tn_network_types::{
     PrimaryToPrimaryClient, RequestVoteRequest, SendCertificateRequest, SendCertificateResponse,
 };
 use tn_primary_metrics::PrimaryMetrics;
-use tn_storage::{CertificateStore};
+use tn_storage::CertificateStore;
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
-    AuthorityIdentifier, Certificate, CertificateDigest, Committee, Database, Header, NetworkPublicKey,
-    Noticer, TaskManager, TnReceiver, TnSender, Vote, CHANNEL_CAPACITY,
+    AuthorityIdentifier, Certificate, CertificateDigest, Committee, Database, Header,
+    NetworkPublicKey, Noticer, TaskManager, TnReceiver, TnSender, Vote, CHANNEL_CAPACITY,
 };
 use tokio::sync::broadcast;
 use tracing::{debug, enabled, error, info, instrument, trace, warn};

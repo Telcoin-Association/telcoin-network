@@ -10,11 +10,9 @@ use crate::{fixture_batch_with_transactions, temp_dir, CommitteeFixture};
 use fastcrypto::hash::Hash;
 use futures::future::join_all;
 use tempfile::TempDir;
-use tn_storage::{
-    mem_db::MemDatabase, open_db, CertificateStore, ConsensusStore, ProposerStore,
-};
+use tn_storage::{mem_db::MemDatabase, open_db, CertificateStore, ConsensusStore, ProposerStore};
 use tn_types::{
-    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Database, Header, 
+    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Database, Header,
     HeaderBuilder, ReputationScores, Round,
 };
 

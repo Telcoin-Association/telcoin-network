@@ -13,9 +13,7 @@ use tn_config::ConsensusConfig;
 use tn_network::anemo_ext::{NetworkExt, WaitingPeer};
 use tn_network_types::{ConsensusOutputRequest, PrimaryToPrimaryClient};
 use tn_primary::{consensus::ConsensusRound, ConsensusBus, NodeMode};
-use tn_storage::{
-    tables::{Batches, ConsensusBlockNumbersByDigest, ConsensusBlocks},
-};
+use tn_storage::tables::{Batches, ConsensusBlockNumbersByDigest, ConsensusBlocks};
 use tn_types::{ConsensusHeader, ConsensusOutput, Database, DbTxMut, TaskManagerClone, TnSender};
 use tracing::info;
 

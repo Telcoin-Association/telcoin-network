@@ -6,10 +6,9 @@ use super::{
     ROCKSDB_PROPERTY_TOTAL_BLOB_FILES_SIZE,
 };
 use crate::{
-    rocks::CF_METRICS_REPORT_PERIOD_MILLIS,
-    BATCHES_CF, CERTIFICATES_CF, CERTIFICATE_DIGEST_BY_ORIGIN_CF, CERTIFICATE_DIGEST_BY_ROUND_CF,
-    CONSENSUS_BLOCK_CF, CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF, LAST_PROPOSED_CF, PAYLOAD_CF,
-    VOTES_CF,
+    rocks::CF_METRICS_REPORT_PERIOD_MILLIS, BATCHES_CF, CERTIFICATES_CF,
+    CERTIFICATE_DIGEST_BY_ORIGIN_CF, CERTIFICATE_DIGEST_BY_ROUND_CF, CONSENSUS_BLOCK_CF,
+    CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF, LAST_PROPOSED_CF, PAYLOAD_CF, VOTES_CF,
 };
 use rocksdb::{properties, AsColumnFamilyRef, Transaction};
 use std::{
@@ -21,7 +20,7 @@ use std::{
     },
     time::Duration,
 };
-use tn_types::{DBIter, Database, DbTx, DbTxMut, decode, encode, encode_key, Table};
+use tn_types::{decode, encode, encode_key, DBIter, Database, DbTx, DbTxMut, Table};
 
 pub struct RocksDbTxMut<'txn> {
     db: RocksDatabase,
@@ -47,11 +46,7 @@ impl DbTx for RocksDbTxMut<'_> {
 }
 
 impl DbTxMut for RocksDbTxMut<'_> {
-    fn insert<T: Table>(
-        &mut self,
-        key: &T::Key,
-        value: &T::Value,
-    ) -> eyre::Result<()> {
+    fn insert<T: Table>(&mut self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
         let cf = self
             .db
             .rocksdb

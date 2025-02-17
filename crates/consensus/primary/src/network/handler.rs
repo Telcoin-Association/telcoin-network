@@ -16,9 +16,7 @@ use std::{
 };
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{GossipMessage, PeerId};
-use tn_storage::{
-    tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
-};
+use tn_storage::tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks};
 use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},

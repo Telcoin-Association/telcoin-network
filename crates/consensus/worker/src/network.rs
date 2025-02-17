@@ -13,10 +13,10 @@ use tn_network_types::{
     RequestBatchesResponse, WorkerOthersBatchMessage, WorkerSynchronizeMessage, WorkerToWorker,
     WorkerToWorkerClient,
 };
-use tn_storage::{
-    tables::Batches,
+use tn_storage::tables::Batches;
+use tn_types::{
+    now, BatchValidation, Committee, Database, DbTxMut, SealedBatch, WorkerCache, WorkerId,
 };
-use tn_types::{now, BatchValidation, Committee, Database, DbTxMut, SealedBatch, WorkerCache, WorkerId};
 use tracing::{debug, trace};
 
 #[cfg(test)]

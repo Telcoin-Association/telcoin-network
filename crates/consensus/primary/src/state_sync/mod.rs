@@ -5,7 +5,9 @@ use cert_validator::CertificateValidator;
 use gc::AtomicRound;
 use header_validator::HeaderValidator;
 use tn_config::ConsensusConfig;
-use tn_types::{error::HeaderResult, Certificate, CertificateDigest, Database, Header, Round, TaskManager};
+use tn_types::{
+    error::HeaderResult, Certificate, CertificateDigest, Database, Header, Round, TaskManager,
+};
 mod cert_collector;
 mod cert_manager;
 mod cert_validator;

@@ -21,7 +21,7 @@ use tn_network_types::FetchBatchesRequest;
 use tn_primary::{consensus::ConsensusRound, ConsensusBus, NodeMode};
 use tn_types::{
     Address, AuthorityIdentifier, Batch, BlockHash, Certificate, CommittedSubDag, Committee,
-    ConsensusHeader, ConsensusOutput, Database, NetworkPublicKey, Noticer, TaskManager, 
+    ConsensusHeader, ConsensusOutput, Database, NetworkPublicKey, Noticer, TaskManager,
     TaskManagerClone, Timestamp, TnReceiver, TnSender, WorkerCache, WorkerId, B256,
 };
 use tracing::{debug, error, info, warn};

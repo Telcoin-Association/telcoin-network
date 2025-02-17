@@ -54,11 +54,7 @@ impl DbTx for ReDbTxMut {
 }
 
 impl DbTxMut for ReDbTxMut {
-    fn insert<T: Table>(
-        &mut self,
-        key: &T::Key,
-        value: &T::Value,
-    ) -> eyre::Result<()> {
+    fn insert<T: Table>(&mut self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
         let td = TableDefinition::<KeyWrap<T::Key>, ValWrap<T::Value>>::new(T::NAME);
         self.tx.open_table(td)?.insert(key, value)?;
         Ok(())
@@ -366,10 +362,8 @@ mod test {
 
     use tempfile::tempdir;
 
-    use crate::{
-        test::{db_simp_bench, TestTable},
-    };
-    
+    use crate::test::{db_simp_bench, TestTable};
+
     use tn_types::{Database, DbTxMut};
 
     use super::ReDB;

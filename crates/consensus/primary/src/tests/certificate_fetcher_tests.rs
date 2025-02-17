@@ -21,7 +21,7 @@ use tn_storage::{mem_db::MemDatabase, CertificateStore};
 use tn_test_utils::{test_network, CommitteeFixture};
 use tn_types::{
     AuthorityIdentifier, BlockHash, BlsAggregateSignatureBytes, Certificate, CertificateDigest,
-    Database, Epoch, Header, HeaderDigest, Round, SignatureVerificationState, SystemMessage, 
+    Database, Epoch, Header, HeaderDigest, Round, SignatureVerificationState, SystemMessage,
     TaskManager, TimestampSec, WorkerId,
 };
 use tokio::{

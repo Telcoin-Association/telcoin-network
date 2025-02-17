@@ -4,7 +4,8 @@ use super::{AuthorityFixture, Builder};
 use crate::fixture_batch_with_transactions;
 use std::collections::BTreeSet;
 use tn_types::{
-    Certificate, CertificateDigest, Committee, Database, Header, HeaderBuilder, Round, Vote, WorkerCache,
+    Certificate, CertificateDigest, Committee, Database, Header, HeaderBuilder, Round, Vote,
+    WorkerCache,
 };
 
 /// Fixture representing a committee to reach consensus.

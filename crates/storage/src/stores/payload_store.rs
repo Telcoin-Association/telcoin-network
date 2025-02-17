@@ -1,7 +1,4 @@
-use crate::{
-    tables::Payload,
-    PayloadToken,
-};
+use crate::{tables::Payload, PayloadToken};
 use std::sync::Arc;
 use tn_types::{BlockHash, Database, DbTx, DbTxMut, WorkerId};
 use tn_utils::{fail_point, sync::notify_read::NotifyRead};

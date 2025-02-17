@@ -29,10 +29,10 @@ use std::{
 };
 use tn_config::ConsensusConfig;
 use tn_primary_metrics::PrimaryMetrics;
-use tn_storage::{ProposerStore};
+use tn_storage::ProposerStore;
 use tn_types::{
-    now, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, Epoch, Header, Noticer, Round,
-    SystemMessage, TaskManager, TimestampSec, TnReceiver, TnSender, WorkerId,
+    now, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, Epoch, Header, Noticer,
+    Round, SystemMessage, TaskManager, TimestampSec, TnReceiver, TnSender, WorkerId,
 };
 use tokio::{
     sync::oneshot,

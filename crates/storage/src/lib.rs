@@ -4,10 +4,10 @@
 #![warn(future_incompatible, nonstandard_style, rust_2018_idioms, rust_2021_compatibility)]
 
 mod stores;
-pub use stores::*;
 use layered_db::LayeredDatabase;
 #[cfg(feature = "reth-libmdbx")]
 use mdbx::MdbxDatabase;
+pub use stores::*;
 // Always build redb, we use it as the default for persistant consensus data.
 pub use redb::database::ReDB;
 #[cfg(feature = "rocksdb")]

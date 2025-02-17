@@ -21,7 +21,8 @@ use std::{
 use tn_storage::{mem_db::MemDatabase, open_db, ConsensusStore};
 use tn_test_utils::{mock_certificate_with_rand, CommitteeFixture};
 use tn_types::{
-    Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Database, Round, Stake,
+    Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Database, Round,
+    Stake,
 };
 use tokio::sync::mpsc::channel;
 

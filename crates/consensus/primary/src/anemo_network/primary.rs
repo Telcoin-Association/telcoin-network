@@ -19,9 +19,7 @@ use tn_network_types::{
     FetchCertificatesResponse, PrimaryToPrimary, RequestVoteRequest, RequestVoteResponse,
     SendCertificateRequest, SendCertificateResponse,
 };
-use tn_storage::{
-    tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
-};
+use tn_storage::tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks};
 use tn_types::{error::DagError, validate_received_certificate, ConsensusHeader, Database};
 use tracing::{debug, instrument, warn};
 

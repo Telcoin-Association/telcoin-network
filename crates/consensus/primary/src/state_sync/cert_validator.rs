@@ -12,8 +12,8 @@ use fastcrypto::hash::Hash as _;
 use std::{collections::HashSet, time::Instant};
 use tn_config::ConsensusConfig;
 use tn_types::{
-    error::CertificateError, Certificate, CertificateDigest, Database, Round, SignatureVerificationState,
-    TnSender as _,
+    error::CertificateError, Certificate, CertificateDigest, Database, Round,
+    SignatureVerificationState, TnSender as _,
 };
 use tokio::sync::oneshot;
 use tracing::{debug, error, trace};

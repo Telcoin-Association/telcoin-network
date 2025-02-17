@@ -1,7 +1,7 @@
 //! Utils for consensus tests
 
 use std::sync::Arc;
-use tn_storage::{ConsensusStore};
+use tn_storage::ConsensusStore;
 use tn_types::Database;
 
 pub const NUM_SUB_DAGS_PER_SCHEDULE: u32 = 100;

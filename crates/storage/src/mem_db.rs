@@ -15,8 +15,7 @@ use dashmap::DashMap;
 use ouroboros::self_referencing;
 use parking_lot::{RwLock, RwLockReadGuard};
 use prometheus::{default_registry, register_int_gauge_with_registry, IntGauge, Registry};
-use tn_types::{DBIter, Database, DbTx, DbTxMut, decode, decode_key, encode, encode_key, Table};
-
+use tn_types::{decode, decode_key, encode, encode_key, DBIter, Database, DbTx, DbTxMut, Table};
 
 type StoreType = DashMap<&'static str, Arc<RwLock<BTreeMap<Vec<u8>, Vec<u8>>>>>;
 

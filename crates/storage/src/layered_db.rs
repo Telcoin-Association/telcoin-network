@@ -9,9 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{
-    mem_db::MemDatabase,
-};
+use crate::mem_db::MemDatabase;
 use tn_types::{DBIter, Database, DbTx, DbTxMut, Table};
 
 #[derive(Clone, Debug)]

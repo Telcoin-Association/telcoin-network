@@ -14,11 +14,11 @@ use reth_libmdbx::{
     ffi::MDBX_dbi, Cursor, DatabaseFlags, Environment, Geometry, PageSize, Transaction, WriteFlags,
     RO, RW,
 };
-use tn_types::{Database, DBIter, DbTx, DbTxMut, decode, decode_key, encode, encode_key, KeyT, Table, ValueT};
-
-use crate::{
-    mdbx::metrics::MdbxMetrics,
+use tn_types::{
+    decode, decode_key, encode, encode_key, DBIter, Database, DbTx, DbTxMut, KeyT, Table, ValueT,
 };
+
+use crate::mdbx::metrics::MdbxMetrics;
 
 /// Wrapper for the libmdbx transaction.
 #[derive(Debug)]
@@ -75,11 +75,7 @@ impl DbTx for MdbxTxMut {
 }
 
 impl DbTxMut for MdbxTxMut {
-    fn insert<T: Table>(
-        &mut self,
-        key: &T::Key,
-        value: &T::Value,
-    ) -> eyre::Result<()> {
+    fn insert<T: Table>(&mut self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
         let key_buf = encode_key(key);
         let value_buf = encode(value);
         self.inner.put(self.get_dbi::<T>()?, key_buf, value_buf, WriteFlags::UPSERT)?;
