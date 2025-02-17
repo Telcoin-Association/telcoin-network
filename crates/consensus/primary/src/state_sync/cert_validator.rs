@@ -11,9 +11,8 @@ use consensus_metrics::monitored_scope;
 use fastcrypto::hash::Hash as _;
 use std::{collections::HashSet, time::Instant};
 use tn_config::ConsensusConfig;
-use tn_storage::traits::Database;
 use tn_types::{
-    error::CertificateError, Certificate, CertificateDigest, Round, SignatureVerificationState,
+    error::CertificateError, Certificate, CertificateDigest, Database, Round, SignatureVerificationState,
     TnSender as _,
 };
 use tokio::sync::oneshot;

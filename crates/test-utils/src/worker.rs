@@ -6,8 +6,7 @@ use fastcrypto::traits::KeyPair as _;
 use std::path::PathBuf;
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_node::worker::WorkerNode;
-use tn_storage::traits::Database;
-use tn_types::{AuthorityIdentifier, Multiaddr, NetworkKeypair, WorkerId, WorkerInfo};
+use tn_types::{AuthorityIdentifier, Database, Multiaddr, NetworkKeypair, WorkerId, WorkerInfo};
 use tracing::info;
 
 #[derive(Clone)]

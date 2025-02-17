@@ -1,5 +1,5 @@
-use crate::{tables::Votes, traits::Database};
-use tn_types::{AuthorityIdentifier, Vote, VoteInfo};
+use crate::{tables::Votes};
+use tn_types::{AuthorityIdentifier, Database, Vote, VoteInfo};
 use tn_utils::fail_point;
 
 /// The storage for the last votes digests per authority

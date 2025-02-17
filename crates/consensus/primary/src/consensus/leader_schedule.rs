@@ -8,9 +8,9 @@ use std::{
     fmt::{Debug, Formatter},
     sync::Arc,
 };
-use tn_storage::{traits::Database, ConsensusStore};
+use tn_storage::{ConsensusStore};
 use tn_types::{
-    Authority, AuthorityIdentifier, Certificate, Committee, ReputationScores, Round, Stake,
+    Authority, AuthorityIdentifier, Certificate, Committee, Database, ReputationScores, Round, Stake,
 };
 use tracing::{debug, trace};
 

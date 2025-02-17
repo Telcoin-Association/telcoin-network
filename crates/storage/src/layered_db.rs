@@ -11,8 +11,8 @@ use std::{
 
 use crate::{
     mem_db::MemDatabase,
-    traits::{DBIter, Database, DbTx, DbTxMut, Table},
 };
+use tn_types::{DBIter, Database, DbTx, DbTxMut, Table};
 
 #[derive(Clone, Debug)]
 pub struct LayeredDbTx {
@@ -20,7 +20,7 @@ pub struct LayeredDbTx {
 }
 
 impl DbTx for LayeredDbTx {
-    fn get<T: crate::traits::Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
+    fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
         self.mem_db.get::<T>(key)
     }
 }

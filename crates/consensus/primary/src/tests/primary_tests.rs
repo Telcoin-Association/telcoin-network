@@ -25,13 +25,13 @@ use tn_network_libp2p::ConsensusNetwork;
 use tn_network_types::{
     FetchCertificatesRequest, MockPrimaryToWorker, PrimaryToPrimary, RequestVoteRequest,
 };
-use tn_storage::{mem_db::MemDatabase, traits::Database};
+use tn_storage::{mem_db::MemDatabase};
 use tn_test_utils::{
     fixture_batch_with_transactions, make_optimal_signed_certificates, test_network,
     CommitteeFixture,
 };
 use tn_types::{
-    now, AuthorityIdentifier, BlockHash, Certificate, Committee, ExecHeader, SealedHeader,
+    now, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, ExecHeader, SealedHeader,
     SignatureVerificationState, TaskManager,
 };
 use tn_worker::{metrics::Metrics, Worker};

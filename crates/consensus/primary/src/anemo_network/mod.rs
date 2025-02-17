@@ -18,14 +18,14 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_network_types::{RequestVoteRequest, RequestVoteResponse};
 use tn_primary_metrics::PrimaryMetrics;
-use tn_storage::{traits::Database, PayloadStore};
+use tn_storage::{PayloadStore};
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
     now,
     traits::ToFromBytes as _,
-    validate_received_certificate, AuthorityIdentifier, Certificate, CertificateDigest, Header,
-    NetworkPublicKey, Round, Vote,
+    validate_received_certificate, AuthorityIdentifier, Certificate, CertificateDigest, Database, 
+    Header, NetworkPublicKey, Round, Vote,
 };
 use tracing::{debug, error, warn};
 mod primary;

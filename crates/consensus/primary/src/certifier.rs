@@ -14,11 +14,11 @@ use tn_network_types::{
     PrimaryToPrimaryClient, RequestVoteRequest, SendCertificateRequest, SendCertificateResponse,
 };
 use tn_primary_metrics::PrimaryMetrics;
-use tn_storage::{traits::Database, CertificateStore};
+use tn_storage::{CertificateStore};
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
-    AuthorityIdentifier, Certificate, CertificateDigest, Committee, Header, NetworkPublicKey,
+    AuthorityIdentifier, Certificate, CertificateDigest, Committee, Database, Header, NetworkPublicKey,
     Noticer, TaskManager, TnReceiver, TnSender, Vote, CHANNEL_CAPACITY,
 };
 use tokio::sync::broadcast;
@@ -65,7 +65,7 @@ impl<DB: Database> Certifier<DB> {
         task_manager: &TaskManager,
     ) {
         let rx_shutdown = config.shutdown().subscribe();
-        let metrics = consensus_bus.primary_metrics().node_metrics.clone();
+        let primary_metrics = consensus_bus.primary_metrics().node_metrics.clone();
         // These channels are used internally to this module (file) and don't need to go in the
         // consensus bus. If this changes they can move.  Note there can be issues receiving
         // certs over the broadcast if not subscribed early.
@@ -121,7 +121,7 @@ impl<DB: Database> Certifier<DB> {
                     rx_shutdown,
                     consensus_bus,
                     network: primary_network,
-                    metrics,
+                    metrics: primary_metrics,
                     tx_own_certificate_broadcast: tx_own_certificate_broadcast.clone(),
                 }
                 .run()

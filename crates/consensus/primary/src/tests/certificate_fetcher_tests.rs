@@ -17,12 +17,12 @@ use tn_network_types::{
     FetchCertificatesResponse, PrimaryToPrimary, PrimaryToPrimaryServer, RequestVoteRequest,
     RequestVoteResponse, SendCertificateRequest, SendCertificateResponse,
 };
-use tn_storage::{mem_db::MemDatabase, traits::Database, CertificateStore};
+use tn_storage::{mem_db::MemDatabase, CertificateStore};
 use tn_test_utils::{test_network, CommitteeFixture};
 use tn_types::{
     AuthorityIdentifier, BlockHash, BlsAggregateSignatureBytes, Certificate, CertificateDigest,
-    Epoch, Header, HeaderDigest, Round, SignatureVerificationState, SystemMessage, TaskManager,
-    TimestampSec, WorkerId,
+    Database, Epoch, Header, HeaderDigest, Round, SignatureVerificationState, SystemMessage, 
+    TaskManager, TimestampSec, WorkerId,
 };
 use tokio::{
     sync::{

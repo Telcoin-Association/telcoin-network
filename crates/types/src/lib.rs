@@ -4,6 +4,7 @@ mod codec;
 #[allow(clippy::mutable_key_type)]
 mod committee;
 mod crypto;
+pub mod database_traits;
 mod genesis;
 mod helpers;
 mod multiaddr;
@@ -18,6 +19,7 @@ pub mod error;
 pub use codec::*;
 pub use committee::*;
 pub use crypto::*;
+pub use database_traits::*;
 pub use genesis::*;
 pub use helpers::*;
 pub use multiaddr::*;

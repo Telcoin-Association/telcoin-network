@@ -11,11 +11,11 @@ use fastcrypto::hash::Hash;
 use futures::future::join_all;
 use tempfile::TempDir;
 use tn_storage::{
-    mem_db::MemDatabase, open_db, traits::Database, CertificateStore, ConsensusStore, ProposerStore,
+    mem_db::MemDatabase, open_db, CertificateStore, ConsensusStore, ProposerStore,
 };
 use tn_types::{
-    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Header, HeaderBuilder,
-    ReputationScores, Round,
+    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Database, Header, 
+    HeaderBuilder, ReputationScores, Round,
 };
 
 pub fn create_header_for_round(round: Round) -> Header {

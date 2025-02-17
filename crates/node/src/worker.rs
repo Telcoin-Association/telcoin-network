@@ -2,8 +2,7 @@
 use anemo::{Network, PeerId};
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
-use tn_storage::traits::Database as ConsensusDatabase;
-use tn_types::{BatchValidation, TaskManager, WorkerId};
+use tn_types::{BatchValidation, Database as ConsensusDatabase, TaskManager, WorkerId};
 use tn_worker::{metrics::Metrics, quorum_waiter::QuorumWaiter, BatchProvider, Worker};
 use tokio::sync::RwLock;
 use tracing::instrument;

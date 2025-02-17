@@ -7,7 +7,6 @@ use super::{
 };
 use crate::{
     rocks::CF_METRICS_REPORT_PERIOD_MILLIS,
-    traits::{DBIter, Database, DbTx, DbTxMut, Table},
     BATCHES_CF, CERTIFICATES_CF, CERTIFICATE_DIGEST_BY_ORIGIN_CF, CERTIFICATE_DIGEST_BY_ROUND_CF,
     CONSENSUS_BLOCK_CF, CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF, LAST_PROPOSED_CF, PAYLOAD_CF,
     VOTES_CF,
@@ -22,7 +21,7 @@ use std::{
     },
     time::Duration,
 };
-use tn_types::{decode, encode, encode_key};
+use tn_types::{DBIter, Database, DbTx, DbTxMut, decode, encode, encode_key, Table};
 
 pub struct RocksDbTxMut<'txn> {
     db: RocksDatabase,
@@ -36,7 +35,7 @@ impl Debug for RocksDbTxMut<'_> {
 }
 
 impl DbTx for RocksDbTxMut<'_> {
-    fn get<T: crate::traits::Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
+    fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
         let cf = self
             .db
             .rocksdb
@@ -48,7 +47,7 @@ impl DbTx for RocksDbTxMut<'_> {
 }
 
 impl DbTxMut for RocksDbTxMut<'_> {
-    fn insert<T: crate::traits::Table>(
+    fn insert<T: Table>(
         &mut self,
         key: &T::Key,
         value: &T::Value,
@@ -82,7 +81,7 @@ impl DbTxMut for RocksDbTxMut<'_> {
         Ok(())
     }
 
-    fn remove<T: crate::traits::Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
+    fn remove<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
         let cf = self
             .db
             .rocksdb
@@ -106,7 +105,7 @@ impl DbTxMut for RocksDbTxMut<'_> {
         Ok(())
     }
 
-    fn clear_table<T: crate::traits::Table>(&mut self) -> eyre::Result<()> {
+    fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
         // This is not using the transaction but ReDB can so leaving in the TXN for now...
         let _ = self.db.rocksdb.drop_cf(T::NAME);
         self.db.rocksdb.create_cf(T::NAME, &default_db_options().options)?;

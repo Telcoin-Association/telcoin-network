@@ -6,8 +6,7 @@ use tn_config::ConsensusConfig;
 use tn_network_libp2p::ConsensusNetwork;
 use tn_node::primary::PrimaryNode;
 use tn_primary::{consensus::ConsensusMetrics, ConsensusBus};
-use tn_storage::traits::Database;
-use tn_types::AuthorityIdentifier;
+use tn_types::{AuthorityIdentifier, Database};
 use tokio::sync::mpsc;
 
 #[derive(Clone)]

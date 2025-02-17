@@ -11,8 +11,7 @@ use std::sync::{
     Arc,
 };
 use tn_config::ConsensusConfig;
-use tn_storage::traits::Database;
-use tn_types::TnSender as _;
+use tn_types::{Database, TnSender as _};
 use tokio::{sync::watch, time::interval};
 use tracing::{error, warn};
 

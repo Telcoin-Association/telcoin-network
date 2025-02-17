@@ -21,9 +21,8 @@ use tn_network_types::{
 };
 use tn_storage::{
     tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
-    traits::Database,
 };
-use tn_types::{error::DagError, validate_received_certificate, ConsensusHeader};
+use tn_types::{error::DagError, validate_received_certificate, ConsensusHeader, Database};
 use tracing::{debug, instrument, warn};
 
 /// Maximum duration to fetch certificates from local storage.

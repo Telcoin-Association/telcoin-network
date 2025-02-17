@@ -9,10 +9,9 @@ use jsonrpsee::http_client::HttpClient;
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
 use tn_config::{Config, ConsensusConfig, KeyConfig};
 use tn_network::local::LocalNetwork;
-use tn_storage::traits::Database;
 use tn_types::{
     Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, Certificate, Committee,
-    Header, HeaderBuilder, Multiaddr, NetworkKeypair, NetworkPublicKey, Round, Vote, WorkerCache,
+    Database, Header, HeaderBuilder, Multiaddr, NetworkKeypair, NetworkPublicKey, Round, Vote, WorkerCache,
     WorkerId,
 };
 use tokio::sync::RwLock;

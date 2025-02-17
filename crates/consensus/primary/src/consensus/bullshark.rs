@@ -6,8 +6,8 @@ use crate::consensus::{
 };
 use fastcrypto::hash::Hash;
 use std::{collections::VecDeque, sync::Arc};
-use tn_storage::{traits::Database, ConsensusStore};
-use tn_types::{Certificate, CommittedSubDag, Committee, ReputationScores, Round, Stake};
+use tn_storage::{ConsensusStore};
+use tn_types::{Certificate, CommittedSubDag, Committee, Database, ReputationScores, Round, Stake};
 use tokio::time::Instant;
 use tracing::{debug, error_span};
 

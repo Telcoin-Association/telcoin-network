@@ -15,13 +15,12 @@ use dashmap::DashMap;
 use ouroboros::self_referencing;
 use parking_lot::{RwLock, RwLockReadGuard};
 use prometheus::{default_registry, register_int_gauge_with_registry, IntGauge, Registry};
-use tn_types::{decode, decode_key, encode, encode_key};
+use tn_types::{DBIter, Database, DbTx, DbTxMut, decode, decode_key, encode, encode_key, Table};
 
-use crate::traits::{DBIter, Database, DbTx, DbTxMut, Table};
 
 type StoreType = DashMap<&'static str, Arc<RwLock<BTreeMap<Vec<u8>, Vec<u8>>>>>;
 
-fn get<T: crate::traits::Table>(store: &StoreType, key: &T::Key) -> eyre::Result<Option<T::Value>> {
+fn get<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<Option<T::Value>> {
     if let Some(table) = store.get(T::NAME) {
         let key_bytes = encode_key(key);
         if let Some(val_bytes) = table.read().get(&key_bytes) {
@@ -38,7 +37,7 @@ pub struct MemDbTx {
 }
 
 impl DbTx for MemDbTx {
-    fn get<T: crate::traits::Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
+    fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
         get::<T>(&self.store, key)
     }
 }
@@ -289,7 +288,7 @@ impl Database for MemDatabase {
         }
     }
 
-    fn reverse_iter<T: Table>(&self) -> crate::traits::DBIter<'_, T> {
+    fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
         if let Some(table) = self.store.get(T::NAME) {
             Box::new(
                 MemDBIterBuilder {

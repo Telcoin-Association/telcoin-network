@@ -16,9 +16,8 @@ use tn_network::WorkerRpc;
 use tn_network_types::{RequestBatchesRequest, RequestBatchesResponse};
 use tn_storage::{
     tables::Batches,
-    traits::{Database, DbTxMut},
 };
-use tn_types::{now, Batch, BlockHash, NetworkPublicKey};
+use tn_types::{now, Batch, BlockHash, Database, DbTxMut, NetworkPublicKey};
 use tokio::{
     select,
     time::{sleep, sleep_until, Instant},

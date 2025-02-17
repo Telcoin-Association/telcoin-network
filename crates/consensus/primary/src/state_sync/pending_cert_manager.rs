@@ -10,8 +10,7 @@ use crate::{
 use fastcrypto::hash::Hash as _;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use tn_config::ConsensusConfig;
-use tn_storage::traits::Database;
-use tn_types::{Certificate, CertificateDigest, Round};
+use tn_types::{Certificate, CertificateDigest, Database, Round};
 use tracing::debug;
 
 /// A certificate that is missing parents and pending approval.

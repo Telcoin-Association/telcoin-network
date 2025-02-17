@@ -7,8 +7,7 @@ use super::WorkerReceiverHandler;
 use crate::proposer::OurDigestMessage;
 use anemo::async_trait;
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimary};
-use tn_storage::traits::Database;
-use tn_types::TnSender;
+use tn_types::{Database, TnSender};
 use tokio::sync::oneshot;
 
 // TODO: anemo still uses async_trait

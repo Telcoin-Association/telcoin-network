@@ -13,13 +13,13 @@ use crate::{
 use assert_matches::assert_matches;
 use fastcrypto::{hash::Hash as _, traits::KeyPair};
 use std::{collections::BTreeSet, time::Duration};
-use tn_storage::{mem_db::MemDatabase, traits::Database};
+use tn_storage::{mem_db::MemDatabase};
 use tn_test_utils::{
     make_optimal_signed_certificates, signed_cert_for_test, AuthorityFixture, CommitteeFixture,
 };
 use tn_types::{
-    error::CertificateError, Certificate, CertificateDigest, Round, TaskManager, TnReceiver as _,
-    TnSender,
+    error::CertificateError, Certificate, CertificateDigest, Database, Round, TaskManager, 
+    TnReceiver as _, TnSender,
 };
 use tokio::time::timeout;
 

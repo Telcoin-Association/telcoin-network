@@ -7,8 +7,8 @@ use crate::{metrics::WorkerMetrics, quorum_waiter::QuorumWaiterTrait};
 use std::{sync::Arc, time::Duration};
 use tn_network::{local::LocalNetwork, WorkerToPrimaryClient as _};
 use tn_network_types::WorkerOwnBatchMessage;
-use tn_storage::{tables::Batches, traits::Database};
-use tn_types::{error::BlockSealError, BatchSender, SealedBatch, WorkerId};
+use tn_storage::{tables::Batches};
+use tn_types::{error::BlockSealError, BatchSender, Database, SealedBatch, WorkerId};
 use tracing::error;
 
 #[cfg(test)]

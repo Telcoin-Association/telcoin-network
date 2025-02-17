@@ -5,7 +5,6 @@
 
 mod stores;
 pub use stores::*;
-pub mod traits;
 use layered_db::LayeredDatabase;
 #[cfg(feature = "reth-libmdbx")]
 use mdbx::MdbxDatabase;
@@ -56,7 +55,7 @@ macro_rules! tables {
             $(
                 #[derive(Debug)]
                 pub struct $table {}
-                impl $crate::traits::Table for $table {
+                impl tn_types::Table for $table {
                     type Key = $K;
                     type Value = $V;
 
@@ -187,11 +186,11 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
 
 #[cfg(test)]
 mod test {
-    use crate::traits::{Database, DbTxMut};
+    use tn_types::{Database, DbTxMut};
 
     #[derive(Debug)]
     pub struct TestTable {}
-    impl crate::traits::Table for TestTable {
+    impl tn_types::Table for TestTable {
         type Key = u64;
         type Value = String;
 
@@ -202,7 +201,7 @@ mod test {
     /// as comparing backends. For example run ```cargo test dbsimpbench --features rocksdb --
     /// --nocapture --test-threads 1``` to run each backend through the bench one at a time.
     pub fn db_simp_bench<DB: Database>(db: DB, name: &str) {
-        use crate::traits::{DbTx, DbTxMut};
+        use tn_types::{DbTx, DbTxMut};
 
         println!("\nDBBENCH [{name}] starting simpdbbench");
         let max = 50_000;

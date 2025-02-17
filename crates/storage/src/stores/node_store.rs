@@ -1,8 +1,9 @@
 use crate::{
-    traits::Database, CertificateStore, ConsensusStore, PayloadStore, ProposerStore,
+    CertificateStore, ConsensusStore, PayloadStore, ProposerStore,
     VoteDigestStore,
 };
 use std::sync::Arc;
+use tn_types::Database;
 
 /// All the data stores of the node.
 #[derive(Clone)]

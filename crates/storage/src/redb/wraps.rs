@@ -3,8 +3,7 @@
 use redb::{Key, TypeName, Value};
 use std::{fmt::Debug, marker::PhantomData};
 
-use crate::traits::{KeyT, ValueT};
-use tn_types::{decode, decode_key, encode, encode_key};
+use tn_types::{decode, decode_key, encode, encode_key, KeyT, ValueT};
 
 #[derive(Debug)]
 pub struct KeyWrap<K: KeyT>(PhantomData<K>);

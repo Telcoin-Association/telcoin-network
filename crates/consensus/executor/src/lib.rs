@@ -11,8 +11,8 @@ use mockall::automock;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_primary::ConsensusBus;
-use tn_storage::{traits::Database, ConsensusStore};
-use tn_types::{CommittedSubDag, ConsensusOutput, Noticer, TaskManager};
+use tn_storage::{ConsensusStore};
+use tn_types::{CommittedSubDag, ConsensusOutput, Database, Noticer, TaskManager};
 use tracing::info;
 
 /// Convenience type representing a serialized transaction.

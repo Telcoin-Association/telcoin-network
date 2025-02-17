@@ -117,7 +117,7 @@ where
         event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
     ) -> NetworkResult<Self>
     where
-        DB: tn_storage::traits::Database,
+        DB: tn_types::database_traits::Database,
     {
         let topics = vec![IdentTopic::new("tn-primary")];
         let network_key = config.key_config().primary_network_keypair().as_ref().to_vec();
@@ -130,7 +130,7 @@ where
         event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
     ) -> NetworkResult<Self>
     where
-        DB: tn_storage::traits::Database,
+        DB: tn_types::database_traits::Database,
     {
         let topics = vec![IdentTopic::new("tn-primary")];
         let network_key = config.key_config().worker_network_keypair().as_ref().to_vec();
@@ -145,7 +145,7 @@ where
         mut ed25519_private_key_bytes: Vec<u8>,
     ) -> NetworkResult<Self>
     where
-        DB: tn_storage::traits::Database,
+        DB: tn_types::database_traits::Database,
     {
         // create libp2p keypair from ed25519 secret bytes
         let keypair =

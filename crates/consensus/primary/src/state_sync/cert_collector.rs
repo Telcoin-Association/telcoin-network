@@ -11,8 +11,8 @@ use std::{
     collections::{BTreeMap, BTreeSet, BinaryHeap},
 };
 use tn_config::ConsensusConfig;
-use tn_storage::{traits::Database, CertificateStore};
-use tn_types::{AuthorityIdentifier, Certificate, Round};
+use tn_storage::{CertificateStore};
+use tn_types::{AuthorityIdentifier, Certificate, Database, Round};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 

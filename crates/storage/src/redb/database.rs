@@ -17,7 +17,7 @@ use redb::{
     TableDefinition, WriteTransaction,
 };
 
-use crate::traits::{DBIter, Database, DbTx, DbTxMut, KeyT, Table, ValueT};
+use tn_types::{DBIter, Database, DbTx, DbTxMut, KeyT, Table, ValueT};
 
 use super::{
     metrics::ReDbMetrics,
@@ -30,7 +30,7 @@ pub struct ReDbTx {
 }
 
 impl DbTx for ReDbTx {
-    fn get<T: crate::traits::Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
+    fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
         let td = TableDefinition::<KeyWrap<T::Key>, ValWrap<T::Value>>::new(T::NAME);
         Ok(self.tx.open_table(td)?.get(key)?.map(|v| v.value().clone()))
     }
@@ -47,14 +47,14 @@ impl Debug for ReDbTxMut {
 }
 
 impl DbTx for ReDbTxMut {
-    fn get<T: crate::traits::Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
+    fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
         let td = TableDefinition::<KeyWrap<T::Key>, ValWrap<T::Value>>::new(T::NAME);
         Ok(self.tx.open_table(td)?.get(key)?.map(|v| v.value().clone()))
     }
 }
 
 impl DbTxMut for ReDbTxMut {
-    fn insert<T: crate::traits::Table>(
+    fn insert<T: Table>(
         &mut self,
         key: &T::Key,
         value: &T::Value,
@@ -64,13 +64,13 @@ impl DbTxMut for ReDbTxMut {
         Ok(())
     }
 
-    fn remove<T: crate::traits::Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
+    fn remove<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
         let td = TableDefinition::<KeyWrap<T::Key>, ValWrap<T::Value>>::new(T::NAME);
         self.tx.open_table(td)?.remove(key)?;
         Ok(())
     }
 
-    fn clear_table<T: crate::traits::Table>(&mut self) -> eyre::Result<()> {
+    fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
         let td = TableDefinition::<KeyWrap<T::Key>, ValWrap<T::Value>>::new(T::NAME);
         self.tx.delete_table(td)?;
         self.tx.open_table(td)?;
@@ -181,33 +181,33 @@ impl Database for ReDB {
         Ok(ReDbTxMut { tx })
     }
 
-    fn contains_key<T: crate::traits::Table>(&self, key: &T::Key) -> eyre::Result<bool> {
+    fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
         self.read_txn()?.contains_key::<T>(key)
     }
 
-    fn get<T: crate::traits::Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
+    fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
         self.read_txn()?.get::<T>(key)
     }
 
-    fn insert<T: crate::traits::Table>(&self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
+    fn insert<T: Table>(&self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
         let mut tx = self.write_txn()?;
         tx.insert::<T>(key, value)?;
         tx.commit()
     }
 
-    fn remove<T: crate::traits::Table>(&self, key: &T::Key) -> eyre::Result<()> {
+    fn remove<T: Table>(&self, key: &T::Key) -> eyre::Result<()> {
         let mut tx = self.write_txn()?;
         tx.remove::<T>(key)?;
         tx.commit()
     }
 
-    fn clear_table<T: crate::traits::Table>(&self) -> eyre::Result<()> {
+    fn clear_table<T: Table>(&self) -> eyre::Result<()> {
         let mut tx = self.write_txn()?;
         tx.clear_table::<T>()?;
         tx.commit()
     }
 
-    fn is_empty<T: crate::traits::Table>(&self) -> bool {
+    fn is_empty<T: Table>(&self) -> bool {
         let td = TableDefinition::<KeyWrap<T::Key>, ValWrap<T::Value>>::new(T::NAME);
         if let Ok(txn) = self.read_txn() {
             if let Ok(table) = txn.tx.open_table(td) {
@@ -217,7 +217,7 @@ impl Database for ReDB {
         false
     }
 
-    fn iter<T: crate::traits::Table>(&self) -> DBIter<'_, T> {
+    fn iter<T: Table>(&self) -> DBIter<'_, T> {
         let guard = self.db.read();
         let td = TableDefinition::<KeyWrap<T::Key>, ValWrap<T::Value>>::new(T::NAME);
         Box::new(
@@ -245,7 +245,7 @@ impl Database for ReDB {
         )
     }
 
-    fn skip_to<T: crate::traits::Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
+    fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
         let td = TableDefinition::<KeyWrap<T::Key>, ValWrap<T::Value>>::new(T::NAME);
         let guard = self.db.read();
         let key = key.clone();
@@ -277,7 +277,7 @@ impl Database for ReDB {
         ))
     }
 
-    fn reverse_iter<T: crate::traits::Table>(&self) -> DBIter<'_, T> {
+    fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
         let td = TableDefinition::<KeyWrap<T::Key>, ValWrap<T::Value>>::new(T::NAME);
         let guard = self.db.read();
         Box::new(
@@ -308,7 +308,7 @@ impl Database for ReDB {
         )
     }
 
-    fn record_prior_to<T: crate::traits::Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
+    fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
         let td = TableDefinition::<KeyWrap<T::Key>, ValWrap<T::Value>>::new(T::NAME);
         let read_table = self.db.read().begin_read().ok()?.open_table(td).ok()?;
         let mut last = None;
@@ -322,7 +322,7 @@ impl Database for ReDB {
         last.map(|(k, v)| (k.clone(), v.clone()))
     }
 
-    fn last_record<T: crate::traits::Table>(&self) -> Option<(T::Key, T::Value)> {
+    fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
         let td = TableDefinition::<KeyWrap<T::Key>, ValWrap<T::Value>>::new(T::NAME);
         let read_table = self.db.read().begin_read().ok()?.open_table(td).ok()?;
         read_table.last().ok().flatten().map(|(k, v)| (k.value().clone(), v.value().clone()))
@@ -368,8 +368,9 @@ mod test {
 
     use crate::{
         test::{db_simp_bench, TestTable},
-        traits::{Database, DbTxMut},
     };
+    
+    use tn_types::{Database, DbTxMut};
 
     use super::ReDB;
 

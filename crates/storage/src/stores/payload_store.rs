@@ -1,10 +1,9 @@
 use crate::{
     tables::Payload,
-    traits::{Database, DbTx, DbTxMut},
     PayloadToken,
 };
 use std::sync::Arc;
-use tn_types::{BlockHash, WorkerId};
+use tn_types::{BlockHash, Database, DbTx, DbTxMut, WorkerId};
 use tn_utils::{fail_point, sync::notify_read::NotifyRead};
 
 /// Store of the batch digests for the primary node for the own created batches.

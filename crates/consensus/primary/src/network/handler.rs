@@ -18,13 +18,12 @@ use tn_config::ConsensusConfig;
 use tn_network_libp2p::{GossipMessage, PeerId};
 use tn_storage::{
     tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
-    traits::Database,
 };
 use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, try_decode, AuthorityIdentifier, BlockHash, Certificate, CertificateDigest,
-    ConsensusHeader, Header, Round, SignatureVerificationState, TnSender as _, Vote,
+    ConsensusHeader, Database, Header, Round, SignatureVerificationState, TnSender as _, Vote,
 };
 use tracing::{debug, error, warn};
 

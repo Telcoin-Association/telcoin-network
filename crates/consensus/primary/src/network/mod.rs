@@ -11,8 +11,7 @@ use tn_network_libp2p::{
     types::{IntoResponse as _, NetworkEvent, NetworkHandle},
     GossipMessage, PeerId, ResponseChannel,
 };
-use tn_storage::traits::Database;
-use tn_types::{BlockHash, Certificate, Header, Noticer, TaskManager};
+use tn_types::{BlockHash, Certificate, Database, Header, Noticer, TaskManager};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, warn};
 mod handler;

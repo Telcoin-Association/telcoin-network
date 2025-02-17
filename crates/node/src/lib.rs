@@ -15,8 +15,8 @@ use tn_network_libp2p::ConsensusNetwork;
 use tn_node_traits::TelcoinNode;
 use tn_primary::{ConsensusBus, NodeMode};
 pub use tn_storage::NodeStorage;
-use tn_storage::{open_db, tables::ConsensusBlocks, traits::Database as _, DatabaseType};
-use tn_types::{ConsensusHeader, TaskManager};
+use tn_storage::{open_db, tables::ConsensusBlocks, DatabaseType};
+use tn_types::{ConsensusHeader, Database as _, TaskManager};
 use tokio::{runtime::Builder, sync::mpsc};
 use tracing::{info, instrument};
 

@@ -11,10 +11,9 @@ use std::{
     num::NonZeroUsize,
 };
 use tn_config::KeyConfig;
-use tn_storage::traits::Database;
 use tn_types::{
-    get_available_udp_port, traits::KeyPair, Address, Authority, BlsKeypair, Committee, Epoch,
-    Multiaddr, Stake, WorkerCache, WorkerIndex, DEFAULT_PRIMARY_PORT, DEFAULT_WORKER_PORT,
+    get_available_udp_port, traits::KeyPair, Address, Authority, BlsKeypair, Committee, Database,
+    Epoch, Multiaddr, Stake, WorkerCache, WorkerIndex, DEFAULT_PRIMARY_PORT, DEFAULT_WORKER_PORT,
 };
 
 pub struct Builder<DB, F, R = OsRng> {

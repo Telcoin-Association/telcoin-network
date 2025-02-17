@@ -23,7 +23,6 @@ futures = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
-tn-storage = { workspace = true }
 
 # req/res requires async_trait
 async-trait = { workspace = true }
@@ -34,6 +33,7 @@ snap = { workspace = true }
 tn-test-utils = { workspace = true }
 eyre = { workspace = true }
 assert_matches = { workspace = true }
+tn-storage = { workspace = true }
 
 [lints]
 workspace = true

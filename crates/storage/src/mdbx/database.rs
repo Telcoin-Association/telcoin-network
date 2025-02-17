@@ -14,11 +14,10 @@ use reth_libmdbx::{
     ffi::MDBX_dbi, Cursor, DatabaseFlags, Environment, Geometry, PageSize, Transaction, WriteFlags,
     RO, RW,
 };
-use tn_types::{decode, decode_key, encode, encode_key};
+use tn_types::{Database, DBIter, DbTx, DbTxMut, decode, decode_key, encode, encode_key, KeyT, Table, ValueT};
 
 use crate::{
     mdbx::metrics::MdbxMetrics,
-    traits::{Database, DbTx, DbTxMut, KeyT, Table, ValueT},
 };
 
 /// Wrapper for the libmdbx transaction.
@@ -76,7 +75,7 @@ impl DbTx for MdbxTxMut {
 }
 
 impl DbTxMut for MdbxTxMut {
-    fn insert<T: crate::traits::Table>(
+    fn insert<T: Table>(
         &mut self,
         key: &T::Key,
         value: &T::Value,
@@ -87,13 +86,13 @@ impl DbTxMut for MdbxTxMut {
         Ok(())
     }
 
-    fn remove<T: crate::traits::Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
+    fn remove<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
         let key_buf = encode_key(key);
         self.inner.del(self.get_dbi::<T>()?, key_buf, None)?;
         Ok(())
     }
 
-    fn clear_table<T: crate::traits::Table>(&mut self) -> eyre::Result<()> {
+    fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
         Ok(self.inner.clear_db(self.get_dbi::<T>()?)?)
     }
 
@@ -251,7 +250,7 @@ impl Database for MdbxDatabase {
         self.iter::<T>().next().is_none()
     }
 
-    fn iter<T: Table>(&self) -> crate::traits::DBIter<'_, T> {
+    fn iter<T: Table>(&self) -> DBIter<'_, T> {
         let cursor = self
             .read_txn()
             .expect("Failed to get cursor!")
@@ -260,7 +259,7 @@ impl Database for MdbxDatabase {
         Box::new(MdbxIter { cursor, _key: PhantomData, _val: PhantomData })
     }
 
-    fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<crate::traits::DBIter<'_, T>> {
+    fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
         let cursor = self
             .read_txn()
             .expect("Failed to get cursor!")
@@ -271,7 +270,7 @@ impl Database for MdbxDatabase {
         Ok(Box::new(i.skip_while(move |(k, _)| k < &key)))
     }
 
-    fn reverse_iter<T: Table>(&self) -> crate::traits::DBIter<'_, T> {
+    fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
         let cursor = self
             .read_txn()
             .expect("Failed to get cursor!")
