@@ -72,7 +72,7 @@ We recommend looking through existing tests as a helpful guide to creating new o
 #### Running tests locally
 
 **make test**: Used by maintainers with credentials to cloud infrastructure.
-**make open-test**: All workspace tests that don't require cloud credentials. This is useful for contributers.
+**make public-test**: All workspace tests that don't require cloud credentials. This is useful for contributers.
 **make fmt**: Preffered format checks using nightly rust.
 **make clippy**: Prefferred lint check using nightly rust.
 
