@@ -2,6 +2,7 @@
 
 use super::{AuthorityFixture, Builder};
 use crate::fixture_batch_with_transactions;
+use fastcrypto::hash::Hash as _;
 use std::collections::BTreeSet;
 use tn_types::{
     Certificate, CertificateDigest, Committee, Database, Header, HeaderBuilder, Round, Vote,
@@ -178,5 +179,10 @@ impl<DB: Database> CommitteeFixture<DB> {
         for a in &self.authorities {
             a.consensus_config().shutdown().notify();
         }
+    }
+
+    /// Create the genesis certificates for the committe.
+    pub fn genesis(&self) -> impl Iterator<Item = CertificateDigest> {
+        Certificate::genesis(&self.committee()).into_iter().map(|x| x.digest())
     }
 }

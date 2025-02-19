@@ -41,6 +41,9 @@ pub struct ConsensusOutput {
     /// A scalar value equal to the number of ancestor blocks. The genesis block has a number of
     /// zero.
     pub number: u64,
+    /// Temporary extra data field - currently unused.
+    /// This is included for now for testnet purposes only.
+    pub _extra: B256,
 }
 
 impl ConsensusOutput {
@@ -90,6 +93,7 @@ impl ConsensusOutput {
             parent_hash: self.parent_hash,
             sub_dag: (*self.sub_dag).clone(),
             number: self.number,
+            _extra: self._extra,
         }
     }
 

@@ -12047,6 +12047,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "consensus-metrics",
+ "eyre",
  "fastcrypto",
  "futures",
  "indexmap 2.7.1",

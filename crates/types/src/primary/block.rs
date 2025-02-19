@@ -27,6 +27,10 @@ pub struct ConsensusHeader {
     /// A scalar value equal to the number of ancestor blocks. The genesis block has a number of
     /// zero.
     pub number: u64,
+
+    /// Temp extra data field - currently unused.
+    /// This is included for now for testnet purposes only.
+    pub _extra: B256,
 }
 
 impl ConsensusHeader {
@@ -59,7 +63,7 @@ impl Default for ConsensusHeader {
             crate::ReputationScores::default(),
             None,
         );
-        Self { parent_hash: B256::default(), sub_dag, number: 0 }
+        Self { parent_hash: B256::default(), sub_dag, number: 0, _extra: B256::default() }
     }
 }
 
@@ -69,6 +73,7 @@ impl From<ConsensusOutput> for ConsensusHeader {
             parent_hash: value.parent_hash,
             sub_dag: Arc::unwrap_or_clone(value.sub_dag),
             number: value.number,
+            _extra: value._extra,
         }
     }
 }

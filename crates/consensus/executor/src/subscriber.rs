@@ -209,6 +209,8 @@ impl<DB: Database> Subscriber<DB> {
         let last_executed_block =
             last_executed_consensus_block(&self.consensus_bus, &self.config).unwrap_or_default();
 
+        info!(target: "executor", ?last_executed_block, "restoring last executed consensus:");
+
         Ok((last_executed_block.digest(), last_executed_block.number))
     }
 
@@ -235,15 +237,17 @@ impl<DB: Database> Subscriber<DB> {
             tokio::select! {
                 // Receive the ordered sequence of consensus messages from a consensus node.
                 Some(sub_dag) = rx_sequence.recv(), if waiting.len() < Self::MAX_PENDING_PAYLOADS => {
+                    debug!(target: "executor", subdag=?sub_dag.digest(), round=?sub_dag.leader_round(), "received committed subdag from consensus");
                     // We can schedule more then MAX_PENDING_PAYLOADS payloads but
                     // don't process more consensus messages when more
                     // then MAX_PENDING_PAYLOADS is pending
                     let parent_hash = last_parent;
                     let number = last_number + 1;
                     last_parent = ConsensusHeader::digest_from_parts(parent_hash, &sub_dag, number);
+
                     // Record the latest ConsensusHeader, we probably don't need this in this mode but keep it up to date anyway.
                     // Note we don't bother sending this to the consensus header channel since not needed when an active CVV.
-                    if let Err(e) = self.consensus_bus.last_consensus_header().send(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number }) {
+                    if let Err(e) = self.consensus_bus.last_consensus_header().send(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, _extra: B256::default() }) {
                         error!(target: "telcoin::subscriber", "error sending latest consensus header for authority {}: {}", self.inner.authority_id, e);
                         return Ok(());
                     }
@@ -256,11 +260,14 @@ impl<DB: Database> Subscriber<DB> {
                 //
                 // NOTE: this broadcasts to all subscribers, but lagging receivers will lose messages
                 Some(output) = waiting.next() => {
+                    debug!(target: "subscriber", output=?output.digest(), "saving next output");
                     save_consensus(self.config.database(), output.clone())?;
+                    debug!(target: "subscriber", "broadcasting output...");
                     if let Err(e) = self.consensus_bus.consensus_output().send(output).await {
                         error!(target: "telcoin::subscriber", "error broadcasting consensus output for authority {}: {}", self.inner.authority_id, e);
                         return Ok(());
                     }
+                    debug!(target: "subscriber", "output broadcast successfully");
                 },
 
                 _ = &self.rx_shutdown => {
@@ -306,6 +313,7 @@ impl<DB: Database> Subscriber<DB> {
                 batch_digests: VecDeque::new(),
                 parent_hash,
                 number,
+                _extra: B256::default(),
             };
         }
 
@@ -317,6 +325,7 @@ impl<DB: Database> Subscriber<DB> {
             batch_digests: VecDeque::new(),
             parent_hash,
             number,
+            _extra: B256::default(),
         };
 
         let mut batch_digests_and_workers: HashMap<
@@ -385,6 +394,7 @@ impl<DB: Database> Subscriber<DB> {
             }
             subscriber_output.batches.push(output_batches);
         }
+        debug!(target: "subscriber", "returning output to subscriber");
         subscriber_output
     }
 
@@ -489,4 +499,209 @@ impl<DB: Database> Subscriber<DB> {
     }
 }
 
-// TODO: add a unit test
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anemo::PeerId;
+    use indexmap::IndexMap;
+    use std::{collections::BTreeSet, ops::RangeInclusive};
+    use tn_network_types::{FetchBatchResponse, PrimaryToWorker, WorkerSynchronizeMessage};
+    use tn_primary::consensus::{Bullshark, Consensus, LeaderSchedule};
+    use tn_primary_metrics::ConsensusMetrics;
+    use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils::{test_network, CommitteeFixture};
+    use tn_types::{
+        CertificateDigest, ExecHeader, HeaderBuilder, Round, SealedHeader, TimestampSec,
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    };
+
+    fn random_batches(
+        number_of_batches: usize,
+    ) -> (IndexMap<BlockHash, (WorkerId, TimestampSec)>, HashMap<BlockHash, Batch>) {
+        let mut payload: IndexMap<BlockHash, (WorkerId, TimestampSec)> =
+            IndexMap::with_capacity(number_of_batches);
+        let mut batches = HashMap::with_capacity(number_of_batches);
+
+        for _ in 0..number_of_batches {
+            let batch = tn_test_utils::batch();
+            let batch_digest = batch.digest();
+
+            payload.insert(batch_digest, (0, 0));
+            batches.insert(batch_digest, batch);
+        }
+
+        (payload, batches)
+    }
+
+    /// Creates one signed certificate from a set of signers - the signers must include the origin
+    fn signed_cert<DB>(
+        origin: AuthorityIdentifier,
+        round: Round,
+        parents: BTreeSet<CertificateDigest>,
+        committee: &CommitteeFixture<DB>,
+    ) -> (CertificateDigest, Certificate, HashMap<BlockHash, Batch>)
+    where
+        DB: Database,
+    {
+        let (payload, batches) = random_batches(3);
+        let header = HeaderBuilder::default()
+            .author(origin)
+            .payload(payload)
+            .round(round)
+            .epoch(0)
+            .parents(parents)
+            .build()
+            .expect("valid header built for test certificate");
+
+        let cert = committee.certificate(&header);
+        (cert.digest(), cert, batches)
+    }
+
+    fn create_test_data<DB>(
+        range: RangeInclusive<Round>,
+        fixture: &CommitteeFixture<DB>,
+    ) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>, HashMap<BlockHash, Batch>)
+    where
+        DB: Database,
+    {
+        let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+        let mut certificates = VecDeque::new();
+        let mut next_parents = BTreeSet::new();
+        let mut batches = HashMap::new();
+        // use genesis for initial parents
+        let mut parents: BTreeSet<_> = fixture.genesis().collect();
+
+        // create signed certificates for every round
+        for round in range {
+            next_parents.clear();
+            for id in &ids {
+                let (digest, certificate, payload) =
+                    signed_cert(id.clone(), round, parents.clone(), fixture);
+                certificates.push_back(certificate);
+                next_parents.insert(digest);
+                batches.extend(payload);
+            }
+            parents.clone_from(&next_parents);
+        }
+
+        (certificates, next_parents, batches)
+    }
+
+    // type to hold batches
+    struct MockWorkerClient {
+        batches: HashMap<BlockHash, Batch>,
+    }
+
+    #[async_trait::async_trait]
+    impl PrimaryToWorker for MockWorkerClient {
+        async fn synchronize(
+            &self,
+            _request: anemo::Request<WorkerSynchronizeMessage>,
+        ) -> Result<anemo::Response<()>, anemo::rpc::Status> {
+            Ok(anemo::Response::new(()))
+        }
+
+        async fn fetch_batches(
+            &self,
+            _request: anemo::Request<FetchBatchesRequest>,
+        ) -> Result<anemo::Response<FetchBatchResponse>, anemo::rpc::Status> {
+            Ok(anemo::Response::new(FetchBatchResponse { batches: self.batches.clone() }))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_output_to_header() -> eyre::Result<()> {
+        tn_test_utils::init_test_tracing();
+        let num_sub_dags_per_schedule = 3;
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let authority = fixture.authorities().next().unwrap();
+        let config = authority.consensus_config().clone();
+        let consensus_store = config.node_storage().consensus_store.clone();
+        let task_manager = TaskManager::new("subscriber tests");
+        let rx_shutdown = config.shutdown().subscribe();
+        let consensus_bus = ConsensusBus::new();
+
+        // subscribe to channels early
+        let rx_consensus_headers = consensus_bus.last_consensus_header().subscribe();
+        let mut consensus_output = consensus_bus.consensus_output().subscribe();
+
+        // removing soon
+        let network = test_network(
+            authority.primary_network_keypair(),
+            &config.authority().primary_network_address(),
+        );
+
+        // spawn the executor
+        spawn_subscriber(
+            config.clone(),
+            rx_shutdown,
+            consensus_bus.clone(),
+            &task_manager,
+            network,
+        );
+
+        // yield for subscriber to spawn
+        tokio::task::yield_now().await;
+
+        // make certificates for rounds 1 to 7 (inclusive)
+        let (certificates, _next_parents, batches) = create_test_data(1..=7, &fixture);
+
+        error!("batches length?? {}", batches.len());
+        // create mock server with batches
+        let worker = Arc::new(MockWorkerClient { batches });
+        let worker_id = PeerId(config.key_config().worker_network_public_key().0.to_bytes());
+        config.local_network().set_primary_to_worker_local_handler(worker_id, worker);
+
+        let metrics = Arc::new(ConsensusMetrics::default());
+        let leader_schedule = LeaderSchedule::from_store(
+            committee.clone(),
+            consensus_store.clone(),
+            DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+        );
+        let bullshark = Bullshark::new(
+            committee.clone(),
+            consensus_store.clone(),
+            metrics.clone(),
+            num_sub_dags_per_schedule,
+            leader_schedule.clone(),
+            DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+        );
+
+        let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
+        consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+        let task_manager = TaskManager::default();
+        Consensus::spawn(config.clone(), &consensus_bus, bullshark, &task_manager);
+
+        // forward certificates to trigger subdag commit
+        for certificate in certificates.iter() {
+            consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();
+        }
+
+        let expected_num = 3;
+        let mut consensus_headers_seen: Vec<_> = Vec::with_capacity(expected_num);
+        debug!(target: "executor", "waiting for consensus headers to change...");
+        while let Some(output) = consensus_output.recv().await {
+            let num = output.number;
+            let consensus_header = output.consensus_header();
+            consensus_headers_seen.push(consensus_header);
+            if num == expected_num as u64 {
+                break;
+            }
+
+            // yield for other tasks
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let last_header = rx_consensus_headers.borrow().clone();
+        assert!(last_header.number == expected_num as u64);
+
+        // NOTE: output.consensus_header() creates the consensus header and should be the same result
+        assert_eq!(
+            last_header.digest(),
+            consensus_headers_seen.last().expect("last consensus header").digest()
+        );
+
+        Ok(())
+    }
+}

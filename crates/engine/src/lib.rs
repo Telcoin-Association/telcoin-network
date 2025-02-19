@@ -360,6 +360,7 @@ mod tests {
             batch_digests: Default::default(), // empty
             parent_hash: ConsensusHeader::default().digest(),
             number: 0,
+            _extra: Default::default(),
         };
         let consensus_output_hash = consensus_output.consensus_header_hash();
 
@@ -592,6 +593,7 @@ mod tests {
             batch_digests: batch_digests_1.clone(),
             parent_hash: ConsensusHeader::default().digest(),
             number: 0,
+            _extra: Default::default(),
         };
 
         // create second output
@@ -620,6 +622,7 @@ mod tests {
             batch_digests: batch_digests_2.clone(),
             parent_hash: consensus_output_1.consensus_header_hash(),
             number: 1,
+            _extra: Default::default(),
         };
         let consensus_output_2_hash = consensus_output_2.consensus_header_hash();
 
@@ -918,6 +921,7 @@ mod tests {
             batch_digests: batch_digests_1.clone(),
             parent_hash: ConsensusHeader::default().digest(),
             number: 0,
+            _extra: Default::default(),
         };
 
         // create second output
@@ -948,6 +952,7 @@ mod tests {
             batch_digests: batch_digests_2.clone(),
             parent_hash: consensus_output_1.consensus_header_hash(),
             number: 1,
+            _extra: Default::default(),
         };
         let consensus_output_2_hash = consensus_output_2.consensus_header_hash();
 
@@ -1217,6 +1222,7 @@ mod tests {
             batch_digests: batch_digests_1,
             parent_hash: ConsensusHeader::default().digest(),
             number: 0,
+            _extra: Default::default(),
         };
         let consensus_output_1_hash = consensus_output_1.consensus_header_hash();
 
@@ -1246,6 +1252,7 @@ mod tests {
             batch_digests: batch_digests_2,
             parent_hash: consensus_output_1.consensus_header_hash(),
             number: 1,
+            _extra: Default::default(),
         };
 
         //=== Execution

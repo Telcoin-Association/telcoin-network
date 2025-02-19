@@ -36,7 +36,9 @@ tn-primary-metrics = { workspace = true }
 [dev-dependencies]
 indexmap.workspace = true
 tempfile.workspace = true
+eyre = { workspace = true }
 tn-primary = { workspace = true }
 tn-node = { workspace = true }
 tn-test-utils = { workspace = true }
 bytes = { workspace = true }
+tn-network = { workspace = true }
