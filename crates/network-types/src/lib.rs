@@ -5,11 +5,10 @@ pub mod local;
 mod notify;
 mod request;
 mod response;
-use std::collections::HashMap;
-
 pub use notify::*;
 pub use request::*;
 pub use response::*;
+use std::collections::HashMap;
 use tn_types::{Batch, BlockHash, NetworkPublicKey};
 
 // async_trait for object safety, get rid of when possible.
