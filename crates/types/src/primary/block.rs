@@ -30,7 +30,7 @@ pub struct ConsensusHeader {
 
     /// Temp extra data field - currently unused.
     /// This is included for now for testnet purposes only.
-    pub _extra: B256,
+    pub extra: B256,
 }
 
 impl ConsensusHeader {
@@ -63,7 +63,7 @@ impl Default for ConsensusHeader {
             crate::ReputationScores::default(),
             None,
         );
-        Self { parent_hash: B256::default(), sub_dag, number: 0, _extra: B256::default() }
+        Self { parent_hash: B256::default(), sub_dag, number: 0, extra: B256::default() }
     }
 }
 
@@ -73,7 +73,7 @@ impl From<ConsensusOutput> for ConsensusHeader {
             parent_hash: value.parent_hash,
             sub_dag: Arc::unwrap_or_clone(value.sub_dag),
             number: value.number,
-            _extra: value._extra,
+            extra: value.extra,
         }
     }
 }

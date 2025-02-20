@@ -43,7 +43,7 @@ pub struct ConsensusOutput {
     pub number: u64,
     /// Temporary extra data field - currently unused.
     /// This is included for now for testnet purposes only.
-    pub _extra: B256,
+    pub extra: B256,
 }
 
 impl ConsensusOutput {
@@ -93,7 +93,7 @@ impl ConsensusOutput {
             parent_hash: self.parent_hash,
             sub_dag: (*self.sub_dag).clone(),
             number: self.number,
-            _extra: self._extra,
+            extra: self.extra,
         }
     }
 

@@ -247,7 +247,7 @@ impl<DB: Database> Subscriber<DB> {
 
                     // Record the latest ConsensusHeader, we probably don't need this in this mode but keep it up to date anyway.
                     // Note we don't bother sending this to the consensus header channel since not needed when an active CVV.
-                    if let Err(e) = self.consensus_bus.last_consensus_header().send(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, _extra: B256::default() }) {
+                    if let Err(e) = self.consensus_bus.last_consensus_header().send(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() }) {
                         error!(target: "telcoin::subscriber", "error sending latest consensus header for authority {}: {}", self.inner.authority_id, e);
                         return Ok(());
                     }
@@ -313,7 +313,7 @@ impl<DB: Database> Subscriber<DB> {
                 batch_digests: VecDeque::new(),
                 parent_hash,
                 number,
-                _extra: B256::default(),
+                extra: B256::default(),
             };
         }
 
@@ -325,7 +325,7 @@ impl<DB: Database> Subscriber<DB> {
             batch_digests: VecDeque::new(),
             parent_hash,
             number,
-            _extra: B256::default(),
+            extra: B256::default(),
         };
 
         let mut batch_digests_and_workers: HashMap<
@@ -502,18 +502,19 @@ impl<DB: Database> Subscriber<DB> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anemo::PeerId;
+    use fastcrypto::traits::KeyPair as _;
     use indexmap::IndexMap;
     use std::{collections::BTreeSet, ops::RangeInclusive};
-    use tn_network_types::{FetchBatchResponse, PrimaryToWorker, WorkerSynchronizeMessage};
+    use tn_network_types::MockPrimaryToWorkerClient;
     use tn_primary::consensus::{Bullshark, Consensus, LeaderSchedule};
     use tn_primary_metrics::ConsensusMetrics;
     use tn_storage::mem_db::MemDatabase;
-    use tn_test_utils::{test_network, CommitteeFixture};
+    use tn_test_utils::CommitteeFixture;
     use tn_types::{
-        CertificateDigest, ExecHeader, HeaderBuilder, Round, SealedHeader, TimestampSec,
-        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+        network_public_key_to_libp2p, CertificateDigest, ExecHeader, HeaderBuilder, Round,
+        SealedHeader, TimestampSec, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     };
+    use tokio::sync::mpsc;
 
     fn random_batches(
         number_of_batches: usize,
@@ -587,36 +588,13 @@ mod tests {
         (certificates, next_parents, batches)
     }
 
-    // type to hold batches
-    struct MockWorkerClient {
-        batches: HashMap<BlockHash, Batch>,
-    }
-
-    #[async_trait::async_trait]
-    impl PrimaryToWorker for MockWorkerClient {
-        async fn synchronize(
-            &self,
-            _request: anemo::Request<WorkerSynchronizeMessage>,
-        ) -> Result<anemo::Response<()>, anemo::rpc::Status> {
-            Ok(anemo::Response::new(()))
-        }
-
-        async fn fetch_batches(
-            &self,
-            _request: anemo::Request<FetchBatchesRequest>,
-        ) -> Result<anemo::Response<FetchBatchResponse>, anemo::rpc::Status> {
-            Ok(anemo::Response::new(FetchBatchResponse { batches: self.batches.clone() }))
-        }
-    }
-
     #[tokio::test]
     async fn test_output_to_header() -> eyre::Result<()> {
-        tn_test_utils::init_test_tracing();
         let num_sub_dags_per_schedule = 3;
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let committee = fixture.committee();
-        let authority = fixture.authorities().next().unwrap();
-        let config = authority.consensus_config().clone();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config().clone();
         let consensus_store = config.node_storage().consensus_store.clone();
         let task_manager = TaskManager::new("subscriber tests");
         let rx_shutdown = config.shutdown().subscribe();
@@ -626,12 +604,8 @@ mod tests {
         let rx_consensus_headers = consensus_bus.last_consensus_header().subscribe();
         let mut consensus_output = consensus_bus.consensus_output().subscribe();
 
-        // removing soon
-        let network = test_network(
-            authority.primary_network_keypair(),
-            &config.authority().primary_network_address(),
-        );
-
+        let (tx, _rx) = mpsc::channel(5);
+        let network = PrimaryNetworkHandle::new_for_test(tx);
         // spawn the executor
         spawn_subscriber(
             config.clone(),
@@ -647,11 +621,12 @@ mod tests {
         // make certificates for rounds 1 to 7 (inclusive)
         let (certificates, _next_parents, batches) = create_test_data(1..=7, &fixture);
 
-        error!("batches length?? {}", batches.len());
-        // create mock server with batches
-        let worker = Arc::new(MockWorkerClient { batches });
-        let worker_id = PeerId(config.key_config().worker_network_public_key().0.to_bytes());
-        config.local_network().set_primary_to_worker_local_handler(worker_id, worker);
+        // Set up mock worker.
+        let worker = primary.worker();
+        let _worker_address = &worker.info().worker_address;
+        let worker_peer_id = network_public_key_to_libp2p(worker.keypair().public());
+        let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
+        config.local_network().set_primary_to_worker_local_handler(worker_peer_id, mock_client);
 
         let metrics = Arc::new(ConsensusMetrics::default());
         let leader_schedule = LeaderSchedule::from_store(
@@ -680,7 +655,6 @@ mod tests {
 
         let expected_num = 3;
         let mut consensus_headers_seen: Vec<_> = Vec::with_capacity(expected_num);
-        debug!(target: "executor", "waiting for consensus headers to change...");
         while let Some(output) = consensus_output.recv().await {
             let num = output.number;
             let consensus_header = output.consensus_header();

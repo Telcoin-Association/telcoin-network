@@ -612,7 +612,7 @@ async fn test_canonical_notification_updates_pool() {
         batch_digests,
         parent_hash: ConsensusHeader::default().digest(),
         number: 0,
-        _extra: Default::default(),
+        extra: Default::default(),
     };
 
     // execute output to trigger canonical update

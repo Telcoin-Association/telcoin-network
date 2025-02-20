@@ -5,10 +5,12 @@ pub mod local;
 mod notify;
 mod request;
 mod response;
+use std::collections::HashMap;
+
 pub use notify::*;
 pub use request::*;
 pub use response::*;
-use tn_types::NetworkPublicKey;
+use tn_types::{Batch, BlockHash, NetworkPublicKey};
 
 // async_trait for object safety, get rid of when possible.
 #[async_trait::async_trait]
@@ -51,13 +53,43 @@ impl WorkerToPrimaryClient for MockWorkerToPrimaryHang {
 pub trait PrimaryToWorkerClient: Send + Sync + 'static {
     async fn synchronize(
         &self,
-        worker_name: NetworkPublicKey,
-        message: WorkerSynchronizeMessage,
+        _worker_name: NetworkPublicKey,
+        _message: WorkerSynchronizeMessage,
     ) -> eyre::Result<()>;
 
     async fn fetch_batches(
         &self,
-        worker_name: NetworkPublicKey,
-        request: FetchBatchesRequest,
+        _worker_name: NetworkPublicKey,
+        _request: FetchBatchesRequest,
     ) -> eyre::Result<FetchBatchResponse>;
+}
+
+/// Type that can return batches.
+pub struct MockPrimaryToWorkerClient {
+    pub batches: HashMap<BlockHash, Batch>,
+}
+
+#[async_trait::async_trait]
+impl PrimaryToWorkerClient for MockPrimaryToWorkerClient {
+    async fn synchronize(
+        &self,
+        _worker_name: NetworkPublicKey,
+        _message: WorkerSynchronizeMessage,
+    ) -> eyre::Result<()> {
+        Ok(())
+    }
+
+    async fn fetch_batches(
+        &self,
+        _worker_name: NetworkPublicKey,
+        _request: FetchBatchesRequest,
+    ) -> eyre::Result<FetchBatchResponse> {
+        Ok(FetchBatchResponse { batches: self.batches.clone() })
+    }
+}
+
+impl Default for MockPrimaryToWorkerClient {
+    fn default() -> Self {
+        Self { batches: HashMap::with_capacity(0) }
+    }
 }
