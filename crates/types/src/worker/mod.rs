@@ -4,11 +4,11 @@ use tokio::sync::{mpsc::Sender, oneshot};
 #[allow(clippy::mutable_key_type)]
 mod info;
 pub use info::*;
-mod sealed_block;
-pub use sealed_block::*;
-mod pending_block;
+mod sealed_batch;
+pub use sealed_batch::*;
+mod pending_batch;
 use crate::error::BlockSealError;
-pub use pending_block::*;
+pub use pending_batch::*;
 
 /// Type for the channel sender to submit sealed batches to the block provider.
 ///
