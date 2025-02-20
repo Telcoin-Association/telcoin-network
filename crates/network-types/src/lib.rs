@@ -52,14 +52,14 @@ impl WorkerToPrimaryClient for MockWorkerToPrimaryHang {
 pub trait PrimaryToWorkerClient: Send + Sync + 'static {
     async fn synchronize(
         &self,
-        _worker_name: NetworkPublicKey,
-        _message: WorkerSynchronizeMessage,
+        worker_name: NetworkPublicKey,
+        message: WorkerSynchronizeMessage,
     ) -> eyre::Result<()>;
 
     async fn fetch_batches(
         &self,
-        _worker_name: NetworkPublicKey,
-        _request: FetchBatchesRequest,
+        worker_name: NetworkPublicKey,
+        request: FetchBatchesRequest,
     ) -> eyre::Result<FetchBatchResponse>;
 }
 

@@ -92,7 +92,6 @@ async fn test_consensus_recovery_with_bullshark() {
     let mut score_no_crash: ReputationScores = ReputationScores::default();
 
     'main: while let Some(sub_dag) = rx_output.recv().await {
-        println!("\n\n{sub_dag:?}\n\n");
         score_no_crash = sub_dag.reputation_score.clone();
         assert_eq!(sub_dag.leader.round(), consensus_index_counter);
         consensus_store.write_subdag_for_test(consensus_index_counter as u64, sub_dag.clone());
