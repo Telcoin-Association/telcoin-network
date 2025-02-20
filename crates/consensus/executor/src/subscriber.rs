@@ -74,7 +74,7 @@ pub fn spawn_subscriber<DB: Database>(
                 "subscriber consensus",
                 monitored_future!(
                     async move {
-                        info!(target: "telcoin::subscriber", "Starting subscriber: CVV");
+                        info!(target: "subscriber", "Starting subscriber: CVV");
                         subscriber.run().await
                     },
                     "SubscriberTask"
@@ -88,7 +88,7 @@ pub fn spawn_subscriber<DB: Database>(
                 "subscriber catch up and rejoin consensus",
                 monitored_future!(
                     async move {
-                        info!(target: "telcoin::subscriber", "Starting subscriber: Catch up and rejoin");
+                        info!(target: "subscriber", "Starting subscriber: Catch up and rejoin");
                         subscriber.catch_up_rejoin_consensus(clone, network).await
                     },
                     "SubscriberFollowTask"
@@ -102,7 +102,7 @@ pub fn spawn_subscriber<DB: Database>(
                 "subscriber follow consensus",
                 monitored_future!(
                     async move {
-                        info!(target: "telcoin::subscriber", "Starting subscriber: Follower");
+                        info!(target: "subscriber", "Starting subscriber: Follower");
                         subscriber.follow_consensus(clone, network).await
                     },
                     "SubscriberFollowTask"
@@ -154,7 +154,7 @@ impl<DB: Database> Subscriber<DB> {
         let _ = self.consensus_bus.primary_round_updates().send(last_round);
 
         if let Err(e) = self.consensus_bus.consensus_output().send(consensus_output).await {
-            error!(target: "telcoin::subscriber", "error broadcasting consensus output for authority {}: {}", self.inner.authority_id, e);
+            error!(target: "subscriber", "error broadcasting consensus output for authority {}: {}", self.inner.authority_id, e);
             return Err(SubscriberError::ClosedChannel("consensus_output".to_string()));
         }
         Ok(())
@@ -176,7 +176,7 @@ impl<DB: Database> Subscriber<DB> {
             if consensus_header_number == self.consensus_bus.last_consensus_header().borrow().number
             {
                 // We are caught up enough so try to jump back into consensus
-                info!(target: "telcoin::subscriber", "attempting to rejoin consensus, consensus block height {consensus_header_number}");
+                info!(target: "subscriber", "attempting to rejoin consensus, consensus block height {consensus_header_number}");
                 // Set restart flag and trigger shutdown by returning.
                 self.consensus_bus.set_restart();
                 let _ = self.consensus_bus.node_mode().send(NodeMode::CvvActive);
@@ -209,7 +209,7 @@ impl<DB: Database> Subscriber<DB> {
         let last_executed_block =
             last_executed_consensus_block(&self.consensus_bus, &self.config).unwrap_or_default();
 
-        info!(target: "executor", ?last_executed_block, "restoring last executed consensus:");
+        info!(target: "subscriber", ?last_executed_block, "restoring last executed consensus:");
 
         Ok((last_executed_block.digest(), last_executed_block.number))
     }
@@ -237,7 +237,7 @@ impl<DB: Database> Subscriber<DB> {
             tokio::select! {
                 // Receive the ordered sequence of consensus messages from a consensus node.
                 Some(sub_dag) = rx_sequence.recv(), if waiting.len() < Self::MAX_PENDING_PAYLOADS => {
-                    debug!(target: "executor", subdag=?sub_dag.digest(), round=?sub_dag.leader_round(), "received committed subdag from consensus");
+                    debug!(target: "subscriber", subdag=?sub_dag.digest(), round=?sub_dag.leader_round(), "received committed subdag from consensus");
                     // We can schedule more then MAX_PENDING_PAYLOADS payloads but
                     // don't process more consensus messages when more
                     // then MAX_PENDING_PAYLOADS is pending
@@ -248,7 +248,7 @@ impl<DB: Database> Subscriber<DB> {
                     // Record the latest ConsensusHeader, we probably don't need this in this mode but keep it up to date anyway.
                     // Note we don't bother sending this to the consensus header channel since not needed when an active CVV.
                     if let Err(e) = self.consensus_bus.last_consensus_header().send(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() }) {
-                        error!(target: "telcoin::subscriber", "error sending latest consensus header for authority {}: {}", self.inner.authority_id, e);
+                        error!(target: "subscriber", "error sending latest consensus header for authority {}: {}", self.inner.authority_id, e);
                         return Ok(());
                     }
                     last_number += 1;
@@ -264,7 +264,7 @@ impl<DB: Database> Subscriber<DB> {
                     save_consensus(self.config.database(), output.clone())?;
                     debug!(target: "subscriber", "broadcasting output...");
                     if let Err(e) = self.consensus_bus.consensus_output().send(output).await {
-                        error!(target: "telcoin::subscriber", "error broadcasting consensus output for authority {}: {}", self.inner.authority_id, e);
+                        error!(target: "subscriber", "error broadcasting consensus output for authority {}: {}", self.inner.authority_id, e);
                         return Ok(());
                     }
                     debug!(target: "subscriber", "output broadcast successfully");
@@ -351,7 +351,7 @@ impl<DB: Database> Subscriber<DB> {
                     subscriber_output.batch_digests.push_back(*digest);
                     worker_set.extend(workers);
                 } else {
-                    error!(target: "telcoin::subscriber", "failed to find a local worker for {worker_id}, malicious certificate?");
+                    error!(target: "subscriber", "failed to find a local worker for {worker_id}, malicious certificate?");
                 }
             }
         }
@@ -386,7 +386,7 @@ impl<DB: Database> Subscriber<DB> {
                     .get(digest)
                     .expect("[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
 
-                debug!(target: "telcoin::subscriber",
+                debug!(target: "subscriber",
                     "Adding fetched batch {digest} from certificate {} to consensus output",
                     cert.digest()
                 );
@@ -413,7 +413,7 @@ impl<DB: Database> Subscriber<DB> {
                 match worker {
                     Ok(worker) => Some(worker.name),
                     Err(err) => {
-                        error!(target: "telcoin::subscriber",
+                        error!(target: "subscriber",
                             "Worker {} not found for authority {}: {:?}",
                             worker_id, authority, err
                         );
@@ -577,7 +577,7 @@ mod tests {
             next_parents.clear();
             for id in &ids {
                 let (digest, certificate, payload) =
-                    signed_cert(id.clone(), round, parents.clone(), fixture);
+                    signed_cert(*id, round, parents.clone(), fixture);
                 certificates.push_back(certificate);
                 next_parents.insert(digest);
                 batches.extend(payload);
@@ -670,7 +670,8 @@ mod tests {
         let last_header = rx_consensus_headers.borrow().clone();
         assert!(last_header.number == expected_num as u64);
 
-        // NOTE: output.consensus_header() creates the consensus header and should be the same result
+        // NOTE: output.consensus_header() creates the consensus header and should be the same
+        // result
         assert_eq!(
             last_header.digest(),
             consensus_headers_seen.last().expect("last consensus header").digest()

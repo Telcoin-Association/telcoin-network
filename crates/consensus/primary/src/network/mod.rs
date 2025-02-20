@@ -8,10 +8,11 @@ use handler::RequestHandler;
 pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
 use message::{PrimaryGossip, PrimaryRPCError};
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::types::NetworkCommand;
 use tn_network_libp2p::{
     error::NetworkError,
-    types::{IdentTopic, IntoResponse as _, NetworkEvent, NetworkHandle, NetworkResult},
+    types::{
+        IdentTopic, IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult,
+    },
     GossipMessage, Multiaddr, PeerId, ResponseChannel,
 };
 use tn_network_types::{
