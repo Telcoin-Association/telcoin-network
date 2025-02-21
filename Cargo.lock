@@ -11703,6 +11703,7 @@ dependencies = [
  "prometheus",
  "rand",
  "rand_chacha",
+ "rayon",
  "reth",
  "reth-basic-payload-builder",
  "reth-chainspec",

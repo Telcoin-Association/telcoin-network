@@ -62,6 +62,7 @@ reth-chainspec = { workspace = true }
 reth-cli-util = { workspace = true }
 reth-cli-commands = { workspace = true }
 tikv-jemallocator = { workspace = true, optional = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 reth-basic-payload-builder = { workspace = true }

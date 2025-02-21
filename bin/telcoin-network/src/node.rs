@@ -5,6 +5,7 @@ use crate::{args::clap_genesis_parser, version::SHORT_VERSION};
 use clap::{value_parser, Parser};
 use core::fmt;
 use fdlimit::raise_fd_limit;
+use rayon::ThreadPoolBuilder;
 use reth::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, NetworkArgs, PayloadBuilderArgs,
@@ -18,7 +19,7 @@ use reth_chainspec::ChainSpec;
 use reth_cli_commands::node::NoArgs;
 use reth_cli_util::parse_socket_address;
 use reth_db::{init_db, DatabaseEnv};
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, thread::available_parallelism};
 use tn_config::{Config, ConfigFmt, ConfigTrait, TelcoinDirs as _};
 use tn_node::{
     dirs::{default_datadir_args, DataDirChainPath, DataDirPath},
@@ -150,6 +151,19 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // Raise the fd limit of the process.
         // Does not do anything on windows.
         raise_fd_limit()?;
+
+        // limit global rayon thread pool for batch validator
+        //
+        // ensure 2 cores are reserved unless the system only has 1 core
+        let num_parallel_threads =
+            available_parallelism().map_or(0, |num| num.get().saturating_sub(2).max(1));
+        if let Err(err) = ThreadPoolBuilder::new()
+            .num_threads(num_parallel_threads)
+            .thread_name(|i| format!("tn-rayon-{i}"))
+            .build_global()
+        {
+            error!("Failed to initialize global thread pool for rayon: {}", err)
+        }
 
         // use TN-specific datadir for finding tn-config
         let default_args = default_datadir_args();
