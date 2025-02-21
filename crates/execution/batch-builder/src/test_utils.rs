@@ -1,6 +1,7 @@
 //! Types for testing only.
 
 use crate::{build_batch, BatchBuilderOutput};
+use reth_rpc_eth_types::utils::recover_raw_transaction;
 use reth_transaction_pool::{
     error::InvalidPoolTransactionError,
     identifier::{SenderIdentifiers, TransactionId},
@@ -27,7 +28,7 @@ use tokio::sync::mpsc::{self, Receiver};
 ///
 /// NOTE: this is loosely based on reth's auto-seal consensus
 pub fn execute_test_batch(test_batch: &mut Batch, parent: &SealedHeader) {
-    let pool = TestPool::new(test_batch.transactions.clone());
+    let pool = TestPool::new(&test_batch.transactions);
 
     let parent_info = LastCanonicalUpdate {
         tip: SealedBlock::new(parent.clone(), BlockBody::default()),
@@ -54,13 +55,14 @@ struct TestPool {
 
 impl TestPool {
     /// Create a new instance of Self.
-    fn new(txs: Vec<TransactionSigned>) -> Self {
+    fn new(txs: &[Vec<u8>]) -> Self {
         let mut sender_ids = SenderIdentifiers::default();
         let mut by_id = Vec::with_capacity(txs.len());
         let transactions = txs
-            .into_iter()
+            .iter()
             .map(|tx| {
-                let ecrecovered = tx.into_ecrecovered().expect("tx into ecrecovered");
+                let ecrecovered: RecoveredTx<_> =
+                    recover_raw_transaction::<TransactionSigned>(tx).expect("tx into ecrecovered");
                 let nonce = ecrecovered.nonce();
                 // add to sender ids
                 let id = sender_ids.sender_id_or_create(ecrecovered.signer());

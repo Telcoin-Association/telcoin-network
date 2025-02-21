@@ -431,6 +431,7 @@ mod tests {
         providers::{BlockchainProvider, StaticFileProvider},
         CanonStateSubscriptions as _, ProviderFactory,
     };
+    use reth_rpc_eth_types::utils::recover_raw_transaction;
     use reth_transaction_pool::{
         blobstore::InMemoryBlobStore, CoinbaseTipOrdering, EthPooledTransaction,
         EthTransactionValidator, Pool, PoolConfig, TransactionValidationTaskExecutor,
@@ -613,7 +614,11 @@ mod tests {
         assert_eq!(3, num_block_txs);
 
         // ensure decoded block transaction is transaction1
-        let block_tx = block_txs.first().cloned().expect("one tx in block");
+        let block_tx_bytes = block_txs.first().expect("one tx in block");
+        let block_tx = recover_raw_transaction::<TransactionSigned>(block_tx_bytes)
+            .expect("recover raw tx for test")
+            .into_tx();
+
         assert_eq!(block_tx, transaction1);
 
         // yield to try and give pool a chance to update
@@ -996,8 +1001,10 @@ mod tests {
         assert_eq!(sealed_batch.batch().transactions().len(), 1);
 
         // confirm 4th transaction hash matches one submitted
-        let tx =
+        let tx_bytes =
             sealed_batch.batch().transactions().first().expect("block transactions length is one");
+        let tx = recover_raw_transaction::<TransactionSigned>(tx_bytes)
+            .expect("recover raw tx for test");
         assert_eq!(tx.hash(), expected_tx_hash);
 
         // yield to try and give pool a chance to update

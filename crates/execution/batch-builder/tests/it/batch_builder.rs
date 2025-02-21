@@ -17,6 +17,7 @@ use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     CanonStateSubscriptions, ProviderFactory,
 };
+use reth_rpc_eth_types::utils::recover_raw_transaction;
 use reth_tasks::TaskManager;
 use reth_transaction_pool::{
     blobstore::InMemoryBlobStore, PoolConfig, TransactionPool, TransactionValidationTaskExecutor,
@@ -32,8 +33,8 @@ use tn_storage::{open_db, tables::Batches};
 use tn_test_utils::{get_gas_price, test_genesis, TransactionFactory};
 use tn_types::{
     Address, Batch, BatchValidation, BlockBody, Bytes, Certificate, CommittedSubDag,
-    ConsensusHeader, ConsensusOutput, Database, LastCanonicalUpdate, ReputationScores, SealedBatch,
-    SealedBlock, U160, U256,
+    ConsensusHeader, ConsensusOutput, Database, Encodable2718 as _, LastCanonicalUpdate,
+    ReputationScores, SealedBatch, SealedBlock, TransactionSigned, U160, U256,
 };
 use tn_worker::{
     metrics::WorkerMetrics,
@@ -222,7 +223,11 @@ async fn test_make_batch_el_to_cl() {
 
     // ensure expected transaction is in batch
     let expected_batch = Batch {
-        transactions: vec![transaction1.clone(), transaction2.clone(), transaction3.clone()],
+        transactions: vec![
+            transaction1.encoded_2718(),
+            transaction2.encoded_2718(),
+            transaction3.encoded_2718(),
+        ],
         received_at: None,
         ..*sealed_batch.batch()
     }
@@ -410,7 +415,11 @@ async fn test_batch_builder_produces_valid_batchess() {
 
     // ensure expected transaction is in batch
     let expected_batch = Batch {
-        transactions: vec![transaction1.clone(), transaction2.clone(), transaction3.clone()],
+        transactions: vec![
+            transaction1.encoded_2718(),
+            transaction2.encoded_2718(),
+            transaction3.encoded_2718(),
+        ],
         received_at: None,
         ..*first_batch.batch()
     };
@@ -433,7 +442,10 @@ async fn test_batch_builder_produces_valid_batchess() {
     assert_eq!(next_batch.batch().transactions().len(), 1);
 
     // confirm 4th transaction hash matches one submitted
-    let tx = next_batch.batch().transactions().first().expect("block transactions length is one");
+    let tx_bytes =
+        next_batch.batch().transactions().first().expect("block transactions length is one");
+    let tx =
+        recover_raw_transaction::<TransactionSigned>(tx_bytes).expect("recover raw tx for test");
     assert_eq!(tx.hash(), expected_tx_hash);
 
     // yield to try and give pool a chance to update
@@ -590,7 +602,11 @@ async fn test_canonical_notification_updates_pool() {
 
     // ensure expected transaction is in batch
     let mut first_batch = Batch {
-        transactions: vec![transaction1.clone(), transaction2.clone(), transaction3.clone()],
+        transactions: vec![
+            transaction1.encoded_2718(),
+            transaction2.encoded_2718(),
+            transaction3.encoded_2718(),
+        ],
         ..Default::default()
     };
 

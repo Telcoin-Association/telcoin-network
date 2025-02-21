@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::util::{get_contract_state_for_genesis, spawn_local_testnet};
+    use crate::util::spawn_local_testnet;
     use alloy::{
         network::EthereumWallet,
         primitives::{FixedBytes, Uint},
@@ -12,7 +12,7 @@ mod tests {
     use reth_chainspec::ChainSpec;
     use std::{sync::Arc, time::Duration};
     use tn_config::{test_fetch_file_content_relative_to_manifest, ContractStandardJson};
-    use tn_test_utils::TransactionFactory;
+    use tn_test_utils::{get_contract_state_for_genesis, TransactionFactory};
     use tn_types::{
         adiri_genesis, hex, sol, Address, BlsKeypair, Bytes, GenesisAccount, NetworkKeypair,
         SolValue, U256,
@@ -149,7 +149,7 @@ mod tests {
         let gas_price = 7;
         let gas_limit = 3_000_000;
         let pre_genesis_chain: Arc<ChainSpec> = Arc::new(tmp_genesis.into());
-        let registry_tx_raw = tx_factory.create_eip1559(
+        let registry_tx_raw = tx_factory.create_eip1559_encoded(
             tmp_chain.clone(),
             Some(gas_limit),
             gas_price,
@@ -159,7 +159,7 @@ mod tests {
         );
         // registry deployment will be `factory_address`'s first tx
         let registry_proxy_address = factory_address.create(0);
-        let initialize_tx_raw = tx_factory.create_eip1559(
+        let initialize_tx_raw = tx_factory.create_eip1559_encoded(
             tmp_chain.clone(),
             Some(gas_limit),
             gas_price,

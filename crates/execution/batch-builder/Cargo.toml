@@ -31,6 +31,9 @@ thiserror = { workspace = true }
 alloy-rlp = { workspace = true }
 async-trait = { workspace = true }
 
+# test-utils
+reth-rpc-eth-types = { workspace = true, optional = true }
+
 [dev-dependencies]
 # unit tests
 tn-node-traits = { workspace = true }
@@ -62,4 +65,4 @@ reth-node-ethereum = { workspace = true }
 
 [features]
 default = []
-test-utils = []
+test-utils = ["reth-rpc-eth-types"]

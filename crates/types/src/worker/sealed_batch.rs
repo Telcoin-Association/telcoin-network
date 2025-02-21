@@ -5,7 +5,7 @@
 
 use crate::{
     adiri_chain_spec, crypto, encode, now, Address, BlockHash, ExecHeader, SealedBlock,
-    TimestampSec, TransactionSigned, TransactionTrait as _, MIN_PROTOCOL_BASE_FEE,
+    TimestampSec, MIN_PROTOCOL_BASE_FEE,
 };
 use fastcrypto::hash::HashFunction;
 use serde::{Deserialize, Serialize};
@@ -71,8 +71,8 @@ impl SealedBatch {
 /// The batch for workers to communicate for consensus.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Batch {
-    /// The collection of transactions executed in this batch.
-    pub transactions: Vec<TransactionSigned>,
+    /// The collection of transactions in this batch as bytes.
+    pub transactions: Vec<Vec<u8>>,
     /// The Keccak 256-bit hash of the parent
     /// batch’s header, in its entirety; formally Hp.
     pub parent_hash: BlockHash,
@@ -101,7 +101,7 @@ impl Batch {
     /// Create a new batch for testing only!
     ///
     /// This is NOT a valid batch for consensus.
-    pub fn new_for_test(transactions: Vec<TransactionSigned>, header: ExecHeader) -> Self {
+    pub fn new_for_test(transactions: Vec<Vec<u8>>, header: ExecHeader) -> Self {
         Self {
             transactions,
             parent_hash: header.parent_hash,
@@ -132,29 +132,14 @@ impl Batch {
         self.timestamp
     }
 
-    /// Pass a reference to a Vec<Transaction>;
-    pub fn transactions(&self) -> &Vec<TransactionSigned> {
+    /// Pass a reference to a collection of transaction bytes;
+    pub fn transactions(&self) -> &Vec<Vec<u8>> {
         &self.transactions
     }
 
-    /// Returns a mutable reference to a Vec<Transaction>.
-    pub fn transactions_mut(&mut self) -> &mut Vec<TransactionSigned> {
+    /// Returns a mutable reference to a collection of transaction bytes.
+    pub fn transactions_mut(&mut self) -> &mut Vec<Vec<u8>> {
         &mut self.transactions
-    }
-
-    /// Return the max possible gas the contained transactions could use.
-    /// Does not execute transactions, just sums up there gas limit.
-    pub fn total_possible_gas(&self) -> u64 {
-        let mut total_possible_gas = 0;
-
-        // begin loop through sorted "best" transactions in pending pool
-        // and execute them to build the batch
-        for tx in &self.transactions {
-            // txs are not executed, so use the gas_limit
-            total_possible_gas += tx.gas_limit();
-        }
-
-        total_possible_gas
     }
 
     /// Returns the received at time if available.
@@ -252,7 +237,9 @@ pub enum BatchValidationError {
         /// The executed block hash of the missing canonical chain header.
         block_hash: BlockHash,
     },
-
+    /// Empty batch.
+    #[error("Batch contains no transactions")]
+    EmptyBatch,
     /// Error when the max gas included in the header exceeds the batch's gas limit.
     #[error("Peer's batch total possible gas ({total_possible_gas}) is greater than batch's gas limit ({gas_limit})")]
     HeaderMaxGasExceedsGasLimit {
@@ -265,10 +252,11 @@ pub enum BatchValidationError {
     /// Error while calculating max possible gas from icluded transactions.
     #[error("Unable to reduce max possible gas limit for peer's batch")]
     CalculateMaxPossibleGas,
-    /// Error while calculating size (in bytes) of icluded transactions.
-    #[error("Unable to reduce size of transactions (in bytes) for peer's batch")]
-    CalculateTransactionByteSize,
     /// Error when peer's transaction list exceeds the maximum bytes allowed.
     #[error("Peer's transactions exceed max byte size: {0}")]
     HeaderTransactionBytesExceedsMax(usize),
+    /// Error trying to decode a transaction in a peer's batch.
+    /// If any transaction fails to decode, the entire batch validation fails.
+    #[error("Failed to decode transaction for batch {0}: {1}")]
+    RecoverTransaction(BlockHash, String),
 }

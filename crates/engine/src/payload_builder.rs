@@ -8,7 +8,6 @@ use reth_blockchain_tree::{BlockValidationKind, BlockchainTreeEngine};
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
 use reth_execution_types::ExecutionOutcome;
-use reth_primitives_traits::SignedTransaction as _;
 use reth_provider::{CanonChainTracker, ChainSpecProvider, StateProviderFactory};
 use reth_revm::{
     cached::CachedReads,
@@ -17,6 +16,7 @@ use reth_revm::{
     primitives::{EVMError, EnvWithHandlerCfg, FixedBytes, ResultAndState, TxEnv},
     DatabaseCommit, State,
 };
+use reth_rpc_eth_types::utils::recover_raw_transaction;
 use std::sync::Arc;
 use tn_node_traits::{BuildArguments, TNPayload, TNPayloadAttributes};
 use tn_types::{
@@ -253,13 +253,15 @@ where
     let env = EnvWithHandlerCfg::new_with_cfg_env(cfg.clone(), block_env.clone(), TxEnv::default());
     let mut evm = evm_config.evm_with_env(&mut db, env);
 
-    for tx in batch.transactions {
-        let recovered = if let Some(signer) = tx.recover_signer() {
-            tx.with_signer(signer)
-        } else {
-            error!(target: "engine", "Could not recover signer for {tx:?}");
-            return Err(TnEngineError::MissingSigner);
-        };
+    for tx_bytes in &batch.transactions {
+        let recovered =
+            recover_raw_transaction::<TransactionSigned>(tx_bytes).inspect_err(|e| {
+                error!(
+                target: "engine",
+                batch=?batch.digest(),
+                ?tx_bytes,
+                "failed to recover signer: {e}")
+            })?;
 
         // Configure the environment for the tx.
         *evm.tx_mut() = evm_config.tx_env(recovered.tx(), recovered.signer());

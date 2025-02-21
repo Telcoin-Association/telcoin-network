@@ -1,18 +1,19 @@
 //! Block validator
 
+use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use reth_node_types::NodeTypesWithDB;
-use reth_primitives_traits::InMemorySize as _;
 use reth_provider::{
     providers::{BlockchainProvider, TreeNodeTypes},
     BlockIdReader, HeaderProvider,
 };
+use reth_rpc_eth_types::utils::recover_raw_transaction;
 use tn_types::{
-    max_batch_gas, max_batch_size, BatchValidation, BatchValidationError, ExecHeader, SealedBatch,
-    TransactionSigned,
+    max_batch_gas, max_batch_size, BatchValidation, BatchValidationError, BlockHash, ExecHeader,
+    SealedBatch, TransactionSigned, TransactionTrait as _, PARALLEL_SENDER_RECOVERY_THRESHOLD,
 };
 
 /// Type convenience for implementing block validation errors.
-type BlockValidationResult<T> = Result<T, BatchValidationError>;
+type BatchValidationResult<T> = Result<T, BatchValidationError>;
 
 /// Block validator
 #[derive(Clone)]
@@ -31,7 +32,7 @@ where
     /// Validate a peer's batch.
     ///
     /// Workers do not execute full batches. This method validates the required information.
-    fn validate_batch(&self, sealed_batch: SealedBatch) -> BlockValidationResult<()> {
+    fn validate_batch(&self, sealed_batch: SealedBatch) -> BatchValidationResult<()> {
         // ensure digest matches batch
         let (batch, digest) = sealed_batch.split();
         let verified_hash = batch.clone().seal_slow().digest();
@@ -69,15 +70,16 @@ where
         // validate timestamp vs parent
         self.validate_against_parent_timestamp(batch.timestamp, &parent)?;
 
-        // validate gas limit
-        self.validate_batch_gas(batch.total_possible_gas(), batch.timestamp)?;
-
         // validate batch size (bytes)
         self.validate_batch_size_bytes(transactions, batch.timestamp)?;
 
-        // validate beneficiary?
-        // no - tips would go to someone else
+        // validate txs decode
+        let decoded_txs = self.decode_transactions(transactions, digest)?;
 
+        // validate gas limit
+        self.validate_batch_gas(&decoded_txs, batch.timestamp)?;
+
+        // no-op
         self.validate_basefee()?;
         Ok(())
     }
@@ -98,7 +100,7 @@ where
         &self,
         timestamp: u64,
         parent: &ExecHeader,
-    ) -> BlockValidationResult<()> {
+    ) -> BatchValidationResult<()> {
         if timestamp <= parent.timestamp {
             return Err(BatchValidationError::TimestampIsInPast {
                 parent_timestamp: parent.timestamp,
@@ -108,38 +110,18 @@ where
         Ok(())
     }
 
-    /// Possible gas used needs to be less than block's gas limit.
-    ///
-    /// Actual amount of gas used cannot be determined until execution.
-    #[inline]
-    fn validate_batch_gas(
-        &self,
-        total_possible_gas: u64,
-        timestamp: u64,
-    ) -> BlockValidationResult<()> {
-        // ensure total tx gas limit fits into block's gas limit
-        let max_tx_gas = max_batch_gas(timestamp);
-        if total_possible_gas > max_tx_gas {
-            return Err(BatchValidationError::HeaderMaxGasExceedsGasLimit {
-                total_possible_gas,
-                gas_limit: max_tx_gas,
-            });
-        }
-        Ok(())
-    }
-
     /// Validate the size of transactions (in bytes).
     fn validate_batch_size_bytes(
         &self,
-        transactions: &[TransactionSigned],
+        transactions: &[Vec<u8>],
         timestamp: u64,
-    ) -> BlockValidationResult<()> {
+    ) -> BatchValidationResult<()> {
         // calculate size (in bytes) of included transactions
         let total_bytes = transactions
             .iter()
-            .map(|tx| tx.size())
+            .map(|tx| tx.len())
             .reduce(|total, size| total + size)
-            .ok_or(BatchValidationError::CalculateTransactionByteSize)?;
+            .ok_or(BatchValidationError::EmptyBatch)?;
         let max_tx_bytes = max_batch_size(timestamp);
 
         // allow txs that equal max tx bytes
@@ -150,9 +132,70 @@ where
         Ok(())
     }
 
-    /// TODO: Validate the block's basefee
-    fn validate_basefee(&self) -> BlockValidationResult<()> {
+    /// Decode transactions to ensure encode/decode is valid.
+    ///
+    /// The decoded transactions are then used to validate max batch gas.
+    #[inline]
+    fn decode_transactions(
+        &self,
+        transactions: &Vec<Vec<u8>>,
+        digest: BlockHash,
+    ) -> BatchValidationResult<Vec<TransactionSigned>> {
+        if transactions.len() < *PARALLEL_SENDER_RECOVERY_THRESHOLD {
+            transactions
+                .iter()
+                .map(|tx| Self::recover_and_validate(tx, digest))
+                .collect::<BatchValidationResult<Vec<_>>>()
+        } else {
+            transactions
+                .par_iter()
+                .map(|tx| Self::recover_and_validate(tx, digest))
+                .collect::<BatchValidationResult<Vec<_>>>()
+        }
+    }
+
+    /// Possible gas used needs to be less than block's gas limit.
+    ///
+    /// Actual amount of gas used cannot be determined until execution.
+    #[inline]
+    fn validate_batch_gas(
+        &self,
+        transactions: &[TransactionSigned],
+        timestamp: u64,
+    ) -> BatchValidationResult<()> {
+        // calculate total using tx gas limit
+        let total_possible_gas = transactions
+            .iter()
+            .map(|tx| tx.gas_limit())
+            .reduce(|total, size| total + size)
+            .ok_or(BatchValidationError::EmptyBatch)?;
+
+        // ensure total tx gas limit fits into block's gas limit
+        let max_tx_gas = max_batch_gas(timestamp);
+        if total_possible_gas > max_tx_gas {
+            return Err(BatchValidationError::HeaderMaxGasExceedsGasLimit {
+                total_possible_gas,
+                gas_limit: max_tx_gas,
+            });
+        }
+
         Ok(())
+    }
+
+    /// TODO: Validate the block's basefee
+    fn validate_basefee(&self) -> BatchValidationResult<()> {
+        Ok(())
+    }
+
+    /// Helper function for decoding and recovering transactions.
+    #[inline]
+    fn recover_and_validate(
+        tx: &[u8],
+        digest: BlockHash,
+    ) -> BatchValidationResult<TransactionSigned> {
+        recover_raw_transaction::<TransactionSigned>(tx)
+            .map(|recovered| recovered.into_tx())
+            .map_err(|e| BatchValidationError::RecoverTransaction(digest, e.to_string()))
     }
 }
 
@@ -188,8 +231,8 @@ mod tests {
     use tn_node_traits::{TNExecution, TelcoinNode};
     use tn_test_utils::{test_genesis, TransactionFactory};
     use tn_types::{
-        adiri_genesis, hex_literal::hex, max_batch_gas, Address, Batch, Bytes, GenesisAccount,
-        B256, MIN_PROTOCOL_BASE_FEE, U256,
+        adiri_genesis, hex_literal::hex, max_batch_gas, Address, Batch, Bytes, Encodable2718 as _,
+        GenesisAccount, B256, MIN_PROTOCOL_BASE_FEE, U256,
     };
     use tracing::debug;
 
@@ -201,9 +244,10 @@ mod tests {
         let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
         let gas_price = 7;
         let chain: Arc<ChainSpec> = Arc::new(test_genesis().into());
+        let genesis_hash = chain.genesis_hash();
 
         // create 3 transactions
-        let transaction1 = tx_factory.create_eip1559(
+        let transaction1 = tx_factory.create_eip1559_encoded(
             chain.clone(),
             None,
             gas_price,
@@ -212,7 +256,7 @@ mod tests {
             Bytes::new(),
         );
 
-        let transaction2 = tx_factory.create_eip1559(
+        let transaction2 = tx_factory.create_eip1559_encoded(
             chain.clone(),
             None,
             gas_price,
@@ -221,7 +265,7 @@ mod tests {
             Bytes::new(),
         );
 
-        let transaction3 = tx_factory.create_eip1559(
+        let transaction3 = tx_factory.create_eip1559_encoded(
             chain,
             None,
             gas_price,
@@ -233,8 +277,7 @@ mod tests {
         let valid_txs = vec![transaction1, transaction2, transaction3];
         let batch = Batch {
             transactions: valid_txs,
-            parent_hash: hex!("a0673579c1a31037ee29a7e3cb7b1495a020bf21d958269ea8291a64326667c5")
-                .into(),
+            parent_hash: genesis_hash,
             beneficiary: Address::ZERO,
             timestamp,
             base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
@@ -246,7 +289,7 @@ mod tests {
         // intentionally used hard-coded values
         SealedBatch::new(
             batch,
-            hex!("c86c3bf24b98a87f19d204dc00a91f9d0a25e22c60f5f91fd864d31d534a06f5").into(),
+            hex!("9f0a6a575088d4aa97eb832e8486a5647109d82e90747c735285393db1d65271").into(),
         )
     }
 
@@ -380,7 +423,7 @@ mod tests {
         let chain: Arc<ChainSpec> = Arc::new(test_genesis().into());
 
         // create transaction with max gas limit above the max allowed
-        let invalid_transaction = tx_factory.create_eip1559(
+        let invalid_transaction = tx_factory.create_eip1559_encoded(
             chain.clone(),
             Some(max_batch_gas(batch.timestamp) + 1),
             gas_price,
@@ -400,9 +443,12 @@ mod tests {
             received_at,
         };
 
+        let decoded_txs = validator
+            .decode_transactions(invalid_batch.transactions(), invalid_batch.digest())
+            .expect("txs decode correctly");
+
         assert_matches!(
-            validator
-                .validate_batch_gas(invalid_batch.total_possible_gas(), invalid_batch.timestamp),
+            validator.validate_batch_gas(&decoded_txs, invalid_batch.timestamp),
             Err(BatchValidationError::HeaderMaxGasExceedsGasLimit {
                 total_possible_gas: _,
                 gas_limit: _
@@ -433,30 +479,31 @@ mod tests {
         let genesis = genesis.extend_accounts(account);
         let chain: Arc<ChainSpec> = Arc::new(genesis.into());
 
-        // currently: 4695 txs at 1000035 bytes
+        // currently: 9714 txs
         let mut too_many_txs = Vec::new();
         let mut total_bytes = 0;
         while total_bytes < max_batch_size(0) {
-            let tx = tx_factory.create_explicit_eip1559(
-                Some(chain.chain.id()),
-                None,                    // default nonce
-                None,                    // no tip
-                Some(7),                 // min basefee for block 1
-                Some(1),                 // low gas limit to prevent excess gas used error
-                Some(Address::random()), // send to random address
-                Some(U256::from(100)),   // send low amount
-                None,                    // no input
-                None,                    // no access list
-            );
+            let tx = tx_factory
+                .create_explicit_eip1559(
+                    Some(chain.chain.id()),
+                    None,                    // default nonce
+                    None,                    // no tip
+                    Some(7),                 // min basefee for block 1
+                    Some(1),                 // low gas limit to prevent excess gas used error
+                    Some(Address::random()), // send to random address
+                    Some(U256::from(100)),   // send low amount
+                    None,                    // no input
+                    None,                    // no access list
+                )
+                .encoded_2718();
 
             // track totals
-            total_bytes += tx.size();
+            total_bytes += tx.len();
             too_many_txs.push(tx);
         }
 
         // NOTE: these assertions aren't important but want to know if tx size changes
-        assert_eq!(total_bytes, 1_000_035);
-        assert_eq!(too_many_txs.len(), 4695);
+        assert_eq!(too_many_txs.len(), 9714);
 
         // update header so tx root is correct
         let (mut block, _hash) = valid_batch.split();
@@ -486,15 +533,44 @@ mod tests {
         );
 
         // NOTE: the actual size just needs to be above 1MB but want to know if tx size ever changes
-        let too_big = giant_tx.size();
-        assert_eq!(too_big, 1_000_213);
+        let too_big = giant_tx.encoded_2718();
+        let expected_len = too_big.len();
+        assert_eq!(expected_len, 1_000_090);
 
-        let invalid_txs = vec![giant_tx];
+        let invalid_txs = vec![too_big];
         block.transactions = invalid_txs;
         let invalid_batch = block.seal_slow();
         assert_matches!(
             validator.validate_batch(invalid_batch),
-            Err(BatchValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == too_big
+            Err(BatchValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == expected_len
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_batch_empty_transactions() {
+        let TestTools { valid_batch, validator } = test_tools().await;
+        let (mut batch, _) = valid_batch.split();
+
+        // test batch with no transactions
+        batch.transactions = Vec::with_capacity(0);
+
+        assert_matches!(
+            validator.validate_batch(batch.clone().seal_slow()),
+            Err(BatchValidationError::EmptyBatch)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_batch_decode_transactions() {
+        let TestTools { valid_batch, validator } = test_tools().await;
+        let (mut batch, _) = valid_batch.split();
+
+        // test batch with bad decode
+        batch.transactions = vec![b"this is a bad batch".to_vec()];
+
+        assert_matches!(
+            validator.validate_batch(batch.clone().seal_slow()),
+            Err(BatchValidationError::RecoverTransaction(_, _))
         );
     }
 }

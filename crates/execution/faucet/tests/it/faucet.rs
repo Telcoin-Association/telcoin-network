@@ -15,9 +15,10 @@ use gcloud_sdk::{
 };
 use jsonrpsee::{core::client::ClientT, rpc_params};
 use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicKey as PubKey};
-use reth::core::primitives::SignedTransaction;
+use reth::{
+    core::primitives::SignedTransaction, rpc::server_types::eth::utils::recover_raw_transaction,
+};
 use reth_chainspec::ChainSpec;
-use reth_provider::ExecutionOutcome;
 use reth_transaction_pool::TransactionPool;
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
@@ -27,12 +28,11 @@ use tn_faucet::Drip;
 use tn_network_types::local::LocalNetwork;
 use tn_storage::open_db;
 use tn_test_utils::{
-    default_test_execution_node, execution_outcome_for_tests, faucet_test_execution_node,
-    TransactionFactory,
+    faucet_test_execution_node, get_contract_state_for_genesis, TransactionFactory,
 };
 use tn_types::{
-    adiri_genesis, error::BlockSealError, hex, public_key_to_address, sol, Address, Batch,
-    GenesisAccount, Notifier, SealedBatch, SolType, SolValue, TaskManager, TransactionSigned,
+    adiri_genesis, error::BlockSealError, hex, public_key_to_address, sol, Address, GenesisAccount,
+    Notifier, SealedBatch, SolType, SolValue, TaskManager, TransactionSigned,
     TransactionTrait as _, B256, U160, U256,
 };
 use tn_worker::{
@@ -188,7 +188,7 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
     // assemble eip1559 transactions using constructed datas
     let pre_genesis_chain: Arc<ChainSpec> = Arc::new(tmp_genesis.into());
     let gas_price = 100;
-    let faucet_tx_raw = tx_factory.create_eip1559(
+    let faucet_tx_raw = tx_factory.create_eip1559_encoded(
         pre_genesis_chain.clone(),
         None,
         gas_price,
@@ -199,7 +199,7 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
 
     // faucet deployment will be `factory_address`'s first transaction
     let faucet_proxy_address = factory_address.create(0);
-    let role_tx_raw = tx_factory.create_eip1559(
+    let role_tx_raw = tx_factory.create_eip1559_encoded(
         pre_genesis_chain.clone(),
         None,
         gas_price,
@@ -290,7 +290,10 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
         time::timeout(duration, next_batch.recv()).await?.expect("batch received");
 
     let batch_txs = new_batch.batch().transactions();
-    let tx = batch_txs.first().expect("first batch tx from faucet");
+    let tx_bytes = batch_txs.first().expect("first batch tx from faucet");
+    let tx = recover_raw_transaction::<TransactionSigned>(tx_bytes)
+        .expect("recover raw tx for test")
+        .into_tx();
 
     // assert recovered transaction
     assert_eq!(tx_hash, tx.tx_hash().to_string());
@@ -498,7 +501,7 @@ async fn test_with_creds_faucet_transfers_stablecoin_with_google_kms() -> eyre::
     // assemble eip1559 transactions using constructed datas
     let pre_genesis_chain: Arc<ChainSpec> = Arc::new(tmp_genesis.into());
     let gas_price = 100;
-    let faucet_tx_raw = tx_factory.create_eip1559(
+    let faucet_tx_raw = tx_factory.create_eip1559_encoded(
         pre_genesis_chain.clone(),
         None,
         gas_price,
@@ -507,7 +510,7 @@ async fn test_with_creds_faucet_transfers_stablecoin_with_google_kms() -> eyre::
         faucet_create_data.clone().into(),
     );
 
-    let role_tx_raw = tx_factory.create_eip1559(
+    let role_tx_raw = tx_factory.create_eip1559_encoded(
         pre_genesis_chain.clone(),
         None,
         gas_price,
@@ -516,7 +519,7 @@ async fn test_with_creds_faucet_transfers_stablecoin_with_google_kms() -> eyre::
         grant_role_call,
     );
 
-    let minter_tx_raw = tx_factory.create_eip1559(
+    let minter_tx_raw = tx_factory.create_eip1559_encoded(
         pre_genesis_chain.clone(),
         None,
         gas_price,
@@ -600,7 +603,10 @@ async fn test_with_creds_faucet_transfers_stablecoin_with_google_kms() -> eyre::
     // send ack
     let _ = ack.send(Ok(()));
     let batch_txs = new_batch.batch().transactions();
-    let tx = batch_txs.first().expect("first batch tx from faucet");
+    let tx_bytes = batch_txs.first().expect("first batch tx from faucet");
+    let tx = recover_raw_transaction::<TransactionSigned>(tx_bytes)
+        .expect("recover raw tx for test")
+        .into_tx();
 
     let contract_params: Vec<u8> = Drip::abi_encode_params(&(&contract_address, &user_address));
 
@@ -749,26 +755,4 @@ async fn set_google_kms_public_key_env_var() -> eyre::Result<()> {
     std::env::set_var("FAUCET_PUBLIC_KEY", kms_pem_pubkey);
 
     Ok(())
-}
-
-async fn get_contract_state_for_genesis(
-    chain: Arc<ChainSpec>,
-    raw_txs_to_execute: Vec<TransactionSigned>,
-) -> eyre::Result<ExecutionOutcome> {
-    // create execution components
-    let execution_node = default_test_execution_node(Some(chain.clone()), None)?;
-    let provider = execution_node.get_provider().await;
-    let batch_executor = execution_node.get_batch_executor().await;
-
-    // execute batch
-    let parent = chain.sealed_genesis_header();
-    let batch = Batch {
-        transactions: raw_txs_to_execute,
-        parent_hash: parent.hash(),
-        ..Default::default()
-    };
-    let execution_outcome =
-        execution_outcome_for_tests(&batch, &parent, &provider, &batch_executor);
-
-    Ok(execution_outcome)
 }

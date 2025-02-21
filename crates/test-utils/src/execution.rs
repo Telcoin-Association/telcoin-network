@@ -12,9 +12,10 @@ use reth_db::{
 };
 use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, Executor as _};
 use reth_node_core::{args::DatadirArgs, node_config::NodeConfig};
-use reth_primitives_traits::{crypto::secp256k1::sign_message, SignedTransaction as _};
+use reth_primitives_traits::crypto::secp256k1::sign_message;
 use reth_provider::{BlockReaderIdExt, ExecutionOutcome, StateProviderFactory};
 use reth_revm::database::StateProviderDatabase;
+use reth_rpc_eth_types::utils::recover_raw_transaction;
 use reth_transaction_pool::{EthPooledTransaction, TransactionOrigin, TransactionPool};
 use secp256k1::Secp256k1;
 use std::{str::FromStr, sync::Arc};
@@ -26,9 +27,9 @@ use tn_node::engine::{ExecutionNode, TnBuilder};
 use tn_node_traits::TelcoinNode;
 use tn_types::{
     adiri_genesis, calculate_transaction_root, now, public_key_to_address, AccessList, Address,
-    Batch, Block, BlockBody, BlockExt as _, BlockHeader as _, Bytes, EthPrimitives, EthSignature,
-    ExecHeader, ExecutionKeypair, Genesis, GenesisAccount, SealedHeader,
-    SignedTransactionIntoRecoveredExt as _, TaskManager, TimestampSec, Transaction,
+    Batch, Block, BlockBody, BlockExt as _, BlockHeader as _, Bytes, Encodable2718 as _,
+    EthPrimitives, EthSignature, ExecHeader, ExecutionKeypair, Genesis, GenesisAccount,
+    SealedHeader, SignedTransactionIntoRecoveredExt as _, TaskManager, TimestampSec, Transaction,
     TransactionSigned, TxEip1559, TxHash, TxKind, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH,
     EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE, U256,
 };
@@ -215,12 +216,17 @@ pub fn seeded_genesis_from_random_batch(
     genesis: Genesis,
     batch: &Batch,
 ) -> (Genesis, Vec<TransactionSigned>, Vec<Address>) {
-    let mut senders = vec![];
-    let mut accounts_to_seed = Vec::new();
+    let max_capacity = batch.transactions.len();
+    let mut decoded_txs = Vec::with_capacity(max_capacity);
+    let mut senders = Vec::with_capacity(max_capacity);
+    let mut accounts_to_seed = Vec::with_capacity(max_capacity);
 
     // loop through the transactions
-    for tx_signed in batch.transactions() {
-        let address = tx_signed.recover_signer().expect("signer recoverable");
+    for tx_bytes in &batch.transactions {
+        let (tx, address) = recover_raw_transaction::<TransactionSigned>(tx_bytes)
+            .expect("raw transaction recovered")
+            .into_parts();
+        decoded_txs.push(tx);
         senders.push(address);
         // fund account with 99mil TEL
         let account = (
@@ -231,7 +237,7 @@ pub fn seeded_genesis_from_random_batch(
         );
         accounts_to_seed.push(account);
     }
-    (genesis.extend_accounts(accounts_to_seed), batch.transactions().clone(), senders)
+    (genesis.extend_accounts(accounts_to_seed), decoded_txs, senders)
 }
 
 /// Helper function to seed an instance of Genesis with random batches.
@@ -324,9 +330,11 @@ where
 
     // decode batch transactions
     let mut txs = vec![];
-    for tx in batch.transactions() {
-        let tx_signed = tx.clone();
-        txs.push(tx_signed);
+    for tx_bytes in batch.transactions() {
+        let tx = recover_raw_transaction::<TransactionSigned>(tx_bytes)
+            .expect("raw transaction recovered for test")
+            .into_tx();
+        txs.push(tx);
     }
 
     // update header's transactions root
@@ -422,6 +430,19 @@ impl TransactionFactory {
     /// Increment nonce after a transaction was created and signed.
     pub fn inc_nonce(&mut self) {
         self.nonce += 1;
+    }
+
+    /// Create a signed EIP1559 transaction and encode it.
+    pub fn create_eip1559_encoded(
+        &mut self,
+        chain: Arc<ChainSpec>,
+        gas_limit: Option<u64>,
+        gas_price: u128,
+        to: Option<Address>,
+        value: U256,
+        input: Bytes,
+    ) -> Vec<u8> {
+        self.create_eip1559(chain, gas_limit, gas_price, to, value, input).encoded_2718()
     }
 
     /// Create and sign an EIP1559 transaction.
@@ -584,4 +605,26 @@ where
         .expect("latest header from provider for gas price")
         .expect("latest header is some for gas price");
     header.next_block_base_fee(BaseFeeParams::ethereum()).unwrap_or_default().into()
+}
+
+/// Test utility to get desired state changes from a temporary genesis for a subsequent one.
+pub async fn get_contract_state_for_genesis(
+    chain: Arc<ChainSpec>,
+    raw_txs_to_execute: Vec<Vec<u8>>,
+) -> eyre::Result<ExecutionOutcome> {
+    let execution_node = default_test_execution_node(Some(chain.clone()), None)?;
+    let provider = execution_node.get_provider().await;
+    let batch_executor = execution_node.get_batch_executor().await;
+
+    // execute batch
+    let parent = chain.sealed_genesis_header();
+    let batch = Batch {
+        transactions: raw_txs_to_execute,
+        parent_hash: parent.hash(),
+        ..Default::default()
+    };
+    let execution_outcome =
+        execution_outcome_for_tests(&batch, &parent, &provider, &batch_executor);
+
+    Ok(execution_outcome)
 }

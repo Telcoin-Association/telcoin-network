@@ -3,6 +3,7 @@
 use reth_blockchain_tree::error::InsertBlockError;
 use reth_errors::{CanonicalError, ProviderError, RethError};
 use reth_revm::primitives::EVMError;
+use reth_rpc_eth_types::EthApiError;
 use tn_types::BatchConversionError;
 use tokio::sync::oneshot;
 
@@ -21,6 +22,9 @@ pub enum TnEngineError {
     /// Error during EVM execution.
     #[error("evm execution error: {0}")]
     EvmExecution(#[from] EVMError<ProviderError>),
+    /// Error recovering transaction from bytes.
+    #[error(transparent)]
+    RecoverTransactionBytes(#[from] EthApiError),
     /// Error converting block to `SealedBlockWithSenders`.
     #[error(transparent)]
     Block(#[from] BatchConversionError),

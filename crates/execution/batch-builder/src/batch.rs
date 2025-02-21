@@ -10,8 +10,8 @@ use crate::error::BatchBuilderError;
 use reth_primitives_traits::InMemorySize as _;
 use reth_transaction_pool::{error::InvalidPoolTransactionError, PoolTransaction, TransactionPool};
 use tn_types::{
-    max_batch_gas, max_batch_size, now, Batch, BatchBuilderArgs, PendingBlockConfig,
-    TransactionSigned, TransactionTrait as _, TxHash,
+    max_batch_gas, max_batch_size, now, Batch, BatchBuilderArgs, Encodable2718 as _,
+    PendingBlockConfig, TransactionSigned, TransactionTrait as _, TxHash,
 };
 use tracing::{debug, warn};
 
@@ -116,11 +116,9 @@ where
 
         // append transaction to the list of executed transactions
         mined_transactions.push(*pool_tx.hash());
-        transactions.push(tx.into_tx());
+        transactions.push(tx.into_tx().encoded_2718());
     }
 
-    // TODO: use ms for batch and sec for final block?
-    //
     // sometimes batch are produced too quickly in certain configs (<1s diff)
     // resulting in batch timestamp == parent timestamp
     //

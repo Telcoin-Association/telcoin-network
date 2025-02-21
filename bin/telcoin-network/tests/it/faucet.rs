@@ -7,11 +7,8 @@
 //! signature to be EVM compatible. The faucet service does all of this and
 //! then submits the transaction to the RPC Transaction Pool for the next batch.
 
-use crate::util::{
-    ensure_account_balance_infinite_loop, get_contract_state_for_genesis, spawn_local_testnet,
-    IT_TEST_MUTEX,
-};
-use alloy::{eips::eip2718::Encodable2718, network::EthereumWallet, providers::ProviderBuilder};
+use crate::util::{ensure_account_balance_infinite_loop, spawn_local_testnet, IT_TEST_MUTEX};
+use alloy::{network::EthereumWallet, providers::ProviderBuilder};
 use futures::{stream::FuturesUnordered, StreamExt};
 use gcloud_sdk::{
     google::cloud::kms::v1::{
@@ -25,9 +22,10 @@ use reth_chainspec::ChainSpec;
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
 use tn_config::{test_fetch_file_content_relative_to_manifest, ContractStandardJson};
-use tn_test_utils::TransactionFactory;
+use tn_test_utils::{get_contract_state_for_genesis, TransactionFactory};
 use tn_types::{
-    adiri_genesis, hex, public_key_to_address, sol, Address, GenesisAccount, SolValue, B256, U256,
+    adiri_genesis, hex, public_key_to_address, sol, Address, Encodable2718 as _, GenesisAccount,
+    SolValue, B256, U256,
 };
 use tokio::{task::JoinHandle, time::timeout};
 use tracing::{debug, info};
@@ -207,7 +205,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
     // assemble eip1559 transactions using constructed datas
     let pre_genesis_chain: Arc<ChainSpec> = Arc::new(tmp_genesis.into());
     let gas_price = 100;
-    let faucet_tx_raw = tx_factory.create_eip1559(
+    let faucet_tx_raw = tx_factory.create_eip1559_encoded(
         pre_genesis_chain.clone(),
         None,
         gas_price,
@@ -216,7 +214,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
         faucet_create_data.clone().into(),
     );
 
-    let stablecoin_tx_raw = tx_factory.create_eip1559(
+    let stablecoin_tx_raw = tx_factory.create_eip1559_encoded(
         pre_genesis_chain.clone(),
         None,
         gas_price,
@@ -225,7 +223,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
         stablecoin_create_data.clone().into(),
     );
 
-    let role_tx_raw = tx_factory.create_eip1559(
+    let role_tx_raw = tx_factory.create_eip1559_encoded(
         pre_genesis_chain.clone(),
         None,
         gas_price,
@@ -234,7 +232,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
         grant_role_call,
     );
 
-    let updatexyz_tx_raw = tx_factory.create_eip1559(
+    let updatexyz_tx_raw = tx_factory.create_eip1559_encoded(
         pre_genesis_chain.clone(),
         None,
         gas_price,
@@ -243,7 +241,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
         updatexyz_call,
     );
 
-    let minter_tx_raw = tx_factory.create_eip1559(
+    let minter_tx_raw = tx_factory.create_eip1559_encoded(
         pre_genesis_chain.clone(),
         None,
         gas_price,

@@ -14,83 +14,11 @@ use std::{
 use tn_types::{
     adiri_chain_spec_arc, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash,
     BlsKeypair, BlsSignature, Bytes, Certificate, CertificateDigest, Committee, Epoch, ExecHeader,
-    HeaderBuilder, ProtocolSignature, Round, Stake, TimestampSec, TransactionSigned, WorkerId,
-    U256,
+    HeaderBuilder, ProtocolSignature, Round, Stake, TimestampSec, WorkerId, U256,
 };
-
-pub const VOTES_CF: &str = "votes";
-pub const HEADERS_CF: &str = "headers";
-pub const CERTIFICATES_CF: &str = "certificates";
-pub const CERTIFICATE_DIGEST_BY_ROUND_CF: &str = "certificate_digest_by_round";
-pub const CERTIFICATE_DIGEST_BY_ORIGIN_CF: &str = "certificate_digest_by_origin";
-pub const PAYLOAD_CF: &str = "payload";
-
-#[macro_export]
-macro_rules! test_channel {
-    ($e:expr) => {
-        consensus_metrics::metered_channel::channel(
-            $e,
-            &prometheus::IntGauge::new("TEST_COUNTER", "test counter").unwrap(),
-        );
-    };
-}
-
-/// Note: use the following macros to initialize your Primary / Consensus channels
-/// if your test is spawning a primary and you encounter an `AllReg` error.
-///
-/// Rationale:
-/// The primary initialization will try to edit a specific metric in its registry
-/// for its new_certificates and committeed_certificates channel. The gauge situated
-/// in the channel you're passing as an argument to the primary initialization is
-/// the replacement. If that gauge is a dummy gauge, such as the one above, the
-/// initialization of the primary will panic (to protect the production code against
-/// an erroneous mistake in editing this bootstrap logic).
-#[macro_export]
-macro_rules! test_committed_certificates_channel {
-    ($e:expr) => {
-        consensus_metrics::metered_channel::channel(
-            $e,
-            &prometheus::IntGauge::new(
-                primary::PrimaryChannelMetrics::NAME_COMMITTED_CERTS,
-                primary::PrimaryChannelMetrics::DESC_COMMITTED_CERTS,
-            )
-            .unwrap(),
-        );
-    };
-}
-
-/// See (not imported to avoid a circular dependancy):
-/// tn_primary_metrics::PrimaryChannelMetrics::NAME_NEW_CERTS,
-pub const NAME_NEW_CERTS: &str = "tx_new_certificates";
-/// See (not imported to avoid a circular dependancy):
-/// tn_primary_metrics::PrimaryChannelMetrics::DESC_NEW_CERTS,
-pub const DESC_NEW_CERTS: &str =
-    "occupancy of the channel from the `Consensus` to the `primary::StateHandler`";
-
-#[macro_export]
-macro_rules! test_new_certificates_channel {
-    ($e:expr) => {
-        consensus_metrics::metered_channel::channel(
-            $e,
-            &prometheus::IntGauge::new(
-                tn_types::test_utils::NAME_NEW_CERTS,
-                tn_types::test_utils::DESC_NEW_CERTS,
-            )
-            .unwrap(),
-        );
-    };
-}
 
 pub fn temp_dir() -> std::path::PathBuf {
     tempfile::tempdir().expect("Failed to open temporary directory").into_path()
-}
-
-pub fn ensure_test_environment() {
-    // One common issue when running tests on Mac is that the default ulimit is too low,
-    // leading to I/O errors such as "Too many open files". Raising fdlimit to bypass it.
-    // Also we can't do this in Windows, apparently.
-    #[cfg(not(target_os = "windows"))]
-    fdlimit::raise_fd_limit().expect("Could not raise ulimit");
 }
 
 ////////////////////////////////////////////////////////////////
@@ -141,7 +69,7 @@ pub fn fixture_payload_with_rand<R: Rng + ?Sized>(
 }
 
 /// Create a transaction with a randomly generated keypair.
-pub fn transaction_with_rand<R: Rng + ?Sized>(rand: &mut R) -> TransactionSigned {
+pub fn transaction_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Vec<u8> {
     let mut tx_factory = TransactionFactory::new_random_from_seed(rand);
     let chain = adiri_chain_spec_arc();
     // TODO: this is excessively high, but very unlikely to ever fail
@@ -149,7 +77,14 @@ pub fn transaction_with_rand<R: Rng + ?Sized>(rand: &mut R) -> TransactionSigned
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
 
     // random transaction
-    tx_factory.create_eip1559(chain, None, gas_price, Some(Address::ZERO), value, Bytes::new())
+    tx_factory.create_eip1559_encoded(
+        chain,
+        None,
+        gas_price,
+        Some(Address::ZERO),
+        value,
+        Bytes::new(),
+    )
 }
 
 pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Batch {
@@ -159,28 +94,22 @@ pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Batch {
     )
 }
 
-// Fixture
-pub fn transaction() -> TransactionSigned {
-    // TODO: make this better
-    //
-    // The fn is complicated bc everything boils down to this fn
-    // for seeding test data.
-    //
-    // gas price for adiri genesis: 875000000
-    //
-    // very inefficient, but less refactoring => quicker release
-
-    // TODO: use [0; 32] seed account instead?
+/// Create a random encoded transaction.
+pub fn transaction() -> Vec<u8> {
     let mut tx_factory = TransactionFactory::new_random();
     let chain = adiri_chain_spec_arc();
     let gas_price = 100_000;
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
 
     // random transaction
-    tx_factory.create_eip1559(chain, None, gas_price, Some(Address::ZERO), value, Bytes::new())
-
-    // // generate random value transactions, but the length will be always 100 bytes
-    // (0..100).map(|_v| rand::random::<u8>()).collect()
+    tx_factory.create_eip1559_encoded(
+        chain,
+        None,
+        gas_price,
+        Some(Address::ZERO),
+        value,
+        Bytes::new(),
+    )
 }
 
 ////////////////////////////////////////////////////////////////

@@ -14,9 +14,10 @@ authors = [
 [dependencies]
 tn-types = { workspace = true }
 reth-provider = { workspace = true }
-reth-primitives-traits = { workspace = true }
 reth-node-types = { workspace = true }
 tracing = { workspace = true }
+reth-rpc-eth-types = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 # unit tests

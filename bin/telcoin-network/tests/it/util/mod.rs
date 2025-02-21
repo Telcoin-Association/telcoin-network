@@ -1,11 +1,9 @@
 use clap::Parser;
-use reth::providers::ExecutionOutcome;
 use reth_chainspec::ChainSpec;
 use std::{path::PathBuf, sync::Arc};
 use telcoin_network::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
 use tn_node::launch_node;
-use tn_test_utils::{default_test_execution_node, execution_outcome_for_tests, CommandParser};
-use tn_types::{Batch, TransactionSigned};
+use tn_test_utils::CommandParser;
 use tracing::error;
 
 pub static IT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -248,26 +246,4 @@ pub async fn ensure_account_balance_infinite_loop(
     }
 
     Ok(U256::ZERO)
-}
-
-/// Test utility to get desired state changes from a temporary genesis for a subsequent one.
-pub async fn get_contract_state_for_genesis(
-    chain: Arc<ChainSpec>,
-    raw_txs_to_execute: Vec<TransactionSigned>,
-) -> eyre::Result<ExecutionOutcome> {
-    let execution_node = default_test_execution_node(Some(chain.clone()), None)?;
-    let provider = execution_node.get_provider().await;
-    let batch_executor = execution_node.get_batch_executor().await;
-
-    // execute batch
-    let parent = chain.sealed_genesis_header();
-    let batch = Batch {
-        transactions: raw_txs_to_execute,
-        parent_hash: parent.hash(),
-        ..Default::default()
-    };
-    let execution_outcome =
-        execution_outcome_for_tests(&batch, &parent, &provider, &batch_executor);
-
-    Ok(execution_outcome)
 }
