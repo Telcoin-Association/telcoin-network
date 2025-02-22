@@ -15,6 +15,8 @@ pub struct NetworkConfig {
     sync_config: SyncConfig,
     /// The configurations for quic protocol.
     quic_config: QuicConfig,
+    /// The configuration for managing peers.
+    peer_config: PeerConfig,
 }
 
 impl NetworkConfig {
@@ -31,6 +33,11 @@ impl NetworkConfig {
     /// Return a reference to the [QuicConfig].
     pub fn quic_config(&self) -> &QuicConfig {
         &self.quic_config
+    }
+
+    /// Return a reference to the [PeerConfig].
+    pub fn peer_config(&self) -> &PeerConfig {
+        &self.peer_config
     }
 }
 
@@ -178,5 +185,91 @@ impl Default for QuicConfig {
             max_stream_data: 50 * 1024 * 1024,      // 50MiB
             max_connection_data: 100 * 1024 * 1024, // 100MiB
         }
+    }
+}
+
+// /// The threshold for a peer's score before they are disconnected.
+// const MIN_SCORE_BEFORE_DISCONNECT: f64 = -20.0;
+// /// The threshold for a peer's score before they are banned.
+// const MIN_SCORE_BEFORE_BAN: f64 = -50.0;
+
+/// Configurations for network peers.
+#[derive(Debug, Clone)]
+pub struct PeerConfig {
+    /// The interval (secs) for updating peer status.
+    pub heartbeat_interval: u64,
+    /// The target number of peers to maintain connections with.
+    pub target_num_peers: usize,
+    /// The threshold before a peer is disconnected
+    pub min_score_for_disconnect: f64,
+    /// The threshold before a peer is banned.
+    pub min_score_for_ban: f64,
+    /// A fraction of `Self::target_num_peers` that is allowed to connect to this node in excess of
+    /// `PeerManager::target_num_peers`.
+    ///
+    /// NOTE: If `Self::target_num_peers` is 20 and peer_excess_factor = 0.1 this node allows 10% more peers, i.e 22.
+    pub peer_excess_factor: f32,
+
+    /// The fraction of extra peers beyond the Self::peer_excess_factor that this node is allowed to dial for
+    /// requiring subnet peers.
+    ///
+    /// NOTE: If the target peer limit is 50, and the excess peer limit is 55, and this node already has 55 peers,
+    /// this value provisions a few more slots for dialing priority peers for validator responsibilities.
+    pub priority_peer_excess: f32,
+
+    /// A fraction of `Self::target_num_peers` that are outbound-only connections.
+    pub target_outbound_only_factor: f32,
+
+    /// A fraction of `Self::target_num_peers` that sets a threshold before the node tries to discovery peers.
+    ///
+    /// NOTE: Self::min_outbound_only_factor must be < Self::target_outbound_only_factor.
+    pub min_outbound_only_factor: f32,
+}
+
+impl Default for PeerConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval: 30,
+            target_num_peers: 5,
+            min_score_for_disconnect: -20.0,
+            min_score_for_ban: -50.0,
+            peer_excess_factor: 0.1,
+            priority_peer_excess: 0.2,
+            target_outbound_only_factor: 0.3,
+            min_outbound_only_factor: 0.2,
+        }
+    }
+}
+
+impl PeerConfig {
+    /// The maximum number of peers allowed to connect to this node.
+    pub fn max_peers(&self) -> usize {
+        (self.target_num_peers as f32 * (1.0 + self.peer_excess_factor)).ceil() as usize
+    }
+
+    /// The maximum number of peers allowed when dialing a priority peer.
+    ///
+    /// Priority peers are known validators that dialed this node or a peer that is explicitly dialed.
+    pub fn max_priority_peers(&self) -> usize {
+        (self.target_num_peers as f32 * (1.0 + self.peer_excess_factor + self.priority_peer_excess))
+            .ceil() as usize
+    }
+
+    /// The minimum number of outbound peers that we reach before we start another discovery query.
+    pub fn min_outbound_only_peers(&self) -> usize {
+        (self.target_num_peers as f32 * self.min_outbound_only_factor).ceil() as usize
+    }
+
+    /// The minimum number of outbound peers that we reach before we start another discovery query.
+    pub fn target_outbound_peers(&self) -> usize {
+        (self.target_num_peers as f32 * self.target_outbound_only_factor).ceil() as usize
+    }
+
+    /// The maximum number of peers that are connected or dialing before we refuse to do another
+    /// discovery search for more outbound peers. We can use up to half the priority peer excess allocation.
+    pub fn max_outbound_dialing_peers(&self) -> usize {
+        (self.target_num_peers as f32
+            * (1.0 + self.peer_excess_factor + self.priority_peer_excess / 2.0))
+            .ceil() as usize
     }
 }

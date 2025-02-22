@@ -559,11 +559,8 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(5);
         tokio::spawn(async move {
             while let Some(com) = rx.recv().await {
-                match com {
-                    NetworkCommand::Publish { topic: _, msg: _, reply } => {
-                        reply.send(Ok(MessageId::new(&[0]))).unwrap();
-                    }
-                    _ => {}
+                if let NetworkCommand::Publish { topic: _, msg: _, reply } = com {
+                    reply.send(Ok(MessageId::new(&[0]))).unwrap();
                 }
             }
         });

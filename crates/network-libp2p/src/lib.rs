@@ -4,6 +4,7 @@
 mod codec;
 mod consensus;
 pub mod error;
+mod peers;
 pub mod types;
 
 // export types

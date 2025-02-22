@@ -29,6 +29,9 @@ async-trait = { workspace = true }
 bcs = { workspace = true }
 snap = { workspace = true }
 
+# peer manager
+rand = { workspace = true }
+
 [dev-dependencies]
 tn-test-utils = { workspace = true }
 eyre = { workspace = true }
