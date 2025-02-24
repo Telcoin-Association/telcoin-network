@@ -335,8 +335,6 @@ backoff = { version = "0.4.0", features = [
     "tokio_1",
 ] }
 
-tikv-jemallocator = "0.6"
-
 libp2p = { version = "0.54", features = [] }
 
 # [patch.crates-io]

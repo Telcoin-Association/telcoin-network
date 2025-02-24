@@ -98,7 +98,7 @@ docker-adiri:
 
 # push local adiri:latest to the gcloud artifact registry
 docker-push:
-	docker push us-docker.pkg.dev/telcoin-network/tn-public/adiri:latest ;
+	docker push us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) ;
 
 # docker buildx used for multiple processor image building
 docker-builder:

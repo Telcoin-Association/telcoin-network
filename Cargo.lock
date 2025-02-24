@@ -11721,7 +11721,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tempfile",
- "tikv-jemallocator",
  "tn-config",
  "tn-faucet",
  "tn-node",

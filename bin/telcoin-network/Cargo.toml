@@ -61,7 +61,6 @@ reth-stages = { workspace = true }
 reth-chainspec = { workspace = true }
 reth-cli-util = { workspace = true }
 reth-cli-commands = { workspace = true }
-tikv-jemallocator = { workspace = true, optional = true }
 rayon = { workspace = true }
 
 [dev-dependencies]
@@ -89,7 +88,6 @@ nix = { version = "0.29", features = ["signal"] }
 [features]
 default = []
 faucet = ["tn-faucet"]
-jemalloc = ["tikv-jemallocator"]
 
 [build-dependencies]
 vergen = { version = "8.0.0", features = ["build", "cargo", "git", "gitcl"] }

@@ -2,31 +2,40 @@ FROM rust:1.82-slim-bookworm AS builder
 
 WORKDIR /usr/src/telcoin-network
 
-RUN apt-get update \
-    && apt-get install -y build-essential cmake libclang-16-dev pkg-config libssl-dev libapr1-dev \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+# install dependencies
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    libclang-16-dev \
+    pkg-config \
+    libssl-dev \
+    libapr1-dev && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY Cargo* ./
 COPY bin/ ./bin/
 COPY crates/ ./crates/
 COPY tn-contracts/ ./tn-contracts/
 
-# must move the resulting binary out of the cache for subsequent build steps
+# move binary out of cache for subsequent build steps
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=./target \
     cargo build --release --features faucet \
     && mv ./target/release/telcoin-network /tmp/
 
-# Production Image
+# production image
 FROM debian:bookworm-slim
 
-# resolves: 'openssl: error while loading shared libraries: libssl.so.3: cannot open shared object file: No such file or directory'
-RUN apt-get update \
-    && apt-get install -y libapr1-dev \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+# openssl
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    libapr1 \
+    libssl3 && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 # specify user id for nonroot
 ENV USER_ID=1101
@@ -35,6 +44,8 @@ ENV USER_ID=1101
 RUN useradd -u $USER_ID -U -ms /bin/bash nonroot
 USER nonroot
 
+# copy binary
 COPY --from=builder /tmp/telcoin-network /usr/local/bin/telcoin
 
+# default
 CMD ["telcoin", "node"]

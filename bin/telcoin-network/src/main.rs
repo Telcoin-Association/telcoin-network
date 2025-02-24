@@ -3,11 +3,6 @@ use clap::{Args, Parser as _};
 use tn_faucet::FaucetArgs;
 use tn_node::launch_node;
 
-// We use jemalloc for performance reasons
-#[cfg(all(feature = "jemalloc", unix))]
-#[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
 /// No Additional arguments
 #[derive(Debug, Clone, Copy, Default, Args)]
 #[non_exhaustive]

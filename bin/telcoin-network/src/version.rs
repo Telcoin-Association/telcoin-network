@@ -10,8 +10,11 @@
 /// ```text
 /// 0.1.0 (defa64b2)
 /// ```
-pub(crate) const SHORT_VERSION: &str =
-    concat!(env!("CARGO_PKG_VERSION"), " (", env!("VERGEN_GIT_SHA"), ")");
+pub(crate) const SHORT_VERSION: &str = {
+    const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+    const GIT_SHA: &str = env!("VERGEN_GIT_SHA");
+    const_str::concat!(PKG_VERSION, " (", GIT_SHA, ")")
+};
 
 /// The long version information for telcoin network.
 ///
@@ -26,24 +29,31 @@ pub(crate) const SHORT_VERSION: &str =
 /// Version: 0.1.0
 /// Commit SHA: defa64b2
 /// Build Timestamp: 2023-05-19T01:47:19.815651705Z
-/// Build Features: jemalloc
 /// ```
-pub(crate) const LONG_VERSION: &str = const_str::concat!(
-    "Version: ",
-    env!("CARGO_PKG_VERSION"),
-    "\n",
-    "Commit SHA: ",
-    env!("VERGEN_GIT_SHA"),
-    "\n",
-    "Build Timestamp: ",
-    env!("VERGEN_BUILD_TIMESTAMP"),
-    "\n",
-    "Build Features: ",
-    env!("VERGEN_CARGO_FEATURES"),
-    "\n",
-    "Build Profile: ",
-    build_profile_name()
-);
+pub(crate) const LONG_VERSION: &str = {
+    const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+    const GIT_SHA: &str = env!("VERGEN_GIT_SHA");
+    const BUILD_TIMESTAMP: &str = env!("VERGEN_BUILD_TIMESTAMP");
+    const CARGO_FEATURES: &str = env!("VERGEN_CARGO_FEATURES");
+    const PROFILE: &str = build_profile_name();
+
+    const_str::concat!(
+        "Version: ",
+        PKG_VERSION,
+        "\n",
+        "Commit SHA: ",
+        GIT_SHA,
+        "\n",
+        "Build Timestamp: ",
+        BUILD_TIMESTAMP,
+        "\n",
+        "Build Features: ",
+        CARGO_FEATURES,
+        "\n",
+        "Build Profile: ",
+        PROFILE
+    )
+};
 
 /// The default extradata used for payload building.
 ///
@@ -60,9 +70,6 @@ pub fn default_extradata() -> String {
 }
 
 const fn build_profile_name() -> &'static str {
-    // Derived from https://stackoverflow.com/questions/73595435/how-to-get-profile-from-cargo-toml-in-build-rs-or-at-runtime
-    // We split on the path separator of the *host* machine, which may be different from
-    // `std::path::MAIN_SEPARATOR_STR`.
     const OUT_DIR: &str = env!("OUT_DIR");
     const SEP: char = if const_str::contains!(OUT_DIR, "/") { '/' } else { '\\' };
     let parts = const_str::split!(OUT_DIR, SEP);
