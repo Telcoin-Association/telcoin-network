@@ -7,7 +7,6 @@ mod crypto;
 pub mod database_traits;
 mod genesis;
 mod helpers;
-mod multiaddr;
 mod notifier;
 mod primary;
 mod serde;
@@ -22,7 +21,6 @@ pub use crypto::*;
 pub use database_traits::*;
 pub use genesis::*;
 pub use helpers::*;
-pub use multiaddr::*;
 pub use notifier::*;
 pub use primary::*;
 pub use sync::*;
@@ -53,6 +51,7 @@ pub use alloy::{
     sol,
     sol_types::{SolType, SolValue},
 };
+pub use libp2p::Multiaddr;
 pub use reth_primitives::{
     public_key_to_address,
     transaction::{SignedTransactionIntoRecoveredExt, PARALLEL_SENDER_RECOVERY_THRESHOLD},

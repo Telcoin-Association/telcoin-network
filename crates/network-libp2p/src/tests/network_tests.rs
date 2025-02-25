@@ -117,8 +117,8 @@ async fn test_valid_req_res() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    peer1.start_listening(config_1.authority().primary_network_address().inner()).await?;
-    peer2.start_listening(config_2.authority().primary_network_address().inner()).await?;
+    peer1.start_listening(config_1.authority().primary_network_address().clone()).await?;
+    peer2.start_listening(config_2.authority().primary_network_address().clone()).await?;
     let peer2_id = peer2.local_peer_id().await?;
     let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
 
@@ -169,8 +169,8 @@ async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    peer1.start_listening(config_1.authority().primary_network_address().inner()).await?;
-    peer2.start_listening(config_2.authority().primary_network_address().inner()).await?;
+    peer1.start_listening(config_1.authority().primary_network_address().clone()).await?;
+    peer2.start_listening(config_2.authority().primary_network_address().clone()).await?;
     let peer2_id = peer2.local_peer_id().await?;
     let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
 
@@ -237,8 +237,8 @@ async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    peer1.start_listening(config_1.authority().primary_network_address().inner()).await?;
-    peer2.start_listening(config_2.authority().primary_network_address().inner()).await?;
+    peer1.start_listening(config_1.authority().primary_network_address().clone()).await?;
+    peer2.start_listening(config_2.authority().primary_network_address().clone()).await?;
     let peer2_id = peer2.local_peer_id().await?;
     let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
 
@@ -308,8 +308,8 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    malicious_peer.start_listening(config_1.authority().primary_network_address().inner()).await?;
-    honest_peer.start_listening(config_2.authority().primary_network_address().inner()).await?;
+    malicious_peer.start_listening(config_1.authority().primary_network_address().clone()).await?;
+    honest_peer.start_listening(config_2.authority().primary_network_address().clone()).await?;
 
     let honest_peer_id = honest_peer.local_peer_id().await?;
     let honest_peer_addr =
@@ -365,8 +365,8 @@ async fn test_outbound_failure_malicious_response() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    honest_peer.start_listening(config_1.authority().primary_network_address().inner()).await?;
-    malicious_peer.start_listening(config_2.authority().primary_network_address().inner()).await?;
+    honest_peer.start_listening(config_1.authority().primary_network_address().clone()).await?;
+    malicious_peer.start_listening(config_2.authority().primary_network_address().clone()).await?;
     let malicious_peer_id = malicious_peer.local_peer_id().await?;
     let malicious_peer_addr =
         malicious_peer.listeners().await?.first().expect("malicious_peer listen addr").clone();
@@ -427,8 +427,8 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    cvv.start_listening(config_1.authority().primary_network_address().inner()).await?;
-    nvv.start_listening(config_2.authority().primary_network_address().inner()).await?;
+    cvv.start_listening(config_1.authority().primary_network_address().clone()).await?;
+    nvv.start_listening(config_2.authority().primary_network_address().clone()).await?;
     let cvv_id = cvv.local_peer_id().await?;
     let cvv_addr = cvv.listeners().await?.first().expect("peer2 listen addr").clone();
 
@@ -490,8 +490,8 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     });
 
     // start swarm listening on default any address
-    cvv.start_listening(config_1.authority().primary_network_address().inner()).await?;
-    nvv.start_listening(config_2.authority().primary_network_address().inner()).await?;
+    cvv.start_listening(config_1.authority().primary_network_address().clone()).await?;
+    nvv.start_listening(config_2.authority().primary_network_address().clone()).await?;
     let cvv_id = cvv.local_peer_id().await?;
     let cvv_addr = cvv.listeners().await?.first().expect("peer2 listen addr").clone();
 

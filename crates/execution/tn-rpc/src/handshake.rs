@@ -71,12 +71,13 @@ impl HandshakeBuilder {
 mod tests {
     use super::*;
     use rand::{rngs::StdRng, SeedableRng as _};
+    use std::str::FromStr as _;
     use tn_types::adiri_genesis;
 
     #[test]
     fn test_handshake_proof() {
         let multiaddr: Multiaddr =
-            Multiaddr::new("/ip4/10.10.10.33/udp/49590".parse().expect("valid multiaddr"));
+            Multiaddr::from_str("/ip4/10.10.10.33/udp/49590").expect("valid multiaddr");
         let network_keypair = NetworkKeypair::generate(&mut StdRng::from_seed([0; 32]));
         let genesis = adiri_genesis();
 

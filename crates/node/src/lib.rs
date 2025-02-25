@@ -2,6 +2,7 @@
 //! Library for managing all components used by a full-node in a single process.
 
 use std::{
+    str::FromStr as _,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
@@ -29,11 +30,11 @@ pub use tn_storage::NodeStorage;
 use tn_storage::{open_db, tables::ConsensusBlocks, DatabaseType};
 use tn_types::{
     network_public_key_to_libp2p, BatchValidation, ConsensusHeader, Database as TNDatabase,
-    TaskManager,
+    Multiaddr, TaskManager,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::{runtime::Builder, sync::mpsc};
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 pub mod dirs;
 pub mod engine;
@@ -93,11 +94,11 @@ async fn start_networks<DB: TNDatabase>(
 ) -> eyre::Result<(PrimaryNetworkHandle, WorkerNetworkHandle)> {
     let (event_stream, rx_event_stream) = mpsc::channel(1000);
     let (worker_event_stream, rx_worker_event_stream) = mpsc::channel(1000);
-    let consensus_network = ConsensusNetwork::new_for_primary(consensus_config, event_stream)
+    let primary_network = ConsensusNetwork::new_for_primary(consensus_config, event_stream)
         .expect("primry p2p network create failed!");
     let worker_network = ConsensusNetwork::new_for_worker(consensus_config, worker_event_stream)
         .expect("worker p2p network create failed!");
-    let consensus_network_handle = consensus_network.network_handle();
+    let primary_network_handle = primary_network.network_handle();
     let worker_network_handle = worker_network.network_handle();
     let rx_shutdown = consensus_config.shutdown().subscribe();
     task_manager.spawn_task("primary network run loop", async move {
@@ -105,7 +106,7 @@ async fn start_networks<DB: TNDatabase>(
             _ = &rx_shutdown => {
                 Ok(())
             }
-            res = consensus_network.run() => {
+            res = primary_network.run() => {
                 res
             }
         )
@@ -121,14 +122,20 @@ async fn start_networks<DB: TNDatabase>(
             }
         )
     });
-    consensus_network_handle.subscribe(IdentTopic::new("tn-primary")).await?;
+    primary_network_handle.subscribe(IdentTopic::new("tn-primary")).await?;
     let my_authority = consensus_config.authority();
-    consensus_network_handle
-        .start_listening(my_authority.primary_network_address().inner())
-        .await?;
+
+    let primary_multiaddr = get_multiaddr_from_env_or_config(
+        "PRIMARY_MULTIADDR",
+        my_authority.primary_network_address().clone(),
+    );
+    primary_network_handle.start_listening(primary_multiaddr).await?;
+
     let worker_address = consensus_config.worker_address(worker_id);
-    worker_network_handle.start_listening(worker_address.inner()).await?;
-    let consensus_network_handle = PrimaryNetworkHandle::new(consensus_network_handle);
+    let worker_multiaddr =
+        get_multiaddr_from_env_or_config("WORKER_MULTIADDR", worker_address.clone());
+    worker_network_handle.start_listening(worker_multiaddr).await?;
+    let primary_network_handle = PrimaryNetworkHandle::new(primary_network_handle);
     let worker_network_handle = WorkerNetworkHandle::new(worker_network_handle);
     let peers_connected = Arc::new(AtomicU32::new(0));
     let workers_connected = Arc::new(AtomicU32::new(0));
@@ -137,22 +144,12 @@ async fn start_networks<DB: TNDatabase>(
     {
         let peer_id =
             consensus_config.peer_id_for_authority(&authority_id).expect("missing peer id!");
-        dial_primary(
-            consensus_network_handle.clone(),
-            peer_id,
-            addr.inner(),
-            peers_connected.clone(),
-        );
+        dial_primary(primary_network_handle.clone(), peer_id, addr, peers_connected.clone());
     }
     for (id, addr) in consensus_config.worker_cache().all_workers() {
         if addr != worker_address {
             let peer_id = network_public_key_to_libp2p(&id);
-            dial_worker(
-                worker_network_handle.clone(),
-                peer_id,
-                addr.inner(),
-                workers_connected.clone(),
-            );
+            dial_worker(worker_network_handle.clone(), peer_id, addr, workers_connected.clone());
         }
     }
     let quorum = consensus_config.committee().quorum_threshold() as u32;
@@ -164,7 +161,7 @@ async fn start_networks<DB: TNDatabase>(
     }
     let primary_network = PrimaryNetwork::new(
         rx_event_stream,
-        consensus_network_handle.clone(),
+        primary_network_handle.clone(),
         consensus_config.clone(),
         consensus_bus.clone(),
         state_sync,
@@ -181,7 +178,7 @@ async fn start_networks<DB: TNDatabase>(
     )
     .spawn(task_manager);
 
-    Ok((consensus_network_handle, worker_network_handle))
+    Ok((primary_network_handle, worker_network_handle))
 }
 
 /// Inner working of launch_node().
@@ -328,7 +325,7 @@ where
         engine_task_manager.update_tasks();
         task_manager.add_task_manager(engine_task_manager);
 
-        info!(target:"tn", tasks=?task_manager, "TASKS");
+        info!(target:"telcoin::node", tasks=?task_manager, "TASKS");
 
         task_manager.join_until_exit(consensus_config.shutdown().clone()).await;
         let running = consensus_bus.restart();
@@ -358,7 +355,7 @@ where
 
     let consensus_db_path = tn_datadir.consensus_db_path();
 
-    tracing::info!(target: "telcoin::cli", "opening node storage at {:?}", consensus_db_path);
+    tracing::info!(target: "telcoin::node", "opening node storage at {:?}", consensus_db_path);
 
     // open storage for consensus
     // In case the DB dir does not yet exist.
@@ -370,4 +367,14 @@ where
         running = launch_node_inner(&builder, &tn_datadir, db.clone())?;
     }
     Ok(())
+}
+
+/// Check the environment to overwrite the host.
+fn get_multiaddr_from_env_or_config(env_var: &str, fallback: Multiaddr) -> Multiaddr {
+    let multiaddr = std::env::var(env_var)
+        .ok()
+        .and_then(|addr_str| Multiaddr::from_str(&addr_str).ok())
+        .unwrap_or_else(|| fallback);
+    info!(target: "telcoin::node", ?multiaddr, env_var);
+    multiaddr
 }
