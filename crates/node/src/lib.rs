@@ -374,7 +374,7 @@ fn get_multiaddr_from_env_or_config(env_var: &str, fallback: Multiaddr) -> Multi
     let multiaddr = std::env::var(env_var)
         .ok()
         .and_then(|addr_str| Multiaddr::from_str(&addr_str).ok())
-        .unwrap_or_else(|| fallback);
+        .unwrap_or(fallback);
     info!(target: "telcoin::node", ?multiaddr, env_var);
     multiaddr
 }
