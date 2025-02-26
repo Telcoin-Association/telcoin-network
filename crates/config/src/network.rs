@@ -13,6 +13,8 @@ pub struct NetworkConfig {
     libp2p_config: LibP2pConfig,
     /// The configurations for incoming requests from peers missing certificates.
     sync_config: SyncConfig,
+    /// The configurations for quic protocol.
+    quic_config: QuicConfig,
 }
 
 impl NetworkConfig {
@@ -24,6 +26,11 @@ impl NetworkConfig {
     /// Return a reference to the [LibP2pConfig].
     pub fn libp2p_config(&self) -> &LibP2pConfig {
         &self.libp2p_config
+    }
+
+    /// Return a reference to the [QuicConfig].
+    pub fn quic_config(&self) -> &QuicConfig {
+        &self.quic_config
     }
 }
 
@@ -129,6 +136,47 @@ impl Default for SyncConfig {
             max_num_missing_certs_within_gc_round: 50,
             certificate_verification_round_interval: 50,
             certificate_verification_chunk_size: 50,
+        }
+    }
+}
+
+/// Configure the quic transport for libp2p.
+#[derive(Debug)]
+pub struct QuicConfig {
+    /// Timeout for the initial handshake when establishing a connection.
+    /// The actual timeout is the minimum of this and the [`Config::max_idle_timeout`].
+    pub handshake_timeout: Duration,
+    /// Maximum duration of inactivity in ms to accept before timing out the connection.
+    pub max_idle_timeout: u32,
+    /// Period of inactivity before sending a keep-alive packet.
+    /// Must be set lower than the idle_timeout of both
+    /// peers to be effective.
+    ///
+    /// See [`quinn::TransportConfig::keep_alive_interval`] for more
+    /// info.
+    pub keep_alive_interval: Duration,
+    /// Maximum number of incoming bidirectional streams that may be open
+    /// concurrently by the remote peer.
+    pub max_concurrent_stream_limit: u32,
+    /// Max unacknowledged data in bytes that may be sent on a single stream.
+    pub max_stream_data: u32,
+    /// Max unacknowledged data in bytes that may be sent in total on all streams
+    /// of a connection.
+    pub max_connection_data: u32,
+}
+
+impl Default for QuicConfig {
+    fn default() -> Self {
+        Self {
+            handshake_timeout: Duration::from_secs(300),
+            max_idle_timeout: 30 * 1000, // 30s
+            keep_alive_interval: Duration::from_secs(300),
+            max_concurrent_stream_limit: 10_000,
+            // may need to increase these based on RTT
+            //
+            // maximum throughput = (buffer size / round-trip time)
+            max_stream_data: 50 * 1024 * 1024,      // 50MiB
+            max_connection_data: 100 * 1024 * 1024, // 100MiB
         }
     }
 }

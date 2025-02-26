@@ -147,7 +147,7 @@ where
 
     /// Create a new instance of Self.
     pub fn new<DB>(
-        config: &ConsensusConfig<DB>,
+        consensus_config: &ConsensusConfig<DB>,
         event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
         topics: Vec<IdentTopic>,
         mut ed25519_private_key_bytes: Vec<u8>,
@@ -176,12 +176,13 @@ where
         )
         .map_err(NetworkError::GossipBehavior)?;
 
-        let tn_codec =
-            TNCodec::<Req, Res>::new(config.network_config().libp2p_config().max_rpc_message_size);
+        let tn_codec = TNCodec::<Req, Res>::new(
+            consensus_config.network_config().libp2p_config().max_rpc_message_size,
+        );
 
         let req_res = request_response::Behaviour::with_codec(
             tn_codec,
-            config.network_config().libp2p_config().supported_req_res_protocols.clone(),
+            consensus_config.network_config().libp2p_config().supported_req_res_protocols.clone(),
             request_response::Config::default(),
         );
 
@@ -191,14 +192,28 @@ where
         // create swarm
         let swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
-            .with_quic()
+            .with_quic_config(|mut config| {
+                config.handshake_timeout =
+                    consensus_config.network_config().quic_config().handshake_timeout;
+                config.max_idle_timeout =
+                    consensus_config.network_config().quic_config().max_idle_timeout;
+                config.keep_alive_interval =
+                    consensus_config.network_config().quic_config().keep_alive_interval;
+                config.max_concurrent_stream_limit =
+                    consensus_config.network_config().quic_config().max_concurrent_stream_limit;
+                config.max_stream_data =
+                    consensus_config.network_config().quic_config().max_stream_data;
+                config.max_connection_data =
+                    consensus_config.network_config().quic_config().max_connection_data;
+                config
+            })
             .with_behaviour(|_| behavior)
             .map_err(|_| NetworkError::BuildSwarm)?
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
 
         let (handle, commands) = tokio::sync::mpsc::channel(100);
-        let config = config.network_config().libp2p_config().clone();
+        let config = consensus_config.network_config().libp2p_config().clone();
 
         Ok(Self {
             swarm,
