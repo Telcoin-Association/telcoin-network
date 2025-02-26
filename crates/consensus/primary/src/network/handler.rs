@@ -75,6 +75,10 @@ where
                 let unverified_cert = cert.validate_received().map_err(CertManagerError::from)?;
                 self.state_sync.process_peer_certificate(unverified_cert).await?;
             }
+            PrimaryGossip::Consenus(number, hash) => {
+                // Other side of this needs to verify.
+                let _ = self.consensus_bus.last_published_consensus_num_hash().send((number, hash));
+            }
         }
         // Send the raw gossip out to whoever else might need it.
         // This should probably be multiple more focussed channels but sorting this out now.

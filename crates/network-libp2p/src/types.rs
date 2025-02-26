@@ -3,14 +3,14 @@
 use crate::{codec::TNMessage, error::NetworkError, GossipMessage};
 use libp2p::{
     core::transport::ListenerId,
-    gossipsub::{MessageId, PublishError, SubscriptionError, TopicHash},
+    gossipsub::{PublishError, SubscriptionError, TopicHash},
     request_response::ResponseChannel,
     Multiaddr, PeerId, TransportError,
 };
 use std::collections::{HashMap, HashSet};
 use tokio::sync::{mpsc, oneshot};
 
-pub use libp2p::gossipsub::IdentTopic;
+pub use libp2p::gossipsub::{IdentTopic, MessageId};
 
 /// The result for network operations.
 pub type NetworkResult<T> = Result<T, NetworkError>;
@@ -120,6 +120,17 @@ where
     SendRequest {
         /// The destination peer.
         peer: PeerId,
+        /// The request to send.
+        request: Req,
+        /// Channel for forwarding any responses.
+        reply: oneshot::Sender<NetworkResult<Res>>,
+    },
+    /// Send a request to any connected peer.
+    ///
+    /// The caller is responsible for decoding message bytes and reporting peers who return bad
+    /// data. Peers that send messages that fail to decode must receive an application score
+    /// penalty.
+    SendRequestAny {
         /// The request to send.
         request: Req,
         /// Channel for forwarding any responses.
@@ -319,6 +330,18 @@ where
     ) -> NetworkResult<oneshot::Receiver<NetworkResult<Res>>> {
         let (reply, to_caller) = oneshot::channel();
         self.sender.send(NetworkCommand::SendRequest { peer, request, reply }).await?;
+        Ok(to_caller)
+    }
+
+    /// Send a request to a peer- any peer will do.
+    ///
+    /// Returns a handle for the caller to await the peer's response.
+    pub async fn send_request_any(
+        &self,
+        request: Req,
+    ) -> NetworkResult<oneshot::Receiver<NetworkResult<Res>>> {
+        let (reply, to_caller) = oneshot::channel();
+        self.sender.send(NetworkCommand::SendRequestAny { request, reply }).await?;
         Ok(to_caller)
     }
 

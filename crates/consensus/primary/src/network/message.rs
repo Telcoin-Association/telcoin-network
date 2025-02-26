@@ -21,6 +21,8 @@ pub enum PrimaryGossip {
     ///
     /// NOTE: `snappy` is slightly larger than uncompressed.
     Certificate(Certificate),
+    /// Consensus output reached- publish the consensus chain height and new block hash.
+    Consenus(u64, BlockHash),
 }
 
 // impl TNMessage trait for types

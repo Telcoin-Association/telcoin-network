@@ -15,8 +15,8 @@ use tn_config::Parameters;
 use tn_network_libp2p::GossipMessage;
 use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
 use tn_types::{
-    BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, Header, Round,
-    TnSender, CHANNEL_CAPACITY,
+    BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput,
+    Header, Round, TnSender, CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
@@ -112,6 +112,10 @@ struct ConsensusBusInner {
     tx_last_consensus_header: watch::Sender<ConsensusHeader>,
     /// Hold onto the consensus header watch to keep it "open"
     _rx_last_consensus_header: watch::Receiver<ConsensusHeader>,
+    /// Watch tracking the last gossipped consensus block number and hash.
+    tx_last_published_consensus_num_hash: watch::Sender<(u64, BlockHash)>,
+    /// Hold onto the published consensus header watch to keep it "open"
+    _rx_last_published_consensus_num_hash: watch::Receiver<(u64, BlockHash)>,
 
     /// Consensus output with a consensus header.
     consensus_output: broadcast::Sender<ConsensusOutput>,
@@ -229,6 +233,8 @@ impl ConsensusBus {
         let (tx_primary_round_updates, _rx_primary_round_updates) = watch::channel(0u32);
         let (tx_last_consensus_header, _rx_last_consensus_header) =
             watch::channel(ConsensusHeader::default());
+        let (tx_last_published_consensus_num_hash, _rx_last_published_consensus_num_hash) =
+            watch::channel((0, BlockHash::default()));
 
         let (tx_recent_blocks, _rx_recent_blocks) =
             watch::channel(RecentBlocks::new(recent_blocks as usize));
@@ -265,6 +271,8 @@ impl ConsensusBus {
                 _rx_recent_blocks,
                 tx_last_consensus_header,
                 _rx_last_consensus_header,
+                tx_last_published_consensus_num_hash,
+                _rx_last_published_consensus_num_hash,
                 consensus_output,
                 _rx_consensus_output,
                 consensus_header,
@@ -373,6 +381,13 @@ impl ConsensusBus {
     /// Track the latest consensus header.
     pub fn last_consensus_header(&self) -> &watch::Sender<ConsensusHeader> {
         &self.inner.tx_last_consensus_header
+    }
+
+    /// Track the latest published consensus header block number and hash seen on the gossip
+    /// network. This is straight from the pub/sub network and should be verified before taking
+    /// action with it.
+    pub fn last_published_consensus_num_hash(&self) -> &watch::Sender<(u64, BlockHash)> {
+        &self.inner.tx_last_published_consensus_num_hash
     }
 
     /// Broadcast channel with consensus output (includes the consensus chain block).

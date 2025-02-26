@@ -75,7 +75,7 @@ pub fn spawn_subscriber<DB: Database>(
                 monitored_future!(
                     async move {
                         info!(target: "subscriber", "Starting subscriber: CVV");
-                        subscriber.run().await
+                        subscriber.run(network).await
                     },
                     "SubscriberTask"
                 ),
@@ -192,7 +192,7 @@ impl<DB: Database> Subscriber<DB> {
         tasks: TaskManagerClone,
         network: PrimaryNetworkHandle,
     ) -> SubscriberResult<()> {
-        // Get a receiver than stream any missing headers so we don't miss them.
+        // Get a receiver then stream any missing headers so we don't miss them.
         let mut rx_consensus_headers = self.consensus_bus.consensus_header().subscribe();
         stream_missing_consensus(&self.config, &self.consensus_bus).await?;
         spawn_state_sync(self.config.clone(), self.consensus_bus.clone(), network, tasks);
@@ -215,7 +215,7 @@ impl<DB: Database> Subscriber<DB> {
     }
 
     /// Main loop connecting to the consensus to listen to sequence messages.
-    async fn run(self) -> SubscriberResult<()> {
+    async fn run(self, network: PrimaryNetworkHandle) -> SubscriberResult<()> {
         // Make sure any old consensus that was not executed gets executed.
         let missing = get_missing_consensus(&self.config, &self.consensus_bus).await?;
         for consensus_header in missing.into_iter() {
@@ -250,6 +250,9 @@ impl<DB: Database> Subscriber<DB> {
                     if let Err(e) = self.consensus_bus.last_consensus_header().send(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() }) {
                         error!(target: "subscriber", "error sending latest consensus header for authority {}: {}", self.inner.authority_id, e);
                         return Ok(());
+                    }
+                    if let Err(e) = network.publish_consensus(number, last_parent).await {
+                        error!(target: "subscriber", "error publishing latest consensus to network {}: {}", self.inner.authority_id, e);
                     }
                     last_number += 1;
                     waiting.push_back(self.fetch_batches(sub_dag, parent_hash, number));
@@ -505,6 +508,7 @@ mod tests {
     use fastcrypto::traits::KeyPair as _;
     use indexmap::IndexMap;
     use std::{collections::BTreeSet, ops::RangeInclusive};
+    use tn_network_libp2p::types::{MessageId, NetworkCommand};
     use tn_network_types::MockPrimaryToWorkerClient;
     use tn_primary::consensus::{Bullshark, Consensus, LeaderSchedule};
     use tn_primary_metrics::ConsensusMetrics;
@@ -604,7 +608,17 @@ mod tests {
         let rx_consensus_headers = consensus_bus.last_consensus_header().subscribe();
         let mut consensus_output = consensus_bus.consensus_output().subscribe();
 
-        let (tx, _rx) = mpsc::channel(5);
+        let (tx, mut rx) = mpsc::channel(5);
+        tokio::spawn(async move {
+            while let Some(com) = rx.recv().await {
+                match com {
+                    NetworkCommand::Publish { topic: _, msg: _, reply } => {
+                        reply.send(Ok(MessageId::new(&[0]))).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        });
         let network = PrimaryNetworkHandle::new_for_test(tx);
         // spawn the executor
         spawn_subscriber(

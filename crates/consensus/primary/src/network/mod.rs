@@ -69,9 +69,19 @@ impl PrimaryNetworkHandle {
     }
 
     /// Publish a certificate to the consensus network.
-    /// NOTE: this is a publish, it is not specific to this client but here for convience.
     pub async fn publish_certificate(&self, certificate: Certificate) -> NetworkResult<()> {
         let data = encode(&PrimaryGossip::Certificate(certificate));
+        self.handle.publish(IdentTopic::new("tn-primary"), data).await?;
+        Ok(())
+    }
+
+    /// Publish a onsensus block number and hash of the header.
+    pub async fn publish_consensus(
+        &self,
+        consensus_block_num: u64,
+        consensus_header_hash: BlockHash,
+    ) -> NetworkResult<()> {
+        let data = encode(&PrimaryGossip::Consenus(consensus_block_num, consensus_header_hash));
         self.handle.publish(IdentTopic::new("tn-primary"), data).await?;
         Ok(())
     }
@@ -120,7 +130,7 @@ impl PrimaryNetworkHandle {
         }
     }
 
-    pub async fn request_consensus(
+    pub async fn request_consensus_from_peer(
         &self,
         peer: PeerId,
         number: Option<u64>,
@@ -136,6 +146,24 @@ impl PrimaryNetworkHandle {
                 "Got wrong response, not a consensus header!".to_string(),
             )),
         }
+    }
+
+    pub async fn request_consensus(
+        &self,
+        number: Option<u64>,
+        hash: Option<BlockHash>,
+    ) -> NetworkResult<ConsensusHeader> {
+        let request = PrimaryRequest::ConsensusHeader { number, hash };
+        // Try up to three times (from three peers) to get consensus.
+        // This could be a lot more complicated but this KISS method should work fine.
+        for _ in 0..3 {
+            let res = self.handle.send_request_any(request.clone()).await?;
+            let res = res.await?;
+            if let Ok(PrimaryResponse::ConsensusHeader(header)) = res {
+                return Ok(header);
+            }
+        }
+        Err(NetworkError::RPCError("Could not get the consensus header!".to_string()))
     }
 }
 

@@ -90,12 +90,13 @@ pub fn spawn_state_sync<DB: Database>(
         NodeMode::CvvInactive | NodeMode::Observer => {
             // If we are not an active CVV then follow latest consensus from peers.
             let (config_clone, consensus_bus_clone) = (config.clone(), consensus_bus.clone());
+            let network_clone = network.clone();
             task_manager.spawn_task(
                 "state sync: track latest consensus header from peers",
                 monitored_future!(
                     async move {
                         info!(target: "telcoin::state-sync", "Starting state sync: track latest consensus header from peers");
-                        spawn_track_recent_consensus(config_clone, consensus_bus_clone).await
+                        spawn_track_recent_consensus(config_clone, consensus_bus_clone, network_clone).await
                     },
                     "StateSyncLatestConsensus"
                 ),
@@ -232,18 +233,30 @@ pub async fn get_missing_consensus<DB: Database>(
 
 /// Spawn a long running task on task_manager that will keep the last_consensus_header watch on
 /// consensus_bus up to date. This should only be used when NOT participating in active consensus.
-///
-/// NOTE: current implementation is a no-op, this is handled by the consensus header stream task.
-/// Expect to have a gossip channel with libp2p soon that will make this task useful so this is a
-/// placeholder for now.
 async fn spawn_track_recent_consensus<DB: Database>(
     config: ConsensusConfig<DB>,
-    _consensus_bus: ConsensusBus,
+    consensus_bus: ConsensusBus,
+    network: PrimaryNetworkHandle,
 ) -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
+    let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
     loop {
         tokio::select! {
-            _ = std::future::pending() => {}
+            _ = rx_gossip_update.changed() => {
+                let (number, _hash) = *rx_gossip_update.borrow();
+                if let Ok(header) = network.request_consensus(Some(number), None).await {
+                    match header.verify_certificates(config.committee()) {
+                        Ok(header) => {
+                            if header.number > consensus_bus.last_consensus_header().borrow().number {
+                                consensus_bus.last_consensus_header().send(header)?;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(target: "telcoin::state-sync", "recieved a consensus header with invalid certs: {e}");
+                        }
+                    }
+                }
+            }
             _ = &rx_shutdown => {
                 return Ok(())
             }
@@ -251,7 +264,7 @@ async fn spawn_track_recent_consensus<DB: Database>(
     }
 }
 
-/// Spawn a long running task on task_manager that will keep stream consensus headers from the
+/// Spawn a long running task on task_manager that will stream consensus headers from the
 /// last saved to the current and then keep up with current headers.
 /// This should only be used when NOT participating in active consensus.
 async fn spawn_stream_consensus_headers<DB: Database>(
@@ -262,41 +275,26 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     let peers = get_peers(&config);
     let rx_shutdown = config.shutdown().subscribe();
 
+    let mut rx_last_consensus_header = consensus_bus.last_consensus_header().subscribe();
     let mut last_consensus_header =
         catch_up_consensus(&network, &config, &consensus_bus, &peers).await?;
     let mut last_consensus_height = last_consensus_header.number;
     // infinite loop over consensus output
     loop {
-        // Rest for bit then try see if chain has advanced and catch up if so.
         tokio::select! {
-            _ = tokio::time::sleep(config.parameters().min_header_delay) => {}
-            _ = &rx_shutdown => {
-                return Ok(())
-            }
-        }
-        tokio::select! {
-            header = max_consensus_header(&network, &peers, config.committee()) => {
-                match header {
-                    Some(max_consensus) => {
-                        consensus_bus.last_consensus_header().send(max_consensus.clone())?;
-                        if max_consensus.number > last_consensus_height {
-                            consensus_bus.last_consensus_header().send(max_consensus.clone())?;
-                            last_consensus_header = catch_up_consensus_from_to(
-                                &network,
-                                &config,
-                                &consensus_bus,
-                                &peers,
-                                last_consensus_header,
-                                max_consensus,
-                            )
-                            .await?;
-                            last_consensus_height = last_consensus_header.number;
-                        }
-                    }
-                    None => {
-                        tracing::error!(target: "telcoin::state-sync", "failed to get the latest max consensus header from peers!");
-                        continue;
-                    }
+            _ = rx_last_consensus_header.changed() => {
+                let header = rx_last_consensus_header.borrow().clone();
+                if header.number > last_consensus_height {
+                    last_consensus_header = catch_up_consensus_from_to(
+                        &network,
+                        &config,
+                        &consensus_bus,
+                        &peers,
+                        last_consensus_header,
+                        header,
+                    )
+                    .await?;
+                    last_consensus_height = last_consensus_header.number;
                 }
             }
             _ = &rx_shutdown => {
@@ -321,7 +319,7 @@ async fn max_consensus_header(
         waiting.push(tokio::time::timeout(
             Duration::from_secs(3), /* Three seconds should be plenty of time to get the
                                      * consensus header. */
-            network.request_consensus(*peer, None, None),
+            network.request_consensus_from_peer(*peer, None, None),
         ));
     }
     while let Some(res) = waiting.next().await {
@@ -429,7 +427,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
                 let peer = *peers
                     .get((number as usize + try_num) % peers_len)
                     .expect("peer found by index");
-                match network.request_consensus(peer, Some(number), None).await {
+                match network.request_consensus_from_peer(peer, Some(number), None).await {
                     Ok(header) => {
                         // Validate all the certificates in this consensus header.
                         match header.verify_certificates(config.committee()) {

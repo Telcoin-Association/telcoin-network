@@ -71,6 +71,9 @@ pub enum NetworkError {
     /// Request/response RPC Error
     #[error("{0}")]
     RPCError(String),
+    /// If a request is made to "any" peer and no peers are currently connected.
+    #[error("No connected peers")]
+    NoPeers,
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {

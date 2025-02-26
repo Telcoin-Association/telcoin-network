@@ -22,7 +22,7 @@ use libp2p::{
     PeerId, Swarm, SwarmBuilder,
 };
 use std::{
-    collections::{hash_map, HashMap, HashSet},
+    collections::{hash_map, HashMap, HashSet, VecDeque},
     time::Duration,
 };
 use tn_config::{ConsensusConfig, LibP2pConfig};
@@ -105,6 +105,10 @@ where
     inbound_requests: HashMap<InboundRequestId, oneshot::Sender<()>>,
     /// The configurables for the libp2p consensus network implementation.
     config: LibP2pConfig,
+    /// Track peers we have a connection with.
+    /// This explicitly tracked and is a VecDeque so we can use to round robin requests without an
+    /// explicit peer.
+    connected_peers: VecDeque<PeerId>,
 }
 
 impl<Req, Res> ConsensusNetwork<Req, Res>
@@ -226,6 +230,7 @@ where
             outbound_requests: Default::default(),
             inbound_requests: Default::default(),
             config,
+            connected_peers: VecDeque::new(),
         })
     }
 
@@ -274,6 +279,9 @@ where
                         send_or_log_error!(sender, Ok(()), "ConnectionEstablished", peer = peer_id);
                     }
                 }
+                if !self.connected_peers.contains(&peer_id) {
+                    self.connected_peers.push_back(peer_id);
+                }
 
                 // Log successful connection establishment
                 info!(
@@ -310,6 +318,7 @@ where
                     remaining = num_established,
                     "connection closed"
                 );
+                self.connected_peers.retain(|peer| *peer != peer_id);
 
                 // handle complete peer disconnect
                 if num_established == 0 {
@@ -461,6 +470,17 @@ where
             NetworkCommand::SendRequest { peer, request, reply } => {
                 let request_id = self.swarm.behaviour_mut().req_res.send_request(&peer, request);
                 self.outbound_requests.insert(request_id, reply);
+            }
+            NetworkCommand::SendRequestAny { request, reply } => {
+                self.connected_peers.rotate_left(1);
+                if let Some(peer) = self.connected_peers.front() {
+                    let request_id = self.swarm.behaviour_mut().req_res.send_request(peer, request);
+                    self.outbound_requests.insert(request_id, reply);
+                } else {
+                    // Ignore error since this means other end lost interest and we don't really
+                    // care.
+                    let _ = reply.send(Err(NetworkError::NoPeers));
+                }
             }
             NetworkCommand::SendResponse { response, channel, reply } => {
                 let res = self.swarm.behaviour_mut().req_res.send_response(channel, response);
