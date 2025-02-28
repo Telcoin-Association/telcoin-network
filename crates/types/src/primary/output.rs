@@ -45,6 +45,11 @@ pub struct ConsensusOutput {
     /// Temporary extra data field - currently unused.
     /// This is included for now for testnet purposes only.
     pub extra: B256,
+    /// If true then finalize blocks as soon as they are executed.
+    /// This is safe to do for a CVV (participating committe members) but otherwise should
+    /// be false unless running a node with the potential to advertise a forked block or
+    /// two before quitting.
+    pub early_finalize: bool,
 }
 
 impl ConsensusOutput {

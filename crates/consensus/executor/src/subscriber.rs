@@ -307,6 +307,13 @@ impl<DB: Database> Subscriber<DB> {
             Address::ZERO
         };
 
+        let early_finalize = if self.consensus_bus.node_mode().borrow().is_active_cvv() {
+            // We are a CVV so we can finalize early.
+            true
+        } else {
+            // Not a CVV so be more conservative about finalizing blocks.
+            false
+        };
         if num_blocks == 0 {
             debug!("No blocks to fetch, payload is empty");
             return ConsensusOutput {
@@ -317,6 +324,7 @@ impl<DB: Database> Subscriber<DB> {
                 parent_hash,
                 number,
                 extra: B256::default(),
+                early_finalize,
             };
         }
 
@@ -329,6 +337,7 @@ impl<DB: Database> Subscriber<DB> {
             parent_hash,
             number,
             extra: B256::default(),
+            early_finalize,
         };
 
         let mut batch_digests_and_workers: HashMap<

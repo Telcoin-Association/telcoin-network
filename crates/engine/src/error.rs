@@ -49,6 +49,9 @@ pub enum TnEngineError {
     // Failed to recover the signer for a transaction.
     #[error("Could not recover signer for transaction")]
     MissingSigner,
+    // Failed to find the block we need to finalize- forked?.
+    #[error("Could not finalize execution block- forked?")]
+    MissingFinalBlock,
 }
 
 impl From<oneshot::error::RecvError> for TnEngineError {

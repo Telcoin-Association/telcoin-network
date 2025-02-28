@@ -20,9 +20,9 @@ use reth_db::{
 };
 use reth_node_builder::{NodeConfig, RethTransactionPoolConfig};
 use reth_provider::{
-    providers::BlockchainProvider, BlockIdReader, BlockReader, CanonStateSubscriptions as _,
-    ChainSpecProvider, ChainStateBlockReader, DatabaseProviderFactory, EthStorage, HeaderProvider,
-    ProviderFactory, TransactionVariant,
+    providers::BlockchainProvider, BlockIdReader, BlockNumReader, BlockReader,
+    CanonStateSubscriptions as _, ChainSpecProvider, ChainStateBlockReader,
+    DatabaseProviderFactory, EthStorage, HeaderProvider, ProviderFactory, TransactionVariant,
 };
 use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, TransactionPool, TransactionValidationTaskExecutor,
@@ -371,7 +371,7 @@ where
         number: u64,
     ) -> eyre::Result<Vec<SealedHeader>> {
         let finalized_block_num =
-            self.blockchain_db.database_provider_ro()?.last_finalized_block_number()?.unwrap_or(0);
+            self.blockchain_db.database_provider_ro()?.last_block_number().unwrap_or(0);
         let mut result = Vec::with_capacity(number as usize);
         if number > 0 {
             let mut block_num = finalized_block_num;

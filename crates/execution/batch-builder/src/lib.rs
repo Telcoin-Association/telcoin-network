@@ -854,6 +854,7 @@ mod tests {
                 parent_hash: ConsensusHeader::default().digest(),
                 number: 0,
                 extra: Default::default(),
+                early_finalize: true,
             };
             // execute output to trigger canonical update
             let args = BuildArguments::new(blockchain_db.clone(), output, parent);

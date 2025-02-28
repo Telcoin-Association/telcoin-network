@@ -8,7 +8,7 @@ use reth_blockchain_tree::{BlockValidationKind, BlockchainTreeEngine};
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
 use reth_execution_types::ExecutionOutcome;
-use reth_provider::{CanonChainTracker, ChainSpecProvider, StateProviderFactory};
+use reth_provider::{CanonChainTracker, ChainSpecProvider, HeaderProvider, StateProviderFactory};
 use reth_revm::{
     cached::CachedReads,
     database::StateProviderDatabase,
@@ -20,11 +20,51 @@ use reth_rpc_eth_types::utils::recover_raw_transaction;
 use std::sync::Arc;
 use tn_node_traits::{BuildArguments, TNPayload, TNPayloadAttributes};
 use tn_types::{
-    calculate_transaction_root, max_batch_gas, Batch, Block, BlockBody, BlockExt as _, ExecHeader,
-    Receipt, SealedBlockWithSenders, SealedHeader, TransactionSigned, Withdrawals, B256,
-    EMPTY_OMMER_ROOT_HASH, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, U256,
+    calculate_transaction_root, max_batch_gas, Batch, Block, BlockBody, BlockExt as _,
+    ConsensusOutput, ExecHeader, Receipt, SealedBlockWithSenders, SealedHeader, TransactionSigned,
+    Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS,
+    EMPTY_WITHDRAWALS, U256,
 };
 use tracing::{debug, error, info, warn};
+
+fn finalize_signed_blocks<Provider>(
+    provider: &Provider,
+    output: &ConsensusOutput,
+    canonical_header: &SealedHeader,
+) -> EngineResult<()>
+where
+    Provider: StateProviderFactory
+        + ChainSpecProvider<ChainSpec = ChainSpec>
+        + BlockchainTreeEngine
+        + HeaderProvider<Header = ExecHeader>
+        + CanonChainTracker<Header = ExecHeader>,
+{
+    let mut last_executed = output.sub_dag.leader.header.latest_execution_block;
+    // Find the latest block that was signed off by the committee.
+    for cert in &output.sub_dag.certificates {
+        if cert.header.latest_execution_block.number > last_executed.number {
+            last_executed = cert.header.latest_execution_block;
+        }
+    }
+    if last_executed.number <= canonical_header.number {
+        if let Some(block) = provider.sealed_header_by_hash(last_executed.hash)? {
+            // finalize the last block from a cert in consensus output and update chain info
+            //
+            // this removes canonical blocks from the tree, stores the finalized block number in the
+            // database, but still need to set_finalized afterwards for utilization in-memory for
+            // components, like RPC
+            provider.finalize_block(block.header().number)?;
+            provider.set_finalized(block.clone());
+
+            // update safe block last because this is less time sensitive but still needs to happen
+            provider.set_safe(block);
+        } else {
+            error!(target: "engine", ?output, "missing the block to finalize!");
+            return Err(TnEngineError::MissingFinalBlock);
+        }
+    }
+    Ok(())
+}
 
 /// Execute output from consensus to extend the canonical chain.
 ///
@@ -39,6 +79,7 @@ where
     Provider: StateProviderFactory
         + ChainSpecProvider<ChainSpec = ChainSpec>
         + BlockchainTreeEngine
+        + HeaderProvider<Header = ExecHeader>
         + CanonChainTracker<Header = ExecHeader>,
 {
     let BuildArguments { provider, mut output, parent_header } = args;
@@ -169,16 +210,20 @@ where
     provider.set_canonical_head(canonical_header.clone());
     info!(target: "engine", "canonical head for round {:?}: {:?} - {:?}", <FixedBytes<8> as Into<u64>>::into(canonical_header.nonce), canonical_header.number, canonical_header.hash());
 
-    // finalize the last block executed from consensus output and update chain info
-    //
-    // this removes canonical blocks from the tree, stores the finalized block number in the
-    // database, but still need to set_finalized afterwards for utilization in-memory for
-    // components, like RPC
-    provider.finalize_block(canonical_header.number)?;
-    provider.set_finalized(canonical_header.clone());
+    if output.early_finalize {
+        // finalize the last block executed from consensus output and update chain info
+        //
+        // this removes canonical blocks from the tree, stores the finalized block number in the
+        // database, but still need to set_finalized afterwards for utilization in-memory for
+        // components, like RPC
+        provider.finalize_block(canonical_header.number)?;
+        provider.set_finalized(canonical_header.clone());
 
-    // update safe block last because this is less time sensitive but still needs to happen
-    provider.set_safe(canonical_header.clone());
+        // update safe block last because this is less time sensitive but still needs to happen
+        provider.set_safe(canonical_header.clone());
+    } else {
+        finalize_signed_blocks(&provider, &output, &canonical_header)?;
+    }
 
     // return new canonical header for next engine task
     Ok(canonical_header)

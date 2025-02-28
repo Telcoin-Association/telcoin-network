@@ -28,8 +28,8 @@ use reth_blockchain_tree::BlockchainTreeEngine;
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
 use reth_provider::{
-    BlockIdReader, BlockReader, CanonChainTracker, ChainSpecProvider, StageCheckpointReader,
-    StateProviderFactory,
+    BlockIdReader, BlockReader, CanonChainTracker, ChainSpecProvider, HeaderProvider,
+    StageCheckpointReader, StateProviderFactory,
 };
 use std::{
     collections::VecDeque,
@@ -129,6 +129,7 @@ where
         BT: StateProviderFactory
             + ChainSpecProvider<ChainSpec = ChainSpec>
             + BlockchainTreeEngine
+            + HeaderProvider<Header = ExecHeader>
             + CanonChainTracker<Header = ExecHeader>
             + Clone,
     {
@@ -200,6 +201,7 @@ where
         + StageCheckpointReader
         + StateProviderFactory
         + ChainSpecProvider<ChainSpec = ChainSpec>
+        + HeaderProvider<Header = ExecHeader>
         + Clone
         + Unpin
         + 'static,
@@ -332,7 +334,7 @@ mod tests {
     /// This tests that a single block is executed if the output from consensus contains no
     /// transactions.
     #[tokio::test]
-    async fn test_empty_output_executes() -> eyre::Result<()> {
+    async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
         //=== Consensus
         //
         // create consensus output bc transactions in batches
@@ -361,6 +363,7 @@ mod tests {
             parent_hash: ConsensusHeader::default().digest(),
             number: 0,
             extra: Default::default(),
+            early_finalize: true,
         };
         let consensus_output_hash = consensus_output.consensus_header_hash();
 
@@ -489,6 +492,96 @@ mod tests {
         Ok(())
     }
 
+    /// This tests that a single block is NOT executed if the output from consensus contains no
+    /// transactions and we are not setting early finalize.
+    #[tokio::test]
+    async fn test_empty_output_executes_late_finalize() -> eyre::Result<()> {
+        //=== Consensus
+        //
+        // create consensus output bc transactions in batches
+        // are randomly generated
+        //
+        // for each tx, seed address with funds in genesis
+        let mut leader = Certificate::default();
+        let sub_dag_index = 0;
+        leader.header.round = sub_dag_index as u32;
+        let reputation_scores = ReputationScores::default();
+        let previous_sub_dag = None;
+        let beneficiary = Address::from_str("0x5555555555555555555555555555555555555555")
+            .expect("beneficiary address from str");
+        let consensus_output = ConsensusOutput {
+            sub_dag: CommittedSubDag::new(
+                vec![Certificate::default()],
+                leader,
+                sub_dag_index,
+                reputation_scores,
+                previous_sub_dag,
+            )
+            .into(),
+            batches: Default::default(), // empty
+            beneficiary,
+            batch_digests: Default::default(), // empty
+            parent_hash: ConsensusHeader::default().digest(),
+            number: 0,
+            extra: Default::default(),
+            early_finalize: false,
+        };
+
+        let chain = adiri_chain_spec_arc();
+
+        // execution node components
+        let execution_node = default_test_execution_node(Some(chain.clone()), None)?;
+
+        let (to_engine, from_consensus) = tokio::sync::broadcast::channel(1);
+        let consensus_output_stream = BroadcastStream::from(from_consensus);
+        let provider = execution_node.get_provider().await;
+        let evm_config = execution_node.get_evm_config().await;
+        let max_round = None;
+        let genesis_header = chain.sealed_genesis_header();
+
+        let shutdown = Notifier::default();
+        let engine = ExecutorEngine::new(
+            provider.clone(),
+            evm_config,
+            max_round,
+            consensus_output_stream,
+            genesis_header.clone(),
+            shutdown.subscribe(),
+        );
+
+        // send output
+        let broadcast_result = to_engine.send(consensus_output.clone());
+        assert!(broadcast_result.is_ok());
+
+        // drop sending channel to shut engine down
+        drop(to_engine);
+
+        let (tx, rx) = oneshot::channel();
+
+        // spawn engine task
+        TaskManager::default().spawn_blocking(Box::pin(async move {
+            let res = engine.await;
+            let _ = tx.send(res);
+        }));
+
+        let engine_task = timeout(Duration::from_secs(10), rx).await?;
+        assert!(engine_task.is_ok());
+
+        let last_block_num = provider.last_block_number()?;
+        let canonical_tip = provider.canonical_tip();
+        let final_block = provider.finalized_block_num_hash()?;
+        assert!(final_block.is_none());
+
+        let expected_block_height = 1;
+        // assert 1 empty block was executed for consensus
+        assert_eq!(last_block_num, expected_block_height);
+        assert_eq!(canonical_tip.number, expected_block_height);
+        // assert last executed output is not finalized
+        let last_output = execution_node.last_executed_output().await?;
+        assert_eq!(last_output, BlockHash::default());
+        Ok(())
+    }
+
     /// Test the engine shuts down after the sending half of the broadcast channel is closed.
     ///
     /// One output is queued (simulating output already received) in the engine and another is sent
@@ -594,6 +687,7 @@ mod tests {
             parent_hash: ConsensusHeader::default().digest(),
             number: 0,
             extra: Default::default(),
+            early_finalize: true,
         };
 
         // create second output
@@ -623,6 +717,7 @@ mod tests {
             parent_hash: consensus_output_1.consensus_header_hash(),
             number: 1,
             extra: Default::default(),
+            early_finalize: true,
         };
         let consensus_output_2_hash = consensus_output_2.consensus_header_hash();
 
@@ -922,6 +1017,7 @@ mod tests {
             parent_hash: ConsensusHeader::default().digest(),
             number: 0,
             extra: Default::default(),
+            early_finalize: true,
         };
 
         // create second output
@@ -953,6 +1049,7 @@ mod tests {
             parent_hash: consensus_output_1.consensus_header_hash(),
             number: 1,
             extra: Default::default(),
+            early_finalize: true,
         };
         let consensus_output_2_hash = consensus_output_2.consensus_header_hash();
 
@@ -1223,6 +1320,7 @@ mod tests {
             parent_hash: ConsensusHeader::default().digest(),
             number: 0,
             extra: Default::default(),
+            early_finalize: true,
         };
         let consensus_output_1_hash = consensus_output_1.consensus_header_hash();
 
@@ -1253,6 +1351,7 @@ mod tests {
             parent_hash: consensus_output_1.consensus_header_hash(),
             number: 1,
             extra: Default::default(),
+            early_finalize: true,
         };
 
         //=== Execution
