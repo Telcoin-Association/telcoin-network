@@ -166,7 +166,7 @@ pub trait TnSender<T>: Unpin + Clone {
     fn send(&self, value: T) -> impl Future<Output = Result<(), SendError<T>>> + Send;
 
     /// Attempts to immediately send a message on this `Sender`
-    fn try_send(&self, message: T) -> Result<(), TrySendError<T>>;
+    fn try_send(&self, value: T) -> Result<(), TrySendError<T>>;
 
     /// Get a reciever for this TnSender.
     /// For an MPSC or other limited channel this may panic if called more than once.
@@ -175,11 +175,19 @@ pub trait TnSender<T>: Unpin + Clone {
 
 impl<T: Send + Clone + 'static> TnSender<T> for broadcast::Sender<T> {
     async fn send(&self, value: T) -> Result<(), SendError<T>> {
-        Ok(self.send(value).map(|_| ())?)
+        // This will only fail if there are no open receivers.
+        // We are not worried about that, if no code is interested
+        // then that is fine, it might be later
+        let _ = self.send(value);
+        Ok(())
     }
 
-    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
-        Ok(self.send(message).map(|_| ())?)
+    fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
+        // This will only fail if there are no open receivers.
+        // We are not worried about that, if no code is interested
+        // then that is fine, it might be later
+        let _ = self.send(value);
+        Ok(())
     }
 
     fn subscribe(&self) -> impl TnReceiver<T> + 'static {
