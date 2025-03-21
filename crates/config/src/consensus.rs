@@ -85,7 +85,7 @@ where
         worker_cache: WorkerCache,
     ) -> eyre::Result<Self> {
         let local_network =
-            LocalNetwork::new_from_public_key(config.validator_info.primary_network_key());
+            LocalNetwork::new_from_public_key(&key_config.primary_network_public_key());
 
         let primary_public_key = key_config.primary_public_key();
         let authority = committee

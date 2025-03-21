@@ -335,7 +335,9 @@ backoff = { version = "0.4.0", features = [
     "tokio_1",
 ] }
 
-libp2p = { version = "0.54", features = [] }
+libp2p = { version = "0.55", features = [] }
+bs58 = { version = "0.5.1" }
+blake2 = { version = "0.10.6" }
 
 # [patch.crates-io]
 # alloy-sol-type-parser = { git = "https://github.com/alloy-rs/core", commit = "6bd4aeddc899c7649c2ce9be383fd5a3d4c0b691" }

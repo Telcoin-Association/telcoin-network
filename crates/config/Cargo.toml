@@ -21,6 +21,7 @@ tn-storage = { workspace = true }
 tn-types = { workspace = true }
 eyre = { workspace = true }
 rand = { workspace = true }
+rand_chacha = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
@@ -29,6 +30,8 @@ reth-chainspec = { workspace = true }
 humantime-serde = { workspace = true }
 libp2p = { workspace = true }
 backoff = { workspace = true }
+blake2 = { workspace = true }
+bs58 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

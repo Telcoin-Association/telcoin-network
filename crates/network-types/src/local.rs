@@ -6,11 +6,7 @@ use crate::{
 use libp2p::PeerId;
 use parking_lot::RwLock;
 use std::{collections::HashSet, sync::Arc};
-use tn_types::{
-    network_public_key_to_libp2p,
-    traits::{InsecureDefault, KeyPair},
-    BlockHash, NetworkKeypair, NetworkPublicKey,
-};
+use tn_types::{network_public_key_to_libp2p, BlockHash, NetworkKeypair, NetworkPublicKey};
 
 // // //
 //
@@ -62,7 +58,7 @@ impl LocalNetwork {
     }
 
     pub fn new_from_keypair(primary_network_keypair: &NetworkKeypair) -> Self {
-        Self::new(network_public_key_to_libp2p(primary_network_keypair.public()))
+        Self::new(primary_network_keypair.public().to_peer_id())
     }
 
     /// Create a new [LocalNetwork] from the primary's network key.
@@ -71,7 +67,7 @@ impl LocalNetwork {
     }
 
     pub fn new_with_empty_id() -> Self {
-        Self::new(network_public_key_to_libp2p(&NetworkPublicKey::insecure_default()))
+        Self::new(network_public_key_to_libp2p(&NetworkKeypair::generate_ed25519().public().into()))
     }
 
     pub fn set_worker_to_primary_local_handler(&self, handler: Arc<dyn WorkerToPrimaryClient>) {

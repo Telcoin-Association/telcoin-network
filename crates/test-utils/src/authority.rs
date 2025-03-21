@@ -42,8 +42,8 @@ impl<DB: Database> AuthorityFixture<DB> {
     }
 
     /// The authority's ed25519 [NetworkKeypair] used to sign messages on the network.
-    pub fn primary_network_keypair(&self) -> NetworkKeypair {
-        self.consensus_config.key_config().primary_network_keypair().copy()
+    pub fn primary_network_keypair(&self) -> &NetworkKeypair {
+        self.consensus_config.key_config().primary_network_keypair()
     }
 
     /// The authority's [Address] for execution layer.

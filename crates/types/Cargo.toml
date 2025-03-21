@@ -48,6 +48,8 @@ parking_lot = { workspace = true }
 serde_yaml = { workspace = true }
 secp256k1 = { workspace = true }
 libp2p = { workspace = true }
+bs58 = { workspace = true }
+blake2 = { workspace = true }
 alloy = { workspace = true, features = ["genesis"] }
 
 [dev-dependencies]

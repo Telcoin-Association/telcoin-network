@@ -7,19 +7,19 @@
 //! - use generic schemes (avoid using the algo's `Struct`` impl functions)
 //! - change type aliases to update codebase with new crypto
 
+use blake2::digest::consts::U32;
 use eyre::Context;
 use fastcrypto::{
-    bls12381, ed25519,
+    bls12381,
     error::FastCryptoError,
-    hash::{Blake2b256, HashFunction},
     traits::{AggregateAuthenticator, KeyPair, Signer, ToFromBytes, VerifyingKey},
 };
 use libp2p::PeerId;
-use std::future::Future;
+use std::{fmt, future::Future, ops::Deref};
 // This re-export allows using the trait-defined APIs
 pub use fastcrypto::traits;
 use reth_chainspec::ChainSpec;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 mod intent;
 mod network;
 use crate::encode;
@@ -47,11 +47,13 @@ pub type BlsKeypair = bls12381::min_sig::BLS12381KeyPair;
 // NETWORK
 //
 /// Public key used to sign network messages between peers during consensus.
-pub type NetworkPublicKey = ed25519::Ed25519PublicKey;
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NetworkPublicKey(libp2p::identity::PublicKey);
 /// Keypair used to sign network messages between peers during consensus.
-pub type NetworkKeypair = ed25519::Ed25519KeyPair;
+pub type NetworkKeypair = libp2p::identity::Keypair;
 /// Signature using network key.
-pub type NetworkSignature = ed25519::Ed25519Signature;
+pub type NetworkSignature = Vec<u8>;
+
 //
 // EXECUTION
 //
@@ -60,16 +62,90 @@ pub type ExecutionPublicKey = secp256k1::PublicKey;
 /// Keypair used for signing transactions in the Execution Layer.
 pub type ExecutionKeypair = secp256k1::Keypair;
 
-// TODO: implement randomness
-pub type RandomnessSignature = fastcrypto_tbls::types::Signature;
-pub type RandomnessPartialSignature = fastcrypto_tbls::tbls::PartialSignature<RandomnessSignature>;
-pub type RandomnessPrivateKey =
-    fastcrypto_tbls::ecies::PrivateKey<fastcrypto::groups::bls12381::G2Element>;
-
 /// Type alias selecting the default hash function for the code base.
-pub type DefaultHashFunction = Blake2b256;
-pub const DIGEST_LENGTH: usize = DefaultHashFunction::OUTPUT_SIZE;
+pub type DefaultHashFunction = blake2::Blake2b<U32>;
+pub const DIGEST_LENGTH: usize = 32;
 pub const INTENT_MESSAGE_LENGTH: usize = INTENT_PREFIX_LENGTH + DIGEST_LENGTH;
+
+impl NetworkPublicKey {}
+
+impl From<libp2p::identity::PublicKey> for NetworkPublicKey {
+    fn from(value: libp2p::identity::PublicKey) -> Self {
+        Self(value)
+    }
+}
+
+impl From<NetworkPublicKey> for libp2p::identity::PublicKey {
+    fn from(value: NetworkPublicKey) -> Self {
+        value.0
+    }
+}
+
+impl Deref for NetworkPublicKey {
+    type Target = libp2p::identity::PublicKey;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Serialize for NetworkPublicKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&bs58::encode(self.encode_protobuf()).into_string())
+        } else {
+            serializer.serialize_bytes(&self.encode_protobuf()[..])
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NetworkPublicKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::*;
+
+        struct NetworkPublicKeyVisitor;
+
+        impl Visitor<'_> for NetworkPublicKeyVisitor {
+            type Value = NetworkPublicKey;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "valid network public key")
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                Ok(NetworkPublicKey(
+                    libp2p::identity::PublicKey::try_decode_protobuf(v)
+                        .map_err(|_| Error::invalid_value(Unexpected::Bytes(v), &self))?,
+                ))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                let bytes = bs58::decode(v)
+                    .into_vec()
+                    .map_err(|_| Error::invalid_value(Unexpected::Str(v), &self))?;
+                self.visit_bytes(&bytes)
+            }
+        }
+
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_str(NetworkPublicKeyVisitor)
+        } else {
+            deserializer.deserialize_bytes(NetworkPublicKeyVisitor)
+        }
+    }
+}
 
 /// Trait to implement Bls key signing.  This allows us to maintain private keys in a
 /// secure enclave and provide a signing service.
@@ -205,22 +281,8 @@ pub fn to_intent_message<T>(value: T) -> IntentMessage<T> {
 }
 
 /// Convert an existing NetworkPublicKey into a libp2p PeerId.
-pub fn network_public_key_to_libp2p(fastcrypto: &NetworkPublicKey) -> PeerId {
-    let bytes = fastcrypto.as_ref().to_vec();
-    let ed_public_key = libp2p::identity::ed25519::PublicKey::try_from_bytes(&bytes)
-        .expect("invalid public key, not able to convert to peer id!");
-    libp2p::PeerId::from_public_key(&ed_public_key.into())
-}
-
-/// Helper method to convert libp2p -> fastcrypto ed25519.
-pub fn libp2p_to_fastcrypto(peer_id: &PeerId) -> fastcrypto::ed25519::Ed25519PublicKey {
-    let bytes = peer_id.as_ref().digest();
-    // skip first 4 bytes:
-    // - 2 bytes: pubkey type (TN is ed25519 only)
-    // - 1 byte: overhead for multihash type
-    // - 1 byte: pubkey size
-    fastcrypto::ed25519::Ed25519PublicKey::from_bytes(&bytes[4..])
-        .expect("invalid public key, not able to convert to fast cyrpto!")
+pub fn network_public_key_to_libp2p(public_key: &NetworkPublicKey) -> PeerId {
+    public_key.to_peer_id()
 }
 
 #[cfg(test)]

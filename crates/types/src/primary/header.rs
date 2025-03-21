@@ -5,8 +5,9 @@ use crate::{
     Round, TimestampSec, VoteDigest, WorkerCache, WorkerId,
 };
 use base64::{engine::general_purpose, Engine};
+use blake2::Digest as _;
 use derive_builder::Builder;
-use fastcrypto::hash::{Digest, Hash, HashFunction};
+use fastcrypto::hash::{Digest, Hash};
 use fastcrypto_tbls::{tbls::ThresholdBls, types::ThresholdBls12381MinSig};
 use indexmap::IndexMap;
 use once_cell::sync::OnceCell;

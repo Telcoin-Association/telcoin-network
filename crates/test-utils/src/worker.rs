@@ -1,6 +1,5 @@
 //! Worker fixture for the cluster
 
-use fastcrypto::traits::KeyPair as _;
 use tn_config::KeyConfig;
 use tn_types::{NetworkKeypair, WorkerId, WorkerInfo};
 
@@ -15,8 +14,8 @@ pub struct WorkerFixture {
 }
 
 impl WorkerFixture {
-    pub fn keypair(&self) -> NetworkKeypair {
-        self.key_config.worker_network_keypair().copy()
+    pub fn keypair(&self) -> &NetworkKeypair {
+        self.key_config.worker_network_keypair()
     }
 
     pub fn info(&self) -> &WorkerInfo {

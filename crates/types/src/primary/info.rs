@@ -1,6 +1,5 @@
 //! Primary information for peers.
-use crate::{crypto::NetworkPublicKey, get_available_udp_port, Multiaddr, WorkerIndex};
-use fastcrypto::traits::InsecureDefault;
+use crate::{get_available_udp_port, Multiaddr, NetworkKeypair, NetworkPublicKey, WorkerIndex};
 use serde::{Deserialize, Serialize};
 
 /// Information for the Primary.
@@ -46,11 +45,11 @@ impl Default for PrimaryInfo {
         let primary_udp_port = get_available_udp_port(&host).unwrap_or(49590).to_string();
 
         Self {
-            network_key: NetworkPublicKey::insecure_default(),
+            network_key: NetworkKeypair::generate_ed25519().public().into(),
             network_address: format!("/ip4/{}/udp/{}/quic-v1", &host, primary_udp_port)
                 .parse()
                 .expect("multiaddr parsed for primary"),
-            worker_network_key: NetworkPublicKey::insecure_default(),
+            worker_network_key: NetworkKeypair::generate_ed25519().public().into(),
             worker_index: Default::default(),
         }
     }

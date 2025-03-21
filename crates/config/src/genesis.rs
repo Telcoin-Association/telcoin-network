@@ -261,14 +261,6 @@ impl NetworkGenesis {
 }
 
 /// information needed for every validator:
-/// - name (not strictly necessary but nice to have)
-/// - bls public key bytes (not `BlsPublicKey` - need to ensure BlsPublikKey::from_bytes() works)
-/// - primary_network_address (Multiaddress)
-/// - execution address (Address - not needed for validation, but for suggested fee recipient)
-/// - network key (only one for now? - worker and primary share?)
-/// - hostname
-/// - worker index (HashMap<WorkerId, WorkerInfo>) - create worker cache
-/// - p2p address (put in now for execution clients later?)
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct ValidatorInfo {
     /// The name for the validator. The default value
@@ -429,7 +421,10 @@ impl PubkeyFlags {
                 *val = validator_infos[i].execution_address.into_word();
                 return;
             } else if *val == flag.ed25519 {
-                *val = B256::from_slice(validator_infos[i].primary_network_key().as_bytes());
+                let key: libp2p::identity::PublicKey =
+                    validator_infos[i].primary_network_key().clone().into();
+                let key = key.try_into_ed25519().expect("ed25519 key");
+                *val = B256::from_slice(&key.to_bytes());
                 return;
             }
         }
@@ -485,7 +480,7 @@ mod tests {
         let paths = tmp_dir.path().to_path_buf();
         // create keys and information for validator
         let bls_keypair = BlsKeypair::generate(&mut StdRng::from_seed([0; 32]));
-        let network_keypair = NetworkKeypair::generate(&mut StdRng::from_seed([0; 32]));
+        let network_keypair = NetworkKeypair::generate_ed25519();
         let address = Address::from_raw_public_key(&[0; 64]);
         let proof_of_possession =
             generate_proof_of_possession_bls(&bls_keypair, &adiri_chain_spec()).unwrap();
@@ -493,9 +488,9 @@ mod tests {
         let worker_info = WorkerInfo::default();
         let worker_index = WorkerIndex(BTreeMap::from([(0, worker_info)]));
         let primary_info = PrimaryInfo::new(
-            network_keypair.public().clone(),
+            network_keypair.public().clone().into(),
             primary_network_address,
-            network_keypair.public().clone(),
+            network_keypair.public().clone().into(),
             worker_index,
         );
         let name = "validator1".to_string();
@@ -559,7 +554,7 @@ mod tests {
         // create keys and information for validators
         for v in 0..4 {
             let bls_keypair = BlsKeypair::generate(&mut StdRng::from_seed([0; 32]));
-            let network_keypair = NetworkKeypair::generate(&mut StdRng::from_seed([0; 32]));
+            let network_keypair = NetworkKeypair::generate_ed25519();
             let address = Address::from_raw_public_key(&[0; 64]);
             let proof_of_possession =
                 generate_proof_of_possession_bls(&bls_keypair, &adiri_chain_spec()).unwrap();
@@ -567,9 +562,9 @@ mod tests {
             let worker_info = WorkerInfo::default();
             let worker_index = WorkerIndex(BTreeMap::from([(0, worker_info)]));
             let primary_info = PrimaryInfo::new(
-                network_keypair.public().clone(),
+                network_keypair.public().clone().into(),
                 primary_network_address,
-                network_keypair.public().clone(),
+                network_keypair.public().clone().into(),
                 worker_index,
             );
             let name = format!("validator-{}", v);
@@ -595,7 +590,7 @@ mod tests {
         // create keys and information for validators
         for v in 0..4 {
             let bls_keypair = BlsKeypair::generate(&mut StdRng::from_seed([0; 32]));
-            let network_keypair = NetworkKeypair::generate(&mut StdRng::from_seed([0; 32]));
+            let network_keypair = NetworkKeypair::generate_ed25519();
             let address = Address::from_raw_public_key(&[0; 64]);
 
             // create wrong chain spec
@@ -609,9 +604,9 @@ mod tests {
             let worker_info = WorkerInfo::default();
             let worker_index = WorkerIndex(BTreeMap::from([(0, worker_info)]));
             let primary_info = PrimaryInfo::new(
-                network_keypair.public().clone(),
+                network_keypair.public().clone().into(),
                 primary_network_address,
-                network_keypair.public().clone(),
+                network_keypair.public().clone().into(),
                 worker_index,
             );
             let name = format!("validator-{}", v);

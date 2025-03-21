@@ -78,6 +78,11 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(long, value_name = "INSTANCE", global = true, default_value_t = 1, value_parser = value_parser!(u16).range(..=200))]
     pub instance: u16,
 
+    /// Is this an observer node?  True if set, an observer will never be in the committee
+    /// but will follow consensus and provide node RPC access.
+    #[arg(long, value_name = "OBSERVER", global = true, default_value_t = false)]
+    pub observer: bool,
+
     /// Sets all ports to unused, allowing the OS to choose random unused ports when sockets are
     /// bound.
     ///
@@ -172,7 +177,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // TODO: use config or CLI chain spec?
         let config_path = self.config.clone().unwrap_or(tn_datadir.node_config_path());
 
-        let tn_config: Config = Config::load_from_path(&config_path, ConfigFmt::YAML)?;
+        let mut tn_config: Config = Config::load_from_path(&config_path, ConfigFmt::YAML)?;
         if load_config {
             // Make sure we are using the chain from config not just the default.
             self.chain = Arc::new(tn_config.chain_spec());
@@ -181,8 +186,9 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // get the worker's transaction address from the config
         let Self {
-            // datadir
-            // config,
+            datadir: _, // Used above
+            config: _,  // Used above
+            consensus_metrics,
             chain,
             metrics,
             instance,
@@ -196,8 +202,10 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             dev,
             pruning,
             ext,
-            ..
+            observer,
         } = self;
+
+        tn_config.observer = observer; // Set observer mode from the config.
 
         // create a reth DatadirArgs from tn datadir
         let datadir = DatadirArgs {
@@ -250,7 +258,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             node_config,
             tn_config,
             opt_faucet_args: None,
-            consensus_metrics: self.consensus_metrics,
+            consensus_metrics,
         };
 
         launcher(builder, ext, tn_datadir)

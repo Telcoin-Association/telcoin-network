@@ -8,7 +8,8 @@ use crate::{
     Address, Batch, BlockHash, Certificate, Committee, Epoch, ReputationScores, Round,
     TimestampSec, B256,
 };
-use fastcrypto::hash::{Digest, Hash, HashFunction};
+use blake2::Digest as _;
+use fastcrypto::hash::{Digest, Hash};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},

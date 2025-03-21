@@ -27,10 +27,7 @@ use tn_primary::{
     ConsensusBus, NodeMode, StateSynchronizer,
 };
 use tn_storage::{open_db, tables::ConsensusBlocks, DatabaseType};
-use tn_types::{
-    network_public_key_to_libp2p, BatchValidation, ConsensusHeader, Database as TNDatabase,
-    Multiaddr, TaskManager,
-};
+use tn_types::{BatchValidation, ConsensusHeader, Database as TNDatabase, Multiaddr, TaskManager};
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::{runtime::Builder, sync::mpsc};
 use tracing::{info, instrument, warn};
@@ -145,9 +142,8 @@ async fn start_networks<DB: TNDatabase>(
             consensus_config.peer_id_for_authority(&authority_id).expect("missing peer id!");
         dial_primary(primary_network_handle.clone(), peer_id, addr, peers_connected.clone());
     }
-    for (id, addr) in consensus_config.worker_cache().all_workers() {
+    for (peer_id, addr) in consensus_config.worker_cache().all_workers() {
         if addr != worker_address {
-            let peer_id = network_public_key_to_libp2p(&id);
             dial_worker(worker_network_handle.clone(), peer_id, addr, workers_connected.clone());
         }
     }
@@ -224,7 +220,7 @@ where
 
         let node_storage = db.clone();
         tracing::info!(target: "telcoin::cli", "node storage open");
-        let key_config = KeyConfig::new(tn_datadir)?;
+        let key_config = KeyConfig::read_config(tn_datadir)?;
         let consensus_config = ConsensusConfig::new(config, tn_datadir, node_storage, key_config)?;
 
         let (worker_id, _worker_info) = consensus_config.config().workers().first_worker()?;
@@ -259,7 +255,9 @@ where
             .unwrap_or_else(|| (0, ConsensusHeader::default()));
         consensus_bus.last_consensus_header().send(last_db_block)?;
 
-        if state_sync::can_cvv(
+        if builder.tn_config.observer {
+            consensus_bus.node_mode().send_modify(|v| *v = NodeMode::Observer);
+        } else  if state_sync::can_cvv(
             consensus_bus.clone(),
             consensus_config.clone(),
             primary.network_handle().await,
