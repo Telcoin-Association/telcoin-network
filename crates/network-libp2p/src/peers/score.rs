@@ -110,7 +110,8 @@ impl Score {
 
     /// Modifies the score based on the penalty type and returns the new score.
     pub fn apply_penalty(&mut self, penalty: Penalty) {
-        // TODO: can these overflow?
+        // NOTE: these use `Self::add`
+        // which cannot overflow using default MIN_SCORE and MAX_SCORE
         let new_score = match penalty {
             Penalty::Mild => self.add(-1.0),
             Penalty::Medium => self.add(-5.0),

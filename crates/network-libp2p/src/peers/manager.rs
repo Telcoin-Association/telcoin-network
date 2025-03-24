@@ -44,6 +44,7 @@ pub enum PeerEvent {
     /// Peer manager has unbanned a peer and associated ip addresses.
     Unbanned(PeerId, Vec<IpAddr>),
 }
+
 impl<DB> PeerManager<DB>
 where
     DB: Database,
@@ -103,7 +104,7 @@ where
 
         // TODO: update peer metrics
 
-        self.prune_excess_peers();
+        self.prune_peers();
 
         // TODO: unban peers
 
@@ -316,27 +317,59 @@ where
     }
 
     /// Prune peers to reach target peer counts.
-    fn prune_excess_peers(&mut self) {
+    ///
+    /// Trusted peers and validators are ignored. Peers are sorted from lowest to highest score and removed until excess peer count reaches target.
+    fn prune_peers(&mut self) {
         // obtain config for convenience
         let config = self.config.network_config().peer_config();
 
-        // The current number of connected peers.
-        let total_connected_peers = self.peers.connected_peer_ids().count();
-        if total_connected_peers <= config.target_num_peers {
+        // connected peers sorted from lowest to highest aggregate score
+        let connected_peers = self.peers.connected_peers_by_score();
+        let mut excess_peer_count = connected_peers.len().saturating_sub(config.target_num_peers);
+        if excess_peer_count == 0 {
             // target num peers within range
             return;
         }
 
-        // let mut peers_to_prune = std::collections::HashSet::new();
-
-        // prune peers - ignore validators and trusted peers
-        for peer in self
-            .peers
-            .connected_peers_by_score()
+        // filter peers that are validators
+        let ready_to_prune = connected_peers
             .iter()
-            .filter(|(id, peer)| !self.peers.is_validator(id) && !peer.is_trusted())
-        {
-            todo!()
+            .filter_map(|(peer_id, peer)| {
+                if !self.peers.is_validator(peer_id) && !peer.is_trusted() {
+                    Some(**peer_id)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // disconnect peers until excess_peer_count is 0
+        for peer_id in ready_to_prune {
+            if excess_peer_count > 0 {
+                self.disconnect_peer(peer_id);
+                excess_peer_count = excess_peer_count.saturating_sub(1);
+                continue;
+            }
+
+            // excess peers 0 - finish pruning
+            break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // delete me
+    #[test]
+    fn saturating_sub() {
+        let connected = vec!['a', 'b', 'c'];
+        let max_peers = 5;
+
+        let res = connected.len().saturating_sub(max_peers);
+        println!("res {res}");
+        assert_eq!(res, 0);
+
+        let danger = connected.len() - max_peers;
+        println!("danger {danger}");
     }
 }
