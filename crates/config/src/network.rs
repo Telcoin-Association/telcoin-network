@@ -224,6 +224,11 @@ pub struct PeerConfig {
     ///
     /// NOTE: Self::min_outbound_only_factor must be < Self::target_outbound_only_factor.
     pub min_outbound_only_factor: f32,
+
+    /// The minimum amount of time before peers are allowed to reconnect after this node disconnects due to too many peers.
+    ///
+    /// If peers try to connect before the reconnection timeout passes, the swarm denies the connection attempt. This essentially results in a temporary ban at the swarm level.
+    pub excess_peers_reconnection_timeout: Duration, // = Duration::from_secs(600);
 }
 
 impl Default for PeerConfig {
@@ -237,6 +242,7 @@ impl Default for PeerConfig {
             priority_peer_excess: 0.2,
             target_outbound_only_factor: 0.3,
             min_outbound_only_factor: 0.2,
+            excess_peers_reconnection_timeout: Duration::from_secs(600),
         }
     }
 }

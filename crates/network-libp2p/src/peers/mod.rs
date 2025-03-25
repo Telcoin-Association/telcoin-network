@@ -15,6 +15,7 @@ use tracing::{debug, error, warn};
 use types::ConnectionDirection;
 mod banned;
 mod behavior;
+mod cache;
 mod manager;
 mod peer;
 mod score;
@@ -402,7 +403,7 @@ impl AllPeers {
         } else {
             // NOTE: this should never happen
             warn!(target: "peer-manager", ?peer_id, "failed to retrieve peer data for handling disconnect and ban");
-            PeerAction::Ban(Vec::with_capacity(0))
+            PeerAction::Ban(Vec::new())
         }
     }
 

@@ -177,7 +177,7 @@ where
                     );
                 }
             }
-            return Ok(HashSet::with_capacity(0));
+            return Ok(HashSet::new());
         }
 
         // check storage

@@ -3,8 +3,8 @@
 use crate::peers::status::ConnectionStatus;
 
 use super::{
-    score::Penalty, types::ConnectionType, AllPeers, ConnectionDirection, NewConnectionStatus,
-    PeerAction,
+    cache::BannedPeerCache, score::Penalty, types::ConnectionType, AllPeers, ConnectionDirection,
+    NewConnectionStatus, PeerAction,
 };
 use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
 use std::{collections::VecDeque, net::IpAddr, task::Context};
@@ -24,6 +24,25 @@ pub struct PeerManager<DB> {
     peers: AllPeers,
     /// A queue of events that the `PeerManager` is waiting to produce.
     events: VecDeque<PeerEvent>,
+    /// Tracks temporarily banned peers to prevent immediate reconnection attempts.
+    ///
+    /// This LRU cache manages a time-based ban list that operates independently
+    /// from the peer's state. Characteristics:
+    ///
+    /// - Prevents reconnection attempts at the network layer without affecting the
+    ///   peer's stored state
+    /// - Peers appear to be banned for connection purposes while still having a
+    ///   non-banned state in the database
+    /// - Ban records persist even after a peer is removed from the database, allowing
+    ///   rejection of unknown peers based on previous temporary bans
+    /// - Control the time-based LRU cache mechanism by leveraging the PeerManager's
+    ///   heartbeat cycle for maintenance instead of requiring separate polling
+    /// - The actual ban duration has a resolution limited by the heartbeat interval,
+    ///   as cache cleanup occurs during heartbeat events
+    ///
+    /// The implementation uses `FnvHashSet` instead of the default Rust hasher `SipHash`
+    /// for improved performance for short keys.
+    temporarily_banned: BannedPeerCache<PeerId>,
     //
     // TNR?
 }
@@ -58,8 +77,11 @@ where
         // TODO: restore from backup?
         let peers = AllPeers::default();
         let events = VecDeque::new();
+        let temporarily_banned = BannedPeerCache::new(
+            config.network_config().peer_config().excess_peers_reconnection_timeout,
+        );
 
-        Self { peer_id, config, heartbeat, peers, events }
+        Self { peer_id, config, heartbeat, peers, events, temporarily_banned }
     }
 
     /// Push a [PeerEvent].
@@ -94,8 +116,6 @@ where
     /// The manager runs routine maintenance to decay penalties for peers. This method
     /// is routine and can not further penalize peers.
     pub(super) fn heartbeat(&mut self) {
-        // TODO: maintain peer count
-
         // update peers
         let actions = self.peers.heartbeat_maintenance();
         for (peer_id, action) in actions {
@@ -106,9 +126,7 @@ where
 
         self.prune_peers();
 
-        // TODO: unban peers
-
-        todo!()
+        self.unban_peers();
     }
 
     // TODO: use RepuationUpdate instead of PeerAction
@@ -355,21 +373,13 @@ where
             break;
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    // delete me
-    #[test]
-    fn saturating_sub() {
-        let connected = vec!['a', 'b', 'c'];
-        let max_peers = 5;
-
-        let res = connected.len().saturating_sub(max_peers);
-        println!("res {res}");
-        assert_eq!(res, 0);
-
-        let danger = connected.len() - max_peers;
-        println!("danger {danger}");
+    /// Unban temporarily banned peers.
+    ///
+    /// Peers are temporarily "banned" when trying to connect while this node has excess peers.
+    fn unban_peers(&mut self) {
+        for peer_id in self.temporarily_banned.heartbeat() {
+            self.push_event(PeerEvent::Unbanned(peer_id, Vec::new()));
+        }
     }
 }
