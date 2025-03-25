@@ -4,7 +4,6 @@ use crate::consensus::{
     Bullshark, ConsensusMetrics, ConsensusState, LeaderSchedule, LeaderSwapTable,
 };
 use blake2::Digest as _;
-use fastcrypto::hash::Hash;
 use futures::{stream::FuturesUnordered, StreamExt};
 use rand::{
     distributions::{Bernoulli, Distribution},
@@ -21,7 +20,8 @@ use std::{
 use tn_storage::{mem_db::MemDatabase, open_db, ConsensusStore};
 use tn_test_utils::{mock_certificate_with_rand, CommitteeFixture};
 use tn_types::{
-    Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Round, Stake,
+    Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Hash as _, Round,
+    Stake,
 };
 use tokio::sync::mpsc::channel;
 

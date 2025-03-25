@@ -1,6 +1,5 @@
 //! IT tests
 
-use fastcrypto::hash::Hash;
 use std::{collections::BTreeSet, sync::Arc};
 use tn_executor::get_restored_consensus_output;
 use tn_primary::{
@@ -10,7 +9,7 @@ use tn_primary::{
 use tn_storage::{mem_db::MemDatabase, CertificateStore, ConsensusStore};
 use tn_test_utils::CommitteeFixture;
 use tn_types::{
-    Certificate, ExecHeader, SealedHeader, TaskManager, TnReceiver, TnSender, B256,
+    Certificate, ExecHeader, Hash as _, SealedHeader, TaskManager, TnReceiver, TnSender, B256,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 

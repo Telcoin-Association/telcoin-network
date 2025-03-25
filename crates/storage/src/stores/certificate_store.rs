@@ -1,6 +1,5 @@
 //! NOTE: tests for this module are in test-utils storage_tests.rs to avoid circular dependancies.
 
-use fastcrypto::hash::Hash;
 use std::{
     cmp::{max, Ordering},
     collections::BTreeMap,
@@ -14,7 +13,7 @@ use crate::{
     StoreResult, ROUNDS_TO_KEEP,
 };
 use tn_types::{
-    AuthorityIdentifier, Certificate, CertificateDigest, Database, DbTx, DbTxMut, Round,
+    AuthorityIdentifier, Certificate, CertificateDigest, Database, DbTx, DbTxMut, Hash, Round,
 };
 use tn_utils::sync::notify_read::NotifyRead;
 

@@ -5,7 +5,6 @@ use crate::{
     ConsensusBus, NodeMode,
 };
 use consensus_metrics::monitored_future;
-use fastcrypto::hash::Hash;
 use std::{
     cmp::{max, Ordering},
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -16,7 +15,7 @@ use tn_config::ConsensusConfig;
 use tn_storage::{CertificateStore, ConsensusStore};
 use tn_types::{
     AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Committee, Database,
-    Noticer, Round, TaskManager, Timestamp, TnReceiver, TnSender,
+    Hash as _, Noticer, Round, TaskManager, Timestamp, TnReceiver, TnSender,
 };
 use tracing::{debug, info, instrument};
 

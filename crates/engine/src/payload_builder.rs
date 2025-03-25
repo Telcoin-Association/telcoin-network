@@ -3,7 +3,6 @@
 //! This approach heavily inspired by reth's `default_ethereum_payload_builder`.
 
 use crate::error::{EngineResult, TnEngineError};
-use fastcrypto::hash::Hash as _;
 use reth_blockchain_tree::{BlockValidationKind, BlockchainTreeEngine};
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
@@ -21,9 +20,9 @@ use std::sync::Arc;
 use tn_node_traits::{BuildArguments, TNPayload, TNPayloadAttributes};
 use tn_types::{
     calculate_transaction_root, max_batch_gas, Batch, Block, BlockBody, BlockExt as _,
-    ConsensusOutput, ExecHeader, Receipt, SealedBlockWithSenders, SealedHeader, TransactionSigned,
-    Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS,
-    EMPTY_WITHDRAWALS, U256,
+    ConsensusOutput, ExecHeader, Hash as _, Receipt, SealedBlockWithSenders, SealedHeader,
+    TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_RECEIPTS,
+    EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, U256,
 };
 use tracing::{debug, error, info, warn};
 

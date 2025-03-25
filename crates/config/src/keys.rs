@@ -2,15 +2,13 @@
 
 use crate::{TelcoinDirs, BLS_KEYFILE, PRIMARY_NETWORK_SEED_FILE, WORKER_NETWORK_SEED_FILE};
 use blake2::Digest;
-use rand::{rngs::StdRng, SeedableRng};
+use rand::{rngs::StdRng, CryptoRng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use reth_chainspec::ChainSpec;
 use std::sync::Arc;
 use tn_types::{
-    encode,
-    traits::{AllowedRng, KeyPair, Signer, ToFromBytes},
-    BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner, DefaultHashFunction, Intent, IntentMessage,
-    IntentScope, NetworkKeypair, NetworkPublicKey, ProtocolSignature as _,
+    encode, BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner, DefaultHashFunction, Intent,
+    IntentMessage, IntentScope, NetworkKeypair, NetworkPublicKey, ProtocolSignature as _, Signer,
 };
 
 #[derive(Debug)]
@@ -82,7 +80,7 @@ impl KeyConfig {
         let primary_network_keypair =
             Self::generate_network_keypair(&primary_keypair, primary_seed);
         let worker_network_keypair = Self::generate_network_keypair(&primary_keypair, worker_seed);
-        let contents = bs58::encode(primary_keypair.as_bytes()).into_string();
+        let contents = bs58::encode(primary_keypair.to_bytes()).into_string();
         std::fs::write(tn_datadir.validator_keys_path().join(BLS_KEYFILE), contents)?;
         std::fs::write(
             tn_datadir.validator_keys_path().join(PRIMARY_NETWORK_SEED_FILE),
@@ -104,7 +102,7 @@ impl KeyConfig {
     /// Generate random keys with provided RNG.
     ///
     /// Useful for testing.
-    pub fn with_random<R: AllowedRng>(rng: &mut R) -> Self {
+    pub fn with_random<R: CryptoRng + RngCore>(rng: &mut R) -> Self {
         let primary_keypair = BlsKeypair::generate(rng);
         let primary_network_keypair =
             Self::generate_network_keypair(&primary_keypair, "primary network keypair");
@@ -136,7 +134,7 @@ impl KeyConfig {
 
     /// Provide the primaries public key.
     pub fn primary_public_key(&self) -> BlsPublicKey {
-        self.inner.primary_keypair.public().clone()
+        *self.inner.primary_keypair.public()
     }
 
     /// Provide the keypair (with private key) for the network.
@@ -158,7 +156,7 @@ impl KeyConfig {
 
     /// The [NetworkPublicKey] for the worker network.
     pub fn worker_network_public_key(&self) -> NetworkPublicKey {
-        self.worker_network_keypair().public().clone().into()
+        self.worker_network_keypair().public().into()
     }
 
     /// Creates a proof of that the authority account address is owned by the
@@ -172,7 +170,7 @@ impl KeyConfig {
         &self,
         chain_spec: &ChainSpec,
     ) -> eyre::Result<BlsSignature> {
-        let mut msg = self.primary_public_key().as_bytes().to_vec();
+        let mut msg = self.primary_public_key().as_ref().to_vec();
         let genesis_bytes = encode(&chain_spec.genesis);
         msg.extend_from_slice(genesis_bytes.as_slice());
         let sig = BlsSignature::new_secure(
@@ -186,7 +184,7 @@ impl KeyConfig {
     /// This is deterministic for a given keypair and seed_str.
     fn generate_network_keypair(primary_keypair: &BlsKeypair, seed_str: &str) -> NetworkKeypair {
         let mut hasher = DefaultHashFunction::new();
-        hasher.update(primary_keypair.sign(seed_str.as_bytes()).as_bytes());
+        hasher.update(primary_keypair.sign(seed_str.as_bytes()).to_bytes());
         let hash = hasher.finalize();
         NetworkKeypair::ed25519_from_bytes(hash[0..32].to_vec()).expect("invalid network key bytes")
     }

@@ -26,7 +26,6 @@ enr = { workspace = true, default-features = false, features = [
     "rust-secp256k1",
 ] }
 
-fastcrypto = { workspace = true }
 tn-executor = { workspace = true }
 tn-node-traits = { workspace = true }
 tn-primary = { workspace = true }

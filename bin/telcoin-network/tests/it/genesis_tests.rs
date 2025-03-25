@@ -2,7 +2,6 @@
 mod tests {
     use crate::util::spawn_local_testnet;
     use alloy::{network::EthereumWallet, primitives::Uint, providers::ProviderBuilder};
-    use fastcrypto::traits::{KeyPair, ToFromBytes};
     use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
     use rand::{rngs::StdRng, SeedableRng};
     use reth_chainspec::ChainSpec;
@@ -113,7 +112,7 @@ mod tests {
                 // generate random bls, ed25519, and ecdsa keys for each validator
                 let mut rng = StdRng::from_entropy();
                 let bls_keypair = BlsKeypair::generate(&mut rng);
-                let bls_pubkey = bls_keypair.public().as_bytes().to_vec();
+                let bls_pubkey = bls_keypair.public().to_bytes().to_vec();
                 let ed_25519_keypair = NetworkKeypair::generate_ed25519();
                 let ecdsa_pubkey = Address::random();
 

@@ -5,7 +5,6 @@ use crate::{
     network::{PrimaryRequest, PrimaryResponse},
     ConsensusBus,
 };
-use fastcrypto::traits::KeyPair;
 use rand::{rngs::StdRng, SeedableRng};
 use std::{collections::HashMap, num::NonZeroUsize};
 use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};

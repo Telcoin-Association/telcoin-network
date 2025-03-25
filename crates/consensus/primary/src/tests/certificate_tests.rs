@@ -1,6 +1,5 @@
 //! Certificate tests
 
-use fastcrypto::traits::KeyPair as _;
 use rand::{
     rngs::{OsRng, StdRng},
     SeedableRng,

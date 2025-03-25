@@ -8,7 +8,6 @@ use crate::{
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
-use fastcrypto::{hash::Hash, traits::KeyPair as _};
 use itertools::Itertools;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -25,7 +24,7 @@ use tn_test_utils::{
 };
 use tn_types::{
     now, AuthorityIdentifier, BlockNumHash, Certificate, Committee, Database, ExecHeader,
-    SealedHeader, SignatureVerificationState, TaskManager,
+    Hash as _, SealedHeader, SignatureVerificationState, TaskManager,
 };
 use tokio::{sync::mpsc, time::timeout};
 
@@ -96,8 +95,7 @@ async fn test_request_vote_has_missing_execution_block() {
         .latest_execution_block(BlockNumHash::default()) // dummy_hash would be correct here but this is the test...
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
         .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
-        .build()
-        .unwrap();
+        .build();
 
     // Write some certificates from round 2 into the store, and leave out the rest to test
     // headers with some parents but not all available. Round 1 certificates should be written
@@ -166,8 +164,7 @@ async fn test_request_vote_older_execution_block() {
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
         .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
-        .build()
-        .unwrap();
+        .build();
 
     // Write some certificates from round 2 into the store, and leave out the rest to test
     // headers with some parents but not all available. Round 1 certificates should be written
@@ -231,8 +228,7 @@ async fn test_request_vote_has_missing_parents() {
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
         .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
-        .build()
-        .unwrap();
+        .build();
 
     // Write some certificates from round 2 into the store, and leave out the rest to test
     // headers with some parents but not all available. Round 1 certificates should be written
@@ -320,8 +316,7 @@ async fn test_request_vote_accept_missing_parents() {
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
-        .build()
-        .unwrap();
+        .build();
 
     // Populate all round 1 certificates and some round 2 certificates into the storage.
     // The new header will have some round 2 certificates missing as parents, but these parents
@@ -396,8 +391,7 @@ async fn test_request_vote_missing_batches() {
         let header = primary
             .header_builder(&fixture.committee())
             .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
-            .build()
-            .unwrap();
+            .build();
 
         let certificate = fixture.certificate(&header);
         let digest = certificate.clone().digest();
@@ -414,8 +408,7 @@ async fn test_request_vote_missing_batches() {
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(certificates.keys().cloned().collect())
         .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
-        .build()
-        .unwrap();
+        .build();
 
     // Set up mock worker.
     let worker = primary.worker();
@@ -465,8 +458,7 @@ async fn test_request_vote_already_voted() {
         let header = primary
             .header_builder(&fixture.committee())
             .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
-            .build()
-            .unwrap();
+            .build();
 
         let certificate = fixture.certificate(&header);
         let digest = certificate.clone().digest();
@@ -492,8 +484,7 @@ async fn test_request_vote_already_voted() {
         .parents(certificates.keys().cloned().collect())
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
-        .build()
-        .unwrap();
+        .build();
 
     let vote = if let PrimaryResponse::Vote(vote) = tokio::time::timeout(
         Duration::from_secs(10),
@@ -525,8 +516,7 @@ async fn test_request_vote_already_voted() {
         .parents(certificates.keys().cloned().collect())
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
-        .build()
-        .unwrap();
+        .build();
 
     let response = handler.vote(peer, test_header, Vec::new()).await;
     assert!(response.is_err());
@@ -671,8 +661,7 @@ async fn test_request_vote_created_at_in_future() {
         let header = primary
             .header_builder(&fixture.committee())
             .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
-            .build()
-            .unwrap();
+            .build();
 
         let certificate = fixture.certificate(&header);
         let digest = certificate.clone().digest();
@@ -703,8 +692,7 @@ async fn test_request_vote_created_at_in_future() {
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
         .created_at(created_at)
-        .build()
-        .unwrap();
+        .build();
 
     // For such a future header we get back an error
     assert!(handler.vote(peer, test_header, Vec::new()).await.is_err());
@@ -721,8 +709,7 @@ async fn test_request_vote_created_at_in_future() {
         .parents(certificates.keys().cloned().collect())
         .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
         .created_at(created_at)
-        .build()
-        .unwrap();
+        .build();
 
     let _vote = if let PrimaryResponse::Vote(vote) =
         handler.vote(peer, test_header, Vec::new()).await.unwrap()

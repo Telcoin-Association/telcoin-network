@@ -5,11 +5,10 @@ use super::{CertificateDigest, ConsensusHeader, SignatureVerificationState};
 use crate::{
     crypto, encode,
     error::{CertificateError, CertificateResult},
-    Address, Batch, BlockHash, Certificate, Committee, Epoch, ReputationScores, Round,
-    TimestampSec, B256,
+    Address, Batch, BlockHash, Certificate, Committee, Digest, Epoch, Hash, ReputationScores,
+    Round, TimestampSec, B256,
 };
 use blake2::Digest as _;
-use fastcrypto::hash::{Digest, Hash};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},
@@ -225,8 +224,7 @@ impl CommittedSubDag {
                 cert.set_signature_verification_state(
                     SignatureVerificationState::VerifiedIndirectly(
                         cert.aggregated_signature()
-                            .ok_or(CertificateError::RecoverBlsAggregateSignatureBytes)?
-                            .clone(),
+                            .ok_or(CertificateError::RecoverBlsAggregateSignatureBytes)?,
                     ),
                 );
                 new_certs.push(cert);
@@ -269,7 +267,7 @@ impl From<ConsensusDigest> for B256 {
 pub type ShutdownToken = mpsc::Sender<()>;
 
 // Digest of ConsususOutput and CommittedSubDag
-#[derive(Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, std::hash::Hash, PartialOrd, Ord)]
 pub struct ConsensusDigest([u8; crypto::DIGEST_LENGTH]);
 
 impl AsRef<[u8]> for ConsensusDigest {

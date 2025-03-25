@@ -33,7 +33,6 @@ async fn test_certificate_signers_are_ordered() {
         1,
         1,
         IndexMap::new(),
-        Vec::new(),
         BTreeSet::new(),
         BlockNumHash::default(),
     );

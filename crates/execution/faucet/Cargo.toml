@@ -48,7 +48,6 @@ tn-types = { workspace = true }
 
 [dev-dependencies]
 prometheus = { workspace = true }
-fastcrypto = { workspace = true }
 consensus-metrics = { workspace = true }
 tn-test-utils = { workspace = true }
 tn-network-types = { workspace = true }

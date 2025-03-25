@@ -4,10 +4,11 @@ use crate::consensus::{
     utils, ConsensusError, ConsensusMetrics, ConsensusState, Dag, LeaderSchedule, LeaderSwapTable,
     Outcome,
 };
-use fastcrypto::hash::Hash;
 use std::{collections::VecDeque, sync::Arc};
 use tn_storage::ConsensusStore;
-use tn_types::{Certificate, CommittedSubDag, Committee, ReputationScores, Round, Stake};
+use tn_types::{
+    Certificate, CommittedSubDag, Committee, Hash as _, ReputationScores, Round, Stake,
+};
 use tokio::time::Instant;
 use tracing::{debug, error_span};
 

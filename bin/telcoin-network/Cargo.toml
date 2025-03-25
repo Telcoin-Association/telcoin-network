@@ -37,7 +37,6 @@ tokio = { workspace = true, features = [
 tracing = { workspace = true }
 pin-project = { workspace = true }
 metrics = { workspace = true }
-fastcrypto = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 prometheus = { workspace = true }

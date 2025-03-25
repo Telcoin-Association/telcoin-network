@@ -1,5 +1,4 @@
 //! Hierarchical type to hold tasks spawned for a worker in the network.
-use fastcrypto::traits::VerifyingKey;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_executor::{Executor, SubscriberResult};
@@ -9,9 +8,7 @@ use tn_primary::{
     ConsensusBus, Primary, StateSynchronizer,
 };
 use tn_primary_metrics::Metrics;
-use tn_types::{
-    BlsPublicKey, Database as ConsensusDatabase, TaskManager, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
-};
+use tn_types::{Database as ConsensusDatabase, TaskManager, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
 use tokio::sync::RwLock;
 use tracing::instrument;
 
@@ -62,10 +59,7 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         &self,
         consensus_bus: &ConsensusBus,
         task_manager: &TaskManager,
-    ) -> SubscriberResult<LeaderSchedule>
-    where
-        BlsPublicKey: VerifyingKey,
-    {
+    ) -> SubscriberResult<LeaderSchedule> {
         let leader_schedule = LeaderSchedule::from_store(
             self.consensus_config.committee().clone(),
             self.consensus_config.node_storage().clone(),

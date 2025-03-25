@@ -7,7 +7,6 @@ use crate::{
     state_sync::{CertificateCollector, StateSynchronizer},
     ConsensusBus,
 };
-use fastcrypto::hash::Hash;
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -24,7 +23,7 @@ use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, try_decode, AuthorityIdentifier, BlockHash, Certificate, CertificateDigest,
-    ConsensusHeader, Database, Header, Round, SignatureVerificationState, Vote,
+    ConsensusHeader, Database, Hash as _, Header, Round, SignatureVerificationState, Vote,
 };
 use tracing::{debug, error, warn};
 
@@ -165,10 +164,8 @@ where
             let verified = parents
                 .into_iter()
                 .map(|mut cert| {
-                    let sig = cert
-                        .aggregated_signature()
-                        .cloned()
-                        .ok_or(HeaderError::ParentMissingSignature)?;
+                    let sig =
+                        cert.aggregated_signature().ok_or(HeaderError::ParentMissingSignature)?;
                     cert.set_signature_verification_state(SignatureVerificationState::Unverified(
                         sig,
                     ));

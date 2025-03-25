@@ -2,7 +2,6 @@
 use crate::{
     Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, Parameters, TelcoinDirs,
 };
-use fastcrypto::hash::Hash as _;
 use libp2p::PeerId;
 use std::{
     collections::{HashMap, HashSet},
@@ -11,7 +10,7 @@ use std::{
 use tn_network_types::local::LocalNetwork;
 use tn_types::{
     network_public_key_to_libp2p, Authority, AuthorityIdentifier, Certificate, CertificateDigest,
-    Committee, Database, Multiaddr, Notifier, WorkerCache, WorkerId,
+    Committee, Database, Hash as _, Multiaddr, Notifier, WorkerCache, WorkerId,
 };
 
 #[derive(Debug)]

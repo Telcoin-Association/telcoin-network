@@ -236,8 +236,6 @@ tn-primary-metrics = { path = "./crates/consensus/primary-metrics" }
 tn-utils = { path = "./crates/tn-utils" }
 
 # misc
-fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "802c1ac98061687d6ce024849c747a250dbeea52" }
-fastcrypto-tbls = { git = "https://github.com/MystenLabs/fastcrypto", rev = "802c1ac98061687d6ce024849c747a250dbeea52" }
 match_opt = "0.1.2"
 serde = { version = "^1.0", features = ["derive", "rc"] }
 serde_repr = "0.1"
@@ -253,8 +251,8 @@ serde-reflection = "0.3.6"
 indexmap = { version = "2.5.0", features = ["serde"] }
 itertools = "0.10.5"
 once_cell = "1.18.0"
-prometheus = "0.13.3"
-tonic = { version = "0.10", features = ["transport", "tls"] }
+prometheus = { version = "0.13.4", default-features = false }
+tonic = { version = "0.13" }
 async-trait = "0.1.61"
 dashmap = "6.0.1"
 parking_lot = "0.12.3"
@@ -284,11 +282,13 @@ tokio-stream = { version = "0.1.14", features = ["sync", "net"] }
 serde_yaml = "0.8.26"
 byteorder = "1.4.3"
 rustversion = "1.0.9"
-protobuf = { version = "2.28", features = ["with-bytes"] }
+protobuf = { version = "3.7.2", features = ["with-bytes"] }
 bytes = "1.4.0"
 anyhow = "1.0.71"
 multiaddr = "0.18"
 humantime = "2.1.0"
+blst = "0.3.14"
+hex = "0.4.3"
 
 criterion = { version = "0.5.0", features = [
     "async",

@@ -8,12 +8,11 @@ use crate::{
     ConsensusBus,
 };
 use consensus_metrics::monitored_scope;
-use fastcrypto::hash::Hash as _;
 use std::{collections::HashSet, sync::Arc, time::Instant};
 use tn_config::ConsensusConfig;
 use tn_storage::CertificateStore;
 use tn_types::{
-    error::CertificateError, Certificate, CertificateDigest, Database, Round,
+    error::CertificateError, Certificate, CertificateDigest, Database, Hash as _, Round,
     SignatureVerificationState, TnSender as _,
 };
 use tokio::sync::oneshot;
@@ -364,8 +363,7 @@ where
     fn mark_verified_indirectly(&self, cert: &mut Certificate) -> CertManagerResult<()> {
         cert.set_signature_verification_state(SignatureVerificationState::VerifiedIndirectly(
             cert.aggregated_signature()
-                .ok_or(CertificateError::RecoverBlsAggregateSignatureBytes)?
-                .clone(),
+                .ok_or(CertificateError::RecoverBlsAggregateSignatureBytes)?,
         ));
 
         Ok(())

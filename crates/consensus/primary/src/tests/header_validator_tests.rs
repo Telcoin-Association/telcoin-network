@@ -4,10 +4,9 @@ use std::collections::HashMap;
 
 use crate::{consensus::ConsensusRound, state_sync::HeaderValidator, ConsensusBus};
 use assert_matches::assert_matches;
-use fastcrypto::hash::Hash as _;
 use tn_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
 use tn_test_utils::{fixture_batch_with_transactions, CommitteeFixture};
-use tn_types::error::HeaderError;
+use tn_types::{error::HeaderError, Hash as _};
 
 #[tokio::test]
 async fn test_sync_batches_drops_old_rounds() -> eyre::Result<()> {
@@ -28,8 +27,7 @@ async fn test_sync_batches_drops_old_rounds() -> eyre::Result<()> {
             let header = a
                 .header_builder(&committee)
                 .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
-                .build()
-                .expect("header for authority");
+                .build();
             let cert = fixture.certificate(&header);
             let digest = cert.digest();
             certificate_store.write(cert.clone()).expect("write cert to storage");
@@ -46,8 +44,7 @@ async fn test_sync_batches_drops_old_rounds() -> eyre::Result<()> {
         .round(2)
         .parents(certs.keys().cloned().collect())
         .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
-        .build()
-        .expect("test header build");
+        .build();
 
     // update round
     let committed_round = 30;

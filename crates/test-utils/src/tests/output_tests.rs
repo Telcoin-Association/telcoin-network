@@ -20,8 +20,7 @@ fn test_zero_timestamp_in_sub_dag() {
         .created_at(50)
         .payload(IndexMap::new())
         .parents(BTreeSet::new())
-        .build()
-        .unwrap();
+        .build();
 
     let certificate = Certificate::new_unsigned(&committee, header, Vec::new()).unwrap();
 
@@ -55,8 +54,7 @@ fn test_monotonically_incremented_commit_timestamps() {
         .created_at(newer_timestamp)
         .payload(IndexMap::new())
         .parents(BTreeSet::new())
-        .build()
-        .unwrap();
+        .build();
 
     let certificate = Certificate::new_unsigned(&committee, header, Vec::new()).unwrap();
 
@@ -81,8 +79,7 @@ fn test_monotonically_incremented_commit_timestamps() {
         .created_at(older_timestamp)
         .payload(IndexMap::new())
         .parents(BTreeSet::new())
-        .build()
-        .unwrap();
+        .build();
 
     let certificate = Certificate::new_unsigned(&committee, header, Vec::new()).unwrap();
 

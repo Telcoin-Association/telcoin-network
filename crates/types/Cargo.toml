@@ -37,8 +37,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "signal"] }
 tracing = { workspace = true }
 eyre = { workspace = true }
-fastcrypto = { workspace = true, features = ["copy_key"] }
-fastcrypto-tbls = { workspace = true }
 once_cell = { workspace = true }
 match_opt = { workspace = true }
 multiaddr = { workspace = true }
@@ -50,7 +48,9 @@ secp256k1 = { workspace = true }
 libp2p = { workspace = true }
 bs58 = { workspace = true }
 blake2 = { workspace = true }
+blst = { workspace = true, features = ["serde"] }
 alloy = { workspace = true, features = ["genesis"] }
+hex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

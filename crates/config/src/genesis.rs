@@ -1,7 +1,6 @@
 //! Genesis information used when configuring a node.
 use crate::{Config, ConfigFmt, ConfigTrait, TelcoinDirs};
 use eyre::Context;
-use fastcrypto::traits::{InsecureDefault, Signer, ToFromBytes};
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -15,8 +14,8 @@ use std::{
 use tn_types::{
     adiri_genesis, hex, keccak256, verify_proof_of_possession_bls, Address, BlsPublicKey,
     BlsSignature, Committee, CommitteeBuilder, Epoch, FromHex as _, GenesisAccount, Intent,
-    IntentMessage, Multiaddr, NetworkPublicKey, PrimaryInfo, ProtocolSignature, WorkerCache,
-    WorkerIndex, B256,
+    IntentMessage, Multiaddr, NetworkPublicKey, PrimaryInfo, ProtocolSignature, Signer,
+    WorkerCache, WorkerIndex, B256,
 };
 use tracing::{info, warn};
 /// The validators directory used to create genesis.
@@ -71,7 +70,7 @@ impl NetworkGenesis {
     /// Adding [ValidatorInfo] to the genesis directory allows other
     /// validators to discover peers using VCS (ie - github).
     pub fn add_validator(&mut self, validator: ValidatorInfo) {
-        self.validators.insert(validator.public_key().clone(), validator);
+        self.validators.insert(*validator.public_key(), validator);
     }
 
     /// Read output file from Solidity GenerateConsensusRegistryStorage utility
@@ -158,7 +157,7 @@ impl NetworkGenesis {
                 let info_bytes = fs::read(&path)?;
                 let validator: ValidatorInfo = serde_yaml::from_slice(&info_bytes)
                     .with_context(|| format!("validator failed to load from {}", path.display()))?;
-                validators.push((validator.bls_public_key.clone(), validator));
+                validators.push((validator.bls_public_key, validator));
             } else {
                 warn!("skipping dir: {}\ndirs should not be in validators dir", path.display());
             }
@@ -230,7 +229,7 @@ impl NetworkGenesis {
         let mut committee_builder = CommitteeBuilder::new(0);
         for (pubkey, validator) in self.validators.iter() {
             committee_builder.add_authority(
-                pubkey.clone(),
+                *pubkey,
                 1,
                 validator.primary_network_address().clone(),
                 validator.execution_address,
@@ -249,9 +248,7 @@ impl NetworkGenesis {
         let workers = self
             .validators
             .iter()
-            .map(|(pubkey, validator)| {
-                (pubkey.clone(), validator.primary_info.worker_index.clone())
-            })
+            .map(|(pubkey, validator)| (*pubkey, validator.primary_info.worker_index.clone()))
             .collect();
 
         let worker_cache = WorkerCache { epoch: 0, workers: Arc::new(workers) };
@@ -320,7 +317,7 @@ impl Default for ValidatorInfo {
     fn default() -> Self {
         Self {
             name: "DEFAULT".to_string(),
-            bls_public_key: BlsPublicKey::insecure_default(),
+            bls_public_key: BlsPublicKey::default(),
             primary_info: Default::default(),
             execution_address: Address::ZERO,
             proof_of_possession: BlsSignature::default(),
@@ -344,7 +341,7 @@ impl ValidatorSignatureInfo {
         value: &T,
         intent: Intent,
         authority: BlsPublicKey,
-        secret: &dyn Signer<BlsSignature>,
+        secret: &dyn Signer,
     ) -> Self
     where
         T: Serialize,
@@ -404,17 +401,17 @@ impl PubkeyFlags {
         for (i, flag) in flags.iter().enumerate() {
             if *val == flag.bls_a {
                 // overwrite using first 32 bytes of bls pubkey
-                let bls_first_word = &validator_infos[i].bls_public_key.as_bytes()[0..32];
+                let bls_first_word = &validator_infos[i].bls_public_key.to_bytes()[0..32];
                 val.copy_from_slice(bls_first_word);
                 return;
             } else if *val == flag.bls_b {
                 // overwrite using middle 32 bytes of bls pubkey
-                let bls_middle_word = &validator_infos[i].bls_public_key.as_bytes()[32..64];
+                let bls_middle_word = &validator_infos[i].bls_public_key.to_bytes()[32..64];
                 val.copy_from_slice(bls_middle_word);
                 return;
             } else if *val == flag.bls_c {
                 // overwrite using last 32 bytes of bls pubkey
-                let bls_last_word = &validator_infos[i].bls_public_key.as_bytes()[64..96];
+                let bls_last_word = &validator_infos[i].bls_public_key.to_bytes()[64..96];
                 val.copy_from_slice(bls_last_word);
                 return;
             } else if *val == flag.ecdsa {
@@ -463,7 +460,6 @@ mod tests {
         genesis::ContractStandardJson, test_fetch_file_content_relative_to_manifest, TelcoinDirs,
         ValidatorInfo,
     };
-    use fastcrypto::traits::KeyPair;
     use rand::{rngs::StdRng, SeedableRng};
     use std::collections::BTreeMap;
     use tempfile::tempdir;

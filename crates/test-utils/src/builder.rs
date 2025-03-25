@@ -15,8 +15,8 @@ use std::{
 };
 use tn_config::KeyConfig;
 use tn_types::{
-    get_available_udp_port, traits::KeyPair, Address, Authority, BlsKeypair, Committee, Database,
-    Epoch, Multiaddr, Stake, WorkerCache, WorkerIndex, DEFAULT_PRIMARY_PORT, DEFAULT_WORKER_PORT,
+    get_available_udp_port, Address, Authority, BlsKeypair, Committee, Database, Epoch, Multiaddr,
+    Stake, WorkerCache, WorkerIndex, DEFAULT_PRIMARY_PORT, DEFAULT_WORKER_PORT,
 };
 
 pub struct Builder<DB, F, R = OsRng> {
@@ -126,7 +126,7 @@ where
                 format!("authority{i}"),
             );
             authorities.insert(
-                authority.protocol_key().clone(),
+                *authority.protocol_key(),
                 (primary_keypair, key_config, authority.clone()),
             );
         }
@@ -162,7 +162,7 @@ where
                     .map(|(primary_keypair, _key_config, _authority, worker)| {
                         let mut worker_index = BTreeMap::new();
                         worker_index.insert(0, worker.info().clone());
-                        (primary_keypair.public().clone(), WorkerIndex(worker_index.clone()))
+                        (*primary_keypair.public(), WorkerIndex(worker_index.clone()))
                     })
                     .collect(),
             ),

@@ -5,7 +5,6 @@ use crate::{
     Multiaddr, NetworkKeypair, NetworkPublicKey,
 };
 use eyre::ContextCompat;
-use fastcrypto::traits::EncodeDecodeBase64;
 use libp2p::PeerId;
 use serde::{
     de::{self, MapAccess, Visitor},
@@ -191,7 +190,7 @@ impl std::fmt::Display for WorkerCache {
             self.workers
                 .iter()
                 .map(|(k, v)| {
-                    if let Some(x) = k.encode_base64().get(0..16) {
+                    if let Some(x) = k.encode_base58().get(0..16) {
                         format!("{}: {}", x, v)
                     } else {
                         format!("Invalid key: {}", k)
@@ -214,13 +213,13 @@ impl WorkerCache {
             .iter()
             .find_map(|v| match_opt::match_opt!(v, (name, authority) if name == to => authority))
             .ok_or_else(|| {
-                ConfigError::NotInWorkerCache(ToString::to_string(&(*to).encode_base64()))
+                ConfigError::NotInWorkerCache(ToString::to_string(&(*to).encode_base58()))
             })?
             .0
             .iter()
             .find(|(worker_id, _)| worker_id == &id)
             .map(|(_, worker)| worker.clone())
-            .ok_or_else(|| ConfigError::NotInWorkerCache((*to).encode_base64()))
+            .ok_or_else(|| ConfigError::NotInWorkerCache((*to).encode_base58()))
     }
 
     /// Returns the addresses of all our workers.
@@ -231,7 +230,7 @@ impl WorkerCache {
             .find_map(
                 |v| match_opt::match_opt!(v, (name, authority) if name == myself => authority),
             )
-            .ok_or_else(|| ConfigError::NotInWorkerCache((*myself).encode_base64()))?
+            .ok_or_else(|| ConfigError::NotInWorkerCache((*myself).encode_base58()))?
             .0
             .values()
             .cloned()
@@ -259,9 +258,10 @@ impl WorkerCache {
         self.workers
             .iter()
             .filter(|(name, _)| *name != myself )
+            .map(|(name, auth)| (*name, auth))
             .flat_map(
                 |(name, authority)|  authority.0.iter().flat_map(
-                    |v| match_opt::match_opt!(v,(worker_id, addresses) if worker_id == id => (name.clone(), addresses.clone()))))
+                    move |v| match_opt::match_opt!(v,(worker_id, addresses) if worker_id == id => (name, addresses.clone()))))
             .collect()
     }
 
@@ -270,7 +270,8 @@ impl WorkerCache {
         self.workers
             .iter()
             .filter(|(name, _)| *name != myself)
-            .flat_map(|(name, authority)| authority.0.iter().map(|v| (name.clone(), v.1.clone())))
+            .map(|(name, auth)| (*name, auth))
+            .flat_map(|(name, authority)| authority.0.iter().map(move |v| (name, v.1.clone())))
             .collect()
     }
 

@@ -1,13 +1,9 @@
 //! Committee of validators reach consensus.
 
 use crate::{
-    crypto::{BlsPublicKey, BlsPublicKeyBytes, NetworkPublicKey},
+    crypto::{BlsPublicKey, NetworkPublicKey},
     error::{CommitteeUpdateError, ConfigError},
     Address, Multiaddr,
-};
-use fastcrypto::{
-    serde_helpers::ToFromByteArray,
-    traits::{EncodeDecodeBase64, ToFromBytes},
 };
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -33,8 +29,6 @@ pub struct Authority {
     id: AuthorityIdentifier,
     /// The authority's main BlsPublicKey which is used to verify the content they sign.
     protocol_key: BlsPublicKey,
-    /// The authority's main BlsPublicKey expressed as pure bytes
-    protocol_key_bytes: BlsPublicKeyBytes,
     /// The voting power of this authority.
     stake: Stake,
     /// The network address of the primary.
@@ -65,12 +59,9 @@ impl Authority {
         network_key: NetworkPublicKey,
         hostname: String,
     ) -> Self {
-        let protocol_key_bytes = BlsPublicKeyBytes::from(&protocol_key);
-
         Self {
             id: Default::default(),
             protocol_key,
-            protocol_key_bytes,
             stake,
             primary_network_address,
             execution_address,
@@ -91,11 +82,9 @@ impl Authority {
         network_key: NetworkPublicKey,
         hostname: String,
     ) -> Self {
-        let protocol_key_bytes = BlsPublicKeyBytes::from(&protocol_key);
         Self {
             id,
             protocol_key,
-            protocol_key_bytes,
             stake,
             primary_network_address,
             execution_address,
@@ -122,11 +111,6 @@ impl Authority {
         // Skip the assert here, this is called in testing before the initialise...
         // assert!(self.initialised);
         &self.protocol_key
-    }
-
-    pub fn protocol_key_bytes(&self) -> &BlsPublicKeyBytes {
-        assert!(self.initialised);
-        &self.protocol_key_bytes
     }
 
     pub fn stake(&self) -> Stake {
@@ -322,30 +306,6 @@ impl Committee {
         self.authorities.keys().cloned().collect::<Vec<BlsPublicKey>>()
     }
 
-    /// Returns info from the committee needed for randomness DKG.
-    pub fn randomness_dkg_info(
-        &self,
-    ) -> Vec<(
-        AuthorityIdentifier,
-        fastcrypto_tbls::ecies::PublicKey<fastcrypto::groups::bls12381::G2Element>,
-        Stake,
-    )> {
-        self.authorities_by_id
-            .iter()
-            .map(|(id, authority)| {
-                let pk = fastcrypto::groups::bls12381::G2Element::from_byte_array(
-                    authority
-                        .protocol_key()
-                        .as_bytes()
-                        .try_into()
-                        .expect("key length should match"),
-                )
-                .expect("should work to convert BLS key to G2Element");
-                (*id, fastcrypto_tbls::ecies::PublicKey::from(pk), authority.stake())
-            })
-            .collect()
-    }
-
     pub fn authorities(&self) -> impl Iterator<Item = &Authority> {
         self.authorities.values()
     }
@@ -417,7 +377,7 @@ impl Committee {
         self.authorities
             .get(&to.clone())
             .map(|x| x.primary_network_address.clone())
-            .ok_or_else(|| ConfigError::NotInCommittee((*to).encode_base64()))
+            .ok_or_else(|| ConfigError::NotInCommittee((*to).encode_base58()))
     }
 
     /// Returns the primary address of the target primary.
@@ -432,7 +392,7 @@ impl Committee {
         self.authorities
             .get(&pk.clone())
             .map(|x| x.network_key.clone())
-            .ok_or_else(|| ConfigError::NotInCommittee((*pk).encode_base64()))
+            .ok_or_else(|| ConfigError::NotInCommittee((*pk).encode_base58()))
     }
 
     /// Return all the network addresses in the committee.
@@ -444,11 +404,7 @@ impl Committee {
             .iter()
             .filter(|(name, _)| *name != myself)
             .map(|(name, authority)| {
-                (
-                    name.clone(),
-                    authority.primary_network_address.clone(),
-                    authority.network_key.clone(),
-                )
+                (*name, authority.primary_network_address.clone(), authority.network_key.clone())
             })
             .collect()
     }
@@ -509,7 +465,7 @@ impl Committee {
                         Ok(mut bmap) => {
                             let mut res = authority.clone();
                             res.primary_network_address = address;
-                            bmap.insert(pk.clone(), res);
+                            bmap.insert(*pk, res);
                             Ok(bmap)
                         }
                         // in error mode, continue
@@ -557,7 +513,7 @@ impl std::fmt::Display for Committee {
             self.authorities
                 .keys()
                 .map(|x| {
-                    if let Some(k) = x.encode_base64().get(0..16) {
+                    if let Some(k) = x.encode_base58().get(0..16) {
                         k.to_owned()
                     } else {
                         format!("Invalid key: {}", x)
@@ -593,7 +549,7 @@ impl CommitteeBuilder {
         hostname: String,
     ) {
         let authority = Authority::new(
-            protocol_key.clone(),
+            protocol_key,
             stake,
             primary_network_address,
             execution_address,
@@ -614,7 +570,6 @@ mod tests {
     use crate::{
         Address, Authority, BlsKeypair, BlsPublicKey, Committee, Multiaddr, NetworkKeypair,
     };
-    use fastcrypto::traits::KeyPair as _;
     use rand::thread_rng;
     use std::collections::BTreeMap;
 

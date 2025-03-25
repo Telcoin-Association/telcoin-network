@@ -15,7 +15,6 @@ authors = [
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }
-fastcrypto = { workspace = true }
 tn-network-types = { workspace = true }
 tn-storage = { workspace = true }
 tn-types = { workspace = true }

@@ -1,7 +1,6 @@
 //! Helper methods for creating useful structs during tests.
 
 use crate::execution::TransactionFactory;
-use fastcrypto::{hash::Hash, traits::KeyPair as _};
 use indexmap::IndexMap;
 use rand::{
     distributions::Bernoulli, prelude::Distribution, rngs::StdRng, thread_rng, Rng, RngCore,
@@ -14,7 +13,7 @@ use std::{
 use tn_types::{
     adiri_chain_spec_arc, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash,
     BlsKeypair, BlsSignature, Bytes, Certificate, CertificateDigest, Committee, Epoch, ExecHeader,
-    HeaderBuilder, ProtocolSignature, Round, Stake, TimestampSec, WorkerId, U256,
+    Hash as _, HeaderBuilder, ProtocolSignature, Round, Stake, TimestampSec, WorkerId, U256,
 };
 
 pub fn temp_dir() -> std::path::PathBuf {
@@ -513,8 +512,7 @@ pub fn mock_certificate_with_rand<R: RngCore + ?Sized>(
         .epoch(0)
         .parents(parents)
         .payload(fixture_payload_with_rand(1, rand))
-        .build()
-        .unwrap();
+        .build();
     let certificate = Certificate::new_unsigned(committee, header, Vec::new()).unwrap();
     (certificate.digest(), certificate)
 }
@@ -546,8 +544,7 @@ pub fn mock_certificate_with_epoch(
         .epoch(epoch)
         .parents(parents)
         .payload(fixture_payload(1))
-        .build()
-        .unwrap();
+        .build();
     let certificate = Certificate::new_unsigned(committee, header, Vec::new()).unwrap();
     (certificate.digest(), certificate)
 }
@@ -566,8 +563,7 @@ pub fn signed_cert_for_test(
         .round(round)
         .epoch(0)
         .parents(parents)
-        .build()
-        .expect("valid header built for test certificate");
+        .build();
 
     let cert = Certificate::new_unsigned(committee, header.clone(), Vec::new())
         .expect("new unsigned cert for tests");

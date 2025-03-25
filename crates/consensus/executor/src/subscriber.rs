@@ -2,7 +2,6 @@
 
 use crate::{errors::SubscriberResult, SubscriberError};
 use consensus_metrics::monitored_future;
-use fastcrypto::hash::Hash;
 use futures::{stream::FuturesOrdered, StreamExt};
 use state_sync::{
     get_missing_consensus, last_executed_consensus_block, save_consensus, spawn_state_sync,
@@ -21,8 +20,8 @@ use tn_primary::{
 use tn_storage::CertificateStore;
 use tn_types::{
     AuthorityIdentifier, Batch, BlockHash, CommittedSubDag, Committee, ConsensusHeader,
-    ConsensusOutput, Database, Noticer, TaskManager, TaskManagerClone, Timestamp, TnReceiver,
-    TnSender, B256,
+    ConsensusOutput, Database, Hash as _, Noticer, TaskManager, TaskManagerClone, Timestamp,
+    TnReceiver, TnSender, B256,
 };
 use tracing::{debug, error, info};
 
@@ -503,8 +502,7 @@ mod tests {
             .round(round)
             .epoch(0)
             .parents(parents)
-            .build()
-            .expect("valid header built for test certificate");
+            .build();
 
         let cert = committee.certificate(&header);
         (cert.digest(), cert, batches)

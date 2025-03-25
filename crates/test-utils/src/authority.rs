@@ -1,13 +1,12 @@
 //! Authority fixture for the cluster
 
 use crate::WorkerFixture;
-use fastcrypto::{hash::Hash, traits::KeyPair as _};
 use std::num::NonZeroUsize;
 use tn_config::{Config, ConsensusConfig, KeyConfig};
 use tn_types::{
     Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, Certificate, Committee,
-    Database, Header, HeaderBuilder, Multiaddr, NetworkKeypair, NetworkPublicKey, Round, Vote,
-    WorkerCache,
+    Database, Hash as _, Header, HeaderBuilder, Multiaddr, NetworkKeypair, NetworkPublicKey, Round,
+    Vote, WorkerCache,
 };
 
 /// Fixture representing an validator node within the network.
@@ -73,12 +72,12 @@ impl<DB: Database> AuthorityFixture<DB> {
 
     /// Create a [Header] with a default payload based on the [Committee] argument.
     pub fn header(&self, committee: &Committee) -> Header {
-        self.header_builder(committee).build().unwrap()
+        self.header_builder(committee).build()
     }
 
     /// Create a [Header] with a default payload based on the [Committee] and [Round] arguments.
     pub fn header_with_round(&self, committee: &Committee, round: Round) -> Header {
-        self.header_builder(committee).payload(Default::default()).round(round).build().unwrap()
+        self.header_builder(committee).payload(Default::default()).round(round).build()
     }
 
     /// Return a [HeaderV1Builder] for round 1. The builder is constructed
