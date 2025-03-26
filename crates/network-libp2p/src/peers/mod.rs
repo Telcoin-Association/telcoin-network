@@ -21,6 +21,7 @@ mod peer;
 mod score;
 mod status;
 mod types;
+pub use manager::{PeerEvent, PeerManager};
 
 //
 // TODO: move this to once-cell peer-config
@@ -599,11 +600,65 @@ impl AllPeers {
         connected_peers
     }
 
+    /// Register the peer as disconnected.
+    ///
+    /// It's possible that the peer's updated connection status results in the peer being banned.
+    /// This method updates the connection status for the peer and ensures the number of banned
+    /// peers doesn't exceed the allowable limit.
     pub(super) fn register_disconnected(
         &mut self,
         peer_id: &PeerId,
     ) -> (PeerAction, Vec<(PeerId, Vec<IpAddr>)>) {
         let action = self.update_connection_status(peer_id, NewConnectionStatus::Disconnected);
+        let pruned_peers = self.prune_disconnected_peers();
+        (action, pruned_peers)
+    }
+
+    /// Prune excess number of banned/disconnected peers to prevent exhausting memory.
+    fn prune_disconnected_peers(&mut self) -> Vec<(PeerId, Vec<IpAddr>)> {
+        // TODO: move to config
+        const MAX_BANNED_PEERS: usize = 1000;
+        let mut excess = self.banned_peers.total().saturating_sub(MAX_BANNED_PEERS);
+        let mut unbanned = Vec::with_capacity(excess);
+
+        // remove excess peers from banned collection
+        if excess > 0 {
+            let mut eligible_peers = self
+                .peers
+                .iter()
+                .filter_map(|(peer_id, peer)| match peer.connection_status() {
+                    ConnectionStatus::Banned { instant } => Some((peer_id, peer, instant)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+
+            // sort by instant so the oldest banned peers are first
+            eligible_peers.sort_by(|a, b| a.2.cmp(&b.2));
+
+            // while excess > 0 {
+            //     // self.banned_peers
+            //     excess = excess.saturating_sub(1);
+            // }
+
+            for (peer_id, peer, _) in &eligible_peers {
+                // break after enough peers pruned
+                if excess <= 0 {
+                    break;
+                }
+
+                // remove peer's ip addresses
+                let ip_addrs = peer.known_ip_addresses();
+                self.banned_peers.remove_banned_peer(ip_addrs);
+
+                self.peers.remove(peer_id);
+
+                unbanned.push((peer_id, ip_addrs));
+
+                // reduce excess peer count
+                excess = excess.saturating_sub(1);
+            }
+        }
+
         todo!()
     }
 }

@@ -5,6 +5,7 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
+    peers::{self, PeerEvent, PeerManager},
     send_or_log_error,
     types::{NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
 };
@@ -26,7 +27,7 @@ use std::{
     time::Duration,
 };
 use tn_config::{ConsensusConfig, LibP2pConfig};
-use tn_types::network_public_key_to_libp2p;
+use tn_types::{network_public_key_to_libp2p, Database};
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot,
@@ -49,6 +50,8 @@ where
     pub(crate) gossipsub: gossipsub::Behaviour,
     /// The request-response network behavior.
     pub(crate) req_res: request_response::Behaviour<C>,
+    /// The peer manager.
+    pub(crate) peer_manager: peers::PeerManager,
 }
 
 impl<C> TNBehavior<C>
@@ -56,8 +59,13 @@ where
     C: Codec + Send + Clone + 'static,
 {
     /// Create a new instance of Self.
-    pub fn new(gossipsub: gossipsub::Behaviour, req_res: request_response::Behaviour<C>) -> Self {
-        Self { gossipsub, req_res }
+    pub fn new<DB: Database>(
+        gossipsub: gossipsub::Behaviour,
+        req_res: request_response::Behaviour<C>,
+        consensus_config: &ConsensusConfig<DB>,
+    ) -> Self {
+        let peer_manager = PeerManager::new(consensus_config);
+        Self { gossipsub, req_res, peer_manager }
     }
 }
 
@@ -95,7 +103,7 @@ where
     /// Callers include a oneshot channel for the network to return response. The caller is
     /// responsible for decoding message bytes and reporting peers who return bad data. Peers that
     /// send messages that fail to decode must receive an application score penalty.
-    outbound_requests: HashMap<OutboundRequestId, oneshot::Sender<NetworkResult<Res>>>,
+    outbound_requests: HashMap<(PeerId, OutboundRequestId), oneshot::Sender<NetworkResult<Res>>>,
     /// The collection of pending inbound requests.
     ///
     /// Callers include a oneshot channel for the network to return a cancellation notice. The
@@ -191,7 +199,7 @@ where
         );
 
         // create custom behavior
-        let behavior = TNBehavior::new(gossipsub, req_res);
+        let behavior = TNBehavior::new(gossipsub, req_res, consensus_config);
 
         // create swarm
         let swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -265,6 +273,7 @@ where
             SwarmEvent::Behaviour(behavior) => match behavior {
                 TNBehaviorEvent::Gossipsub(event) => self.process_gossip_event(event)?,
                 TNBehaviorEvent::ReqRes(event) => self.process_reqres_event(event)?,
+                TNBehaviorEvent::PeerManager(event) => self.process_peer_manager_event(event)?,
             },
             SwarmEvent::ConnectionEstablished {
                 peer_id,
@@ -469,13 +478,13 @@ where
             }
             NetworkCommand::SendRequest { peer, request, reply } => {
                 let request_id = self.swarm.behaviour_mut().req_res.send_request(&peer, request);
-                self.outbound_requests.insert(request_id, reply);
+                self.outbound_requests.insert((peer, request_id), reply);
             }
             NetworkCommand::SendRequestAny { request, reply } => {
                 self.connected_peers.rotate_left(1);
                 if let Some(peer) = self.connected_peers.front() {
                     let request_id = self.swarm.behaviour_mut().req_res.send_request(peer, request);
-                    self.outbound_requests.insert(request_id, reply);
+                    self.outbound_requests.insert((*peer, request_id), reply);
                 } else {
                     // Ignore error since this means other end lost interest and we don't really
                     // care.
@@ -562,7 +571,7 @@ where
                         // try to forward response to original caller
                         let _ = self
                             .outbound_requests
-                            .remove(&request_id)
+                            .remove(&(peer, request_id))
                             .ok_or(NetworkError::PendingRequestChannelLost)?
                             .send(Ok(response));
                     }
@@ -573,7 +582,7 @@ where
                 // try to forward error to original caller
                 let _ = self
                     .outbound_requests
-                    .remove(&request_id)
+                    .remove(&(peer, request_id))
                     .ok_or(NetworkError::PendingRequestChannelLost)?
                     .send(Err(error.into()));
             }
@@ -619,6 +628,12 @@ where
         } else {
             GossipAcceptance::Reject
         }
+    }
+
+    /// Process an event from the peer manager.
+    fn process_peer_manager_event(&self, event: PeerEvent) -> NetworkResult<()> {
+        println!("Peer Manager Event: {event:?}");
+        Ok(())
     }
 }
 

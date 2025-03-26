@@ -8,16 +8,14 @@ use super::{
 };
 use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
 use std::{collections::VecDeque, net::IpAddr, task::Context};
-use tn_config::ConsensusConfig;
+use tn_config::{ConsensusConfig, PeerConfig};
 use tn_types::Database;
 use tracing::error;
 
 /// The type to manage peers.
-pub struct PeerManager<DB> {
-    /// The local [PeerId] of this node.
-    peer_id: PeerId,
+pub struct PeerManager {
     /// Config
-    config: ConsensusConfig<DB>,
+    config: PeerConfig,
     /// The interval to perform maintenance.
     heartbeat: tokio::time::Interval,
     /// All peers for the manager.
@@ -43,8 +41,6 @@ pub struct PeerManager<DB> {
     /// The implementation uses `FnvHashSet` instead of the default Rust hasher `SipHash`
     /// for improved performance for short keys.
     temporarily_banned: BannedPeerCache<PeerId>,
-    //
-    // TNR?
 }
 
 /// Events for the [PeerManager].
@@ -64,24 +60,19 @@ pub enum PeerEvent {
     Unbanned(PeerId, Vec<IpAddr>),
 }
 
-impl<DB> PeerManager<DB>
-where
-    DB: Database,
-{
+impl PeerManager {
     /// Create a new instance of Self.
-    pub(crate) fn new(peer_id: PeerId, config: ConsensusConfig<DB>) -> Self {
-        let heartbeat = tokio::time::interval(tokio::time::Duration::from_secs(
-            config.network_config().peer_config().heartbeat_interval,
-        ));
+    pub(crate) fn new<DB: Database>(consensus_config: &ConsensusConfig<DB>) -> Self {
+        let config = consensus_config.network_config().peer_config();
+        let heartbeat =
+            tokio::time::interval(tokio::time::Duration::from_secs(config.heartbeat_interval));
 
         // TODO: restore from backup?
         let peers = AllPeers::default();
         let events = VecDeque::new();
-        let temporarily_banned = BannedPeerCache::new(
-            config.network_config().peer_config().excess_peers_reconnection_timeout,
-        );
+        let temporarily_banned = BannedPeerCache::new(config.excess_peers_reconnection_timeout);
 
-        Self { peer_id, config, heartbeat, peers, events, temporarily_banned }
+        Self { config: *config, heartbeat, peers, events, temporarily_banned }
     }
 
     /// Push a [PeerEvent].
@@ -124,7 +115,7 @@ where
 
         // TODO: update peer metrics
 
-        self.prune_peers();
+        self.prune_connected_peers();
 
         self.unban_peers();
     }
@@ -190,8 +181,7 @@ where
     pub(super) fn peer_limit_reached(&self, endpoint: &ConnectedPoint) -> bool {
         if endpoint.is_dialer() {
             // this node dialed peer
-            self.peers.connected_peer_ids().count()
-                >= self.config.network_config().peer_config().max_outbound_dialing_peers()
+            self.peers.connected_peer_ids().count() >= self.config.max_outbound_dialing_peers()
         } else {
             // peer dialed this node
             self.connected_or_dialing_peers() >= self.max_peers()
@@ -205,7 +195,7 @@ where
 
     /// The maximum number of peers allowed to connect with this node.
     fn max_peers(&self) -> usize {
-        self.config.network_config().peer_config().max_peers()
+        self.config.max_peers()
     }
 
     /// Disconnect from a peer.
@@ -337,13 +327,11 @@ where
     /// Prune peers to reach target peer counts.
     ///
     /// Trusted peers and validators are ignored. Peers are sorted from lowest to highest score and removed until excess peer count reaches target.
-    fn prune_peers(&mut self) {
-        // obtain config for convenience
-        let config = self.config.network_config().peer_config();
-
+    fn prune_connected_peers(&mut self) {
         // connected peers sorted from lowest to highest aggregate score
         let connected_peers = self.peers.connected_peers_by_score();
-        let mut excess_peer_count = connected_peers.len().saturating_sub(config.target_num_peers);
+        let mut excess_peer_count =
+            connected_peers.len().saturating_sub(self.config.target_num_peers);
         if excess_peer_count == 0 {
             // target num peers within range
             return;

@@ -14,13 +14,9 @@ use std::{
     net::IpAddr,
     task::{Context, Poll},
 };
-use tn_types::Database;
 use tracing::{debug, error, trace};
 
-impl<DB> NetworkBehaviour for PeerManager<DB>
-where
-    DB: Database,
-{
+impl NetworkBehaviour for PeerManager {
     type ConnectionHandler = ConnectionHandler;
     type ToSwarm = PeerEvent;
 
@@ -149,10 +145,7 @@ where
     }
 }
 
-impl<DB> PeerManager<DB>
-where
-    DB: Database,
-{
+impl PeerManager {
     /// Handle on connection established event from the swarm.
     ///
     /// The ConnectionEstablished event must be handled separately because

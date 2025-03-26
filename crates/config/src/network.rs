@@ -194,7 +194,7 @@ impl Default for QuicConfig {
 // const MIN_SCORE_BEFORE_BAN: f64 = -50.0;
 
 /// Configurations for network peers.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct PeerConfig {
     /// The interval (secs) for updating peer status.
     pub heartbeat_interval: u64,
