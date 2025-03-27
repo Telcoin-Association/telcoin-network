@@ -48,8 +48,8 @@ impl Peer {
         // TODO: this should not be called if peer.is_trusted
         //
         match self.score.aggregate_score() {
-            score if score <= self.config.min_score_for_disconnect => Reputation::Disconnected,
             score if score <= self.config.min_score_for_ban => Reputation::Banned,
+            score if score <= self.config.min_score_for_disconnect => Reputation::Disconnected,
             _ => Reputation::Trusted,
         }
     }

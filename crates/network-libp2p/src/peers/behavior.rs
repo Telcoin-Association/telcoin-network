@@ -195,7 +195,7 @@ impl PeerManager {
             return;
         }
 
-        // There are no more connections
+        // there are no more connections
         if self.is_peer_connected_or_disconnecting(&peer_id) {
             // if the peer's connection status is either `Connected` or `Disconnecting`,
             // ensure the application layer is notified the peer has disconnected
@@ -203,7 +203,7 @@ impl PeerManager {
             debug!(target: "peer-manager", ?peer_id, "peer disconnected");
         }
 
-        // if this node has too many peers, the peer will be disconnected
+        // if this node has too many peers, disconnect from the peer.
         // when this happens, the peer manager still needs to register this peer
         self.register_disconnected(&peer_id);
 

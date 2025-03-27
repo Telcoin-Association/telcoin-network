@@ -327,24 +327,26 @@ where
                     remaining = num_established,
                     "connection closed"
                 );
-                self.connected_peers.retain(|peer| *peer != peer_id);
+                // TODO: moved to peer manager disconnected event
+                //
+                // self.connected_peers.retain(|peer| *peer != peer_id);
 
-                // handle complete peer disconnect
-                if num_established == 0 {
-                    tracing::debug!(target:"network::events", pending=?self.outbound_requests.len());
-                    // clean up any pending requests for this peer
-                    //
-                    // NOTE: self.outbound_requests are removed by `OutboundFailure`
-                    // but only if the Option<PeerId> is included. This is a
-                    // sanity check to prevent the HashMap from growing indefinitely when peers
-                    // disconnect after a request is made and the PeerId is lost.
-                    self.outbound_requests.retain(|_, sender| !sender.is_closed());
+                // // handle complete peer disconnect
+                // if num_established == 0 {
+                //     tracing::debug!(target:"network::events", pending=?self.outbound_requests.len());
+                //     // clean up any pending requests for this peer
+                //     //
+                //     // NOTE: self.outbound_requests are removed by `OutboundFailure`
+                //     // but only if the Option<PeerId> is included. This is a
+                //     // sanity check to prevent the HashMap from growing indefinitely when peers
+                //     // disconnect after a request is made and the PeerId is lost.
+                //     self.outbound_requests.retain(|_, sender| !sender.is_closed());
 
-                    // TODO: schedule reconnection attempt?
-                    if self.authorized_publishers.contains(&peer_id) {
-                        warn!(target: "network::events", ?peer_id, "authorized peer disconnected");
-                    }
-                }
+                //     // TODO: schedule reconnection attempt?
+                //     if self.authorized_publishers.contains(&peer_id) {
+                //         warn!(target: "network::events", ?peer_id, "authorized peer disconnected");
+                //     }
+                // }
             }
             SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } => {
                 if let Some(sender) = self.pending_dials.remove(&peer_id) {
@@ -379,7 +381,7 @@ where
             | SwarmEvent::ExternalAddrConfirmed { .. }
             | SwarmEvent::ExternalAddrExpired { .. }
             | SwarmEvent::NewExternalAddrOfPeer { .. } => {}
-            _e => {}
+            _ => {}
         }
         Ok(())
     }
@@ -631,8 +633,51 @@ where
     }
 
     /// Process an event from the peer manager.
-    fn process_peer_manager_event(&self, event: PeerEvent) -> NetworkResult<()> {
+    fn process_peer_manager_event(&mut self, event: PeerEvent) -> NetworkResult<()> {
+        // TODO: remove this!!!!!!
         println!("Peer Manager Event: {event:?}");
+
+        match event {
+            PeerEvent::PeerDisconnected(peer_id) => {
+                // remove from connected peers
+                self.connected_peers.retain(|peer| *peer != peer_id);
+
+                // TODO: schedule reconnection attempt?
+                if self.authorized_publishers.contains(&peer_id) {
+                    warn!(target: "network::events", ?peer_id, "authorized peer disconnected");
+                }
+
+                let keys = self
+                    .outbound_requests
+                    .iter()
+                    .filter_map(
+                        |((p_id, req_id), _)| {
+                            if *p_id == peer_id {
+                                Some((*p_id, *req_id))
+                            } else {
+                                None
+                            }
+                        },
+                    )
+                    .collect::<Vec<_>>();
+
+                // remove from outbound_requests and send error
+                for k in keys {
+                    let _ = self
+                        .outbound_requests
+                        .remove(&k)
+                        .ok_or(NetworkError::PendingRequestChannelLost)?
+                        .send(Err(NetworkError::Disconnected));
+                }
+            }
+            _ => (),
+            // PeerEvent::PeerConnectedIncoming(peer_id) => todo!(),
+            // PeerEvent::PeerConnectedOutgoing(peer_id) => todo!(),
+            // PeerEvent::DisconnectPeer(peer_id) => todo!(),
+            // PeerEvent::Banned(peer_id, ip_addrs) => todo!(),
+            // PeerEvent::Unbanned(peer_id, ip_addrs) => todo!(),
+        }
+
         Ok(())
     }
 }

@@ -216,7 +216,6 @@ async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
-    tn_test_utils::init_test_tracing();
     // start honest peer1 network
     let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;

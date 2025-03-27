@@ -1,11 +1,10 @@
 //! Manage peer connection status and reputation.
 
-use crate::peers::status::ConnectionStatus;
-
 use super::{
     cache::BannedPeerCache, score::Penalty, types::ConnectionType, AllPeers, ConnectionDirection,
     NewConnectionStatus, PeerAction,
 };
+use crate::peers::status::ConnectionStatus;
 use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
 use std::{collections::VecDeque, net::IpAddr, task::Context};
 use tn_config::{ConsensusConfig, PeerConfig};
@@ -170,7 +169,7 @@ impl PeerManager {
         })
     }
 
-    /// Check for banned peer ids and ip addresses and return true if present.
+    /// Check if the peer id is banned or associated with any banned ip addresses.
     ///
     /// This is called before accepting new connections.
     pub(super) fn connection_banned(&self, peer_id: &PeerId) -> bool {
@@ -310,15 +309,23 @@ impl PeerManager {
         true
     }
 
+    /// Register disconnected peers.
+    ///
+    /// Some peers are disconnected with the intention to ban that peer.
+    /// This method registers the peer as disconnected and ensures the list of banned/disconnected peers
+    /// doesn't grow infinitely large. Peers may become "unbanned" if the limit for banned peers
+    /// is reached.
     pub(super) fn register_disconnected(&mut self, peer_id: &PeerId) {
-        let (penalty, purged_peers) = self.peers.register_disconnected(peer_id);
+        let (action, pruned_peers) = self.peers.register_disconnected(peer_id);
 
-        // The peer was awaiting a ban, continue to ban the peer.
-        // TODO: this is not the right type
-        // self.handle_reported_penalty(peer_id, penalty);
+        // if the peer is banned, continue to ban the peer
+        if action.is_ban() {
+            self.apply_reputation_updates(*peer_id, action);
+        }
 
+        // process pruned peers
         self.events.extend(
-            purged_peers
+            pruned_peers
                 .into_iter()
                 .map(|(peer_id, unbanned_ips)| PeerEvent::Unbanned(peer_id, unbanned_ips)),
         );
@@ -369,5 +376,96 @@ impl PeerManager {
         for peer_id in self.temporarily_banned.heartbeat() {
             self.push_event(PeerEvent::Unbanned(peer_id, Vec::new()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+    use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils::CommitteeFixture;
+
+    fn create_test_peer_manager() -> PeerManager {
+        let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+        let mut authorities = all_nodes.authorities();
+        let authority_1 = authorities.next().expect("first authority");
+        let config = authority_1.consensus_config();
+        PeerManager::new(&config)
+    }
+
+    fn create_test_multiaddr(id: u8) -> Multiaddr {
+        format!("/ip4/{}/udp/45454/quic-v1", Ipv4Addr::new(127, 0, 0, id)).parse().unwrap()
+    }
+
+    /// Helper function to extract events of a certain type
+    fn extract_events<'a>(
+        events: &'a [PeerEvent],
+        event_type: fn(&'a PeerEvent) -> bool,
+    ) -> Vec<&'a PeerEvent> {
+        events.iter().filter(|e| event_type(e)).collect()
+    }
+
+    #[test]
+    fn test_register_disconnected_basic() {
+        let mut peer_manager = create_test_peer_manager();
+        let peer_id = PeerId::random();
+        let multiaddr = create_test_multiaddr(1);
+
+        // register connection
+        assert!(peer_manager.register_incoming_connection(&peer_id, multiaddr));
+
+        // register disconnection
+        peer_manager.register_disconnected(&peer_id);
+
+        // assert peer is no longer connected
+        assert!(!peer_manager.is_connected(&peer_id));
+
+        // assert no events from disconnect without ban
+        assert!(peer_manager.poll_events().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_register_disconnected_with_banned_peer() {
+        tn_test_utils::init_test_tracing();
+
+        let mut peer_manager = create_test_peer_manager();
+        let peer_id = PeerId::random();
+        let multiaddr = create_test_multiaddr(2);
+
+        // Register connection first
+        assert!(peer_manager.register_incoming_connection(&peer_id, multiaddr));
+
+        // Apply a severe penalty to trigger ban
+        peer_manager.handle_reported_penalty(&peer_id, Penalty::Fatal);
+
+        // Clear events from banning
+        let mut ban_events = Vec::new();
+        while let Some(event) = peer_manager.poll_events() {
+            ban_events.push(event);
+        }
+
+        // Verify at least one ban event was generated
+        let ban_event_count =
+            extract_events(&ban_events, |e| matches!(e, PeerEvent::Banned(_, _))).len();
+        assert!(ban_event_count > 0, "Expected at least one ban event");
+
+        tracing::debug!(target: "peer-manager", ?ban_event_count, "made it here :D");
+
+        // register disconnection
+        peer_manager.register_disconnected(&peer_id);
+
+        // There should be no additional ban events since the peer is already banned
+        let mut additional_events = Vec::new();
+        while let Some(event) = peer_manager.poll_events() {
+            additional_events.push(event);
+        }
+
+        // assert peer is still banned after disconnection
+        assert!(
+            peer_manager.connection_banned(&peer_id),
+            "Peer should remain banned after disconnection"
+        );
     }
 }

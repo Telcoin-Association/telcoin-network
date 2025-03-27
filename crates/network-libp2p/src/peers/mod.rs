@@ -7,7 +7,8 @@ use rand::seq::SliceRandom as _;
 use score::{Penalty, Reputation, ReputationUpdate};
 use status::{ConnectionStatus, NewConnectionStatus};
 use std::{
-    collections::{BTreeSet, HashMap},
+    cmp::Reverse,
+    collections::{BTreeSet, BinaryHeap, HashMap},
     net::IpAddr,
     time::{Duration, Instant},
 };
@@ -59,6 +60,13 @@ pub enum PeerAction {
     Unban(Vec<IpAddr>),
 }
 
+impl PeerAction {
+    /// Helper method if the action is to ban the peer.
+    fn is_ban(&self) -> bool {
+        matches!(self, PeerAction::Ban(_))
+    }
+}
+
 impl AllPeers {
     /// Handle reported action.
     ///
@@ -80,9 +88,10 @@ impl AllPeers {
         if let Some(peer) = self.peers.get_mut(peer_id) {
             let prior_reputation = peer.reputation();
             let new_reputation = peer.apply_penalty(penalty);
+            debug!(target: "peer-manager", ?peer_id, ?prior_reputation, ?new_reputation);
 
             if new_reputation == prior_reputation {
-                // TODO: NoAction
+                return PeerAction::NoAction;
             }
 
             let res = match new_reputation {
@@ -551,7 +560,7 @@ impl AllPeers {
         self.banned_peers.ip_banned(ip)
     }
 
-    /// Boolean indicating if a peer id is banned or associated with a banned ip address.
+    /// Boolean indicating if a peer id is banned or associated with any banned ip addresses.
     pub(super) fn peer_banned(&self, peer_id: &PeerId) -> bool {
         self.peers.get(peer_id).is_some_and(|peer| {
             peer.reputation().banned() || peer.known_ip_addresses().any(|ip| self.ip_banned(&ip))
@@ -610,55 +619,122 @@ impl AllPeers {
         peer_id: &PeerId,
     ) -> (PeerAction, Vec<(PeerId, Vec<IpAddr>)>) {
         let action = self.update_connection_status(peer_id, NewConnectionStatus::Disconnected);
-        let pruned_peers = self.prune_disconnected_peers();
+        // prune excess disconnected/banned peers
+        self.prune_disconnected_peers();
+        let pruned_peers = self.prune_banned_peers();
         (action, pruned_peers)
     }
 
-    /// Prune excess number of banned/disconnected peers to prevent exhausting memory.
-    fn prune_disconnected_peers(&mut self) -> Vec<(PeerId, Vec<IpAddr>)> {
+    /// Filter peers based on connection status.
+    ///
+    /// This creates a min-heap with the excess number of peers.
+    /// Used by Self::prune_banned_peers and Self::prune_disconnected_peers.
+    fn collect_excess_peers<F>(
+        &self,
+        excess: usize,
+        filter: F,
+    ) -> BinaryHeap<(Reverse<Instant>, PeerId, Vec<IpAddr>)>
+    where
+        F: Fn(&ConnectionStatus) -> Option<Instant>,
+    {
+        // collection of peers to prune
+        let mut excess_peers = BinaryHeap::with_capacity(excess);
+
+        for (peer_id, peer) in &self.peers {
+            if let Some(instant) = filter(peer.connection_status()) {
+                // min-heap sorted by instant (oldest first)
+                let entry =
+                    (Reverse(instant), *peer_id, peer.known_ip_addresses().collect::<Vec<_>>());
+
+                if excess_peers.len() < excess {
+                    // fill the heap until `excess` elements
+                    excess_peers.push(entry);
+                } else if let Some(current_max) = excess_peers.peek() {
+                    // if peer's banned instant is older, replace it
+                    if entry.0 < current_max.0 {
+                        excess_peers.pop();
+                        excess_peers.push(entry);
+                    }
+                }
+            }
+        }
+
+        excess_peers
+    }
+
+    /// Prune excess number of banned peers to prevent exhausting memory.
+    fn prune_banned_peers(&mut self) -> Vec<(PeerId, Vec<IpAddr>)> {
         // TODO: move to config
         const MAX_BANNED_PEERS: usize = 1000;
-        let mut excess = self.banned_peers.total().saturating_sub(MAX_BANNED_PEERS);
+        let excess = self.banned_peers.total().saturating_sub(MAX_BANNED_PEERS);
         let mut unbanned = Vec::with_capacity(excess);
 
         // remove excess peers from banned collection
         if excess > 0 {
-            let mut eligible_peers = self
-                .peers
-                .iter()
-                .filter_map(|(peer_id, peer)| match peer.connection_status() {
-                    ConnectionStatus::Banned { instant } => Some((peer_id, peer, instant)),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+            // // collection of peers to prune
+            // let mut excess_peers = BinaryHeap::with_capacity(excess);
 
-            // sort by instant so the oldest banned peers are first
-            eligible_peers.sort_by(|a, b| a.2.cmp(&b.2));
+            // // sort and collect peers with oldest ban instant
+            // for (peer_id, peer) in &self.peers {
+            //     if let ConnectionStatus::Banned { instant } = peer.connection_status() {
+            //         // min-heap sorted by instant (oldest first)
+            //         let entry = (
+            //             Reverse(*instant),
+            //             *peer_id,
+            //             peer.known_ip_addresses().collect::<Vec<_>>(),
+            //         );
 
-            // while excess > 0 {
-            //     // self.banned_peers
-            //     excess = excess.saturating_sub(1);
+            //         if excess_peers.len() < excess {
+            //             // fill the heap until `excess` elements
+            //             excess_peers.push(entry);
+            //         } else if let Some(current_max) = excess_peers.peek() {
+            //             // if peer's banned instant is older, replace it
+            //             if entry.0 < current_max.0 {
+            //                 excess_peers.pop();
+            //                 excess_peers.push(entry);
+            //             }
+            //         }
+            //     }
             // }
 
-            for (peer_id, peer, _) in &eligible_peers {
-                // break after enough peers pruned
-                if excess <= 0 {
-                    break;
+            let excess_peers = self.collect_excess_peers(excess, |status| {
+                if let ConnectionStatus::Banned { instant } = status {
+                    Some(*instant)
+                } else {
+                    None
                 }
+            });
 
-                // remove peer's ip addresses
-                let ip_addrs = peer.known_ip_addresses();
-                self.banned_peers.remove_banned_peer(ip_addrs);
-
-                self.peers.remove(peer_id);
-
-                unbanned.push((peer_id, ip_addrs));
-
-                // reduce excess peer count
-                excess = excess.saturating_sub(1);
+            for (_, peer_id, ip_addrs) in excess_peers {
+                self.peers.remove(&peer_id);
+                let ips = self.banned_peers.remove_banned_peer(ip_addrs.clone().into_iter());
+                unbanned.push((peer_id, ips));
             }
         }
 
-        todo!()
+        unbanned
+    }
+
+    /// Prune excess number of disconnected peers to prevent exhausting memory.
+    fn prune_disconnected_peers(&mut self) {
+        // TODO: move to config
+        const MAX_DISCONNECTED_PEERS: usize = 1000;
+        let excess = self.disconnected_peers.saturating_sub(MAX_DISCONNECTED_PEERS);
+
+        if excess > 0 {
+            let excess_peers = self.collect_excess_peers(excess, |status| {
+                if let ConnectionStatus::Disconnected { instant } = status {
+                    Some(*instant)
+                } else {
+                    None
+                }
+            });
+
+            // remove peer
+            for (_, peer_id, _) in excess_peers {
+                self.peers.remove(&peer_id);
+                self.disconnected_peers = self.disconnected_peers.saturating_sub(1);
+            }
+        }
     }
 }
