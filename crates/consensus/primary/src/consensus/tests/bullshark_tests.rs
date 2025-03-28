@@ -480,7 +480,7 @@ async fn dead_node() {
     // Make the certificates.
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee: Committee = fixture.committee();
-    let mut ids: Vec<_> = committee.authorities().map(|authority| authority.id()).collect();
+    let mut ids: Vec<_> = committee.authorities().iter().map(|authority| authority.id()).collect();
 
     // remove the last authority - 4
     let dead_node = ids.pop().unwrap();
@@ -1043,7 +1043,7 @@ async fn restart_with_new_committee() {
     // Run for a few epochs.
     for epoch in 0..5 {
         let config = fixture.authorities().next().unwrap().consensus_config();
-        let config = ConsensusConfig::new_with_committee(
+        let config = ConsensusConfig::new_with_committee_for_test(
             config.config().clone(),
             config.node_storage().clone(),
             config.key_config().clone(),
@@ -1143,7 +1143,7 @@ async fn garbage_collection_basic() {
     // referring to its certificates. That will create a lone chain for authority 4. We should
     // not see any certificate committed for authority 4.
     let ids: Vec<AuthorityIdentifier> =
-        committee.authorities().map(|authority| authority.id()).collect();
+        committee.authorities().iter().map(|authority| authority.id()).collect();
     let slow_node = ids[3];
     let genesis = Certificate::genesis(&committee);
 
@@ -1224,7 +1224,7 @@ async fn slow_node() {
     // referring to its certificates. That will create a lone chain for authority 4. We should
     // not see any certificate committed for authority 4.
     let ids: Vec<AuthorityIdentifier> =
-        committee.authorities().map(|authority| authority.id()).collect();
+        committee.authorities().iter().map(|authority| authority.id()).collect();
     let slow_node = ids[3];
     let genesis = Certificate::genesis(&committee);
 
@@ -1347,7 +1347,7 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
     let committee: Committee = fixture.committee();
 
     let ids: Vec<AuthorityIdentifier> =
-        committee.authorities().map(|authority| authority.id()).collect();
+        committee.authorities().iter().map(|authority| authority.id()).collect();
 
     // take the first 3 nodes only - 4th one won't propose anything
     let keys_with_dead_node = ids[0..=2].to_vec();

@@ -7,7 +7,7 @@ use crate::consensus::{
 use std::{collections::VecDeque, sync::Arc};
 use tn_storage::ConsensusStore;
 use tn_types::{
-    Certificate, CommittedSubDag, Committee, Hash as _, ReputationScores, Round, Stake,
+    Certificate, CommittedSubDag, Committee, Hash as _, ReputationScores, Round, VotingPower,
 };
 use tokio::time::Instant;
 use tracing::{debug, error_span};
@@ -219,7 +219,7 @@ impl<DB: ConsensusStore> Bullshark<DB> {
         };
 
         // Check if the leader has f+1 support from its children (ie. leader_round+1).
-        let stake: Stake = state
+        let stake: VotingPower = state
             .dag
             .get(&(leader_round + 1))
             .expect("We should have the whole history by now")

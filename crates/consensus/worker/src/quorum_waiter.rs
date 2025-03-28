@@ -12,7 +12,8 @@ use std::{
 use thiserror::Error;
 use tn_network_libp2p::error::NetworkError;
 use tn_types::{
-    network_public_key_to_libp2p, Authority, Committee, SealedBatch, Stake, WorkerCache, WorkerId,
+    network_public_key_to_libp2p, Authority, Committee, SealedBatch, VotingPower, WorkerCache,
+    WorkerId,
 };
 use tokio::task::JoinHandle;
 
@@ -90,8 +91,8 @@ impl QuorumWaiter {
     /// Helper function. It waits for a future to complete and then delivers a value.
     async fn waiter(
         wait_for: JoinHandle<Result<(), NetworkError>>,
-        deliver: Stake,
-    ) -> Result<Stake, WaiterError> {
+        deliver: VotingPower,
+    ) -> Result<VotingPower, WaiterError> {
         match wait_for.await {
             Ok(r) => {
                 match r {
@@ -138,8 +139,9 @@ impl QuorumWaiterTrait for QuorumWaiter {
                 let _timer = inner.metrics.batch_broadcast_quorum_latency.start_timer();
 
                 // Collect all the handlers to receive acknowledgements.
-                let mut wait_for_quorum: FuturesUnordered<QMBoxFuture<Result<Stake, WaiterError>>> =
-                    FuturesUnordered::new();
+                let mut wait_for_quorum: FuturesUnordered<
+                    QMBoxFuture<Result<VotingPower, WaiterError>>,
+                > = FuturesUnordered::new();
                 // Total stake available for the entire committee.
                 // Can use this to determine anti-quorum more quickly.
                 let mut available_stake = 0;
@@ -244,7 +246,7 @@ pub enum QuorumWaiterError {
 #[derive(Clone, Debug, Error)]
 enum WaiterError {
     #[error("Block was rejected by peer")]
-    Rejected(Stake),
+    Rejected(VotingPower),
     #[error("Network Error")]
-    Network(Stake),
+    Network(VotingPower),
 }

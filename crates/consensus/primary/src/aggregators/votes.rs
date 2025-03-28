@@ -6,8 +6,8 @@ use tn_types::{
     ensure,
     error::{DagError, DagResult},
     to_intent_message, AuthorityIdentifier, BlsAggregateSignature, BlsSignature, Certificate,
-    Committee, Digest, Hash as _, Header, ProtocolSignature, SignatureVerificationState, Stake,
-    ValidatorAggregateSignature, Vote,
+    Committee, Digest, Hash as _, Header, ProtocolSignature, SignatureVerificationState,
+    ValidatorAggregateSignature, Vote, VotingPower,
 };
 use tracing::{trace, warn};
 
@@ -16,7 +16,7 @@ pub(crate) struct VotesAggregator {
     /// The accumulated amount of voting power in favor of a proposed header.
     ///
     /// This amount is used to verify enough voting power to reach quorum within the committee.
-    weight: Stake,
+    weight: VotingPower,
     /// The vote received from a peer.
     votes: Vec<(AuthorityIdentifier, BlsSignature)>,
     /// The collection of authority ids that have already voted.
@@ -74,13 +74,17 @@ impl VotesAggregator {
                     "Failed to verify aggregated sig on certificate",
                 );
                 self.votes.retain(|(id, sig)| {
-                    let pk = committee.authority_safe(id).protocol_key();
-                    if !sig.verify_secure(&to_intent_message(certificate_digest), pk) {
-                        warn!(target: "primary::votes_aggregator", "Invalid signature on header from authority: {}", id);
-                        self.weight -= committee.stake(pk);
-                        false
+                    if let Some(auth) = committee.authority(id) {
+                        let pk = auth.protocol_key();
+                        if !sig.verify_secure(&to_intent_message(certificate_digest), pk) {
+                            warn!(target: "primary::votes_aggregator", "Invalid signature on header from authority: {}", id);
+                            self.weight -= committee.stake(pk);
+                            false
+                        } else {
+                            true
+                        }
                     } else {
-                        true
+                        false
                     }
                 });
 

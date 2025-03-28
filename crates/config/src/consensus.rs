@@ -44,7 +44,7 @@ where
         key_config: KeyConfig,
     ) -> eyre::Result<Self> {
         // load committee from file
-        let mut committee: Committee =
+        let committee: Committee =
             Config::load_from_path(tn_datadir.committee_path(), ConfigFmt::YAML)?;
         committee.load();
         tracing::info!(target: "telcoin::consensus_config", "committee loaded");
@@ -74,9 +74,21 @@ where
 
     /// Create a new config with a committe.
     ///
-    /// This should only be called by `Self::new`.
     /// The method is exposed publicly for testing ONLY.
-    pub fn new_with_committee(
+    pub fn new_with_committee_for_test(
+        config: Config,
+        node_storage: DB,
+        key_config: KeyConfig,
+        committee: Committee,
+        worker_cache: WorkerCache,
+    ) -> eyre::Result<Self> {
+        Self::new_with_committee(config, node_storage, key_config, committee, worker_cache)
+    }
+
+    /// Create a new config with a committe.
+    ///
+    /// This should only be called by `Self::new` or by the testing wrapper.
+    fn new_with_committee(
         config: Config,
         node_storage: DB,
         key_config: KeyConfig,
@@ -161,10 +173,6 @@ where
         &self.inner.config.parameters
     }
 
-    pub fn database(&self) -> &DB {
-        &self.inner.node_storage
-    }
-
     pub fn local_network(&self) -> &LocalNetwork {
         &self.inner.local_network
     }
@@ -175,6 +183,7 @@ where
 
     /// Committee network peer ids.
     pub fn committee_peer_ids(&self) -> HashSet<PeerId> {
+        // XXXX- authority map should live on committee or better yet go away.
         self.inner.authority_map.peer_id_to_authority.keys().copied().collect()
     }
 
@@ -212,6 +221,7 @@ impl AuthorityMapping {
     pub fn new(committee: &Committee) -> Self {
         let authority_to_peer_id: HashMap<AuthorityIdentifier, PeerId> = committee
             .authorities()
+            .iter()
             .map(|a| {
                 let fc = a.network_key();
                 let peer_id = network_public_key_to_libp2p(&fc);

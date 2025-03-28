@@ -151,7 +151,7 @@ pub fn last_executed_consensus_block<DB: Database>(
     if let Some(last_executed_consensus_hash) =
         consensus_bus.recent_blocks().borrow().latest_block().header().parent_beacon_block_root
     {
-        let db = config.database();
+        let db = config.node_storage();
         if let Ok(Some(number)) =
             db.get::<ConsensusBlockNumbersByDigest>(&last_executed_consensus_hash)
         {
@@ -179,7 +179,7 @@ pub async fn stream_missing_consensus<DB: Database>(
         last_executed_consensus_block(consensus_bus, config).unwrap_or_default();
     // Edge case, in case we don't hear from peers but have un-executed blocks...
     // Not sure we should handle this, but it hurts nothing.
-    let db = config.database();
+    let db = config.node_storage();
     let (_, last_db_block) = db
         .last_record::<ConsensusBlocks>()
         .unwrap_or_else(|| (last_executed_block.number, last_executed_block.clone()));
@@ -205,7 +205,7 @@ pub async fn get_missing_consensus<DB: Database>(
         last_executed_consensus_block(consensus_bus, config).unwrap_or_default();
     // Edge case, in case we don't hear from peers but have un-executed blocks...
     // Not sure we should handle this, but it hurts nothing.
-    let db = config.database();
+    let db = config.node_storage();
     let (_, last_db_block) = db
         .last_record::<ConsensusBlocks>()
         .unwrap_or_else(|| (last_executed_block.number, last_executed_block.clone()));
@@ -264,7 +264,7 @@ async fn spawn_stream_consensus_headers<DB: Database>(
 
     let mut rx_last_consensus_header = consensus_bus.last_consensus_header().subscribe();
     //let mut last_consensus_header = catch_up_consensus(&network, &config, &consensus_bus).await?;
-    let db = config.database();
+    let db = config.node_storage();
     let (_, mut last_consensus_header) =
         db.last_record::<ConsensusBlocks>().unwrap_or_else(|| (0, ConsensusHeader::default()));
     let mut last_consensus_height = last_consensus_header.number;
@@ -374,7 +374,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
     if last_consensus_height >= max_consensus_height {
         return Ok(from);
     }
-    let db = config.database();
+    let db = config.node_storage();
     let mut result_header = from;
     for number in last_consensus_height + 1..=max_consensus_height {
         tracing::debug!(target: "telcoin::state-sync", "trying to get consensus block {number}");

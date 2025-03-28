@@ -7,7 +7,7 @@ use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
     AuthorityIdentifier, BlockNumHash, BlsPublicKey, BlsSignature, Certificate, Committee, Header,
-    Stake, Vote,
+    Vote, VotingPower,
 };
 
 #[tokio::test]
@@ -65,5 +65,5 @@ async fn test_certificate_signers_are_ordered() {
     // AND authorities public keys are returned in order
     assert_eq!(signers, sorted_signers);
 
-    assert_eq!(stake, last_three_stake as Stake);
+    assert_eq!(stake, last_three_stake as VotingPower);
 }

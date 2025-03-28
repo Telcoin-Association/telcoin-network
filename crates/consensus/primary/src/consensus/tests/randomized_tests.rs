@@ -21,7 +21,7 @@ use tn_storage::{mem_db::MemDatabase, open_db, ConsensusStore};
 use tn_test_utils::{mock_certificate_with_rand, CommitteeFixture};
 use tn_types::{
     Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Hash as _, Round,
-    Stake,
+    VotingPower,
 };
 use tokio::sync::mpsc::channel;
 
@@ -292,7 +292,7 @@ pub fn make_certificates_with_parameters(
     // Pick the slow nodes - ensure we don't have more than 33% of slow nodes
     assert!(modes.slow_nodes_percentage <= 0.33, "Slow nodes can't be more than 33% of total nodes - otherwise we'll basically simulate a consensus stall");
 
-    let mut authorities: Vec<Authority> = committee.authorities().cloned().collect();
+    let mut authorities: Vec<Authority> = committee.authorities();
 
     // Now shuffle authorities and pick the slow nodes, if should exist
     authorities.shuffle(&mut rand);
@@ -300,7 +300,7 @@ pub fn make_certificates_with_parameters(
     // Step 1 - determine the slow nodes , assuming those should exist
     let slow_nodes: Vec<(Authority, f64)> = {
         let stake_of_slow_nodes =
-            (committee.total_stake() as f64 * modes.slow_nodes_percentage) as Stake;
+            (committee.total_stake() as f64 * modes.slow_nodes_percentage) as VotingPower;
         let stake_of_slow_nodes = stake_of_slow_nodes.min(committee.validity_threshold() - 1);
         let mut total_stake = 0;
 

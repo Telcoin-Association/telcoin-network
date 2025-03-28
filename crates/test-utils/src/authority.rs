@@ -126,7 +126,7 @@ impl<DB: Database> AuthorityFixture<DB> {
         config.validator_info.primary_info.network_address =
             authority.primary_network_address().clone();
 
-        let consensus_config = ConsensusConfig::new_with_committee(
+        let consensus_config = ConsensusConfig::new_with_committee_for_test(
             config,
             db,
             key_config.clone(),

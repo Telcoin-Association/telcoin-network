@@ -475,7 +475,7 @@ where
 
     /// Retrieve the consensus header by number.
     fn get_header_by_number(&self, number: u64) -> PrimaryNetworkResult<ConsensusHeader> {
-        match self.consensus_config.database().get::<ConsensusBlocks>(&number)? {
+        match self.consensus_config.node_storage().get::<ConsensusBlocks>(&number)? {
             Some(header) => Ok(header),
             None => {
                 Err(PrimaryNetworkError::InvalidRequest("consensus header unknown".to_string()))
@@ -488,7 +488,7 @@ where
         // get the block number from the hash
         let number = self
             .consensus_config
-            .database()
+            .node_storage()
             .get::<ConsensusBlockNumbersByDigest>(&hash)?
             .ok_or(PrimaryNetworkError::UnknowConsensusHeaderDigest(hash))?;
 
@@ -499,7 +499,7 @@ where
     /// Retrieve the last record in consensus blocks table.
     fn get_latest_output(&self) -> PrimaryNetworkResult<ConsensusHeader> {
         self.consensus_config
-            .database()
+            .node_storage()
             .last_record::<ConsensusBlocks>()
             .map(|(_, header)| header)
             .ok_or(PrimaryNetworkError::InvalidRequest("Consensus headers unavailable".to_string()))

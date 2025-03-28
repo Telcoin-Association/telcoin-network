@@ -6,7 +6,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     sync::Arc,
 };
-use tn_types::{AuthorityIdentifier, Certificate, Committee, Round, Stake, TnSender as _};
+use tn_types::{AuthorityIdentifier, Certificate, Committee, Round, TnSender as _, VotingPower};
 use tracing::trace;
 
 /// Manage certificates as they aggregate through rounds.
@@ -60,7 +60,7 @@ struct CertificatesAggregator {
     /// The accumulated amount of voting power in favor of a proposed header.
     ///
     /// This amount is used to verify enough voting power to reach quorum within the committee.
-    weight: Stake,
+    weight: VotingPower,
     /// The certificates aggregated for this round.
     certificates: Vec<Certificate>,
     /// The collection of authority ids that have already voted.

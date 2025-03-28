@@ -12,8 +12,8 @@ use crate::{
     error::{CertificateError, CertificateResult, DagError, DagResult, HeaderError},
     now,
     serde::CertificateSignatures,
-    AuthorityIdentifier, BlockHash, Committee, Digest, Epoch, Hash, Header, Round, Stake,
-    TimestampSec, WorkerCache,
+    AuthorityIdentifier, BlockHash, Committee, Digest, Epoch, Hash, Header, Round, TimestampSec,
+    VotingPower, WorkerCache,
 };
 use base64::{engine::general_purpose, Engine};
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,7 @@ impl Certificate {
     pub fn genesis(committee: &Committee) -> Vec<Self> {
         committee
             .authorities()
+            .iter()
             .map(|authority| Self {
                 header: Header {
                     author: authority.id(),
@@ -85,8 +86,9 @@ impl Certificate {
         let mut weight = 0;
         let mut sigs = Vec::new();
 
-        let filtered_votes = committee
-            .authorities()
+        let auths = committee.authorities();
+        let filtered_votes = auths
+            .iter()
             .enumerate()
             .filter(|(_, authority)| {
                 if !votes.is_empty() && authority.id() == votes.front().expect("votes not empty").0
@@ -156,7 +158,7 @@ impl Certificate {
 
     /// Return the total stake and group of authorities that formed the committee for this
     /// certificate.
-    pub fn signed_by(&self, committee: &Committee) -> (Stake, Vec<BlsPublicKey>) {
+    pub fn signed_by(&self, committee: &Committee) -> (VotingPower, Vec<BlsPublicKey>) {
         // Ensure the certificate has a quorum.
         let mut weight = 0;
 
@@ -164,6 +166,7 @@ impl Certificate {
         let mut auth_iter = 0;
         let pks = committee
             .authorities()
+            .iter()
             .enumerate()
             .filter(|(i, authority)| match auth_indexes.get(auth_iter) {
                 Some(index) if *index == *i as u32 => {

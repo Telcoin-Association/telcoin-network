@@ -10,7 +10,7 @@ use std::{
 };
 use tn_storage::ConsensusStore;
 use tn_types::{
-    Authority, AuthorityIdentifier, Certificate, Committee, ReputationScores, Round, Stake,
+    Authority, AuthorityIdentifier, Certificate, Committee, ReputationScores, Round, VotingPower,
 };
 use tracing::{debug, trace};
 
@@ -38,9 +38,9 @@ impl Debug for LeaderSwapTable {
             "LeaderSwapTable round:{}, good_nodes:{:?} with stake:{}, bad_nodes:{:?} with stake:{}",
             self.round,
             self.good_nodes.iter().map(|a| a.id()).collect::<Vec<AuthorityIdentifier>>(),
-            self.good_nodes.iter().map(|a| a.stake()).sum::<Stake>(),
+            self.good_nodes.iter().map(|a| a.stake()).sum::<VotingPower>(),
             self.bad_nodes.iter().map(|a| *a.0).collect::<Vec<AuthorityIdentifier>>(),
-            self.bad_nodes.iter().map(|a| a.1.stake()).sum::<Stake>(),
+            self.bad_nodes.iter().map(|a| a.1.stake()).sum::<VotingPower>(),
         ))
     }
 }
@@ -161,10 +161,12 @@ impl LeaderSwapTable {
 
             // if the total accumulated stake has surpassed the stake threshold then we omit this
             // last authority and we exit the loop.
-            if stake > (stake_threshold * committee.total_stake()) / 100 as Stake {
+            if stake > (stake_threshold * committee.total_stake()) / 100 as VotingPower {
                 break;
             }
-            filtered_authorities.push(committee.authority_safe(&authority_id).to_owned());
+            if let Some(auth) = committee.authority(&authority_id) {
+                filtered_authorities.push(auth.to_owned());
+            }
         }
 
         filtered_authorities
@@ -249,7 +251,7 @@ impl LeaderSchedule {
                 // start with base zero 0.
                 let next_leader = (round as u64 / 2 + self.committee.size() as u64 - 1) as usize % self.committee.size();
 
-                let leader: Authority = self.committee.authorities().nth(next_leader).expect("authority out of bounds!").clone();
+                let leader: Authority = self.committee.authorities().get(next_leader).expect("authority out of bounds!").clone();
                 let table = self.leader_swap_table.read();
 
                 table.swap(&leader.id(), round).unwrap_or(leader)

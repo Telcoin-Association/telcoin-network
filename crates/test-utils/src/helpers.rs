@@ -13,7 +13,7 @@ use std::{
 use tn_types::{
     adiri_chain_spec_arc, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash,
     BlsKeypair, BlsSignature, Bytes, Certificate, CertificateDigest, Committee, Epoch, ExecHeader,
-    Hash as _, HeaderBuilder, ProtocolSignature, Round, Stake, TimestampSec, WorkerId, U256,
+    Hash as _, HeaderBuilder, ProtocolSignature, Round, TimestampSec, VotingPower, WorkerId, U256,
 };
 
 pub fn temp_dir() -> std::path::PathBuf {
@@ -248,7 +248,7 @@ pub fn make_certificates_with_slow_nodes(
     let mut rand = StdRng::seed_from_u64(1);
 
     // ensure provided slow nodes do not account > f
-    let slow_nodes_stake: Stake =
+    let slow_nodes_stake: VotingPower =
         slow_nodes.iter().map(|(key, _)| committee.authority(key).unwrap().stake()).sum();
 
     assert!(slow_nodes_stake < committee.validity_threshold());

@@ -16,7 +16,7 @@ use std::{
 use tn_config::KeyConfig;
 use tn_types::{
     get_available_udp_port, Address, Authority, BlsKeypair, Committee, Database, Epoch, Multiaddr,
-    Stake, WorkerCache, WorkerIndex, DEFAULT_PRIMARY_PORT, DEFAULT_WORKER_PORT,
+    VotingPower, WorkerCache, WorkerIndex, DEFAULT_PRIMARY_PORT, DEFAULT_WORKER_PORT,
 };
 
 pub struct Builder<DB, F, R = OsRng> {
@@ -25,7 +25,7 @@ pub struct Builder<DB, F, R = OsRng> {
     number_of_workers: NonZeroUsize,
     randomize_ports: bool,
     epoch: Epoch,
-    stake: VecDeque<Stake>,
+    stake: VecDeque<VotingPower>,
     new_db: F,
     _phantom_data: PhantomData<DB>,
 }
@@ -69,7 +69,7 @@ where
         self
     }
 
-    pub fn stake_distribution(mut self, stake: VecDeque<Stake>) -> Self {
+    pub fn stake_distribution(mut self, stake: VecDeque<VotingPower>) -> Self {
         self.stake = stake;
         self
     }

@@ -21,7 +21,8 @@ impl ReputationScores {
     /// Creating a new ReputationScores instance pre-populating the authorities entries with
     /// zero score value.
     pub fn new(committee: &Committee) -> Self {
-        let scores_per_authority = committee.authorities().map(|a| (a.id(), 0_u64)).collect();
+        let scores_per_authority =
+            committee.authorities().iter().map(|a| (a.id(), 0_u64)).collect();
 
         Self { scores_per_authority, ..Default::default() }
     }
