@@ -114,6 +114,7 @@ where
     /// The configurables for the libp2p consensus network implementation.
     config: LibP2pConfig,
     /// Track peers we have a connection with.
+    ///
     /// This explicitly tracked and is a VecDeque so we can use to round robin requests without an
     /// explicit peer.
     connected_peers: VecDeque<PeerId>,

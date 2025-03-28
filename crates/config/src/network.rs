@@ -198,7 +198,7 @@ impl Default for QuicConfig {
 pub struct PeerConfig {
     /// The interval (secs) for updating peer status.
     pub heartbeat_interval: u64,
-    /// The target number of peers to maintain connections with.
+    /// The target number of connected peers.
     pub target_num_peers: usize,
     /// The threshold before a peer is disconnected
     pub min_score_for_disconnect: f64,

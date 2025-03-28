@@ -43,17 +43,22 @@ pub struct AllPeers {
     banned_peers: BannedPeers,
     /// The number of peers that have disconnected from this node.
     disconnected_peers: usize,
+    /// The target number of connected peers for this node.
+    target_num_peers: usize,
 }
 
-/// The action to take based on the reported penalty and score update.
+/// The action to take after a peer's reputation or connection status changes.
+///
+/// Both reputation and connection status changes may require the manager to take
+/// action to update the peer.
+#[derive(Debug)]
 pub enum PeerAction {
     /// Ban the peer and the associated IP addresses.
     Ban(Vec<IpAddr>),
+    /// Temporarily ban a peer when target number of peers reached.
+    TempBan,
     /// No action needed.
     NoAction,
-    /// Peer already disconnecting - nothing to do?
-    /// TODO: can this also be NoAction?
-    Disconnecting,
     /// Disconnect from peer.
     Disconnect,
     /// Unban the peer and it's known ip addresses.
@@ -108,20 +113,13 @@ impl AllPeers {
                             NewConnectionStatus::Disconnecting { banned: false },
                         )
                     } else {
-                        // TODO: use peer's ip addresses
-                        let ip_addr = vec![];
-                        PeerAction::Unban(ip_addr)
+                        warn!(target: "peer-manager", ?peer_id, ?prior_reputation, "process_penalty for disconnected peer");
+                        self.update_connection_status(peer_id, NewConnectionStatus::Disconnected)
                     }
                 }
                 Reputation::Trusted => {
-                    match prior_reputation {
-                        Reputation::Trusted => { /* no action */ }
-                        Reputation::Disconnected => {
-                            // no action
-                        }
-                        Reputation::Banned => { /* THIS SHOULD NEVER HAPPEN */ }
-                    }
-
+                    // this should never happen
+                    error!(target: "peer-manager", ?peer_id, "process_penalty resulted in peer becoming trusted");
                     PeerAction::NoAction
                 }
             };
@@ -172,7 +170,7 @@ impl AllPeers {
         self.peers
             .get(peer_id)
             .map(|peer| peer.connection_status().clone())
-            .unwrap_or(ConnectionStatus::Unknown) // impossible
+            .unwrap_or(ConnectionStatus::Unknown)
     }
 
     /// Filter banned peer's ip addresses against already known banned ip addresses.
@@ -259,6 +257,8 @@ impl AllPeers {
     ) -> PeerAction {
         let current_status = self.ensure_peer_exists(peer_id, &new_status);
 
+        debug!(target: "peer-manager", ?peer_id, ?current_status, ?new_status, "update_connection_status");
+
         // Handle the state transition and return any necessary ban operations
         self.handle_status_transition(peer_id, current_status, new_status)
     }
@@ -272,24 +272,20 @@ impl AllPeers {
         current_status: ConnectionStatus,
         new_status: NewConnectionStatus,
     ) -> PeerAction {
-        match (current_status, new_status) {
+        match new_status {
             // Group transitions by the new status
-            (current_status, NewConnectionStatus::Connected { multiaddr, direction }) => {
+            NewConnectionStatus::Connected { multiaddr, direction } => {
                 self.handle_connected_transition(peer_id, current_status, multiaddr, direction)
             }
-            (current_status, NewConnectionStatus::Dialing) => {
-                self.handle_dialing_transition(peer_id, current_status)
-            }
-            (current_status, NewConnectionStatus::Disconnected) => {
+            NewConnectionStatus::Dialing => self.handle_dialing_transition(peer_id, current_status),
+            NewConnectionStatus::Disconnected => {
                 self.handle_disconnected_transition(peer_id, current_status)
             }
-            (current_status, NewConnectionStatus::Disconnecting { banned }) => {
+            NewConnectionStatus::Disconnecting { banned } => {
                 self.handle_disconnecting_transition(peer_id, current_status, banned)
             }
-            (current_status, NewConnectionStatus::Banned) => {
-                self.handle_banned_transition(peer_id, current_status)
-            }
-            (current_status, NewConnectionStatus::Unbanned) => {
+            NewConnectionStatus::Banned => self.handle_banned_transition(peer_id, current_status),
+            NewConnectionStatus::Unbanned => {
                 self.handle_unbanned_transition(peer_id, current_status)
             }
         }
@@ -425,7 +421,12 @@ impl AllPeers {
             peer.set_connection_status(ConnectionStatus::Disconnected { instant: Instant::now() });
         }
 
-        PeerAction::Disconnect
+        // temporarily ban a disconnected peer if the target number of peers is reached
+        if self.connected_peer_ids().count() >= self.target_num_peers {
+            PeerAction::TempBan
+        } else {
+            PeerAction::Disconnect
+        }
     }
 
     /// Handle transition to Disconnecting state
@@ -435,6 +436,11 @@ impl AllPeers {
         current_state: ConnectionStatus,
         banned: bool,
     ) -> PeerAction {
+        // set the peer to disconnecting state
+        if let Some(peer) = self.peers.get_mut(peer_id) {
+            peer.set_connection_status(ConnectionStatus::Disconnecting { banned });
+        }
+
         match current_state {
             ConnectionStatus::Disconnected { .. } => {
                 // if the peer was previously disconnected and is now being disconnected,
@@ -445,12 +451,14 @@ impl AllPeers {
                 // banned peers should already be disconnected
                 error!(target: "peer-manager", ?peer_id, "disconnecting from a banned peer - banned peer should already be disconnected");
             }
-            _ => {} // Nothing else to do
-        }
-
-        // set the peer to disconnecting state
-        if let Some(peer) = self.peers.get_mut(peer_id) {
-            peer.set_connection_status(ConnectionStatus::Disconnecting { banned });
+            ConnectionStatus::Connected { .. } | ConnectionStatus::Dialing { .. } => {
+                // TODO: should the penalty method just update new status to `Disconnected` instead?
+                // - what is important about `Disconnecting` that needs to flow
+                //
+                // this transition is possible when a penalty is assessed for a peer
+                return PeerAction::Disconnect;
+            }
+            _ => {}
         }
 
         PeerAction::NoAction
@@ -473,7 +481,7 @@ impl AllPeers {
                 ConnectionStatus::Disconnecting { .. } => {
                     // ban the peer once the disconnection process completes
                     debug!(target: "peer-manager", ?peer_id, "banning peer that is currently disconnecting");
-                    PeerAction::Disconnecting
+                    PeerAction::NoAction
                 }
                 ConnectionStatus::Banned { .. } => {
                     error!(target: "peer-manager", ?peer_id, "banning already banned peer");
@@ -495,6 +503,7 @@ impl AllPeers {
                 }
             }
         } else {
+            warn!(target: "peer-manager", ?peer_id, "failed to retrieve peer data for handling banned transition");
             PeerAction::NoAction
         }
     }
@@ -535,15 +544,6 @@ impl AllPeers {
 
         PeerAction::NoAction
     }
-
-    /*
-
-
-    turtle
-
-
-
-    */
 
     /// Return the [Peer] by [PeerId] if it is known.
     pub(super) fn get_peer(&self, peer_id: &PeerId) -> Option<&Peer> {
@@ -671,32 +671,6 @@ impl AllPeers {
 
         // remove excess peers from banned collection
         if excess > 0 {
-            // // collection of peers to prune
-            // let mut excess_peers = BinaryHeap::with_capacity(excess);
-
-            // // sort and collect peers with oldest ban instant
-            // for (peer_id, peer) in &self.peers {
-            //     if let ConnectionStatus::Banned { instant } = peer.connection_status() {
-            //         // min-heap sorted by instant (oldest first)
-            //         let entry = (
-            //             Reverse(*instant),
-            //             *peer_id,
-            //             peer.known_ip_addresses().collect::<Vec<_>>(),
-            //         );
-
-            //         if excess_peers.len() < excess {
-            //             // fill the heap until `excess` elements
-            //             excess_peers.push(entry);
-            //         } else if let Some(current_max) = excess_peers.peek() {
-            //             // if peer's banned instant is older, replace it
-            //             if entry.0 < current_max.0 {
-            //                 excess_peers.pop();
-            //                 excess_peers.push(entry);
-            //             }
-            //         }
-            //     }
-            // }
-
             let excess_peers = self.collect_excess_peers(excess, |status| {
                 if let ConnectionStatus::Banned { instant } = status {
                     Some(*instant)

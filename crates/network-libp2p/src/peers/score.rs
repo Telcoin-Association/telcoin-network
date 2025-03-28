@@ -278,8 +278,7 @@ impl Reputation {
 
 /// The peer's reputation change after a heartbeat score update.
 ///
-/// TODO: remove `PeerAction` and only use `ReputationUpdate`?
-/// These are essentially the same thing and the reputation should be the source of truth.
+/// The reputation update is used to generate a `PeerAction` for the manager.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(super) enum ReputationUpdate {
     /// The updated score resulted in a peer becoming banned.

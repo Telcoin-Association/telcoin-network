@@ -9,7 +9,7 @@ use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
 use std::{collections::VecDeque, net::IpAddr, task::Context};
 use tn_config::{ConsensusConfig, PeerConfig};
 use tn_types::Database;
-use tracing::error;
+use tracing::{debug, error};
 
 /// The type to manage peers.
 pub struct PeerManager {
@@ -109,24 +109,25 @@ impl PeerManager {
         // update peers
         let actions = self.peers.heartbeat_maintenance();
         for (peer_id, action) in actions {
-            self.apply_reputation_updates(peer_id, action);
+            self.apply_peer_action(peer_id, action);
         }
 
         // TODO: update peer metrics
 
         self.prune_connected_peers();
 
-        self.unban_peers();
+        self.unban_temp_banned_peers();
     }
 
     // TODO: use RepuationUpdate instead of PeerAction
-    fn apply_reputation_updates(&mut self, peer_id: PeerId, update: PeerAction) {
-        match update {
+    fn apply_peer_action(&mut self, peer_id: PeerId, action: PeerAction) {
+        match action {
             PeerAction::Ban(ip_addrs) => {
                 // TODO: ensure TemporaryBan is sufficiently handled at the AllPeers level
                 // - current approach is to issue PeerAction::Disconnect there and use empty
                 // ip addresses here to intercept for self.temp_ban LRU cache
 
+                debug!(target: "peer-manager", ?peer_id, ?ip_addrs, "reputation update results in ban");
                 self.process_ban(&peer_id, ip_addrs);
             }
             PeerAction::Disconnect => {
@@ -135,13 +136,14 @@ impl PeerManager {
             PeerAction::Unban(ip_addrs) => {
                 self.push_event(PeerEvent::Unbanned(peer_id, ip_addrs));
             }
+            PeerAction::TempBan => {
+                debug!(target: "peer-manager", ?peer_id, "reputation update results in disconnect");
+                self.temporarily_banned.insert(peer_id);
+                // prevent immediate reconnection attempts
+                self.events.push_back(PeerEvent::Banned(peer_id, vec![]));
+            }
             // no action
             PeerAction::NoAction => { /* nothing to do */ }
-            // TODO: keep this?
-            //
-            // NOTE: disconnecting is not an option for `ScoreUpdateResult`
-            //
-            PeerAction::Disconnecting => todo!(),
         }
     }
 
@@ -197,37 +199,23 @@ impl PeerManager {
         self.config.max_peers()
     }
 
-    /// Disconnect from a peer.
+    /// Process a penalty from the application layer.
     ///
     /// The application layer reports issues from peers that are processed here.
-    /// Some reports are propagated to libp2p network layer.
-    pub(crate) fn handle_reported_penalty(&mut self, peer_id: &PeerId, penalty: Penalty) {
-        let action = self.peers.process_penalty(peer_id, penalty);
+    /// Some reports are propagated to libp2p network layer. Caller is responsible
+    /// for specifying the severity of the penalty to apply.
+    pub(crate) fn handle_reported_penalty(&mut self, peer_id: PeerId, penalty: Penalty) {
+        let action = self.peers.process_penalty(&peer_id, penalty);
 
-        match action {
-            PeerAction::Ban(ips) => {
-                // Process peer banning and associated IP addresses
-                //
-                // IP banning applies to the specific peer address.
-                // Connected peers using the same IP remain connected.
-                //
-                // Any new connections or reconnection attempts from banned IPs
-                // result in immediate disconnection and banning.
-                self.process_ban(peer_id, ips)
-            }
-            PeerAction::NoAction => todo!(),
-            PeerAction::Disconnect => todo!(),
-            PeerAction::Disconnecting => todo!(),
-            PeerAction::Unban(_) => todo!(), // impossible
-        }
+        debug!(target: "peer-manager", ?peer_id, ?action, "processed penalty");
+
+        self.apply_peer_action(peer_id, action);
     }
 
     /// Process newly banned IP addresses.
     ///
-    /// The peer is disconnected and can be banned from network layer.
+    /// The peer is disconnected and is banned from network layer.
     fn process_ban(&mut self, peer_id: &PeerId, ips: Vec<IpAddr>) {
-        self.events.push_back(PeerEvent::Banned(*peer_id, ips));
-
         // ensure unbanned events are removed for this peer
         self.events.retain(|event| {
             if let PeerEvent::Unbanned(unbanned_peer_id, _) = event {
@@ -236,6 +224,9 @@ impl PeerManager {
                 true
             }
         });
+
+        // push banned event
+        self.events.push_back(PeerEvent::Banned(*peer_id, ips));
     }
 
     /// Disconnect from a peer.
@@ -320,7 +311,7 @@ impl PeerManager {
 
         // if the peer is banned, continue to ban the peer
         if action.is_ban() {
-            self.apply_reputation_updates(*peer_id, action);
+            self.apply_peer_action(*peer_id, action);
         }
 
         // process pruned peers
@@ -372,7 +363,7 @@ impl PeerManager {
     /// Unban temporarily banned peers.
     ///
     /// Peers are temporarily "banned" when trying to connect while this node has excess peers.
-    fn unban_peers(&mut self) {
+    fn unban_temp_banned_peers(&mut self) {
         for peer_id in self.temporarily_banned.heartbeat() {
             self.push_event(PeerEvent::Unbanned(peer_id, Vec::new()));
         }
@@ -381,9 +372,9 @@ impl PeerManager {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
-
     use super::*;
+    use assert_matches::assert_matches;
+    use std::net::Ipv4Addr;
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils::CommitteeFixture;
 
@@ -438,29 +429,43 @@ mod tests {
         assert!(peer_manager.register_incoming_connection(&peer_id, multiaddr));
 
         // Apply a severe penalty to trigger ban
-        peer_manager.handle_reported_penalty(&peer_id, Penalty::Fatal);
+        peer_manager.handle_reported_penalty(peer_id, Penalty::Fatal);
 
-        // Clear events from banning
-        let mut ban_events = Vec::new();
+        // clear events from reported penalty
+        let mut disconnect_events = Vec::new();
         while let Some(event) = peer_manager.poll_events() {
-            ban_events.push(event);
+            disconnect_events.push(event);
         }
 
-        // Verify at least one ban event was generated
-        let ban_event_count =
-            extract_events(&ban_events, |e| matches!(e, PeerEvent::Banned(_, _))).len();
-        assert!(ban_event_count > 0, "Expected at least one ban event");
+        // assert peer is set for disconnect
+        let disconnect_event =
+            extract_events(&disconnect_events, |e| matches!(e, PeerEvent::DisconnectPeer(_))).len();
+        assert!(disconnect_event == 1, "Expect one disconnect event");
+        assert_matches!(
+            disconnect_events.first().unwrap(),
+            PeerEvent::DisconnectPeer(id) if *id == peer_id
+        );
 
-        tracing::debug!(target: "peer-manager", ?ban_event_count, "made it here :D");
+        debug!(target: "peer-manager", ?disconnect_event, "made it here :D");
 
         // register disconnection
         peer_manager.register_disconnected(&peer_id);
 
         // There should be no additional ban events since the peer is already banned
-        let mut additional_events = Vec::new();
+        let mut banned_events = Vec::new();
         while let Some(event) = peer_manager.poll_events() {
-            additional_events.push(event);
+            banned_events.push(event);
         }
+
+        debug!(target: "peer-manager", ?banned_events, "made it here");
+
+        let banned_event =
+            extract_events(&banned_events, |e| matches!(e, PeerEvent::Banned(_, _))).len();
+        assert!(banned_event == 1, "Expect one banned event");
+        assert_matches!(
+            banned_events.first().unwrap(),
+            PeerEvent::Banned(id, _) if *id == peer_id
+        );
 
         // assert peer is still banned after disconnection
         assert!(
