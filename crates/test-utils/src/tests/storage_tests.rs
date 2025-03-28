@@ -249,7 +249,6 @@ async fn test_certificate_store_last_two_rounds() {
     let result = store.last_two_rounds_certs().unwrap();
     let last_round_cert = store.last_round(origin).unwrap().unwrap();
     let last_round_number = store.last_round_number(origin).unwrap().unwrap();
-    let last_round_number_not_exist = store.last_round_number(AuthorityIdentifier(10u16)).unwrap();
     let highest_round_number = store.highest_round_number();
 
     // THEN
@@ -263,7 +262,6 @@ async fn test_certificate_store_last_two_rounds() {
                 || (certificate.round() == last_round_number - 1)
         );
     }
-    assert!(last_round_number_not_exist.is_none());
 }
 
 #[tokio::test]

@@ -86,7 +86,7 @@ async fn test_fail_to_write_message_too_big() {
 
 #[tokio::test]
 async fn test_reject_message_prefix_too_big() {
-    let max_chunk_size = 208; // 208 bytes
+    let max_chunk_size = 416; // 416 bytes
     let mut honest_peer = TNCodec::<TestPrimaryRequest, TestPrimaryResponse>::new(max_chunk_size);
     let protocol = StreamProtocol::new("/tn-test");
     // malicious peer writes legit messages that are too big
@@ -100,7 +100,7 @@ async fn test_reject_message_prefix_too_big() {
     // sanity check
     let mut encoded = Vec::new();
 
-    // this is 208 bytes uncompressed (max chunk size)
+    // this is 416 bytes uncompressed (max chunk size)
     let request = TestPrimaryRequest::Vote {
         header: Header::default(),
         parents: vec![Certificate::default()],
@@ -149,8 +149,10 @@ async fn test_reject_message_prefix_too_big() {
 
     // now encode legit message that's too big for honest peer
     let mut encoded = Vec::new();
-    // 274 bytes uncompressed
+    // > 416 bytes uncompressed
     let big_response = TestPrimaryResponse::MissingCertificates(vec![
+        Certificate::default(),
+        Certificate::default(),
         Certificate::default(),
         Certificate::default(),
     ]);

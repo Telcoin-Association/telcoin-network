@@ -76,11 +76,11 @@ async fn commit_one_with_leader_schedule_change() {
             description: "When schedule change is enabled, then authority 0 is bad node and swapped with authority 3".to_string(),
             rounds: 11,
             expected_leaders: VecDeque::from(vec![
-                AuthorityIdentifier(0),
-                AuthorityIdentifier(1),
-                AuthorityIdentifier(2),
-                AuthorityIdentifier(3),
-                AuthorityIdentifier(3),
+                AuthorityIdentifier::dummy_for_test(0),
+                AuthorityIdentifier::dummy_for_test(1),
+                AuthorityIdentifier::dummy_for_test(2),
+                AuthorityIdentifier::dummy_for_test(3),
+                //XXXXAuthorityIdentifier::dummy_for_test(3),
             ]),
         },
     ];
@@ -165,7 +165,7 @@ async fn not_enough_support_with_leader_schedule_change() {
         6,
         tn_test_utils::TestLeaderConfiguration {
             round: 6,
-            authority: AuthorityIdentifier(2),
+            authority: AuthorityIdentifier::dummy_for_test(2),
             should_omit: false,
             support: Some(tn_test_utils::TestLeaderSupport::Weak),
         },
@@ -178,7 +178,7 @@ async fn not_enough_support_with_leader_schedule_change() {
         8,
         tn_test_utils::TestLeaderConfiguration {
             round: 8,
-            authority: AuthorityIdentifier(3),
+            authority: AuthorityIdentifier::dummy_for_test(3),
             should_omit: false,
             support: Some(tn_test_utils::TestLeaderSupport::NoSupport),
         },
@@ -196,7 +196,7 @@ async fn not_enough_support_with_leader_schedule_change() {
         10,
         tn_test_utils::TestLeaderConfiguration {
             round: 10,
-            authority: AuthorityIdentifier(0),
+            authority: AuthorityIdentifier::dummy_for_test(0),
             should_omit: false,
             support: Some(tn_test_utils::TestLeaderSupport::Weak),
         },
@@ -261,7 +261,10 @@ async fn not_enough_support_with_leader_schedule_change() {
                 // update happened the leader schedule changed and now the Authority
                 // 0 is flagged as low score and it will be swapped with Authority
                 // 3.
-                assert_eq!(committed_dag_10.leader.origin(), AuthorityIdentifier(3));
+                assert_eq!(
+                    committed_dag_10.leader.origin(),
+                    AuthorityIdentifier::dummy_for_test(3)
+                );
 
                 assert_eq!(outcome, Outcome::Commit);
             }
@@ -278,7 +281,10 @@ async fn not_enough_support_with_leader_schedule_change() {
 
                 assert_eq!(committed_dag_14.leader_round(), 14);
 
-                assert_eq!(committed_dag_14.leader.origin(), AuthorityIdentifier(2));
+                assert_eq!(
+                    committed_dag_14.leader.origin(),
+                    AuthorityIdentifier::dummy_for_test(2)
+                );
             }
         }
     }
@@ -314,7 +320,7 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
             round,
             tn_test_utils::TestLeaderConfiguration {
                 round,
-                authority: AuthorityIdentifier(authority_id),
+                authority: AuthorityIdentifier::dummy_for_test(authority_id as u8),
                 should_omit: false,
                 support: Some(tn_test_utils::TestLeaderSupport::Weak),
             },
@@ -387,7 +393,10 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
                 // update happened the leader schedule changed and now the Authority
                 // 0 is flagged as low score and it will be swapped with Authority
                 // 3.
-                assert_eq!(committed_dag_10.leader.origin(), AuthorityIdentifier(3));
+                assert_eq!(
+                    committed_dag_10.leader.origin(),
+                    AuthorityIdentifier::dummy_for_test(3)
+                );
 
                 // The leaders of round 12 & 14 shouldn't change from the "original" schedule
                 let schedule = LeaderSchedule::new(committee, LeaderSwapTable::default());

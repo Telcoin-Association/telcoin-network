@@ -14,7 +14,7 @@ fn test_zero_timestamp_in_sub_dag() {
 
     let header_builder = HeaderBuilder::default();
     let header = header_builder
-        .author(AuthorityIdentifier(1u16))
+        .author(AuthorityIdentifier::default())
         .round(2)
         .epoch(0)
         .created_at(50)
@@ -48,7 +48,7 @@ fn test_monotonically_incremented_commit_timestamps() {
 
     let header_builder = HeaderBuilder::default();
     let header = header_builder
-        .author(AuthorityIdentifier(1u16))
+        .author(AuthorityIdentifier::default())
         .round(2)
         .epoch(0)
         .created_at(newer_timestamp)
@@ -73,7 +73,7 @@ fn test_monotonically_incremented_commit_timestamps() {
     // Now create the leader of round 4 with the older timestamp
     let header_builder = HeaderBuilder::default();
     let header = header_builder
-        .author(AuthorityIdentifier(1u16))
+        .author(AuthorityIdentifier::default())
         .round(4)
         .epoch(0)
         .created_at(older_timestamp)

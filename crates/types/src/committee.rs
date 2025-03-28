@@ -4,6 +4,7 @@ use crate::{
     crypto::{BlsPublicKey, NetworkPublicKey},
     Address, Multiaddr,
 };
+use libp2p::{multihash::Multihash, PeerId};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -23,9 +24,6 @@ pub type VotingPower = u64;
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct Authority {
-    /// The id under which we identify this authority across Narwhal
-    #[serde(skip)]
-    id: AuthorityIdentifier,
     /// The authority's main BlsPublicKey which is used to verify the content they sign.
     protocol_key: BlsPublicKey,
     /// The voting power of this authority.
@@ -39,10 +37,6 @@ pub struct Authority {
     network_key: NetworkPublicKey,
     /// The validator's hostname
     hostname: String,
-    /// There are secondary indexes that should be initialised before we are ready to use the
-    /// authority - this bool protect us for premature use.
-    #[serde(skip)]
-    initialised: bool,
 }
 
 impl Authority {
@@ -59,21 +53,18 @@ impl Authority {
         hostname: String,
     ) -> Self {
         Self {
-            id: Default::default(),
             protocol_key,
             stake,
             primary_network_address,
             execution_address,
             network_key,
             hostname,
-            initialised: false,
         }
     }
 
     /// Version of new that can be called directly.  Useful for testing, if you are calling this
     /// outside of a test you are wrong (see comment on new).
     pub fn new_for_test(
-        id: AuthorityIdentifier,
         protocol_key: BlsPublicKey,
         stake: VotingPower,
         primary_network_address: Multiaddr,
@@ -82,58 +73,41 @@ impl Authority {
         hostname: String,
     ) -> Self {
         Self {
-            id,
             protocol_key,
             stake,
             primary_network_address,
             execution_address,
             network_key,
             hostname,
-            initialised: false,
         }
     }
 
-    /// Exposed for testing, can only be called once.
-    /// In normal use is called at creation.
-    pub fn initialise(&mut self, id: AuthorityIdentifier) {
-        assert!(!self.initialised);
-        self.id = id;
-        self.initialised = true;
-    }
-
     pub fn id(&self) -> AuthorityIdentifier {
-        assert!(self.initialised);
-        self.id
+        self.network_key.to_peer_id().into()
     }
 
     pub fn protocol_key(&self) -> &BlsPublicKey {
         // Skip the assert here, this is called in testing before the initialise...
-        // assert!(self.initialised);
         &self.protocol_key
     }
 
     pub fn stake(&self) -> VotingPower {
-        assert!(self.initialised);
         self.stake
     }
 
     pub fn primary_network_address(&self) -> &Multiaddr {
-        assert!(self.initialised);
         &self.primary_network_address
     }
 
     pub fn execution_address(&self) -> Address {
-        assert!(self.initialised);
         self.execution_address
     }
 
     pub fn network_key(&self) -> NetworkPublicKey {
-        assert!(self.initialised);
         self.network_key.clone()
     }
 
     pub fn hostname(&self) -> &str {
-        assert!(self.initialised);
         self.hostname.as_str()
     }
 }
@@ -159,12 +133,11 @@ struct CommitteeInner {
 impl CommitteeInner {
     /// Updates the committee internal secondary indexes.
     pub fn load(&mut self) {
-        self.authorities_by_id = (0_u16..)
-            .zip(self.authorities.iter_mut())
-            .map(|(identifier, (_key, authority))| {
-                let id = AuthorityIdentifier(identifier);
-                authority.initialise(id);
-
+        self.authorities_by_id = self
+            .authorities
+            .values()
+            .map(|authority| {
+                let id = authority.id();
                 (id, authority.clone())
             })
             .collect();
@@ -229,10 +202,30 @@ impl Eq for Committee {}
 
 // Every authority gets uniquely identified by the AuthorityIdentifier
 // The type can be easily swapped without needing to change anything else in the implementation.
-#[derive(
-    Eq, PartialEq, Ord, PartialOrd, Clone, Copy, Debug, Default, Hash, Serialize, Deserialize,
-)]
-pub struct AuthorityIdentifier(pub u16);
+#[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Copy, Debug, Hash, Serialize, Deserialize)]
+pub struct AuthorityIdentifier(PeerId);
+
+impl AuthorityIdentifier {
+    pub fn dummy_for_test(byte: u8) -> Self {
+        let data = [byte; 32];
+        PeerId::from_multihash(
+            Multihash::wrap(0x0, &data).expect("The digest size is never too large"),
+        )
+        .expect("valid multihash bytes")
+        .into()
+    }
+}
+
+impl Default for AuthorityIdentifier {
+    fn default() -> Self {
+        let data = [0_u8; 32];
+        PeerId::from_multihash(
+            Multihash::wrap(0x0, &data).expect("The digest size is never too large"),
+        )
+        .expect("valid multihash bytes")
+        .into()
+    }
+}
 
 impl Display for AuthorityIdentifier {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -240,9 +233,15 @@ impl Display for AuthorityIdentifier {
     }
 }
 
-impl From<u16> for AuthorityIdentifier {
-    fn from(value: u16) -> Self {
+impl From<PeerId> for AuthorityIdentifier {
+    fn from(value: PeerId) -> Self {
         Self(value)
+    }
+}
+
+impl From<AuthorityIdentifier> for PeerId {
+    fn from(value: AuthorityIdentifier) -> Self {
+        value.0
     }
 }
 
@@ -264,12 +263,6 @@ impl Committee {
 
         assert_eq!(committee.validity_threshold, committee.calculate_validity_threshold().get());
         assert_eq!(committee.quorum_threshold, committee.calculate_quorum_threshold().get());
-
-        // ensure all the authorities are ordered in incremented manner with their ids - just some
-        // extra confirmation here.
-        for (index, (_, authority)) in committee.authorities.iter().enumerate() {
-            assert_eq!(index as u16, authority.id.0);
-        }
 
         Self { inner: Arc::new(RwLock::new(committee)) }
     }
@@ -319,7 +312,8 @@ impl Committee {
     }
 
     pub fn authorities(&self) -> Vec<Authority> {
-        self.inner.read().authorities.values().cloned().collect()
+        // Return sorted by id (using the id keyed BTree) since this may be important to some code.
+        self.inner.read().authorities_by_id.values().cloned().collect()
     }
 
     /// Returns the number of authorities.

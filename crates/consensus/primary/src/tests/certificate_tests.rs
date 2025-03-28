@@ -111,7 +111,7 @@ fn test_unknown_signature_in_certificate() {
     }
 
     let malicious_key = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
-    let malicious_id: AuthorityIdentifier = AuthorityIdentifier(50u16);
+    let malicious_id: AuthorityIdentifier = AuthorityIdentifier::dummy_for_test(50u8);
 
     let vote = Vote::new_with_signer(&header, &malicious_id, &malicious_key);
     signatures.push((vote.author(), vote.signature().clone()));

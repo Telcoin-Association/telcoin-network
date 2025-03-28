@@ -117,7 +117,6 @@ where
             let primary_network_address: Multiaddr =
                 format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap();
             let authority = Authority::new_for_test(
-                (i as u16).into(),
                 key_config.primary_public_key(),
                 *self.stake.get(i).unwrap_or(&1),
                 primary_network_address,
@@ -133,8 +132,7 @@ where
         // Reset the authority ids so they are in sort order.  Some tests require this.
         for (i, (_, (primary_keypair, key_config, authority))) in authorities.iter_mut().enumerate()
         {
-            authority.initialise((i as u16).into());
-            let worker = WorkerFixture::generate(key_config.clone(), authority.id().0, |host| {
+            let worker = WorkerFixture::generate(key_config.clone(), i as u16, |host| {
                 if self.randomize_ports {
                     get_available_udp_port(host).unwrap_or(DEFAULT_PRIMARY_PORT)
                 } else {
