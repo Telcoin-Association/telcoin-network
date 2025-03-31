@@ -96,7 +96,7 @@ fn new_worker_internal<DB: Database>(
         id,
         consensus_config.committee().clone(),
         consensus_config.worker_cache().clone(),
-        network_handle,
+        network_handle.clone(),
         node_metrics.clone(),
     );
 
@@ -107,6 +107,7 @@ fn new_worker_internal<DB: Database>(
         client,
         consensus_config.database().clone(),
         consensus_config.parameters().batch_vote_timeout,
+        network_handle,
     )
 }
 
@@ -127,6 +128,8 @@ pub struct Worker<DB, QW> {
     tx_batches: BatchSender,
     /// The amount of time to wait on a reply from peer before timing out.
     timeout: Duration,
+    /// Worker network handle.
+    network_handle: WorkerNetworkHandle,
 }
 
 impl<DB, QW> std::fmt::Debug for Worker<DB, QW> {
@@ -143,9 +146,19 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         client: LocalNetwork,
         store: DB,
         timeout: Duration,
+        network_handle: WorkerNetworkHandle,
     ) -> Self {
         let (tx_batches, mut rx_batches) = tokio::sync::mpsc::channel(1000);
-        let this = Self { id, quorum_waiter, node_metrics, client, store, tx_batches, timeout };
+        let this = Self {
+            id,
+            quorum_waiter,
+            node_metrics,
+            client,
+            store,
+            tx_batches,
+            timeout,
+            network_handle,
+        };
         let this_clone = this.clone();
         // Spawn a little task to accept batches from a channel and seal them that way.
         // Allows the engine to remain removed from the worker.
@@ -180,7 +193,14 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         match batch_attest_handle.await {
             Ok(res) => {
                 match res {
-                    Ok(_) => {} // batch reached quorum!
+                    Ok(()) => {
+                        // batch reached quorum!
+                        // Publish the digest for any nodes listening to this gossip (non-committee
+                        // members). Note, ignore error- this should not
+                        // happen and should not cause an issue (except the
+                        // underlying p2p network may be in trouble but that will manifest quickly).
+                        let _ = self.network_handle.publish_batch(sealed_batch.digest()).await;
+                    }
                     Err(e) => {
                         return Err(match e {
                             crate::quorum_waiter::QuorumWaiterError::QuorumRejected => {

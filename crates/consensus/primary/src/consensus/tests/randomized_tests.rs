@@ -3,7 +3,8 @@
 use crate::consensus::{
     Bullshark, ConsensusMetrics, ConsensusState, LeaderSchedule, LeaderSwapTable,
 };
-use fastcrypto::hash::{Hash, HashFunction};
+use blake2::Digest as _;
+use fastcrypto::hash::Hash;
 use futures::{stream::FuturesUnordered, StreamExt};
 use rand::{
     distributions::{Bernoulli, Distribution},

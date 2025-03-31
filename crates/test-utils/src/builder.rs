@@ -107,8 +107,7 @@ where
         // Pass 1 to make the authorities so we can make the committee struct we need later.
         for i in 0..committee_size {
             let primary_keypair = BlsKeypair::generate(&mut rng);
-            let key_config =
-                KeyConfig::with_primary_random_networks(primary_keypair.copy(), &mut rng);
+            let key_config = KeyConfig::new_with_testing_key(primary_keypair.copy());
             let host = "127.0.0.1";
             let port = if self.randomize_ports {
                 get_available_udp_port(host).unwrap_or(DEFAULT_WORKER_PORT)

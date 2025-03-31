@@ -28,7 +28,7 @@ pub trait DbTx {
 }
 
 /// Interface to a DB write transaction.
-pub trait DbTxMut {
+pub trait DbTxMut: DbTx {
     /// Returns the value for the given key from the map, if it exists.
     fn insert<T: Table>(&mut self, key: &T::Key, value: &T::Value) -> eyre::Result<()>;
 

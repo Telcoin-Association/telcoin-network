@@ -7,7 +7,7 @@ use crate::{
     adiri_chain_spec, crypto, encode, now, Address, BlockHash, ExecHeader, TimestampSec,
     MIN_PROTOCOL_BASE_FEE,
 };
-use fastcrypto::hash::HashFunction;
+use blake2::Digest as _;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use thiserror::Error;
@@ -113,7 +113,7 @@ impl Batch {
         let mut hasher = crypto::DefaultHashFunction::new();
         hasher.update(encode(self));
         // finalize
-        BlockHash::from_slice(&hasher.finalize().digest)
+        BlockHash::from_slice(&hasher.finalize()[..])
     }
 
     /// Timestamp of this batch header.

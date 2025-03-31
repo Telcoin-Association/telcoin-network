@@ -8,7 +8,8 @@
 
 use super::{CommittedSubDag, ConsensusOutput};
 use crate::{crypto, error::CertificateResult, BlockHash, Certificate, Committee, B256};
-use fastcrypto::hash::{Hash, HashFunction};
+use blake2::Digest as _;
+use fastcrypto::hash::Hash;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -50,7 +51,7 @@ impl ConsensusHeader {
         hasher.update(parent_hash);
         hasher.update(sub_dag.digest());
         hasher.update(number.to_le_bytes());
-        BlockHash::from_slice(&hasher.finalize().digest)
+        BlockHash::from_slice(&hasher.finalize()[..])
     }
 
     /// Verify that all of the contained certificates are valid and signed by a quorum of committee.

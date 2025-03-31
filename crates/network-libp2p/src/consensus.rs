@@ -27,7 +27,7 @@ use std::{
     time::Duration,
 };
 use tn_config::{ConsensusConfig, LibP2pConfig};
-use tn_types::{network_public_key_to_libp2p, Database};
+use tn_types::{Database, NetworkKeypair};
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot,
@@ -142,7 +142,7 @@ where
         DB: tn_types::database_traits::Database,
     {
         let topics = vec![IdentTopic::new("tn-primary")];
-        let network_key = config.key_config().primary_network_keypair().as_ref().to_vec();
+        let network_key = config.key_config().primary_network_keypair().clone();
         let authorized_publishers = config.committee_peer_ids();
         Self::new(config, event_stream, topics, network_key, authorized_publishers)
     }
@@ -156,13 +156,9 @@ where
         DB: tn_types::database_traits::Database,
     {
         let topics = vec![IdentTopic::new("tn-worker")];
-        let network_key = config.key_config().worker_network_keypair().as_ref().to_vec();
-        let authorized_publishers = config
-            .worker_cache()
-            .all_workers()
-            .iter()
-            .map(|(id, _)| network_public_key_to_libp2p(id))
-            .collect();
+        let network_key = config.key_config().worker_network_keypair().clone();
+        let authorized_publishers =
+            config.worker_cache().all_workers().iter().map(|(id, _)| *id).collect();
         Self::new(config, event_stream, topics, network_key, authorized_publishers)
     }
 
@@ -171,18 +167,12 @@ where
         consensus_config: &ConsensusConfig<DB>,
         event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
         topics: Vec<IdentTopic>,
-        mut ed25519_private_key_bytes: Vec<u8>,
+        keypair: NetworkKeypair,
         authorized_publishers: HashSet<PeerId>,
     ) -> NetworkResult<Self>
     where
         DB: tn_types::database_traits::Database,
     {
-        // create libp2p keypair from ed25519 secret bytes
-        let keypair =
-            libp2p::identity::Keypair::ed25519_from_bytes(&mut ed25519_private_key_bytes)?;
-
-        // NOTE: peer exchange not implemented yet
-        // see: https://github.com/libp2p/rust-libp2p/issues/2398
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             // explicitly set default
             .heartbeat_interval(Duration::from_secs(1))
@@ -230,7 +220,11 @@ where
             })
             .with_behaviour(|_| behavior)
             .map_err(|_| NetworkError::BuildSwarm)?
-            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .with_swarm_config(|c| {
+                c.with_idle_connection_timeout(
+                    consensus_config.network_config().libp2p_config().max_idle_connection_timeout,
+                )
+            })
             .build();
 
         let (handle, commands) = tokio::sync::mpsc::channel(100);
@@ -537,14 +531,12 @@ where
                 trace!(target: "network", ?msg_acceptance, "gossip message verification status");
 
                 // report message validation results
-                if let Err(e) =
-                    self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
-                        &message_id,
-                        &propagation_source,
-                        msg_acceptance.into(),
-                    )
-                {
-                    error!(target: "network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "error reporting message validation result");
+                if !self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                    &message_id,
+                    &propagation_source,
+                    msg_acceptance.into(),
+                ) {
+                    error!(target: "network", topics=?self.topics, ?propagation_source, ?message_id, "error reporting message validation result");
                 }
             }
             GossipEvent::Subscribed { peer_id, topic } => {
@@ -557,6 +549,9 @@ where
                 // TODO: remove peer at self point?
                 trace!(target: "network", topics=?self.topics, ?peer_id, "gossipsub event - not supported")
             }
+            GossipEvent::SlowPeer { peer_id, failed_messages } => {
+                trace!(target: "network", topics=?self.topics, ?peer_id, ?failed_messages, "gossipsub event - not supported")
+            }
         }
 
         Ok(())
@@ -565,7 +560,7 @@ where
     /// Process req/res events.
     fn process_reqres_event(&mut self, event: ReqResEvent<Req, Res>) -> NetworkResult<()> {
         match event {
-            ReqResEvent::Message { peer, message } => {
+            ReqResEvent::Message { peer, message, connection_id: _ } => {
                 match message {
                     request_response::Message::Request { request_id, request, channel } => {
                         let (notify, cancel) = oneshot::channel();
@@ -593,7 +588,7 @@ where
                     }
                 }
             }
-            ReqResEvent::OutboundFailure { peer, request_id, error } => {
+            ReqResEvent::OutboundFailure { peer, request_id, error, connection_id: _ } => {
                 error!(target: "network", ?peer, ?error, "outbound failure");
                 // try to forward error to original caller
                 let _ = self
@@ -602,7 +597,7 @@ where
                     .ok_or(NetworkError::PendingRequestChannelLost)?
                     .send(Err(error.into()));
             }
-            ReqResEvent::InboundFailure { peer, request_id, error } => {
+            ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
                 match error {
                     ReqResInboundFailure::Io(e) => {
                         // TODO: update peer score - could be malicious

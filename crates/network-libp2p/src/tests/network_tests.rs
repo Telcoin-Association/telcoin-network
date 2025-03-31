@@ -7,7 +7,7 @@ use common::{TestPrimaryRequest, TestPrimaryResponse, TestWorkerRequest, TestWor
 use tn_config::ConsensusConfig;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{fixture_batch_with_transactions, CommitteeFixture};
-use tn_types::{libp2p_to_fastcrypto, Certificate, Header};
+use tn_types::{Certificate, Header};
 use tokio::{sync::mpsc, time::timeout};
 
 /// A peer on TN
@@ -56,7 +56,7 @@ where
     let topics = vec![IdentTopic::new("test-topic")];
 
     // peer1
-    let network_key_1 = config_1.key_config().primary_network_keypair().as_ref().to_vec();
+    let network_key_1 = config_1.key_config().primary_network_keypair().clone();
     let authorized_publishers = config_1.committee_peer_ids();
     let peer1_network = ConsensusNetwork::<Req, Res>::new(
         &config_1,
@@ -75,7 +75,7 @@ where
     };
 
     // peer2
-    let network_key_2 = config_2.key_config().primary_network_keypair().as_ref().to_vec();
+    let network_key_2 = config_2.key_config().primary_network_keypair().clone();
     let authorized_publishers = config_2.committee_peer_ids();
     let peer2_network = ConsensusNetwork::<Req, Res>::new(
         &config_2,
@@ -538,22 +538,4 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     // TODO: assert peer score after bad message
 
     Ok(())
-}
-
-#[test]
-fn test_peer_id_to_from_fastcrypto() {
-    let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
-    let mut authorities = all_nodes.authorities();
-    let authority = authorities.next().expect("first authority");
-    let config = authority.consensus_config();
-
-    // converts fastcrypto -> libp2p or panics
-    let fastcrypto_to_libp2p = config.committee_peer_ids();
-    // assert libp2p -> fastcrypto works
-    for key in fastcrypto_to_libp2p.iter() {
-        let fc_key = libp2p_to_fastcrypto(key);
-        let libp2p_key_again = network_public_key_to_libp2p(&fc_key);
-        // sanity check - cast back to original type
-        assert_eq!(fc_key.as_ref(), &libp2p_key_again.as_ref().digest()[4..]);
-    }
 }

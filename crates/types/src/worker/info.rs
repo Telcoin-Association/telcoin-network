@@ -1,12 +1,12 @@
 //! Worker peer information.
 
 use crate::{
-    crypto::{BlsPublicKey, NetworkPublicKey},
-    error::ConfigError,
-    get_available_tcp_port, get_available_udp_port, Epoch, Multiaddr,
+    error::ConfigError, get_available_tcp_port, get_available_udp_port, BlsPublicKey, Epoch,
+    Multiaddr, NetworkKeypair, NetworkPublicKey,
 };
 use eyre::ContextCompat;
-use fastcrypto::traits::{EncodeDecodeBase64, InsecureDefault};
+use fastcrypto::traits::EncodeDecodeBase64;
+use libp2p::PeerId;
 use serde::{
     de::{self, MapAccess, Visitor},
     ser::SerializeMap,
@@ -49,7 +49,7 @@ impl Default for WorkerInfo {
         let worker_udp_port = get_available_udp_port(&host).unwrap_or(49594).to_string();
 
         Self {
-            name: NetworkPublicKey::insecure_default(),
+            name: NetworkKeypair::generate_ed25519().public().into(),
             transactions: format!(
                 "/ip4/{}/tcp/{}/http",
                 &host,
@@ -240,10 +240,12 @@ impl WorkerCache {
     }
 
     /// Returns the addresses of all known workers.
-    pub fn all_workers(&self) -> Vec<(NetworkPublicKey, Multiaddr)> {
+    pub fn all_workers(&self) -> Vec<(PeerId, Multiaddr)> {
         self.workers
             .iter()
-            .flat_map(|(_, w)| w.0.values().map(|w| (w.name.clone(), w.worker_address.clone())))
+            .flat_map(|(_, w)| {
+                w.0.values().map(|w| (w.name.to_peer_id(), w.worker_address.clone()))
+            })
             .collect()
     }
 

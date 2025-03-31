@@ -38,7 +38,7 @@ use tn_types::{
 use tn_worker::{
     metrics::WorkerMetrics,
     quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
-    Worker,
+    Worker, WorkerNetworkHandle,
 };
 use tokio::{
     sync::{mpsc::Sender, oneshot},
@@ -256,8 +256,15 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
     let qw = TestChanQuorumWaiter(to_worker);
     let node_metrics = WorkerMetrics::default();
     let timeout = Duration::from_secs(5);
-    let batch_provider =
-        Worker::new(0, qw.clone(), Arc::new(node_metrics), client, store.clone(), timeout);
+    let batch_provider = Worker::new(
+        0,
+        qw.clone(),
+        Arc::new(node_metrics),
+        client,
+        store.clone(),
+        timeout,
+        WorkerNetworkHandle::new_for_test(),
+    );
 
     let shutdown = Notifier::default();
     // start batch maker

@@ -104,8 +104,7 @@ impl KeyArgs {
                         // initialize path and warn users if overwriting keys
                         self.init_path(&authority_key_path, args.force)?;
                         // execute and store keypath
-                        args.execute(&authority_key_path, &mut config)?;
-                        config.keypath = authority_key_path;
+                        args.execute(&mut config, &datadir)?;
 
                         debug!("{config:?}");
                         Config::store_path(self.config_path(), config, ConfigFmt::YAML)?;

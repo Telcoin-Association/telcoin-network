@@ -1,13 +1,9 @@
 //! Configurations for the Telcoin Network.
 
 use crate::{ConfigTrait, ValidatorInfo};
-use fastcrypto::traits::KeyPair as KeyPairTrait;
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::time::Duration;
 use tn_types::{
     adiri_genesis, get_available_tcp_port, get_available_udp_port, Address, BlsPublicKey,
     BlsSignature, Genesis, Multiaddr, NetworkPublicKey, WorkerIndex,
@@ -16,19 +12,14 @@ use tracing::info;
 
 /// The filename to use when reading/writing the validator's BlsKey.
 pub const BLS_KEYFILE: &str = "bls.key";
-/// The filename to use when reading/writing the primary's network key.
-pub const PRIMARY_NETWORK_KEYFILE: &str = "primary.key";
-/// The filename to use when reading/writing the network key used by all workers.
-pub const WORKER_NETWORK_KEYFILE: &str = "worker.key";
+/// The filename to use when reading/writing the primary's network keys seed.
+pub const PRIMARY_NETWORK_SEED_FILE: &str = "primary.seed";
+/// The filename to use when reading/writing the network key seed used by all workers.
+pub const WORKER_NETWORK_SEED_FILE: &str = "worker.seed";
 
 /// Configuration for the Telcoin Network node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// The path where keys are stored, if successfully generated.
-    ///
-    /// Note: `PathBuf` default is "".
-    pub keypath: PathBuf,
-
     /// [ValidatorInfo] for the node
     pub validator_info: ValidatorInfo,
 
@@ -37,17 +28,20 @@ pub struct Config {
 
     /// The [Genesis] for the node.
     pub genesis: Genesis,
+
+    /// Is this an observer node?
+    pub observer: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             // defaults
-            keypath: Default::default(),
             validator_info: Default::default(),
             parameters: Default::default(),
             // specify adiri chain spec
             genesis: adiri_genesis(),
+            observer: false,
         }
     }
 }
@@ -106,11 +100,6 @@ impl Config {
     /// Return a reference to the primary's public BLS key.
     pub fn primary_bls_key(&self) -> &BlsPublicKey {
         self.validator_info.public_key()
-    }
-
-    /// Return a reference to the primary's public network key.
-    pub fn primary_network_key(&self) -> &NetworkPublicKey {
-        self.validator_info.primary_network_key()
     }
 
     /// Return a reference to the primary's [WorkerIndex].
@@ -307,16 +296,4 @@ impl Parameters {
         info!("Max concurrent requests set to {}", self.max_concurrent_requests);
         info!("Prometheus metrics server will run on {}", self.prometheus_metrics.socket_addr);
     }
-}
-
-/// Read from file as Base64 encoded `privkey` and return a KeyPair.
-///
-/// TODO: where should this function go?
-pub fn read_validator_keypair_from_file<KP, P>(path: P) -> eyre::Result<KP>
-where
-    KP: KeyPairTrait,
-    P: AsRef<Path>,
-{
-    let contents = std::fs::read_to_string(path)?;
-    KP::decode_base64(contents.as_str().trim()).map_err(|e| eyre::eyre!(e))
 }

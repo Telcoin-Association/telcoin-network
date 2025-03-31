@@ -450,7 +450,7 @@ mod tests {
     use tn_worker::{
         metrics::WorkerMetrics,
         quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
-        Worker,
+        Worker, WorkerNetworkHandle,
     };
     use tokio::time::timeout;
 
@@ -524,8 +524,15 @@ mod tests {
         let qw = TestMakeBlockQuorumWaiter();
         let node_metrics = WorkerMetrics::default();
         let timeout = Duration::from_secs(5);
-        let block_provider =
-            Worker::new(0, qw, Arc::new(node_metrics), client, store.clone(), timeout);
+        let block_provider = Worker::new(
+            0,
+            qw,
+            Arc::new(node_metrics),
+            client,
+            store.clone(),
+            timeout,
+            WorkerNetworkHandle::new_for_test(),
+        );
 
         let tx_pool_latest = txpool.block_info();
         let tip = SealedBlock::new(chain.sealed_genesis_header(), BlockBody::default());

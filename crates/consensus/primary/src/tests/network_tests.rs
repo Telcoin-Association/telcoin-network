@@ -9,12 +9,13 @@ use crate::{
 use assert_matches::assert_matches;
 use fastcrypto::hash::Hash as _;
 use std::collections::{BTreeMap, BTreeSet};
+use tn_network_libp2p::PeerId;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
 use tn_types::{
-    error::HeaderError, network_public_key_to_libp2p, now, traits::InsecureDefault,
-    AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash, Certificate, CertificateDigest,
-    ExecHeader, SealedHeader, TaskManager,
+    error::HeaderError, network_public_key_to_libp2p, now, AuthorityIdentifier, BlockHash,
+    BlockHeader, BlockNumHash, Certificate, CertificateDigest, ExecHeader, SealedHeader,
+    TaskManager,
 };
 use tracing::debug;
 
@@ -138,8 +139,7 @@ async fn test_vote_fails_wrong_authority_network_key() -> eyre::Result<()> {
 
     let parents = Vec::new();
     // workaround until anemo/fastcrypto replaced
-    let default = fastcrypto::ed25519::Ed25519PublicKey::insecure_default();
-    let random_peer_id = network_public_key_to_libp2p(&default);
+    let random_peer_id = PeerId::random(); //network_public_key_to_libp2p(&default);
 
     // create valid header proposed by last peer in the committee for round 1
     let header = committee

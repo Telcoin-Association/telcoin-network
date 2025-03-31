@@ -165,9 +165,8 @@ mod tests {
     use crate::{WorkerRequest, WorkerResponse};
 
     use super::*;
-    use fastcrypto::traits::KeyPair;
     use itertools::Itertools as _;
-    use rand::rngs::StdRng;
+    use rand::{rngs::StdRng, RngCore};
     use tempfile::TempDir;
     use tn_network_libp2p::{
         types::{NetworkCommand, NetworkHandle},
@@ -175,7 +174,7 @@ mod tests {
     };
     use tn_storage::open_db;
     use tn_test_utils::transaction;
-    use tn_types::{network_public_key_to_libp2p, NetworkKeypair};
+    use tn_types::NetworkKeypair;
     use tokio::sync::{mpsc, Mutex};
 
     #[tokio::test]
@@ -460,6 +459,11 @@ mod tests {
     fn test_pk(i: u8) -> PeerId {
         use rand::SeedableRng;
         let mut rng = StdRng::from_seed([i; 32]);
-        network_public_key_to_libp2p(NetworkKeypair::generate(&mut rng).public())
+        let mut bytes = [0_u8; 32];
+        rng.fill_bytes(&mut bytes);
+        NetworkKeypair::ed25519_from_bytes(bytes)
+            .expect("invalid network key bytes")
+            .public()
+            .to_peer_id()
     }
 }

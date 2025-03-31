@@ -1,11 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::util::spawn_local_testnet;
-    use alloy::{
-        network::EthereumWallet,
-        primitives::{FixedBytes, Uint},
-        providers::ProviderBuilder,
-    };
+    use alloy::{network::EthereumWallet, primitives::Uint, providers::ProviderBuilder};
     use fastcrypto::traits::{KeyPair, ToFromBytes};
     use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
     use rand::{rngs::StdRng, SeedableRng};
@@ -118,14 +114,17 @@ mod tests {
                 let mut rng = StdRng::from_entropy();
                 let bls_keypair = BlsKeypair::generate(&mut rng);
                 let bls_pubkey = bls_keypair.public().as_bytes().to_vec();
-                let ed_25519_keypair = NetworkKeypair::generate(&mut rng);
+                let ed_25519_keypair = NetworkKeypair::generate_ed25519();
                 let ecdsa_pubkey = Address::random();
 
                 ConsensusRegistry::ValidatorInfo {
                     blsPubkey: bls_pubkey.clone().into(),
-                    ed25519Pubkey: FixedBytes::<32>::from_slice(
-                        ed_25519_keypair.public().as_bytes(),
-                    ),
+                    ed25519Pubkey: ed_25519_keypair
+                        .public()
+                        .try_into_ed25519()
+                        .expect("is an ed_25519")
+                        .to_bytes()
+                        .into(),
                     ecdsaPubkey: ecdsa_pubkey,
                     activationEpoch: activation_epoch,
                     exitEpoch: exit_epoch,

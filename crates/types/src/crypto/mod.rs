@@ -7,11 +7,11 @@
 //! - use generic schemes (avoid using the algo's `Struct`` impl functions)
 //! - change type aliases to update codebase with new crypto
 
+use blake2::digest::consts::U32;
 use eyre::Context;
 use fastcrypto::{
-    bls12381, ed25519,
+    bls12381,
     error::FastCryptoError,
-    hash::{Blake2b256, HashFunction},
     traits::{AggregateAuthenticator, KeyPair, Signer, ToFromBytes, VerifyingKey},
 };
 use libp2p::PeerId;
@@ -43,15 +43,7 @@ pub type BlsAggregateSignatureBytes = bls12381::min_sig::BLS12381AggregateSignat
 pub type BlsPrivateKey = bls12381::min_sig::BLS12381PrivateKey;
 /// Validator's main protocol keypair.
 pub type BlsKeypair = bls12381::min_sig::BLS12381KeyPair;
-//
-// NETWORK
-//
-/// Public key used to sign network messages between peers during consensus.
-pub type NetworkPublicKey = ed25519::Ed25519PublicKey;
-/// Keypair used to sign network messages between peers during consensus.
-pub type NetworkKeypair = ed25519::Ed25519KeyPair;
-/// Signature using network key.
-pub type NetworkSignature = ed25519::Ed25519Signature;
+
 //
 // EXECUTION
 //
@@ -60,15 +52,9 @@ pub type ExecutionPublicKey = secp256k1::PublicKey;
 /// Keypair used for signing transactions in the Execution Layer.
 pub type ExecutionKeypair = secp256k1::Keypair;
 
-// TODO: implement randomness
-pub type RandomnessSignature = fastcrypto_tbls::types::Signature;
-pub type RandomnessPartialSignature = fastcrypto_tbls::tbls::PartialSignature<RandomnessSignature>;
-pub type RandomnessPrivateKey =
-    fastcrypto_tbls::ecies::PrivateKey<fastcrypto::groups::bls12381::G2Element>;
-
 /// Type alias selecting the default hash function for the code base.
-pub type DefaultHashFunction = Blake2b256;
-pub const DIGEST_LENGTH: usize = DefaultHashFunction::OUTPUT_SIZE;
+pub type DefaultHashFunction = blake2::Blake2b<U32>;
+pub const DIGEST_LENGTH: usize = 32;
 pub const INTENT_MESSAGE_LENGTH: usize = INTENT_PREFIX_LENGTH + DIGEST_LENGTH;
 
 /// Trait to implement Bls key signing.  This allows us to maintain private keys in a
@@ -205,22 +191,8 @@ pub fn to_intent_message<T>(value: T) -> IntentMessage<T> {
 }
 
 /// Convert an existing NetworkPublicKey into a libp2p PeerId.
-pub fn network_public_key_to_libp2p(fastcrypto: &NetworkPublicKey) -> PeerId {
-    let bytes = fastcrypto.as_ref().to_vec();
-    let ed_public_key = libp2p::identity::ed25519::PublicKey::try_from_bytes(&bytes)
-        .expect("invalid public key, not able to convert to peer id!");
-    libp2p::PeerId::from_public_key(&ed_public_key.into())
-}
-
-/// Helper method to convert libp2p -> fastcrypto ed25519.
-pub fn libp2p_to_fastcrypto(peer_id: &PeerId) -> fastcrypto::ed25519::Ed25519PublicKey {
-    let bytes = peer_id.as_ref().digest();
-    // skip first 4 bytes:
-    // - 2 bytes: pubkey type (TN is ed25519 only)
-    // - 1 byte: overhead for multihash type
-    // - 1 byte: pubkey size
-    fastcrypto::ed25519::Ed25519PublicKey::from_bytes(&bytes[4..])
-        .expect("invalid public key, not able to convert to fast cyrpto!")
+pub fn network_public_key_to_libp2p(public_key: &NetworkPublicKey) -> PeerId {
+    public_key.to_peer_id()
 }
 
 #[cfg(test)]

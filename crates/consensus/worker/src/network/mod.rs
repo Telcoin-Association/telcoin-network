@@ -44,6 +44,13 @@ impl WorkerNetworkHandle {
         Self { handle }
     }
 
+    //// Convenience method for creating a new Self for tests- sends events no-where and does
+    //// nothing.
+    pub fn new_for_test() -> Self {
+        let (tx, _rx) = mpsc::channel(5);
+        Self { handle: NetworkHandle::new(tx) }
+    }
+
     /// Dial a peer.
     ///
     /// Return swarm error to caller.
@@ -222,7 +229,8 @@ where
         validator: Arc<dyn BatchValidation>,
     ) -> Self {
         let shutdown_rx = consensus_config.shutdown().subscribe();
-        let request_handler = RequestHandler::new(id, validator, consensus_config);
+        let request_handler =
+            RequestHandler::new(id, validator, consensus_config, network_handle.clone());
         Self { network_events, network_handle, request_handler, shutdown_rx }
     }
 

@@ -27,7 +27,7 @@ use tn_types::{
     TaskManager, TnSender, Vote,
 };
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, warn};
+use tracing::warn;
 pub mod handler;
 mod message;
 
@@ -331,20 +331,23 @@ where
     fn process_gossip(&self, msg: GossipMessage) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
+        // let network_handle = self.network_handle.clone();
+
+        // commented out to prevent CertificateError::TooNew from forcing disconnect when peers
+        // are trying to resync
         tokio::spawn(async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "primary::network", ?e, "process_gossip");
                 // TODO: peers don't track reputation yet
                 //
                 // NOTE: the network ensures the peer id is present before forwarding the msg
-                if let Some(peer_id) = msg.source {
-                    if let Err(e) =
-                        network_handle.handle.set_application_score(peer_id, -100.0).await
-                    {
-                        error!(target: "primary::network", ?e, "failed to penalize malicious peer")
-                    }
-                }
+                // if let Some(peer_id) = msg.source {
+                //     if let Err(e) =
+                //         network_handle.handle.set_application_score(peer_id, -100.0).await
+                //     {
+                //         error!(target: "primary::network", ?e, "failed to penalize malicious peer")
+                //     }
+                // }
 
                 // match on error to lower peer score
                 //todo!();

@@ -12,7 +12,6 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 use tn_config::Parameters;
-use tn_network_libp2p::GossipMessage;
 use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
 use tn_types::{
     BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput,
@@ -119,14 +118,9 @@ struct ConsensusBusInner {
 
     /// Consensus output with a consensus header.
     consensus_output: broadcast::Sender<ConsensusOutput>,
-    /// Hold onto consensus output with a consensus header to keep it open.
-    _rx_consensus_output: broadcast::Receiver<ConsensusOutput>,
     /// Consensus header.  Note this can be used to create consensus output to execute for non
     /// validators.
     consensus_header: broadcast::Sender<ConsensusHeader>,
-    /// Hold onto consensus header to keep it open.
-    _rx_consensus_header: broadcast::Receiver<ConsensusHeader>,
-
     /// Status of sync?
     tx_sync_status: watch::Sender<NodeMode>,
     /// Hold onto the recent sync_status to keep it "open"
@@ -143,10 +137,6 @@ struct ConsensusBusInner {
 
     /// Flag to indicate a node should restart after a shutdown.
     restart: AtomicBool,
-    /// Consensus output with a consensus header.
-    consensus_network_gossip: broadcast::Sender<GossipMessage>,
-    /// Hold onto consensus output with a consensus header to keep it open.
-    _rx_consensus_network_gossip: broadcast::Receiver<GossipMessage>,
 }
 
 #[derive(Clone, Debug)]
@@ -246,9 +236,6 @@ impl ConsensusBus {
         let (consensus_output, _rx_consensus_output) = broadcast::channel(CHANNEL_CAPACITY);
         let (consensus_header, _rx_consensus_header) = broadcast::channel(CHANNEL_CAPACITY);
 
-        let (consensus_network_gossip, _rx_consensus_network_gossip) =
-            broadcast::channel(CHANNEL_CAPACITY);
-
         Self {
             inner: Arc::new(ConsensusBusInner {
                 new_certificates,
@@ -274,9 +261,7 @@ impl ConsensusBus {
                 tx_last_published_consensus_num_hash,
                 _rx_last_published_consensus_num_hash,
                 consensus_output,
-                _rx_consensus_output,
                 consensus_header,
-                _rx_consensus_header,
                 tx_sync_status,
                 _rx_sync_status,
                 consensus_metrics,
@@ -284,8 +269,6 @@ impl ConsensusBus {
                 channel_metrics,
                 executor_metrics,
                 restart: AtomicBool::new(false),
-                consensus_network_gossip,
-                _rx_consensus_network_gossip,
             }),
         }
     }
@@ -447,10 +430,6 @@ impl ConsensusBus {
     /// True if the node should restart after shutdown.
     pub fn restart(&self) -> bool {
         self.inner.restart.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    pub fn consensus_network_gossip(&self) -> &impl TnSender<GossipMessage> {
-        &self.inner.consensus_network_gossip
     }
 
     /// Update consensus round watch channels.

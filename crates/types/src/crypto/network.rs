@@ -1,37 +1,97 @@
 //! Crypto functions to help with new node handshake using network keys.
 
-use super::{
-    Intent, IntentMessage, IntentScope, NetworkKeypair, NetworkPublicKey, NetworkSignature,
-    ProtocolSignature,
-};
+use std::{fmt, ops::Deref};
+
+use serde::{Deserialize, Serialize};
+
+use super::{Intent, IntentMessage, IntentScope};
 use crate::{encode, Genesis};
-use fastcrypto::{
-    error::FastCryptoError,
-    traits::{KeyPair as _, Signer, ToFromBytes as _, VerifyingKey as _},
-};
-use serde::Serialize;
 
-impl ProtocolSignature for NetworkSignature {
-    type Pubkey = NetworkPublicKey;
+/// Public key used to sign network messages between peers during consensus.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NetworkPublicKey(libp2p::identity::PublicKey);
+/// Keypair used to sign network messages between peers during consensus.
+pub type NetworkKeypair = libp2p::identity::Keypair;
+/// Signature using network key.
+pub type NetworkSignature = Vec<u8>;
 
-    fn new_secure<T>(value: &IntentMessage<T>, secret: &dyn Signer<Self>) -> Self
-    where
-        T: Serialize,
-    {
-        let message = encode(&value);
-        secret.sign(&message)
+impl NetworkPublicKey {}
+
+impl From<libp2p::identity::PublicKey> for NetworkPublicKey {
+    fn from(value: libp2p::identity::PublicKey) -> Self {
+        Self(value)
     }
+}
 
-    fn verify_secure<T>(
-        &self,
-        value: &IntentMessage<T>,
-        public_key: &NetworkPublicKey,
-    ) -> Result<(), FastCryptoError>
+impl From<NetworkPublicKey> for libp2p::identity::PublicKey {
+    fn from(value: NetworkPublicKey) -> Self {
+        value.0
+    }
+}
+
+impl Deref for NetworkPublicKey {
+    type Target = libp2p::identity::PublicKey;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Serialize for NetworkPublicKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        T: Serialize,
+        S: serde::Serializer,
     {
-        let message = encode(&value);
-        public_key.verify(&message, self)
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&bs58::encode(self.encode_protobuf()).into_string())
+        } else {
+            serializer.serialize_bytes(&self.encode_protobuf()[..])
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NetworkPublicKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::*;
+
+        struct NetworkPublicKeyVisitor;
+
+        impl Visitor<'_> for NetworkPublicKeyVisitor {
+            type Value = NetworkPublicKey;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "valid network public key")
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                Ok(NetworkPublicKey(
+                    libp2p::identity::PublicKey::try_decode_protobuf(v)
+                        .map_err(|_| Error::invalid_value(Unexpected::Bytes(v), &self))?,
+                ))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                let bytes = bs58::decode(v)
+                    .into_vec()
+                    .map_err(|_| Error::invalid_value(Unexpected::Str(v), &self))?;
+                self.visit_bytes(&bytes)
+            }
+        }
+
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_str(NetworkPublicKeyVisitor)
+        } else {
+            deserializer.deserialize_bytes(NetworkPublicKeyVisitor)
+        }
     }
 }
 
@@ -46,13 +106,11 @@ pub fn generate_proof_of_possession_network(
     keypair: &NetworkKeypair,
     genesis: &Genesis,
 ) -> NetworkSignature {
-    let mut msg = keypair.public().as_bytes().to_vec();
+    let mut msg = keypair.public().encode_protobuf();
     let genesis_bytes = encode(&genesis);
     msg.extend_from_slice(genesis_bytes.as_slice());
-    NetworkSignature::new_secure(
-        &IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg),
-        keypair,
-    )
+    let message = encode(&IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg));
+    keypair.sign(&message).expect("failed to sign proof of possession")
 }
 
 /// Verify proof of possession against the expected intent message.
@@ -64,13 +122,9 @@ pub fn verify_proof_of_possession_network(
     public_key: &NetworkPublicKey,
     genesis: &Genesis,
 ) -> bool {
-    let mut msg = public_key.as_bytes().to_vec();
+    let mut msg = public_key.encode_protobuf();
     let genesis_bytes = encode(genesis);
     msg.extend_from_slice(genesis_bytes.as_slice());
-    proof
-        .verify_secure(
-            &IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg),
-            public_key,
-        )
-        .is_ok()
+    let message = encode(&IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg));
+    public_key.verify(&message, proof)
 }

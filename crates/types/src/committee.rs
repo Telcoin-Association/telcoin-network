@@ -627,7 +627,7 @@ mod tests {
         let authorities = (0..num_of_authorities)
             .map(|i| {
                 let keypair = BlsKeypair::generate(&mut rng);
-                let network_keypair = NetworkKeypair::generate(&mut rng);
+                let network_keypair = NetworkKeypair::generate_ed25519();
                 let execution_address = Address::random();
 
                 let a = Authority::new(
@@ -635,7 +635,7 @@ mod tests {
                     1,
                     Multiaddr::empty(),
                     execution_address,
-                    network_keypair.public().clone(),
+                    network_keypair.public().clone().into(),
                     i.to_string(),
                 );
 

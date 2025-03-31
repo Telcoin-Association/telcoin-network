@@ -2,15 +2,12 @@
 
 use crate::args::{clap_address_parser, clap_genesis_parser};
 use clap::{value_parser, Args, Subcommand};
-use fastcrypto::traits::KeyPair as KeyPairTraits;
-use rand::prelude::*;
-use rand_chacha::ChaCha20Rng;
 use reth::dirs::MaybePlatformPath;
 use reth_chainspec::ChainSpec;
-use std::{path::Path, sync::Arc};
-use tn_config::{Config, BLS_KEYFILE, PRIMARY_NETWORK_KEYFILE, WORKER_NETWORK_KEYFILE};
+use std::sync::Arc;
+use tn_config::{Config, KeyConfig, TelcoinDirs};
 use tn_node::dirs::DataDirPath;
-use tn_types::{generate_proof_of_possession_bls, Address, BlsKeypair, NetworkKeypair};
+use tn_types::Address;
 use tracing::info;
 
 /// Generate keypairs and save them to a file.
@@ -91,67 +88,29 @@ pub struct ValidatorArgs {
 
 impl ValidatorArgs {
     /// Create all necessary information needed for validator and save to file.
-    pub fn execute(&self, authority_key_path: &Path, config: &mut Config) -> eyre::Result<()> {
+    pub fn execute<TND: TelcoinDirs>(
+        &self,
+        config: &mut Config,
+        tn_datadir: &TND,
+    ) -> eyre::Result<()> {
         info!(target: "tn::generate_keys", "generating keys for full validator node");
 
-        // bls keypair for consensus - drop after write to zeroize memory
-        let bls_keypair = self.generate_keypair_from_rng::<BlsKeypair>()?;
-        self.write_keypair_to_file(&bls_keypair, authority_key_path.join(BLS_KEYFILE))?;
-        let proof = generate_proof_of_possession_bls(&bls_keypair, &self.chain)?;
-        config.update_protocol_key(bls_keypair.public().clone())?;
+        let key_config = KeyConfig::generate_and_save(tn_datadir)?;
+        let proof = key_config.generate_proof_of_possession_bls(&self.chain)?;
+        config.update_protocol_key(key_config.primary_public_key())?;
         config.update_proof_of_possession(proof)?;
-        drop(bls_keypair); // calls zeroize() for OnceCell containing private key
 
         // network keypair for authority
-        let network_keypair = self.generate_keypair_from_rng::<NetworkKeypair>()?;
-        self.write_keypair_to_file(
-            &network_keypair,
-            authority_key_path.join(PRIMARY_NETWORK_KEYFILE),
-        )?;
-        config.update_primary_network_key(network_keypair.public().clone())?;
-        drop(network_keypair); // calls zeroize() for OnceCell containing private key
+        let network_publickey = key_config.primary_network_public_key();
+        config.update_primary_network_key(network_publickey)?;
 
         // network keypair for workers
-        let network_keypair = self.generate_keypair_from_rng::<NetworkKeypair>()?;
-        self.write_keypair_to_file(
-            &network_keypair,
-            authority_key_path.join(WORKER_NETWORK_KEYFILE),
-        )?;
-        config.update_worker_network_key(network_keypair.public().clone())?;
-        drop(network_keypair); // calls zeroize() for OnceCell containing private key
+        let network_publickey = key_config.worker_network_public_key();
+        config.update_worker_network_key(network_publickey)?;
 
         // add execution address
         config.update_execution_address(self.address)?;
 
-        Ok(())
-    }
-
-    /// Generate a keypair from a ChaCha20 RNG.
-    ///
-    /// based on: https://rust-random.github.io/book/guide-seeding.html
-    ///
-    /// TODO: discuss with @Utku
-    pub fn generate_keypair_from_rng<KP>(&self) -> eyre::Result<KP>
-    where
-        // R: rand::CryptoRng + rand::RngCore,
-        KP: KeyPairTraits,
-        // <KP as KeyPairTraits>::PubKey: SuiPublicKey,
-    {
-        // this is expensive
-        let rng = ChaCha20Rng::from_entropy();
-        // note: StdRng uses ChaCha12
-        let kp = KP::generate(&mut StdRng::from_rng(rng)?);
-        Ok(kp)
-    }
-
-    /// Write Base64 encoded `privkey` to file.
-    pub fn write_keypair_to_file<KP, P>(&self, keypair: &KP, path: P) -> eyre::Result<()>
-    where
-        KP: KeyPairTraits,
-        P: AsRef<Path>,
-    {
-        let contents = keypair.encode_base64();
-        std::fs::write(path, contents)?;
         Ok(())
     }
 }

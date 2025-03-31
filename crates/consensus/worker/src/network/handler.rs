@@ -11,6 +11,7 @@ use tn_types::{
 use super::{
     error::{WorkerNetworkError, WorkerNetworkResult},
     message::WorkerGossip,
+    WorkerNetworkHandle,
 };
 
 /// The type that handles requests from peers.
@@ -22,6 +23,8 @@ pub struct RequestHandler<DB> {
     validator: Arc<dyn BatchValidation>,
     /// Consensus config with access to database.
     consensus_config: ConsensusConfig<DB>,
+    /// Network handle- so we can respond to gossip.
+    network_handle: WorkerNetworkHandle,
 }
 
 impl<DB> RequestHandler<DB>
@@ -33,25 +36,45 @@ where
         id: WorkerId,
         validator: Arc<dyn BatchValidation>,
         consensus_config: ConsensusConfig<DB>,
+        network_handle: WorkerNetworkHandle,
     ) -> Self {
-        Self { id, validator, consensus_config }
+        Self { id, validator, consensus_config, network_handle }
     }
 
     /// Process gossip from the committee.
     ///
-    /// Peers gossip the CertificateDigest so peers can request the Certificate. This waits until
-    /// the certificate can be retrieved and timesout after some time. It's important to give up
-    /// after enough time to limit the DoS attack surface. Peers who timeout must lose reputation.
+    /// Workers gossip the Batch Digests once accepted so that non-committee peers can request the
+    /// Batch.
     pub(super) async fn process_gossip(&self, msg: &GossipMessage) -> WorkerNetworkResult<()> {
         // deconstruct message
-        let GossipMessage { data, .. } = msg;
+        let GossipMessage { data, source: _, sequence_number: _, topic: _ } = msg;
 
         // gossip is uncompressed
         let gossip = try_decode(data)?;
 
         match gossip {
-            WorkerGossip::Batch(_block_hash) => {
+            WorkerGossip::Batch(batch_hash) => {
                 // Retrieve the block...
+                let store = self.consensus_config.node_storage();
+                if !matches!(store.get::<Batches>(&batch_hash), Ok(Some(_))) {
+                    // If we don't have this batch already then try to get it.
+                    // If we are CVV then we should already have it.
+                    // This allows non-CVVs to pre fetch batches they will soon need.
+                    match self.network_handle.request_batches(vec![batch_hash]).await {
+                        Ok(batches) => {
+                            if let Some(batch) = batches.first() {
+                                store.insert::<Batches>(&batch.digest(), batch).map_err(|e| {
+                                    WorkerNetworkError::Internal(format!(
+                                        "failed to write to batch store: {e}"
+                                    ))
+                                })?;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(target: "worker:network", "failed to get gossipped batch {batch_hash}: {e}");
+                        }
+                    }
+                }
             }
         }
 
