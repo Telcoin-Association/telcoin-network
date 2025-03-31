@@ -25,7 +25,7 @@ use tn_types::{
     TaskManager, TnSender, Vote,
 };
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, warn};
+use tracing::warn;
 pub mod handler;
 mod message;
 
@@ -295,7 +295,10 @@ where
     fn process_gossip(&self, msg: GossipMessage) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
+        // let network_handle = self.network_handle.clone();
+
+        // commented out to prevent CertificateError::TooNew from forcing disconnect when peers
+        // are trying to resync
         tokio::spawn(async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "primary::network", ?e, "process_gossip");
