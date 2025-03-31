@@ -96,6 +96,11 @@ where
         removed_elements
     }
 
+    /// Check if the key is in the cache.
+    pub(super) fn contains(&self, key: &Key) -> bool {
+        self.map.contains(key)
+    }
+
     #[cfg(test)]
     #[track_caller]
     fn check_invariant(&self) {

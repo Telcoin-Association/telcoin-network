@@ -1,5 +1,7 @@
 //! Implement the libp2p network behavior to manage peers in the swarm.
 
+use crate::peers::manager::DisconnectReason;
+
 use super::manager::{PeerEvent, PeerManager};
 use libp2p::{
     core::{multiaddr::Protocol, transport::PortUse, ConnectedPoint, Endpoint},
@@ -57,7 +59,6 @@ impl NetworkBehaviour for PeerManager {
     ) -> Result<THandler<Self>, ConnectionDenied> {
         trace!(target: "peer-manager", ?peer, ?remote_addr, "inbound connection established");
         // ensure banned peers are not accepted
-        // NOTE: this is already checked in handle_pending_inbound_connection
         if self.connection_banned(&peer) {
             return Err(ConnectionDenied::new("peer is banned"));
         }
@@ -166,8 +167,8 @@ impl PeerManager {
 
         // check connection limits
         if self.peer_limit_reached(endpoint) && !self.is_validator(&peer_id) {
-            // gracefully disconnect
-            self.disconnect_peer(peer_id);
+            // gracefully disconnect and indicate excess peers
+            self.disconnect_peer(peer_id, true);
             return;
         }
 

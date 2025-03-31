@@ -4,11 +4,11 @@ use banned::BannedPeers;
 use libp2p::{Multiaddr, PeerId};
 use peer::Peer;
 use rand::seq::SliceRandom as _;
-use score::{Penalty, Reputation, ReputationUpdate};
+use score::{Reputation, ReputationUpdate};
 use status::{ConnectionStatus, NewConnectionStatus};
 use std::{
     cmp::Reverse,
-    collections::{BTreeSet, BinaryHeap, HashMap},
+    collections::{BTreeSet, BinaryHeap, HashMap, HashSet},
     net::IpAddr,
     time::{Duration, Instant},
 };
@@ -23,6 +23,7 @@ mod score;
 mod status;
 mod types;
 pub use manager::{PeerEvent, PeerManager};
+pub use score::Penalty;
 
 //
 // TODO: move this to once-cell peer-config
@@ -32,7 +33,6 @@ const DIAL_TIMEOUT: u64 = 15;
 /// State for known peers.
 ///
 /// This keeps track of [Peer], [BannedPeers], and the number of disconnected peers.
-// TODO: this was PeerDB
 #[derive(Debug, Default)]
 pub struct AllPeers {
     /// The collection of known connected peers, their status and reputation
@@ -55,12 +55,13 @@ pub struct AllPeers {
 pub enum PeerAction {
     /// Ban the peer and the associated IP addresses.
     Ban(Vec<IpAddr>),
-    /// Temporarily ban a peer when target number of peers reached.
-    TempBan,
     /// No action needed.
     NoAction,
     /// Disconnect from peer.
     Disconnect,
+    /// Disconnect a peer with peer exchange information to support discovery.
+    /// This results in a temporary ban to prevent immediate reconnection attempts.
+    DisconnectWithPX,
     /// Unban the peer and it's known ip addresses.
     Unban(Vec<IpAddr>),
 }
@@ -80,8 +81,6 @@ impl AllPeers {
     // - ban operation
     // - disconnect
     // - or unban
-    //
-    // TODO: review this logic before merge - heavily modified from PeerDB::report_peer
     pub(super) fn process_penalty(&mut self, peer_id: &PeerId, penalty: Penalty) -> PeerAction {
         // penalty was reported by application layer:
         // - if this results in a ban, ban the peer
@@ -415,15 +414,15 @@ impl AllPeers {
 
     /// Handle disconnected state for a peer that was disconnected without being banned.
     fn handle_disconnected_normal(&mut self, peer_id: &PeerId) -> PeerAction {
-        // The peer was disconnected but not banned.
+        // the peer was disconnected but not banned.
         self.disconnected_peers += 1;
         if let Some(peer) = self.peers.get_mut(peer_id) {
             peer.set_connection_status(ConnectionStatus::Disconnected { instant: Instant::now() });
         }
 
-        // temporarily ban a disconnected peer if the target number of peers is reached
+        // support discovery with peer exchange if the target number of peers is reached
         if self.connected_peer_ids().count() >= self.target_num_peers {
-            PeerAction::TempBan
+            PeerAction::DisconnectWithPX
         } else {
             PeerAction::Disconnect
         }
@@ -595,6 +594,20 @@ impl AllPeers {
                 ConnectionStatus::Connected { .. } | ConnectionStatus::Disconnecting { .. }
             )
         })
+    }
+
+    /// Collect connected peers to exchange with disconnecting peer.
+    pub(super) fn peer_exchange(&self) -> HashMap<PeerId, HashSet<Multiaddr>> {
+        self.peers
+            .iter()
+            .filter_map(|(id, peer)| {
+                if peer.connection_status().is_connected() {
+                    Some((*id, peer.exchange_info()))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Sort connected peers from lowest to highest score.

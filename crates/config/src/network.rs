@@ -61,6 +61,18 @@ pub struct LibP2pConfig {
     /// - 5 batch digests max per certificate (32 bytes each)
     /// - (6 * 4)(300 + (5 * 32)) = 11,040
     pub max_gossip_message_size: usize,
+    /// The maximum number of pending peer-exchance disconnect messages before this node immediately disconnects.
+    ///
+    /// When Self::target_num_peers is reached, this node disconnects gracefully from the connected peer
+    /// and exchanges peer information to faciliate discovery. The current solution requires an async task
+    /// to wait for an ack before timing out. This is a workaround until a custom RPC NetworkBehaviour is
+    /// implemented. The ideal approach is to use a custom `ConnectionHandler` and support an event that
+    /// disconnects as soon as the message is sent.
+    ///
+    /// This limit is set to prevent a node from spawning too many disconnect tasks.
+    pub max_px_disconnects: usize,
+    /// The maximum amount of time to wait for a peer's ack during a px_disconnect before forcing the disconnect.
+    pub px_disconnect_timeout: Duration,
 }
 
 impl Default for LibP2pConfig {
@@ -72,6 +84,8 @@ impl Default for LibP2pConfig {
             )],
             max_rpc_message_size: 1024 * 1024, // 1 MiB
             max_gossip_message_size: 12_000,   // 12kb
+            max_px_disconnects: 10,
+            px_disconnect_timeout: Duration::from_secs(3),
         }
     }
 }
@@ -228,7 +242,7 @@ pub struct PeerConfig {
     /// The minimum amount of time before peers are allowed to reconnect after this node disconnects due to too many peers.
     ///
     /// If peers try to connect before the reconnection timeout passes, the swarm denies the connection attempt. This essentially results in a temporary ban at the swarm level.
-    pub excess_peers_reconnection_timeout: Duration, // = Duration::from_secs(600);
+    pub excess_peers_reconnection_timeout: Duration,
 }
 
 impl Default for PeerConfig {

@@ -26,7 +26,7 @@ pub struct Peer {
     listening_addresses: Vec<Multiaddr>,
     /// The multiaddrs this node has witnessed the peer using.
     ///
-    /// These are used to manage the banning process.
+    /// These are used to manage the banning process and exchanged with peers.
     multiaddrs: HashSet<Multiaddr>,
     /// Connection status of the peer.
     connection_status: ConnectionStatus,
@@ -204,5 +204,10 @@ impl Peer {
     /// Boolean indicating if the peer is trusted.
     pub(super) fn is_trusted(&self) -> bool {
         self.is_trusted
+    }
+
+    /// Extract relevant information for peer exchange.
+    pub(super) fn exchange_info(&self) -> HashSet<Multiaddr> {
+        self.multiaddrs.clone()
     }
 }

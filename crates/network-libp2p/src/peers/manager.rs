@@ -1,12 +1,16 @@
 //! Manage peer connection status and reputation.
 
 use super::{
-    cache::BannedPeerCache, score::Penalty, types::ConnectionType, AllPeers, ConnectionDirection,
-    NewConnectionStatus, PeerAction,
+    cache::BannedPeerCache, peer::Peer, score::Penalty, types::ConnectionType, AllPeers,
+    ConnectionDirection, NewConnectionStatus, PeerAction,
 };
 use crate::peers::status::ConnectionStatus;
 use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
-use std::{collections::VecDeque, net::IpAddr, task::Context};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    net::IpAddr,
+    task::Context,
+};
 use tn_config::{ConsensusConfig, PeerConfig};
 use tn_types::Database;
 use tracing::{debug, error};
@@ -51,12 +55,30 @@ pub enum PeerEvent {
     PeerConnectedOutgoing(PeerId),
     /// Peer was disconnected.
     PeerDisconnected(PeerId),
-    /// Peer is scheduled to be disconnected.
+    /// Disconnect from the peer without exchanging peer information.
+    /// This is the event for disconnecting from penalized peers.
     DisconnectPeer(PeerId),
+    /// Disconnect from the peer and share peer information for discovery.
+    /// This is the event for disconnecting from excess peers with otherwise trusted reputations.
+    DisconnectPeerX(PeerId, HashMap<PeerId, HashSet<Multiaddr>>),
     /// Peer manager has identified a peer and associated ip addresses to ban.
     Banned(PeerId, Vec<IpAddr>),
     /// Peer manager has unbanned a peer and associated ip addresses.
     Unbanned(PeerId, Vec<IpAddr>),
+}
+
+/// The reason this node disconnected from a peer.
+///
+/// If the peer was disconnected because this node has excess peers,
+/// then exchange other peer information to support discovery.
+#[derive(Debug)]
+pub enum DisconnectReason {
+    /// Connecting with this peer would cause excess peers.
+    ExcessPeers,
+    /// The peer's reputation caused the disconnect.
+    Reputation,
+    /// The peer is banned.
+    Banned,
 }
 
 impl PeerManager {
@@ -119,30 +141,31 @@ impl PeerManager {
         self.unban_temp_banned_peers();
     }
 
-    // TODO: use RepuationUpdate instead of PeerAction
+    /// Apply a [PeerAction].
+    ///
+    /// Actions on peers happen when their reputation or connection status changes.
     fn apply_peer_action(&mut self, peer_id: PeerId, action: PeerAction) {
         match action {
             PeerAction::Ban(ip_addrs) => {
-                // TODO: ensure TemporaryBan is sufficiently handled at the AllPeers level
-                // - current approach is to issue PeerAction::Disconnect there and use empty
-                // ip addresses here to intercept for self.temp_ban LRU cache
-
                 debug!(target: "peer-manager", ?peer_id, ?ip_addrs, "reputation update results in ban");
                 self.process_ban(&peer_id, ip_addrs);
             }
             PeerAction::Disconnect => {
+                debug!(target: "peer-manager", ?peer_id, "reputation update results in disconnect");
                 self.push_event(PeerEvent::DisconnectPeer(peer_id));
             }
+            PeerAction::DisconnectWithPX => {
+                debug!(target: "peer-manager", ?peer_id, "reputation update results in temp ban");
+                // prevent immediate reconnection attempts
+                self.temporarily_banned.insert(peer_id);
+                let exchange = self.peers.peer_exchange();
+                self.events.push_back(PeerEvent::DisconnectPeerX(peer_id, exchange));
+            }
             PeerAction::Unban(ip_addrs) => {
+                debug!(target: "peer-manager", ?peer_id, ?ip_addrs, "reputation update results in unban");
                 self.push_event(PeerEvent::Unbanned(peer_id, ip_addrs));
             }
-            PeerAction::TempBan => {
-                debug!(target: "peer-manager", ?peer_id, "reputation update results in disconnect");
-                self.temporarily_banned.insert(peer_id);
-                // prevent immediate reconnection attempts
-                self.events.push_back(PeerEvent::Banned(peer_id, vec![]));
-            }
-            // no action
+
             PeerAction::NoAction => { /* nothing to do */ }
         }
     }
@@ -173,9 +196,10 @@ impl PeerManager {
 
     /// Check if the peer id is banned or associated with any banned ip addresses.
     ///
-    /// This is called before accepting new connections.
+    /// This is called before accepting new connections. Also checks that the peer
+    /// wasn't temporarily banned due to excess peers connections.
     pub(super) fn connection_banned(&self, peer_id: &PeerId) -> bool {
-        self.peers.peer_banned(peer_id)
+        self.temporarily_banned.contains(peer_id) || self.peers.peer_banned(peer_id)
     }
 
     /// Process new connection and return boolean indicating if the peer limit was reached.
@@ -204,11 +228,10 @@ impl PeerManager {
     /// The application layer reports issues from peers that are processed here.
     /// Some reports are propagated to libp2p network layer. Caller is responsible
     /// for specifying the severity of the penalty to apply.
-    pub(crate) fn handle_reported_penalty(&mut self, peer_id: PeerId, penalty: Penalty) {
+    pub(crate) fn process_penalty(&mut self, peer_id: PeerId, penalty: Penalty) {
         let action = self.peers.process_penalty(&peer_id, penalty);
 
         debug!(target: "peer-manager", ?peer_id, ?action, "processed penalty");
-
         self.apply_peer_action(peer_id, action);
     }
 
@@ -231,10 +254,23 @@ impl PeerManager {
 
     /// Disconnect from a peer.
     ///
-    /// This is the recommended graceful disconnect method. Peers are not banned.
-    // TODO: include reason? "DisconnectReason"
-    pub(super) fn disconnect_peer(&mut self, peer_id: PeerId) {
-        self.events.push_back(PeerEvent::DisconnectPeer(peer_id));
+    /// This is the recommended graceful disconnect method and is called when peers
+    /// are penalized or if connecting with a dialing peer would result in excess peer
+    /// count.
+    ///
+    /// The argument `support_discovery` indicates if the disconnect message should
+    /// include additional connected peers to help the peer discovery other nodes.
+    /// Peers that are disconnected because of excess peer limits support discovery.
+    pub(super) fn disconnect_peer(&mut self, peer_id: PeerId, support_discovery: bool) {
+        // include peer exchange or not
+        let event = if support_discovery {
+            let exchange = self.peers.peer_exchange();
+            PeerEvent::DisconnectPeerX(peer_id, exchange)
+        } else {
+            PeerEvent::DisconnectPeer(peer_id)
+        };
+
+        self.events.push_back(event);
         self.peers.update_connection_status(
             &peer_id,
             NewConnectionStatus::Disconnecting { banned: false },
@@ -350,7 +386,7 @@ impl PeerManager {
         // disconnect peers until excess_peer_count is 0
         for peer_id in ready_to_prune {
             if excess_peer_count > 0 {
-                self.disconnect_peer(peer_id);
+                self.disconnect_peer(peer_id, true);
                 excess_peer_count = excess_peer_count.saturating_sub(1);
                 continue;
             }
@@ -429,7 +465,7 @@ mod tests {
         assert!(peer_manager.register_incoming_connection(&peer_id, multiaddr));
 
         // Apply a severe penalty to trigger ban
-        peer_manager.handle_reported_penalty(peer_id, Penalty::Fatal);
+        peer_manager.process_penalty(peer_id, Penalty::Fatal);
 
         // clear events from reported penalty
         let mut disconnect_events = Vec::new();
@@ -473,4 +509,6 @@ mod tests {
             "Peer should remain banned after disconnection"
         );
     }
+
+    // test temp ban from DisconnectWithPX
 }

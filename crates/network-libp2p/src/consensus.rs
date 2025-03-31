@@ -32,7 +32,7 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot,
 };
-use tracing::{error, info, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 #[cfg(test)]
 #[path = "tests/network_tests.rs"]
@@ -98,6 +98,14 @@ where
     authorized_publishers: HashSet<PeerId>,
     /// The collection of pending dials.
     pending_dials: HashMap<PeerId, oneshot::Sender<NetworkResult<()>>>,
+    /// The collection of pending *graceful* disconnects.
+    ///
+    /// This node disconnects from new peers if it already has the target number of peers.
+    /// For these types of "peer exchange / discovery disconnects", the node shares peer records
+    /// before disconnecting. This keeps track of the number of disconnects to ensure resources
+    /// aren't starved while waiting for the peer's ack.
+    pending_px_disconnects: HashMap<OutboundRequestId, PeerId>,
+    ///
     /// The collection of pending outbound requests.
     ///
     /// Callers include a oneshot channel for the network to return response. The caller is
@@ -173,13 +181,13 @@ where
         let keypair =
             libp2p::identity::Keypair::ed25519_from_bytes(&mut ed25519_private_key_bytes)?;
 
+        // NOTE: peer exchange not implemented yet
+        // see: https://github.com/libp2p/rust-libp2p/issues/2398
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             // explicitly set default
             .heartbeat_interval(Duration::from_secs(1))
             // explicitly set default
             .validation_mode(gossipsub::ValidationMode::Strict)
-            // support peer exchange
-            .do_px()
             // TN specific: filter against authorized_publishers for certain topics
             .validate_messages()
             .build()?;
@@ -227,6 +235,7 @@ where
 
         let (handle, commands) = tokio::sync::mpsc::channel(100);
         let config = consensus_config.network_config().libp2p_config().clone();
+        let pending_px_disconnects = HashMap::with_capacity(config.max_px_disconnects);
 
         Ok(Self {
             swarm,
@@ -240,6 +249,7 @@ where
             inbound_requests: Default::default(),
             config,
             connected_peers: VecDeque::new(),
+            pending_px_disconnects,
         })
     }
 
@@ -502,6 +512,9 @@ where
                 let count = self.outbound_requests.len();
                 send_or_log_error!(reply, count, "SendResponse");
             }
+            NetworkCommand::ReportPenalty { peer_id, penalty } => {
+                self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, penalty);
+            }
         }
     }
 
@@ -635,11 +648,12 @@ where
 
     /// Process an event from the peer manager.
     fn process_peer_manager_event(&mut self, event: PeerEvent) -> NetworkResult<()> {
-        // TODO: remove this!!!!!!
-        println!("Peer Manager Event: {event:?}");
+        debug!(target: "network", ?event, "process peer manager event");
 
         match event {
             PeerEvent::PeerDisconnected(peer_id) => {
+                // TODO: read this from PeerManager
+                //
                 // remove from connected peers
                 self.connected_peers.retain(|peer| *peer != peer_id);
 
@@ -670,6 +684,36 @@ where
                         .ok_or(NetworkError::PendingRequestChannelLost)?
                         .send(Err(NetworkError::Disconnected));
                 }
+            }
+            PeerEvent::DisconnectPeerX(peer_id, peer_exchange) => {
+                // - create message to send to peer with discovery records
+                // - send the request (don't care about response)
+                // - track in self.pending_disconnects
+                //      - if too many pending disconnects, disconnect immediately
+                // - spawn task with timeout to wait for ack from peer
+
+                // TODO: the flow for `PeerAction` returns a `TempBan` which
+                // results in a `PeerEvent::Banned` event.
+                // I think the only time `DisconnectPeer` happens is when the peer's
+                // reputation is poor.
+                //
+                // This should not be the case. Lighthouse has a `GoodbyeReason` that
+                // includes too many peers, so something is broken in the TN flow.
+                //
+                // Consider adding another type so this is more straight foward
+                //
+                // instead of `DisconnectReason` just have `DisconnectPeerX`?
+
+                // attempt to exchange peer information if limits allow
+                if self.pending_px_disconnects.len() <= self.config.max_px_disconnects {
+                    //
+                    todo!()
+                } else {
+                    // force disconnect
+                }
+
+                // let request_id = self.swarm.behaviour_mut().req_res.send_request(&peer, request);
+                // self.outbound_requests.insert((peer, request_id), reply);
             }
             _ => (),
             // PeerEvent::PeerConnectedIncoming(peer_id) => todo!(),

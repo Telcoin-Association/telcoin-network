@@ -1,6 +1,6 @@
 //! Constants and trait implementations for network compatibility.
 
-use crate::{codec::TNMessage, error::NetworkError, GossipMessage};
+use crate::{codec::TNMessage, error::NetworkError, peers::Penalty, GossipMessage};
 use libp2p::{
     core::transport::ListenerId,
     gossipsub::{PublishError, SubscriptionError, TopicHash},
@@ -167,6 +167,8 @@ where
     ///
     /// Peer's application score is P₅ of the peer scoring system.
     SetApplicationScore { peer_id: PeerId, new_score: f64, reply: oneshot::Sender<bool> },
+    /// Report penalty for peer.
+    ReportPenalty { peer_id: PeerId, penalty: Penalty },
     /// Return the number of pending outbound requests.
     PendingRequestCount { reply: oneshot::Sender<usize> },
 }
