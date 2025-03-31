@@ -302,13 +302,13 @@ where
                 // TODO: peers don't track reputation yet
                 //
                 // NOTE: the network ensures the peer id is present before forwarding the msg
-                if let Some(peer_id) = msg.source {
-                    if let Err(e) =
-                        network_handle.handle.set_application_score(peer_id, -100.0).await
-                    {
-                        error!(target: "primary::network", ?e, "failed to penalize malicious peer")
-                    }
-                }
+                // if let Some(peer_id) = msg.source {
+                //     if let Err(e) =
+                //         network_handle.handle.set_application_score(peer_id, -100.0).await
+                //     {
+                //         error!(target: "primary::network", ?e, "failed to penalize malicious peer")
+                //     }
+                // }
 
                 // match on error to lower peer score
                 //todo!();
