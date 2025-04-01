@@ -2,7 +2,7 @@
 
 use super::{
     cache::BannedPeerCache, peer::Peer, score::Penalty, types::ConnectionType, AllPeers,
-    ConnectionDirection, NewConnectionStatus, PeerAction,
+    ConnectionDirection, NewConnectionStatus, PeerAction, PeerExchangeMap,
 };
 use crate::peers::status::ConnectionStatus;
 use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
@@ -60,7 +60,7 @@ pub enum PeerEvent {
     DisconnectPeer(PeerId),
     /// Disconnect from the peer and share peer information for discovery.
     /// This is the event for disconnecting from excess peers with otherwise trusted reputations.
-    DisconnectPeerX(PeerId, HashMap<PeerId, HashSet<Multiaddr>>),
+    DisconnectPeerX(PeerId, PeerExchangeMap),
     /// Peer manager has identified a peer and associated ip addresses to ban.
     Banned(PeerId, Vec<IpAddr>),
     /// Peer manager has unbanned a peer and associated ip addresses.
@@ -403,6 +403,25 @@ impl PeerManager {
         for peer_id in self.temporarily_banned.heartbeat() {
             self.push_event(PeerEvent::Unbanned(peer_id, Vec::new()));
         }
+    }
+
+    /// Process peer exchange for peer discovery.
+    pub(crate) fn process_peer_exchange(&mut self, peers: PeerExchangeMap) {
+        // peers.into_iter()
+        todo!()
+    }
+
+    /// Create [PeerExchangeMap] for exchange with peers.
+    pub(crate) fn peers_for_exchange(&self) -> PeerExchangeMap {
+        self.peers.peer_exchange()
+    }
+
+    /// Test only
+    ///
+    /// Push an event to the swarm from `Self`.
+    #[cfg(test)]
+    pub(crate) fn push_test_event(&mut self, event: PeerEvent) {
+        self.push_event(event);
     }
 }
 

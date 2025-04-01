@@ -12044,6 +12044,7 @@ dependencies = [
  "libp2p",
  "rand",
  "serde",
+ "serde_with 2.3.3",
  "snap",
  "thiserror 1.0.69",
  "tn-config",

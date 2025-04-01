@@ -24,6 +24,7 @@ mod status;
 mod types;
 pub use manager::{PeerEvent, PeerManager};
 pub use score::Penalty;
+pub use types::PeerExchangeMap;
 
 //
 // TODO: move this to once-cell peer-config
@@ -597,7 +598,7 @@ impl AllPeers {
     }
 
     /// Collect connected peers to exchange with disconnecting peer.
-    pub(super) fn peer_exchange(&self) -> HashMap<PeerId, HashSet<Multiaddr>> {
+    pub(super) fn peer_exchange(&self) -> PeerExchangeMap {
         self.peers
             .iter()
             .filter_map(|(id, peer)| {
@@ -607,7 +608,8 @@ impl AllPeers {
                     None
                 }
             })
-            .collect()
+            .collect::<HashMap<_, _>>()
+            .into()
     }
 
     /// Sort connected peers from lowest to highest score.

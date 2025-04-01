@@ -8,6 +8,7 @@ use crate::{
     peers::{self, PeerEvent, PeerManager},
     send_or_log_error,
     types::{NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
+    PeerExchangeMap,
 };
 use futures::StreamExt as _;
 use libp2p::{
@@ -509,6 +510,20 @@ where
             NetworkCommand::ReportPenalty { peer_id, penalty } => {
                 self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, penalty);
             }
+            NetworkCommand::DisconnectPeer { peer_id, reply } => {
+                let res = self.swarm.disconnect_peer_id(peer_id);
+                send_or_log_error!(reply, res, "DisconnectPeer");
+            }
+            NetworkCommand::PeerExchange { peers, channel } => {
+                self.swarm.behaviour_mut().peer_manager.process_peer_exchange(peers);
+                // send empty ack and ignore errors
+                let ack = PeerExchangeMap::default().into();
+                let _ = self.swarm.behaviour_mut().req_res.send_response(channel, ack);
+            }
+            NetworkCommand::PeersForExchange { reply } => {
+                let peers = self.swarm.behaviour_mut().peer_manager.peers_for_exchange();
+                send_or_log_error!(reply, peers, "PeersForExchange");
+            }
         }
     }
 
@@ -700,15 +715,31 @@ where
                 // instead of `DisconnectReason` just have `DisconnectPeerX`?
 
                 // attempt to exchange peer information if limits allow
-                if self.pending_px_disconnects.len() <= self.config.max_px_disconnects {
-                    //
-                    todo!()
-                } else {
-                    // force disconnect
-                }
+                if self.pending_px_disconnects.len() < self.config.max_px_disconnects {
+                    let (reply, done) = oneshot::channel();
+                    let request_id = self
+                        .swarm
+                        .behaviour_mut()
+                        .req_res
+                        .send_request(&peer_id, peer_exchange.into());
+                    self.outbound_requests.insert((peer_id, request_id), reply);
 
-                // let request_id = self.swarm.behaviour_mut().req_res.send_request(&peer, request);
-                // self.outbound_requests.insert((peer, request_id), reply);
+                    let timeout = self.config.px_disconnect_timeout.clone();
+                    let handle = self.network_handle();
+
+                    // spawn task
+                    tokio::spawn(async move {
+                        // ignore errors and disconnect after px attempt
+                        let _ = tokio::time::timeout(timeout, done);
+                        let _ = handle.disconnect_peer(peer_id);
+                    });
+
+                    // insert to pending px disconnects
+                    self.pending_px_disconnects.insert(request_id, peer_id);
+                } else {
+                    // too many px disconnects pending - force disconnect
+                    let _ = self.swarm.disconnect_peer_id(peer_id);
+                }
             }
             _ => (),
             // PeerEvent::PeerConnectedIncoming(peer_id) => todo!(),

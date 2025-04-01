@@ -7,7 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
-use tn_network_libp2p::{types::IntoRpcError, TNMessage};
+use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, TNMessage};
 use tn_types::{
     AuthorityIdentifier, BlockHash, Certificate, CertificateDigest, ConsensusHeader, Header, Round,
     Vote,
@@ -58,6 +58,12 @@ pub enum PrimaryRequest {
         /// Block hash requesting if not None.
         hash: Option<BlockHash>,
     },
+    /// Exchange peer information.
+    ///
+    /// This "request" is sent to peers when this node disconnects
+    /// due to excess peers. The peer exchange is intended to support
+    /// discovery.
+    PeerExchange { peers: PeerExchangeMap },
 }
 
 // unit test for this struct in primary::src::tests::network_tests::test_missing_certs_request
@@ -128,6 +134,12 @@ impl MissingCertificatesRequest {
     }
 }
 
+impl From<PeerExchangeMap> for PrimaryRequest {
+    fn from(value: PeerExchangeMap) -> Self {
+        Self::PeerExchange { peers: value.into() }
+    }
+}
+
 //
 //
 //=== Response types
@@ -148,6 +160,8 @@ pub enum PrimaryResponse {
     MissingParents(Vec<CertificateDigest>),
     /// The requested consensus header.
     ConsensusHeader(Arc<ConsensusHeader>),
+    /// Exchange peer information.
+    PeerExchange { peers: PeerExchangeMap },
     /// RPC error while handling request.
     ///
     /// This is an application-layer error response.
@@ -176,3 +190,9 @@ impl From<PrimaryRPCError> for PrimaryResponse {
 /// Application-specific error type while handling Primary request.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PrimaryRPCError(pub String);
+
+impl From<PeerExchangeMap> for PrimaryResponse {
+    fn from(value: PeerExchangeMap) -> Self {
+        Self::PeerExchange { peers: value.into() }
+    }
+}

@@ -1,6 +1,9 @@
 //! Constants and trait implementations for network compatibility.
 
-use crate::{codec::TNMessage, error::NetworkError, peers::Penalty, GossipMessage};
+use crate::{
+    codec::TNMessage, error::NetworkError, peers::Penalty, GossipMessage, PeerExchangeMap,
+};
+pub use libp2p::gossipsub::{IdentTopic, MessageId};
 use libp2p::{
     core::transport::ListenerId,
     gossipsub::{PublishError, SubscriptionError, TopicHash},
@@ -9,8 +12,6 @@ use libp2p::{
 };
 use std::collections::{HashMap, HashSet};
 use tokio::sync::{mpsc, oneshot};
-
-pub use libp2p::gossipsub::{IdentTopic, MessageId};
 
 /// The result for network operations.
 pub type NetworkResult<T> = Result<T, NetworkError>;
@@ -171,6 +172,18 @@ where
     ReportPenalty { peer_id: PeerId, penalty: Penalty },
     /// Return the number of pending outbound requests.
     PendingRequestCount { reply: oneshot::Sender<usize> },
+    /// Disconnect a peer by [PeerId]. The oneshot returns a result if the peer
+    /// was connected or not.
+    DisconnectPeer { peer_id: PeerId, reply: oneshot::Sender<Result<(), ()>> },
+    /// Process peer information and possibly discover new peers.
+    PeerExchange {
+        /// Peers for discovery.
+        peers: PeerExchangeMap,
+        /// The libp2p response channel to send back an ack.
+        channel: ResponseChannel<Res>,
+    },
+    /// Retrieve peers from peer manager to share with a requesting peer.
+    PeersForExchange { reply: oneshot::Sender<PeerExchangeMap> },
 }
 
 /// Network handle.
@@ -365,6 +378,36 @@ where
         let (reply, count) = oneshot::channel();
         self.sender.send(NetworkCommand::PendingRequestCount { reply }).await?;
         count.await.map_err(Into::into)
+    }
+
+    /// Disconnect from the peer.
+    ///
+    /// This method closes all connections to the peer without waiting for handlers
+    /// to complete.
+    pub async fn disconnect_peer(&self, peer_id: PeerId) -> NetworkResult<()> {
+        let (reply, res) = oneshot::channel();
+        self.sender.send(NetworkCommand::DisconnectPeer { peer_id, reply }).await?;
+        res.await?.map_err(|_| NetworkError::DisconnectPeer)
+    }
+
+    /// Process peer exchange message.
+    ///
+    /// This is a side-effect of generic `ConsensusNetwork`. Primary and Workers
+    /// receive peer exchange requests and pass them back to the peer manager.
+    pub async fn process_peer_exchange(
+        &self,
+        peers: PeerExchangeMap,
+        channel: ResponseChannel<Res>,
+    ) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::PeerExchange { peers, channel }).await?;
+        Ok(())
+    }
+
+    /// Create a [PeerExchangeMap] for exchanging peers.
+    pub async fn peers_for_exchange(&self) -> NetworkResult<PeerExchangeMap> {
+        let (reply, res) = oneshot::channel();
+        self.sender.send(NetworkCommand::PeersForExchange { reply }).await?;
+        res.await.map_err(Into::into)
     }
 }
 

@@ -1,5 +1,6 @@
 //! Codec for encoding/decoding consensus network messages.
 
+use crate::PeerExchangeMap;
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response::Codec, StreamProtocol};
@@ -17,7 +18,10 @@ use tn_types::encode_into_buffer;
 mod tn_codec_tests;
 
 /// Convenience type for all traits implemented for messages used for TN request-response codec.
-pub trait TNMessage: Send + Serialize + DeserializeOwned + Clone + fmt::Debug + 'static {}
+pub trait TNMessage:
+    Send + Serialize + DeserializeOwned + Clone + fmt::Debug + From<PeerExchangeMap> + 'static
+{
+}
 
 /// The Telcoin Network request/response codec for consensus messages between peers.
 ///

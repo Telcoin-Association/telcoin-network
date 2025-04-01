@@ -83,6 +83,9 @@ pub enum NetworkError {
     /// This node disconnected from the peer.
     #[error("Disconnected from peer")]
     Disconnected,
+    /// The peer was already disconnected.
+    #[error("Peer already disconnected")]
+    DisconnectPeer,
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {

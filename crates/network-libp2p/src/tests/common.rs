@@ -1,6 +1,6 @@
 //! Fixtures used in multiple tests.
 
-use crate::TNMessage;
+use crate::{PeerExchangeMap, TNMessage};
 use serde::{Deserialize, Serialize};
 use tn_types::{BlockHash, Certificate, CertificateDigest, Header, SealedBatch, Vote};
 
@@ -46,4 +46,28 @@ pub(super) enum TestPrimaryResponse {
     Vote(Vote),
     MissingCertificates(Vec<Certificate>),
     MissingParents(Vec<CertificateDigest>),
+}
+
+impl From<PeerExchangeMap> for TestWorkerRequest {
+    fn from(_: PeerExchangeMap) -> Self {
+        unimplemented!()
+    }
+}
+
+impl From<PeerExchangeMap> for TestWorkerResponse {
+    fn from(_: PeerExchangeMap) -> Self {
+        unimplemented!()
+    }
+}
+
+impl From<PeerExchangeMap> for TestPrimaryRequest {
+    fn from(_: PeerExchangeMap) -> Self {
+        unimplemented!()
+    }
+}
+
+impl From<PeerExchangeMap> for TestPrimaryResponse {
+    fn from(_: PeerExchangeMap) -> Self {
+        unimplemented!()
+    }
 }

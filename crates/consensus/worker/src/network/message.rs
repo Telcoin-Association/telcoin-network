@@ -1,5 +1,7 @@
+//! Messages sent between workers.
+
 use serde::{Deserialize, Serialize};
-use tn_network_libp2p::TNMessage;
+use tn_network_libp2p::{PeerExchangeMap, TNMessage};
 use tn_types::{Batch, BlockHash, SealedBatch};
 
 /// Worker messages on the gossip network.
@@ -20,6 +22,18 @@ pub enum WorkerRequest {
     ReportBatch { sealed_batch: SealedBatch },
     /// Request batches by digest from a peer.
     RequestBatches { batch_digests: Vec<BlockHash> },
+    /// Exchange peer information.
+    ///
+    /// This "request" is sent to peers when this node disconnects
+    /// due to excess peers. The peer exchange is intended to support
+    /// discovery.
+    PeerExchange { peers: PeerExchangeMap },
+}
+
+impl From<PeerExchangeMap> for WorkerRequest {
+    fn from(value: PeerExchangeMap) -> Self {
+        Self::PeerExchange { peers: value.into() }
+    }
 }
 
 //
@@ -33,6 +47,10 @@ pub enum WorkerRequest {
 pub enum WorkerResponse {
     ReportBatch,
     RequestBatches(Vec<Batch>),
+    /// Exchange peer information.
+    PeerExchange {
+        peers: PeerExchangeMap,
+    },
     /// RPC error while handling request.
     ///
     /// This is an application-layer error response.
@@ -55,3 +73,9 @@ impl From<WorkerRPCError> for WorkerResponse {
 /// Application-specific error type while handling Worker request.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct WorkerRPCError(pub String);
+
+impl From<PeerExchangeMap> for WorkerResponse {
+    fn from(value: PeerExchangeMap) -> Self {
+        Self::PeerExchange { peers: value.into() }
+    }
+}

@@ -1,3 +1,8 @@
+use super::{
+    error::{WorkerNetworkError, WorkerNetworkResult},
+    message::WorkerGossip,
+    WorkerNetworkHandle,
+};
 use itertools::Itertools;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
@@ -6,12 +11,6 @@ use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
 use tn_storage::tables::Batches;
 use tn_types::{
     now, try_decode, Batch, BatchValidation, BlockHash, Database, SealedBatch, WorkerId,
-};
-
-use super::{
-    error::{WorkerNetworkError, WorkerNetworkResult},
-    message::WorkerGossip,
-    WorkerNetworkHandle,
 };
 
 /// The type that handles requests from peers.
