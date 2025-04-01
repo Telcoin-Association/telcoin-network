@@ -4,11 +4,11 @@ use banned::BannedPeers;
 use libp2p::{Multiaddr, PeerId};
 use peer::Peer;
 use rand::seq::SliceRandom as _;
-use score::{Reputation, ReputationUpdate};
+use score::{init_peer_score_config, Reputation, ReputationUpdate};
 use status::{ConnectionStatus, NewConnectionStatus};
 use std::{
     cmp::Reverse,
-    collections::{BTreeSet, BinaryHeap, HashMap, HashSet},
+    collections::{BTreeSet, BinaryHeap, HashMap},
     net::IpAddr,
     time::{Duration, Instant},
 };
@@ -26,15 +26,10 @@ pub use manager::{PeerEvent, PeerManager};
 pub use score::Penalty;
 pub use types::PeerExchangeMap;
 
-//
-// TODO: move this to once-cell peer-config
-// // // // //
-const DIAL_TIMEOUT: u64 = 15;
-
 /// State for known peers.
 ///
 /// This keeps track of [Peer], [BannedPeers], and the number of disconnected peers.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AllPeers {
     /// The collection of known connected peers, their status and reputation
     peers: HashMap<PeerId, Peer>,
@@ -46,6 +41,8 @@ pub struct AllPeers {
     disconnected_peers: usize,
     /// The target number of connected peers for this node.
     target_num_peers: usize,
+    /// The timeout for dialing peers.
+    dial_timeout: Duration,
 }
 
 /// The action to take after a peer's reputation or connection status changes.
@@ -75,6 +72,21 @@ impl PeerAction {
 }
 
 impl AllPeers {
+    /// Create a new instance of Self.
+    pub(super) fn new(
+        validators: BTreeSet<PeerId>,
+        target_num_peers: usize,
+        dial_timeout: Duration,
+    ) -> Self {
+        Self {
+            peers: Default::default(),
+            validators,
+            banned_peers: Default::default(),
+            disconnected_peers: 0,
+            target_num_peers,
+            dial_timeout,
+        }
+    }
     /// Handle reported action.
     ///
     /// This method is called when the application layer identifies a problem and reports a peer.
@@ -195,7 +207,7 @@ impl AllPeers {
             .iter()
             .filter_map(|(peer_id, info)| {
                 if let ConnectionStatus::Dialing { instant } = info.connection_status() {
-                    if (*instant) + Duration::from_secs(DIAL_TIMEOUT) < Instant::now() {
+                    if (*instant) + self.dial_timeout < Instant::now() {
                         return Some(*peer_id);
                     }
                 }

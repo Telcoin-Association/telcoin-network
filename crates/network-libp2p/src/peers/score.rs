@@ -7,37 +7,26 @@
 
 use serde::Serialize;
 use std::fmt::Display;
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
+use tn_config::ScoreConfig;
 
-// Replace the lazy_static macro with a static OnceLock
-static HALFLIFE_DECAY: OnceLock<f64> = OnceLock::new();
+/// Global static configuration that is initialized only once for all peers.
+pub(super) static GLOBAL_SCORE_CONFIG: OnceLock<Arc<ScoreConfig>> = OnceLock::new();
 
-/// The default score for new peers.
-pub(crate) const DEFAULT_SCORE: f64 = 0.0;
-/// The threshold for a peer's score before they are banned, regardless of any other scoring
-/// parameters.
-const MIN_APPLICATION_SCORE_BEFORE_BAN: f64 = -60.0;
-/// The maximum score a peer can obtain.
-const MAX_SCORE: f64 = 100.0;
-/// The minimum score a peer can obtain.
-const MIN_SCORE: f64 = -100.0;
-/// The halflife of a peer's score.
+/// Initialize the global peer score configuration.
+#[must_use]
+pub(super) fn init_peer_score_config(config: ScoreConfig) -> Result<(), &'static str> {
+    let config = Arc::new(config);
+    GLOBAL_SCORE_CONFIG.set(config).map_err(|_| "Peer score configuration already initialized")
+}
+
+/// Get a reference to the global peer score configuration
 ///
-/// This represents the time (seconds) before the score decays to half its value.
-const SCORE_HALFLIFE: f64 = 600.0;
-/// The minimum amount of time (seconds) a peer is banned before their score begins to decay.
-const BANNED_BEFORE_DECAY: Duration = Duration::from_secs(12 * 3600); // 12 hours
-/// Threshold to prevent libp2p gossipsub from disconnecting peers.
-pub const GOSSIPSUB_GREYLIST_THRESHOLD: f64 = -16000.0;
-
-// TODO: all values go into config - use once lock and initialize when peer manager starts
-const MIN_SCORE_BEFORE_DISCONNECT: f64 = -20.0;
-const MIN_SCORE_BEFORE_BAN: f64 = -50.0;
-
-/// Weight for gossipsub scores to prevent non-decaying scores for disconnected peers.
-const GOSSIPSUB_SCORE_WEIGHT: f64 =
-    (MIN_SCORE_BEFORE_DISCONNECT + 1.0) / GOSSIPSUB_GREYLIST_THRESHOLD;
+/// Panics if score config isn't set.
+fn global_score_config() -> Arc<ScoreConfig> {
+    GLOBAL_SCORE_CONFIG.get().expect("Peer score configuration not initialized").clone()
+}
 
 /// Penalties applied to peers based on the significance of their actions.
 ///
@@ -92,10 +81,12 @@ pub struct Score {
 
 impl Default for Score {
     fn default() -> Self {
+        let config = global_score_config();
+
         Score {
-            telcoin_score: DEFAULT_SCORE,
-            gossipsub_score: DEFAULT_SCORE,
-            aggregate_score: DEFAULT_SCORE,
+            telcoin_score: config.default_score,
+            gossipsub_score: config.default_score,
+            aggregate_score: config.default_score,
             last_updated: Instant::now(),
             ignore_negative_gossipsub_score: false,
         }
@@ -110,13 +101,15 @@ impl Score {
 
     /// Modifies the score based on the penalty type and returns the new score.
     pub fn apply_penalty(&mut self, penalty: Penalty) {
+        let config = global_score_config();
+
         // NOTE: these use `Self::add`
-        // which cannot overflow using default MIN_SCORE and MAX_SCORE
+        // which cannot overflow using default config min and max scores
         let new_score = match penalty {
             Penalty::Mild => self.add(-1.0),
             Penalty::Medium => self.add(-5.0),
             Penalty::Severe => self.add(-10.0),
-            Penalty::Fatal => MIN_SCORE, // The worst possible score
+            Penalty::Fatal => config.min_score, // The worst possible score
         };
 
         // set application score
@@ -127,7 +120,8 @@ impl Score {
 
     /// Add an f64 to the currrent application score within the min/max limits.
     fn add(&mut self, score: f64) -> f64 {
-        (self.telcoin_score + score).clamp(MIN_SCORE, MAX_SCORE)
+        let config = global_score_config();
+        (self.telcoin_score + score).clamp(config.min_score, config.max_score)
     }
 
     /// Update all relevant scores based on the current instant.
@@ -149,8 +143,10 @@ impl Score {
         if let Some(prev_update) =
             now.checked_duration_since(self.last_updated).map(|d| d.as_secs())
         {
+            let config = global_score_config();
+
             // e^(-ln(2)/HL*t)
-            let halflife_decay = self.get_halflife_decay();
+            let halflife_decay = config.halflife_decay();
             let decay_factor = (halflife_decay * prev_update as f64).exp();
             self.telcoin_score *= decay_factor;
             self.last_updated = now;
@@ -159,11 +155,6 @@ impl Score {
 
         // // return no update if this is the first time a score is set
         // ReputationUpdate::None
-    }
-
-    /// Function to get the [HALFLIFE_DECAY] and initializing it if needed.
-    fn get_halflife_decay(&self) -> f64 {
-        *HALFLIFE_DECAY.get_or_init(|| -(2.0f64.ln()) / SCORE_HALFLIFE)
     }
 
     /// Update the aggregate score by effectively assessing penalties.
@@ -178,8 +169,10 @@ impl Score {
 
         // ban the peer if threshold reached
         if !already_banned && self.is_banned() {
+            let config = global_score_config();
+
             // ban the peer for at least BANNED_BEFORE_DECAY seconds
-            self.last_updated += BANNED_BEFORE_DECAY;
+            self.last_updated += config.banned_before_decay();
         }
     }
 
@@ -188,16 +181,18 @@ impl Score {
     /// If the application score is too low, the method does nothing because the peer will be
     /// banned.
     fn apply_gossip_weights(&mut self) {
+        let config = global_score_config();
+
         // start with new application score
         self.aggregate_score = self.telcoin_score;
 
         // apply additional weight factors
-        if self.telcoin_score <= MIN_APPLICATION_SCORE_BEFORE_BAN {
+        if self.telcoin_score <= config.min_application_score_before_ban {
             //ignore all other scores - peer is banned
         } else if self.gossipsub_score >= 0.0 {
-            self.aggregate_score += self.gossipsub_score * GOSSIPSUB_SCORE_WEIGHT;
+            self.aggregate_score += self.gossipsub_score * config.gossipsub_score_weight();
         } else if !self.ignore_negative_gossipsub_score {
-            self.aggregate_score += self.gossipsub_score * GOSSIPSUB_SCORE_WEIGHT;
+            self.aggregate_score += self.gossipsub_score * config.gossipsub_score_weight();
         }
     }
 
@@ -219,7 +214,8 @@ impl Score {
 
     /// Helper method if a peer has reached the threshold for being banned.
     pub fn is_banned(&self) -> bool {
-        self.aggregate_score <= MIN_SCORE_BEFORE_BAN
+        let config = global_score_config();
+        self.aggregate_score <= config.min_score_before_ban
     }
 }
 

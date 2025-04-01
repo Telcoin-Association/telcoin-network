@@ -1,13 +1,14 @@
 //! Manage peer connection status and reputation.
 
 use super::{
-    cache::BannedPeerCache, peer::Peer, score::Penalty, types::ConnectionType, AllPeers,
-    ConnectionDirection, NewConnectionStatus, PeerAction, PeerExchangeMap,
+    cache::BannedPeerCache, init_peer_score_config, peer::Peer, score::Penalty,
+    types::ConnectionType, AllPeers, ConnectionDirection, NewConnectionStatus, PeerAction,
+    PeerExchangeMap,
 };
 use crate::peers::status::ConnectionStatus;
 use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     net::IpAddr,
     task::Context,
 };
@@ -88,10 +89,16 @@ impl PeerManager {
         let heartbeat =
             tokio::time::interval(tokio::time::Duration::from_secs(config.heartbeat_interval));
 
-        // TODO: restore from backup?
-        let peers = AllPeers::default();
+        // TODO: restore peers from backup?
+        //
+        // TODO: pass in validators!!!!!!!!!
+        let validators = BTreeSet::new();
+        let peers = AllPeers::new(validators, config.target_num_peers, config.dial_timeout);
         let events = VecDeque::new();
         let temporarily_banned = BannedPeerCache::new(config.excess_peers_reconnection_timeout);
+
+        // initialize global score config
+        init_peer_score_config(config.score_config);
 
         Self { config: *config, heartbeat, peers, events, temporarily_banned }
     }

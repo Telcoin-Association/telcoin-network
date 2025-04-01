@@ -220,6 +220,8 @@ pub struct PeerConfig {
     pub heartbeat_interval: u64,
     /// The target number of connected peers.
     pub target_num_peers: usize,
+    /// The timeout for dialing a peer.
+    pub dial_timeout: Duration,
     /// The threshold before a peer is disconnected
     pub min_score_for_disconnect: f64,
     /// The threshold before a peer is banned.
@@ -229,26 +231,24 @@ pub struct PeerConfig {
     ///
     /// NOTE: If `Self::target_num_peers` is 20 and peer_excess_factor = 0.1 this node allows 10% more peers, i.e 22.
     pub peer_excess_factor: f32,
-
     /// The fraction of extra peers beyond the Self::peer_excess_factor that this node is allowed to dial for
     /// requiring subnet peers.
     ///
     /// NOTE: If the target peer limit is 50, and the excess peer limit is 55, and this node already has 55 peers,
     /// this value provisions a few more slots for dialing priority peers for validator responsibilities.
     pub priority_peer_excess: f32,
-
     /// A fraction of `Self::target_num_peers` that are outbound-only connections.
     pub target_outbound_only_factor: f32,
-
     /// A fraction of `Self::target_num_peers` that sets a threshold before the node tries to discovery peers.
     ///
     /// NOTE: Self::min_outbound_only_factor must be < Self::target_outbound_only_factor.
     pub min_outbound_only_factor: f32,
-
     /// The minimum amount of time before peers are allowed to reconnect after this node disconnects due to too many peers.
     ///
     /// If peers try to connect before the reconnection timeout passes, the swarm denies the connection attempt. This essentially results in a temporary ban at the swarm level.
     pub excess_peers_reconnection_timeout: Duration,
+    /// The config for scoring peers.
+    pub score_config: ScoreConfig,
 }
 
 impl Default for PeerConfig {
@@ -256,6 +256,7 @@ impl Default for PeerConfig {
         Self {
             heartbeat_interval: 30,
             target_num_peers: 5,
+            dial_timeout: Duration::from_secs(15),
             min_score_for_disconnect: -20.0,
             min_score_for_ban: -50.0,
             peer_excess_factor: 0.1,
@@ -263,6 +264,7 @@ impl Default for PeerConfig {
             target_outbound_only_factor: 0.3,
             min_outbound_only_factor: 0.2,
             excess_peers_reconnection_timeout: Duration::from_secs(600),
+            score_config: ScoreConfig::default(),
         }
     }
 }
@@ -297,5 +299,61 @@ impl PeerConfig {
         (self.target_num_peers as f32
             * (1.0 + self.peer_excess_factor + self.priority_peer_excess / 2.0))
             .ceil() as usize
+    }
+}
+
+/// Configuration for peer scoring parameters
+#[derive(Clone, Debug, Copy)]
+pub struct ScoreConfig {
+    /// The default score for new peers.
+    pub default_score: f64,
+    /// The threshold for a peer's score before they are banned, regardless of any other scoring parameters.
+    pub min_application_score_before_ban: f64,
+    /// The maximum score a peer can obtain.
+    pub max_score: f64,
+    /// The minimum score a peer can obtain.
+    pub min_score: f64,
+    /// The halflife of a peer's score in seconds.
+    pub score_halflife: f64,
+    /// The minimum amount of time (seconds) a peer is banned before their score begins to decay.
+    pub banned_before_decay_secs: u64,
+    /// Threshold to prevent libp2p gossipsub from disconnecting peers.
+    pub gossipsub_greylist_threshold: f64,
+    /// Minimum score before a peer is disconnected.
+    pub min_score_before_disconnect: f64,
+    /// Minimum score before a peer is banned.
+    pub min_score_before_ban: f64,
+}
+
+impl Default for ScoreConfig {
+    fn default() -> Self {
+        ScoreConfig {
+            default_score: 0.0,
+            min_application_score_before_ban: -60.0,
+            max_score: 100.0,
+            min_score: -100.0,
+            score_halflife: 600.0,
+            banned_before_decay_secs: 12 * 3600, // 12 hours
+            gossipsub_greylist_threshold: -16000.0,
+            min_score_before_disconnect: -20.0,
+            min_score_before_ban: -50.0,
+        }
+    }
+}
+
+impl ScoreConfig {
+    /// Returns the banned before decay duration
+    pub fn banned_before_decay(&self) -> Duration {
+        Duration::from_secs(self.banned_before_decay_secs)
+    }
+
+    /// Calculate the gossipsub score weight based on configuration values
+    pub fn gossipsub_score_weight(&self) -> f64 {
+        (self.min_score_before_disconnect + 1.0) / self.gossipsub_greylist_threshold
+    }
+
+    /// Calculate the halflife decay constant
+    pub fn halflife_decay(&self) -> f64 {
+        -(2.0f64.ln()) / self.score_halflife
     }
 }
