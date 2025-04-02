@@ -95,7 +95,7 @@ impl MissingCertificatesRequest {
                     .into_iter()
                     .map(|r| self.exclusive_lower_bound + r as Round)
                     .collect::<BTreeSet<Round>>();
-                Ok((*k, rounds))
+                Ok((k.clone(), rounds))
             })
             .collect::<PrimaryNetworkResult<BTreeMap<_, _>>>()?;
         Ok((self.exclusive_lower_bound, skip_rounds))

@@ -68,7 +68,7 @@ impl<DB: Database> ConsensusStore for DB {
         for (id, round, certs) in
             self.reverse_iter::<ConsensusBlocks>().take(50).map(|(_, block)| {
                 (
-                    block.sub_dag.leader.origin(),
+                    block.sub_dag.leader.origin().clone(),
                     block.sub_dag.leader_round(),
                     block.sub_dag.certificates,
                 )
@@ -76,7 +76,7 @@ impl<DB: Database> ConsensusStore for DB {
         {
             res.entry(id).and_modify(|r| *r = max(*r, round)).or_insert_with(|| round);
             for c in &certs {
-                res.entry(c.origin())
+                res.entry(c.origin().clone())
                     .and_modify(|r| *r = max(*r, c.round()))
                     .or_insert_with(|| c.round());
             }

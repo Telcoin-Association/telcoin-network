@@ -64,10 +64,10 @@ where
             }
 
             if let Some(next_round) =
-                Self::find_next_round(config.node_storage(), *origin, lower_bound, rounds)?
+                Self::find_next_round(config.node_storage(), origin, lower_bound, rounds)?
             {
                 debug!(target: "cert-collector", ?next_round, ?origin, "found next round!");
-                fetch_queue.push(Reverse((next_round, *origin)));
+                fetch_queue.push(Reverse((next_round, origin.clone())));
             }
         }
 
@@ -88,7 +88,7 @@ where
     /// Find the next available round for an authority that shouldn't be skipped
     fn find_next_round(
         store: &DB,
-        origin: AuthorityIdentifier,
+        origin: &AuthorityIdentifier,
         current_round: Round,
         skip_rounds: &BTreeSet<Round>,
     ) -> PrimaryNetworkResult<Option<Round>> {
@@ -107,12 +107,12 @@ where
     /// Try to fetch the next available certificate
     pub(crate) fn next_certificate(&mut self) -> PrimaryNetworkResult<Option<Certificate>> {
         while let Some(Reverse((round, origin))) = self.fetch_queue.pop() {
-            match self.config.node_storage().read_by_index(origin, round)? {
+            match self.config.node_storage().read_by_index(&origin, round)? {
                 Some(cert) => {
                     // Queue up the next round for this authority if available
                     if let Some(next_round) = Self::find_next_round(
                         self.config.node_storage(),
-                        origin,
+                        &origin,
                         round,
                         self.skip_rounds.get(&origin).ok_or(PrimaryNetworkError::Internal(
                             "failed to retrieve authority from skipped rounds".to_string(),

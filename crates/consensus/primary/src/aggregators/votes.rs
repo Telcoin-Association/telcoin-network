@@ -44,10 +44,13 @@ impl VotesAggregator {
     ) -> DagResult<Option<Certificate>> {
         // ensure authority hasn't voted already
         let author = vote.author();
-        ensure!(self.authorities_seen.insert(author), DagError::AuthorityReuse(author.to_string()));
+        ensure!(
+            self.authorities_seen.insert(author.clone()),
+            DagError::AuthorityReuse(author.to_string())
+        );
 
         // accumulate vote and voting power
-        self.votes.push((author, *vote.signature()));
+        self.votes.push((author.clone(), *vote.signature()));
         self.weight += committee.voting_power_by_id(author);
 
         // update metrics

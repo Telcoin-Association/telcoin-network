@@ -156,7 +156,7 @@ impl ConsensusState {
         if let Some((_, existing_certificate)) = dag
             .entry(certificate.round())
             .or_default()
-            .insert(certificate.origin(), (certificate.digest(), certificate.clone()))
+            .insert(certificate.origin().clone(), (certificate.digest(), certificate.clone()))
         {
             // we want to error only if we try to insert a different certificate in the dag
             if existing_certificate.digest() != certificate.digest() {
@@ -168,13 +168,13 @@ impl ConsensusState {
         }
 
         Ok(certificate.round()
-            > last_committed.get(&certificate.origin()).cloned().unwrap_or_default())
+            > last_committed.get(certificate.origin()).cloned().unwrap_or_default())
     }
 
     /// Update and clean up internal state after committing a certificate.
     pub fn update(&mut self, certificate: &Certificate) {
         self.last_committed
-            .entry(certificate.origin())
+            .entry(certificate.origin().clone())
             .and_modify(|r| *r = max(*r, certificate.round()))
             .or_insert_with(|| certificate.round());
         self.last_round = self.last_round.update(certificate.round(), self.gc_depth);

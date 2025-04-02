@@ -55,7 +55,7 @@ pub trait CertificateStore {
     /// If not found, None is returned as result.
     fn read_by_index(
         &self,
-        origin: AuthorityIdentifier,
+        origin: &AuthorityIdentifier,
         round: Round,
     ) -> StoreResult<Option<Certificate>>;
 
@@ -98,7 +98,7 @@ pub trait CertificateStore {
 
     /// Retrieves the last certificate of the given origin.
     /// Returns None if there is no certificate for the origin.
-    fn last_round(&self, origin: AuthorityIdentifier) -> StoreResult<Option<Certificate>>;
+    fn last_round(&self, origin: &AuthorityIdentifier) -> StoreResult<Option<Certificate>>;
 
     /// Retrieves the highest round number in the store.
     /// Returns 0 if there is no certificate in the store.
@@ -106,13 +106,13 @@ pub trait CertificateStore {
 
     /// Retrieves the last round number of the given origin.
     /// Returns None if there is no certificate for the origin.
-    fn last_round_number(&self, origin: AuthorityIdentifier) -> StoreResult<Option<Round>>;
+    fn last_round_number(&self, origin: &AuthorityIdentifier) -> StoreResult<Option<Round>>;
 
     /// Retrieves the next round number bigger than the given round for the origin.
     /// Returns None if there is no more local certificate from the origin with bigger round.
     fn next_round_number(
         &self,
-        origin: AuthorityIdentifier,
+        origin: &AuthorityIdentifier,
         round: Round,
     ) -> StoreResult<Option<Round>>;
 
@@ -133,11 +133,11 @@ fn save_cert<TX: DbTxMut>(
     txn.insert::<Certificates>(&digest, &certificate)?;
 
     // write the certificates id by their rounds
-    let key = (certificate.round(), certificate.origin());
+    let key = (certificate.round(), certificate.origin().clone());
     txn.insert::<CertificateDigestByRound>(&key, &digest)?;
 
     // write the certificates id by their origins
-    let key = (certificate.origin(), certificate.round());
+    let key = (certificate.origin().clone(), certificate.round());
     txn.insert::<CertificateDigestByOrigin>(&key, &digest)?;
 
     NOTIFY_SUBSCRIBERS.notify(&digest, &certificate);
@@ -163,7 +163,7 @@ fn gc_rounds<DB: Database>(db: &DB, target_round: Round) -> StoreResult<()> {
     let mut txn = db.write_txn()?;
     for (round, origin, digest) in certs {
         txn.remove::<Certificates>(&digest)?;
-        txn.remove::<CertificateDigestByRound>(&(round, origin))?;
+        txn.remove::<CertificateDigestByRound>(&(round, origin.clone()))?;
         txn.remove::<CertificateDigestByOrigin>(&(origin, round))?;
     }
     txn.commit()?;
@@ -219,10 +219,10 @@ impl<DB: Database> CertificateStore for DB {
     /// If not found, None is returned as result.
     fn read_by_index(
         &self,
-        origin: AuthorityIdentifier,
+        origin: &AuthorityIdentifier,
         round: Round,
     ) -> StoreResult<Option<Certificate>> {
-        match self.get::<CertificateDigestByOrigin>(&(origin, round))? {
+        match self.get::<CertificateDigestByOrigin>(&(origin.clone(), round))? {
             Some(d) => self.read(d),
             None => Ok(None),
         }
@@ -284,7 +284,7 @@ impl<DB: Database> CertificateStore for DB {
         txn.remove::<Certificates>(&id)?;
 
         // delete the certificate index by its round
-        let key = (cert.round(), cert.origin());
+        let key = (cert.round(), cert.origin().clone());
 
         txn.remove::<CertificateDigestByRound>(&key)?;
 
@@ -303,7 +303,7 @@ impl<DB: Database> CertificateStore for DB {
             // delete the certificates from the secondary index
             if let Some(cert) = self.read(id)? {
                 del_certs = true;
-                txn.remove::<CertificateDigestByRound>(&(cert.round(), cert.origin()))?;
+                txn.remove::<CertificateDigestByRound>(&(cert.round(), cert.origin().clone()))?;
             }
             if !del_certs {
                 return Ok(());
@@ -412,12 +412,12 @@ impl<DB: Database> CertificateStore for DB {
 
     /// Retrieves the last certificate of the given origin.
     /// Returns None if there is no certificate for the origin.
-    fn last_round(&self, origin: AuthorityIdentifier) -> StoreResult<Option<Certificate>> {
-        let key = (origin, Round::MAX);
+    fn last_round(&self, origin: &AuthorityIdentifier) -> StoreResult<Option<Certificate>> {
+        let key = (origin.clone(), Round::MAX);
         if let Some(((name, _round), digest)) =
             self.record_prior_to::<CertificateDigestByOrigin>(&key)
         {
-            if name == origin {
+            if &name == origin {
                 return self.read(digest);
             }
         }
@@ -434,10 +434,10 @@ impl<DB: Database> CertificateStore for DB {
 
     /// Retrieves the last round number of the given origin.
     /// Returns None if there is no certificate for the origin.
-    fn last_round_number(&self, origin: AuthorityIdentifier) -> StoreResult<Option<Round>> {
-        let key = (origin, Round::MAX);
+    fn last_round_number(&self, origin: &AuthorityIdentifier) -> StoreResult<Option<Round>> {
+        let key = (origin.clone(), Round::MAX);
         if let Some(((name, round), _)) = self.record_prior_to::<CertificateDigestByOrigin>(&key) {
-            if name == origin {
+            if &name == origin {
                 return Ok(Some(round));
             }
         }
@@ -448,12 +448,12 @@ impl<DB: Database> CertificateStore for DB {
     /// Returns None if there is no more local certificate from the origin with bigger round.
     fn next_round_number(
         &self,
-        origin: AuthorityIdentifier,
+        origin: &AuthorityIdentifier,
         round: Round,
     ) -> StoreResult<Option<Round>> {
-        let key = (origin, round + 1);
+        let key = (origin.clone(), round + 1);
         if let Some(((name, round), _)) = self.skip_to::<CertificateDigestByOrigin>(&key)?.next() {
-            if name == origin {
+            if &name == origin {
                 return Ok(Some(round));
             }
         }

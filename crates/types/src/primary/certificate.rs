@@ -18,7 +18,7 @@ use crate::{
 use base64::{engine::general_purpose, Engine};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
-use std::{collections::VecDeque, fmt};
+use std::{collections::BTreeMap, fmt};
 
 /// Certificates are the output of consensus.
 /// The certificate issued after a successful round of consensus.
@@ -61,7 +61,7 @@ impl Certificate {
         header: Header,
         votes: Vec<(AuthorityIdentifier, BlsSignature)>,
     ) -> DagResult<Certificate> {
-        Self::new_unsafe(committee, header, votes, true)
+        Self::new_unsafe(committee, header, votes.into_iter().collect(), true)
     }
 
     /// Create a new, unsafe certificate that does not check stake.
@@ -70,19 +70,17 @@ impl Certificate {
         header: Header,
         votes: Vec<(AuthorityIdentifier, BlsSignature)>,
     ) -> DagResult<Certificate> {
-        Self::new_unsafe(committee, header, votes, false)
+        Self::new_unsafe(committee, header, votes.into_iter().collect(), false)
     }
 
     /// Create a new certificate without verifying authority signatures.
     fn new_unsafe(
         committee: &Committee,
         header: Header,
-        mut votes: Vec<(AuthorityIdentifier, BlsSignature)>,
+        // We need votes to be a BTreeMap to force authorities to be in the expected order.
+        mut votes: BTreeMap<AuthorityIdentifier, BlsSignature>,
         check_stake: bool,
     ) -> DagResult<Certificate> {
-        votes.sort_by_key(|(pk, _)| *pk);
-        let mut votes: VecDeque<_> = votes.into_iter().collect();
-
         let mut weight = 0;
         let mut sigs = Vec::new();
 
@@ -91,16 +89,18 @@ impl Certificate {
             .iter()
             .enumerate()
             .filter(|(_, authority)| {
-                if !votes.is_empty() && authority.id() == votes.front().expect("votes not empty").0
+                if !votes.is_empty()
+                    && &authority.id() == votes.first_key_value().expect("votes not empty").0
                 {
-                    sigs.push(votes.pop_front().expect("votes not empty"));
+                    sigs.push(votes.pop_first().expect("votes not empty"));
                     weight += authority.voting_power();
+                    let sig_last = sigs.last().expect("sigs not empty");
                     // If there are repeats, also remove them
                     while !votes.is_empty()
-                        && votes.front().expect("votes not empty")
-                            == sigs.last().expect("votes not empty")
+                        && votes.first_key_value().expect("votes not empty")
+                            == (&sig_last.0, &sig_last.1)
                     {
-                        votes.pop_front().expect("votes not empty");
+                        votes.pop_first().expect("votes not empty");
                     }
                     return true;
                 }
@@ -114,7 +114,9 @@ impl Certificate {
         // Ensure that all authorities in the set of votes are known
         ensure!(
             votes.is_empty(),
-            DagError::UnknownAuthority(votes.front().expect("votes not empty").0.to_string())
+            DagError::UnknownAuthority(
+                votes.first_key_value().expect("votes not empty").0.to_string()
+            )
         );
 
         // Ensure that the authorities have enough weight
@@ -302,7 +304,7 @@ impl Certificate {
     }
 
     /// The author of the certificate.
-    pub fn origin(&self) -> AuthorityIdentifier {
+    pub fn origin(&self) -> &AuthorityIdentifier {
         self.header.author()
     }
 

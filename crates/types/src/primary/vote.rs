@@ -32,7 +32,7 @@ impl Vote {
     /// Create a new instance of [Vote]
     pub async fn new<BLS: BlsSigner>(
         header: &Header,
-        author: &AuthorityIdentifier,
+        author: AuthorityIdentifier,
         signature_service: &BLS,
     ) -> Self {
         Self::new_sync(header, author, signature_service)
@@ -41,7 +41,7 @@ impl Vote {
     /// Create a new instance of [Vote], sync version.
     pub fn new_sync<BLS: BlsSigner>(
         header: &Header,
-        author: &AuthorityIdentifier,
+        author: AuthorityIdentifier,
         signature_service: &BLS,
     ) -> Self {
         let header_digest = header.digest();
@@ -52,15 +52,15 @@ impl Vote {
             header_digest,
             round: header.round(),
             epoch: header.epoch(),
-            origin: header.author(),
-            author: *author,
+            origin: header.author().clone(),
+            author,
             signature,
         }
     }
 
     /// Create a vote directly with a suplied signer (private key).
     /// Used for testing, other wise use one BlsSigner versions.
-    pub fn new_with_signer<S>(header: &Header, author: &AuthorityIdentifier, signer: &S) -> Self
+    pub fn new_with_signer<S>(header: &Header, author: AuthorityIdentifier, signer: &S) -> Self
     where
         S: Signer,
     {
@@ -71,8 +71,8 @@ impl Vote {
             header_digest,
             round: header.round(),
             epoch: header.epoch(),
-            origin: header.author(),
-            author: *author,
+            origin: header.author().clone(),
+            author,
             signature,
         }
     }
@@ -86,11 +86,11 @@ impl Vote {
     pub fn epoch(&self) -> Epoch {
         self.epoch
     }
-    pub fn origin(&self) -> AuthorityIdentifier {
-        self.origin
+    pub fn origin(&self) -> &AuthorityIdentifier {
+        &self.origin
     }
-    pub fn author(&self) -> AuthorityIdentifier {
-        self.author
+    pub fn author(&self) -> &AuthorityIdentifier {
+        &self.author
     }
     pub fn signature(&self) -> &BlsSignature {
         &self.signature

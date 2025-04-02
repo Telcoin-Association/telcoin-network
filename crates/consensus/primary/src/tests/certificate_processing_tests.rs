@@ -186,7 +186,7 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
     let wrong_round = 2000;
     let (digest, cert) = signed_cert_for_test(
         keys.as_slice(),
-        all_certificates.iter().last().cloned().unwrap().origin(),
+        all_certificates.iter().last().cloned().unwrap().origin().clone(),
         wrong_round,
         next_parents,
         &committee,

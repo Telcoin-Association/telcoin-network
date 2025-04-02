@@ -82,16 +82,16 @@ impl CertificatesAggregator {
         certificate: Certificate,
         committee: &Committee,
     ) -> Option<Vec<Certificate>> {
-        let origin = certificate.origin();
+        let origin = certificate.origin().clone();
 
         // ensure authority hasn't issued certificate already
-        if !self.authorities_seen.insert(origin) {
+        if !self.authorities_seen.insert(origin.clone()) {
             return None;
         }
 
         // accumulate certificates and voting power
         self.certificates.push(certificate);
-        self.weight += committee.voting_power_by_id(origin);
+        self.weight += committee.voting_power_by_id(&origin);
 
         // check for quorum
         if self.weight >= committee.quorum_threshold() {

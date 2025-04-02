@@ -378,7 +378,7 @@ impl<DB: Database> Proposer<DB> {
     fn update_leader(&mut self) -> bool {
         let leader = self.leader_schedule.leader(self.round);
         self.last_leader =
-            self.last_parents.iter().find(|cert| cert.origin() == leader.id()).cloned();
+            self.last_parents.iter().find(|cert| cert.origin() == &leader.id()).cloned();
 
         debug!(target: "primary::proposer", leader=?self.last_leader, round=self.round, "Last leader for round?");
 
@@ -683,7 +683,7 @@ impl<DB: Database> Proposer<DB> {
                 let num_of_digests = self.digests.len().min(self.max_header_num_of_batches);
                 let digests: VecDeque<_> = self.digests.drain(..num_of_digests).collect();
                 let parents = std::mem::take(&mut self.last_parents);
-                let authority_id = self.authority_id;
+                let authority_id = self.authority_id.clone();
                 let min_delay = self.min_header_delay; // copy
                 let leader_and_support = if current_round % 2 == 0 {
                     let authority = self.leader_schedule.leader(current_round);
@@ -694,7 +694,7 @@ impl<DB: Database> Proposer<DB> {
                     }
                 } else {
                     let authority = self.leader_schedule.leader(current_round - 1);
-                    if parents.iter().any(|c| c.origin() == authority.id()) {
+                    if parents.iter().any(|c| c.origin() == &authority.id()) {
                         "odd_round_gives_support"
                     } else {
                         "odd_round_no_support"

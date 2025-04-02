@@ -14,7 +14,7 @@ fn test_zero_timestamp_in_sub_dag() {
 
     let header_builder = HeaderBuilder::default();
     let header = header_builder
-        .author(AuthorityIdentifier(1u16))
+        .author(AuthorityIdentifier::default())
         .round(2)
         .epoch(0)
         .created_at(50)
@@ -48,7 +48,7 @@ fn test_monotonically_incremented_commit_timestamps() {
 
     let header_builder = HeaderBuilder::default();
     let header = header_builder
-        .author(AuthorityIdentifier(1u16))
+        .author(AuthorityIdentifier::default())
         .round(2)
         .epoch(0)
         .created_at(newer_timestamp)
@@ -73,7 +73,7 @@ fn test_monotonically_incremented_commit_timestamps() {
     // Now create the leader of round 4 with the older timestamp
     let header_builder = HeaderBuilder::default();
     let header = header_builder
-        .author(AuthorityIdentifier(1u16))
+        .author(AuthorityIdentifier::default())
         .round(4)
         .epoch(0)
         .created_at(older_timestamp)
@@ -106,32 +106,32 @@ fn test_authority_sorting_in_reputation_scores() {
 
     let mut scores = ReputationScores::new(&committee);
 
-    let ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
+    let mut ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
 
     // adding some scores
-    scores.add_score(ids[0], 0);
-    scores.add_score(ids[1], 10);
-    scores.add_score(ids[2], 10);
-    scores.add_score(ids[3], 10);
-    scores.add_score(ids[4], 10);
-    scores.add_score(ids[5], 20);
-    scores.add_score(ids[6], 30);
-    scores.add_score(ids[7], 30);
-    scores.add_score(ids[8], 40);
-    scores.add_score(ids[9], 40);
+    scores.add_score(ids.get(0).unwrap(), 0);
+    scores.add_score(ids.get(1).unwrap(), 10);
+    scores.add_score(ids.get(2).unwrap(), 10);
+    scores.add_score(ids.get(3).unwrap(), 10);
+    scores.add_score(ids.get(4).unwrap(), 10);
+    scores.add_score(ids.get(5).unwrap(), 20);
+    scores.add_score(ids.get(6).unwrap(), 30);
+    scores.add_score(ids.get(7).unwrap(), 30);
+    scores.add_score(ids.get(8).unwrap(), 40);
+    scores.add_score(ids.get(9).unwrap(), 40);
 
     // the expected authorities
     let expected_authorities = vec![
-        (ids[9], 40),
-        (ids[8], 40),
-        (ids[7], 30),
-        (ids[6], 30),
-        (ids[5], 20),
-        (ids[4], 10),
-        (ids[3], 10),
-        (ids[2], 10),
-        (ids[1], 10),
-        (ids[0], 0),
+        (ids.pop().unwrap(), 40),
+        (ids.pop().unwrap(), 40),
+        (ids.pop().unwrap(), 30),
+        (ids.pop().unwrap(), 30),
+        (ids.pop().unwrap(), 20),
+        (ids.pop().unwrap(), 10),
+        (ids.pop().unwrap(), 10),
+        (ids.pop().unwrap(), 10),
+        (ids.pop().unwrap(), 10),
+        (ids.pop().unwrap(), 0),
     ];
 
     // sorting the authorities

@@ -49,10 +49,10 @@ fn test_certificate_iterator() {
     // already in store. But this does not matter for testing here.
     let mut authorities = Vec::<AuthorityIdentifier>::new();
     for i in 0..total_authorities {
-        authorities.push(certificates[i].header().author());
+        authorities.push(certificates[i].header().author().clone());
         for j in 0..=i {
             let mut cert = certificates[i + j * total_authorities].clone();
-            assert_eq!(&cert.header().author(), authorities.last().unwrap());
+            assert_eq!(&cert.header().author(), &authorities.last().unwrap());
             if i == 3 && j == 3 {
                 // Simulating only 1 directly verified certificate (Auth 3 Round 4) being stored.
                 cert.set_signature_verification_state(

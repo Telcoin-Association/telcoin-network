@@ -9,8 +9,8 @@ use std::{
 };
 use tn_network_types::local::LocalNetwork;
 use tn_types::{
-    network_public_key_to_libp2p, Authority, AuthorityIdentifier, Certificate, CertificateDigest,
-    Committee, Database, Hash as _, Multiaddr, Notifier, WorkerCache, WorkerId,
+    Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Database, Hash as _,
+    Multiaddr, Notifier, WorkerCache, WorkerId,
 };
 
 #[derive(Debug)]
@@ -22,7 +22,6 @@ struct ConsensusConfigInner<DB> {
     authority: Authority,
     local_network: LocalNetwork,
     network_config: NetworkConfig,
-    authority_map: AuthorityMapping,
     genesis: HashMap<CertificateDigest, Certificate>,
 }
 
@@ -108,7 +107,6 @@ where
 
         let shutdown = Notifier::new();
         let network_config = NetworkConfig::default();
-        let authority_map = AuthorityMapping::new(&committee);
         let genesis = Certificate::genesis(&committee)
             .into_iter()
             .map(|cert| (cert.digest(), cert))
@@ -123,7 +121,6 @@ where
                 authority,
                 local_network,
                 network_config,
-                authority_map,
                 genesis,
             }),
             worker_cache,
@@ -183,18 +180,11 @@ where
 
     /// Committee network peer ids.
     pub fn committee_peer_ids(&self) -> HashSet<PeerId> {
-        // XXXX- authority map should live on committee or better yet go away.
-        self.inner.authority_map.peer_id_to_authority.keys().copied().collect()
+        self.inner.committee.authorities().iter().map(|a| a.peer_id()).collect()
     }
 
-    /// Return the libp2p network [PeerId] for an authority.
-    pub fn peer_id_for_authority(&self, authority_id: &AuthorityIdentifier) -> Option<PeerId> {
-        self.inner.authority_map.authority_to_peer_id.get(authority_id).copied()
-    }
-
-    /// Return the [AuthorityIdentifier] for a libp2p network [PeerId].
-    pub fn authority_for_peer_id(&self, peer_id: &PeerId) -> Option<AuthorityIdentifier> {
-        self.inner.authority_map.peer_id_to_authority.get(peer_id).copied()
+    pub fn in_committee(&self, id: &AuthorityIdentifier) -> bool {
+        self.inner.committee.is_authority(id)
     }
 
     /// Retrieve the worker's network address by id.
@@ -204,34 +194,5 @@ where
             .worker(self.authority().protocol_key(), id)
             .expect("Our public key or worker id is not in the worker cache")
             .worker_address
-    }
-}
-
-/// Authority mappings between authority id (used by consensus) and peer id (used by network).
-#[derive(Debug)]
-pub struct AuthorityMapping {
-    /// Map the [AuthorityIdentifier] to the network [PeerId].
-    authority_to_peer_id: HashMap<AuthorityIdentifier, PeerId>,
-    /// Map the [PeerId] to the network [AuthorityIdentifier].
-    peer_id_to_authority: HashMap<PeerId, AuthorityIdentifier>,
-}
-
-impl AuthorityMapping {
-    /// Create a new instance of [Self].
-    pub fn new(committee: &Committee) -> Self {
-        let authority_to_peer_id: HashMap<AuthorityIdentifier, PeerId> = committee
-            .authorities()
-            .iter()
-            .map(|a| {
-                let fc = a.network_key();
-                let peer_id = network_public_key_to_libp2p(&fc);
-                (a.id(), peer_id)
-            })
-            .collect();
-
-        let peer_id_to_authority =
-            authority_to_peer_id.iter().map(|(a, p_id)| (*p_id, *a)).collect();
-
-        Self { authority_to_peer_id, peer_id_to_authority }
     }
 }

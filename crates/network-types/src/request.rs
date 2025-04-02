@@ -53,7 +53,7 @@ impl FetchCertificatesRequest {
                             .into_iter()
                             .map(|r| self.exclusive_lower_bound + r as Round)
                             .collect();
-                        Some((*k, rounds))
+                        Some((k.clone(), rounds))
                     }
                     Err(e) => {
                         warn!("Failed to deserialize RoaringBitmap {e}");

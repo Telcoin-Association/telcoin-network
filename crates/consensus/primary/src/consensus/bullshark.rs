@@ -340,7 +340,7 @@ impl<DB: ConsensusStore> Bullshark<DB> {
 
         to_commit.iter().for_each(|certificate| {
             let authority = committee
-                .authority(&certificate.origin())
+                .authority(certificate.origin())
                 .expect("verified certificate signed by authority in committee");
 
             metrics.leader_election.with_label_values(&["committed", authority.hostname()]).inc();

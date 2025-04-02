@@ -21,7 +21,7 @@ async fn test_leader_swap_table() {
     let mut scores = ReputationScores::new(&committee);
     scores.final_of_schedule = true;
     for (score, id) in authority_ids.iter().enumerate() {
-        scores.add_score(*id, score as u64);
+        scores.add_score(id, score as u64);
     }
 
     let table = LeaderSwapTable::new(
@@ -58,7 +58,7 @@ async fn test_leader_swap_table() {
     let mut scores = ReputationScores::new(&committee);
     scores.final_of_schedule = true;
     for (score, id) in authority_ids.iter().enumerate() {
-        scores.add_score(*id, score as u64);
+        scores.add_score(id, score as u64);
     }
 
     // We expect the first 3 authorities (f) to be amongst the bad nodes
@@ -99,7 +99,7 @@ async fn test_leader_schedule() {
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
 
     // Call the leader for round 2. It should give us the validator of position 0
-    let original_leader = authority_ids[0];
+    let original_leader = authority_ids.get(0).unwrap().clone();
     let leader_2 = schedule.leader(2);
 
     assert_eq!(leader_2.id(), original_leader);
@@ -108,7 +108,7 @@ async fn test_leader_schedule() {
     let mut scores = ReputationScores::new(&committee);
     scores.final_of_schedule = true;
     for (score, id) in authority_ids.iter().enumerate() {
-        scores.add_score(*id, score as u64);
+        scores.add_score(id, score as u64);
     }
 
     // Update the schedule
@@ -169,7 +169,7 @@ async fn test_leader_schedule_from_store() {
     let mut scores = ReputationScores::new(&committee);
     scores.final_of_schedule = true;
     for (score, id) in fixture.authorities().map(|a| a.id()).enumerate() {
-        scores.add_score(id, score as u64);
+        scores.add_score(&id, score as u64);
     }
 
     let sub_dag = CommittedSubDag::new(vec![], Certificate::default(), 0, scores, None);

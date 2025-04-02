@@ -157,7 +157,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                     // Unnecessary to validate the header and certificate further, since it has
                     // already been validated.
 
-                    if let Some(r) = self.targets.get(&header.author()) {
+                    if let Some(r) = self.targets.get(header.author()) {
                         if header.round() <= *r {
                             // Ignore fetch request when we already need to sync to a later
                             // certificate from the same authority. Although this certificate may
@@ -190,7 +190,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                     };
 
                     // Update the target rounds for the authority.
-                    self.targets.insert(header.author(), header.round());
+                    self.targets.insert(header.author().clone(), header.round());
 
                     // Kick start a fetch task if there is no other task running.
                     if self.fetch_certificates_task.is_empty() {
@@ -320,14 +320,9 @@ async fn run_fetch_task<DB: Database>(
     let request = FetchCertificatesRequest::default()
         .set_bounds(gc_round, written_rounds)
         .set_max_items(MAX_CERTIFICATES_TO_FETCH);
-    let Some(response) = fetch_certificates_helper(
-        state.authority_id,
-        state.network.clone(),
-        &committee,
-        request,
-        state.config.clone(),
-    )
-    .await
+    let Some(response) =
+        fetch_certificates_helper(&state.authority_id, state.network.clone(), &committee, request)
+            .await
     else {
         error!(target: "primary::cert_fetcher", "error awaiting fetch_certificates_helper");
         return Err(CertManagerError::NoCertificateFetched);
@@ -345,12 +340,11 @@ async fn run_fetch_task<DB: Database>(
 /// Fetches certificates from other primaries concurrently, with ~5 sec interval between each
 /// request. Terminates after the 1st successful response is received.
 #[instrument(level = "debug", skip_all)]
-async fn fetch_certificates_helper<DB: Database>(
-    name: AuthorityIdentifier,
+async fn fetch_certificates_helper(
+    name: &AuthorityIdentifier,
     network: PrimaryNetworkHandle,
     committee: &Committee,
     request: FetchCertificatesRequest,
-    config: ConsensusConfig<DB>,
 ) -> Option<FetchCertificatesResponse> {
     let _scope = monitored_scope("FetchingCertificatesFromPeers");
     trace!(target: "primary::cert_fetcher", "Start sending fetch certificates requests");
@@ -359,7 +353,7 @@ async fn fetch_certificates_helper<DB: Database>(
     let mut peers: Vec<PeerId> = committee
         .others_primaries_by_id(name)
         .into_iter()
-        .map(|(auth_id, _, _)| config.peer_id_for_authority(&auth_id).expect("missing peer id!"))
+        .map(|(auth_id, _, _)| auth_id.peer_id())
         .collect();
     peers.shuffle(&mut ThreadRng::default());
     let fetch_timeout = PARALLEL_FETCH_REQUEST_INTERVAL_SECS

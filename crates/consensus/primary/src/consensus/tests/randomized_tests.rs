@@ -367,7 +367,7 @@ pub fn make_certificates_with_parameters(
             // We want to ensure that we always refer to "our" certificate of the previous round -
             // assuming that exist, so we can re-add it later.
             let my_parent_digest = if let Some(my_previous_round) =
-                current_parents.iter().find(|c| c.origin() == authority.id())
+                current_parents.iter().find(|c| c.origin() == &authority.id())
             {
                 parent_digests.remove(&my_previous_round.digest());
                 Some(my_previous_round.digest())

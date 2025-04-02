@@ -110,11 +110,12 @@ where
             .certificates_in_votes
             .inc_by(num_parents as u64);
 
-        let committee_peer = self
-            .consensus_config
-            .authority_for_peer_id(&peer)
-            .ok_or(HeaderError::UnknownNetworkKey(peer))?;
-        ensure!(header.author() == committee_peer, HeaderError::PeerNotAuthor.into());
+        let committee_peer: AuthorityIdentifier = peer.into();
+        ensure!(
+            self.consensus_config.in_committee(&committee_peer),
+            HeaderError::UnknownNetworkKey(peer).into()
+        );
+        ensure!(header.author() == &committee_peer, HeaderError::PeerNotAuthor.into());
 
         // TODO: ensure peer's header isn't too far in the past
         //  - peer can't propose a block from round 1 when this node is on 100
@@ -277,7 +278,7 @@ where
         let previous_vote = self
             .consensus_config
             .node_storage()
-            .read_vote_info(&header.author())
+            .read_vote_info(header.author())
             .map_err(HeaderError::Storage)?;
         if let Some(vote_info) = previous_vote {
             ensure!(
@@ -297,7 +298,7 @@ where
                 // Make sure we don't vote twice for the same authority in the same epoch/round.
                 let vote = Vote::new(
                     &header,
-                    &self.consensus_config.authority().id(),
+                    self.consensus_config.authority().id(),
                     self.consensus_config.key_config(),
                 )
                 .await;
@@ -326,7 +327,7 @@ where
         // this node hasn't voted yet
         let vote = Vote::new(
             &header,
-            &self.consensus_config.authority().id(),
+            self.consensus_config.authority().id(),
             self.consensus_config.key_config(),
         )
         .await;
@@ -381,7 +382,7 @@ where
         unknown_certs.retain(|digest| {
             let key = (header.round() - 1, *digest);
             if let std::collections::btree_map::Entry::Vacant(e) = current_requests.entry(key) {
-                e.insert(header.author());
+                e.insert(header.author().clone());
                 true
             } else {
                 false
@@ -406,7 +407,7 @@ where
             parents.retain(|cert| {
                 let req = (cert.round(), cert.digest());
                 if let Some(authority) = requested_parents.get(&req) {
-                    *authority == header.author()
+                    authority == header.author()
                 } else {
                     false
                 }

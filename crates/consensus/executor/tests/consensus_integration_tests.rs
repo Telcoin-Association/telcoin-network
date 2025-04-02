@@ -30,10 +30,15 @@ async fn test_recovery() {
         tn_test_utils::make_optimal_certificates(&committee, 1..=4, &genesis, &ids);
 
     // Make two certificate (f+1) with round 5 to trigger the commits.
-    let (_, certificate) =
-        tn_test_utils::mock_certificate(&committee, ids[0], 5, next_parents.clone());
+    let (_, certificate) = tn_test_utils::mock_certificate(
+        &committee,
+        ids.get(0).unwrap().clone(),
+        5,
+        next_parents.clone(),
+    );
     certificates.push_back(certificate);
-    let (_, certificate) = tn_test_utils::mock_certificate(&committee, ids[1], 5, next_parents);
+    let (_, certificate) =
+        tn_test_utils::mock_certificate(&committee, ids.get(1).unwrap().clone(), 5, next_parents);
     certificates.push_back(certificate);
 
     const NUM_SUB_DAGS_PER_SCHEDULE: u32 = 100;

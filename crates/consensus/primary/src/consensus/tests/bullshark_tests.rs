@@ -76,22 +76,24 @@ async fn commit_one_with_leader_schedule_change() {
             description: "When schedule change is enabled, then authority 0 is bad node and swapped with authority 3".to_string(),
             rounds: 11,
             expected_leaders: VecDeque::from(vec![
-                AuthorityIdentifier(0),
-                AuthorityIdentifier(1),
-                AuthorityIdentifier(2),
-                AuthorityIdentifier(3),
-                AuthorityIdentifier(3),
+                AuthorityIdentifier::dummy_for_test(0),
+                AuthorityIdentifier::dummy_for_test(1),
+                AuthorityIdentifier::dummy_for_test(2),
+                AuthorityIdentifier::dummy_for_test(3),
+                AuthorityIdentifier::dummy_for_test(3),
             ]),
         },
     ];
 
-    for mut test_case in test_cases {
+    for test_case in test_cases {
         tracing::debug!("Running test case \"{}\"", test_case.description);
         // GIVEN
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let committee = fixture.committee();
         // Make certificates for rounds 1 to 9.
         let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+        let mut expected_leaders: VecDeque<AuthorityIdentifier> = ids.iter().cloned().collect();
+        expected_leaders.push_back(ids.last().unwrap().clone());
         let genesis =
             Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
         let (certificates, _next_parents) = tn_test_utils::make_optimal_certificates(
@@ -124,17 +126,14 @@ async fn commit_one_with_leader_schedule_change() {
 
             if outcome == Outcome::Commit {
                 for sub_dag in &committed {
-                    assert_eq!(
-                        sub_dag.leader.origin(),
-                        test_case.expected_leaders.pop_front().unwrap()
-                    )
+                    assert_eq!(sub_dag.leader.origin(), &expected_leaders.pop_front().unwrap())
                 }
             }
 
             committed_sub_dags.extend(committed);
         }
 
-        assert!(test_case.expected_leaders.is_empty());
+        assert!(expected_leaders.is_empty());
     }
 }
 
@@ -165,7 +164,7 @@ async fn not_enough_support_with_leader_schedule_change() {
         6,
         tn_test_utils::TestLeaderConfiguration {
             round: 6,
-            authority: AuthorityIdentifier(2),
+            authority: ids.get(2).unwrap().clone(),
             should_omit: false,
             support: Some(tn_test_utils::TestLeaderSupport::Weak),
         },
@@ -178,7 +177,7 @@ async fn not_enough_support_with_leader_schedule_change() {
         8,
         tn_test_utils::TestLeaderConfiguration {
             round: 8,
-            authority: AuthorityIdentifier(3),
+            authority: ids.get(3).unwrap().clone(),
             should_omit: false,
             support: Some(tn_test_utils::TestLeaderSupport::NoSupport),
         },
@@ -196,7 +195,7 @@ async fn not_enough_support_with_leader_schedule_change() {
         10,
         tn_test_utils::TestLeaderConfiguration {
             round: 10,
-            authority: AuthorityIdentifier(0),
+            authority: ids.get(0).unwrap().clone(),
             should_omit: false,
             support: Some(tn_test_utils::TestLeaderSupport::Weak),
         },
@@ -261,7 +260,7 @@ async fn not_enough_support_with_leader_schedule_change() {
                 // update happened the leader schedule changed and now the Authority
                 // 0 is flagged as low score and it will be swapped with Authority
                 // 3.
-                assert_eq!(committed_dag_10.leader.origin(), AuthorityIdentifier(3));
+                assert_eq!(committed_dag_10.leader.origin(), ids.get(3).unwrap());
 
                 assert_eq!(outcome, Outcome::Commit);
             }
@@ -278,7 +277,7 @@ async fn not_enough_support_with_leader_schedule_change() {
 
                 assert_eq!(committed_dag_14.leader_round(), 14);
 
-                assert_eq!(committed_dag_14.leader.origin(), AuthorityIdentifier(2));
+                assert_eq!(committed_dag_14.leader.origin(), ids.get(2).unwrap());
             }
         }
     }
@@ -314,7 +313,7 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
             round,
             tn_test_utils::TestLeaderConfiguration {
                 round,
-                authority: AuthorityIdentifier(authority_id),
+                authority: ids.get(authority_id).unwrap().clone(),
                 should_omit: false,
                 support: Some(tn_test_utils::TestLeaderSupport::Weak),
             },
@@ -387,13 +386,13 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
                 // update happened the leader schedule changed and now the Authority
                 // 0 is flagged as low score and it will be swapped with Authority
                 // 3.
-                assert_eq!(committed_dag_10.leader.origin(), AuthorityIdentifier(3));
+                assert_eq!(committed_dag_10.leader.origin(), ids.get(3).unwrap());
 
                 // The leaders of round 12 & 14 shouldn't change from the "original" schedule
                 let schedule = LeaderSchedule::new(committee, LeaderSwapTable::default());
 
-                assert_eq!(committed_dag_12.leader.origin(), schedule.leader(12).id());
-                assert_eq!(committed_dag_14.leader.origin(), schedule.leader(14).id());
+                assert_eq!(committed_dag_12.leader.origin(), &schedule.leader(12).id());
+                assert_eq!(committed_dag_14.leader.origin(), &schedule.leader(14).id());
 
                 assert_eq!(outcome, Outcome::Commit);
 
@@ -420,10 +419,15 @@ async fn commit_one() {
         tn_test_utils::make_optimal_certificates(&committee, 1..=2, &genesis, &ids);
 
     // Make two certificate (f+1) with round 3 to trigger the commits.
-    let (_, certificate) =
-        tn_test_utils::mock_certificate(&committee, ids[0], 3, next_parents.clone());
+    let (_, certificate) = tn_test_utils::mock_certificate(
+        &committee,
+        ids.get(0).unwrap().clone(),
+        3,
+        next_parents.clone(),
+    );
     certificates.push_back(certificate);
-    let (_, certificate) = tn_test_utils::mock_certificate(&committee, ids[1], 3, next_parents);
+    let (_, certificate) =
+        tn_test_utils::mock_certificate(&committee, ids.get(1).unwrap().clone(), 3, next_parents);
     certificates.push_back(certificate);
 
     let config = fixture.authorities().next().unwrap().consensus_config();
@@ -554,7 +558,7 @@ async fn dead_node() {
             // For any other commit we expect to always have a +1 score for each authority, as
             // everyone always votes for the leader
             for (key, score) in &sub_dag.reputation_score.scores_per_authority {
-                if *key == dead_node {
+                if key == &dead_node {
                     assert_eq!(*score as usize, 0);
                 } else {
                     assert_eq!(*score as usize, index);
@@ -586,8 +590,12 @@ async fn not_enough_support() {
 
     // Round 2: Fully connect graph. But remember the digest of the leader. Note that this
     // round is the only one with 4 certificates.
-    let (leader_2_digest, certificate) =
-        tn_test_utils::mock_certificate(&committee, ids[0], 2, parents.clone());
+    let (leader_2_digest, certificate) = tn_test_utils::mock_certificate(
+        &committee,
+        ids.get(0).unwrap().clone(),
+        2,
+        parents.clone(),
+    );
     certificates.push_back(certificate);
 
     let nodes: Vec<_> = ids.iter().skip(1).cloned().collect();
@@ -598,19 +606,19 @@ async fn not_enough_support() {
     // Round 3: Only node 0 links to the leader of round 2.
     let mut next_parents = BTreeSet::new();
 
-    let name = ids[1];
+    let name = ids.get(1).unwrap().clone();
     let (digest, certificate) =
         tn_test_utils::mock_certificate(&committee, name, 3, parents.clone());
     certificates.push_back(certificate);
     next_parents.insert(digest);
 
-    let name = ids[2];
+    let name = ids.get(2).unwrap().clone();
     let (digest, certificate) =
         tn_test_utils::mock_certificate(&committee, name, 3, parents.clone());
     certificates.push_back(certificate);
     next_parents.insert(digest);
 
-    let name = ids[0];
+    let name = ids.get(0).unwrap().clone();
     parents.insert(leader_2_digest);
     let (digest, certificate) =
         tn_test_utils::mock_certificate(&committee, name, 3, parents.clone());
@@ -626,9 +634,15 @@ async fn not_enough_support() {
     certificates.extend(out);
 
     // Round 5: Send f+1 certificates to trigger the commit of leader 4.
-    let (_, certificate) = tn_test_utils::mock_certificate(&committee, ids[0], 5, parents.clone());
+    let (_, certificate) = tn_test_utils::mock_certificate(
+        &committee,
+        ids.get(0).unwrap().clone(),
+        5,
+        parents.clone(),
+    );
     certificates.push_back(certificate);
-    let (_, certificate) = tn_test_utils::mock_certificate(&committee, ids[1], 5, parents);
+    let (_, certificate) =
+        tn_test_utils::mock_certificate(&committee, ids.get(1).unwrap().clone(), 5, parents);
     certificates.push_back(certificate);
 
     let config = fixture.authorities().next().unwrap().consensus_config();
@@ -693,7 +707,7 @@ async fn not_enough_support() {
     // with value 1, and everything else should be zero.
     assert_eq!(committed_sub_dag.reputation_score.total_authorities(), 4);
 
-    let node_0_name: AuthorityIdentifier = ids[0];
+    let node_0_name: AuthorityIdentifier = ids.get(0).unwrap().clone();
     committed_sub_dag.reputation_score.scores_per_authority.iter().for_each(|(key, score)| {
         if *key == node_0_name {
             assert_eq!(*score, 1_u64);
@@ -729,9 +743,15 @@ async fn missing_leader() {
     certificates.extend(out);
 
     // Add f+1 certificates of round 5 to commit the leader of round 4.
-    let (_, certificate) = tn_test_utils::mock_certificate(&committee, ids[0], 5, parents.clone());
+    let (_, certificate) = tn_test_utils::mock_certificate(
+        &committee,
+        ids.get(0).unwrap().clone(),
+        5,
+        parents.clone(),
+    );
     certificates.push_back(certificate);
-    let (_, certificate) = tn_test_utils::mock_certificate(&committee, ids[1], 5, parents);
+    let (_, certificate) =
+        tn_test_utils::mock_certificate(&committee, ids.get(1).unwrap().clone(), 5, parents);
     certificates.push_back(certificate);
 
     let config = fixture.authorities().next().unwrap().consensus_config();
@@ -1084,14 +1104,19 @@ async fn restart_with_new_committee() {
         // Make two certificate (f+1) with round 3 to trigger the commits.
         let (_, certificate) = tn_test_utils::mock_certificate_with_epoch(
             &committee,
-            ids[0],
+            ids.get(0).unwrap().clone(),
             3,
             epoch,
             next_parents.clone(),
         );
         certificates.push_back(certificate);
-        let (_, certificate) =
-            tn_test_utils::mock_certificate_with_epoch(&committee, ids[1], 3, epoch, next_parents);
+        let (_, certificate) = tn_test_utils::mock_certificate_with_epoch(
+            &committee,
+            ids.get(1).unwrap().clone(),
+            3,
+            epoch,
+            next_parents,
+        );
         certificates.push_back(certificate);
 
         // Feed all certificates to the consensus. Only the last certificate should trigger
@@ -1144,10 +1169,10 @@ async fn garbage_collection_basic() {
     // not see any certificate committed for authority 4.
     let ids: Vec<AuthorityIdentifier> =
         committee.authorities().iter().map(|authority| authority.id()).collect();
-    let slow_node = ids[3];
+    let slow_node = ids.get(3).unwrap().clone();
     let genesis = Certificate::genesis(&committee);
 
-    let slow_nodes = vec![(slow_node, 0.0_f64)];
+    let slow_nodes = vec![(slow_node.clone(), 0.0_f64)];
     let (certificates, _round_5_certificates) = tn_test_utils::make_certificates_with_slow_nodes(
         &committee,
         1..=7,
@@ -1177,7 +1202,7 @@ async fn garbage_collection_basic() {
         sub_dags.iter().for_each(|sub_dag| {
             // ensure nothing has been committed for authority 4
             assert!(
-                !sub_dag.certificates.iter().any(|c| c.header().author() == slow_node),
+                !sub_dag.certificates.iter().any(|c| c.header().author() == &slow_node),
                 "Slow authority shouldn't be amongst the committed ones"
             );
 
@@ -1225,10 +1250,10 @@ async fn slow_node() {
     // not see any certificate committed for authority 4.
     let ids: Vec<AuthorityIdentifier> =
         committee.authorities().iter().map(|authority| authority.id()).collect();
-    let slow_node = ids[3];
+    let slow_node = ids.get(3).unwrap().clone();
     let genesis = Certificate::genesis(&committee);
 
-    let slow_nodes = vec![(slow_node, 0.0_f64)];
+    let slow_nodes = vec![(slow_node.clone(), 0.0_f64)];
     let (certificates, round_8_certificates) = tn_test_utils::make_certificates_with_slow_nodes(
         &committee,
         1..=8,
@@ -1242,7 +1267,7 @@ async fn slow_node() {
 
     // Now we keep only the certificates from authorities 1-3
     certificates.retain(|c| {
-        if c.origin() == slow_node {
+        if c.origin() == &slow_node {
             // if it is slow node's add it to the dedicated vec
             slow_node_certificates.push_back(c.clone());
             return false;
@@ -1320,7 +1345,7 @@ async fn slow_node() {
                 }
 
                 let slow_node_total =
-                    sub_dag.certificates.iter().filter(|c| c.origin() == slow_node).count();
+                    sub_dag.certificates.iter().filter(|c| c.origin() == &slow_node).count();
 
                 assert_eq!(slow_node_total, 4);
 
@@ -1351,7 +1376,7 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
 
     // take the first 3 nodes only - 4th one won't propose anything
     let keys_with_dead_node = ids[0..=2].to_vec();
-    let slow_node = ids[3];
+    let slow_node = ids.get(3).unwrap().clone();
     let slow_nodes = vec![(slow_node, 0.0_f64)];
     let genesis = Certificate::genesis(&committee);
 
@@ -1371,16 +1396,18 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
         if id == first_node {
             let parents =
                 round_2_certificates.iter().map(|cert| cert.digest()).collect::<BTreeSet<_>>();
-            let (_, certificate) = tn_test_utils::mock_certificate(&committee, *id, 3, parents);
+            let (_, certificate) =
+                tn_test_utils::mock_certificate(&committee, id.clone(), 3, parents);
             round_3_certificates.push(certificate);
         } else {
             // we filter out the round 2 leader
             let parents = round_2_certificates
                 .iter()
-                .filter(|cert| cert.origin() != *first_node)
+                .filter(|cert| cert.origin() != first_node)
                 .map(|cert| cert.digest())
                 .collect::<BTreeSet<_>>();
-            let (_, certificate) = tn_test_utils::mock_certificate(&committee, *id, 3, parents);
+            let (_, certificate) =
+                tn_test_utils::mock_certificate(&committee, id.clone(), 3, parents);
             round_3_certificates.push(certificate);
         }
     }
@@ -1391,13 +1418,13 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
     for id in ids.iter().filter(|a| *a != missing_leader) {
         let parents =
             round_3_certificates.iter().map(|cert| cert.digest()).collect::<BTreeSet<_>>();
-        let (_, certificate) = tn_test_utils::mock_certificate(&committee, *id, 4, parents);
+        let (_, certificate) = tn_test_utils::mock_certificate(&committee, id.clone(), 4, parents);
         round_4_certificates.push(certificate);
     }
 
     // now from round 5 to 7 create all certificates. Node 1 is now a slow node and won't create
     // referrencies to the certificates of that one.
-    let slow_node = ids[0];
+    let slow_node = ids.get(0).unwrap().clone();
     let slow_nodes = vec![(slow_node, 0.0_f64)];
 
     let (certificates_5_to_7, _round_7_certificates) =

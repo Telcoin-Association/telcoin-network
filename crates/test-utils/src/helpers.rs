@@ -207,7 +207,7 @@ fn rounds_of_certificates(
         for id in ids {
             let this_cert_parents = this_cert_parents(&parents, failure_probability);
 
-            let (digest, certificate) = make_one_certificate(*id, round, this_cert_parents);
+            let (digest, certificate) = make_one_certificate(id.clone(), round, this_cert_parents);
             certificates.push_back(certificate);
             next_parents.insert(digest);
         }
@@ -268,7 +268,8 @@ pub fn make_certificates_with_slow_nodes(
                 committee,
             );
 
-            let (_, certificate) = mock_certificate(committee, *name, round, this_cert_parents);
+            let (_, certificate) =
+                mock_certificate(committee, name.clone(), round, this_cert_parents);
             certificates.push_back(certificate.clone());
             next_parents.push(certificate);
         }
@@ -342,7 +343,7 @@ pub fn make_certificates_with_leader_configuration(
                             let leader_certificate = certificates
                                 .iter()
                                 .find(|c| {
-                                    c.round() == round - 1 && c.origin() == leader_config.authority
+                                    c.round() == round - 1 && c.origin() == &leader_config.authority
                                 })
                                 .unwrap();
 
@@ -369,7 +370,7 @@ pub fn make_certificates_with_leader_configuration(
                             let c = certificates
                                 .iter()
                                 .find(|c| {
-                                    c.round() == round - 1 && c.origin() == leader_config.authority
+                                    c.round() == round - 1 && c.origin() == &leader_config.authority
                                 })
                                 .unwrap();
                             let mut p = parents.clone();
@@ -386,7 +387,7 @@ pub fn make_certificates_with_leader_configuration(
             };
 
             // Create the certificates
-            let (_, certificate) = mock_certificate(committee, *name, round, cert_parents);
+            let (_, certificate) = mock_certificate(committee, name.clone(), round, cert_parents);
             certificates.push_back(certificate.clone());
             next_parents.insert(certificate.digest());
         }
@@ -414,13 +415,12 @@ pub fn this_cert_parents_with_slow_nodes(
     let mut total_stake = 0;
 
     for parent in ancestors {
-        let authority = committee.authority(&parent.origin()).unwrap();
+        let authority = committee.authority(parent.origin()).unwrap();
 
         // Identify if the parent is within the slow nodes - and is not the same author as the
         // one we want to create the certificate for.
-        if let Some((_, inclusion_probability)) = slow_nodes
-            .iter()
-            .find(|(id, _)| *id != *authority_id && *id == parent.header().author())
+        if let Some((_, inclusion_probability)) =
+            slow_nodes.iter().find(|(id, _)| id != authority_id && id == parent.header().author())
         {
             let b = Bernoulli::new(*inclusion_probability).unwrap();
             let should_include = b.sample(rand);
@@ -442,7 +442,7 @@ pub fn this_cert_parents_with_slow_nodes(
     // ensure we'll have enough parents (2f + 1)
     while total_stake < committee.quorum_threshold() {
         let parent = not_included.pop().unwrap();
-        let authority = committee.authority(&parent.origin()).unwrap();
+        let authority = committee.authority(parent.origin()).unwrap();
 
         total_stake += authority.voting_power();
 
@@ -475,7 +475,7 @@ pub fn make_certificates_with_epoch(
         next_parents.clear();
         for name in keys {
             let (digest, certificate) =
-                mock_certificate_with_epoch(committee, *name, round, epoch, parents.clone());
+                mock_certificate_with_epoch(committee, name.clone(), round, epoch, parents.clone());
             certificates.push_back(certificate);
             next_parents.insert(digest);
         }
@@ -492,7 +492,7 @@ pub fn make_signed_certificates(
     keys: &[(AuthorityIdentifier, BlsKeypair)],
     failure_probability: f64,
 ) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>) {
-    let ids = keys.iter().map(|(authority, _)| *authority).collect::<Vec<_>>();
+    let ids = keys.iter().map(|(authority, _)| authority.clone()).collect::<Vec<_>>();
     let generator = |pk, round, parents| signed_cert_for_test(keys, pk, round, parents, committee);
 
     rounds_of_certificates(range, initial_parents, &ids[..], failure_probability, generator)
@@ -571,7 +571,10 @@ pub fn signed_cert_for_test(
     let votes = signers
         .iter()
         .map(|(name, signer)| {
-            (*name, BlsSignature::new_secure(&to_intent_message(cert.header().digest()), signer))
+            (
+                name.clone(),
+                BlsSignature::new_secure(&to_intent_message(cert.header().digest()), signer),
+            )
         })
         .collect();
 

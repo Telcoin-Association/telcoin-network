@@ -20,7 +20,7 @@ impl<DB: Database> VoteDigestStore for DB {
     fn write_vote(&self, vote: &Vote) -> eyre::Result<()> {
         fail_point!("vote-digest-store-before-write");
 
-        let result = self.insert::<Votes>(&vote.origin(), &vote.into());
+        let result = self.insert::<Votes>(vote.origin(), &vote.into());
 
         fail_point!("vote-digest-store-after-write");
         result

@@ -2,10 +2,10 @@
 
 use super::{AuthorityFixture, Builder};
 use crate::fixture_batch_with_transactions;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use tn_types::{
-    Certificate, CertificateDigest, Committee, Database, Hash as _, Header, HeaderBuilder, Round,
-    Vote, WorkerCache,
+    AuthorityIdentifier, Certificate, CertificateDigest, Committee, Database, Hash as _, Header,
+    HeaderBuilder, Round, Vote, WorkerCache,
 };
 
 /// Fixture representing a committee to reach consensus.
@@ -14,7 +14,8 @@ use tn_types::{
 #[derive(Debug)]
 pub struct CommitteeFixture<DB> {
     /// The collection of [AuthorityFixture]s that comprise the committee.
-    pub(crate) authorities: Vec<AuthorityFixture<DB>>,
+    /// This is a BTreeMap sorted by AuthorityIdentifier to maintain sort order for tests.
+    pub(crate) authorities: BTreeMap<AuthorityIdentifier, AuthorityFixture<DB>>,
     /// The [Committee] used in production.
     pub(crate) committee: Committee,
 }
@@ -27,7 +28,7 @@ impl<DB: Database> CommitteeFixture<DB> {
 
     /// Return an Iterator for [AuthorityFixture] references.
     pub fn authorities(&self) -> impl Iterator<Item = &AuthorityFixture<DB>> {
-        self.authorities.iter()
+        self.authorities.values()
     }
 
     /// Return a builder for the [CommitteeFixture].
@@ -47,7 +48,8 @@ impl<DB: Database> CommitteeFixture<DB> {
     pub fn worker_cache(&self) -> WorkerCache {
         // All the authorities have the same work cache so just use the first one.
         self.authorities
-            .first()
+            .values()
+            .next()
             .expect("no authorities so no worker cache!")
             .consensus_config()
             .worker_cache()
@@ -63,12 +65,12 @@ impl<DB: Database> CommitteeFixture<DB> {
     ///
     /// NOTE: it is the caller's responsibility to handle errors.
     pub fn authority_fixture_by_idx(&self, idx: usize) -> Option<&AuthorityFixture<DB>> {
-        self.authorities.get(idx)
+        self.authorities.values().nth(idx)
     }
 
     /// Return a reference to the last authority in the committee.
     pub fn last_authority(&self) -> &AuthorityFixture<DB> {
-        self.authorities.last().expect("4 nodes in committee fixture")
+        self.authorities.values().last().expect("4 nodes in committee fixture")
     }
 
     /// Return a [HeaderBuilder] from the last authority in the committee.
@@ -83,6 +85,7 @@ impl<DB: Database> CommitteeFixture<DB> {
     /// See [AuthorityFixture::header()] for more information.
     pub fn header_from_last_authority(&self) -> Header {
         self.authorities
+            .values()
             .last()
             .expect("4 authorities in committee fixture")
             .header(&self.committee())
@@ -95,7 +98,7 @@ impl<DB: Database> CommitteeFixture<DB> {
     pub fn headers(&self) -> Vec<Header> {
         let committee = self.committee();
 
-        self.authorities.iter().map(|a| a.header_with_round(&committee, 1)).collect()
+        self.authorities.values().map(|a| a.header_with_round(&committee, 1)).collect()
     }
 
     /// Return a `Vec<Header>` - one [Header] per authority in the committee for round 2.
@@ -104,7 +107,7 @@ impl<DB: Database> CommitteeFixture<DB> {
     /// Currently only builds a header for hard-coded round `2`.
     pub fn headers_next_round(&self) -> Vec<Header> {
         let committee = self.committee();
-        self.authorities.iter().map(|a| a.header_with_round(&committee, 2)).collect()
+        self.authorities.values().map(|a| a.header_with_round(&committee, 2)).collect()
     }
 
     /// Return a `Vec<Header>` for the next round - one [Header] per authority in the committee.
@@ -118,7 +121,7 @@ impl<DB: Database> CommitteeFixture<DB> {
         let round = prior_round + 1;
         let next_headers = self
             .authorities
-            .iter()
+            .values()
             .map(|a| {
                 let builder = HeaderBuilder::default();
                 builder
@@ -142,7 +145,7 @@ impl<DB: Database> CommitteeFixture<DB> {
             .flat_map(|a| {
                 // we should not re-sign using the key of the authority
                 // that produced the header
-                if a.id() == header.author() {
+                if &a.id() == header.author() {
                     None
                 } else {
                     Some(a.vote(header))
@@ -157,7 +160,7 @@ impl<DB: Database> CommitteeFixture<DB> {
     pub fn certificate(&self, header: &Header) -> Certificate {
         let committee = self.committee();
         let votes: Vec<_> =
-            self.votes(header).into_iter().map(|x| (x.author(), *x.signature())).collect();
+            self.votes(header).into_iter().map(|x| (x.author().clone(), *x.signature())).collect();
         Certificate::new_unverified(&committee, header.clone(), votes).unwrap()
     }
 
@@ -174,7 +177,7 @@ impl<DB: Database> CommitteeFixture<DB> {
 
     /// Send a shutdown notfication to all authorities.
     pub fn notify_shutdown(&self) {
-        for a in &self.authorities {
+        for a in self.authorities.values() {
             a.consensus_config().shutdown().notify();
         }
     }

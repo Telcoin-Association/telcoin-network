@@ -235,7 +235,7 @@ where
             let highest_processed_round =
                 self.highest_processed_round.fetch_max(cert.round()).max(cert.round());
             let certificate_source =
-                if self.config.authority().id().eq(&cert.origin()) { "own" } else { "other" };
+                if self.config.authority().id().eq(cert.origin()) { "own" } else { "other" };
             self.consensus_bus
                 .primary_metrics()
                 .node_metrics

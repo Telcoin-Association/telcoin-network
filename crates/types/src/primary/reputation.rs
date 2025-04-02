@@ -27,11 +27,12 @@ impl ReputationScores {
         Self { scores_per_authority, ..Default::default() }
     }
     /// Adds the provided `score` to the existing score for the provided `authority`
-    pub fn add_score(&mut self, authority: AuthorityIdentifier, score: u64) {
-        self.scores_per_authority
-            .entry(authority)
-            .and_modify(|value| *value += score)
-            .or_insert(score);
+    pub fn add_score(&mut self, authority: &AuthorityIdentifier, score: u64) {
+        if let Some(val) = self.scores_per_authority.get_mut(authority) {
+            *val += score;
+        } else {
+            self.scores_per_authority.insert(authority.clone(), score);
+        }
     }
 
     /// The total number of authorities.
@@ -49,7 +50,7 @@ impl ReputationScores {
         let mut authorities: Vec<_> = self
             .scores_per_authority
             .iter()
-            .map(|(authority, score)| (*authority, *score))
+            .map(|(authority, score)| (authority.clone(), *score))
             .collect();
 
         authorities.sort_by(|a1, a2| {

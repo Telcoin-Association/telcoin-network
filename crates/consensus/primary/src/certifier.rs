@@ -79,14 +79,14 @@ impl<DB: Database> Certifier<DB> {
         // tx_own_certificate_broadcast.send()
         let broadcast_targets: Vec<(_, _)> = config
             .committee()
-            .others_primaries_by_id(config.authority().id())
+            .others_primaries_by_id(&config.authority().id())
             .into_iter()
             .map(|(name, _addr, _network_key)| (name, tx_own_certificate_broadcast.subscribe()))
             .collect();
 
         let highest_created_certificate = config
             .node_storage()
-            .last_round(config.authority().id())
+            .last_round(&config.authority().id())
             .expect("certificate store available");
 
         // TODO- these tasks to send to each peer should be replaced with a libp2p pub/sub topic.
@@ -141,7 +141,7 @@ impl<DB: Database> Certifier<DB> {
         header: Header,
     ) -> DagResult<Vote> {
         debug!(target: "primary::certifier", ?authority, ?header, "requesting vote for header...");
-        let peer_id = self.config.peer_id_for_authority(&authority).expect("missing peer id!");
+        let peer_id = authority.peer_id();
 
         let mut missing_parents: Vec<CertificateDigest> = Vec::new();
         let mut attempt: u32 = 0;
@@ -211,7 +211,7 @@ impl<DB: Database> Certifier<DB> {
         ensure!(
             vote.header_digest() == header.digest()
                 && vote.origin() == header.author()
-                && vote.author() == authority,
+                && vote.author() == &authority,
             DagError::UnexpectedVote(vote.header_digest())
         );
         // Possible equivocations.
@@ -245,7 +245,7 @@ impl<DB: Database> Certifier<DB> {
         header: Header,
         rx_headers: &mut RXH,
     ) -> DagResult<Certificate> {
-        let authority_id = self.authority_id;
+        let authority_id = &self.authority_id;
         debug!(target: "primary::certifier", ?authority_id, "proposing header");
         if header.epoch() != self.committee.epoch() {
             error!(
@@ -264,13 +264,13 @@ impl<DB: Database> Certifier<DB> {
 
         // Reset the votes aggregator and sign our own header.
         let mut votes_aggregator = VotesAggregator::new(self.metrics.clone());
-        let vote = Vote::new(&header, &self.authority_id, &self.signature_service).await;
+        let vote = Vote::new(&header, self.authority_id.clone(), &self.signature_service).await;
         let mut certificate = votes_aggregator.append(vote, &self.committee, &header)?;
 
         // Trigger vote requests.
         let peers = self
             .committee
-            .others_primaries_by_id(self.authority_id)
+            .others_primaries_by_id(&self.authority_id)
             .into_iter()
             .map(|(name, _, network_key)| (name, network_key));
         let mut requests: FuturesUnordered<_> = peers

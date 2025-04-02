@@ -24,8 +24,8 @@ fn test_missing_certs_request() {
     let max = 10;
     let expected_gc_round = 3;
     let expected_skip_rounds: BTreeMap<_, _> = [
-        (AuthorityIdentifier(0), BTreeSet::from([4, 5, 6, 7])),
-        (AuthorityIdentifier(2), BTreeSet::from([6, 7, 8])),
+        (AuthorityIdentifier::dummy_for_test(0), BTreeSet::from([4, 5, 6, 7])),
+        (AuthorityIdentifier::dummy_for_test(2), BTreeSet::from([6, 7, 8])),
     ]
     .into_iter()
     .collect();
@@ -280,10 +280,10 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
         network_public_key_to_libp2p(&committee.last_authority().primary_network_public_key());
 
     // create valid header proposed by last peer in the committee for round 1
-    let wrong_authority = AuthorityIdentifier(100);
+    let wrong_authority = AuthorityIdentifier::dummy_for_test(100);
     let header = committee
         .header_builder_last_authority()
-        .author(wrong_authority)
+        .author(wrong_authority.clone())
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(1) // parent is 0
         .build();

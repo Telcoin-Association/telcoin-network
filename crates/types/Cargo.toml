@@ -45,7 +45,7 @@ alloy-rlp = { workspace = true }
 parking_lot = { workspace = true }
 serde_yaml = { workspace = true }
 secp256k1 = { workspace = true }
-libp2p = { workspace = true }
+libp2p = { workspace = true, features = ["serde"] }
 bs58 = { workspace = true }
 blake2 = { workspace = true }
 blst = { workspace = true, features = ["serde"] }

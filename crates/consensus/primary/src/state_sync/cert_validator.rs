@@ -131,7 +131,7 @@ where
         debug!(target: "primary::cert_validator", round=certificate.round(), ?certificate, "processing certificate");
 
         let certificate_source =
-            if self.config.authority().id().eq(&certificate.origin()) { "own" } else { "other" };
+            if self.config.authority().id().eq(certificate.origin()) { "own" } else { "other" };
         self.forward_verified_certs(certificate_source, certificate.round(), vec![certificate])
             .await
     }

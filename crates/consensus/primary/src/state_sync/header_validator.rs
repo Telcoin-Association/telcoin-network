@@ -73,7 +73,7 @@ where
     ) -> HeaderResult<()> {
         // skip batch sync for own workers
         let authority_id = self.config.authority().id();
-        if header.author() == authority_id {
+        if header.author() == &authority_id {
             debug!(target: "primary::header_validator", "skipping sync_batches for header - no need to sync payload from own workers");
             return Ok(());
         }
@@ -128,7 +128,7 @@ where
                 let digests = digests.clone();
                 let message = WorkerSynchronizeMessage {
                     digests: digests.clone(),
-                    target: header.author(),
+                    target: header.author().clone(),
                     is_certified,
                 };
                 let client = client.clone();

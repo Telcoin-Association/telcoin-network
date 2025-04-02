@@ -297,12 +297,12 @@ impl<DB: Database> Subscriber<DB> {
         let num_certs = deliver.len();
 
         // get the execution address of the authority or use zero address
-        let leader = self.inner.committee.authority(&deliver.leader.origin());
+        let leader = self.inner.committee.authority(deliver.leader.origin());
         let address = if let Some(authority) = leader {
             authority.execution_address()
         } else {
             error!(target: "subscriber", "Execution address missing for {}", &deliver.leader.origin());
-            return Err(SubscriberError::UnexpectedAuthority(deliver.leader.origin()));
+            return Err(SubscriberError::UnexpectedAuthority(deliver.leader.origin().clone()));
         };
 
         let early_finalize = if self.consensus_bus.node_mode().borrow().is_active_cvv() {
@@ -524,7 +524,7 @@ mod tests {
             next_parents.clear();
             for id in &ids {
                 let (digest, certificate, payload) =
-                    signed_cert(*id, round, parents.clone(), fixture);
+                    signed_cert(id.clone(), round, parents.clone(), fixture);
                 certificates.push_back(certificate);
                 next_parents.insert(digest);
                 batches.extend(payload);

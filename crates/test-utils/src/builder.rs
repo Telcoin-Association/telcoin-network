@@ -15,8 +15,9 @@ use std::{
 };
 use tn_config::KeyConfig;
 use tn_types::{
-    get_available_udp_port, Address, Authority, BlsKeypair, Committee, Database, Epoch, Multiaddr,
-    VotingPower, WorkerCache, WorkerIndex, DEFAULT_PRIMARY_PORT, DEFAULT_WORKER_PORT,
+    get_available_udp_port, Address, Authority, AuthorityIdentifier, BlsKeypair, Committee,
+    Database, Epoch, Multiaddr, VotingPower, WorkerCache, WorkerIndex, DEFAULT_PRIMARY_PORT,
+    DEFAULT_WORKER_PORT,
 };
 
 pub struct Builder<DB, F, R = OsRng> {
@@ -117,7 +118,6 @@ where
             let primary_network_address: Multiaddr =
                 format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap();
             let authority = Authority::new_for_test(
-                (i as u16).into(),
                 key_config.primary_public_key(),
                 *self.voting_power.get(i).unwrap_or(&1),
                 primary_network_address,
@@ -133,8 +133,7 @@ where
         // Reset the authority ids so they are in sort order.  Some tests require this.
         for (i, (_, (primary_keypair, key_config, authority))) in authorities.iter_mut().enumerate()
         {
-            authority.initialise((i as u16).into());
-            let worker = WorkerFixture::generate(key_config.clone(), authority.id().0, |host| {
+            let worker = WorkerFixture::generate(key_config.clone(), i as u16, |host| {
                 if self.randomize_ports {
                     get_available_udp_port(host).unwrap_or(DEFAULT_PRIMARY_PORT)
                 } else {
@@ -168,26 +167,23 @@ where
             ),
         };
         // All the authorities use the same worker cache.
-        let mut authorities: Vec<AuthorityFixture<DB>> = committee_info
+        let authorities: BTreeMap<AuthorityIdentifier, AuthorityFixture<DB>> = committee_info
             .into_iter()
             .map(|(primary_keypair, key_config, authority, worker)| {
-                AuthorityFixture::generate(
-                    self.number_of_workers,
-                    authority,
-                    (primary_keypair, key_config),
-                    committee.clone(),
-                    (self.new_db)(),
-                    worker,
-                    worker_cache.clone(),
+                (
+                    authority.id(),
+                    AuthorityFixture::generate(
+                        self.number_of_workers,
+                        authority,
+                        (primary_keypair, key_config),
+                        committee.clone(),
+                        (self.new_db)(),
+                        worker,
+                        worker_cache.clone(),
+                    ),
                 )
             })
             .collect();
-
-        // now order the AuthorityFixtures by the authority BlsPublicKey so when we iterate either
-        // via the committee.authorities() or via the fixture.authorities() we'll get the
-        // same order.
-        // These are probably already sorted but this does not hurt and the comment is helpful.
-        authorities.sort_by_key(|a1| a1.primary_public_key());
 
         CommitteeFixture { authorities, committee }
     }
