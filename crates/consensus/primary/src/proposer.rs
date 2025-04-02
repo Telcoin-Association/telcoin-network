@@ -21,7 +21,6 @@ use crate::{
     ConsensusBus,
 };
 use consensus_metrics::monitored_future;
-use fastcrypto::hash::Hash as _;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
@@ -31,8 +30,8 @@ use tn_config::ConsensusConfig;
 use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::ProposerStore;
 use tn_types::{
-    now, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, Epoch, Header, Noticer,
-    Round, SystemMessage, TaskManager, TimestampSec, TnReceiver, TnSender, WorkerId,
+    now, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, Epoch, Hash as _,
+    Header, Noticer, Round, TaskManager, TimestampSec, TnReceiver, TnSender, WorkerId,
 };
 use tokio::{
     sync::oneshot,
@@ -127,8 +126,6 @@ pub struct Proposer<DB: ProposerStore> {
     /// Holds the batches' digests waiting to be included in the next header.
     /// Digests are roughly oldest to newest, and popped in FIFO order from the front.
     digests: VecDeque<ProposerDigest>,
-    /// Holds the system messages waiting to be included in the next header.
-    system_messages: Vec<SystemMessage>,
     /// Holds the map of proposed previous round headers and their digest messages, to ensure that
     /// all batches' digest included will eventually be re-sent.
     proposed_headers: BTreeMap<Round, Header>,
@@ -173,7 +170,6 @@ impl<DB: Database> Proposer<DB> {
             last_parents: genesis,
             last_leader: None,
             digests: VecDeque::with_capacity(2 * config.parameters().max_header_num_of_batches),
-            system_messages: Vec::new(),
             proposed_headers: BTreeMap::new(),
             leader_schedule,
             advance_round: true,
@@ -195,7 +191,6 @@ impl<DB: Database> Proposer<DB> {
         consensus_bus: &ConsensusBus,
         parents: Vec<Certificate>,
         digests: VecDeque<ProposerDigest>,
-        system_messages: Vec<SystemMessage>,
         reason: String,
         metrics: Arc<PrimaryMetrics>,
         leader_and_support: String,
@@ -225,7 +220,6 @@ impl<DB: Database> Proposer<DB> {
             current_round,
             current_epoch,
             digests.iter().map(|m| (m.digest, (m.worker_id, m.timestamp))).collect(),
-            system_messages.clone(),
             parents.iter().map(|x| x.digest()).collect(),
             consensus_bus.recent_blocks().borrow().latest_block_num_hash(),
         );
@@ -414,7 +408,7 @@ impl<DB: Database> Proposer<DB> {
         let mut votes_for_leader = 0;
         let mut no_votes = 0;
         for certificate in &self.last_parents {
-            let stake = self.committee.stake_by_id(certificate.origin());
+            let stake = self.committee.voting_power_by_id(certificate.origin());
             if certificate.header().parents().contains(&leader) {
                 votes_for_leader += stake;
             } else {
@@ -566,8 +560,6 @@ impl<DB: Database> Proposer<DB> {
         //
         // payloads: oldest -> newest
         let mut digests_to_resend = VecDeque::new();
-        // Oldest to newest system messages.
-        let mut system_messages_to_resend = Vec::new();
         // Oldest to newest rounds.
         let mut retransmit_rounds = Vec::new();
 
@@ -578,7 +570,6 @@ impl<DB: Database> Proposer<DB> {
                 break;
             }
 
-            let mut system_messages = header.system_messages().to_vec();
             let mut digests = header
                 .payload()
                 .into_iter()
@@ -587,20 +578,16 @@ impl<DB: Database> Proposer<DB> {
 
             // add payloads and system messages from oldest to newest
             digests_to_resend.append(&mut digests);
-            system_messages_to_resend.append(&mut system_messages);
             retransmit_rounds.push(*header_round);
         }
 
         // process rounds that need to be retransmitted
         if !retransmit_rounds.is_empty() {
             let num_digests_to_resend = digests_to_resend.len();
-            let num_system_messages_to_resend = system_messages_to_resend.len();
 
             // prepend missing batches from previous round and update `self`
             digests_to_resend.append(&mut self.digests);
             self.digests = digests_to_resend;
-            system_messages_to_resend.append(&mut self.system_messages);
-            self.system_messages = system_messages_to_resend;
 
             // remove the old headers that failed
             // the proposed blocks are included in the next header
@@ -611,7 +598,7 @@ impl<DB: Database> Proposer<DB> {
             // TODO: observe this warning and possibly reduce it to a debug
             warn!(
                 target: "primary::proposer",
-                "Repropose {num_digests_to_resend} batches and {num_system_messages_to_resend} system messages in undelivered headers {retransmit_rounds:?} at commit round {commit_round:?}, remaining headers {}",
+                "Repropose {num_digests_to_resend} batches in undelivered headers {retransmit_rounds:?} at commit round {commit_round:?}, remaining headers {}",
                 self.proposed_headers.len()
             );
 
@@ -695,7 +682,6 @@ impl<DB: Database> Proposer<DB> {
                 // collect values from &mut self for this header
                 let num_of_digests = self.digests.len().min(self.max_header_num_of_batches);
                 let digests: VecDeque<_> = self.digests.drain(..num_of_digests).collect();
-                let system_messages = std::mem::take(&mut self.system_messages);
                 let parents = std::mem::take(&mut self.last_parents);
                 let authority_id = self.authority_id;
                 let min_delay = self.min_header_delay; // copy
@@ -726,7 +712,6 @@ impl<DB: Database> Proposer<DB> {
                         &consensus_bus,
                         parents,
                         digests,
-                        system_messages,
                         reason,
                         metrics,
                         leader_and_support.to_string(),

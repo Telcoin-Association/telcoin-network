@@ -2,7 +2,6 @@
 
 use libp2p::{
     gossipsub::{ConfigBuilderError, PublishError, SubscriptionError},
-    identity::DecodingError,
     request_response::OutboundFailure,
     swarm::DialError,
     TransportError,
@@ -65,9 +64,6 @@ pub enum NetworkError {
     /// Failed to build swarm with behavior.
     #[error("SwarmBuilder::with_behaviour failed somehow.")]
     BuildSwarm,
-    /// Temporary error - used when converting fastcrypto -> libp2p key
-    #[error(transparent)]
-    Ed25519Decode(#[from] DecodingError),
     /// Request/response RPC Error
     #[error("{0}")]
     RPCError(String),

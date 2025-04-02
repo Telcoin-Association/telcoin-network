@@ -2,11 +2,10 @@
 
 use super::{AuthorityFixture, Builder};
 use crate::fixture_batch_with_transactions;
-use fastcrypto::hash::Hash as _;
 use std::collections::BTreeSet;
 use tn_types::{
-    Certificate, CertificateDigest, Committee, Database, Header, HeaderBuilder, Round, Vote,
-    WorkerCache,
+    Certificate, CertificateDigest, Committee, Database, Hash as _, Header, HeaderBuilder, Round,
+    Vote, WorkerCache,
 };
 
 /// Fixture representing a committee to reach consensus.
@@ -129,7 +128,6 @@ impl<DB: Database> CommitteeFixture<DB> {
                     .parents(parents.clone())
                     .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
                     .build()
-                    .unwrap()
             })
             .collect();
 
@@ -159,7 +157,7 @@ impl<DB: Database> CommitteeFixture<DB> {
     pub fn certificate(&self, header: &Header) -> Certificate {
         let committee = self.committee();
         let votes: Vec<_> =
-            self.votes(header).into_iter().map(|x| (x.author(), x.signature().clone())).collect();
+            self.votes(header).into_iter().map(|x| (x.author(), *x.signature())).collect();
         Certificate::new_unverified(&committee, header.clone(), votes).unwrap()
     }
 

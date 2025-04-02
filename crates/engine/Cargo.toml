@@ -12,7 +12,6 @@ authors = [
 ]
 
 [dependencies]
-fastcrypto = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 thiserror = { workspace = true }

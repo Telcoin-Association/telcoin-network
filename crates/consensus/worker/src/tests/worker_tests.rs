@@ -7,7 +7,6 @@
 
 use super::*;
 use async_trait::async_trait;
-use fastcrypto::encoding::{Encoding, Hex};
 use prometheus::Registry;
 use std::time::Duration;
 use tempfile::TempDir;

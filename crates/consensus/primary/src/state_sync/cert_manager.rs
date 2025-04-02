@@ -11,7 +11,6 @@ use crate::{
     ConsensusBus,
 };
 use consensus_metrics::monitored_scope;
-use fastcrypto::hash::Hash as _;
 use std::{
     collections::{HashSet, VecDeque},
     sync::Arc,
@@ -20,7 +19,7 @@ use tn_config::ConsensusConfig;
 use tn_storage::CertificateStore;
 use tn_types::{
     error::{CertificateError, HeaderError},
-    Certificate, CertificateDigest, Database, TnReceiver as _, TnSender as _,
+    Certificate, CertificateDigest, Database, Hash as _, TnReceiver as _, TnSender as _,
 };
 use tokio::sync::oneshot;
 use tracing::{debug, error};

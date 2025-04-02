@@ -12,7 +12,8 @@ use std::{
 use thiserror::Error;
 use tn_network_libp2p::error::NetworkError;
 use tn_types::{
-    network_public_key_to_libp2p, Authority, Committee, SealedBatch, Stake, WorkerCache, WorkerId,
+    network_public_key_to_libp2p, Authority, Committee, SealedBatch, VotingPower, WorkerCache,
+    WorkerId,
 };
 use tokio::task::JoinHandle;
 
@@ -90,8 +91,8 @@ impl QuorumWaiter {
     /// Helper function. It waits for a future to complete and then delivers a value.
     async fn waiter(
         wait_for: JoinHandle<Result<(), NetworkError>>,
-        deliver: Stake,
-    ) -> Result<Stake, WaiterError> {
+        deliver: VotingPower,
+    ) -> Result<VotingPower, WaiterError> {
         match wait_for.await {
             Ok(r) => {
                 match r {
@@ -138,8 +139,9 @@ impl QuorumWaiterTrait for QuorumWaiter {
                 let _timer = inner.metrics.batch_broadcast_quorum_latency.start_timer();
 
                 // Collect all the handlers to receive acknowledgements.
-                let mut wait_for_quorum: FuturesUnordered<QMBoxFuture<Result<Stake, WaiterError>>> =
-                    FuturesUnordered::new();
+                let mut wait_for_quorum: FuturesUnordered<
+                    QMBoxFuture<Result<VotingPower, WaiterError>>,
+                > = FuturesUnordered::new();
                 // Total stake available for the entire committee.
                 // Can use this to determine anti-quorum more quickly.
                 let mut available_stake = 0;
@@ -149,7 +151,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                     .into_iter()
                     .zip(handlers.into_iter())
                     .map(|(name, handler)| {
-                        let stake = inner.committee.stake(&name);
+                        let stake = inner.committee.voting_power(&name);
                         available_stake += stake;
                         Box::pin(monitored_future!(Self::waiter(handler, stake)))
                     })
@@ -159,7 +161,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                 // delivered and we send its digest to the primary (that will include it into
                 // the dag). This should reduce the amount of syncing.
                 let threshold = inner.committee.quorum_threshold();
-                let mut total_stake = inner.authority.stake();
+                let mut total_stake = inner.authority.voting_power();
                 // If more stake than this is rejected then the batch will never be accepted.
                 let max_rejected_stake = available_stake - threshold;
 
@@ -244,7 +246,7 @@ pub enum QuorumWaiterError {
 #[derive(Clone, Debug, Error)]
 enum WaiterError {
     #[error("Block was rejected by peer")]
-    Rejected(Stake),
+    Rejected(VotingPower),
     #[error("Network Error")]
-    Network(Stake),
+    Network(VotingPower),
 }

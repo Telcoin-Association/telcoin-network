@@ -7,7 +7,6 @@ use crate::{
     state_sync::{CertificateCollector, StateSynchronizer},
     ConsensusBus,
 };
-use fastcrypto::hash::Hash;
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -24,7 +23,7 @@ use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, try_decode, AuthorityIdentifier, BlockHash, Certificate, CertificateDigest,
-    ConsensusHeader, Database, Header, Round, SignatureVerificationState, Vote,
+    ConsensusHeader, Database, Hash as _, Header, Round, SignatureVerificationState, Vote,
 };
 use tracing::{debug, error, warn};
 
@@ -165,10 +164,8 @@ where
             let verified = parents
                 .into_iter()
                 .map(|mut cert| {
-                    let sig = cert
-                        .aggregated_signature()
-                        .cloned()
-                        .ok_or(HeaderError::ParentMissingSignature)?;
+                    let sig =
+                        cert.aggregated_signature().ok_or(HeaderError::ParentMissingSignature)?;
                     cert.set_signature_verification_state(SignatureVerificationState::Unverified(
                         sig,
                     ));
@@ -220,7 +217,7 @@ where
                 HeaderError::DuplicateParents.into()
             );
 
-            stake += committee.stake_by_id(parent.origin());
+            stake += committee.voting_power_by_id(parent.origin());
         }
 
         // verify aggregate signatures form quorum
@@ -478,7 +475,7 @@ where
 
     /// Retrieve the consensus header by number.
     fn get_header_by_number(&self, number: u64) -> PrimaryNetworkResult<ConsensusHeader> {
-        match self.consensus_config.database().get::<ConsensusBlocks>(&number)? {
+        match self.consensus_config.node_storage().get::<ConsensusBlocks>(&number)? {
             Some(header) => Ok(header),
             None => {
                 Err(PrimaryNetworkError::InvalidRequest("consensus header unknown".to_string()))
@@ -491,7 +488,7 @@ where
         // get the block number from the hash
         let number = self
             .consensus_config
-            .database()
+            .node_storage()
             .get::<ConsensusBlockNumbersByDigest>(&hash)?
             .ok_or(PrimaryNetworkError::UnknowConsensusHeaderDigest(hash))?;
 
@@ -502,7 +499,7 @@ where
     /// Retrieve the last record in consensus blocks table.
     fn get_latest_output(&self) -> PrimaryNetworkResult<ConsensusHeader> {
         self.consensus_config
-            .database()
+            .node_storage()
             .last_record::<ConsensusBlocks>()
             .map(|(_, header)| header)
             .ok_or(PrimaryNetworkError::InvalidRequest("Consensus headers unavailable".to_string()))

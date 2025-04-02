@@ -6,7 +6,6 @@ use crate::{
     synchronizer::Synchronizer,
     ConsensusBus,
 };
-use fastcrypto::{hash::Hash, traits::KeyPair};
 use itertools::Itertools;
 use std::{
     collections::{BTreeSet, HashMap},
@@ -21,8 +20,8 @@ use tn_test_utils::{
 };
 use tn_types::{
     error::{CertificateError, HeaderError},
-    BlsAggregateSignatureBytes, Certificate, Committee, Round, SignatureVerificationState,
-    TaskManager, TnReceiver, TnSender,
+    BlsAggregateSignatureBytes, Certificate, Committee, Hash as _, Round,
+    SignatureVerificationState, TaskManager, TnReceiver, TnSender,
 };
 
 /// Try to accept certificate. Sleep if error.

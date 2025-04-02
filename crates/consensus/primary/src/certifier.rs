@@ -232,7 +232,7 @@ impl<DB: Database> Certifier<DB> {
 
         // Ensure the authority has voting rights.
         ensure!(
-            self.committee.stake_by_id(vote.author()) > 0,
+            self.committee.voting_power_by_id(vote.author()) > 0,
             DagError::UnknownAuthority(vote.author().to_string())
         );
 

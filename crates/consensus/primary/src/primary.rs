@@ -11,7 +11,7 @@ use crate::{
 };
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
-use tn_types::{network_public_key_to_libp2p, traits::EncodeDecodeBase64, Database, TaskManager};
+use tn_types::{network_public_key_to_libp2p, Database, TaskManager};
 use tracing::info;
 
 #[cfg(test)]
@@ -41,7 +41,7 @@ impl<DB: Database> Primary<DB> {
         info!(
             "Boot primary node with peer id {} and public key {}",
             own_peer_id,
-            config.authority().protocol_key().encode_base64(),
+            config.authority().protocol_key().encode_base58(),
         );
 
         let worker_receiver_handler =

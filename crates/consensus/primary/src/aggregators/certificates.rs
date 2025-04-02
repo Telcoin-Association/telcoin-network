@@ -2,7 +2,7 @@
 
 use crate::{error::CertManagerResult, ConsensusBus};
 use std::collections::{BTreeMap, HashSet};
-use tn_types::{AuthorityIdentifier, Certificate, Committee, Round, Stake, TnSender as _};
+use tn_types::{AuthorityIdentifier, Certificate, Committee, Round, TnSender as _, VotingPower};
 use tracing::trace;
 
 /// Manage certificates as they aggregate through rounds.
@@ -55,7 +55,7 @@ struct CertificatesAggregator {
     /// The accumulated amount of voting power in favor of a proposed header.
     ///
     /// This amount is used to verify enough voting power to reach quorum within the committee.
-    weight: Stake,
+    weight: VotingPower,
     /// The certificates aggregated for this round.
     certificates: Vec<Certificate>,
     /// The collection of authority ids that have already voted.
@@ -86,7 +86,7 @@ impl CertificatesAggregator {
 
         // accumulate certificates and voting power
         self.certificates.push(certificate);
-        self.weight += committee.stake_by_id(origin);
+        self.weight += committee.voting_power_by_id(origin);
 
         // check for quorum
         if self.weight >= committee.quorum_threshold() {

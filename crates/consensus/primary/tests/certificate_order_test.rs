@@ -7,7 +7,7 @@ use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
     AuthorityIdentifier, BlockNumHash, BlsPublicKey, BlsSignature, Certificate, Committee, Header,
-    Stake, Vote,
+    Vote, VotingPower,
 };
 
 #[tokio::test]
@@ -15,15 +15,15 @@ async fn test_certificate_signers_are_ordered() {
     // GIVEN
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .committee_size(NonZeroUsize::new(4).unwrap())
-        .stake_distribution(vec![3, 3, 4, 4].into() /* (1..=4).collect() */) // provide some non-uniform stake
+        .voting_power_distribution(vec![3, 3, 4, 4].into() /* (1..=4).collect() */) // provide some non-uniform stake
         .build();
     let committee: Committee = fixture.committee();
 
     let authorities = fixture.authorities().collect::<Vec<&AuthorityFixture<MemDatabase>>>();
-    let total_stake: u64 = authorities.iter().map(|a| a.authority().stake()).sum();
+    let total_stake: u64 = authorities.iter().map(|a| a.authority().voting_power()).sum();
     assert_eq!(total_stake, 14);
     // authorities are ordered by keys so the stake may not be 1, 2, 3, 4...
-    let last_three_stake: u64 = authorities[1..].iter().map(|a| a.authority().stake()).sum();
+    let last_three_stake: u64 = authorities[1..].iter().map(|a| a.authority().voting_power()).sum();
 
     // The authority that creates the Header
     let authority = authorities[0];
@@ -33,7 +33,6 @@ async fn test_certificate_signers_are_ordered() {
         1,
         1,
         IndexMap::new(),
-        Vec::new(),
         BTreeSet::new(),
         BlockNumHash::default(),
     );
@@ -66,5 +65,5 @@ async fn test_certificate_signers_are_ordered() {
     // AND authorities public keys are returned in order
     assert_eq!(signers, sorted_signers);
 
-    assert_eq!(stake, last_three_stake as Stake);
+    assert_eq!(stake, last_three_stake as VotingPower);
 }

@@ -7,13 +7,12 @@ use std::{
 };
 
 use crate::{fixture_batch_with_transactions, temp_dir, CommitteeFixture};
-use fastcrypto::hash::Hash;
 use futures::future::join_all;
 use tempfile::TempDir;
 use tn_storage::{mem_db::MemDatabase, open_db, CertificateStore, ConsensusStore, ProposerStore};
 use tn_types::{
-    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Header, HeaderBuilder,
-    ReputationScores, Round,
+    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Hash as _, Header,
+    HeaderBuilder, ReputationScores, Round,
 };
 
 pub fn create_header_for_round(round: Round) -> Header {
@@ -28,7 +27,6 @@ pub fn create_header_for_round(round: Round) -> Header {
         .parents([CertificateDigest::default()].iter().cloned().collect())
         .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
         .build()
-        .unwrap()
 }
 
 // helper method that creates certificates for the provided

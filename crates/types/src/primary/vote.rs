@@ -1,16 +1,11 @@
 //! Vote implementation for consensus
 
 use crate::{
-    crypto::{
-        self, to_intent_message, BlsPublicKey, BlsSignature, IntentMessage, ProtocolSignature,
-    },
-    encode, AuthorityIdentifier, BlsSigner, Epoch, Header, HeaderDigest, Round,
+    crypto::{self, to_intent_message, BlsSignature, IntentMessage, ProtocolSignature},
+    encode, AuthorityIdentifier, BlsSigner, Digest, Epoch, Hash, Header, HeaderDigest, Round,
+    Signer,
 };
 use base64::{engine::general_purpose, Engine};
-use fastcrypto::{
-    hash::{Digest, Hash},
-    traits::{Signer, VerifyingKey},
-};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -29,7 +24,7 @@ pub struct Vote {
     /// Author of this vote.
     pub author: AuthorityIdentifier,
     /// Signature of the HeaderDigest.
-    pub signature: <BlsPublicKey as VerifyingKey>::Sig,
+    pub signature: BlsSignature,
 }
 
 impl Vote {
@@ -40,18 +35,7 @@ impl Vote {
         author: &AuthorityIdentifier,
         signature_service: &BLS,
     ) -> Self {
-        let vote = Self {
-            header_digest: header.digest(),
-            round: header.round(),
-            epoch: header.epoch(),
-            origin: header.author(),
-            author: *author,
-            signature: BlsSignature::default(),
-        };
-        let vote_digest: Digest<{ crypto::DIGEST_LENGTH }> = vote.digest().into();
-        let signature =
-            signature_service.request_signature(encode(&to_intent_message(vote_digest))).await;
-        Self { signature, ..vote }
+        Self::new_sync(header, author, signature_service)
     }
 
     /// Create a new instance of [Vote], sync version.
@@ -60,39 +44,37 @@ impl Vote {
         author: &AuthorityIdentifier,
         signature_service: &BLS,
     ) -> Self {
-        let vote = Self {
-            header_digest: header.digest(),
+        let header_digest = header.digest();
+        let vote_digest: Digest<{ crypto::DIGEST_LENGTH }> = header_digest.into();
+        let signature =
+            signature_service.request_signature_direct(&encode(&to_intent_message(vote_digest)));
+        Self {
+            header_digest,
             round: header.round(),
             epoch: header.epoch(),
             origin: header.author(),
             author: *author,
-            signature: BlsSignature::default(),
-        };
-        let vote_digest: Digest<{ crypto::DIGEST_LENGTH }> = vote.digest().into();
-        let signature =
-            signature_service.request_signature_direct(&encode(&to_intent_message(vote_digest)));
-        Self { signature, ..vote }
+            signature,
+        }
     }
 
     /// Create a vote directly with a suplied signer (private key).
     /// Used for testing, other wise use one BlsSigner versions.
     pub fn new_with_signer<S>(header: &Header, author: &AuthorityIdentifier, signer: &S) -> Self
     where
-        S: Signer<BlsSignature>,
+        S: Signer,
     {
-        let vote = Self {
-            header_digest: header.digest(),
+        let header_digest = header.digest();
+        let vote_digest: Digest<{ crypto::DIGEST_LENGTH }> = header_digest.into();
+        let signature = BlsSignature::new_secure(&to_intent_message(vote_digest), signer);
+        Self {
+            header_digest,
             round: header.round(),
             epoch: header.epoch(),
             origin: header.author(),
             author: *author,
-            signature: BlsSignature::default(),
-        };
-
-        let vote_digest: Digest<{ crypto::DIGEST_LENGTH }> = vote.digest().into();
-        let signature = BlsSignature::new_secure(&to_intent_message(vote_digest), signer);
-
-        Self { signature, ..vote }
+            signature,
+        }
     }
 
     pub fn header_digest(&self) -> HeaderDigest {
@@ -110,7 +92,7 @@ impl Vote {
     pub fn author(&self) -> AuthorityIdentifier {
         self.author
     }
-    pub fn signature(&self) -> &<BlsPublicKey as VerifyingKey>::Sig {
+    pub fn signature(&self) -> &BlsSignature {
         &self.signature
     }
 }
@@ -140,7 +122,6 @@ impl From<VoteDigest> for HeaderDigest {
 
 impl From<VoteDigest> for Digest<{ crypto::INTENT_MESSAGE_LENGTH }> {
     fn from(digest: VoteDigest) -> Self {
-        // let intent_message = to_intent_message(HeaderDigest(digest.0));
         let intent_message: IntentMessage<HeaderDigest> = to_intent_message(digest.into());
         Digest {
             digest: encode(&intent_message).try_into().expect("INTENT_MESSAGE_LENGTH is correct"),

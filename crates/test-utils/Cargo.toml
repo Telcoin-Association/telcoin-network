@@ -22,7 +22,6 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 once_cell = { workspace = true }
 
-fastcrypto = { workspace = true }
 tn-network-libp2p = { workspace = true }
 tn-network-types = { workspace = true }
 tn-node = { workspace = true }

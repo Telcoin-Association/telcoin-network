@@ -1,14 +1,13 @@
 //! Aggregate votes after proposing a header.
 
-use fastcrypto::hash::{Digest, Hash};
 use std::{collections::HashSet, sync::Arc};
 use tn_primary_metrics::PrimaryMetrics;
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
     to_intent_message, AuthorityIdentifier, BlsAggregateSignature, BlsSignature, Certificate,
-    Committee, Header, ProtocolSignature, SignatureVerificationState, Stake,
-    ValidatorAggregateSignature, Vote,
+    Committee, Digest, Hash as _, Header, ProtocolSignature, SignatureVerificationState,
+    ValidatorAggregateSignature, Vote, VotingPower,
 };
 use tracing::{trace, warn};
 
@@ -17,7 +16,7 @@ pub(crate) struct VotesAggregator {
     /// The accumulated amount of voting power in favor of a proposed header.
     ///
     /// This amount is used to verify enough voting power to reach quorum within the committee.
-    weight: Stake,
+    weight: VotingPower,
     /// The vote received from a peer.
     votes: Vec<(AuthorityIdentifier, BlsSignature)>,
     /// The collection of authority ids that have already voted.
@@ -48,8 +47,8 @@ impl VotesAggregator {
         ensure!(self.authorities_seen.insert(author), DagError::AuthorityReuse(author.to_string()));
 
         // accumulate vote and voting power
-        self.votes.push((author, vote.signature().clone()));
-        self.weight += committee.stake_by_id(author);
+        self.votes.push((author, *vote.signature()));
+        self.weight += committee.voting_power_by_id(author);
 
         // update metrics
         self.metrics.votes_received_last_round.set(self.votes.len() as i64);
@@ -64,26 +63,28 @@ impl VotesAggregator {
                 Digest::from(cert.digest());
 
             // check aggregate signature verification
-            if let Err(e) = BlsAggregateSignature::try_from(
-                cert.aggregated_signature().ok_or(DagError::InvalidSignature)?,
+            if !BlsAggregateSignature::from_signature(
+                &cert.aggregated_signature().ok_or(DagError::InvalidSignature)?,
             )
-            .map_err(|_| DagError::InvalidSignature)?
             .verify_secure(&to_intent_message(certificate_digest), &pks[..])
             {
                 warn!(
                     target: "primary::votes_aggregator",
-                    ?e,
                     ?certificate_digest,
                     "Failed to verify aggregated sig on certificate",
                 );
                 self.votes.retain(|(id, sig)| {
-                    let pk = committee.authority_safe(id).protocol_key();
-                    if sig.verify_secure(&to_intent_message(certificate_digest), pk).is_err() {
-                        warn!(target: "primary::votes_aggregator", "Invalid signature on header from authority: {}", id);
-                        self.weight -= committee.stake(pk);
-                        false
+                    if let Some(auth) = committee.authority(id) {
+                        let pk = auth.protocol_key();
+                        if !sig.verify_secure(&to_intent_message(certificate_digest), pk) {
+                            warn!(target: "primary::votes_aggregator", "Invalid signature on header from authority: {}", id);
+                            self.weight -= committee.voting_power(pk);
+                            false
+                        } else {
+                            true
+                        }
                     } else {
-                        true
+                        false
                     }
                 });
 
@@ -93,7 +94,7 @@ impl VotesAggregator {
                 // cert signature verified
                 cert.set_signature_verification_state(
                     SignatureVerificationState::VerifiedDirectly(
-                        cert.aggregated_signature().ok_or(DagError::InvalidSignature)?.clone(),
+                        cert.aggregated_signature().ok_or(DagError::InvalidSignature)?,
                     ),
                 );
 

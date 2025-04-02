@@ -7,10 +7,9 @@ use crate::{
     error::{CertManagerError, CertManagerResult},
     ConsensusBus,
 };
-use fastcrypto::hash::Hash as _;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use tn_config::ConsensusConfig;
-use tn_types::{Certificate, CertificateDigest, Database, Round};
+use tn_types::{Certificate, CertificateDigest, Database, Hash as _, Round};
 use tracing::debug;
 
 /// A certificate that is missing parents and pending approval.

@@ -1,37 +1,16 @@
 use crate::{
     crypto, encode,
     error::{HeaderError, HeaderResult},
-    now, AuthorityIdentifier, Batch, BlockHash, BlockNumHash, CertificateDigest, Committee, Epoch,
-    Round, TimestampSec, VoteDigest, WorkerCache, WorkerId,
+    now, AuthorityIdentifier, Batch, BlockHash, BlockNumHash, CertificateDigest, Committee, Digest,
+    Epoch, Hash, Round, TimestampSec, VoteDigest, WorkerCache, WorkerId,
 };
 use base64::{engine::general_purpose, Engine};
 use blake2::Digest as _;
 use derive_builder::Builder;
-use fastcrypto::hash::{Digest, Hash};
-use fastcrypto_tbls::{tbls::ThresholdBls, types::ThresholdBls12381MinSig};
 use indexmap::IndexMap;
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt};
-
-/// Messages generated internally by Narwhal that are included in headers for sequencing.
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone, Deserialize, Serialize)]
-pub enum SystemMessage {
-    // DKG is used to generate keys for use in the random beacon protocol.
-    // `DkgMessage` is sent out at start-of-epoch to initiate the process.
-    DkgMessage(
-        fastcrypto_tbls::dkg::Message<
-            <ThresholdBls12381MinSig as ThresholdBls>::Public,
-            <ThresholdBls12381MinSig as ThresholdBls>::Public,
-        >,
-    ),
-    // `DkgConfirmation` is the second DKG message, sent as soon as a threshold amount of
-    // `DkgMessages` have been received locally, to complete the key generation process.
-    DkgConfirmation(
-        fastcrypto_tbls::dkg::Confirmation<<ThresholdBls12381MinSig as ThresholdBls>::Public>,
-    ),
-}
 
 /// `Header` type for consensus layer.
 #[derive(Builder, Clone, Deserialize, Serialize, Default)]
@@ -48,8 +27,6 @@ pub struct Header {
     /// IndexMap of the [BatchDigest] to the [WorkerId] and [TimestampSec]
     #[serde(with = "indexmap::map::serde_seq")]
     pub payload: IndexMap<BlockHash, (WorkerId, TimestampSec)>,
-    /// Collection of [SystemMessage]s.
-    pub system_messages: Vec<SystemMessage>,
     /// Parent certificates for this Header.
     pub parents: BTreeSet<CertificateDigest>,
     /// Hash and number of the latest known execution block when this Header was build.
@@ -69,7 +46,6 @@ impl Header {
         round: Round,
         epoch: Epoch,
         payload: IndexMap<BlockHash, (WorkerId, TimestampSec)>,
-        system_messages: Vec<SystemMessage>,
         parents: BTreeSet<CertificateDigest>,
         latest_execution_block: BlockNumHash,
     ) -> Self {
@@ -79,7 +55,6 @@ impl Header {
             epoch,
             created_at: now(),
             payload,
-            system_messages,
             parents,
             digest: OnceCell::default(),
             latest_execution_block,
@@ -109,7 +84,7 @@ impl Header {
         }
 
         // Ensure the authority has voting rights.
-        let voting_rights = committee.stake_by_id(self.author);
+        let voting_rights = committee.voting_power_by_id(self.author);
         if voting_rights == 0 {
             return Err(HeaderError::UnknownAuthority(self.author.to_string()));
         }
@@ -149,10 +124,6 @@ impl Header {
     /// The payload for the header.
     pub fn payload(&self) -> &IndexMap<BlockHash, (WorkerId, TimestampSec)> {
         &self.payload
-    }
-    /// The [SystemMessage]s included with the header.
-    pub fn system_messages(&self) -> &[SystemMessage] {
-        &self.system_messages
     }
     /// The parents for the header.
     pub fn parents(&self) -> &BTreeSet<CertificateDigest> {
@@ -199,23 +170,21 @@ impl HeaderBuilder {
     /// "Build" the header by taking all fields and calculating the hash.
     /// This is used for tests, if used for "real" code then at least latest_execution_block will
     /// need to be visited.
-    pub fn build(self) -> Result<Header, fastcrypto::error::FastCryptoError> {
+    pub fn build(self) -> Header {
         let h = Header {
             author: self.author.expect("author set for header builder"),
             round: self.round.expect("round set for header builder"),
             epoch: self.epoch.expect("epoch set for header builder"),
             created_at: self.created_at.unwrap_or(0),
             payload: self.payload.unwrap_or_default(),
-            system_messages: self.system_messages.unwrap_or_default(),
             parents: self.parents.expect("parents set for header builder"),
             digest: OnceCell::default(),
             latest_execution_block: self.latest_execution_block.unwrap_or_default(),
         };
 
-        // TODO: return error here
         h.digest.set(Hash::digest(&h)).expect("digest oncecell empty for new header");
 
-        Ok(h)
+        h
     }
 
     /// Helper method to directly set values of the payload
@@ -237,7 +206,9 @@ impl HeaderBuilder {
 }
 
 /// The slice of bytes for the header's digest.
-#[derive(Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, std::hash::Hash, PartialOrd, Ord,
+)]
 pub struct HeaderDigest(pub [u8; crypto::DIGEST_LENGTH]);
 
 impl HeaderDigest {

@@ -5,21 +5,17 @@
 
 use crate::{
     crypto::{
-        self, to_intent_message, BlsAggregateSignature, BlsAggregateSignatureBytes, BlsPublicKey,
-        BlsSignature, ValidatorAggregateSignature,
+        self, to_intent_message, BlsAggregateSignature, BlsPublicKey, BlsSignature,
+        ValidatorAggregateSignature,
     },
     ensure,
     error::{CertificateError, CertificateResult, DagError, DagResult, HeaderError},
     now,
     serde::CertificateSignatures,
-    AuthorityIdentifier, BlockHash, Committee, Epoch, Header, Round, Stake, TimestampSec,
-    WorkerCache,
+    AuthorityIdentifier, BlockHash, Committee, Digest, Epoch, Hash, Header, Round, TimestampSec,
+    VotingPower, WorkerCache,
 };
 use base64::{engine::general_purpose, Engine};
-use fastcrypto::{
-    hash::{Digest, Hash},
-    traits::AggregateAuthenticator,
-};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::{collections::VecDeque, fmt};
@@ -27,7 +23,7 @@ use std::{collections::VecDeque, fmt};
 /// Certificates are the output of consensus.
 /// The certificate issued after a successful round of consensus.
 #[serde_as]
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Certificate {
     /// Certificate's header.
     pub header: Header,
@@ -47,6 +43,7 @@ impl Certificate {
     pub fn genesis(committee: &Committee) -> Vec<Self> {
         committee
             .authorities()
+            .iter()
             .map(|authority| Self {
                 header: Header {
                     author: authority.id(),
@@ -89,14 +86,15 @@ impl Certificate {
         let mut weight = 0;
         let mut sigs = Vec::new();
 
-        let filtered_votes = committee
-            .authorities()
+        let auths = committee.authorities();
+        let filtered_votes = auths
+            .iter()
             .enumerate()
             .filter(|(_, authority)| {
                 if !votes.is_empty() && authority.id() == votes.front().expect("votes not empty").0
                 {
                     sigs.push(votes.pop_front().expect("votes not empty"));
-                    weight += authority.stake();
+                    weight += authority.voting_power();
                     // If there are repeats, also remove them
                     while !votes.is_empty()
                         && votes.front().expect("votes not empty")
@@ -125,21 +123,20 @@ impl Certificate {
             DagError::CertificateRequiresQuorum
         );
 
-        let aggregated_signature = if sigs.is_empty() {
-            BlsAggregateSignature::default()
+        let sigs: Vec<&BlsSignature> = sigs.iter().map(|(_, sig)| sig).collect();
+        let bls_signature = if sigs.is_empty() {
+            BlsSignature::default()
         } else {
-            BlsAggregateSignature::aggregate::<BlsSignature, Vec<&BlsSignature>>(
-                sigs.iter().map(|(_, sig)| sig).collect(),
-            )
-            .map_err(|_| DagError::InvalidSignature)?
+            let aggregated_signature = BlsAggregateSignature::aggregate(&sigs[..], true)
+                .map_err(|_| DagError::InvalidSignature)?;
+
+            aggregated_signature.to_signature()
         };
 
-        let aggregate_signature_bytes = BlsAggregateSignatureBytes::from(&aggregated_signature);
-
         let signature_verification_state = if !check_stake {
-            SignatureVerificationState::Unsigned(aggregate_signature_bytes)
+            SignatureVerificationState::Unsigned(bls_signature)
         } else {
-            SignatureVerificationState::Unverified(aggregate_signature_bytes)
+            SignatureVerificationState::Unverified(bls_signature)
         };
 
         Ok(Certificate {
@@ -161,7 +158,7 @@ impl Certificate {
 
     /// Return the total stake and group of authorities that formed the committee for this
     /// certificate.
-    pub fn signed_by(&self, committee: &Committee) -> (Stake, Vec<BlsPublicKey>) {
+    pub fn signed_by(&self, committee: &Committee) -> (VotingPower, Vec<BlsPublicKey>) {
         // Ensure the certificate has a quorum.
         let mut weight = 0;
 
@@ -169,16 +166,17 @@ impl Certificate {
         let mut auth_iter = 0;
         let pks = committee
             .authorities()
+            .iter()
             .enumerate()
             .filter(|(i, authority)| match auth_indexes.get(auth_iter) {
                 Some(index) if *index == *i as u32 => {
-                    weight += authority.stake();
+                    weight += authority.voting_power();
                     auth_iter += 1;
                     true
                 }
                 _ => false,
             })
-            .map(|(_, authority)| authority.protocol_key().clone())
+            .map(|(_, authority)| *authority.protocol_key())
             .collect();
         (weight, pks)
     }
@@ -256,11 +254,11 @@ impl Certificate {
     /// Check the verification state and try to verify directly.
     fn verify_signature(mut self, pks: Vec<BlsPublicKey>) -> CertificateResult<Certificate> {
         // get signature from verification state
-        let aggregrate_signature_bytes = match self.signature_verification_state {
+        let signature = match self.signature_verification_state {
             SignatureVerificationState::VerifiedIndirectly(_)
             | SignatureVerificationState::VerifiedDirectly(_)
             | SignatureVerificationState::Genesis => return Ok(self),
-            SignatureVerificationState::Unverified(ref bytes) => bytes,
+            SignatureVerificationState::Unverified(ref sig) => sig,
             SignatureVerificationState::Unsigned(_) => {
                 return Err(CertificateError::Unsigned);
             }
@@ -268,11 +266,13 @@ impl Certificate {
 
         // Verify the signatures
         let certificate_digest = self.digest();
-        BlsAggregateSignature::try_from(aggregrate_signature_bytes)?
-            .verify_secure(&to_intent_message(certificate_digest), &pks[..])?;
+        let aggregate_signature = BlsAggregateSignature::from_signature(signature);
+        if !aggregate_signature.verify_secure(&to_intent_message(certificate_digest), &pks[..]) {
+            return Err(CertificateError::InvalidSignature);
+        }
 
         self.signature_verification_state =
-            SignatureVerificationState::VerifiedDirectly(aggregrate_signature_bytes.clone());
+            SignatureVerificationState::VerifiedDirectly(*signature);
 
         Ok(self)
     }
@@ -281,8 +281,7 @@ impl Certificate {
     pub fn validate_received(mut self) -> CertificateResult<Self> {
         self.set_signature_verification_state(SignatureVerificationState::Unverified(
             self.aggregated_signature()
-                .ok_or(CertificateError::RecoverBlsAggregateSignatureBytes)?
-                .clone(),
+                .ok_or(CertificateError::RecoverBlsAggregateSignatureBytes)?,
         ));
         Ok(self)
     }
@@ -313,12 +312,12 @@ impl Certificate {
     }
 
     /// The aggregate signature for the certriciate.
-    pub fn aggregated_signature(&self) -> Option<&BlsAggregateSignatureBytes> {
+    pub fn aggregated_signature(&self) -> Option<BlsSignature> {
         match &self.signature_verification_state {
-            SignatureVerificationState::VerifiedDirectly(bytes)
-            | SignatureVerificationState::Unverified(bytes)
-            | SignatureVerificationState::VerifiedIndirectly(bytes)
-            | SignatureVerificationState::Unsigned(bytes) => Some(bytes),
+            SignatureVerificationState::VerifiedDirectly(sig)
+            | SignatureVerificationState::Unverified(sig)
+            | SignatureVerificationState::VerifiedIndirectly(sig)
+            | SignatureVerificationState::Unsigned(sig) => Some(*sig),
             SignatureVerificationState::Genesis => None,
         }
     }
@@ -414,29 +413,29 @@ impl From<&Certificate> for Vec<u8> {
 ///    - `VerifiedDirectly` status with different signature bytes than what was actually verified
 ///    - an unsigned state containing signature bytes
 ///    - a verified state with missing/corrupted signature bytes
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Copy, Clone, Serialize, Deserialize, Debug)]
 pub enum SignatureVerificationState {
-    // This state occurs when the certificate has not yet received a quorum of
-    // signatures.
-    Unsigned(BlsAggregateSignatureBytes),
-    // This state occurs when a certificate has just been received from the network
-    // and has not been verified yet.
-    Unverified(BlsAggregateSignatureBytes),
-    // This state occurs when a certificate was either created locally, received
-    // via brodacast, or fetched but was not the parent of another certificate.
-    // Therefore this certificate had to be verified directly.
-    VerifiedDirectly(BlsAggregateSignatureBytes),
-    // This state occurs when the cert was a parent of another fetched certificate
-    // that was verified directly, then this certificate is verified indirectly.
-    VerifiedIndirectly(BlsAggregateSignatureBytes),
-    // This state occurs only for genesis certificates which always has valid
-    // signatures bytes but the bytes are garbage so we don't mark them as verified.
+    /// This state occurs when the certificate has not yet received a quorum of
+    /// signatures.
+    Unsigned(BlsSignature),
+    /// This state occurs when a certificate has just been received from the network
+    /// and has not been verified yet.
+    Unverified(BlsSignature),
+    /// This state occurs when a certificate was either created locally, received
+    /// via brodacast, or fetched but was not the parent of another certificate.
+    /// Therefore this certificate had to be verified directly.
+    VerifiedDirectly(BlsSignature),
+    /// This state occurs when the cert was a parent of another fetched certificate
+    /// that was verified directly, then this certificate is verified indirectly.
+    VerifiedIndirectly(BlsSignature),
+    /// This state occurs only for genesis certificates which always has valid
+    /// signatures bytes but the bytes are garbage so we don't mark them as verified.
     Genesis,
 }
 
 impl Default for SignatureVerificationState {
     fn default() -> Self {
-        SignatureVerificationState::Unsigned(BlsAggregateSignatureBytes::default())
+        SignatureVerificationState::Unsigned(BlsSignature::default())
     }
 }
 
@@ -450,14 +449,15 @@ pub fn validate_received_certificate(
     certificate.set_signature_verification_state(SignatureVerificationState::Unverified(
         certificate
             .aggregated_signature()
-            .ok_or(CertificateError::RecoverBlsAggregateSignatureBytes)?
-            .clone(),
+            .ok_or(CertificateError::RecoverBlsAggregateSignatureBytes)?,
     ));
     Ok(certificate)
 }
 
 /// Certificate digest.
-#[derive(Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, std::hash::Hash, PartialOrd, Ord,
+)]
 pub struct CertificateDigest([u8; crypto::DIGEST_LENGTH]);
 
 impl CertificateDigest {

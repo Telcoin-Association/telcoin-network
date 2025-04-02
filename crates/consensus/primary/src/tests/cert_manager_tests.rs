@@ -3,11 +3,10 @@
 use super::CertificateManager;
 use crate::{error::CertManagerError, state_sync::AtomicRound, ConsensusBus};
 use assert_matches::assert_matches;
-use fastcrypto::{hash::Hash as _, traits::KeyPair};
 use std::collections::BTreeSet;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{make_optimal_signed_certificates, CommitteeFixture};
-use tn_types::{Certificate, SignatureVerificationState};
+use tn_types::{Certificate, Hash as _, SignatureVerificationState};
 
 struct TestTypes<DB = MemDatabase> {
     /// The CertificateManager

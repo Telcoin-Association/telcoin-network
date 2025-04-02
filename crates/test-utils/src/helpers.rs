@@ -1,7 +1,6 @@
 //! Helper methods for creating useful structs during tests.
 
 use crate::execution::TransactionFactory;
-use fastcrypto::{hash::Hash, traits::KeyPair as _};
 use indexmap::IndexMap;
 use rand::{
     distributions::Bernoulli, prelude::Distribution, rngs::StdRng, thread_rng, Rng, RngCore,
@@ -14,7 +13,7 @@ use std::{
 use tn_types::{
     adiri_chain_spec_arc, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash,
     BlsKeypair, BlsSignature, Bytes, Certificate, CertificateDigest, Committee, Epoch, ExecHeader,
-    HeaderBuilder, ProtocolSignature, Round, Stake, TimestampSec, WorkerId, U256,
+    Hash as _, HeaderBuilder, ProtocolSignature, Round, TimestampSec, VotingPower, WorkerId, U256,
 };
 
 pub fn temp_dir() -> std::path::PathBuf {
@@ -249,10 +248,10 @@ pub fn make_certificates_with_slow_nodes(
     let mut rand = StdRng::seed_from_u64(1);
 
     // ensure provided slow nodes do not account > f
-    let slow_nodes_stake: Stake =
-        slow_nodes.iter().map(|(key, _)| committee.authority(key).unwrap().stake()).sum();
+    let slow_nodes_voting_power: VotingPower =
+        slow_nodes.iter().map(|(key, _)| committee.authority(key).unwrap().voting_power()).sum();
 
-    assert!(slow_nodes_stake < committee.validity_threshold());
+    assert!(slow_nodes_voting_power < committee.validity_threshold());
 
     let mut certificates = VecDeque::new();
     let mut parents = initial_parents;
@@ -428,7 +427,7 @@ pub fn this_cert_parents_with_slow_nodes(
 
             if should_include {
                 parents.insert(parent.digest());
-                total_stake += authority.stake();
+                total_stake += authority.voting_power();
             } else {
                 not_included.push(parent);
             }
@@ -436,7 +435,7 @@ pub fn this_cert_parents_with_slow_nodes(
             // just add it directly as it is not within the slow nodes or we are the
             // same author.
             parents.insert(parent.digest());
-            total_stake += authority.stake();
+            total_stake += authority.voting_power();
         }
     }
 
@@ -445,7 +444,7 @@ pub fn this_cert_parents_with_slow_nodes(
         let parent = not_included.pop().unwrap();
         let authority = committee.authority(&parent.origin()).unwrap();
 
-        total_stake += authority.stake();
+        total_stake += authority.voting_power();
 
         parents.insert(parent.digest());
     }
@@ -513,8 +512,7 @@ pub fn mock_certificate_with_rand<R: RngCore + ?Sized>(
         .epoch(0)
         .parents(parents)
         .payload(fixture_payload_with_rand(1, rand))
-        .build()
-        .unwrap();
+        .build();
     let certificate = Certificate::new_unsigned(committee, header, Vec::new()).unwrap();
     (certificate.digest(), certificate)
 }
@@ -546,8 +544,7 @@ pub fn mock_certificate_with_epoch(
         .epoch(epoch)
         .parents(parents)
         .payload(fixture_payload(1))
-        .build()
-        .unwrap();
+        .build();
     let certificate = Certificate::new_unsigned(committee, header, Vec::new()).unwrap();
     (certificate.digest(), certificate)
 }
@@ -566,8 +563,7 @@ pub fn signed_cert_for_test(
         .round(round)
         .epoch(0)
         .parents(parents)
-        .build()
-        .expect("valid header built for test certificate");
+        .build();
 
     let cert = Certificate::new_unsigned(committee, header.clone(), Vec::new())
         .expect("new unsigned cert for tests");

@@ -7,14 +7,13 @@ use crate::{
     ConsensusBus, RecentBlocks,
 };
 use assert_matches::assert_matches;
-use fastcrypto::hash::Hash as _;
 use std::collections::{BTreeMap, BTreeSet};
 use tn_network_libp2p::PeerId;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
 use tn_types::{
     error::HeaderError, network_public_key_to_libp2p, now, AuthorityIdentifier, BlockHash,
-    BlockHeader, BlockNumHash, Certificate, CertificateDigest, ExecHeader, SealedHeader,
+    BlockHeader, BlockNumHash, Certificate, CertificateDigest, ExecHeader, Hash as _, SealedHeader,
     TaskManager,
 };
 use tracing::debug;
@@ -96,7 +95,7 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
         .header_builder_last_authority()
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(1) // parent is 0
-        .build()?;
+        .build();
 
     // process vote
     let res = handler.vote(peer_id, header, parents).await;
@@ -123,7 +122,7 @@ async fn test_vote_fails_too_many_parents() -> eyre::Result<()> {
         .header_builder_last_authority()
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(1) // parent is 0
-        .build()?;
+        .build();
 
     // process vote
     let res = handler.vote(peer_id, header, too_many_parents).await;
@@ -136,17 +135,15 @@ async fn test_vote_fails_too_many_parents() -> eyre::Result<()> {
 async fn test_vote_fails_wrong_authority_network_key() -> eyre::Result<()> {
     // common types
     let TestTypes { committee, handler, parent, .. } = create_test_types();
-
     let parents = Vec::new();
-    // workaround until anemo/fastcrypto replaced
-    let random_peer_id = PeerId::random(); //network_public_key_to_libp2p(&default);
+    let random_peer_id = PeerId::random();
 
     // create valid header proposed by last peer in the committee for round 1
     let header = committee
         .header_builder_last_authority()
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(1) // parent is 0
-        .build()?;
+        .build();
 
     // process vote
     let res = handler.vote(random_peer_id, header, parents).await;
@@ -177,7 +174,7 @@ async fn test_vote_fails_invalid_genesis_parent() -> eyre::Result<()> {
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(1) // parent is 0
         .parents(wrong_genesis)
-        .build()?;
+        .build();
 
     // process vote
     let res = handler.vote(peer_id, header, parents).await;
@@ -239,7 +236,7 @@ async fn test_vote_fails_invalid_timestamp() -> eyre::Result<()> {
         .header_builder_last_authority()
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(wrong_time)
-        .build()?;
+        .build();
 
     // process vote
     let res = handler.vote(peer_id, header, parents).await;
@@ -264,7 +261,7 @@ async fn test_vote_fails_wrong_epoch() -> eyre::Result<()> {
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(1) // parent is 0
         .epoch(wrong_epoch)
-        .build()?;
+        .build();
 
     // process vote
     let res = handler.vote(peer_id, header, parents).await;
@@ -289,7 +286,7 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
         .author(wrong_authority)
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(1) // parent is 0
-        .build()?;
+        .build();
 
     // process vote
     let res = handler.vote(peer_id, header, parents).await;

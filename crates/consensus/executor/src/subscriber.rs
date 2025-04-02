@@ -2,7 +2,6 @@
 
 use crate::{errors::SubscriberResult, SubscriberError};
 use consensus_metrics::monitored_future;
-use fastcrypto::hash::Hash;
 use futures::{stream::FuturesOrdered, StreamExt};
 use state_sync::{
     get_missing_consensus, last_executed_consensus_block, save_consensus, spawn_state_sync,
@@ -21,8 +20,8 @@ use tn_primary::{
 use tn_storage::CertificateStore;
 use tn_types::{
     AuthorityIdentifier, Batch, BlockHash, CommittedSubDag, Committee, ConsensusHeader,
-    ConsensusOutput, Database, Noticer, TaskManager, TaskManagerClone, Timestamp, TnReceiver,
-    TnSender, B256,
+    ConsensusOutput, Database, Hash as _, Noticer, TaskManager, TaskManagerClone, Timestamp,
+    TnReceiver, TnSender, B256,
 };
 use tracing::{debug, error, info};
 
@@ -127,7 +126,7 @@ impl<DB: Database> Subscriber<DB> {
                 consensus_header.number,
             )
             .await?;
-        save_consensus(self.config.database(), consensus_output.clone())?;
+        save_consensus(self.config.node_storage(), consensus_output.clone())?;
 
         // If we want to rejoin consensus eventually then save certs.
         let _ = self.config.node_storage().write(consensus_output.sub_dag.leader.clone());
@@ -256,7 +255,7 @@ impl<DB: Database> Subscriber<DB> {
                     match output {
                         Ok(output) => {
                             debug!(target: "subscriber", output=?output.digest(), "saving next output");
-                            save_consensus(self.config.database(), output.clone())?;
+                            save_consensus(self.config.node_storage(), output.clone())?;
                             debug!(target: "subscriber", "broadcasting output...");
                             if let Err(e) = self.consensus_bus.consensus_output().send(output).await {
                                 error!(target: "subscriber", "error broadcasting consensus output for authority {}: {}", self.inner.authority_id, e);
@@ -298,10 +297,7 @@ impl<DB: Database> Subscriber<DB> {
         let num_certs = deliver.len();
 
         // get the execution address of the authority or use zero address
-        let leader = self
-            .inner
-            .committee
-            .authority_at_epoch(deliver.leader_epoch(), &deliver.leader.origin());
+        let leader = self.inner.committee.authority(&deliver.leader.origin());
         let address = if let Some(authority) = leader {
             authority.execution_address()
         } else {
@@ -503,8 +499,7 @@ mod tests {
             .round(round)
             .epoch(0)
             .parents(parents)
-            .build()
-            .expect("valid header built for test certificate");
+            .build();
 
         let cert = committee.certificate(&header);
         (cert.digest(), cert, batches)

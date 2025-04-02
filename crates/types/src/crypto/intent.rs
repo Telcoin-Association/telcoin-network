@@ -2,7 +2,6 @@
 
 use crate::try_decode;
 use eyre::eyre;
-use fastcrypto::encoding::decode_bytes_hex;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::str::FromStr;
@@ -96,7 +95,8 @@ pub struct Intent {
 impl FromStr for Intent {
     type Err = eyre::Report;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s: Vec<u8> = decode_bytes_hex(s).map_err(|_| eyre!("Invalid Intent"))?;
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        let s = hex::decode(s)?;
         if s.len() != 3 {
             return Err(eyre!("Invalid Intent"));
         }
