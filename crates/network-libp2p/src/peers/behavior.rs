@@ -1,7 +1,5 @@
 //! Implement the libp2p network behavior to manage peers in the swarm.
 
-use crate::peers::manager::DisconnectReason;
-
 use super::manager::{PeerEvent, PeerManager};
 use libp2p::{
     core::{multiaddr::Protocol, transport::PortUse, ConnectedPoint, Endpoint},

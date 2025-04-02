@@ -5,7 +5,7 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
-    peers::{self, PeerEvent, PeerManager},
+    peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     types::{NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
     PeerExchangeMap,
@@ -106,7 +106,6 @@ where
     /// before disconnecting. This keeps track of the number of disconnects to ensure resources
     /// aren't starved while waiting for the peer's ack.
     pending_px_disconnects: HashMap<OutboundRequestId, PeerId>,
-    ///
     /// The collection of pending outbound requests.
     ///
     /// Callers include a oneshot channel for the network to return response. The caller is
@@ -324,7 +323,7 @@ where
             SwarmEvent::ConnectionClosed {
                 peer_id, connection_id, num_established, cause, ..
             } => {
-                // Log connection closure with cause
+                // log connection closure with cause
                 info!(
                     target: "network",
                     ?peer_id,
@@ -594,6 +593,11 @@ where
                         self.inbound_requests.insert(request_id, notify);
                     }
                     request_response::Message::Response { request_id, response } => {
+                        // check if response associated with PX disconnect
+                        if self.pending_px_disconnects.remove(&request_id).is_some() {
+                            let _ = self.swarm.disconnect_peer_id(peer);
+                        }
+
                         // try to forward response to original caller
                         let _ = self
                             .outbound_requests
@@ -604,7 +608,17 @@ where
                 }
             }
             ReqResEvent::OutboundFailure { peer, request_id, error, connection_id: _ } => {
+                // handle px disconnects
+                //
+                // px attempts to support peer discovery, but failures are okay
+                // this node disconnects after a px timeout
+                if self.pending_px_disconnects.remove(&request_id).is_some() {
+                    return Ok(());
+                }
+
+                // log errors for other outbound failures
                 error!(target: "network", ?peer, ?error, "outbound failure");
+
                 // try to forward error to original caller
                 let _ = self
                     .outbound_requests
@@ -615,8 +629,12 @@ where
             ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
                 match error {
                     ReqResInboundFailure::Io(e) => {
-                        // TODO: update peer score - could be malicious
+                        // penalize peer since this is an attack surface
                         warn!(target: "network", ?e, ?peer, ?request_id, "inbound IO failure");
+                        self.swarm
+                            .behaviour_mut()
+                            .peer_manager
+                            .process_penalty(peer, Penalty::Mild);
                     }
                     ReqResInboundFailure::UnsupportedProtocols => {
                         warn!(target: "network", ?peer, ?request_id, ?error, "inbound failure: unsupported protocol");
@@ -737,7 +755,7 @@ where
                     // insert to pending px disconnects
                     self.pending_px_disconnects.insert(request_id, peer_id);
                 } else {
-                    // too many px disconnects pending - force disconnect
+                    // too many px disconnects pending so disconnect without px
                     let _ = self.swarm.disconnect_peer_id(peer_id);
                 }
             }

@@ -4,6 +4,7 @@ mod common;
 use super::*;
 use assert_matches::assert_matches;
 use common::{TestPrimaryRequest, TestPrimaryResponse, TestWorkerRequest, TestWorkerResponse};
+use eyre::eyre;
 use tn_config::ConsensusConfig;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{fixture_batch_with_transactions, CommitteeFixture};
@@ -545,34 +546,19 @@ async fn test_pending_disconnects() -> eyre::Result<()> {
     let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let TestTypes { peer1: peer3, peer2: peer4 } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
-    let NetworkPeer { config: config_1, network_handle: cvv, network, .. } = peer1;
+    let NetworkPeer { network_handle: cvv, network: mut network_1, .. } = peer1;
 
-    let NetworkPeer {
-        config: config_2,
-        network_handle: nvv,
-        network_events: mut nvv_network_events,
-        network,
-    } = peer2;
+    let NetworkPeer { config: config_2, .. } = peer2;
+    let NetworkPeer { config: config_3, .. } = peer3;
+    let NetworkPeer { config: config_4, network: network_4, .. } = peer4;
 
-    let NetworkPeer {
-        config: config_3,
-        network_handle: nvv,
-        network_events: mut nvv_network_events,
-        network,
-    } = peer3;
-
-    let NetworkPeer {
-        config: config_4,
-        network_handle: nvv,
-        network_events: mut nvv_network_events,
-        network,
-    } = peer4;
-
-    // get peer2 id and multiaddr
+    // create px from peer1 for peer4
     let expected_multi_1 = HashSet::from([config_2.authority().primary_network_address().clone()]);
-    let expected_peer_id_1 = PeerId::from_public_key(config_2.authority().network_key().into());
+    let pk_2 = config_2.authority().network_key().into();
+    let expected_peer_id_1 = PeerId::from_public_key(&pk_2);
     let expected_multi_2 = HashSet::from([config_3.authority().primary_network_address().clone()]);
-    let expected_peer_id_2 = PeerId::from_public_key(config_3.authority().network_key().into());
+    let pk_3 = config_3.authority().network_key().into();
+    let expected_peer_id_2 = PeerId::from_public_key(&pk_3);
 
     let exchange_info = HashMap::from([
         (expected_peer_id_1, expected_multi_1.clone()),
@@ -580,19 +566,22 @@ async fn test_pending_disconnects() -> eyre::Result<()> {
     ]);
 
     // disconnect from peer 4
-    let peer4 = PeerId::from_public_key(config_4.authority().network_key().into());
-    network
+    let pk_4 = config_4.authority().network_key().into();
+    let peer4 = PeerId::from_public_key(&pk_4);
+
+    // insert px event
+    network_1
         .swarm
         .behaviour_mut()
         .peer_manager
         .push_test_event(PeerEvent::DisconnectPeerX(peer4, exchange_info.into()));
 
     tokio::spawn(async move {
-        network.run().await.expect("network run failed!");
+        network_1.run().await.expect("network run failed!");
     });
 
     let pending_count = cvv.get_pending_request_count().await?;
     assert_eq!(pending_count, 0);
 
-    Ok(())
+    Err(eyre!("finish test"))
 }

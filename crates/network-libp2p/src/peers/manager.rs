@@ -68,20 +68,6 @@ pub enum PeerEvent {
     Unbanned(PeerId, Vec<IpAddr>),
 }
 
-/// The reason this node disconnected from a peer.
-///
-/// If the peer was disconnected because this node has excess peers,
-/// then exchange other peer information to support discovery.
-#[derive(Debug)]
-pub enum DisconnectReason {
-    /// Connecting with this peer would cause excess peers.
-    ExcessPeers,
-    /// The peer's reputation caused the disconnect.
-    Reputation,
-    /// The peer is banned.
-    Banned,
-}
-
 impl PeerManager {
     /// Create a new instance of Self.
     pub(crate) fn new<DB: Database>(consensus_config: &ConsensusConfig<DB>) -> Self {
