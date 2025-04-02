@@ -315,10 +315,6 @@ pub enum CertificateError {
     /// Certificate is unsigned.
     #[error("Certificate verification state is unsigned")]
     Unsigned,
-
-    /// TODO: Refactor this out - only used to debug notify and suspend
-    #[error("Certificate suspended: {0}")]
-    DebugSuspend(String),
 }
 
 impl<T: std::fmt::Debug> From<SendError<T>> for HeaderError {

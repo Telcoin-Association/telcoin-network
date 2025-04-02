@@ -15,7 +15,7 @@ use tn_network_libp2p::{
     types::{
         IdentTopic, IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult,
     },
-    GossipMessage, Multiaddr, PeerId, ResponseChannel,
+    GossipMessage, Multiaddr, PeerExchangeMap, PeerId, ResponseChannel,
 };
 use tn_network_types::{
     FetchCertificatesRequest, WorkerOthersBatchMessage, WorkerOwnBatchMessage,
@@ -23,8 +23,8 @@ use tn_network_types::{
 };
 use tn_storage::PayloadStore;
 use tn_types::{
-    encode, BlockHash, Certificate, CertificateDigest, ConsensusHeader, Database, Header, Noticer,
-    TaskManager, TnSender, Vote,
+    encode, error::CertificateError, BlockHash, Certificate, CertificateDigest, ConsensusHeader,
+    Database, Header, Noticer, TaskManager, TnSender, Vote,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
@@ -111,6 +111,9 @@ impl PrimaryNetworkHandle {
             PrimaryResponse::ConsensusHeader(_consensus_header) => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is consensus header!".to_string(),
             )),
+            PrimaryResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
+                "Got wrong response, not a vote is peer exchange!".to_string(),
+            )),
         }
     }
 
@@ -166,6 +169,15 @@ impl PrimaryNetworkHandle {
             }
         }
         Err(NetworkError::RPCError("Could not get the consensus header!".to_string()))
+    }
+
+    /// Notify peer manager of peer exchange information.
+    pub(crate) async fn process_peer_exchange(
+        &self,
+        peers: PeerExchangeMap,
+        channel: ResponseChannel<PrimaryResponse>,
+    ) {
+        let _ = self.handle.process_peer_exchange(peers, channel).await;
     }
 }
 
@@ -239,6 +251,9 @@ where
                 }
                 PrimaryRequest::ConsensusHeader { number, hash } => {
                     self.process_consensus_output_request(peer, number, hash, channel, cancel)
+                }
+                PrimaryRequest::PeerExchange { peers } => {
+                    self.process_peer_exchange(peers, channel)
                 }
             },
             NetworkEvent::Gossip(msg) => {
@@ -331,7 +346,7 @@ where
     fn process_gossip(&self, msg: GossipMessage) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
-        // let network_handle = self.network_handle.clone();
+        let network_handle = self.network_handle.clone();
 
         // commented out to prevent CertificateError::TooNew from forcing disconnect when peers
         // are trying to resync
@@ -350,8 +365,28 @@ where
                 // }
 
                 // match on error to lower peer score
-                //todo!();
+
+                // TODO: I think just author should be penalized, not source of propogation
+
+                match e {
+                    // CertificateError::Inquorate { .. } => network_handle.report_penalty(peer_id, Penalty::)
+                    _ => (), // ignore
+                }
             }
+        });
+    }
+
+    /// Process peer exchange.
+    fn process_peer_exchange(
+        &self,
+        peers: PeerExchangeMap,
+        channel: ResponseChannel<PrimaryResponse>,
+    ) {
+        let network_handle = self.network_handle.clone();
+
+        // notify peer manager and respond with ack
+        tokio::spawn(async move {
+            network_handle.process_peer_exchange(peers, channel).await;
         });
     }
 }

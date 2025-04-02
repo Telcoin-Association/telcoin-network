@@ -38,7 +38,7 @@ async fn test_leader_swap_table() {
             let s = table.swap(id, index as Round).unwrap();
 
             // make sure that the returned node is amongst the good nodes
-            assert!(table.good_nodes.iter().any(|n| *n == s));
+            assert!(table.good_nodes.contains(&s));
         } else {
             assert!(table.swap(id, index as Round).is_none());
         }
@@ -78,7 +78,7 @@ async fn test_leader_swap_table() {
             let s = table.swap(id, index as Round).unwrap();
 
             // make sure that the returned node is amongst the good nodes
-            assert!(table.good_nodes.iter().any(|n| *n == s));
+            assert!(table.good_nodes.contains(&s));
         } else {
             assert!(table.swap(id, index as Round).is_none());
         }

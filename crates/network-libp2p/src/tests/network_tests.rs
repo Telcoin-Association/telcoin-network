@@ -4,6 +4,7 @@ mod common;
 use super::*;
 use assert_matches::assert_matches;
 use common::{TestPrimaryRequest, TestPrimaryResponse, TestWorkerRequest, TestWorkerResponse};
+use eyre::eyre;
 use tn_config::ConsensusConfig;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{fixture_batch_with_transactions, CommitteeFixture};
@@ -216,7 +217,6 @@ async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
-    tn_test_utils::init_test_tracing();
     // start honest peer1 network
     let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
@@ -525,7 +525,7 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     }
 
     // remove cvv from whitelist and try to publish again
-    nvv.update_authorized_publishers(HashSet::with_capacity(0)).await?;
+    nvv.update_authorized_publishers(HashSet::new()).await?;
 
     let random_block = fixture_batch_with_transactions(10);
     let sealed_block = random_block.seal_slow();
@@ -539,4 +539,49 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     // TODO: assert peer score after bad message
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_pending_disconnects() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let TestTypes { peer1: peer3, peer2: peer4 } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { network_handle: cvv, network: mut network_1, .. } = peer1;
+
+    let NetworkPeer { config: config_2, .. } = peer2;
+    let NetworkPeer { config: config_3, .. } = peer3;
+    let NetworkPeer { config: config_4, network: network_4, .. } = peer4;
+
+    // create px from peer1 for peer4
+    let expected_multi_1 = HashSet::from([config_2.authority().primary_network_address().clone()]);
+    let pk_2 = config_2.authority().network_key().into();
+    let expected_peer_id_1 = PeerId::from_public_key(&pk_2);
+    let expected_multi_2 = HashSet::from([config_3.authority().primary_network_address().clone()]);
+    let pk_3 = config_3.authority().network_key().into();
+    let expected_peer_id_2 = PeerId::from_public_key(&pk_3);
+
+    let exchange_info = HashMap::from([
+        (expected_peer_id_1, expected_multi_1.clone()),
+        (expected_peer_id_2, expected_multi_2.clone()),
+    ]);
+
+    // disconnect from peer 4
+    let pk_4 = config_4.authority().network_key().into();
+    let peer4 = PeerId::from_public_key(&pk_4);
+
+    // insert px event
+    network_1
+        .swarm
+        .behaviour_mut()
+        .peer_manager
+        .push_test_event(PeerEvent::DisconnectPeerX(peer4, exchange_info.into()));
+
+    tokio::spawn(async move {
+        network_1.run().await.expect("network run failed!");
+    });
+
+    let pending_count = cvv.get_pending_request_count().await?;
+    assert_eq!(pending_count, 0);
+
+    Err(eyre!("finish test"))
 }

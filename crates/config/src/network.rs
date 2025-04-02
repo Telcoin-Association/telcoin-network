@@ -15,6 +15,8 @@ pub struct NetworkConfig {
     sync_config: SyncConfig,
     /// The configurations for quic protocol.
     quic_config: QuicConfig,
+    /// The configuration for managing peers.
+    peer_config: PeerConfig,
 }
 
 impl NetworkConfig {
@@ -31,6 +33,11 @@ impl NetworkConfig {
     /// Return a reference to the [QuicConfig].
     pub fn quic_config(&self) -> &QuicConfig {
         &self.quic_config
+    }
+
+    /// Return a reference to the [PeerConfig].
+    pub fn peer_config(&self) -> &PeerConfig {
+        &self.peer_config
     }
 }
 
@@ -56,6 +63,18 @@ pub struct LibP2pConfig {
     pub max_gossip_message_size: usize,
     /// The maximum duration to keep an idle connection alive between peers.
     pub max_idle_connection_timeout: Duration,
+    /// The maximum number of pending peer-exchance disconnect messages before this node immediately disconnects.
+    ///
+    /// When Self::target_num_peers is reached, this node disconnects gracefully from the connected peer
+    /// and exchanges peer information to faciliate discovery. The current solution requires an async task
+    /// to wait for an ack before timing out. This is a workaround until a custom RPC NetworkBehaviour is
+    /// implemented. The ideal approach is to use a custom `ConnectionHandler` and support an event that
+    /// disconnects as soon as the message is sent.
+    ///
+    /// This limit is set to prevent a node from spawning too many disconnect tasks.
+    pub max_px_disconnects: usize,
+    /// The maximum amount of time to wait for a peer's ack during a px_disconnect before forcing the disconnect.
+    pub px_disconnect_timeout: Duration,
 }
 
 impl Default for LibP2pConfig {
@@ -68,6 +87,8 @@ impl Default for LibP2pConfig {
             max_rpc_message_size: 1024 * 1024, // 1 MiB
             max_gossip_message_size: 12_000,   // 12kb
             max_idle_connection_timeout: Duration::from_secs(60 * 60), // 60min
+            max_px_disconnects: 10,
+            px_disconnect_timeout: Duration::from_secs(3),
         }
     }
 }
@@ -184,5 +205,155 @@ impl Default for QuicConfig {
             max_stream_data: 50 * 1024 * 1024,      // 50MiB
             max_connection_data: 100 * 1024 * 1024, // 100MiB
         }
+    }
+}
+
+// /// The threshold for a peer's score before they are disconnected.
+// const MIN_SCORE_BEFORE_DISCONNECT: f64 = -20.0;
+// /// The threshold for a peer's score before they are banned.
+// const MIN_SCORE_BEFORE_BAN: f64 = -50.0;
+
+/// Configurations for network peers.
+#[derive(Debug, Clone, Copy)]
+pub struct PeerConfig {
+    /// The interval (secs) for updating peer status.
+    pub heartbeat_interval: u64,
+    /// The target number of connected peers.
+    pub target_num_peers: usize,
+    /// The timeout for dialing a peer.
+    pub dial_timeout: Duration,
+    /// The threshold before a peer is disconnected
+    pub min_score_for_disconnect: f64,
+    /// The threshold before a peer is banned.
+    pub min_score_for_ban: f64,
+    /// A fraction of `Self::target_num_peers` that is allowed to connect to this node in excess of
+    /// `PeerManager::target_num_peers`.
+    ///
+    /// NOTE: If `Self::target_num_peers` is 20 and peer_excess_factor = 0.1 this node allows 10% more peers, i.e 22.
+    pub peer_excess_factor: f32,
+    /// The fraction of extra peers beyond the Self::peer_excess_factor that this node is allowed to dial for
+    /// requiring subnet peers.
+    ///
+    /// NOTE: If the target peer limit is 50, and the excess peer limit is 55, and this node already has 55 peers,
+    /// this value provisions a few more slots for dialing priority peers for validator responsibilities.
+    pub priority_peer_excess: f32,
+    /// A fraction of `Self::target_num_peers` that are outbound-only connections.
+    pub target_outbound_only_factor: f32,
+    /// A fraction of `Self::target_num_peers` that sets a threshold before the node tries to discovery peers.
+    ///
+    /// NOTE: Self::min_outbound_only_factor must be < Self::target_outbound_only_factor.
+    pub min_outbound_only_factor: f32,
+    /// The minimum amount of time before peers are allowed to reconnect after this node disconnects due to too many peers.
+    ///
+    /// If peers try to connect before the reconnection timeout passes, the swarm denies the connection attempt. This essentially results in a temporary ban at the swarm level.
+    pub excess_peers_reconnection_timeout: Duration,
+    /// The config for scoring peers.
+    pub score_config: ScoreConfig,
+}
+
+impl Default for PeerConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval: 30,
+            target_num_peers: 5,
+            dial_timeout: Duration::from_secs(15),
+            min_score_for_disconnect: -20.0,
+            min_score_for_ban: -50.0,
+            peer_excess_factor: 0.1,
+            priority_peer_excess: 0.2,
+            target_outbound_only_factor: 0.3,
+            min_outbound_only_factor: 0.2,
+            excess_peers_reconnection_timeout: Duration::from_secs(600),
+            score_config: ScoreConfig::default(),
+        }
+    }
+}
+
+impl PeerConfig {
+    /// The maximum number of peers allowed to connect to this node.
+    pub fn max_peers(&self) -> usize {
+        (self.target_num_peers as f32 * (1.0 + self.peer_excess_factor)).ceil() as usize
+    }
+
+    /// The maximum number of peers allowed when dialing a priority peer.
+    ///
+    /// Priority peers are known validators that dialed this node or a peer that is explicitly dialed.
+    pub fn max_priority_peers(&self) -> usize {
+        (self.target_num_peers as f32 * (1.0 + self.peer_excess_factor + self.priority_peer_excess))
+            .ceil() as usize
+    }
+
+    /// The minimum number of outbound peers that we reach before we start another discovery query.
+    pub fn min_outbound_only_peers(&self) -> usize {
+        (self.target_num_peers as f32 * self.min_outbound_only_factor).ceil() as usize
+    }
+
+    /// The minimum number of outbound peers that we reach before we start another discovery query.
+    pub fn target_outbound_peers(&self) -> usize {
+        (self.target_num_peers as f32 * self.target_outbound_only_factor).ceil() as usize
+    }
+
+    /// The maximum number of peers that are connected or dialing before we refuse to do another
+    /// discovery search for more outbound peers. We can use up to half the priority peer excess allocation.
+    pub fn max_outbound_dialing_peers(&self) -> usize {
+        (self.target_num_peers as f32
+            * (1.0 + self.peer_excess_factor + self.priority_peer_excess / 2.0))
+            .ceil() as usize
+    }
+}
+
+/// Configuration for peer scoring parameters
+#[derive(Clone, Debug, Copy)]
+pub struct ScoreConfig {
+    /// The default score for new peers.
+    pub default_score: f64,
+    /// The threshold for a peer's score before they are banned, regardless of any other scoring parameters.
+    pub min_application_score_before_ban: f64,
+    /// The maximum score a peer can obtain.
+    pub max_score: f64,
+    /// The minimum score a peer can obtain.
+    pub min_score: f64,
+    /// The halflife of a peer's score in seconds.
+    pub score_halflife: f64,
+    /// The minimum amount of time (seconds) a peer is banned before their score begins to decay.
+    pub banned_before_decay_secs: u64,
+    /// Threshold to prevent libp2p gossipsub from disconnecting peers.
+    pub gossipsub_greylist_threshold: f64,
+    /// Minimum score before a peer is disconnected.
+    pub min_score_before_disconnect: f64,
+    /// Minimum score before a peer is banned.
+    pub min_score_before_ban: f64,
+}
+
+impl Default for ScoreConfig {
+    fn default() -> Self {
+        ScoreConfig {
+            default_score: 0.0,
+            min_application_score_before_ban: -60.0,
+            max_score: 100.0,
+            min_score: -100.0,
+            score_halflife: 600.0,
+            banned_before_decay_secs: 12 * 3600, // 12 hours
+            gossipsub_greylist_threshold: -16000.0,
+            min_score_before_disconnect: -20.0,
+            min_score_before_ban: -50.0,
+        }
+    }
+}
+
+impl ScoreConfig {
+    /// Returns the banned before decay duration
+    pub fn banned_before_decay(&self) -> Duration {
+        Duration::from_secs(self.banned_before_decay_secs)
+    }
+
+    /// Calculate the gossipsub score weight based on configuration values
+    pub fn gossipsub_score_weight(&self) -> f64 {
+        (self.min_score_before_disconnect + 1.0) / self.gossipsub_greylist_threshold
+    }
+
+    /// Calculate the halflife decay constant
+    pub fn halflife_decay(&self) -> f64 {
+        -(2.0f64.ln()) / self.score_halflife
     }
 }

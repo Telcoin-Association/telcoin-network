@@ -1,15 +1,16 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+//! Worker network implementation.
 
 use error::WorkerNetworkError;
 use futures::{stream::FuturesUnordered, StreamExt};
 use handler::RequestHandler;
 use message::{WorkerGossip, WorkerRPCError};
 pub use message::{WorkerRequest, WorkerResponse};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
     types::{IdentTopic, NetworkEvent, NetworkHandle, NetworkResult},
-    GossipMessage, Multiaddr, PeerId, ResponseChannel,
+    GossipMessage, Multiaddr, PeerExchangeMap, PeerId, ResponseChannel,
 };
 use tn_network_types::{FetchBatchResponse, PrimaryToWorkerClient, WorkerSynchronizeMessage};
 use tn_storage::tables::Batches;
@@ -77,6 +78,9 @@ impl WorkerNetworkHandle {
             WorkerResponse::RequestBatches { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a report batch is request batches!".to_string(),
             )),
+            WorkerResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
+                "Got wrong response, not a report batch is peer exchange!".to_string(),
+            )),
             WorkerResponse::Error(WorkerRPCError(s)) => Err(NetworkError::RPCError(s)),
         }
     }
@@ -110,6 +114,9 @@ impl WorkerNetworkHandle {
         match res {
             WorkerResponse::ReportBatch => Err(NetworkError::RPCError(
                 "Got wrong response, not a request batches is report batch!".to_string(),
+            )),
+            WorkerResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
+                "Got wrong response, not a request batches is peer exchange!".to_string(),
             )),
             WorkerResponse::RequestBatches(batches) => {
                 for batch in &batches {
@@ -202,6 +209,15 @@ impl WorkerNetworkHandle {
             Ok(all_batches)
         }
     }
+
+    /// Notify peer manager of peer exchange information.
+    pub(crate) async fn process_peer_exchange(
+        &self,
+        peers: PeerExchangeMap,
+        channel: ResponseChannel<WorkerResponse>,
+    ) {
+        let _ = self.handle.process_peer_exchange(peers, channel).await;
+    }
 }
 
 /// Handle inter-node communication between primaries.
@@ -261,6 +277,10 @@ where
                 }
                 WorkerRequest::RequestBatches { batch_digests } => {
                     self.process_request_batches(peer, batch_digests, channel, cancel);
+                }
+                WorkerRequest::PeerExchange { peers } => {
+                    // notify peer manager
+                    self.process_peer_exchange(peers, channel);
                 }
             },
             NetworkEvent::Gossip(msg) => {
@@ -348,6 +368,20 @@ where
                 // match on error to lower peer score
                 //todo!();
             }
+        });
+    }
+
+    /// Process peer exchange.
+    fn process_peer_exchange(
+        &self,
+        peers: PeerExchangeMap,
+        channel: ResponseChannel<WorkerResponse>,
+    ) {
+        let network_handle = self.network_handle.clone();
+
+        // notify peer manager and respond with ack
+        tokio::spawn(async move {
+            network_handle.process_peer_exchange(peers, channel).await;
         });
     }
 }

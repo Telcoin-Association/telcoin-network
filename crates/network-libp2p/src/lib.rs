@@ -4,11 +4,13 @@
 mod codec;
 mod consensus;
 pub mod error;
+mod peers;
 pub mod types;
 
 // export types
 pub use codec::{TNCodec, TNMessage};
 pub use consensus::ConsensusNetwork;
+pub use peers::PeerExchangeMap;
 
 // re-export specific libp2p types
 pub use libp2p::{

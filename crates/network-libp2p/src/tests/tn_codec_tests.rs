@@ -11,6 +11,18 @@ use tn_types::{Certificate, CertificateDigest, Header, Vote};
 impl TNMessage for TestPrimaryRequest {}
 impl TNMessage for TestPrimaryResponse {}
 
+impl From<PeerExchangeMap> for TestPrimaryRequest {
+    fn from(_: PeerExchangeMap) -> Self {
+        unimplemented!()
+    }
+}
+
+impl From<PeerExchangeMap> for TestPrimaryResponse {
+    fn from(_: PeerExchangeMap) -> Self {
+        unimplemented!()
+    }
+}
+
 /// Test requests from Primary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(super) enum TestPrimaryRequest {

@@ -80,6 +80,12 @@ pub enum NetworkError {
     /// A network operation timed out.
     #[error("Timed Out")]
     Timeout,
+    /// This node disconnected from the peer.
+    #[error("Disconnected from peer")]
+    Disconnected,
+    /// The peer was already disconnected.
+    #[error("Peer already disconnected")]
+    DisconnectPeer,
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {

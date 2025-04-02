@@ -5,8 +5,10 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
+    peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     types::{NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
+    PeerExchangeMap,
 };
 use futures::StreamExt as _;
 use libp2p::{
@@ -26,12 +28,12 @@ use std::{
     time::Duration,
 };
 use tn_config::{ConsensusConfig, LibP2pConfig};
-use tn_types::NetworkKeypair;
+use tn_types::{Database, NetworkKeypair};
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot,
 };
-use tracing::{error, info, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 #[cfg(test)]
 #[path = "tests/network_tests.rs"]
@@ -49,6 +51,8 @@ where
     pub(crate) gossipsub: gossipsub::Behaviour,
     /// The request-response network behavior.
     pub(crate) req_res: request_response::Behaviour<C>,
+    /// The peer manager.
+    pub(crate) peer_manager: peers::PeerManager,
 }
 
 impl<C> TNBehavior<C>
@@ -56,8 +60,13 @@ where
     C: Codec + Send + Clone + 'static,
 {
     /// Create a new instance of Self.
-    pub fn new(gossipsub: gossipsub::Behaviour, req_res: request_response::Behaviour<C>) -> Self {
-        Self { gossipsub, req_res }
+    pub fn new<DB: Database>(
+        gossipsub: gossipsub::Behaviour,
+        req_res: request_response::Behaviour<C>,
+        consensus_config: &ConsensusConfig<DB>,
+    ) -> Self {
+        let peer_manager = PeerManager::new(consensus_config);
+        Self { gossipsub, req_res, peer_manager }
     }
 }
 
@@ -90,12 +99,19 @@ where
     authorized_publishers: HashSet<PeerId>,
     /// The collection of pending dials.
     pending_dials: HashMap<PeerId, oneshot::Sender<NetworkResult<()>>>,
+    /// The collection of pending *graceful* disconnects.
+    ///
+    /// This node disconnects from new peers if it already has the target number of peers.
+    /// For these types of "peer exchange / discovery disconnects", the node shares peer records
+    /// before disconnecting. This keeps track of the number of disconnects to ensure resources
+    /// aren't starved while waiting for the peer's ack.
+    pending_px_disconnects: HashMap<OutboundRequestId, PeerId>,
     /// The collection of pending outbound requests.
     ///
     /// Callers include a oneshot channel for the network to return response. The caller is
     /// responsible for decoding message bytes and reporting peers who return bad data. Peers that
     /// send messages that fail to decode must receive an application score penalty.
-    outbound_requests: HashMap<OutboundRequestId, oneshot::Sender<NetworkResult<Res>>>,
+    outbound_requests: HashMap<(PeerId, OutboundRequestId), oneshot::Sender<NetworkResult<Res>>>,
     /// The collection of pending inbound requests.
     ///
     /// Callers include a oneshot channel for the network to return a cancellation notice. The
@@ -106,6 +122,7 @@ where
     /// The configurables for the libp2p consensus network implementation.
     config: LibP2pConfig,
     /// Track peers we have a connection with.
+    ///
     /// This explicitly tracked and is a VecDeque so we can use to round robin requests without an
     /// explicit peer.
     connected_peers: VecDeque<PeerId>,
@@ -161,8 +178,6 @@ where
             .heartbeat_interval(Duration::from_secs(1))
             // explicitly set default
             .validation_mode(gossipsub::ValidationMode::Strict)
-            // support peer exchange
-            .do_px()
             // TN specific: filter against authorized_publishers for certain topics
             .validate_messages()
             .build()?;
@@ -183,7 +198,7 @@ where
         );
 
         // create custom behavior
-        let behavior = TNBehavior::new(gossipsub, req_res);
+        let behavior = TNBehavior::new(gossipsub, req_res, consensus_config);
 
         // create swarm
         let swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -214,6 +229,7 @@ where
 
         let (handle, commands) = tokio::sync::mpsc::channel(100);
         let config = consensus_config.network_config().libp2p_config().clone();
+        let pending_px_disconnects = HashMap::with_capacity(config.max_px_disconnects);
 
         Ok(Self {
             swarm,
@@ -227,6 +243,7 @@ where
             inbound_requests: Default::default(),
             config,
             connected_peers: VecDeque::new(),
+            pending_px_disconnects,
         })
     }
 
@@ -261,6 +278,7 @@ where
             SwarmEvent::Behaviour(behavior) => match behavior {
                 TNBehaviorEvent::Gossipsub(event) => self.process_gossip_event(event)?,
                 TNBehaviorEvent::ReqRes(event) => self.process_reqres_event(event)?,
+                TNBehaviorEvent::PeerManager(event) => self.process_peer_manager_event(event)?,
             },
             SwarmEvent::ConnectionEstablished {
                 peer_id,
@@ -305,7 +323,7 @@ where
             SwarmEvent::ConnectionClosed {
                 peer_id, connection_id, num_established, cause, ..
             } => {
-                // Log connection closure with cause
+                // log connection closure with cause
                 info!(
                     target: "network",
                     ?peer_id,
@@ -314,24 +332,26 @@ where
                     remaining = num_established,
                     "connection closed"
                 );
-                self.connected_peers.retain(|peer| *peer != peer_id);
+                // TODO: moved to peer manager disconnected event
+                //
+                // self.connected_peers.retain(|peer| *peer != peer_id);
 
-                // handle complete peer disconnect
-                if num_established == 0 {
-                    tracing::debug!(target:"network::events", pending=?self.outbound_requests.len());
-                    // clean up any pending requests for this peer
-                    //
-                    // NOTE: self.outbound_requests are removed by `OutboundFailure`
-                    // but only if the Option<PeerId> is included. This is a
-                    // sanity check to prevent the HashMap from growing indefinitely when peers
-                    // disconnect after a request is made and the PeerId is lost.
-                    self.outbound_requests.retain(|_, sender| !sender.is_closed());
+                // // handle complete peer disconnect
+                // if num_established == 0 {
+                //     tracing::debug!(target:"network::events", pending=?self.outbound_requests.len());
+                //     // clean up any pending requests for this peer
+                //     //
+                //     // NOTE: self.outbound_requests are removed by `OutboundFailure`
+                //     // but only if the Option<PeerId> is included. This is a
+                //     // sanity check to prevent the HashMap from growing indefinitely when peers
+                //     // disconnect after a request is made and the PeerId is lost.
+                //     self.outbound_requests.retain(|_, sender| !sender.is_closed());
 
-                    // TODO: schedule reconnection attempt?
-                    if self.authorized_publishers.contains(&peer_id) {
-                        warn!(target: "network::events", ?peer_id, "authorized peer disconnected");
-                    }
-                }
+                //     // TODO: schedule reconnection attempt?
+                //     if self.authorized_publishers.contains(&peer_id) {
+                //         warn!(target: "network::events", ?peer_id, "authorized peer disconnected");
+                //     }
+                // }
             }
             SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } => {
                 if let Some(sender) = self.pending_dials.remove(&peer_id) {
@@ -366,7 +386,7 @@ where
             | SwarmEvent::ExternalAddrConfirmed { .. }
             | SwarmEvent::ExternalAddrExpired { .. }
             | SwarmEvent::NewExternalAddrOfPeer { .. } => {}
-            _e => {}
+            _ => {}
         }
         Ok(())
     }
@@ -465,13 +485,13 @@ where
             }
             NetworkCommand::SendRequest { peer, request, reply } => {
                 let request_id = self.swarm.behaviour_mut().req_res.send_request(&peer, request);
-                self.outbound_requests.insert(request_id, reply);
+                self.outbound_requests.insert((peer, request_id), reply);
             }
             NetworkCommand::SendRequestAny { request, reply } => {
                 self.connected_peers.rotate_left(1);
                 if let Some(peer) = self.connected_peers.front() {
                     let request_id = self.swarm.behaviour_mut().req_res.send_request(peer, request);
-                    self.outbound_requests.insert(request_id, reply);
+                    self.outbound_requests.insert((*peer, request_id), reply);
                 } else {
                     // Ignore error since this means other end lost interest and we don't really
                     // care.
@@ -485,6 +505,23 @@ where
             NetworkCommand::PendingRequestCount { reply } => {
                 let count = self.outbound_requests.len();
                 send_or_log_error!(reply, count, "SendResponse");
+            }
+            NetworkCommand::ReportPenalty { peer_id, penalty } => {
+                self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, penalty);
+            }
+            NetworkCommand::DisconnectPeer { peer_id, reply } => {
+                let res = self.swarm.disconnect_peer_id(peer_id);
+                send_or_log_error!(reply, res, "DisconnectPeer");
+            }
+            NetworkCommand::PeerExchange { peers, channel } => {
+                self.swarm.behaviour_mut().peer_manager.process_peer_exchange(peers);
+                // send empty ack and ignore errors
+                let ack = PeerExchangeMap::default().into();
+                let _ = self.swarm.behaviour_mut().req_res.send_response(channel, ack);
+            }
+            NetworkCommand::PeersForExchange { reply } => {
+                let peers = self.swarm.behaviour_mut().peer_manager.peers_for_exchange();
+                send_or_log_error!(reply, peers, "PeersForExchange");
             }
         }
     }
@@ -556,29 +593,48 @@ where
                         self.inbound_requests.insert(request_id, notify);
                     }
                     request_response::Message::Response { request_id, response } => {
+                        // check if response associated with PX disconnect
+                        if self.pending_px_disconnects.remove(&request_id).is_some() {
+                            let _ = self.swarm.disconnect_peer_id(peer);
+                        }
+
                         // try to forward response to original caller
                         let _ = self
                             .outbound_requests
-                            .remove(&request_id)
+                            .remove(&(peer, request_id))
                             .ok_or(NetworkError::PendingRequestChannelLost)?
                             .send(Ok(response));
                     }
                 }
             }
             ReqResEvent::OutboundFailure { peer, request_id, error, connection_id: _ } => {
+                // handle px disconnects
+                //
+                // px attempts to support peer discovery, but failures are okay
+                // this node disconnects after a px timeout
+                if self.pending_px_disconnects.remove(&request_id).is_some() {
+                    return Ok(());
+                }
+
+                // log errors for other outbound failures
                 error!(target: "network", ?peer, ?error, "outbound failure");
+
                 // try to forward error to original caller
                 let _ = self
                     .outbound_requests
-                    .remove(&request_id)
+                    .remove(&(peer, request_id))
                     .ok_or(NetworkError::PendingRequestChannelLost)?
                     .send(Err(error.into()));
             }
             ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
                 match error {
                     ReqResInboundFailure::Io(e) => {
-                        // TODO: update peer score - could be malicious
+                        // penalize peer since this is an attack surface
                         warn!(target: "network", ?e, ?peer, ?request_id, "inbound IO failure");
+                        self.swarm
+                            .behaviour_mut()
+                            .peer_manager
+                            .process_penalty(peer, Penalty::Mild);
                     }
                     ReqResInboundFailure::UnsupportedProtocols => {
                         warn!(target: "network", ?peer, ?request_id, ?error, "inbound failure: unsupported protocol");
@@ -616,6 +672,102 @@ where
         } else {
             GossipAcceptance::Reject
         }
+    }
+
+    /// Process an event from the peer manager.
+    fn process_peer_manager_event(&mut self, event: PeerEvent) -> NetworkResult<()> {
+        debug!(target: "network", ?event, "process peer manager event");
+
+        match event {
+            PeerEvent::PeerDisconnected(peer_id) => {
+                // TODO: read this from PeerManager
+                //
+                // remove from connected peers
+                self.connected_peers.retain(|peer| *peer != peer_id);
+
+                // TODO: schedule reconnection attempt?
+                if self.authorized_publishers.contains(&peer_id) {
+                    warn!(target: "network::events", ?peer_id, "authorized peer disconnected");
+                }
+
+                let keys = self
+                    .outbound_requests
+                    .iter()
+                    .filter_map(
+                        |((p_id, req_id), _)| {
+                            if *p_id == peer_id {
+                                Some((*p_id, *req_id))
+                            } else {
+                                None
+                            }
+                        },
+                    )
+                    .collect::<Vec<_>>();
+
+                // remove from outbound_requests and send error
+                for k in keys {
+                    let _ = self
+                        .outbound_requests
+                        .remove(&k)
+                        .ok_or(NetworkError::PendingRequestChannelLost)?
+                        .send(Err(NetworkError::Disconnected));
+                }
+            }
+            PeerEvent::DisconnectPeerX(peer_id, peer_exchange) => {
+                // - create message to send to peer with discovery records
+                // - send the request (don't care about response)
+                // - track in self.pending_disconnects
+                //      - if too many pending disconnects, disconnect immediately
+                // - spawn task with timeout to wait for ack from peer
+
+                // TODO: the flow for `PeerAction` returns a `TempBan` which
+                // results in a `PeerEvent::Banned` event.
+                // I think the only time `DisconnectPeer` happens is when the peer's
+                // reputation is poor.
+                //
+                // This should not be the case. Lighthouse has a `GoodbyeReason` that
+                // includes too many peers, so something is broken in the TN flow.
+                //
+                // Consider adding another type so this is more straight foward
+                //
+                // instead of `DisconnectReason` just have `DisconnectPeerX`?
+
+                // attempt to exchange peer information if limits allow
+                if self.pending_px_disconnects.len() < self.config.max_px_disconnects {
+                    let (reply, done) = oneshot::channel();
+                    let request_id = self
+                        .swarm
+                        .behaviour_mut()
+                        .req_res
+                        .send_request(&peer_id, peer_exchange.into());
+                    self.outbound_requests.insert((peer_id, request_id), reply);
+
+                    let timeout = self.config.px_disconnect_timeout.clone();
+                    let handle = self.network_handle();
+
+                    // spawn task
+                    tokio::spawn(async move {
+                        // ignore errors and disconnect after px attempt
+                        let _ = tokio::time::timeout(timeout, done);
+                        let _ = handle.disconnect_peer(peer_id);
+                    });
+
+                    // insert to pending px disconnects
+                    self.pending_px_disconnects.insert(request_id, peer_id);
+                } else {
+                    // too many px disconnects pending so disconnect without px
+                    let _ = self.swarm.disconnect_peer_id(peer_id);
+                }
+            }
+            _ => (),
+            // PeerEvent::PeerConnectedIncoming(peer_id) => todo!(),
+            // PeerEvent::PeerConnectedOutgoing(peer_id) => todo!(),
+            // PeerEvent::DisconnectPeer(peer_id) => todo!(),
+            // PeerEvent::Banned(peer_id, ip_addrs) => todo!(),
+            // PeerEvent::Unbanned(peer_id, ip_addrs) => todo!(),
+        }
+
+        Ok(())
     }
 }
 
