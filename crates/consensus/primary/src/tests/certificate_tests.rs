@@ -23,7 +23,7 @@ fn test_empty_certificate_verification() {
         .collect();
 
     let certificate =
-        Certificate::new_unsigned(&committee, header, votes).expect("new unsigned cert");
+        Certificate::new_unsigned_for_test(&committee, header, votes).expect("new unsigned cert");
     assert!(certificate.verify(&committee, &fixture.worker_cache()).is_err());
 }
 
@@ -67,7 +67,7 @@ fn test_certificate_insufficient_signatures() {
 
     assert!(Certificate::new_unverified(&committee, header.clone(), signatures.clone()).is_err());
 
-    let certificate = Certificate::new_unsigned(&committee, header, signatures).unwrap();
+    let certificate = Certificate::new_unsigned_for_test(&committee, header, signatures).unwrap();
 
     assert!(certificate.verify(&committee, &fixture.worker_cache()).is_err());
 }
