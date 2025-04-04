@@ -25,6 +25,9 @@ mod types;
 pub use manager::{PeerEvent, PeerManager};
 pub use score::Penalty;
 pub use types::PeerExchangeMap;
+// visibility for tests
+#[cfg(test)]
+pub(crate) use score::GLOBAL_SCORE_CONFIG;
 
 /// State for known peers.
 ///
@@ -183,12 +186,6 @@ impl AllPeers {
             .get(peer_id)
             .map(|peer| peer.connection_status().clone())
             .unwrap_or(ConnectionStatus::Unknown)
-    }
-
-    /// Filter banned peer's ip addresses against already known banned ip addresses.
-    fn filter_new_ips_to_ban(&self, peer: &Peer) -> Vec<IpAddr> {
-        let already_banned_ips = self.banned_peers.banned_ips();
-        peer.known_ip_addresses().filter(|ip| already_banned_ips.contains(ip)).collect::<Vec<_>>()
     }
 
     /// Heartbeat maintenance.

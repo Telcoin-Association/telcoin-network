@@ -2,41 +2,10 @@
 
 use super::*;
 use crate::TNCodec;
+mod common;
+use common::{TestPrimaryRequest, TestPrimaryResponse};
 use libp2p::StreamProtocol;
-use serde::Deserialize;
-use tn_types::{Certificate, CertificateDigest, Header, Vote};
-
-// For some reason, clippy doesn't like importing these from common mod.
-// However, it works just fine for network_tests.rs ¯\_(ツ)_/¯
-impl TNMessage for TestPrimaryRequest {}
-impl TNMessage for TestPrimaryResponse {}
-
-impl From<PeerExchangeMap> for TestPrimaryRequest {
-    fn from(_: PeerExchangeMap) -> Self {
-        unimplemented!()
-    }
-}
-
-impl From<PeerExchangeMap> for TestPrimaryResponse {
-    fn from(_: PeerExchangeMap) -> Self {
-        unimplemented!()
-    }
-}
-
-/// Test requests from Primary.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(super) enum TestPrimaryRequest {
-    NewCertificate { certificate: Certificate },
-    Vote { header: Header, parents: Vec<Certificate> },
-}
-
-/// Test response to primary requests.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(super) enum TestPrimaryResponse {
-    Vote(Vote),
-    MissingCertificates(Vec<Certificate>),
-    MissingParents(Vec<CertificateDigest>),
-}
+use tn_types::{Certificate, CertificateDigest, Header};
 
 #[tokio::test]
 async fn test_encode_decode_same_message() {

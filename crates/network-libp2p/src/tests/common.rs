@@ -1,8 +1,23 @@
 //! Fixtures used in multiple tests.
 
-use crate::{PeerExchangeMap, TNMessage};
+use crate::{peers::GLOBAL_SCORE_CONFIG, PeerExchangeMap, TNMessage};
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Once};
+use tn_config::ScoreConfig;
 use tn_types::{BlockHash, Certificate, CertificateDigest, Header, SealedBatch, Vote};
+
+// ensure `init_peer_score_config` is only set once
+static INIT: Once = Once::new();
+
+/// Initialize without error for unit tests.
+pub(super) fn ensure_score_config() {
+    INIT.call_once(|| {
+        // use default
+        let config = ScoreConfig::default();
+        // ignore result
+        let _ = GLOBAL_SCORE_CONFIG.set(Arc::new(config));
+    });
+}
 
 // impl TNMessage trait for types
 impl TNMessage for TestWorkerRequest {}

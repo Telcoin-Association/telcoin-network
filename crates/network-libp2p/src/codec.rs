@@ -14,8 +14,8 @@ use std::{
 use tn_types::encode_into_buffer;
 
 #[cfg(test)]
-#[path = "tests/tn_codec_tests.rs"]
-mod tn_codec_tests;
+#[path = "tests/codec_tests.rs"]
+mod codec_tests;
 
 /// Convenience type for all traits implemented for messages used for TN request-response codec.
 pub trait TNMessage:
