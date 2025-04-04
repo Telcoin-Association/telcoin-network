@@ -103,9 +103,28 @@ impl BannedPeers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peers::score::GLOBAL_SCORE_CONFIG;
     use libp2p::{multiaddr::Protocol, Multiaddr};
     use rand::prelude::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::{Arc, Once};
+    use tn_config::ScoreConfig;
+
+    // TODO: make this visible to all unit tests
+    // - maybe add in peers::types behind a mod test-utils?
+
+    // ensure `init_peer_score_config` is only set once
+    static INIT: Once = Once::new();
+
+    // ensure `init_peer_score_config` is only set once
+    pub fn ensure_score_config() {
+        INIT.call_once(|| {
+            // use default
+            let config = ScoreConfig::default();
+            // ignore result
+            let _ = GLOBAL_SCORE_CONFIG.set(Arc::new(config));
+        });
+    }
 
     /// Helper function to create a random IPV4 address.
     fn random_ip_addr() -> IpAddr {
@@ -130,6 +149,8 @@ mod tests {
 
     /// Helper function to create a peer with specific IP addresses.
     fn create_peer_with_ips(ips: Vec<IpAddr>) -> Peer {
+        ensure_score_config();
+
         let mut peer = Peer::default();
 
         // add multiaddrs with the specified IPs
@@ -210,6 +231,7 @@ mod tests {
 
     #[test]
     fn test_add_peer_no_ip() {
+        ensure_score_config();
         let mut banned_peers = BannedPeers::default();
 
         // Create a peer with no IP addresses

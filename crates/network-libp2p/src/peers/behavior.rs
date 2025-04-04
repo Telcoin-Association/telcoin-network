@@ -14,7 +14,7 @@ use std::{
     net::IpAddr,
     task::{Context, Poll},
 };
-use tracing::{debug, error, trace};
+use tracing::{debug, error, info, trace};
 
 impl NetworkBehaviour for PeerManager {
     type ConnectionHandler = ConnectionHandler;
@@ -181,6 +181,13 @@ impl PeerManager {
                 self.push_event(PeerEvent::PeerConnectedOutgoing(peer_id));
             }
         }
+
+        // log successful connection establishment
+        info!(
+            target: "network",
+            ?endpoint,
+            "new connection established",
+        );
     }
 
     /// Handle the connection closed event.

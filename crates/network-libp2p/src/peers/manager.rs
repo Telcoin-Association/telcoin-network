@@ -1,18 +1,17 @@
 //! Manage peer connection status and reputation.
 
 use super::{
-    cache::BannedPeerCache, init_peer_score_config, peer::Peer, score::Penalty,
-    types::ConnectionType, AllPeers, ConnectionDirection, NewConnectionStatus, PeerAction,
-    PeerExchangeMap,
+    cache::BannedPeerCache, init_peer_score_config, score::Penalty, types::ConnectionType,
+    AllPeers, ConnectionDirection, NewConnectionStatus, PeerAction, PeerExchangeMap,
 };
 use crate::peers::status::ConnectionStatus;
 use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     net::IpAddr,
     task::Context,
 };
-use tn_config::{ConsensusConfig, PeerConfig};
+use tn_config::{ConsensusConfig, PeerConfig, GENESIS_VALIDATORS_DIR};
 use tn_types::Database;
 use tracing::{debug, error};
 
@@ -76,9 +75,7 @@ impl PeerManager {
             tokio::time::interval(tokio::time::Duration::from_secs(config.heartbeat_interval));
 
         // TODO: restore peers from backup?
-        //
-        // TODO: pass in validators!!!!!!!!!
-        let validators = BTreeSet::new();
+        let validators = consensus_config.committee_peer_ids();
         let peers = AllPeers::new(validators, config.target_num_peers, config.dial_timeout);
         let events = VecDeque::new();
         let temporarily_banned = BannedPeerCache::new(config.excess_peers_reconnection_timeout);
@@ -338,7 +335,9 @@ impl PeerManager {
     pub(super) fn register_disconnected(&mut self, peer_id: &PeerId) {
         let (action, pruned_peers) = self.peers.register_disconnected(peer_id);
 
-        // if the peer is banned, continue to ban the peer
+        // banning is the only action that happens after disconnect
+        // if the peer is banned then manager needs to apply the ban still
+        // otherwise, there is no other action to take
         if action.is_ban() {
             self.apply_peer_action(*peer_id, action);
         }

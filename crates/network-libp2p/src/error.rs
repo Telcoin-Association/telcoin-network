@@ -82,6 +82,9 @@ pub enum NetworkError {
     /// The peer was already disconnected.
     #[error("Peer already disconnected")]
     DisconnectPeer,
+    /// Fatal error - the swarm is not connected to any listeners.
+    #[error("All swarm listeners closed. Network shutting down...")]
+    AllListenersClosed,
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {

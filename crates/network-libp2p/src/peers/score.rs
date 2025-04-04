@@ -16,9 +16,9 @@ pub(super) static GLOBAL_SCORE_CONFIG: OnceLock<Arc<ScoreConfig>> = OnceLock::ne
 
 /// Initialize the global peer score configuration.
 #[must_use]
-pub(super) fn init_peer_score_config(config: ScoreConfig) -> Result<(), &'static str> {
+pub(super) fn init_peer_score_config(config: ScoreConfig) {
     let config = Arc::new(config);
-    GLOBAL_SCORE_CONFIG.set(config).map_err(|_| "Peer score configuration already initialized")
+    GLOBAL_SCORE_CONFIG.set(config).expect("Peer score configuration initialized once")
 }
 
 /// Get a reference to the global peer score configuration
@@ -243,7 +243,6 @@ impl Display for Score {
 
 /// The expected status of the peer based on the peer's score.
 #[derive(Debug, PartialEq, Clone, Copy)]
-// TODO: this was ScoreState
 pub(super) enum Reputation {
     /// The peer is performing within the tolerable threshold.
     Trusted,

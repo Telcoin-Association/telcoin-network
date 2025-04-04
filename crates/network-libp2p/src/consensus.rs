@@ -15,7 +15,6 @@ use libp2p::{
     gossipsub::{
         self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance,
     },
-    multiaddr::Protocol,
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
         InboundRequestId, OutboundRequestId,
@@ -280,112 +279,73 @@ where
                 TNBehaviorEvent::ReqRes(event) => self.process_reqres_event(event)?,
                 TNBehaviorEvent::PeerManager(event) => self.process_peer_manager_event(event)?,
             },
-            SwarmEvent::ConnectionEstablished {
-                peer_id,
-                connection_id,
-                endpoint,
-                num_established,
-                concurrent_dial_errors,
-                established_in,
-            } => {
-                if endpoint.is_dialer() {
-                    if let Some(sender) = self.pending_dials.remove(&peer_id) {
-                        send_or_log_error!(sender, Ok(()), "ConnectionEstablished", peer = peer_id);
-                    }
-                }
-                if !self.connected_peers.contains(&peer_id) {
-                    self.connected_peers.push_back(peer_id);
-                }
-
-                // Log successful connection establishment
-                info!(
-                    target: "network::events",
-                    ?peer_id,
-                    ?connection_id,
-                    ?num_established,
-                    ?established_in,
-                    ?concurrent_dial_errors,
-                    "new connection established"
-                );
-
-                // TODO: manage connnections?
-                // - better to manage after `IncomingConnection` event?
-                // if num_established > MAX_CONNECTIONS_PER_PEER {
-                //     warn!(
-                //         target: "network",
-                //         ?peer_id,
-                //         connections = num_established,
-                //         "excessive connections from peer"
-                //     );
-                //     // close excess connections
-                // }
-            }
-            SwarmEvent::ConnectionClosed {
-                peer_id, connection_id, num_established, cause, ..
-            } => {
-                // log connection closure with cause
-                info!(
-                    target: "network",
-                    ?peer_id,
-                    ?connection_id,
-                    ?cause,
-                    remaining = num_established,
-                    "connection closed"
-                );
-                // TODO: moved to peer manager disconnected event
-                //
-                // self.connected_peers.retain(|peer| *peer != peer_id);
-
-                // // handle complete peer disconnect
-                // if num_established == 0 {
-                //     tracing::debug!(target:"network::events", pending=?self.outbound_requests.len());
-                //     // clean up any pending requests for this peer
-                //     //
-                //     // NOTE: self.outbound_requests are removed by `OutboundFailure`
-                //     // but only if the Option<PeerId> is included. This is a
-                //     // sanity check to prevent the HashMap from growing indefinitely when peers
-                //     // disconnect after a request is made and the PeerId is lost.
-                //     self.outbound_requests.retain(|_, sender| !sender.is_closed());
-
-                //     // TODO: schedule reconnection attempt?
-                //     if self.authorized_publishers.contains(&peer_id) {
-                //         warn!(target: "network::events", ?peer_id, "authorized peer disconnected");
-                //     }
-                // }
-            }
-            SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } => {
-                if let Some(sender) = self.pending_dials.remove(&peer_id) {
-                    send_or_log_error!(sender, Err(error.into()), "OutgoingConnectionError");
-                }
-            }
             SwarmEvent::ExpiredListenAddr { address, .. } => {
-                // log listening addr
-                info!(
+                debug!(
                     target: "network",
-                    address = ?address.with(Protocol::P2p(*self.swarm.local_peer_id())),
-                    "network listening"
+                    ?address,
+                    "listener address expired"
                 );
             }
             SwarmEvent::ListenerError { listener_id, error } => {
-                // Log listener errors
-                error!(
-                    target: "network::events",
-                    ?listener_id,
+                // TODO: ignore quic accept and close errors?
+                if error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<libp2p::quic::Error>())
+                    .filter(|err| matches!(err, libp2p::quic::Error::Connection(_)))
+                    .is_some()
+                {
+                    debug!(
+                        target: "network",
+                        ?listener_id,
+                        ?error,
+                        "quic listener error"
+                    );
+                } else {
+                    // Log listener errors
+                    error!(
+                        target: "network::events",
+                        ?listener_id,
+                        ?error,
+                        "listener error"
+                    );
+                }
+            }
+            SwarmEvent::ListenerClosed { addresses, reason, .. } => {
+                // log errors
+                if let Err(e) = reason {
+                    error!(target: "network", ?e, "listener unexpectedly closed");
+                }
+
+                // critical failure
+                if self.swarm.listeners().count() == 0 {
+                    error!(target: "network", ?addresses, "no listeners for swarm - network shutting down");
+                    return Err(NetworkError::AllListenersClosed);
+                }
+            }
+            SwarmEvent::IncomingConnectionError { local_addr, send_back_addr, error, .. } => {
+                debug!(
+                    target: "network",
                     ?error,
-                    "listener error"
+                    ?local_addr,
+                    ?send_back_addr,
+                    "incoming connection error"
                 );
             }
             // These events are included here because they will likely become useful in near-future
             // PRs
-            SwarmEvent::IncomingConnection { .. }
-            | SwarmEvent::IncomingConnectionError { .. }
-            | SwarmEvent::NewListenAddr { .. }
-            | SwarmEvent::ListenerClosed { .. }
+            // SwarmEvent::IncomingConnection { .. }
+            // | SwarmEvent::IncomingConnectionError { .. }
+            SwarmEvent::NewListenAddr { .. }
             | SwarmEvent::Dialing { .. }
             | SwarmEvent::NewExternalAddrCandidate { .. }
             | SwarmEvent::ExternalAddrConfirmed { .. }
             | SwarmEvent::ExternalAddrExpired { .. }
-            | SwarmEvent::NewExternalAddrOfPeer { .. } => {}
+            | SwarmEvent::NewExternalAddrOfPeer { .. }
+            // handled by PeerManager behavior
+            | SwarmEvent::ConnectionEstablished { .. }
+            | SwarmEvent::ConnectionClosed { .. }
+            | SwarmEvent::IncomingConnection { .. } => {}
+            | SwarmEvent::OutgoingConnectionError { .. } => {}
             _ => {}
         }
         Ok(())
@@ -680,14 +640,12 @@ where
 
         match event {
             PeerEvent::PeerDisconnected(peer_id) => {
-                // TODO: read this from PeerManager
-                //
                 // remove from connected peers
                 self.connected_peers.retain(|peer| *peer != peer_id);
 
-                // TODO: schedule reconnection attempt?
                 if self.authorized_publishers.contains(&peer_id) {
                     warn!(target: "network::events", ?peer_id, "authorized peer disconnected");
+                    // TODO: schedule reconnection attempt if this node is cvv
                 }
 
                 let keys = self
@@ -759,9 +717,12 @@ where
                     let _ = self.swarm.disconnect_peer_id(peer_id);
                 }
             }
+            PeerEvent::PeerConnectedIncoming(peer_id)
+            | PeerEvent::PeerConnectedOutgoing(peer_id) => {
+                // add peer to connected peers for requests
+                self.connected_peers.push_back(peer_id);
+            }
             _ => (),
-            // PeerEvent::PeerConnectedIncoming(peer_id) => todo!(),
-            // PeerEvent::PeerConnectedOutgoing(peer_id) => todo!(),
             // PeerEvent::DisconnectPeer(peer_id) => todo!(),
             // PeerEvent::Banned(peer_id, ip_addrs) => todo!(),
             // PeerEvent::Unbanned(peer_id, ip_addrs) => todo!(),
@@ -798,3 +759,10 @@ impl From<GossipAcceptance> for MessageAcceptance {
         }
     }
 }
+
+// For tomorrow:
+// + review commented out SwarmEvents above and ensure they all match with the peer manager implementation
+// + refactor connected peers and round-robin logic - leave alone for PR
+// - update tests
+// - how to handle authorized publishers AND validators? leave separate for PR
+// - work on the next PeerEvent

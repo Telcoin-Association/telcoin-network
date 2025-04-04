@@ -8,7 +8,7 @@ use score::{init_peer_score_config, Reputation, ReputationUpdate};
 use status::{ConnectionStatus, NewConnectionStatus};
 use std::{
     cmp::Reverse,
-    collections::{BTreeSet, BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     net::IpAddr,
     time::{Duration, Instant},
 };
@@ -34,7 +34,7 @@ pub struct AllPeers {
     /// The collection of known connected peers, their status and reputation
     peers: HashMap<PeerId, Peer>,
     /// The collection of staked validators at the beginning of each epoch.
-    validators: BTreeSet<PeerId>,
+    validators: HashSet<PeerId>,
     /// Information for peers that scored poorly enough to become banned.
     banned_peers: BannedPeers,
     /// The number of peers that have disconnected from this node.
@@ -74,7 +74,7 @@ impl PeerAction {
 impl AllPeers {
     /// Create a new instance of Self.
     pub(super) fn new(
-        validators: BTreeSet<PeerId>,
+        validators: HashSet<PeerId>,
         target_num_peers: usize,
         dial_timeout: Duration,
     ) -> Self {

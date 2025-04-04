@@ -2,12 +2,11 @@
 //!
 //! The connection status and sync status for the peer.
 
+use super::ConnectionDirection;
 use libp2p::Multiaddr;
 use serde::{ser::SerializeStruct as _, Serialize, Serializer};
 use std::{net::IpAddr, time::Instant};
 use tn_types::{BlockHash, Epoch};
-
-use super::ConnectionDirection;
 
 /// Connection status of the peer.
 #[derive(Debug, Clone, Default)]

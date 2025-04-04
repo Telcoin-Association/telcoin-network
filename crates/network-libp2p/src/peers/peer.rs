@@ -38,7 +38,6 @@ pub struct Peer {
     ///
     /// `None` if this peer was never connected.
     connection_direction: Option<ConnectionDirection>,
-    // TODO: include TNR?
 }
 
 impl Peer {
