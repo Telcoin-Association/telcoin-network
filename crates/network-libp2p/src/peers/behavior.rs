@@ -1,12 +1,19 @@
 //! Implement the libp2p network behavior to manage peers in the swarm.
 
-use super::manager::{PeerEvent, PeerManager};
+use crate::peers::types::ConnectionType;
+
+use super::{
+    manager::{PeerEvent, PeerManager},
+    types::DialRequest,
+};
 use libp2p::{
     core::{multiaddr::Protocol, transport::PortUse, ConnectedPoint, Endpoint},
     swarm::{
-        behaviour::ConnectionEstablished, dummy::ConnectionHandler, ConnectionClosed,
-        ConnectionDenied, ConnectionId, DialFailure, FromSwarm, NetworkBehaviour, THandler,
-        THandlerInEvent, ToSwarm,
+        behaviour::ConnectionEstablished,
+        dial_opts::{DialOpts, PeerCondition},
+        dummy::ConnectionHandler,
+        ConnectionClosed, ConnectionDenied, ConnectionId, DialError, DialFailure, FromSwarm,
+        NetworkBehaviour, THandler, THandlerInEvent, ToSwarm,
     },
     Multiaddr, PeerId,
 };
@@ -102,7 +109,7 @@ impl NetworkBehaviour for PeerManager {
             }) => self.on_connection_closed(peer_id, endpoint, remaining_established),
             FromSwarm::DialFailure(DialFailure { peer_id, error, connection_id: _ }) => {
                 debug!(target: "peer-manager", ?peer_id, ?error, "failed to dial peer");
-                self.on_dial_failure(peer_id);
+                self.on_dial_failure(peer_id, error);
             }
             FromSwarm::ExternalAddrConfirmed(_) => {
                 // The external address was confirmed: possible to support NAT traversal
@@ -140,6 +147,24 @@ impl NetworkBehaviour for PeerManager {
             return Poll::Ready(ToSwarm::GenerateEvent(next_event));
         }
 
+        // process dial requests after all events drained
+        if let Some(request) = self.next_dial_request() {
+            let DialRequest { peer_id, multiaddrs, reply } = request;
+
+            debug!(target: "network", ?peer_id, "network behior processing next dial request");
+
+            // register to send result back to caller
+            self.register_dial_attempt(peer_id, reply);
+
+            // swarm to dial peer
+            return Poll::Ready(ToSwarm::Dial {
+                opts: DialOpts::peer_id(peer_id)
+                    .condition(PeerCondition::Disconnected)
+                    .addresses(multiaddrs)
+                    .build(),
+            });
+        }
+
         Poll::Pending
     }
 }
@@ -171,16 +196,24 @@ impl PeerManager {
         }
 
         // do not register peers that were immediately disconnected - network service does not need to know about these peers
-        match endpoint {
+        let multiaddr = match endpoint {
             ConnectedPoint::Listener { send_back_addr, .. } => {
-                self.register_incoming_connection(&peer_id, send_back_addr.clone());
-                self.push_event(PeerEvent::PeerConnectedIncoming(peer_id));
+                self.register_peer_connection(
+                    &peer_id,
+                    ConnectionType::IncomingConnection { multiaddr: send_back_addr.clone() },
+                );
+                send_back_addr.clone()
             }
             ConnectedPoint::Dialer { address, .. } => {
-                self.register_outgoing_connection(&peer_id, address.clone());
-                self.push_event(PeerEvent::PeerConnectedOutgoing(peer_id));
+                self.register_peer_connection(
+                    &peer_id,
+                    ConnectionType::OutgoingConnection { multiaddr: address.clone() },
+                );
+                address.clone()
             }
-        }
+        };
+
+        self.push_event(PeerEvent::PeerConnected(peer_id, multiaddr));
 
         // log successful connection establishment
         info!(
@@ -218,13 +251,16 @@ impl PeerManager {
 
     /// Dial attempt failed.
     ///
-    /// NOTE: `AllPeers` is only updated if the peer is not already connected. It's possible that
+    /// NOTE: `AllPeers` is only updated if the peer is _not_ already connected. It's possible that
     /// an outgoing dial attempt fails because the peer connected during the dial.
-    fn on_dial_failure(&mut self, peer_id: Option<PeerId>) {
+    fn on_dial_failure(&mut self, peer_id: Option<PeerId>, error: &DialError) {
         if let Some(peer_id) = peer_id {
             if !self.is_connected(&peer_id) {
                 self.register_disconnected(&peer_id);
             }
+
+            // return error to dialer
+            self.notify_dial_result(&peer_id, Err(error.into()));
         }
     }
 }

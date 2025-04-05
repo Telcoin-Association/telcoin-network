@@ -1,15 +1,25 @@
 //! Manage peer connection status and reputation.
 
 use super::{
-    cache::BannedPeerCache, init_peer_score_config, score::Penalty, types::ConnectionType,
+    cache::BannedPeerCache,
+    init_peer_score_config,
+    score::Penalty,
+    types::{ConnectionType, DialRequest},
     AllPeers, ConnectionDirection, NewConnectionStatus, PeerAction, PeerExchangeMap,
 };
-use crate::peers::status::ConnectionStatus;
+use crate::{
+    error::NetworkError, peers::status::ConnectionStatus, send_or_log_error, types::NetworkResult,
+};
 use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
-use std::{collections::VecDeque, net::IpAddr, task::Context};
+use std::{
+    collections::{HashMap, VecDeque},
+    net::IpAddr,
+    task::Context,
+};
 use tn_config::{ConsensusConfig, PeerConfig};
 use tn_types::Database;
-use tracing::{debug, error};
+use tokio::sync::oneshot;
+use tracing::{debug, error, warn};
 
 #[cfg(test)]
 #[path = "../tests/peer_manager.rs"]
@@ -25,6 +35,10 @@ pub struct PeerManager {
     peers: AllPeers,
     /// A queue of events that the `PeerManager` is waiting to produce.
     events: VecDeque<PeerEvent>,
+    /// A queue of peers to dial.
+    dial_requests: VecDeque<DialRequest>,
+    /// The collection of pending dials.
+    pending_dials: HashMap<PeerId, oneshot::Sender<NetworkResult<()>>>,
     /// Tracks temporarily banned peers to prevent immediate reconnection attempts.
     ///
     /// This LRU cache manages a time-based ban list that operates independently
@@ -49,10 +63,8 @@ pub struct PeerManager {
 /// Events for the [PeerManager].
 #[derive(Debug)]
 pub enum PeerEvent {
-    /// Received dial from peer.
-    PeerConnectedIncoming(PeerId),
-    /// Peer was dialed.
-    PeerConnectedOutgoing(PeerId),
+    /// Connected with peer.
+    PeerConnected(PeerId, Multiaddr),
     /// Peer was disconnected.
     PeerDisconnected(PeerId),
     /// Disconnect from the peer without exchanging peer information.
@@ -77,18 +89,100 @@ impl PeerManager {
         // TODO: restore peers from backup?
         let validators = consensus_config.committee_peer_ids();
         let peers = AllPeers::new(validators, config.target_num_peers, config.dial_timeout);
-        let events = VecDeque::new();
         let temporarily_banned = BannedPeerCache::new(config.excess_peers_reconnection_timeout);
 
         // initialize global score config
         init_peer_score_config(config.score_config);
 
-        Self { config: *config, heartbeat, peers, events, temporarily_banned }
+        Self {
+            config: *config,
+            heartbeat,
+            peers,
+            events: Default::default(),
+            dial_requests: Default::default(),
+            pending_dials: Default::default(),
+            temporarily_banned,
+        }
+    }
+
+    /// Process the request to dial a peer.
+    pub(crate) fn dial_peer(
+        &mut self,
+        peer_id: PeerId,
+        multiaddr: Multiaddr,
+        reply: oneshot::Sender<NetworkResult<()>>,
+    ) {
+        // return early if peer is banned, connected, or currently being dialed
+        if let Some(peer) = self.peers.get_peer(&peer_id) {
+            match peer.connection_status() {
+                ConnectionStatus::Banned { .. } => {
+                    // report error - dial banned peer
+                    let error = NetworkError::Dial(format!("Peer {} is banned", peer_id));
+                    warn!(target: "peer-manager", ?error, "invalid dial request");
+                    send_or_log_error!(reply, Err(error), "DialPeer", peer = peer_id);
+                    return;
+                }
+                ConnectionStatus::Dialing { .. } => {
+                    // report error - dialing already in progress
+                    let error = NetworkError::Dial(format!("Already dialing {}", peer_id));
+                    warn!(target: "peer-manager", ?error, "invalid dial request");
+                    send_or_log_error!(reply, Err(error), "DialPeer", peer = peer_id);
+                    return;
+                }
+                ConnectionStatus::Connected { .. } => {
+                    // report error - dialing already connected
+                    let error =
+                        NetworkError::Dial(format!("Peer {} is already connected", peer_id));
+                    warn!(target: "peer-manager", ?error, "invalid dial request");
+                    send_or_log_error!(reply, Err(error), "DialPeer", peer = peer_id);
+                    return;
+                }
+                _ => { /* ignore */ }
+            }
+        }
+        // schedule swarm to dial peer
+        debug!(target: "peer-manager", ?peer_id, "sending dial request to swarm");
+        let request = DialRequest { peer_id, multiaddrs: vec![multiaddr], reply };
+        self.dial_requests.push_back(request);
     }
 
     /// Push a [PeerEvent].
     pub(super) fn push_event(&mut self, event: PeerEvent) {
         self.events.push_back(event);
+    }
+
+    /// Register a dial attempt to return the result to caller.
+    ///
+    /// This method initializes the peer and sets the connection to `Dialing`.
+    pub(super) fn register_dial_attempt(
+        &mut self,
+        peer_id: PeerId,
+        reply: oneshot::Sender<NetworkResult<()>>,
+    ) {
+        // create the peer if it doesn't exist and register as dialing
+        self.peers.update_connection_status(&peer_id, NewConnectionStatus::Dialing);
+        self.pending_dials.insert(peer_id, reply);
+    }
+
+    /// Return the next dial request if it exists.
+    pub(super) fn next_dial_request(&mut self) -> Option<DialRequest> {
+        self.dial_requests.pop_front()
+    }
+
+    /// Return the oneshot sender for dial attempt if it exists.
+    pub(super) fn reply_for_dial_attempt(
+        &mut self,
+        peer_id: &PeerId,
+    ) -> Option<oneshot::Sender<NetworkResult<()>>> {
+        self.pending_dials.remove(peer_id)
+    }
+
+    /// Notify the caller that a dial attempt was successful.
+    pub(super) fn notify_dial_result(&mut self, peer_id: &PeerId, result: NetworkResult<()>) {
+        // return result to caller
+        if let Some(reply) = self.reply_for_dial_attempt(&peer_id) {
+            send_or_log_error!(reply, result, "DialResult", peer = peer_id);
+        }
     }
 
     /// Poll events.
@@ -262,42 +356,22 @@ impl PeerManager {
         );
     }
 
-    /// Convenience method to register a connected peer if their reputation is sufficient.
-    ///
-    /// Returns a boolean if the peer was successfully registered.
-    pub(super) fn register_incoming_connection(
-        &mut self,
-        peer_id: &PeerId,
-        multiaddr: Multiaddr,
-    ) -> bool {
-        self.register_peer_connection(peer_id, ConnectionType::IncomingConnection { multiaddr })
-    }
-
-    /// Convenience method to register a connected peer if their reputation is sufficient.
-    ///
-    /// Returns a boolean if the peer was successfully registered.
-    pub(super) fn register_outgoing_connection(
-        &mut self,
-        peer_id: &PeerId,
-        multiaddr: Multiaddr,
-    ) -> bool {
-        self.register_peer_connection(peer_id, ConnectionType::OutgoingConnection { multiaddr })
-    }
-
     /// Register a connected peer if their reputation is sufficient.
     ///
-    /// Returns a boolean if the peer was successfully registered.
-    fn register_peer_connection(&mut self, peer_id: &PeerId, connection: ConnectionType) -> bool {
+    /// Returns a boolean if the peer was successfully registered. This is the initial
+    /// method to call for registering a new peer through dialing or incoming connections.
+    pub(super) fn register_peer_connection(
+        &mut self,
+        peer_id: &PeerId,
+        connection: ConnectionType,
+    ) -> bool {
         if self.peers.peer_banned(peer_id) {
             // log error if the peer is banned
             error!(target: "peer-manager", ?peer_id, "connected with banned peer");
+            return false;
         }
 
         match connection {
-            ConnectionType::Dialing => {
-                self.peers.update_connection_status(peer_id, NewConnectionStatus::Dialing);
-                return true;
-            }
             ConnectionType::IncomingConnection { multiaddr } => {
                 self.peers.update_connection_status(
                     peer_id,
@@ -315,6 +389,8 @@ impl PeerManager {
                         direction: ConnectionDirection::Outgoing,
                     },
                 );
+                // this node dials for outgoing connections
+                self.notify_dial_result(peer_id, Ok(()));
             }
         }
 

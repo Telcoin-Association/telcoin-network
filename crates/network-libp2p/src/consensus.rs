@@ -331,12 +331,15 @@ where
                     "incoming connection error"
                 );
             }
+            SwarmEvent::Dialing { peer_id, connection_id } => {
+                debug!(target: "network", ?peer_id, ?connection_id, "dialing peer");
+                // ignore this and wait for connection
+            }
             // These events are included here because they will likely become useful in near-future
             // PRs
             // SwarmEvent::IncomingConnection { .. }
             // | SwarmEvent::IncomingConnectionError { .. }
             SwarmEvent::NewListenAddr { .. }
-            | SwarmEvent::Dialing { .. }
             | SwarmEvent::NewExternalAddrCandidate { .. }
             | SwarmEvent::ExternalAddrConfirmed { .. }
             | SwarmEvent::ExternalAddrExpired { .. }
@@ -371,31 +374,7 @@ where
                 self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
             }
             NetworkCommand::Dial { peer_id, peer_addr, reply } => {
-                if let hash_map::Entry::Vacant(entry) = self.pending_dials.entry(peer_id) {
-                    // Add the peer we are dialing so we can easily reconnect after a timeout, etc.
-                    // Can use "peer_addr.with(Protocol::P2p(peer_id))})" as the dial parameter
-                    // without adding the peer but libp2p won't remember it.
-                    self.swarm.add_peer_address(peer_id, peer_addr);
-                    match self.swarm.dial(peer_id) {
-                        Ok(()) => {
-                            entry.insert(reply);
-                        }
-                        Err(e) => {
-                            send_or_log_error!(
-                                reply,
-                                Err(e.into()),
-                                "AddExplicitPeer",
-                                peer = peer_id,
-                            );
-                        }
-                    }
-                } else {
-                    // return error - dial attempt already tracked for peer
-                    //
-                    // may be necessary to update entry in future, but for now assume only one dial
-                    // attempt
-                    send_or_log_error!(reply, Err(NetworkError::RedialAttempt), "AddExplicitPeer");
-                }
+                self.swarm.behaviour_mut().peer_manager.dial_peer(peer_id, peer_addr, reply);
             }
             NetworkCommand::LocalPeerId { reply } => {
                 let peer_id = *self.swarm.local_peer_id();
@@ -690,6 +669,9 @@ where
                 //
                 // instead of `DisconnectReason` just have `DisconnectPeerX`?
 
+                // remove from connected peers
+                self.connected_peers.retain(|peer| *peer != peer_id);
+
                 // attempt to exchange peer information if limits allow
                 if self.pending_px_disconnects.len() < self.config.max_px_disconnects {
                     let (reply, done) = oneshot::channel();
@@ -717,9 +699,9 @@ where
                     let _ = self.swarm.disconnect_peer_id(peer_id);
                 }
             }
-            PeerEvent::PeerConnectedIncoming(peer_id)
-            | PeerEvent::PeerConnectedOutgoing(peer_id) => {
-                // add peer to connected peers for requests
+            PeerEvent::PeerConnected(peer_id, addr) => {
+                // notify other behaviors so they can dial using peer_id
+                self.swarm.add_peer_address(peer_id, addr);
                 self.connected_peers.push_back(peer_id);
             }
             _ => (),

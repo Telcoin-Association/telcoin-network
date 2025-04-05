@@ -26,14 +26,15 @@ fn extract_events<'a>(
     events.iter().filter(|e| event_type(e)).collect()
 }
 
-#[test]
-fn test_register_disconnected_basic() {
+#[tokio::test]
+async fn test_register_disconnected_basic() {
     let mut peer_manager = create_test_peer_manager();
     let peer_id = PeerId::random();
     let multiaddr = create_test_multiaddr(1);
 
     // register connection
-    assert!(peer_manager.register_incoming_connection(&peer_id, multiaddr));
+    let connection = ConnectionType::IncomingConnection { multiaddr };
+    assert!(peer_manager.register_peer_connection(&peer_id, connection));
 
     // register disconnection
     peer_manager.register_disconnected(&peer_id);
@@ -47,14 +48,13 @@ fn test_register_disconnected_basic() {
 
 #[tokio::test]
 async fn test_register_disconnected_with_banned_peer() {
-    tn_test_utils::init_test_tracing();
-
     let mut peer_manager = create_test_peer_manager();
     let peer_id = PeerId::random();
     let multiaddr = create_test_multiaddr(2);
 
-    // Register connection first
-    assert!(peer_manager.register_incoming_connection(&peer_id, multiaddr));
+    // register connection
+    let connection = ConnectionType::IncomingConnection { multiaddr };
+    assert!(peer_manager.register_peer_connection(&peer_id, connection));
 
     // Apply a severe penalty to trigger ban
     peer_manager.process_penalty(peer_id, Penalty::Fatal);

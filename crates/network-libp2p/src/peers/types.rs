@@ -1,15 +1,24 @@
 //! Types for managing peers.
 
-use std::collections::{hash_map::IntoIter, HashMap, HashSet};
-
+use crate::types::NetworkResult;
 use libp2p::{Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
+use std::collections::{hash_map::IntoIter, HashMap, HashSet};
+use tokio::sync::oneshot;
+
+/// Request for dialing peers.
+pub(crate) struct DialRequest {
+    /// The peer's network id.
+    pub(crate) peer_id: PeerId,
+    /// The multiaddr to dial.
+    pub(crate) multiaddrs: Vec<Multiaddr>,
+    /// The channel to forward results and errors.
+    pub(crate) reply: oneshot::Sender<NetworkResult<()>>,
+}
 
 /// Types of connections between peers.
 pub(super) enum ConnectionType {
-    /// This node is dialing the peer.
-    Dialing,
     /// A peer has successfully dialed this node.
     IncomingConnection {
         /// The peer's multiaddr.

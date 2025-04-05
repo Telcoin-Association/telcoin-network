@@ -217,10 +217,13 @@ async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
+    tn_test_utils::init_test_tracing();
+
     // start honest peer1 network
     let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
 
+    debug!(target: "network", "spawn peer1 network");
     let peer1_network_task = tokio::spawn(async move {
         network.run().await.expect("network run failed!");
     });
@@ -232,26 +235,36 @@ async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
         network_events: mut network_events_2,
         network,
     } = peer2;
+    debug!(target: "network", "spawn peer2 network");
     tokio::spawn(async move {
         network.run().await.expect("network run failed!");
     });
 
     // start swarm listening on default any address
+    debug!(target: "network", "start listening...");
     peer1.start_listening(config_1.authority().primary_network_address().clone()).await?;
     peer2.start_listening(config_2.authority().primary_network_address().clone()).await?;
+    debug!(target: "network", "get peer2 ids...");
     let peer2_id = peer2.local_peer_id().await?;
     let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
+
+    debug!(target: "network", ?peer2_id, ?peer2_addr, "done");
 
     let missing_block = fixture_batch_with_transactions(3).seal_slow();
     let digests = vec![missing_block.digest()];
     let batch_req = TestWorkerRequest::MissingBatches(digests);
 
+    debug!(target: "network", "dialing peer2");
     // dial peer2
     peer1.dial(peer2_id, peer2_addr).await?;
+
+    debug!(target: "network", "dial awaited :D - requesting pending count");
 
     // expect no pending requests yet
     let count = peer1.get_pending_request_count().await?;
     assert_eq!(count, 0);
+
+    debug!(target: "network", ?count, "count?? - sending request...");
 
     // send request and wait for response
     let max_time = Duration::from_secs(5);

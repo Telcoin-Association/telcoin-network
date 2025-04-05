@@ -257,7 +257,6 @@ where
     pub async fn dial(&self, peer_id: PeerId, peer_addr: Multiaddr) -> NetworkResult<()> {
         let (reply, ack) = oneshot::channel();
         self.sender.send(NetworkCommand::Dial { peer_id, peer_addr, reply }).await?;
-
         ack.await?
     }
 

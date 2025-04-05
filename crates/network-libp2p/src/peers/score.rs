@@ -17,7 +17,10 @@ pub(crate) static GLOBAL_SCORE_CONFIG: OnceLock<Arc<ScoreConfig>> = OnceLock::ne
 /// Initialize the global peer score configuration.
 pub(super) fn init_peer_score_config(config: ScoreConfig) {
     let config = Arc::new(config);
-    GLOBAL_SCORE_CONFIG.set(config).expect("Peer score configuration initialized once");
+
+    // allow multiple calls to this fn
+    let _ = GLOBAL_SCORE_CONFIG.set(config);
+    // GLOBAL_SCORE_CONFIG.set(config).expect("peer score config initialized once");
 }
 
 /// Get a reference to the global peer score configuration
