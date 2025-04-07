@@ -96,7 +96,7 @@ impl AllPeers {
     /// This overwrites peer records and unbans ips.
     pub(super) fn add_trusted_peer(&mut self, peer_id: PeerId, addr: Multiaddr) {
         let trusted_peer = Peer::new_trusted(addr);
-        let unban_ips = self.banned_peers.remove_banned_peer(trusted_peer.known_ip_addresses());
+        let _ = self.banned_peers.remove_banned_peer(trusted_peer.known_ip_addresses());
         self.peers.insert(peer_id, trusted_peer);
     }
 

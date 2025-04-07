@@ -718,13 +718,13 @@ where
                 // manage connected peers for
                 self.connected_peers.push_back(peer_id);
             }
-            PeerEvent::Banned(peer_id, ip_addrs) => {
-                debug!(target: "network", ?peer_id, ?ip_addrs, "peer banned");
+            PeerEvent::Banned(peer_id) => {
+                debug!(target: "network", ?peer_id, "peer banned");
                 // blacklist gossipsub
                 self.swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
             }
-            PeerEvent::Unbanned(peer_id, ip_addrs) => {
-                debug!(target: "network", ?peer_id, ?ip_addrs, "peer unbanned");
+            PeerEvent::Unbanned(peer_id) => {
+                debug!(target: "network", ?peer_id, "peer unbanned");
                 // remove blacklist gossipsub
                 self.swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&peer_id);
             }

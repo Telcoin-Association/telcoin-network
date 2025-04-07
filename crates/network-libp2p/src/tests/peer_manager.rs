@@ -87,12 +87,11 @@ async fn test_register_disconnected_with_banned_peer() {
 
     debug!(target: "peer-manager", ?banned_events, "made it here");
 
-    let banned_event =
-        extract_events(&banned_events, |e| matches!(e, PeerEvent::Banned(_, _))).len();
+    let banned_event = extract_events(&banned_events, |e| matches!(e, PeerEvent::Banned(_))).len();
     assert!(banned_event == 1, "Expect one banned event");
     assert_matches!(
         banned_events.first().unwrap(),
-        PeerEvent::Banned(id, _) if *id == peer_id
+        PeerEvent::Banned(id) if *id == peer_id
     );
 
     // assert peer is still banned after disconnection

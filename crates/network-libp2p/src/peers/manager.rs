@@ -74,9 +74,9 @@ pub enum PeerEvent {
     /// This is the event for disconnecting from excess peers with otherwise trusted reputations.
     DisconnectPeerX(PeerId, PeerExchangeMap),
     /// Peer manager has identified a peer and associated ip addresses to ban.
-    Banned(PeerId, Vec<IpAddr>),
+    Banned(PeerId),
     /// Peer manager has unbanned a peer and associated ip addresses.
-    Unbanned(PeerId, Vec<IpAddr>),
+    Unbanned(PeerId),
 }
 
 impl PeerManager {
@@ -248,7 +248,7 @@ impl PeerManager {
         match action {
             PeerAction::Ban(ip_addrs) => {
                 debug!(target: "peer-manager", ?peer_id, ?ip_addrs, "reputation update results in ban");
-                self.process_ban(&peer_id, ip_addrs);
+                self.process_ban(&peer_id);
             }
             PeerAction::Disconnect => {
                 debug!(target: "peer-manager", ?peer_id, "reputation update results in disconnect");
@@ -263,7 +263,7 @@ impl PeerManager {
             }
             PeerAction::Unban(ip_addrs) => {
                 debug!(target: "peer-manager", ?peer_id, ?ip_addrs, "reputation update results in unban");
-                self.push_event(PeerEvent::Unbanned(peer_id, ip_addrs));
+                self.push_event(PeerEvent::Unbanned(peer_id));
             }
 
             PeerAction::NoAction => { /* nothing to do */ }
@@ -333,10 +333,10 @@ impl PeerManager {
     /// Process newly banned IP addresses.
     ///
     /// The peer is disconnected and is banned from network layer.
-    fn process_ban(&mut self, peer_id: &PeerId, ips: Vec<IpAddr>) {
+    fn process_ban(&mut self, peer_id: &PeerId) {
         // ensure unbanned events are removed for this peer
         self.events.retain(|event| {
-            if let PeerEvent::Unbanned(unbanned_peer_id, _) = event {
+            if let PeerEvent::Unbanned(unbanned_peer_id) = event {
                 unbanned_peer_id != peer_id
             } else {
                 true
@@ -344,7 +344,7 @@ impl PeerManager {
         });
 
         // push banned event
-        self.events.push_back(PeerEvent::Banned(*peer_id, ips));
+        self.events.push_back(PeerEvent::Banned(*peer_id));
     }
 
     /// Disconnect from a peer.
@@ -430,11 +430,8 @@ impl PeerManager {
         }
 
         // process pruned peers
-        self.events.extend(
-            pruned_peers
-                .into_iter()
-                .map(|(peer_id, unbanned_ips)| PeerEvent::Unbanned(peer_id, unbanned_ips)),
-        );
+        self.events
+            .extend(pruned_peers.into_iter().map(|(peer_id, _)| PeerEvent::Unbanned(peer_id)));
     }
 
     /// Prune peers to reach target peer counts.
@@ -480,7 +477,7 @@ impl PeerManager {
     /// Peers are temporarily "banned" when trying to connect while this node has excess peers.
     fn unban_temp_banned_peers(&mut self) {
         for peer_id in self.temporarily_banned.heartbeat() {
-            self.push_event(PeerEvent::Unbanned(peer_id, Vec::new()));
+            self.push_event(PeerEvent::Unbanned(peer_id));
         }
     }
 
@@ -519,13 +516,5 @@ impl PeerManager {
     /// Return the score for a peer if they exist.
     pub(crate) fn peer_score(&self, peer_id: &PeerId) -> Option<f64> {
         self.peers.get_peer(peer_id).map(|peer| peer.score().aggregate_score())
-    }
-
-    /// Test only
-    ///
-    /// Push an event to the swarm from `Self`.
-    #[cfg(test)]
-    pub(crate) fn push_test_event(&mut self, event: PeerEvent) {
-        self.push_event(event);
     }
 }
