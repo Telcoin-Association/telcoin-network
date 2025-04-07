@@ -101,6 +101,8 @@ where
         peer_id: PeerId,
         /// The peer's address.
         addr: Multiaddr,
+        /// Reply for connection outcome.
+        reply: oneshot::Sender<NetworkResult<()>>,
     },
     /// Dial a peer to establish a connection.
     Dial {
@@ -244,9 +246,14 @@ where
     }
 
     /// Add explicit peer.
-    pub async fn add_explicit_peer(&self, peer_id: PeerId, addr: Multiaddr) -> NetworkResult<()> {
+    pub async fn add_explicit_peer(
+        &self,
+        peer_id: PeerId,
+        addr: Multiaddr,
+        reply: oneshot::Sender<NetworkResult<()>>,
+    ) -> NetworkResult<()> {
         self.sender
-            .send(NetworkCommand::AddExplicitPeer { peer_id, addr })
+            .send(NetworkCommand::AddExplicitPeer { peer_id, addr, reply })
             .await
             .map_err(Into::into)
     }

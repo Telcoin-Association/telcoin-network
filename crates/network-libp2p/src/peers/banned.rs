@@ -13,8 +13,7 @@ use std::{
 mod banned_peers;
 
 /// The threshold of banned peers before an IP address is blocked.
-// TODO: move to config
-const BANNED_PEERS_PER_IP_THRESHOLD: usize = 5;
+const BANNED_PEERS_PER_IP_THRESHOLD: usize = 1;
 
 /// The total number of banned peers and a collection of the number of bad peers by IP address.
 #[derive(Debug, Default)]
@@ -38,12 +37,6 @@ impl BannedPeers {
         ip_addresses: impl Iterator<Item = IpAddr>,
     ) -> Vec<IpAddr> {
         self.total = self.total.saturating_sub(1);
-
-        // for address in ip_addresses {
-        //     if let Some(count) = self.banned_peers_by_ip.get_mut(&address) {
-        //         *count = count.saturating_sub(1);
-        //     }
-        // }
 
         ip_addresses
             .filter_map(|ip| {

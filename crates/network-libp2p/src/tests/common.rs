@@ -34,6 +34,8 @@ pub(super) enum TestWorkerRequest {
     NewBatch(SealedBatch),
     /// The collection of missing [BlockHash]es for this peer.
     MissingBatches(Vec<BlockHash>),
+    /// Peer exchange.
+    PeerExchange(PeerExchangeMap),
 }
 
 /// Response to worker requests.
@@ -46,6 +48,8 @@ pub(super) enum TestWorkerResponse {
         /// The collection of requested blocks.
         batches: Vec<SealedBatch>,
     },
+    /// Peer exchange.
+    PeerExchange(PeerExchangeMap),
 }
 
 /// Requests from Primary.
@@ -64,14 +68,14 @@ pub(super) enum TestPrimaryResponse {
 }
 
 impl From<PeerExchangeMap> for TestWorkerRequest {
-    fn from(_: PeerExchangeMap) -> Self {
-        unimplemented!()
+    fn from(map: PeerExchangeMap) -> Self {
+        Self::PeerExchange(map)
     }
 }
 
 impl From<PeerExchangeMap> for TestWorkerResponse {
-    fn from(_: PeerExchangeMap) -> Self {
-        unimplemented!()
+    fn from(map: PeerExchangeMap) -> Self {
+        Self::PeerExchange(map)
     }
 }
 

@@ -96,10 +96,7 @@ async fn test_register_disconnected_with_banned_peer() {
     );
 
     // assert peer is still banned after disconnection
-    assert!(
-        peer_manager.connection_banned(&peer_id),
-        "Peer should remain banned after disconnection"
-    );
+    assert!(peer_manager.peer_banned(&peer_id), "Peer should remain banned after disconnection");
 }
 
 // test temp ban from DisconnectWithPX

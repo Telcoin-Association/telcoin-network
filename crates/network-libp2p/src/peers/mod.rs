@@ -90,21 +90,20 @@ impl AllPeers {
             dial_timeout,
         }
     }
+
+    /// Create a peer that is "trusted".
+    ///
+    /// This overwrites peer records and unbans ips.
+    pub(super) fn add_trusted_peer(&mut self, peer_id: PeerId, addr: Multiaddr) {
+        let trusted_peer = Peer::new_trusted(addr);
+        let unban_ips = self.banned_peers.remove_banned_peer(trusted_peer.known_ip_addresses());
+        self.peers.insert(peer_id, trusted_peer);
+    }
+
     /// Handle reported action.
     ///
     /// This method is called when the application layer identifies a problem and reports a peer.
-    // the PeerManager uses this result to:
-    // - ban operation
-    // - disconnect
-    // - or unban
     pub(super) fn process_penalty(&mut self, peer_id: &PeerId, penalty: Penalty) -> PeerAction {
-        // penalty was reported by application layer:
-        // - if this results in a ban, ban the peer
-        //  - consider previous status to ensure correct updates
-        // - if this results in disconnecting, start disconnecting
-        //  - consider previous status to ensure correct updates
-        // - everything else is a noop
-
         if let Some(peer) = self.peers.get_mut(peer_id) {
             let prior_reputation = peer.reputation();
             let new_reputation = peer.apply_penalty(penalty);
@@ -196,8 +195,6 @@ impl AllPeers {
     /// Peers that fail to connect within dial timeout are updated to `ConnectionStatus::Disconnected`.
     /// It's important these peers are disconnected because dialing peers are counted towards the limit
     /// on inbound connections.
-    ///
-    /// TODO: best way to handle committee peers with dial timeout?
     fn heartbeat_maintenance(&mut self) -> Vec<(PeerId, PeerAction)> {
         let peers_to_disconnect: Vec<_> = self
             .peers

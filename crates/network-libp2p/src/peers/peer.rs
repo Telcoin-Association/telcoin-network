@@ -22,8 +22,6 @@ pub struct Peer {
     config: PeerConfig,
     /// The peer's score - used to derive [Reputation].
     score: Score,
-    /// The known listening addresses for this peer.
-    listening_addresses: Vec<Multiaddr>,
     /// The multiaddrs this node has witnessed the peer using.
     ///
     /// These are used to manage the banning process and exchanged with peers.
@@ -41,11 +39,18 @@ pub struct Peer {
 }
 
 impl Peer {
+    /// Create a new trusted peer.
+    pub(super) fn new_trusted(addr: Multiaddr) -> Peer {
+        Self {
+            multiaddrs: HashSet::from([addr]),
+            score: Score::new_max(),
+            is_trusted: true,
+            ..Default::default()
+        }
+    }
+
     /// Return a peer's reputation based on the aggregate score.
     pub(super) fn reputation(&self) -> Reputation {
-        //
-        // TODO: this should not be called if peer.is_trusted
-        //
         match self.score.aggregate_score() {
             score if score <= self.config.min_score_for_ban => Reputation::Banned,
             score if score <= self.config.min_score_for_disconnect => Reputation::Disconnected,
@@ -68,7 +73,6 @@ impl Peer {
 
     /// Apply a penalty to the peer's score.
     pub(super) fn apply_penalty(&mut self, penalty: Penalty) -> Reputation {
-        // TODO: is there a better way to do this?
         if !self.is_trusted {
             self.score.apply_penalty(penalty);
         }

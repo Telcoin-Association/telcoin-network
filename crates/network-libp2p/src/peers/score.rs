@@ -20,7 +20,6 @@ pub(super) fn init_peer_score_config(config: ScoreConfig) {
 
     // allow multiple calls to this fn
     let _ = GLOBAL_SCORE_CONFIG.set(config);
-    // GLOBAL_SCORE_CONFIG.set(config).expect("peer score config initialized once");
 }
 
 /// Get a reference to the global peer score configuration
@@ -96,6 +95,19 @@ impl Default for Score {
 }
 
 impl Score {
+    /// Create `Self` with max values.
+    pub(super) fn new_max() -> Self {
+        let config = global_score_config();
+
+        Self {
+            telcoin_score: config.max_score,
+            gossipsub_score: config.max_score,
+            aggregate_score: config.max_score,
+            last_updated: Instant::now(),
+            ignore_negative_gossipsub_score: true,
+        }
+    }
+
     /// The aggregate score.
     pub(super) fn aggregate_score(&self) -> f64 {
         self.aggregate_score
@@ -245,7 +257,6 @@ impl Display for Score {
 
 /// The expected status of the peer based on the peer's score.
 #[derive(Debug, PartialEq, Clone, Copy)]
-// TODO: this was ScoreState
 pub(super) enum Reputation {
     /// The peer is performing within the tolerable threshold.
     Trusted,

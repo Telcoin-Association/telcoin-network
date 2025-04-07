@@ -23,7 +23,7 @@ use libp2p::{
     PeerId, Swarm, SwarmBuilder,
 };
 use std::{
-    collections::{hash_map, HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     time::Duration,
 };
 use tn_config::{ConsensusConfig, LibP2pConfig};
@@ -96,9 +96,7 @@ where
     /// This set must be updated at the start of each epoch. It is used to verify message sources
     /// are from validators.
     authorized_publishers: HashSet<PeerId>,
-    /// The collection of pending dials.
-    pending_dials: HashMap<PeerId, oneshot::Sender<NetworkResult<()>>>,
-    /// The collection of pending *graceful* disconnects.
+    /// The collection of pending _graceful_ disconnects.
     ///
     /// This node disconnects from new peers if it already has the target number of peers.
     /// For these types of "peer exchange / discovery disconnects", the node shares peer records
@@ -237,7 +235,6 @@ where
             commands,
             event_stream,
             authorized_publishers,
-            pending_dials: Default::default(),
             outbound_requests: Default::default(),
             inbound_requests: Default::default(),
             config,
@@ -359,6 +356,7 @@ where
         match command {
             NetworkCommand::UpdateAuthorizedPublishers { authorities, reply } => {
                 self.authorized_publishers = authorities;
+                // TODO: update peer records with manager
                 send_or_log_error!(reply, Ok(()), "UpdateAuthorizedPublishers");
             }
             NetworkCommand::StartListening { multiaddr, reply } => {
@@ -369,9 +367,16 @@ where
                 let addrs = self.swarm.listeners().cloned().collect();
                 send_or_log_error!(reply, addrs, "GetListeners");
             }
-            NetworkCommand::AddExplicitPeer { peer_id, addr } => {
+            NetworkCommand::AddExplicitPeer { peer_id, addr, reply } => {
+                // update peer manager
+                self.swarm.behaviour_mut().peer_manager.add_explicit_peer(
+                    peer_id,
+                    addr.clone(),
+                    reply,
+                );
+                // update request-response - no action for `FromSwarm::ConnectionEstablished`
+                // NOTE: gossipsub manages peers through `FromSwarm::ConnectionEstablished`
                 self.swarm.add_peer_address(peer_id, addr);
-                self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
             }
             NetworkCommand::Dial { peer_id, peer_addr, reply } => {
                 self.swarm.behaviour_mut().peer_manager.dial_peer(peer_id, peer_addr, reply);
@@ -393,7 +398,7 @@ where
                 send_or_log_error!(reply, res, "ConnectedPeers");
             }
             NetworkCommand::PeerScore { peer_id, reply } => {
-                let opt_score = self.swarm.behaviour_mut().gossipsub.peer_score(&peer_id);
+                let opt_score = self.swarm.behaviour().peer_manager.peer_score(&peer_id);
                 send_or_log_error!(reply, opt_score, "PeerScore");
             }
             NetworkCommand::SetApplicationScore { peer_id, new_score, reply } => {
@@ -449,6 +454,7 @@ where
                 self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, penalty);
             }
             NetworkCommand::DisconnectPeer { peer_id, reply } => {
+                // this is called after timeout for disconnected peer exchanges
                 let res = self.swarm.disconnect_peer_id(peer_id);
                 send_or_log_error!(reply, res, "DisconnectPeer");
             }
@@ -480,7 +486,14 @@ where
                         // fatal - unable to process gossip messages
                         return Err(e.into());
                     }
+                } else {
+                    // report propagation source as fatal
+                    self.swarm
+                        .behaviour_mut()
+                        .peer_manager
+                        .process_penalty(propagation_source, Penalty::Fatal);
                 }
+
                 trace!(target: "network", ?msg_acceptance, "gossip message verification status");
 
                 // report message validation results
@@ -499,11 +512,12 @@ where
                 trace!(target: "network", topics=?self.topics, ?peer_id, ?topic, "gossipsub event - unsubscribed")
             }
             GossipEvent::GossipsubNotSupported { peer_id } => {
-                // TODO: remove peer at self point?
-                trace!(target: "network", topics=?self.topics, ?peer_id, "gossipsub event - not supported")
+                trace!(target: "network", topics=?self.topics, ?peer_id, "gossipsub event - not supported");
+                self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, Penalty::Fatal);
             }
             GossipEvent::SlowPeer { peer_id, failed_messages } => {
-                trace!(target: "network", topics=?self.topics, ?peer_id, ?failed_messages, "gossipsub event - not supported")
+                trace!(target: "network", topics=?self.topics, ?peer_id, ?failed_messages, "gossipsub event - slow peer");
+                self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, Penalty::Mild);
             }
         }
 
@@ -573,10 +587,16 @@ where
                         self.swarm
                             .behaviour_mut()
                             .peer_manager
-                            .process_penalty(peer, Penalty::Mild);
+                            .process_penalty(peer, Penalty::Medium);
                     }
                     ReqResInboundFailure::UnsupportedProtocols => {
                         warn!(target: "network", ?peer, ?request_id, ?error, "inbound failure: unsupported protocol");
+
+                        // the local peer supports none of the protocols requested by the remote
+                        self.swarm
+                            .behaviour_mut()
+                            .peer_manager
+                            .process_penalty(peer, Penalty::Fatal);
                     }
                     _ => { /* ignore timeout, connection closed, and response ommission */ }
                 }
@@ -618,6 +638,15 @@ where
         debug!(target: "network", ?event, "process peer manager event");
 
         match event {
+            PeerEvent::DisconnectPeer(peer_id) => {
+                debug!(target: "network", ?peer_id, "peer manager: disconnect peer");
+                // remove from connected peers
+                self.connected_peers.retain(|peer| *peer != peer_id);
+
+                // remove from request-response
+                // NOTE: gossipsub handles `FromSwarm::ConnectionClosed`
+                let _ = self.swarm.disconnect_peer_id(peer_id);
+            }
             PeerEvent::PeerDisconnected(peer_id) => {
                 // remove from connected peers
                 self.connected_peers.retain(|peer| *peer != peer_id);
@@ -651,24 +680,6 @@ where
                 }
             }
             PeerEvent::DisconnectPeerX(peer_id, peer_exchange) => {
-                // - create message to send to peer with discovery records
-                // - send the request (don't care about response)
-                // - track in self.pending_disconnects
-                //      - if too many pending disconnects, disconnect immediately
-                // - spawn task with timeout to wait for ack from peer
-
-                // TODO: the flow for `PeerAction` returns a `TempBan` which
-                // results in a `PeerEvent::Banned` event.
-                // I think the only time `DisconnectPeer` happens is when the peer's
-                // reputation is poor.
-                //
-                // This should not be the case. Lighthouse has a `GoodbyeReason` that
-                // includes too many peers, so something is broken in the TN flow.
-                //
-                // Consider adding another type so this is more straight foward
-                //
-                // instead of `DisconnectReason` just have `DisconnectPeerX`?
-
                 // remove from connected peers
                 self.connected_peers.retain(|peer| *peer != peer_id);
 
@@ -700,14 +711,23 @@ where
                 }
             }
             PeerEvent::PeerConnected(peer_id, addr) => {
-                // notify other behaviors so they can dial using peer_id
+                // register peer for request-response behaviour
+                // NOTE: gossipsub handles `FromSwarm::ConnectionEstablished`
                 self.swarm.add_peer_address(peer_id, addr);
+
+                // manage connected peers for
                 self.connected_peers.push_back(peer_id);
             }
-            _ => (),
-            // PeerEvent::DisconnectPeer(peer_id) => todo!(),
-            // PeerEvent::Banned(peer_id, ip_addrs) => todo!(),
-            // PeerEvent::Unbanned(peer_id, ip_addrs) => todo!(),
+            PeerEvent::Banned(peer_id, ip_addrs) => {
+                debug!(target: "network", ?peer_id, ?ip_addrs, "peer banned");
+                // blacklist gossipsub
+                self.swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
+            }
+            PeerEvent::Unbanned(peer_id, ip_addrs) => {
+                debug!(target: "network", ?peer_id, ?ip_addrs, "peer unbanned");
+                // remove blacklist gossipsub
+                self.swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&peer_id);
+            }
         }
 
         Ok(())
@@ -741,10 +761,3 @@ impl From<GossipAcceptance> for MessageAcceptance {
         }
     }
 }
-
-// For tomorrow:
-// + review commented out SwarmEvents above and ensure they all match with the peer manager implementation
-// + refactor connected peers and round-robin logic - leave alone for PR
-// - update tests
-// - how to handle authorized publishers AND validators? leave separate for PR
-// - work on the next PeerEvent

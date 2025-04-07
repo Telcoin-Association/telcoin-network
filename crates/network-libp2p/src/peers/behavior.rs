@@ -64,7 +64,7 @@ impl NetworkBehaviour for PeerManager {
     ) -> Result<THandler<Self>, ConnectionDenied> {
         trace!(target: "peer-manager", ?peer, ?remote_addr, "inbound connection established");
         // ensure banned peers are not accepted
-        if self.connection_banned(&peer) {
+        if self.peer_banned(&peer) {
             return Err(ConnectionDenied::new("peer is banned"));
         }
 
@@ -80,7 +80,7 @@ impl NetworkBehaviour for PeerManager {
         _port_use: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
         trace!(target: "peer-manager", ?peer, ?addr, "outbound connection established");
-        if self.connection_banned(&peer) {
+        if self.peer_banned(&peer) {
             error!(target: "peer-manager", ?peer, ?addr, "established outbound connection with banned peer - disconnecting...");
             return Err(ConnectionDenied::new("peer is banned"));
         }

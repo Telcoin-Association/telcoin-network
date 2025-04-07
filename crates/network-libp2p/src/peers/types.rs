@@ -14,7 +14,8 @@ pub(crate) struct DialRequest {
     /// The multiaddr to dial.
     pub(crate) multiaddrs: Vec<Multiaddr>,
     /// The channel to forward results and errors.
-    pub(crate) reply: oneshot::Sender<NetworkResult<()>>,
+    /// Optional in case dial is the result of a peer-exchange.
+    pub(crate) reply: Option<oneshot::Sender<NetworkResult<()>>>,
 }
 
 /// Types of connections between peers.

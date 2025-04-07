@@ -86,7 +86,6 @@ impl PeerManager {
         let heartbeat =
             tokio::time::interval(tokio::time::Duration::from_secs(config.heartbeat_interval));
 
-        // TODO: restore peers from backup?
         let validators = consensus_config.committee_peer_ids();
         let peers = AllPeers::new(validators, config.target_num_peers, config.dial_timeout);
         let temporarily_banned = BannedPeerCache::new(config.excess_peers_reconnection_timeout);
@@ -103,6 +102,21 @@ impl PeerManager {
             pending_dials: Default::default(),
             temporarily_banned,
         }
+    }
+
+    /// Explicitly add a peer.
+    ///
+    /// These peers are considered "trusted" and do not receive penalties.
+    /// This does not unban ips and should only be called during initialization.
+    pub(crate) fn add_explicit_peer(
+        &mut self,
+        peer_id: PeerId,
+        multiaddr: Multiaddr,
+        reply: oneshot::Sender<NetworkResult<()>>,
+    ) {
+        self.peers.add_trusted_peer(peer_id, multiaddr.clone());
+        let _ = self.temporarily_banned.remove(&peer_id);
+        self.dial_peer(peer_id, multiaddr, reply);
     }
 
     /// Process the request to dial a peer.
@@ -142,7 +156,7 @@ impl PeerManager {
         }
         // schedule swarm to dial peer
         debug!(target: "peer-manager", ?peer_id, "sending dial request to swarm");
-        let request = DialRequest { peer_id, multiaddrs: vec![multiaddr], reply };
+        let request = DialRequest { peer_id, multiaddrs: vec![multiaddr], reply: Some(reply) };
         self.dial_requests.push_back(request);
     }
 
@@ -157,11 +171,13 @@ impl PeerManager {
     pub(super) fn register_dial_attempt(
         &mut self,
         peer_id: PeerId,
-        reply: oneshot::Sender<NetworkResult<()>>,
+        reply: Option<oneshot::Sender<NetworkResult<()>>>,
     ) {
         // create the peer if it doesn't exist and register as dialing
         self.peers.update_connection_status(&peer_id, NewConnectionStatus::Dialing);
-        self.pending_dials.insert(peer_id, reply);
+        if let Some(reply) = reply {
+            self.pending_dials.insert(peer_id, reply);
+        }
     }
 
     /// Return the next dial request if it exists.
@@ -282,7 +298,7 @@ impl PeerManager {
     ///
     /// This is called before accepting new connections. Also checks that the peer
     /// wasn't temporarily banned due to excess peers connections.
-    pub(super) fn connection_banned(&self, peer_id: &PeerId) -> bool {
+    pub(super) fn peer_banned(&self, peer_id: &PeerId) -> bool {
         self.temporarily_banned.contains(peer_id) || self.peers.peer_banned(peer_id)
     }
 
@@ -340,7 +356,7 @@ impl PeerManager {
     /// The argument `support_discovery` indicates if the disconnect message should
     /// include additional connected peers to help the peer discovery other nodes.
     /// Peers that are disconnected because of excess peer limits support discovery.
-    pub(super) fn disconnect_peer(&mut self, peer_id: PeerId, support_discovery: bool) {
+    pub(crate) fn disconnect_peer(&mut self, peer_id: PeerId, support_discovery: bool) {
         // include peer exchange or not
         let event = if support_discovery {
             let exchange = self.peers.peer_exchange();
@@ -472,6 +488,8 @@ impl PeerManager {
     ///
     /// This method is called when a peer disconnects immediately from this node due to having too many peers.
     /// The disconnecting peer shares information about other known peers to facilitate discovery.
+    ///
+    /// Peers should be weary of these reported peers (eclipse attacks).
     pub(crate) fn process_peer_exchange(&mut self, peers: PeerExchangeMap) {
         // // skip processing if there's already enough peers
         // if self.connected_or_dialing_peers() >= self.config.target_num_peers {
@@ -483,13 +501,24 @@ impl PeerManager {
 
         // });
 
-        // peers.into_iter()
-        todo!()
+        for (peer_id, addr) in peers.into_iter() {
+            // skip peers that are already known
+            if self.peers.get_peer(&peer_id).is_none() {
+                let multiaddrs = addr.into_iter().collect();
+                let request = DialRequest { peer_id, multiaddrs, reply: None };
+                self.dial_requests.push_back(request);
+            }
+        }
     }
 
     /// Create [PeerExchangeMap] for exchange with peers.
     pub(crate) fn peers_for_exchange(&self) -> PeerExchangeMap {
         self.peers.peer_exchange()
+    }
+
+    /// Return the score for a peer if they exist.
+    pub(crate) fn peer_score(&self, peer_id: &PeerId) -> Option<f64> {
+        self.peers.get_peer(peer_id).map(|peer| peer.score().aggregate_score())
     }
 
     /// Test only
