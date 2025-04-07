@@ -284,28 +284,13 @@ where
                 );
             }
             SwarmEvent::ListenerError { listener_id, error } => {
-                // TODO: ignore quic accept and close errors?
-                if error
-                    .get_ref()
-                    .and_then(|e| e.downcast_ref::<libp2p::quic::Error>())
-                    .filter(|err| matches!(err, libp2p::quic::Error::Connection(_)))
-                    .is_some()
-                {
-                    debug!(
-                        target: "network",
-                        ?listener_id,
-                        ?error,
-                        "quic listener error"
-                    );
-                } else {
-                    // Log listener errors
-                    error!(
-                        target: "network::events",
-                        ?listener_id,
-                        ?error,
-                        "listener error"
-                    );
-                }
+                // log listener errors
+                error!(
+                    target: "network::events",
+                    ?listener_id,
+                    ?error,
+                    "listener error"
+                );
             }
             SwarmEvent::ListenerClosed { addresses, reason, .. } => {
                 // log errors
@@ -319,33 +304,7 @@ where
                     return Err(NetworkError::AllListenersClosed);
                 }
             }
-            SwarmEvent::IncomingConnectionError { local_addr, send_back_addr, error, .. } => {
-                debug!(
-                    target: "network",
-                    ?error,
-                    ?local_addr,
-                    ?send_back_addr,
-                    "incoming connection error"
-                );
-            }
-            SwarmEvent::Dialing { peer_id, connection_id } => {
-                debug!(target: "network", ?peer_id, ?connection_id, "dialing peer");
-                // ignore this and wait for connection
-            }
-            // These events are included here because they will likely become useful in near-future
-            // PRs
-            // SwarmEvent::IncomingConnection { .. }
-            // | SwarmEvent::IncomingConnectionError { .. }
-            SwarmEvent::NewListenAddr { .. }
-            | SwarmEvent::NewExternalAddrCandidate { .. }
-            | SwarmEvent::ExternalAddrConfirmed { .. }
-            | SwarmEvent::ExternalAddrExpired { .. }
-            | SwarmEvent::NewExternalAddrOfPeer { .. }
-            // handled by PeerManager behavior
-            | SwarmEvent::ConnectionEstablished { .. }
-            | SwarmEvent::ConnectionClosed { .. }
-            | SwarmEvent::IncomingConnection { .. } => {}
-            | SwarmEvent::OutgoingConnectionError { .. } => {}
+            // other events handled by peer manager and other behaviors
             _ => {}
         }
         Ok(())
@@ -493,7 +452,10 @@ where
                 // process gossip in application layer
                 if valid {
                     // forward gossip to handler
-                    if let Err(e) = self.event_stream.try_send(NetworkEvent::Gossip(message)) {
+                    if let Err(e) = self
+                        .event_stream
+                        .try_send(NetworkEvent::Gossip(message, propagation_source))
+                    {
                         error!(target: "network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
                         // fatal - unable to process gossip messages
                         return Err(e.into());
@@ -570,7 +532,10 @@ where
                 }
 
                 // log errors for other outbound failures
-                error!(target: "network", ?peer, ?error, "outbound failure");
+                warn!(target: "network", ?peer, ?error, "outbound failure");
+
+                // apply penalty
+                self.swarm.behaviour_mut().peer_manager.process_penalty(peer, Penalty::Medium);
 
                 // try to forward error to original caller
                 let _ = self
@@ -598,7 +563,14 @@ where
                             .peer_manager
                             .process_penalty(peer, Penalty::Fatal);
                     }
-                    _ => { /* ignore timeout, connection closed, and response ommission */ }
+                    ReqResInboundFailure::Timeout | ReqResInboundFailure::ConnectionClosed => {
+                        // penalty for potentially malicious request
+                        self.swarm
+                            .behaviour_mut()
+                            .peer_manager
+                            .process_penalty(peer, Penalty::Mild);
+                    }
+                    ReqResInboundFailure::ResponseOmission => { /* ignore local error */ }
                 }
 
                 // forward cancelation to handler

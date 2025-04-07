@@ -15,7 +15,7 @@ use tn_network_libp2p::{
     types::{
         IdentTopic, IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult,
     },
-    GossipMessage, Multiaddr, PeerExchangeMap, PeerId, ResponseChannel,
+    GossipMessage, Multiaddr, PeerExchangeMap, PeerId, Penalty, ResponseChannel,
 };
 use tn_network_types::{
     FetchCertificatesRequest, WorkerOthersBatchMessage, WorkerOwnBatchMessage,
@@ -23,8 +23,8 @@ use tn_network_types::{
 };
 use tn_storage::PayloadStore;
 use tn_types::{
-    encode, error::CertificateError, BlockHash, Certificate, CertificateDigest, ConsensusHeader,
-    Database, Header, Noticer, TaskManager, TnSender, Vote,
+    encode, BlockHash, Certificate, CertificateDigest, ConsensusHeader, Database, Header, Noticer,
+    TaskManager, TnSender, Vote,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
@@ -171,6 +171,11 @@ impl PrimaryNetworkHandle {
         Err(NetworkError::RPCError("Could not get the consensus header!".to_string()))
     }
 
+    /// Report a penalty to the network's peer manager.
+    pub(crate) async fn report_penalty(&self, peer_id: PeerId, penalty: Penalty) {
+        self.handle.report_penalty(peer_id, penalty).await;
+    }
+
     /// Notify peer manager of peer exchange information.
     pub(crate) async fn process_peer_exchange(
         &self,
@@ -256,8 +261,8 @@ where
                     self.process_peer_exchange(peers, channel)
                 }
             },
-            NetworkEvent::Gossip(msg) => {
-                self.process_gossip(msg);
+            NetworkEvent::Gossip(msg, source) => {
+                self.process_gossip(msg, source);
             }
         }
     }
@@ -343,34 +348,18 @@ where
     }
 
     /// Process gossip from committee.
-    fn process_gossip(&self, msg: GossipMessage) {
+    fn process_gossip(&self, msg: GossipMessage, source: PeerId) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
 
-        // commented out to prevent CertificateError::TooNew from forcing disconnect when peers
-        // are trying to resync
+        // spawn task to process gossip
         tokio::spawn(async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "primary::network", ?e, "process_gossip");
-                // TODO: peers don't track reputation yet
-                //
-                // NOTE: the network ensures the peer id is present before forwarding the msg
-                // if let Some(peer_id) = msg.source {
-                //     if let Err(e) =
-                //         network_handle.handle.set_application_score(peer_id, -100.0).await
-                //     {
-                //         error!(target: "primary::network", ?e, "failed to penalize malicious
-                // peer")     }
-                // }
-
-                // match on error to lower peer score
-
-                // TODO: I think just author should be penalized, not source of propogation
-
-                match e {
-                    // CertificateError::Inquorate { .. } => network_handle.report_penalty(peer_id, Penalty::)
-                    _ => (), // ignore
+                // convert error into penalty to lower peer score
+                if let Some(penalty) = e.into() {
+                    network_handle.report_penalty(source, penalty).await;
                 }
             }
         });

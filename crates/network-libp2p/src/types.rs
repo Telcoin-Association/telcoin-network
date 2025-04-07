@@ -61,8 +61,8 @@ pub enum NetworkEvent<Req, Res> {
         /// The oneshot channel if the request gets cancelled at the network level.
         cancel: oneshot::Receiver<()>,
     },
-    /// Gossip message received.
-    Gossip(GossipMessage),
+    /// Gossip message received and propagation source.
+    Gossip(GossipMessage, PeerId),
 }
 
 /// Commands for the swarm.
@@ -407,6 +407,11 @@ where
     ) -> NetworkResult<()> {
         self.sender.send(NetworkCommand::PeerExchange { peers, channel }).await?;
         Ok(())
+    }
+
+    /// Report a penalty to the peer manager.
+    pub async fn report_penalty(&self, peer_id: PeerId, penalty: Penalty) {
+        let _ = self.sender.send(NetworkCommand::ReportPenalty { peer_id, penalty }).await;
     }
 
     /// Create a [PeerExchangeMap] for exchanging peers.

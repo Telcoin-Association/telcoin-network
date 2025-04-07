@@ -10,7 +10,7 @@ use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
     types::{IdentTopic, NetworkEvent, NetworkHandle, NetworkResult},
-    GossipMessage, Multiaddr, PeerExchangeMap, PeerId, ResponseChannel,
+    GossipMessage, Multiaddr, PeerExchangeMap, PeerId, Penalty, ResponseChannel,
 };
 use tn_network_types::{FetchBatchResponse, PrimaryToWorkerClient, WorkerSynchronizeMessage};
 use tn_storage::tables::Batches;
@@ -22,7 +22,7 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::batch_fetcher::BatchFetcher;
 
@@ -210,6 +210,11 @@ impl WorkerNetworkHandle {
         }
     }
 
+    /// Report penalty to peer manager.
+    pub(crate) async fn report_penalty(&self, peer_id: PeerId, penalty: Penalty) {
+        self.handle.report_penalty(peer_id, penalty).await;
+    }
+
     /// Notify peer manager of peer exchange information.
     pub(crate) async fn process_peer_exchange(
         &self,
@@ -283,8 +288,8 @@ where
                     self.process_peer_exchange(peers, channel);
                 }
             },
-            NetworkEvent::Gossip(msg) => {
-                self.process_gossip(msg);
+            NetworkEvent::Gossip(msg, source) => {
+                self.process_gossip(msg, source);
             }
         }
     }
@@ -347,26 +352,20 @@ where
     }
 
     /// Process gossip from a worker.
-    fn process_gossip(&self, msg: GossipMessage) {
+    fn process_gossip(&self, msg: GossipMessage, source: PeerId) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
         tokio::spawn(async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "worker::network", ?e, "process_gossip");
-                // TODO: peers don't track reputation yet
-                //
-                // NOTE: the network ensures the peer id is present before forwarding the msg
-                if let Some(peer_id) = msg.source {
-                    if let Err(e) =
-                        network_handle.handle.set_application_score(peer_id, -100.0).await
-                    {
-                        error!(target: "worker::network", ?e, "failed to penalize malicious peer")
+                if let Err(e) = request_handler.process_gossip(&msg).await {
+                    warn!(target: "worker::network", ?e, "process_gossip");
+                    // convert error into penalty to lower peer score
+                    if let Some(penalty) = e.into() {
+                        network_handle.report_penalty(source, penalty).await;
                     }
                 }
-
-                // match on error to lower peer score
-                //todo!();
             }
         });
     }

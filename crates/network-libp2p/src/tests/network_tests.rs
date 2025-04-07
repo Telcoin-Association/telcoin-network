@@ -472,7 +472,7 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
         timeout(Duration::from_secs(2), nvv_network_events.recv()).await?.expect("batch received");
 
     // assert gossip message
-    if let NetworkEvent::Gossip(msg) = event {
+    if let NetworkEvent::Gossip(msg, _) = event {
         assert_eq!(msg.data, expected_result);
     } else {
         panic!("unexpected network event received");
@@ -530,7 +530,7 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
         timeout(Duration::from_secs(2), nvv_network_events.recv()).await?.expect("batch received");
 
     // assert gossip message
-    if let NetworkEvent::Gossip(msg) = event {
+    if let NetworkEvent::Gossip(msg, _) = event {
         assert_eq!(msg.data, expected_result);
     } else {
         panic!("unexpected network event received");
@@ -548,7 +548,9 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     let timeout = timeout(Duration::from_secs(2), nvv_network_events.recv()).await;
     assert!(timeout.is_err());
 
-    // TODO: assert peer score after bad message
+    // assert fatal score
+    let score = nvv.peer_score(cvv_id).await?;
+    assert_eq!(score, Some(config_2.network_config().peer_config().score_config.min_score));
 
     Ok(())
 }

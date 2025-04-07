@@ -1,4 +1,4 @@
-use tn_network_libp2p::error::NetworkError;
+use tn_network_libp2p::{error::NetworkError, Penalty};
 use tn_types::{BatchValidationError, BcsError};
 use tokio::time::error::Elapsed;
 
@@ -23,4 +23,37 @@ pub(crate) enum WorkerNetworkError {
     // Network error.
     #[error("Network error occured: {0}")]
     Network(#[from] NetworkError),
+}
+
+impl Into<Option<Penalty>> for WorkerNetworkError {
+    fn into(self) -> Option<Penalty> {
+        //
+        // explicitly match every error type to ensure penalties are updated with changes
+        //
+        match self {
+            WorkerNetworkError::BatchValidation(batch_validation_error) => {
+                match batch_validation_error {
+                    // mild
+                    BatchValidationError::CanonicalChain { .. } => Some(Penalty::Mild),
+                    // severe
+                    BatchValidationError::RecoverTransaction(_, _) => Some(Penalty::Severe),
+                    // fatal
+                    BatchValidationError::EmptyBatch
+                    | BatchValidationError::InvalidDigest
+                    | BatchValidationError::TimestampIsInPast { .. }
+                    | BatchValidationError::CalculateMaxPossibleGas
+                    | BatchValidationError::HeaderMaxGasExceedsGasLimit { .. }
+                    | BatchValidationError::HeaderTransactionBytesExceedsMax(_) => {
+                        Some(Penalty::Fatal)
+                    }
+                }
+            }
+            // fatal
+            WorkerNetworkError::Decode(_) => Some(Penalty::Fatal),
+            // ignore
+            WorkerNetworkError::Timeout(_)
+            | WorkerNetworkError::Network(_)
+            | WorkerNetworkError::Internal(_) => None,
+        }
+    }
 }

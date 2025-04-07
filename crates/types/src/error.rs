@@ -284,9 +284,6 @@ pub type CertificateResult<T> = Result<T, CertificateError>;
 /// Core error variants when verifying and processing a Certificate.
 #[derive(Debug, Error)]
 pub enum CertificateError {
-    /// TODO: REMOVE THIS
-    #[error("The certificate is suspended until missing parents recovered.")]
-    Suspended,
     /// Error retrieving value from storage.
     #[error("Storage failure: {0}")]
     Storage(#[from] StoreError),
