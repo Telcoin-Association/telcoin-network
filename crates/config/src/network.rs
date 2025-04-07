@@ -317,8 +317,6 @@ pub struct ScoreConfig {
     pub score_halflife: f64,
     /// The minimum amount of time (seconds) a peer is banned before their score begins to decay.
     pub banned_before_decay_secs: u64,
-    /// Threshold to prevent libp2p gossipsub from disconnecting peers.
-    pub gossipsub_greylist_threshold: f64,
     /// Minimum score before a peer is disconnected.
     pub min_score_before_disconnect: f64,
     /// Minimum score before a peer is banned.
@@ -334,7 +332,6 @@ impl Default for ScoreConfig {
             min_score: -100.0,
             score_halflife: 600.0,
             banned_before_decay_secs: 12 * 3600, // 12 hours
-            gossipsub_greylist_threshold: -16000.0,
             min_score_before_disconnect: -20.0,
             min_score_before_ban: -50.0,
         }
@@ -345,11 +342,6 @@ impl ScoreConfig {
     /// Returns the banned before decay duration
     pub fn banned_before_decay(&self) -> Duration {
         Duration::from_secs(self.banned_before_decay_secs)
-    }
-
-    /// Calculate the gossipsub score weight based on configuration values
-    pub fn gossipsub_score_weight(&self) -> f64 {
-        (self.min_score_before_disconnect + 1.0) / self.gossipsub_greylist_threshold
     }
 
     /// Calculate the halflife decay constant

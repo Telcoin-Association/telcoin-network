@@ -65,12 +65,6 @@ pub struct Score {
     ///
     /// Once penalties are applied, they affect the `aggregate_score`.
     telcoin_score: f64,
-    /// The score from gossip network peers.
-    gossipsub_score: f64,
-    /// Indicates if a negative gossipsub score should be ignored.
-    ///
-    /// Optional: allow a peer to stay connected while their score decays.
-    ignore_negative_gossipsub_score: bool,
     /// The aggregate score.
     ///
     /// This is the score used to rank peers.
@@ -86,10 +80,8 @@ impl Default for Score {
 
         Score {
             telcoin_score: config.default_score,
-            gossipsub_score: config.default_score,
             aggregate_score: config.default_score,
             last_updated: Instant::now(),
-            ignore_negative_gossipsub_score: false,
         }
     }
 }
@@ -101,10 +93,8 @@ impl Score {
 
         Self {
             telcoin_score: config.max_score,
-            gossipsub_score: config.max_score,
             aggregate_score: config.max_score,
             last_updated: Instant::now(),
-            ignore_negative_gossipsub_score: true,
         }
     }
 
@@ -178,8 +168,8 @@ impl Score {
         // capture current status
         let already_banned = self.is_banned();
 
-        // apply gossip score weights
-        self.apply_gossip_weights();
+        // update aggregate score
+        self.aggregate_score = self.telcoin_score;
 
         // ban the peer if threshold reached
         if !already_banned && self.is_banned() {
@@ -188,42 +178,6 @@ impl Score {
             // ban the peer for at least BANNED_BEFORE_DECAY seconds
             self.last_updated += config.banned_before_decay();
         }
-    }
-
-    /// Calculate the aggregate score based on application and gossipsub scores.
-    ///
-    /// If the application score is too low, the method does nothing because the peer will be
-    /// banned.
-    fn apply_gossip_weights(&mut self) {
-        let config = global_score_config();
-
-        // start with new application score
-        self.aggregate_score = self.telcoin_score;
-
-        // apply additional weight factors
-        if self.telcoin_score <= config.min_application_score_before_ban {
-            //ignore all other scores - peer is banned
-        } else if self.gossipsub_score >= 0.0 {
-            self.aggregate_score += self.gossipsub_score * config.gossipsub_score_weight();
-        } else if !self.ignore_negative_gossipsub_score {
-            self.aggregate_score += self.gossipsub_score * config.gossipsub_score_weight();
-        }
-    }
-
-    /// Update the gossipsub score for this peer with a new value.
-    pub fn update_gossipsub_score(&mut self, new_score: f64, ignore: bool) {
-        // we only update gossipsub if last_updated is in the past which means either the peer is
-        // not banned or the BANNED_BEFORE_DECAY time is over.
-        if self.last_updated <= Instant::now() {
-            self.gossipsub_score = new_score;
-            self.ignore_negative_gossipsub_score = ignore;
-            self.update_score();
-        }
-    }
-
-    /// Helper method if a peer is scored above the default `0.0`.
-    pub fn is_good_gossipsub_peer(&self) -> bool {
-        self.gossipsub_score >= 0.0
     }
 
     /// Helper method if a peer has reached the threshold for being banned.
@@ -269,16 +223,6 @@ pub(super) enum Reputation {
 }
 
 impl Reputation {
-    /// Matches on self.
-    pub(super) fn trusted(&self) -> bool {
-        matches!(self, Reputation::Trusted)
-    }
-
-    /// Matches on self.
-    pub(super) fn disconnected(&self) -> bool {
-        matches!(self, Reputation::Disconnected)
-    }
-
     /// Matches on self.
     pub(super) fn banned(&self) -> bool {
         matches!(self, Reputation::Banned)

@@ -4,7 +4,6 @@ mod common;
 use super::*;
 use assert_matches::assert_matches;
 use common::{TestPrimaryRequest, TestPrimaryResponse, TestWorkerRequest, TestWorkerResponse};
-use eyre::eyre;
 use tn_config::ConsensusConfig;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{fixture_batch_with_transactions, CommitteeFixture};

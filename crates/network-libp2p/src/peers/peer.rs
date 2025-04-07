@@ -2,7 +2,7 @@
 
 use super::{
     score::{Penalty, Reputation, ReputationUpdate, Score},
-    status::{ConnectionStatus, SyncStatus},
+    status::ConnectionStatus,
     ConnectionDirection,
 };
 use libp2p::{
@@ -28,8 +28,6 @@ pub struct Peer {
     multiaddrs: HashSet<Multiaddr>,
     /// Connection status of the peer.
     connection_status: ConnectionStatus,
-    /// The peer's syncing status compared to the most recent state change.
-    sync_status: SyncStatus,
     /// Trusted peers are specifically included by node operators.
     is_trusted: bool,
     /// Direction of the most recent connection with this peer.

@@ -259,7 +259,7 @@ where
                         info!(target: "network", topics=?self.topics, "subscriber shutting down...");
                         return Ok(())
                     }
-                }
+                },
             }
         }
     }
@@ -478,8 +478,20 @@ where
                 trace!(target: "network", topic=?self.topics, ?propagation_source, ?message_id, ?message, "message received from publisher");
                 // verify message was published by authorized node
                 let msg_acceptance = self.verify_gossip(&message);
+                let valid = msg_acceptance.is_accepted();
+                trace!(target: "network", ?msg_acceptance, "gossip message verification status");
 
-                if msg_acceptance.is_accepted() {
+                // report message validation results to propagate valid messages
+                if !self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                    &message_id,
+                    &propagation_source,
+                    msg_acceptance.into(),
+                ) {
+                    error!(target: "network", topics=?self.topics, ?propagation_source, ?message_id, "error reporting message validation result");
+                }
+
+                // process gossip in application layer
+                if valid {
                     // forward gossip to handler
                     if let Err(e) = self.event_stream.try_send(NetworkEvent::Gossip(message)) {
                         error!(target: "network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
@@ -487,22 +499,10 @@ where
                         return Err(e.into());
                     }
                 } else {
-                    // report propagation source as fatal
                     self.swarm
                         .behaviour_mut()
                         .peer_manager
                         .process_penalty(propagation_source, Penalty::Fatal);
-                }
-
-                trace!(target: "network", ?msg_acceptance, "gossip message verification status");
-
-                // report message validation results
-                if !self.swarm.behaviour_mut().gossipsub.report_message_validation_result(
-                    &message_id,
-                    &propagation_source,
-                    msg_acceptance.into(),
-                ) {
-                    error!(target: "network", topics=?self.topics, ?propagation_source, ?message_id, "error reporting message validation result");
                 }
             }
             GossipEvent::Subscribed { peer_id, topic } => {
