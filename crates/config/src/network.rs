@@ -208,11 +208,6 @@ impl Default for QuicConfig {
     }
 }
 
-// /// The threshold for a peer's score before they are disconnected.
-// const MIN_SCORE_BEFORE_DISCONNECT: f64 = -20.0;
-// /// The threshold for a peer's score before they are banned.
-// const MIN_SCORE_BEFORE_BAN: f64 = -50.0;
-
 /// Configurations for network peers.
 #[derive(Debug, Clone, Copy)]
 pub struct PeerConfig {

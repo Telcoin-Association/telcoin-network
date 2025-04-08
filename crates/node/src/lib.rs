@@ -118,7 +118,10 @@ async fn start_networks<DB: TNDatabase>(
             }
         )
     });
+
+    // subscribe to epoch closing gossip messages
     primary_network_handle.subscribe(IdentTopic::new("tn-primary")).await?;
+
     let my_authority = consensus_config.authority();
 
     let primary_multiaddr = get_multiaddr_from_env_or_config(
@@ -138,11 +141,16 @@ async fn start_networks<DB: TNDatabase>(
     for (authority_id, addr, _) in
         consensus_config.committee().others_primaries_by_id(&consensus_config.authority().id())
     {
+        // TODO: add as trusted peer
+        // this should also account for nvv/cvv
+        // primary gossips out on topics but only subscribes to epoch boundary notifications
         let peer_id = authority_id.peer_id();
         dial_primary(primary_network_handle.clone(), peer_id, addr, peers_connected.clone());
     }
     for (peer_id, addr) in consensus_config.worker_cache().all_workers() {
         if addr != worker_address {
+            // TODO: add as trusted peer
+            // worker gossips out batch digests but only subscribes if NVV
             dial_worker(worker_network_handle.clone(), peer_id, addr, workers_connected.clone());
         }
     }

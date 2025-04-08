@@ -1,4 +1,7 @@
 //! Peer service to track known peers.
+//!
+//! `AllPeers` is responsible for processing updates to peers and returns `PeerAction`s for the
+//! manager to take. Some actions are propagated up to the swarm level and affect other behaviors.
 
 use banned::BannedPeers;
 use libp2p::{Multiaddr, PeerId};
@@ -25,6 +28,9 @@ mod types;
 pub use manager::{PeerEvent, PeerManager};
 pub use score::Penalty;
 pub use types::PeerExchangeMap;
+#[cfg(test)]
+#[path = "../tests/all_peers.rs"]
+mod all_peers;
 // visibility for tests
 #[cfg(test)]
 pub(crate) use score::GLOBAL_SCORE_CONFIG;
@@ -42,8 +48,6 @@ pub struct AllPeers {
     banned_peers: BannedPeers,
     /// The number of peers that have disconnected from this node.
     disconnected_peers: usize,
-    /// The target number of connected peers for this node.
-    target_num_peers: usize,
     /// The timeout for dialing peers.
     dial_timeout: Duration,
 }
@@ -76,17 +80,12 @@ impl PeerAction {
 
 impl AllPeers {
     /// Create a new instance of Self.
-    pub(super) fn new(
-        validators: HashSet<PeerId>,
-        target_num_peers: usize,
-        dial_timeout: Duration,
-    ) -> Self {
+    pub(super) fn new(validators: HashSet<PeerId>, dial_timeout: Duration) -> Self {
         Self {
             peers: Default::default(),
             validators,
             banned_peers: Default::default(),
             disconnected_peers: 0,
-            target_num_peers,
             dial_timeout,
         }
     }
@@ -124,7 +123,7 @@ impl AllPeers {
                     if peer.connection_status().is_connected_or_dialing() {
                         self.update_connection_status(
                             peer_id,
-                            NewConnectionStatus::Disconnecting { banned: false },
+                            NewConnectionStatus::Disconnecting { banned: true },
                         )
                     } else {
                         warn!(target: "peer-manager", ?peer_id, ?prior_reputation, "process_penalty for disconnected peer");
@@ -403,6 +402,8 @@ impl AllPeers {
         // filter these with newly banned peer
         let already_banned_ips = self.banned_peers.banned_ips();
 
+        debug!(target: "peer-manager", ?already_banned_ips, "handle disconnected and banned");
+
         // update peer's status
         if let Some(peer) = self.peers.get_mut(peer_id) {
             peer.set_connection_status(ConnectionStatus::Banned { instant: Instant::now() });
@@ -421,18 +422,12 @@ impl AllPeers {
 
     /// Handle disconnected state for a peer that was disconnected without being banned.
     fn handle_disconnected_normal(&mut self, peer_id: &PeerId) -> PeerAction {
-        // the peer was disconnected but not banned.
         self.disconnected_peers += 1;
         if let Some(peer) = self.peers.get_mut(peer_id) {
             peer.set_connection_status(ConnectionStatus::Disconnected { instant: Instant::now() });
         }
 
-        // support discovery with peer exchange if the target number of peers is reached
-        if self.connected_peer_ids().count() >= self.target_num_peers {
-            PeerAction::DisconnectWithPX
-        } else {
-            PeerAction::Disconnect
-        }
+        PeerAction::NoAction
     }
 
     /// Handle transition to Disconnecting state
@@ -458,11 +453,10 @@ impl AllPeers {
                 error!(target: "peer-manager", ?peer_id, "disconnecting from a banned peer - banned peer should already be disconnected");
             }
             ConnectionStatus::Connected { .. } | ConnectionStatus::Dialing { .. } => {
-                // TODO: should the penalty method just update new status to `Disconnected` instead?
-                // - what is important about `Disconnecting` that needs to flow
-                //
-                // this transition is possible when a penalty is assessed for a peer
-                return PeerAction::Disconnect;
+                // support discovery with peer exchange if the target number of peers is reached
+                let action =
+                    if banned { PeerAction::Disconnect } else { PeerAction::DisconnectWithPX };
+                return action;
             }
             _ => {}
         }
@@ -482,11 +476,20 @@ impl AllPeers {
                     self.banned_peers.add_banned_peer(peer);
                     self.disconnected_peers = self.disconnected_peers.saturating_sub(1);
                     let already_banned_ips = self.banned_peers.banned_ips();
+
+                    // ensure the peer is banned
+                    if !peer.connection_status().is_banned() {
+                        peer.set_connection_status(ConnectionStatus::Banned {
+                            instant: Instant::now(),
+                        });
+                    }
+
                     PeerAction::Ban(peer.filter_new_ips_to_ban(&already_banned_ips))
                 }
                 ConnectionStatus::Disconnecting { .. } => {
                     // ban the peer once the disconnection process completes
                     debug!(target: "peer-manager", ?peer_id, "banning peer that is currently disconnecting");
+                    peer.set_connection_status(ConnectionStatus::Disconnecting { banned: true });
                     PeerAction::NoAction
                 }
                 ConnectionStatus::Banned { .. } => {
@@ -567,6 +570,8 @@ impl AllPeers {
     }
 
     /// Boolean indicating if a peer id is banned or associated with any banned ip addresses.
+    /// NOTE: the peer can still be in a connected status but pending a ban, so the connection
+    /// status is not used.
     pub(super) fn peer_banned(&self, peer_id: &PeerId) -> bool {
         self.peers.get(peer_id).is_some_and(|peer| {
             peer.reputation().banned() || peer.known_ip_addresses().any(|ip| self.ip_banned(&ip))

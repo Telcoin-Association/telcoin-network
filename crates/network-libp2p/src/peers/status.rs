@@ -46,6 +46,11 @@ pub enum ConnectionStatus {
 
 impl ConnectionStatus {
     /// Matches the connection status.
+    pub(super) fn is_banned(&self) -> bool {
+        matches!(self, Self::Banned { .. })
+    }
+
+    /// Matches the connection status.
     pub(super) fn is_connected(&self) -> bool {
         matches!(self, Self::Connected { .. })
     }

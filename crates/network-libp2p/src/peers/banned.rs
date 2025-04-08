@@ -13,7 +13,8 @@ use std::{
 mod banned_peers;
 
 /// The threshold of banned peers before an IP address is blocked.
-const BANNED_PEERS_PER_IP_THRESHOLD: usize = 1;
+/// Currently set to 0, so ips are immediately banned.
+const BANNED_PEERS_PER_IP_THRESHOLD: usize = 0;
 
 /// The total number of banned peers and a collection of the number of bad peers by IP address.
 #[derive(Debug, Default)]
@@ -61,6 +62,7 @@ impl BannedPeers {
     pub(super) fn add_banned_peer(&mut self, peer: &Peer) {
         self.total = self.total.saturating_add(1);
         for address in peer.known_ip_addresses() {
+            tracing::debug!(target: "peer-manager", ?address, "known ip address for banned peer");
             *self.banned_peers_by_ip.entry(address).or_insert(0) += 1;
         }
     }

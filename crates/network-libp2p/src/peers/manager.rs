@@ -87,7 +87,7 @@ impl PeerManager {
             tokio::time::interval(tokio::time::Duration::from_secs(config.heartbeat_interval));
 
         let validators = consensus_config.committee_peer_ids();
-        let peers = AllPeers::new(validators, config.target_num_peers, config.dial_timeout);
+        let peers = AllPeers::new(validators, config.dial_timeout);
         let temporarily_banned = BannedPeerCache::new(config.excess_peers_reconnection_timeout);
 
         // initialize global score config
@@ -488,16 +488,6 @@ impl PeerManager {
     ///
     /// Peers should be weary of these reported peers (eclipse attacks).
     pub(crate) fn process_peer_exchange(&mut self, peers: PeerExchangeMap) {
-        // // skip processing if there's already enough peers
-        // if self.connected_or_dialing_peers() >= self.config.target_num_peers {
-        //     debug!(target: "peer-manager", "Skipping peer exchange processing, already at target peer count");
-        //     return;
-        // }
-
-        // let peers_to_dial = peers.into_iter().map(|| {
-
-        // });
-
         for (peer_id, addr) in peers.into_iter() {
             // skip peers that are already known
             if self.peers.get_peer(&peer_id).is_none() {
