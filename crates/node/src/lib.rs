@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Library for managing all components used by a full-node in a single process.
 
-use std::{
-    str::FromStr as _,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
-
 use crate::{primary::PrimaryNode, worker::WorkerNode};
 use consensus_metrics::start_prometheus_server;
 use engine::{ExecutionNode, TnBuilder};
@@ -19,7 +10,15 @@ use reth_db::{
     Database,
 };
 use reth_provider::CanonStateSubscriptions;
-use tn_config::{ConsensusConfig, KeyConfig, TelcoinDirs};
+use std::{
+    str::FromStr as _,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use tn_config::{ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::IdentTopic, ConsensusNetwork, PeerId};
 use tn_node_traits::TelcoinNode;
 use tn_primary::{
@@ -220,7 +219,8 @@ where
         let node_storage = db.clone();
         tracing::info!(target: "telcoin::cli", "node storage open");
         let key_config = KeyConfig::read_config(tn_datadir)?;
-        let consensus_config = ConsensusConfig::new(config, tn_datadir, node_storage, key_config)?;
+        let network_config = NetworkConfig::read_config(tn_datadir)?;
+        let consensus_config = ConsensusConfig::new(config, tn_datadir, node_storage, key_config, network_config)?;
 
         let (worker_id, _worker_info) = consensus_config.config().workers().first_worker()?;
         let worker = WorkerNode::new(*worker_id, consensus_config.clone());

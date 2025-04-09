@@ -6,7 +6,7 @@ use crate::{
     ConsensusBus,
 };
 use std::collections::{BTreeSet, HashMap};
-use tn_config::ConsensusConfig;
+use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_storage::{mem_db::MemDatabase, open_db, CertificateStore};
 use tn_test_utils::CommitteeFixture;
 use tn_types::{
@@ -1069,6 +1069,7 @@ async fn restart_with_new_committee() {
             config.key_config().clone(),
             committee.clone(),
             config.worker_cache().clone(),
+            NetworkConfig::default(),
         )
         .unwrap();
         let store = config.node_storage().clone();

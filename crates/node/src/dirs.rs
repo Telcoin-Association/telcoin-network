@@ -137,6 +137,10 @@ impl TelcoinDirs for DataDirChainPath {
     fn consensus_db_path(&self) -> PathBuf {
         self.0.as_ref().join("consensus-db")
     }
+
+    fn network_config_path(&self) -> PathBuf {
+        self.0.as_ref().join("network-config")
+    }
 }
 
 /// Returns the path to the telcoin network data dir.
