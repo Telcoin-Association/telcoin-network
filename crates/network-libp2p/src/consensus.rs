@@ -360,11 +360,6 @@ where
                 let opt_score = self.swarm.behaviour().peer_manager.peer_score(&peer_id);
                 send_or_log_error!(reply, opt_score, "PeerScore");
             }
-            NetworkCommand::SetApplicationScore { peer_id, new_score, reply } => {
-                let bool =
-                    self.swarm.behaviour_mut().gossipsub.set_application_score(&peer_id, new_score);
-                send_or_log_error!(reply, bool, "SetApplicationScore");
-            }
             NetworkCommand::AllPeers { reply } => {
                 let collection = self
                     .swarm

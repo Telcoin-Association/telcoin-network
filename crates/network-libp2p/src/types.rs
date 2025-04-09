@@ -166,10 +166,6 @@ where
     MeshPeers { topic: TopicHash, reply: oneshot::Sender<Vec<PeerId>> },
     /// The peer's score, if it exists.
     PeerScore { peer_id: PeerId, reply: oneshot::Sender<Option<f64>> },
-    /// Set peer's application score.
-    ///
-    /// Peer's application score is P₅ of the peer scoring system.
-    SetApplicationScore { peer_id: PeerId, new_score: f64, reply: oneshot::Sender<bool> },
     /// Report penalty for peer.
     ReportPenalty { peer_id: PeerId, penalty: Penalty },
     /// Return the number of pending outbound requests.
@@ -325,19 +321,6 @@ where
     pub async fn peer_score(&self, peer_id: PeerId) -> NetworkResult<Option<f64>> {
         let (reply, score) = oneshot::channel();
         self.sender.send(NetworkCommand::PeerScore { peer_id, reply }).await?;
-        score.await.map_err(Into::into)
-    }
-
-    /// Set the peer's application score.
-    ///
-    /// This is useful for reporting messages from a peer that fails decoding.
-    pub async fn set_application_score(
-        &self,
-        peer_id: PeerId,
-        new_score: f64,
-    ) -> NetworkResult<bool> {
-        let (reply, score) = oneshot::channel();
-        self.sender.send(NetworkCommand::SetApplicationScore { peer_id, new_score, reply }).await?;
         score.await.map_err(Into::into)
     }
 

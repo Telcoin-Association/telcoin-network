@@ -39,6 +39,11 @@ impl NetworkConfig {
     pub fn peer_config(&self) -> &PeerConfig {
         &self.peer_config
     }
+
+    /// Return a mutable reference to [PeerConfig] for tests only.
+    pub fn peer_config_mut(&mut self) -> &mut PeerConfig {
+        &mut self.peer_config
+    }
 }
 
 /// Configurations for libp2p library.
