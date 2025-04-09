@@ -1,7 +1,7 @@
 //! Configuration for network variables.
 
 use libp2p::{request_response::ProtocolSupport, StreamProtocol};
-use std::time::Duration;
+use std::{sync::OnceLock, time::Duration};
 use tn_types::Round;
 
 /// The container for all network configurations.
@@ -254,7 +254,7 @@ impl Default for PeerConfig {
             dial_timeout: Duration::from_secs(15),
             min_score_for_disconnect: -20.0,
             min_score_for_ban: -50.0,
-            peer_excess_factor: 0.1,
+            peer_excess_factor: 0.2,
             priority_peer_excess: 0.2,
             target_outbound_only_factor: 0.3,
             min_outbound_only_factor: 0.2,
@@ -339,8 +339,13 @@ impl ScoreConfig {
         Duration::from_secs(self.banned_before_decay_secs)
     }
 
-    /// Calculate the halflife decay constant
+    /// Calculate the halflife decay constant =
+    /// -(2.0f64.ln()) / self.score_halflife
     pub fn halflife_decay(&self) -> f64 {
-        -(2.0f64.ln()) / self.score_halflife
+        // static cache that persists
+        static CACHE: OnceLock<f64> = OnceLock::new();
+
+        // return the cached value if it exists
+        *CACHE.get_or_init(|| -(2.0f64.ln()) / self.score_halflife)
     }
 }

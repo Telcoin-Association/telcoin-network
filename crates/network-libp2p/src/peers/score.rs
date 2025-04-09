@@ -11,6 +11,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tn_config::ScoreConfig;
 
+use super::types::Penalty;
+
 /// Global static configuration that is initialized only once for all peers.
 pub(crate) static GLOBAL_SCORE_CONFIG: OnceLock<Arc<ScoreConfig>> = OnceLock::new();
 
@@ -27,32 +29,6 @@ pub(super) fn init_peer_score_config(config: ScoreConfig) {
 /// Panics if score config isn't set.
 fn global_score_config() -> Arc<ScoreConfig> {
     GLOBAL_SCORE_CONFIG.get().expect("Peer score configuration not initialized").clone()
-}
-
-/// Penalties applied to peers based on the significance of their actions.
-///
-/// Each variant has an associated score change.
-///
-/// NOTE: the number of variations is intentionally low.
-/// Too many variations or specific penalties would result in more complexity.
-#[derive(Debug, Clone, Copy)]
-pub enum Penalty {
-    /// The penalty assessed for actions that result in an error and are likely not malicious.
-    ///
-    /// Peers have a high tolerance for this type of error and will be banned ~50 occurances.
-    Mild,
-    /// The penalty assessed for actions that result in an error and are likely not malicious.
-    ///
-    /// Peers have a medium tolerance for this type of error and will be banned ~10 occurances.
-    Medium,
-    /// The penalty assessed for actions that are likely not malicious, but will not be tolerated.
-    ///
-    /// The peer will be banned after ~5 occurances (based on -100).
-    Severe,
-    /// The penalty assessed for unforgiveable actions.
-    ///
-    /// This type of action results in disconnecting from a peer and banning them.
-    Fatal,
 }
 
 /// A peer's score (perceived potential usefulness).

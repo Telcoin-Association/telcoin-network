@@ -52,11 +52,10 @@ fn test_process_penalty() {
     let config = ScoreConfig::default();
     let mut all_peers = create_all_peers();
     let peer_id = PeerId::random();
-    let multiaddr = create_multiaddr(1);
 
     // add connected peer first and set as this node dialed
     let mut peer = Peer::default();
-    peer.set_connection_status(ConnectionStatus::Connected { multiaddr, num_in: 0, num_out: 1 });
+    peer.set_connection_status(ConnectionStatus::Connected { num_in: 0, num_out: 1 });
     all_peers.peers.insert(peer_id, peer);
 
     // test penalty that doesn't change reputation

@@ -28,6 +28,7 @@ pub enum PeerEvent {
     /// Peer manager has unbanned a peer and associated ip addresses.
     Unbanned(PeerId),
 }
+
 /// The action to take after a peer's reputation or connection status changes.
 ///
 /// Both reputation and connection status changes may require the manager to take
@@ -53,6 +54,33 @@ impl PeerAction {
         matches!(self, PeerAction::Ban(_))
     }
 }
+
+/// Penalties applied to peers based on the significance of their actions.
+///
+/// Each variant has an associated score change.
+///
+/// NOTE: the number of variations is intentionally low.
+/// Too many variations or specific penalties would result in more complexity.
+#[derive(Debug, Clone, Copy)]
+pub enum Penalty {
+    /// The penalty assessed for actions that result in an error and are likely not malicious.
+    ///
+    /// Peers have a high tolerance for this type of error and will be banned ~50 occurances.
+    Mild,
+    /// The penalty assessed for actions that result in an error and are likely not malicious.
+    ///
+    /// Peers have a medium tolerance for this type of error and will be banned ~10 occurances.
+    Medium,
+    /// The penalty assessed for actions that are likely not malicious, but will not be tolerated.
+    ///
+    /// The peer will be banned after ~5 occurances (based on -100).
+    Severe,
+    /// The penalty assessed for unforgiveable actions.
+    ///
+    /// This type of action results in disconnecting from a peer and banning them.
+    Fatal,
+}
+
 /// Request for dialing peers.
 pub(crate) struct DialRequest {
     /// The peer's network id.

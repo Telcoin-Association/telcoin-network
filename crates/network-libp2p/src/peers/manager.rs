@@ -3,20 +3,16 @@
 use super::{
     all_peers::AllPeers,
     cache::BannedPeerCache,
-    score::{init_peer_score_config, Penalty},
+    score::init_peer_score_config,
     status::NewConnectionStatus,
     types::{ConnectionDirection, ConnectionType, DialRequest, PeerAction},
-    PeerEvent, PeerExchangeMap,
+    PeerEvent, PeerExchangeMap, Penalty,
 };
 use crate::{
     error::NetworkError, peers::status::ConnectionStatus, send_or_log_error, types::NetworkResult,
 };
 use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
-use std::{
-    collections::{HashMap, VecDeque},
-    net::IpAddr,
-    task::Context,
-};
+use std::{collections::VecDeque, net::IpAddr, task::Context};
 use tn_config::{ConsensusConfig, PeerConfig};
 use tn_types::Database;
 use tokio::sync::oneshot;
@@ -38,8 +34,6 @@ pub struct PeerManager {
     events: VecDeque<PeerEvent>,
     /// A queue of peers to dial.
     dial_requests: VecDeque<DialRequest>,
-    /// The collection of pending dials.
-    pending_dials: HashMap<PeerId, oneshot::Sender<NetworkResult<()>>>,
     /// Tracks temporarily banned peers to prevent immediate reconnection attempts.
     ///
     /// This LRU cache manages a time-based ban list that operates independently
@@ -81,7 +75,6 @@ impl PeerManager {
             peers,
             events: Default::default(),
             dial_requests: Default::default(),
-            pending_dials: Default::default(),
             temporarily_banned,
         }
     }
@@ -150,16 +143,13 @@ impl PeerManager {
     /// Register a dial attempt to return the result to caller.
     ///
     /// This method initializes the peer and sets the connection to `Dialing`.
+    /// If a dial attempt was already registered, the reply channel is updated.
     pub(super) fn register_dial_attempt(
         &mut self,
         peer_id: PeerId,
         reply: Option<oneshot::Sender<NetworkResult<()>>>,
     ) {
-        // create the peer if it doesn't exist and register as dialing
-        self.peers.update_connection_status(&peer_id, NewConnectionStatus::Dialing);
-        if let Some(reply) = reply {
-            self.pending_dials.insert(peer_id, reply);
-        }
+        self.peers.register_dial_attempt(peer_id, reply);
     }
 
     /// Return the next dial request if it exists.
@@ -167,20 +157,9 @@ impl PeerManager {
         self.dial_requests.pop_front()
     }
 
-    /// Return the oneshot sender for dial attempt if it exists.
-    pub(super) fn reply_for_dial_attempt(
-        &mut self,
-        peer_id: &PeerId,
-    ) -> Option<oneshot::Sender<NetworkResult<()>>> {
-        self.pending_dials.remove(peer_id)
-    }
-
     /// Notify the caller that a dial attempt was successful.
     pub(super) fn notify_dial_result(&mut self, peer_id: &PeerId, result: NetworkResult<()>) {
-        // return result to caller
-        if let Some(reply) = self.reply_for_dial_attempt(&peer_id) {
-            send_or_log_error!(reply, result, "DialResult", peer = peer_id);
-        }
+        self.peers.notify_dial_result(peer_id, result);
     }
 
     /// Poll events.
@@ -296,7 +275,7 @@ impl PeerManager {
     }
 
     /// Return an iterator of peers that are connected or dialed.
-    pub fn connected_or_dialing_peers(&self) -> usize {
+    pub(crate) fn connected_or_dialing_peers(&self) -> usize {
         self.peers.connected_or_dialing_peers().count()
     }
 

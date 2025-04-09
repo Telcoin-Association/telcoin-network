@@ -7,7 +7,12 @@ use super::{
     banned::BannedPeers, peer::Peer, score::ReputationUpdate, status::ConnectionStatus,
     types::ConnectionDirection, PeerExchangeMap, Penalty,
 };
-use crate::peers::{score::Reputation, status::NewConnectionStatus, PeerAction};
+use crate::{
+    error::NetworkError,
+    peers::{score::Reputation, status::NewConnectionStatus, PeerAction},
+    send_or_log_error,
+    types::NetworkResult,
+};
 use libp2p::{Multiaddr, PeerId};
 use rand::seq::SliceRandom as _;
 use std::{
@@ -16,6 +21,7 @@ use std::{
     net::IpAddr,
     time::{Duration, Instant},
 };
+use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 #[cfg(test)]
 #[path = "../tests/all_peers.rs"]
@@ -36,6 +42,8 @@ pub struct AllPeers {
     disconnected_peers: usize,
     /// The timeout for dialing peers.
     dial_timeout: Duration,
+    /// The collection of pending dials.
+    pending_dials: HashMap<PeerId, oneshot::Sender<NetworkResult<()>>>,
 }
 
 impl AllPeers {
@@ -47,6 +55,7 @@ impl AllPeers {
             banned_peers: Default::default(),
             disconnected_peers: 0,
             dial_timeout,
+            pending_dials: Default::default(),
         }
     }
 
@@ -228,6 +237,38 @@ impl AllPeers {
         self.handle_status_transition(peer_id, current_status, new_status)
     }
 
+    /// Register a dial attempt to return the result to caller.
+    ///
+    /// This method initializes the peer and sets the connection to `Dialing`.
+    /// If a dial attempt was already registered, the reply channel is updated.
+    pub(super) fn register_dial_attempt(
+        &mut self,
+        peer_id: PeerId,
+        reply: Option<oneshot::Sender<NetworkResult<()>>>,
+    ) {
+        // create the peer if it doesn't exist and register as dialing
+        self.update_connection_status(&peer_id, NewConnectionStatus::Dialing);
+        if let Some(reply) = reply {
+            self.pending_dials.insert(peer_id, reply);
+        }
+    }
+
+    /// Return the oneshot sender for dial attempt if it exists.
+    pub(super) fn reply_for_dial_attempt(
+        &mut self,
+        peer_id: &PeerId,
+    ) -> Option<oneshot::Sender<NetworkResult<()>>> {
+        self.pending_dials.remove(peer_id)
+    }
+
+    /// Notify the caller about the result of a dial attempt.
+    pub(super) fn notify_dial_result(&mut self, peer_id: &PeerId, result: NetworkResult<()>) {
+        // return result to caller
+        if let Some(reply) = self.reply_for_dial_attempt(&peer_id) {
+            send_or_log_error!(reply, result, "DialResult", peer = peer_id);
+        }
+    }
+
     /// Handle the state transition and return ban operations if needed
     ///
     /// WARNING: callers should call `Self::ensure_peer_exists` before handling the status transition
@@ -240,7 +281,17 @@ impl AllPeers {
         match new_status {
             // Group transitions by the new status
             NewConnectionStatus::Connected { multiaddr, direction } => {
-                self.handle_connected_transition(peer_id, current_status, multiaddr, direction)
+                let action = self.handle_connected_transition(
+                    peer_id,
+                    &current_status,
+                    multiaddr,
+                    direction,
+                );
+                // return ok to caller if dial attempt resulted in connection
+                if current_status.is_dialing() {
+                    self.notify_dial_result(peer_id, Ok(()));
+                }
+                action
             }
             NewConnectionStatus::Dialing => self.handle_dialing_transition(peer_id, current_status),
             NewConnectionStatus::Disconnected => {
@@ -260,7 +311,7 @@ impl AllPeers {
     fn handle_connected_transition(
         &mut self,
         peer_id: &PeerId,
-        current_status: ConnectionStatus,
+        current_status: &ConnectionStatus,
         multiaddr: Multiaddr,
         direction: ConnectionDirection,
     ) -> PeerAction {
@@ -351,6 +402,12 @@ impl AllPeers {
                         instant: Instant::now(),
                     });
                 }
+
+                // notify caller of dial error if present
+                self.notify_dial_result(
+                    peer_id,
+                    Err(NetworkError::Dial("dial attempt timedout".to_string())),
+                );
             }
         }
 

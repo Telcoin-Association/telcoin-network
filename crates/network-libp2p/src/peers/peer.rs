@@ -1,9 +1,10 @@
 //! Information shared between peers.
 
 use super::{
-    score::{Penalty, Reputation, ReputationUpdate, Score},
+    score::{Reputation, ReputationUpdate, Score},
     status::ConnectionStatus,
     types::ConnectionDirection,
+    Penalty,
 };
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
@@ -22,7 +23,7 @@ pub struct Peer {
     score: Score,
     /// The multiaddrs this node has witnessed the peer using.
     ///
-    /// These are used to manage the banning process and exchanged with peers.
+    /// These are used to manage the banning process and are exchanged with peers.
     multiaddrs: HashSet<Multiaddr>,
     /// Connection status of the peer.
     connection_status: ConnectionStatus,
@@ -117,8 +118,7 @@ impl Peer {
             | ConnectionStatus::Dialing { .. }
             | ConnectionStatus::Disconnecting { .. }
             | ConnectionStatus::Unknown => {
-                self.connection_status =
-                    ConnectionStatus::Connected { num_in: 1, num_out: 0, multiaddr };
+                self.connection_status = ConnectionStatus::Connected { num_in: 1, num_out: 0 };
                 self.connection_direction = Some(ConnectionDirection::Incoming);
             }
         }
@@ -129,6 +129,7 @@ impl Peer {
     /// This method also updates the number of outgoing connections +1.
     pub(super) fn register_outgoing(&mut self, multiaddr: Multiaddr) {
         self.multiaddrs.insert(multiaddr.clone());
+
         match &mut self.connection_status {
             ConnectionStatus::Connected { num_out, .. } => *num_out += 1,
             ConnectionStatus::Disconnected { .. }
@@ -136,8 +137,7 @@ impl Peer {
             | ConnectionStatus::Dialing { .. }
             | ConnectionStatus::Disconnecting { .. }
             | ConnectionStatus::Unknown => {
-                self.connection_status =
-                    ConnectionStatus::Connected { num_in: 0, num_out: 1, multiaddr };
+                self.connection_status = ConnectionStatus::Connected { num_in: 0, num_out: 1 };
                 self.connection_direction = Some(ConnectionDirection::Outgoing);
             }
         }

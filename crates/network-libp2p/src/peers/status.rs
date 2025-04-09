@@ -2,18 +2,15 @@
 //!
 //! The connection status and sync status for the peer.
 
+use super::types::ConnectionDirection;
 use libp2p::Multiaddr;
 use std::time::Instant;
-
-use super::types::ConnectionDirection;
 
 /// Connection status of the peer.
 #[derive(Debug, Clone, Default)]
 pub enum ConnectionStatus {
     /// The peer is connected.
     Connected {
-        /// The multiaddr that we are connected via.
-        multiaddr: Multiaddr,
         /// The number of ingoing connections.
         num_in: u8,
         /// The number of outgoing connections.
