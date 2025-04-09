@@ -538,7 +538,7 @@ mod tests {
                 let execution_address = Address::random();
 
                 let a = Authority::new(
-                    keypair.public().clone(),
+                    *keypair.public(),
                     1,
                     Multiaddr::empty(),
                     execution_address,
@@ -546,7 +546,7 @@ mod tests {
                     i.to_string(),
                 );
 
-                (keypair.public().clone(), a)
+                (*keypair.public(), a)
             })
             .collect::<BTreeMap<BlsPublicKey, Authority>>();
 

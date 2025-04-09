@@ -402,39 +402,40 @@ mod tests {
                         NetworkCommand::ConnectedPeers { reply } => {
                             reply.send(data_clone.lock().await.keys().copied().collect()).unwrap();
                         }
-                        NetworkCommand::SendRequest { peer, request, reply } => match request {
-                            WorkerRequest::RequestBatches { batch_digests: digests } => {
-                                // Use this to simulate server side response size limit in
-                                // RequestBlocks
-                                const MAX_REQUEST_BATCHES_RESPONSE_SIZE: usize = 2;
-                                const MAX_READ_BLOCK_DIGESTS: usize = 5;
+                        NetworkCommand::SendRequest {
+                            peer,
+                            request: WorkerRequest::RequestBatches { batch_digests: digests },
+                            reply,
+                        } => {
+                            // Use this to simulate server side response size limit in
+                            // RequestBlocks
+                            const MAX_REQUEST_BATCHES_RESPONSE_SIZE: usize = 2;
+                            const MAX_READ_BLOCK_DIGESTS: usize = 5;
 
-                                let mut batches = Vec::new();
-                                let mut total_size = 0;
+                            let mut batches = Vec::new();
+                            let mut total_size = 0;
 
-                                let digests_chunks = digests
-                                    .chunks(MAX_READ_BLOCK_DIGESTS)
-                                    .map(|chunk| chunk.to_vec())
-                                    .collect_vec();
-                                for digests_chunk in digests_chunks {
-                                    for digest in digests_chunk {
-                                        if let Some(batch) =
-                                            data_clone.lock().await.get(&peer).unwrap().get(&digest)
-                                        {
-                                            if total_size < MAX_REQUEST_BATCHES_RESPONSE_SIZE {
-                                                batches.push(batch.clone());
-                                                total_size += batch.size();
-                                            } else {
-                                                break;
-                                            }
+                            let digests_chunks = digests
+                                .chunks(MAX_READ_BLOCK_DIGESTS)
+                                .map(|chunk| chunk.to_vec())
+                                .collect_vec();
+                            for digests_chunk in digests_chunks {
+                                for digest in digests_chunk {
+                                    if let Some(batch) =
+                                        data_clone.lock().await.get(&peer).unwrap().get(&digest)
+                                    {
+                                        if total_size < MAX_REQUEST_BATCHES_RESPONSE_SIZE {
+                                            batches.push(batch.clone());
+                                            total_size += batch.size();
+                                        } else {
+                                            break;
                                         }
                                     }
                                 }
-
-                                reply.send(Ok(WorkerResponse::RequestBatches(batches))).unwrap();
                             }
-                            _ => {}
-                        },
+
+                            reply.send(Ok(WorkerResponse::RequestBatches(batches))).unwrap();
+                        }
                         _ => {}
                     }
                 }
@@ -446,7 +447,7 @@ mod tests {
             for key in keys {
                 let key = test_pk(*key);
                 let mut guard = self.data.lock().await;
-                let entry = guard.entry(key.into()).or_default();
+                let entry = guard.entry(key).or_default();
                 entry.insert(batch.digest(), batch.clone());
             }
         }

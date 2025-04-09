@@ -16,11 +16,8 @@ fn test_empty_certificate_verification() {
     let header = fixture.header_from_last_authority();
 
     // 3 Signers satisfies the 2F + 1 signed stake requirement
-    let votes = fixture
-        .authorities()
-        .take(3)
-        .map(|a| (a.id(), a.vote(&header).signature().clone()))
-        .collect();
+    let votes =
+        fixture.authorities().take(3).map(|a| (a.id(), *a.vote(&header).signature())).collect();
 
     let certificate =
         Certificate::new_unsigned_for_test(&committee, header, votes).expect("new unsigned cert");
@@ -38,7 +35,7 @@ fn test_valid_certificate_verification() {
     // 3 Signers satisfies the 2F + 1 signed stake requirement
     for authority in fixture.authorities().take(3) {
         let vote = authority.vote(&header);
-        signatures.push((vote.author().clone(), vote.signature().clone()));
+        signatures.push((vote.author().clone(), *vote.signature()));
     }
 
     let certificate = Certificate::new_unverified(&committee, header, signatures).unwrap();
@@ -62,7 +59,7 @@ fn test_certificate_insufficient_signatures() {
     // 2 Signatures. This is less than 2F + 1 (3).
     for authority in fixture.authorities().take(2) {
         let vote = authority.vote(&header);
-        signatures.push((vote.author().clone(), vote.signature().clone()));
+        signatures.push((vote.author().clone(), *vote.signature()));
     }
 
     assert!(Certificate::new_unverified(&committee, header.clone(), signatures.clone()).is_err());
@@ -85,8 +82,8 @@ fn test_certificate_validly_repeated_public_keys() {
         let vote = authority.vote(&header);
         // We double every (pk, signature) pair - these should be ignored when forming the
         // certificate.
-        signatures.push((vote.author().clone(), vote.signature().clone()));
-        signatures.push((vote.author().clone(), vote.signature().clone()));
+        signatures.push((vote.author().clone(), *vote.signature()));
+        signatures.push((vote.author().clone(), *vote.signature()));
     }
 
     let certificate_res = Certificate::new_unverified(&committee, header, signatures);
@@ -107,14 +104,14 @@ fn test_unknown_signature_in_certificate() {
     // 2 Signatures. This is less than 2F + 1 (3).
     for authority in fixture.authorities().take(2) {
         let vote = authority.vote(&header);
-        signatures.push((vote.author().clone(), vote.signature().clone()));
+        signatures.push((vote.author().clone(), *vote.signature()));
     }
 
     let malicious_key = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
     let malicious_id: AuthorityIdentifier = AuthorityIdentifier::dummy_for_test(50u8);
 
     let vote = Vote::new_with_signer(&header, malicious_id, &malicious_key);
-    signatures.push((vote.author().clone(), vote.signature().clone()));
+    signatures.push((vote.author().clone(), *vote.signature()));
 
     assert!(Certificate::new_unverified(&committee, header, signatures).is_err());
 }
@@ -136,7 +133,7 @@ proptest::proptest! {
 
         for authority in fixture.authorities().take(quorum_threshold) {
             let vote = authority.vote(&header);
-            signatures.push((vote.author().clone(), vote.signature().clone()));
+            signatures.push((vote.author().clone(), *vote.signature()));
         }
 
         let certificate = Certificate::new_unverified(&committee, header, signatures).unwrap();

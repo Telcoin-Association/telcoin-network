@@ -210,7 +210,7 @@ mod protocol_vec {
     use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S>(
-        protocols: &Vec<(StreamProtocol, ProtocolSupport)>,
+        protocols: &[(StreamProtocol, ProtocolSupport)],
         serializer: S,
     ) -> Result<S::Ok, S::Error>
     where

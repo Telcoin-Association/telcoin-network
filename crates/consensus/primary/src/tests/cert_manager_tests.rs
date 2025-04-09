@@ -67,7 +67,7 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
         .into_iter()
         .map(|mut c| {
             c.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
-                c.aggregated_signature().expect("signature valid").clone(),
+                c.aggregated_signature().expect("signature valid"),
             ));
             c
         })

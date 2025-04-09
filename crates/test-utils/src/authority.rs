@@ -101,6 +101,7 @@ impl<DB: Database> AuthorityFixture<DB> {
     }
 
     /// Generate a new [AuthorityFixture].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn generate(
         number_of_workers: NonZeroUsize,
         authority: Authority,

@@ -32,7 +32,7 @@ async fn test_recovery() {
     // Make two certificate (f+1) with round 5 to trigger the commits.
     let (_, certificate) = tn_test_utils::mock_certificate(
         &committee,
-        ids.get(0).unwrap().clone(),
+        ids.first().unwrap().clone(),
         5,
         next_parents.clone(),
     );

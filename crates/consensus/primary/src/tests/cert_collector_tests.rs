@@ -57,14 +57,14 @@ fn test_certificate_iterator() {
                 // Simulating only 1 directly verified certificate (Auth 3 Round 4) being stored.
                 cert.set_signature_verification_state(
                     SignatureVerificationState::VerifiedDirectly(
-                        cert.aggregated_signature().expect("Invalid Signature").clone(),
+                        cert.aggregated_signature().expect("Invalid Signature"),
                     ),
                 );
             } else {
                 // Simulating some indirectly verified certificates being stored.
                 cert.set_signature_verification_state(
                     SignatureVerificationState::VerifiedIndirectly(
-                        cert.aggregated_signature().expect("Invalid Signature").clone(),
+                        cert.aggregated_signature().expect("Invalid Signature"),
                     ),
                 );
             }

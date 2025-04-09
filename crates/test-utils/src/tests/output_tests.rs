@@ -109,7 +109,7 @@ fn test_authority_sorting_in_reputation_scores() {
     let mut ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
 
     // adding some scores
-    scores.add_score(ids.get(0).unwrap(), 0);
+    scores.add_score(ids.first().unwrap(), 0);
     scores.add_score(ids.get(1).unwrap(), 10);
     scores.add_score(ids.get(2).unwrap(), 10);
     scores.add_score(ids.get(3).unwrap(), 10);
