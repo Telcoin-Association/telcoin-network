@@ -1,8 +1,9 @@
 //! Time-based LRU cache for managing temporarily banned peers.
 
-use std::collections::{HashSet, VecDeque};
-use std::time::Duration;
-use std::time::Instant;
+use std::{
+    collections::{HashSet, VecDeque},
+    time::{Duration, Instant},
+};
 
 #[cfg(test)]
 #[path = "../tests/cache_peers.rs"]
@@ -76,7 +77,8 @@ where
 
     /// Remove and return all expired elements from the cache.
     ///
-    /// The method is called during the peer manager's heartbeat interval to limit constant polling for the cache.
+    /// The method is called during the peer manager's heartbeat interval to limit constant polling
+    /// for the cache.
     pub(super) fn heartbeat(&mut self) -> Vec<Key> {
         if self.list.is_empty() {
             return Vec::new();

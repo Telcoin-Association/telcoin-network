@@ -160,9 +160,9 @@ impl AllPeers {
     /// Update scores and connection status for peers.
     ///
     /// Update peer connection status if dialing instant is greater than the timeout allowed.
-    /// Peers that fail to connect within dial timeout are updated to `ConnectionStatus::Disconnected`.
-    /// It's important these peers are disconnected because dialing peers are counted towards the limit
-    /// on inbound connections.
+    /// Peers that fail to connect within dial timeout are updated to
+    /// `ConnectionStatus::Disconnected`. It's important these peers are disconnected because
+    /// dialing peers are counted towards the limit on inbound connections.
     pub(super) fn heartbeat_maintenance(&mut self) -> Vec<(PeerId, PeerAction)> {
         let peers_to_disconnect: Vec<_> = self
             .peers
@@ -188,9 +188,9 @@ impl AllPeers {
 
     /// Update scores for heartbeat interval.
     ///
-    /// Returns any subsequent actions the peer manager should take after the peer's score is updated.
-    /// Peers are possibly unbanned, but penalties are not applied with this method. It's
-    /// impossible for a peer to become banned during heartbeat maintenance.
+    /// Returns any subsequent actions the peer manager should take after the peer's score is
+    /// updated. Peers are possibly unbanned, but penalties are not applied with this method.
+    /// It's impossible for a peer to become banned during heartbeat maintenance.
     ///
     /// See [Self::apply_penalty] for ban logic.
     fn update_peer_scores(&mut self) -> Vec<(PeerId, PeerAction)> {
@@ -271,7 +271,8 @@ impl AllPeers {
 
     /// Handle the state transition and return ban operations if needed
     ///
-    /// WARNING: callers should call `Self::ensure_peer_exists` before handling the status transition
+    /// WARNING: callers should call `Self::ensure_peer_exists` before handling the status
+    /// transition
     fn handle_status_transition(
         &mut self,
         peer_id: &PeerId,
@@ -548,7 +549,8 @@ impl AllPeers {
             // expected status is "banned", but there are possible edge cases
             match current_state {
                 ConnectionStatus::Banned { instant } => {
-                    // change the status to "disconnected" so the peer isn't registered as "banned" anymore
+                    // change the status to "disconnected" so the peer isn't registered as "banned"
+                    // anymore
                     peer.set_connection_status(ConnectionStatus::Disconnected { instant });
 
                     // update counters

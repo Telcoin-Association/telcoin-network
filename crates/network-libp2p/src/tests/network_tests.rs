@@ -557,8 +557,8 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
 
 // #[tokio::test]
 // async fn test_pending_disconnects() -> eyre::Result<()> {
-//     let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
-//     let TestTypes { peer1: peer3, peer2: peer4 } =
+//     let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest,
+// TestWorkerResponse>();     let TestTypes { peer1: peer3, peer2: peer4 } =
 //         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
 //     let NetworkPeer { network_handle: cvv, network: mut network_1, .. } = peer1;
 //     let NetworkPeer { config: config_2, .. } = peer2;
@@ -567,13 +567,13 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
 //         peer4;
 
 //     // create px from peer1 for peer4
-//     let expected_multi_1 = HashSet::from([config_2.authority().primary_network_address().clone()]);
-//     let pk_2 = config_2.authority().network_key().into();
-//     let expected_peer_id_1 = PeerId::from_public_key(&pk_2);
-//     let expected_multi_2 = HashSet::from([config_3.authority().primary_network_address().clone()]);
-//     let pk_3 = config_3.authority().network_key().into();
-//     let expected_peer_id_2 = PeerId::from_public_key(&pk_3);
-//     let exchange_info = HashMap::from([
+//     let expected_multi_1 =
+// HashSet::from([config_2.authority().primary_network_address().clone()]);     let pk_2 =
+// config_2.authority().network_key().into();     let expected_peer_id_1 =
+// PeerId::from_public_key(&pk_2);     let expected_multi_2 =
+// HashSet::from([config_3.authority().primary_network_address().clone()]);     let pk_3 =
+// config_3.authority().network_key().into();     let expected_peer_id_2 =
+// PeerId::from_public_key(&pk_3);     let exchange_info = HashMap::from([
 //         (expected_peer_id_1, expected_multi_1.clone()),
 //         (expected_peer_id_2, expected_multi_2.clone()),
 //     ]);

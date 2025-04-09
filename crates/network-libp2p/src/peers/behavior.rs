@@ -191,7 +191,8 @@ impl PeerManager {
             return;
         }
 
-        // do not register peers that were immediately disconnected - network service does not need to know about these peers
+        // do not register peers that were immediately disconnected - network service does not need
+        // to know about these peers
         let multiaddr = match endpoint {
             ConnectedPoint::Listener { send_back_addr, .. } => {
                 self.register_peer_connection(

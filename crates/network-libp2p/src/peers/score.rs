@@ -6,9 +6,11 @@
 //! Heavily inspired by Sigma Prime Lighthouse's scoring system.
 
 use serde::Serialize;
-use std::fmt::Display;
-use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::{
+    fmt::Display,
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 use tn_config::ScoreConfig;
 
 use super::types::Penalty;

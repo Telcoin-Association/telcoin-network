@@ -39,16 +39,16 @@ pub struct PeerManager {
     /// This LRU cache manages a time-based ban list that operates independently
     /// from the peer's state. Characteristics:
     ///
-    /// - Prevents reconnection attempts at the network layer without affecting the
-    ///   peer's stored state
-    /// - Peers appear to be banned for connection purposes while still having a
-    ///   non-banned state in the database
-    /// - Ban records persist even after a peer is removed from the database, allowing
-    ///   rejection of unknown peers based on previous temporary bans
-    /// - Control the time-based LRU cache mechanism by leveraging the PeerManager's
-    ///   heartbeat cycle for maintenance instead of requiring separate polling
-    /// - The actual ban duration has a resolution limited by the heartbeat interval,
-    ///   as cache cleanup occurs during heartbeat events
+    /// - Prevents reconnection attempts at the network layer without affecting the peer's stored
+    ///   state
+    /// - Peers appear to be banned for connection purposes while still having a non-banned state
+    ///   in the database
+    /// - Ban records persist even after a peer is removed from the database, allowing rejection of
+    ///   unknown peers based on previous temporary bans
+    /// - Control the time-based LRU cache mechanism by leveraging the PeerManager's heartbeat
+    ///   cycle for maintenance instead of requiring separate polling
+    /// - The actual ban duration has a resolution limited by the heartbeat interval, as cache
+    ///   cleanup occurs during heartbeat events
     ///
     /// The implementation uses `FnvHashSet` instead of the default Rust hasher `SipHash`
     /// for improved performance for short keys.
@@ -377,9 +377,9 @@ impl PeerManager {
     /// Register disconnected peers.
     ///
     /// Some peers are disconnected with the intention to ban that peer.
-    /// This method registers the peer as disconnected and ensures the list of banned/disconnected peers
-    /// doesn't grow infinitely large. Peers may become "unbanned" if the limit for banned peers
-    /// is reached.
+    /// This method registers the peer as disconnected and ensures the list of banned/disconnected
+    /// peers doesn't grow infinitely large. Peers may become "unbanned" if the limit for banned
+    /// peers is reached.
     pub(super) fn register_disconnected(&mut self, peer_id: &PeerId) {
         let (action, pruned_peers) = self.peers.register_disconnected(peer_id);
 
@@ -397,7 +397,8 @@ impl PeerManager {
 
     /// Prune peers to reach target peer counts.
     ///
-    /// Trusted peers and validators are ignored. Peers are sorted from lowest to highest score and removed until excess peer count reaches target.
+    /// Trusted peers and validators are ignored. Peers are sorted from lowest to highest score and
+    /// removed until excess peer count reaches target.
     fn prune_connected_peers(&mut self) {
         // connected peers sorted from lowest to highest aggregate score
         let connected_peers = self.peers.connected_peers_by_score();
@@ -444,8 +445,9 @@ impl PeerManager {
 
     /// Process peer exchange for peer discovery.
     ///
-    /// This method is called when a peer disconnects immediately from this node due to having too many peers.
-    /// The disconnecting peer shares information about other known peers to facilitate discovery.
+    /// This method is called when a peer disconnects immediately from this node due to having too
+    /// many peers. The disconnecting peer shares information about other known peers to
+    /// facilitate discovery.
     ///
     /// Peers should be weary of these reported peers (eclipse attacks).
     pub(crate) fn process_peer_exchange(&mut self, peers: PeerExchangeMap) {

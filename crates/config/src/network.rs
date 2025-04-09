@@ -63,17 +63,20 @@ pub struct LibP2pConfig {
     pub max_gossip_message_size: usize,
     /// The maximum duration to keep an idle connection alive between peers.
     pub max_idle_connection_timeout: Duration,
-    /// The maximum number of pending peer-exchance disconnect messages before this node immediately disconnects.
+    /// The maximum number of pending peer-exchance disconnect messages before this node
+    /// immediately disconnects.
     ///
-    /// When Self::target_num_peers is reached, this node disconnects gracefully from the connected peer
-    /// and exchanges peer information to faciliate discovery. The current solution requires an async task
-    /// to wait for an ack before timing out. This is a workaround until a custom RPC NetworkBehaviour is
-    /// implemented. The ideal approach is to use a custom `ConnectionHandler` and support an event that
-    /// disconnects as soon as the message is sent.
+    /// When Self::target_num_peers is reached, this node disconnects gracefully from the connected
+    /// peer and exchanges peer information to faciliate discovery. The current solution
+    /// requires an async task to wait for an ack before timing out. This is a workaround until
+    /// a custom RPC NetworkBehaviour is implemented. The ideal approach is to use a custom
+    /// `ConnectionHandler` and support an event that disconnects as soon as the message is
+    /// sent.
     ///
     /// This limit is set to prevent a node from spawning too many disconnect tasks.
     pub max_px_disconnects: usize,
-    /// The maximum amount of time to wait for a peer's ack during a px_disconnect before forcing the disconnect.
+    /// The maximum amount of time to wait for a peer's ack during a px_disconnect before forcing
+    /// the disconnect.
     pub px_disconnect_timeout: Duration,
 }
 
@@ -224,23 +227,28 @@ pub struct PeerConfig {
     /// A fraction of `Self::target_num_peers` that is allowed to connect to this node in excess of
     /// `PeerManager::target_num_peers`.
     ///
-    /// NOTE: If `Self::target_num_peers` is 20 and peer_excess_factor = 0.1 this node allows 10% more peers, i.e 22.
+    /// NOTE: If `Self::target_num_peers` is 20 and peer_excess_factor = 0.1 this node allows 10%
+    /// more peers, i.e 22.
     pub peer_excess_factor: f32,
-    /// The fraction of extra peers beyond the Self::peer_excess_factor that this node is allowed to dial for
-    /// requiring subnet peers.
+    /// The fraction of extra peers beyond the Self::peer_excess_factor that this node is allowed
+    /// to dial for requiring subnet peers.
     ///
-    /// NOTE: If the target peer limit is 50, and the excess peer limit is 55, and this node already has 55 peers,
-    /// this value provisions a few more slots for dialing priority peers for validator responsibilities.
+    /// NOTE: If the target peer limit is 50, and the excess peer limit is 55, and this node
+    /// already has 55 peers, this value provisions a few more slots for dialing priority peers
+    /// for validator responsibilities.
     pub priority_peer_excess: f32,
     /// A fraction of `Self::target_num_peers` that are outbound-only connections.
     pub target_outbound_only_factor: f32,
-    /// A fraction of `Self::target_num_peers` that sets a threshold before the node tries to discovery peers.
+    /// A fraction of `Self::target_num_peers` that sets a threshold before the node tries to
+    /// discovery peers.
     ///
     /// NOTE: Self::min_outbound_only_factor must be < Self::target_outbound_only_factor.
     pub min_outbound_only_factor: f32,
-    /// The minimum amount of time before peers are allowed to reconnect after this node disconnects due to too many peers.
+    /// The minimum amount of time before peers are allowed to reconnect after this node
+    /// disconnects due to too many peers.
     ///
-    /// If peers try to connect before the reconnection timeout passes, the swarm denies the connection attempt. This essentially results in a temporary ban at the swarm level.
+    /// If peers try to connect before the reconnection timeout passes, the swarm denies the
+    /// connection attempt. This essentially results in a temporary ban at the swarm level.
     pub excess_peers_reconnection_timeout: Duration,
     /// The config for scoring peers.
     pub score_config: ScoreConfig,
@@ -272,7 +280,8 @@ impl PeerConfig {
 
     /// The maximum number of peers allowed when dialing a priority peer.
     ///
-    /// Priority peers are known validators that dialed this node or a peer that is explicitly dialed.
+    /// Priority peers are known validators that dialed this node or a peer that is explicitly
+    /// dialed.
     pub fn max_priority_peers(&self) -> usize {
         (self.target_num_peers as f32 * (1.0 + self.peer_excess_factor + self.priority_peer_excess))
             .ceil() as usize
@@ -289,7 +298,8 @@ impl PeerConfig {
     }
 
     /// The maximum number of peers that are connected or dialing before we refuse to do another
-    /// discovery search for more outbound peers. We can use up to half the priority peer excess allocation.
+    /// discovery search for more outbound peers. We can use up to half the priority peer excess
+    /// allocation.
     pub fn max_outbound_dialing_peers(&self) -> usize {
         (self.target_num_peers as f32
             * (1.0 + self.peer_excess_factor + self.priority_peer_excess / 2.0))
@@ -302,7 +312,8 @@ impl PeerConfig {
 pub struct ScoreConfig {
     /// The default score for new peers.
     pub default_score: f64,
-    /// The threshold for a peer's score before they are banned, regardless of any other scoring parameters.
+    /// The threshold for a peer's score before they are banned, regardless of any other scoring
+    /// parameters.
     pub min_application_score_before_ban: f64,
     /// The maximum score a peer can obtain.
     pub max_score: f64,
