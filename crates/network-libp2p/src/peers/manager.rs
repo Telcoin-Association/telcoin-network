@@ -1,11 +1,12 @@
 //! Manage peer connection status and reputation.
 
 use super::{
+    all_peers::{AllPeers, PeerAction},
     cache::BannedPeerCache,
-    init_peer_score_config,
-    score::Penalty,
-    types::{ConnectionType, DialRequest},
-    AllPeers, ConnectionDirection, NewConnectionStatus, PeerAction, PeerExchangeMap,
+    score::{init_peer_score_config, Penalty},
+    status::NewConnectionStatus,
+    types::{ConnectionDirection, ConnectionType, DialRequest},
+    PeerExchangeMap,
 };
 use crate::{
     error::NetworkError, peers::status::ConnectionStatus, send_or_log_error, types::NetworkResult,

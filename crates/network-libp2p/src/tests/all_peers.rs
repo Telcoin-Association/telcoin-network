@@ -70,7 +70,6 @@ fn test_process_penalty() {
     {
         action = all_peers.process_penalty(&peer_id, Penalty::Severe);
     }
-    debug!(target: "network", ?action, "processed SEVERE");
     assert!(matches!(action, PeerAction::Disconnect));
 
     // test penalty that causes ban
@@ -287,20 +286,37 @@ fn test_ip_and_peer_banned() {
     all_peers.update_connection_status(
         &peer_id,
         NewConnectionStatus::Connected {
-            multiaddr: addr,
+            multiaddr: addr.clone(),
             direction: ConnectionDirection::Incoming,
         },
     );
     all_peers
         .update_connection_status(&peer_id, NewConnectionStatus::Disconnecting { banned: true });
     let action = all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
-    println!("action: {action:?}");
-    let res = all_peers.peer_banned(&peer_id);
-    println!("res: {res:?}");
+    assert!(matches!(action, PeerAction::Ban(_)));
+    let banned = all_peers.peer_banned(&peer_id);
+    assert!(!banned);
 
     // check if IP is banned
-    assert!(all_peers.ip_banned(&expected_ip));
+    assert!(!all_peers.ip_banned(&expected_ip));
     assert!(!all_peers.ip_banned(&create_ip(2)));
+
+    // new peer connects from same IP
+    let new_peer = PeerId::random();
+    all_peers.update_connection_status(
+        &new_peer,
+        NewConnectionStatus::Connected {
+            multiaddr: addr,
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+
+    all_peers
+        .update_connection_status(&new_peer, NewConnectionStatus::Disconnecting { banned: true });
+    let action = all_peers.update_connection_status(&new_peer, NewConnectionStatus::Disconnected);
+    assert!(matches!(action, PeerAction::Ban(_)));
+    let banned = all_peers.peer_banned(&new_peer);
+    assert!(banned);
 
     // Check if peer is banned
     assert!(all_peers.peer_banned(&peer_id));

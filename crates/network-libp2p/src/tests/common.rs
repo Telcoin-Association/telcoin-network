@@ -9,8 +9,11 @@ use tn_types::{BlockHash, Certificate, CertificateDigest, Header, SealedBatch, V
 // ensure `init_peer_score_config` is only set once
 static INIT: Once = Once::new();
 
+// allow dead code due to compile warning that this fn is never used
+// but it is used in `all_peers` and `banned_peers`
 /// Initialize without error for unit tests.
-pub(super) fn ensure_score_config() {
+#[allow(dead_code)]
+pub fn ensure_score_config() {
     INIT.call_once(|| {
         // use default
         let config = ScoreConfig::default();

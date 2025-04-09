@@ -3,7 +3,7 @@
 use super::{
     score::{Penalty, Reputation, ReputationUpdate, Score},
     status::ConnectionStatus,
-    ConnectionDirection,
+    types::ConnectionDirection,
 };
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},

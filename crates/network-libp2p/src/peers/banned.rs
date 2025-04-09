@@ -13,8 +13,8 @@ use std::{
 mod banned_peers;
 
 /// The threshold of banned peers before an IP address is blocked.
-/// Currently set to 0, so ips are immediately banned.
-const BANNED_PEERS_PER_IP_THRESHOLD: usize = 0;
+/// Currently set to 1, so ips are banned if more than one peer is banned.
+const BANNED_PEERS_PER_IP_THRESHOLD: usize = 1;
 
 /// The total number of banned peers and a collection of the number of bad peers by IP address.
 #[derive(Debug, Default)]
