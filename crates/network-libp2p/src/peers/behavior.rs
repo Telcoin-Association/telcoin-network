@@ -1,11 +1,7 @@
 //! Implement the libp2p network behavior to manage peers in the swarm.
 
+use super::{manager::PeerManager, types::DialRequest, PeerEvent};
 use crate::peers::types::ConnectionType;
-
-use super::{
-    manager::{PeerEvent, PeerManager},
-    types::DialRequest,
-};
 use libp2p::{
     core::{multiaddr::Protocol, transport::PortUse, ConnectedPoint, Endpoint},
     swarm::{

@@ -4,9 +4,55 @@ use crate::types::NetworkResult;
 use libp2p::{Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
-use std::collections::{hash_map::IntoIter, HashMap, HashSet};
+use std::{
+    collections::{hash_map::IntoIter, HashMap, HashSet},
+    net::IpAddr,
+};
 use tokio::sync::oneshot;
 
+/// Events for the `PeerManager`.
+#[derive(Debug)]
+pub enum PeerEvent {
+    /// Connected with peer.
+    PeerConnected(PeerId, Multiaddr),
+    /// Peer was disconnected.
+    PeerDisconnected(PeerId),
+    /// Disconnect from the peer without exchanging peer information.
+    /// This is the event for disconnecting from penalized peers.
+    DisconnectPeer(PeerId),
+    /// Disconnect from the peer and share peer information for discovery.
+    /// This is the event for disconnecting from excess peers with otherwise trusted reputations.
+    DisconnectPeerX(PeerId, PeerExchangeMap),
+    /// Peer manager has identified a peer and associated ip addresses to ban.
+    Banned(PeerId),
+    /// Peer manager has unbanned a peer and associated ip addresses.
+    Unbanned(PeerId),
+}
+/// The action to take after a peer's reputation or connection status changes.
+///
+/// Both reputation and connection status changes may require the manager to take
+/// action to update the peer.
+#[derive(Debug)]
+pub enum PeerAction {
+    /// Ban the peer and the associated IP addresses.
+    Ban(Vec<IpAddr>),
+    /// No action needed.
+    NoAction,
+    /// Disconnect from peer.
+    Disconnect,
+    /// Disconnect a peer with peer exchange information to support discovery.
+    /// This results in a temporary ban to prevent immediate reconnection attempts.
+    DisconnectWithPX,
+    /// Unban the peer and it's known ip addresses.
+    Unban(Vec<IpAddr>),
+}
+
+impl PeerAction {
+    /// Helper method if the action is to ban the peer.
+    pub(super) fn is_ban(&self) -> bool {
+        matches!(self, PeerAction::Ban(_))
+    }
+}
 /// Request for dialing peers.
 pub(crate) struct DialRequest {
     /// The peer's network id.

@@ -9,16 +9,14 @@ use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
     PeerId,
 };
-use serde::Serialize;
 use std::{collections::HashSet, net::IpAddr, time::Instant};
 use tn_config::PeerConfig;
 use tracing::error;
 
 /// Information about a given connected peer.
-#[derive(Serialize, Clone, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Peer {
     /// The config
-    #[serde(skip)]
     config: PeerConfig,
     /// The peer's score - used to derive [Reputation].
     score: Score,

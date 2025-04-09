@@ -3,8 +3,7 @@
 //! The connection status and sync status for the peer.
 
 use libp2p::Multiaddr;
-use serde::{ser::SerializeStruct as _, Serialize, Serializer};
-use std::{net::IpAddr, time::Instant};
+use std::time::Instant;
 
 use super::types::ConnectionDirection;
 
@@ -64,59 +63,6 @@ impl ConnectionStatus {
     /// Matches the connection status if the peer is already connected or dialing.
     pub(super) fn is_connected_or_dialing(&self) -> bool {
         self.is_connected() || self.is_dialing()
-    }
-}
-
-/// Serialization for http requests.
-impl Serialize for ConnectionStatus {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut s = serializer.serialize_struct("connection_status", 6)?;
-        match self {
-            ConnectionStatus::Connected { num_in, num_out, multiaddr } => {
-                s.serialize_field("multiaddr", multiaddr)?;
-                s.serialize_field("status", "connected")?;
-                s.serialize_field("connections_in", num_in)?;
-                s.serialize_field("connections_out", num_out)?;
-                s.serialize_field("last_seen", &0)?;
-                s.end()
-            }
-            ConnectionStatus::Disconnecting { .. } => {
-                s.serialize_field("status", "disconnecting")?;
-                s.serialize_field("connections_in", &0)?;
-                s.serialize_field("connections_out", &0)?;
-                s.serialize_field("last_seen", &0)?;
-                s.end()
-            }
-            ConnectionStatus::Disconnected { instant } => {
-                s.serialize_field("status", "disconnected")?;
-                s.serialize_field("connections_in", &0)?;
-                s.serialize_field("connections_out", &0)?;
-                s.serialize_field("instant", &instant.elapsed().as_secs())?;
-                s.serialize_field("banned_ips", &Vec::<IpAddr>::new())?;
-                s.end()
-            }
-            ConnectionStatus::Banned { instant } => {
-                s.serialize_field("status", "banned")?;
-                s.serialize_field("connections_in", &0)?;
-                s.serialize_field("connections_out", &0)?;
-                s.serialize_field("instant", &instant.elapsed().as_secs())?;
-                s.end()
-            }
-            ConnectionStatus::Dialing { instant } => {
-                s.serialize_field("status", "dialing")?;
-                s.serialize_field("connections_in", &0)?;
-                s.serialize_field("connections_out", &0)?;
-                s.serialize_field("instant", &instant.elapsed().as_secs())?;
-                s.end()
-            }
-            ConnectionStatus::Unknown => {
-                s.serialize_field("status", "unknown")?;
-                s.serialize_field("connections_in", &0)?;
-                s.serialize_field("connections_out", &0)?;
-                s.serialize_field("last_seen", &0)?;
-                s.end()
-            }
-        }
     }
 }
 

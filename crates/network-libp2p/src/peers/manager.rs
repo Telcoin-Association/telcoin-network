@@ -1,12 +1,12 @@
 //! Manage peer connection status and reputation.
 
 use super::{
-    all_peers::{AllPeers, PeerAction},
+    all_peers::AllPeers,
     cache::BannedPeerCache,
     score::{init_peer_score_config, Penalty},
     status::NewConnectionStatus,
-    types::{ConnectionDirection, ConnectionType, DialRequest},
-    PeerExchangeMap,
+    types::{ConnectionDirection, ConnectionType, DialRequest, PeerAction},
+    PeerEvent, PeerExchangeMap,
 };
 use crate::{
     error::NetworkError, peers::status::ConnectionStatus, send_or_log_error, types::NetworkResult,
@@ -59,25 +59,6 @@ pub struct PeerManager {
     /// The implementation uses `FnvHashSet` instead of the default Rust hasher `SipHash`
     /// for improved performance for short keys.
     temporarily_banned: BannedPeerCache<PeerId>,
-}
-
-/// Events for the [PeerManager].
-#[derive(Debug)]
-pub enum PeerEvent {
-    /// Connected with peer.
-    PeerConnected(PeerId, Multiaddr),
-    /// Peer was disconnected.
-    PeerDisconnected(PeerId),
-    /// Disconnect from the peer without exchanging peer information.
-    /// This is the event for disconnecting from penalized peers.
-    DisconnectPeer(PeerId),
-    /// Disconnect from the peer and share peer information for discovery.
-    /// This is the event for disconnecting from excess peers with otherwise trusted reputations.
-    DisconnectPeerX(PeerId, PeerExchangeMap),
-    /// Peer manager has identified a peer and associated ip addresses to ban.
-    Banned(PeerId),
-    /// Peer manager has unbanned a peer and associated ip addresses.
-    Unbanned(PeerId),
 }
 
 impl PeerManager {

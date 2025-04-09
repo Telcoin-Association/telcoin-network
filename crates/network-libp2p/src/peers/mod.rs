@@ -9,9 +9,9 @@ mod peer;
 mod score;
 mod status;
 mod types;
-pub use manager::{PeerEvent, PeerManager};
+pub use manager::PeerManager;
 pub use score::Penalty;
-pub use types::PeerExchangeMap;
+pub use types::{PeerAction, PeerEvent, PeerExchangeMap};
 
 // visibility for tests
 #[cfg(test)]

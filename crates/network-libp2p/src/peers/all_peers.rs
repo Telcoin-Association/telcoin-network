@@ -7,7 +7,7 @@ use super::{
     banned::BannedPeers, peer::Peer, score::ReputationUpdate, status::ConnectionStatus,
     types::ConnectionDirection, PeerExchangeMap, Penalty,
 };
-use crate::peers::{score::Reputation, status::NewConnectionStatus};
+use crate::peers::{score::Reputation, status::NewConnectionStatus, PeerAction};
 use libp2p::{Multiaddr, PeerId};
 use rand::seq::SliceRandom as _;
 use std::{
@@ -36,32 +36,6 @@ pub struct AllPeers {
     disconnected_peers: usize,
     /// The timeout for dialing peers.
     dial_timeout: Duration,
-}
-
-/// The action to take after a peer's reputation or connection status changes.
-///
-/// Both reputation and connection status changes may require the manager to take
-/// action to update the peer.
-#[derive(Debug)]
-pub enum PeerAction {
-    /// Ban the peer and the associated IP addresses.
-    Ban(Vec<IpAddr>),
-    /// No action needed.
-    NoAction,
-    /// Disconnect from peer.
-    Disconnect,
-    /// Disconnect a peer with peer exchange information to support discovery.
-    /// This results in a temporary ban to prevent immediate reconnection attempts.
-    DisconnectWithPX,
-    /// Unban the peer and it's known ip addresses.
-    Unban(Vec<IpAddr>),
-}
-
-impl PeerAction {
-    /// Helper method if the action is to ban the peer.
-    pub(super) fn is_ban(&self) -> bool {
-        matches!(self, PeerAction::Ban(_))
-    }
 }
 
 impl AllPeers {

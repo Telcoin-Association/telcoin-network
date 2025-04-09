@@ -130,7 +130,7 @@ where
                 self.list.iter().position(|e| &e.key == k).expect("Map and list should be in sync");
         }
 
-        // One last check to make sure there are no duplicates in the list
+        // assert there are no duplicates in the list
         assert_eq!(self.list.len(), self.map.len());
     }
 }
