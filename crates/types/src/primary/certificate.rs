@@ -61,20 +61,20 @@ impl Certificate {
         header: Header,
         votes: Vec<(AuthorityIdentifier, BlsSignature)>,
     ) -> DagResult<Certificate> {
-        Self::new_unsafe(committee, header, votes.into_iter().collect(), true)
+        Self::new_internal(committee, header, votes.into_iter().collect(), true)
     }
 
     /// Create a new, unsafe certificate that does not check stake.
-    pub fn new_unsigned(
+    pub fn new_unsigned_for_test(
         committee: &Committee,
         header: Header,
         votes: Vec<(AuthorityIdentifier, BlsSignature)>,
     ) -> DagResult<Certificate> {
-        Self::new_unsafe(committee, header, votes.into_iter().collect(), false)
+        Self::new_internal(committee, header, votes.into_iter().collect(), false)
     }
 
     /// Create a new certificate without verifying authority signatures.
-    fn new_unsafe(
+    fn new_internal(
         committee: &Committee,
         header: Header,
         // We need votes to be a BTreeMap to force authorities to be in the expected order.

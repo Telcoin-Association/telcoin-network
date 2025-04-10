@@ -48,7 +48,7 @@ async fn test_certificate_signers_are_ordered() {
         let vote =
             Vote::new(&header.clone(), authority.id(), authority.consensus_config().key_config())
                 .await;
-        votes.push((vote.author().clone(), vote.signature().clone()));
+        votes.push((vote.author().clone(), *vote.signature()));
     }
 
     // Just shuffle to ensure that any underlying sorting will work correctly

@@ -1,11 +1,15 @@
 //! Configuration for network variables.
 
+use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
 use libp2p::{request_response::ProtocolSupport, StreamProtocol};
+use serde::{Deserialize, Serialize};
 use std::{sync::OnceLock, time::Duration};
 use tn_types::Round;
 
+impl ConfigTrait for NetworkConfig {}
+
 /// The container for all network configurations.
-#[derive(Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct NetworkConfig {
     /// The configurations for libp2p library.
     ///
@@ -39,18 +43,25 @@ impl NetworkConfig {
     pub fn peer_config(&self) -> &PeerConfig {
         &self.peer_config
     }
+    /// Read a network config file.
+    pub fn read_config<TND: TelcoinDirs>(tn_datadir: &TND) -> eyre::Result<Self> {
+        let path = tn_datadir.network_config_path();
+        Self::load_from_path(path, ConfigFmt::YAML)
+    }
 
-    /// Return a mutable reference to [PeerConfig] for tests only.
-    pub fn peer_config_mut(&mut self) -> &mut PeerConfig {
-        &mut self.peer_config
+    /// Write the current network config to file.
+    pub fn write_config<TND: TelcoinDirs>(&self, tn_datadir: &TND) -> eyre::Result<()> {
+        let path = tn_datadir.network_config_path();
+        Self::store_path(path, self, ConfigFmt::YAML)
     }
 }
 
 /// Configurations for libp2p library.
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct LibP2pConfig {
     /// The supported inbound/outbound protocols for request/response behavior.
     /// - ex) "/telcoin-network/mainnet/0.0.1"
+    #[serde(with = "protocol_vec")]
     pub supported_req_res_protocols: Vec<(StreamProtocol, ProtocolSupport)>,
     /// Maximum message size between request/response network messages in bytes.
     pub max_rpc_message_size: usize,
@@ -102,7 +113,7 @@ impl Default for LibP2pConfig {
 }
 
 /// Configuration for state syncing operations.
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SyncConfig {
     /// Maximum number of rounds that can be skipped for a single authority when requesting missing
     /// certificates.
@@ -173,7 +184,7 @@ impl Default for SyncConfig {
 }
 
 /// Configure the quic transport for libp2p.
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct QuicConfig {
     /// Timeout for the initial handshake when establishing a connection.
     /// The actual timeout is the minimum of this and the [`Config::max_idle_timeout`].
@@ -217,7 +228,7 @@ impl Default for QuicConfig {
 }
 
 /// Configurations for network peers.
-#[derive(Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct PeerConfig {
     /// The interval (secs) for updating peer status.
     pub heartbeat_interval: u64,
@@ -313,7 +324,7 @@ impl PeerConfig {
 }
 
 /// Configuration for peer scoring parameters
-#[derive(Clone, Debug, Copy)]
+#[derive(Serialize, Deserialize, Clone, Debug, Copy)]
 pub struct ScoreConfig {
     /// The default score for new peers.
     pub default_score: f64,
@@ -363,5 +374,68 @@ impl ScoreConfig {
 
         // return the cached value if it exists
         *CACHE.get_or_init(|| -(2.0f64.ln()) / self.score_halflife)
+    }
+}
+
+// Serialize and deserialize for tuples of protocols
+mod protocol_vec {
+    use super::*;
+    use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(
+        protocols: &[(StreamProtocol, ProtocolSupport)],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Simply convert to a Vec of string tuples
+        let string_tuples: Vec<(String, String)> = protocols
+            .iter()
+            .map(|(protocol, support)| {
+                let support_str = match support {
+                    ProtocolSupport::Inbound => "inbound".to_string(),
+                    ProtocolSupport::Outbound => "outbound".to_string(),
+                    ProtocolSupport::Full => "full".to_string(),
+                };
+                (protocol.as_ref().to_string(), support_str)
+            })
+            .collect();
+
+        string_tuples.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<Vec<(StreamProtocol, ProtocolSupport)>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let string_tuples: Vec<(String, String)> = Vec::deserialize(deserializer)?;
+
+        string_tuples
+            .into_iter()
+            .map(|(protocol_str, support_str)| {
+                // Convert the protocol string to StreamProtocol
+                let protocol = StreamProtocol::try_from_owned(protocol_str).map_err(|_| {
+                    D::Error::custom("Invalid protocol: must start with a forward slash")
+                })?;
+
+                // Convert the support string to ProtocolSupport
+                let support = match support_str.as_str() {
+                    "inbound" => ProtocolSupport::Inbound,
+                    "outbound" => ProtocolSupport::Outbound,
+                    "full" => ProtocolSupport::Full,
+                    _ => {
+                        return Err(D::Error::custom(format!(
+                            "Invalid protocol support: {}, expected inbound, outbound, or full",
+                            support_str
+                        )))
+                    }
+                };
+
+                Ok((protocol, support))
+            })
+            .collect()
     }
 }

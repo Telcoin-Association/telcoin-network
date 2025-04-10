@@ -513,7 +513,7 @@ pub fn mock_certificate_with_rand<R: RngCore + ?Sized>(
         .parents(parents)
         .payload(fixture_payload_with_rand(1, rand))
         .build();
-    let certificate = Certificate::new_unsigned(committee, header, Vec::new()).unwrap();
+    let certificate = Certificate::new_unsigned_for_test(committee, header, Vec::new()).unwrap();
     (certificate.digest(), certificate)
 }
 
@@ -545,7 +545,7 @@ pub fn mock_certificate_with_epoch(
         .parents(parents)
         .payload(fixture_payload(1))
         .build();
-    let certificate = Certificate::new_unsigned(committee, header, Vec::new()).unwrap();
+    let certificate = Certificate::new_unsigned_for_test(committee, header, Vec::new()).unwrap();
     (certificate.digest(), certificate)
 }
 
@@ -565,7 +565,7 @@ pub fn signed_cert_for_test(
         .parents(parents)
         .build();
 
-    let cert = Certificate::new_unsigned(committee, header.clone(), Vec::new())
+    let cert = Certificate::new_unsigned_for_test(committee, header.clone(), Vec::new())
         .expect("new unsigned cert for tests");
 
     let votes = signers

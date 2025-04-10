@@ -22,7 +22,7 @@ fn test_zero_timestamp_in_sub_dag() {
         .parents(BTreeSet::new())
         .build();
 
-    let certificate = Certificate::new_unsigned(&committee, header, Vec::new()).unwrap();
+    let certificate = Certificate::new_unsigned_for_test(&committee, header, Vec::new()).unwrap();
 
     // AND we initialise the sub dag via the "restore" way
     let sub_dag_round = CommittedSubDag::new(
@@ -56,7 +56,7 @@ fn test_monotonically_incremented_commit_timestamps() {
         .parents(BTreeSet::new())
         .build();
 
-    let certificate = Certificate::new_unsigned(&committee, header, Vec::new()).unwrap();
+    let certificate = Certificate::new_unsigned_for_test(&committee, header, Vec::new()).unwrap();
 
     // AND
     let sub_dag_round_2 = CommittedSubDag::new(
@@ -81,7 +81,7 @@ fn test_monotonically_incremented_commit_timestamps() {
         .parents(BTreeSet::new())
         .build();
 
-    let certificate = Certificate::new_unsigned(&committee, header, Vec::new()).unwrap();
+    let certificate = Certificate::new_unsigned_for_test(&committee, header, Vec::new()).unwrap();
 
     // WHEN create the sub dag based on the "previously committed" sub dag.
     let sub_dag_round_4 = CommittedSubDag::new(
@@ -109,7 +109,7 @@ fn test_authority_sorting_in_reputation_scores() {
     let mut ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
 
     // adding some scores
-    scores.add_score(ids.get(0).unwrap(), 0);
+    scores.add_score(ids.first().unwrap(), 0);
     scores.add_score(ids.get(1).unwrap(), 10);
     scores.add_score(ids.get(2).unwrap(), 10);
     scores.add_score(ids.get(3).unwrap(), 10);

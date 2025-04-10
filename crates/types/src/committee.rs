@@ -23,7 +23,7 @@ pub type Epoch = u32;
 pub type VotingPower = u64;
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
-pub struct Authority {
+struct AuthorityInner {
     /// The authority's main BlsPublicKey which is used to verify the content they sign.
     protocol_key: BlsPublicKey,
     /// The voting power of this authority.
@@ -37,6 +37,11 @@ pub struct Authority {
     network_key: NetworkPublicKey,
     /// The validator's hostname
     hostname: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Authority {
+    inner: Arc<AuthorityInner>,
 }
 
 impl Authority {
@@ -53,12 +58,14 @@ impl Authority {
         hostname: String,
     ) -> Self {
         Self {
-            protocol_key,
-            voting_power,
-            primary_network_address,
-            execution_address,
-            network_key,
-            hostname,
+            inner: Arc::new(AuthorityInner {
+                protocol_key,
+                voting_power,
+                primary_network_address,
+                execution_address,
+                network_key,
+                hostname,
+            }),
         }
     }
 
@@ -73,52 +80,74 @@ impl Authority {
         hostname: String,
     ) -> Self {
         Self {
-            protocol_key,
-            voting_power,
-            primary_network_address,
-            execution_address,
-            network_key,
-            hostname,
+            inner: Arc::new(AuthorityInner {
+                protocol_key,
+                voting_power,
+                primary_network_address,
+                execution_address,
+                network_key,
+                hostname,
+            }),
         }
     }
 
     pub fn id(&self) -> AuthorityIdentifier {
-        self.network_key.to_peer_id().into()
+        self.inner.network_key.to_peer_id().into()
     }
 
     /// Return the peer id for the primary network.
     pub fn peer_id(&self) -> PeerId {
-        self.network_key.to_peer_id()
+        self.inner.network_key.to_peer_id()
     }
 
     pub fn protocol_key(&self) -> &BlsPublicKey {
         // Skip the assert here, this is called in testing before the initialise...
-        &self.protocol_key
+        &self.inner.protocol_key
     }
 
     pub fn voting_power(&self) -> VotingPower {
-        self.voting_power
+        self.inner.voting_power
     }
 
     pub fn primary_network_address(&self) -> &Multiaddr {
-        &self.primary_network_address
+        &self.inner.primary_network_address
     }
 
     pub fn execution_address(&self) -> Address {
-        self.execution_address
+        self.inner.execution_address
     }
 
     pub fn network_key(&self) -> NetworkPublicKey {
-        self.network_key.clone()
+        self.inner.network_key.clone()
     }
 
     pub fn hostname(&self) -> &str {
-        self.hostname.as_str()
+        self.inner.hostname.as_str()
+    }
+}
+
+impl Serialize for Authority {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let ok = self.inner.serialize(serializer)?;
+        Ok(ok)
+    }
+}
+
+impl<'de> Deserialize<'de> for Authority {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let inner = AuthorityInner::deserialize(deserializer)?;
+        Ok(Self { inner: Arc::new(inner) })
     }
 }
 
 /// The committee lists all validators that participate in consensus.
-#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Default)]
 struct CommitteeInner {
     /// The authorities of epoch.
     authorities: BTreeMap<BlsPublicKey, Authority>,
@@ -167,7 +196,7 @@ impl CommitteeInner {
     }
 
     pub fn total_voting_power(&self) -> VotingPower {
-        self.authorities.values().map(|x| x.voting_power).sum()
+        self.authorities.values().map(|x| x.inner.voting_power).sum()
     }
 }
 
@@ -344,7 +373,7 @@ impl Committee {
 
     /// Return the stake of a specific authority.
     pub fn voting_power(&self, name: &BlsPublicKey) -> VotingPower {
-        self.inner.read().authorities.get(&name.clone()).map_or_else(|| 0, |x| x.voting_power)
+        self.inner.read().authorities.get(&name.clone()).map_or_else(|| 0, |x| x.inner.voting_power)
     }
 
     pub fn voting_power_by_id(&self, id: &AuthorityIdentifier) -> VotingPower {
@@ -352,7 +381,7 @@ impl Committee {
             .read()
             .authorities_by_id
             .get(id)
-            .map_or_else(|| 0, |authority| authority.voting_power)
+            .map_or_else(|| 0, |authority| authority.inner.voting_power)
     }
 
     /// Returns the stake required to reach a quorum (2f+1).
@@ -389,7 +418,7 @@ impl Committee {
             .read()
             .authorities
             .values()
-            .map(|authority| (authority.clone(), authority.voting_power as f32))
+            .map(|authority| (authority.clone(), authority.inner.voting_power as f32))
             .collect::<Vec<_>>();
         choices
             .choose_weighted(&mut rng, |item| item.1)
@@ -509,7 +538,7 @@ mod tests {
                 let execution_address = Address::random();
 
                 let a = Authority::new(
-                    keypair.public().clone(),
+                    *keypair.public(),
                     1,
                     Multiaddr::empty(),
                     execution_address,
@@ -517,7 +546,7 @@ mod tests {
                     i.to_string(),
                 );
 
-                (keypair.public().clone(), a)
+                (*keypair.public(), a)
             })
             .collect::<BTreeMap<BlsPublicKey, Authority>>();
 

@@ -12,6 +12,7 @@ use tn_types::{
     Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Database, Hash as _,
     Multiaddr, Notifier, WorkerCache, WorkerId,
 };
+use tracing::info;
 
 #[derive(Debug)]
 struct ConsensusConfigInner<DB> {
@@ -41,34 +42,25 @@ where
         tn_datadir: &TND,
         node_storage: DB,
         key_config: KeyConfig,
+        network_config: NetworkConfig,
     ) -> eyre::Result<Self> {
         // load committee from file
         let committee: Committee =
             Config::load_from_path(tn_datadir.committee_path(), ConfigFmt::YAML)?;
         committee.load();
-        tracing::info!(target: "telcoin::consensus_config", "committee loaded");
-        // TODO: make worker cache part of committee?
+        info!(target: "telcoin", "committee loaded");
         let worker_cache: WorkerCache =
             Config::load_from_path(tn_datadir.worker_cache_path(), ConfigFmt::YAML)?;
-        // TODO: this could be a separate method on `Committee` to have robust checks in place
-        // - all public keys are unique
-        // - thresholds / stake
-        //
-        // assert committee loaded correctly
-        // assert!(committee.size() >= 4, "not enough validators in committee.");
 
-        // TODO: better assertion here
-        // right now, each validator should only have 1 worker
-        // this assertion would incorrectly pass if 1 authority had 2 workers and another had 0
-        //
-        // assert worker cache loaded correctly
-        assert!(
-            worker_cache.all_workers().len() == committee.size(),
-            "each validator within committee must have one worker"
-        );
-
-        tracing::info!(target: "telcoin::consensus_config", "worker cache loaded");
-        Self::new_with_committee(config, node_storage, key_config, committee, worker_cache)
+        info!(target: "telcoin", "worker cache loaded");
+        Self::new_with_committee(
+            config,
+            node_storage,
+            key_config,
+            committee,
+            worker_cache,
+            network_config,
+        )
     }
 
     /// Create a new config with a committe.
@@ -80,8 +72,16 @@ where
         key_config: KeyConfig,
         committee: Committee,
         worker_cache: WorkerCache,
+        network_config: NetworkConfig,
     ) -> eyre::Result<Self> {
-        Self::new_with_committee(config, node_storage, key_config, committee, worker_cache)
+        Self::new_with_committee(
+            config,
+            node_storage,
+            key_config,
+            committee,
+            worker_cache,
+            network_config,
+        )
     }
 
     /// Create a new config with a committe.
@@ -93,6 +93,7 @@ where
         key_config: KeyConfig,
         committee: Committee,
         worker_cache: WorkerCache,
+        network_config: NetworkConfig,
     ) -> eyre::Result<Self> {
         let local_network =
             LocalNetwork::new_from_public_key(&key_config.primary_network_public_key());
@@ -106,7 +107,6 @@ where
             .clone();
 
         let shutdown = Notifier::new();
-        let network_config = NetworkConfig::default();
         let genesis = Certificate::genesis(&committee)
             .into_iter()
             .map(|cert| (cert.digest(), cert))

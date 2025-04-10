@@ -99,7 +99,7 @@ async fn test_leader_schedule() {
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
 
     // Call the leader for round 2. It should give us the validator of position 0
-    let original_leader = authority_ids.get(0).unwrap().clone();
+    let original_leader = authority_ids.first().unwrap().clone();
     let leader_2 = schedule.leader(2);
 
     assert_eq!(leader_2.id(), original_leader);

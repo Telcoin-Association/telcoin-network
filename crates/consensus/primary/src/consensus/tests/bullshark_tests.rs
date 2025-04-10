@@ -6,7 +6,7 @@ use crate::{
     ConsensusBus,
 };
 use std::collections::{BTreeSet, HashMap};
-use tn_config::ConsensusConfig;
+use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_storage::{mem_db::MemDatabase, open_db, CertificateStore};
 use tn_test_utils::CommitteeFixture;
 use tn_types::{
@@ -195,7 +195,7 @@ async fn not_enough_support_with_leader_schedule_change() {
         10,
         tn_test_utils::TestLeaderConfiguration {
             round: 10,
-            authority: ids.get(0).unwrap().clone(),
+            authority: ids.first().unwrap().clone(),
             should_omit: false,
             support: Some(tn_test_utils::TestLeaderSupport::Weak),
         },
@@ -421,7 +421,7 @@ async fn commit_one() {
     // Make two certificate (f+1) with round 3 to trigger the commits.
     let (_, certificate) = tn_test_utils::mock_certificate(
         &committee,
-        ids.get(0).unwrap().clone(),
+        ids.first().unwrap().clone(),
         3,
         next_parents.clone(),
     );
@@ -592,7 +592,7 @@ async fn not_enough_support() {
     // round is the only one with 4 certificates.
     let (leader_2_digest, certificate) = tn_test_utils::mock_certificate(
         &committee,
-        ids.get(0).unwrap().clone(),
+        ids.first().unwrap().clone(),
         2,
         parents.clone(),
     );
@@ -618,7 +618,7 @@ async fn not_enough_support() {
     certificates.push_back(certificate);
     next_parents.insert(digest);
 
-    let name = ids.get(0).unwrap().clone();
+    let name = ids.first().unwrap().clone();
     parents.insert(leader_2_digest);
     let (digest, certificate) =
         tn_test_utils::mock_certificate(&committee, name, 3, parents.clone());
@@ -636,7 +636,7 @@ async fn not_enough_support() {
     // Round 5: Send f+1 certificates to trigger the commit of leader 4.
     let (_, certificate) = tn_test_utils::mock_certificate(
         &committee,
-        ids.get(0).unwrap().clone(),
+        ids.first().unwrap().clone(),
         5,
         parents.clone(),
     );
@@ -707,7 +707,7 @@ async fn not_enough_support() {
     // with value 1, and everything else should be zero.
     assert_eq!(committed_sub_dag.reputation_score.total_authorities(), 4);
 
-    let node_0_name: AuthorityIdentifier = ids.get(0).unwrap().clone();
+    let node_0_name: AuthorityIdentifier = ids.first().unwrap().clone();
     committed_sub_dag.reputation_score.scores_per_authority.iter().for_each(|(key, score)| {
         if *key == node_0_name {
             assert_eq!(*score, 1_u64);
@@ -745,7 +745,7 @@ async fn missing_leader() {
     // Add f+1 certificates of round 5 to commit the leader of round 4.
     let (_, certificate) = tn_test_utils::mock_certificate(
         &committee,
-        ids.get(0).unwrap().clone(),
+        ids.first().unwrap().clone(),
         5,
         parents.clone(),
     );
@@ -1069,6 +1069,7 @@ async fn restart_with_new_committee() {
             config.key_config().clone(),
             committee.clone(),
             config.worker_cache().clone(),
+            NetworkConfig::default(),
         )
         .unwrap();
         let store = config.node_storage().clone();
@@ -1104,7 +1105,7 @@ async fn restart_with_new_committee() {
         // Make two certificate (f+1) with round 3 to trigger the commits.
         let (_, certificate) = tn_test_utils::mock_certificate_with_epoch(
             &committee,
-            ids.get(0).unwrap().clone(),
+            ids.first().unwrap().clone(),
             3,
             epoch,
             next_parents.clone(),
@@ -1424,7 +1425,7 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
 
     // now from round 5 to 7 create all certificates. Node 1 is now a slow node and won't create
     // referrencies to the certificates of that one.
-    let slow_node = ids.get(0).unwrap().clone();
+    let slow_node = ids.first().unwrap().clone();
     let slow_nodes = vec![(slow_node, 0.0_f64)];
 
     let (certificates_5_to_7, _round_7_certificates) =

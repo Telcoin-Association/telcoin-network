@@ -149,7 +149,7 @@ async fn fetch_certificates_basic() {
         // Manually writing the certificates to store so we can consider them verified
         // directly
         cert.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
-            cert.aggregated_signature().expect("Invalid Signature").clone(),
+            cert.aggregated_signature().expect("Invalid Signature"),
         ));
         certificate_store.write(cert.clone()).expect("Writing certificate to store failed");
     }

@@ -493,7 +493,7 @@ mod tests {
         // create validator
         let validator = ValidatorInfo::new(
             name,
-            bls_keypair.public().clone(),
+            *bls_keypair.public(),
             primary_info,
             address,
             proof_of_possession,
@@ -567,7 +567,7 @@ mod tests {
             // create validator
             let validator = ValidatorInfo::new(
                 name,
-                bls_keypair.public().clone(),
+                *bls_keypair.public(),
                 primary_info,
                 address,
                 proof_of_possession,
@@ -609,7 +609,7 @@ mod tests {
             // create validator
             let validator = ValidatorInfo::new(
                 name,
-                bls_keypair.public().clone(),
+                *bls_keypair.public(),
                 primary_info,
                 address,
                 proof_of_possession,

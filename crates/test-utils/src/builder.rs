@@ -13,7 +13,7 @@ use std::{
     num::NonZeroUsize,
     sync::Arc,
 };
-use tn_config::KeyConfig;
+use tn_config::{KeyConfig, NetworkConfig};
 use tn_types::{
     get_available_udp_port, Address, Authority, AuthorityIdentifier, BlsKeypair, Committee,
     Database, Epoch, Multiaddr, VotingPower, WorkerCache, WorkerIndex, DEFAULT_PRIMARY_PORT,
@@ -27,6 +27,7 @@ pub struct Builder<DB, F, R = OsRng> {
     randomize_ports: bool,
     epoch: Epoch,
     voting_power: VecDeque<VotingPower>,
+    network_config: Option<NetworkConfig>,
     new_db: F,
     _phantom_data: PhantomData<DB>,
 }
@@ -44,6 +45,7 @@ where
             number_of_workers: NonZeroUsize::new(1).unwrap(),
             randomize_ports: false,
             voting_power: VecDeque::new(),
+            network_config: None,
             new_db,
             _phantom_data: PhantomData::<DB>,
         }
@@ -75,6 +77,11 @@ where
         self
     }
 
+    pub fn with_network_config(mut self, network_config: NetworkConfig) -> Self {
+        self.network_config = Some(network_config);
+        self
+    }
+
     pub fn rng<N: rand::RngCore + rand::CryptoRng>(self, rng: N) -> Builder<DB, F, N> {
         Builder {
             rng,
@@ -83,6 +90,7 @@ where
             number_of_workers: self.number_of_workers,
             randomize_ports: self.randomize_ports,
             voting_power: self.voting_power,
+            network_config: None,
             new_db: self.new_db,
             _phantom_data: PhantomData::<DB>,
         }
@@ -100,6 +108,7 @@ where
             assert_eq!(self.voting_power.len(), self.committee_size.get(), "Stake vector has been provided but is different length the committee - it should be the same");
         }
         let committee_size = self.committee_size.get();
+        let network_config = self.network_config.unwrap_or_default();
 
         let mut rng = StdRng::from_rng(&mut self.rng).unwrap();
         let mut committee_info = Vec::with_capacity(committee_size);
@@ -145,6 +154,7 @@ where
                 key_config.clone(),
                 authority.clone(),
                 worker,
+                network_config.clone(),
             ));
         }
         // Make the committee so we can give it the AuthorityFixtures below.
@@ -158,7 +168,7 @@ where
             workers: Arc::new(
                 committee_info
                     .iter()
-                    .map(|(primary_keypair, _key_config, _authority, worker)| {
+                    .map(|(primary_keypair, _key_config, _authority, worker, _network_config)| {
                         let mut worker_index = BTreeMap::new();
                         worker_index.insert(0, worker.info().clone());
                         (*primary_keypair.public(), WorkerIndex(worker_index.clone()))
@@ -169,7 +179,7 @@ where
         // All the authorities use the same worker cache.
         let authorities: BTreeMap<AuthorityIdentifier, AuthorityFixture<DB>> = committee_info
             .into_iter()
-            .map(|(primary_keypair, key_config, authority, worker)| {
+            .map(|(primary_keypair, key_config, authority, worker, network_config)| {
                 (
                     authority.id(),
                     AuthorityFixture::generate(
@@ -180,6 +190,7 @@ where
                         (self.new_db)(),
                         worker,
                         worker_cache.clone(),
+                        network_config,
                     ),
                 )
             })
