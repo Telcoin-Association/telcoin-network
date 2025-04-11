@@ -63,7 +63,12 @@ impl PeerManager {
             tokio::time::interval(tokio::time::Duration::from_secs(config.heartbeat_interval));
 
         let validators = consensus_config.committee_peer_ids();
-        let peers = AllPeers::new(validators, config.dial_timeout);
+        let peers = AllPeers::new(
+            validators,
+            config.dial_timeout,
+            config.max_banned_peers,
+            config.max_disconnected_peers,
+        );
         let temporarily_banned = BannedPeerCache::new(config.excess_peers_reconnection_timeout);
 
         // initialize global score config
@@ -195,7 +200,7 @@ impl PeerManager {
             self.apply_peer_action(peer_id, action);
         }
 
-        // TODO: update peer metrics
+        // TODO: update metrics
 
         self.prune_connected_peers();
 

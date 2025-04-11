@@ -272,6 +272,10 @@ pub struct PeerConfig {
     /// If peers try to connect before the reconnection timeout passes, the swarm denies the
     /// connection attempt. This essentially results in a temporary ban at the swarm level.
     pub excess_peers_reconnection_timeout: Duration,
+    /// The maximum number of banned peers to maintain before pruning.
+    pub max_banned_peers: usize,
+    /// The maximum number of disconnected peers to maintain before pruning.
+    pub max_disconnected_peers: usize,
     /// The config for scoring peers.
     pub score_config: ScoreConfig,
 }
@@ -289,6 +293,8 @@ impl Default for PeerConfig {
             target_outbound_only_factor: 0.3,
             min_outbound_only_factor: 0.2,
             excess_peers_reconnection_timeout: Duration::from_secs(600),
+            max_banned_peers: 100,
+            max_disconnected_peers: 100,
             score_config: ScoreConfig::default(),
         }
     }

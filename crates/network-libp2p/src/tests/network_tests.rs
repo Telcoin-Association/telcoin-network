@@ -41,7 +41,12 @@ fn create_test_peers<Req: TNMessage, Res: TNMessage>(
                     .expect("peer1 network created");
 
             let network_handle = network.network_handle();
-            TestPeer { config, network_events, network_handle, network: Some(network) }
+            TestPeer {
+                config,
+                _network_events: network_events,
+                network_handle,
+                network: Some(network),
+            }
         })
         .collect();
 
@@ -59,7 +64,7 @@ where
     /// Peer's node config.
     config: ConsensusConfig<DB>,
     /// Receiver for network events.
-    network_events: mpsc::Receiver<NetworkEvent<Req, Res>>,
+    _network_events: mpsc::Receiver<NetworkEvent<Req, Res>>,
     /// Network handle to send commands.
     network_handle: NetworkHandle<Req, Res>,
     /// The network task.
@@ -755,6 +760,8 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
 /// Test banning and unbanning of malicious peers
 #[tokio::test]
 async fn test_ban_and_unban_malicious_peers() -> eyre::Result<()> {
+    tn_test_utils::init_test_tracing();
+
     // Set up honest and malicious peers
     let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
 
@@ -782,10 +789,7 @@ async fn test_ban_and_unban_malicious_peers() -> eyre::Result<()> {
     malicious_peer.start_listening(config_2.authority().primary_network_address().clone()).await?;
 
     // Get peer IDs and addresses
-    let honest_peer_id = honest_peer.local_peer_id().await?;
     let malicious_peer_id = malicious_peer.local_peer_id().await?;
-    let honest_addr =
-        honest_peer.listeners().await?.first().expect("honest peer listen addr").clone();
     let malicious_addr =
         malicious_peer.listeners().await?.first().expect("malicious peer listen addr").clone();
 
@@ -844,15 +848,8 @@ async fn test_ban_and_unban_malicious_peers() -> eyre::Result<()> {
         .start_listening(config_2.authority().primary_network_address().clone())
         .await?;
 
-    // Wait for reputation to be reset or banned status to expire
-    // In a real scenario, we might use the time fast-forward feature to simulate this
-    // For testing purposes, we'll artificially reset the ban via the API
-
-    // Force unban by setting a positive score
-    // honest_peer.set_application_score(malicious_peer_id, 50.0).await?;
-
     // Allow time for the unban to take effect
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
     // Try to reconnect after unban
     honest_peer.dial(malicious_peer_id, malicious_addr).await?;

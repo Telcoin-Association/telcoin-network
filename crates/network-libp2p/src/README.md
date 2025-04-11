@@ -22,11 +22,13 @@ The `ConsensusNetwork` holds a `VecDeque` of connected peer ids for convenience.
 
 The main implementation for high-throughput messages propogating throughout the network.
 The protocol is optimized for throughput, so message sizes must be small.
+Gossipsub has a robust peer scoring system, but it is not used right now because of the complexity of finely tuning the system.
 
 #### Managing peers
 
 Gossipsub manages peers using the `FromSwarm::ConnectionEstablished` and `FromSwarm::ConnectionClosed`.
-Explicit peers are never used so the `PeerManager` remainds the source of truth.
+Explicit peers are only used for validators and trusted peers so the `PeerManager` remains the source of truth.
+Both validators and trusted peers do not receive penalties and maintain max scores.
 Peers are still blacklisted directly on the gossipsub out of an abundance of caution.
 However, the `PeerManager` is still expected to intercept these connections and initiate a disconnect.
 

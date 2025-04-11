@@ -15,7 +15,9 @@ fn create_all_peers() -> AllPeers {
     ensure_score_config();
     let validators = HashSet::new();
     let dial_timeout = Duration::from_secs(5);
-    AllPeers::new(validators, dial_timeout)
+    let max_banned_peers = 10;
+    let max_disconnected_peers = 10;
+    AllPeers::new(validators, dial_timeout, max_banned_peers, max_disconnected_peers)
 }
 
 #[test]
@@ -253,7 +255,7 @@ fn test_is_validator() {
     let validator_id = PeerId::random();
     validators.insert(validator_id);
 
-    let all_peers = AllPeers::new(validators, Duration::from_secs(5));
+    let all_peers = AllPeers::new(validators, Duration::from_secs(5), 10, 10);
 
     assert!(all_peers.is_validator(&validator_id));
     assert!(!all_peers.is_validator(&PeerId::random()));

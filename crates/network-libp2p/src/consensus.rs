@@ -13,7 +13,7 @@ use crate::{
 use futures::StreamExt as _;
 use libp2p::{
     gossipsub::{
-        self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance, Topic,
+        self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance,
     },
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
@@ -312,13 +312,16 @@ where
         match command {
             NetworkCommand::UpdateAuthorizedPublishers { authorities, reply } => {
                 self.authorized_publishers = authorities;
-                // TODO: update peer records with manager
                 send_or_log_error!(reply, Ok(()), "UpdateAuthorizedPublishers");
+                // the peer manager should track these but will happen in a follow up PR
+                // to further distinguish authorized publishers at the epoch boundary
+                // vs consensus
+                //
+                // only CVVs should publish consensus messages, but every staked node
+                // should publish epoch boundary checkpoint votes
             }
             NetworkCommand::StartListening { multiaddr, reply } => {
-                debug!(target: "network", ?multiaddr, "start listening");
                 let res = self.swarm.listen_on(multiaddr);
-                debug!(target: "network", ?res, "listening res");
                 send_or_log_error!(reply, res, "StartListening");
             }
             NetworkCommand::GetListener { reply } => {
@@ -606,8 +609,6 @@ where
 
     /// Process an event from the peer manager.
     fn process_peer_manager_event(&mut self, event: PeerEvent) -> NetworkResult<()> {
-        debug!(target: "network", ?event, "process peer manager event");
-
         match event {
             PeerEvent::DisconnectPeer(peer_id) => {
                 debug!(target: "network", ?peer_id, "peer manager: disconnect peer");
@@ -649,7 +650,6 @@ where
             PeerEvent::DisconnectPeerX(peer_id, peer_exchange) => {
                 // attempt to exchange peer information if limits allow
                 if self.pending_px_disconnects.len() < self.config.max_px_disconnects {
-                    debug!(target: "network", "pending disconnects valid - initiating PX");
                     let (reply, done) = oneshot::channel();
                     let request_id = self
                         .swarm
@@ -663,17 +663,14 @@ where
 
                     // spawn task
                     tokio::spawn(async move {
-                        debug!(target: "network", "inside disconnect request");
                         // ignore errors and disconnect after px attempt
                         let _res = tokio::time::timeout(timeout, done).await;
-                        debug!(target: "network", res=?_res, "timeout or success in spawned task");
                         let _ = handle.disconnect_peer(peer_id);
                     });
 
                     // insert to pending px disconnects
                     self.pending_px_disconnects.insert(request_id, peer_id);
                 } else {
-                    debug!(target: "network", "too many px disconnects - forcing");
                     // too many px disconnects pending so disconnect without px
                     let _ = self.swarm.disconnect_peer_id(peer_id);
                 }

@@ -40,22 +40,33 @@ pub(super) struct AllPeers {
     banned_peers: BannedPeers,
     /// The number of peers that have disconnected from this node.
     disconnected_peers: usize,
-    /// The timeout for dialing peers.
-    dial_timeout: Duration,
     /// The collection of pending dials.
     pending_dials: HashMap<PeerId, oneshot::Sender<NetworkResult<()>>>,
+    /// The timeout for dialing peers.
+    dial_timeout: Duration,
+    /// The maximum number of banned peers to maintain before pruning.
+    max_banned_peers: usize,
+    /// The maximum number of disconnected peers to maintain before pruning.
+    max_disconnected_peers: usize,
 }
 
 impl AllPeers {
     /// Create a new instance of Self.
-    pub(super) fn new(validators: HashSet<PeerId>, dial_timeout: Duration) -> Self {
+    pub(super) fn new(
+        validators: HashSet<PeerId>,
+        dial_timeout: Duration,
+        max_banned_peers: usize,
+        max_disconnected_peers: usize,
+    ) -> Self {
         Self {
             peers: Default::default(),
             validators,
             banned_peers: Default::default(),
             disconnected_peers: 0,
-            dial_timeout,
             pending_dials: Default::default(),
+            dial_timeout,
+            max_banned_peers,
+            max_disconnected_peers,
         }
     }
 
@@ -714,9 +725,7 @@ impl AllPeers {
 
     /// Prune excess number of banned peers to prevent exhausting memory.
     fn prune_banned_peers(&mut self) -> Vec<(PeerId, Vec<IpAddr>)> {
-        // TODO: move to config
-        const MAX_BANNED_PEERS: usize = 1000;
-        let excess = self.banned_peers.total().saturating_sub(MAX_BANNED_PEERS);
+        let excess = self.banned_peers.total().saturating_sub(self.max_banned_peers);
         let mut unbanned = Vec::with_capacity(excess);
 
         // remove excess peers from banned collection
@@ -741,9 +750,7 @@ impl AllPeers {
 
     /// Prune excess number of disconnected peers to prevent exhausting memory.
     fn prune_disconnected_peers(&mut self) {
-        // TODO: move to config
-        const MAX_DISCONNECTED_PEERS: usize = 1000;
-        let excess = self.disconnected_peers.saturating_sub(MAX_DISCONNECTED_PEERS);
+        let excess = self.disconnected_peers.saturating_sub(self.max_disconnected_peers);
 
         if excess > 0 {
             let excess_peers = self.collect_excess_peers(excess, |status| {
