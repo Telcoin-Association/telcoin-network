@@ -1,8 +1,13 @@
 //! Fixtures used in multiple tests.
 
 use crate::{peers::GLOBAL_SCORE_CONFIG, PeerExchangeMap, TNMessage};
+use libp2p::Multiaddr;
+use rand::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Once};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::{Arc, Once},
+};
 use tn_config::ScoreConfig;
 use tn_types::{BlockHash, Certificate, CertificateDigest, Header, SealedBatch, Vote};
 
@@ -13,7 +18,7 @@ static INIT: Once = Once::new();
 // but it is used in `all_peers` and `banned_peers`
 /// Initialize without error for unit tests.
 #[allow(dead_code)]
-pub fn ensure_score_config() {
+pub(crate) fn ensure_score_config() {
     INIT.call_once(|| {
         // use default
         let config = ScoreConfig::default();
@@ -92,4 +97,36 @@ impl From<PeerExchangeMap> for TestPrimaryResponse {
     fn from(_: PeerExchangeMap) -> Self {
         unimplemented!()
     }
+}
+
+/// Helper function to create a random IPV4 address.
+#[allow(dead_code)]
+pub(crate) fn random_ip_addr() -> IpAddr {
+    let mut rng = rand::thread_rng();
+    // random between IPv4 and IPv6 (80% v4, 20% v6)
+    if rng.gen_bool(0.8) {
+        // random IPv4
+        let a = rng.gen_range(1..255);
+        let b = rng.gen_range(0..255);
+        let c = rng.gen_range(0..255);
+        let d = rng.gen_range(1..255);
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    } else {
+        // random IPv6
+        let random: Vec<u16> = [(); 8].iter().map(|_| rng.gen_range(0..255)).collect();
+        IpAddr::V6(Ipv6Addr::new(
+            random[0], random[1], random[2], random[3], random[4], random[5], random[6], random[7],
+        ))
+    }
+}
+
+/// Helper function to create a [Multiaddr] for tests.
+#[allow(dead_code)]
+pub(crate) fn create_multiaddr(ip: Option<IpAddr>) -> Multiaddr {
+    let ip = ip.unwrap_or_else(|| random_ip_addr());
+    let ip = match ip {
+        IpAddr::V4(ip) => format!("/ip4/{}", ip),
+        IpAddr::V6(ip) => format!("/ip6/{}", ip),
+    };
+    format!("{}/tcp/8000", &ip).parse().unwrap()
 }

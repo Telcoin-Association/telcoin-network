@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     error::NetworkError,
-    peers::{score::Reputation, status::NewConnectionStatus, PeerAction},
+    peers::{score::Reputation, status::NewConnectionStatus, types::PeerAction},
     send_or_log_error,
     types::NetworkResult,
 };
@@ -31,7 +31,7 @@ mod all_peers;
 ///
 /// This keeps track of [Peer], [BannedPeers], and the number of disconnected peers.
 #[derive(Debug)]
-pub struct AllPeers {
+pub(super) struct AllPeers {
     /// The collection of known connected peers, their status and reputation
     peers: HashMap<PeerId, Peer>,
     /// The collection of staked validators at the beginning of each epoch.
@@ -579,7 +579,7 @@ impl AllPeers {
     }
 
     /// Boolean indicating if this peer is a staked validator.
-    pub fn is_validator(&self, peer_id: &PeerId) -> bool {
+    pub(super) fn is_validator(&self, peer_id: &PeerId) -> bool {
         self.validators.contains(peer_id)
     }
 

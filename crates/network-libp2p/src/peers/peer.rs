@@ -16,7 +16,7 @@ use tracing::error;
 
 /// Information about a given connected peer.
 #[derive(Clone, Debug, Default)]
-pub struct Peer {
+pub(super) struct Peer {
     /// The config
     config: PeerConfig,
     /// The peer's score - used to derive [Reputation].

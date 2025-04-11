@@ -5,6 +5,7 @@
 //!
 //! Heavily inspired by Sigma Prime Lighthouse's scoring system.
 
+use super::types::Penalty;
 use serde::Serialize;
 use std::{
     fmt::Display,
@@ -12,8 +13,6 @@ use std::{
     time::Instant,
 };
 use tn_config::ScoreConfig;
-
-use super::types::Penalty;
 
 /// Global static configuration that is initialized only once for all peers.
 pub(crate) static GLOBAL_SCORE_CONFIG: OnceLock<Arc<ScoreConfig>> = OnceLock::new();
@@ -38,7 +37,7 @@ fn global_score_config() -> Arc<ScoreConfig> {
 /// This simplistic version consists of a global score per peer which decays to 0 over time. The
 /// decay rate applies equally to positive and negative scores.
 #[derive(PartialEq, Clone, Debug, Serialize)]
-pub struct Score {
+pub(super) struct Score {
     /// The global score used to accumulate penalties.
     ///
     /// Once penalties are applied, they affect the `aggregate_score`.
@@ -82,7 +81,7 @@ impl Score {
     }
 
     /// Modifies the score based on the penalty type and returns the new score.
-    pub fn apply_penalty(&mut self, penalty: Penalty) {
+    pub(super) fn apply_penalty(&mut self, penalty: Penalty) {
         let config = global_score_config();
 
         // NOTE: these use `Self::add`
@@ -109,7 +108,7 @@ impl Score {
     /// Update all relevant scores based on the current instant.
     ///
     /// Nodes periodically call this method to assess decaying time intervals.
-    pub fn update(&mut self) {
+    pub(super) fn update(&mut self) {
         self.update_at(Instant::now());
     }
 
@@ -134,9 +133,6 @@ impl Score {
             self.last_updated = now;
             self.update_score();
         }
-
-        // // return no update if this is the first time a score is set
-        // ReputationUpdate::None
     }
 
     /// Update the aggregate score by effectively assessing penalties.
@@ -159,7 +155,7 @@ impl Score {
     }
 
     /// Helper method if a peer has reached the threshold for being banned.
-    pub fn is_banned(&self) -> bool {
+    pub(super) fn is_banned(&self) -> bool {
         let config = global_score_config();
         self.aggregate_score <= config.min_score_before_ban
     }

@@ -43,6 +43,12 @@ impl NetworkConfig {
     pub fn peer_config(&self) -> &PeerConfig {
         &self.peer_config
     }
+
+    /// Return a mutable reference to the [PeerConfig].
+    pub fn peer_config_mut(&mut self) -> &mut PeerConfig {
+        &mut self.peer_config
+    }
+
     /// Read a network config file.
     pub fn read_config<TND: TelcoinDirs>(tn_datadir: &TND) -> eyre::Result<Self> {
         let path = tn_datadir.network_config_path();

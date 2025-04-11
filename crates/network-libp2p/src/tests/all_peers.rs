@@ -2,26 +2,15 @@
 
 use super::*;
 mod common;
-use common::ensure_score_config;
-use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
+use common::{create_multiaddr, ensure_score_config, random_ip_addr};
+use libp2p::{multiaddr::Protocol, PeerId};
 use std::{
-    net::{IpAddr, Ipv4Addr},
+    net::IpAddr,
     time::{Duration, Instant},
 };
 use tn_config::ScoreConfig;
 
-// Helper function to create a test Multiaddr
-fn create_multiaddr(id: u8) -> Multiaddr {
-    let ip = Ipv4Addr::new(127, 0, 0, id);
-    format!("/ip4/{}/tcp/8000", ip).parse().unwrap()
-}
-
-// Helper function to create an IpAddr from an ID
-fn create_ip(id: u8) -> IpAddr {
-    IpAddr::V4(Ipv4Addr::new(127, 0, 0, id))
-}
-
-// Helper function to create a test AllPeers instance
+/// Helper function to create a test AllPeers instance
 fn create_all_peers() -> AllPeers {
     ensure_score_config();
     let validators = HashSet::new();
@@ -34,7 +23,7 @@ fn test_add_trusted_peer() {
     let config = ScoreConfig::default();
     let mut all_peers = create_all_peers();
     let peer_id = PeerId::random();
-    let addr = create_multiaddr(1);
+    let addr = create_multiaddr(None);
 
     all_peers.add_trusted_peer(peer_id, addr.clone());
 
@@ -112,9 +101,9 @@ fn test_peer_exchange() {
     let mut all_peers = create_all_peers();
 
     // Add some connected peers
-    for i in 1..4 {
+    for _ in 1..4 {
         let peer_id = PeerId::random();
-        let addr = create_multiaddr(i);
+        let addr = create_multiaddr(None);
 
         all_peers.update_connection_status(
             &peer_id,
@@ -139,9 +128,9 @@ fn test_connected_peers_by_score() {
     let mut all_peers = create_all_peers();
 
     // Add some connected peers
-    for i in 1..4 {
+    for _ in 1..4 {
         let peer_id = PeerId::random();
-        let addr = create_multiaddr(i);
+        let addr = create_multiaddr(None);
 
         all_peers.update_connection_status(
             &peer_id,
@@ -274,7 +263,7 @@ fn test_is_validator() {
 fn test_ip_and_peer_banned() {
     let mut all_peers = create_all_peers();
     let peer_id = PeerId::random();
-    let addr = create_multiaddr(1);
+    let addr = create_multiaddr(None);
 
     let expected_ip = match addr.iter().next() {
         Some(Protocol::Ip4(ip)) => IpAddr::V4(ip),
@@ -298,7 +287,7 @@ fn test_ip_and_peer_banned() {
 
     // check if IP is banned
     assert!(!all_peers.ip_banned(&expected_ip));
-    assert!(!all_peers.ip_banned(&create_ip(2)));
+    assert!(!all_peers.ip_banned(&random_ip_addr()));
 
     // new peer connects from same IP
     let new_peer = PeerId::random();
@@ -335,7 +324,7 @@ fn test_connected_peer_methods() {
     all_peers.update_connection_status(
         &connected_peer_id,
         NewConnectionStatus::Connected {
-            multiaddr: create_multiaddr(1),
+            multiaddr: create_multiaddr(None),
             direction: ConnectionDirection::Incoming,
         },
     );
@@ -371,7 +360,7 @@ fn test_connected_peer_methods() {
 fn test_unknown_to_connected_transition() {
     let mut all_peers = create_all_peers();
     let peer_id = PeerId::random();
-    let addr = create_multiaddr(1);
+    let addr = create_multiaddr(None);
 
     // Test Unknown -> Connected (incoming)
     let action = all_peers.update_connection_status(
@@ -392,7 +381,7 @@ fn test_unknown_to_connected_transition() {
 fn test_connected_to_disconnecting_transition() {
     let mut all_peers = create_all_peers();
     let peer_id = PeerId::random();
-    let addr = create_multiaddr(1);
+    let addr = create_multiaddr(None);
 
     // Setup: Unknown -> Connected
     all_peers.update_connection_status(
@@ -417,7 +406,7 @@ fn test_connected_to_disconnecting_transition() {
 fn test_disconnecting_to_disconnected_transition() {
     let mut all_peers = create_all_peers();
     let peer_id = PeerId::random();
-    let addr = create_multiaddr(1);
+    let addr = create_multiaddr(None);
 
     // Setup: Unknown -> Connected -> Disconnecting
     all_peers.update_connection_status(
@@ -463,7 +452,7 @@ fn test_disconnected_to_dialing_transition() {
 fn test_dialing_to_connected_transition() {
     let mut all_peers = create_all_peers();
     let peer_id = PeerId::random();
-    let addr = create_multiaddr(1);
+    let addr = create_multiaddr(None);
 
     // Setup: Unknown -> Dialing
     all_peers.update_connection_status(&peer_id, NewConnectionStatus::Dialing);
@@ -522,7 +511,7 @@ fn test_banned_to_unbanned_transition() {
 fn test_connected_to_banned_transition() {
     let mut all_peers = create_all_peers();
     let peer_id = PeerId::random();
-    let addr = create_multiaddr(1);
+    let addr = create_multiaddr(None);
 
     // Setup: Unknown -> Connected
     all_peers.update_connection_status(

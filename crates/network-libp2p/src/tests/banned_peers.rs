@@ -2,30 +2,9 @@
 
 mod common;
 use super::*;
-use common::ensure_score_config;
+use common::{ensure_score_config, random_ip_addr};
 use libp2p::{multiaddr::Protocol, Multiaddr};
-use rand::prelude::*;
-use std::net::{Ipv4Addr, Ipv6Addr};
-
-/// Helper function to create a random IPV4 address.
-fn random_ip_addr() -> IpAddr {
-    let mut rng = rand::thread_rng();
-    // random between IPv4 and IPv6 (80% v4, 20% v6)
-    if rng.gen_bool(0.8) {
-        // random IPv4
-        let a = rng.gen_range(1..255);
-        let b = rng.gen_range(0..255);
-        let c = rng.gen_range(0..255);
-        let d = rng.gen_range(1..255);
-        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
-    } else {
-        // random IPv6
-        let random: Vec<u16> = [(); 8].iter().map(|_| rng.gen_range(0..255)).collect();
-        IpAddr::V6(Ipv6Addr::new(
-            random[0], random[1], random[2], random[3], random[4], random[5], random[6], random[7],
-        ))
-    }
-}
+use std::net::Ipv4Addr;
 
 /// Helper function to create a peer with specific IP addresses.
 fn create_peer_with_ips(ips: Vec<IpAddr>) -> Peer {

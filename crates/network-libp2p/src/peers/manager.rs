@@ -23,7 +23,7 @@ use tracing::{debug, error, warn};
 mod peer_manager;
 
 /// The type to manage peers.
-pub struct PeerManager {
+pub(crate) struct PeerManager {
     /// Config
     config: PeerConfig,
     /// The interval to perform maintenance.
@@ -184,7 +184,7 @@ impl PeerManager {
         self.heartbeat.poll_tick(cx).is_ready()
     }
 
-    /// Heeartbeat maintenance.
+    /// Heartbeat maintenance.
     ///
     /// The manager runs routine maintenance to decay penalties for peers. This method
     /// is routine and can not further penalize peers.
@@ -327,10 +327,11 @@ impl PeerManager {
         };
 
         self.events.push_back(event);
-        self.peers.update_connection_status(
+        let action = self.peers.update_connection_status(
             &peer_id,
             NewConnectionStatus::Disconnecting { banned: false },
         );
+        self.apply_peer_action(peer_id, action);
     }
 
     /// Register a connected peer if their reputation is sufficient.

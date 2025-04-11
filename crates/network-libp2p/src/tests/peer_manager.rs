@@ -1,28 +1,27 @@
 //! Unit tests for peer manager
 
+mod common;
 use super::*;
 use assert_matches::assert_matches;
+use common::{create_multiaddr, random_ip_addr};
 use libp2p::swarm::{ConnectionId, NetworkBehaviour as _};
 use std::{
     collections::{HashMap, HashSet},
-    net::Ipv4Addr,
     time::Duration,
 };
-use tn_config::ScoreConfig;
+use tn_config::{NetworkConfig, ScoreConfig};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
-fn create_test_peer_manager() -> PeerManager {
-    let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+fn create_test_peer_manager(network_config: Option<NetworkConfig>) -> PeerManager {
+    let network_config = network_config.unwrap_or_default();
+    let all_nodes =
+        CommitteeFixture::builder(MemDatabase::default).with_network_config(network_config).build();
     let mut authorities = all_nodes.authorities();
     let authority_1 = authorities.next().expect("first authority");
     let config = authority_1.consensus_config();
     PeerManager::new(&config)
-}
-
-fn create_test_multiaddr(id: u8) -> Multiaddr {
-    format!("/ip4/{}/udp/45454/quic-v1", Ipv4Addr::new(127, 0, 0, id)).parse().unwrap()
 }
 
 /// Helper function to extract events of a certain type
@@ -43,9 +42,9 @@ fn collect_all_events(peer_manager: &mut PeerManager) -> Vec<PeerEvent> {
 }
 
 /// Register a peer connection and return its PeerId
-fn register_peer(peer_manager: &mut PeerManager, addr_id: u8) -> PeerId {
+fn register_peer(peer_manager: &mut PeerManager, multiaddr: Option<Multiaddr>) -> PeerId {
     let peer_id = PeerId::random();
-    let multiaddr = create_test_multiaddr(addr_id);
+    let multiaddr = multiaddr.unwrap_or_else(|| create_multiaddr(None));
     let connection = ConnectionType::IncomingConnection { multiaddr };
     assert!(peer_manager.register_peer_connection(&peer_id, connection));
     peer_id
@@ -53,9 +52,9 @@ fn register_peer(peer_manager: &mut PeerManager, addr_id: u8) -> PeerId {
 
 #[tokio::test]
 async fn test_register_disconnected_basic() {
-    let mut peer_manager = create_test_peer_manager();
+    let mut peer_manager = create_test_peer_manager(None);
     let peer_id = PeerId::random();
-    let multiaddr = create_test_multiaddr(1);
+    let multiaddr = create_multiaddr(None);
 
     // register connection
     let connection = ConnectionType::IncomingConnection { multiaddr };
@@ -73,9 +72,9 @@ async fn test_register_disconnected_basic() {
 
 #[tokio::test]
 async fn test_register_disconnected_with_banned_peer() {
-    let mut peer_manager = create_test_peer_manager();
+    let mut peer_manager = create_test_peer_manager(None);
     let peer_id = PeerId::random();
-    let multiaddr = create_test_multiaddr(2);
+    let multiaddr = create_multiaddr(None);
 
     // register connection
     let connection = ConnectionType::IncomingConnection { multiaddr };
@@ -122,9 +121,9 @@ async fn test_register_disconnected_with_banned_peer() {
 #[tokio::test]
 async fn test_add_trusted_peer() {
     let config = ScoreConfig::default();
-    let mut peer_manager = create_test_peer_manager();
+    let mut peer_manager = create_test_peer_manager(None);
     let peer_id = PeerId::random();
-    let multiaddr = create_test_multiaddr(3);
+    let multiaddr = create_multiaddr(None);
 
     // Create a oneshot channel to simulate the reply channel
     let (sender, _receiver) = oneshot::channel();
@@ -149,9 +148,9 @@ async fn test_add_trusted_peer() {
 
 #[tokio::test]
 async fn test_dial_peer_success() {
-    let mut peer_manager = create_test_peer_manager();
+    let mut peer_manager = create_test_peer_manager(None);
     let peer_id = PeerId::random();
-    let multiaddr = create_test_multiaddr(4);
+    let multiaddr = create_multiaddr(None);
 
     // Create a oneshot channel to simulate the reply channel
     let (sender, receiver) = oneshot::channel();
@@ -179,9 +178,9 @@ async fn test_dial_peer_success() {
 
 #[tokio::test]
 async fn test_dial_peer_already_dialing_error() {
-    let mut peer_manager = create_test_peer_manager();
+    let mut peer_manager = create_test_peer_manager(None);
     let peer_id = PeerId::random();
-    let multiaddr = create_test_multiaddr(5);
+    let multiaddr = create_multiaddr(None);
 
     // Create a oneshot channel to simulate the reply channel
     let (sender, _receiver) = oneshot::channel();
@@ -211,9 +210,9 @@ async fn test_dial_peer_already_dialing_error() {
 
 #[tokio::test]
 async fn test_dial_peer_already_connected() {
-    let mut peer_manager = create_test_peer_manager();
+    let mut peer_manager = create_test_peer_manager(None);
     let peer_id = PeerId::random();
-    let multiaddr = create_test_multiaddr(6);
+    let multiaddr = create_multiaddr(None);
 
     // Register a connected peer
     let connection = ConnectionType::IncomingConnection { multiaddr: multiaddr.clone() };
@@ -237,8 +236,8 @@ async fn test_dial_peer_already_connected() {
 
 #[tokio::test]
 async fn test_process_penalty_mild() {
-    let mut peer_manager = create_test_peer_manager();
-    let peer_id = register_peer(&mut peer_manager, 7);
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = register_peer(&mut peer_manager, None);
 
     // Apply multiple mild penalties
     for _ in 0..5 {
@@ -258,8 +257,8 @@ async fn test_process_penalty_mild() {
 
 #[tokio::test]
 async fn test_process_penalty_medium() {
-    let mut peer_manager = create_test_peer_manager();
-    let peer_id = register_peer(&mut peer_manager, 8);
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = register_peer(&mut peer_manager, None);
 
     // Apply medium penalties
     for _ in 0..3 {
@@ -288,8 +287,8 @@ async fn test_process_penalty_medium() {
 
 #[tokio::test]
 async fn test_process_penalty_severe() {
-    let mut peer_manager = create_test_peer_manager();
-    let peer_id = register_peer(&mut peer_manager, 9);
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = register_peer(&mut peer_manager, None);
 
     // Apply severe penalties
     peer_manager.process_penalty(peer_id, Penalty::Severe);
@@ -319,8 +318,8 @@ async fn test_process_penalty_severe() {
 
 #[tokio::test]
 async fn test_process_penalty_fatal() {
-    let mut peer_manager = create_test_peer_manager();
-    let peer_id = register_peer(&mut peer_manager, 10);
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = register_peer(&mut peer_manager, None);
 
     // Apply a fatal penalty
     peer_manager.process_penalty(peer_id, Penalty::Fatal);
@@ -364,22 +363,27 @@ async fn test_process_penalty_fatal() {
 
 #[tokio::test]
 async fn test_heartbeat_maintenance() {
-    let config = ScoreConfig::default();
-    let mut peer_manager = create_test_peer_manager();
-    let peer_id = register_peer(&mut peer_manager, 11);
+    // custom network config with short heartbeat interval for peer manager
+    let mut network_config = NetworkConfig::default();
+    network_config.peer_config_mut().score_config.score_halflife = 0.5;
+    let default_score = network_config.peer_config().score_config.default_score;
+
+    let mut peer_manager = create_test_peer_manager(Some(network_config));
+    let peer_id = register_peer(&mut peer_manager, None);
 
     // Apply a mild penalty
     peer_manager.process_penalty(peer_id, Penalty::Mild);
     let score_after_penalty = peer_manager.peer_score(&peer_id).unwrap();
-    assert!(score_after_penalty < config.default_score);
+    assert!(score_after_penalty < default_score);
 
     // Clear events
     collect_all_events(&mut peer_manager);
 
-    // Force multiple heartbeats to decay penalties
-    for _ in 0..10 {
-        peer_manager.heartbeat();
-    }
+    // halflife set to 0.5
+    sleep(Duration::from_secs(1)).await;
+
+    // trigger heartbeat for update
+    peer_manager.heartbeat();
 
     // Verify the peer score increases after heartbeats (penalties decay)
     let score_after_heartbeat = peer_manager.peer_score(&peer_id).unwrap();
@@ -388,8 +392,13 @@ async fn test_heartbeat_maintenance() {
 
 #[tokio::test]
 async fn test_temporarily_banned_peer() {
-    let mut peer_manager = create_test_peer_manager();
-    let peer_id = register_peer(&mut peer_manager, 12);
+    let mut network_config = NetworkConfig::default();
+    // make the temp ban very short
+    let temp_ban_duration = Duration::from_millis(10);
+    network_config.peer_config_mut().excess_peers_reconnection_timeout = temp_ban_duration;
+
+    let mut peer_manager = create_test_peer_manager(Some(network_config));
+    let peer_id = register_peer(&mut peer_manager, None);
 
     // Disconnect the peer with PX (this should temp ban the peer)
     peer_manager.disconnect_peer(peer_id, true);
@@ -404,11 +413,14 @@ async fn test_temporarily_banned_peer() {
         matches!(
             disconnect_px_events.first().unwrap(), PeerEvent::DisconnectPeerX(id, _) if *id == peer_id
         ),
-        "Expected disconnect event after fatal penalty"
+        "Expected disconnect event with peer exchange"
     );
 
     // Verify peer is temporarily banned
     assert!(peer_manager.peer_banned(&peer_id), "Peer should be temporarily banned");
+
+    // sleep for temp ban duration
+    let _ = sleep(temp_ban_duration * 2).await;
 
     // Run heartbeat to clear temporary bans
     peer_manager.heartbeat();
@@ -418,11 +430,12 @@ async fn test_temporarily_banned_peer() {
 
     // Verify there's an unbanned event
     let unbanned_events = extract_events(&events, |e| matches!(e, PeerEvent::Unbanned(_)));
+    println!("events: {unbanned_events:?}");
     assert!(
         matches!(
             unbanned_events.first().unwrap(), PeerEvent::Unbanned(id) if *id == peer_id
         ),
-        "Expected disconnect event after fatal penalty"
+        "Expected peer is unbanned"
     );
 
     // Verify peer is no longer banned
@@ -431,13 +444,13 @@ async fn test_temporarily_banned_peer() {
 
 #[tokio::test]
 async fn test_process_peer_exchange() {
-    let mut peer_manager = create_test_peer_manager();
+    let mut peer_manager = create_test_peer_manager(None);
 
     // Create peer exchange data
     let peer_id1 = PeerId::random();
     let peer_id2 = PeerId::random();
-    let multiaddr1 = create_test_multiaddr(13);
-    let multiaddr2 = create_test_multiaddr(14);
+    let multiaddr1 = create_multiaddr(None);
+    let multiaddr2 = create_multiaddr(None);
 
     let mut exchange_map = HashMap::new();
     let multiaddrs1 = HashSet::from([multiaddr1]);
@@ -460,12 +473,12 @@ async fn test_process_peer_exchange() {
 
 #[tokio::test]
 async fn test_prune_connected_peers() {
-    let mut peer_manager = create_test_peer_manager();
+    let mut peer_manager = create_test_peer_manager(None);
 
     // Register many peers
     let mut peer_ids = Vec::new();
-    for i in 20..40 {
-        let peer_id = register_peer(&mut peer_manager, i);
+    for _ in 0..20 {
+        let peer_id = register_peer(&mut peer_manager, None);
         peer_ids.push(peer_id);
     }
 
@@ -485,8 +498,8 @@ async fn test_prune_connected_peers() {
 
 #[tokio::test]
 async fn test_is_peer_connected_or_disconnecting() {
-    let mut peer_manager = create_test_peer_manager();
-    let peer_id = register_peer(&mut peer_manager, 41);
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = register_peer(&mut peer_manager, None);
 
     // Verify peer is considered connected
     assert!(peer_manager.is_peer_connected_or_disconnecting(&peer_id));
@@ -506,17 +519,17 @@ async fn test_is_peer_connected_or_disconnecting() {
 
 #[tokio::test]
 async fn test_is_validator() {
-    // TODO: ensure validators are loaded on new
-    let peer_manager = create_test_peer_manager();
-
-    // Get committee peer ids
     let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
-    let validator = all_nodes.authorities().next().unwrap();
-    let validator_peer_id = validator.id().peer_id();
+    let mut authorities = all_nodes.authorities();
+    let authority_1 = authorities.next().expect("first authority");
+    let config = authority_1.consensus_config();
+    let peer_manager = PeerManager::new(&config);
+
+    let validator = authority_1.id().peer_id();
     let random_peer_id = PeerId::random();
 
     // Verify validator peer is recognized
-    assert!(peer_manager.is_validator(&validator_peer_id));
+    assert!(peer_manager.is_validator(&validator));
 
     // Verify random peer is not a validator
     assert!(!peer_manager.is_validator(&random_peer_id));
@@ -524,9 +537,9 @@ async fn test_is_validator() {
 
 #[tokio::test]
 async fn test_register_outgoing_connection() {
-    let mut peer_manager = create_test_peer_manager();
+    let mut peer_manager = create_test_peer_manager(None);
     let peer_id = PeerId::random();
-    let multiaddr = create_test_multiaddr(42);
+    let multiaddr = create_multiaddr(None);
 
     // Create a oneshot channel
     let (sender, receiver) = oneshot::channel();
@@ -548,17 +561,17 @@ async fn test_register_outgoing_connection() {
 
 #[tokio::test]
 async fn test_peer_limit_reached() {
-    let mut peer_manager = create_test_peer_manager();
+    let mut peer_manager = create_test_peer_manager(None);
 
     // Create many connected peers to reach the limit
     let mut peer_ids = Vec::new();
-    for i in 50..100 {
-        let peer_id = register_peer(&mut peer_manager, i);
+    for _ in 0..50 {
+        let peer_id = register_peer(&mut peer_manager, None);
         peer_ids.push(peer_id);
     }
 
     // Create endpoint for inbound connection
-    let multiaddr = create_test_multiaddr(101);
+    let multiaddr = create_multiaddr(None);
     let endpoint = ConnectedPoint::Listener {
         local_addr: multiaddr.clone(),
         send_back_addr: multiaddr.clone(),
@@ -570,11 +583,11 @@ async fn test_peer_limit_reached() {
 
 #[tokio::test]
 async fn test_peers_for_exchange() {
-    let mut peer_manager = create_test_peer_manager();
+    let mut peer_manager = create_test_peer_manager(None);
 
     // Register some peers
-    for i in 110..115 {
-        register_peer(&mut peer_manager, i);
+    for _ in 0..5 {
+        register_peer(&mut peer_manager, None);
     }
 
     // Get peers for exchange
@@ -591,10 +604,10 @@ async fn test_peers_for_exchange() {
 
 #[tokio::test]
 async fn test_banned_peer_dial_fails_and_ip_ban() {
-    let mut peer_manager = create_test_peer_manager();
-    let peer_id = register_peer(&mut peer_manager, 140);
-    let ipv4 = Ipv4Addr::new(127, 0, 0, 140);
-    let ip = IpAddr::V4(ipv4);
+    let mut peer_manager = create_test_peer_manager(None);
+    let ip = random_ip_addr();
+    let multiaddr = create_multiaddr(Some(ip));
+    let peer_id = register_peer(&mut peer_manager, Some(multiaddr.clone()));
 
     // Initially IP is not banned
     assert!(!peer_manager.is_ip_banned(&ip));
@@ -623,31 +636,35 @@ async fn test_banned_peer_dial_fails_and_ip_ban() {
 
     // assert behavior stops connection
     let connection_id = ConnectionId::new_unchecked(0);
-    let local = create_test_multiaddr(1);
-    let remote = format!("/ip4/{}/udp/45454/quic-v1", ipv4).parse().unwrap();
+    let local = create_multiaddr(None);
 
-    // handle banned peer trying to reconnect
-    let reconnect_attempt =
-        peer_manager.handle_established_inbound_connection(connection_id, peer_id, &local, &remote);
+    // handle banned peer id trying to reconnect
+    let reconnect_attempt = peer_manager.handle_established_inbound_connection(
+        connection_id,
+        peer_id,
+        &local,
+        &multiaddr,
+    );
 
     // assert inbound connection fails
     assert!(reconnect_attempt.is_err());
 
     // register different malicious peer id from same ip
     let peer_id = PeerId::random();
-    let connection = ConnectionType::IncomingConnection { multiaddr: remote.clone() };
+    let connection = ConnectionType::IncomingConnection { multiaddr: multiaddr.clone() };
     assert!(peer_manager.register_peer_connection(&peer_id, connection));
+
     // apply fatal penalty
     peer_manager.process_penalty(peer_id, Penalty::Fatal);
+
     // Register disconnection to finalize the first ban for ip
     peer_manager.register_disconnected(&peer_id);
-    assert!(peer_manager.is_ip_banned(&ip));
 
-    // Verify IP is now banned after second peer banned from ip
+    // verify IP is now banned after second peer banned from ip
     assert!(peer_manager.is_ip_banned(&ip));
 
     // assert pending dial attempt fails
     let dial_attempt =
-        peer_manager.handle_pending_inbound_connection(connection_id, &local, &remote);
+        peer_manager.handle_pending_inbound_connection(connection_id, &local, &multiaddr);
     assert!(dial_attempt.is_err());
 }

@@ -84,7 +84,7 @@ impl NetworkBehaviour for PeerManager {
         Ok(ConnectionHandler)
     }
 
-    fn on_swarm_event(&mut self, event: FromSwarm) {
+    fn on_swarm_event<'a>(&mut self, event: FromSwarm<'a>) {
         match event {
             FromSwarm::ConnectionEstablished(ConnectionEstablished {
                 peer_id, endpoint, ..

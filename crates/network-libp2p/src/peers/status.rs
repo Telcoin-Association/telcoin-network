@@ -8,7 +8,7 @@ use std::time::Instant;
 
 /// Connection status of the peer.
 #[derive(Debug, Clone, Default)]
-pub enum ConnectionStatus {
+pub(super) enum ConnectionStatus {
     /// The peer is connected.
     Connected {
         /// The number of ingoing connections.

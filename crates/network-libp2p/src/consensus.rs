@@ -42,7 +42,7 @@ mod network_tests;
 ///
 /// The behavior includes gossipsub and request-response.
 #[derive(NetworkBehaviour)]
-pub struct TNBehavior<C>
+pub(crate) struct TNBehavior<C>
 where
     C: Codec + Send + Clone + 'static,
 {
@@ -59,7 +59,7 @@ where
     C: Codec + Send + Clone + 'static,
 {
     /// Create a new instance of Self.
-    pub fn new<DB: Database>(
+    pub(crate) fn new<DB: Database>(
         gossipsub: gossipsub::Behaviour,
         req_res: request_response::Behaviour<C>,
         consensus_config: &ConsensusConfig<DB>,
@@ -647,11 +647,9 @@ where
                 }
             }
             PeerEvent::DisconnectPeerX(peer_id, peer_exchange) => {
-                // remove from connected peers
-                self.connected_peers.retain(|peer| *peer != peer_id);
-
                 // attempt to exchange peer information if limits allow
                 if self.pending_px_disconnects.len() < self.config.max_px_disconnects {
+                    debug!(target: "network", "pending disconnects valid - initiating PX");
                     let (reply, done) = oneshot::channel();
                     let request_id = self
                         .swarm
@@ -665,17 +663,23 @@ where
 
                     // spawn task
                     tokio::spawn(async move {
+                        debug!(target: "network", "inside disconnect request");
                         // ignore errors and disconnect after px attempt
-                        let _ = tokio::time::timeout(timeout, done);
+                        let _res = tokio::time::timeout(timeout, done).await;
+                        debug!(target: "network", res=?_res, "timeout or success in spawned task");
                         let _ = handle.disconnect_peer(peer_id);
                     });
 
                     // insert to pending px disconnects
                     self.pending_px_disconnects.insert(request_id, peer_id);
                 } else {
+                    debug!(target: "network", "too many px disconnects - forcing");
                     // too many px disconnects pending so disconnect without px
                     let _ = self.swarm.disconnect_peer_id(peer_id);
                 }
+
+                // remove from connected peers
+                self.connected_peers.retain(|peer| *peer != peer_id);
             }
             PeerEvent::PeerConnected(peer_id, addr) => {
                 // register peer for request-response behaviour
@@ -726,5 +730,24 @@ impl From<GossipAcceptance> for MessageAcceptance {
             GossipAcceptance::Accept => MessageAcceptance::Accept,
             GossipAcceptance::Reject => MessageAcceptance::Reject,
         }
+    }
+}
+
+impl<Req, Res> std::fmt::Debug for ConsensusNetwork<Req, Res>
+where
+    Req: TNMessage,
+    Res: TNMessage,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsensusNetwork")
+            .field("topics", &self.topics)
+            .field("authorized_publishers", &self.authorized_publishers)
+            .field("pending_px_disconnects", &self.pending_px_disconnects)
+            .field("outbound_requests", &self.outbound_requests.len())
+            .field("inbound_requests", &self.inbound_requests.len())
+            .field("config", &self.config)
+            .field("connected_peers", &self.connected_peers)
+            .field("swarm", &"<swarm>") // Skip detailed debug for swarm
+            .finish()
     }
 }

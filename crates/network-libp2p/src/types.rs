@@ -92,7 +92,10 @@ where
         reply: oneshot::Sender<Result<ListenerId, TransportError<std::io::Error>>>,
     },
     /// Listeners
-    GetListener { reply: oneshot::Sender<Vec<Multiaddr>> },
+    GetListener {
+        /// The reply to caller.
+        reply: oneshot::Sender<Vec<Multiaddr>>,
+    },
     /// Add explicit peer to add.
     ///
     /// This adds to the swarm's peers and the gossipsub's peers.
@@ -114,7 +117,10 @@ where
         reply: oneshot::Sender<NetworkResult<()>>,
     },
     /// Return an owned copy of this node's [PeerId].
-    LocalPeerId { reply: oneshot::Sender<PeerId> },
+    LocalPeerId {
+        /// Reply to caller.
+        reply: oneshot::Sender<PeerId>,
+    },
     /// Send a request to a peer.
     ///
     /// The caller is responsible for decoding message bytes and reporting peers who return bad
@@ -149,30 +155,70 @@ where
         reply: oneshot::Sender<Result<(), Res>>,
     },
     /// Subscribe to a topic.
-    Subscribe { topic: IdentTopic, reply: oneshot::Sender<Result<bool, SubscriptionError>> },
+    Subscribe {
+        /// The topic to subscribe to.
+        topic: IdentTopic,
+        /// The reply to caller.
+        reply: oneshot::Sender<Result<bool, SubscriptionError>>,
+    },
     /// Publish a message to topic subscribers.
     Publish {
+        /// The topic to publish the message on.
         topic: IdentTopic,
+        /// The encoded message to publish.
         msg: Vec<u8>,
+        /// The reply to caller.
         reply: oneshot::Sender<Result<MessageId, PublishError>>,
     },
     /// Map of all known peers and their associated subscribed topics.
-    AllPeers { reply: oneshot::Sender<HashMap<PeerId, Vec<TopicHash>>> },
+    AllPeers {
+        /// Reply to caller.
+        reply: oneshot::Sender<HashMap<PeerId, Vec<TopicHash>>>,
+    },
     /// Collection of this node's connected peers.
-    ConnectedPeers { reply: oneshot::Sender<Vec<PeerId>> },
+    ConnectedPeers {
+        /// Reply to caller.
+        reply: oneshot::Sender<Vec<PeerId>>,
+    },
     /// Collection of all mesh peers.
-    AllMeshPeers { reply: oneshot::Sender<Vec<PeerId>> },
+    AllMeshPeers {
+        /// Reply to caller.
+        reply: oneshot::Sender<Vec<PeerId>>,
+    },
     /// Collection of all mesh peers by a certain topic hash.
-    MeshPeers { topic: TopicHash, reply: oneshot::Sender<Vec<PeerId>> },
+    MeshPeers {
+        /// The topic to filter peers.
+        topic: TopicHash,
+        /// Reply to caller.
+        reply: oneshot::Sender<Vec<PeerId>>,
+    },
     /// The peer's score, if it exists.
-    PeerScore { peer_id: PeerId, reply: oneshot::Sender<Option<f64>> },
+    PeerScore {
+        /// The peer's id.
+        peer_id: PeerId,
+        /// Reply to caller.
+        reply: oneshot::Sender<Option<f64>>,
+    },
     /// Report penalty for peer.
-    ReportPenalty { peer_id: PeerId, penalty: Penalty },
+    ReportPenalty {
+        /// The peer's id.
+        peer_id: PeerId,
+        /// The penalty to apply to the peer.
+        penalty: Penalty,
+    },
     /// Return the number of pending outbound requests.
-    PendingRequestCount { reply: oneshot::Sender<usize> },
+    PendingRequestCount {
+        /// Reply to caller.
+        reply: oneshot::Sender<usize>,
+    },
     /// Disconnect a peer by [PeerId]. The oneshot returns a result if the peer
     /// was connected or not.
-    DisconnectPeer { peer_id: PeerId, reply: oneshot::Sender<Result<(), ()>> },
+    DisconnectPeer {
+        /// The peer's id.
+        peer_id: PeerId,
+        /// Reply to caller.
+        reply: oneshot::Sender<Result<(), ()>>,
+    },
     /// Process peer information and possibly discover new peers.
     PeerExchange {
         /// Peers for discovery.
@@ -181,13 +227,16 @@ where
         channel: ResponseChannel<Res>,
     },
     /// Retrieve peers from peer manager to share with a requesting peer.
-    PeersForExchange { reply: oneshot::Sender<PeerExchangeMap> },
+    PeersForExchange {
+        /// The reply to caller.
+        reply: oneshot::Sender<PeerExchangeMap>,
+    },
 }
 
 /// Network handle.
 ///
 /// The type that sends commands to the running network (swarm) task.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NetworkHandle<Req, Res>
 where
     Req: TNMessage,

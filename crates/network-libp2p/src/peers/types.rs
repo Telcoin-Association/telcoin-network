@@ -12,7 +12,7 @@ use tokio::sync::oneshot;
 
 /// Events for the `PeerManager`.
 #[derive(Debug)]
-pub enum PeerEvent {
+pub(crate) enum PeerEvent {
     /// Connected with peer.
     PeerConnected(PeerId, Multiaddr),
     /// Peer was disconnected.
@@ -34,7 +34,7 @@ pub enum PeerEvent {
 /// Both reputation and connection status changes may require the manager to take
 /// action to update the peer.
 #[derive(Debug)]
-pub enum PeerAction {
+pub(super) enum PeerAction {
     /// Ban the peer and the associated IP addresses.
     Ban(Vec<IpAddr>),
     /// No action needed.
