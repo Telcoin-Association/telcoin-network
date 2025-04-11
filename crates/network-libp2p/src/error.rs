@@ -14,8 +14,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 #[derive(Debug, Error)]
 pub enum NetworkError {
     /// Swarm error dialing a peer.
-    #[error(transparent)]
-    Dial(#[from] DialError),
+    #[error("{0}")]
+    // Dial(#[from] DialError),
+    Dial(String),
     /// Dial attempt currently ongoing for peer.
     #[error("Peer already dialed")]
     RedialAttempt,
@@ -76,6 +77,15 @@ pub enum NetworkError {
     /// A network operation timed out.
     #[error("Timed Out")]
     Timeout,
+    /// This node disconnected from the peer.
+    #[error("Disconnected from peer")]
+    Disconnected,
+    /// The peer was already disconnected.
+    #[error("Peer already disconnected")]
+    DisconnectPeer,
+    /// Fatal error - the swarm is not connected to any listeners.
+    #[error("All swarm listeners closed. Network shutting down...")]
+    AllListenersClosed,
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {
@@ -99,5 +109,11 @@ impl<T> From<broadcast::error::SendError<T>> for NetworkError {
 impl<T> From<mpsc::error::TrySendError<T>> for NetworkError {
     fn from(e: mpsc::error::TrySendError<T>) -> Self {
         Self::MpscTrySend(e.to_string())
+    }
+}
+
+impl<'a> From<&DialError> for NetworkError {
+    fn from(e: &DialError) -> Self {
+        Self::Dial(e.to_string())
     }
 }

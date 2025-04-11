@@ -1,6 +1,9 @@
 //! Constants and trait implementations for network compatibility.
 
-use crate::{codec::TNMessage, error::NetworkError, GossipMessage};
+use crate::{
+    codec::TNMessage, error::NetworkError, peers::Penalty, GossipMessage, PeerExchangeMap,
+};
+pub use libp2p::gossipsub::{IdentTopic, MessageId};
 use libp2p::{
     core::transport::ListenerId,
     gossipsub::{PublishError, SubscriptionError, TopicHash},
@@ -9,8 +12,6 @@ use libp2p::{
 };
 use std::collections::{HashMap, HashSet};
 use tokio::sync::{mpsc, oneshot};
-
-pub use libp2p::gossipsub::{IdentTopic, MessageId};
 
 /// The result for network operations.
 pub type NetworkResult<T> = Result<T, NetworkError>;
@@ -60,8 +61,8 @@ pub enum NetworkEvent<Req, Res> {
         /// The oneshot channel if the request gets cancelled at the network level.
         cancel: oneshot::Receiver<()>,
     },
-    /// Gossip message received.
-    Gossip(GossipMessage),
+    /// Gossip message received and propagation source.
+    Gossip(GossipMessage, PeerId),
 }
 
 /// Commands for the swarm.
@@ -91,7 +92,10 @@ where
         reply: oneshot::Sender<Result<ListenerId, TransportError<std::io::Error>>>,
     },
     /// Listeners
-    GetListener { reply: oneshot::Sender<Vec<Multiaddr>> },
+    GetListener {
+        /// The reply to caller.
+        reply: oneshot::Sender<Vec<Multiaddr>>,
+    },
     /// Add explicit peer to add.
     ///
     /// This adds to the swarm's peers and the gossipsub's peers.
@@ -100,6 +104,8 @@ where
         peer_id: PeerId,
         /// The peer's address.
         addr: Multiaddr,
+        /// Reply for connection outcome.
+        reply: oneshot::Sender<NetworkResult<()>>,
     },
     /// Dial a peer to establish a connection.
     Dial {
@@ -111,7 +117,10 @@ where
         reply: oneshot::Sender<NetworkResult<()>>,
     },
     /// Return an owned copy of this node's [PeerId].
-    LocalPeerId { reply: oneshot::Sender<PeerId> },
+    LocalPeerId {
+        /// Reply to caller.
+        reply: oneshot::Sender<PeerId>,
+    },
     /// Send a request to a peer.
     ///
     /// The caller is responsible for decoding message bytes and reporting peers who return bad
@@ -146,35 +155,88 @@ where
         reply: oneshot::Sender<Result<(), Res>>,
     },
     /// Subscribe to a topic.
-    Subscribe { topic: IdentTopic, reply: oneshot::Sender<Result<bool, SubscriptionError>> },
+    Subscribe {
+        /// The topic to subscribe to.
+        topic: IdentTopic,
+        /// The reply to caller.
+        reply: oneshot::Sender<Result<bool, SubscriptionError>>,
+    },
     /// Publish a message to topic subscribers.
     Publish {
+        /// The topic to publish the message on.
         topic: IdentTopic,
+        /// The encoded message to publish.
         msg: Vec<u8>,
+        /// The reply to caller.
         reply: oneshot::Sender<Result<MessageId, PublishError>>,
     },
     /// Map of all known peers and their associated subscribed topics.
-    AllPeers { reply: oneshot::Sender<HashMap<PeerId, Vec<TopicHash>>> },
+    AllPeers {
+        /// Reply to caller.
+        reply: oneshot::Sender<HashMap<PeerId, Vec<TopicHash>>>,
+    },
     /// Collection of this node's connected peers.
-    ConnectedPeers { reply: oneshot::Sender<Vec<PeerId>> },
+    ConnectedPeers {
+        /// Reply to caller.
+        reply: oneshot::Sender<Vec<PeerId>>,
+    },
     /// Collection of all mesh peers.
-    AllMeshPeers { reply: oneshot::Sender<Vec<PeerId>> },
+    AllMeshPeers {
+        /// Reply to caller.
+        reply: oneshot::Sender<Vec<PeerId>>,
+    },
     /// Collection of all mesh peers by a certain topic hash.
-    MeshPeers { topic: TopicHash, reply: oneshot::Sender<Vec<PeerId>> },
+    MeshPeers {
+        /// The topic to filter peers.
+        topic: TopicHash,
+        /// Reply to caller.
+        reply: oneshot::Sender<Vec<PeerId>>,
+    },
     /// The peer's score, if it exists.
-    PeerScore { peer_id: PeerId, reply: oneshot::Sender<Option<f64>> },
-    /// Set peer's application score.
-    ///
-    /// Peer's application score is P₅ of the peer scoring system.
-    SetApplicationScore { peer_id: PeerId, new_score: f64, reply: oneshot::Sender<bool> },
+    PeerScore {
+        /// The peer's id.
+        peer_id: PeerId,
+        /// Reply to caller.
+        reply: oneshot::Sender<Option<f64>>,
+    },
+    /// Report penalty for peer.
+    ReportPenalty {
+        /// The peer's id.
+        peer_id: PeerId,
+        /// The penalty to apply to the peer.
+        penalty: Penalty,
+    },
     /// Return the number of pending outbound requests.
-    PendingRequestCount { reply: oneshot::Sender<usize> },
+    PendingRequestCount {
+        /// Reply to caller.
+        reply: oneshot::Sender<usize>,
+    },
+    /// Disconnect a peer by [PeerId]. The oneshot returns a result if the peer
+    /// was connected or not.
+    DisconnectPeer {
+        /// The peer's id.
+        peer_id: PeerId,
+        /// Reply to caller.
+        reply: oneshot::Sender<Result<(), ()>>,
+    },
+    /// Process peer information and possibly discover new peers.
+    PeerExchange {
+        /// Peers for discovery.
+        peers: PeerExchangeMap,
+        /// The libp2p response channel to send back an ack.
+        channel: ResponseChannel<Res>,
+    },
+    /// Retrieve peers from peer manager to share with a requesting peer.
+    PeersForExchange {
+        /// The reply to caller.
+        reply: oneshot::Sender<PeerExchangeMap>,
+    },
 }
 
 /// Network handle.
 ///
 /// The type that sends commands to the running network (swarm) task.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NetworkHandle<Req, Res>
 where
     Req: TNMessage,
@@ -229,9 +291,14 @@ where
     }
 
     /// Add explicit peer.
-    pub async fn add_explicit_peer(&self, peer_id: PeerId, addr: Multiaddr) -> NetworkResult<()> {
+    pub async fn add_explicit_peer(
+        &self,
+        peer_id: PeerId,
+        addr: Multiaddr,
+        reply: oneshot::Sender<NetworkResult<()>>,
+    ) -> NetworkResult<()> {
         self.sender
-            .send(NetworkCommand::AddExplicitPeer { peer_id, addr })
+            .send(NetworkCommand::AddExplicitPeer { peer_id, addr, reply })
             .await
             .map_err(Into::into)
     }
@@ -242,7 +309,6 @@ where
     pub async fn dial(&self, peer_id: PeerId, peer_addr: Multiaddr) -> NetworkResult<()> {
         let (reply, ack) = oneshot::channel();
         self.sender.send(NetworkCommand::Dial { peer_id, peer_addr, reply }).await?;
-
         ack.await?
     }
 
@@ -307,19 +373,6 @@ where
         score.await.map_err(Into::into)
     }
 
-    /// Set the peer's application score.
-    ///
-    /// This is useful for reporting messages from a peer that fails decoding.
-    pub async fn set_application_score(
-        &self,
-        peer_id: PeerId,
-        new_score: f64,
-    ) -> NetworkResult<bool> {
-        let (reply, score) = oneshot::channel();
-        self.sender.send(NetworkCommand::SetApplicationScore { peer_id, new_score, reply }).await?;
-        score.await.map_err(Into::into)
-    }
-
     /// Send a request to a peer.
     ///
     /// Returns a handle for the caller to await the peer's response.
@@ -363,6 +416,41 @@ where
         let (reply, count) = oneshot::channel();
         self.sender.send(NetworkCommand::PendingRequestCount { reply }).await?;
         count.await.map_err(Into::into)
+    }
+
+    /// Disconnect from the peer.
+    ///
+    /// This method closes all connections to the peer without waiting for handlers
+    /// to complete.
+    pub async fn disconnect_peer(&self, peer_id: PeerId) -> NetworkResult<()> {
+        let (reply, res) = oneshot::channel();
+        self.sender.send(NetworkCommand::DisconnectPeer { peer_id, reply }).await?;
+        res.await?.map_err(|_| NetworkError::DisconnectPeer)
+    }
+
+    /// Process peer exchange message.
+    ///
+    /// This is a side-effect of generic `ConsensusNetwork`. Primary and Workers
+    /// receive peer exchange requests and pass them back to the peer manager.
+    pub async fn process_peer_exchange(
+        &self,
+        peers: PeerExchangeMap,
+        channel: ResponseChannel<Res>,
+    ) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::PeerExchange { peers, channel }).await?;
+        Ok(())
+    }
+
+    /// Report a penalty to the peer manager.
+    pub async fn report_penalty(&self, peer_id: PeerId, penalty: Penalty) {
+        let _ = self.sender.send(NetworkCommand::ReportPenalty { peer_id, penalty }).await;
+    }
+
+    /// Create a [PeerExchangeMap] for exchanging peers.
+    pub async fn peers_for_exchange(&self) -> NetworkResult<PeerExchangeMap> {
+        let (reply, res) = oneshot::channel();
+        self.sender.send(NetworkCommand::PeersForExchange { reply }).await?;
+        res.await.map_err(Into::into)
     }
 }
 

@@ -76,6 +76,6 @@ impl PrimaryToWorkerClient for MockPrimaryToWorkerClient {
 
 impl Default for MockPrimaryToWorkerClient {
     fn default() -> Self {
-        Self { batches: HashMap::with_capacity(0) }
+        Self { batches: HashMap::new() }
     }
 }

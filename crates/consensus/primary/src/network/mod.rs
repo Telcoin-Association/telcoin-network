@@ -15,7 +15,7 @@ use tn_network_libp2p::{
     types::{
         IdentTopic, IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult,
     },
-    GossipMessage, Multiaddr, PeerId, ResponseChannel,
+    GossipMessage, Multiaddr, PeerExchangeMap, PeerId, Penalty, ResponseChannel,
 };
 use tn_network_types::{
     FetchCertificatesRequest, WorkerOthersBatchMessage, WorkerOwnBatchMessage,
@@ -111,6 +111,9 @@ impl PrimaryNetworkHandle {
             PrimaryResponse::ConsensusHeader(_consensus_header) => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is consensus header!".to_string(),
             )),
+            PrimaryResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
+                "Got wrong response, not a vote is peer exchange!".to_string(),
+            )),
         }
     }
 
@@ -166,6 +169,20 @@ impl PrimaryNetworkHandle {
             }
         }
         Err(NetworkError::RPCError("Could not get the consensus header!".to_string()))
+    }
+
+    /// Report a penalty to the network's peer manager.
+    pub(crate) async fn report_penalty(&self, peer_id: PeerId, penalty: Penalty) {
+        self.handle.report_penalty(peer_id, penalty).await;
+    }
+
+    /// Notify peer manager of peer exchange information.
+    pub(crate) async fn process_peer_exchange(
+        &self,
+        peers: PeerExchangeMap,
+        channel: ResponseChannel<PrimaryResponse>,
+    ) {
+        let _ = self.handle.process_peer_exchange(peers, channel).await;
     }
 }
 
@@ -240,9 +257,12 @@ where
                 PrimaryRequest::ConsensusHeader { number, hash } => {
                     self.process_consensus_output_request(peer, number, hash, channel, cancel)
                 }
+                PrimaryRequest::PeerExchange { peers } => {
+                    self.process_peer_exchange(peers, channel)
+                }
             },
-            NetworkEvent::Gossip(msg) => {
-                self.process_gossip(msg);
+            NetworkEvent::Gossip(msg, source) => {
+                self.process_gossip(msg, source);
             }
         }
     }
@@ -328,30 +348,34 @@ where
     }
 
     /// Process gossip from committee.
-    fn process_gossip(&self, msg: GossipMessage) {
+    fn process_gossip(&self, msg: GossipMessage, source: PeerId) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
-        // let network_handle = self.network_handle.clone();
+        let network_handle = self.network_handle.clone();
 
-        // commented out to prevent CertificateError::TooNew from forcing disconnect when peers
-        // are trying to resync
+        // spawn task to process gossip
         tokio::spawn(async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "primary::network", ?e, "process_gossip");
-                // TODO: peers don't track reputation yet
-                //
-                // NOTE: the network ensures the peer id is present before forwarding the msg
-                // if let Some(peer_id) = msg.source {
-                //     if let Err(e) =
-                //         network_handle.handle.set_application_score(peer_id, -100.0).await
-                //     {
-                //         error!(target: "primary::network", ?e, "failed to penalize malicious
-                // peer")     }
-                // }
-
-                // match on error to lower peer score
-                //todo!();
+                // convert error into penalty to lower peer score
+                if let Some(penalty) = e.into() {
+                    network_handle.report_penalty(source, penalty).await;
+                }
             }
+        });
+    }
+
+    /// Process peer exchange.
+    fn process_peer_exchange(
+        &self,
+        peers: PeerExchangeMap,
+        channel: ResponseChannel<PrimaryResponse>,
+    ) {
+        let network_handle = self.network_handle.clone();
+
+        // notify peer manager and respond with ack
+        tokio::spawn(async move {
+            network_handle.process_peer_exchange(peers, channel).await;
         });
     }
 }

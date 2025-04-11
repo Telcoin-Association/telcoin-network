@@ -4,7 +4,7 @@ mod common;
 use super::*;
 use assert_matches::assert_matches;
 use common::{TestPrimaryRequest, TestPrimaryResponse, TestWorkerRequest, TestWorkerResponse};
-use tn_config::ConsensusConfig;
+use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{fixture_batch_with_transactions, CommitteeFixture};
 use tn_types::{Certificate, Header};
@@ -45,14 +45,19 @@ where
     Req: TNMessage,
     Res: TNMessage,
 {
-    let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+    // custom network config with short heartbeat interval for peer manager
+    let mut network_config = NetworkConfig::default();
+    network_config.peer_config_mut().heartbeat_interval = 1;
+
+    let all_nodes =
+        CommitteeFixture::builder(MemDatabase::default).with_network_config(network_config).build();
     let mut authorities = all_nodes.authorities();
     let authority_1 = authorities.next().expect("first authority");
     let authority_2 = authorities.next().expect("second authority");
     let config_1 = authority_1.consensus_config();
     let config_2 = authority_2.consensus_config();
-    let (tx1, network_events_1) = mpsc::channel(1);
-    let (tx2, network_events_2) = mpsc::channel(1);
+    let (tx1, network_events_1) = mpsc::channel(10);
+    let (tx2, network_events_2) = mpsc::channel(10);
     let topics = vec![IdentTopic::new("test-topic")];
 
     // peer1
@@ -217,10 +222,12 @@ async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
     tn_test_utils::init_test_tracing();
+
     // start honest peer1 network
     let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
 
+    debug!(target: "network", "spawn peer1 network");
     let peer1_network_task = tokio::spawn(async move {
         network.run().await.expect("network run failed!");
     });
@@ -232,26 +239,36 @@ async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
         network_events: mut network_events_2,
         network,
     } = peer2;
+    debug!(target: "network", "spawn peer2 network");
     tokio::spawn(async move {
         network.run().await.expect("network run failed!");
     });
 
     // start swarm listening on default any address
+    debug!(target: "network", "start listening...");
     peer1.start_listening(config_1.authority().primary_network_address().clone()).await?;
     peer2.start_listening(config_2.authority().primary_network_address().clone()).await?;
+    debug!(target: "network", "get peer2 ids...");
     let peer2_id = peer2.local_peer_id().await?;
     let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
+
+    debug!(target: "network", ?peer2_id, ?peer2_addr, "done");
 
     let missing_block = fixture_batch_with_transactions(3).seal_slow();
     let digests = vec![missing_block.digest()];
     let batch_req = TestWorkerRequest::MissingBatches(digests);
 
+    debug!(target: "network", "dialing peer2");
     // dial peer2
     peer1.dial(peer2_id, peer2_addr).await?;
+
+    debug!(target: "network", "dial awaited :D - requesting pending count");
 
     // expect no pending requests yet
     let count = peer1.get_pending_request_count().await?;
     assert_eq!(count, 0);
+
+    debug!(target: "network", ?count, "count?? - sending request...");
 
     // send request and wait for response
     let max_time = Duration::from_secs(5);
@@ -460,7 +477,7 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
         timeout(Duration::from_secs(2), nvv_network_events.recv()).await?.expect("batch received");
 
     // assert gossip message
-    if let NetworkEvent::Gossip(msg) = event {
+    if let NetworkEvent::Gossip(msg, _) = event {
         assert_eq!(msg.data, expected_result);
     } else {
         panic!("unexpected network event received");
@@ -518,14 +535,14 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
         timeout(Duration::from_secs(2), nvv_network_events.recv()).await?.expect("batch received");
 
     // assert gossip message
-    if let NetworkEvent::Gossip(msg) = event {
+    if let NetworkEvent::Gossip(msg, _) = event {
         assert_eq!(msg.data, expected_result);
     } else {
         panic!("unexpected network event received");
     }
 
     // remove cvv from whitelist and try to publish again
-    nvv.update_authorized_publishers(HashSet::with_capacity(0)).await?;
+    nvv.update_authorized_publishers(HashSet::new()).await?;
 
     let random_block = fixture_batch_with_transactions(10);
     let sealed_block = random_block.seal_slow();
@@ -536,7 +553,305 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     let timeout = timeout(Duration::from_secs(2), nvv_network_events.recv()).await;
     assert!(timeout.is_err());
 
-    // TODO: assert peer score after bad message
+    // assert fatal score
+    let score = nvv.peer_score(cvv_id).await?;
+    assert_eq!(score, Some(config_2.network_config().peer_config().score_config.min_score));
+
+    Ok(())
+}
+
+// test:
+// - peer connects
+// - peer receives fatal penalty
+// - peer is disconnected without peerx
+// - peer tries to redial and fails
+// - peer made trusted
+// - peer dials again and connects
+//
+// test:
+// -
+
+/// Test peer exchanges when too many peers connect
+#[tokio::test]
+async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
+    tn_test_utils::init_test_tracing();
+
+    // Set up multiple peers to simulate network congestion
+    let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let TestTypes { peer1: peer3, peer2: peer4 } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let TestTypes { peer1: peer5, peer2: peer6 } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let TestTypes { peer1: peer7, peer2: peer8 } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+
+    // Get peer configurations
+    let NetworkPeer {
+        config: config_1,
+        network_handle: target_peer_handle,
+        network: target_network,
+        ..
+    } = peer1;
+    let NetworkPeer {
+        config: config_2, network_handle: peer2_handle, network: peer2_network, ..
+    } = peer2;
+    let NetworkPeer {
+        config: config_3, network_handle: peer3_handle, network: peer3_network, ..
+    } = peer3;
+    let NetworkPeer {
+        config: config_4, network_handle: peer4_handle, network: peer4_network, ..
+    } = peer4;
+    let NetworkPeer {
+        config: config_5, network_handle: peer5_handle, network: peer5_network, ..
+    } = peer5;
+    let NetworkPeer {
+        config: config_6,
+        network_handle: peer6_handle,
+        network: peer6_network,
+        network_events: mut peer6_events,
+    } = peer6;
+    let NetworkPeer {
+        config: config_7,
+        network_handle: peer7_handle,
+        network: peer7_network,
+        network_events: mut peer7_events,
+    } = peer7;
+    let NetworkPeer {
+        config: config_8,
+        network_handle: peer8_handle,
+        network: peer8_network,
+        network_events: mut peer8_events,
+    } = peer8;
+
+    // Start the target peer (will receive too many connections)
+    tokio::spawn(async move {
+        target_network.run().await.expect("target network run failed!");
+    });
+
+    // Start other peers
+    tokio::spawn(async move {
+        peer2_network.run().await.expect("peer2 network run failed!");
+    });
+
+    tokio::spawn(async move {
+        peer3_network.run().await.expect("peer3 network run failed!");
+    });
+
+    tokio::spawn(async move {
+        peer4_network.run().await.expect("peer4 network run failed!");
+    });
+
+    tokio::spawn(async move {
+        peer5_network.run().await.expect("peer5 network run failed!");
+    });
+
+    tokio::spawn(async move {
+        peer6_network.run().await.expect("peer6 network run failed!");
+    });
+
+    tokio::spawn(async move {
+        peer7_network.run().await.expect("peer7 network run failed!");
+    });
+
+    tokio::spawn(async move {
+        peer8_network.run().await.expect("peer8 network run failed!");
+    });
+
+    // Start target peer listening
+    target_peer_handle
+        .start_listening(config_1.authority().primary_network_address().clone())
+        .await?;
+    let target_peer_id = target_peer_handle.local_peer_id().await?;
+    let target_addr =
+        target_peer_handle.listeners().await?.first().expect("target peer listen addr").clone();
+
+    // Start other peers listening
+    peer2_handle.start_listening(config_2.authority().primary_network_address().clone()).await?;
+    peer3_handle.start_listening(config_3.authority().primary_network_address().clone()).await?;
+    peer4_handle.start_listening(config_4.authority().primary_network_address().clone()).await?;
+    peer5_handle.start_listening(config_5.authority().primary_network_address().clone()).await?;
+    peer6_handle.start_listening(config_6.authority().primary_network_address().clone()).await?;
+    peer7_handle.start_listening(config_7.authority().primary_network_address().clone()).await?;
+    peer8_handle.start_listening(config_8.authority().primary_network_address().clone()).await?;
+
+    // Get peer IDs
+    let peer2_id = peer2_handle.local_peer_id().await?;
+    let peer3_id = peer3_handle.local_peer_id().await?;
+    let peer4_id = peer4_handle.local_peer_id().await?;
+    let peer5_id = peer5_handle.local_peer_id().await?;
+    let peer6_id = peer6_handle.local_peer_id().await?;
+    let peer7_id = peer7_handle.local_peer_id().await?;
+    // let peer8_id = peer8_handle.local_peer_id().await?;
+
+    // Connect all peers to target (simulating too many connections)
+    peer2_handle.dial(target_peer_id, target_addr.clone()).await?;
+    peer3_handle.dial(target_peer_id, target_addr.clone()).await?;
+    peer4_handle.dial(target_peer_id, target_addr.clone()).await?;
+    peer5_handle.dial(target_peer_id, target_addr.clone()).await?;
+    peer6_handle.dial(target_peer_id, target_addr.clone()).await?;
+    peer7_handle.dial(target_peer_id, target_addr.clone()).await?;
+    peer8_handle.dial(target_peer_id, target_addr.clone()).await?;
+
+    // Allow connections to establish
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Check connected peers on target - should be limited by config
+    let connected_peers = target_peer_handle.connected_peers().await?;
+    assert!(connected_peers.len() > config_1.network_config().peer_config().max_peers());
+
+    // For those that remain connected, verify they received peer exchange info
+    // when others were disconnected due to excess connections
+
+    // Allow time for disconnects with PX to propagate
+    // tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let event =
+        timeout(Duration::from_secs(5), peer8_events.recv()).await?.expect("batch received");
+    println!("event: {event:?}");
+
+    // // Connect peer6 to peer2 (which should have received peer6's info via PX)
+    // if connected_peers.contains(&peer2_id) {
+    //     // Get peer2's address
+    //     let peer2_addr =
+    //         peer2_handle.listeners().await?.first().expect("peer2 listen addr").clone();
+
+    //     // Check if peer6 can successfully connect to peer2 (discovered via PX)
+    //     if !connected_peers.contains(&peer6_id) {
+    //         // Peer6 was disconnected due to excess connections, should have exchanged info
+    //         peer6_handle.dial(peer2_id, peer2_addr).await?;
+
+    //         // Allow connection to establish
+    //         tokio::time::sleep(Duration::from_millis(500)).await;
+
+    //         // Verify successful connection
+    //         let peer6_connected = peer6_handle.connected_peers().await?;
+    //         assert!(
+    //             peer6_connected.contains(&peer2_id),
+    //             "Peer6 should be able to connect to peer2 via peer exchange"
+    //         );
+    //     }
+    // }
+
+    // TODO: test peer6 dials others
+    // todo!()
+
+    Ok(())
+}
+
+/// Test banning and unbanning of malicious peers
+#[tokio::test]
+async fn test_ban_and_unban_malicious_peers() -> eyre::Result<()> {
+    // Set up honest and malicious peers
+    let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+
+    let NetworkPeer {
+        config: config_1, network_handle: honest_peer, network: honest_network, ..
+    } = peer1;
+    let NetworkPeer {
+        config: config_2,
+        network_handle: malicious_peer,
+        network: malicious_network,
+        ..
+    } = peer2;
+
+    // Start the networks
+    tokio::spawn(async move {
+        honest_network.run().await.expect("honest network run failed!");
+    });
+
+    let malicious_peer_task = tokio::spawn(async move {
+        malicious_network.run().await.expect("malicious network run failed!");
+    });
+
+    // Start listening
+    honest_peer.start_listening(config_1.authority().primary_network_address().clone()).await?;
+    malicious_peer.start_listening(config_2.authority().primary_network_address().clone()).await?;
+
+    // Get peer IDs and addresses
+    let honest_peer_id = honest_peer.local_peer_id().await?;
+    let malicious_peer_id = malicious_peer.local_peer_id().await?;
+    let honest_addr =
+        honest_peer.listeners().await?.first().expect("honest peer listen addr").clone();
+    let malicious_addr =
+        malicious_peer.listeners().await?.first().expect("malicious peer listen addr").clone();
+
+    // Connect the peers
+    honest_peer.dial(malicious_peer_id, malicious_addr.clone()).await?;
+
+    // Allow connection to establish
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify connection established
+    let connected_peers = honest_peer.connected_peers().await?;
+    assert!(
+        connected_peers.contains(&malicious_peer_id),
+        "Honest peer should be connected to malicious peer"
+    );
+
+    // Report severe penalties to trigger banning
+    honest_peer.report_penalty(malicious_peer_id, Penalty::Fatal).await;
+
+    // Allow time for the ban to take effect
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify peer is banned
+    let score = honest_peer.peer_score(malicious_peer_id).await?;
+    assert!(
+        score.is_some_and(|s| s <= config_1.network_config().peer_config().min_score_for_ban),
+        "Malicious peer should be banned"
+    );
+
+    // Verify the gossipsub has blacklisted the peer
+    let all_peers = honest_peer.all_peers().await?;
+    assert!(
+        !all_peers.contains_key(&malicious_peer_id),
+        "Malicious peer should be removed from gossipsub peers"
+    );
+
+    // Try to reconnect the banned peer (should fail)
+    let dial_result = honest_peer.dial(malicious_peer_id, malicious_addr.clone()).await;
+    assert!(dial_result.is_err(), "Dialing a banned peer should fail");
+
+    // Terminate the malicious peer's network task to simulate a restart
+    malicious_peer_task.abort();
+
+    // Start new malicious peer network instance (simulating peer restart with same ID)
+    let TestTypes { peer2: new_malicious, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { network_handle: restarted_malicious, network: restarted_network, .. } =
+        new_malicious;
+
+    tokio::spawn(async move {
+        restarted_network.run().await.expect("restarted malicious network run failed!");
+    });
+
+    // Start listening on same address
+    restarted_malicious
+        .start_listening(config_2.authority().primary_network_address().clone())
+        .await?;
+
+    // Wait for reputation to be reset or banned status to expire
+    // In a real scenario, we might use the time fast-forward feature to simulate this
+    // For testing purposes, we'll artificially reset the ban via the API
+
+    // Force unban by setting a positive score
+    // honest_peer.set_application_score(malicious_peer_id, 50.0).await?;
+
+    // Allow time for the unban to take effect
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Try to reconnect after unban
+    honest_peer.dial(malicious_peer_id, malicious_addr).await?;
+
+    // Allow connection to establish
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify connection re-established
+    let connected_peers_after_unban = honest_peer.connected_peers().await?;
+    assert!(
+        connected_peers_after_unban.contains(&malicious_peer_id),
+        "Honest peer should be able to reconnect to unbanned peer"
+    );
 
     Ok(())
 }

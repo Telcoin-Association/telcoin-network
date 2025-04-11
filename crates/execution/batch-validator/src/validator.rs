@@ -552,7 +552,7 @@ mod tests {
         let (mut batch, _) = valid_batch.split();
 
         // test batch with no transactions
-        batch.transactions = Vec::with_capacity(0);
+        batch.transactions = Vec::new();
 
         assert_matches!(
             validator.validate_batch(batch.clone().seal_slow()),
