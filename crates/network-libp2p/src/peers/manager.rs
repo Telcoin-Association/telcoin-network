@@ -384,10 +384,13 @@ impl PeerManager {
     pub(super) fn register_disconnected(&mut self, peer_id: &PeerId) {
         let (action, pruned_peers) = self.peers.register_disconnected(peer_id);
 
+        debug!(target: "peer-manager", ?action, ?pruned_peers, ?peer_id, "register disconnected");
+
         // banning is the only action that happens after disconnect
         // if the peer is banned then manager needs to apply the ban still
         // otherwise, there is no other action to take
         if action.is_ban() {
+            debug!(target: "peer-manager", ?peer_id, "processing ban");
             self.apply_peer_action(*peer_id, action);
         }
 
@@ -470,5 +473,11 @@ impl PeerManager {
     /// Return the score for a peer if they exist.
     pub(crate) fn peer_score(&self, peer_id: &PeerId) -> Option<f64> {
         self.peers.get_peer(peer_id).map(|peer| peer.score().aggregate_score())
+    }
+
+    /// Bool indicating if the peer is trusted or a validator.
+    pub(crate) fn peer_is_important(&self, peer_id: &PeerId) -> bool {
+        self.is_validator(peer_id)
+            || self.peers.get_peer(peer_id).and_then(|p| Some(p.is_trusted())).unwrap_or_default()
     }
 }

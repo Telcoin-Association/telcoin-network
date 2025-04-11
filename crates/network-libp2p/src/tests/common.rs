@@ -11,6 +11,10 @@ use std::{
 use tn_config::ScoreConfig;
 use tn_types::{BlockHash, Certificate, CertificateDigest, Header, SealedBatch, Vote};
 
+/// Default heartbeat for tests.
+#[allow(dead_code)] // used in network_tests.rs
+pub(crate) const TEST_HEARTBEAT_INTERVAL: u64 = 1;
+
 // ensure `init_peer_score_config` is only set once
 static INIT: Once = Once::new();
 

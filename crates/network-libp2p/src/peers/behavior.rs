@@ -147,7 +147,7 @@ impl NetworkBehaviour for PeerManager {
         if let Some(request) = self.next_dial_request() {
             let DialRequest { peer_id, multiaddrs, reply } = request;
 
-            debug!(target: "network", ?peer_id, "network behior processing next dial request");
+            debug!(target: "network", ?peer_id, "network behavior processing next dial request");
 
             // register to send result back to caller
             self.register_dial_attempt(peer_id, reply);
@@ -185,7 +185,7 @@ impl PeerManager {
         // TODO: update metrics
 
         // check connection limits
-        if self.peer_limit_reached(endpoint) && !self.is_validator(&peer_id) {
+        if self.peer_limit_reached(endpoint) && !self.peer_is_important(&peer_id) {
             // gracefully disconnect and indicate excess peers
             self.disconnect_peer(peer_id, true);
             return;

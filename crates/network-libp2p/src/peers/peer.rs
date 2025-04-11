@@ -191,7 +191,9 @@ impl Peer {
                     // otherwise, peer was healthy and disconnected now
                 }
                 Reputation::Banned => {
-                    return ReputationUpdate::Banned;
+                    if !prev_reputation.banned() {
+                        return ReputationUpdate::Banned;
+                    }
                 }
             }
         }

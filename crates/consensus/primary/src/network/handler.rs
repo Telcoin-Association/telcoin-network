@@ -117,20 +117,8 @@ where
         );
         ensure!(header.author() == &committee_peer, HeaderError::PeerNotAuthor.into());
 
-        // TODO: ensure peer's header isn't too far in the past
-        //  - peer can't propose a block from round 1 when this node is on 100
-        // ^^^^^^^^^^^^^^^^^^^^^^^^^^ TODO: check if header is too old
-        //
-        //
-
-        // logic:
-        // - ensure block header isn't too far in the past
-        // - ensure block header isn't too far in the future
-        //      - if block header is ahead, but within bounds, then wait for EL results
-
         // if peer is ahead, wait for execution to catch up
-        // NOTE: this doesn't hurt anything since this node shouldn't vote until execution is caught
-        // up
+        // NOTE: this doesn't hurt since this node shouldn't vote until execution is caught up
         // ensure execution results match if this succeeds.
         if self.consensus_bus.wait_for_execution(header.latest_execution_block).await.is_err() {
             error!(

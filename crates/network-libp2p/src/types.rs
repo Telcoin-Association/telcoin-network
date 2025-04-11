@@ -330,8 +330,6 @@ where
     }
 
     /// Publish a message on a certain topic.
-    ///
-    /// TODO: make this <M> generic to prevent accidental publishing of incorrect messages?
     pub async fn publish(&self, topic: IdentTopic, msg: Vec<u8>) -> NetworkResult<MessageId> {
         let (reply, published) = oneshot::channel();
         self.sender.send(NetworkCommand::Publish { topic, msg, reply }).await?;

@@ -13,7 +13,7 @@ use crate::{
 use futures::StreamExt as _;
 use libp2p::{
     gossipsub::{
-        self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance,
+        self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance, Topic,
     },
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
@@ -23,7 +23,7 @@ use libp2p::{
     PeerId, Swarm, SwarmBuilder,
 };
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     time::Duration,
 };
 use tn_config::{ConsensusConfig, LibP2pConfig};
@@ -84,7 +84,7 @@ where
     /// The gossip network for flood publishing sealed batches.
     swarm: Swarm<TNBehavior<TNCodec<Req, Res>>>,
     /// The subscribed gossip network topics.
-    topics: Vec<IdentTopic>,
+    topics: BTreeSet<IdentTopic>,
     /// The stream for forwarding network events.
     event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
     /// The sender for network handles.
@@ -138,10 +138,9 @@ where
     where
         DB: tn_types::database_traits::Database,
     {
-        let topics = vec![IdentTopic::new("tn-primary")];
         let network_key = config.key_config().primary_network_keypair().clone();
         let authorized_publishers = config.committee_peer_ids();
-        Self::new(config, event_stream, topics, network_key, authorized_publishers)
+        Self::new(config, event_stream, network_key, authorized_publishers)
     }
 
     /// Convenience method for spawning a worker network instance.
@@ -152,18 +151,16 @@ where
     where
         DB: tn_types::database_traits::Database,
     {
-        let topics = vec![IdentTopic::new("tn-worker")];
         let network_key = config.key_config().worker_network_keypair().clone();
         let authorized_publishers =
             config.worker_cache().all_workers().iter().map(|(id, _)| *id).collect();
-        Self::new(config, event_stream, topics, network_key, authorized_publishers)
+        Self::new(config, event_stream, network_key, authorized_publishers)
     }
 
     /// Create a new instance of Self.
     pub fn new<DB>(
         consensus_config: &ConsensusConfig<DB>,
         event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
-        topics: Vec<IdentTopic>,
         keypair: NetworkKeypair,
         authorized_publishers: HashSet<PeerId>,
     ) -> NetworkResult<Self>
@@ -230,7 +227,7 @@ where
 
         Ok(Self {
             swarm,
-            topics,
+            topics: Default::default(),
             handle,
             commands,
             event_stream,
@@ -319,7 +316,9 @@ where
                 send_or_log_error!(reply, Ok(()), "UpdateAuthorizedPublishers");
             }
             NetworkCommand::StartListening { multiaddr, reply } => {
+                debug!(target: "network", ?multiaddr, "start listening");
                 let res = self.swarm.listen_on(multiaddr);
+                debug!(target: "network", ?res, "listening res");
                 send_or_log_error!(reply, res, "StartListening");
             }
             NetworkCommand::GetListener { reply } => {
@@ -333,9 +332,6 @@ where
                     addr.clone(),
                     reply,
                 );
-                // update request-response - no action for `FromSwarm::ConnectionEstablished`
-                // NOTE: gossipsub manages peers through `FromSwarm::ConnectionEstablished`
-                self.swarm.add_peer_address(peer_id, addr);
             }
             NetworkCommand::Dial { peer_id, peer_addr, reply } => {
                 self.swarm.behaviour_mut().peer_manager.dial_peer(peer_id, peer_addr, reply);
@@ -456,6 +452,14 @@ where
                         return Err(e.into());
                     }
                 } else {
+                    let GossipMessage { source, topic, .. } = message;
+                    warn!(
+                        target: "network",
+                        author = ?source,
+                        ?topic,
+                        "received invalid gossip - applying fatal penalty to propagation source: {:?}",
+                        propagation_source
+                    );
                     self.swarm
                         .behaviour_mut()
                         .peer_manager
@@ -607,9 +611,6 @@ where
         match event {
             PeerEvent::DisconnectPeer(peer_id) => {
                 debug!(target: "network", ?peer_id, "peer manager: disconnect peer");
-                // remove from connected peers
-                self.connected_peers.retain(|peer| *peer != peer_id);
-
                 // remove from request-response
                 // NOTE: gossipsub handles `FromSwarm::ConnectionClosed`
                 let _ = self.swarm.disconnect_peer_id(peer_id);
@@ -620,7 +621,6 @@ where
 
                 if self.authorized_publishers.contains(&peer_id) {
                     warn!(target: "network::events", ?peer_id, "authorized peer disconnected");
-                    // TODO: schedule reconnection attempt if this node is cvv
                 }
 
                 let keys = self
@@ -688,6 +688,11 @@ where
 
                 // manage connected peers for
                 self.connected_peers.push_back(peer_id);
+
+                // if this is a trusted/validator (important) peer, mark it as explicit in gossipsub
+                if self.swarm.behaviour().peer_manager.peer_is_important(&peer_id) {
+                    self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                }
             }
             PeerEvent::Banned(peer_id) => {
                 debug!(target: "network", ?peer_id, "peer banned");

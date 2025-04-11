@@ -203,7 +203,12 @@ impl AllPeers {
                 },
                 // filter other results and log error
                 ReputationUpdate::Banned | ReputationUpdate::Disconnect => {
-                    error!(target: "peer-manager", ?update, "peer reputation penalized during heartbeat - penalties only expected to decay");
+                    error!(
+                        target: "peer-manager",
+                        ?update,
+                        ?id,
+                        "peer reputation penalized during heartbeat - penalties only expected to decay"
+                    );
                     None
                 },
                 ReputationUpdate::None => None,
