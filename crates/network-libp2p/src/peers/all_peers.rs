@@ -53,14 +53,13 @@ pub(super) struct AllPeers {
 impl AllPeers {
     /// Create a new instance of Self.
     pub(super) fn new(
-        validators: HashSet<PeerId>,
         dial_timeout: Duration,
         max_banned_peers: usize,
         max_disconnected_peers: usize,
     ) -> Self {
         Self {
             peers: Default::default(),
-            validators,
+            validators: Default::default(),
             banned_peers: Default::default(),
             disconnected_peers: 0,
             pending_dials: Default::default(),
@@ -74,7 +73,7 @@ impl AllPeers {
     ///
     /// This overwrites peer records and unbans ips.
     pub(super) fn add_trusted_peer(&mut self, peer_id: PeerId, addr: Multiaddr) {
-        let trusted_peer = Peer::new_trusted(addr);
+        let trusted_peer = Peer::new_trusted(Some(addr));
         let _ = self.banned_peers.remove_banned_peer(trusted_peer.known_ip_addresses());
         self.peers.insert(peer_id, trusted_peer);
     }

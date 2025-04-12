@@ -62,9 +62,7 @@ impl PeerManager {
         let heartbeat =
             tokio::time::interval(tokio::time::Duration::from_secs(config.heartbeat_interval));
 
-        let validators = consensus_config.committee_peer_ids();
         let peers = AllPeers::new(
-            validators,
             config.dial_timeout,
             config.max_banned_peers,
             config.max_disconnected_peers,

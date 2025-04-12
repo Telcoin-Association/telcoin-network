@@ -12,11 +12,10 @@ use tn_config::ScoreConfig;
 /// Helper function to create a test AllPeers instance
 fn create_all_peers() -> AllPeers {
     ensure_score_config();
-    let validators = HashSet::new();
     let dial_timeout = Duration::from_secs(5);
     let max_banned_peers = 10;
     let max_disconnected_peers = 10;
-    AllPeers::new(validators, dial_timeout, max_banned_peers, max_disconnected_peers)
+    AllPeers::new(dial_timeout, max_banned_peers, max_disconnected_peers)
 }
 
 #[test]
@@ -250,12 +249,9 @@ fn test_pruning_logic() {
 fn test_is_validator() {
     ensure_score_config();
 
-    let mut validators = HashSet::new();
     let validator_id = PeerId::random();
-    validators.insert(validator_id);
-
-    let all_peers = AllPeers::new(validators, Duration::from_secs(5), 10, 10);
-
+    let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
+    all_peers.validators.insert(validator_id);
     assert!(all_peers.is_validator(&validator_id));
     assert!(!all_peers.is_validator(&PeerId::random()));
 }

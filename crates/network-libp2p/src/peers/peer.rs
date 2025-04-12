@@ -37,13 +37,9 @@ pub(super) struct Peer {
 
 impl Peer {
     /// Create a new trusted peer.
-    pub(super) fn new_trusted(addr: Multiaddr) -> Peer {
-        Self {
-            multiaddrs: HashSet::from([addr]),
-            score: Score::new_max(),
-            is_trusted: true,
-            ..Default::default()
-        }
+    pub(super) fn new_trusted(addr: Option<Multiaddr>) -> Peer {
+        let multiaddrs = addr.map(|multi| HashSet::from([multi])).unwrap_or_default();
+        Self { multiaddrs, score: Score::new_max(), is_trusted: true, ..Default::default() }
     }
 
     /// Return a peer's reputation based on the aggregate score.
