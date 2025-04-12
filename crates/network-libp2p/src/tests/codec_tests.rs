@@ -1,9 +1,10 @@
 //! TNCodec tests used by the consensus network libp2p req/res protocol.
 
 use super::*;
-use crate::TNCodec;
-mod common;
-use common::{TestPrimaryRequest, TestPrimaryResponse};
+use crate::{
+    common::{TestPrimaryRequest, TestPrimaryResponse},
+    TNCodec,
+};
 use libp2p::StreamProtocol;
 use tn_types::{Certificate, CertificateDigest, Header};
 

@@ -1,9 +1,8 @@
 //! Unit tests for peer manager
 
-mod common;
 use super::*;
+use crate::common::{create_multiaddr, random_ip_addr};
 use assert_matches::assert_matches;
-use common::{create_multiaddr, random_ip_addr};
 use libp2p::swarm::{ConnectionId, NetworkBehaviour as _};
 use std::{
     collections::{HashMap, HashSet},

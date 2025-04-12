@@ -24,8 +24,8 @@ use std::{
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 #[cfg(test)]
-#[path = "../tests/all_peers.rs"]
-mod all_peers;
+#[path = "../tests/peers.rs"]
+mod peers;
 
 /// State for known peers.
 ///
@@ -280,7 +280,7 @@ impl AllPeers {
     /// Notify the caller about the result of a dial attempt.
     pub(super) fn notify_dial_result(&mut self, peer_id: &PeerId, result: NetworkResult<()>) {
         // return result to caller
-        if let Some(reply) = self.reply_for_dial_attempt(&peer_id) {
+        if let Some(reply) = self.reply_for_dial_attempt(peer_id) {
             send_or_log_error!(reply, result, "DialResult", peer = peer_id);
         }
     }

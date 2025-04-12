@@ -1,8 +1,7 @@
 //! Unit tests for `AllPeers`
 
 use super::*;
-mod common;
-use common::{create_multiaddr, ensure_score_config, random_ip_addr};
+use crate::common::{create_multiaddr, ensure_score_config, random_ip_addr};
 use libp2p::{multiaddr::Protocol, PeerId};
 use std::{
     net::IpAddr,
@@ -55,7 +54,7 @@ fn test_process_penalty() {
 
     let mut action = PeerAction::NoAction;
     // test penalty that causes disconnection
-    while all_peers.get_peer(&peer_id).and_then(|p| Some(p.score().aggregate_score())).unwrap()
+    while all_peers.get_peer(&peer_id).map(|p| p.score().aggregate_score()).unwrap()
         > config.min_score_before_disconnect
     {
         action = all_peers.process_penalty(&peer_id, Penalty::Severe);
@@ -69,7 +68,7 @@ fn test_process_penalty() {
     // assert ban applied after disconnect
     let action = all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
     assert!(matches!(action, PeerAction::Ban(_)));
-    let score = all_peers.get_peer(&peer_id).and_then(|p| Some(p.score().aggregate_score()));
+    let score = all_peers.get_peer(&peer_id).map(|p| p.score().aggregate_score());
     assert_eq!(score, Some(config.min_score));
 
     // test penalty for unknown peer
@@ -401,7 +400,7 @@ fn test_connected_to_disconnecting_transition() {
     assert!(matches!(action, PeerAction::DisconnectWithPX));
     let peer = all_peers.get_peer(&peer_id).unwrap();
     assert!(matches!(peer.connection_status(), ConnectionStatus::Disconnecting { banned }
-            if *banned == false));
+            if !(*banned)));
 }
 
 #[test]
@@ -530,5 +529,5 @@ fn test_connected_to_banned_transition() {
     assert!(matches!(action, PeerAction::Disconnect));
     let peer = all_peers.get_peer(&peer_id).unwrap();
     assert!(matches!(peer.connection_status(), ConnectionStatus::Disconnecting { banned }
-            if *banned == true));
+            if *banned));
 }

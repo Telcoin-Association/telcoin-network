@@ -40,19 +40,15 @@ impl BannedPeers {
         self.total = self.total.saturating_sub(1);
 
         ip_addresses
-            .filter_map(|ip| {
-                match self.banned_peers_by_ip.get_mut(&ip) {
+            .filter(|ip| {
+                match self.banned_peers_by_ip.get_mut(ip) {
                     Some(count) => {
                         // reduce count
                         *count = count.saturating_sub(1);
                         // return ip if no longer associated with a banned peer
-                        if !self.ip_banned(&ip) {
-                            Some(ip)
-                        } else {
-                            None
-                        }
+                        !self.ip_banned(ip)
                     }
-                    None => None,
+                    None => false,
                 }
             })
             .collect()
@@ -93,8 +89,6 @@ impl BannedPeers {
     /// IP addresses are banned if the number of banned peers exceeds the
     /// [BANNED_PEERS_PER_IP_THRESHOLD].
     pub(super) fn ip_banned(&self, ip: &IpAddr) -> bool {
-        self.banned_peers_by_ip
-            .get(ip)
-            .map_or(false, |count| *count > BANNED_PEERS_PER_IP_THRESHOLD)
+        self.banned_peers_by_ip.get(ip).is_some_and(|count| *count > BANNED_PEERS_PER_IP_THRESHOLD)
     }
 }

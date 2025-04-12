@@ -1,8 +1,7 @@
 //! Unit tests for banned peers
 
-mod common;
 use super::*;
-use common::{ensure_score_config, random_ip_addr};
+use crate::common::{ensure_score_config, random_ip_addr};
 use libp2p::{multiaddr::Protocol, Multiaddr};
 use std::net::Ipv4Addr;
 

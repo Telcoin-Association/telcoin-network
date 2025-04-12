@@ -25,12 +25,12 @@ pub(crate) enum WorkerNetworkError {
     Network(#[from] NetworkError),
 }
 
-impl Into<Option<Penalty>> for WorkerNetworkError {
-    fn into(self) -> Option<Penalty> {
+impl From<WorkerNetworkError> for Option<Penalty> {
+    fn from(val: WorkerNetworkError) -> Self {
         //
         // explicitly match every error type to ensure penalties are updated with changes
         //
-        match self {
+        match val {
             WorkerNetworkError::BatchValidation(batch_validation_error) => {
                 match batch_validation_error {
                     // mild

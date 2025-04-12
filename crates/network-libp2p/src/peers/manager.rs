@@ -483,6 +483,6 @@ impl PeerManager {
     /// Bool indicating if the peer is trusted or a validator.
     pub(crate) fn peer_is_important(&self, peer_id: &PeerId) -> bool {
         self.is_validator(peer_id)
-            || self.peers.get_peer(peer_id).and_then(|p| Some(p.is_trusted())).unwrap_or_default()
+            || self.peers.get_peer(peer_id).map(|p| p.is_trusted()).unwrap_or_default()
     }
 }

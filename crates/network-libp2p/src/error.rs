@@ -112,7 +112,7 @@ impl<T> From<mpsc::error::TrySendError<T>> for NetworkError {
     }
 }
 
-impl<'a> From<&DialError> for NetworkError {
+impl From<&DialError> for NetworkError {
     fn from(e: &DialError) -> Self {
         Self::Dial(e.to_string())
     }

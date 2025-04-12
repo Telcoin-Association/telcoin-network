@@ -127,7 +127,7 @@ pub(crate) fn random_ip_addr() -> IpAddr {
 /// Helper function to create a [Multiaddr] for tests.
 #[allow(dead_code)]
 pub(crate) fn create_multiaddr(ip: Option<IpAddr>) -> Multiaddr {
-    let ip = ip.unwrap_or_else(|| random_ip_addr());
+    let ip = ip.unwrap_or_else(random_ip_addr);
     let ip = match ip {
         IpAddr::V4(ip) => format!("/ip4/{}", ip),
         IpAddr::V6(ip) => format!("/ip6/{}", ip),

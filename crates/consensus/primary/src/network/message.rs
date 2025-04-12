@@ -136,7 +136,7 @@ impl MissingCertificatesRequest {
 
 impl From<PeerExchangeMap> for PrimaryRequest {
     fn from(value: PeerExchangeMap) -> Self {
-        Self::PeerExchange { peers: value.into() }
+        Self::PeerExchange { peers: value }
     }
 }
 
@@ -193,6 +193,6 @@ pub struct PrimaryRPCError(pub String);
 
 impl From<PeerExchangeMap> for PrimaryResponse {
     fn from(value: PeerExchangeMap) -> Self {
-        Self::PeerExchange { peers: value.into() }
+        Self::PeerExchange { peers: value }
     }
 }

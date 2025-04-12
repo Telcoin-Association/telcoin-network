@@ -43,12 +43,12 @@ pub(crate) enum PrimaryNetworkError {
     UnknowConsensusHeaderDigest(BlockHash),
 }
 
-impl Into<Option<Penalty>> for PrimaryNetworkError {
-    fn into(self) -> Option<Penalty> {
+impl From<PrimaryNetworkError> for Option<Penalty> {
+    fn from(val: PrimaryNetworkError) -> Self {
         //
         // explicitly match every error type to ensure penalties are updated with changes
         //
-        match self {
+        match val {
             PrimaryNetworkError::InvalidHeader(header_error) => {
                 penalty_from_header_error(header_error)
             }

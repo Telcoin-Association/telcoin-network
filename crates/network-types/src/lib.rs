@@ -56,6 +56,7 @@ pub trait PrimaryToWorkerClient: Send + Sync + 'static {
 }
 
 /// Type that can return batches.
+#[derive(Default)]
 pub struct MockPrimaryToWorkerClient {
     pub batches: HashMap<BlockHash, Batch>,
 }
@@ -71,11 +72,5 @@ impl PrimaryToWorkerClient for MockPrimaryToWorkerClient {
         _digests: HashSet<BlockHash>,
     ) -> eyre::Result<FetchBatchResponse> {
         Ok(FetchBatchResponse { batches: self.batches.clone() })
-    }
-}
-
-impl Default for MockPrimaryToWorkerClient {
-    fn default() -> Self {
-        Self { batches: HashMap::new() }
     }
 }

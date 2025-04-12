@@ -658,14 +658,14 @@ where
                         .send_request(&peer_id, peer_exchange.into());
                     self.outbound_requests.insert((peer_id, request_id), reply);
 
-                    let timeout = self.config.px_disconnect_timeout.clone();
+                    let timeout = self.config.px_disconnect_timeout;
                     let handle = self.network_handle();
 
                     // spawn task
                     tokio::spawn(async move {
                         // ignore errors and disconnect after px attempt
                         let _res = tokio::time::timeout(timeout, done).await;
-                        let _ = handle.disconnect_peer(peer_id);
+                        let _ = handle.disconnect_peer(peer_id).await;
                     });
 
                     // insert to pending px disconnects

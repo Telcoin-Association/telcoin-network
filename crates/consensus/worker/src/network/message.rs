@@ -32,7 +32,7 @@ pub enum WorkerRequest {
 
 impl From<PeerExchangeMap> for WorkerRequest {
     fn from(value: PeerExchangeMap) -> Self {
-        Self::PeerExchange { peers: value.into() }
+        Self::PeerExchange { peers: value }
     }
 }
 
@@ -76,6 +76,6 @@ pub struct WorkerRPCError(pub String);
 
 impl From<PeerExchangeMap> for WorkerResponse {
     fn from(value: PeerExchangeMap) -> Self {
-        Self::PeerExchange { peers: value.into() }
+        Self::PeerExchange { peers: value }
     }
 }

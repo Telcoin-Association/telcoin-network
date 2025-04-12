@@ -1,12 +1,11 @@
 //! Tests networking using libp2p between peers.
 
-mod common;
 use super::*;
-use assert_matches::assert_matches;
-use common::{
+use crate::common::{
     create_multiaddr, TestPrimaryRequest, TestPrimaryResponse, TestWorkerRequest,
     TestWorkerResponse, TEST_HEARTBEAT_INTERVAL,
 };
+use assert_matches::assert_matches;
 use eyre::eyre;
 use std::num::NonZeroUsize;
 use tn_config::{ConsensusConfig, NetworkConfig};
@@ -16,7 +15,7 @@ use tn_types::{Certificate, Header};
 use tokio::{sync::mpsc, time::timeout};
 
 /// Test topic for gossip.
-const TEST_TOPIC: &'static str = "test-topic";
+const TEST_TOPIC: &str = "test-topic";
 
 /// Helper function to create peers.
 fn create_test_peers<Req: TNMessage, Res: TNMessage>(
@@ -605,8 +604,6 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
 /// Test peer exchanges when too many peers connect
 #[tokio::test]
 async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
-    tn_test_utils::init_test_tracing();
-
     // Create a custom config with very low peer limits for testing
     let mut network_config = NetworkConfig::default();
     network_config.peer_config_mut().target_num_peers = 3;
@@ -942,8 +939,6 @@ async fn test_dial_timeout_behavior() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
-    tn_test_utils::init_test_tracing();
-
     // Create multiple peers but with more realistic constraints
     let num_peers = NonZeroUsize::new(4).unwrap();
     let mut network_config = NetworkConfig::default();
