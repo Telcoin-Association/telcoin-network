@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 use tn_config::{ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs};
-use tn_network_libp2p::{types::IdentTopic, ConsensusNetwork, PeerId};
+use tn_network_libp2p::{ConsensusNetwork, PeerId};
 use tn_node_traits::TelcoinNode;
 use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
@@ -119,7 +119,12 @@ async fn start_networks<DB: TNDatabase>(
     });
 
     // subscribe to epoch closing gossip messages
-    primary_network_handle.subscribe(IdentTopic::new("tn-primary")).await?;
+    primary_network_handle
+        .subscribe(
+            consensus_config.network_config().libp2p_config().primary_topics(),
+            consensus_config.committee_peer_ids(),
+        )
+        .await?;
 
     let my_authority = consensus_config.authority();
 

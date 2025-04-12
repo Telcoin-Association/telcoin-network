@@ -34,10 +34,8 @@ fn create_test_peers<Req: TNMessage, Res: TNMessage>(
             let config = a.consensus_config();
             let (tx, network_events) = mpsc::channel(10);
             let network_key = config.key_config().primary_network_keypair().clone();
-            let authorized_publishers = config.committee_peer_ids();
-            let network =
-                ConsensusNetwork::<Req, Res>::new(&config, tx, network_key, authorized_publishers)
-                    .expect("peer1 network created");
+            let network = ConsensusNetwork::<Req, Res>::new(&config, tx, network_key)
+                .expect("peer1 network created");
 
             let network_handle = network.network_handle();
             TestPeer {
@@ -120,10 +118,8 @@ where
 
     // peer1
     let network_key_1 = config_1.key_config().primary_network_keypair().clone();
-    let authorized_publishers = config_1.committee_peer_ids();
-    let peer1_network =
-        ConsensusNetwork::<Req, Res>::new(&config_1, tx1, network_key_1, authorized_publishers)
-            .expect("peer1 network created");
+    let peer1_network = ConsensusNetwork::<Req, Res>::new(&config_1, tx1, network_key_1)
+        .expect("peer1 network created");
     let network_handle_1 = peer1_network.network_handle();
     let peer1 = NetworkPeer {
         config: config_1,
@@ -134,10 +130,8 @@ where
 
     // peer2
     let network_key_2 = config_2.key_config().primary_network_keypair().clone();
-    let authorized_publishers = config_2.committee_peer_ids();
-    let peer2_network =
-        ConsensusNetwork::<Req, Res>::new(&config_2, tx2, network_key_2, authorized_publishers)
-            .expect("peer2 network created");
+    let peer2_network = ConsensusNetwork::<Req, Res>::new(&config_2, tx2, network_key_2)
+        .expect("peer2 network created");
     let network_handle_2 = peer2_network.network_handle();
     let peer2 = NetworkPeer {
         config: config_2,
@@ -495,11 +489,8 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
     let cvv_id = cvv.local_peer_id().await?;
     let cvv_addr = cvv.listeners().await?.first().expect("peer2 listen addr").clone();
 
-    // topics for pubsub
-    let test_topic = IdentTopic::new(TEST_TOPIC);
-
     // subscribe
-    nvv.subscribe(test_topic.clone()).await?;
+    nvv.subscribe(TEST_TOPIC.into(), config_1.committee_peer_ids()).await?;
 
     // dial cvv
     nvv.dial(cvv_id, cvv_addr).await?;
@@ -513,12 +504,11 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // publish on wrong topic - no peers
-    let expected_failure =
-        cvv.publish(IdentTopic::new("WRONG_TOPIC"), expected_result.clone()).await;
+    let expected_failure = cvv.publish("WRONG_TOPIC".into(), expected_result.clone()).await;
     assert!(expected_failure.is_err());
 
     // publish correct message and wait to receive
-    let _message_id = cvv.publish(test_topic, expected_result.clone()).await?;
+    let _message_id = cvv.publish(TEST_TOPIC.into(), expected_result.clone()).await?;
     let event =
         timeout(Duration::from_secs(2), nvv_network_events.recv()).await?.expect("batch received");
 
@@ -558,11 +548,8 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     let cvv_id = cvv.local_peer_id().await?;
     let cvv_addr = cvv.listeners().await?.first().expect("peer2 listen addr").clone();
 
-    // topics for pubsub
-    let test_topic = IdentTopic::new(TEST_TOPIC);
-
     // subscribe
-    nvv.subscribe(test_topic.clone()).await?;
+    nvv.subscribe(TEST_TOPIC.into(), config_1.committee_peer_ids()).await?;
 
     // dial cvv
     nvv.dial(cvv_id, cvv_addr).await?;
@@ -576,7 +563,7 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // publish correct message and wait to receive
-    let _message_id = cvv.publish(test_topic.clone(), expected_result.clone()).await?;
+    let _message_id = cvv.publish(TEST_TOPIC.into(), expected_result.clone()).await?;
     let event =
         timeout(Duration::from_secs(2), nvv_network_events.recv()).await?.expect("batch received");
 
@@ -588,12 +575,12 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     }
 
     // remove cvv from whitelist and try to publish again
-    nvv.update_authorized_publishers(HashSet::new()).await?;
+    nvv.update_authorized_publishers(HashMap::new()).await?;
 
     let random_block = fixture_batch_with_transactions(10);
     let sealed_block = random_block.seal_slow();
     let expected_result = Vec::from(&sealed_block);
-    let _message_id = cvv.publish(test_topic, expected_result.clone()).await?;
+    let _message_id = cvv.publish(TEST_TOPIC.into(), expected_result.clone()).await?;
 
     // message should never be forwarded
     let timeout = timeout(Duration::from_secs(2), nvv_network_events.recv()).await;
@@ -659,7 +646,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
             .await?;
 
         // subscribe to topic
-        peer.network_handle.subscribe(IdentTopic::new(TEST_TOPIC)).await?;
+        peer.network_handle.subscribe(TEST_TOPIC.into(), peer.config.committee_peer_ids()).await?;
 
         // Connect to target
         peer.network_handle.dial(target_peer_id, target_addr.clone()).await?;
@@ -692,9 +679,8 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     nvv.start_listening(nvv_config.authority().primary_network_address().clone()).await?;
 
     // subscribe to topic
-    nvv.subscribe(IdentTopic::new(TEST_TOPIC)).await?;
     // add target peer as authorized publisher
-    nvv.update_authorized_publishers(HashSet::from([target_peer_id])).await?;
+    nvv.subscribe(TEST_TOPIC.into(), HashSet::from([target_peer_id])).await?;
 
     // connect to target
     nvv.dial(target_peer_id, target_addr.clone()).await?;
@@ -733,7 +719,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     let expected_msg = Vec::from(&sealed_block);
 
     // assert gossip from disconnected target peer is received by nvv
-    target_peer.network_handle.publish(IdentTopic::new(TEST_TOPIC), expected_msg.clone()).await?;
+    target_peer.network_handle.publish(TEST_TOPIC.into(), expected_msg.clone()).await?;
 
     // wait for gossip from disconnected peer
     match timeout(Duration::from_secs(5), nvv_events.recv()).await {
@@ -973,11 +959,11 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
 
     let target_peer_id = target_peer.network_handle.local_peer_id().await?;
 
-    // Define test topic
-    let test_topic = IdentTopic::new(TEST_TOPIC);
-
     // Subscribe target to test topic
-    target_peer.network_handle.subscribe(test_topic.clone()).await?;
+    target_peer
+        .network_handle
+        .subscribe(TEST_TOPIC.into(), target_peer.config.committee_peer_ids())
+        .await?;
 
     // Start other peers and connect them all to the target (star topology)
     for peer in other_peers.iter_mut() {
@@ -993,10 +979,15 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
             .await?;
 
         // add target peer as authorized
-        peer.network_handle.update_authorized_publishers(HashSet::from([target_peer_id])).await?;
+        peer.network_handle
+            .update_authorized_publishers(HashMap::from([(
+                TEST_TOPIC.into(),
+                HashSet::from([target_peer_id]),
+            )]))
+            .await?;
 
         // Subscribe to test topic
-        peer.network_handle.subscribe(test_topic.clone()).await?;
+        peer.network_handle.subscribe(TEST_TOPIC.into(), peer.config.committee_peer_ids()).await?;
 
         // Connect to target peer
         peer.network_handle.dial(target_peer_id, target_addr.clone()).await?;
@@ -1013,7 +1004,7 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
     assert_eq!(connected_peers.len(), other_peers.len(), "All peers should be connected to target");
 
     // Check gossipsub mesh formation
-    let mesh_peers = target_peer.network_handle.mesh_peers(test_topic.hash()).await?;
+    let mesh_peers = target_peer.network_handle.mesh_peers(TEST_TOPIC.into()).await?;
     debug!(target: "network", "Target has {} peers in its gossipsub mesh", mesh_peers.len());
 
     // Mesh formation takes time, we should have at least some peers in the mesh
@@ -1022,7 +1013,7 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
 
     // Test message propagation
     let test_data = Vec::from("test data for propagation".as_bytes());
-    target_peer.network_handle.publish(test_topic.clone(), test_data.clone()).await?;
+    target_peer.network_handle.publish(TEST_TOPIC.into(), test_data.clone()).await?;
 
     // Wait for message propagation
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1035,7 +1026,7 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
     // For each peer, check if they're subscribed to the topic
     for (peer_id, topics) in gossip_peers {
         assert!(
-            topics.iter().any(|t| *t == test_topic.hash()),
+            topics.iter().any(|t| *t == TopicHash::from_raw(TEST_TOPIC)),
             "Peer {:?} should be subscribed to test topic",
             peer_id
         );

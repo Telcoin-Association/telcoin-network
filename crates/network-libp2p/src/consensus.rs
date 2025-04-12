@@ -13,7 +13,8 @@ use crate::{
 use futures::StreamExt as _;
 use libp2p::{
     gossipsub::{
-        self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance,
+        self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance, Topic,
+        TopicHash,
     },
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
@@ -23,7 +24,7 @@ use libp2p::{
     PeerId, Swarm, SwarmBuilder,
 };
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     time::Duration,
 };
 use tn_config::{ConsensusConfig, LibP2pConfig};
@@ -83,19 +84,17 @@ where
 {
     /// The gossip network for flood publishing sealed batches.
     swarm: Swarm<TNBehavior<TNCodec<Req, Res>>>,
-    /// The subscribed gossip network topics.
-    topics: BTreeSet<IdentTopic>,
     /// The stream for forwarding network events.
     event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
     /// The sender for network handles.
     handle: Sender<NetworkCommand<Req, Res>>,
     /// The receiver for processing network handle requests.
     commands: Receiver<NetworkCommand<Req, Res>>,
-    /// The collection of staked validators.
+    /// The collection of authorized publishers per topic.
     ///
-    /// This set must be updated at the start of each epoch. It is used to verify message sources
-    /// are from validators.
-    authorized_publishers: HashSet<PeerId>,
+    /// This set must be updated at the start of each epoch. It is used to verify messages
+    /// published on certain topics. These are updated when the caller subscribes to a topic.
+    authorized_publishers: HashMap<String, HashSet<PeerId>>,
     /// The collection of pending _graceful_ disconnects.
     ///
     /// This node disconnects from new peers if it already has the target number of peers.
@@ -139,8 +138,7 @@ where
         DB: tn_types::database_traits::Database,
     {
         let network_key = config.key_config().primary_network_keypair().clone();
-        let authorized_publishers = config.committee_peer_ids();
-        Self::new(config, event_stream, network_key, authorized_publishers)
+        Self::new(config, event_stream, network_key)
     }
 
     /// Convenience method for spawning a worker network instance.
@@ -152,9 +150,7 @@ where
         DB: tn_types::database_traits::Database,
     {
         let network_key = config.key_config().worker_network_keypair().clone();
-        let authorized_publishers =
-            config.worker_cache().all_workers().iter().map(|(id, _)| *id).collect();
-        Self::new(config, event_stream, network_key, authorized_publishers)
+        Self::new(config, event_stream, network_key)
     }
 
     /// Create a new instance of Self.
@@ -162,7 +158,6 @@ where
         consensus_config: &ConsensusConfig<DB>,
         event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
         keypair: NetworkKeypair,
-        authorized_publishers: HashSet<PeerId>,
     ) -> NetworkResult<Self>
     where
         DB: tn_types::database_traits::Database,
@@ -227,11 +222,10 @@ where
 
         Ok(Self {
             swarm,
-            topics: Default::default(),
             handle,
             commands,
             event_stream,
-            authorized_publishers,
+            authorized_publishers: Default::default(),
             outbound_requests: Default::default(),
             inbound_requests: Default::default(),
             config,
@@ -253,7 +247,7 @@ where
                 command = self.commands.recv() => match command {
                     Some(c) => self.process_command(c),
                     None => {
-                        info!(target: "network", topics=?self.topics, "subscriber shutting down...");
+                        info!(target: "network", "network shutting down...");
                         return Ok(())
                     }
                 },
@@ -262,7 +256,7 @@ where
     }
 
     /// Process events from the swarm.
-    #[instrument(level = "trace", target = "network::events", skip(self), fields(topics = ?self.topics))]
+    #[instrument(level = "trace", target = "network::events", skip(self), fields(topics = ?self.authorized_publishers.keys()))]
     async fn process_event(
         &mut self,
         event: SwarmEvent<TNBehaviorEvent<TNCodec<Req, Res>>>,
@@ -344,11 +338,14 @@ where
                 send_or_log_error!(reply, peer_id, "LocalPeerId");
             }
             NetworkCommand::Publish { topic, msg, reply } => {
-                let res = self.swarm.behaviour_mut().gossipsub.publish(topic, msg);
+                let res =
+                    self.swarm.behaviour_mut().gossipsub.publish(TopicHash::from_raw(topic), msg);
                 send_or_log_error!(reply, res, "Publish");
             }
-            NetworkCommand::Subscribe { topic, reply } => {
-                let res = self.swarm.behaviour_mut().gossipsub.subscribe(&topic);
+            NetworkCommand::Subscribe { topic, publishers, reply } => {
+                let sub: IdentTopic = Topic::new(&topic);
+                let res = self.swarm.behaviour_mut().gossipsub.subscribe(&sub);
+                self.authorized_publishers.insert(topic, publishers);
                 send_or_log_error!(reply, res, "Subscribe");
             }
             NetworkCommand::ConnectedPeers { reply } => {
@@ -376,8 +373,13 @@ where
                 send_or_log_error!(reply, collection, "AllMeshPeers");
             }
             NetworkCommand::MeshPeers { topic, reply } => {
-                let collection =
-                    self.swarm.behaviour_mut().gossipsub.mesh_peers(&topic).cloned().collect();
+                let collection = self
+                    .swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .mesh_peers(&TopicHash::from_raw(topic))
+                    .cloned()
+                    .collect();
                 send_or_log_error!(reply, collection, "MeshPeers");
             }
             NetworkCommand::SendRequest { peer, request, reply } => {
@@ -428,7 +430,7 @@ where
     fn process_gossip_event(&mut self, event: GossipEvent) -> NetworkResult<()> {
         match event {
             GossipEvent::Message { propagation_source, message_id, message } => {
-                trace!(target: "network", topic=?self.topics, ?propagation_source, ?message_id, ?message, "message received from publisher");
+                trace!(target: "network", topic=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?message, "message received from publisher");
                 // verify message was published by authorized node
                 let msg_acceptance = self.verify_gossip(&message);
                 let valid = msg_acceptance.is_accepted();
@@ -440,7 +442,7 @@ where
                     &propagation_source,
                     msg_acceptance.into(),
                 ) {
-                    error!(target: "network", topics=?self.topics, ?propagation_source, ?message_id, "error reporting message validation result");
+                    error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, "error reporting message validation result");
                 }
 
                 // process gossip in application layer
@@ -450,7 +452,7 @@ where
                         .event_stream
                         .try_send(NetworkEvent::Gossip(message, propagation_source))
                     {
-                        error!(target: "network", topics=?self.topics, ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
+                        error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
                         // fatal - unable to process gossip messages
                         return Err(e.into());
                     }
@@ -470,17 +472,17 @@ where
                 }
             }
             GossipEvent::Subscribed { peer_id, topic } => {
-                trace!(target: "network", topics=?self.topics, ?peer_id, ?topic, "gossipsub event - subscribed")
+                trace!(target: "network", topics=?self.authorized_publishers.keys(), ?peer_id, ?topic, "gossipsub event - subscribed")
             }
             GossipEvent::Unsubscribed { peer_id, topic } => {
-                trace!(target: "network", topics=?self.topics, ?peer_id, ?topic, "gossipsub event - unsubscribed")
+                trace!(target: "network", topics=?self.authorized_publishers.keys(), ?peer_id, ?topic, "gossipsub event - unsubscribed")
             }
             GossipEvent::GossipsubNotSupported { peer_id } => {
-                trace!(target: "network", topics=?self.topics, ?peer_id, "gossipsub event - not supported");
+                trace!(target: "network", topics=?self.authorized_publishers.keys(), ?peer_id, "gossipsub event - not supported");
                 self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, Penalty::Fatal);
             }
             GossipEvent::SlowPeer { peer_id, failed_messages } => {
-                trace!(target: "network", topics=?self.topics, ?peer_id, ?failed_messages, "gossipsub event - slow peer");
+                trace!(target: "network", topics=?self.authorized_publishers.keys(), ?peer_id, ?failed_messages, "gossipsub event - slow peer");
                 self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, Penalty::Mild);
             }
         }
@@ -502,7 +504,7 @@ where
                             channel,
                             cancel,
                         }) {
-                            error!(target: "network", topics=?self.topics, ?request_id, ?e, "failed to forward request!");
+                            error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
                             // fatal - unable to process requests
                             return Err(e.into());
                         }
@@ -597,10 +599,14 @@ where
             return GossipAcceptance::Reject;
         }
 
+        let GossipMessage { topic, .. } = gossip;
+
         // ensure publisher is authorized
         //
         // NOTE: expand on this based on gossip::topic - not all topics need to be permissioned
-        if gossip.source.is_some_and(|id| self.authorized_publishers.contains(&id)) {
+        if gossip.source.is_some_and(|id| {
+            self.authorized_publishers.get(topic.as_str()).is_some_and(|auth| auth.contains(&id))
+        }) {
             GossipAcceptance::Accept
         } else {
             GossipAcceptance::Reject
@@ -619,10 +625,6 @@ where
             PeerEvent::PeerDisconnected(peer_id) => {
                 // remove from connected peers
                 self.connected_peers.retain(|peer| *peer != peer_id);
-
-                if self.authorized_publishers.contains(&peer_id) {
-                    warn!(target: "network::events", ?peer_id, "authorized peer disconnected");
-                }
 
                 let keys = self
                     .outbound_requests
@@ -742,7 +744,6 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConsensusNetwork")
-            .field("topics", &self.topics)
             .field("authorized_publishers", &self.authorized_publishers)
             .field("pending_px_disconnects", &self.pending_px_disconnects)
             .field("outbound_requests", &self.outbound_requests.len())

@@ -102,6 +102,18 @@ pub struct LibP2pConfig {
     pub px_disconnect_timeout: Duration,
 }
 
+impl LibP2pConfig {
+    /// Return topics for primary.
+    pub fn primary_topics(&self) -> String {
+        String::from("tn-primary")
+    }
+
+    /// Return topics for worker.
+    pub fn worker_topics(&self) -> String {
+        String::from("tn-worker")
+    }
+}
+
 impl Default for LibP2pConfig {
     fn default() -> Self {
         Self {
