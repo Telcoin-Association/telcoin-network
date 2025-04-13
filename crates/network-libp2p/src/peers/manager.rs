@@ -12,7 +12,11 @@ use crate::{
     error::NetworkError, peers::status::ConnectionStatus, send_or_log_error, types::NetworkResult,
 };
 use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
-use std::{collections::VecDeque, net::IpAddr, task::Context};
+use std::{
+    collections::{HashMap, VecDeque},
+    net::IpAddr,
+    task::Context,
+};
 use tn_config::{ConsensusConfig, PeerConfig};
 use tn_types::Database;
 use tokio::sync::oneshot;
@@ -93,7 +97,12 @@ impl PeerManager {
         reply: oneshot::Sender<NetworkResult<()>>,
     ) {
         self.peers.add_trusted_peer(peer_id, multiaddr.clone());
-        let _ = self.temporarily_banned.remove(&peer_id);
+
+        // remove from temporary banned and warn if peer was banned
+        if self.temporarily_banned.remove(&peer_id) {
+            warn!(target: "peer-manager", ?peer_id, "removed trusted peer from temporarily banned list");
+        }
+
         self.dial_peer(peer_id, multiaddr, reply);
     }
 
@@ -482,5 +491,23 @@ impl PeerManager {
     pub(crate) fn peer_is_important(&self, peer_id: &PeerId) -> bool {
         self.is_validator(peer_id)
             || self.peers.get_peer(peer_id).map(|p| p.is_trusted()).unwrap_or_default()
+    }
+
+    /// Update the committee for the new epoch.
+    pub(crate) fn new_epoch(&mut self, committee: HashMap<PeerId, Multiaddr>) {
+        // remove from temporary banned and warn if validator was banned
+        for peer_id in committee.keys() {
+            if self.temporarily_banned.remove(peer_id) {
+                warn!(target: "peer-manager", ?peer_id, "removed committee member from temporarily banned list");
+            }
+        }
+
+        // add trusted peer record
+        let unban_actions = self.peers.new_epoch(committee);
+
+        // apply unban for any banned validators
+        for (peer_id, action) in unban_actions {
+            self.apply_peer_action(peer_id, action);
+        }
     }
 }

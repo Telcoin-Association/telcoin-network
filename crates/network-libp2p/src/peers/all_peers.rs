@@ -574,10 +574,21 @@ impl AllPeers {
 
                     return PeerAction::Unban(peer.known_ip_addresses().collect());
                 }
-                ConnectionStatus::Disconnected { .. } | ConnectionStatus::Disconnecting { .. } => {
-                    debug!(target: "peer-manager", ?peer_id, "unbanning disconnected or disconnecting peer");
+                ConnectionStatus::Disconnecting { banned } => {
+                    debug!(target: "peer-manager", ?peer_id, "unbanning disconnecting peer");
+                    if banned {
+                        // set disconnecting status false
+                        peer.set_connection_status(ConnectionStatus::Disconnecting {
+                            banned: false,
+                        });
+                    }
                 }
-                ConnectionStatus::Dialing { .. } => {} // odd but acceptable
+                ConnectionStatus::Disconnected { .. } => {
+                    debug!(target: "peer-manager", ?peer_id, "unbanning disconnected peer");
+                }
+                ConnectionStatus::Dialing { .. } => {
+                    debug!(target: "peer-manager", ?peer_id, "unbanning dialing peer");
+                }
                 ConnectionStatus::Unknown | ConnectionStatus::Connected { .. } => {
                     // technically an error, but not fatal
                     error!(target: "peer-manager", ?peer_id, "unbanning a connected peer");
@@ -766,5 +777,55 @@ impl AllPeers {
                 self.disconnected_peers = self.disconnected_peers.saturating_sub(1);
             }
         }
+    }
+
+    /// Update committee for the new epoch.
+    ///
+    /// NOTE: very similar to `Self::add_explicit_peer` but doesn't dial.
+    pub(super) fn new_epoch(
+        &mut self,
+        committee: HashMap<PeerId, Multiaddr>,
+    ) -> Vec<(PeerId, PeerAction)> {
+        // update current committee of validators
+        self.validators = committee.keys().cloned().collect();
+
+        let mut actions = Vec::with_capacity(committee.len());
+        for (peer_id, addr) in committee.into_iter() {
+            // the new connection status doesn't affect this call
+            let status = self.ensure_peer_exists(&peer_id, &NewConnectionStatus::Unbanned);
+
+            match status {
+                ConnectionStatus::Disconnecting { banned } => {
+                    // unban peer
+                    if banned {
+                        warn!(target: "peer-manager", ?peer_id, "unbanning committee member that was disconnecting pending ban");
+                        let action =
+                            self.update_connection_status(&peer_id, NewConnectionStatus::Unbanned);
+                        actions.push((peer_id, action));
+                    }
+                }
+                ConnectionStatus::Banned { .. } => {
+                    warn!(target: "peer-manager", ?peer_id, "unbanning committee member that was disconnecting pending ban");
+                    let action =
+                        self.update_connection_status(&peer_id, NewConnectionStatus::Unbanned);
+                    actions.push((peer_id, action));
+                }
+                ConnectionStatus::Disconnected { .. }
+                | ConnectionStatus::Dialing { .. }
+                | ConnectionStatus::Unknown
+                | ConnectionStatus::Connected { .. } => { /* nothing to do */ }
+            }
+
+            // already ensured peer exists
+            if let Some(peer) = self.peers.get_mut(&peer_id) {
+                // update peer regardless of connection status
+                peer.make_trusted();
+                peer.update_listening_addrs(addr);
+                self.banned_peers.remove_validator_ip(&peer_id, peer.known_ip_addresses());
+            }
+        }
+
+        // return any unban actions for committee peers
+        actions
     }
 }

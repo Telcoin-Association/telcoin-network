@@ -22,12 +22,10 @@ static INIT: Once = Once::new();
 // but it is used in `all_peers` and `banned_peers`
 /// Initialize without error for unit tests.
 #[allow(dead_code)]
-pub(crate) fn ensure_score_config() {
+pub(crate) fn ensure_score_config(config: Option<ScoreConfig>) {
     INIT.call_once(|| {
-        // use default
-        let config = ScoreConfig::default();
         // ignore result
-        let _ = GLOBAL_SCORE_CONFIG.set(Arc::new(config));
+        let _ = GLOBAL_SCORE_CONFIG.set(Arc::new(config.unwrap_or_default()));
     });
 }
 

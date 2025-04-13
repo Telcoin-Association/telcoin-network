@@ -2,6 +2,9 @@
 //!
 //! Peers that score poorly are eventually banned.
 
+use libp2p::PeerId;
+use tracing::warn;
+
 use super::peer::Peer;
 use std::{
     collections::{HashMap, HashSet},
@@ -52,6 +55,26 @@ impl BannedPeers {
                 }
             })
             .collect()
+    }
+
+    /// Remove IP address associated with validator.
+    ///
+    /// This method is a precaution to ensure a committee member's IP address won't become
+    /// blocked during initial connection. It's possible the IP address becomes banned again,
+    /// but the validator won't be disconnected because it is a trusted peer.
+    ///
+    /// TODO: network test to confirm this
+    pub(super) fn remove_validator_ip(
+        &mut self,
+        peer_id: &PeerId,
+        ip_addresses: impl Iterator<Item = IpAddr>,
+    ) {
+        for ip in ip_addresses {
+            if let Some((_, _)) = self.banned_peers_by_ip.remove_entry(&ip) {
+                warn!(target: "peer-manager", ?peer_id, "removed banned ip address associated with validator");
+                self.total = self.total.saturating_sub(1);
+            }
+        }
     }
 
     /// Add IP addresses to the banned peers collection and update counts.

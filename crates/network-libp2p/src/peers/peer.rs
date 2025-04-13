@@ -25,6 +25,8 @@ pub(super) struct Peer {
     ///
     /// These are used to manage the banning process and are exchanged with peers.
     multiaddrs: HashSet<Multiaddr>,
+    /// The listening multiaddrs advertised by this peer.
+    listening_addrs: Vec<Multiaddr>,
     /// Connection status of the peer.
     connection_status: ConnectionStatus,
     /// Trusted peers are specifically included by node operators.
@@ -38,8 +40,8 @@ pub(super) struct Peer {
 impl Peer {
     /// Create a new trusted peer.
     pub(super) fn new_trusted(addr: Option<Multiaddr>) -> Peer {
-        let multiaddrs = addr.map(|multi| HashSet::from([multi])).unwrap_or_default();
-        Self { multiaddrs, score: Score::new_max(), is_trusted: true, ..Default::default() }
+        let listening_addrs = addr.map(|multi| vec![multi]).unwrap_or_default();
+        Self { listening_addrs, score: Score::new_max(), is_trusted: true, ..Default::default() }
     }
 
     /// Return a peer's reputation based on the aggregate score.
@@ -206,5 +208,25 @@ impl Peer {
     /// Extract relevant information for peer exchange.
     pub(super) fn exchange_info(&self) -> HashSet<Multiaddr> {
         self.multiaddrs.clone()
+    }
+
+    /// Update a peer record to make it trusted.
+    pub(super) fn make_trusted(&mut self) {
+        if !self.is_trusted {
+            self.is_trusted = true;
+            self.score = Score::new_max();
+        }
+    }
+
+    /// Update multiaddrs for the peer.
+    ///
+    /// Returns a boolean indicating if the multiaddr was newly recorded.
+    pub(super) fn update_listening_addrs(&mut self, multiaddr: Multiaddr) -> bool {
+        if !self.listening_addrs.contains(&multiaddr) {
+            self.listening_addrs.push(multiaddr);
+            true
+        } else {
+            false
+        }
     }
 }

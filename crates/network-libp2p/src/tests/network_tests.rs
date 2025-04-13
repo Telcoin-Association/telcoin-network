@@ -978,16 +978,8 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
             .start_listening(peer.config.authority().primary_network_address().clone())
             .await?;
 
-        // add target peer as authorized
-        peer.network_handle
-            .update_authorized_publishers(HashMap::from([(
-                TEST_TOPIC.into(),
-                HashSet::from([target_peer_id]),
-            )]))
-            .await?;
-
-        // Subscribe to test topic
-        peer.network_handle.subscribe(TEST_TOPIC.into(), peer.config.committee_peer_ids()).await?;
+        // subscribe to test topic with target peer as authorized publisher
+        peer.network_handle.subscribe(TEST_TOPIC.into(), HashSet::from([target_peer_id])).await?;
 
         // Connect to target peer
         peer.network_handle.dial(target_peer_id, target_addr.clone()).await?;
@@ -1031,6 +1023,265 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
             peer_id
         );
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
+    // Start with two peers
+    let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    let NetworkPeer { config: config_2, network_handle: peer2, network, .. } = peer2;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    // Start swarm listening
+    peer1.start_listening(config_1.authority().primary_network_address().clone()).await?;
+    peer2.start_listening(config_2.authority().primary_network_address().clone()).await?;
+
+    let peer2_id = peer2.local_peer_id().await?;
+    let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
+
+    // Connect peers
+    peer1.dial(peer2_id, peer2_addr.clone()).await?;
+
+    // Wait for connection to establish
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Verify connection established
+    let connected_peers = peer1.connected_peers().await?;
+    assert!(connected_peers.contains(&peer2_id), "Peer2 should be connected initially");
+
+    // Apply fatal penalty to peer2 - should ban it
+    peer1.report_penalty(peer2_id, Penalty::Fatal).await;
+
+    // Wait for ban to take effect
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+
+    // Verify peer2 is disconnected and banned
+    let connected_peers = peer1.connected_peers().await?;
+    assert!(!connected_peers.contains(&peer2_id), "Peer2 should be disconnected after ban");
+
+    let score = peer1.peer_score(peer2_id).await?.unwrap();
+    let min_score = config_1.network_config().peer_config().score_config.min_score;
+    assert_eq!(score, min_score, "Peer2 should have ban-level score");
+
+    // Now simulate a new epoch where peer2 is in the committee
+    let committee = HashMap::from([(peer2_id, peer2_addr.clone())]);
+
+    // Send NewEpoch command to peer1
+    let handle = peer1.clone();
+    tokio::spawn(async move {
+        handle.new_epoch(committee).await.expect("Failed to send NewEpoch command");
+    })
+    .await?;
+
+    // Wait for unban to take effect
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+
+    // Verify peer2's score has improved and is no longer banned
+    let score_after_epoch = peer1.peer_score(peer2_id).await?.unwrap();
+    assert_eq!(
+        score_after_epoch,
+        config_1.network_config().peer_config().score_config.max_score,
+        "Peer2 should have improved score after new epoch"
+    );
+
+    // Try reconnecting peer2
+    let dial_result = peer1.dial(peer2_id, peer2_addr).await;
+    warn!(target: "network", ?dial_result, "dial result??");
+    assert!(dial_result.is_ok(), "Should be able to reconnect to peer2 after unban");
+
+    // Wait for connection to reestablish
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Verify connection reestablished
+    let connected_peers_after = peer1.connected_peers().await?;
+    assert!(connected_peers_after.contains(&peer2_id), "Peer2 should be reconnected after unban");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
+    // Create multiple peers for this test
+    let num_peers = NonZeroUsize::new(4).unwrap();
+    let (mut target_peer, _) =
+        create_test_peers::<TestWorkerRequest, TestWorkerResponse>(num_peers, None);
+
+    // create new committee
+    let (_, mut other_peers) =
+        create_test_peers::<TestWorkerRequest, TestWorkerResponse>(num_peers, None);
+
+    // Start target peer network
+    let target_network = target_peer.network.take().expect("target network is some");
+    tokio::spawn(async move {
+        target_network.run().await.expect("network run failed!");
+    });
+
+    // Start listening
+    target_peer
+        .network_handle
+        .start_listening(target_peer.config.authority().primary_network_address().clone())
+        .await?;
+
+    // Take peer1 and peer2 from other_peers
+    let mut peer1 = other_peers.remove(0);
+    let mut peer2 = other_peers.remove(0);
+
+    // Start peer1 network
+    let peer1_network = peer1.network.take().expect("peer1 network is some");
+    let peer1_network_task = tokio::spawn(async move {
+        peer1_network.run().await.expect("network run failed!");
+    });
+
+    peer1
+        .network_handle
+        .start_listening(peer1.config.authority().primary_network_address().clone())
+        .await?;
+    let peer1_id = peer1.network_handle.local_peer_id().await?;
+    let peer1_addr =
+        peer1.network_handle.listeners().await?.first().expect("peer1 listen addr").clone();
+
+    // Start peer2 network - this will be our future committee member
+    // Use the SAME multiaddr as peer1 to simulate same IP
+    let peer2_network = peer2.network.take().expect("peer2 network is some");
+    tokio::spawn(async move {
+        peer2_network.run().await.expect("network run failed!");
+    });
+
+    // For peer2, create a multiaddr with the same IP as peer1 but different port
+    // Extract IP from peer1's multiaddr
+    let peer2_addr = peer1_addr.clone();
+    let peer2_id = peer2.network_handle.local_peer_id().await?;
+
+    // Connect target to peer1
+    target_peer.network_handle.dial(peer1_id, peer1_addr.clone()).await?;
+
+    // Wait for connection to establish
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Apply fatal penalty to peer1 - should ban it and its IP
+    target_peer.network_handle.report_penalty(peer1_id, Penalty::Fatal).await;
+
+    // Wait for ban to take effect
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+
+    // Verify peer1 is disconnected and banned
+    let connected_peers = target_peer.network_handle.connected_peers().await?;
+    assert!(!connected_peers.contains(&peer1_id), "Peer1 should be disconnected after ban");
+
+    // shutdown peer1 network
+    peer1_network_task.abort();
+
+    // allow os to make port available again
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+
+    peer2.network_handle.start_listening(peer2_addr.clone()).await?;
+
+    // Now simulate a new epoch where peer2 is in the committee with the same IP as banned peer1
+    let committee = HashMap::from([(peer2_id, peer2_addr)]);
+    let handle = target_peer.network_handle.clone();
+    tokio::spawn(async move {
+        handle.new_epoch(committee).await.expect("Failed to send NewEpoch command");
+    })
+    .await?;
+
+    // Verify connection can be established with peer2 despite sharing IP with banned peer1
+    target_peer.network_handle.dial(peer2_id, peer1_addr.clone()).await?;
+
+    // Wait for connection to establish
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Verify connection established with peer2
+    let connected_peers_after = target_peer.network_handle.connected_peers().await?;
+    assert!(
+        connected_peers_after.contains(&peer2_id),
+        "Peer2 should be connected despite sharing IP with banned peer1"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> {
+    // Start with two peers
+    let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    let NetworkPeer { config: config_2, network_handle: peer2, network, .. } = peer2;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    // Start swarm listening
+    peer1.start_listening(config_1.authority().primary_network_address().clone()).await?;
+    peer2.start_listening(config_2.authority().primary_network_address().clone()).await?;
+
+    let peer2_id = peer2.local_peer_id().await?;
+    let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
+
+    // Connect peers
+    peer1.dial(peer2_id, peer2_addr.clone()).await?;
+
+    // Wait for connection to establish
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Verify connection established
+    let connected_peers = peer1.connected_peers().await?;
+    assert!(connected_peers.contains(&peer2_id), "Peer2 should be connected initially");
+
+    // Apply severe penalties to put peer in a disconnecting state pending ban
+    // We need to apply penalties but not enough to cause immediate ban
+    // First apply medium penalties
+    for _ in 0..3 {
+        peer1.report_penalty(peer2_id, Penalty::Medium).await;
+    }
+
+    // Then apply a severe penalty - should trigger disconnect pending ban
+    peer1.report_penalty(peer2_id, Penalty::Severe).await;
+
+    // Wait for disconnect to begin but not complete
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Now simulate a new epoch where peer2 is in the committee
+    let committee = HashMap::from([(peer2_id, peer2_addr.clone())]);
+
+    // Send NewEpoch command to peer1
+    let handle = peer1.clone();
+    tokio::spawn(async move {
+        handle.new_epoch(committee).await.expect("Failed to send NewEpoch command");
+    })
+    .await?;
+
+    // Wait for epoch processing
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+
+    // Verify peer2's score has improved and is trusted
+    let score_after_epoch = peer1.peer_score(peer2_id).await?.unwrap();
+    assert!(score_after_epoch > 0.0, "Peer2 should have a positive score after new epoch");
+
+    // Try reconnecting peer2 if it was disconnected during the process
+    if !peer1.connected_peers().await?.contains(&peer2_id) {
+        let dial_result = peer1.dial(peer2_id, peer2_addr).await;
+        assert!(dial_result.is_ok(), "Should be able to reconnect to peer2 after new epoch");
+
+        // Wait for connection to reestablish
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Verify connection is established
+    let connected_peers_after = peer1.connected_peers().await?;
+    assert!(connected_peers_after.contains(&peer2_id), "Peer2 should be connected after new epoch");
 
     Ok(())
 }

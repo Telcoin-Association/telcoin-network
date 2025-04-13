@@ -305,14 +305,9 @@ where
     fn process_command(&mut self, command: NetworkCommand<Req, Res>) {
         match command {
             NetworkCommand::UpdateAuthorizedPublishers { authorities, reply } => {
+                // this value should be updated at the start of each epoch
                 self.authorized_publishers = authorities;
                 send_or_log_error!(reply, Ok(()), "UpdateAuthorizedPublishers");
-                // the peer manager should track these but will happen in a follow up PR
-                // to further distinguish authorized publishers at the epoch boundary
-                // vs consensus
-                //
-                // only CVVs should publish consensus messages, but every staked node
-                // should publish epoch boundary checkpoint votes
             }
             NetworkCommand::StartListening { multiaddr, reply } => {
                 let res = self.swarm.listen_on(multiaddr);
@@ -423,6 +418,18 @@ where
                 let peers = self.swarm.behaviour_mut().peer_manager.peers_for_exchange();
                 send_or_log_error!(reply, peers, "PeersForExchange");
             }
+            NetworkCommand::NewEpoch { committee } => {
+                // - add peers as trusted
+                // - gossipsub msg validation is updated by NetworkCommand::UpdateAuthorizedPublishers
+
+                // if committee.contains(self.peer_id) {
+                //      // only forward gossip messages
+                //      // don't try to store to db
+                //      self.process_gossip = false;
+                // }
+
+                self.swarm.behaviour_mut().peer_manager.new_epoch(committee);
+            }
         }
     }
 
@@ -447,6 +454,17 @@ where
 
                 // process gossip in application layer
                 if valid {
+                    // ???????
+                    //
+                    //
+                    //
+                    // don't process gossip if cvv - only validate and forward
+                    //
+                    //
+                    //
+                    //
+                    // DON't MeRGe THiS CoMMeNT
+
                     // forward gossip to handler
                     if let Err(e) = self
                         .event_stream

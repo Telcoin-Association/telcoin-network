@@ -7,39 +7,42 @@ use std::{
     net::IpAddr,
     time::{Duration, Instant},
 };
-use tn_config::ScoreConfig;
+use tn_config::{PeerConfig, ScoreConfig};
 
 /// Helper function to create a test AllPeers instance
-fn create_all_peers() -> AllPeers {
-    ensure_score_config();
+fn create_all_peers(peer_config: Option<PeerConfig>) -> AllPeers {
+    let config = peer_config.unwrap_or_default();
+    ensure_score_config(Some(config.score_config.clone()));
     let dial_timeout = Duration::from_secs(5);
-    let max_banned_peers = 10;
-    let max_disconnected_peers = 10;
-    AllPeers::new(dial_timeout, max_banned_peers, max_disconnected_peers)
+    AllPeers::new(dial_timeout, config.max_banned_peers, config.max_disconnected_peers)
 }
 
 #[test]
 fn test_add_trusted_peer() {
     let config = ScoreConfig::default();
-    let mut all_peers = create_all_peers();
+    let mut all_peers = create_all_peers(None);
     let peer_id = PeerId::random();
     let addr = create_multiaddr(None);
 
     all_peers.add_trusted_peer(peer_id, addr.clone());
 
     assert!(all_peers.peers.contains_key(&peer_id));
-    let peer = all_peers.peers.get(&peer_id).unwrap();
+    let peer = all_peers.peers.get_mut(&peer_id).unwrap();
     assert_eq!(peer.reputation(), Reputation::Trusted);
     assert_eq!(peer.score().aggregate_score(), config.max_score);
 
-    // check that address is stored
+    // assert that peer exchange doesn't include address for disconnected
+    assert!(!peer.exchange_info().iter().any(|a| a == &addr));
+
+    // update connection and assert exchange info
+    peer.register_outgoing(addr.clone());
     assert!(peer.exchange_info().iter().any(|a| a == &addr));
 }
 
 #[test]
 fn test_process_penalty() {
     let config = ScoreConfig::default();
-    let mut all_peers = create_all_peers();
+    let mut all_peers = create_all_peers(None);
     let peer_id = PeerId::random();
 
     // add connected peer first and set as this node dialed
@@ -78,7 +81,7 @@ fn test_process_penalty() {
 
 #[test]
 fn test_ensure_peer_exists() {
-    let mut all_peers = create_all_peers();
+    let mut all_peers = create_all_peers(None);
     let peer_id = PeerId::random();
 
     // Unknown peer, valid initial state
@@ -98,7 +101,7 @@ fn test_ensure_peer_exists() {
 
 #[test]
 fn test_peer_exchange() {
-    let mut all_peers = create_all_peers();
+    let mut all_peers = create_all_peers(None);
 
     // Add some connected peers
     for _ in 1..4 {
@@ -125,7 +128,7 @@ fn test_peer_exchange() {
 
 #[test]
 fn test_connected_peers_by_score() {
-    let mut all_peers = create_all_peers();
+    let mut all_peers = create_all_peers(None);
 
     // Add some connected peers
     for _ in 1..4 {
@@ -152,7 +155,7 @@ fn test_connected_peers_by_score() {
 
 #[test]
 fn test_heartbeat_maintenance() {
-    let mut all_peers = create_all_peers();
+    let mut all_peers = create_all_peers(None);
     let peer_id = PeerId::random();
 
     // Add a dialing peer
@@ -178,10 +181,12 @@ fn test_heartbeat_maintenance() {
 
 #[test]
 fn test_pruning_logic() {
-    let mut all_peers = create_all_peers();
+    let config = PeerConfig::default();
+    let mut all_peers = create_all_peers(Some(config.clone()));
 
     // Add many disconnected peers
-    for i in 1..1002_u16 {
+    let peer_num = 101;
+    for i in 1..=peer_num {
         let peer_id = PeerId::random();
 
         all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
@@ -199,20 +204,20 @@ fn test_pruning_logic() {
         }
     }
 
-    assert_eq!(all_peers.disconnected_peers, 1001);
+    assert_eq!(all_peers.disconnected_peers, peer_num);
 
     // Pruning happens in register_disconnected
     all_peers.register_disconnected(&PeerId::random());
 
     // Should be pruned to MAX_DISCONNECTED_PEERS (1000)
-    assert_eq!(all_peers.disconnected_peers, 1000);
-    assert_eq!(all_peers.peers.len(), 1000);
+    assert_eq!(all_peers.disconnected_peers, config.max_disconnected_peers);
+    assert_eq!(all_peers.peers.len(), config.max_disconnected_peers);
 
     // Now test banned peers pruning
-    let mut all_peers = create_all_peers();
+    let mut all_peers = create_all_peers(None);
 
     // Add many banned peers
-    for i in 1..1002 {
+    for i in 1..=peer_num {
         let peer_id = PeerId::random();
 
         // Need to go through disconnecting first
@@ -235,20 +240,20 @@ fn test_pruning_logic() {
         }
     }
 
-    assert_eq!(all_peers.banned_peers.total(), 1001);
+    assert_eq!(all_peers.banned_peers.total(), peer_num);
 
     // Trigger pruning
     let (_, pruned) = all_peers.register_disconnected(&PeerId::random());
 
     // Should be pruned to MAX_BANNED_PEERS (1000)
-    assert_eq!(all_peers.banned_peers.total(), 1000);
-    assert_eq!(pruned.len(), 1); // 1 peer should be pruned
+    assert_eq!(all_peers.banned_peers.total(), config.max_banned_peers);
+    let expected = peer_num - config.max_banned_peers;
+    assert_eq!(pruned.len(), expected); // 1 peer should be pruned
 }
 
 #[test]
 fn test_is_validator() {
-    ensure_score_config();
-
+    ensure_score_config(None);
     let validator_id = PeerId::random();
     let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
     all_peers.validators.insert(validator_id);
@@ -258,7 +263,7 @@ fn test_is_validator() {
 
 #[test]
 fn test_ip_and_peer_banned() {
-    let mut all_peers = create_all_peers();
+    let mut all_peers = create_all_peers(None);
     let peer_id = PeerId::random();
     let addr = create_multiaddr(None);
 
@@ -310,7 +315,7 @@ fn test_ip_and_peer_banned() {
 
 #[test]
 fn test_connected_peer_methods() {
-    let mut all_peers = create_all_peers();
+    let mut all_peers = create_all_peers(None);
 
     // Add some connected peers
     let connected_peer_id = PeerId::random();
@@ -355,7 +360,7 @@ fn test_connected_peer_methods() {
 
 #[test]
 fn test_unknown_to_connected_transition() {
-    let mut all_peers = create_all_peers();
+    let mut all_peers = create_all_peers(None);
     let peer_id = PeerId::random();
     let addr = create_multiaddr(None);
 
@@ -376,7 +381,7 @@ fn test_unknown_to_connected_transition() {
 
 #[test]
 fn test_connected_to_disconnecting_transition() {
-    let mut all_peers = create_all_peers();
+    let mut all_peers = create_all_peers(None);
     let peer_id = PeerId::random();
     let addr = create_multiaddr(None);
 
@@ -401,7 +406,7 @@ fn test_connected_to_disconnecting_transition() {
 
 #[test]
 fn test_disconnecting_to_disconnected_transition() {
-    let mut all_peers = create_all_peers();
+    let mut all_peers = create_all_peers(None);
     let peer_id = PeerId::random();
     let addr = create_multiaddr(None);
 
@@ -428,7 +433,7 @@ fn test_disconnecting_to_disconnected_transition() {
 
 #[test]
 fn test_disconnected_to_dialing_transition() {
-    let mut all_peers = create_all_peers();
+    let mut all_peers = create_all_peers(None);
     let peer_id = PeerId::random();
 
     // set to Disconnected
@@ -447,7 +452,7 @@ fn test_disconnected_to_dialing_transition() {
 
 #[test]
 fn test_dialing_to_connected_transition() {
-    let mut all_peers = create_all_peers();
+    let mut all_peers = create_all_peers(None);
     let peer_id = PeerId::random();
     let addr = create_multiaddr(None);
 
@@ -471,7 +476,7 @@ fn test_dialing_to_connected_transition() {
 
 #[test]
 fn test_disconnected_to_banned_transition() {
-    let mut all_peers = create_all_peers();
+    let mut all_peers = create_all_peers(None);
     let peer_id = PeerId::random();
 
     // Setup: Set to Disconnected
@@ -488,7 +493,7 @@ fn test_disconnected_to_banned_transition() {
 
 #[test]
 fn test_banned_to_unbanned_transition() {
-    let mut all_peers = create_all_peers();
+    let mut all_peers = create_all_peers(None);
     let peer_id = PeerId::random();
 
     // Setup: Disconnected -> Banned
@@ -506,7 +511,7 @@ fn test_banned_to_unbanned_transition() {
 
 #[test]
 fn test_connected_to_banned_transition() {
-    let mut all_peers = create_all_peers();
+    let mut all_peers = create_all_peers(None);
     let peer_id = PeerId::random();
     let addr = create_multiaddr(None);
 
