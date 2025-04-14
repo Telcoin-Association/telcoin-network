@@ -124,7 +124,7 @@ async fn start_networks<DB: TNDatabase>(
     // subscribe to epoch closing gossip messages
     primary_network_handle
         .subscribe(
-            consensus_config.network_config().libp2p_config().primary_topics(),
+            consensus_config.network_config().libp2p_config().primary_topic(),
             consensus_config.committee_peer_ids(),
         )
         .await?;

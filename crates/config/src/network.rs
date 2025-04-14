@@ -104,12 +104,12 @@ pub struct LibP2pConfig {
 
 impl LibP2pConfig {
     /// Return topics for primary.
-    pub fn primary_topics(&self) -> String {
+    pub fn primary_topic(&self) -> String {
         String::from("tn-primary")
     }
 
     /// Return topics for worker.
-    pub fn worker_topics(&self) -> String {
+    pub fn worker_topic(&self) -> String {
         String::from("tn-worker")
     }
 }
