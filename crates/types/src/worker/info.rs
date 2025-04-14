@@ -12,7 +12,7 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     str::FromStr,
     sync::Arc,
@@ -43,7 +43,6 @@ pub struct WorkerInfo {
 
 impl Default for WorkerInfo {
     fn default() -> Self {
-        // TODO: env vars should be applied at the CLI level, not here
         let host = std::env::var("NARWHAL_HOST").unwrap_or("127.0.0.1".to_string());
         let worker_udp_port = get_available_udp_port(&host).unwrap_or(49594).to_string();
 
@@ -239,7 +238,7 @@ impl WorkerCache {
     }
 
     /// Returns the addresses of all known workers.
-    pub fn all_workers(&self) -> Vec<(PeerId, Multiaddr)> {
+    pub fn all_workers(&self) -> HashMap<PeerId, Multiaddr> {
         self.workers
             .iter()
             .flat_map(|(_, w)| {

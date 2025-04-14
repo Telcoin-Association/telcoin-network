@@ -305,14 +305,9 @@ where
     fn process_command(&mut self, command: NetworkCommand<Req, Res>) {
         match command {
             NetworkCommand::UpdateAuthorizedPublishers { authorities, reply } => {
+                // this value should be updated at the start of each epoch
                 self.authorized_publishers = authorities;
                 send_or_log_error!(reply, Ok(()), "UpdateAuthorizedPublishers");
-                // the peer manager should track these but will happen in a follow up PR
-                // to further distinguish authorized publishers at the epoch boundary
-                // vs consensus
-                //
-                // only CVVs should publish consensus messages, but every staked node
-                // should publish epoch boundary checkpoint votes
             }
             NetworkCommand::StartListening { multiaddr, reply } => {
                 let res = self.swarm.listen_on(multiaddr);
@@ -423,6 +418,20 @@ where
                 let peers = self.swarm.behaviour_mut().peer_manager.peers_for_exchange();
                 send_or_log_error!(reply, peers, "PeersForExchange");
             }
+            NetworkCommand::NewEpoch { committee } => {
+                // at the start of a new epoch, each node needs to know:
+                // - the current committee
+                // - all staked nodes who will vote at the end of the epoch
+                //      - only synced nodes can vote
+                //
+                // once a node stakes and tries to sync, it would be nice
+                // if it could receive priority on the network for syncing
+                // state
+                //
+                // for now, this only supports the current committee for the epoch
+
+                self.swarm.behaviour_mut().peer_manager.new_epoch(committee);
+            }
         }
     }
 
@@ -447,6 +456,8 @@ where
 
                 // process gossip in application layer
                 if valid {
+                    // TODO: Issue #253
+                    //
                     // forward gossip to handler
                     if let Err(e) = self
                         .event_stream

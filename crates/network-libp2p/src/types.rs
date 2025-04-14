@@ -233,6 +233,11 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<PeerExchangeMap>,
     },
+    /// Start a new epoch.
+    NewEpoch {
+        /// The epoch committee.
+        committee: HashMap<PeerId, Multiaddr>,
+    },
 }
 
 /// Network handle.
@@ -455,6 +460,12 @@ where
         let (reply, res) = oneshot::channel();
         self.sender.send(NetworkCommand::PeersForExchange { reply }).await?;
         res.await.map_err(Into::into)
+    }
+
+    /// Create a [PeerExchangeMap] for exchanging peers.
+    pub async fn new_epoch(&self, committee: HashMap<PeerId, Multiaddr>) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::NewEpoch { committee }).await?;
+        Ok(())
     }
 }
 

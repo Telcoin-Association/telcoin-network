@@ -7,7 +7,7 @@ use std::net::Ipv4Addr;
 
 /// Helper function to create a peer with specific IP addresses.
 fn create_peer_with_ips(ips: Vec<IpAddr>) -> Peer {
-    ensure_score_config();
+    ensure_score_config(None);
 
     let mut peer = Peer::default();
 
@@ -89,7 +89,7 @@ fn test_add_multiple_peers_same_ip() {
 
 #[test]
 fn test_add_peer_no_ip() {
-    ensure_score_config();
+    ensure_score_config(None);
     let mut banned_peers = BannedPeers::default();
 
     // Create a peer with no IP addresses
