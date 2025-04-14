@@ -3,7 +3,7 @@
 use crate::{
     codec::TNMessage, error::NetworkError, peers::Penalty, GossipMessage, PeerExchangeMap,
 };
-pub use libp2p::gossipsub::{IdentTopic, MessageId};
+pub use libp2p::gossipsub::MessageId;
 use libp2p::{
     core::transport::ListenerId,
     gossipsub::{PublishError, SubscriptionError, TopicHash},
@@ -77,8 +77,8 @@ where
     /// This list is used to verify messages came from an authorized source.
     /// Only valid for Subscriber implementations.
     UpdateAuthorizedPublishers {
-        /// The unique set of authorized peers.
-        authorities: HashSet<PeerId>,
+        /// The unique set of authorized peers by topic.
+        authorities: HashMap<String, HashSet<PeerId>>,
         /// The acknowledgement that the set was updated.
         reply: oneshot::Sender<NetworkResult<()>>,
     },
@@ -157,14 +157,16 @@ where
     /// Subscribe to a topic.
     Subscribe {
         /// The topic to subscribe to.
-        topic: IdentTopic,
+        topic: String,
+        /// Authorized publishers.
+        publishers: HashSet<PeerId>,
         /// The reply to caller.
         reply: oneshot::Sender<Result<bool, SubscriptionError>>,
     },
     /// Publish a message to topic subscribers.
     Publish {
         /// The topic to publish the message on.
-        topic: IdentTopic,
+        topic: String,
         /// The encoded message to publish.
         msg: Vec<u8>,
         /// The reply to caller.
@@ -188,7 +190,7 @@ where
     /// Collection of all mesh peers by a certain topic hash.
     MeshPeers {
         /// The topic to filter peers.
-        topic: TopicHash,
+        topic: String,
         /// Reply to caller.
         reply: oneshot::Sender<Vec<PeerId>>,
     },
@@ -231,6 +233,11 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<PeerExchangeMap>,
     },
+    /// Start a new epoch.
+    NewEpoch {
+        /// The epoch committee.
+        committee: HashMap<PeerId, Multiaddr>,
+    },
 }
 
 /// Network handle.
@@ -265,7 +272,7 @@ where
     /// Update the list of authorized publishers.
     pub async fn update_authorized_publishers(
         &self,
-        authorities: HashSet<PeerId>,
+        authorities: HashMap<String, HashSet<PeerId>>,
     ) -> NetworkResult<()> {
         let (reply, ack) = oneshot::channel();
         self.sender.send(NetworkCommand::UpdateAuthorizedPublishers { authorities, reply }).await?;
@@ -322,15 +329,19 @@ where
     /// Subscribe to a topic.
     ///
     /// Return swarm error to caller.
-    pub async fn subscribe(&self, topic: IdentTopic) -> NetworkResult<bool> {
+    pub async fn subscribe(
+        &self,
+        topic: String,
+        publishers: HashSet<PeerId>,
+    ) -> NetworkResult<bool> {
         let (reply, already_subscribed) = oneshot::channel();
-        self.sender.send(NetworkCommand::Subscribe { topic, reply }).await?;
+        self.sender.send(NetworkCommand::Subscribe { topic, publishers, reply }).await?;
         let res = already_subscribed.await?;
         res.map_err(Into::into)
     }
 
     /// Publish a message on a certain topic.
-    pub async fn publish(&self, topic: IdentTopic, msg: Vec<u8>) -> NetworkResult<MessageId> {
+    pub async fn publish(&self, topic: String, msg: Vec<u8>) -> NetworkResult<MessageId> {
         let (reply, published) = oneshot::channel();
         self.sender.send(NetworkCommand::Publish { topic, msg, reply }).await?;
         published.await?.map_err(Into::into)
@@ -358,7 +369,7 @@ where
     }
 
     /// Collection of all mesh peers by a certain topic hash.
-    pub async fn mesh_peers(&self, topic: TopicHash) -> NetworkResult<Vec<PeerId>> {
+    pub async fn mesh_peers(&self, topic: String) -> NetworkResult<Vec<PeerId>> {
         let (reply, mesh_peers) = oneshot::channel();
         self.sender.send(NetworkCommand::MeshPeers { topic, reply }).await?;
         mesh_peers.await.map_err(Into::into)
@@ -449,6 +460,12 @@ where
         let (reply, res) = oneshot::channel();
         self.sender.send(NetworkCommand::PeersForExchange { reply }).await?;
         res.await.map_err(Into::into)
+    }
+
+    /// Create a [PeerExchangeMap] for exchanging peers.
+    pub async fn new_epoch(&self, committee: HashMap<PeerId, Multiaddr>) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::NewEpoch { committee }).await?;
+        Ok(())
     }
 }
 

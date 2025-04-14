@@ -12,9 +12,7 @@ use message::{PrimaryGossip, PrimaryRPCError};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
-    types::{
-        IdentTopic, IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult,
-    },
+    types::{IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
     GossipMessage, Multiaddr, PeerExchangeMap, PeerId, Penalty, ResponseChannel,
 };
 use tn_network_types::{
@@ -73,7 +71,7 @@ impl PrimaryNetworkHandle {
     /// Publish a certificate to the consensus network.
     pub async fn publish_certificate(&self, certificate: Certificate) -> NetworkResult<()> {
         let data = encode(&PrimaryGossip::Certificate(Box::new(certificate)));
-        self.handle.publish(IdentTopic::new("tn-primary"), data).await?;
+        self.handle.publish("tn-primary".into(), data).await?;
         Ok(())
     }
 
@@ -84,7 +82,7 @@ impl PrimaryNetworkHandle {
         consensus_header_hash: BlockHash,
     ) -> NetworkResult<()> {
         let data = encode(&PrimaryGossip::Consenus(consensus_block_num, consensus_header_hash));
-        self.handle.publish(IdentTopic::new("tn-primary"), data).await?;
+        self.handle.publish("tn-primary".into(), data).await?;
         Ok(())
     }
 

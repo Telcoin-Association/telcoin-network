@@ -9,7 +9,7 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
-    types::{IdentTopic, NetworkEvent, NetworkHandle, NetworkResult},
+    types::{NetworkEvent, NetworkHandle, NetworkResult},
     GossipMessage, Multiaddr, PeerExchangeMap, PeerId, Penalty, ResponseChannel,
 };
 use tn_network_types::{FetchBatchResponse, PrimaryToWorkerClient, WorkerSynchronizeMessage};
@@ -62,7 +62,7 @@ impl WorkerNetworkHandle {
     /// Publish a batch digest to the worker network.
     pub async fn publish_batch(&self, batch_digest: BlockHash) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Batch(batch_digest));
-        self.handle.publish(IdentTopic::new("tn-worker"), data).await?;
+        self.handle.publish("tn-worker".into(), data).await?;
         Ok(())
     }
 
