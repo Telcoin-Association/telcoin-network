@@ -183,6 +183,17 @@ where
         self.inner.committee.authorities().iter().map(|a| a.peer_id()).collect()
     }
 
+    /// Map of primary peer ids and multiaddrs in the current committee.
+    pub fn primary_network_map(&self) -> HashMap<PeerId, Multiaddr> {
+        self.inner
+            .committee
+            .authorities()
+            .iter()
+            .map(|a| (a.peer_id(), a.primary_network_address().clone()))
+            .collect()
+    }
+
+    /// Bool indicating if an authority identifier is in the current committee.
     pub fn in_committee(&self, id: &AuthorityIdentifier) -> bool {
         self.inner.committee.is_authority(id)
     }
@@ -194,5 +205,10 @@ where
             .worker(self.authority().protocol_key(), id)
             .expect("Our public key or worker id is not in the worker cache")
             .worker_address
+    }
+
+    /// Map of worker peer ids and multiaddrs in the current committee.
+    pub fn worker_network_map(&self) -> HashMap<PeerId, Multiaddr> {
+        self.worker_cache().all_workers()
     }
 }

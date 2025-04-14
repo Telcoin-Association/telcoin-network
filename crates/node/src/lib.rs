@@ -118,6 +118,9 @@ async fn start_networks<DB: TNDatabase>(
         )
     });
 
+    // set committee for network to prevent banning
+    primary_network_handle.new_epoch(consensus_config.primary_network_map()).await?;
+
     // subscribe to epoch closing gossip messages
     primary_network_handle
         .subscribe(
@@ -138,6 +141,9 @@ async fn start_networks<DB: TNDatabase>(
     let worker_multiaddr =
         get_multiaddr_from_env_or_config("WORKER_MULTIADDR", worker_address.clone());
     worker_network_handle.start_listening(worker_multiaddr).await?;
+    worker_network_handle.new_epoch(consensus_config.worker_network_map()).await?;
+
+    // create specific handles for primary/worker
     let primary_network_handle = PrimaryNetworkHandle::new(primary_network_handle);
     let worker_network_handle = WorkerNetworkHandle::new(worker_network_handle);
     let peers_connected = Arc::new(AtomicU32::new(0));
@@ -145,16 +151,11 @@ async fn start_networks<DB: TNDatabase>(
     for (authority_id, addr, _) in
         consensus_config.committee().others_primaries_by_id(&consensus_config.authority().id())
     {
-        // TODO: add as trusted peer
-        // this should also account for nvv/cvv
-        // primary gossips out on topics but only subscribes to epoch boundary notifications
         let peer_id = authority_id.peer_id();
         dial_primary(primary_network_handle.clone(), peer_id, addr, peers_connected.clone());
     }
     for (peer_id, addr) in consensus_config.worker_cache().all_workers() {
         if addr != worker_address {
-            // TODO: add as trusted peer
-            // worker gossips out batch digests but only subscribes if NVV
             dial_worker(worker_network_handle.clone(), peer_id, addr, workers_connected.clone());
         }
     }
