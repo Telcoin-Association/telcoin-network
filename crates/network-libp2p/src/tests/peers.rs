@@ -12,7 +12,7 @@ use tn_config::{PeerConfig, ScoreConfig};
 /// Helper function to create a test AllPeers instance
 fn create_all_peers(peer_config: Option<PeerConfig>) -> AllPeers {
     let config = peer_config.unwrap_or_default();
-    ensure_score_config(Some(config.score_config.clone()));
+    ensure_score_config(Some(config.score_config));
     let dial_timeout = Duration::from_secs(5);
     AllPeers::new(dial_timeout, config.max_banned_peers, config.max_disconnected_peers)
 }
@@ -182,7 +182,7 @@ fn test_heartbeat_maintenance() {
 #[test]
 fn test_pruning_logic() {
     let config = PeerConfig::default();
-    let mut all_peers = create_all_peers(Some(config.clone()));
+    let mut all_peers = create_all_peers(Some(config));
 
     // Add many disconnected peers
     let peer_num = 101;
@@ -256,7 +256,7 @@ fn test_is_validator() {
     ensure_score_config(None);
     let validator_id = PeerId::random();
     let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
-    all_peers.validators.insert(validator_id);
+    all_peers.current_committee.insert(validator_id);
     assert!(all_peers.is_validator(&validator_id));
     assert!(!all_peers.is_validator(&PeerId::random()));
 }

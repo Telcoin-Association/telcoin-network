@@ -419,14 +419,16 @@ where
                 send_or_log_error!(reply, peers, "PeersForExchange");
             }
             NetworkCommand::NewEpoch { committee } => {
-                // - add peers as trusted
-                // - gossipsub msg validation is updated by NetworkCommand::UpdateAuthorizedPublishers
-
-                // if committee.contains(self.peer_id) {
-                //      // only forward gossip messages
-                //      // don't try to store to db
-                //      self.process_gossip = false;
-                // }
+                // at the start of a new epoch, each node needs to know:
+                // - the current committee
+                // - all staked nodes who will vote at the end of the epoch
+                //      - only synced nodes can vote
+                //
+                // once a node stakes and tries to sync, it would be nice
+                // if it could receive priority on the network for syncing
+                // state
+                //
+                // for now, this only supports the current committee for the epoch
 
                 self.swarm.behaviour_mut().peer_manager.new_epoch(committee);
             }
@@ -454,17 +456,8 @@ where
 
                 // process gossip in application layer
                 if valid {
-                    // ???????
+                    // TODO: Issue #253
                     //
-                    //
-                    //
-                    // don't process gossip if cvv - only validate and forward
-                    //
-                    //
-                    //
-                    //
-                    // DON't MeRGe THiS CoMMeNT
-
                     // forward gossip to handler
                     if let Err(e) = self
                         .event_stream

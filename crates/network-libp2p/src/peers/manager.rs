@@ -207,7 +207,7 @@ impl PeerManager {
             self.apply_peer_action(peer_id, action);
         }
 
-        // TODO: update metrics
+        // TODO: Issue #254 update metrics
 
         self.prune_connected_peers();
 
@@ -256,6 +256,10 @@ impl PeerManager {
     }
 
     /// Returns a boolean if the peer is a known validator.
+    ///
+    /// `AllPeers` only tracks CVVs for now. (current voting validators)
+    ///
+    /// This method will be extended to support any staked validator.
     pub(super) fn is_validator(&self, peer_id: &PeerId) -> bool {
         self.peers.is_validator(peer_id)
     }
@@ -429,7 +433,7 @@ impl PeerManager {
         let ready_to_prune = connected_peers
             .iter()
             .filter_map(|(peer_id, peer)| {
-                if !self.peers.is_validator(peer_id) && !peer.is_trusted() {
+                if !self.is_validator(peer_id) && !peer.is_trusted() {
                     Some(**peer_id)
                 } else {
                     None

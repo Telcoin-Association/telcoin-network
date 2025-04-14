@@ -62,8 +62,6 @@ impl BannedPeers {
     /// This method is a precaution to ensure a committee member's IP address won't become
     /// blocked during initial connection. It's possible the IP address becomes banned again,
     /// but the validator won't be disconnected because it is a trusted peer.
-    ///
-    /// TODO: network test to confirm this
     pub(super) fn remove_validator_ip(
         &mut self,
         peer_id: &PeerId,

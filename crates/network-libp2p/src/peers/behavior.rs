@@ -110,7 +110,7 @@ impl NetworkBehaviour for PeerManager {
             FromSwarm::ExternalAddrConfirmed(_) => {
                 // The external address was confirmed: possible to support NAT traversal
                 //
-                // TODO: update metrics here
+                // TODO: Issue #254 update metrics here
             }
             _ => {
                 // `FromSwarm` is non-exhaustive
@@ -182,7 +182,7 @@ impl PeerManager {
             "connection established"
         );
 
-        // TODO: update metrics
+        // TODO: Issue #254 update metrics
 
         // check connection limits
         if self.peer_limit_reached(endpoint) && !self.peer_is_important(&peer_id) {
@@ -243,7 +243,7 @@ impl PeerManager {
         // when this happens, the peer manager still needs to register this peer
         self.register_disconnected(&peer_id);
 
-        // TODO: update metrics
+        // TODO: Issue #254 update metrics
     }
 
     /// Dial attempt failed.

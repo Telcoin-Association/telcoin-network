@@ -34,8 +34,8 @@ mod peers;
 pub(super) struct AllPeers {
     /// The collection of known connected peers, their status and reputation
     peers: HashMap<PeerId, Peer>,
-    /// The collection of staked validators at the beginning of each epoch.
-    validators: HashSet<PeerId>,
+    /// The collection of staked current_committee at the beginning of each epoch.
+    current_committee: HashSet<PeerId>,
     /// Information for peers that scored poorly enough to become banned.
     banned_peers: BannedPeers,
     /// The number of peers that have disconnected from this node.
@@ -59,7 +59,7 @@ impl AllPeers {
     ) -> Self {
         Self {
             peers: Default::default(),
-            validators: Default::default(),
+            current_committee: Default::default(),
             banned_peers: Default::default(),
             disconnected_peers: 0,
             pending_dials: Default::default(),
@@ -604,9 +604,15 @@ impl AllPeers {
         self.peers.get(peer_id)
     }
 
-    /// Boolean indicating if this peer is a staked validator.
+    /// Boolean indicating if this peer is a validator.
+    /// This method will be updated to include nvvs as well.
     pub(super) fn is_validator(&self, peer_id: &PeerId) -> bool {
-        self.validators.contains(peer_id)
+        self.is_cvv(peer_id)
+    }
+
+    /// Boolean indicating if this peer is in the current committee of voting validators.
+    pub(super) fn is_cvv(&self, peer_id: &PeerId) -> bool {
+        self.current_committee.contains(peer_id)
     }
 
     /// Boolean indicating if the ip address is associated with a banned peer.
@@ -781,13 +787,17 @@ impl AllPeers {
 
     /// Update committee for the new epoch.
     ///
-    /// NOTE: very similar to `Self::add_explicit_peer` but doesn't dial.
+    /// The committee is tracked to ensure priority on the network.
+    /// The banned status of any committee peer is forgiven and IPs
+    /// associated with the committee node are reset. The advertised
+    /// listening addresses are updated and the peer is marked `trusted`
+    /// so it won't incur any additional penalties.
     pub(super) fn new_epoch(
         &mut self,
         committee: HashMap<PeerId, Multiaddr>,
     ) -> Vec<(PeerId, PeerAction)> {
-        // update current committee of validators
-        self.validators = committee.keys().cloned().collect();
+        // update current committee
+        self.current_committee = committee.keys().cloned().collect();
 
         let mut actions = Vec::with_capacity(committee.len());
         for (peer_id, addr) in committee.into_iter() {
