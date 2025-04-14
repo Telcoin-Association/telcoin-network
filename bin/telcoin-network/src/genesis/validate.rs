@@ -30,7 +30,6 @@ pub struct ValidateArgs {
     ///
     /// The GENESIS_DIRECTORY contains more directories:
     /// - committee
-    /// - todo
     ///
     /// Validators add their information to the directory using VCS like
     /// github. Using individual files prevents merge conflicts.
@@ -60,8 +59,6 @@ impl ValidateArgs {
     /// Process:
     /// - loop through validators within the genesis directory
     /// - ensure valid state for validators
-    ///
-    /// TODO: `validate` only verifies proof of possession for now
     pub fn execute(&self) -> eyre::Result<()> {
         info!(target: "genesis::validate", "validating validators nominated for committee");
 

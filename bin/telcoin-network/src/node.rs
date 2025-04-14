@@ -90,8 +90,6 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(long, conflicts_with = "instance", global = true)]
     pub with_unused_ports: bool,
 
-    // TODO: this is painful to maintain
-    // need a better way to overwrite reth DataDirPath
     /// The path to the data dir for all telcoin-network files and subdirectories.
     ///
     /// Defaults to the OS-specific data directory:
@@ -174,7 +172,6 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         let default_args = default_datadir_args();
         let tn_datadir: DataDirChainPath =
             self.datadir.unwrap_or_chain_default(self.chain.chain, default_args.clone()).into();
-        // TODO: use config or CLI chain spec?
         let config_path = self.config.clone().unwrap_or(tn_datadir.node_config_path());
 
         let mut tn_config: Config = Config::load_from_path(&config_path, ConfigFmt::YAML)?;
@@ -252,7 +249,6 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         let database =
             Arc::new(init_db(db_path.clone(), node_config.db.database_args())?.with_metrics());
 
-        // TODO: temporary solution until upstream reth supports public rpc hooks
         let builder = TnBuilder {
             database,
             node_config,

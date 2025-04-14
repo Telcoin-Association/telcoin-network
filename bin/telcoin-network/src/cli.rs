@@ -81,22 +81,6 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     /// This accepts a closure that is used to launch the node via the
     /// [NodeCommand](node::NodeCommand).
     ///
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use reth::cli::Cli;
-    /// use reth_node_ethereum::EthereumNode;
-    ///
-    /// Cli::parse_args()
-    ///     .run(|builder, _| async move {
-    ///         let handle = builder.launch_node(EthereumNode::default()).await?;
-    ///
-    ///         handle.wait_for_node_exit().await
-    ///     })
-    ///     .unwrap();
-    /// ```
-    ///
     /// # Example
     ///
     /// Parse additional CLI arguments for the node command and use it to configure the node.
@@ -207,8 +191,8 @@ mod tests {
         assert!(log_dir.as_ref().ends_with(end), "{log_dir:?}");
     }
 
-    #[tokio::test]
-    async fn parse_env_filter_directives() {
+    #[test]
+    fn parse_env_filter_directives() {
         let temp_dir = tempfile::tempdir().unwrap();
 
         std::env::set_var("RUST_LOG", "info,evm=debug");
