@@ -1,3 +1,5 @@
+//! Comprehensive tests for random nodes restarting during network activity.
+
 use crate::util::{config_local_testnet, IT_TEST_MUTEX};
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;

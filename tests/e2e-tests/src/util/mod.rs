@@ -1,3 +1,5 @@
+//! Utilities for e2e tests.
+
 use clap::Parser;
 use reth_chainspec::ChainSpec;
 use std::{path::PathBuf, sync::Arc};
@@ -6,6 +8,7 @@ use tn_node::launch_node;
 use tn_test_utils::CommandParser;
 use tracing::error;
 
+/// Guard for ensuring restart tests run in-sync.
 pub static IT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Execute genesis ceremony inside tempdir

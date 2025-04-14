@@ -68,21 +68,10 @@ reth-payload-builder = { workspace = true }
 tempfile = { workspace = true }
 
 # Used for integration testing.
-ethereum-tx-sign = "6.1.3"
 const-hex = "1.12.0"
 # Alternate sync json rpc lib- just for integration testing.
 jsonrpc = "0.18.0"
 
-# faucet-specific
-gcloud-sdk = { version = "=0.24.6", default-features = false, features = [
-    "google-cloud-kms-v1",
-    "tls-webpki-roots",
-] }
-jsonrpsee = { workspace = true }
-k256 = "0.13.3"
-tn-test-utils = { workspace = true }
-tonic = { workspace = true }
-nix = { version = "0.29", features = ["signal"] }
 
 [features]
 default = []

@@ -2897,6 +2897,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d6ef0072f8a535281e4876be788938b528e9a1d43900b82c2569af7da799125"
 
 [[package]]
+name = "e2e-tests"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "clap",
+ "const-hex",
+ "ethereum-tx-sign",
+ "eyre",
+ "futures",
+ "gcloud-sdk",
+ "jsonrpc",
+ "jsonrpsee",
+ "k256",
+ "nix 0.29.0",
+ "rand",
+ "reth-chainspec",
+ "secp256k1 0.29.1",
+ "serde_json",
+ "telcoin-network",
+ "tempfile",
+ "tn-config",
+ "tn-faucet",
+ "tn-node",
+ "tn-test-utils",
+ "tn-types",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ecdsa"
 version = "0.16.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11222,21 +11252,16 @@ dependencies = [
  "consensus-metrics",
  "const-hex",
  "const-str",
- "ethereum-tx-sign",
  "eyre",
  "fdlimit",
  "futures",
- "gcloud-sdk",
  "humantime",
  "hyper 0.14.32",
  "jsonrpc",
- "jsonrpsee",
- "k256",
  "metrics 0.23.0",
  "metrics-exporter-prometheus 0.12.2",
  "metrics-process 1.2.1",
  "metrics-util 0.15.0",
- "nix 0.29.0",
  "pin-project 1.1.8",
  "prometheus",
  "rand",
@@ -11262,10 +11287,8 @@ dependencies = [
  "tn-config",
  "tn-faucet",
  "tn-node",
- "tn-test-utils",
  "tn-types",
  "tokio",
- "tonic 0.13.0",
  "tracing",
  "vergen",
 ]
