@@ -16,12 +16,10 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 // pub for tests
-pub mod util;
+pub mod utils;
 
 #[cfg(test)]
 pub mod genesis_tests;
-#[cfg(test)]
-pub mod restarts;
 
 #[cfg(test)]
 #[cfg(feature = "faucet")]
@@ -34,3 +32,5 @@ use futures as _;
 use gcloud_sdk as _;
 #[cfg(feature = "faucet")]
 use k256 as _;
+#[cfg(feature = "faucet")]
+use secp256k1 as _;

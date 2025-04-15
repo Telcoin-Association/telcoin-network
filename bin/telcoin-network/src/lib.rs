@@ -25,6 +25,22 @@ pub mod keytool;
 pub mod node;
 pub mod version;
 
+#[cfg(feature = "test-utils")]
+pub mod utils;
+
 // prevent unused dep warning
 #[cfg(feature = "faucet")]
 use tn_faucet as _;
+
+// prevent unused dep warning
+#[cfg(test)]
+mod deps_for_tests {
+    use const_hex as _;
+    use ethereum_tx_sign as _;
+    use jsonrpc as _;
+    use nix as _;
+    use serde_json as _;
+    use telcoin_network as _;
+    use tokio as _;
+    use tracing_subscriber as _;
+}

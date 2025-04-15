@@ -39,8 +39,10 @@ use tracing::debug;
 pub type TestExecutionNode = ExecutionNode<TelcoinNode<Arc<TempDatabase<DatabaseEnv>>>>;
 
 /// A helper type to parse Args more easily.
+/// NOTE: this also lives in telcoin-network bin but creates a circular dependency.
 #[derive(Parser, Debug)]
 pub struct CommandParser<T: Args> {
+    /// The generic args to parse.
     #[clap(flatten)]
     pub args: T,
 }

@@ -1,6 +1,6 @@
 //! Tests for setting up genesis.
 
-use crate::util::spawn_local_testnet;
+use crate::utils::spawn_local_testnet;
 use alloy::{network::EthereumWallet, primitives::Uint, providers::ProviderBuilder};
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
 use rand::{rngs::StdRng, SeedableRng};

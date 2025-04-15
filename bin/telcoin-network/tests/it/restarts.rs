@@ -1,6 +1,5 @@
 //! Comprehensive tests for random nodes restarting during network activity.
 
-use crate::util::{config_local_testnet, IT_TEST_MUTEX};
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
 use nix::{
@@ -16,10 +15,11 @@ use std::{
     process::{Child, Command},
     time::Duration,
 };
-use tn_test_utils::init_test_tracing;
+use telcoin_network::utils::{config_local_testnet, IT_TEST_MUTEX};
 use tn_types::{get_available_tcp_port, keccak256, Address};
 use tokio::runtime::Runtime;
 use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 
 /// One unit of TEL (10^18) measured in wei.
 const WEI_PER_TEL: u128 = 1_000_000_000_000_000_000;
@@ -141,7 +141,13 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
 
 fn do_restarts(delay: u64) -> eyre::Result<()> {
     let _guard = IT_TEST_MUTEX.lock();
-    init_test_tracing();
+    // init_test_tracing:
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::ACTIVE)
+        .with_writer(std::io::stdout)
+        .try_init();
+
     info!(target: "restart-test", "do_restarts, delay: {delay}");
     // the tmp dir should be removed once tmp_quard is dropped
     let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");

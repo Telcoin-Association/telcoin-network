@@ -12,7 +12,9 @@ exclude.workspace = true
 
 [dependencies]
 # utils
-telcoin-network = { path = "../../bin/telcoin-network" }
+telcoin-network = { path = "../../bin/telcoin-network", features = [
+    "test-utils",
+] }
 tn-test-utils = { workspace = true }
 tn-node = { workspace = true }
 tempfile = { workspace = true }
@@ -32,24 +34,19 @@ gcloud-sdk = { version = "=0.24.6", default-features = false, features = [
 k256 = { version = "0.13.3", optional = true }
 tn-types = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
-
-[dev-dependencies]
-alloy = { workspace = true }
-serde_json = { workspace = true }
-rand = { workspace = true }
 secp256k1 = { workspace = true, features = [
     "global-context",
     "rand-std",
     "recovery",
-] }
+], optional = true }
+
+[dev-dependencies]
+alloy = { workspace = true }
+rand = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
 jsonrpsee = { workspace = true }
-ethereum-tx-sign = "6.1.3"
-const-hex = "1.12.0"
-# Alternate sync json rpc lib- just for integration testing.
-jsonrpc = "0.18.0"
-nix = { version = "0.29", features = ["signal"] }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = [
     "sync",
     "macros",
@@ -66,5 +63,6 @@ faucet = [
     "dep:gcloud-sdk",
     "dep:k256",
     "dep:futures",
+    "dep:secp256k1",
     "tn-types",
 ]
