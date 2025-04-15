@@ -8,7 +8,6 @@ members = [
     "crates/storage",
     "crates/test-utils",
     "crates/tn-utils",
-    "crates/test-utils",
     "crates/types",
     "crates/network-types",
     "crates/network-libp2p",
@@ -27,6 +26,9 @@ members = [
     "crates/execution/faucet",
     "crates/execution/tn-rpc",
     "crates/execution/node-traits",
+
+    # tests
+    "tests/e2e-tests",
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
@@ -222,6 +224,7 @@ tn-network-libp2p = { path = "./crates/network-libp2p" }
 tn-network-types = { path = "./crates/network-types" }
 tn-rpc = { path = "./crates/execution/tn-rpc" }
 state-sync = { path = "./crates/state-sync" }
+tn-test-utils = { path = "./crates/test-utils" }
 
 # optional
 tn-faucet = { path = "./crates/execution/faucet" }
@@ -231,7 +234,6 @@ tn-executor = { path = "./crates/consensus/executor" }
 tn-worker = { path = "./crates/consensus/worker" }
 tn-storage = { path = "./crates/storage" }
 tn-primary = { path = "./crates/consensus/primary" }
-tn-test-utils = { path = "./crates/test-utils" }
 consensus-metrics = { path = "./crates/consensus/consensus-metrics" }
 tn-primary-metrics = { path = "./crates/consensus/primary-metrics" }
 tn-utils = { path = "./crates/tn-utils" }

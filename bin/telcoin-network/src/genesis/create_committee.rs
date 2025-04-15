@@ -30,7 +30,6 @@ pub struct CreateCommitteeArgs {
     ///
     /// The GENESIS_DIRECTORY contains more directories:
     /// - committee
-    /// - todo
     ///
     /// Validators add their information to the directory using VCS like
     /// github. Using individual files prevents merge conflicts.
@@ -66,8 +65,6 @@ impl CreateCommitteeArgs {
     /// - ensure valid state for validators
     /// - write Committee to file
     /// - write WorkerCache to file
-    ///
-    /// TODO: `validate` only verifies proof of possession for now
     pub fn execute(&self) -> eyre::Result<()> {
         info!(target: "genesis::add-validator", "Adding validator to committee");
 

@@ -14,7 +14,7 @@
     html_favicon_url = "https://www.telco.in/logos/TEL.svg",
     issue_tracker_base_url = "https://github.com/telcoin-association/telcoin-network/issues/"
 )]
-#![warn(missing_docs, unreachable_pub, rustdoc::all)]
+#![warn(missing_docs, unreachable_pub, rustdoc::all, unused_crate_dependencies)]
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
@@ -24,3 +24,23 @@ pub mod genesis;
 pub mod keytool;
 pub mod node;
 pub mod version;
+
+#[cfg(feature = "test-utils")]
+pub mod utils;
+
+// prevent unused dep warning
+#[cfg(feature = "faucet")]
+use tn_faucet as _;
+
+// prevent unused dep warning
+#[cfg(test)]
+mod deps_for_tests {
+    use const_hex as _;
+    use ethereum_tx_sign as _;
+    use jsonrpc as _;
+    use nix as _;
+    use serde_json as _;
+    use telcoin_network as _;
+    use tokio as _;
+    use tracing_subscriber as _;
+}

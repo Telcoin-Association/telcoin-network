@@ -88,10 +88,10 @@ echo "clippy for workspace: default and all features passed"
 cargo test --workspace --no-fail-fast -- --show-output
 # Run tests that require credentials.
 cargo test test_with_creds -- --ignored
-# faucet it test
-cargo test -p telcoin-network --test it --features faucet --no-fail-fast -- faucet --show-output
+# faucet test
+cargo test -p e2e-tests --features faucet --no-fail-fast -- faucet --show-output
 
-echo "default tests and specific faucet it test passing"
+echo "default tests and specific faucet test passing"
 
 #
 # If we've reached this point, all checks have passed

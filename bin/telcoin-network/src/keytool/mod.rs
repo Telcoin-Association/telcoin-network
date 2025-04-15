@@ -49,11 +49,10 @@ pub struct KeyArgs {
 
     /// Generate command that creates keypairs and writes to file.
     ///
-    /// TODO: rename this key "command".
     /// Intentionally leaving this here to help others identify
     /// patterns in clap.
     #[command(subcommand)]
-    pub read_or_write: KeySubcommand,
+    pub subcommand: KeySubcommand,
 
     /// Add a new instance of a node.
     ///
@@ -78,9 +77,6 @@ pub enum KeySubcommand {
     /// Generate keys and write to file.
     #[command(name = "generate")]
     Generate(GenerateKeys),
-    /// Read public keys from file.
-    #[command(name = "read")]
-    Read,
 }
 
 /// Read arg that reads from file.
@@ -95,7 +91,7 @@ impl KeyArgs {
         // creates a default config if none exists
         let mut config = self.load_config()?;
 
-        match &self.read_or_write {
+        match &self.subcommand {
             // generate keys
             KeySubcommand::Generate(args) => {
                 match &args.node_type {
@@ -106,14 +102,10 @@ impl KeyArgs {
                         // execute and store keypath
                         args.execute(&mut config, &datadir)?;
 
-                        debug!("{config:?}");
                         Config::store_path(self.config_path(), config, ConfigFmt::YAML)?;
                     }
                 }
             }
-
-            // read public key from file
-            KeySubcommand::Read => todo!(),
         }
 
         Ok(())
@@ -130,28 +122,7 @@ impl KeyArgs {
                 format!("Could not create authority key directory {}", rpath.display())
             })?;
         } else if !force {
-            warn!("overwriting keys for validator")
-            // TODO: this causes an infinite recursion of the question
-            // when run from the adiri genesis makefile
-
-            // // ask user if they want to continue generating new keys
-            // let answer =
-            //     Question::new("Keys might already exist. Do you want to generate new keys?
-            // (y/n)")         .confirm();
-
-            // if answer != Answer::YES {
-            //     // TODO: something better than panic here
-            //     panic!("Abandoning new key generation.")
-            // }
-
-            // // double-check
-            // let answer = Question::new("Warning: this action is irreversable. Are you sure you
-            // want to overwrite authority keys? (y/n)")     .confirm();
-
-            // if answer != Answer::YES {
-            //     // TODO: something better than panic here
-            //     panic!("Abandoning new key generation.")
-            // }
+            warn!("not supported - failed to overwrite keys for validator. manually remove keys first.")
         }
 
         Ok(())
@@ -207,10 +178,8 @@ mod tests {
     /// This test also ensures that confy is able to
     /// load the default config.toml, update the file,
     /// and save it.
-    ///
-    /// TODO: better unit test for arg methods.
-    #[tokio::test]
-    async fn test_generate_keypairs() {
+    #[test]
+    fn test_generate_keypairs() {
         // use tempdir
         let tempdir = tempdir().expect("tempdir created").into_path();
         let tn = Cli::<NoArgs>::try_parse_from([

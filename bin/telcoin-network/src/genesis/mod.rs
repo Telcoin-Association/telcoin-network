@@ -37,10 +37,6 @@ pub struct GenesisArgs {
     #[arg(long, value_name = "COMMITTEE_FILE", verbatim_doc_comment)]
     pub committee_file: Option<PathBuf>,
 
-    // TODO: support custom genesis path
-    // /// The path to the genesis directory with validator information to build the committee.
-    // #[arg(long, value_name = "GENESIS_DIR", verbatim_doc_comment)]
-    // pub genesis_dir: Option<PathBuf>,
     /// The chain this node is running.
     ///
     /// The value parser matches either a known chain, the path
@@ -76,10 +72,6 @@ pub enum CeremonySubcommand {
     /// Create a committee from genesis.
     #[command(name = "create-committee", alias = "finalize")]
     CreateCommittee(CreateCommitteeArgs),
-    // TODO: add more commands
-    // - list validators (print peers)
-    // - verify and sign (sign EL Genesis)
-    // - finalize (todo)
 }
 
 /// Capture an optional test account for development.
@@ -134,13 +126,11 @@ impl GenesisArgs {
 
         match &self.command {
             CeremonySubcommand::Initialize(init) => {
-                // TODO: support custom genesis path
                 let datadir: DataDirChainPath = self
                     .datadir
                     .unwrap_or_chain_default(self.chain.chain, default_datadir_args())
                     .into();
 
-                // TODO: use config or CLI chain spec?
                 let config_path = self.config.clone().unwrap_or(datadir.node_config_path());
 
                 let mut tn_config: Config = Config::load_from_path(&config_path, ConfigFmt::YAML)?;

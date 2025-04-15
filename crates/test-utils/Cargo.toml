@@ -55,7 +55,9 @@ reth-transaction-pool = { workspace = true }
 jsonrpsee = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 tn-storage = { workspace = true }
-telcoin-network = { path = "../../bin/telcoin-network" }
+telcoin-network = { path = "../../bin/telcoin-network", features = [
+    "test-utils",
+] }
 reth-evm = { workspace = true }
 alloy = { workspace = true, features = [
     "contract",

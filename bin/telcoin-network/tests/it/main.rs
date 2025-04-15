@@ -1,9 +1,5 @@
-//! CLI integration test
+//! IT test for main binary.
 
-#[cfg(feature = "faucet")]
-mod faucet;
-mod genesis_tests;
 mod restarts;
-mod util;
 
 async fn main() {}

@@ -269,7 +269,8 @@ fn test_ip_and_peer_banned() {
 
     let expected_ip = match addr.iter().next() {
         Some(Protocol::Ip4(ip)) => IpAddr::V4(ip),
-        _ => panic!("only ip4 created for multiaddr"),
+        Some(Protocol::Ip6(ip)) => IpAddr::V6(ip),
+        _ => panic!("no ip address found for multiaddr"),
     };
 
     // Add a peer and ban it
