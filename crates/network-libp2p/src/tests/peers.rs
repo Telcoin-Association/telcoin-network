@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::common::{create_multiaddr, ensure_score_config, random_ip_addr};
-use libp2p::{multiaddr::Protocol, PeerId};
+use libp2p::PeerId;
 use std::{
     net::IpAddr,
     time::{Duration, Instant},
@@ -265,12 +265,8 @@ fn test_is_validator() {
 fn test_ip_and_peer_banned() {
     let mut all_peers = create_all_peers(None);
     let peer_id = PeerId::random();
-    let addr = create_multiaddr(None);
-
-    let expected_ip = match addr.iter().next() {
-        Some(Protocol::Ip4(ip)) => IpAddr::V4(ip),
-        _ => panic!("only ip4 created for multiaddr"),
-    };
+    let ip = IpAddr::V4("52.3.3.3".parse().unwrap());
+    let addr = create_multiaddr(Some(ip));
 
     // Add a peer and ban it
     all_peers.update_connection_status(
@@ -288,7 +284,7 @@ fn test_ip_and_peer_banned() {
     assert!(!banned);
 
     // check if IP is banned
-    assert!(!all_peers.ip_banned(&expected_ip));
+    assert!(!all_peers.ip_banned(&ip));
     assert!(!all_peers.ip_banned(&random_ip_addr()));
 
     // new peer connects from same IP

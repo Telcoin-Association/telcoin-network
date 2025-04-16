@@ -429,7 +429,6 @@ async fn test_temporarily_banned_peer() {
 
     // Verify there's an unbanned event
     let unbanned_events = extract_events(&events, |e| matches!(e, PeerEvent::Unbanned(_)));
-    println!("events: {unbanned_events:?}");
     assert!(
         matches!(
             unbanned_events.first().unwrap(), PeerEvent::Unbanned(id) if *id == peer_id

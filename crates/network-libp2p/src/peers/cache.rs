@@ -84,8 +84,8 @@ where
             return Vec::new();
         }
 
-        let mut removed_elements = Vec::new();
         let now = Instant::now();
+        let mut removed_elements = Vec::new();
         // remove any expired results
         while let Some(element) = self.list.pop_front() {
             if element.inserted + self.duration > now {

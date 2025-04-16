@@ -144,21 +144,18 @@ fn test_remove_expired_ordering() {
 
     // assert peer1 expired
     let expired = cache.heartbeat();
-    println!("expired: {expired:?}");
     assert_eq!(expired.len(), 1, "Only Peer1 should be expired");
     assert_eq!(expired[0], peer1, "Peer1 should be expired");
 
     // wait for peer2 to expire
     std::thread::sleep(Duration::from_millis(20));
     let expired = cache.heartbeat();
-    println!("expired: {expired:?}");
     assert_eq!(expired.len(), 1, "Only peer2 should be expired");
     assert_eq!(expired[0], peer2, "Peer2 should be expired");
 
     // wait for peer3 and peer4 to expire
     std::thread::sleep(Duration::from_millis(41));
     let expired = cache.heartbeat();
-    println!("expired: {expired:?}");
     assert_eq!(expired.len(), 2, "Peer3 and Peer4 should be expired");
     assert_eq!(expired[0], peer3, "The first expired element should be peer3");
     assert_eq!(expired[1], peer4, "The second expired element should be peer4");
