@@ -3,6 +3,7 @@
 //! These are used to spawn execution components for the node and maintain compatibility with reth's
 //! API.
 
+use crate::RethEnv;
 use reth_chainspec::ChainSpec;
 pub use reth_consensus::{Consensus, ConsensusError};
 use reth_consensus::{FullConsensus, HeaderValidator, PostExecutionInput};
@@ -25,8 +26,6 @@ use tn_types::{
     Address, BlockExt as _, BlockWithSenders, ConsensusOutput, EthPrimitives, ExecHeader,
     NodePrimitives, SealedBlock, SealedHeader, TransactionSigned, Withdrawals, B256, U256,
 };
-
-use crate::RethEnv;
 
 /// Telcoin Network specific node types for reth compatibility.
 pub trait TelcoinNodeTypes: NodeTypesWithEngine + NodeTypesWithDB {
@@ -205,6 +204,7 @@ impl TNPayload {
         let block_env = BlockEnv {
             // the block's number should come from the canonical tip, NOT the batch's number
             number: U256::from(self.attributes.parent_header.number + 1),
+            // special fee address
             coinbase: self.suggested_fee_recipient(),
             timestamp: U256::from(self.timestamp()),
             // leave difficulty zero
@@ -268,7 +268,7 @@ pub struct TNPayloadAttributes {
     /// The index of the block within the entire output from consensus.
     ///
     /// Used as executed block header's `difficulty`.
-    pub batch_index: u64,
+    pub batch_index: usize,
     /// Value for the `timestamp` field of the new payload
     pub timestamp: u64,
     /// Value for the `extra_data` field in the new block.
@@ -288,6 +288,10 @@ pub struct TNPayloadAttributes {
     ///
     /// This is currently always empty vec. This comes from the batch block's withdrawals.
     pub withdrawals: Withdrawals,
+    /// Boolean indicating if the payload should use system calls to close the epoch during execution.
+    ///
+    /// This is the last batch for the `ConsensusOutput` if the epoch is closing.
+    pub close_epoch: bool,
 }
 
 impl TNPayloadAttributes {
@@ -295,7 +299,7 @@ impl TNPayloadAttributes {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         parent_header: SealedHeader,
-        batch_index: u64,
+        batch_index: usize,
         batch_digest: B256,
         output: &ConsensusOutput,
         consensus_output_digest: B256,
@@ -304,6 +308,7 @@ impl TNPayloadAttributes {
         mix_hash: B256,
         withdrawals: Withdrawals,
     ) -> Self {
+        let close_epoch = output.epoch_closing_index().is_some_and(|idx| idx == batch_index);
         Self {
             parent_header,
             beneficiary: output.beneficiary(),
@@ -316,6 +321,7 @@ impl TNPayloadAttributes {
             gas_limit,
             mix_hash,
             withdrawals,
+            close_epoch,
         }
     }
 }

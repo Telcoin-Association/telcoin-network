@@ -18,14 +18,12 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-use std::{
-    net::SocketAddr,
-    ops::RangeInclusive,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
-
 use crate::traits::TNExecution;
+use alloy::{
+    primitives::{address, Bytes},
+    sol,
+    sol_types::SolCall as _,
+};
 use clap::Parser;
 use dirs::path_to_datadir;
 use error::{TnRethError, TnRethResult};
@@ -55,7 +53,7 @@ use reth_db_common::init::init_genesis;
 use reth_eth_wire::BlockHashNumber;
 use reth_evm::{
     execute::{BlockExecutorProvider, Executor as _},
-    ConfigureEvm as _, ConfigureEvmEnv as _,
+    ConfigureEvm, ConfigureEvmEnv as _,
 };
 use reth_evm_ethereum::EthEvmConfig;
 use reth_node_ethereum::{BasicBlockExecutorProvider, EthExecutionStrategyFactory};
@@ -70,10 +68,17 @@ use reth_revm::{
     cached::CachedReads,
     database::StateProviderDatabase,
     db::{states::bundle_state::BundleRetention, BundleState},
+    interpreter::Host,
     primitives::{EVMError, EnvWithHandlerCfg, ResultAndState, TxEnv},
-    DatabaseCommit, State,
+    Database, DatabaseCommit, Evm, State,
 };
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
+use std::{
+    net::SocketAddr,
+    ops::RangeInclusive,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 // Reth stuff we are just re-exporting.  Need to reduce this over time.
 pub use alloy::primitives::FixedBytes;
@@ -95,10 +100,11 @@ pub use reth_transaction_pool::{
 };
 
 use tn_types::{
-    adiri_chain_spec_arc, calculate_transaction_root, Batch, Block, BlockBody, BlockExt as _,
-    BlockHashOrNumber, BlockNumHash, BlockNumber, BlockWithSenders, ExecHeader, Genesis, Receipt,
-    SealedBlock, SealedBlockWithSenders, SealedHeader, TaskManager, TransactionSigned, B256,
-    EMPTY_OMMER_ROOT_HASH, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, U256,
+    adiri_chain_spec_arc, calculate_transaction_root, Address, Batch, Block, BlockBody,
+    BlockExt as _, BlockHashOrNumber, BlockNumHash, BlockNumber, BlockWithSenders, ExecHeader,
+    Genesis, Receipt, SealedBlock, SealedBlockWithSenders, SealedHeader, TaskManager,
+    TransactionSigned, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS,
+    EMPTY_WITHDRAWALS, U256,
 };
 use tokio::sync::mpsc::{self, unbounded_channel};
 use tracing::{debug, info, warn};
@@ -114,6 +120,18 @@ pub mod worker;
 
 /// Rpc Server type, used for getting the node started.
 pub type RpcServer = TransportRpcModules<()>;
+
+/// The system address.
+pub const SYSTEM_ADDRESS: Address = address!("fffffffffffffffffffffffffffffffffffffffe");
+
+/// The address for consensus registry.
+pub const CONSENSUS_REGISTRY_ADDRESS: Address =
+    address!("7777777777777777777777777777777777777777");
+
+sol! {
+    /// Define the interface for your ConsensusRegistry contract
+    function concludeEpoch(address[] calldata newCommittee) external;
+}
 
 /// Defaults for chain spec clap parser.
 ///
@@ -561,6 +579,9 @@ impl RethEnv {
             executed_txs.push(recovered.into_tx());
         }
 
+        // close epoch
+        payload.attributes.close_epoch.then(|| self.apply_closing_epoch_contract_call(&mut evm));
+
         // Release db
         drop(evm);
 
@@ -574,12 +595,8 @@ impl RethEnv {
         // and 4788 contract call
         db.merge_transitions(BundleRetention::PlainState);
 
-        let execution_outcome = ExecutionOutcome::new(
-            db.take_bundle(),
-            vec![receipts].into(),
-            block_number,
-            vec![], // TODO: support requests
-        );
+        let execution_outcome =
+            ExecutionOutcome::new(db.take_bundle(), vec![receipts].into(), block_number, vec![]);
         let receipts_root =
             execution_outcome.ethereum_receipts_root(block_number).expect("Number is in range");
         let logs_bloom =
@@ -622,8 +639,8 @@ impl RethEnv {
             gas_used: cumulative_gas_used,
             extra_data: payload.attributes.batch_digest.into(),
             parent_beacon_block_root: Some(consensus_header_hash),
-            blob_gas_used: None,   // TODO: support blobs
-            excess_blob_gas: None, // TODO: support blobs
+            blob_gas_used: None,
+            excess_blob_gas: None,
             requests_hash: None,
         };
 
@@ -714,8 +731,8 @@ impl RethEnv {
             gas_used: 0,
             extra_data: payload.attributes.batch_digest.into(),
             parent_beacon_block_root: Some(consensus_header_digest),
-            blob_gas_used: None,   // TODO: support blobs
-            excess_blob_gas: None, // TODO: support blobs
+            blob_gas_used: None,
+            excess_blob_gas: None,
             requests_hash: None,
         };
 
@@ -734,6 +751,62 @@ impl RethEnv {
         Ok(sealed_block_with_senders)
     }
 
+    /// Generate calldata for updating the ConsensusRegistry to conclude the epoch.
+    fn generate_conclude_epoch_calldata(&self) -> Bytes {
+        // shuffle all validators for new committee
+        let new_committee = self.shuffle_new_committee();
+
+        // encode the call to bytes with method selector and args
+        concludeEpochCall { newCommittee: new_committee }.abi_encode().into()
+    }
+
+    #[inline]
+    fn apply_closing_epoch_contract_call<EXT, DB>(
+        &self,
+        evm: &mut Evm<'_, EXT, DB>,
+    ) -> TnRethResult<ResultAndState>
+    where
+        DB: Database,
+        DB::Error: core::fmt::Display,
+    {
+        let prev_env = Box::new(evm.context.env().clone());
+        let calldata = self.generate_conclude_epoch_calldata();
+
+        // fill tx env to execute system call to consensus registry
+        self.evm_config.fill_tx_env_system_contract_call(
+            &mut evm.context.evm.env,
+            SYSTEM_ADDRESS,
+            CONSENSUS_REGISTRY_ADDRESS,
+            // concludeEpoch(address[] calldata newCommittee)
+            calldata,
+        );
+
+        let mut res = match evm.transact() {
+            Ok(res) => res,
+            Err(e) => {
+                // fatal error
+                return Err(EVMError::Custom(format!("epoch closing execution failed: {e}")).into());
+            }
+        };
+
+        // NOTE: revm marks these accounts as "touched" after the contract call
+        // and includes them in the result
+        //
+        // remove the state changes for system call
+        res.state.remove(&SYSTEM_ADDRESS);
+        res.state.remove(&evm.block().coinbase);
+
+        // restore the previous env
+        evm.context.evm.env = prev_env;
+
+        Ok(res)
+    }
+
+    /// Shuffle the committee from state.
+    fn shuffle_new_committee(&self) -> Vec<Address> {
+        todo!()
+    }
+
     /// Adds block to the tree and skips state root validation.
     pub fn insert_block(
         &self,
@@ -743,6 +816,7 @@ impl RethEnv {
             sealed_block_with_senders,
             BlockValidationKind::SkipStateRootValidation,
         )?;
+
         Ok(())
     }
 

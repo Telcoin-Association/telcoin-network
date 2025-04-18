@@ -473,6 +473,7 @@ async fn test_canonical_notification_updates_pool() {
         number: 0,
         extra: Default::default(),
         early_finalize: true,
+        close_epoch: false,
     };
 
     // execute output to trigger canonical update

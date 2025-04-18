@@ -16,12 +16,14 @@ fn finalize_signed_blocks(
     canonical_header: &SealedHeader,
 ) -> EngineResult<()> {
     let mut last_executed = output.sub_dag.leader.header.latest_execution_block;
+
     // Find the latest block that was signed off by the committee.
     for cert in &output.sub_dag.certificates {
         if cert.header.latest_execution_block.number > last_executed.number {
             last_executed = cert.header.latest_execution_block;
         }
     }
+
     if last_executed.number <= canonical_header.number {
         if let Some(block) = reth_env.sealed_header_by_hash(last_executed.hash)? {
             // finalize the last block from a cert in consensus output and update chain info
@@ -94,8 +96,8 @@ pub fn execute_consensus_output(args: BuildArguments) -> EngineResult<SealedHead
 
         // add block to the tree and skip state root validation
         reth_env.insert_block(next_canonical_block).inspect_err(|e| {
-                error!(target: "engine", header=?canonical_header, ?e, "failed to insert next canonical block");
-            })?;
+            error!(target: "engine", header=?canonical_header, ?e, "failed to insert next canonical block");
+        })?;
     } else {
         // loop and construct blocks with transactions
         for (block_index, block) in batches.into_iter().enumerate() {
@@ -111,7 +113,7 @@ pub fn execute_consensus_output(args: BuildArguments) -> EngineResult<SealedHead
             let withdrawals = Withdrawals::new(vec![]);
             let payload_attributes = TNPayloadAttributes::new(
                 canonical_header,
-                block_index as u64,
+                block_index,
                 batch_digest,
                 &output,
                 output_digest,
@@ -136,8 +138,8 @@ pub fn execute_consensus_output(args: BuildArguments) -> EngineResult<SealedHead
 
             // add block to the tree and skip state root validation
             reth_env.insert_block(next_canonical_block).inspect_err(|e| {
-                    error!(target: "engine", header=?canonical_header, ?e, "failed to insert next canonical block");
-                })?;
+                error!(target: "engine", header=?canonical_header, ?e, "failed to insert next canonical block");
+            })?;
         }
     } // end block execution for round
 

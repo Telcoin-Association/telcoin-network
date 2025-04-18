@@ -310,6 +310,7 @@ mod tests {
                 previous_sub_dag,
             )
             .into(),
+            close_epoch: false,
             batches: Default::default(), // empty
             beneficiary,
             batch_digests: Default::default(), // empty
@@ -472,6 +473,7 @@ mod tests {
                 previous_sub_dag,
             )
             .into(),
+            close_epoch: false,
             batches: Default::default(), // empty
             beneficiary,
             batch_digests: Default::default(), // empty
@@ -647,6 +649,7 @@ mod tests {
             number: 0,
             extra: Default::default(),
             early_finalize: true,
+            close_epoch: false,
         };
 
         // create second output
@@ -677,6 +680,7 @@ mod tests {
             number: 1,
             extra: Default::default(),
             early_finalize: true,
+            close_epoch: false,
         };
         let consensus_output_2_hash = consensus_output_2.consensus_header_hash();
 
@@ -977,6 +981,7 @@ mod tests {
             number: 0,
             extra: Default::default(),
             early_finalize: true,
+            close_epoch: false,
         };
 
         // create second output
@@ -1009,6 +1014,7 @@ mod tests {
             number: 1,
             extra: Default::default(),
             early_finalize: true,
+            close_epoch: false,
         };
         let consensus_output_2_hash = consensus_output_2.consensus_header_hash();
 
@@ -1281,6 +1287,7 @@ mod tests {
             number: 0,
             extra: Default::default(),
             early_finalize: true,
+            close_epoch: false,
         };
         let consensus_output_1_hash = consensus_output_1.consensus_header_hash();
 
@@ -1312,6 +1319,7 @@ mod tests {
             number: 1,
             extra: Default::default(),
             early_finalize: true,
+            close_epoch: false,
         };
 
         //=== Execution
