@@ -100,20 +100,20 @@ pub fn execute_consensus_output(args: BuildArguments) -> EngineResult<SealedHead
         })?;
     } else {
         // loop and construct blocks with transactions
-        for (block_index, block) in batches.into_iter().enumerate() {
+        for (batch_index, batch) in batches.into_iter().enumerate() {
             let batch_digest =
                 output.next_batch_digest().ok_or(TnEngineError::NextBlockDigestMissing)?;
             // use batch's base fee, gas limit, and withdrawals
-            let base_fee_per_gas = block.base_fee_per_gas.unwrap_or_default();
-            let gas_limit = max_batch_gas(block.timestamp);
+            let base_fee_per_gas = batch.base_fee_per_gas.unwrap_or_default();
+            let gas_limit = max_batch_gas(batch.timestamp);
 
-            // apply XOR bitwise operator with worker's digest to ensure unique mixed hash per block
+            // apply XOR bitwise operator with worker's digest to ensure unique mixed hash per batch
             // for round
-            let mix_hash = output_digest ^ block.digest();
+            let mix_hash = output_digest ^ batch.digest();
             let withdrawals = Withdrawals::new(vec![]);
             let payload_attributes = TNPayloadAttributes::new(
                 canonical_header,
-                block_index,
+                batch_index,
                 batch_digest,
                 &output,
                 output_digest,
@@ -127,7 +127,7 @@ pub fn execute_consensus_output(args: BuildArguments) -> EngineResult<SealedHead
             // execute
             let next_canonical_block = reth_env.build_block_from_batch_payload(
                 payload,
-                block,
+                batch,
                 output.consensus_header_hash(),
             )?;
 

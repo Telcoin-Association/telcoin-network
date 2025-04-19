@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tn_types::{
     Address, BlockExt as _, BlockWithSenders, BlsSignature, ConsensusOutput, EthPrimitives,
-    ExecHeader, NodePrimitives, SealedBlock, SealedHeader, TransactionSigned, Withdrawals, B256,
-    U256,
+    ExecHeader, Hash as _, NodePrimitives, SealedBlock, SealedHeader, TransactionSigned,
+    Withdrawals, B256, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tracing::error;
 
@@ -182,46 +182,46 @@ impl TNPayload {
         Self { attributes }
     }
 
-    /// Create a Reth config and block environment.
-    pub(crate) fn cfg_and_block_env(
-        &self,
-        chain_spec: &ChainSpec,
-    ) -> (CfgEnvWithHandlerCfg, BlockEnv) {
-        // configure evm env based on parent block
-        let cfg = CfgEnv::default().with_chain_id(chain_spec.chain().id());
+    // /// Create a Reth config and block environment.
+    // pub(crate) fn cfg_and_block_env(
+    //     &self,
+    //     chain_spec: &ChainSpec,
+    // ) -> (CfgEnvWithHandlerCfg, BlockEnv) {
+    //     // configure evm env based on parent block
+    //     let cfg = CfgEnv::default().with_chain_id(chain_spec.chain().id());
 
-        // ensure we're not missing any timestamp based hardforks
-        let spec_id = SpecId::SHANGHAI;
+    //     // ensure we're not missing any timestamp based hardforks
+    //     let spec_id = SpecId::SHANGHAI;
 
-        // use the blob excess gas and price set by the worker during batch creation
-        let blob_excess_gas_and_price = Some(BlobExcessGasAndPrice::new(0, false));
+    //     // use the blob excess gas and price set by the worker during batch creation
+    //     let blob_excess_gas_and_price = Some(BlobExcessGasAndPrice::new(0, false));
 
-        // use the basefee set by the worker during batch creation
-        let basefee = U256::from(self.attributes.base_fee_per_gas);
+    //     // use the basefee set by the worker during batch creation
+    //     let basefee = U256::from(self.attributes.base_fee_per_gas);
 
-        // ensure gas_limit enforced during block validation
-        let gas_limit = U256::from(self.attributes.gas_limit);
+    //     // ensure gas_limit enforced during block validation
+    //     let gas_limit = U256::from(self.attributes.gas_limit);
 
-        // create block environment to re-execute worker's block
-        let block_env = BlockEnv {
-            // the block's number should come from the canonical tip, NOT the batch's number
-            number: U256::from(self.attributes.parent_header.number + 1),
-            // special fee address
-            coinbase: self.suggested_fee_recipient(),
-            timestamp: U256::from(self.timestamp()),
-            // leave difficulty zero
-            // this value is useful for post-execution, but worker's block is created with this
-            // value
-            difficulty: U256::ZERO,
-            prevrandao: Some(self.prev_randao()),
-            gas_limit,
-            basefee,
-            // calculate excess gas based on parent block's blob gas usage
-            blob_excess_gas_and_price,
-        };
+    //     // create block environment to re-execute worker's block
+    //     let block_env = BlockEnv {
+    //         // the block's number should come from the canonical tip, NOT the batch's number
+    //         number: U256::from(self.attributes.parent_header.number + 1),
+    //         // special fee address
+    //         coinbase: self.suggested_fee_recipient(),
+    //         timestamp: U256::from(self.timestamp()),
+    //         // leave difficulty zero
+    //         // this value is useful for post-execution, but worker's block is created with this
+    //         // value
+    //         difficulty: U256::ZERO,
+    //         prevrandao: Some(self.prev_randao()),
+    //         gas_limit,
+    //         basefee,
+    //         // calculate excess gas based on parent block's blob gas usage
+    //         blob_excess_gas_and_price,
+    //     };
 
-        (CfgEnvWithHandlerCfg::new_with_spec_id(cfg, spec_id), block_env)
-    }
+    //     (CfgEnvWithHandlerCfg::new_with_spec_id(cfg, spec_id), block_env)
+    // }
 
     /// Passthrough attribute timestamp.
     pub(crate) fn timestamp(&self) -> u64 {
@@ -333,5 +333,30 @@ impl TNPayloadAttributes {
             withdrawals,
             close_epoch,
         }
+    }
+
+    /// Method to create an instance of Self useful for tests.
+    ///
+    /// WARNING: only use this for tests.
+    pub fn new_for_test(parent_header: SealedHeader, output: &ConsensusOutput) -> Self {
+        let batch_index = 0;
+        let batch_digest = B256::random();
+        let consensus_output_digest = output.digest().into();
+        let base_fee_per_gas = parent_header.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE);
+        let gas_limit = parent_header.gas_limit;
+        let mix_hash = B256::random();
+        let withdrawals = Withdrawals::default();
+
+        Self::new(
+            parent_header,
+            batch_index,
+            batch_digest,
+            output,
+            consensus_output_digest,
+            base_fee_per_gas,
+            gas_limit,
+            mix_hash,
+            withdrawals,
+        )
     }
 }

@@ -57,6 +57,7 @@ sol!(
         }
 
         /// The epoch info stored on-chain.
+        #[derive(PartialEq, Debug)]
         struct EpochInfo {
             /// The committee of validators responsible for the epoch.
             address[] committee;
@@ -83,6 +84,8 @@ sol!(
         function getValidators(uint8 status) public view returns (ValidatorInfo[] memory);
         /// Return committee epoch info for a specific epoch.
         function getEpochInfo(uint32 epoch) public view returns (EpochInfo memory epochInfo);
+        /// Return the current epoch.
+        function getCurrentEpoch() public view returns (uint32) ;
         /// Conclude the current epoch. Caller must pass a new committee of eligible validators.
         function concludeEpoch(address[] calldata newCommittee) external;
     }

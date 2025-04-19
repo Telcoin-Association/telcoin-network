@@ -83,7 +83,7 @@ mod tests {
                 let ecdsa_pubkey = Address::random();
 
                 ConsensusRegistry::ValidatorInfo {
-                    blsPubkey: bls_pubkey.clone().into(),
+                    blsPubkey: bls_pubkey.into(),
                     ed25519Pubkey: ed_25519_keypair
                         .public()
                         .try_into_ed25519()
@@ -145,12 +145,7 @@ mod tests {
             .get(&registry_proxy_address)
             .expect("registry address missing from bundle state")
             .storage;
-        let proxy_json = test_fetch_file_content_relative_to_manifest(
-            "../../tn-contracts/artifacts/ERC1967Proxy.json".into(),
-        );
-        let proxy_contract: ContractStandardJson =
-            serde_json::from_str(&proxy_json).expect("json parsing failure");
-        let proxy_bytecode = hex::decode(proxy_contract.deployed_bytecode.object)
+        let proxy_bytecode = hex::decode(registry_proxy_contract.deployed_bytecode.object)
             .expect("invalid bytecode hexstring");
 
         // perform canonical adiri chain genesis with fetched storage

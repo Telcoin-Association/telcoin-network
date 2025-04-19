@@ -36,6 +36,9 @@ pub enum TnRethError {
     /// An RPC failed.
     #[error("RPC failed: {0}")]
     Rpc(#[from] RpcError),
+    /// Error decoding alloy abi.
+    #[error("Error encoding/decoding abi for sol type: {0}")]
+    SolAbi(#[from] alloy::sol_types::Error),
 }
 
 impl From<TnRethError> for EthApiError {
