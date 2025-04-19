@@ -18,19 +18,18 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-use std::{
-    net::SocketAddr,
-    ops::RangeInclusive,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
-
 use crate::traits::TNExecution;
+use alloy::{
+    primitives::{address, Bytes, ChainId},
+    sol_types::SolCall,
+};
 use clap::Parser;
 use dirs::path_to_datadir;
+use enr::secp256k1::rand::Rng as _;
 use error::{TnRethError, TnRethResult};
 use futures::StreamExt as _;
 use jsonrpsee::Methods;
+use rand_chacha::rand_core::SeedableRng as _;
 use reth::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, NetworkArgs, PayloadBuilderArgs,
@@ -48,17 +47,19 @@ use reth::{
     },
 };
 use reth_blockchain_tree::{BlockValidationKind, BlockchainTreeEngine};
-use reth_chainspec::BaseFeeParams;
+use reth_chainspec::{BaseFeeParams, EthChainSpec};
 use reth_consensus::FullConsensus;
 use reth_db::{init_db, DatabaseEnv};
 use reth_db_common::init::init_genesis;
 use reth_eth_wire::BlockHashNumber;
 use reth_evm::{
+    env::EvmEnv,
     execute::{BlockExecutorProvider, Executor as _},
-    ConfigureEvm as _, ConfigureEvmEnv as _,
+    ConfigureEvm, ConfigureEvmEnv as _,
 };
 use reth_evm_ethereum::EthEvmConfig;
 use reth_node_ethereum::{BasicBlockExecutorProvider, EthExecutionStrategyFactory};
+use reth_primitives::{Log, TxType};
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     BlockExecutionOutput, BlockIdReader as _, BlockNumReader, BlockReader, CanonChainTracker,
@@ -70,10 +71,34 @@ use reth_revm::{
     cached::CachedReads,
     database::StateProviderDatabase,
     db::{states::bundle_state::BundleRetention, BundleState},
-    primitives::{EVMError, EnvWithHandlerCfg, ResultAndState, TxEnv},
-    DatabaseCommit, State,
+    interpreter::Host,
+    primitives::{
+        BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, EVMError, Env,
+        EnvWithHandlerCfg, ExecutionResult, ResultAndState, TxEnv,
+    },
+    Database, DatabaseCommit, Evm, State,
 };
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
+use std::{
+    net::SocketAddr,
+    ops::RangeInclusive,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use system_calls::{
+    ConsensusRegistry::{self, ValidatorStatus},
+    CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
+};
+use tn_types::{
+    adiri_chain_spec_arc, calculate_transaction_root, Address, Batch, Block, BlockBody,
+    BlockExt as _, BlockHashOrNumber, BlockNumHash, BlockNumber, BlockWithSenders, BlsSignature,
+    ExecHeader, Genesis, Receipt, SealedBlock, SealedBlockWithSenders, SealedHeader, TaskManager,
+    TransactionSigned, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS,
+    EMPTY_WITHDRAWALS, U256,
+};
+use tokio::sync::mpsc::{self, unbounded_channel};
+use tracing::{debug, error, info, warn};
+use traits::{TNPayload, TelcoinNode, TelcoinNodeTypes as _};
 
 // Reth stuff we are just re-exporting.  Need to reduce this over time.
 pub use alloy::primitives::FixedBytes;
@@ -94,26 +119,25 @@ pub use reth_transaction_pool::{
     BestTransactions, EthPooledTransaction,
 };
 
-use tn_types::{
-    adiri_chain_spec_arc, calculate_transaction_root, Batch, Block, BlockBody, BlockExt as _,
-    BlockHashOrNumber, BlockNumHash, BlockNumber, BlockWithSenders, ExecHeader, Genesis, Receipt,
-    SealedBlock, SealedBlockWithSenders, SealedHeader, TaskManager, TransactionSigned, B256,
-    EMPTY_OMMER_ROOT_HASH, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, U256,
-};
-use tokio::sync::mpsc::{self, unbounded_channel};
-use tracing::{debug, info, warn};
-use traits::{TNPayload, TelcoinNode, TelcoinNodeTypes as _};
-
 pub mod dirs;
 pub mod traits;
 pub mod txn_pool;
 pub use txn_pool::*;
 use worker::WorkerNetwork;
 pub mod error;
+pub mod system_calls;
 pub mod worker;
 
 /// Rpc Server type, used for getting the node started.
 pub type RpcServer = TransportRpcModules<()>;
+
+/// The address for consensus registry.
+///
+// TODO: UPDATE THIS ADDRESS FOR fee distribution
+//
+//
+// !!!!!
+const TN_COINBASE_ADDRESS: Address = address!("5555555555555555555555555555555555555555");
 
 /// Defaults for chain spec clap parser.
 ///
@@ -284,6 +308,11 @@ impl ChainSpec {
     pub fn sealed_genesis_block(&self) -> SealedBlock {
         SealedBlock::new(self.0.sealed_genesis_header(), BlockBody::default())
     }
+
+    /// Return the chain id.
+    pub fn chain_id(&self) -> ChainId {
+        self.0.chain_id()
+    }
 }
 
 impl RethEnv {
@@ -437,7 +466,6 @@ impl RethEnv {
         batch: Batch,
         consensus_header_hash: B256,
     ) -> TnRethResult<SealedBlockWithSenders> {
-        let chain_spec = self.node_config.chain.clone();
         let state_provider = self
             .blockchain_provider
             .state_by_block_hash(payload.attributes.parent_header.hash())?;
@@ -454,7 +482,12 @@ impl RethEnv {
             .with_bundle_update()
             .build();
 
-        debug!(target: "payload_builder", parent_hash = ?payload.attributes.parent_header.hash(), parent_number = payload.attributes.parent_header.number, "building new payload");
+        debug!(
+            target: "payload_builder",
+            parent_hash = ?payload.attributes.parent_header.hash(),
+            parent_number = payload.attributes.parent_header.number,
+            "building new payload"
+        );
         // collect these totals to report at the end
         let mut cumulative_gas_used = 0;
         let mut total_fees = U256::ZERO;
@@ -466,11 +499,10 @@ impl RethEnv {
         //
         // note: uses the worker's sealed header for "parent" values
         // note the sealed header below is more or less junk but payload trait requires it.
-        let (cfg, block_env) = payload.cfg_and_block_env(chain_spec.as_ref());
-
-        let block_gas_limit: u64 = block_env.gas_limit.try_into().unwrap_or(u64::MAX);
-        let base_fee = block_env.basefee.to::<u64>();
-        let block_number = block_env.number.to::<u64>();
+        let tn_env = self.tn_env_for_evm(&payload);
+        let block_gas_limit: u64 = tn_env.block.gas_limit.try_into().unwrap_or(u64::MAX);
+        let base_fee = tn_env.block.basefee.to::<u64>();
+        let block_number = tn_env.block.number.to::<u64>();
 
         // // apply eip-4788 pre block contract call
         // pre_block_beacon_root_contract_call(
@@ -495,9 +527,7 @@ impl RethEnv {
         // TODO: parallelize tx recovery when it's worth it (see
         // TransactionSigned::recover_signers())
 
-        let env =
-            EnvWithHandlerCfg::new_with_cfg_env(cfg.clone(), block_env.clone(), TxEnv::default());
-        let mut evm = self.evm_config.evm_with_env(&mut db, env);
+        let mut evm = self.evm_config.evm_with_env(&mut db, tn_env);
 
         for tx_bytes in &batch.transactions {
             let recovered = reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
@@ -561,6 +591,26 @@ impl RethEnv {
             executed_txs.push(recovered.into_tx());
         }
 
+        // close epoch using leader's aggregate signature if conditions are met
+        match payload
+            .attributes
+            .close_epoch
+            .map(|sig| self.apply_closing_epoch_contract_call(&mut evm, sig))
+        {
+            Some(res) => {
+                // add logs if epoch closed
+                let logs = res?;
+                receipts.push(Some(Receipt {
+                    // no better option
+                    tx_type: TxType::Legacy,
+                    success: true,
+                    cumulative_gas_used: 0,
+                    logs,
+                }));
+            }
+            None => (), // epoch isn't closing
+        }
+
         // Release db
         drop(evm);
 
@@ -574,12 +624,8 @@ impl RethEnv {
         // and 4788 contract call
         db.merge_transitions(BundleRetention::PlainState);
 
-        let execution_outcome = ExecutionOutcome::new(
-            db.take_bundle(),
-            vec![receipts].into(),
-            block_number,
-            vec![], // TODO: support requests
-        );
+        let execution_outcome =
+            ExecutionOutcome::new(db.take_bundle(), vec![receipts].into(), block_number, vec![]);
         let receipts_root =
             execution_outcome.ethereum_receipts_root(block_number).expect("Number is in range");
         let logs_bloom =
@@ -605,7 +651,10 @@ impl RethEnv {
         let header = ExecHeader {
             parent_hash: payload.parent(),
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
-            beneficiary: block_env.coinbase,
+            // TODO: make sure this works as expected!!!
+            // !!  - send to contract
+            // !!!!!
+            beneficiary: payload.suggested_fee_recipient(),
             state_root,
             transactions_root,
             receipts_root,
@@ -622,8 +671,8 @@ impl RethEnv {
             gas_used: cumulative_gas_used,
             extra_data: payload.attributes.batch_digest.into(),
             parent_beacon_block_root: Some(consensus_header_hash),
-            blob_gas_used: None,   // TODO: support blobs
-            excess_blob_gas: None, // TODO: support blobs
+            blob_gas_used: None,
+            excess_blob_gas: None,
             requests_hash: None,
         };
 
@@ -650,7 +699,6 @@ impl RethEnv {
         payload: TNPayload,
         consensus_header_digest: B256,
     ) -> TnRethResult<SealedBlockWithSenders> {
-        let chain_spec = self.node_config.chain.clone();
         let state = self
             .blockchain_provider
             .state_by_block_hash(payload.attributes.parent_header.hash())
@@ -668,10 +716,10 @@ impl RethEnv {
             .with_bundle_update()
             .build();
 
-        // initialize values for execution from block env
-        //
-        // use the parent's header bc there are no batches and the header arg is not used
-        let (_cfg, block_env) = payload.cfg_and_block_env(chain_spec.as_ref());
+        // // initialize values for execution from block env
+        // //
+        // // use the parent's header bc there are no batches and the header arg is not used
+        // let (_cfg, block_env) = payload.cfg_and_block_env(chain_spec.as_ref());
 
         // merge all transitions into bundle state, this would apply the withdrawal balance
         // changes and 4788 contract call
@@ -697,7 +745,7 @@ impl RethEnv {
         let header = ExecHeader {
             parent_hash: payload.parent(),
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
-            beneficiary: block_env.coinbase,
+            beneficiary: payload.suggested_fee_recipient(),
             state_root,
             transactions_root: EMPTY_TRANSACTIONS,
             receipts_root: EMPTY_RECEIPTS,
@@ -714,8 +762,8 @@ impl RethEnv {
             gas_used: 0,
             extra_data: payload.attributes.batch_digest.into(),
             parent_beacon_block_root: Some(consensus_header_digest),
-            blob_gas_used: None,   // TODO: support blobs
-            excess_blob_gas: None, // TODO: support blobs
+            blob_gas_used: None,
+            excess_blob_gas: None,
             requests_hash: None,
         };
 
@@ -734,6 +782,190 @@ impl RethEnv {
         Ok(sealed_block_with_senders)
     }
 
+    #[inline]
+    fn apply_closing_epoch_contract_call<EXT, DB>(
+        &self,
+        evm: &mut Evm<'_, EXT, DB>,
+        randomness: BlsSignature,
+    ) -> TnRethResult<Vec<Log>>
+    where
+        DB: Database + DatabaseCommit,
+        DB::Error: core::fmt::Display,
+    {
+        let prev_env = Box::new(evm.context.env().clone());
+        let calldata = self.generate_conclude_epoch_calldata(evm, randomness)?;
+
+        // fill tx env to execute system call to consensus registry
+        self.evm_config.fill_tx_env_system_contract_call(
+            &mut evm.context.evm.env,
+            SYSTEM_ADDRESS,
+            CONSENSUS_REGISTRY_ADDRESS,
+            // concludeEpoch(address[] calldata newCommittee)
+            calldata,
+        );
+
+        // execute system call to consensus registry
+        let mut res = match evm.transact() {
+            Ok(res) => res,
+            Err(e) => {
+                // fatal error
+                return Err(EVMError::Custom(format!("epoch closing execution failed: {e}")).into());
+            }
+        };
+
+        // capture closing epoch log
+        debug!(target: "engine", "closing epoch logs:\n{:#?}", res.result.logs());
+        let closing_epoch_logs = res.result.clone().into_logs();
+
+        // remove residual artifacts
+        self.restore_evm_context_after_system_call(&mut res, evm, prev_env);
+
+        debug!(target: "engine", "committing closing epoch state:\n{:#?}", res.state);
+
+        // commit the changes
+        evm.db_mut().commit(res.state);
+
+        Ok(closing_epoch_logs)
+    }
+
+    /// Generate calldata for updating the ConsensusRegistry to conclude the epoch.
+    #[inline]
+    fn generate_conclude_epoch_calldata<EXT, DB>(
+        &self,
+        evm: &mut Evm<'_, EXT, DB>,
+        randomness: BlsSignature,
+    ) -> TnRethResult<Bytes>
+    where
+        DB: Database,
+        DB::Error: core::fmt::Display,
+    {
+        // shuffle all validators for new committee
+        let new_committee = self.shuffle_new_committee(evm, randomness)?;
+
+        // encode the call to bytes with method selector and args
+        let bytes = ConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
+            .abi_encode()
+            .into();
+
+        Ok(bytes)
+    }
+
+    /// Read eligible validators from latest state and shuffle the committee deterministically.
+    #[inline]
+    fn shuffle_new_committee<EXT, DB>(
+        &self,
+        evm: &mut Evm<'_, EXT, DB>,
+        randomness: BlsSignature,
+    ) -> TnRethResult<Vec<Address>>
+    where
+        DB: Database,
+        DB::Error: core::fmt::Display,
+    {
+        // read all active validators from consensus registry
+        let calldata =
+            ConsensusRegistry::getValidatorsCall { status: ValidatorStatus::Active.into() }
+                .abi_encode()
+                .into();
+        let read_state =
+            self.read_state_on_chain(evm, SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+
+        debug!(target: "engine", "result after shuffle:\n{:#?}", read_state);
+
+        // retrieve data from execution result
+        let data = match read_state.result {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            e => return Err(EVMError::Custom(format!("getValidatorsCall failed: {e:?}")).into()),
+        };
+
+        // Use SolValue to decode the result
+        let mut all_validators: Vec<ConsensusRegistry::ValidatorInfo> =
+            alloy::sol_types::SolValue::abi_decode(&data, true)?;
+
+        debug!(target: "engine",  "validators pre-shuffle {:#?}", all_validators);
+
+        // simple Fisher-Yates shuffle
+        //
+        // create seed
+        let mut seed = [0; 32];
+        let random_bytes = randomness.to_bytes();
+        for i in 0..seed.len() {
+            seed[i] = random_bytes[i];
+        }
+        debug!(target: "engine", ?seed, "seed after");
+
+        let mut rng = rand_chacha::ChaCha8Rng::from_seed(seed);
+        for i in (1..all_validators.len()).rev() {
+            let j = rng.gen_range(0..=i);
+            all_validators.swap(i, j);
+        }
+
+        debug!(target: "engine",  "validators post-shuffle {:#?}", all_validators);
+
+        let new_committee = all_validators.into_iter().map(|v| v.ecdsaPubkey).collect();
+
+        Ok(new_committee)
+    }
+
+    /// Read state on-chain.
+    #[inline]
+    fn read_state_on_chain<EXT, DB>(
+        &self,
+        evm: &mut Evm<'_, EXT, DB>,
+        caller: Address,
+        contract: Address,
+        calldata: Bytes,
+    ) -> TnRethResult<ResultAndState>
+    where
+        DB: Database,
+        DB::Error: core::fmt::Display,
+    {
+        let prev_env = Box::new(evm.context.env().clone());
+
+        // fill tx env to disable certain EVM checks
+        self.evm_config.fill_tx_env_system_contract_call(
+            &mut evm.context.evm.env,
+            caller,
+            contract,
+            calldata,
+        );
+
+        // read from state
+        let res = match evm.transact() {
+            Ok(res) => res,
+            Err(e) => {
+                // fatal error
+                error!(target: "engine", ?caller, ?contract, "failed to read state: {}", e);
+                return Err(EVMError::Custom(format!("getValidatorsCall failed: {e}")).into());
+            }
+        };
+
+        // restore env for evm
+        evm.context.evm.env = prev_env;
+
+        Ok(res)
+    }
+
+    /// Restore evm context after system call.
+    #[inline]
+    fn restore_evm_context_after_system_call<EXT, DB>(
+        &self,
+        res: &mut ResultAndState,
+        evm: &mut Evm<'_, EXT, DB>,
+        prev_env: Box<Env>,
+    ) where
+        DB: Database,
+    {
+        // NOTE: revm marks these accounts as "touched" after the contract call
+        // and includes them in the result
+        //
+        // remove the state changes for system call
+        res.state.remove(&SYSTEM_ADDRESS);
+        res.state.remove(&evm.block().coinbase);
+
+        // restore the previous env
+        evm.context.evm.env = prev_env;
+    }
+
     /// Adds block to the tree and skips state root validation.
     pub fn insert_block(
         &self,
@@ -743,6 +975,7 @@ impl RethEnv {
             sealed_block_with_senders,
             BlockValidationKind::SkipStateRootValidation,
         )?;
+
         Ok(())
     }
 
@@ -966,5 +1199,427 @@ impl RethEnv {
         let BlockExecutionOutput { state, receipts, .. } =
             self.evm_executor.executor(&mut db).execute(block)?;
         Ok((state, receipts))
+    }
+
+    /// Create an EVM
+    pub fn execute_call_tx_for_test_bypass_evm_checks(
+        &self,
+        header: &SealedHeader,
+        contract_address: Address,
+        caller_address: Address,
+        data: Bytes,
+    ) -> TnRethResult<BundleState> {
+        // create execution db
+        let state = StateProviderDatabase::new(
+            self.latest().expect("provider retrieves latest during test batch execution"),
+        );
+
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
+
+        // Setup environment for the execution.
+        let EvmEnv { cfg_env_with_handler_cfg, block_env } =
+            self.evm_config.cfg_and_block_env(header);
+
+        // setup EVM
+        let mut evm = self.evm_config.evm_with_env(
+            &mut db,
+            EnvWithHandlerCfg::new_with_cfg_env(
+                cfg_env_with_handler_cfg,
+                block_env,
+                Default::default(),
+            ),
+        );
+
+        // modify env to disable checks
+        self.evm_config.fill_tx_env_system_contract_call(
+            &mut evm.context.evm.env,
+            caller_address,
+            contract_address,
+            data,
+        );
+
+        // execute the transaction
+        let ResultAndState { state, .. } = evm.transact().expect("evm transaction failed");
+        evm.db_mut().commit(state);
+
+        drop(evm);
+
+        // apply changes
+        db.merge_transitions(BundleRetention::PlainState);
+        Ok(db.take_bundle())
+    }
+
+    /// Creates a new [`EnvWithHandlerConfg`] based on the provided payload.
+    ///
+    /// see reth `ConfigureEvmEnv::cfg_and_block_env` which uses a default SpecId (latest)
+    ///
+    /// This method is used to create TN-Specific EVM environment with the correct forks
+    /// and defaults for execution.
+    fn tn_env_for_evm(&self, payload: &TNPayload) -> EnvWithHandlerCfg {
+        let spec_id = reth_revm::primitives::SpecId::SHANGHAI;
+        let cfg_env = CfgEnv::default().with_chain_id(self.chainspec().chain_id());
+        let cfg = CfgEnvWithHandlerCfg::new_with_spec_id(cfg_env, spec_id);
+
+        // use the basefee set by the worker during batch creation
+        let basefee = U256::from(payload.attributes.base_fee_per_gas);
+
+        // ensure gas_limit enforced during block validation
+        let gas_limit = U256::from(payload.attributes.gas_limit);
+
+        // create block env
+        let block_env = BlockEnv {
+            // build env for the next block based on parent
+            number: U256::from(payload.attributes.parent_header.number + 1),
+            // special fee address
+            coinbase: TN_COINBASE_ADDRESS,
+            timestamp: U256::from(payload.timestamp()),
+            // leave difficulty zero
+            // this value is useful for post-execution, but worker batches are created with this
+            // value
+            difficulty: U256::ZERO,
+            prevrandao: Some(payload.prev_randao()),
+            gas_limit,
+            basefee,
+            // calculate excess gas based on parent block's blob gas usage
+            blob_excess_gas_and_price: payload
+                .attributes
+                .parent_header
+                .excess_blob_gas
+                .map(|price| BlobExcessGasAndPrice::new(price, false)),
+        };
+
+        EnvWithHandlerCfg::new_with_cfg_env(cfg.clone(), block_env.clone(), TxEnv::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr as _;
+
+    use crate::traits::TNPayloadAttributes;
+
+    use super::*;
+    use alloy::{hex, primitives::Uint};
+    use rand_chacha::ChaCha8Rng;
+    use tempfile::TempDir;
+    use tn_config::{test_fetch_file_content_relative_to_manifest, ContractStandardJson};
+    use tn_types::{
+        adiri_genesis, BlsKeypair, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput,
+        GenesisAccount, ReputationScores,
+    };
+
+    /// Helper function to call `ConsensusRegistry` state on-chain.
+    fn call_consensus_registry<EXT, DB, T>(
+        reth_env: &RethEnv,
+        evm: &mut Evm<'_, EXT, DB>,
+        calldata: Bytes,
+    ) -> eyre::Result<T>
+    where
+        DB: Database,
+        DB::Error: core::fmt::Display,
+        T: alloy::sol_types::SolValue,
+        T: From<
+            <<T as alloy::sol_types::SolValue>::SolType as alloy::sol_types::SolType>::RustType,
+        >,
+    {
+        let state = reth_env.read_state_on_chain(
+            evm,
+            SYSTEM_ADDRESS,
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+        )?;
+
+        // retrieve epoch from state
+        match state.result {
+            ExecutionResult::Success { output, .. } => {
+                let data = output.into_data();
+                // use SolValue to decode the result
+                // let res = T::abi_decode(&data, true)?;
+                // Ok(res)
+                // Ok(T::abi_decode(&data, true)?)
+                let decoded = alloy::sol_types::SolValue::abi_decode(&data, true)?;
+                Ok(decoded)
+            }
+            e => Err(eyre::eyre!("failed to read validators from state: {e:?}")),
+        }
+    }
+
+    // /// Helper function to call `ConsensusRegistry::getCurrentEpoch` state on-chain.
+    // fn get_current_epoch_on_chain<EXT, DB>(
+    //     reth_env: &RethEnv,
+    //     evm: &mut Evm<'_, EXT, DB>,
+    // ) -> eyre::Result<u32>
+    // where
+    //     DB: Database,
+    //     DB::Error: core::fmt::Display,
+    // {
+    //     // read curent epoch
+    //     let calldata = ConsensusRegistry::getCurrentEpochCall {}.abi_encode();
+    //     let state = reth_env.read_state_on_chain(
+    //         evm,
+    //         SYSTEM_ADDRESS,
+    //         CONSENSUS_REGISTRY_ADDRESS,
+    //         calldata.into(),
+    //     )?;
+
+    //     // retrieve epoch from state
+    //     match state.result {
+    //         ExecutionResult::Success { output, .. } => {
+    //             let data = output.into_data();
+    //             // use SolValue to decode the result
+    //             let epoch: u32 = alloy::sol_types::SolValue::abi_decode(&data, true)?;
+    //             Ok(epoch)
+    //         }
+    //         e => Err(eyre::eyre!("failed to read validators from state: {e:?}")),
+    //     }
+    // }
+
+    // /// Helper function to call `ConsensusRegistry::getEpochInfo` state on-chain.
+    // fn get_epoch_info_on_chain<EXT, DB>(
+    //     reth_env: &RethEnv,
+    //     evm: &mut Evm<'_, EXT, DB>,
+    //     epoch: u32,
+    // ) -> eyre::Result<ConsensusRegistry::EpochInfo>
+    // where
+    //     DB: Database,
+    //     DB::Error: core::fmt::Display,
+    // {
+    //     // read curent epoch
+    //     let calldata = ConsensusRegistry::getEpochInfoCall { epoch }.abi_encode();
+    //     let state = reth_env.read_state_on_chain(
+    //         evm,
+    //         SYSTEM_ADDRESS,
+    //         CONSENSUS_REGISTRY_ADDRESS,
+    //         calldata.into(),
+    //     )?;
+
+    //     // retrieve epoch from state
+    //     match state.result {
+    //         ExecutionResult::Success { output, .. } => {
+    //             let data = output.into_data();
+    //             // use SolValue to decode the result
+    //             let epoch: u32 = alloy::sol_types::SolValue::abi_decode(&data, true)?;
+    //             Ok(epoch)
+    //         }
+    //         e => Err(eyre::eyre!("failed to read validators from state: {e:?}")),
+    //     }
+    // }
+
+    /// TODO: move this to consensus output.
+    /// !!!!!!!!!!!
+    fn consensus_output_for_tests() -> ConsensusOutput {
+        let mut leader = Certificate::default();
+        let sub_dag_index = 0;
+        leader.header.round = sub_dag_index as u32;
+        let reputation_scores = ReputationScores::default();
+        let previous_sub_dag = None;
+        let beneficiary = Address::from_str("0x5555555555555555555555555555555555555555")
+            .expect("beneficiary address from str");
+        ConsensusOutput {
+            sub_dag: CommittedSubDag::new(
+                vec![leader.clone(), Certificate::default()],
+                leader,
+                sub_dag_index,
+                reputation_scores,
+                previous_sub_dag,
+            )
+            .into(),
+            close_epoch: false,
+            batches: Default::default(), // empty
+            beneficiary,
+            batch_digests: Default::default(), // empty
+            parent_hash: ConsensusHeader::default().digest(),
+            number: 0,
+            extra: Default::default(),
+            early_finalize: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validator_shuffle() -> eyre::Result<()> {
+        // TODO: REMOVE - init_test_tracing
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::ACTIVE)
+            .with_writer(std::io::stdout)
+            .try_init();
+
+        let task_manager = TaskManager::new("Test Task Manager");
+        let tmp_dir = TempDir::new().unwrap();
+
+        // fetch registry impl bytecode from compiled output in tn-contracts
+        let registry_standard_json = test_fetch_file_content_relative_to_manifest(
+            "../../tn-contracts/artifacts/ConsensusRegistry.json".into(),
+        );
+        let registry_contract: ContractStandardJson =
+            serde_json::from_str(&registry_standard_json).expect("json parsing failure");
+        let registry_bytecode = hex::decode(registry_contract.deployed_bytecode.object)
+            .expect("invalid bytecode hexstring");
+        let validator_1 = Address::from_slice(&[0x11; 20]);
+        let validator_2 = Address::from_slice(&[0x22; 20]);
+        let validator_3 = Address::from_slice(&[0x33; 20]);
+        let validator_4 = Address::from_slice(&[0x44; 20]);
+        let validator_5 = Address::from_slice(&[0x55; 20]);
+
+        // create initial validators for testing
+        let initial_validators =
+            vec![validator_1, validator_2, validator_3, validator_4, validator_5];
+
+        // create validator info objects for each address
+        let validator_infos: Vec<ConsensusRegistry::ValidatorInfo> = initial_validators
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| {
+                let ed_25519_keypair = tn_types::NetworkKeypair::generate_ed25519();
+                // use deterministic seed
+                let mut rng = ChaCha8Rng::seed_from_u64(i as u64);
+                let bls = BlsKeypair::generate(&mut rng);
+                let bls_pubkey = bls.public().to_bytes().to_vec();
+
+                ConsensusRegistry::ValidatorInfo {
+                    blsPubkey: bls_pubkey.into(),
+                    ed25519Pubkey: ed_25519_keypair
+                        .public()
+                        .try_into_ed25519()
+                        .expect("is an ed_25519")
+                        .to_bytes()
+                        .into(),
+                    ecdsaPubkey: *addr,
+                    activationEpoch: 0,
+                    exitEpoch: 0,
+                    validatorIndex: Uint::<24, 1>::from(i as u32 + 1),
+                    currentStatus: ConsensusRegistry::ValidatorStatus::Active,
+                }
+            })
+            .collect();
+
+        debug!(target: "engine", "created validators for consensus registry {:#?}", validator_infos);
+
+        // set up genesis with the ConsensusRegistry deployed
+        let genesis = adiri_genesis().extend_accounts([(
+            CONSENSUS_REGISTRY_ADDRESS,
+            GenesisAccount::default().with_code(Some(registry_bytecode.clone().into())),
+        )]);
+
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let reth_env =
+            RethEnv::new_for_test_with_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
+
+        let init_calldata = ConsensusRegistry::initializeCall {
+            rwTEL_: Address::random(),
+            stakeAmount_: U256::from(1_000_000e18),
+            minWithdrawAmount_: U256::from(10_000e18),
+            initialValidators_: validator_infos.clone(),
+            owner_: SYSTEM_ADDRESS,
+        }
+        .abi_encode()
+        .into();
+
+        let BundleState { state, contracts, reverts, state_size, reverts_size } = reth_env
+            .execute_call_tx_for_test_bypass_evm_checks(
+                &chain.sealed_genesis_header(),
+                CONSENSUS_REGISTRY_ADDRESS,
+                SYSTEM_ADDRESS,
+                init_calldata,
+            )?;
+
+        debug!(target: "engine", "contracts:\n{:#?}", contracts);
+        debug!(target: "engine", "reverts:\n{:#?}", reverts);
+        debug!(target: "engine", "state_size:{:#?}", state_size);
+        debug!(target: "engine", "reverts_size:{:#?}", reverts_size);
+
+        // place initialized bytecode in genesis
+        let storage = state.get(&CONSENSUS_REGISTRY_ADDRESS).and_then(|account| {
+            Some(
+                account
+                    .storage
+                    .iter()
+                    .map(|(k, v)| ((*k).into(), v.present_value.into()))
+                    .collect(),
+            )
+        });
+
+        let genesis = adiri_genesis().extend_accounts([(
+            CONSENSUS_REGISTRY_ADDRESS,
+            GenesisAccount::default()
+                .with_code(Some(registry_bytecode.into()))
+                .with_storage(storage),
+        )]);
+
+        // create new env with initialized consensus registry for tests
+        let tmp_dir = TempDir::new().unwrap();
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let reth_env =
+            RethEnv::new_for_test_with_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
+
+        // create execution db
+        let state = StateProviderDatabase::new(
+            reth_env.latest().expect("provider retrieves latest during test batch execution"),
+        );
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
+
+        // setup environment for execution
+        let payload = TNPayload::new(TNPayloadAttributes::new_for_test(
+            chain.sealed_genesis_header(),
+            &consensus_output_for_tests(),
+        ));
+        let tn_env = reth_env.tn_env_for_evm(&payload);
+        let mut evm = reth_env.evm_config.evm_with_env(&mut db, tn_env);
+        let original_env = evm.context.env().clone();
+
+        // read curent epoch
+        let calldata = ConsensusRegistry::getCurrentEpochCall {}.abi_encode().into();
+        let epoch = call_consensus_registry::<_, _, u32>(&reth_env, &mut evm, calldata)?;
+        let expected_epoch = 0;
+        assert_eq!(expected_epoch, epoch);
+
+        // read current epoch info
+        let calldata = ConsensusRegistry::getEpochInfoCall { epoch }.abi_encode().into();
+        let epoch_info = call_consensus_registry::<_, _, ConsensusRegistry::EpochInfo>(
+            &reth_env, &mut evm, calldata,
+        )?;
+        let expected_committee = validator_infos.iter().map(|v| v.ecdsaPubkey.clone()).collect();
+        let expected_epoch_info =
+            ConsensusRegistry::EpochInfo { committee: expected_committee, blockHeight: 0 };
+        assert_eq!(epoch_info, expected_epoch_info);
+
+        // close epoch with deterministic signature as source of randomness
+        let sig = BlsSignature::default();
+        reth_env.apply_closing_epoch_contract_call(&mut evm, sig)?;
+        assert_eq!(&original_env, evm.context.env());
+
+        // read new epoch info
+        let calldata = ConsensusRegistry::getCurrentEpochCall {}.abi_encode().into();
+        let epoch = call_consensus_registry::<_, _, u32>(&reth_env, &mut evm, calldata)?;
+        let expected_epoch = expected_epoch + 1;
+        assert_eq!(expected_epoch, epoch);
+
+        // read new committee (always 2 epochs ahead)
+        let calldata = ConsensusRegistry::getEpochInfoCall { epoch: epoch + 2 }.abi_encode().into();
+        let new_epoch_info = call_consensus_registry::<_, _, ConsensusRegistry::EpochInfo>(
+            &reth_env, &mut evm, calldata,
+        )?;
+
+        // ensure shuffle is deterministic
+        let expected_new_committee =
+            vec![validator_4, validator_2, validator_5, validator_1, validator_3];
+
+        let expected =
+            ConsensusRegistry::EpochInfo { committee: expected_new_committee, blockHeight: 0 };
+
+        debug!(target: "engine", "new epoch info:{:#?}", new_epoch_info);
+
+        assert_eq!(new_epoch_info, expected);
+
+        // TODO: assert event emitted
+
+        // merge transitions to apply state changes
+        evm.context.evm.db.merge_transitions(BundleRetention::PlainState);
+
+        // debug! take bundle
+        let bundle = evm.context.evm.db.take_bundle();
+        debug!(target: "engine", "bundle from execution:\n{:#?}", bundle);
+
+        Ok(())
     }
 }

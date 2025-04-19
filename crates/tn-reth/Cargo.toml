@@ -20,7 +20,6 @@ enr = { workspace = true, default-features = false, features = [
     "rust-secp256k1",
 ] }
 
-
 reth = { workspace = true }
 reth-db = { workspace = true }
 reth-db-common = { workspace = true }
@@ -51,7 +50,7 @@ reth-discv4 = { workspace = true }
 reth-eth-wire = { workspace = true }
 reth-tracing = { workspace = true }
 
-
+rand_chacha = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
@@ -61,3 +60,6 @@ eyre = { workspace = true }
 alloy = { workspace = true, features = ["genesis"] }
 
 [dev-dependencies]
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }

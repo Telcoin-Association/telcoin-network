@@ -11667,6 +11667,7 @@ dependencies = [
  "eyre",
  "futures",
  "jsonrpsee",
+ "rand_chacha",
  "reth",
  "reth-blockchain-tree",
  "reth-chainspec",
@@ -11695,11 +11696,14 @@ dependencies = [
  "reth-transaction-pool",
  "reth-trie-db",
  "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tn-config",
  "tn-types",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

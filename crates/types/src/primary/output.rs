@@ -51,6 +51,10 @@ pub struct ConsensusOutput {
     /// be false unless running a node with the potential to advertise a forked block or
     /// two before quitting.
     pub early_finalize: bool,
+    /// Boolean indicating if this is the last output for the epoch.
+    ///
+    /// The engine should make a system call to consensus registry contract to close the epoch.
+    pub close_epoch: bool,
 }
 
 impl ConsensusOutput {
@@ -107,6 +111,14 @@ impl ConsensusOutput {
     /// Return the hash of the consensus header that matches this output.
     pub fn consensus_header_hash(&self) -> B256 {
         ConsensusHeader::digest_from_parts(self.parent_hash, &self.sub_dag, self.number)
+    }
+
+    /// Return the index of the last batch if the epoch should be closed.
+    ///
+    /// This is used by the engine to apply system calls at the end of the epoch.
+    pub fn epoch_closing_index(&self) -> Option<usize> {
+        // handle edge case for no transactions
+        self.close_epoch.then(|| self.batch_digests.len().saturating_sub(1))
     }
 }
 

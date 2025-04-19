@@ -651,6 +651,7 @@ mod tests {
                 number: 0,
                 extra: Default::default(),
                 early_finalize: true,
+                close_epoch: false,
             };
             // execute output to trigger canonical update
             let args = BuildArguments::new(reth_env.clone(), output, parent);
