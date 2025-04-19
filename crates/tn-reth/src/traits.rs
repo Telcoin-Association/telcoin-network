@@ -23,9 +23,11 @@ use reth_trie_db::MerklePatriciaTrie;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tn_types::{
-    Address, BlockExt as _, BlockWithSenders, ConsensusOutput, EthPrimitives, ExecHeader,
-    NodePrimitives, SealedBlock, SealedHeader, TransactionSigned, Withdrawals, B256, U256,
+    Address, BlockExt as _, BlockWithSenders, BlsSignature, ConsensusOutput, EthPrimitives,
+    ExecHeader, NodePrimitives, SealedBlock, SealedHeader, TransactionSigned, Withdrawals, B256,
+    U256,
 };
+use tracing::error;
 
 /// Telcoin Network specific node types for reth compatibility.
 pub trait TelcoinNodeTypes: NodeTypesWithEngine + NodeTypesWithDB {
@@ -291,7 +293,7 @@ pub struct TNPayloadAttributes {
     /// Boolean indicating if the payload should use system calls to close the epoch during execution.
     ///
     /// This is the last batch for the `ConsensusOutput` if the epoch is closing.
-    pub close_epoch: bool,
+    pub close_epoch: Option<BlsSignature>,
 }
 
 impl TNPayloadAttributes {
@@ -308,7 +310,15 @@ impl TNPayloadAttributes {
         mix_hash: B256,
         withdrawals: Withdrawals,
     ) -> Self {
-        let close_epoch = output.epoch_closing_index().is_some_and(|idx| idx == batch_index);
+        // include leader's aggregate bls signature if this is the last payload for the epoch
+        let close_epoch = output
+            .epoch_closing_index()
+            .is_some_and(|idx| idx == batch_index)
+            .then(|| output.leader().aggregated_signature().unwrap_or_else(|| {
+                error!(target: "engine", ?output, "BLS signature missing for leader - using default for closing epoch");
+                BlsSignature::default()
+            }));
+
         Self {
             parent_header,
             beneficiary: output.beneficiary(),

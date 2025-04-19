@@ -1,17 +1,18 @@
 #[cfg(test)]
 mod tests {
     use crate::util::spawn_local_testnet;
-    use alloy::{network::EthereumWallet, primitives::Uint, providers::ProviderBuilder};
+    use alloy::{
+        network::EthereumWallet, primitives::Uint, providers::ProviderBuilder, sol_types::SolCall,
+    };
     use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
     use rand::{rngs::StdRng, SeedableRng};
     use std::{sync::Arc, time::Duration};
     use tempfile::TempDir;
     use tn_config::{test_fetch_file_content_relative_to_manifest, ContractStandardJson};
-    use tn_reth::RethChainSpec;
+    use tn_reth::{system_calls::ConsensusRegistry, RethChainSpec};
     use tn_test_utils::{get_contract_state_for_genesis, TransactionFactory};
     use tn_types::{
-        adiri_genesis, hex, sol, Address, BlsKeypair, Bytes, GenesisAccount, NetworkKeypair,
-        SolValue, U256,
+        adiri_genesis, hex, sol, Address, BlsKeypair, Bytes, GenesisAccount, SolValue, U256,
     };
 
     #[tokio::test]
@@ -46,7 +47,6 @@ mod tests {
 
         // ERC1967Proxy interface
         sol!(
-            #[allow(clippy::too_many_arguments)]
             #[sol(rpc)]
             contract ERC1967Proxy {
                 constructor(address implementation, bytes memory _data);
@@ -65,44 +65,9 @@ mod tests {
         let registry_create_data =
             [registry_proxy_initcode.as_slice(), &constructor_params[..]].concat();
 
-        // ConsensusRegistry interface
-        sol!(
-            #[allow(clippy::too_many_arguments)]
-            #[sol(rpc)]
-            contract ConsensusRegistry {
-                enum ValidatorStatus {
-                    Undefined,
-                    PendingActivation,
-                    Active,
-                    PendingExit,
-                    Exited
-                }
-                struct ValidatorInfo {
-                    bytes blsPubkey;
-                    bytes32 ed25519Pubkey;
-                    address ecdsaPubkey;
-                    uint32 activationEpoch;
-                    uint32 exitEpoch;
-                    uint24 validatorIndex;
-                    ValidatorStatus currentStatus;
-                }
-                struct EpochInfo {
-                    address[] committee;
-                    uint64 blockHeight;
-                }
-                function initialize(
-                    address rwTEL_,
-                    uint256 stakeAmount_,
-                    uint256 minWithdrawAmount_,
-                    ValidatorInfo[] memory initialValidators_,
-                    address owner_
-                );
-                function getValidators(uint8 status) public view returns (ValidatorInfo[] memory);
-                function getEpochInfo(uint32 epoch) public view returns (EpochInfo memory epochInfo);
-            }
-        );
+        let registry_init_selector = ConsensusRegistry::initializeCall::SELECTOR;
+        // let registry_init_selector = [97, 175, 158, 105];
 
-        let registry_init_selector = [97, 175, 158, 105];
         let activation_epoch = u32::default();
         let exit_epoch = u32::default();
         let active_status = ConsensusRegistry::ValidatorStatus::Active;
@@ -114,7 +79,7 @@ mod tests {
                 let mut rng = StdRng::from_entropy();
                 let bls_keypair = BlsKeypair::generate(&mut rng);
                 let bls_pubkey = bls_keypair.public().to_bytes().to_vec();
-                let ed_25519_keypair = NetworkKeypair::generate_ed25519();
+                let ed_25519_keypair = tn_types::NetworkKeypair::generate_ed25519();
                 let ecdsa_pubkey = Address::random();
 
                 ConsensusRegistry::ValidatorInfo {
