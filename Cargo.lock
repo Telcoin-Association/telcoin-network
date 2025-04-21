@@ -11703,7 +11703,6 @@ dependencies = [
  "tn-types",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

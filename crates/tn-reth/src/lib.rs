@@ -1270,13 +1270,11 @@ impl RethEnv {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr as _;
-
-    use crate::traits::TNPayloadAttributes;
-
     use super::*;
+    use crate::traits::TNPayloadAttributes;
     use alloy::{hex, primitives::Uint};
     use rand_chacha::ChaCha8Rng;
+    use std::str::FromStr as _;
     use tempfile::TempDir;
     use tn_config::{test_fetch_file_content_relative_to_manifest, ContractStandardJson};
     use tn_types::{
@@ -1310,9 +1308,6 @@ mod tests {
             ExecutionResult::Success { output, .. } => {
                 let data = output.into_data();
                 // use SolValue to decode the result
-                // let res = T::abi_decode(&data, true)?;
-                // Ok(res)
-                // Ok(T::abi_decode(&data, true)?)
                 let decoded = alloy::sol_types::SolValue::abi_decode(&data, true)?;
                 Ok(decoded)
             }
@@ -1320,8 +1315,7 @@ mod tests {
         }
     }
 
-    /// TODO: move this to consensus output.
-    /// !!!!!!!!!!!
+    /// Helper function for creating a consensus output for tests.
     fn consensus_output_for_tests() -> ConsensusOutput {
         let mut leader = Certificate::default();
         let sub_dag_index = 0;
@@ -1352,13 +1346,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_validator_shuffle() -> eyre::Result<()> {
-        // TODO: REMOVE - init_test_tracing
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::ACTIVE)
-            .with_writer(std::io::stdout)
-            .try_init();
-
         let task_manager = TaskManager::new("Test Task Manager");
         let tmp_dir = TempDir::new().unwrap();
 
@@ -1518,8 +1505,6 @@ mod tests {
         debug!(target: "engine", "new epoch info:{:#?}", new_epoch_info);
 
         assert_eq!(new_epoch_info, expected);
-
-        // TODO: assert event emitted
 
         // merge transitions to apply state changes
         evm.context.evm.db.merge_transitions(BundleRetention::PlainState);
