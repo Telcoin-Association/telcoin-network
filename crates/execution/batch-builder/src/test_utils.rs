@@ -10,7 +10,7 @@ use tn_reth::{
     PoolTxnId, SenderIdentifiers, TxPool,
 };
 use tn_types::{
-    Batch, BatchBuilderArgs, BlockBody, PendingBlockConfig, RecoveredTx, SealedBlock, SealedHeader,
+    Batch, BatchBuilderArgs, BlockBody, PendingBatchConfig, RecoveredTx, SealedBlock, SealedHeader,
     TransactionTrait as _, TxHash, MIN_PROTOCOL_BASE_FEE,
 };
 
@@ -22,7 +22,7 @@ pub fn execute_test_batch(test_batch: &mut Batch, parent: &SealedHeader) {
 
     let parent_info = SealedBlock::new(parent.clone(), BlockBody::default());
 
-    let batch_config = PendingBlockConfig::new(test_batch.beneficiary, parent_info);
+    let batch_config = PendingBatchConfig::new(test_batch.beneficiary, parent_info);
     let args = BatchBuilderArgs { pool, batch_config };
     let BatchBuilderOutput { batch, .. } = build_batch(args);
     test_batch.parent_hash = batch.parent_hash;

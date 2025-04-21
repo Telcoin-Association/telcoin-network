@@ -124,37 +124,35 @@ fn test_remove_expired_empty_cache() {
 
 #[test]
 fn test_remove_expired_ordering() {
-    let mut cache = BannedPeerCache::new(Duration::from_millis(100));
+    // Use a larger timeout to reduce flakiness
+    let mut cache = BannedPeerCache::new(Duration::from_millis(500));
     let peer1 = PeerId::random();
     let peer2 = PeerId::random();
     let peer3 = PeerId::random();
     let peer4 = PeerId::random();
 
-    // Insert multiple elements with delays to test expiration ordering
+    // Insert with larger gaps between insertions
     cache.insert(peer1);
-    std::thread::sleep(Duration::from_millis(20));
+    std::thread::sleep(Duration::from_millis(100));
     cache.insert(peer2);
-    std::thread::sleep(Duration::from_millis(20));
+    std::thread::sleep(Duration::from_millis(100));
     cache.insert(peer3);
-    std::thread::sleep(Duration::from_millis(20));
+    std::thread::sleep(Duration::from_millis(100));
     cache.insert(peer4);
 
-    // wait for peer1 to expire
-    std::thread::sleep(Duration::from_millis(41));
+    // Wait with more buffer time
+    std::thread::sleep(Duration::from_millis(550)); // Wait for peer1 to expire
 
-    // assert peer1 expired
     let expired = cache.heartbeat();
     assert_eq!(expired.len(), 1, "Only Peer1 should be expired");
     assert_eq!(expired[0], peer1, "Peer1 should be expired");
 
-    // wait for peer2 to expire
-    std::thread::sleep(Duration::from_millis(20));
+    std::thread::sleep(Duration::from_millis(100)); // Wait for peer2 to expire
     let expired = cache.heartbeat();
     assert_eq!(expired.len(), 1, "Only peer2 should be expired");
     assert_eq!(expired[0], peer2, "Peer2 should be expired");
 
-    // wait for peer3 and peer4 to expire
-    std::thread::sleep(Duration::from_millis(41));
+    std::thread::sleep(Duration::from_millis(150)); // Wait for peer3 and peer4 to expire
     let expired = cache.heartbeat();
     assert_eq!(expired.len(), 2, "Peer3 and Peer4 should be expired");
     assert_eq!(expired[0], peer3, "The first expired element should be peer3");

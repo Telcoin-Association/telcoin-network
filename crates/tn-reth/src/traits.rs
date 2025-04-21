@@ -16,9 +16,6 @@ use reth_node_ethereum::{
     BasicBlockExecutorProvider, EthEngineTypes, EthExecutionStrategyFactory, EthExecutorProvider,
 };
 use reth_provider::EthStorage;
-use reth_revm::primitives::{
-    BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, SpecId,
-};
 use reth_trie_db::MerklePatriciaTrie;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -182,47 +179,6 @@ impl TNPayload {
         Self { attributes }
     }
 
-    // /// Create a Reth config and block environment.
-    // pub(crate) fn cfg_and_block_env(
-    //     &self,
-    //     chain_spec: &ChainSpec,
-    // ) -> (CfgEnvWithHandlerCfg, BlockEnv) {
-    //     // configure evm env based on parent block
-    //     let cfg = CfgEnv::default().with_chain_id(chain_spec.chain().id());
-
-    //     // ensure we're not missing any timestamp based hardforks
-    //     let spec_id = SpecId::SHANGHAI;
-
-    //     // use the blob excess gas and price set by the worker during batch creation
-    //     let blob_excess_gas_and_price = Some(BlobExcessGasAndPrice::new(0, false));
-
-    //     // use the basefee set by the worker during batch creation
-    //     let basefee = U256::from(self.attributes.base_fee_per_gas);
-
-    //     // ensure gas_limit enforced during block validation
-    //     let gas_limit = U256::from(self.attributes.gas_limit);
-
-    //     // create block environment to re-execute worker's block
-    //     let block_env = BlockEnv {
-    //         // the block's number should come from the canonical tip, NOT the batch's number
-    //         number: U256::from(self.attributes.parent_header.number + 1),
-    //         // special fee address
-    //         coinbase: self.suggested_fee_recipient(),
-    //         timestamp: U256::from(self.timestamp()),
-    //         // leave difficulty zero
-    //         // this value is useful for post-execution, but worker's block is created with this
-    //         // value
-    //         difficulty: U256::ZERO,
-    //         prevrandao: Some(self.prev_randao()),
-    //         gas_limit,
-    //         basefee,
-    //         // calculate excess gas based on parent block's blob gas usage
-    //         blob_excess_gas_and_price,
-    //     };
-
-    //     (CfgEnvWithHandlerCfg::new_with_spec_id(cfg, spec_id), block_env)
-    // }
-
     /// Passthrough attribute timestamp.
     pub(crate) fn timestamp(&self) -> u64 {
         self.attributes.timestamp
@@ -290,7 +246,8 @@ pub struct TNPayloadAttributes {
     ///
     /// This is currently always empty vec. This comes from the batch block's withdrawals.
     pub withdrawals: Withdrawals,
-    /// Boolean indicating if the payload should use system calls to close the epoch during execution.
+    /// Boolean indicating if the payload should use system calls to close the epoch during
+    /// execution.
     ///
     /// This is the last batch for the `ConsensusOutput` if the epoch is closing.
     pub close_epoch: Option<BlsSignature>,
@@ -337,7 +294,7 @@ impl TNPayloadAttributes {
 
     /// Method to create an instance of Self useful for tests.
     ///
-    /// WARNING: only use this for tests.
+    /// WARNING: only use this for tests. Data is invalid.
     pub fn new_for_test(parent_header: SealedHeader, output: &ConsensusOutput) -> Self {
         let batch_index = 0;
         let batch_digest = B256::random();

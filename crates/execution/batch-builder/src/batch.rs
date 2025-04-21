@@ -9,7 +9,7 @@
 use tn_reth::TxPool;
 use tn_types::{
     max_batch_gas, max_batch_size, now, Batch, BatchBuilderArgs, Encodable2718 as _,
-    PendingBlockConfig, TransactionTrait as _, TxHash,
+    PendingBatchConfig, TransactionTrait as _, TxHash,
 };
 use tracing::{debug, warn};
 
@@ -48,7 +48,7 @@ pub fn build_batch<P: TxPool>(args: BatchBuilderArgs<P>) -> BatchBuilderOutput {
     let gas_limit = max_batch_gas(batch_config.parent_info.timestamp);
     let max_size = max_batch_size(batch_config.parent_info.timestamp);
     let base_fee_per_gas = batch_config.parent_info.base_fee_per_gas;
-    let PendingBlockConfig { beneficiary, parent_info } = batch_config;
+    let PendingBatchConfig { beneficiary, parent_info } = batch_config;
 
     // NOTE: this obtains a `read` lock on the tx pool
     // pull best transactions and rely on watch channel to ensure basefee is current

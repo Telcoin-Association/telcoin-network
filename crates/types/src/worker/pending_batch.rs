@@ -10,19 +10,19 @@ pub struct BatchBuilderArgs<Pool> {
     /// The transaction pool.
     pub pool: Pool,
     /// The attributes for the next block.
-    pub batch_config: PendingBlockConfig,
+    pub batch_config: PendingBatchConfig,
 }
 
 impl<Pool> BatchBuilderArgs<Pool> {
     /// Create a new instance of [Self].
-    pub fn new(pool: Pool, batch_config: PendingBlockConfig) -> Self {
+    pub fn new(pool: Pool, batch_config: PendingBatchConfig) -> Self {
         Self { pool, batch_config }
     }
 }
 
 /// The configuration to use for building the next batch.
 #[derive(Debug)]
-pub struct PendingBlockConfig {
+pub struct PendingBatchConfig {
     /// The worker primary's address.
     pub beneficiary: Address,
     /// The current information from canonical tip and finalized batch.
@@ -33,7 +33,7 @@ pub struct PendingBlockConfig {
     pub parent_info: SealedBlock,
 }
 
-impl PendingBlockConfig {
+impl PendingBatchConfig {
     /// Creates a new instance of [Self].
     pub fn new(beneficiary: Address, parent_info: SealedBlock) -> Self {
         Self { beneficiary, parent_info }

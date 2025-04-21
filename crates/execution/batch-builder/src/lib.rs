@@ -33,7 +33,7 @@ use std::{
 };
 use tn_reth::{RethEnv, TxPool as _, WorkerTxPool};
 use tn_types::{
-    error::BlockSealError, Address, BatchBuilderArgs, BatchSender, PendingBlockConfig, SealedBlock,
+    error::BlockSealError, Address, BatchBuilderArgs, BatchSender, PendingBatchConfig, SealedBlock,
     TxHash,
 };
 use tokio::{
@@ -126,8 +126,8 @@ impl BatchBuilder {
         let pool = self.pool.clone();
         let to_worker = self.to_worker.clone();
 
-        // configure params for next block to build
-        let config = PendingBlockConfig::new(self.address, self.last_canonical_update.clone());
+        // configure params for next building the next batch
+        let config = PendingBatchConfig::new(self.address, self.last_canonical_update.clone());
         let build_args = BatchBuilderArgs::new(pool.clone(), config);
         let (result, done) = oneshot::channel();
 

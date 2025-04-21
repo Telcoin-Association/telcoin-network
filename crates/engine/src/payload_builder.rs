@@ -86,8 +86,16 @@ pub fn execute_consensus_output(args: BuildArguments) -> EngineResult<SealedHead
         let payload = TNPayload::new(payload_attributes);
 
         // execute
-        let next_canonical_block =
-            reth_env.build_block_from_empty_payload(payload, output.consensus_header_hash())?;
+        let next_canonical_block = if payload.attributes.close_epoch.is_none() {
+            reth_env.build_block_from_empty_payload(payload, output.consensus_header_hash())?
+        } else {
+            // pass empty transactions and use logic to add receipts for closing epoch
+            reth_env.build_block_from_batch_payload(
+                payload,
+                vec![],
+                output.consensus_header_hash(),
+            )?
+        };
 
         debug!(target: "engine", ?next_canonical_block, "empty block");
 
@@ -127,7 +135,7 @@ pub fn execute_consensus_output(args: BuildArguments) -> EngineResult<SealedHead
             // execute
             let next_canonical_block = reth_env.build_block_from_batch_payload(
                 payload,
-                batch,
+                batch.transactions,
                 output.consensus_header_hash(),
             )?;
 
