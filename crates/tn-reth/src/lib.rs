@@ -90,9 +90,9 @@ use system_calls::{
     CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
 };
 use tn_types::{
-    adiri_chain_spec_arc, calculate_transaction_root, Address, Block, BlockBody, BlockExt as _,
-    BlockHashOrNumber, BlockNumHash, BlockNumber, BlockWithSenders, BlsSignature, ExecHeader,
-    Genesis, Receipt, SealedBlock, SealedBlockWithSenders, SealedHeader, TaskManager,
+    adiri_chain_spec_arc, calculate_transaction_root, keccak256, Address, Block, BlockBody,
+    BlockExt as _, BlockHashOrNumber, BlockNumHash, BlockNumber, BlockWithSenders, BlsSignature,
+    ExecHeader, Genesis, Receipt, SealedBlock, SealedBlockWithSenders, SealedHeader, TaskManager,
     TransactionSigned, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS,
     EMPTY_WITHDRAWALS, U256,
 };
@@ -760,7 +760,6 @@ impl RethEnv {
         Ok(sealed_block_with_senders)
     }
 
-    #[inline]
     fn apply_closing_epoch_contract_call<EXT, DB>(
         &self,
         evm: &mut Evm<'_, EXT, DB>,
@@ -806,7 +805,6 @@ impl RethEnv {
     }
 
     /// Generate calldata for updating the ConsensusRegistry to conclude the epoch.
-    #[inline]
     fn generate_conclude_epoch_calldata<EXT, DB>(
         &self,
         evm: &mut Evm<'_, EXT, DB>,
@@ -828,7 +826,6 @@ impl RethEnv {
     }
 
     /// Read eligible validators from latest state and shuffle the committee deterministically.
-    #[inline]
     fn shuffle_new_committee<EXT, DB>(
         &self,
         evm: &mut Evm<'_, EXT, DB>,
@@ -862,11 +859,10 @@ impl RethEnv {
 
         // simple Fisher-Yates shuffle
         //
-        // create seed
-        const SEED_LENGTH: usize = 32;
-        let mut seed = [0; SEED_LENGTH];
-        let random_bytes = randomness.to_bytes();
-        seed.copy_from_slice(&random_bytes[..SEED_LENGTH]);
+        // create seed from hashed bls agg signature
+        let mut seed = [0; 32];
+        let random_bytes = keccak256(randomness.to_bytes());
+        seed.copy_from_slice(random_bytes.as_slice());
         debug!(target: "engine", ?seed, "seed after");
 
         let mut rng = rand_chacha::ChaCha8Rng::from_seed(seed);
@@ -883,7 +879,6 @@ impl RethEnv {
     }
 
     /// Read state on-chain.
-    #[inline]
     fn read_state_on_chain<EXT, DB>(
         &self,
         evm: &mut Evm<'_, EXT, DB>,
@@ -922,7 +917,6 @@ impl RethEnv {
     }
 
     /// Restore evm context after system call.
-    #[inline]
     fn restore_evm_context_after_system_call<EXT, DB>(
         &self,
         res: &mut ResultAndState,
@@ -1177,7 +1171,9 @@ impl RethEnv {
         Ok((state, receipts))
     }
 
-    /// Create an EVM
+    /// Create an EVM tx enviornment that bypasses certain checks.
+    ///
+    /// This method is useful for executing transactions pre-genesis.
     pub fn execute_call_tx_for_test_bypass_evm_checks(
         &self,
         header: &SealedHeader,
@@ -1497,7 +1493,7 @@ mod tests {
 
         // ensure shuffle is deterministic
         let expected_new_committee =
-            vec![validator_4, validator_2, validator_5, validator_1, validator_3];
+            vec![validator_4, validator_5, validator_3, validator_2, validator_1];
 
         let expected =
             ConsensusRegistry::EpochInfo { committee: expected_new_committee, blockHeight: 0 };
