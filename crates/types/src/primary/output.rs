@@ -98,7 +98,7 @@ impl ConsensusOutput {
         self.batches.iter().flat_map(|batches| batches.iter().cloned()).collect()
     }
 
-    /// Build a new ConsensusHeader frome this output.
+    /// Build a new ConsensusHeader from this output.
     pub fn consensus_header(&self) -> ConsensusHeader {
         ConsensusHeader {
             parent_hash: self.parent_hash,

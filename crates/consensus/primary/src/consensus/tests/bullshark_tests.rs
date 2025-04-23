@@ -1070,6 +1070,7 @@ async fn restart_with_new_committee() {
             committee.clone(),
             config.worker_cache().clone(),
             NetworkConfig::default(),
+            None, // disable epoch transitions
         )
         .unwrap();
         let store = config.node_storage().clone();

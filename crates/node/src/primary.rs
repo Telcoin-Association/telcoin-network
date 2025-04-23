@@ -82,14 +82,15 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
             task_manager,
         );
 
-        // Spawn the client executing the transactions. It can also synchronize with the
-        // subscriber handler if it missed some transactions.
+        // Spawn the client executing the transactions.
+        // It also synchronizes with the subscriber handler if it missed some transactions.
         Executor::spawn(
             self.consensus_config.clone(),
             self.consensus_config.shutdown().subscribe(),
             consensus_bus.clone(),
             task_manager,
             self.primary.network_handle().clone(),
+            self.consensus_config.epoch_boundary(),
         );
 
         Ok(leader_schedule)
