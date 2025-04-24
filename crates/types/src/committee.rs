@@ -430,13 +430,21 @@ impl Committee {
     /// Return all the network addresses in the committee.
     pub fn others_primaries_by_id(
         &self,
-        myself: &AuthorityIdentifier,
+        myself: Option<&AuthorityIdentifier>,
     ) -> Vec<(AuthorityIdentifier, Multiaddr, NetworkPublicKey)> {
         self.inner
             .read()
             .authorities
             .iter()
-            .filter(|(_, authority)| &authority.id() != myself)
+            .filter(
+                |(_, authority)| {
+                    if let Some(myself) = myself {
+                        &authority.id() != myself
+                    } else {
+                        true
+                    }
+                },
+            )
             .map(|(_, authority)| {
                 (
                     authority.id(),

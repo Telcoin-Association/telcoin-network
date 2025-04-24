@@ -39,9 +39,9 @@ impl<DB: Database> Primary<DB> {
         let own_peer_id =
             network_public_key_to_libp2p(&config.key_config().primary_network_public_key());
         info!(
-            "Boot primary node with peer id {} and public key {}",
+            "Boot primary node with peer id {} and public key {:?}",
             own_peer_id,
-            config.authority().protocol_key().encode_base58(),
+            config.authority().as_ref().map(|a| a.protocol_key().encode_base58()),
         );
 
         let worker_receiver_handler =
@@ -88,26 +88,34 @@ impl<DB: Database> Primary<DB> {
         if consensus_bus.node_mode().borrow().is_cvv() {
             // When the `Synchronizer` collects enough parent certificates, the `Proposer` generates
             // a new header with new block digests from our workers and sends it to the `Certifier`.
-            let proposer = Proposer::new(config.clone(), consensus_bus.clone(), leader_schedule);
+            let proposer = Proposer::new(
+                config.clone(),
+                config.authority_id().expect("CVV has an auth id"),
+                consensus_bus.clone(),
+                leader_schedule,
+            );
 
             proposer.spawn(task_manager);
         }
 
-        // Keeps track of the latest consensus round and allows other tasks to clean up their their
-        // internal state
-        StateHandler::spawn(
-            config.authority().id(),
-            consensus_bus,
-            config.shutdown().subscribe(),
-            self.primary_network.clone(),
-            task_manager,
-        );
+        if let Some(authority_id) = config.authority_id() {
+            // This only makes sense if we are a validator (i.e. have an authority id).
+            // Keeps track of the latest consensus round and allows other tasks to clean up their
+            // their internal state
+            StateHandler::spawn(
+                authority_id,
+                consensus_bus,
+                config.shutdown().subscribe(),
+                self.primary_network.clone(),
+                task_manager,
+            );
+        }
 
         // NOTE: This log entry is used to compute performance.
         info!(
-            "Primary {} successfully booted on {}",
-            config.authority().id(),
-            config.authority().primary_network_address()
+            "Primary {:?} successfully booted on {:?}",
+            config.authority_id(),
+            config.authority().as_ref().map(|a| a.primary_network_address())
         );
     }
 

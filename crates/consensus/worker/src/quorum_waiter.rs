@@ -46,7 +46,7 @@ pub trait QuorumWaiterTrait: Send + Sync + Clone + Unpin + 'static {
 type QMBoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 struct QuorumWaiterInner {
-    /// This authority.
+    /// This authority- if None we are not a validator and this won't do much...
     authority: Authority,
     /// The id of this worker.
     id: WorkerId,

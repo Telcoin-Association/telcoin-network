@@ -90,6 +90,8 @@ cargo test --workspace --no-fail-fast -- --show-output
 cargo test test_with_creds -- --ignored
 # faucet it test
 cargo test -p telcoin-network --test it --features faucet --no-fail-fast -- faucet --show-output
+# run the restart tests, they are seperate to avoid any port/node confusion
+cargo test test_restarts -- --ignored
 
 echo "default tests and specific faucet it test passing"
 

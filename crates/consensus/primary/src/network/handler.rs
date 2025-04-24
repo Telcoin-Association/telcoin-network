@@ -286,7 +286,7 @@ where
                 // Make sure we don't vote twice for the same authority in the same epoch/round.
                 let vote = Vote::new(
                     &header,
-                    self.consensus_config.authority().id(),
+                    self.consensus_config.authority_id().expect("only validators can vote"),
                     self.consensus_config.key_config(),
                 )
                 .await;
@@ -315,7 +315,7 @@ where
         // this node hasn't voted yet
         let vote = Vote::new(
             &header,
-            self.consensus_config.authority().id(),
+            self.consensus_config.authority_id().expect("only validators can vote"),
             self.consensus_config.key_config(),
         )
         .await;

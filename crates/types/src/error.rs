@@ -172,6 +172,8 @@ pub enum BlockSealError {
     FailedQuorum,
     #[error("Failed to access consensus DB, this is fatal")]
     FatalDBFailure,
+    #[error("Not a validator, can not validate/seal batches")]
+    NotValidator,
 }
 
 #[derive(Error, Debug)]

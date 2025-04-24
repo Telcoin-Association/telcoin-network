@@ -29,6 +29,9 @@ help:
 	@echo "make test-faucet" ;
 	@echo "    :::> Test faucet integration test in main binary." ;
 	@echo ;
+	@echo "make test-restarts" ;
+	@echo "    :::> Test restart integration tests." ;
+	@echo ;
 	@echo "make fmt" ;
 	@echo "    :::> cargo +nightly fmt" ;
 	@echo ;
@@ -78,6 +81,10 @@ test:
 # run faucet integration test
 test-faucet:
 	cargo test --package telcoin-network --features faucet --test it ;
+
+# run restart integration tests
+test-restarts:
+	cargo test test_restarts -- --ignored ;
 
 # format using +nightly toolchain
 fmt:

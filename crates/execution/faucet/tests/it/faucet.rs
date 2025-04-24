@@ -265,7 +265,7 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
     let timeout = Duration::from_secs(5);
     let batch_provider = Worker::new(
         0,
-        qw.clone(),
+        Some(qw.clone()),
         Arc::new(node_metrics),
         client,
         store.clone(),

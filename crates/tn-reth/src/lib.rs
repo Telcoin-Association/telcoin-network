@@ -359,7 +359,6 @@ impl RethEnv {
         Self::new(&reth_config, db_path, task_manager)
     }
 
-    /// Initialize the provider factory and related components
     /// Create a new RethEnv for testing only.
     pub fn new_for_test<P: AsRef<Path>>(
         db_path: P,
@@ -584,23 +583,20 @@ impl RethEnv {
         }
 
         // close epoch using leader's aggregate signature if conditions are met
-        match payload
+        if let Some(res) = payload
             .attributes
             .close_epoch
             .map(|sig| self.apply_closing_epoch_contract_call(&mut evm, sig))
         {
-            Some(res) => {
-                // add logs if epoch closed
-                let logs = res?;
-                receipts.push(Some(Receipt {
-                    // no better tx type
-                    tx_type: TxType::Legacy,
-                    success: true,
-                    cumulative_gas_used: 0,
-                    logs,
-                }));
-            }
-            None => (), // epoch isn't closing
+            // add logs if epoch closed
+            let logs = res?;
+            receipts.push(Some(Receipt {
+                // no better tx type
+                tx_type: TxType::Legacy,
+                success: true,
+                cumulative_gas_used: 0,
+                logs,
+            }));
         }
 
         // Release db

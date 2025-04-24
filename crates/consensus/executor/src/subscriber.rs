@@ -45,7 +45,9 @@ pub struct Subscriber<DB> {
 /// Inner subscriber type.
 struct Inner {
     /// The identifier for the authority.
-    authority_id: AuthorityIdentifier,
+    ///
+    /// Used for logging, None if we are not a validator.
+    authority_id: Option<AuthorityIdentifier>,
     /// The committee for the epoch.
     committee: Committee,
     /// The client to request worker batches and build consensus output.
@@ -67,7 +69,7 @@ pub fn spawn_subscriber<DB: Database>(
     network_handle: PrimaryNetworkHandle,
     epoch_boundary: TimestampSec,
 ) {
-    let authority_id = config.authority().id();
+    let authority_id = config.authority_id();
     let committee = config.committee().clone();
     let client = config.local_network().clone();
     let mode = *consensus_bus.node_mode().borrow();
@@ -86,7 +88,9 @@ pub fn spawn_subscriber<DB: Database>(
                 monitored_future!(
                     async move {
                         info!(target: "subscriber", "Starting subscriber: CVV");
-                        subscriber.run().await
+                        if let Err(e) = subscriber.run().await {
+                            error!(target: "subscriber", "Error subscriber consensus: {e}");
+                        }
                     },
                     "SubscriberTask"
                 ),
@@ -100,7 +104,9 @@ pub fn spawn_subscriber<DB: Database>(
                 monitored_future!(
                     async move {
                         info!(target: "subscriber", "Starting subscriber: Catch up and rejoin");
-                        subscriber.catch_up_rejoin_consensus(clone).await
+                        if let Err(e) = subscriber.catch_up_rejoin_consensus(clone).await {
+                            error!(target: "subscriber", "Error catching up consensus: {e}");
+                        }
                     },
                     "SubscriberFollowTask"
                 ),
@@ -114,7 +120,9 @@ pub fn spawn_subscriber<DB: Database>(
                 monitored_future!(
                     async move {
                         info!(target: "subscriber", "Starting subscriber: Follower");
-                        subscriber.follow_consensus(clone).await
+                        if let Err(e) = subscriber.follow_consensus(clone).await {
+                            error!(target: "subscriber", "Error following consensus: {e}");
+                        }
                     },
                     "SubscriberFollowTask"
                 ),
@@ -157,7 +165,7 @@ impl<DB: Database> Subscriber<DB> {
         let _ = self.consensus_bus.primary_round_updates().send(last_round);
 
         if let Err(e) = self.consensus_bus.consensus_output().send(consensus_output).await {
-            error!(target: "subscriber", "error broadcasting consensus output for authority {}: {}", self.inner.authority_id, e);
+            error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
             return Err(SubscriberError::ClosedChannel("consensus_output".to_string()));
         }
         Ok(())
@@ -253,11 +261,11 @@ impl<DB: Database> Subscriber<DB> {
                     // Record the latest ConsensusHeader, we probably don't need this in this mode but keep it up to date anyway.
                     // Note we don't bother sending this to the consensus header channel since not needed when an active CVV.
                     if let Err(e) = self.consensus_bus.last_consensus_header().send(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() }) {
-                        error!(target: "subscriber", "error sending latest consensus header for authority {}: {}", self.inner.authority_id, e);
+                        error!(target: "subscriber", "error sending latest consensus header for authority {:?}: {}", self.inner.authority_id, e);
                         return Ok(());
                     }
                     if let Err(e) = self.network_handle.publish_consensus(number, last_parent).await {
-                        error!(target: "subscriber", "error publishing latest consensus to network {}: {}", self.inner.authority_id, e);
+                        error!(target: "subscriber", "error publishing latest consensus to network {:?}: {}", self.inner.authority_id, e);
                     }
                     last_number += 1;
                     waiting.push_back(self.fetch_batches(sub_dag, parent_hash, number));
@@ -274,7 +282,7 @@ impl<DB: Database> Subscriber<DB> {
                             save_consensus(self.config.node_storage(), output.clone())?;
                             debug!(target: "subscriber", "broadcasting output...");
                             if let Err(e) = self.consensus_bus.consensus_output().send(output).await {
-                                error!(target: "subscriber", "error broadcasting consensus output for authority {}: {}", self.inner.authority_id, e);
+                                error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
                                 return Ok(());
                             }
                             debug!("output broadcast successfully");

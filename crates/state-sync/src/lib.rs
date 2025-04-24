@@ -13,7 +13,7 @@ use tn_primary::{
 };
 use tn_storage::tables::{Batches, ConsensusBlockNumbersByDigest, ConsensusBlocks};
 use tn_types::{ConsensusHeader, ConsensusOutput, Database, DbTxMut, TaskManagerClone, TnSender};
-use tracing::info;
+use tracing::{error, info};
 
 /// Return true if this node should be able to participate as a CVV, false otherwise.
 ///
@@ -83,7 +83,9 @@ pub fn spawn_state_sync<DB: Database>(
                 monitored_future!(
                     async move {
                         info!(target: "telcoin::state-sync", "Starting state sync: track latest consensus header from peers");
-                        spawn_track_recent_consensus(config_clone, consensus_bus_clone, network_clone).await
+                        if let Err(e) = spawn_track_recent_consensus(config_clone, consensus_bus_clone, network_clone).await {
+                            error!(target: "telcoin::state-sync", "Error tracking latest consensus headers: {e}");
+                        }
                     },
                     "StateSyncLatestConsensus"
                 ),
@@ -93,7 +95,9 @@ pub fn spawn_state_sync<DB: Database>(
                 monitored_future!(
                     async move {
                         info!(target: "telcoin::state-sync", "Starting state sync: stream consensus header from peers");
-                        spawn_stream_consensus_headers(config, consensus_bus, network).await
+                        if let Err(e) = spawn_stream_consensus_headers(config, consensus_bus, network).await {
+                            error!(target: "telcoin::state-sync", "Error streaming consensus headers: {e}");
+                        }
                     },
                     "StateSyncStreamConsensusHeaders"
                 ),
@@ -349,7 +353,7 @@ async fn max_consensus_header_from_committee<DB: Database>(
 fn get_peers<DB: Database>(config: &ConsensusConfig<DB>) -> Vec<PeerId> {
     config
         .committee()
-        .others_primaries_by_id(&config.authority().id())
+        .others_primaries_by_id(config.authority_id().as_ref())
         .into_iter()
         .map(|(auth_id, _, _)| auth_id.peer_id())
         .collect()

@@ -60,6 +60,14 @@ pub struct Certifier<DB> {
 }
 
 impl<DB: Database> Certifier<DB> {
+    fn highest_created_certificate(config: &ConsensusConfig<DB>) -> Option<Certificate> {
+        if let Some(id) = config.authority_id() {
+            config.node_storage().last_round(&id).expect("certificate store available")
+        } else {
+            None
+        }
+    }
+
     pub fn spawn(
         config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
@@ -67,6 +75,11 @@ impl<DB: Database> Certifier<DB> {
         primary_network: PrimaryNetworkHandle,
         task_manager: &TaskManager,
     ) {
+        let Some(authority_id) = config.authority_id() else {
+            // If we don't have an authority id then we are not a validator and should not be
+            // proposing anything...
+            return;
+        };
         let rx_shutdown = config.shutdown().subscribe();
         let primary_metrics = consensus_bus.primary_metrics().node_metrics.clone();
         // These channels are used internally to this module (file) and don't need to go in the
@@ -79,15 +92,12 @@ impl<DB: Database> Certifier<DB> {
         // tx_own_certificate_broadcast.send()
         let broadcast_targets: Vec<(_, _)> = config
             .committee()
-            .others_primaries_by_id(&config.authority().id())
+            .others_primaries_by_id(Some(&authority_id))
             .into_iter()
             .map(|(name, _addr, _network_key)| (name, tx_own_certificate_broadcast.subscribe()))
             .collect();
 
-        let highest_created_certificate = config
-            .node_storage()
-            .last_round(&config.authority().id())
-            .expect("certificate store available");
+        let highest_created_certificate = Self::highest_created_certificate(&config);
 
         // TODO- these tasks to send to each peer should be replaced with a libp2p pub/sub topic.
         for (name, rx_own_certificate_broadcast) in broadcast_targets.into_iter() {
@@ -110,9 +120,9 @@ impl<DB: Database> Certifier<DB> {
 
         task_manager.spawn_task("certifier task", monitored_future!(
             async move {
-                info!(target: "primary::certifier", "Certifier on node {} has started successfully.", config.authority().id());
+                info!(target: "primary::certifier", "Certifier on node {:?} has started successfully.", authority_id);
                 Self {
-                    authority_id: config.authority().id(),
+                    authority_id: authority_id.clone(),
                     committee: config.committee().clone(),
                     certificate_store: config.node_storage().clone(),
                     state_sync,
@@ -126,7 +136,7 @@ impl<DB: Database> Certifier<DB> {
                 }
                 .run()
                 .await;
-                info!(target: "primary::certifier", "Certifier on node {} has shutdown.", config.authority().id());
+                info!(target: "primary::certifier", "Certifier on node {} has shutdown.", authority_id);
             },
             "CertifierTask"
         ));
@@ -270,7 +280,7 @@ impl<DB: Database> Certifier<DB> {
         // Trigger vote requests.
         let peers = self
             .committee
-            .others_primaries_by_id(&self.authority_id)
+            .others_primaries_by_id(Some(&self.authority_id))
             .into_iter()
             .map(|(name, _, network_key)| (name, network_key));
         let mut requests: FuturesUnordered<_> = peers

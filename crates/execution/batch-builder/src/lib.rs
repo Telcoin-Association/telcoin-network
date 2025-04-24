@@ -168,6 +168,7 @@ impl BatchBuilder {
                                 BlockSealError::QuorumRejected
                                 | BlockSealError::AntiQuorum
                                 | BlockSealError::Timeout
+                                | BlockSealError::NotValidator
                                 | BlockSealError::FailedQuorum => {
                                     // potentially non-fatal error
                                     //
@@ -386,7 +387,7 @@ mod tests {
         let timeout = Duration::from_secs(5);
         let block_provider = Worker::new(
             0,
-            qw,
+            Some(qw),
             Arc::new(node_metrics),
             client,
             store.clone(),

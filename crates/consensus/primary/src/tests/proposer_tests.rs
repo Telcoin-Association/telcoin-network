@@ -17,6 +17,7 @@ async fn test_empty_proposal() {
     let mut rx_headers = cb.headers().subscribe();
     let proposer = Proposer::new(
         primary.consensus_config(),
+        primary.consensus_config().authority_id().expect("authority"),
         cb.clone(),
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
     );
@@ -50,6 +51,7 @@ async fn test_equivocation_protection_after_restart() {
     let mut rx_headers = cb.headers().subscribe();
     let proposer = Proposer::new(
         primary.consensus_config(),
+        primary.consensus_config().authority_id().expect("authority"),
         cb.clone(),
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
     );
@@ -96,6 +98,7 @@ async fn test_equivocation_protection_after_restart() {
     let mut rx_headers = cb.headers().subscribe();
     let proposer = Proposer::new(
         primary.consensus_config(),
+        primary.consensus_config().authority_id().expect("authority"),
         cb.clone(),
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
     );

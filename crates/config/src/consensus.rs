@@ -20,7 +20,7 @@ struct ConsensusConfigInner<DB> {
     committee: Committee,
     node_storage: DB,
     key_config: KeyConfig,
-    authority: Authority,
+    authority: Option<Authority>,
     local_network: LocalNetwork,
     network_config: NetworkConfig,
     genesis: HashMap<CertificateDigest, Certificate>,
@@ -107,12 +107,7 @@ where
             LocalNetwork::new_from_public_key(&key_config.primary_network_public_key());
 
         let primary_public_key = key_config.primary_public_key();
-        let authority = committee
-            .authority_by_key(&primary_public_key)
-            .unwrap_or_else(|| {
-                panic!("Our node with key {:?} should be in committee", primary_public_key)
-            })
-            .clone();
+        let authority = committee.authority_by_key(&primary_public_key);
 
         let shutdown = Notifier::new();
         let genesis = Certificate::genesis(&committee)
@@ -171,8 +166,12 @@ where
         &self.inner.key_config
     }
 
-    pub fn authority(&self) -> &Authority {
+    pub fn authority(&self) -> &Option<Authority> {
         &self.inner.authority
+    }
+
+    pub fn authority_id(&self) -> Option<AuthorityIdentifier> {
+        self.inner.authority.as_ref().map(|a| a.id())
     }
 
     pub fn parameters(&self) -> &Parameters {
@@ -192,6 +191,22 @@ where
         self.inner.committee.authorities().iter().map(|a| a.peer_id()).collect()
     }
 
+    /// Retrieve the primaries network address.
+    /// Note if this node is not an authority, retrieve the next available udp port assigned by the
+    /// system.
+    pub fn primary_address(&self) -> Multiaddr {
+        if let Some(authority) = self.authority() {
+            authority.primary_network_address().clone()
+        } else {
+            let host = std::env::var("TN_PRIMARY_HOST").unwrap_or("0.0.0.0".to_string());
+            let primary_udp_port =
+                tn_types::get_available_udp_port(&host).unwrap_or(49584).to_string();
+            format!("/ip4/{}/udp/{}/quic-v1", &host, primary_udp_port)
+                .parse()
+                .expect("multiaddr parsed for primary consensus")
+        }
+    }
+
     /// Map of primary peer ids and multiaddrs in the current committee.
     pub fn primary_network_map(&self) -> HashMap<PeerId, Multiaddr> {
         self.inner
@@ -208,12 +223,22 @@ where
     }
 
     /// Retrieve the worker's network address by id.
-    /// Note, will panic if id is not valid (not found in our worker cache).
+    /// Note, will panic if id is not valid (not found in our worker cache) and the node is an
+    /// authority. Otherwise, retrieve the next available udp port assigned by the system.
     pub fn worker_address(&self, id: &WorkerId) -> Multiaddr {
-        self.worker_cache()
-            .worker(self.authority().protocol_key(), id)
-            .expect("Our public key or worker id is not in the worker cache")
-            .worker_address
+        if let Some(authority) = self.authority() {
+            self.worker_cache()
+                .worker(authority.protocol_key(), id)
+                .expect("Our public key or worker id is not in the worker cache")
+                .worker_address
+        } else {
+            let host = std::env::var("TN_WORKER_HOST").unwrap_or("0.0.0.0".to_string());
+            let worker_udp_port =
+                tn_types::get_available_udp_port(&host).unwrap_or(49594).to_string();
+            format!("/ip4/{}/udp/{}/quic-v1", &host, worker_udp_port)
+                .parse()
+                .expect("multiaddr parsed for worker consensus")
+        }
     }
 
     /// Map of worker peer ids and multiaddrs in the current committee.

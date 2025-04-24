@@ -8,6 +8,7 @@ use crate::{
     aggregators::certificates::CertificatesAggregatorManager,
     certificate_fetcher::CertificateFetcherCommand,
     error::{CertManagerError, CertManagerResult, GarbageCollectorError},
+    state_sync::cert_validator::certificate_source,
     ConsensusBus,
 };
 use consensus_metrics::monitored_scope;
@@ -234,8 +235,7 @@ where
             // Update metrics for accepted certificates.
             let highest_processed_round =
                 self.highest_processed_round.fetch_max(cert.round()).max(cert.round());
-            let certificate_source =
-                if self.config.authority().id().eq(cert.origin()) { "own" } else { "other" };
+            let certificate_source = certificate_source(&self.config, &cert);
             self.consensus_bus
                 .primary_metrics()
                 .node_metrics

@@ -58,7 +58,7 @@ async fn test_make_batch_el_to_cl() {
     let timeout = Duration::from_secs(5);
     let batch_provider = Worker::new(
         0,
-        qw.clone(),
+        Some(qw.clone()),
         Arc::new(node_metrics),
         network_client,
         store.clone(),

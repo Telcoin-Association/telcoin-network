@@ -65,16 +65,23 @@ pub fn new_worker<DB: Database>(
         network_handle.clone(),
     );
 
-    // NOTE: This log entry is used to compute performance.
-    info!(target: "worker::worker",
-        "Worker {} successfully booted on {}",
-        id,
-        consensus_config
-            .worker_cache()
-            .worker(consensus_config.authority().protocol_key(), &id)
-            .expect("Our public key or worker id is not in the worker cache")
-            .transactions
-    );
+    if let Some(authority) = consensus_config.authority() {
+        // NOTE: This log entry is used to compute performance.
+        info!(target: "worker::worker",
+            "Worker {} successfully booted on {}",
+            id,
+            consensus_config
+                .worker_cache()
+                .worker(authority.protocol_key(), &id)
+                .expect("Our public key or worker id is not in the worker cache")
+                .worker_address
+        );
+    } else {
+        info!(target: "worker::worker",
+            "Worker {} successfully booted",
+            id,
+        );
+    }
 
     batch_provider
 }
@@ -91,14 +98,17 @@ fn new_worker_internal<DB: Database>(
 
     // The `QuorumWaiter` waits for 2f authorities to acknowledge receiving the batch
     // before forwarding the batch to the `Processor`
-    let quorum_waiter = QuorumWaiter::new(
-        consensus_config.authority().clone(),
-        id,
-        consensus_config.committee().clone(),
-        consensus_config.worker_cache().clone(),
-        network_handle.clone(),
-        node_metrics.clone(),
-    );
+    // Only have a quorum waiter if we are an authority (validator).
+    let quorum_waiter = consensus_config.authority().clone().map(|authority| {
+        QuorumWaiter::new(
+            authority,
+            id,
+            consensus_config.committee().clone(),
+            consensus_config.worker_cache().clone(),
+            network_handle.clone(),
+            node_metrics.clone(),
+        )
+    });
 
     Worker::new(
         id,
@@ -117,7 +127,7 @@ pub struct Worker<DB, QW> {
     /// Our worker's id.
     id: WorkerId,
     /// Use `QuorumWaiter` to attest to batches.
-    quorum_waiter: QW,
+    quorum_waiter: Option<QW>,
     /// Metrics handler
     node_metrics: Arc<WorkerMetrics>,
     /// The network client to send our batches to the primary.
@@ -141,7 +151,7 @@ impl<DB, QW> std::fmt::Debug for Worker<DB, QW> {
 impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
     pub fn new(
         id: WorkerId,
-        quorum_waiter: QW,
+        quorum_waiter: Option<QW>,
         node_metrics: Arc<WorkerMetrics>,
         client: LocalNetwork,
         store: DB,
@@ -179,6 +189,9 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
 
     /// Seal and broadcast the current batch.
     pub async fn seal(&self, sealed_batch: SealedBatch) -> Result<(), BlockSealError> {
+        let Some(quorum_waiter) = &self.quorum_waiter else {
+            return Err(BlockSealError::NotValidator);
+        };
         let size = sealed_batch.size();
 
         self.node_metrics
@@ -186,8 +199,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             .with_label_values(&["latest batch size"])
             .observe(size as f64);
 
-        let batch_attest_handle =
-            self.quorum_waiter.verify_batch(sealed_batch.clone(), self.timeout);
+        let batch_attest_handle = quorum_waiter.verify_batch(sealed_batch.clone(), self.timeout);
 
         // Wait for our batch to reach quorum or fail to do so.
         match batch_attest_handle.await {

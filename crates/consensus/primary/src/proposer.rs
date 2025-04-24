@@ -143,6 +143,7 @@ impl<DB: Database> Proposer<DB> {
     /// Also set `advance_round` to true.
     pub fn new(
         config: ConsensusConfig<DB>,
+        authority_id: AuthorityIdentifier, // We need to be a validator so must have an id.
         consensus_bus: ConsensusBus,
         leader_schedule: LeaderSchedule,
     ) -> Self {
@@ -153,7 +154,7 @@ impl<DB: Database> Proposer<DB> {
         let max_delay_interval = tokio::time::interval(config.parameters().max_header_delay);
 
         Self {
-            authority_id: config.authority().id(),
+            authority_id,
             committee: config.committee().clone(),
             header_num_of_batches_threshold: config.parameters().header_num_of_batches_threshold,
             max_header_num_of_batches: config.parameters().max_header_num_of_batches,

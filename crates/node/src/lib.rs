@@ -122,12 +122,8 @@ async fn start_networks<DB: TNDatabase>(
         )
         .await?;
 
-    let my_authority = consensus_config.authority();
-
-    let primary_multiaddr = get_multiaddr_from_env_or_config(
-        "PRIMARY_MULTIADDR",
-        my_authority.primary_network_address().clone(),
-    );
+    let primary_address = consensus_config.primary_address();
+    let primary_multiaddr = get_multiaddr_from_env_or_config("PRIMARY_MULTIADDR", primary_address);
     primary_network_handle.start_listening(primary_multiaddr).await?;
 
     let worker_address = consensus_config.worker_address(worker_id);
@@ -141,8 +137,9 @@ async fn start_networks<DB: TNDatabase>(
     let worker_network_handle = WorkerNetworkHandle::new(worker_network_handle);
     let peers_connected = Arc::new(AtomicU32::new(0));
     let workers_connected = Arc::new(AtomicU32::new(0));
-    for (authority_id, addr, _) in
-        consensus_config.committee().others_primaries_by_id(&consensus_config.authority().id())
+    for (authority_id, addr, _) in consensus_config
+        .committee()
+        .others_primaries_by_id(consensus_config.authority_id().as_ref())
     {
         let peer_id = authority_id.peer_id();
         dial_primary(primary_network_handle.clone(), peer_id, addr, peers_connected.clone());

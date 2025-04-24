@@ -72,10 +72,11 @@ where
         max_age: Round,
     ) -> HeaderResult<()> {
         // skip batch sync for own workers
-        let authority_id = self.config.authority().id();
-        if header.author() == &authority_id {
-            debug!(target: "primary::header_validator", "skipping sync_batches for header - no need to sync payload from own workers");
-            return Ok(());
+        if let Some(authority_id) = self.config.authority_id() {
+            if header.author() == &authority_id {
+                debug!(target: "primary::header_validator", "skipping sync_batches for header - no need to sync payload from own workers");
+                return Ok(());
+            }
         }
 
         // Clone the round updates channel so we can get update notifications specific to

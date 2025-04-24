@@ -46,7 +46,7 @@ async fn make_batch() {
     let timeout = Duration::from_secs(5);
     let batch_provider = Worker::new(
         id,
-        qw.clone(),
+        Some(qw.clone()),
         Arc::new(node_metrics),
         client,
         store.clone(),

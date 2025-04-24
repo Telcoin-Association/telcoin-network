@@ -164,8 +164,16 @@ async fn test_valid_req_res() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    peer1.start_listening(config_1.authority().primary_network_address().clone()).await?;
-    peer2.start_listening(config_2.authority().primary_network_address().clone()).await?;
+    peer1
+        .start_listening(
+            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
+    peer2
+        .start_listening(
+            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
     let peer2_id = peer2.local_peer_id().await?;
     let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
 
@@ -216,8 +224,16 @@ async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    peer1.start_listening(config_1.authority().primary_network_address().clone()).await?;
-    peer2.start_listening(config_2.authority().primary_network_address().clone()).await?;
+    peer1
+        .start_listening(
+            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
+    peer2
+        .start_listening(
+            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
     let peer2_id = peer2.local_peer_id().await?;
     let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
 
@@ -282,8 +298,16 @@ async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    peer1.start_listening(config_1.authority().primary_network_address().clone()).await?;
-    peer2.start_listening(config_2.authority().primary_network_address().clone()).await?;
+    peer1
+        .start_listening(
+            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
+    peer2
+        .start_listening(
+            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
     let peer2_id = peer2.local_peer_id().await?;
     let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
 
@@ -353,8 +377,16 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    malicious_peer.start_listening(config_1.authority().primary_network_address().clone()).await?;
-    honest_peer.start_listening(config_2.authority().primary_network_address().clone()).await?;
+    malicious_peer
+        .start_listening(
+            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
+    honest_peer
+        .start_listening(
+            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
 
     let malicious_peer_id = malicious_peer.local_peer_id().await?;
     let honest_peer_id = honest_peer.local_peer_id().await?;
@@ -422,8 +454,16 @@ async fn test_outbound_failure_malicious_response() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    honest_peer.start_listening(config_1.authority().primary_network_address().clone()).await?;
-    malicious_peer.start_listening(config_2.authority().primary_network_address().clone()).await?;
+    honest_peer
+        .start_listening(
+            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
+    malicious_peer
+        .start_listening(
+            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
     let malicious_peer_id = malicious_peer.local_peer_id().await?;
     let malicious_peer_addr =
         malicious_peer.listeners().await?.first().expect("malicious_peer listen addr").clone();
@@ -484,8 +524,14 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    cvv.start_listening(config_1.authority().primary_network_address().clone()).await?;
-    nvv.start_listening(config_2.authority().primary_network_address().clone()).await?;
+    cvv.start_listening(
+        config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+    )
+    .await?;
+    nvv.start_listening(
+        config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+    )
+    .await?;
     let cvv_id = cvv.local_peer_id().await?;
     let cvv_addr = cvv.listeners().await?.first().expect("peer2 listen addr").clone();
 
@@ -543,8 +589,14 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     });
 
     // start swarm listening on default any address
-    cvv.start_listening(config_1.authority().primary_network_address().clone()).await?;
-    nvv.start_listening(config_2.authority().primary_network_address().clone()).await?;
+    cvv.start_listening(
+        config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+    )
+    .await?;
+    nvv.start_listening(
+        config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+    )
+    .await?;
     let cvv_id = cvv.local_peer_id().await?;
     let cvv_addr = cvv.listeners().await?.first().expect("peer2 listen addr").clone();
 
@@ -611,7 +663,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
 
     // spawn target network
     let target_network = target_peer.network.take().expect("target network is some");
-    let id = target_peer.config.authority().id().peer_id();
+    let id = target_peer.config.authority().as_ref().expect("authority").id().peer_id();
     tokio::spawn(async move {
         let res = target_network.run().await;
         debug!(target: "network", ?id, ?res, "network shutdown");
@@ -620,7 +672,15 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     // Start target peer listening
     target_peer
         .network_handle
-        .start_listening(target_peer.config.authority().primary_network_address().clone())
+        .start_listening(
+            target_peer
+                .config
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .clone(),
+        )
         .await?;
     let target_addr = target_peer
         .network_handle
@@ -635,14 +695,21 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     for peer in other_peers.iter_mut() {
         // spawn peer network
         let peer_network = peer.network.take().expect("peer network is some");
-        let id = peer.config.authority().id().peer_id();
+        let id = peer.config.authority().as_ref().expect("authority").id().peer_id();
         tokio::spawn(async move {
             let res = peer_network.run().await;
             debug!(target: "network", ?id, ?res, "network shutdown");
         });
 
         peer.network_handle
-            .start_listening(peer.config.authority().primary_network_address().clone())
+            .start_listening(
+                peer.config
+                    .authority()
+                    .as_ref()
+                    .expect("authority")
+                    .primary_network_address()
+                    .clone(),
+            )
             .await?;
 
         // subscribe to topic
@@ -676,7 +743,10 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
         network.run().await.expect("network run failed!");
     });
 
-    nvv.start_listening(nvv_config.authority().primary_network_address().clone()).await?;
+    nvv.start_listening(
+        nvv_config.authority().as_ref().expect("authority").primary_network_address().clone(),
+    )
+    .await?;
 
     // subscribe to topic
     // add target peer as authorized publisher
@@ -709,7 +779,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     let connected = nvv.connected_peers().await?;
     assert!(!connected.contains(&target_peer_id));
     for peer in other_peers.iter() {
-        let id = peer.config.authority().id().peer_id();
+        let id = peer.config.authority().as_ref().expect("authority").id().peer_id();
         assert!(connected.contains(&id));
     }
 
@@ -756,8 +826,16 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
     });
 
     // Start listeners and establish connection
-    peer1.start_listening(config_1.authority().primary_network_address().clone()).await?;
-    peer2.start_listening(config_2.authority().primary_network_address().clone()).await?;
+    peer1
+        .start_listening(
+            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
+    peer2
+        .start_listening(
+            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
 
     let peer2_id = peer2.local_peer_id().await?;
     let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
@@ -810,8 +888,16 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
     });
 
     // Start listeners
-    honest_peer.start_listening(config_1.authority().primary_network_address().clone()).await?;
-    malicious_peer.start_listening(config_2.authority().primary_network_address().clone()).await?;
+    honest_peer
+        .start_listening(
+            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
+    malicious_peer
+        .start_listening(
+            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
 
     let honest_id = honest_peer.local_peer_id().await?;
     let malicious_id = malicious_peer.local_peer_id().await?;
@@ -890,7 +976,9 @@ async fn test_dial_timeout_behavior() -> eyre::Result<()> {
     // Start listener
     peer1
         .network_handle
-        .start_listening(peer1.config.authority().primary_network_address().clone())
+        .start_listening(
+            peer1.config.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
         .await?;
 
     // Create a peer ID that doesn't exist
@@ -946,7 +1034,15 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
     // Start target peer listening
     target_peer
         .network_handle
-        .start_listening(target_peer.config.authority().primary_network_address().clone())
+        .start_listening(
+            target_peer
+                .config
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .clone(),
+        )
         .await?;
 
     let target_addr = target_peer
@@ -975,7 +1071,14 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
 
         // Start listener
         peer.network_handle
-            .start_listening(peer.config.authority().primary_network_address().clone())
+            .start_listening(
+                peer.config
+                    .authority()
+                    .as_ref()
+                    .expect("authority")
+                    .primary_network_address()
+                    .clone(),
+            )
             .await?;
 
         // subscribe to test topic with target peer as authorized publisher
@@ -1042,8 +1145,16 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     });
 
     // Start swarm listening
-    peer1.start_listening(config_1.authority().primary_network_address().clone()).await?;
-    peer2.start_listening(config_2.authority().primary_network_address().clone()).await?;
+    peer1
+        .start_listening(
+            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
+    peer2
+        .start_listening(
+            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
 
     let peer2_id = peer2.local_peer_id().await?;
     let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
@@ -1128,7 +1239,15 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
     // Start listening
     target_peer
         .network_handle
-        .start_listening(target_peer.config.authority().primary_network_address().clone())
+        .start_listening(
+            target_peer
+                .config
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .clone(),
+        )
         .await?;
 
     // Take peer1 and peer2 from other_peers
@@ -1143,7 +1262,9 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
 
     peer1
         .network_handle
-        .start_listening(peer1.config.authority().primary_network_address().clone())
+        .start_listening(
+            peer1.config.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
         .await?;
     let peer1_id = peer1.network_handle.local_peer_id().await?;
     let peer1_addr =
@@ -1224,8 +1345,16 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     });
 
     // Start swarm listening
-    peer1.start_listening(config_1.authority().primary_network_address().clone()).await?;
-    peer2.start_listening(config_2.authority().primary_network_address().clone()).await?;
+    peer1
+        .start_listening(
+            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
+    peer2
+        .start_listening(
+            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+        )
+        .await?;
 
     let peer2_id = peer2.local_peer_id().await?;
     let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();

@@ -82,7 +82,7 @@ pub(crate) struct CertificateFetcher<DB> {
 /// Thread-safe internal state of CertificateFetcher shared with its fetch task.
 struct CertificateFetcherState<DB> {
     /// Identity of the current authority.
-    authority_id: AuthorityIdentifier,
+    authority_id: Option<AuthorityIdentifier>,
     /// Network client to fetch certificates from other primaries.
     network: PrimaryNetworkHandle,
     /// Accepts Certificates into local storage.
@@ -101,7 +101,7 @@ impl<DB: Database> CertificateFetcher<DB> {
         state_sync: StateSynchronizer<DB>,
         task_manager: &TaskManager,
     ) {
-        let authority_id = config.authority().id();
+        let authority_id = config.authority_id();
         let committee = config.committee().clone();
         let certificate_store = config.node_storage().clone();
         let rx_shutdown = config.shutdown().subscribe();
@@ -320,9 +320,13 @@ async fn run_fetch_task<DB: Database>(
     let request = FetchCertificatesRequest::default()
         .set_bounds(gc_round, written_rounds)
         .set_max_items(MAX_CERTIFICATES_TO_FETCH);
-    let Some(response) =
-        fetch_certificates_helper(&state.authority_id, state.network.clone(), &committee, request)
-            .await
+    let Some(response) = fetch_certificates_helper(
+        state.authority_id.as_ref(),
+        state.network.clone(),
+        &committee,
+        request,
+    )
+    .await
     else {
         error!(target: "primary::cert_fetcher", "error awaiting fetch_certificates_helper");
         return Err(CertManagerError::NoCertificateFetched);
@@ -341,7 +345,7 @@ async fn run_fetch_task<DB: Database>(
 /// request. Terminates after the 1st successful response is received.
 #[instrument(level = "debug", skip_all)]
 async fn fetch_certificates_helper(
-    name: &AuthorityIdentifier,
+    name: Option<&AuthorityIdentifier>,
     network: PrimaryNetworkHandle,
     committee: &Committee,
     request: FetchCertificatesRequest,

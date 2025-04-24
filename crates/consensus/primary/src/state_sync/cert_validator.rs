@@ -22,6 +22,21 @@ use tracing::{debug, error, trace};
 #[path = "../tests/cert_validator_tests.rs"]
 mod cert_validator_tests;
 
+pub fn certificate_source<DB: Database>(
+    config: &ConsensusConfig<DB>,
+    certificate: &Certificate,
+) -> &'static str {
+    if let Some(authority_id) = config.authority_id() {
+        if authority_id.eq(certificate.origin()) {
+            "own"
+        } else {
+            "other"
+        }
+    } else {
+        "other"
+    }
+}
+
 /// Process unverified headers and certificates.
 #[derive(Debug, Clone)]
 pub(super) struct CertificateValidator<DB> {
@@ -130,8 +145,7 @@ where
         // update metrics
         debug!(target: "primary::cert_validator", round=certificate.round(), ?certificate, "processing certificate");
 
-        let certificate_source =
-            if self.config.authority().id().eq(certificate.origin()) { "own" } else { "other" };
+        let certificate_source = certificate_source(&self.config, &certificate);
         self.forward_verified_certs(certificate_source, certificate.round(), vec![certificate])
             .await
     }
