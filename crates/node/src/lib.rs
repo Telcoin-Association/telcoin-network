@@ -224,10 +224,7 @@ where
         tracing::info!(target: "telcoin::cli", "node storage open");
         let key_config = KeyConfig::read_config(tn_datadir)?;
         let network_config = NetworkConfig::read_config(tn_datadir)?;
-
-        // disable epochs for now
-        let epoch_boundary = u64::MAX;
-        let consensus_config = ConsensusConfig::new(config, tn_datadir, node_storage, key_config, network_config, epoch_boundary)?;
+        let consensus_config = ConsensusConfig::new(config, tn_datadir, node_storage, key_config, network_config)?;
 
         let (worker_id, _worker_info) = consensus_config.config().workers().first_worker()?;
         let worker = WorkerNode::new(*worker_id, consensus_config.clone());

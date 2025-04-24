@@ -170,6 +170,7 @@ where
         let committee = Committee::new_for_test(
             authorities.into_iter().map(|(k, (_, _, a))| (k, a)).collect(),
             0,
+            self.epoch_boundary,
         );
         // Build our worker cache.  This is map of authorities to it's worker (one per authority).
         let worker_cache = WorkerCache {
@@ -200,7 +201,6 @@ where
                         worker,
                         worker_cache.clone(),
                         network_config,
-                        self.epoch_boundary,
                     ),
                 )
             })

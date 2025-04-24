@@ -90,7 +90,7 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
             consensus_bus.clone(),
             task_manager,
             self.primary.network_handle().clone(),
-            self.consensus_config.epoch_boundary(),
+            self.consensus_config.committee().epoch_boundary(),
         );
 
         Ok(leader_schedule)

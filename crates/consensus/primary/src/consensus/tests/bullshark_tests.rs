@@ -1070,7 +1070,6 @@ async fn restart_with_new_committee() {
             committee.clone(),
             config.worker_cache().clone(),
             NetworkConfig::default(),
-            None, // disable epoch transitions
         )
         .unwrap();
         let store = config.node_storage().clone();
@@ -1141,7 +1140,7 @@ async fn restart_with_new_committee() {
         assert_eq!(output.round(), 2);
 
         // Move to the next epoch.
-        committee = committee.advance_epoch_for_test(epoch + 1);
+        committee = committee.advance_epoch_for_test(epoch + 1, None);
         fixture.update_committee(committee.clone());
         config.shutdown().notify();
 

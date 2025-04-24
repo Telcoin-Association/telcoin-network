@@ -10,7 +10,7 @@ use std::{
 use tn_network_types::local::LocalNetwork;
 use tn_types::{
     Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Database, Hash as _,
-    Multiaddr, Notifier, TimestampSec, WorkerCache, WorkerId,
+    Multiaddr, Notifier, WorkerCache, WorkerId,
 };
 use tracing::info;
 
@@ -24,7 +24,6 @@ struct ConsensusConfigInner<DB> {
     local_network: LocalNetwork,
     network_config: NetworkConfig,
     genesis: HashMap<CertificateDigest, Certificate>,
-    epoch_boundary: TimestampSec,
 }
 
 #[derive(Debug, Clone)]
@@ -44,7 +43,6 @@ where
         node_storage: DB,
         key_config: KeyConfig,
         network_config: NetworkConfig,
-        epoch_boundary: TimestampSec,
     ) -> eyre::Result<Self> {
         // load committee from file
         let committee: Committee =
@@ -62,15 +60,12 @@ where
             committee,
             worker_cache,
             network_config,
-            epoch_boundary,
         )
     }
 
     /// Create a new config with a committe.
     ///
     /// The method is exposed publicly for testing ONLY.
-    /// Pass an optional epoch_boundary timestamp. Defaults to u64::MAX to disable epoch
-    /// transitions.
     pub fn new_with_committee_for_test(
         config: Config,
         node_storage: DB,
@@ -78,7 +73,6 @@ where
         committee: Committee,
         worker_cache: WorkerCache,
         network_config: NetworkConfig,
-        epoch_boundary: Option<TimestampSec>,
     ) -> eyre::Result<Self> {
         Self::new_with_committee(
             config,
@@ -87,7 +81,6 @@ where
             committee,
             worker_cache,
             network_config,
-            epoch_boundary.unwrap_or(u64::MAX),
         )
     }
 
@@ -101,7 +94,6 @@ where
         committee: Committee,
         worker_cache: WorkerCache,
         network_config: NetworkConfig,
-        epoch_boundary: TimestampSec,
     ) -> eyre::Result<Self> {
         let local_network =
             LocalNetwork::new_from_public_key(&key_config.primary_network_public_key());
@@ -125,7 +117,6 @@ where
                 local_network,
                 network_config,
                 genesis,
-                epoch_boundary,
             }),
             worker_cache,
             shutdown,
@@ -244,12 +235,5 @@ where
     /// Map of worker peer ids and multiaddrs in the current committee.
     pub fn worker_network_map(&self) -> HashMap<PeerId, Multiaddr> {
         self.worker_cache().all_workers()
-    }
-
-    /// The timestamp for the epoch boundary.
-    ///
-    /// This is the time (in secs) when the committee should transition.
-    pub fn epoch_boundary(&self) -> TimestampSec {
-        self.inner.epoch_boundary
     }
 }

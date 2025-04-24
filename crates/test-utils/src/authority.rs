@@ -6,7 +6,7 @@ use tn_config::{Config, ConsensusConfig, KeyConfig, NetworkConfig};
 use tn_types::{
     Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, Certificate, Committee,
     Database, Hash as _, Header, HeaderBuilder, Multiaddr, NetworkKeypair, NetworkPublicKey, Round,
-    TimestampSec, Vote, WorkerCache,
+    Vote, WorkerCache,
 };
 
 /// Fixture representing an validator node within the network.
@@ -111,7 +111,6 @@ impl<DB: Database> AuthorityFixture<DB> {
         worker: WorkerFixture,
         worker_cache: WorkerCache,
         network_config: NetworkConfig,
-        epoch_boundary: Option<TimestampSec>,
     ) -> Self {
         let (primary_keypair, key_config) = keys;
         // Make sure our keys are correct.
@@ -136,7 +135,6 @@ impl<DB: Database> AuthorityFixture<DB> {
             committee,
             worker_cache,
             network_config,
-            epoch_boundary,
         )
         .expect("failed to generate config!");
 
