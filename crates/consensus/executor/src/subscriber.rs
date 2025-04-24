@@ -21,7 +21,7 @@ use tn_storage::CertificateStore;
 use tn_types::{
     AuthorityIdentifier, Batch, BlockHash, CommittedSubDag, Committee, ConsensusHeader,
     ConsensusOutput, Database, Hash as _, Noticer, TaskManager, TaskManagerClone, Timestamp,
-    TnReceiver, TnSender, B256,
+    TimestampSec, TnReceiver, TnSender, B256,
 };
 use tracing::{debug, error, info};
 
@@ -36,34 +36,49 @@ pub struct Subscriber<DB> {
     consensus_bus: ConsensusBus,
     /// Consensus configuration (contains the consensus DB)
     config: ConsensusConfig<DB>,
+    /// The handle to the network.
+    network_handle: PrimaryNetworkHandle,
     /// Inner state.
     inner: Arc<Inner>,
 }
 
+/// Inner subscriber type.
 struct Inner {
+    /// The identifier for the authority.
+    ///
     /// Used for logging, None if we are not a validator.
     authority_id: Option<AuthorityIdentifier>,
+    /// The committee for the epoch.
     committee: Committee,
+    /// The client to request worker batches and build consensus output.
     client: LocalNetwork,
+    /// The timestamp for when this epoch closes.
+    ///
+    /// The subscriber monitors leader timestamps for the epoch boundary.
+    /// If the timestamp of the leader is >= the epoch_boundary then the
+    /// subscriber indicates that the epoch should close.
+    epoch_boundary: TimestampSec,
 }
 
+/// Spawn the subscriber in the correct mode based on the validator status for the current epoch.
 pub fn spawn_subscriber<DB: Database>(
     config: ConsensusConfig<DB>,
     rx_shutdown: Noticer,
     consensus_bus: ConsensusBus,
     task_manager: &TaskManager,
-    network: PrimaryNetworkHandle,
+    network_handle: PrimaryNetworkHandle,
+    epoch_boundary: TimestampSec,
 ) {
     let authority_id = config.authority_id();
     let committee = config.committee().clone();
     let client = config.local_network().clone();
-
     let mode = *consensus_bus.node_mode().borrow();
     let subscriber = Subscriber {
         rx_shutdown,
         consensus_bus,
         config,
-        inner: Arc::new(Inner { authority_id, committee, client }),
+        network_handle,
+        inner: Arc::new(Inner { authority_id, committee, client, epoch_boundary }),
     };
     match mode {
         // If we are active then partcipate in consensus.
@@ -73,7 +88,7 @@ pub fn spawn_subscriber<DB: Database>(
                 monitored_future!(
                     async move {
                         info!(target: "subscriber", "Starting subscriber: CVV");
-                        if let Err(e) = subscriber.run(network).await {
+                        if let Err(e) = subscriber.run().await {
                             error!(target: "subscriber", "Error subscriber consensus: {e}");
                         }
                     },
@@ -89,7 +104,7 @@ pub fn spawn_subscriber<DB: Database>(
                 monitored_future!(
                     async move {
                         info!(target: "subscriber", "Starting subscriber: Catch up and rejoin");
-                        if let Err(e) = subscriber.catch_up_rejoin_consensus(clone, network).await {
+                        if let Err(e) = subscriber.catch_up_rejoin_consensus(clone).await {
                             error!(target: "subscriber", "Error catching up consensus: {e}");
                         }
                     },
@@ -105,7 +120,7 @@ pub fn spawn_subscriber<DB: Database>(
                 monitored_future!(
                     async move {
                         info!(target: "subscriber", "Starting subscriber: Follower");
-                        if let Err(e) = subscriber.follow_consensus(clone, network).await {
+                        if let Err(e) = subscriber.follow_consensus(clone).await {
                             error!(target: "subscriber", "Error following consensus: {e}");
                         }
                     },
@@ -157,15 +172,16 @@ impl<DB: Database> Subscriber<DB> {
     }
 
     /// Catch up to current consensus and then try to rejoin as an active CVV.
-    async fn catch_up_rejoin_consensus(
-        &self,
-        tasks: TaskManagerClone,
-        network: PrimaryNetworkHandle,
-    ) -> SubscriberResult<()> {
+    async fn catch_up_rejoin_consensus(&self, tasks: TaskManagerClone) -> SubscriberResult<()> {
         // Get a receiver than stream any missing headers so we don't miss them.
         let mut rx_consensus_headers = self.consensus_bus.consensus_header().subscribe();
         stream_missing_consensus(&self.config, &self.consensus_bus).await?;
-        spawn_state_sync(self.config.clone(), self.consensus_bus.clone(), network, tasks);
+        spawn_state_sync(
+            self.config.clone(),
+            self.consensus_bus.clone(),
+            self.network_handle.clone(),
+            tasks,
+        );
         while let Some(consensus_header) = rx_consensus_headers.recv().await {
             let consensus_header_number = consensus_header.number;
             self.handle_consensus_header(consensus_header).await?;
@@ -183,15 +199,16 @@ impl<DB: Database> Subscriber<DB> {
     }
 
     /// Follow along with consensus output but do not try to join consensus.
-    async fn follow_consensus(
-        &self,
-        tasks: TaskManagerClone,
-        network: PrimaryNetworkHandle,
-    ) -> SubscriberResult<()> {
+    async fn follow_consensus(&self, tasks: TaskManagerClone) -> SubscriberResult<()> {
         // Get a receiver then stream any missing headers so we don't miss them.
         let mut rx_consensus_headers = self.consensus_bus.consensus_header().subscribe();
         stream_missing_consensus(&self.config, &self.consensus_bus).await?;
-        spawn_state_sync(self.config.clone(), self.consensus_bus.clone(), network, tasks);
+        spawn_state_sync(
+            self.config.clone(),
+            self.consensus_bus.clone(),
+            self.network_handle.clone(),
+            tasks,
+        );
         while let Some(consensus_header) = rx_consensus_headers.recv().await {
             self.handle_consensus_header(consensus_header).await?;
         }
@@ -211,7 +228,7 @@ impl<DB: Database> Subscriber<DB> {
     }
 
     /// Main loop connecting to the consensus to listen to sequence messages.
-    async fn run(self, network: PrimaryNetworkHandle) -> SubscriberResult<()> {
+    async fn run(self) -> SubscriberResult<()> {
         // Make sure any old consensus that was not executed gets executed.
         let missing = get_missing_consensus(&self.config, &self.consensus_bus).await?;
         for consensus_header in missing.into_iter() {
@@ -247,7 +264,7 @@ impl<DB: Database> Subscriber<DB> {
                         error!(target: "subscriber", "error sending latest consensus header for authority {:?}: {}", self.inner.authority_id, e);
                         return Ok(());
                     }
-                    if let Err(e) = network.publish_consensus(number, last_parent).await {
+                    if let Err(e) = self.network_handle.publish_consensus(number, last_parent).await {
                         error!(target: "subscriber", "error publishing latest consensus to network {:?}: {}", self.inner.authority_id, e);
                     }
                     last_number += 1;
@@ -319,6 +336,10 @@ impl<DB: Database> Subscriber<DB> {
             // Not a CVV so be more conservative about finalizing blocks.
             false
         };
+
+        // logic to indicate engine should conclude epoch
+        let close_epoch = deliver.commit_timestamp() >= self.inner.epoch_boundary;
+
         if num_blocks == 0 {
             debug!(target: "subscriber", "No blocks to fetch, payload is empty");
             return Ok(ConsensusOutput {
@@ -331,7 +352,7 @@ impl<DB: Database> Subscriber<DB> {
                 extra: B256::default(),
                 early_finalize,
                 // always false for now
-                close_epoch: false,
+                close_epoch,
             });
         }
 
@@ -345,8 +366,7 @@ impl<DB: Database> Subscriber<DB> {
             number,
             extra: B256::default(),
             early_finalize,
-            // always false for now
-            close_epoch: false,
+            close_epoch,
         };
 
         let mut batch_set: HashSet<BlockHash> = HashSet::new();
@@ -462,7 +482,7 @@ impl<DB: Database> Subscriber<DB> {
 mod tests {
     use super::*;
     use indexmap::IndexMap;
-    use std::{collections::BTreeSet, ops::RangeInclusive};
+    use std::{collections::BTreeSet, ops::RangeInclusive, time::Duration};
     use tn_network_libp2p::types::{MessageId, NetworkCommand};
     use tn_network_types::MockPrimaryToWorkerClient;
     use tn_primary::consensus::{Bullshark, Consensus, LeaderSchedule};
@@ -470,10 +490,10 @@ mod tests {
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils::CommitteeFixture;
     use tn_types::{
-        Certificate, CertificateDigest, ExecHeader, HeaderBuilder, Round, SealedHeader,
+        now, Certificate, CertificateDigest, ExecHeader, HeaderBuilder, Round, SealedHeader,
         TimestampSec, WorkerId, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     };
-    use tokio::sync::mpsc;
+    use tokio::{sync::mpsc, time::timeout};
 
     fn random_batches(
         number_of_batches: usize,
@@ -510,6 +530,7 @@ mod tests {
             .round(round)
             .epoch(0)
             .parents(parents)
+            .created_at(now())
             .build();
 
         let cert = committee.certificate(&header);
@@ -571,6 +592,9 @@ mod tests {
             }
         });
         let network = PrimaryNetworkHandle::new_for_test(tx);
+        // ensure epoch boundary is not reached
+        let epoch_boundary = u64::MAX;
+
         // spawn the executor
         spawn_subscriber(
             config.clone(),
@@ -578,6 +602,7 @@ mod tests {
             consensus_bus.clone(),
             &task_manager,
             network,
+            epoch_boundary,
         );
 
         // yield for subscriber to spawn
@@ -620,6 +645,9 @@ mod tests {
         let expected_num = 3;
         let mut consensus_headers_seen: Vec<_> = Vec::with_capacity(expected_num);
         while let Some(output) = consensus_output.recv().await {
+            // assert epoch boundary not reached
+            assert!(!output.close_epoch);
+
             let num = output.number;
             let consensus_header = output.consensus_header();
             consensus_headers_seen.push(consensus_header);
@@ -640,6 +668,100 @@ mod tests {
             last_header.digest(),
             consensus_headers_seen.last().expect("last consensus header").digest()
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_epoch_boundary() -> eyre::Result<()> {
+        let num_sub_dags_per_schedule = 3;
+
+        // create committee with epoch boundary `now`
+        let epoch_boundary = now();
+        // note: setting epoch boundary here doesn't actually affect the test
+        let fixture =
+            CommitteeFixture::builder(MemDatabase::default).with_epoch_boundary(now()).build();
+        let committee = fixture.committee();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config().clone();
+        let consensus_store = config.node_storage().clone();
+        let task_manager = TaskManager::new("subscriber tests");
+        let rx_shutdown = config.shutdown().subscribe();
+        let consensus_bus = ConsensusBus::new();
+
+        // subscribe to channels early
+        let rx_consensus_headers = consensus_bus.last_consensus_header().subscribe();
+        let mut consensus_output = consensus_bus.consensus_output().subscribe();
+
+        let (tx, mut rx) = mpsc::channel(5);
+        tokio::spawn(async move {
+            while let Some(com) = rx.recv().await {
+                if let NetworkCommand::Publish { topic: _, msg: _, reply } = com {
+                    reply.send(Ok(MessageId::new(&[0]))).unwrap();
+                }
+            }
+        });
+        let network = PrimaryNetworkHandle::new_for_test(tx);
+
+        // spawn the executor
+        spawn_subscriber(
+            config.clone(),
+            rx_shutdown,
+            consensus_bus.clone(),
+            &task_manager,
+            network,
+            epoch_boundary,
+        );
+
+        // yield for subscriber to spawn
+        tokio::task::yield_now().await;
+
+        // make certificates for rounds 1 to 3 (inclusive)
+        let (certificates, _next_parents, batches) = create_test_data(1..=3, &fixture);
+
+        // Set up mock worker.
+        let worker = primary.worker();
+        let _worker_address = &worker.info().worker_address;
+        let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
+        config.local_network().set_primary_to_worker_local_handler(mock_client);
+
+        let metrics = Arc::new(ConsensusMetrics::default());
+        let leader_schedule = LeaderSchedule::from_store(
+            committee.clone(),
+            consensus_store.clone(),
+            DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+        );
+        let bullshark = Bullshark::new(
+            committee.clone(),
+            consensus_store.clone(),
+            metrics.clone(),
+            num_sub_dags_per_schedule,
+            leader_schedule.clone(),
+            DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+        );
+
+        let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
+        consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+        let task_manager = TaskManager::default();
+        Consensus::spawn(config.clone(), &consensus_bus, bullshark, &task_manager);
+
+        // forward certificates to trigger subdag commit
+        for certificate in certificates.iter() {
+            consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();
+        }
+
+        let output = timeout(Duration::from_secs(5), consensus_output.recv())
+            .await
+            .expect("dag commits")
+            .expect("recv consensus output");
+        let last_header = rx_consensus_headers.borrow().clone();
+
+        // NOTE: output.consensus_header() creates the consensus header and should be the same
+        // result
+        assert_eq!(last_header.digest(), output.consensus_header().digest());
+
+        // assert epoch boundary reached
+        assert!(output.close_epoch);
 
         Ok(())
     }

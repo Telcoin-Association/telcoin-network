@@ -127,8 +127,8 @@ pub(crate) fn random_ip_addr() -> IpAddr {
 pub(crate) fn create_multiaddr(ip: Option<IpAddr>) -> Multiaddr {
     let ip = ip.unwrap_or_else(random_ip_addr);
     let ip = match ip {
-        IpAddr::V4(ip) => format!("/ip4/{}", ip),
-        IpAddr::V6(ip) => format!("/ip6/{}", ip),
+        IpAddr::V4(ip) => format!("/ip4/{ip}"),
+        IpAddr::V6(ip) => format!("/ip6/{ip}"),
     };
     format!("{}/tcp/8000", &ip).parse().unwrap()
 }

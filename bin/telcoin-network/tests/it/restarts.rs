@@ -54,6 +54,7 @@ fn kill_child(child: &mut Child) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_and_confirm(
     node: &str,
     node_test: &str,
@@ -64,6 +65,7 @@ fn send_and_confirm(
     gas: u128,
     nonce: u128,
 ) -> eyre::Result<()> {
+    #[allow(clippy::too_many_arguments)]
     fn send_and_confirm_int(
         node: &str,
         node_test: &str,
@@ -76,9 +78,9 @@ fn send_and_confirm(
     ) -> eyre::Result<()> {
         let current = get_balance(node, &to_account.to_string(), 1)?;
         let expected = current + amount;
-        if let Err(e) = send_tel(node, &key, to_account, amount, gas_price, gas, nonce) {
+        if let Err(e) = send_tel(node, key, to_account, amount, gas_price, gas, nonce) {
             if e.to_string().contains("nonce too low") {
-                send_tel(node, &key, to_account, amount, gas_price, gas, nonce + 1)?;
+                send_tel(node, key, to_account, amount, gas_price, gas, nonce + 1)?;
             } else {
                 return Err(e);
             }
@@ -187,8 +189,8 @@ fn run_restart_tests1(
 fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
-    for i in 0..4 {
-        let bal = get_positive_balance_with_retry(&client_urls[i], &to_account.to_string())?;
+    for (i, uri) in client_urls.iter().enumerate().take(4) {
+        let bal = get_positive_balance_with_retry(uri, &to_account.to_string())?;
         if 20 * WEI_PER_TEL != bal {
             return Err(Report::msg(format!(
                 "Expected a balance of {} got {bal} for node {i}!",

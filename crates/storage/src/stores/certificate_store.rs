@@ -399,8 +399,7 @@ impl<DB: Database> CertificateStore for DB {
 
             let certificate = self.get::<Certificates>(&digest)?.ok_or_else(|| {
                 eyre::Report::msg(format!(
-                    "Certificate with id {} not found in main storage although it should",
-                    digest
+                    "Certificate with id {digest} not found in main storage although it should"
                 ))
             })?;
 

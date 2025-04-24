@@ -69,7 +69,7 @@ async fn test_certificates_verified() -> eyre::Result<()> {
                     certificates
                 }
                 other => {
-                    panic!("unexpected command: {:?}", other);
+                    panic!("unexpected command: {other:?}");
                 }
             };
             assert_eq!(*received, vec![cert]);
@@ -128,7 +128,7 @@ async fn test_process_fetched_certificates_in_parallel() -> eyre::Result<()> {
                     certificates
                 }
                 other => {
-                    panic!("unexpected command: {:?}", other);
+                    panic!("unexpected command: {other:?}");
                 }
             };
 

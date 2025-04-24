@@ -75,8 +75,7 @@ pub trait ConfigTrait {
         fmt: ConfigFmt,
     ) -> eyre::Result<()> {
         let path = path.as_ref();
-        let config_dir =
-            path.parent().with_context(|| format!("{:?} is a root or prefix", path))?;
+        let config_dir = path.parent().with_context(|| format!("{path:?} is a root or prefix"))?;
         fs::create_dir_all(config_dir)
             .with_context(|| "directory creation failed while storing")?;
 

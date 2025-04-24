@@ -1140,7 +1140,7 @@ async fn restart_with_new_committee() {
         assert_eq!(output.round(), 2);
 
         // Move to the next epoch.
-        committee = committee.advance_epoch_for_test(epoch + 1);
+        committee = committee.advance_epoch_for_test(epoch + 1, None);
         fixture.update_committee(committee.clone());
         config.shutdown().notify();
 
@@ -1352,7 +1352,7 @@ async fn slow_node() {
 
                 committed = true;
             }
-            _ => panic!("Unexpected outcome {:?}", outcome),
+            _ => panic!("Unexpected outcome {outcome:?}"),
         }
     }
 
@@ -1500,7 +1500,7 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
                     assert_eq!(state.dag.len(), 5);
 
                     for (round, entries) in state.dag.iter() {
-                        assert!(*round >= 3, "{}", format!("Round detected: {}", round));
+                        assert!(*round >= 3, "{}", format!("Round detected: {round}"));
 
                         if *round == 3 || *round == 4 {
                             assert_eq!(entries.len(), 3);
@@ -1513,7 +1513,7 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
 
                     committed = true;
                 }
-                _ => panic!("Unexpected outcome: {:?}", outcome),
+                _ => panic!("Unexpected outcome: {outcome:?}"),
             }
         }
     }

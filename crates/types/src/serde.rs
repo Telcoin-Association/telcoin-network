@@ -16,9 +16,9 @@ impl SerializeAs<roaring::RoaringBitmap> for CertificateSignatures {
     {
         let mut bytes = vec![];
 
-        source.serialize_into(&mut bytes).map_err(|e| {
-            S::Error::custom(format!("roaring bitmap serialization failed: {:?}", e))
-        })?;
+        source
+            .serialize_into(&mut bytes)
+            .map_err(|e| S::Error::custom(format!("roaring bitmap serialization failed: {e:?}")))?;
         Bytes::serialize_as(&bytes, serializer)
     }
 }
@@ -30,6 +30,6 @@ impl<'de> DeserializeAs<'de, roaring::RoaringBitmap> for CertificateSignatures {
     {
         let bytes: Vec<u8> = Bytes::deserialize_as(deserializer)?;
         roaring::RoaringBitmap::deserialize_from(&bytes[..])
-            .map_err(|e| Error::custom(format!("roaring bitmap deserialization failed: {:?}", e)))
+            .map_err(|e| Error::custom(format!("roaring bitmap deserialization failed: {e:?}")))
     }
 }

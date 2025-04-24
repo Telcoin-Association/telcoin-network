@@ -401,8 +401,7 @@ pub fn make_certificates_with_parameters(
 
             assert!(
                 parents_digests.len() >= committee.quorum_threshold() as usize,
-                "Failed on seed {}. At least 2f+1 parents are needed.",
-                seed
+                "Failed on seed {seed}. At least 2f+1 parents are needed."
             );
 
             let parents_digests: BTreeSet<CertificateDigest> =
@@ -432,8 +431,7 @@ pub fn make_certificates_with_parameters(
         // Ensure total stake of the round provides strong quorum
         assert!(
             committee.reached_quorum(total_round_stake),
-            "Failed on seed {}. Strong quorum is needed per round to ensure DAG advance.",
-            seed
+            "Failed on seed {seed}. Strong quorum is needed per round to ensure DAG advance."
         );
 
         // Ensure each certificate's parents exist from previous processing
@@ -443,9 +441,7 @@ pub fn make_certificates_with_parameters(
             .for_each(|digest| {
                 assert!(
                     certificate_digests.contains(digest),
-                    "Failed on seed {}. Certificate with digest {} should be found in processed certificates.",
-                    seed,
-                    digest
+                    "Failed on seed {seed}. Certificate with digest {digest} should be found in processed certificates."
                 );
             });
     }

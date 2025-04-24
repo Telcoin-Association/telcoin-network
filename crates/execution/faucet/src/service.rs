@@ -383,7 +383,7 @@ where
             let recid = RecoveryId::from_i32(recovery_id).expect("Invalid recovery id");
             let recoverable_signature =
                 RecoverableSignature::from_compact(compact_signature, recid).map_err(|e| {
-                    EthApiError::InvalidParams(format!("failed to recover signature: {}", e))
+                    EthApiError::InvalidParams(format!("failed to recover signature: {e}"))
                 })?;
             if let Ok(recovered_key) = SECP256K1.recover_ecdsa(message, &recoverable_signature) {
                 let recovered_pubkey = recovered_key.serialize();
@@ -446,7 +446,7 @@ where
                                 // trim off ms, us, and ns
                                 let human_readable =
                                     format_duration(Duration::new(time.as_secs(), 0));
-                                let msg = format!("Wait period over at: {}", human_readable);
+                                let msg = format!("Wait period over at: {human_readable}");
                                 Err(EthApiError::InvalidParams(msg))
                             }
                             Err(e) => Err(e),
@@ -467,7 +467,7 @@ where
                                 // trim off ms, us, and ns
                                 let human_readable =
                                     format_duration(Duration::new(time.as_secs(), 0));
-                                let msg = format!("Wait period over at: {}", human_readable);
+                                let msg = format!("Wait period over at: {human_readable}");
                                 Err(EthApiError::InvalidParams(msg))
                             }
                             Err(e) => Err(e),

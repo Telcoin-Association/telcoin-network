@@ -16,8 +16,8 @@ use std::{
 use tn_config::{KeyConfig, NetworkConfig};
 use tn_types::{
     get_available_udp_port, Address, Authority, AuthorityIdentifier, BlsKeypair, Committee,
-    Database, Epoch, Multiaddr, VotingPower, WorkerCache, WorkerIndex, DEFAULT_PRIMARY_PORT,
-    DEFAULT_WORKER_PORT,
+    Database, Epoch, Multiaddr, TimestampSec, VotingPower, WorkerCache, WorkerIndex,
+    DEFAULT_PRIMARY_PORT, DEFAULT_WORKER_PORT,
 };
 
 pub struct Builder<DB, F, R = OsRng> {
@@ -28,6 +28,7 @@ pub struct Builder<DB, F, R = OsRng> {
     epoch: Epoch,
     voting_power: VecDeque<VotingPower>,
     network_config: Option<NetworkConfig>,
+    epoch_boundary: Option<TimestampSec>,
     new_db: F,
     _phantom_data: PhantomData<DB>,
 }
@@ -46,6 +47,7 @@ where
             randomize_ports: false,
             voting_power: VecDeque::new(),
             network_config: None,
+            epoch_boundary: None,
             new_db,
             _phantom_data: PhantomData::<DB>,
         }
@@ -82,6 +84,12 @@ where
         self
     }
 
+    /// Include a timestamp (in secs) for closing the epoch.
+    pub fn with_epoch_boundary(mut self, epoch_boundary: TimestampSec) -> Self {
+        self.epoch_boundary = Some(epoch_boundary);
+        self
+    }
+
     pub fn rng<N: rand::RngCore + rand::CryptoRng>(self, rng: N) -> Builder<DB, F, N> {
         Builder {
             rng,
@@ -91,6 +99,7 @@ where
             randomize_ports: self.randomize_ports,
             voting_power: self.voting_power,
             network_config: None,
+            epoch_boundary: None,
             new_db: self.new_db,
             _phantom_data: PhantomData::<DB>,
         }
@@ -161,6 +170,7 @@ where
         let committee = Committee::new_for_test(
             authorities.into_iter().map(|(k, (_, _, a))| (k, a)).collect(),
             0,
+            self.epoch_boundary,
         );
         // Build our worker cache.  This is map of authorities to it's worker (one per authority).
         let worker_cache = WorkerCache {

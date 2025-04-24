@@ -1122,8 +1122,7 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
     for (peer_id, topics) in gossip_peers {
         assert!(
             topics.iter().any(|t| *t == TopicHash::from_raw(TEST_TOPIC)),
-            "Peer {:?} should be subscribed to test topic",
-            peer_id
+            "Peer {peer_id:?} should be subscribed to test topic"
         );
     }
 

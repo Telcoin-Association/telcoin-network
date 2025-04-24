@@ -120,7 +120,7 @@ impl<Req, Res> TNCodec<Req, Res> {
 
         // encode into allocated buffer
         encode_into_buffer(&mut self.decode_buffer, &msg).map_err(|e| {
-            let error = format!("encode into buffer: {}", e);
+            let error = format!("encode into buffer: {e}");
             std::io::Error::other(error)
         })?;
 

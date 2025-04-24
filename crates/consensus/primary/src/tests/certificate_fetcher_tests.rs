@@ -63,13 +63,11 @@ async fn verify_certificates_in_store<DB: CertificateStore>(
 
     assert_eq!(
         verified_directly, expected_verified_directly_count,
-        "Verified {} certificates directly in the store, expected {}",
-        verified_directly, expected_verified_directly_count
+        "Verified {verified_directly} certificates directly in the store, expected {expected_verified_directly_count}"
     );
     assert_eq!(
         verified_indirectly, expected_verified_indirectly_count,
-        "Verified {} certificates indirectly in the store, expected {}",
-        verified_indirectly, expected_verified_indirectly_count
+        "Verified {verified_indirectly} certificates indirectly in the store, expected {expected_verified_indirectly_count}"
     );
 }
 
@@ -82,7 +80,7 @@ fn verify_certificates_not_in_store<DB: CertificateStore>(
 
     let found_count = found_certificates.iter().filter(|&c| c.is_some()).count();
 
-    assert_eq!(found_count, 0, "Found {} certificates in the store", found_count);
+    assert_eq!(found_count, 0, "Found {found_count} certificates in the store");
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -266,7 +264,7 @@ async fn fetch_certificates_basic() {
                         .unwrap();
                     continue;
                 }
-                panic!("No more fetch request is expected! {:#?}", inner);
+                panic!("No more fetch request is expected! {inner:#?}");
             }
             Ok(_) => {}
             Err(TryRecvError::Empty) => break,

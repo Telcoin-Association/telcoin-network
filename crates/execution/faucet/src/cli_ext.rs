@@ -124,8 +124,7 @@ impl FaucetArgs {
 
             // construct api endpoint for Google KMS requests
             let name = format!(
-                "projects/{}/locations/{}/keyRings/{}/cryptoKeys/{}/cryptoKeyVersions/{}",
-                google_project_id, locations, key_rings, crypto_keys, crypto_key_versions
+                "projects/{google_project_id}/locations/{locations}/keyRings/{key_rings}/cryptoKeys/{crypto_keys}/cryptoKeyVersions/{crypto_key_versions}"
             );
 
             let wallet = FaucetWallet { address, public_key_bytes, name };

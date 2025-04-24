@@ -151,9 +151,6 @@ impl NetworkGenesis {
             if path.is_file()
                 && path.file_name().and_then(OsStr::to_str).is_none_or(|s| !s.starts_with('.'))
             {
-                // TODO: checking this is probably more trouble than it's worth
-                // && path.extension().and_then(OsStr::to_str) == Some("yaml")
-
                 let info_bytes = fs::read(&path)?;
                 let validator: ValidatorInfo = serde_yaml::from_slice(&info_bytes)
                     .with_context(|| format!("validator failed to load from {}", path.display()))?;
@@ -211,10 +208,6 @@ impl NetworkGenesis {
 
     /// Validate each validator:
     /// - verify proof of possession
-    ///
-    /// TODO: addition validation?
-    ///     - validator name isn't default
-    ///     - ???
     pub fn validate(&self) -> eyre::Result<()> {
         for (pubkey, validator) in self.validators.iter() {
             info!(target: "genesis::validate", "verifying validator: {}", pubkey);
@@ -226,7 +219,9 @@ impl NetworkGenesis {
 
     /// Create a [Committee] from the validators in [NetworkGenesis].
     pub fn create_committee(&self) -> eyre::Result<Committee> {
-        let mut committee_builder = CommitteeBuilder::new(0);
+        // disable epochs for now
+        let epoch_boundary = u64::MAX;
+        let mut committee_builder = CommitteeBuilder::new(0, epoch_boundary);
         for (pubkey, validator) in self.validators.iter() {
             committee_builder.add_authority(
                 *pubkey,
@@ -325,8 +320,6 @@ impl Default for ValidatorInfo {
     }
 }
 
-/// TODO: decide if this is needed or not.
-///
 /// If using aggregate signatures for NetworkGenesis over chainspec.
 #[derive(Clone, Debug, Eq, Serialize, Deserialize)]
 pub struct ValidatorSignatureInfo {
@@ -385,11 +378,11 @@ impl PubkeyFlags {
     fn new(num_validators: usize) -> Vec<PubkeyFlags> {
         (1..=num_validators)
             .map(|i| PubkeyFlags {
-                bls_a: keccak256(format!("VALIDATOR_{}_BLS_A", i)),
-                bls_b: keccak256(format!("VALIDATOR_{}_BLS_B", i)),
-                bls_c: keccak256(format!("VALIDATOR_{}_BLS_C", i)),
-                ed25519: keccak256(format!("VALIDATOR_{}_ED25519", i)),
-                ecdsa: keccak256(format!("VALIDATOR_{}_ECDSA", i)),
+                bls_a: keccak256(format!("VALIDATOR_{i}_BLS_A")),
+                bls_b: keccak256(format!("VALIDATOR_{i}_BLS_B")),
+                bls_c: keccak256(format!("VALIDATOR_{i}_BLS_C")),
+                ed25519: keccak256(format!("VALIDATOR_{i}_ED25519")),
+                ecdsa: keccak256(format!("VALIDATOR_{i}_ECDSA")),
             })
             .collect()
     }
@@ -563,7 +556,7 @@ mod tests {
                 network_keypair.public().clone().into(),
                 worker_index,
             );
-            let name = format!("validator-{}", v);
+            let name = format!("validator-{v}");
             // create validator
             let validator = ValidatorInfo::new(
                 name,
@@ -605,7 +598,7 @@ mod tests {
                 network_keypair.public().clone().into(),
                 worker_index,
             );
-            let name = format!("validator-{}", v);
+            let name = format!("validator-{v}");
             // create validator
             let validator = ValidatorInfo::new(
                 name,

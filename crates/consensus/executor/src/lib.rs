@@ -10,7 +10,7 @@ use mockall::automock;
 use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
 use tn_storage::ConsensusStore;
-use tn_types::{CommittedSubDag, ConsensusOutput, Database, Noticer, TaskManager};
+use tn_types::{CommittedSubDag, ConsensusOutput, Database, Noticer, TaskManager, TimestampSec};
 use tracing::info;
 
 /// Convenience type representing a serialized transaction.
@@ -40,9 +40,10 @@ impl Executor {
         consensus_bus: ConsensusBus,
         task_manager: &TaskManager,
         network: PrimaryNetworkHandle,
+        epoch_boundary: TimestampSec,
     ) {
         // Spawn the subscriber.
-        spawn_subscriber(config, rx_shutdown, consensus_bus, task_manager, network);
+        spawn_subscriber(config, rx_shutdown, consensus_bus, task_manager, network, epoch_boundary);
 
         // Return the handle.
         info!("Consensus subscriber successfully started");

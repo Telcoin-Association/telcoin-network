@@ -117,7 +117,7 @@ impl AddValidator {
     /// Loads the reth config with the given datadir root
     fn load_config(&self, config_path: PathBuf) -> eyre::Result<Config> {
         Config::load_from_path::<Config>(config_path.clone(), ConfigFmt::YAML)
-            .wrap_err_with(|| format!("Could not load config file {:?}", config_path))
+            .wrap_err_with(|| format!("Could not load config file {config_path:?}"))
     }
 
     // /// Get bls key for validator

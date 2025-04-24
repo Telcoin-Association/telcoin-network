@@ -392,8 +392,7 @@ mod tests {
         let crypto_key_versions = "1";
 
         let name = format!(
-            "projects/{}/locations/{}/keyRings/{}/cryptoKeys/{}/cryptoKeyVersions/{}",
-            google_project_id, locations, key_rings, crypto_keys, crypto_key_versions
+            "projects/{google_project_id}/locations/{locations}/keyRings/{key_rings}/cryptoKeys/{crypto_keys}/cryptoKeyVersions/{crypto_key_versions}"
         );
 
         let digest_bytes = keccak256("this is a test").0.to_vec();

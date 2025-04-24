@@ -182,22 +182,20 @@ mod tests {
         let path = path.unwrap_or_chain_default(Chain::from_id(2017), default_datadir_args());
         assert!(
             path.as_ref().ends_with("telcoin-network/2017"),
-            "actual default path is: {:?}",
-            path
+            "actual default path is: {path:?}"
         );
 
         let db_path = path.db();
-        assert!(db_path.ends_with("telcoin-network/2017/db"), "actual db path is: {:?}", db_path);
+        assert!(db_path.ends_with("telcoin-network/2017/db"), "actual db path is: {db_path:?}");
 
         let static_files_path = path.static_files();
         assert!(
             static_files_path.ends_with("telcoin-network/2017/static_files"),
-            "actual static_files path is: {:?}",
-            static_files_path
+            "actual static_files path is: {static_files_path:?}"
         );
 
         let path = MaybePlatformPath::<DataDirPath>::from_str("my/path/to/datadir").unwrap();
         let path = path.unwrap_or_chain_default(Chain::from_id(2017), default_datadir_args());
-        assert!(path.as_ref().ends_with("my/path/to/datadir"), "{:?}", path);
+        assert!(path.as_ref().ends_with("my/path/to/datadir"), "{path:?}");
     }
 }

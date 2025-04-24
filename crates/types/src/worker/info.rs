@@ -190,9 +190,9 @@ impl std::fmt::Display for WorkerCache {
                 .iter()
                 .map(|(k, v)| {
                     if let Some(x) = k.encode_base58().get(0..16) {
-                        format!("{}: {}", x, v)
+                        format!("{x}: {v}")
                     } else {
-                        format!("Invalid key: {}", k)
+                        format!("Invalid key: {k}")
                     }
                 })
                 .collect::<Vec<_>>()

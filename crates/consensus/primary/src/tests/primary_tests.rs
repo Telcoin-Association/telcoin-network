@@ -109,7 +109,7 @@ async fn test_request_vote_has_missing_execution_block() {
     // Trying to build on off of a missing execution block, will be an error.
     let result = timeout(Duration::from_secs(5), handler.vote(peer, test_header, Vec::new())).await;
     let result = result.unwrap();
-    assert!(result.is_err(), "{:?}", result);
+    assert!(result.is_err(), "{result:?}");
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -177,7 +177,7 @@ async fn test_request_vote_older_execution_block() {
     // Trying to build on off of a missing execution block, will be an error.
     let result = timeout(Duration::from_secs(5), handler.vote(peer, test_header, Vec::new())).await;
     let result = result.unwrap();
-    assert!(result.is_ok(), "{:?}", result);
+    assert!(result.is_ok(), "{result:?}");
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -254,7 +254,7 @@ async fn test_request_vote_has_missing_parents() {
     // No additional missing parents will be requested.
     let result =
         timeout(Duration::from_secs(5), handler.vote(peer, test_header.clone(), Vec::new())).await;
-    assert!(result.is_err(), "{:?}", result);
+    assert!(result.is_err(), "{result:?}");
 
     // TEST PHASE 3: Handler should return error if header is too old.
     // Increase round threshold.
@@ -262,7 +262,7 @@ async fn test_request_vote_has_missing_parents() {
     // Because round 1 certificates are not in store, the missing parents will not be accepted yet.
     let result =
         timeout(Duration::from_secs(5), handler.vote(peer, test_header, Vec::new())).await.unwrap();
-    assert!(result.is_err(), "{:?}", result);
+    assert!(result.is_err(), "{result:?}");
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -351,7 +351,7 @@ async fn test_request_vote_accept_missing_parents() {
     let result = timeout(Duration::from_secs(5), handler.vote(peer, test_header, round_2_missing))
         .await
         .unwrap();
-    assert!(result.is_ok(), "{:?}", result);
+    assert!(result.is_ok(), "{result:?}");
 }
 
 #[tokio::test]

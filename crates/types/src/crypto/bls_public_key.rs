@@ -110,14 +110,14 @@ impl Ord for BlsPublicKey {
 impl std::fmt::Debug for BlsPublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         let bytes: BlsPublicKeyBytes = self.into();
-        write!(f, "{}", bytes)
+        write!(f, "{bytes}")
     }
 }
 
 impl std::fmt::Display for BlsPublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         let bytes: BlsPublicKeyBytes = self.into();
-        write!(f, "{}", bytes)
+        write!(f, "{bytes}")
     }
 }
 

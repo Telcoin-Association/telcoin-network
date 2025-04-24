@@ -452,8 +452,7 @@ mod protocol_vec {
                     "full" => ProtocolSupport::Full,
                     _ => {
                         return Err(D::Error::custom(format!(
-                            "Invalid protocol support: {}, expected inbound, outbound, or full",
-                            support_str
+                            "Invalid protocol support: {support_str}, expected inbound, outbound, or full"
                         )))
                     }
                 };
