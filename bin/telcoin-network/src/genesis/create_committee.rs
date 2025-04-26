@@ -44,13 +44,12 @@ pub struct CreateCommitteeArgs {
     ///
     /// Possible values are either a built-in chain or the path to a chain specification file.
     ///
-    /// Defaults to the custom
+    /// Defaults to the adiri testnet.
     #[arg(
         long,
         value_name = "CHAIN_OR_PATH",
         verbatim_doc_comment,
         default_value = "adiri",
-        // default_value_if("dev", "true", "dev"),
         value_parser = clap_genesis_parser,
         required = false,
     )]
@@ -99,7 +98,7 @@ pub struct CreateCommitteeArgs {
     #[arg(
         long = "epoch-block-rewards",
         alias = "block_rewards_per_epoch",
-        help_heading = "The minimal amount a validator can withdraw. The default is 20mil TEL per 28 days.",
+        help_heading = "The amount of TEL (incl 18 decimals) for the committee starting at genesis.",
         default_value_t = U256::from(20_000_000e18).checked_div(U256::from(28)).expect("U256 div works"),
         verbatim_doc_comment
     )]
@@ -119,7 +118,7 @@ pub struct CreateCommitteeArgs {
     #[arg(
         long = "rwtel-contract-address",
         alias = "rwtel",
-        help_heading = "The length of each epoch in seconds.",
+        help_heading = "The address for RWTEL contract.",
         default_value_t = RWTEL_ADDRESS,
         verbatim_doc_comment
     )]

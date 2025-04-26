@@ -1344,6 +1344,7 @@ impl RethEnv {
             CONSENSUS_REGISTRY_ADDRESS,
             GenesisAccount::default()
                 .with_code(Some(registry_bytecode.into()))
+                .with_balance(total_stake_balance)
                 .with_storage(storage),
         )]);
 
