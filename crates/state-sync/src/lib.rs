@@ -32,7 +32,6 @@ pub async fn can_cvv<DB: Database>(
         last_executed_consensus_block(&consensus_bus, &config).unwrap_or_default();
 
     // Set some of the round watches to the current default.
-    // TODO- replace 0 with the epoch once we have them..
     let last_consensus_epoch = last_executed_block.sub_dag.leader.epoch();
     let last_consensus_round = last_executed_block.sub_dag.leader_round();
     let _ = consensus_bus.update_consensus_rounds(ConsensusRound::new_with_gc_depth(

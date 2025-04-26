@@ -22,15 +22,16 @@ use tracing::{error, info};
 /// One unit of TEL (10^18) measured in wei.
 const WEI_PER_TEL: u128 = 1_000_000_000_000_000_000;
 
-/// Helper function to shutdown child processes and log errors.
-fn kill_child(child: &mut Child) {
-    // The code below will send SIGKILL without the use of nix.
-    //if let Err(e) = child.kill() {
-    //    error!(target: "restart-test", ?e, "error killing child");
-    //}
+/// Send SIGTERM to child, can use this to pre-send TERM to all children when shutting down.
+fn send_term(child: &mut Child) {
     if let Err(e) = signal::kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM) {
         error!(target: "restart-test", ?e, "error killing child");
     }
+}
+
+/// Helper function to shutdown child processes and log errors.
+fn kill_child(child: &mut Child) {
+    send_term(child);
 
     for _ in 0..5 {
         match child.try_wait() {
@@ -54,58 +55,28 @@ fn kill_child(child: &mut Child) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn send_and_confirm(
     node: &str,
     node_test: &str,
     key: &str,
     to_account: Address,
-    amount: u128,
-    gas_price: u128,
-    gas: u128,
     nonce: u128,
 ) -> eyre::Result<()> {
-    #[allow(clippy::too_many_arguments)]
-    fn send_and_confirm_int(
-        node: &str,
-        node_test: &str,
-        key: &str,
-        to_account: Address,
-        amount: u128,
-        gas_price: u128,
-        gas: u128,
-        nonce: u128,
-    ) -> eyre::Result<()> {
-        let current = get_balance(node, &to_account.to_string(), 1)?;
-        let expected = current + amount;
-        if let Err(e) = send_tel(node, key, to_account, amount, gas_price, gas, nonce) {
-            if e.to_string().contains("nonce too low") {
-                send_tel(node, key, to_account, amount, gas_price, gas, nonce + 1)?;
-            } else {
-                return Err(e);
-            }
-        }
+    let current = get_balance(node, &to_account.to_string(), 1)?;
+    let amount = 10 * WEI_PER_TEL; // 10 TEL
+    let expected = current + amount;
+    send_tel(node, &key, to_account, amount, 250, 21000, nonce)?;
 
-        // sleep
-        std::thread::sleep(Duration::from_millis(1000));
-        info!(target: "restart-test", "calling get_positive_balance_with_retry...");
+    // sleep
+    std::thread::sleep(Duration::from_millis(1000));
+    info!(target: "restart-test", "calling get_positive_balance_with_retry...");
 
-        // get positive bal and kill child2 if error
-        let bal = get_balance_above_with_retry(node_test, &to_account.to_string(), expected - 1)?;
+    // get positive bal and kill child2 if error
+    let bal = get_balance_above_with_retry(node_test, &to_account.to_string(), expected - 1)?;
 
-        if expected != bal {
-            error!(target: "restart-test", "{expected} != {bal} - returning error!");
-            return Err(Report::msg(format!("Expected a balance of {expected} got {bal}!")));
-        }
-        Ok(())
-    }
-    if let Err(_e) =
-        send_and_confirm_int(node, node_test, key, to_account, amount, gas_price, gas, nonce)
-    {
-        std::thread::sleep(Duration::from_millis(3000));
-        // Try once more then fail test.
-        // Maybe our txn got dropped for some reason.
-        send_and_confirm_int(node, node_test, key, to_account, amount, gas_price, gas, nonce)?;
+    if expected != bal {
+        error!(target: "restart-test", "{expected} != {bal} - returning error!");
+        return Err(Report::msg(format!("Expected a balance of {expected} got {bal}!")));
     }
     Ok(())
 }
@@ -119,21 +90,18 @@ fn run_restart_tests1(
     rpc_port2: u16,
     delay_secs: u64,
 ) -> eyre::Result<Child> {
+    network_advancing(&client_urls).inspect_err(|e| {
+        kill_child(child2);
+        error!(target: "restart-test", ?e);
+    })?;
+    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
+
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
 
+    test_blocks_same(client_urls)?;
     // Try once more then fail test.
-    send_and_confirm(
-        &client_urls[1],
-        &client_urls[2],
-        &key,
-        to_account,
-        10 * WEI_PER_TEL,
-        250,
-        21000,
-        0,
-    )
-    .inspect_err(|e| {
+    send_and_confirm(&client_urls[1], &client_urls[2], &key, to_account, 0).inspect_err(|e| {
         kill_child(child2);
         error!(target: "restart-test", ?e);
     })?;
@@ -163,17 +131,7 @@ fn run_restart_tests1(
         return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 10 * WEI_PER_TEL)));
     }
     // Try once more then fail test.
-    send_and_confirm(
-        &client_urls[0],
-        &client_urls[2],
-        &key,
-        to_account,
-        10 * WEI_PER_TEL,
-        250,
-        21000,
-        1,
-    )
-    .inspect_err(|e| {
+    send_and_confirm(&client_urls[0], &client_urls[2], &key, to_account, 1).inspect_err(|e| {
         kill_child(&mut child2);
         error!(target: "restart-test", ?e);
     })?;
@@ -187,6 +145,9 @@ fn run_restart_tests1(
 
 /// Run the second part of tests, broken up like this to allow more robust node shutdown.
 fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
+    network_advancing(&client_urls)?;
+    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
+    test_blocks_same(client_urls)?; // Starting from a solid position after a restart?
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
     for (i, uri) in client_urls.iter().enumerate().take(4) {
@@ -199,28 +160,38 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
         }
     }
     let number_start = get_block_number(&client_urls[3])?;
-    if let Err(e) = send_and_confirm(
-        &client_urls[0],
-        &client_urls[3],
-        &key,
-        to_account,
-        10 * WEI_PER_TEL,
-        250,
-        21000,
-        2,
-    ) {
+    if let Err(e) = send_and_confirm(&client_urls[0], &client_urls[3], &key, to_account, 2) {
         let number_0 = get_block_number(&client_urls[0])?;
         let number_1 = get_block_number(&client_urls[1])?;
         let number_2 = get_block_number(&client_urls[2])?;
         let number_3 = get_block_number(&client_urls[3])?;
         if number_start == number_3 {
             return Err(eyre::eyre!(
-                "Stuck on block {number_3}, other nodes {number_0}, {number_1}, {number_2}"
+                "Stuck on block {number_3}, other nodes {number_0}, {number_1}, {number_2}, error: {e}"
             ));
         }
         return Err(e);
     }
     test_blocks_same(client_urls)?;
+    Ok(())
+}
+
+fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
+    let mut start_num = get_block_number(&client_urls[0])?;
+    start_num = start_num.max(get_block_number(&client_urls[1])?);
+    start_num = start_num.max(get_block_number(&client_urls[2])?);
+    start_num = start_num.max(get_block_number(&client_urls[3])?);
+    let mut next_num = start_num;
+    let mut i = 0;
+    // Wait until a node is advancing agian, network should be back now.
+    while next_num <= start_num {
+        std::thread::sleep(Duration::from_secs(1));
+        next_num = get_block_number(&client_urls[0])?;
+        i += 1;
+        if i > 30 {
+            return Err(eyre::eyre!("Network not advancing within 30 seconds after restart!"));
+        }
+    }
     Ok(())
 }
 
@@ -254,8 +225,6 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
         client_urls[i].push_str(&format!(":{rpc_port}"));
         *child = Some(start_validator(i, &exe_path, &temp_path, rpc_port));
     }
-    // Let the nodes start- we should consider an admin port or some way to indicate this is done.
-    std::thread::sleep(Duration::from_secs(10));
 
     // pass &mut to `run_restart_tests1` to shutdown child in case of error
     let mut child2 = children[2].take().expect("missing child 2");
@@ -280,6 +249,15 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
         }
     };
 
+    // send SIGTERM to all children (child2 should already be dead)
+    // This lets them start shutting down in parrallel.
+    for (i, child) in children.iter_mut().enumerate() {
+        if i != 2 {
+            let child = child.as_mut().expect("missing a child");
+            send_term(child);
+        }
+    }
+
     // kill all children (child2 should already be dead)
     for (i, child) in children.iter_mut().enumerate() {
         // Best effort to kill all the other nodes.
@@ -302,12 +280,16 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
     for (i, child) in children.iter_mut().enumerate() {
         *child = Some(start_validator(i, &exe_path, &temp_path, rpc_ports[i]));
     }
-    // Let the nodes start- we should consider an admin port or some way to indicate this is done.
-    std::thread::sleep(Duration::from_secs(6));
 
     info!(target: "restart-test", "Running restart tests 2");
     let res2 = run_restart_tests2(&client_urls);
     info!(target: "restart-test", "Ran restart tests 2: {res2:?}");
+
+    // SIGTERM children so they can shutdown in parrellel.
+    for child in children.iter_mut() {
+        let child = child.as_mut().expect("missing a child");
+        send_term(child);
+    }
 
     // kill children before returnin final_result
     for child in children.iter_mut() {
@@ -315,9 +297,6 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
         kill_child(child);
         info!(target: "restart-test", "kill and wait on child complete for final result");
     }
-
-    // Snooze a bit just in case...
-    std::thread::sleep(Duration::from_millis(3000));
     res2
 }
 
@@ -363,7 +342,34 @@ fn start_validator(instance: usize, exe_path: &Path, base_dir: &Path, mut rpc_po
     command.spawn().expect("failed to execute")
 }
 
+fn test_numbers_within_one(client_urls: &[String; 4]) -> eyre::Result<()> {
+    let num0 = get_block_number(&client_urls[0])?;
+    let num1 = get_block_number(&client_urls[1])?;
+    let num2 = get_block_number(&client_urls[2])?;
+    let num3 = get_block_number(&client_urls[3])?;
+    if num0.saturating_sub(num1) > 1 || num1.saturating_sub(num0) > 1 {
+        return Err(eyre::eyre!(
+            "Nodes are not within one block of each other, delta found {}",
+            num0 as i64 - num1 as i64
+        ));
+    }
+    if num0.saturating_sub(num2) > 1 || num2.saturating_sub(num0) > 1 {
+        return Err(eyre::eyre!(
+            "Nodes are not within one block of each other, delta found {}",
+            num0 as i64 - num2 as i64
+        ));
+    }
+    if num0.saturating_sub(num3) > 1 || num3.saturating_sub(num0) > 1 {
+        return Err(eyre::eyre!(
+            "Nodes are not within one block of each other, delta found {}",
+            num0 as i64 - num3 as i64
+        ));
+    }
+    Ok(())
+}
+
 fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
+    test_numbers_within_one(client_urls)?;
     let block0 = get_block(&client_urls[0], None)?;
     let number = u64::from_str_radix(&block0["number"].as_str().unwrap_or("0x100_000")[2..], 16)?;
     let block = get_block(&client_urls[1], Some(number))?;
@@ -407,12 +413,12 @@ fn get_positive_balance_with_retry(node: &str, address: &str) -> eyre::Result<u1
 ///
 /// Max time to get balance is 1min.
 fn get_balance_above_with_retry(node: &str, address: &str, above: u128) -> eyre::Result<u128> {
-    let mut bal = get_balance(node, address, 5).unwrap_or(0);
+    let mut bal = get_balance(node, address, 5)?;
     let mut i = 0;
     while i < 30 && bal <= above {
         std::thread::sleep(Duration::from_millis(1200));
         i += 1;
-        bal = get_balance(node, address, 5).unwrap_or(0);
+        bal = get_balance(node, address, 5)?;
     }
     if i == 30 && bal <= above {
         error!(target:"restart-test", "get_balance_above_with_retry i == 30 - returning error!!");

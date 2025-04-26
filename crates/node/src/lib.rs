@@ -4,21 +4,14 @@
 use crate::{primary::PrimaryNode, worker::WorkerNode};
 use consensus_metrics::start_prometheus_server;
 use engine::{ExecutionNode, TnBuilder};
-use std::{
-    str::FromStr as _,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{str::FromStr as _, sync::Arc, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{ConsensusNetwork, PeerId};
 use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
     ConsensusBus, NodeMode, StateSynchronizer,
 };
-use tn_reth::RethEnv;
+use tn_reth::{RethDb, RethEnv};
 use tn_storage::{open_db, tables::ConsensusBlocks, DatabaseType};
 use tn_types::{BatchValidation, ConsensusHeader, Database as TNDatabase, Multiaddr, TaskManager};
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
@@ -35,7 +28,6 @@ fn dial_primary(
     handle: PrimaryNetworkHandle,
     peer_id: PeerId,
     peer_addr: tn_network_libp2p::Multiaddr,
-    connected_count: Arc<AtomicU32>,
 ) {
     tokio::spawn(async move {
         let mut backoff = 1;
@@ -45,8 +37,12 @@ fn dial_primary(
             if backoff < 120 {
                 backoff += backoff;
             }
+            if let Ok(peers) = handle.connected_peers().await {
+                if peers.contains(&peer_id) {
+                    return;
+                };
+            }
         }
-        connected_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     });
 }
 
@@ -55,7 +51,6 @@ fn dial_worker(
     handle: WorkerNetworkHandle,
     peer_id: PeerId,
     peer_addr: tn_network_libp2p::Multiaddr,
-    connected_count: Arc<AtomicU32>,
 ) {
     tokio::spawn(async move {
         let mut backoff = 1;
@@ -65,8 +60,12 @@ fn dial_worker(
             if backoff < 120 {
                 backoff += backoff;
             }
+            if let Ok(peers) = handle.connected_peers().await {
+                if peers.contains(&peer_id) {
+                    return;
+                };
+            }
         }
-        connected_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     });
 }
 
@@ -135,26 +134,25 @@ async fn start_networks<DB: TNDatabase>(
     // create specific handles for primary/worker
     let primary_network_handle = PrimaryNetworkHandle::new(primary_network_handle);
     let worker_network_handle = WorkerNetworkHandle::new(worker_network_handle);
-    let peers_connected = Arc::new(AtomicU32::new(0));
-    let workers_connected = Arc::new(AtomicU32::new(0));
     for (authority_id, addr, _) in consensus_config
         .committee()
         .others_primaries_by_id(consensus_config.authority_id().as_ref())
     {
         let peer_id = authority_id.peer_id();
-        dial_primary(primary_network_handle.clone(), peer_id, addr, peers_connected.clone());
+        dial_primary(primary_network_handle.clone(), peer_id, addr);
     }
     for (peer_id, addr) in consensus_config.worker_cache().all_workers() {
         if addr != worker_address {
-            dial_worker(worker_network_handle.clone(), peer_id, addr, workers_connected.clone());
+            dial_worker(worker_network_handle.clone(), peer_id, addr);
         }
     }
-    let quorum = consensus_config.committee().quorum_threshold() as u32;
-    // Wait until we are connected to a quorum of peers (note this assumes we are a validator...).
-    while peers_connected.load(Ordering::Relaxed) < quorum
-        || workers_connected.load(Ordering::Relaxed) < quorum
-    {
+    // Wait until we have a peer, once we have that lets move on- should be able to work now (?).
+    let mut primary_peers =
+        primary_network_handle.connected_peers().await.map(|p| p.len()).unwrap_or(0);
+    while primary_peers == 0 {
         tokio::time::sleep(Duration::from_millis(500)).await;
+        primary_peers =
+            primary_network_handle.connected_peers().await.map(|p| p.len()).unwrap_or(0);
     }
     let primary_network = PrimaryNetwork::new(
         rx_event_stream,
@@ -191,6 +189,7 @@ pub fn launch_node_inner<P>(
     builder: &TnBuilder,
     tn_datadir: &P,
     db: DatabaseType,
+    reth_db: RethDb,
 ) -> eyre::Result<bool>
 where
     P: TelcoinDirs + 'static,
@@ -213,8 +212,7 @@ where
         // config for validator keys
         let config = builder.tn_config.clone();
         let mut task_manager = TaskManager::new("Task Manager");
-
-        let reth_env = RethEnv::new(&builder.node_config, tn_datadir.reth_db_path(), &task_manager)?;
+        let reth_env = RethEnv::new(&builder.node_config, &task_manager, reth_db)?;
         let mut engine_task_manager = TaskManager::new("Engine Task Manager");
         let engine = ExecutionNode::new(builder, reth_env)?;
         let validator = engine.new_batch_validator().await;
@@ -357,11 +355,14 @@ where
     // open storage for consensus
     // In case the DB dir does not yet exist.
     let _ = std::fs::create_dir_all(&consensus_db_path);
+    // Create both of the MDBX DBs and hold onto them.
+    // MDBX seems to have issues occasionally if recreated on a relaunch...
     let db = open_db(&consensus_db_path);
+    let reth_db = RethEnv::new_database(&builder.node_config, tn_datadir.reth_db_path())?;
 
     let mut running = true;
     while running {
-        running = launch_node_inner(&builder, &tn_datadir, db.clone())?;
+        running = launch_node_inner(&builder, &tn_datadir, db.clone(), reth_db.clone())?;
     }
     Ok(())
 }

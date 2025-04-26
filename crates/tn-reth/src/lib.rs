@@ -311,16 +311,20 @@ impl ChainSpec {
     }
 }
 
+/// Type wrapper for a Reth DB.
+/// Used primary as a opaque type to allow
+/// the node launcher to create the DB upfront and reuse.
+pub type RethDb = Arc<DatabaseEnv>;
+
 impl RethEnv {
-    /// Produce a new wrapped Reth environment from a config, DB path and task manager.
-    pub fn new<P: AsRef<Path>>(
+    /// Create a new Reth DB.
+    /// Break this out so this can be created upfront and used even on a
+    /// restart (when catching up for instance).
+    pub fn new_database<P: AsRef<Path>>(
         reth_config: &RethConfig,
         db_path: P,
-        task_manager: &TaskManager,
-    ) -> eyre::Result<Self> {
+    ) -> eyre::Result<RethDb> {
         let db_path = db_path.as_ref();
-        // create node builders for Primary and Worker
-        //
         // Register the prometheus recorder before creating the database,
         // then start metrics
         //
@@ -333,7 +337,15 @@ impl RethEnv {
         let _ = install_prometheus_recorder();
 
         info!(target: "tn::reth", path = ?db_path, "opening database");
-        let database = Arc::new(init_db(db_path, reth_config.0.db.database_args())?.with_metrics());
+        Ok(Arc::new(init_db(db_path, reth_config.0.db.database_args())?.with_metrics()))
+    }
+
+    /// Produce a new wrapped Reth environment from a config, DB path and task manager.
+    pub fn new(
+        reth_config: &RethConfig,
+        task_manager: &TaskManager,
+        database: RethDb,
+    ) -> eyre::Result<Self> {
         let node_config = reth_config.0.clone();
         let (evm_executor, evm_config) = Self::init_evm_components(&node_config);
         let provider_factory = Self::init_provider_factory(&node_config, database)?;
@@ -360,7 +372,8 @@ impl RethEnv {
             ..NodeConfig::default()
         };
         let reth_config = RethConfig(node_config);
-        Self::new(&reth_config, db_path, task_manager)
+        let database = Self::new_database(&reth_config, db_path)?;
+        Self::new(&reth_config, task_manager, database)
     }
 
     /// Create a new RethEnv for testing only.
