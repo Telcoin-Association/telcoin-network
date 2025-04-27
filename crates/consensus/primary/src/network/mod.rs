@@ -182,6 +182,11 @@ impl PrimaryNetworkHandle {
     ) {
         let _ = self.handle.process_peer_exchange(peers, channel).await;
     }
+
+    /// Retrieve a collection of connected peers.
+    pub async fn connected_peers(&self) -> NetworkResult<Vec<PeerId>> {
+        self.handle.connected_peers().await
+    }
 }
 
 /// Handle inter-node communication between primaries.

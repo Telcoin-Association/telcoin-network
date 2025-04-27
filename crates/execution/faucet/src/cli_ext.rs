@@ -28,7 +28,7 @@ pub struct FaucetArgs {
     /// The address for the Telcoin-Network Faucet which handles TEL and XYZ transfers to each
     /// recipient.
     #[clap(long, default_value_t = Address::ZERO, value_parser = Address::from_str, value_name = "FAUCET_CONTRACT_ADDRESS")]
-    pub(crate) contract_address: Address,
+    pub(crate) faucet_contract: Address,
 
     /// The chain id for the faucet to use when creating transactions.
     #[clap(long, default_value_t = 2017, value_name = "CHAIN_ID")]
@@ -132,7 +132,7 @@ impl FaucetArgs {
                 wait_period: self.wait_period,
                 chain_id: self.chain_id,
                 wallet,
-                contract_address: self.contract_address,
+                contract_address: self.faucet_contract,
             };
 
             let ext = FaucetRpcExt::new(reth_env, pool, config);

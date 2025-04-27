@@ -20,11 +20,11 @@ use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_param
 use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicKey as PubKey};
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
-use tn_config::{test_fetch_file_content_relative_to_manifest, ContractStandardJson};
-use tn_reth::RethChainSpec;
+use tn_config::fetch_file_content_relative_to_manifest;
+use tn_reth::{RethChainSpec, RethEnv};
 use tn_test_utils::{get_contract_state_for_genesis, TransactionFactory};
 use tn_types::{
-    adiri_genesis, hex, public_key_to_address, sol, Address, Encodable2718 as _, GenesisAccount,
+    adiri_genesis, public_key_to_address, sol, Address, Encodable2718 as _, GenesisAccount,
     SolValue, B256, U256,
 };
 use tokio::{task::JoinHandle, time::timeout};
@@ -87,20 +87,15 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
     let faucet_impl_address = Address::random();
     let stablecoin_impl_address = Address::random();
     // fetch bytecode attributes from compiled jsons in tn-contracts repo
-    let faucet_standard_json = test_fetch_file_content_relative_to_manifest(
-        "../../tn-contracts/artifacts/StablecoinManager.json".into(),
+    let faucet_standard_json = fetch_file_content_relative_to_manifest(
+        "../../tn-contracts/artifacts/StablecoinManager.json",
     );
-    let faucet_contract: ContractStandardJson =
-        serde_json::from_str(&faucet_standard_json).expect("json parsing failure");
-    let faucet_bytecode =
-        hex::decode(faucet_contract.deployed_bytecode.object).expect("invalid bytecode hexstring");
-    let stablecoin_json = test_fetch_file_content_relative_to_manifest(
-        "../../tn-contracts/artifacts/Stablecoin.json".into(),
-    );
-    let stablecoin_contract: ContractStandardJson =
-        serde_json::from_str(&stablecoin_json).expect("json parsing failure");
-    let stablecoin_impl_bytecode = hex::decode(stablecoin_contract.deployed_bytecode.object)
-        .expect("invalid bytecode hexstring");
+    let faucet_deployed_bytecode =
+        RethEnv::parse_deployed_bytecode_from_json_str(&faucet_standard_json)?;
+    let stablecoin_json =
+        fetch_file_content_relative_to_manifest("../../tn-contracts/artifacts/Stablecoin.json");
+    let stablecoin_impl_bytecode =
+        RethEnv::parse_deployed_bytecode_from_json_str(&stablecoin_json)?;
 
     // extend genesis accounts to fund factory_address, etch bytecodes, construct proxy creation txs
     let mut tx_factory = TransactionFactory::new();
@@ -110,7 +105,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
             (factory_address, GenesisAccount::default().with_balance(U256::MAX)),
             (
                 faucet_impl_address,
-                GenesisAccount::default().with_code(Some(faucet_bytecode.clone().into())),
+                GenesisAccount::default().with_code(Some(faucet_deployed_bytecode.clone().into())),
             ),
             (
                 stablecoin_impl_address,
@@ -155,15 +150,10 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
     // construct create data for faucet proxy address
     let init_call = [&faucet_init_selector, &init_params[..]].concat();
     let constructor_params = (faucet_impl_address, init_call.clone()).abi_encode_params();
-    let proxy_json = test_fetch_file_content_relative_to_manifest(
-        "../../tn-contracts/artifacts/ERC1967Proxy.json".into(),
-    );
-    let proxy_contract: ContractStandardJson =
-        serde_json::from_str(&proxy_json).expect("json parsing failure");
-    let proxy_initcode =
-        hex::decode(proxy_contract.bytecode.object).expect("invalid bytecode hexstring");
-    let proxy_bytecode =
-        hex::decode(proxy_contract.deployed_bytecode.object).expect("invalid bytecode hexstring");
+    let proxy_json =
+        fetch_file_content_relative_to_manifest("../../tn-contracts/artifacts/ERC1967Proxy.json");
+    let proxy_initcode = RethEnv::parse_bytecode_from_json_str(&proxy_json)?;
+    let proxy_bytecode = RethEnv::parse_deployed_bytecode_from_json_str(&proxy_json)?;
     let faucet_create_data = [proxy_initcode.clone().as_slice(), &constructor_params[..]].concat();
 
     // construct `grantRole(faucet)` data
@@ -289,7 +279,10 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
                 ),
             ),
         ),
-        (faucet_impl_address, GenesisAccount::default().with_code(Some(faucet_bytecode.into()))),
+        (
+            faucet_impl_address,
+            GenesisAccount::default().with_code(Some(faucet_deployed_bytecode.into())),
+        ),
         // convert U256 HashMap to B256 for BTreeMap
         (
             faucet_proxy_address,
@@ -532,7 +525,6 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
         .collect();
 
     while let Some(res) = check_account_balances.next().await {
-        // results.push(res?);
         assert!(res.is_ok());
     }
 

@@ -128,14 +128,8 @@ fn account_from_word(key_word: &str) -> Address {
 impl GenesisArgs {
     /// Execute command
     pub fn execute(&self) -> eyre::Result<()> {
-        // // create datadir
-        // let datadir = self.data_dir();
-        // // creates a default config if none exists
-        // let mut config = self.load_config()?;
-
         match &self.command {
             CeremonySubcommand::Initialize(init) => {
-                // TODO: support custom genesis path
                 let datadir: DataDirChainPath = self
                     .datadir
                     .unwrap_or_chain_default(self.chain.chain, default_datadir_args())

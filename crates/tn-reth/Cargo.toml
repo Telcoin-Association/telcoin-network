@@ -58,7 +58,8 @@ tokio = { workspace = true, features = ["sync", "rt", "macros", "signal"] }
 tracing = { workspace = true }
 eyre = { workspace = true }
 alloy = { workspace = true, features = ["genesis"] }
-
-[dev-dependencies]
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

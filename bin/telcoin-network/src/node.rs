@@ -56,8 +56,6 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(long, conflicts_with = "instance", global = true)]
     pub with_unused_ports: bool,
 
-    // TODO: this is painful to maintain
-    // need a better way to overwrite reth DataDirPath
     /// The path to the data dir for all telcoin-network files and subdirectories.
     ///
     /// Defaults to the OS-specific data directory:
@@ -114,14 +112,17 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             .datadir
             .unwrap_or_chain_default(self.reth.chain.chain, default_args.clone())
             .into();
-        // TODO: use config or CLI chain spec?
-        let config_path = self.config.clone().unwrap_or(tn_datadir.node_config_path());
 
+        // use config for chain spec
+        let config_path = self.config.clone().unwrap_or(tn_datadir.node_config_path());
         let mut tn_config: Config = Config::load_from_path(&config_path, ConfigFmt::YAML)?;
+        debug!(target: "cli", validator = ?tn_config.validator_info.name, "config path for node command: {config_path:?}");
+        debug!(target: "cli", validator = ?tn_config.validator_info.name, "tn datadir for node command: {tn_datadir:?}");
+
         if load_config {
             // Make sure we are using the chain from config not just the default.
             self.reth.chain = Arc::new(tn_config.chain_spec());
-            info!(target: "telcoin::cli", validator = ?tn_config.validator_info.name, "config loaded");
+            info!(target: "cli", validator = ?tn_config.validator_info.name, "config loaded");
         }
 
         // get the worker's transaction address from the config
@@ -137,6 +138,8 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         } = self;
 
         tn_config.observer = observer; // Set observer mode from the config.
+
+        info!(target: "cli", "node command genesis: {:#?}", reth.chain.genesis());
 
         // set up reth node config for engine components
         let node_config = RethConfig::new(

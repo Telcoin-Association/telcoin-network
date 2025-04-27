@@ -132,7 +132,7 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
 pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// Genesis ceremony for starting the network.
     #[command(name = "genesis")]
-    Genesis(genesis::GenesisArgs),
+    Genesis(Box<genesis::GenesisArgs>),
 
     /// Key management.
     /// Generate or read keys for node management.
