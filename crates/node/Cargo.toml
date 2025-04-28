@@ -50,7 +50,6 @@ tn-batch-builder = { workspace = true }
 tn-batch-validator = { workspace = true }
 jsonrpsee = { workspace = true }
 fdlimit = { workspace = true }
-epoch-manager = { workspace = true }
 
 # TODO: temporary solution until reth supports public rpc hooks
 tn-faucet = { workspace = true }

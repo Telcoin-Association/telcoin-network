@@ -3020,6 +3020,10 @@ dependencies = [
 [[package]]
 name = "epoch-manager"
 version = "0.1.0"
+dependencies = [
+ "tn-config",
+ "tn-primary",
+]
 
 [[package]]
 name = "equivalent"
@@ -11571,7 +11575,6 @@ dependencies = [
  "consensus-metrics",
  "dirs-next",
  "enr",
- "epoch-manager",
  "eyre",
  "fdlimit",
  "futures",

@@ -11,6 +11,8 @@ description.workspace = true
 exclude.workspace = true
 
 [dependencies]
+tn-config = { workspace = true }
+tn-primary = { workspace = true }
 
 [lints]
 workspace = true

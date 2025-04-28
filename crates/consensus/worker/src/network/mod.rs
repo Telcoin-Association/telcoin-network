@@ -35,7 +35,7 @@ pub(crate) type Req = WorkerRequest;
 /// Convenience type for Primary network.
 pub(crate) type Res = WorkerResponse;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WorkerNetworkHandle {
     handle: NetworkHandle<Req, Res>,
 }

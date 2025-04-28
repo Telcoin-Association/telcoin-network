@@ -29,12 +29,11 @@ pub use tn_reth::worker::*;
 ///
 /// Used to build the node until upstream reth supports
 /// broader node customization.
+#[derive(Debug)]
 pub struct TnBuilder {
     /// The node configuration.
     pub node_config: RethConfig,
     /// Telcoin Network config.
-    ///
-    /// TODO: consolidate configs
     pub tn_config: Config,
     /// TODO: temporary solution until upstream reth
     /// rpc hooks are publicly available.
@@ -46,7 +45,7 @@ pub struct TnBuilder {
 }
 
 /// Wrapper for the inner execution node components.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ExecutionNode {
     internal: Arc<RwLock<ExecutionNodeInner>>,
 }

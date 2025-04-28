@@ -18,6 +18,8 @@ use tracing::info;
 #[path = "tests/primary_tests.rs"]
 pub mod primary_tests;
 
+#[derive(Debug)]
+/// The main `Primary` struct.
 pub struct Primary<DB> {
     /// Handle to the primary network.
     primary_network: PrimaryNetworkHandle,
@@ -122,5 +124,10 @@ impl<DB: Database> Primary<DB> {
     /// Return a reference to the Primary's network.
     pub fn network_handle(&self) -> &PrimaryNetworkHandle {
         &self.primary_network
+    }
+
+    /// Return a reference to the Primary's state-sync.
+    pub fn state_sync(&self) -> StateSynchronizer<DB> {
+        self.state_sync.clone()
     }
 }

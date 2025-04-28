@@ -22,14 +22,14 @@ use tracing::{error, info};
 /// This function also sets some of the round watches on the consensus bus to proper defaults on
 /// startup.
 pub async fn can_cvv<DB: Database>(
-    consensus_bus: ConsensusBus,
-    config: ConsensusConfig<DB>,
-    network: PrimaryNetworkHandle,
+    consensus_bus: &ConsensusBus,
+    config: &ConsensusConfig<DB>,
+    network: &PrimaryNetworkHandle,
 ) -> bool {
     // Get the DB and load our last executed consensus block (note there may be unexecuted
     // blocks, catch up will execute them).
     let last_executed_block =
-        last_executed_consensus_block(&consensus_bus, &config).unwrap_or_default();
+        last_executed_consensus_block(&consensus_bus, config).unwrap_or_default();
 
     // Set some of the round watches to the current default.
     let last_consensus_epoch = last_executed_block.sub_dag.leader.epoch();
@@ -40,7 +40,7 @@ pub async fn can_cvv<DB: Database>(
     ));
     let _ = consensus_bus.primary_round_updates().send(last_consensus_round);
 
-    let max_consensus_header = max_consensus_header_from_committee(&network, &config)
+    let max_consensus_header = max_consensus_header_from_committee(network, config)
         .await
         .unwrap_or_else(|| last_executed_block.clone());
     let max_epoch = max_consensus_header.sub_dag.leader.epoch();

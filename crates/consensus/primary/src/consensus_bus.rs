@@ -57,6 +57,8 @@ impl NodeMode {
     }
 }
 
+/// The thread-safe inner type that holds all the channels for inner-consensus
+/// communication between different tasks.
 #[derive(Debug)]
 struct ConsensusBusInner {
     /// New certificates from the primary. The primary should send us new certificates
@@ -139,8 +141,11 @@ struct ConsensusBusInner {
     restart: AtomicBool,
 }
 
+/// The type that holds the collection of send/sync channels for
+/// inner task communicatin during consensus.
 #[derive(Clone, Debug)]
 pub struct ConsensusBus {
+    /// The inner type to make this thread-safe.
     inner: Arc<ConsensusBusInner>,
 }
 

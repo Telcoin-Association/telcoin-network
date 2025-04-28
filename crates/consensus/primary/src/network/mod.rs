@@ -39,7 +39,7 @@ pub(crate) type Req = PrimaryRequest;
 pub(crate) type Res = PrimaryResponse;
 
 /// Primary network specific handle.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PrimaryNetworkHandle {
     handle: NetworkHandle<Req, Res>,
 }

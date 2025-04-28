@@ -12,6 +12,7 @@ use tn_types::{Database as ConsensusDatabase, TaskManager, DEFAULT_BAD_NODES_STA
 use tokio::sync::RwLock;
 use tracing::instrument;
 
+#[derive(Debug)]
 struct PrimaryNodeInner<CDB> {
     /// Consensus configuration.
     consensus_config: ConsensusConfig<CDB>,
@@ -97,7 +98,7 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PrimaryNode<CDB> {
     internal: Arc<RwLock<PrimaryNodeInner<CDB>>>,
 }
@@ -144,8 +145,18 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
         self.internal.read().await.consensus_bus.clone()
     }
 
-    /// Return the WAN handke if the primary p2p is runnig.
+    /// Return the WAN handle if the primary p2p is runnig.
     pub async fn network_handle(&self) -> PrimaryNetworkHandle {
         self.internal.read().await.primary.network_handle().clone()
+    }
+
+    /// Return the [StateSynchronizer]
+    pub async fn state_sync(&self) -> StateSynchronizer<CDB> {
+        self.internal.read().await.primary.state_sync()
+    }
+
+    /// Return the [ConsensusConfig].
+    pub async fn consensus_config(&self) -> ConsensusConfig<CDB> {
+        self.internal.read().await.consensus_config.clone()
     }
 }

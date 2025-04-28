@@ -11,7 +11,7 @@ use tn_types::{
 type BatchValidationResult<T> = Result<T, BatchValidationError>;
 
 /// Block validator
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BatchValidator {
     /// Database provider to encompass tree and provider factory.
     reth_env: RethEnv,
@@ -174,7 +174,7 @@ impl BatchValidator {
 
 /// Noop validation struct that validates any block.
 #[cfg(any(test, feature = "test-utils"))]
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct NoopBatchValidator;
 
 #[cfg(any(test, feature = "test-utils"))]

@@ -24,6 +24,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::{error, info};
 
 /// Inner type for holding execution layer types.
+#[derive(Debug)]
 pub(super) struct ExecutionNodeInner {
     /// The [Address] for the authority used as the suggested beneficiary.
     ///
@@ -38,7 +39,6 @@ pub(super) struct ExecutionNodeInner {
     pub(super) opt_faucet_args: Option<FaucetArgs>,
     /// Collection of execution components by worker.
     pub(super) workers: HashMap<WorkerId, WorkerComponents>,
-    // TODO: add Pool to self.workers for direct access (tests)
 }
 
 impl ExecutionNodeInner {

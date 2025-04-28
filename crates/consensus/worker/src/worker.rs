@@ -183,6 +183,10 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         this
     }
 
+    pub fn id(&self) -> WorkerId {
+        self.id
+    }
+
     pub fn batches_tx(&self) -> BatchSender {
         self.tx_batches.clone()
     }

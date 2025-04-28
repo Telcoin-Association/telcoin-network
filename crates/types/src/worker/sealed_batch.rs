@@ -201,7 +201,7 @@ pub fn max_batch_size(_timestamp: u64) -> usize {
 /// of a batch of transactions (from another validator).
 ///
 /// Invalid transactions will not receive further processing.
-pub trait BatchValidation: Send + Sync {
+pub trait BatchValidation: Send + Sync + Debug {
     /// Determines if this batch can be voted on
     fn validate_batch(&self, b: SealedBatch) -> Result<(), BatchValidationError>;
 }
