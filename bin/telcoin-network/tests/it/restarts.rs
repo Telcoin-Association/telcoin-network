@@ -17,7 +17,7 @@ use std::{
 use tn_test_utils::init_test_tracing;
 use tn_types::{get_available_tcp_port, keccak256, Address};
 use tokio::runtime::Runtime;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// One unit of TEL (10^18) measured in wei.
 const WEI_PER_TEL: u128 = 1_000_000_000_000_000_000;
@@ -413,6 +413,7 @@ fn get_positive_balance_with_retry(node: &str, address: &str) -> eyre::Result<u1
 ///
 /// Max time to get balance is 1min.
 fn get_balance_above_with_retry(node: &str, address: &str, above: u128) -> eyre::Result<u128> {
+    debug!(target: "restart-test", ?node, ?address, "requesting balance...");
     let mut bal = get_balance(node, address, 5)?;
     let mut i = 0;
     while i < 30 && bal <= above {

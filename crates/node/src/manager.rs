@@ -94,7 +94,7 @@ where
     /// If it returns Ok(true) this indicates a mode change occurred and a restart
     /// is required.
     async fn run_epoch(&mut self) -> eyre::Result<bool> {
-        info!(target: "epoch-manager", "Starting new epoch");
+        info!(target: "epoch-manager", "Starting node");
 
         // start consensus metrics for the epoch
         if let Some(metrics_socket) = self.builder.consensus_metrics {
