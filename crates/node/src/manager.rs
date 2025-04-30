@@ -84,13 +84,6 @@ where
 
     /// Run the node, handling epoch transitions.
     pub fn run(&mut self) -> eyre::Result<()> {
-        let runtime = Builder::new_multi_thread()
-            .thread_name("telcoin-network")
-            .enable_io()
-            .enable_time()
-            .build()
-            .expect("failed to build a tokio runtime");
-
         // create dbs to survive between sync state transitions
         let reth_db =
             RethEnv::new_database(&self.builder.node_config, self.tn_datadir.reth_db_path())?;
@@ -99,11 +92,22 @@ where
         // start initial epoch
         let mut running = true;
         while running {
-            running = runtime.block_on(self.run_epoch(reth_db.clone(), consensus_db.clone()))?;
+            running = {
+                let runtime = Builder::new_multi_thread()
+                    .thread_name("telcoin-network")
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                    .expect("failed to build a tokio runtime");
+
+                let res = runtime.block_on(self.run_epoch(reth_db.clone(), consensus_db.clone()));
+                // shutdown background tasks
+                runtime.shutdown_background();
+                // return result after shutdown
+                res?
+            }
         }
 
-        // Shutdown background tasks
-        runtime.shutdown_background();
         Ok(())
     }
 
