@@ -11,7 +11,7 @@ use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
     ConsensusBus, NodeMode, StateSynchronizer,
 };
-use tn_reth::RethEnv;
+use tn_reth::{RethDb, RethEnv};
 use tn_storage::{open_db, tables::ConsensusBlocks, DatabaseType};
 use tn_types::{
     BatchValidation, ConsensusHeader, Database as TNDatabase, Multiaddr, Noticer, SealedBlock,
@@ -91,10 +91,15 @@ where
             .build()
             .expect("failed to build a tokio runtime");
 
+        // create dbs to survive between sync state transitions
+        let reth_db =
+            RethEnv::new_database(&self.builder.node_config, self.tn_datadir.reth_db_path())?;
+        let consensus_db = open_db(&self.tn_datadir.consensus_db_path());
+
         // start initial epoch
         let mut running = true;
         while running {
-            running = runtime.block_on(self.run_epoch())?;
+            running = runtime.block_on(self.run_epoch(reth_db.clone(), consensus_db.clone()))?;
         }
 
         // Shutdown background tasks
@@ -112,7 +117,11 @@ where
     ///
     /// If it returns Ok(true) this indicates a mode change occurred and a restart
     /// is required.
-    async fn run_epoch(&mut self) -> eyre::Result<bool> {
+    async fn run_epoch(
+        &mut self,
+        reth_db: RethDb,
+        consensus_db: DatabaseType,
+    ) -> eyre::Result<bool> {
         info!(target: "epoch-manager", "Starting node");
 
         // start consensus metrics for the epoch
@@ -124,10 +133,10 @@ where
         let mut engine_task_manager = TaskManager::new("Engine Task Manager");
 
         // create the engine
-        let engine = self.create_engine(&engine_task_manager)?;
+        let engine = self.create_engine(&engine_task_manager, reth_db)?;
 
         // create primary and worker nodes
-        let (primary, worker_node) = self.create_consensus(&engine).await?;
+        let (primary, worker_node) = self.create_consensus(&engine, consensus_db).await?;
 
         // create receiving channel before spawning primary to ensure messages are not lost
         let consensus_bus = primary.consensus_bus().await;
@@ -190,10 +199,14 @@ where
     /// Helper method to create all engine components.
     ///
     /// The engine task is long-living and is shared across epochs.
-    fn create_engine(&self, engine_task_manager: &TaskManager) -> eyre::Result<ExecutionNode> {
+    fn create_engine(
+        &self,
+        engine_task_manager: &TaskManager,
+        reth_db: RethDb,
+    ) -> eyre::Result<ExecutionNode> {
         // create execution components (ie - reth env)
-        let reth_db =
-            RethEnv::new_database(&self.builder.node_config, self.tn_datadir.reth_db_path())?;
+        // let reth_db =
+        //     RethEnv::new_database(&self.builder.node_config, self.tn_datadir.reth_db_path())?;
         let reth_env = RethEnv::new(&self.builder.node_config, engine_task_manager, reth_db)?;
         let engine = ExecutionNode::new(&self.builder, reth_env)?;
 
@@ -206,12 +219,13 @@ where
     async fn create_consensus(
         &mut self,
         engine: &ExecutionNode,
+        consensus_db: DatabaseType,
     ) -> eyre::Result<(PrimaryNode<DatabaseType>, WorkerNode<DatabaseType>)> {
         // open the consensus db for this epoch
         //
         // TODO: consensus db should be epoch-specific - see issue #269
         let consensus_db_path = self.tn_datadir.consensus_db_path();
-        let consensus_db = open_db(&consensus_db_path);
+        // let consensus_db = open_db(&consensus_db_path);
         info!(target: "epoch-manager", ?consensus_db_path, "node storage opened for epoch");
 
         // create config for consensus
