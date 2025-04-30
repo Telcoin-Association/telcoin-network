@@ -341,6 +341,8 @@ impl RethEnv {
     }
 
     /// Produce a new wrapped Reth environment from a config, DB path and task manager.
+    ///
+    /// This method MUST be called from within a tokio runtime.
     pub fn new(
         reth_config: &RethConfig,
         task_manager: &TaskManager,
