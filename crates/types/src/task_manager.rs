@@ -3,6 +3,7 @@
 use crate::Notifier;
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use std::{
+    collections::HashMap,
     fmt::{Debug, Display},
     future::Future,
     pin::pin,
@@ -45,7 +46,7 @@ impl Future for TaskHandle {
 /// there JoinHandles.
 pub struct TaskManager {
     tasks: FuturesUnordered<TaskHandle>,
-    submanagers: Vec<TaskManager>,
+    submanagers: HashMap<String, TaskManager>,
     name: String,
     new_task_rx: mpsc::Receiver<TaskHandle>,
     new_task_tx: mpsc::Sender<TaskHandle>,
@@ -85,7 +86,7 @@ impl TaskManager {
         let (new_task_tx, new_task_rx) = mpsc::channel(100);
         Self {
             tasks: FuturesUnordered::new(),
-            submanagers: Vec::new(),
+            submanagers: HashMap::new(),
             name: name.to_string(),
             new_task_rx,
             new_task_tx,
@@ -110,9 +111,14 @@ impl TaskManager {
         TaskManagerClone { new_task_tx: self.new_task_tx.clone() }
     }
 
+    /// Return a mutable reference to a submanager.
+    pub fn get_submanager(&mut self, name: &str) -> Option<&mut TaskManager> {
+        self.submanagers.get_mut(name)
+    }
+
     /// Adds a subtask manager by name to this TaskManager.  Allows building a heirarchy of tasks.
     pub fn add_task_manager(&mut self, manager: TaskManager) {
-        self.submanagers.push(manager);
+        self.submanagers.insert(manager.name.clone(), manager);
     }
 
     /// Will resolve once one of the tasks for the manager resolves.
@@ -162,8 +168,8 @@ impl TaskManager {
         let shutdown_ref = &shutdown;
         let mut future_managers: FuturesUnordered<_> = self
             .submanagers
-            .drain(..)
-            .map(|mut sub| async move { (sub.join(shutdown_ref.clone()).await, sub.name.clone()) })
+            .drain()
+            .map(|(name, mut sub)| async move { (sub.join(shutdown_ref.clone()).await, name) })
             .collect();
         let rx_shutdown = shutdown.subscribe();
         loop {
@@ -294,7 +300,7 @@ impl Display for TaskManager {
         for task in self.tasks.iter() {
             writeln!(f, "Task: {}", task.name)?;
         }
-        for sub in &self.submanagers {
+        for sub in self.submanagers.values() {
             writeln!(f, "++++++++++++++++++++++++++++++++++++++++++++++++++++")?;
             writeln!(f, "{sub}")?;
             writeln!(f, "++++++++++++++++++++++++++++++++++++++++++++++++++++")?;
