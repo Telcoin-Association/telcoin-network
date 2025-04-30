@@ -3,6 +3,11 @@
 //! This oversees the tasks that run for each epoch. Some consensus-related
 //! tasks run for one epoch. Other resources are shared across epochs.
 
+use crate::{
+    engine::{ExecutionNode, TnBuilder},
+    primary::PrimaryNode,
+    worker::WorkerNode,
+};
 use consensus_metrics::start_prometheus_server;
 use std::{str::FromStr as _, sync::Arc, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs};
@@ -20,12 +25,6 @@ use tn_types::{
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::{runtime::Builder, sync::mpsc};
 use tracing::info;
-
-use crate::{
-    engine::{ExecutionNode, TnBuilder},
-    primary::PrimaryNode,
-    worker::WorkerNode,
-};
 
 /// The long-running type that oversees epoch transitions.
 #[derive(Debug)]
@@ -87,7 +86,7 @@ where
         // create dbs to survive between sync state transitions
         let reth_db =
             RethEnv::new_database(&self.builder.node_config, self.tn_datadir.reth_db_path())?;
-        let consensus_db = open_db(&self.tn_datadir.consensus_db_path());
+        let consensus_db = open_db(self.tn_datadir.consensus_db_path());
 
         // start initial epoch
         let mut running = true;

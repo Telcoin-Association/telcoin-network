@@ -16,7 +16,6 @@ members = [
     "crates/tn-reth",
 
     # consensus
-    "crates/consensus/epoch-manager",
     "crates/consensus/consensus-metrics",
     "crates/consensus/executor",
     "crates/consensus/primary",
@@ -182,7 +181,6 @@ tn-utils = { path = "./crates/tn-utils" }
 tn-faucet = { path = "./crates/execution/faucet" }
 
 # consensus
-epoch-manager = { path = "./crates/consensus/epoch-manager" }
 tn-executor = { path = "./crates/consensus/executor" }
 tn-worker = { path = "./crates/consensus/worker" }
 tn-storage = { path = "./crates/storage" }
