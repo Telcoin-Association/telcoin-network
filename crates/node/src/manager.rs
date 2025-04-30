@@ -105,7 +105,7 @@ where
         let mut engine_task_manager = TaskManager::new("Engine Task Manager");
 
         // create the engine
-        let engine = Self::create_engine(&mut self.task_manager, &self.builder, &self.tn_datadir)?;
+        let engine = self.create_engine(&engine_task_manager)?;
 
         // create primary and worker nodes
         let (primary, worker_node) = self.create_consensus(&engine).await?;
@@ -171,15 +171,12 @@ where
     /// Helper method to create all engine components.
     ///
     /// The engine task is long-living and is shared across epochs.
-    fn create_engine(
-        engine_task_manager: &TaskManager,
-        builder: &TnBuilder,
-        tn_datadir: &P,
-    ) -> eyre::Result<ExecutionNode> {
+    fn create_engine(&self, engine_task_manager: &TaskManager) -> eyre::Result<ExecutionNode> {
         // create execution components (ie - reth env)
-        let reth_db = RethEnv::new_database(&builder.node_config, tn_datadir.reth_db_path())?;
-        let reth_env = RethEnv::new(&builder.node_config, engine_task_manager, reth_db)?;
-        let engine = ExecutionNode::new(builder, reth_env)?;
+        let reth_db =
+            RethEnv::new_database(&self.builder.node_config, self.tn_datadir.reth_db_path())?;
+        let reth_env = RethEnv::new(&self.builder.node_config, engine_task_manager, reth_db)?;
+        let engine = ExecutionNode::new(&self.builder, reth_env)?;
 
         Ok(engine)
     }
@@ -217,7 +214,7 @@ where
 
         // set execution state for consensus
         let consensus_bus = primary.consensus_bus().await;
-        self.try_restore_state(&consensus_bus, &consensus_db, &engine).await?;
+        self.try_restore_state(&consensus_bus, &consensus_db, engine).await?;
 
         let primary_network_handle = primary.network_handle().await;
         let _mode = self

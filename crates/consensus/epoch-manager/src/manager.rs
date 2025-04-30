@@ -3,9 +3,6 @@
 //! This oversees the tasks that run for each epoch. Some consensus-related
 //! tasks run for one epoch. Other resources are shared across epochs.
 
-use tn_config::ConsensusConfig;
-use tn_primary::ConsensusBus;
-
 //
 //
 // epoch manager shared tasks:

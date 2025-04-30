@@ -29,7 +29,7 @@ pub async fn can_cvv<DB: Database>(
     // Get the DB and load our last executed consensus block (note there may be unexecuted
     // blocks, catch up will execute them).
     let last_executed_block =
-        last_executed_consensus_block(&consensus_bus, config).unwrap_or_default();
+        last_executed_consensus_block(consensus_bus, config).unwrap_or_default();
 
     // Set some of the round watches to the current default.
     let last_consensus_epoch = last_executed_block.sub_dag.leader.epoch();

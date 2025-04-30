@@ -82,7 +82,7 @@ impl DbTxMut for ReDbTxMut {
 /// An interface to a btree map database. This is mainly intended
 /// for tests and performing benchmark comparisons or anywhere where an ephemeral database is
 /// useful.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ReDB {
     db: Arc<RwLock<ReDatabase>>,
     shutdown_tx: SyncSender<()>,

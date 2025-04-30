@@ -65,7 +65,7 @@ fn send_and_confirm(
     let current = get_balance(node, &to_account.to_string(), 1)?;
     let amount = 10 * WEI_PER_TEL; // 10 TEL
     let expected = current + amount;
-    send_tel(node, &key, to_account, amount, 250, 21000, nonce)?;
+    send_tel(node, key, to_account, amount, 250, 21000, nonce)?;
 
     // sleep
     std::thread::sleep(Duration::from_millis(1000));
@@ -90,7 +90,7 @@ fn run_restart_tests1(
     rpc_port2: u16,
     delay_secs: u64,
 ) -> eyre::Result<Child> {
-    network_advancing(&client_urls).inspect_err(|e| {
+    network_advancing(client_urls).inspect_err(|e| {
         kill_child(child2);
         error!(target: "restart-test", ?e);
     })?;
@@ -145,7 +145,7 @@ fn run_restart_tests1(
 
 /// Run the second part of tests, broken up like this to allow more robust node shutdown.
 fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
-    network_advancing(&client_urls)?;
+    network_advancing(client_urls)?;
     std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
     test_blocks_same(client_urls)?; // Starting from a solid position after a restart?
     let key = get_key("test-source");

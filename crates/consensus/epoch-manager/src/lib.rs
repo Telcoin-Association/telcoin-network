@@ -5,4 +5,3 @@
 //! others expire with each epoch.
 
 mod manager;
-pub use manager::*;
