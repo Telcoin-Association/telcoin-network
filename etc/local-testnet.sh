@@ -12,7 +12,8 @@ START=false
 # must be prefixed with 0x and be a valid account.
 DEV_FUNDS=""
 
-#
+export TN_BLS_PASSPHRASE="local"
+
 while [ "$1" != "" ]; do
     case $1 in
         --start )
@@ -47,6 +48,7 @@ VALIDATORSDIR="${GENESISDIR}/validators"
 SHARED_GENESISDIR="${ROOTDIR}/${VALIDATORSDIR}"
 COMMITTEE_PATH="${ROOTDIR}/${GENESISDIR}/committee.yaml"
 WORKER_CACHE_PATH="${ROOTDIR}/${GENESISDIR}/worker_cache.yaml"
+GENESIS_JSON_PATH="${ROOTDIR}/${GENESISDIR}/genesis.json"
 
 # number of validators
 LENGTH="${#VALIDATORS[@]}"
@@ -64,7 +66,7 @@ if [ -d "${ROOTDIR}" ]; then
 else
     # Make sure we have a test account with funds if configuring.
     if [ "$DEV_FUNDS" == "" ]; then
-        echo "Must use --def-funds=[ADDRESS] to fund a test account."
+        echo "Must use --dev-funds=[ADDRESS] to fund a test account and own the consensus registry."
         echo "For example: --dev-funds 0x1111111111111111111111111111111111111111"
         echo "This sould be an account you have the private key to allow access to TEL on the test network"
         exit 1
@@ -107,7 +109,9 @@ else
     done
 
     # create committee and worker cache yamls
-    target/${RELEASE}/telcoin-network genesis create-committee --datadir "${ROOTDIR}"
+    target/${RELEASE}/telcoin-network genesis create-committee \
+        --datadir "${ROOTDIR}" \
+        --consensus-registry-owner $DEV_FUNDS
 
     # copy config files to each validator
     for ((i=0; i<$LENGTH; i++)); do
@@ -115,7 +119,10 @@ else
         DATADIR="${ROOTDIR}/${VALIDATOR}"
         cp "${COMMITTEE_PATH}" "${DATADIR}/genesis"
         cp "${WORKER_CACHE_PATH}" "${DATADIR}/genesis"
+        cp "${GENESIS_JSON_PATH}" "${DATADIR}/genesis"
     done
+
+    target/${RELEASE}/telcoin-network genesis init --datadir "${ROOTDIR}"
 fi
 
 if [ "$START" = true ]; then
@@ -131,7 +138,7 @@ if [ "$START" = true ]; then
         # -vvv for INFO, -vvvvv for TRACE, etc
         # start validator
         target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
-           --chain adiri \
+           --genesis "${DATADIR}/genesis/genesis.json" \
            --disable-discovery \
            --instance "${INSTANCE}" \
            --metrics "${METRICS}" \

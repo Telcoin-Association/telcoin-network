@@ -2,11 +2,14 @@
 
 use crate::args::{clap_address_parser, clap_genesis_parser};
 use clap::Args;
-use std::{path::PathBuf, sync::Arc};
-use tn_config::{Config, ConfigFmt, ConfigTrait, NetworkGenesis, TelcoinDirs as _};
+use core::panic;
+use std::{path::PathBuf, str::FromStr, sync::Arc};
+use tn_config::{
+    Config, ConfigFmt, ConfigTrait, NetworkGenesis, QueryResult, TelcoinDirs as _, DEPLOYMENTS_JSON,
+};
 use tn_reth::{
     dirs::{default_datadir_args, DataDirChainPath, DataDirPath},
-    system_calls::{ConsensusRegistry, RWTEL_ADDRESS},
+    system_calls::ConsensusRegistry,
     MaybePlatformPath, RethChainSpec, RethEnv,
 };
 use tn_types::{Address, U256};
@@ -54,10 +57,6 @@ pub struct CreateCommitteeArgs {
         required = false,
     )]
     pub chain: Arc<RethChainSpec>,
-
-    /// The path to the consensus registry storage yaml file.
-    #[arg(long, value_name = "CONSENSUS_REGISTRY_PATH", verbatim_doc_comment)]
-    pub consensus_registry: Option<PathBuf>,
 
     /// The owner's address for initializing the `ConsensusRegistry` in genesis.
     ///
@@ -113,16 +112,6 @@ pub struct CreateCommitteeArgs {
         verbatim_doc_comment
     )]
     pub epoch_duration: u32,
-
-    /// The address for RWTEL in genesis.
-    #[arg(
-        long = "rwtel-contract-address",
-        alias = "rwtel",
-        help_heading = "The address for RWTEL contract.",
-        default_value_t = RWTEL_ADDRESS,
-        verbatim_doc_comment
-    )]
-    pub rwtel_address: Address,
 }
 
 impl CreateCommitteeArgs {
@@ -147,7 +136,7 @@ impl CreateCommitteeArgs {
         network_genesis.validate()?;
 
         // execute data so committee is on-chain and in genesis
-        let validators = network_genesis.validators().values().cloned().collect();
+        let validators: Vec<_> = network_genesis.validators().values().cloned().collect();
         let genesis = network_genesis.genesis().clone();
 
         let initial_stake_config = ConsensusRegistry::StakeConfig {
@@ -156,14 +145,48 @@ impl CreateCommitteeArgs {
             epochIssuance: self.epoch_rewards,
             epochDuration: self.epoch_duration,
         };
+        let rwtel_address =
+            match NetworkGenesis::fetch_from_json_str(DEPLOYMENTS_JSON, Some("rwTEL")) {
+                Ok(QueryResult::Single(value)) => {
+                    Address::from_str(value.as_str().expect("RWTEL address incorrect"))
+                        .expect("RWTEK address incorrect")
+                }
+                _ => panic!("RWTEL address not found"),
+            };
 
-        let updated_genesis = RethEnv::create_consensus_registry_accounts_for_genesis(
-            validators,
-            genesis,
-            initial_stake_config,
-            self.consensus_registry_owner,
-            self.rwtel_address,
-        )?;
+        // try to create a runtime if one doesn't already exist
+        // this is a workaround for executing committees pre-genesis during tests and normal CLI
+        // operations
+        let genesis_with_consensus_registry = if tokio::runtime::Handle::try_current().is_ok() {
+            // use the current runtime (ie - tests)
+            RethEnv::create_consensus_registry_genesis_account(
+                validators.clone(),
+                genesis.clone(),
+                initial_stake_config.clone(),
+                self.consensus_registry_owner,
+                rwtel_address,
+            )?
+        } else {
+            // no runtime exists (normal CLI operation)
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .thread_name("consensus-registry")
+                .build()?;
+
+            runtime.block_on(async {
+                RethEnv::create_consensus_registry_genesis_account(
+                    validators,
+                    genesis,
+                    initial_stake_config,
+                    self.consensus_registry_owner,
+                    rwtel_address,
+                )
+            })?
+        };
+        // use embedded ITS config from submodule
+        let precompiles =
+            NetworkGenesis::fetch_precompile_genesis_accounts().expect("precompile fetch error");
+
+        let updated_genesis = genesis_with_consensus_registry.extend_accounts(precompiles);
 
         // updated genesis with registry information
         network_genesis.update_chain(updated_genesis.into());

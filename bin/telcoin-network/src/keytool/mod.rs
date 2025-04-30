@@ -90,7 +90,7 @@ pub struct Read; // public keys for: bls, network, execution, address
 
 impl KeyArgs {
     /// Execute command
-    pub fn execute(&self) -> eyre::Result<()> {
+    pub fn execute(&self, passphrase: Option<String>) -> eyre::Result<()> {
         // create datadir
         let datadir = self.data_dir();
         // creates a default config if none exists
@@ -105,7 +105,7 @@ impl KeyArgs {
                         // initialize path and warn users if overwriting keys
                         self.init_path(&authority_key_path, args.force)?;
                         // execute and store keypath
-                        args.execute(&mut config, &datadir)?;
+                        args.execute(&mut config, &datadir, passphrase)?;
 
                         debug!("{config:?}");
                         Config::store_path(self.config_path(), config, ConfigFmt::YAML)?;
@@ -227,7 +227,8 @@ mod tests {
         ])
         .expect("cli parsed");
 
-        tn.run(|_, _, _| Ok(())).expect("generate keys command");
+        tn.run(Some("gen_keys_test".to_string()), |_, _, _, _| Ok(()))
+            .expect("generate keys command");
 
         Config::load_from_path::<Config>(
             tempdir.join("telcoin-network.yaml").as_path(),

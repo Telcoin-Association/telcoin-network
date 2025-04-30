@@ -14,7 +14,9 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tempfile::TempDir;
-use tn_config::fetch_file_content_relative_to_manifest;
+use tn_config::{
+    fetch_file_content_relative_to_manifest, NetworkGenesis, QueryResult, DEPLOYMENTS_JSON,
+};
 use tn_reth::{
     system_calls::{
         ConsensusRegistry::{self, getCurrentEpochInfoReturn, getValidatorsReturn},
@@ -24,9 +26,109 @@ use tn_reth::{
 };
 use tn_test_utils::TransactionFactory;
 use tn_types::{
-    adiri_genesis, hex, sol, Address, BlsKeypair, Bytes, Genesis, GenesisAccount, TaskManager, U256,
+    adiri_genesis, hex, sol, Address, BlsKeypair, Bytes, FromHex, Genesis, GenesisAccount,
+    TaskManager, U256,
 };
 use tracing::debug;
+
+#[tokio::test]
+async fn test_genesis_with_its() -> eyre::Result<()> {
+    // create genesis with a proxy
+    let genesis = adiri_genesis();
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // spawn testnet for RPC calls
+    spawn_local_testnet(
+        chain,
+        #[cfg(feature = "faucet")]
+        "0x0000000000000000000000000000000000000000",
+    )
+    .expect("failed to spawn testnet");
+    // allow time for nodes to start
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let rpc_url = "http://127.0.0.1:8545".to_string();
+    let client = HttpClientBuilder::default().build(&rpc_url).expect("couldn't build rpc client");
+
+    let precompiles =
+        NetworkGenesis::fetch_precompile_genesis_accounts().expect("its precompiles not found");
+    for (address, genesis_account) in precompiles {
+        let returned_code: String = client
+            .request("eth_getCode", rpc_params!(address))
+            .await
+            .expect("Failed to fetch runtime code");
+        assert_eq!(Bytes::from_hex(returned_code), Ok(genesis_account.code.unwrap()));
+
+        if genesis_account.storage.is_some() {
+            for (slot, value) in genesis_account.storage.unwrap().iter() {
+                let returned_storage: String = client
+                    .request("eth_getStorageAt", rpc_params!(address, slot.to_string(), "latest"))
+                    .await
+                    .expect("Failed to fetch storage slot");
+                assert_eq!(returned_storage, value.to_string());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
+    let precompiles =
+        NetworkGenesis::fetch_precompile_genesis_accounts().expect("its precompiles not found");
+
+    // check that all addresses in expected_deployments are present in precompiles
+    let is_address_present = |address: &str, genesis_config: Vec<(Address, GenesisAccount)>| {
+        genesis_config
+            .iter()
+            .any(|(precompile_address, _)| precompile_address.to_string() == address)
+    };
+    let expected_deployments = match NetworkGenesis::fetch_from_json_str(DEPLOYMENTS_JSON, None) {
+        Ok(QueryResult::Map(value)) => value,
+        _ => panic!("deployments not found"),
+    };
+    let its = expected_deployments.get("its").and_then(|v| v.as_object()).unwrap();
+    for (key, value) in its {
+        let address = value.as_str().unwrap();
+        assert!(
+            is_address_present(address, precompiles.clone()),
+            "{key} is not present in precompiles"
+        );
+    }
+
+    for key in ["rwTEL", "rwTELImpl", "rwTELTokenManager"] {
+        let address = expected_deployments.get(key).and_then(|v| v.as_str()).unwrap();
+        assert!(
+            is_address_present(address, precompiles.clone()),
+            "{key} is not present in precompiles"
+        );
+    }
+
+    // assert stateful contracts possess storage config
+    let rwtel = expected_deployments.get("rwTEL").and_then(|v| v.as_str()).unwrap();
+    let rwtel_impl = expected_deployments.get("rwTELImpl").and_then(|v| v.as_str()).unwrap();
+    let gateway = its.get("AxelarAmplifierGateway").and_then(|v| v.as_str()).unwrap();
+    let gas_service = its.get("GasService").and_then(|v| v.as_str()).unwrap();
+    let token_service = its.get("InterchainTokenService").and_then(|v| v.as_str()).unwrap();
+    let factory = its.get("InterchainTokenFactory").and_then(|v| v.as_str()).unwrap();
+    for (address, genesis_account) in precompiles {
+        let addr_str = address.to_string();
+        // contracts with storage
+        if [rwtel, rwtel_impl, gateway, gas_service, token_service, factory]
+            .iter()
+            .any(|&a| a == addr_str)
+        {
+            assert!(genesis_account.storage.is_some());
+        }
+        // check rwtel balance exists, actual val checked later
+        if addr_str == rwtel {
+            assert!(genesis_account.balance > U256::ZERO);
+        }
+    }
+
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
@@ -120,7 +222,6 @@ fn genesis_with_proxy(registry_impl_deployed_bytecode: Vec<u8>) -> eyre::Result<
     let test_cr_address: Address = Address::random();
 
     // create proxy transaction
-    // let proxy_address = Address::random();
     let registry_proxy_json =
         fetch_file_content_relative_to_manifest("../../tn-contracts/artifacts/ERC1967Proxy.json");
     let registry_proxy_bytecode = RethEnv::parse_bytecode_from_json_str(&registry_proxy_json)?;

@@ -92,7 +92,7 @@ use system_calls::{
     CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
 };
 use tempfile::TempDir;
-use tn_config::{fetch_file_content_relative_to_manifest, ValidatorInfo};
+use tn_config::{ValidatorInfo, CONSENSUS_REGISTRY_JSON};
 use tn_types::{
     adiri_chain_spec_arc, calculate_transaction_root, keccak256, Address, Block, BlockBody,
     BlockExt as _, BlockHashOrNumber, BlockNumHash, BlockNumber, BlockWithSenders, BlsSignature,
@@ -1275,7 +1275,7 @@ impl RethEnv {
     }
 
     /// Convenience method for compiling storage and bytecode to include genesis.
-    pub fn create_consensus_registry_accounts_for_genesis(
+    pub fn create_consensus_registry_genesis_account(
         validators: Vec<ValidatorInfo>,
         genesis: Genesis,
         initial_stake_config: ConsensusRegistry::StakeConfig,
@@ -1301,12 +1301,8 @@ impl RethEnv {
             .checked_mul(U256::from(validators.len()))
             .ok_or_eyre("Failed to calculate total stake for consensus registry at genesis")?;
 
-        // read bytecode from tn-contracts
-        let json_content = fetch_file_content_relative_to_manifest(
-            "../../tn-contracts/artifacts/ConsensusRegistry.json",
-        );
-
-        let registry_bytecode = Self::parse_deployed_bytecode_from_json_str(&json_content)?;
+        let registry_bytecode =
+            Self::parse_deployed_bytecode_from_json_str(CONSENSUS_REGISTRY_JSON)?;
 
         // extend accounts for initial execution
         let tmp_genesis = genesis.clone().extend_accounts([(
@@ -1356,8 +1352,8 @@ impl RethEnv {
         let genesis = genesis.extend_accounts([(
             CONSENSUS_REGISTRY_ADDRESS,
             GenesisAccount::default()
-                .with_code(Some(registry_bytecode.into()))
                 .with_balance(total_stake_balance)
+                .with_code(Some(registry_bytecode.into()))
                 .with_storage(storage),
         )]);
 
@@ -1638,7 +1634,7 @@ mod tests {
         };
 
         let owner = Address::random();
-        let genesis = RethEnv::create_consensus_registry_accounts_for_genesis(
+        let genesis = RethEnv::create_consensus_registry_genesis_account(
             validators.clone(),
             adiri_genesis(),
             initial_stake_config,

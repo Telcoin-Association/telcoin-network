@@ -46,6 +46,7 @@ consensus-metrics = { workspace = true }
 tn-faucet = { workspace = true, optional = true }
 alloy = { workspace = true }
 tn-reth = { workspace = true }
+rpassword = { workspace = true }
 
 # config
 tn-config = { workspace = true }

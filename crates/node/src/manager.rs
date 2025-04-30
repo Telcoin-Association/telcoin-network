@@ -42,6 +42,8 @@ pub struct EpochManager<P> {
     worker_node: Option<WorkerNode<DatabaseType>>,
     /// Main task manager that runs across epochs
     task_manager: TaskManager,
+    /// Key config - loaded once for application lifetime.
+    key_config: KeyConfig,
 }
 
 impl<P> EpochManager<P>
@@ -49,9 +51,25 @@ where
     P: TelcoinDirs + 'static,
 {
     /// Create a new instance of [Self].
-    pub fn new(builder: TnBuilder, tn_datadir: P) -> eyre::Result<Self> {
+    pub fn new(
+        builder: TnBuilder,
+        tn_datadir: P,
+        passphrase: Option<String>,
+    ) -> eyre::Result<Self> {
         // create main task manager for all tasks
         let task_manager = TaskManager::new("Epoch Manager");
+
+        let passphrase = if std::fs::exists(
+            tn_datadir.validator_keys_path().join(tn_config::BLS_WRAPPED_KEYFILE),
+        )
+        .unwrap_or(false)
+        {
+            passphrase
+        } else {
+            None
+        };
+
+        let key_config = KeyConfig::read_config(&tn_datadir, passphrase)?;
 
         Ok(Self {
             builder,
@@ -60,6 +78,7 @@ where
             primary_node: None,
             worker_node: None,
             task_manager,
+            key_config,
         })
     }
 
@@ -196,13 +215,12 @@ where
         info!(target: "epoch-manager", ?consensus_db_path, "node storage opened for epoch");
 
         // create config for consensus
-        let key_config = KeyConfig::read_config(&self.tn_datadir)?;
         let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
         let consensus_config = ConsensusConfig::new(
             self.builder.tn_config.clone(),
             &self.tn_datadir,
             consensus_db.clone(),
-            key_config,
+            self.key_config.clone(),
             network_config,
         )?;
 

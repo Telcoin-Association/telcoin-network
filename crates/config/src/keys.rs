@@ -1,10 +1,16 @@
 //! Cryptographic keys used by the node.
 
-use crate::{TelcoinDirs, BLS_KEYFILE, PRIMARY_NETWORK_SEED_FILE, WORKER_NETWORK_SEED_FILE};
+use crate::{
+    TelcoinDirs, BLS_KEYFILE, BLS_WRAPPED_KEYFILE, PRIMARY_NETWORK_SEED_FILE,
+    WORKER_NETWORK_SEED_FILE,
+};
+use aes_gcm_siv::{aead::Aead as _, Aes256GcmSiv, Key, KeyInit, Nonce};
 use blake2::Digest;
-use rand::{rngs::StdRng, CryptoRng, RngCore, SeedableRng};
+use pbkdf2::pbkdf2_hmac;
+use rand::{rngs::StdRng, Rng as _, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use reth_chainspec::ChainSpec;
+use sha2::Sha256;
 use std::sync::Arc;
 use tn_types::{
     encode, BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner, DefaultHashFunction, Intent,
@@ -39,14 +45,55 @@ pub struct KeyConfig {
 }
 
 impl KeyConfig {
+    /// Wrap (encrypt) a BLS key with passphrase.
+    /// Returns a String that is the Base58 encoding of the encrypted bytes.
+    /// bytes 0-11 are the pbkdf2 salt, 12-23 are the aes-gcm-siv nonce and 24.. are the encrypted
+    /// key.
+    fn wrap_bls_key(primary_keypair: &BlsKeypair, passphrase: &str) -> eyre::Result<String> {
+        let mut salt = [0_u8; 12];
+        rand::thread_rng().fill(&mut salt);
+        let mut nonce_bytes = [0_u8; 12];
+        rand::thread_rng().fill(&mut nonce_bytes);
+        let mut passphrase_bytes = [0_u8; 32];
+        pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), &salt, 1_000, &mut passphrase_bytes);
+        let key = Key::<Aes256GcmSiv>::from_slice(&passphrase_bytes);
+        let cipher = Aes256GcmSiv::new(key);
+        let nonce = Nonce::from_slice(&nonce_bytes); // 96-bits
+        let ciphertext = cipher
+            .encrypt(nonce, &primary_keypair.to_bytes()[..])
+            .map_err(|e| eyre::eyre!("Could not encrypt BLS key: {e}"))?;
+        let encrypted_data = [&salt[..], &nonce_bytes[..], &ciphertext[..]].concat();
+        Ok(bs58::encode(&encrypted_data).into_string())
+    }
+
+    /// Accepts bytes that are a wrapped BLS key and unwraps with the passphrase.
+    /// bytes 0-11 are the pbkdf2 salt, 12-23 are the aes-gcm-siv nonce and 24.. are the encrypted
+    /// key.
+    fn unwrap_bls_key(bytes: &[u8], passphrase: &str) -> eyre::Result<BlsKeypair> {
+        let mut passphrase_bytes = [0_u8; 32];
+        pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), &bytes[0..12], 1_000, &mut passphrase_bytes);
+        let nonce = Nonce::from_slice(&bytes[12..24]); // 96-bits
+        let key = Key::<Aes256GcmSiv>::from_slice(&passphrase_bytes);
+        let cipher = Aes256GcmSiv::new(key);
+        let plaintext = cipher
+            .decrypt(nonce, &bytes[24..])
+            .map_err(|e| eyre::eyre!("Could not decrypt BLS key: {e}"))?;
+        BlsKeypair::from_bytes(&plaintext)
+    }
+
     /// Read a key config file that contains the primary BLS key in Base 58 format.
-    pub fn read_config<TND: TelcoinDirs>(tn_datadir: &TND) -> eyre::Result<Self> {
-        // TODO: find a better way to manage keys
-        //
+    pub fn read_config<TND: TelcoinDirs>(
+        tn_datadir: &TND,
+        passphrase: Option<String>,
+    ) -> eyre::Result<Self> {
         // load keys to start the primary
         let validator_keypath = tn_datadir.validator_keys_path();
         tracing::info!(target: "telcoin::consensus_config", "loading validator keys at {:?}", validator_keypath);
-        let contents = std::fs::read_to_string(tn_datadir.validator_keys_path().join(BLS_KEYFILE))?;
+        let contents = if passphrase.is_some() {
+            std::fs::read_to_string(tn_datadir.validator_keys_path().join(BLS_WRAPPED_KEYFILE))?
+        } else {
+            std::fs::read_to_string(tn_datadir.validator_keys_path().join(BLS_KEYFILE))?
+        };
         let primary_seed = std::fs::read_to_string(
             tn_datadir.validator_keys_path().join(PRIMARY_NETWORK_SEED_FILE),
         )
@@ -56,7 +103,11 @@ impl KeyConfig {
         )
         .unwrap_or_else(|_| "worker network keypair".to_string());
         let bytes = bs58::decode(contents.as_str().trim()).into_vec()?;
-        let primary_keypair = BlsKeypair::from_bytes(&bytes)?;
+        let primary_keypair = if let Some(passphrase) = passphrase {
+            Self::unwrap_bls_key(&bytes, &passphrase)?
+        } else {
+            BlsKeypair::from_bytes(&bytes)?
+        };
         let primary_network_keypair =
             Self::generate_network_keypair(&primary_keypair, &primary_seed);
         let worker_network_keypair = Self::generate_network_keypair(&primary_keypair, &worker_seed);
@@ -71,7 +122,10 @@ impl KeyConfig {
 
     /// Generate a new random primary BLS key and save to the config file.
     /// Note, this is not very secure in that it is writing the private key to a file...
-    pub fn generate_and_save<TND: TelcoinDirs>(tn_datadir: &TND) -> eyre::Result<Self> {
+    pub fn generate_and_save<TND: TelcoinDirs>(
+        tn_datadir: &TND,
+        passphrase: Option<String>,
+    ) -> eyre::Result<Self> {
         let rng = ChaCha20Rng::from_entropy();
         // note: StdRng uses ChaCha12
         let primary_keypair = BlsKeypair::generate(&mut StdRng::from_rng(rng)?);
@@ -80,8 +134,16 @@ impl KeyConfig {
         let primary_network_keypair =
             Self::generate_network_keypair(&primary_keypair, primary_seed);
         let worker_network_keypair = Self::generate_network_keypair(&primary_keypair, worker_seed);
-        let contents = bs58::encode(primary_keypair.to_bytes()).into_string();
-        std::fs::write(tn_datadir.validator_keys_path().join(BLS_KEYFILE), contents)?;
+        // Make sure we have the validator dir.
+        // Don't error out if path exists.
+        let _ = std::fs::create_dir(tn_datadir.validator_keys_path());
+        if let Some(passphrase) = passphrase {
+            let contents = Self::wrap_bls_key(&primary_keypair, &passphrase)?;
+            std::fs::write(tn_datadir.validator_keys_path().join(BLS_WRAPPED_KEYFILE), contents)?;
+        } else {
+            let contents = bs58::encode(primary_keypair.to_bytes()).into_string();
+            std::fs::write(tn_datadir.validator_keys_path().join(BLS_KEYFILE), contents)?;
+        }
         std::fs::write(
             tn_datadir.validator_keys_path().join(PRIMARY_NETWORK_SEED_FILE),
             primary_seed,
@@ -97,24 +159,6 @@ impl KeyConfig {
                 worker_network_keypair,
             }),
         })
-    }
-
-    /// Generate random keys with provided RNG.
-    ///
-    /// Useful for testing.
-    pub fn with_random<R: CryptoRng + RngCore>(rng: &mut R) -> Self {
-        let primary_keypair = BlsKeypair::generate(rng);
-        let primary_network_keypair =
-            Self::generate_network_keypair(&primary_keypair, "primary network keypair");
-        let worker_network_keypair =
-            Self::generate_network_keypair(&primary_keypair, "worker network keypair");
-        Self {
-            inner: Arc::new(KeyConfigInner {
-                primary_keypair,
-                primary_network_keypair,
-                worker_network_keypair,
-            }),
-        }
     }
 
     /// Create a config with a provided key- this is ONLY for testing.
@@ -193,5 +237,45 @@ impl KeyConfig {
 impl BlsSigner for KeyConfig {
     fn request_signature_direct(&self, msg: &[u8]) -> BlsSignature {
         self.inner.primary_keypair.sign(msg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::KeyConfig;
+
+    #[test]
+    fn test_bls_passphrase() {
+        let tmp_dir = TempDir::new().expect("tmp dir");
+        let pp = Some("test_bls_passphrase".to_string());
+        let kc = KeyConfig::generate_and_save(&tmp_dir.path().to_path_buf(), pp.clone())
+            .expect("BLS key config");
+        let kc2 =
+            KeyConfig::read_config(&tmp_dir.path().to_path_buf(), pp.clone()).expect("load config");
+        assert_eq!(kc.inner.primary_keypair.to_bytes(), kc2.inner.primary_keypair.to_bytes());
+        assert!(KeyConfig::read_config(&tmp_dir.path().to_path_buf(), None).is_err());
+        assert!(KeyConfig::read_config(
+            &tmp_dir.path().to_path_buf(),
+            Some("not_passphrase".to_string())
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_bls_no_passphrase() {
+        let tmp_dir = TempDir::new().expect("tmp dir");
+        let pp = None;
+        let kc = KeyConfig::generate_and_save(&tmp_dir.path().to_path_buf(), pp.clone())
+            .expect("BLS key config");
+        let kc2 =
+            KeyConfig::read_config(&tmp_dir.path().to_path_buf(), pp.clone()).expect("load config");
+        assert_eq!(kc.inner.primary_keypair.to_bytes(), kc2.inner.primary_keypair.to_bytes());
+        assert!(KeyConfig::read_config(
+            &tmp_dir.path().to_path_buf(),
+            Some("not_passphrase".to_string())
+        )
+        .is_err());
     }
 }

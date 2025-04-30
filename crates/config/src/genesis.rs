@@ -1,8 +1,9 @@
 //! Genesis information used when configuring a node.
 use crate::{Config, ConfigFmt, ConfigTrait, TelcoinDirs};
-use eyre::Context;
+use eyre::{Context, OptionExt};
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::{
     collections::BTreeMap,
     ffi::OsStr,
@@ -13,12 +14,28 @@ use std::{
 };
 use tn_types::{
     adiri_genesis, keccak256, verify_proof_of_possession_bls, Address, BlsPublicKey, BlsSignature,
-    Committee, CommitteeBuilder, Epoch, Genesis, Intent, IntentMessage, Multiaddr,
+    Committee, CommitteeBuilder, Epoch, Genesis, GenesisAccount, Intent, IntentMessage, Multiaddr,
     NetworkPublicKey, PrimaryInfo, ProtocolSignature, Signer, WorkerCache, WorkerIndex,
 };
 use tracing::{info, warn};
-/// The validators directory used to create genesis.
+
+/// The validators directory used to create genesis
 pub const GENESIS_VALIDATORS_DIR: &str = "validators";
+/// Precompile info for genesis, read from current submodule commit
+pub const DEPLOYMENTS_JSON: &str =
+    include_str!("../../../tn-contracts/deployments/deployments.json");
+pub const CONSENSUS_REGISTRY_JSON: &str =
+    include_str!("../../../tn-contracts/artifacts/ConsensusRegistry.json");
+pub const ERC1967PROXY_JSON: &str =
+    include_str!("../../../tn-contracts/artifacts/ERC1967Proxy.json");
+pub const ITS_CFG_YAML: &str =
+    include_str!("../../../tn-contracts/deployments/genesis/its-config.yaml");
+
+/// Wrapper for fetching JSON keys as object or values
+pub enum QueryResult {
+    Map(Map<String, Value>),
+    Single(Value),
+}
 
 /// The struct for starting a network at genesis.
 pub struct NetworkGenesis {
@@ -188,6 +205,60 @@ impl NetworkGenesis {
     /// Return a reference to the validators.
     pub fn validators(&self) -> &BTreeMap<BlsPublicKey, ValidatorInfo> {
         &self.validators
+    }
+
+    /// Returns configurations for precompiles as genesis accounts
+    /// Precompiles configs yamls are generated using foundry in tn-Contracts
+    pub fn fetch_precompile_genesis_accounts() -> eyre::Result<Vec<(Address, GenesisAccount)>> {
+        let yaml_content = ITS_CFG_YAML;
+        let config: std::collections::HashMap<Address, GenesisAccount> =
+            serde_yaml::from_str(yaml_content).expect("yaml parsing failure");
+        let mut accounts = Vec::new();
+        for (address, precompile_config) in config {
+            let account = GenesisAccount::default()
+                .with_nonce(precompile_config.nonce)
+                .with_balance(precompile_config.balance)
+                .with_code(precompile_config.code)
+                .with_storage(precompile_config.storage);
+
+            accounts.push((address, account));
+        }
+
+        Ok(accounts)
+    }
+
+    /// Fetches json info from the given string
+    ///
+    /// If a query is specified, return the corresponding nested object.
+    /// Otherwise return the entire JSON
+    /// With a generic this could be adjused to handle YAML also
+    pub fn fetch_from_json_str(
+        json_string: &str,
+        query: Option<&str>,
+    ) -> eyre::Result<QueryResult> {
+        let json: Value = serde_json::from_str(json_string).expect("json string malformed");
+        let result = match query {
+            Some(path) => {
+                let keys: Vec<&str> = path.split('.').collect();
+                let mut current_value = &json;
+                for &key in &keys {
+                    current_value = current_value.get(key).ok_or_eyre("query key not found")?;
+                }
+
+                match current_value {
+                    // return objects directly
+                    Value::Object(map) => QueryResult::Map(map.clone()),
+                    // return single entries wrapped in a Map
+                    _ => QueryResult::Single(current_value.clone()),
+                }
+            }
+            None => {
+                let map = json.as_object().cloned().ok_or_eyre("json string malformed")?;
+                QueryResult::Map(map)
+            }
+        };
+
+        Ok(result)
     }
 }
 

@@ -33,5 +33,10 @@ backoff = { workspace = true }
 blake2 = { workspace = true }
 bs58 = { workspace = true }
 
+# Crypto specific to key wrapping, not used elsewhere.
+aes-gcm-siv = "0.11.1"
+pbkdf2 = "0.12.2"
+sha2 = "0.10.8"
+
 [dev-dependencies]
 tempfile = { workspace = true }

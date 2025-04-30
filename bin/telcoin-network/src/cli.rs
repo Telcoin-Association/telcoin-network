@@ -10,6 +10,27 @@ use std::{ffi::OsString, fmt, sync::Arc};
 use tn_node::engine::TnBuilder;
 use tn_reth::{dirs::DataDirChainPath, FileWorkerGuard, LogArgs, RethChainSpec};
 
+/// How do we want to get the BLS key passphrase?
+#[derive(Debug, Copy, Clone, clap::ValueEnum)]
+pub enum PassSource {
+    /// Get the passphrase from then environment variable TN_BLS_PASSPHRASE.
+    Env,
+    /// Read the passphrase from stdin.  Will read the first line of stdin or until EOF.
+    Stdin,
+    /// Ask the user on startup, only works if running in foreground on a TTY.
+    Ask,
+    /// Do not use a passphrase- save the BLS key in the clear.
+    /// Only do this for testing, one offs, etc.
+    NoPassphrase,
+}
+
+impl PassSource {
+    /// Use a passphrase to wrap the BLS key.
+    pub fn with_passphrase(&self) -> bool {
+        !matches!(self, Self::NoPassphrase)
+    }
+}
+
 /// The main TN cli interface.
 ///
 /// This is the entrypoint to the executable.
@@ -54,6 +75,19 @@ pub struct Cli<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// The log configuration.
     #[clap(flatten)]
     pub logs: LogArgs,
+
+    /// How to get the BLS key passphrase.
+    ///
+    /// The default is to use the env variable TN_BLS_PASSPHRASE
+    /// Note, this variable should be securily managed if used on a validator.
+    #[arg(
+        long,
+        value_name = "TN_PASSPHRASE_SOURCE",
+        verbatim_doc_comment,
+        default_value = "env",
+        global = true
+    )]
+    pub bls_passphrase_source: PassSource,
 }
 
 impl Cli {
@@ -94,15 +128,17 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     /// }
     ///
     /// if let Err(err) = telcoin_network::cli::Cli::<MyArgs>::parse()
-    ///     .run(|builder, _, tn_datadir| launch_node(builder, tn_datadir))
+    ///     .run(None, |builder, _, tn_datadir, passphrase| {
+    ///         launch_node(builder, tn_datadir, passphrase)
+    ///     })
     /// {
     ///     eprintln!("Error: {err:?}");
     ///     std::process::exit(1);
     /// }
     /// ```
-    pub fn run<L>(mut self, launcher: L) -> eyre::Result<()>
+    pub fn run<L>(mut self, passphrase: Option<String>, launcher: L) -> eyre::Result<()>
     where
-        L: FnOnce(TnBuilder, Ext, DataDirChainPath) -> eyre::Result<()>,
+        L: FnOnce(TnBuilder, Ext, DataDirChainPath, Option<String>) -> eyre::Result<()>,
     {
         // add network name to logs dir
         self.logs.log_file_directory =
@@ -112,8 +148,8 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
 
         match self.command {
             Commands::Genesis(command) => command.execute(),
-            Commands::Node(command) => command.execute(true, launcher),
-            Commands::Keytool(command) => command.execute(),
+            Commands::Node(command) => command.execute(passphrase, true, launcher),
+            Commands::Keytool(command) => command.execute(passphrase),
         }
     }
 
@@ -203,6 +239,6 @@ mod tests {
             "debug,net=trace",
         ])
         .unwrap();
-        assert!(tn.run(|_, _, _| { Ok(()) }).is_ok());
+        assert!(tn.run(None, |_, _, _, _| { Ok(()) }).is_ok());
     }
 }

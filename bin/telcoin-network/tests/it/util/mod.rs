@@ -10,7 +10,11 @@ use tracing::error;
 pub static IT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Execute genesis ceremony inside tempdir
-pub fn create_validator_info(datadir: &str, address: &str) -> eyre::Result<()> {
+pub fn create_validator_info(
+    datadir: &str,
+    address: &str,
+    passphrase: Option<String>,
+) -> eyre::Result<()> {
     // init genesis
     // Note, we speed up block times for tests.
     let init_command = CommandParser::<GenesisArgs>::parse_from([
@@ -37,7 +41,7 @@ pub fn create_validator_info(datadir: &str, address: &str) -> eyre::Result<()> {
         "--address",
         address,
     ]);
-    keys_command.args.execute()?;
+    keys_command.args.execute(passphrase)?;
 
     // add validator
     let add_validator_command =
@@ -46,7 +50,10 @@ pub fn create_validator_info(datadir: &str, address: &str) -> eyre::Result<()> {
 }
 
 /// Create validator info, genesis ceremony, and spawn node command with faucet active.
-pub async fn config_local_testnet(temp_path: PathBuf) -> eyre::Result<()> {
+pub async fn config_local_testnet(
+    temp_path: PathBuf,
+    passphrase: Option<String>,
+) -> eyre::Result<()> {
     let validators = [
         ("validator-1", "0x1111111111111111111111111111111111111111"),
         ("validator-2", "0x2222222222222222222222222222222222222222"),
@@ -64,7 +71,7 @@ pub async fn config_local_testnet(temp_path: PathBuf) -> eyre::Result<()> {
         let dir = temp_path.join(v);
         let datadir = dir.to_str().expect("validator temp dir");
         // init genesis ceremony to create committee / worker_cache files
-        create_validator_info(datadir, addr)?;
+        create_validator_info(datadir, addr, passphrase.clone())?;
 
         // copy to shared genesis dir
         let copy = dir.join("genesis/validators");
@@ -122,7 +129,7 @@ pub fn spawn_local_testnet(
         let datadir = dir.to_str().expect("validator temp dir");
         let address = Address::random().to_string();
         // init genesis ceremony to create committee / worker_cache files
-        create_validator_info(datadir, &address)?;
+        create_validator_info(datadir, &address, Some("it_test_pass".to_string()))?;
 
         // copy to shared genesis dir
         let copy = dir.join("genesis/validators");
@@ -212,10 +219,11 @@ pub fn spawn_local_testnet(
 
         std::thread::spawn(|| {
             let err = command.execute(
+                Some("it_test_pass".to_string()),
                 false, // don't overwrite chain with the default
-                |mut builder, faucet_args, tn_datadir| {
+                |mut builder, faucet_args, tn_datadir, passphrase| {
                     builder.opt_faucet_args = Some(faucet_args);
-                    launch_node(builder, tn_datadir)
+                    launch_node(builder, tn_datadir, passphrase)
                 },
             );
             error!("{:?}", err);

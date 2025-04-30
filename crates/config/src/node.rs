@@ -12,6 +12,8 @@ use tracing::info;
 
 /// The filename to use when reading/writing the validator's BlsKey.
 pub const BLS_KEYFILE: &str = "bls.key";
+// The filename to use when reading/writing a wrapped (encypted) validator BlsKey.
+pub const BLS_WRAPPED_KEYFILE: &str = "bls.kw";
 /// The filename to use when reading/writing the primary's network keys seed.
 pub const PRIMARY_NETWORK_SEED_FILE: &str = "primary.seed";
 /// The filename to use when reading/writing the network key seed used by all workers.
