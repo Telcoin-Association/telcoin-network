@@ -396,6 +396,7 @@ where
             consensus_config.clone(),
             consensus_bus.clone(),
             state_sync,
+            &self.epoch_task_manager, // tasks should abort with epoch
         )
         .spawn(&self.node_task_manager);
 
