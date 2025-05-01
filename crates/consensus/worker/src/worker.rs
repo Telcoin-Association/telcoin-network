@@ -16,7 +16,7 @@ use tn_network_types::{local::LocalNetwork, WorkerOwnBatchMessage, WorkerToPrima
 use tn_storage::tables::Batches;
 use tn_types::{
     error::BlockSealError, network_public_key_to_libp2p, BatchSender, BatchValidation, Database,
-    SealedBatch, WorkerId,
+    SealedBatch, TaskManager, WorkerId,
 };
 use tracing::{error, info};
 
@@ -36,6 +36,7 @@ pub fn new_worker<DB: Database>(
     metrics: Metrics,
     consensus_config: ConsensusConfig<DB>,
     network_handle: WorkerNetworkHandle,
+    task_manager: &mut TaskManager,
 ) -> Worker<DB, QuorumWaiter> {
     let worker_name = consensus_config.key_config().worker_network_public_key();
     let worker_peer_id = network_public_key_to_libp2p(&worker_name);
@@ -63,6 +64,7 @@ pub fn new_worker<DB: Database>(
         node_metrics,
         consensus_config.local_network().clone(),
         network_handle.clone(),
+        task_manager,
     );
 
     if let Some(authority) = consensus_config.authority() {
@@ -93,6 +95,7 @@ fn new_worker_internal<DB: Database>(
     node_metrics: Arc<WorkerMetrics>,
     client: LocalNetwork,
     network_handle: WorkerNetworkHandle,
+    task_manager: &mut TaskManager,
 ) -> Worker<DB, QuorumWaiter> {
     info!(target: "worker::worker", "Starting handler for transactions");
 
@@ -118,6 +121,7 @@ fn new_worker_internal<DB: Database>(
         consensus_config.node_storage().clone(),
         consensus_config.parameters().batch_vote_timeout,
         network_handle,
+        task_manager,
     )
 }
 
@@ -149,6 +153,7 @@ impl<DB, QW> std::fmt::Debug for Worker<DB, QW> {
 }
 
 impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: WorkerId,
         quorum_waiter: Option<QW>,
@@ -157,6 +162,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         store: DB,
         timeout: Duration,
         network_handle: WorkerNetworkHandle,
+        task_manager: &mut TaskManager,
     ) -> Self {
         let (tx_batches, mut rx_batches) = tokio::sync::mpsc::channel(1000);
         let this = Self {
@@ -172,7 +178,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         let this_clone = this.clone();
         // Spawn a little task to accept batches from a channel and seal them that way.
         // Allows the engine to remain removed from the worker.
-        tokio::spawn(async move {
+        task_manager.spawn_task("batch-builder", async move {
             while let Some((batch, tx)) = rx_batches.recv().await {
                 let res = this_clone.seal(batch).await;
                 if tx.send(res).is_err() {

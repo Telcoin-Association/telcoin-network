@@ -26,6 +26,18 @@ use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::{runtime::Builder, sync::mpsc};
 use tracing::info;
 
+/// The execution engine task manager name.
+const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
+
+/// The execution engine task manager name.
+const ENGINE_TASK_MANAGER: &str = "Engine Task Manager";
+
+/// The primary task manager name.
+pub(super) const PRIMARY_TASK_MANAGER: &str = "Primary Task Manager";
+
+/// The worker's base task manager name. This is used by `fn worker_task_manager_name(id)`.
+pub(super) const WORKER_TASK_MANAGER_BASE: &str = "Worker Task Manager";
+
 /// The long-running type that oversees epoch transitions.
 #[derive(Debug)]
 pub struct EpochManager<P> {
@@ -56,7 +68,7 @@ where
         passphrase: Option<String>,
     ) -> eyre::Result<Self> {
         // create main task manager for all tasks
-        let task_manager = TaskManager::new("Epoch Manager");
+        let task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
 
         let passphrase = if std::fs::exists(
             tn_datadir.validator_keys_path().join(tn_config::BLS_WRAPPED_KEYFILE),
@@ -68,6 +80,7 @@ where
             None
         };
 
+        // create key config for lifetime of the app
         let key_config = KeyConfig::read_config(&tn_datadir, passphrase)?;
 
         Ok(Self {
@@ -96,8 +109,7 @@ where
                     .thread_name("telcoin-network")
                     .enable_io()
                     .enable_time()
-                    .build()
-                    .expect("failed to build a tokio runtime");
+                    .build()?;
 
                 let res = runtime.block_on(self.run_epoch(reth_db.clone(), consensus_db.clone()));
                 // shutdown background tasks
@@ -133,7 +145,7 @@ where
         }
 
         // create submanager for engine tasks
-        let mut engine_task_manager = TaskManager::new("Engine Task Manager");
+        let mut engine_task_manager = TaskManager::new(ENGINE_TASK_MANAGER);
 
         // create the engine
         let engine = self.create_engine(&engine_task_manager, reth_db)?;
@@ -149,7 +161,7 @@ where
         let mut primary_task_manager = primary.start().await?;
 
         // start worker
-        let worker = worker_node.start().await?;
+        let (mut worker_task_manager, worker) = worker_node.start().await?;
 
         // consensus config for shutdown subscribers
         let consensus_config = primary.consensus_config().await;
@@ -180,10 +192,12 @@ where
         // update tasks
         primary_task_manager.update_tasks();
         engine_task_manager.update_tasks();
+        worker_task_manager.update_tasks();
 
         // add manager as a submanager
         self.task_manager.add_task_manager(primary_task_manager);
         self.task_manager.add_task_manager(engine_task_manager);
+        self.task_manager.add_task_manager(worker_task_manager);
 
         info!(target: "epoch-manager", tasks=?self.task_manager, "TASKS");
 
@@ -208,8 +222,6 @@ where
         reth_db: RethDb,
     ) -> eyre::Result<ExecutionNode> {
         // create execution components (ie - reth env)
-        // let reth_db =
-        //     RethEnv::new_database(&self.builder.node_config, self.tn_datadir.reth_db_path())?;
         let reth_env = RethEnv::new(&self.builder.node_config, engine_task_manager, reth_db)?;
         let engine = ExecutionNode::new(&self.builder, reth_env)?;
 

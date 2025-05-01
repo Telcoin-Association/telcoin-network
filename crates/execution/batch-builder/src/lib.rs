@@ -385,6 +385,7 @@ mod tests {
         let qw = TestMakeBlockQuorumWaiter();
         let node_metrics = WorkerMetrics::default();
         let timeout = Duration::from_secs(5);
+        let mut task_manager = TaskManager::new("Batch Builder Test");
         let block_provider = Worker::new(
             0,
             Some(qw),
@@ -393,6 +394,7 @@ mod tests {
             store.clone(),
             timeout,
             WorkerNetworkHandle::new_for_test(),
+            &mut task_manager,
         );
 
         // build execution block proposer
