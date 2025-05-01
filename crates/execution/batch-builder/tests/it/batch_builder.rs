@@ -41,7 +41,7 @@ impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
 #[tokio::test]
 async fn test_make_batch_el_to_cl() {
     let tmp_dir = TempDir::new().expect("temp dir");
-    let task_manager = TaskManager::default();
+    let mut task_manager = TaskManager::default();
     //
     //=== Consensus Layer
     //
@@ -64,6 +64,7 @@ async fn test_make_batch_el_to_cl() {
         store.clone(),
         timeout,
         WorkerNetworkHandle::new_for_test(),
+        &mut task_manager,
     );
 
     //

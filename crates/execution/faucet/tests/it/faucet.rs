@@ -256,6 +256,7 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
     let qw = TestChanQuorumWaiter(to_worker);
     let node_metrics = WorkerMetrics::default();
     let timeout = Duration::from_secs(5);
+    let mut task_manager = TaskManager::default();
     let batch_provider = Worker::new(
         0,
         Some(qw.clone()),
@@ -264,6 +265,7 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
         store.clone(),
         timeout,
         WorkerNetworkHandle::new_for_test(),
+        &mut task_manager,
     );
 
     let shutdown = Notifier::default();

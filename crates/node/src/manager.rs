@@ -32,8 +32,11 @@ const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
 /// The execution engine task manager name.
 const ENGINE_TASK_MANAGER: &str = "Engine Task Manager";
 
-/// The execution engine task manager name.
+/// The primary task manager name.
 pub(super) const PRIMARY_TASK_MANAGER: &str = "Primary Task Manager";
+
+/// The worker's base task manager name. This is used by `fn worker_task_manager_name(id)`.
+pub(super) const WORKER_TASK_MANAGER_BASE: &str = "Worker Task Manager";
 
 /// The long-running type that oversees epoch transitions.
 #[derive(Debug)]
@@ -158,7 +161,7 @@ where
         let mut primary_task_manager = primary.start().await?;
 
         // start worker
-        let worker = worker_node.start().await?;
+        let (mut worker_task_manager, worker) = worker_node.start().await?;
 
         // consensus config for shutdown subscribers
         let consensus_config = primary.consensus_config().await;
@@ -189,10 +192,12 @@ where
         // update tasks
         primary_task_manager.update_tasks();
         engine_task_manager.update_tasks();
+        worker_task_manager.update_tasks();
 
         // add manager as a submanager
         self.task_manager.add_task_manager(primary_task_manager);
         self.task_manager.add_task_manager(engine_task_manager);
+        self.task_manager.add_task_manager(worker_task_manager);
 
         info!(target: "epoch-manager", tasks=?self.task_manager, "TASKS");
 
