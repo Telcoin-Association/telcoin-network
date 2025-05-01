@@ -150,7 +150,7 @@ where
 
         // start consensus metrics for the epoch
         if let Some(metrics_socket) = self.builder.consensus_metrics {
-            start_prometheus_server(metrics_socket);
+            start_prometheus_server(metrics_socket, &self.epoch_task_manager);
         }
 
         // create submanager for engine tasks

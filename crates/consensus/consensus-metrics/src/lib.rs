@@ -9,6 +9,7 @@ use std::{
     task::{Context, Poll},
     time::Instant,
 };
+use tn_types::TaskManager;
 
 use once_cell::sync::OnceCell;
 use prometheus::{
@@ -240,7 +241,7 @@ pub const METRICS_ROUTE: &str = "/metrics";
 // Creates a new http server that has as a sole purpose to expose
 // and endpoint that prometheus agent can use to poll for the metrics.
 // A RegistryService is returned that can be used to get access in prometheus Registries.
-pub fn start_prometheus_server(addr: SocketAddr) {
+pub fn start_prometheus_server(addr: SocketAddr, task_manager: &TaskManager) {
     init_metrics();
     if cfg!(msim) {
         // prometheus uses difficult-to-support features such as TcpSocket::from_raw_fd(), so we
@@ -251,7 +252,7 @@ pub fn start_prometheus_server(addr: SocketAddr) {
 
     let app = Router::new().route(METRICS_ROUTE, get(metrics));
 
-    tokio::spawn(async move {
+    task_manager.spawn_task("ConsensusMetrics", async move {
         if let Err(e) = axum::Server::bind(&addr).serve(app.into_make_service()).await {
             tracing::error!(target: "prometheus", ?e, "server returned error");
         }
