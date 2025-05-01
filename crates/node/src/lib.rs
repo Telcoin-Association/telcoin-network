@@ -42,24 +42,4 @@ where
     // create the epoch manager
     let mut epoch_manager = EpochManager::new(builder, tn_datadir, passphrase)?;
     epoch_manager.run()
-    // let mut running = true;
-    // let passphrase =
-    //     if std::fs::exists(tn_datadir.validator_keys_path().join(tn_config::BLS_WRAPPED_KEYFILE))
-    //         .unwrap_or(false)
-    //     {
-    //         passphrase
-    //     } else {
-    //         None
-    //     };
-    // let key_config = KeyConfig::read_config(&tn_datadir, passphrase)?;
-    // while running {
-    //     running = launch_node_inner(
-    //         &builder,
-    //         &tn_datadir,
-    //         db.clone(),
-    //         reth_db.clone(),
-    //         key_config.clone(),
-    //     )?;
-    // }
-    // Ok(())
 }

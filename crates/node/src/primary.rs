@@ -1,4 +1,5 @@
 //! Hierarchical type to hold tasks spawned for a worker in the network.
+use crate::manager::PRIMARY_TASK_MANAGER;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_executor::{Executor, SubscriberResult};
@@ -32,7 +33,7 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
     /// method will return an error instead.
     #[instrument(name = "primary_node", skip_all)]
     async fn start(&mut self) -> eyre::Result<TaskManager> {
-        let task_manager = TaskManager::new("Primary Task Manager");
+        let task_manager = TaskManager::new(PRIMARY_TASK_MANAGER);
         // spawn primary and update `self`
         self.spawn_primary(&task_manager).await?;
 

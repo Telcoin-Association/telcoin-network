@@ -1,7 +1,8 @@
 //! Hierarchical type to hold tasks spawned for a worker in the network.
+use crate::manager::WORKER_TASK_MANAGER_BASE;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
-use tn_types::{BatchValidation, Database as ConsensusDatabase, WorkerId};
+use tn_types::{BatchValidation, Database as ConsensusDatabase, TaskManager, WorkerId};
 use tn_worker::{
     metrics::Metrics, new_worker, quorum_waiter::QuorumWaiter, Worker, WorkerNetworkHandle,
 };
@@ -22,10 +23,15 @@ pub struct WorkerNodeInner<CDB> {
 }
 
 impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
-    /// Starts the worker node with the provided info. If the node is already running then this
-    /// method will return an error instead.
+    /// Starts the worker node with the provided info.
+    ///
+    /// If the node is already running then this method will return an error instead.
+    ///
+    /// Return the task manager for the worker and the [Worker] struct for spawning execution tasks.
     #[instrument(name = "worker", skip_all)]
-    async fn start(&mut self) -> eyre::Result<Worker<CDB, QuorumWaiter>> {
+    async fn start(&mut self) -> eyre::Result<(TaskManager, Worker<CDB, QuorumWaiter>)> {
+        let task_manager_name = worker_task_manager_name(self.id);
+        let mut task_manager = TaskManager::new(task_manager_name);
         let metrics = Metrics::default();
 
         let batch_provider = new_worker(
@@ -34,9 +40,10 @@ impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
             metrics,
             self.consensus_config.clone(),
             self.network_handle.clone(),
+            &mut task_manager,
         );
 
-        Ok(batch_provider)
+        Ok((task_manager, batch_provider))
     }
 }
 
@@ -57,8 +64,13 @@ impl<CDB: ConsensusDatabase> WorkerNode<CDB> {
         Self { internal: Arc::new(RwLock::new(inner)) }
     }
 
-    pub async fn start(&self) -> eyre::Result<Worker<CDB, QuorumWaiter>> {
+    pub async fn start(&self) -> eyre::Result<(TaskManager, Worker<CDB, QuorumWaiter>)> {
         let mut guard = self.internal.write().await;
         guard.start().await
     }
+}
+
+/// Helper method to create a worker's task manager name by id.
+pub fn worker_task_manager_name(id: WorkerId) -> String {
+    format!("{WORKER_TASK_MANAGER_BASE} - {id}")
 }
