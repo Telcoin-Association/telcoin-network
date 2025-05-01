@@ -126,7 +126,7 @@ impl<DB: Database> Primary<DB> {
         &self.primary_network
     }
 
-    /// Return a reference to the Primary's state-sync.
+    /// Return a clone of the Primary's [StateSynchronizer].
     pub fn state_sync(&self) -> StateSynchronizer<DB> {
         self.state_sync.clone()
     }

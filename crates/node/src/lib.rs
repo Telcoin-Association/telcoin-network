@@ -34,10 +34,6 @@ where
     // open storage for consensus
     // In case the DB dir does not yet exist.
     let _ = std::fs::create_dir_all(&consensus_db_path);
-    // // Create both of the MDBX DBs and hold onto them.
-    // // MDBX seems to have issues occasionally if recreated on a relaunch...
-    // let db = open_db(&consensus_db_path);
-    // let reth_db = RethEnv::new_database(&builder.node_config, tn_datadir.reth_db_path())?;
 
     // create the epoch manager
     let mut epoch_manager = EpochManager::new(builder, tn_datadir, passphrase)?;

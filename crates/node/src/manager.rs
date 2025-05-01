@@ -95,6 +95,12 @@ where
     }
 
     /// Run the node, handling epoch transitions.
+    ///
+    /// This will bring up a tokio runtime and start the app within it.
+    /// It also will shutdown this runtime, potentially violently, to make
+    /// sure any lefteover tasks are ended.  This allows it to be called more
+    /// than once per program execution to support changing modes of the
+    /// running node.
     pub fn run(&mut self) -> eyre::Result<()> {
         // create dbs to survive between sync state transitions
         let reth_db =
@@ -123,12 +129,6 @@ where
     }
 
     /// Run a single epoch.
-    ///
-    /// This will bring up a tokio runtime and start the app within it.
-    /// It also will shutdown this runtime, potentially violently, to make
-    /// sure any lefteover tasks are ended.  This allows it to be called more
-    /// than once per program execution to support changing modes of the
-    /// running node.
     ///
     /// If it returns Ok(true) this indicates a mode change occurred and a restart
     /// is required.
@@ -214,8 +214,6 @@ where
     }
 
     /// Helper method to create all engine components.
-    ///
-    /// The engine task is long-living and is shared across epochs.
     fn create_engine(
         &self,
         engine_task_manager: &TaskManager,

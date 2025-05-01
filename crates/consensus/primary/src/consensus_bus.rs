@@ -142,10 +142,10 @@ struct ConsensusBusInner {
 }
 
 /// The type that holds the collection of send/sync channels for
-/// inner task communicatin during consensus.
+/// inter-task communication during consensus.
 #[derive(Clone, Debug)]
 pub struct ConsensusBus {
-    /// The inner type to make this thread-safe.
+    /// The inner type to make this thread-safe and cheap to own.
     inner: Arc<ConsensusBusInner>,
 }
 
