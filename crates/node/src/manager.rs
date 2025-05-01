@@ -26,7 +26,10 @@ use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::{runtime::Builder, sync::mpsc};
 use tracing::info;
 
-/// The execution engine task manager name.
+/// The long-running task manager name.
+const NODE_TASK_MANAGER: &str = "Node Task Manager";
+
+/// The epoch-specific task manager name.
 const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
 
 /// The execution engine task manager name.
@@ -51,10 +54,14 @@ pub struct EpochManager<P> {
     primary_node: Option<PrimaryNode<DatabaseType>>,
     /// Worker node.
     worker_node: Option<WorkerNode<DatabaseType>>,
-    /// Main task manager that runs across epochs
-    task_manager: TaskManager,
     /// Key config - loaded once for application lifetime.
     key_config: KeyConfig,
+    /// Main task manager that manages tasks across epochs.
+    /// Long-running tasks for the lifetime of the node.
+    node_task_manager: TaskManager,
+    /// The task manager that resets every epoch.
+    /// Short-running tasks for the lifetime of the epoch.
+    epoch_task_manager: TaskManager,
 }
 
 impl<P> EpochManager<P>
@@ -68,7 +75,8 @@ where
         passphrase: Option<String>,
     ) -> eyre::Result<Self> {
         // create main task manager for all tasks
-        let task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
+        let node_task_manager = TaskManager::new(NODE_TASK_MANAGER);
+        let epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
 
         let passphrase = if std::fs::exists(
             tn_datadir.validator_keys_path().join(tn_config::BLS_WRAPPED_KEYFILE),
@@ -89,8 +97,9 @@ where
             execution_node: None,
             primary_node: None,
             worker_node: None,
-            task_manager,
             key_config,
+            node_task_manager,
+            epoch_task_manager,
         })
     }
 
@@ -194,15 +203,18 @@ where
         engine_task_manager.update_tasks();
         worker_task_manager.update_tasks();
 
-        // add manager as a submanager
-        self.task_manager.add_task_manager(primary_task_manager);
-        self.task_manager.add_task_manager(engine_task_manager);
-        self.task_manager.add_task_manager(worker_task_manager);
+        // add epoch-specific tasks to manager
+        self.epoch_task_manager.add_task_manager(primary_task_manager);
+        self.epoch_task_manager.add_task_manager(worker_task_manager);
 
-        info!(target: "epoch-manager", tasks=?self.task_manager, "TASKS");
+        // add long-running tasks to manager
+        self.node_task_manager.add_task_manager(engine_task_manager);
 
-        // await all tasks on epoch-manager
-        self.task_manager.join_until_exit(consensus_config.shutdown().clone()).await;
+        info!(target: "epoch-manager", tasks=?self.epoch_task_manager, "EPOCH TASKS");
+        info!(target: "epoch-manager", tasks=?self.node_task_manager, "NODE TASKS");
+
+        // await all tasks on epoch-task-manager
+        self.epoch_task_manager.join_until_exit(consensus_config.shutdown().clone()).await;
         let running = consensus_bus.restart();
 
         // reset to default - this is updated during restart sequence
@@ -331,7 +343,7 @@ where
         let rx_shutdown = consensus_config.shutdown().subscribe();
 
         // spawn long-running primary network task
-        self.task_manager.spawn_task("Primary Network", async move {
+        self.node_task_manager.spawn_task("Primary Network", async move {
             tokio::select!(
                 _ = &rx_shutdown => {
                     Ok(())
@@ -366,7 +378,7 @@ where
             .others_primaries_by_id(consensus_config.authority_id().as_ref())
         {
             let peer_id = authority_id.peer_id();
-            Self::dial_peer(network_handle.clone(), peer_id, addr);
+            self.dial_peer(network_handle.clone(), peer_id, addr);
         }
 
         // wait until the primary has connected with at least 1 peer
@@ -385,7 +397,7 @@ where
             consensus_bus.clone(),
             state_sync,
         )
-        .spawn(&self.task_manager);
+        .spawn(&self.node_task_manager);
 
         Ok(primary_network_handle)
     }
@@ -402,11 +414,14 @@ where
 
     /// Dial peer.
     fn dial_peer<Req: TNMessage, Res: TNMessage>(
+        &self,
         handle: NetworkHandle<Req, Res>,
         peer_id: PeerId,
         peer_addr: Multiaddr,
     ) {
-        tokio::spawn(async move {
+        // spawn dials on long-running task manager
+        let task_name = format!("DialPeer {peer_id}");
+        self.node_task_manager.spawn_task(task_name, async move {
             let mut backoff = 1;
             while let Err(e) = handle.dial(peer_id, peer_addr.clone()).await {
                 tracing::warn!(target: "node", "failed to dial {peer_id} at {peer_addr}: {e}");
@@ -437,7 +452,7 @@ where
         let rx_shutdown = consensus_config.shutdown().subscribe();
 
         // spawn long-running worker network task
-        self.task_manager.spawn_task("Worker Network", async move {
+        self.node_task_manager.spawn_task("Worker Network", async move {
             tokio::select!(
                 _ = &rx_shutdown => {
                     Ok(())
@@ -457,7 +472,7 @@ where
 
         for (peer_id, addr) in consensus_config.worker_cache().all_workers() {
             if addr != worker_address {
-                Self::dial_peer(network_handle.clone(), peer_id, addr);
+                self.dial_peer(network_handle.clone(), peer_id, addr);
             }
         }
 
@@ -470,7 +485,7 @@ where
             *worker_id,
             validator,
         )
-        .spawn(&self.task_manager);
+        .spawn(&self.node_task_manager);
 
         Ok(worker_network_handle)
     }
@@ -531,7 +546,8 @@ where
         consensus_bus: ConsensusBus,
         mut engine_state: mpsc::Receiver<SealedBlock>,
     ) {
-        self.task_manager.spawn_task("latest execution block", async move {
+        // spawn epoch-specific task to forward blocks from the engine to consensus
+        self.epoch_task_manager.spawn_task("latest execution block", async move {
             loop {
                 tokio::select!(
                     _ = &shutdown => {
