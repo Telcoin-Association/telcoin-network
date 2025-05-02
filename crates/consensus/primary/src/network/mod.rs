@@ -386,9 +386,8 @@ where
         channel: ResponseChannel<PrimaryResponse>,
     ) {
         let network_handle = self.network_handle.clone();
-        let task_name = format!("ProcessPeerExchange");
         // notify peer manager and respond with ack
-        self.task_spawner.spawn_task(task_name, async move {
+        self.task_spawner.spawn_task("ProcessPeerExchange", async move {
             network_handle.process_peer_exchange(peers, channel).await;
         });
     }
