@@ -23,7 +23,8 @@ use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, try_decode, AuthorityIdentifier, BlockHash, Certificate, CertificateDigest,
-    ConsensusHeader, Database, Hash as _, Header, Round, SignatureVerificationState, Vote,
+    ConsensusHeader, Database, Hash as _, Header, Round, SignatureVerificationState, TaskSpawner,
+    Vote,
 };
 use tracing::{debug, error, warn};
 
@@ -43,6 +44,8 @@ pub(crate) struct RequestHandler<DB> {
     /// header with these parents. The node keeps track of requested Certificates to prevent
     /// unsolicited certificate attacks.
     requested_parents: Arc<Mutex<BTreeMap<(Round, CertificateDigest), AuthorityIdentifier>>>,
+    /// The type to spawn tasks during the epoch.
+    task_spawner: TaskSpawner,
 }
 
 impl<DB> RequestHandler<DB>
@@ -54,8 +57,15 @@ where
         consensus_config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
         state_sync: StateSynchronizer<DB>,
+        task_spawner: TaskSpawner,
     ) -> Self {
-        Self { consensus_config, consensus_bus, state_sync, requested_parents: Default::default() }
+        Self {
+            consensus_config,
+            consensus_bus,
+            state_sync,
+            requested_parents: Default::default(),
+            task_spawner,
+        }
     }
 
     /// Process gossip from the committee.

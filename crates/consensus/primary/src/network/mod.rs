@@ -22,7 +22,7 @@ use tn_network_types::{
 use tn_storage::PayloadStore;
 use tn_types::{
     encode, BlockHash, Certificate, CertificateDigest, ConsensusHeader, Database, Header, Noticer,
-    TaskManager, TnSender, Vote,
+    TaskManager, TaskSpawner, TnSender, Vote,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
@@ -199,6 +199,8 @@ pub struct PrimaryNetwork<DB> {
     request_handler: RequestHandler<DB>,
     /// Shutdown notification.
     shutdown_rx: Noticer,
+    /// The type to spawn tasks.
+    task_spawner: TaskSpawner,
 }
 
 impl<DB> PrimaryNetwork<DB>
@@ -212,11 +214,17 @@ where
         consensus_config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
         state_sync: StateSynchronizer<DB>,
+        task_manager: &TaskManager,
     ) -> Self {
         let shutdown_rx = consensus_config.shutdown().subscribe();
-        let request_handler =
-            RequestHandler::new(consensus_config, consensus_bus, state_sync.clone());
-        Self { network_events, network_handle, request_handler, shutdown_rx }
+        let task_spawner = task_manager.get_spawner();
+        let request_handler = RequestHandler::new(
+            consensus_config,
+            consensus_bus,
+            state_sync.clone(),
+            task_spawner.clone(),
+        );
+        Self { network_events, network_handle, request_handler, shutdown_rx, task_spawner }
     }
 
     pub fn handle(&self) -> &PrimaryNetworkHandle {
@@ -284,7 +292,8 @@ where
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        tokio::spawn(async move {
+        let task_name = format!("VoteRequest-{}", header.digest());
+        self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
                 vote = request_handler.vote(peer, header, parents) => {
                     let response = vote.into_response();
@@ -299,7 +308,7 @@ where
     /// Attempt to retrieve certificates for a peer that's missing them.
     fn process_request_for_missing_certs(
         &self,
-        _peer: PeerId,
+        peer: PeerId,
         request: MissingCertificatesRequest,
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
@@ -307,7 +316,8 @@ where
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        tokio::spawn(async move {
+        let task_name = format!("MissingCertsReq-{peer}");
+        self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
                 certs = request_handler.retrieve_missing_certs(request) => {
                     let response = certs.into_response();
@@ -326,7 +336,7 @@ where
     /// Attempt to retrieve consensus chain header from the database.
     fn process_consensus_output_request(
         &self,
-        _peer: PeerId,
+        peer: PeerId,
         number: Option<u64>,
         hash: Option<BlockHash>,
         channel: ResponseChannel<PrimaryResponse>,
@@ -335,7 +345,8 @@ where
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        tokio::spawn(async move {
+        let task_name = format!("ConsensusOutputReq-{peer}");
+        self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
                 header =
                     request_handler.retrieve_consensus_header(number, hash) => {
@@ -355,9 +366,9 @@ where
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-
+        let task_name = format!("ProcessGossip-{source}");
         // spawn task to process gossip
-        tokio::spawn(async move {
+        self.task_spawner.spawn_task(task_name, async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "primary::network", ?e, "process_gossip");
                 // convert error into penalty to lower peer score
@@ -375,9 +386,9 @@ where
         channel: ResponseChannel<PrimaryResponse>,
     ) {
         let network_handle = self.network_handle.clone();
-
+        let task_name = format!("ProcessPeerExchange");
         // notify peer manager and respond with ack
-        tokio::spawn(async move {
+        self.task_spawner.spawn_task(task_name, async move {
             network_handle.process_peer_exchange(peers, channel).await;
         });
     }
