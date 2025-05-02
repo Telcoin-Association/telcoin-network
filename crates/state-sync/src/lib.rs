@@ -12,7 +12,7 @@ use tn_primary::{
     consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, NodeMode,
 };
 use tn_storage::tables::{Batches, ConsensusBlockNumbersByDigest, ConsensusBlocks};
-use tn_types::{ConsensusHeader, ConsensusOutput, Database, DbTxMut, TaskManagerClone, TnSender};
+use tn_types::{ConsensusHeader, ConsensusOutput, Database, DbTxMut, TaskSpawner, TnSender};
 use tracing::{error, info};
 
 /// Return true if this node should be able to participate as a CVV, false otherwise.
@@ -67,7 +67,7 @@ pub fn spawn_state_sync<DB: Database>(
     config: ConsensusConfig<DB>,
     consensus_bus: ConsensusBus,
     network: PrimaryNetworkHandle,
-    task_manager: TaskManagerClone,
+    task_manager: TaskSpawner,
 ) {
     let mode = *consensus_bus.node_mode().borrow();
     match mode {

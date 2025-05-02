@@ -150,7 +150,7 @@ where
 
         // start consensus metrics for the epoch
         if let Some(metrics_socket) = self.builder.consensus_metrics {
-            start_prometheus_server(metrics_socket);
+            start_prometheus_server(metrics_socket, &self.epoch_task_manager);
         }
 
         // create submanager for engine tasks
@@ -396,6 +396,7 @@ where
             consensus_config.clone(),
             consensus_bus.clone(),
             state_sync,
+            &self.epoch_task_manager, // tasks should abort with epoch
         )
         .spawn(&self.node_task_manager);
 

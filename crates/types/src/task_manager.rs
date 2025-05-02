@@ -52,12 +52,17 @@ pub struct TaskManager {
     new_task_tx: mpsc::Sender<TaskHandle>,
 }
 
+/// The type that can spawn tasks for a parent `TaskManager`.
+///
+/// The TaskSpawner is clone-able and forwards tasks to the task manager
+/// to track. This type lives with other types to spawn short-lived tasks.
 #[derive(Clone, Debug)]
-pub struct TaskManagerClone {
+pub struct TaskSpawner {
+    /// The channel to forward task handles to the parent [TaskManager].
     new_task_tx: mpsc::Sender<TaskHandle>,
 }
 
-impl TaskManagerClone {
+impl TaskSpawner {
     /// Spawns a task on tokio and records it's JoinHandle and name.
     pub fn spawn_task<F, S: ToString>(&self, name: S, future: F)
     where
@@ -107,8 +112,8 @@ impl TaskManager {
     }
 
     /// Return a clonable spawner (also implements Reth's TaskSpawner trait).
-    pub fn get_spawner(&self) -> TaskManagerClone {
-        TaskManagerClone { new_task_tx: self.new_task_tx.clone() }
+    pub fn get_spawner(&self) -> TaskSpawner {
+        TaskSpawner { new_task_tx: self.new_task_tx.clone() }
     }
 
     /// Return a mutable reference to a submanager.
@@ -315,7 +320,7 @@ impl Debug for TaskManager {
     }
 }
 
-impl reth_tasks::TaskSpawner for TaskManagerClone {
+impl reth_tasks::TaskSpawner for TaskSpawner {
     fn spawn(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
         tokio::spawn(fut)
     }

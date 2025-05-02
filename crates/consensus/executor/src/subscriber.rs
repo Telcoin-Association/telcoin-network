@@ -20,7 +20,7 @@ use tn_primary::{
 use tn_storage::CertificateStore;
 use tn_types::{
     AuthorityIdentifier, Batch, BlockHash, CommittedSubDag, Committee, ConsensusHeader,
-    ConsensusOutput, Database, Hash as _, Noticer, TaskManager, TaskManagerClone, Timestamp,
+    ConsensusOutput, Database, Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp,
     TimestampSec, TnReceiver, TnSender, B256,
 };
 use tracing::{debug, error, info};
@@ -172,7 +172,7 @@ impl<DB: Database> Subscriber<DB> {
     }
 
     /// Catch up to current consensus and then try to rejoin as an active CVV.
-    async fn catch_up_rejoin_consensus(&self, tasks: TaskManagerClone) -> SubscriberResult<()> {
+    async fn catch_up_rejoin_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
         // Get a receiver than stream any missing headers so we don't miss them.
         let mut rx_consensus_headers = self.consensus_bus.consensus_header().subscribe();
         stream_missing_consensus(&self.config, &self.consensus_bus).await?;
@@ -199,7 +199,7 @@ impl<DB: Database> Subscriber<DB> {
     }
 
     /// Follow along with consensus output but do not try to join consensus.
-    async fn follow_consensus(&self, tasks: TaskManagerClone) -> SubscriberResult<()> {
+    async fn follow_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
         // Get a receiver then stream any missing headers so we don't miss them.
         let mut rx_consensus_headers = self.consensus_bus.consensus_header().subscribe();
         stream_missing_consensus(&self.config, &self.consensus_bus).await?;
