@@ -18,12 +18,32 @@ use tokio::{
 /// Used for the futures that will resolve when tasks do.
 /// Allows us to hold a FuturesUnordered in directly in the TaskManager struct.
 struct TaskHandle {
+    /// The  owned permission to join on a task (await its termination).
     handle: JoinHandle<()>,
+    /// The name for the task.
+    info: TaskInfo,
+}
+
+impl TaskHandle {
+    /// Create a new instance of `Self`.
+    fn new(name: String, handle: JoinHandle<()>, critical: bool) -> Self {
+        Self { handle, info: TaskInfo { name, critical } }
+    }
+}
+
+/// The information for task results.
+#[derive(Clone, Debug)]
+struct TaskInfo {
+    /// The name of the task.
     name: String,
+    /// Bool indicating if the task is critical. Critical tasks cause the loop to break and force
+    /// shutdown.
+    critical: bool,
 }
 
 impl Future for TaskHandle {
-    type Output = Result<String, (String, JoinError)>;
+    // Return the `name` and `critical` status for task.
+    type Output = Result<TaskInfo, (TaskInfo, JoinError)>;
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
@@ -32,8 +52,8 @@ impl Future for TaskHandle {
         let this = self.get_mut();
         match this.handle.poll_unpin(cx) {
             Poll::Ready(res) => match res {
-                Ok(_) => Poll::Ready(Ok(this.name.clone())),
-                Err(err) => Poll::Ready(Err((this.name.clone(), err))),
+                Ok(_) => Poll::Ready(Ok(this.info.clone())),
+                Err(err) => Poll::Ready(Err((this.info.clone(), err))),
             },
             Poll::Pending => Poll::Pending,
         }
@@ -63,8 +83,31 @@ pub struct TaskSpawner {
 }
 
 impl TaskSpawner {
-    /// Spawns a task on tokio and records it's JoinHandle and name.
+    /// Spawns a non-critical task on tokio and records it's JoinHandle and name. Other tasks are
+    /// unaffected when this task resolves.
     pub fn spawn_task<F, S: ToString>(&self, name: S, future: F)
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.create_task(name, future, false);
+    }
+
+    /// Spawns a critical task on tokio and records it's JoinHandle and name.
+    ///
+    /// The task is tracked as "critical". When the task resolves, other tasks
+    /// will shutdown.
+    pub fn spawn_critical_task<F, S: ToString>(&self, name: S, future: F)
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.create_task(name, future, true);
+    }
+
+    /// The main function to spawn tasks on the `tokio` runtime. These tasks are tracked by the
+    /// manager.
+    fn create_task<F, S: ToString>(&self, name: S, future: F, critical: bool)
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
@@ -73,9 +116,64 @@ impl TaskSpawner {
         let handle = tokio::spawn(async move {
             future.await;
         });
-        if let Err(err) = self.new_task_tx.try_send(TaskHandle { name, handle }) {
+        if let Err(err) = self.new_task_tx.try_send(TaskHandle::new(name, handle, critical)) {
             tracing::error!(target: "tn::tasks", "Task error sending joiner: {err}");
         }
+    }
+
+    /// Internal method to spawn and manage tasks. Critical and blocking bools are used to spawn and
+    /// track the correct type.
+    fn spawn_reth_task(
+        &self,
+        name: &str,
+        fut: BoxFuture<'static, ()>,
+        critical: bool,
+        blocking: bool,
+    ) -> JoinHandle<()> {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        // Need two join handles so do this channel dance to get them.
+        // Required because the task manager needs one and this foreign Reth interface return one.
+        let f = async move {
+            let value = fut.await;
+            let _ = tx.send(value);
+        };
+        let join = tokio::spawn(async move {
+            let _ = rx.recv().await;
+        });
+
+        match (critical, blocking) {
+            // critical, blocking
+            (true, true) => {
+                let handle = tokio::runtime::Handle::current();
+                let join_handle = tokio::task::spawn_blocking(move || handle.block_on(f));
+                if let Err(err) =
+                    self.new_task_tx.try_send(TaskHandle::new(name.to_string(), join_handle, true))
+                {
+                    tracing::error!(target: "tn::tasks", "Task error sending joiner: {err}");
+                }
+            }
+            // critical, non-blocking
+            (true, false) => {
+                self.spawn_critical_task(name, f);
+            }
+            // non-critical, blocking
+            (false, true) => {
+                let handle = tokio::runtime::Handle::current();
+                let join_handle = tokio::task::spawn_blocking(move || handle.block_on(f));
+                if let Err(err) =
+                    self.new_task_tx.try_send(TaskHandle::new(name.to_string(), join_handle, false))
+                {
+                    tracing::error!(target: "tn::tasks", "Task error sending joiner: {err}");
+                }
+            }
+            // non-critical, non-blocking
+            (false, false) => {
+                self.spawn_task(name, f);
+            }
+        }
+
+        // return join
+        join
     }
 }
 
@@ -108,7 +206,7 @@ impl TaskManager {
         let handle = tokio::spawn(async move {
             future.await;
         });
-        self.tasks.push(TaskHandle { name, handle });
+        self.tasks.push(TaskHandle::new(name, handle, true));
     }
 
     /// Return a clonable spawner (also implements Reth's TaskSpawner trait).
@@ -128,8 +226,8 @@ impl TaskManager {
 
     /// Will resolve once one of the tasks for the manager resolves.
     ///
-    /// Note the manager is based on the assumption that all tasks added via spawn_task
-    /// are critical and and one stopping is problem.
+    /// The manager tracks critical and non-critical tasks. Critical tasks
+    /// that stop force the process to shutdown.
     pub async fn join(&mut self, shutdown: Notifier) {
         self.join_internal(shutdown, false).await;
     }
@@ -144,10 +242,22 @@ impl TaskManager {
     }
 
     /// Abort all of our direct tasks (not sub task managers though).
-    /// This is included for some tests, should not use in real code.
     pub fn abort(&self) {
         for task in self.tasks.iter() {
+            tracing::debug!(target: "tn::tasks", task_name=?task.info.name, "aborting task");
             task.handle.abort();
+        }
+    }
+
+    /// Abort all tasks including submanagers.
+    ///
+    /// This is used to close epoch-related tasks.
+    pub fn abort_all_tasks(&self) {
+        self.abort();
+
+        // abort submanager tasks as well
+        for manager in self.submanagers.values() {
+            manager.abort_all_tasks();
         }
     }
 
@@ -192,20 +302,32 @@ impl TaskManager {
                     continue;
                 },
                 res = self.tasks.next() => {
+
                     // If any task self.tasks exits then this could indicate an error.
                     //
                     // Some tasks are expected to exit graceful at the epoch boundary.
                     match res {
-                        Some(Ok(name)) => {
-                            tracing::info!(target: "tn::tasks", "{}: {name} returned Ok, node exiting", self.name);
+                        Some(Ok(info)) => {
+                            // ignore short-lived, non-critical tasks that resolve
+                            if !info.critical {
+                                continue;
+                            }
+
+                            tracing::info!(target: "tn::tasks", "{}: {} returned Ok, node exiting", self.name, info.name);
                         }
-                        Some(Err((name, join_err))) => {
-                            tracing::error!(target: "tn::tasks", "{}: {name} returned error {join_err}, node exiting", self.name);
+                        Some(Err((info, join_err))) => {
+                            // ignore short-lived, non-critical tasks that resolve
+                            if !info.critical {
+                                continue;
+                            }
+
+                            tracing::error!(target: "tn::tasks", "{}: {} returned error {join_err}, node exiting", self.name, info.name);
                         }
                         None => {
                             tracing::error!(target: "tn::tasks", "{}: Out of tasks! node exiting", self.name);
                         }
                     }
+
                     break;
                 }
                 Some((_, name)) = future_managers.next() => {
@@ -223,17 +345,19 @@ impl TaskManager {
         if tokio::time::timeout(Duration::from_secs(2), async move {
             while let Some(res) = self.tasks.next().await {
                 match res {
-                    Ok(name) => {
+                    Ok(info) => {
                         tracing::info!(
                             target = "tn::tasks",
-                            "{}: {name} shutdown successfully",
-                            self.name
+                            "{}: {} shutdown successfully",
+                            self.name,
+                            info.name,
                         )
                     }
-                    Err((name, err)) => tracing::error!(
+                    Err((info, err)) => tracing::error!(
                         target = "tn::tasks",
-                        "{}: {name} shutdown with error {err}",
-                        self.name
+                        "{}: {} shutdown with error {err}",
+                        self.name,
+                        info.name,
                     ),
                 }
             }
@@ -303,7 +427,7 @@ impl Display for TaskManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "{}", self.name)?;
         for task in self.tasks.iter() {
-            writeln!(f, "Task: {}", task.name)?;
+            writeln!(f, "Task: {} (critical: {})", task.info.name, task.info.critical)?;
         }
         for sub in self.submanagers.values() {
             writeln!(f, "++++++++++++++++++++++++++++++++++++++++++++++++++++")?;
@@ -322,27 +446,15 @@ impl Debug for TaskManager {
 
 impl reth_tasks::TaskSpawner for TaskSpawner {
     fn spawn(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
-        tokio::spawn(fut)
+        self.spawn_reth_task("reth-task", fut, false, false)
     }
 
     fn spawn_critical(&self, name: &'static str, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
-        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
-        // Need two join handles so do this channel dance to get them.
-        // Required because the task manager needs one and this foreign Reth interface return one.
-        let f = async move {
-            let value = fut.await;
-            let _ = tx.send(value);
-        };
-        let join = tokio::spawn(async move {
-            let _ = rx.recv().await;
-        });
-        self.spawn_task(name.to_string(), f);
-        join
+        self.spawn_reth_task(name, fut, true, false)
     }
 
     fn spawn_blocking(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
-        let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || handle.block_on(fut))
+        self.spawn_reth_task("reth-blocking-task", fut, false, true)
     }
 
     fn spawn_critical_blocking(
@@ -350,23 +462,6 @@ impl reth_tasks::TaskSpawner for TaskSpawner {
         name: &'static str,
         fut: BoxFuture<'static, ()>,
     ) -> JoinHandle<()> {
-        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
-        // Need two join handles so do this channel dance to get them.
-        // Required because the task manager needs one and this foreign Reth interface return one.
-        let f = async move {
-            let value = fut.await;
-            let _ = tx.send(value);
-        };
-        let join = tokio::spawn(async move {
-            let _ = rx.recv().await;
-        });
-        let handle = tokio::runtime::Handle::current();
-        let join_handle = tokio::task::spawn_blocking(move || handle.block_on(f));
-        if let Err(err) =
-            self.new_task_tx.try_send(TaskHandle { name: name.to_string(), handle: join_handle })
-        {
-            tracing::error!(target: "tn::tasks", "Task error sending joiner: {err}");
-        }
-        join
+        self.spawn_reth_task(name, fut, true, true)
     }
 }
