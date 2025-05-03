@@ -11,6 +11,7 @@ use libp2p::{
     Multiaddr, PeerId, TransportError,
 };
 use std::collections::{HashMap, HashSet};
+use tn_types::TaskSpawner;
 use tokio::sync::{mpsc, oneshot};
 
 /// The result for network operations.
@@ -63,6 +64,8 @@ pub enum NetworkEvent<Req, Res> {
     },
     /// Gossip message received and propagation source.
     Gossip(GossipMessage, PeerId),
+    /// The node has entered a new epoch resulting in a new `TaskSpawner`.
+    Epoch(TaskSpawner),
 }
 
 /// Commands for the swarm.
@@ -237,6 +240,11 @@ where
     NewEpoch {
         /// The epoch committee.
         committee: HashMap<PeerId, Multiaddr>,
+    },
+    /// TODO: combine with the variant above
+    UpdateTaskSpawner {
+        /// The new task spawner for this epoch.
+        task_spawner: TaskSpawner,
     },
 }
 
@@ -465,6 +473,14 @@ where
     /// Create a [PeerExchangeMap] for exchanging peers.
     pub async fn new_epoch(&self, committee: HashMap<PeerId, Multiaddr>) -> NetworkResult<()> {
         self.sender.send(NetworkCommand::NewEpoch { committee }).await?;
+        Ok(())
+    }
+
+    /// Update the task spawner for the new epoch.
+    ///
+    /// TODO: consolidate this with the method above.
+    pub async fn update_task_spawner(&self, task_spawner: TaskSpawner) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::UpdateTaskSpawner { task_spawner }).await?;
         Ok(())
     }
 }

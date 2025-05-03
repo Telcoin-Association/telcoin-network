@@ -245,7 +245,7 @@ where
             tokio::select! {
                 event = self.swarm.select_next_some() => self.process_event(event).await?,
                 command = self.commands.recv() => match command {
-                    Some(c) => self.process_command(c),
+                    Some(c) => self.process_command(c)?,
                     None => {
                         info!(target: "network", "network shutting down...");
                         return Ok(())
@@ -302,7 +302,7 @@ where
     }
 
     /// Process commands for the network.
-    fn process_command(&mut self, command: NetworkCommand<Req, Res>) {
+    fn process_command(&mut self, command: NetworkCommand<Req, Res>) -> NetworkResult<()> {
         match command {
             NetworkCommand::UpdateAuthorizedPublishers { authorities, reply } => {
                 // this value should be updated at the start of each epoch
@@ -432,7 +432,17 @@ where
 
                 self.swarm.behaviour_mut().peer_manager.new_epoch(committee);
             }
+            // TODO: combine this with the command above
+            NetworkCommand::UpdateTaskSpawner { task_spawner } => {
+                if let Err(e) = self.event_stream.try_send(NetworkEvent::Epoch(task_spawner)) {
+                    error!(target: "network", ?e, "failed to update task spawner for new epoch!");
+                    // fatal - unable to transition epochs
+                    return Err(e.into());
+                }
+            }
         }
+
+        Ok(())
     }
 
     /// Process gossip events.

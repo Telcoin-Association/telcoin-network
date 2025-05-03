@@ -15,7 +15,7 @@ use tn_network_libp2p::{
 use tn_network_types::{FetchBatchResponse, PrimaryToWorkerClient, WorkerSynchronizeMessage};
 use tn_storage::tables::Batches;
 use tn_types::{
-    encode, now, Batch, BatchValidation, BlockHash, Database, DbTxMut, SealedBatch, TaskManager,
+    encode, now, Batch, BatchValidation, BlockHash, Database, DbTxMut, SealedBatch, TaskSpawner,
     WorkerId,
 };
 use tokio::{
@@ -258,8 +258,8 @@ where
     }
 
     /// Run the network.
-    pub fn spawn(mut self, task_manager: &TaskManager) {
-        task_manager.spawn_task("worker network events", async move {
+    pub fn spawn(mut self, node_task_spawner: &TaskSpawner) {
+        node_task_spawner.spawn_task("worker network events", async move {
             loop {
                 while let Some(event) = self.network_events.recv().await {
                     self.process_network_event(event);
@@ -286,6 +286,13 @@ where
             },
             NetworkEvent::Gossip(msg, source) => {
                 self.process_gossip(msg, source);
+            }
+            NetworkEvent::Epoch(_) => {
+                tracing::info!(
+                    target: "worker",
+                    "received epoch network event for worker network handle !!!!!!!!! delete me"
+                );
+                // TODO: confirm no need to update for now
             }
         }
     }

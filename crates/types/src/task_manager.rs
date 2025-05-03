@@ -116,8 +116,9 @@ impl TaskSpawner {
         let handle = tokio::spawn(async move {
             future.await;
         });
-        if let Err(err) = self.new_task_tx.try_send(TaskHandle::new(name, handle, critical)) {
-            tracing::error!(target: "tn::tasks", "Task error sending joiner: {err}");
+        if let Err(err) = self.new_task_tx.try_send(TaskHandle::new(name.clone(), handle, critical))
+        {
+            tracing::error!(target: "tn::tasks", "Task error sending joiner for {name}: {err}");
         }
     }
 
@@ -149,7 +150,7 @@ impl TaskSpawner {
                 if let Err(err) =
                     self.new_task_tx.try_send(TaskHandle::new(name.to_string(), join_handle, true))
                 {
-                    tracing::error!(target: "tn::tasks", "Task error sending joiner: {err}");
+                    tracing::error!(target: "tn::tasks", "Task error sending joiner for critical, blocking task: {err}");
                 }
             }
             // critical, non-blocking
@@ -163,7 +164,7 @@ impl TaskSpawner {
                 if let Err(err) =
                     self.new_task_tx.try_send(TaskHandle::new(name.to_string(), join_handle, false))
                 {
-                    tracing::error!(target: "tn::tasks", "Task error sending joiner: {err}");
+                    tracing::error!(target: "tn::tasks", "Task error sending joiner for non-critical, blocking task: {err}");
                 }
             }
             // non-critical, non-blocking
@@ -278,6 +279,21 @@ impl TaskManager {
         }
     }
 
+    // /// Abort and await the termination of all tasks.
+    // pub async fn shutdown_and_wait(&mut self) -> bool {
+    //     // abort all tasks
+    //     self.abort_all_tasks();
+
+    //     // wait for tasks to complete
+    //     match timeout(Duration::from_secs(30), self.wait_for_empty_tasks()).await {
+    //         Ok(_) => true, // All tasks completed
+    //         Err(_) => {
+    //             tracing::error!(target: "tn::tasks", "{}: Tasks did not terminate within timeout", self.name);
+    //             false // Timed out
+    //         }
+    //     }
+    // }
+
     /// Implements the join logic for the manager.
     async fn join_internal(&mut self, shutdown: Notifier, do_exit: bool) {
         let shutdown_ref = &shutdown;
@@ -341,8 +357,8 @@ impl TaskManager {
         shutdown.notify();
         let task_name = self.name.clone();
         // wait some time for shutdown...
-        // Two seconds for our tasks to end...
-        if tokio::time::timeout(Duration::from_secs(2), async move {
+        // 15 seconds for our tasks to end...
+        if tokio::time::timeout(Duration::from_secs(15), async move {
             while let Some(res) = self.tasks.next().await {
                 match res {
                     Ok(info) => {
@@ -369,9 +385,9 @@ impl TaskManager {
             tracing::error!(target = "tn::tasks", "{}: All tasks NOT shutdown", task_name);
         }
 
-        // Another two seconds for any of our sub tasks to end...
+        // Another 15 seconds for any of our sub tasks to end...
         let task_name_clone = task_name.clone();
-        if tokio::time::timeout(Duration::from_secs(2), async move {
+        if tokio::time::timeout(Duration::from_secs(15), async move {
             while let Some((_, name)) = future_managers.next().await {
                 tracing::info!(
                     target = "tn::tasks",

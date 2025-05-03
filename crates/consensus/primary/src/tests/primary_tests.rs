@@ -38,15 +38,16 @@ fn get_bus_and_primary<DB: Database>(
         .expect("p2p network create failed!");
     let consensus_network_handle = consensus_network.network_handle();
     let state_sync = StateSynchronizer::new(config.clone(), consensus_bus.clone());
+    let task_spawner = task_manager.get_spawner();
     let primary_network = PrimaryNetwork::new(
         rx_event_stream,
         consensus_network_handle.clone().into(),
         config.clone(),
         consensus_bus.clone(),
         state_sync.clone(),
-        task_manager.get_spawner(),
+        task_spawner.clone(),
     );
-    primary_network.spawn(task_manager);
+    primary_network.spawn(&task_spawner);
 
     let primary = Primary::new(config, &consensus_bus, consensus_network_handle.into(), state_sync);
     (consensus_bus, primary)

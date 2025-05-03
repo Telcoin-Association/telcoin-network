@@ -22,7 +22,7 @@ use tn_network_types::{
 use tn_storage::PayloadStore;
 use tn_types::{
     encode, BlockHash, Certificate, CertificateDigest, ConsensusHeader, Database, Header,
-    TaskManager, TaskSpawner, TnSender, Vote,
+    TaskSpawner, TnSender, Vote,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
@@ -187,6 +187,13 @@ impl PrimaryNetworkHandle {
     pub async fn connected_peers(&self) -> NetworkResult<Vec<PeerId>> {
         self.handle.connected_peers().await
     }
+
+    /// Update the task spawner for the epoch.
+    ///
+    /// This is needed for each new epoch so epoch-related tasks are closed with the epoch.
+    pub async fn new_epoch(&self, task_spawner: TaskSpawner) -> NetworkResult<()> {
+        self.handle.update_task_spawner(task_spawner).await
+    }
 }
 
 /// Handle inter-node communication between primaries.
@@ -228,8 +235,8 @@ where
     }
 
     /// Run the network.
-    pub fn spawn(mut self, task_manager: &TaskManager) {
-        task_manager.spawn_task("primary network events", async move {
+    pub fn spawn(mut self, node_task_spawner: &TaskSpawner) {
+        node_task_spawner.spawn_critical_task("primary network events", async move {
             while let Some(event) = self.network_events.recv().await {
                 self.process_network_event(event)
             }
@@ -237,7 +244,7 @@ where
     }
 
     /// Handle events concurrently.
-    fn process_network_event(&self, event: NetworkEvent<Req, Res>) {
+    fn process_network_event(&mut self, event: NetworkEvent<Req, Res>) {
         // match event
         match event {
             NetworkEvent::Request { peer, request, channel, cancel } => match request {
@@ -262,6 +269,10 @@ where
             },
             NetworkEvent::Gossip(msg, source) => {
                 self.process_gossip(msg, source);
+            }
+            NetworkEvent::Epoch(task_spawner) => {
+                // update task spawner
+                self.task_spawner = task_spawner;
             }
         }
     }
