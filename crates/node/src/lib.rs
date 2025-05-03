@@ -4,6 +4,7 @@
 use engine::TnBuilder;
 use manager::EpochManager;
 use tn_config::TelcoinDirs;
+use tokio::runtime::Builder;
 use tracing::{instrument, warn};
 
 pub mod engine;
@@ -35,7 +36,21 @@ where
     // In case the DB dir does not yet exist.
     let _ = std::fs::create_dir_all(&consensus_db_path);
 
-    // create the epoch manager
-    let mut epoch_manager = EpochManager::new(builder, tn_datadir, passphrase)?;
-    epoch_manager.run()
+    let runtime = Builder::new_multi_thread()
+        .thread_name("telcoin-network")
+        .enable_io()
+        .enable_time()
+        .build()?;
+
+    let res = runtime.block_on(async move {
+        // create the epoch manager
+        let mut epoch_manager = EpochManager::new(builder, tn_datadir, passphrase)?;
+        epoch_manager.run().await
+    });
+
+    // shutdown background tasks
+    runtime.shutdown_background();
+
+    // return result after shutdown
+    res
 }

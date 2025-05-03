@@ -214,10 +214,9 @@ where
         consensus_config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
         state_sync: StateSynchronizer<DB>,
-        task_manager: &TaskManager,
+        task_spawner: TaskSpawner,
     ) -> Self {
         let shutdown_rx = consensus_config.shutdown().subscribe();
-        let task_spawner = task_manager.get_spawner();
         let request_handler = RequestHandler::new(
             consensus_config,
             consensus_bus,

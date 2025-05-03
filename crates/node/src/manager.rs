@@ -23,7 +23,7 @@ use tn_types::{
     TaskManager,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
-use tokio::{runtime::Builder, sync::mpsc};
+use tokio::sync::mpsc;
 use tracing::info;
 
 /// The long-running task manager name.
@@ -110,7 +110,7 @@ where
     /// sure any lefteover tasks are ended.  This allows it to be called more
     /// than once per program execution to support changing modes of the
     /// running node.
-    pub fn run(&mut self) -> eyre::Result<()> {
+    pub async fn run(&mut self) -> eyre::Result<()> {
         // create dbs to survive between sync state transitions
         let reth_db =
             RethEnv::new_database(&self.builder.node_config, self.tn_datadir.reth_db_path())?;
@@ -120,17 +120,16 @@ where
         let mut running = true;
         while running {
             running = {
-                let runtime = Builder::new_multi_thread()
-                    .thread_name("telcoin-network")
-                    .enable_io()
-                    .enable_time()
-                    .build()?;
+                let epoch_result = self.run_epoch(reth_db.clone(), consensus_db.clone()).await;
 
-                let res = runtime.block_on(self.run_epoch(reth_db.clone(), consensus_db.clone()));
-                // shutdown background tasks
-                runtime.shutdown_background();
-                // return result after shutdown
-                res?
+                // abort all epoch-related tasks
+                self.epoch_task_manager.abort_all_tasks();
+
+                // create new manager for next epoch
+                self.epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
+
+                // return result after aborting all tasks
+                epoch_result?
             }
         }
 
@@ -396,7 +395,7 @@ where
             consensus_config.clone(),
             consensus_bus.clone(),
             state_sync,
-            &self.epoch_task_manager, // tasks should abort with epoch
+            self.epoch_task_manager.get_spawner(), // tasks should abort with epoch
         )
         .spawn(&self.node_task_manager);
 
