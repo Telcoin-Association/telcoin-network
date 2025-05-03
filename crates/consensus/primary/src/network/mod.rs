@@ -21,7 +21,7 @@ use tn_network_types::{
 };
 use tn_storage::PayloadStore;
 use tn_types::{
-    encode, BlockHash, Certificate, CertificateDigest, ConsensusHeader, Database, Header, Noticer,
+    encode, BlockHash, Certificate, CertificateDigest, ConsensusHeader, Database, Header,
     TaskManager, TaskSpawner, TnSender, Vote,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -197,8 +197,6 @@ pub struct PrimaryNetwork<DB> {
     network_handle: PrimaryNetworkHandle,
     /// Request handler to process requests and return responses.
     request_handler: RequestHandler<DB>,
-    /// Shutdown notification.
-    shutdown_rx: Noticer,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
 }
@@ -216,14 +214,13 @@ where
         state_sync: StateSynchronizer<DB>,
         task_spawner: TaskSpawner,
     ) -> Self {
-        let shutdown_rx = consensus_config.shutdown().subscribe();
         let request_handler = RequestHandler::new(
             consensus_config,
             consensus_bus,
             state_sync.clone(),
             task_spawner.clone(),
         );
-        Self { network_events, network_handle, request_handler, shutdown_rx, task_spawner }
+        Self { network_events, network_handle, request_handler, task_spawner }
     }
 
     pub fn handle(&self) -> &PrimaryNetworkHandle {
@@ -233,16 +230,8 @@ where
     /// Run the network.
     pub fn spawn(mut self, task_manager: &TaskManager) {
         task_manager.spawn_task("primary network events", async move {
-            loop {
-                tokio::select!(
-                    _ = &self.shutdown_rx => break,
-                    event = self.network_events.recv() => {
-                        match event {
-                            Some(e) => self.process_network_event(e),
-                            None => break,
-                        }
-                    }
-                )
+            while let Some(event) = self.network_events.recv().await {
+                self.process_network_event(event)
             }
         });
     }

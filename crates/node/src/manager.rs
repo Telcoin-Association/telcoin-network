@@ -9,6 +9,7 @@ use crate::{
     worker::WorkerNode,
 };
 use consensus_metrics::start_prometheus_server;
+use eyre::eyre;
 use std::{str::FromStr as _, sync::Arc, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkHandle, ConsensusNetwork, PeerId, TNMessage};
@@ -19,8 +20,8 @@ use tn_primary::{
 use tn_reth::{RethDb, RethEnv};
 use tn_storage::{open_db, tables::ConsensusBlocks, DatabaseType};
 use tn_types::{
-    BatchValidation, ConsensusHeader, Database as TNDatabase, Multiaddr, Noticer, SealedBlock,
-    TaskManager,
+    BatchValidation, ConsensusHeader, Database as TNDatabase, Multiaddr, Noticer, Notifier,
+    SealedBlock, TaskManager, TaskSpawner,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -48,20 +49,14 @@ pub struct EpochManager<P> {
     builder: TnBuilder,
     /// The data directory
     tn_datadir: P,
-    /// The execution engine that should continue across epochs.
-    execution_node: Option<ExecutionNode>,
     /// Primary network handle.
     primary_network_handle: Option<PrimaryNetworkHandle>,
     /// Worker network handle.
     worker_network_handle: Option<WorkerNetworkHandle>,
     /// Key config - loaded once for application lifetime.
     key_config: KeyConfig,
-    /// Main task manager that manages tasks across epochs.
-    /// Long-running tasks for the lifetime of the node.
-    node_task_manager: TaskManager,
-    /// The task manager that resets every epoch.
-    /// Short-running tasks for the lifetime of the epoch.
-    epoch_task_manager: TaskManager,
+    /// The epoch manager's [Notifier] to shutdown all node processes.
+    node_shutdown: Notifier,
 }
 
 impl<P> EpochManager<P>
@@ -74,10 +69,6 @@ where
         tn_datadir: P,
         passphrase: Option<String>,
     ) -> eyre::Result<Self> {
-        // create main task manager for all tasks
-        let node_task_manager = TaskManager::new(NODE_TASK_MANAGER);
-        let epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
-
         let passphrase = if std::fs::exists(
             tn_datadir.validator_keys_path().join(tn_config::BLS_WRAPPED_KEYFILE),
         )
@@ -91,15 +82,16 @@ where
         // create key config for lifetime of the app
         let key_config = KeyConfig::read_config(&tn_datadir, passphrase)?;
 
+        // shutdown long-running node components
+        let node_shutdown = Notifier::new();
+
         Ok(Self {
             builder,
             tn_datadir,
-            execution_node: None,
             primary_network_handle: None,
             worker_network_handle: None,
             key_config,
-            node_task_manager,
-            epoch_task_manager,
+            node_shutdown,
         })
     }
 
@@ -124,15 +116,30 @@ where
 
         // start initial epoch
         let mut running = true;
+
+        // Main task manager that manages tasks across epochs.
+        // Long-running tasks for the lifetime of the node.
+        let mut node_task_manager = TaskManager::new(NODE_TASK_MANAGER);
+
+        // The task manager that resets every epoch.
+        // Short-running tasks for the lifetime of the epoch.
+        let mut epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
+
         while running {
             running = {
-                let epoch_result = self.run_epoch(reth_db.clone(), consensus_db.clone()).await;
-
+                let epoch_result = self
+                    .run_epoch(
+                        reth_db.clone(),
+                        consensus_db.clone(),
+                        &mut node_task_manager,
+                        &mut epoch_task_manager,
+                    )
+                    .await;
                 // abort all epoch-related tasks
-                self.epoch_task_manager.abort_all_tasks();
+                epoch_task_manager.abort_all_tasks();
 
                 // create new manager for next epoch
-                self.epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
+                epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
 
                 // return result after aborting all tasks
                 epoch_result?
@@ -150,12 +157,14 @@ where
         &mut self,
         reth_db: RethDb,
         consensus_db: DatabaseType,
+        node_task_manager: &mut TaskManager,
+        epoch_task_manager: &mut TaskManager,
     ) -> eyre::Result<bool> {
         info!(target: "epoch-manager", "Starting node");
 
         // start consensus metrics for the epoch
         if let Some(metrics_socket) = self.builder.consensus_metrics {
-            start_prometheus_server(metrics_socket, &self.epoch_task_manager);
+            start_prometheus_server(metrics_socket, epoch_task_manager);
         }
 
         // create submanager for engine tasks
@@ -165,7 +174,9 @@ where
         let engine = self.create_engine(&engine_task_manager, reth_db)?;
 
         // create primary and worker nodes
-        let (primary, worker_node) = self.create_consensus(&engine, consensus_db).await?;
+        let (primary, worker_node) = self
+            .create_consensus(&engine, consensus_db, node_task_manager, epoch_task_manager)
+            .await?;
 
         // create receiving channel before spawning primary to ensure messages are not lost
         let consensus_bus = primary.consensus_bus().await;
@@ -198,40 +209,38 @@ where
             )
             .await?;
 
-        // TODO: this is probably wrong?
-        // - the challenge is ensuring engine executes last block but can't receive extra
-        // - shutdown subscriber after send but leave engine running?
-        // - have engine send ack before shutdown?
-        // - epoch manager in the middle to confirm?
-        //    - easier to broadcast once that's added
-        // take ownership over node components
-        // self.execution_node = Some(engine);
-
         // update tasks
         primary_task_manager.update_tasks();
         engine_task_manager.update_tasks();
         worker_task_manager.update_tasks();
 
         // add epoch-specific tasks to manager
-        self.epoch_task_manager.add_task_manager(primary_task_manager);
-        self.epoch_task_manager.add_task_manager(worker_task_manager);
+        epoch_task_manager.add_task_manager(primary_task_manager);
+        epoch_task_manager.add_task_manager(worker_task_manager);
 
         // add long-running tasks to manager
-        self.epoch_task_manager.add_task_manager(engine_task_manager);
+        epoch_task_manager.add_task_manager(engine_task_manager);
 
-        info!(target: "epoch-manager", tasks=?self.epoch_task_manager, "EPOCH TASKS");
-        info!(target: "epoch-manager", tasks=?self.node_task_manager, "NODE TASKS");
+        info!(target: "epoch-manager", tasks=?epoch_task_manager, "EPOCH TASKS");
+        info!(target: "epoch-manager", tasks=?node_task_manager, "NODE TASKS");
 
-        // await all tasks on epoch-task-manager
-        self.epoch_task_manager.join_until_exit(consensus_config.shutdown().clone()).await;
-        let running = consensus_bus.restart();
+        // await all tasks on epoch-task-manager or node shutdown
+        tokio::select! {
+            _ = node_task_manager.join_until_exit(self.node_shutdown.clone()) => {
+                Err(eyre!("Node task shutdown"))
+            }
+            _ = epoch_task_manager.join_until_exit(consensus_config.shutdown().clone()) => {
+                // epoch complete
+                let running = consensus_bus.restart();
 
-        // reset to default - this is updated during restart sequence
-        consensus_bus.clear_restart();
+                // reset to default - this is updated during restart sequence
+                consensus_bus.clear_restart();
 
-        info!(target: "epoch-manager", "TASKS complete, restart: {running}");
+                info!(target: "epoch-manager", "TASKS complete, restart: {running}");
 
-        Ok(running)
+                Ok(running)
+            }
+        }
     }
 
     /// Helper method to create all engine components.
@@ -254,6 +263,8 @@ where
         &mut self,
         engine: &ExecutionNode,
         consensus_db: DatabaseType,
+        node_task_manager: &TaskManager,
+        epoch_task_manager: &TaskManager,
     ) -> eyre::Result<(PrimaryNode<DatabaseType>, WorkerNode<DatabaseType>)> {
         // create config for consensus
         let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
@@ -265,11 +276,21 @@ where
             network_config,
         )?;
 
-        let primary = self.create_primary_node_components(&consensus_config).await?;
+        let primary = self
+            .create_primary_node_components(
+                &consensus_config,
+                node_task_manager,
+                epoch_task_manager.get_spawner(),
+            )
+            .await?;
 
         // only spawns one worker for now
         let worker = self
-            .spawn_worker_node_components(&consensus_config, engine.new_batch_validator().await)
+            .spawn_worker_node_components(
+                &consensus_config,
+                engine.new_batch_validator().await,
+                node_task_manager,
+            )
             .await?;
 
         // set execution state for consensus
@@ -288,6 +309,7 @@ where
             consensus_config.shutdown().subscribe(),
             consensus_bus.clone(),
             engine.canonical_block_stream().await,
+            epoch_task_manager,
         );
 
         Ok((primary, worker))
@@ -299,6 +321,8 @@ where
     async fn create_primary_node_components<DB: TNDatabase>(
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
+        node_task_manager: &TaskManager,
+        epoch_task_spawner: TaskSpawner,
     ) -> eyre::Result<PrimaryNode<DB>> {
         let consensus_bus =
             ConsensusBus::new_with_args(consensus_config.config().parameters.gc_depth);
@@ -309,7 +333,13 @@ where
             handle.clone()
         } else {
             let handle = self
-                .spawn_primary_network(consensus_config, &consensus_bus, state_sync.clone())
+                .spawn_primary_network(
+                    consensus_config,
+                    &consensus_bus,
+                    state_sync.clone(),
+                    node_task_manager,
+                    epoch_task_spawner,
+                )
                 .await?;
             self.primary_network_handle = Some(handle.clone());
             handle
@@ -327,6 +357,7 @@ where
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
         validator: Arc<dyn BatchValidation>,
+        node_task_manager: &TaskManager,
     ) -> eyre::Result<WorkerNode<DB>> {
         // only support one worker for now - otherwise, loop here
         let (worker_id, _worker_info) = consensus_config.config().workers().first_worker()?;
@@ -335,8 +366,14 @@ where
         let network_handle = if let Some(handle) = self.worker_network_handle.as_ref() {
             handle.clone()
         } else {
-            let handle =
-                self.spawn_worker_network(consensus_config, worker_id, validator.clone()).await?;
+            let handle = self
+                .spawn_worker_network(
+                    consensus_config,
+                    worker_id,
+                    validator.clone(),
+                    node_task_manager,
+                )
+                .await?;
             self.worker_network_handle = Some(handle.clone());
             handle
         };
@@ -353,17 +390,19 @@ where
         consensus_config: &ConsensusConfig<DB>,
         consensus_bus: &ConsensusBus,
         state_sync: StateSynchronizer<DB>,
+        node_task_manager: &TaskManager,
+        epoch_task_spawner: TaskSpawner,
     ) -> eyre::Result<PrimaryNetworkHandle> {
         // create event streams for the primary network handler
         let (event_stream, rx_event_stream) = mpsc::channel(1000);
         let network = ConsensusNetwork::new_for_primary(consensus_config, event_stream)?;
         let network_handle = network.network_handle();
-        let rx_shutdown = consensus_config.shutdown().subscribe();
+        let node_shutdown = self.node_shutdown.subscribe();
 
         // spawn long-running primary network task
-        self.node_task_manager.spawn_task("Primary Network", async move {
+        node_task_manager.spawn_task("Primary Network", async move {
             tokio::select!(
-                _ = &rx_shutdown => {
+                _ = &node_shutdown => {
                     Ok(())
                 }
                 res = network.run() => {
@@ -395,7 +434,7 @@ where
             .others_primaries_by_id(consensus_config.authority_id().as_ref())
         {
             let peer_id = authority_id.peer_id();
-            self.dial_peer(network_handle.clone(), peer_id, addr);
+            self.dial_peer(network_handle.clone(), peer_id, addr, node_task_manager.get_spawner());
         }
 
         // wait until the primary has connected with at least 1 peer
@@ -413,9 +452,9 @@ where
             consensus_config.clone(),
             consensus_bus.clone(),
             state_sync,
-            self.epoch_task_manager.get_spawner(), // tasks should abort with epoch
+            epoch_task_spawner, // tasks should abort with epoch
         )
-        .spawn(&self.node_task_manager);
+        .spawn(node_task_manager);
 
         Ok(primary_network_handle)
     }
@@ -436,10 +475,11 @@ where
         handle: NetworkHandle<Req, Res>,
         peer_id: PeerId,
         peer_addr: Multiaddr,
+        node_task_spawner: TaskSpawner,
     ) {
         // spawn dials on long-running task manager
         let task_name = format!("DialPeer {peer_id}");
-        self.node_task_manager.spawn_task(task_name, async move {
+        node_task_spawner.spawn_task(task_name, async move {
             let mut backoff = 1;
             while let Err(e) = handle.dial(peer_id, peer_addr.clone()).await {
                 tracing::warn!(target: "node", "failed to dial {peer_id} at {peer_addr}: {e}");
@@ -462,15 +502,16 @@ where
         consensus_config: &ConsensusConfig<DB>,
         worker_id: &u16,
         validator: Arc<dyn BatchValidation>,
+        node_task_manager: &TaskManager,
     ) -> eyre::Result<WorkerNetworkHandle> {
         // create event streams for the worker network handler
         let (event_stream, rx_event_stream) = mpsc::channel(1000);
         let network = ConsensusNetwork::new_for_worker(consensus_config, event_stream)?;
         let network_handle = network.network_handle();
-        let rx_shutdown = consensus_config.shutdown().subscribe();
+        let rx_shutdown = self.node_shutdown.subscribe();
 
         // spawn long-running worker network task
-        self.node_task_manager.spawn_task("Worker Network", async move {
+        node_task_manager.spawn_task("Worker Network", async move {
             tokio::select!(
                 _ = &rx_shutdown => {
                     Ok(())
@@ -490,7 +531,12 @@ where
 
         for (peer_id, addr) in consensus_config.worker_cache().all_workers() {
             if addr != worker_address {
-                self.dial_peer(network_handle.clone(), peer_id, addr);
+                self.dial_peer(
+                    network_handle.clone(),
+                    peer_id,
+                    addr,
+                    node_task_manager.get_spawner(),
+                );
             }
         }
 
@@ -503,7 +549,7 @@ where
             *worker_id,
             validator,
         )
-        .spawn(&self.node_task_manager);
+        .spawn(node_task_manager);
 
         Ok(worker_network_handle)
     }
@@ -563,9 +609,10 @@ where
         shutdown: Noticer,
         consensus_bus: ConsensusBus,
         mut engine_state: mpsc::Receiver<SealedBlock>,
+        epoch_task_manager: &TaskManager,
     ) {
         // spawn epoch-specific task to forward blocks from the engine to consensus
-        self.epoch_task_manager.spawn_task("latest execution block", async move {
+        epoch_task_manager.spawn_task("latest execution block", async move {
             loop {
                 tokio::select!(
                     _ = &shutdown => {

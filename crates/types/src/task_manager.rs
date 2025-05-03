@@ -252,11 +252,11 @@ impl TaskManager {
     /// Abort all tasks including submanagers.
     ///
     /// This is used to close epoch-related tasks.
-    pub fn abort_all_tasks(&self) {
+    pub fn abort_all_tasks(&mut self) {
         self.abort();
 
         // abort submanager tasks as well
-        for manager in self.submanagers.values() {
+        for manager in self.submanagers.values_mut() {
             manager.abort_all_tasks();
         }
     }

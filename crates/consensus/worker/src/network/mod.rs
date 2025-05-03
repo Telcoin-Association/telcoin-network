@@ -15,8 +15,8 @@ use tn_network_libp2p::{
 use tn_network_types::{FetchBatchResponse, PrimaryToWorkerClient, WorkerSynchronizeMessage};
 use tn_storage::tables::Batches;
 use tn_types::{
-    encode, now, Batch, BatchValidation, BlockHash, Database, DbTxMut, Noticer, SealedBatch,
-    TaskManager, WorkerId,
+    encode, now, Batch, BatchValidation, BlockHash, Database, DbTxMut, SealedBatch, TaskManager,
+    WorkerId,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -238,8 +238,6 @@ pub struct WorkerNetwork<DB> {
     network_handle: WorkerNetworkHandle,
     // Request handler to process requests and return responses.
     request_handler: RequestHandler<DB>,
-    /// Shutdown notification.
-    shutdown_rx: Noticer,
 }
 
 impl<DB> WorkerNetwork<DB>
@@ -254,25 +252,18 @@ where
         id: WorkerId,
         validator: Arc<dyn BatchValidation>,
     ) -> Self {
-        let shutdown_rx = consensus_config.shutdown().subscribe();
         let request_handler =
             RequestHandler::new(id, validator, consensus_config, network_handle.clone());
-        Self { network_events, network_handle, request_handler, shutdown_rx }
+        Self { network_events, network_handle, request_handler }
     }
 
     /// Run the network.
     pub fn spawn(mut self, task_manager: &TaskManager) {
         task_manager.spawn_task("worker network events", async move {
             loop {
-                tokio::select!(
-                    _ = &self.shutdown_rx => break,
-                    event = self.network_events.recv() => {
-                        match event {
-                            Some(e) => self.process_network_event(e),
-                            None => break,
-                        }
-                    }
-                )
+                while let Some(event) = self.network_events.recv().await {
+                    self.process_network_event(event);
+                }
             }
         });
     }
