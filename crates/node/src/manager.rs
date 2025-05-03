@@ -50,10 +50,10 @@ pub struct EpochManager<P> {
     tn_datadir: P,
     /// The execution engine that should continue across epochs.
     execution_node: Option<ExecutionNode>,
-    /// Primary node.
-    primary_node: Option<PrimaryNode<DatabaseType>>,
-    /// Worker node.
-    worker_node: Option<WorkerNode<DatabaseType>>,
+    /// Primary network handle.
+    primary_network_handle: Option<PrimaryNetworkHandle>,
+    /// Worker network handle.
+    worker_network_handle: Option<WorkerNetworkHandle>,
     /// Key config - loaded once for application lifetime.
     key_config: KeyConfig,
     /// Main task manager that manages tasks across epochs.
@@ -95,8 +95,8 @@ where
             builder,
             tn_datadir,
             execution_node: None,
-            primary_node: None,
-            worker_node: None,
+            primary_network_handle: None,
+            worker_network_handle: None,
             key_config,
             node_task_manager,
             epoch_task_manager,
@@ -114,7 +114,13 @@ where
         // create dbs to survive between sync state transitions
         let reth_db =
             RethEnv::new_database(&self.builder.node_config, self.tn_datadir.reth_db_path())?;
-        let consensus_db = open_db(self.tn_datadir.consensus_db_path());
+
+        // open the consensus db for this epoch
+        //
+        // TODO: consensus db should be epoch-specific - see issue #269
+        let consensus_db_path = self.tn_datadir.consensus_db_path();
+        info!(target: "epoch-manager", ?consensus_db_path, "node storage opened for epoch");
+        let consensus_db = open_db(consensus_db_path);
 
         // start initial epoch
         let mut running = true;
@@ -192,10 +198,14 @@ where
             )
             .await?;
 
+        // TODO: this is probably wrong?
+        // - the challenge is ensuring engine executes last block but can't receive extra
+        // - shutdown subscriber after send but leave engine running?
+        // - have engine send ack before shutdown?
+        // - epoch manager in the middle to confirm?
+        //    - easier to broadcast once that's added
         // take ownership over node components
-        self.execution_node = Some(engine);
-        self.primary_node = Some(primary);
-        self.worker_node = Some(worker_node);
+        // self.execution_node = Some(engine);
 
         // update tasks
         primary_task_manager.update_tasks();
@@ -207,7 +217,7 @@ where
         self.epoch_task_manager.add_task_manager(worker_task_manager);
 
         // add long-running tasks to manager
-        self.node_task_manager.add_task_manager(engine_task_manager);
+        self.epoch_task_manager.add_task_manager(engine_task_manager);
 
         info!(target: "epoch-manager", tasks=?self.epoch_task_manager, "EPOCH TASKS");
         info!(target: "epoch-manager", tasks=?self.node_task_manager, "NODE TASKS");
@@ -245,13 +255,6 @@ where
         engine: &ExecutionNode,
         consensus_db: DatabaseType,
     ) -> eyre::Result<(PrimaryNode<DatabaseType>, WorkerNode<DatabaseType>)> {
-        // open the consensus db for this epoch
-        //
-        // TODO: consensus db should be epoch-specific - see issue #269
-        let consensus_db_path = self.tn_datadir.consensus_db_path();
-        // let consensus_db = open_db(&consensus_db_path);
-        info!(target: "epoch-manager", ?consensus_db_path, "node storage opened for epoch");
-
         // create config for consensus
         let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
         let consensus_config = ConsensusConfig::new(
@@ -263,6 +266,7 @@ where
         )?;
 
         let primary = self.create_primary_node_components(&consensus_config).await?;
+
         // only spawns one worker for now
         let worker = self
             .spawn_worker_node_components(&consensus_config, engine.new_batch_validator().await)
@@ -300,10 +304,16 @@ where
             ConsensusBus::new_with_args(consensus_config.config().parameters.gc_depth);
         let state_sync = StateSynchronizer::new(consensus_config.clone(), consensus_bus.clone());
 
-        // start networks to obtain handles
-        let network_handle = self
-            .spawn_primary_network(consensus_config, &consensus_bus, state_sync.clone())
-            .await?;
+        // use primary network if it exist or spawn the network
+        let network_handle = if let Some(handle) = self.primary_network_handle.as_ref() {
+            handle.clone()
+        } else {
+            let handle = self
+                .spawn_primary_network(consensus_config, &consensus_bus, state_sync.clone())
+                .await?;
+            self.primary_network_handle = Some(handle.clone());
+            handle
+        };
 
         // spawn primary - create node and spawn network
         let primary =
@@ -320,8 +330,17 @@ where
     ) -> eyre::Result<WorkerNode<DB>> {
         // only support one worker for now - otherwise, loop here
         let (worker_id, _worker_info) = consensus_config.config().workers().first_worker()?;
-        let network_handle =
-            self.spawn_worker_network(consensus_config, worker_id, validator.clone()).await?;
+
+        // use worker network if it exist or spawn the network
+        let network_handle = if let Some(handle) = self.worker_network_handle.as_ref() {
+            handle.clone()
+        } else {
+            let handle =
+                self.spawn_worker_network(consensus_config, worker_id, validator.clone()).await?;
+            self.worker_network_handle = Some(handle.clone());
+            handle
+        };
+
         let worker =
             WorkerNode::new(*worker_id, consensus_config.clone(), network_handle, validator);
 
@@ -350,7 +369,6 @@ where
                 res = network.run() => {
                     res
                 }
-
             )
         });
 

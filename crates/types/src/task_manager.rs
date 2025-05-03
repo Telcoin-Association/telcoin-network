@@ -427,7 +427,8 @@ impl Display for TaskManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "{}", self.name)?;
         for task in self.tasks.iter() {
-            writeln!(f, "Task: {} (critical: {})", task.info.name, task.info.critical)?;
+            let critical = if task.info.critical { "critical" } else { "not critical" };
+            writeln!(f, "Task: {} ({critical})", task.info.name)?;
         }
         for sub in self.submanagers.values() {
             writeln!(f, "++++++++++++++++++++++++++++++++++++++++++++++++++++")?;
