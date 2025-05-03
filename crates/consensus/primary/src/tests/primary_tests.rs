@@ -44,7 +44,7 @@ fn get_bus_and_primary<DB: Database>(
         config.clone(),
         consensus_bus.clone(),
         state_sync.clone(),
-        task_manager,
+        task_manager.get_spawner(),
     );
     primary_network.spawn(task_manager);
 
