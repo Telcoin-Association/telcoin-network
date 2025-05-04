@@ -196,7 +196,7 @@ impl<DB: Database> Certifier<DB> {
                             "irrecoverable error requesting vote for {header}: {error}"
                         )));
                     } else {
-                        // error!(target: "primary::certifier", ?authority, ?error, ?header, "network error requesting vote");
+                        error!(target: "primary::certifier", ?authority, ?error, ?header, "network error requesting vote");
                     }
                     missing_parents = Vec::new();
                 }

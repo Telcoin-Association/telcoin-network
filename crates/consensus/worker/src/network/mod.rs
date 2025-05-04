@@ -52,6 +52,11 @@ impl WorkerNetworkHandle {
         Self { handle: NetworkHandle::new(tx) }
     }
 
+    /// Return a reference to the inner handle.
+    pub fn inner_handle(&self) -> &NetworkHandle<WorkerRequest, WorkerResponse> {
+        &self.handle
+    }
+
     /// Dial a peer.
     ///
     /// Return swarm error to caller.
