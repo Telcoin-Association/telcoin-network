@@ -887,7 +887,7 @@ impl<DB: Database> Proposer<DB> {
                     // that the network is experiencing periods of asynchrony
                     //
                     // periods of asynchrony possibly caused by misconfigured `max_header_delay`
-                    warn!(target: "primary::proposer", interval=?self.max_delay_interval.period(), "max delay interval expired for round {}", self.round);
+                    // warn!(target: "primary::proposer", interval=?self.max_delay_interval.period(), "max delay interval expired for round {}", self.round);
                 }
 
                 // obtain reason for metrics

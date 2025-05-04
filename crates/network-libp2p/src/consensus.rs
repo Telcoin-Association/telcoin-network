@@ -557,7 +557,7 @@ where
                 }
 
                 // log errors for other outbound failures
-                warn!(target: "network", ?peer, ?error, "outbound failure");
+                // warn!(target: "network", ?peer, ?error, "outbound failure");
 
                 // apply penalty
                 self.swarm.behaviour_mut().peer_manager.process_penalty(peer, Penalty::Medium);

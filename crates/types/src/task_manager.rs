@@ -197,7 +197,7 @@ impl TaskManager {
         }
     }
 
-    /// Spawns a task on tokio and records it's JoinHandle and name.
+    /// Spawns a critical task on tokio and records it's JoinHandle and name.
     pub fn spawn_task<F, S: ToString>(&self, name: S, future: F)
     where
         F: Future + Send + 'static,
@@ -357,46 +357,47 @@ impl TaskManager {
         shutdown.notify();
         let task_name = self.name.clone();
         // wait some time for shutdown...
-        // 15 seconds for our tasks to end...
-        if tokio::time::timeout(Duration::from_secs(15), async move {
+        // 2 seconds for our tasks to end...
+        if tokio::time::timeout(Duration::from_secs(2), async move {
+            tracing::debug!(target: "tn::tasks", "awaiting shutdown for task manager\n{self:?}");
             while let Some(res) = self.tasks.next().await {
                 match res {
                     Ok(info) => {
                         tracing::info!(
-                            target = "tn::tasks",
+                            target: "tn::tasks",
                             "{}: {} shutdown successfully",
                             self.name,
                             info.name,
                         )
                     }
                     Err((info, err)) => tracing::error!(
-                        target = "tn::tasks",
+                        target: "tn::tasks",
                         "{}: {} shutdown with error {err}",
                         self.name,
                         info.name,
                     ),
                 }
             }
-            tracing::info!(target = "tn::tasks", "{}: All tasks shutdown", self.name);
+            tracing::info!(target: "tn::tasks", "{}: All tasks shutdown", self.name);
         })
         .await
         .is_err()
         {
-            tracing::error!(target = "tn::tasks", "{}: All tasks NOT shutdown", task_name);
+            tracing::error!(target:"tn::tasks", "{}: All tasks NOT shutdown", task_name);
         }
 
-        // Another 15 seconds for any of our sub tasks to end...
+        // Another 2 seconds for any of our sub tasks to end...
         let task_name_clone = task_name.clone();
-        if tokio::time::timeout(Duration::from_secs(15), async move {
+        if tokio::time::timeout(Duration::from_secs(2), async move {
             while let Some((_, name)) = future_managers.next().await {
                 tracing::info!(
-                    target = "tn::tasks",
+                    target: "tn::tasks",
                     "{}: TaskManager {name} shutdown successfully",
                     task_name_clone
                 )
             }
             tracing::info!(
-                target = "tn::tasks",
+                target: "tn::tasks",
                 "{}: All tasks managers shutdown",
                 task_name_clone
             );
@@ -404,7 +405,7 @@ impl TaskManager {
         .await
         .is_err()
         {
-            tracing::error!(target = "tn::tasks", "{}: All tasks managers NOT shutdown", task_name);
+            tracing::error!(target: "tn::tasks", "{}: All tasks managers NOT shutdown", task_name);
         }
     }
 

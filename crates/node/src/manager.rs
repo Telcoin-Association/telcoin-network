@@ -25,7 +25,7 @@ use tn_types::{
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::{mpsc, oneshot};
-use tracing::info;
+use tracing::{debug, info};
 
 /// The long-running task manager name.
 const NODE_TASK_MANAGER: &str = "Node Task Manager";
@@ -135,6 +135,8 @@ where
         // ensure task is tracked
         node_task_manager.update_tasks();
 
+        info!(target: "epoch-manager", "starting node and launching first epoch");
+
         // await all tasks on epoch-task-manager or node shutdown
         tokio::select! {
             // run long-living node tasks
@@ -220,6 +222,9 @@ where
                         &mut epoch_task_manager,
                     )
                     .await;
+
+                info!(target: "epoch-manager", ?epoch_result, "aborting epoch tasks for next epoch");
+
                 // abort all epoch-related tasks
                 epoch_task_manager.abort_all_tasks();
 
@@ -245,11 +250,16 @@ where
         node_task_spawner: TaskSpawner,
         epoch_task_manager: &mut TaskManager,
     ) -> eyre::Result<bool> {
-        info!(target: "epoch-manager", "Starting node");
+        info!(target: "epoch-manager", "Starting epoch");
 
+        let metrics_shutdown = Notifier::new();
         // start consensus metrics for the epoch
         if let Some(metrics_socket) = self.builder.consensus_metrics {
-            start_prometheus_server(metrics_socket, epoch_task_manager);
+            start_prometheus_server(
+                metrics_socket,
+                epoch_task_manager,
+                metrics_shutdown.subscribe(),
+            );
         }
 
         // create submanager for engine tasks
@@ -306,11 +316,12 @@ where
         // add long-running tasks to manager
         epoch_task_manager.add_task_manager(engine_task_manager);
 
-        info!(target: "epoch-manager", tasks=?epoch_task_manager, "EPOCH TASKS");
+        info!(target: "epoch-manager", tasks=?epoch_task_manager, "EPOCH TASKS\n");
 
         // indicate node is ready if this is the first epoch
         if let Some(ack) = self.node_ready.take() {
-            let _ = ack.send(());
+            let _res = ack.send(());
+            debug!(target: "epoch-manager", ?_res, "sent ack for node startup");
         }
 
         epoch_task_manager.join_until_exit(consensus_config.shutdown().clone()).await;

@@ -101,7 +101,7 @@ impl<DB: Database> Certifier<DB> {
 
         // TODO- these tasks to send to each peer should be replaced with a libp2p pub/sub topic.
         for (name, rx_own_certificate_broadcast) in broadcast_targets.into_iter() {
-            trace!(target:"primary::synchronizer::broadcast_certificates", ?name, "spawning sender for peer");
+            trace!(target: "primary::synchronizer::broadcast_certificates", ?name, "spawning sender for peer");
             task_manager.spawn_task(
                 format!("broadcast certificates to {name}"),
                 Self::push_certificates(
@@ -196,7 +196,7 @@ impl<DB: Database> Certifier<DB> {
                             "irrecoverable error requesting vote for {header}: {error}"
                         )));
                     } else {
-                        error!(target: "primary::certifier", ?authority, ?error, ?header, "network error requesting vote");
+                        // error!(target: "primary::certifier", ?authority, ?error, ?header, "network error requesting vote");
                     }
                     missing_parents = Vec::new();
                 }
