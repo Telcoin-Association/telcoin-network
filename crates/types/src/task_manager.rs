@@ -279,21 +279,6 @@ impl TaskManager {
         }
     }
 
-    // /// Abort and await the termination of all tasks.
-    // pub async fn shutdown_and_wait(&mut self) -> bool {
-    //     // abort all tasks
-    //     self.abort_all_tasks();
-
-    //     // wait for tasks to complete
-    //     match timeout(Duration::from_secs(30), self.wait_for_empty_tasks()).await {
-    //         Ok(_) => true, // All tasks completed
-    //         Err(_) => {
-    //             tracing::error!(target: "tn::tasks", "{}: Tasks did not terminate within timeout", self.name);
-    //             false // Timed out
-    //         }
-    //     }
-    // }
-
     /// Implements the join logic for the manager.
     async fn join_internal(&mut self, shutdown: Notifier, do_exit: bool) {
         let shutdown_ref = &shutdown;

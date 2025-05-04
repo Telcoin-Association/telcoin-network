@@ -61,6 +61,11 @@ impl PrimaryNetworkHandle {
         Self { handle: NetworkHandle::new(sender) }
     }
 
+    /// Return a reference to the inner handle.
+    pub fn inner_handle(&self) -> &NetworkHandle<PrimaryRequest, PrimaryResponse> {
+        &self.handle
+    }
+
     /// Dial a peer.
     ///
     /// Return swarm error to caller.

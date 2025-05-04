@@ -12,7 +12,10 @@ use libp2p::{
 };
 use std::collections::{HashMap, HashSet};
 use tn_types::TaskSpawner;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{
+    mpsc::{self, Sender},
+    oneshot,
+};
 
 /// The result for network operations.
 pub type NetworkResult<T> = Result<T, NetworkError>;
@@ -240,6 +243,8 @@ where
     NewEpoch {
         /// The epoch committee.
         committee: HashMap<PeerId, Multiaddr>,
+        /// The new sender for events.
+        new_event_stream: Sender<NetworkEvent<Req, Res>>,
     },
     /// TODO: combine with the variant above
     UpdateTaskSpawner {
@@ -471,8 +476,12 @@ where
     }
 
     /// Create a [PeerExchangeMap] for exchanging peers.
-    pub async fn new_epoch(&self, committee: HashMap<PeerId, Multiaddr>) -> NetworkResult<()> {
-        self.sender.send(NetworkCommand::NewEpoch { committee }).await?;
+    pub async fn new_epoch(
+        &self,
+        committee: HashMap<PeerId, Multiaddr>,
+        new_event_stream: Sender<NetworkEvent<Req, Res>>,
+    ) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::NewEpoch { committee, new_event_stream }).await?;
         Ok(())
     }
 

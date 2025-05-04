@@ -17,8 +17,7 @@ use std::{
     net::IpAddr,
     task::Context,
 };
-use tn_config::{ConsensusConfig, PeerConfig};
-use tn_types::Database;
+use tn_config::PeerConfig;
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 
@@ -61,8 +60,7 @@ pub(crate) struct PeerManager {
 
 impl PeerManager {
     /// Create a new instance of Self.
-    pub(crate) fn new<DB: Database>(consensus_config: &ConsensusConfig<DB>) -> Self {
-        let config = consensus_config.network_config().peer_config();
+    pub(crate) fn new(config: &PeerConfig) -> Self {
         let heartbeat =
             tokio::time::interval(tokio::time::Duration::from_secs(config.heartbeat_interval));
 
