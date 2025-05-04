@@ -21,8 +21,8 @@ use tn_network_types::{
 };
 use tn_storage::PayloadStore;
 use tn_types::{
-    encode, BlockHash, Certificate, CertificateDigest, ConsensusHeader, Database, Header, Noticer,
-    TaskManager, TaskSpawner, TnSender, Vote,
+    encode, BlockHash, Certificate, CertificateDigest, ConsensusHeader, Database, Header,
+    TaskSpawner, TnSender, Vote,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
@@ -59,6 +59,11 @@ impl PrimaryNetworkHandle {
     //// Convenience method for creating a new Self for tests.
     pub fn new_for_test(sender: mpsc::Sender<NetworkCommand<Req, Res>>) -> Self {
         Self { handle: NetworkHandle::new(sender) }
+    }
+
+    /// Return a reference to the inner handle.
+    pub fn inner_handle(&self) -> &NetworkHandle<PrimaryRequest, PrimaryResponse> {
+        &self.handle
     }
 
     /// Dial a peer.
@@ -187,6 +192,13 @@ impl PrimaryNetworkHandle {
     pub async fn connected_peers(&self) -> NetworkResult<Vec<PeerId>> {
         self.handle.connected_peers().await
     }
+
+    /// Update the task spawner for the epoch.
+    ///
+    /// This is needed for each new epoch so epoch-related tasks are closed with the epoch.
+    pub async fn new_epoch(&self, task_spawner: TaskSpawner) -> NetworkResult<()> {
+        self.handle.update_task_spawner(task_spawner).await
+    }
 }
 
 /// Handle inter-node communication between primaries.
@@ -197,8 +209,6 @@ pub struct PrimaryNetwork<DB> {
     network_handle: PrimaryNetworkHandle,
     /// Request handler to process requests and return responses.
     request_handler: RequestHandler<DB>,
-    /// Shutdown notification.
-    shutdown_rx: Noticer,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
 }
@@ -216,14 +226,13 @@ where
         state_sync: StateSynchronizer<DB>,
         task_spawner: TaskSpawner,
     ) -> Self {
-        let shutdown_rx = consensus_config.shutdown().subscribe();
         let request_handler = RequestHandler::new(
             consensus_config,
             consensus_bus,
             state_sync.clone(),
             task_spawner.clone(),
         );
-        Self { network_events, network_handle, request_handler, shutdown_rx, task_spawner }
+        Self { network_events, network_handle, request_handler, task_spawner }
     }
 
     pub fn handle(&self) -> &PrimaryNetworkHandle {
@@ -231,24 +240,16 @@ where
     }
 
     /// Run the network.
-    pub fn spawn(mut self, task_manager: &TaskManager) {
-        task_manager.spawn_task("primary network events", async move {
-            loop {
-                tokio::select!(
-                    _ = &self.shutdown_rx => break,
-                    event = self.network_events.recv() => {
-                        match event {
-                            Some(e) => self.process_network_event(e),
-                            None => break,
-                        }
-                    }
-                )
+    pub fn spawn(mut self, node_task_spawner: &TaskSpawner) {
+        node_task_spawner.spawn_critical_task("primary network events", async move {
+            while let Some(event) = self.network_events.recv().await {
+                self.process_network_event(event)
             }
         });
     }
 
     /// Handle events concurrently.
-    fn process_network_event(&self, event: NetworkEvent<Req, Res>) {
+    fn process_network_event(&mut self, event: NetworkEvent<Req, Res>) {
         // match event
         match event {
             NetworkEvent::Request { peer, request, channel, cancel } => match request {
@@ -273,6 +274,10 @@ where
             },
             NetworkEvent::Gossip(msg, source) => {
                 self.process_gossip(msg, source);
+            }
+            NetworkEvent::Epoch(task_spawner) => {
+                // update task spawner
+                self.task_spawner = task_spawner;
             }
         }
     }
