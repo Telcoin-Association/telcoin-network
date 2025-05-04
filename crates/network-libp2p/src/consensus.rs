@@ -27,8 +27,8 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     time::Duration,
 };
-use tn_config::{ConsensusConfig, LibP2pConfig};
-use tn_types::{Database, NetworkKeypair};
+use tn_config::{LibP2pConfig, NetworkConfig, PeerConfig};
+use tn_types::NetworkKeypair;
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot,
@@ -60,12 +60,12 @@ where
     C: Codec + Send + Clone + 'static,
 {
     /// Create a new instance of Self.
-    pub(crate) fn new<DB: Database>(
+    pub(crate) fn new(
         gossipsub: gossipsub::Behaviour,
         req_res: request_response::Behaviour<C>,
-        consensus_config: &ConsensusConfig<DB>,
+        peer_config: &PeerConfig,
     ) -> Self {
-        let peer_manager = PeerManager::new(consensus_config);
+        let peer_manager = PeerManager::new(peer_config);
         Self { gossipsub, req_res, peer_manager }
     }
 }
@@ -129,39 +129,12 @@ where
     Req: TNMessage,
     Res: TNMessage,
 {
-    /// Convenience method for spawning a primary network instance.
-    pub fn new_for_primary<DB>(
-        config: &ConsensusConfig<DB>,
-        event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
-    ) -> NetworkResult<Self>
-    where
-        DB: tn_types::database_traits::Database,
-    {
-        let network_key = config.key_config().primary_network_keypair().clone();
-        Self::new(config, event_stream, network_key)
-    }
-
-    /// Convenience method for spawning a worker network instance.
-    pub fn new_for_worker<DB>(
-        config: &ConsensusConfig<DB>,
-        event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
-    ) -> NetworkResult<Self>
-    where
-        DB: tn_types::database_traits::Database,
-    {
-        let network_key = config.key_config().worker_network_keypair().clone();
-        Self::new(config, event_stream, network_key)
-    }
-
     /// Create a new instance of Self.
-    pub fn new<DB>(
-        consensus_config: &ConsensusConfig<DB>,
+    pub fn new(
+        network_config: &NetworkConfig,
         event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
         keypair: NetworkKeypair,
-    ) -> NetworkResult<Self>
-    where
-        DB: tn_types::database_traits::Database,
-    {
+    ) -> NetworkResult<Self> {
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             // explicitly set default
             .heartbeat_interval(Duration::from_secs(1))
@@ -176,48 +149,42 @@ where
         )
         .map_err(NetworkError::GossipBehavior)?;
 
-        let tn_codec = TNCodec::<Req, Res>::new(
-            consensus_config.network_config().libp2p_config().max_rpc_message_size,
-        );
+        let tn_codec =
+            TNCodec::<Req, Res>::new(network_config.libp2p_config().max_rpc_message_size);
 
         let req_res = request_response::Behaviour::with_codec(
             tn_codec,
-            consensus_config.network_config().libp2p_config().supported_req_res_protocols.clone(),
+            network_config.libp2p_config().supported_req_res_protocols.clone(),
             request_response::Config::default(),
         );
 
         // create custom behavior
-        let behavior = TNBehavior::new(gossipsub, req_res, consensus_config);
+        let behavior = TNBehavior::new(gossipsub, req_res, network_config.peer_config());
 
         // create swarm
         let swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_quic_config(|mut config| {
-                config.handshake_timeout =
-                    consensus_config.network_config().quic_config().handshake_timeout;
-                config.max_idle_timeout =
-                    consensus_config.network_config().quic_config().max_idle_timeout;
-                config.keep_alive_interval =
-                    consensus_config.network_config().quic_config().keep_alive_interval;
+                config.handshake_timeout = network_config.quic_config().handshake_timeout;
+                config.max_idle_timeout = network_config.quic_config().max_idle_timeout;
+                config.keep_alive_interval = network_config.quic_config().keep_alive_interval;
                 config.max_concurrent_stream_limit =
-                    consensus_config.network_config().quic_config().max_concurrent_stream_limit;
-                config.max_stream_data =
-                    consensus_config.network_config().quic_config().max_stream_data;
-                config.max_connection_data =
-                    consensus_config.network_config().quic_config().max_connection_data;
+                    network_config.quic_config().max_concurrent_stream_limit;
+                config.max_stream_data = network_config.quic_config().max_stream_data;
+                config.max_connection_data = network_config.quic_config().max_connection_data;
                 config
             })
             .with_behaviour(|_| behavior)
             .map_err(|_| NetworkError::BuildSwarm)?
             .with_swarm_config(|c| {
                 c.with_idle_connection_timeout(
-                    consensus_config.network_config().libp2p_config().max_idle_connection_timeout,
+                    network_config.libp2p_config().max_idle_connection_timeout,
                 )
             })
             .build();
 
         let (handle, commands) = tokio::sync::mpsc::channel(100);
-        let config = consensus_config.network_config().libp2p_config().clone();
+        let config = network_config.libp2p_config().clone();
         let pending_px_disconnects = HashMap::with_capacity(config.max_px_disconnects);
 
         Ok(Self {
@@ -241,11 +208,12 @@ where
 
     /// Run the network loop to process incoming gossip.
     pub async fn run(mut self) -> NetworkResult<()> {
+        // loop until shutdown command received then return self
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => self.process_event(event).await?,
                 command = self.commands.recv() => match command {
-                    Some(c) => self.process_command(c),
+                    Some(c) => self.process_command(c)?,
                     None => {
                         info!(target: "network", "network shutting down...");
                         return Ok(())
@@ -302,7 +270,7 @@ where
     }
 
     /// Process commands for the network.
-    fn process_command(&mut self, command: NetworkCommand<Req, Res>) {
+    fn process_command(&mut self, command: NetworkCommand<Req, Res>) -> NetworkResult<()> {
         match command {
             NetworkCommand::UpdateAuthorizedPublishers { authorities, reply } => {
                 // this value should be updated at the start of each epoch
@@ -418,7 +386,7 @@ where
                 let peers = self.swarm.behaviour_mut().peer_manager.peers_for_exchange();
                 send_or_log_error!(reply, peers, "PeersForExchange");
             }
-            NetworkCommand::NewEpoch { committee } => {
+            NetworkCommand::NewEpoch { committee, new_event_stream } => {
                 // at the start of a new epoch, each node needs to know:
                 // - the current committee
                 // - all staked nodes who will vote at the end of the epoch
@@ -431,8 +399,21 @@ where
                 // for now, this only supports the current committee for the epoch
 
                 self.swarm.behaviour_mut().peer_manager.new_epoch(committee);
+
+                // update the stream to forward events
+                self.event_stream = new_event_stream;
+            }
+            // TODO: combine this with the command above
+            NetworkCommand::UpdateTaskSpawner { task_spawner } => {
+                if let Err(e) = self.event_stream.try_send(NetworkEvent::Epoch(task_spawner)) {
+                    error!(target: "network", ?e, "failed to update task spawner for new epoch!");
+                    // fatal - unable to transition epochs
+                    return Err(e.into());
+                }
             }
         }
+
+        Ok(())
     }
 
     /// Process gossip events.
@@ -547,7 +528,7 @@ where
                 }
 
                 // log errors for other outbound failures
-                warn!(target: "network", ?peer, ?error, "outbound failure");
+                // warn!(target: "network", ?peer, ?error, "outbound failure");
 
                 // apply penalty
                 self.swarm.behaviour_mut().peer_manager.process_penalty(peer, Penalty::Medium);
