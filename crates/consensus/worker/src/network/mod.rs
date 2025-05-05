@@ -1,5 +1,6 @@
 //! Worker network implementation.
 
+use crate::batch_fetcher::BatchFetcher;
 use error::WorkerNetworkError;
 use futures::{stream::FuturesUnordered, StreamExt};
 use handler::RequestHandler;
@@ -23,8 +24,6 @@ use tokio::{
     task::JoinHandle,
 };
 use tracing::{debug, trace, warn};
-
-use crate::batch_fetcher::BatchFetcher;
 
 mod error;
 mod handler;
@@ -68,6 +67,14 @@ impl WorkerNetworkHandle {
     pub async fn publish_batch(&self, batch_digest: BlockHash) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Batch(batch_digest));
         self.handle.publish("tn-worker".into(), data).await?;
+        Ok(())
+    }
+
+    /// Publish a transaction (as raw bytes) worker network.
+    /// Do this when not a committee member so a CVV can include the txn.
+    pub async fn publish_txn(&self, txn: Vec<u8>) -> NetworkResult<()> {
+        let data = encode(&WorkerGossip::Txn(txn));
+        self.handle.publish("tn-txn".into(), data).await?;
         Ok(())
     }
 

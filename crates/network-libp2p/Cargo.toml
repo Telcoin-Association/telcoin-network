@@ -15,6 +15,7 @@ libp2p = { workspace = true, features = [
     "tokio",
     "quic",
     "macros",
+    "kad",
 ] }
 tokio = { workspace = true, features = ["rt", "net", "sync", "macros", "time"] }
 tn-types = { workspace = true }

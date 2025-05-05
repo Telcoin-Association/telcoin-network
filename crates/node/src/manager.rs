@@ -172,10 +172,10 @@ where
         let (tmp_event_stream, _temp_rx) = mpsc::channel(1000);
 
         // create long-running network task for primary
-        let primary_network = ConsensusNetwork::new(
+        let primary_network = ConsensusNetwork::new_for_primary(
             network_config,
             tmp_event_stream,
-            self.key_config.primary_network_keypair().clone(),
+            self.key_config.clone(),
         )?;
         let network_handle = primary_network.network_handle();
         let node_shutdown = self.node_shutdown.subscribe();
@@ -201,10 +201,10 @@ where
         let (tmp_event_stream, _temp_rx) = mpsc::channel(1000);
 
         // create long-running network task for worker
-        let worker_network = ConsensusNetwork::new(
+        let worker_network = ConsensusNetwork::new_for_worker(
             network_config,
             tmp_event_stream,
-            self.key_config.worker_network_keypair().clone(),
+            self.key_config.clone(),
         )?;
         let network_handle = worker_network.network_handle();
         let node_shutdown = self.node_shutdown.subscribe();
@@ -350,8 +350,6 @@ where
         // add epoch-specific tasks to manager
         epoch_task_manager.add_task_manager(primary_task_manager);
         epoch_task_manager.add_task_manager(worker_task_manager);
-
-        // add long-running tasks to manager
         epoch_task_manager.add_task_manager(engine_task_manager);
 
         info!(target: "epoch-manager", tasks=?epoch_task_manager, "EPOCH TASKS\n");
@@ -463,8 +461,6 @@ where
         let consensus_bus =
             ConsensusBus::new_with_args(consensus_config.config().parameters.gc_depth);
         let state_sync = StateSynchronizer::new(consensus_config.clone(), consensus_bus.clone());
-
-        // use primary network if it exist or spawn the network
         let network_handle = self
             .primary_network_handle
             .as_ref()
@@ -499,8 +495,6 @@ where
     ) -> eyre::Result<WorkerNode<DB>> {
         // only support one worker for now - otherwise, loop here
         let (worker_id, _worker_info) = consensus_config.config().workers().first_worker()?;
-
-        // use worker network if it exist or spawn the network
         let network_handle = self
             .worker_network_handle
             .as_ref()
@@ -546,21 +540,21 @@ where
 
         // start listening if the network needs to be initialized
         if *initialize_networks {
-            // subscribe to gossip
-            network_handle
-                .inner_handle()
-                .subscribe(
-                    consensus_config.network_config().libp2p_config().primary_topic(),
-                    consensus_config.committee_peer_ids(),
-                )
-                .await?;
-
             // start listening for p2p messages
             let primary_address = consensus_config.primary_address();
             let primary_multiaddr =
                 Self::get_multiaddr_from_env_or_config("PRIMARY_MULTIADDR", primary_address);
             network_handle.inner_handle().start_listening(primary_multiaddr).await?;
         }
+
+        // update the authorized publishers for gossip every epoch
+        network_handle
+            .inner_handle()
+            .subscribe_with_publishers(
+                consensus_config.network_config().libp2p_config().primary_topic(),
+                consensus_config.committee_peer_ids(),
+            )
+            .await?;
 
         // always dial peers for the new epoch
         for (authority_id, addr, _) in consensus_config
@@ -646,6 +640,7 @@ where
     ) -> eyre::Result<()> {
         // create event streams for the worker network handler
         let (event_stream, rx_event_stream) = mpsc::channel(1000);
+
         let worker_address = consensus_config.worker_address(worker_id);
 
         network_handle
@@ -672,6 +667,15 @@ where
             }
         }
 
+        // update the authorized publishers for gossip every epoch
+        network_handle
+            .inner_handle()
+            .subscribe_with_publishers(
+                consensus_config.network_config().libp2p_config().worker_txn_topic(),
+                consensus_config.worker_cache().all_workers().keys().copied().collect(),
+            )
+            .await?;
+
         // spawn worker network
         WorkerNetwork::new(
             rx_event_stream,
@@ -681,8 +685,6 @@ where
             validator,
         )
         .spawn(&epoch_task_spawner);
-
-        // TODO: update event stream!!!
 
         Ok(())
     }

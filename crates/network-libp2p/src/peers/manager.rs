@@ -272,7 +272,7 @@ impl PeerManager {
     ///
     /// This is called before accepting new connections. Also checks that the peer
     /// wasn't temporarily banned due to excess peers connections.
-    pub(super) fn peer_banned(&self, peer_id: &PeerId) -> bool {
+    pub(crate) fn peer_banned(&self, peer_id: &PeerId) -> bool {
         self.temporarily_banned.contains(peer_id) || self.peers.peer_banned(peer_id)
     }
 

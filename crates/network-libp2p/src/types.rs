@@ -10,11 +10,10 @@ use libp2p::{
     request_response::ResponseChannel,
     Multiaddr, PeerId, TransportError,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use tokio::sync::{
-    mpsc::{self, Sender},
-    oneshot,
-};
+use tn_types::BlsSignature;
+use tokio::sync::{mpsc, oneshot};
 
 /// The result for network operations.
 pub type NetworkResult<T> = Result<T, NetworkError>;
@@ -81,7 +80,7 @@ where
     /// Only valid for Subscriber implementations.
     UpdateAuthorizedPublishers {
         /// The unique set of authorized peers by topic.
-        authorities: HashMap<String, HashSet<PeerId>>,
+        authorities: HashMap<String, Option<HashSet<PeerId>>>,
         /// The acknowledgement that the set was updated.
         reply: oneshot::Sender<NetworkResult<()>>,
     },
@@ -162,7 +161,7 @@ where
         /// The topic to subscribe to.
         topic: String,
         /// Authorized publishers.
-        publishers: HashSet<PeerId>,
+        publishers: Option<HashSet<PeerId>>,
         /// The reply to caller.
         reply: oneshot::Sender<Result<bool, SubscriptionError>>,
     },
@@ -241,7 +240,7 @@ where
         /// The epoch committee.
         committee: HashMap<PeerId, Multiaddr>,
         /// The new sender for events.
-        new_event_stream: Sender<NetworkEvent<Req, Res>>,
+        new_event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
     },
 }
 
@@ -277,7 +276,7 @@ where
     /// Update the list of authorized publishers.
     pub async fn update_authorized_publishers(
         &self,
-        authorities: HashMap<String, HashSet<PeerId>>,
+        authorities: HashMap<String, Option<HashSet<PeerId>>>,
     ) -> NetworkResult<()> {
         let (reply, ack) = oneshot::channel();
         self.sender.send(NetworkCommand::UpdateAuthorizedPublishers { authorities, reply }).await?;
@@ -331,16 +330,28 @@ where
         peer_id.await.map_err(Into::into)
     }
 
-    /// Subscribe to a topic.
+    /// Subscribe to a topic with valid publishers.
     ///
     /// Return swarm error to caller.
-    pub async fn subscribe(
+    pub async fn subscribe_with_publishers(
         &self,
         topic: String,
         publishers: HashSet<PeerId>,
     ) -> NetworkResult<bool> {
         let (reply, already_subscribed) = oneshot::channel();
-        self.sender.send(NetworkCommand::Subscribe { topic, publishers, reply }).await?;
+        self.sender
+            .send(NetworkCommand::Subscribe { topic, publishers: Some(publishers), reply })
+            .await?;
+        let res = already_subscribed.await?;
+        res.map_err(Into::into)
+    }
+
+    /// Subscribe to a topic, any publisher valid.
+    ///
+    /// Return swarm error to caller.
+    pub async fn subscribe(&self, topic: String) -> NetworkResult<bool> {
+        let (reply, already_subscribed) = oneshot::channel();
+        self.sender.send(NetworkCommand::Subscribe { topic, publishers: None, reply }).await?;
         let res = already_subscribed.await?;
         res.map_err(Into::into)
     }
@@ -471,11 +482,25 @@ where
     pub async fn new_epoch(
         &self,
         committee: HashMap<PeerId, Multiaddr>,
-        new_event_stream: Sender<NetworkEvent<Req, Res>>,
+        new_event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
     ) -> NetworkResult<()> {
         self.sender.send(NetworkCommand::NewEpoch { committee, new_event_stream }).await?;
         Ok(())
     }
+}
+
+/// List of addresses for a node, signature will be the nodes BLS signature
+/// over the addresses to verify they are from the node in question.
+/// Used to publish this to kademlia.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct AddrList {
+    /// Signature of the value field with the nodes BLS key.
+    /// This is part of a kademlia record keyed on a BLS public key
+    /// that can be used for verifiction.  Intended to stop malicious
+    /// nodes from poisoning the routing table.
+    pub signature: BlsSignature,
+    /// Vector of libp2p network addresses for node.
+    pub value: Vec<Multiaddr>,
 }
 
 /// Helper macro for sending oneshot replies and logging errors.

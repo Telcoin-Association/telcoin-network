@@ -1282,7 +1282,7 @@ impl RethEnv {
         genesis: Genesis,
         initial_stake_config: ConsensusRegistry::StakeConfig,
         owner_address: Address,
-        rwtel_address: Address,
+        itel_address: Address,
     ) -> eyre::Result<Genesis> {
         let validators: Vec<_> = validators
             .iter()
@@ -1324,7 +1324,7 @@ impl RethEnv {
 
         // generate calldata for initialization call
         let init_calldata = ConsensusRegistry::initializeCall {
-            rwTEL_: rwtel_address,
+            iTEL_: itel_address,
             genesisConfig_: initial_stake_config,
             initialValidators_: validators,
             owner_: owner_address,
@@ -1516,6 +1516,7 @@ impl From<CreateRequest> for PregenesisRequest {
 mod tests {
     use super::*;
     use crate::traits::TNPayloadAttributes;
+    use alloy::primitives::utils::parse_ether;
     use rand_chacha::ChaCha8Rng;
     use std::str::FromStr as _;
     use tempfile::TempDir;
@@ -1627,9 +1628,10 @@ mod tests {
 
         let epoch_duration = 60 * 60 * 24; // 24hrs
         let initial_stake_config = ConsensusRegistry::StakeConfig {
-            stakeAmount: U256::from(1_000_000e18),
-            minWithdrawAmount: U256::from(1_000e18),
-            epochIssuance: U256::from(20_000_000e18)
+            stakeAmount: U256::try_from(parse_ether("1_000_000").unwrap()).unwrap(),
+            minWithdrawAmount: U256::try_from(parse_ether("1_000").unwrap()).unwrap(),
+            epochIssuance: U256::try_from(parse_ether("20_000_000").unwrap())
+                .unwrap()
                 .checked_div(U256::from(28))
                 .expect("u256 div checked"),
             epochDuration: epoch_duration,
@@ -1641,7 +1643,7 @@ mod tests {
             adiri_genesis(),
             initial_stake_config,
             owner,
-            Address::random(), // rwtel
+            Address::random(), // itel
         )?;
 
         // create new env with initialized consensus registry for tests

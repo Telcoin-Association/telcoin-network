@@ -75,6 +75,19 @@ where
                     }
                 }
             }
+            WorkerGossip::Txn(tx_bytes) => {
+                if let Some(authority) = self.consensus_config.authority() {
+                    let committee = self.consensus_config.committee();
+                    let authorities = committee.authorities();
+                    let size = authorities.len();
+                    for (slot, auth) in authorities.into_iter().enumerate() {
+                        if &auth == authority {
+                            self.validator.submit_txn_if_mine(&tx_bytes, size as u64, slot as u64);
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
         Ok(())

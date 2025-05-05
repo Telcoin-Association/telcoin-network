@@ -34,10 +34,10 @@ fn get_bus_and_primary<DB: Database>(
 ) -> (ConsensusBus, Primary<DB>) {
     let (event_stream, rx_event_stream) = mpsc::channel(100);
     let consensus_bus = ConsensusBus::new_with_args(config.config().parameters.gc_depth);
-    let consensus_network = ConsensusNetwork::new(
+    let consensus_network = ConsensusNetwork::new_for_primary(
         config.network_config(),
         event_stream,
-        config.key_config().primary_network_keypair().clone(),
+        config.key_config().clone(),
     )
     .expect("p2p network create failed!");
     let consensus_network_handle = consensus_network.network_handle();

@@ -34,9 +34,13 @@ fn create_test_peers<Req: TNMessage, Res: TNMessage>(
             let config = a.consensus_config();
             let (tx, network_events) = mpsc::channel(10);
             let network_key = config.key_config().primary_network_keypair().clone();
-            let network =
-                ConsensusNetwork::<Req, Res>::new(config.network_config(), tx, network_key)
-                    .expect("peer1 network created");
+            let network = ConsensusNetwork::<Req, Res>::new(
+                config.network_config(),
+                tx,
+                config.key_config().clone(),
+                network_key,
+            )
+            .expect("peer1 network created");
 
             let network_handle = network.network_handle();
             TestPeer {
@@ -119,9 +123,13 @@ where
 
     // peer1
     let network_key_1 = config_1.key_config().primary_network_keypair().clone();
-    let peer1_network =
-        ConsensusNetwork::<Req, Res>::new(config_1.network_config(), tx1, network_key_1)
-            .expect("peer1 network created");
+    let peer1_network = ConsensusNetwork::<Req, Res>::new(
+        config_1.network_config(),
+        tx1,
+        config_1.key_config().clone(),
+        network_key_1,
+    )
+    .expect("peer1 network created");
     let network_handle_1 = peer1_network.network_handle();
     let peer1 = NetworkPeer {
         config: config_1,
@@ -132,9 +140,13 @@ where
 
     // peer2
     let network_key_2 = config_2.key_config().primary_network_keypair().clone();
-    let peer2_network =
-        ConsensusNetwork::<Req, Res>::new(config_2.network_config(), tx2, network_key_2)
-            .expect("peer2 network created");
+    let peer2_network = ConsensusNetwork::<Req, Res>::new(
+        config_2.network_config(),
+        tx2,
+        config_2.key_config().clone(),
+        network_key_2,
+    )
+    .expect("peer2 network created");
     let network_handle_2 = peer2_network.network_handle();
     let peer2 = NetworkPeer {
         config: config_2,
@@ -539,7 +551,7 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
     let cvv_addr = cvv.listeners().await?.first().expect("peer2 listen addr").clone();
 
     // subscribe
-    nvv.subscribe(TEST_TOPIC.into(), config_1.committee_peer_ids()).await?;
+    nvv.subscribe_with_publishers(TEST_TOPIC.into(), config_1.committee_peer_ids()).await?;
 
     // dial cvv
     nvv.dial(cvv_id, cvv_addr).await?;
@@ -604,7 +616,7 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     let cvv_addr = cvv.listeners().await?.first().expect("peer2 listen addr").clone();
 
     // subscribe
-    nvv.subscribe(TEST_TOPIC.into(), config_1.committee_peer_ids()).await?;
+    nvv.subscribe_with_publishers(TEST_TOPIC.into(), config_1.committee_peer_ids()).await?;
 
     // dial cvv
     nvv.dial(cvv_id, cvv_addr).await?;
@@ -665,7 +677,10 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
         );
 
     // spawn target network
-    let target_network = target_peer.network.take().expect("target network is some");
+    let mut target_network = target_peer.network.take().expect("target network is some");
+    // Need to disable kademlia peers or the various networks will connect on their own and trip up
+    // the test...
+    target_network.no_kad_peers_for_test();
     let id = target_peer.config.authority().as_ref().expect("authority").id().peer_id();
     tokio::spawn(async move {
         let res = target_network.run().await;
@@ -697,7 +712,8 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     // Start other peers and connect them one by one to the target
     for peer in other_peers.iter_mut() {
         // spawn peer network
-        let peer_network = peer.network.take().expect("peer network is some");
+        let mut peer_network = peer.network.take().expect("peer network is some");
+        peer_network.no_kad_peers_for_test();
         let id = peer.config.authority().as_ref().expect("authority").id().peer_id();
         tokio::spawn(async move {
             let res = peer_network.run().await;
@@ -716,7 +732,9 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
             .await?;
 
         // subscribe to topic
-        peer.network_handle.subscribe(TEST_TOPIC.into(), peer.config.committee_peer_ids()).await?;
+        peer.network_handle
+            .subscribe_with_publishers(TEST_TOPIC.into(), peer.config.committee_peer_ids())
+            .await?;
 
         // Connect to target
         peer.network_handle.dial(target_peer_id, target_addr.clone()).await?;
@@ -739,9 +757,10 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     let NetworkPeer {
         config: nvv_config,
         network_handle: nvv,
-        network,
+        mut network,
         network_events: mut nvv_events,
     } = peer1;
+    network.no_kad_peers_for_test();
     tokio::spawn(async move {
         network.run().await.expect("network run failed!");
     });
@@ -753,7 +772,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
 
     // subscribe to topic
     // add target peer as authorized publisher
-    nvv.subscribe(TEST_TOPIC.into(), HashSet::from([target_peer_id])).await?;
+    nvv.subscribe_with_publishers(TEST_TOPIC.into(), HashSet::from([target_peer_id])).await?;
 
     // connect to target
     nvv.dial(target_peer_id, target_addr.clone()).await?;
@@ -1061,7 +1080,7 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
     // Subscribe target to test topic
     target_peer
         .network_handle
-        .subscribe(TEST_TOPIC.into(), target_peer.config.committee_peer_ids())
+        .subscribe_with_publishers(TEST_TOPIC.into(), target_peer.config.committee_peer_ids())
         .await?;
 
     // Start other peers and connect them all to the target (star topology)
@@ -1085,7 +1104,9 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
             .await?;
 
         // subscribe to test topic with target peer as authorized publisher
-        peer.network_handle.subscribe(TEST_TOPIC.into(), HashSet::from([target_peer_id])).await?;
+        peer.network_handle
+            .subscribe_with_publishers(TEST_TOPIC.into(), HashSet::from([target_peer_id]))
+            .await?;
 
         // Connect to target peer
         peer.network_handle.dial(target_peer_id, target_addr.clone()).await?;

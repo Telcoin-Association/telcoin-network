@@ -106,8 +106,8 @@ sol!(
         /// Initialize the contract.
         #[derive(Debug)]
         function initialize(
-            /// The rwTEL contract address.
-            address rwTEL_,
+            /// The InterchainTEL contract address.
+            address iTEL_,
             /// The configuration for staking.
             StakeConfig memory genesisConfig_,
             /// The initial validators with stake.

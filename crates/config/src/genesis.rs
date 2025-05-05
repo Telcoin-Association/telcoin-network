@@ -1,9 +1,9 @@
 //! Genesis information used when configuring a node.
 use crate::{Config, ConfigFmt, ConfigTrait, TelcoinDirs};
-use eyre::{Context, OptionExt};
+use eyre::Context;
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::{
     collections::BTreeMap,
     ffi::OsStr,
@@ -30,12 +30,6 @@ pub const ERC1967PROXY_JSON: &str =
     include_str!("../../../tn-contracts/artifacts/ERC1967Proxy.json");
 pub const ITS_CFG_YAML: &str =
     include_str!("../../../tn-contracts/deployments/genesis/its-config.yaml");
-
-/// Wrapper for fetching JSON keys as object or values
-pub enum QueryResult {
-    Map(Map<String, Value>),
-    Single(Value),
-}
 
 /// The struct for starting a network at genesis.
 pub struct NetworkGenesis {
@@ -209,15 +203,22 @@ impl NetworkGenesis {
 
     /// Returns configurations for precompiles as genesis accounts
     /// Precompiles configs yamls are generated using foundry in tn-Contracts
-    pub fn fetch_precompile_genesis_accounts() -> eyre::Result<Vec<(Address, GenesisAccount)>> {
+    ///
+    /// Overrides InterchainTEL genesis balance to reflect genesis validator stake
+    pub fn fetch_precompile_genesis_accounts(
+        itel_address: Address,
+        itel_balance: tn_types::U256,
+    ) -> eyre::Result<Vec<(Address, GenesisAccount)>> {
         let yaml_content = ITS_CFG_YAML;
         let config: std::collections::HashMap<Address, GenesisAccount> =
             serde_yaml::from_str(yaml_content).expect("yaml parsing failure");
         let mut accounts = Vec::new();
         for (address, precompile_config) in config {
+            let bal =
+                if address == itel_address { itel_balance } else { precompile_config.balance };
             let account = GenesisAccount::default()
                 .with_nonce(precompile_config.nonce)
-                .with_balance(precompile_config.balance)
+                .with_balance(bal)
                 .with_code(precompile_config.code)
                 .with_storage(precompile_config.storage);
 
@@ -229,33 +230,22 @@ impl NetworkGenesis {
 
     /// Fetches json info from the given string
     ///
-    /// If a query is specified, return the corresponding nested object.
+    /// If a key is specified, return the corresponding nested object.
     /// Otherwise return the entire JSON
     /// With a generic this could be adjused to handle YAML also
-    pub fn fetch_from_json_str(
-        json_string: &str,
-        query: Option<&str>,
-    ) -> eyre::Result<QueryResult> {
-        let json: Value = serde_json::from_str(json_string).expect("json string malformed");
-        let result = match query {
+    pub fn fetch_from_json_str(json_content: &str, key: Option<&str>) -> eyre::Result<Value> {
+        let json: Value = serde_json::from_str(json_content)?;
+        let result = match key {
             Some(path) => {
-                let keys: Vec<&str> = path.split('.').collect();
+                let key: Vec<&str> = path.split('.').collect();
                 let mut current_value = &json;
-                for &key in &keys {
-                    current_value = current_value.get(key).ok_or_eyre("query key not found")?;
+                for &k in &key {
+                    current_value =
+                        current_value.get(k).ok_or_else(|| eyre::eyre!("key '{}' not found", k))?;
                 }
-
-                match current_value {
-                    // return objects directly
-                    Value::Object(map) => QueryResult::Map(map.clone()),
-                    // return single entries wrapped in a Map
-                    _ => QueryResult::Single(current_value.clone()),
-                }
+                current_value.clone()
             }
-            None => {
-                let map = json.as_object().cloned().ok_or_eyre("json string malformed")?;
-                QueryResult::Map(map)
-            }
+            None => json,
         };
 
         Ok(result)

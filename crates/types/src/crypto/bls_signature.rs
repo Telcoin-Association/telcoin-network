@@ -25,6 +25,11 @@ impl BlsSignature {
             .map_err(|_| eyre::eyre!("Invalid signature bytes!"))?;
         Ok(Self(sig))
     }
+
+    /// Verify a signature over a message (raw bytes) with public key.
+    pub fn verify_raw(&self, message: &[u8], public_key: &BlsPublicKey) -> bool {
+        self.verify(true, message, DST_G1, &[], public_key, true) == blst::BLST_ERROR::BLST_SUCCESS
+    }
 }
 
 impl Deref for BlsSignature {

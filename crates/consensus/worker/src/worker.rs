@@ -197,10 +197,20 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         self.tx_batches.clone()
     }
 
+    async fn disburse_txns(&self, sealed_batch: SealedBatch) -> Result<(), BlockSealError> {
+        for txn in sealed_batch.batch.transactions {
+            if let Err(err) = self.network_handle.publish_txn(txn).await {
+                error!(target: "worker::batch_provider", "Error publishing transaction: {err}");
+            }
+        }
+        Ok(())
+    }
+
     /// Seal and broadcast the current batch.
     pub async fn seal(&self, sealed_batch: SealedBatch) -> Result<(), BlockSealError> {
         let Some(quorum_waiter) = &self.quorum_waiter else {
-            return Err(BlockSealError::NotValidator);
+            // We are not a validator so need to send any transactions out for a CVV to pickup.
+            return self.disburse_txns(sealed_batch).await;
         };
         let size = sealed_batch.size();
 

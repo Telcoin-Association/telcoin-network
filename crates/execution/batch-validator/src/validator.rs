@@ -1,7 +1,7 @@
 //! Block validator
 
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
-use tn_reth::{recover_signed_transaction, RethEnv};
+use tn_reth::{bytes_to_txn, recover_signed_transaction, RethEnv};
 use tn_types::{
     max_batch_gas, max_batch_size, BatchValidation, BatchValidationError, BlockHash, ExecHeader,
     SealedBatch, TransactionSigned, TransactionTrait as _, PARALLEL_SENDER_RECOVERY_THRESHOLD,
@@ -60,6 +60,19 @@ impl BatchValidation for BatchValidator {
         // no-op
         self.validate_basefee()?;
         Ok(())
+    }
+
+    fn submit_txn_if_mine(&self, tx_bytes: &[u8], committee_size: u64, committee_slot: u64) {
+        let reth_env = self.reth_env.clone();
+        if let Ok(tx) = bytes_to_txn(tx_bytes) {
+            let mut bytes = [0_u8; 8];
+            bytes.copy_from_slice(&tx.hash()[0..8]);
+            if (u64::from_ne_bytes(bytes) % committee_size) == committee_slot {
+                tokio::task::spawn(async move {
+                    let _ = reth_env.worker_txn_pool().add_raw_transaction_external(tx).await;
+                });
+            }
+        }
     }
 }
 
@@ -182,6 +195,8 @@ impl BatchValidation for NoopBatchValidator {
     fn validate_batch(&self, _batch: SealedBatch) -> Result<(), BatchValidationError> {
         Ok(())
     }
+
+    fn submit_txn_if_mine(&self, _tx_bytes: &[u8], _committee_size: u64, _committee_slot: u64) {}
 }
 
 #[cfg(test)]

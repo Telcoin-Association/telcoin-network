@@ -112,6 +112,11 @@ impl LibP2pConfig {
     pub fn worker_topic(&self) -> String {
         String::from("tn-worker")
     }
+
+    /// Return topics for worker.
+    pub fn worker_txn_topic(&self) -> String {
+        String::from("tn-txn")
+    }
 }
 
 impl Default for LibP2pConfig {

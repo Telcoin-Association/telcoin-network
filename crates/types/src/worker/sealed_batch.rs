@@ -204,6 +204,10 @@ pub fn max_batch_size(_timestamp: u64) -> usize {
 pub trait BatchValidation: Send + Sync + Debug {
     /// Determines if this batch can be voted on
     fn validate_batch(&self, b: SealedBatch) -> Result<(), BatchValidationError>;
+
+    /// Submit a transaction (as bytes) for inclusion in a batch.
+    /// Will only submit if the txn hash fits the provided committee slot.
+    fn submit_txn_if_mine(&self, tx_bytes: &[u8], committee_size: u64, committee_slot: u64);
 }
 
 /// Block validation error types

@@ -143,7 +143,13 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // overwrite all genesis if `genesis` was passed to CLI
         if let Some(chain) = self.genesis.take() {
             info!(target: "cli", ?chain, "Overwriting TN config with specified chain");
-            self.reth.chain = chain;
+            // Copy over any initial allocations.  This is for testing (and testnets).
+            let mut chain = Arc::unwrap_or_clone(chain);
+            chain
+                .genesis
+                .alloc
+                .extend(self.reth.chain.genesis.alloc.iter().map(|(k, v)| (*k, v.clone())));
+            self.reth.chain = Arc::new(chain);
         }
 
         // get the worker's transaction address from the config

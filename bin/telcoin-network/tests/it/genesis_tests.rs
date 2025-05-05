@@ -6,17 +6,17 @@
 use crate::util::spawn_local_testnet;
 use alloy::{
     network::EthereumWallet,
+    primitives::utils::parse_ether,
     providers::ProviderBuilder,
     sol_types::{SolCall, SolConstructor},
 };
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use serde_json::Value;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tempfile::TempDir;
-use tn_config::{
-    fetch_file_content_relative_to_manifest, NetworkGenesis, QueryResult, DEPLOYMENTS_JSON,
-};
+use tn_config::{fetch_file_content_relative_to_manifest, NetworkGenesis, DEPLOYMENTS_JSON};
 use tn_reth::{
     system_calls::{
         ConsensusRegistry::{self, getCurrentEpochInfoReturn, getValidatorsReturn},
@@ -50,8 +50,17 @@ async fn test_genesis_with_its() -> eyre::Result<()> {
     let rpc_url = "http://127.0.0.1:8545".to_string();
     let client = HttpClientBuilder::default().build(&rpc_url).expect("couldn't build rpc client");
 
-    let precompiles =
-        NetworkGenesis::fetch_precompile_genesis_accounts().expect("its precompiles not found");
+    let itel_address =
+        NetworkGenesis::fetch_from_json_str(DEPLOYMENTS_JSON, Some("its.InterchainTEL"))?
+            .as_str()
+            .map(|hex_str| Address::from_hex(hex_str).unwrap())
+            .unwrap();
+    let tel_supply = U256::try_from(parse_ether("100_000_000_000").unwrap()).unwrap();
+    // 4 million tel staked at genesis for 4 validators
+    let itel_bal = tel_supply - U256::try_from(parse_ether("4_000_000").unwrap()).unwrap();
+
+    let precompiles = NetworkGenesis::fetch_precompile_genesis_accounts(itel_address, itel_bal)
+        .expect("its precompiles not found");
     for (address, genesis_account) in precompiles {
         let returned_code: String = client
             .request("eth_getCode", rpc_params!(address))
@@ -59,6 +68,14 @@ async fn test_genesis_with_its() -> eyre::Result<()> {
             .expect("Failed to fetch runtime code");
         assert_eq!(Bytes::from_hex(returned_code), Ok(genesis_account.code.unwrap()));
 
+        if address == itel_address {
+            let returned_bal: String = client
+                .request("eth_getBalance", rpc_params!(address))
+                .await
+                .expect("Failed to fetch RWTEL balance");
+            let returned_bal = returned_bal.trim_start_matches("0x");
+            assert_eq!(U256::from_str_radix(returned_bal, 16)?, itel_bal);
+        }
         if genesis_account.storage.is_some() {
             for (slot, value) in genesis_account.storage.unwrap().iter() {
                 let returned_storage: String = client
@@ -75,57 +92,64 @@ async fn test_genesis_with_its() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
-    let precompiles =
-        NetworkGenesis::fetch_precompile_genesis_accounts().expect("its precompiles not found");
-
     // check that all addresses in expected_deployments are present in precompiles
     let is_address_present = |address: &str, genesis_config: Vec<(Address, GenesisAccount)>| {
         genesis_config
             .iter()
             .any(|(precompile_address, _)| precompile_address.to_string() == address)
     };
-    let expected_deployments = match NetworkGenesis::fetch_from_json_str(DEPLOYMENTS_JSON, None) {
-        Ok(QueryResult::Map(value)) => value,
-        _ => panic!("deployments not found"),
-    };
-    let its = expected_deployments.get("its").and_then(|v| v.as_object()).unwrap();
-    for (key, value) in its {
-        let address = value.as_str().unwrap();
-        assert!(
-            is_address_present(address, precompiles.clone()),
-            "{key} is not present in precompiles"
-        );
-    }
+    let expected_deployments = NetworkGenesis::fetch_from_json_str(DEPLOYMENTS_JSON, None)?;
 
-    for key in ["rwTEL", "rwTELImpl", "rwTELTokenManager"] {
-        let address = expected_deployments.get(key).and_then(|v| v.as_str()).unwrap();
-        assert!(
-            is_address_present(address, precompiles.clone()),
-            "{key} is not present in precompiles"
-        );
-    }
+    // assert all interchain token service precompile configs are present
+    let its_addresses = expected_deployments.get("its").and_then(|v| v.as_object()).unwrap();
+    let itel_address =
+        Address::from_hex(its_addresses.get("InterchainTEL").and_then(|v| v.as_str()).unwrap())
+            .unwrap();
 
-    // assert stateful contracts possess storage config
-    let rwtel = expected_deployments.get("rwTEL").and_then(|v| v.as_str()).unwrap();
-    let rwtel_impl = expected_deployments.get("rwTELImpl").and_then(|v| v.as_str()).unwrap();
-    let gateway = its.get("AxelarAmplifierGateway").and_then(|v| v.as_str()).unwrap();
-    let gas_service = its.get("GasService").and_then(|v| v.as_str()).unwrap();
-    let token_service = its.get("InterchainTokenService").and_then(|v| v.as_str()).unwrap();
-    let factory = its.get("InterchainTokenFactory").and_then(|v| v.as_str()).unwrap();
-    for (address, genesis_account) in precompiles {
-        let addr_str = address.to_string();
-        // contracts with storage
-        if [rwtel, rwtel_impl, gateway, gas_service, token_service, factory]
-            .iter()
-            .any(|&a| a == addr_str)
-        {
-            assert!(genesis_account.storage.is_some());
-        }
-        // check rwtel balance exists, actual val checked later
-        if addr_str == rwtel {
-            assert!(genesis_account.balance > U256::ZERO);
-        }
-    }
+    let some_bal = U256::try_from(parse_ether("95_000_000_000").unwrap()).unwrap();
+    let precompiles = NetworkGenesis::fetch_precompile_genesis_accounts(itel_address, some_bal)
+        .expect("its precompiles not found");
+    let addresses_with_storage: Vec<&str> = [
+        "InterchainTEL",
+        "InterchainTELImpl",
+        "AxelarAmplifierGateway",
+        "GasService",
+        "InterchainTokenService",
+        "InterchainTokenFactory",
+    ]
+    .iter()
+    .filter_map(|&key| its_addresses.get(key).and_then(Value::as_str))
+    .collect();
+    its_addresses
+        .iter()
+        .filter_map(|(key, value)| value.as_str().map(|address| (key, address)))
+        .for_each(|(key, address)| {
+            println!("{key}");
+            println!("{address}");
+            assert!(
+                is_address_present(address, precompiles.clone()),
+                "{key} is not present in precompiles"
+            );
+
+            if addresses_with_storage.contains(&address) {
+                if let Some((_, genesis_account)) = precompiles
+                    .iter()
+                    .find(|precompile| precompile.0 == Address::from_hex(address).unwrap())
+                {
+                    assert!(
+                        genesis_account.storage.is_some(),
+                        "Storage should be present for {address}"
+                    );
+
+                    if key == "InterchainTEL" {
+                        assert!(
+                            genesis_account.balance == some_bal,
+                            "ITEL balance should be 100 billion TEL minus genesis validator stake"
+                        );
+                    }
+                }
+            }
+        });
 
     Ok(())
 }
@@ -260,11 +284,12 @@ fn genesis_with_proxy(registry_impl_deployed_bytecode: Vec<u8>) -> eyre::Result<
         .collect();
 
     let epoch_duration = 60 * 60 * 24; // 24-hours
-    let stake_amount = U256::from(1_000_000e18);
+    let stake_amount = U256::try_from(parse_ether("1_000_000").unwrap()).unwrap();
     let initial_stake_config = ConsensusRegistry::StakeConfig {
         stakeAmount: stake_amount,
-        minWithdrawAmount: U256::from(1_000e18),
-        epochIssuance: U256::from(20_000_000e18)
+        minWithdrawAmount: U256::try_from(parse_ether("1_000").unwrap()).unwrap(),
+        epochIssuance: U256::try_from(parse_ether("20_000_000").unwrap())
+            .unwrap()
             .checked_div(U256::from(28))
             .expect("u256 div checked"),
         epochDuration: epoch_duration,
@@ -293,7 +318,7 @@ fn genesis_with_proxy(registry_impl_deployed_bytecode: Vec<u8>) -> eyre::Result<
 
     // now init the registry impl
     let init_data = ConsensusRegistry::initializeCall {
-        rwTEL_: Address::random(),
+        iTEL_: Address::random(),
         genesisConfig_: initial_stake_config,
         initialValidators_: initial_validators.clone(),
         owner_: Address::random(),

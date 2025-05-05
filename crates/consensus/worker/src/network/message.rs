@@ -9,6 +9,8 @@ use tn_types::{Batch, BlockHash, SealedBatch};
 pub enum WorkerGossip {
     /// A new is available.
     Batch(BlockHash),
+    /// Transaction- published so a committee member can include in a batch.
+    Txn(Vec<u8>),
 }
 
 // impl TNMessage trait for types

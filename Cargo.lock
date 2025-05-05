@@ -5086,6 +5086,7 @@ dependencies = [
  "libp2p-core",
  "libp2p-gossipsub",
  "libp2p-identity",
+ "libp2p-kad",
  "libp2p-swarm",
  "pin-project 1.1.8",
  "prometheus-client",

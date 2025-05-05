@@ -2,8 +2,6 @@
 
 set -e
 
-# TODO: this doesn't work very well all in one terminal
-#
 # indicates if the network should start or just generate config files
 START=false
 
@@ -146,6 +144,7 @@ if [ "$START" = true ]; then
            --log.stdout.format log-fmt \
            -vvv \
            --http > "${ROOTDIR}/${VALIDATOR}.log" &
+
     done
     echo "$LENGTH validators started in background, \
     use 'killall telcoin-network' to bring the test network down"
