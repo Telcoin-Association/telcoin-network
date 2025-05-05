@@ -403,14 +403,6 @@ where
                 // update the stream to forward events
                 self.event_stream = new_event_stream;
             }
-            // TODO: combine this with the command above
-            NetworkCommand::UpdateTaskSpawner { task_spawner } => {
-                if let Err(e) = self.event_stream.try_send(NetworkEvent::Epoch(task_spawner)) {
-                    error!(target: "network", ?e, "failed to update task spawner for new epoch!");
-                    // fatal - unable to transition epochs
-                    return Err(e.into());
-                }
-            }
         }
 
         Ok(())

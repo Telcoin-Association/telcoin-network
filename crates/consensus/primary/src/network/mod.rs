@@ -185,19 +185,14 @@ impl PrimaryNetworkHandle {
         peers: PeerExchangeMap,
         channel: ResponseChannel<PrimaryResponse>,
     ) {
-        let _ = self.handle.process_peer_exchange(peers, channel).await;
+        if let Err(e) = self.handle.process_peer_exchange(peers, channel).await {
+            warn!(target: "primary::network", ?e, "process peer exchange failed");
+        }
     }
 
     /// Retrieve a collection of connected peers.
     pub async fn connected_peers(&self) -> NetworkResult<Vec<PeerId>> {
         self.handle.connected_peers().await
-    }
-
-    /// Update the task spawner for the epoch.
-    ///
-    /// This is needed for each new epoch so epoch-related tasks are closed with the epoch.
-    pub async fn new_epoch(&self, task_spawner: TaskSpawner) -> NetworkResult<()> {
-        self.handle.update_task_spawner(task_spawner).await
     }
 }
 
@@ -239,9 +234,9 @@ where
         &self.network_handle
     }
 
-    /// Run the network.
-    pub fn spawn(mut self, node_task_spawner: &TaskSpawner) {
-        node_task_spawner.spawn_critical_task("primary network events", async move {
+    /// Run the network for the epoch.
+    pub fn spawn(mut self, epoch_task_spawner: &TaskSpawner) {
+        epoch_task_spawner.spawn_critical_task("primary network events", async move {
             while let Some(event) = self.network_events.recv().await {
                 self.process_network_event(event)
             }
@@ -274,10 +269,6 @@ where
             },
             NetworkEvent::Gossip(msg, source) => {
                 self.process_gossip(msg, source);
-            }
-            NetworkEvent::Epoch(task_spawner) => {
-                // update task spawner
-                self.task_spawner = task_spawner;
             }
         }
     }

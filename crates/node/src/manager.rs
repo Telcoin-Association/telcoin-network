@@ -482,9 +482,6 @@ where
         )
         .await?;
 
-        // update the network's task spawner so epoch-related tasks are closed with the epoch
-        network_handle.new_epoch(epoch_task_spawner).await?;
-
         // spawn primary - create node and spawn network
         let primary =
             PrimaryNode::new(consensus_config.clone(), consensus_bus, network_handle, state_sync);

@@ -262,9 +262,9 @@ where
         Self { network_events, network_handle, request_handler }
     }
 
-    /// Run the network.
-    pub fn spawn(mut self, node_task_spawner: &TaskSpawner) {
-        node_task_spawner.spawn_task("worker network events", async move {
+    /// Run the network for the epoch.
+    pub fn spawn(mut self, epoch_task_spawner: &TaskSpawner) {
+        epoch_task_spawner.spawn_task("worker network events", async move {
             loop {
                 while let Some(event) = self.network_events.recv().await {
                     self.process_network_event(event);
@@ -291,13 +291,6 @@ where
             },
             NetworkEvent::Gossip(msg, source) => {
                 self.process_gossip(msg, source);
-            }
-            NetworkEvent::Epoch(_) => {
-                tracing::info!(
-                    target: "worker",
-                    "received epoch network event for worker network handle !!!!!!!!! delete me"
-                );
-                // TODO: confirm no need to update for now
             }
         }
     }
