@@ -15,8 +15,8 @@ use tn_network_libp2p::{
 use tn_network_types::{FetchBatchResponse, PrimaryToWorkerClient, WorkerSynchronizeMessage};
 use tn_storage::tables::Batches;
 use tn_types::{
-    encode, now, Batch, BatchValidation, BlockHash, Database, DbTxMut, Noticer, SealedBatch,
-    TaskManager, WorkerId,
+    encode, now, Batch, BatchValidation, BlockHash, Database, DbTxMut, SealedBatch, TaskSpawner,
+    WorkerId,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -50,6 +50,11 @@ impl WorkerNetworkHandle {
     pub fn new_for_test() -> Self {
         let (tx, _rx) = mpsc::channel(5);
         Self { handle: NetworkHandle::new(tx) }
+    }
+
+    /// Return a reference to the inner handle.
+    pub fn inner_handle(&self) -> &NetworkHandle<WorkerRequest, WorkerResponse> {
+        &self.handle
     }
 
     /// Dial a peer.
@@ -238,8 +243,6 @@ pub struct WorkerNetwork<DB> {
     network_handle: WorkerNetworkHandle,
     // Request handler to process requests and return responses.
     request_handler: RequestHandler<DB>,
-    /// Shutdown notification.
-    shutdown_rx: Noticer,
 }
 
 impl<DB> WorkerNetwork<DB>
@@ -254,25 +257,18 @@ where
         id: WorkerId,
         validator: Arc<dyn BatchValidation>,
     ) -> Self {
-        let shutdown_rx = consensus_config.shutdown().subscribe();
         let request_handler =
             RequestHandler::new(id, validator, consensus_config, network_handle.clone());
-        Self { network_events, network_handle, request_handler, shutdown_rx }
+        Self { network_events, network_handle, request_handler }
     }
 
     /// Run the network.
-    pub fn spawn(mut self, task_manager: &TaskManager) {
-        task_manager.spawn_task("worker network events", async move {
+    pub fn spawn(mut self, node_task_spawner: &TaskSpawner) {
+        node_task_spawner.spawn_task("worker network events", async move {
             loop {
-                tokio::select!(
-                    _ = &self.shutdown_rx => break,
-                    event = self.network_events.recv() => {
-                        match event {
-                            Some(e) => self.process_network_event(e),
-                            None => break,
-                        }
-                    }
-                )
+                while let Some(event) = self.network_events.recv().await {
+                    self.process_network_event(event);
+                }
             }
         });
     }
@@ -295,6 +291,13 @@ where
             },
             NetworkEvent::Gossip(msg, source) => {
                 self.process_gossip(msg, source);
+            }
+            NetworkEvent::Epoch(_) => {
+                tracing::info!(
+                    target: "worker",
+                    "received epoch network event for worker network handle !!!!!!!!! delete me"
+                );
+                // TODO: confirm no need to update for now
             }
         }
     }
