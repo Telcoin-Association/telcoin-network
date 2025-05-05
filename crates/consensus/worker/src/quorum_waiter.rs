@@ -15,7 +15,7 @@ use tn_types::{
     network_public_key_to_libp2p, Authority, Committee, SealedBatch, VotingPower, WorkerCache,
     WorkerId,
 };
-use tokio::task::JoinHandle;
+use tokio::{sync::oneshot, task::JoinHandle};
 
 #[cfg(test)]
 #[path = "tests/quorum_waiter_tests.rs"]
@@ -90,7 +90,7 @@ impl QuorumWaiter {
 
     /// Helper function. It waits for a future to complete and then delivers a value.
     async fn waiter(
-        wait_for: JoinHandle<Result<(), NetworkError>>,
+        wait_for: oneshot::Receiver<Result<(), NetworkError>>,
         deliver: VotingPower,
     ) -> Result<VotingPower, WaiterError> {
         match wait_for.await {

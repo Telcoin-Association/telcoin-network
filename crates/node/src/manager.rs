@@ -221,7 +221,9 @@ where
             )
         });
 
-        self.worker_network_handle = Some(WorkerNetworkHandle::new(network_handle));
+        // set temporary task spawner - this is updated with each epoch
+        self.worker_network_handle =
+            Some(WorkerNetworkHandle::new(network_handle, node_task_spawner.clone()));
 
         Ok(())
     }
@@ -495,6 +497,16 @@ where
     ) -> eyre::Result<WorkerNode<DB>> {
         // only support one worker for now - otherwise, loop here
         let (worker_id, _worker_info) = consensus_config.config().workers().first_worker()?;
+
+        // update the network handle's task spawner for reporting batches in the epoch
+        {
+            let network_handle = self
+                .worker_network_handle
+                .as_mut()
+                .ok_or_eyre("worker network handle missing from epoch manager")?;
+            network_handle.update_task_spawner(epoch_task_spawner.clone());
+        }
+
         let network_handle = self
             .worker_network_handle
             .as_ref()
@@ -511,8 +523,12 @@ where
         )
         .await?;
 
-        let worker =
-            WorkerNode::new(*worker_id, consensus_config.clone(), network_handle, validator);
+        let worker = WorkerNode::new(
+            *worker_id,
+            consensus_config.clone(),
+            network_handle.clone(),
+            validator,
+        );
 
         Ok(worker)
     }

@@ -162,9 +162,8 @@ impl RequestBatchesNetwork for WorkerNetworkHandle {
 
 #[cfg(test)]
 mod tests {
-    use crate::{WorkerRequest, WorkerResponse};
-
     use super::*;
+    use crate::{WorkerRequest, WorkerResponse};
     use itertools::Itertools as _;
     use rand::{rngs::StdRng, RngCore};
     use tempfile::TempDir;
@@ -174,7 +173,7 @@ mod tests {
     };
     use tn_storage::open_db;
     use tn_test_utils::transaction;
-    use tn_types::NetworkKeypair;
+    use tn_types::{NetworkKeypair, TaskManager};
     use tokio::sync::{mpsc, Mutex};
 
     #[tokio::test]
@@ -394,10 +393,13 @@ mod tests {
             let data: Arc<Mutex<HashMap<PeerId, HashMap<BlockHash, Batch>>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let data_clone = data.clone();
-            let (rx, mut tx) = mpsc::channel(100);
-            let handle = WorkerNetworkHandle::new(NetworkHandle::new(rx));
+            let (tx, mut rx) = mpsc::channel(100);
+            let task_manager = TaskManager::default();
+            let handle =
+                WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner());
             tokio::spawn(async move {
-                while let Some(r) = tx.recv().await {
+                let _owned = task_manager;
+                while let Some(r) = rx.recv().await {
                     match r {
                         NetworkCommand::ConnectedPeers { reply } => {
                             reply.send(data_clone.lock().await.keys().copied().collect()).unwrap();
