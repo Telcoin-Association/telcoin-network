@@ -20,8 +20,8 @@ use tn_primary::{
 use tn_reth::{RethDb, RethEnv};
 use tn_storage::{open_db, tables::ConsensusBlocks, DatabaseType};
 use tn_types::{
-    BatchValidation, ConsensusHeader, Database as TNDatabase, Multiaddr, Noticer, Notifier,
-    SealedBlock, TaskManager, TaskSpawner,
+    BatchValidation, BlsPublicKey, ConsensusHeader, Database as TNDatabase, Multiaddr, Noticer,
+    Notifier, SealedBlock, TaskManager, TaskSpawner,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::{
@@ -397,6 +397,9 @@ where
         network_config: &NetworkConfig,
         initialize_networks: &mut bool,
     ) -> eyre::Result<(PrimaryNode<DatabaseType>, WorkerNode<DatabaseType>)> {
+        // send these to the swarm for validator discovery
+        let _committee_bls_keys = self.create_committee_from_state(engine).await?;
+
         // create config for consensus
         let consensus_config = ConsensusConfig::new(
             self.builder.tn_config.clone(),
@@ -447,6 +450,24 @@ where
         );
 
         Ok((primary, worker))
+    }
+
+    /// Create the [Committee] for the current epoch.
+    ///
+    /// This is the first step for configuring consensus.
+    async fn create_committee_from_state(
+        &self,
+        engine: &ExecutionNode,
+    ) -> eyre::Result<Vec<BlsPublicKey>> {
+        // retrieve the committee from state
+        let validator_infos = engine.read_committee_from_chain().await?;
+        let committee_bls_keys = validator_infos
+            .iter()
+            .map(|v| BlsPublicKey::from_bytes_on_chain(v.blsPubkey.as_ref()))
+            .collect::<Result<_, _>>()
+            .map_err(|err| eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
+
+        Ok(committee_bls_keys)
     }
 
     /// Create a [PrimaryNode].

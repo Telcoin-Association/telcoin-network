@@ -118,6 +118,11 @@ sol!(
 
         /// Return the validators by status. Pass `0` for status to return all validators.
         function getValidators(uint8 status) public view returns (ValidatorInfo[] memory);
+        /// @dev Fetches the `tokenId` for a given validator validatorAddress
+        function getValidatorTokenId(address validatorAddress) external view returns (uint256);
+        /// @dev Fetches the `ValidatorInfo` for a given ConsensusNFT tokenId
+        /// @notice To enable checks against storage slots initialized to zero by the EVM, `tokenId` cannot be `0`
+        function getValidatorByTokenId(uint256 tokenId) external view returns (ValidatorInfo memory);
         /// Return committee epoch info for a specific epoch.
         function getEpochInfo(uint32 epoch) public view returns (EpochInfo memory epochInfo);
         /// Return the current epoch.
