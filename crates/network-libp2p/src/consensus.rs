@@ -7,7 +7,10 @@ use crate::{
     error::NetworkError,
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
-    types::{AddrList, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
+    types::{
+        AuthorityInfoRequest, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult,
+        NodeRecord,
+    },
     PeerExchangeMap,
 };
 use futures::StreamExt as _;
@@ -16,7 +19,7 @@ use libp2p::{
         self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance, Topic,
         TopicHash,
     },
-    kad::{self, store::MemoryStore, Mode},
+    kad::{self, store::MemoryStore, Mode, QueryId},
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
         InboundRequestId, OutboundRequestId,
@@ -119,6 +122,11 @@ where
     /// data. Peers that send messages that fail to decode must receive an application score
     /// penalty.
     inbound_requests: HashMap<InboundRequestId, oneshot::Sender<()>>,
+    /// The collection of kademlia record requests.
+    ///
+    /// When the application layer makes a request, the swarm stores the kad::QueryId and the reply channel
+    /// to the caller. On the `Event::OutboundQueryProgressed`, the result is sent through the oneshot channel.
+    kad_requests: HashMap<QueryId, oneshot::Sender<NetworkResult<NodeRecord>>>,
     /// The configurables for the libp2p consensus network implementation.
     config: LibP2pConfig,
     /// Track peers we have a connection with.
@@ -226,6 +234,7 @@ where
             authorized_publishers: Default::default(),
             outbound_requests: Default::default(),
             inbound_requests: Default::default(),
+            kad_requests: Default::default(),
             config,
             connected_peers: VecDeque::new(),
             pending_px_disconnects,
@@ -247,32 +256,31 @@ where
     /// Return a kademlia record keyed on our BlsPublicKey with our peer_id and network addresses.
     /// Return None if we don't have any confirmed external addresses yet.
     fn get_peer_record(&self) -> Option<kad::Record> {
-        let key = kad::RecordKey::new(&encode(&self.key_config.primary_public_key()));
-        let value: Vec<Multiaddr> = self.swarm.external_addresses().cloned().collect();
-        if value.is_empty() {
+        let key = kad::RecordKey::new(&self.key_config.primary_public_key());
+        let multiaddrs: Vec<Multiaddr> = self.swarm.external_addresses().cloned().collect();
+        if multiaddrs.is_empty() {
             return None;
         }
         let peer_id = *self.swarm.local_peer_id();
+
+        // TODO: how does this get republished?
         let expires = Instant::now().checked_add(Duration::from_secs(60 * 60 * 24)); // one day
-        let signature = self.key_config.request_signature_direct(&encode(&value));
-        let addr_list = AddrList { signature, value };
+        let node_record = NodeRecord::build(peer_id, multiaddrs, |data| {
+            self.key_config.request_signature_direct(data)
+        });
         Some(kad::Record {
             key: key.clone(),
-            value: encode(&addr_list),
+            value: encode(&node_record),
             publisher: Some(peer_id),
             expires,
         })
     }
 
     /// Verify the address list in Record was signed by the key.
-    fn peer_record_valid(&self, record: &kad::Record) -> Option<(BlsPublicKey, AddrList)> {
+    fn peer_record_valid(&self, record: &kad::Record) -> Option<(BlsPublicKey, NodeRecord)> {
         let key = try_decode::<BlsPublicKey>(record.key.as_ref()).ok()?;
-        let addr_list = try_decode::<AddrList>(record.value.as_ref()).ok()?;
-        if addr_list.signature.verify_raw(&encode(&addr_list.value), &key) {
-            Some((key, addr_list))
-        } else {
-            None
-        }
+        let node_record = try_decode::<NodeRecord>(record.value.as_ref()).ok()?;
+        node_record.verify(&key)
     }
 
     /// Publish and provide our network addresses and peer id under our BLS public key for
@@ -509,6 +517,18 @@ where
 
                 // update the stream to forward events
                 self.event_stream = new_event_stream;
+            }
+            NetworkCommand::FindAuthorities { requests } => {
+                // check peer manager first, if not found try kademlia
+                //
+                // TODO:!!! check peer manager
+
+                // this is only used for discovery, so will hang indefinitely
+                for AuthorityInfoRequest { bls_key, reply } in requests {
+                    let key = kad::RecordKey::new(&bls_key);
+                    let request_id = self.swarm.behaviour_mut().kademlia.get_record(key);
+                    self.kad_requests.insert(request_id, reply);
+                }
             }
         }
 
@@ -808,7 +828,7 @@ where
             kad::Event::InboundRequest { request } => {
                 trace!(target: "network-kad", "inbound {request:?}")
             }
-            kad::Event::OutboundQueryProgressed { id: _, result, stats: _, step: _ } => {
+            kad::Event::OutboundQueryProgressed { id: query_id, result, stats: _, step } => {
                 match result {
                     kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders {
                         key,
@@ -831,12 +851,31 @@ where
                         error!(target: "network-kad", "Failed to get providers: {err:?}");
                     }
                     kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(
-                        kad::PeerRecord { record, .. },
+                        kad::PeerRecord { record, peer },
                     ))) => {
                         if let Some((key, value)) = self.peer_record_valid(&record) {
                             trace!(target: "network-kad", "Got record {key} {value:?}");
+
+                            // TODO: what happens with stale records?
+                            self.return_kad_result(&query_id, Ok(value));
                         } else {
                             error!(target: "network-kad", "Recieved invalid peer record!");
+
+                            // assess penalty for invalid peer record
+                            if let Some(peer_id) = peer {
+                                self.swarm
+                                    .behaviour_mut()
+                                    .peer_manager
+                                    .process_penalty(peer_id, Penalty::Severe);
+                            }
+
+                            // return an error to caller if this is the last response for the query
+                            if step.last {
+                                self.return_kad_result(
+                                    &query_id,
+                                    Err(NetworkError::InvalidPeerRecord),
+                                );
+                            }
                         }
                     }
                     kad::QueryResult::GetRecord(Ok(_)) => {}
@@ -894,6 +933,14 @@ where
             }
         }
         Ok(())
+    }
+
+    /// Return the kademlia result to application layer.
+    fn return_kad_result(&mut self, query_id: &QueryId, result: NetworkResult<NodeRecord>) {
+        // ignore multiple query results
+        if let Some(reply) = self.kad_requests.remove(query_id) {
+            send_or_log_error!(reply, result, "kad");
+        }
     }
 }
 
