@@ -1,12 +1,14 @@
 use clap::Parser;
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
+#[cfg(feature = "faucet")]
+use std::sync::Arc;
 use telcoin_network::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
 use tn_node::launch_node;
-use tn_reth::RethChainSpec;
 use tn_test_utils::CommandParser;
-use tn_types::Address;
+use tn_types::{Address, Genesis};
 use tracing::error;
 
+/// Limit potential for port collisions.
 pub static IT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Execute genesis ceremony inside tempdir
@@ -110,7 +112,7 @@ pub async fn config_local_testnet(
 
 /// Create validator info, genesis ceremony, and spawn node command with faucet active.
 pub fn spawn_local_testnet(
-    _chain: Arc<RethChainSpec>,
+    _genesis: Genesis, // only needed for faucet tests
     #[cfg(feature = "faucet")] faucet_contract_address: &str,
 ) -> eyre::Result<()> {
     // create temp path for test
@@ -213,7 +215,11 @@ pub fn spawn_local_testnet(
         // update faucet genesis
         cfg_if::cfg_if! {
             if #[cfg(feature = "faucet")] {
-                command.reth.chain = _chain.clone();
+                // extend genesis accounts
+                let consensus_accounts: Vec<_> =
+                    command.reth.chain.genesis.alloc.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                command.reth.chain =
+                    Arc::new(_genesis.clone().extend_accounts(consensus_accounts.into_iter()).into());
             }
         }
 
