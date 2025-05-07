@@ -6,6 +6,7 @@ use super::*;
 use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{batch, CommitteeFixture};
+use tn_types::TaskManager;
 use tokio::sync::mpsc;
 
 #[tokio::test]
@@ -14,12 +15,12 @@ async fn wait_for_quorum() {
     let committee = fixture.committee();
     let worker_cache = fixture.worker_cache();
     let my_primary = fixture.authorities().next().unwrap();
-
     let node_metrics = Arc::new(WorkerMetrics::default());
+    let task_manager = TaskManager::default();
 
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
-    let network = WorkerNetworkHandle::new(NetworkHandle::new(sender));
+    let network = WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner());
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter = QuorumWaiter::new(
         my_primary.authority().clone(),

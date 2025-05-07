@@ -1,12 +1,14 @@
 use clap::Parser;
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
+#[cfg(feature = "faucet")]
+use std::sync::Arc;
 use telcoin_network::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
 use tn_node::launch_node;
-use tn_reth::RethChainSpec;
 use tn_test_utils::CommandParser;
-use tn_types::Address;
+use tn_types::{Address, Genesis};
 use tracing::error;
 
+/// Limit potential for port collisions.
 pub static IT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Execute genesis ceremony inside tempdir
@@ -49,6 +51,21 @@ pub fn create_validator_info(
     add_validator_command.args.execute()
 }
 
+/// Execute observer config inside tempdir
+pub fn create_observer_info(datadir: &str, passphrase: Option<String>) -> eyre::Result<()> {
+    // keytool
+    let keys_command = CommandParser::<KeyArgs>::parse_from([
+        "tn",
+        "generate",
+        "observer",
+        "--datadir",
+        datadir,
+        "--dev-funded-account",
+        "test-source",
+    ]);
+    keys_command.args.execute(passphrase)
+}
+
 /// Create validator info, genesis ceremony, and spawn node command with faucet active.
 pub async fn config_local_testnet(
     temp_path: PathBuf,
@@ -81,6 +98,12 @@ pub async fn config_local_testnet(
         }
     }
 
+    // Create an observer config.
+    let dir = temp_path.join("observer");
+    let datadir = dir.to_str().expect("observer temp dir");
+    // init config ceremony for observer
+    create_observer_info(datadir, passphrase.clone())?;
+
     // create committee from shared genesis dir
     let create_committee_command = CommandParser::<GenesisArgs>::parse_from([
         "tn",
@@ -103,14 +126,29 @@ pub async fn config_local_testnet(
             shared_genesis_dir.join("genesis/worker_cache.yaml"),
             dir.join("genesis/worker_cache.yaml"),
         )?;
+
+        // use genesis file
+        let genesis_json_path = dir.join("genesis/genesis.json");
+        std::fs::copy(shared_genesis_dir.join("genesis/genesis.json"), &genesis_json_path)?;
     }
 
+    let dir = temp_path.join("observer");
+    // copy genesis files back to observer dirs
+    std::fs::create_dir_all(dir.join("genesis"))?;
+    std::fs::copy(
+        shared_genesis_dir.join("genesis/committee.yaml"),
+        dir.join("genesis/committee.yaml"),
+    )?;
+    std::fs::copy(
+        shared_genesis_dir.join("genesis/worker_cache.yaml"),
+        dir.join("genesis/worker_cache.yaml"),
+    )?;
     Ok(())
 }
 
 /// Create validator info, genesis ceremony, and spawn node command with faucet active.
 pub fn spawn_local_testnet(
-    _chain: Arc<RethChainSpec>,
+    _genesis: Genesis, // only needed for faucet tests
     #[cfg(feature = "faucet")] faucet_contract_address: &str,
 ) -> eyre::Result<()> {
     // create temp path for test
@@ -213,7 +251,11 @@ pub fn spawn_local_testnet(
         // update faucet genesis
         cfg_if::cfg_if! {
             if #[cfg(feature = "faucet")] {
-                command.reth.chain = _chain.clone();
+                // extend genesis accounts
+                let consensus_accounts: Vec<_> =
+                    command.reth.chain.genesis.alloc.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                command.reth.chain =
+                    Arc::new(_genesis.clone().extend_accounts(consensus_accounts.into_iter()).into());
             }
         }
 

@@ -301,11 +301,11 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
     // start canonical adiri chain with fetched storage
     let real_genesis = adiri_genesis();
     let genesis = real_genesis.extend_accounts(genesis_accounts.into_iter());
-    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
 
     // create and launch validator nodes on local network,
     // use expected faucet contract address from `TransactionFactory::default` with nonce == 0
-    spawn_local_testnet(chain.clone(), &faucet_proxy_address.to_string())?;
+    spawn_local_testnet(genesis, &faucet_proxy_address.to_string())?;
 
     info!(target: "faucet-test", "nodes started - sleeping for 10s...");
 

@@ -60,6 +60,7 @@ eyre = { workspace = true }
 alloy = { workspace = true, features = ["genesis"] }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+alloy-consensus = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

@@ -16,14 +16,11 @@ use tn_network_libp2p::{
 use tn_network_types::{FetchBatchResponse, PrimaryToWorkerClient, WorkerSynchronizeMessage};
 use tn_storage::tables::Batches;
 use tn_types::{
-    encode, now, Batch, BatchValidation, BlockHash, Database, DbTxMut, SealedBatch, TaskSpawner,
-    WorkerId,
+    encode, now, Batch, BatchValidation, BlockHash, Database, DbTxMut, SealedBatch, TaskManager,
+    TaskSpawner, WorkerId,
 };
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::JoinHandle,
-};
-use tracing::{debug, trace, warn};
+use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, error, trace, warn};
 
 mod error;
 mod handler;
@@ -34,21 +31,26 @@ pub(crate) type Req = WorkerRequest;
 /// Convenience type for Primary network.
 pub(crate) type Res = WorkerResponse;
 
+/// The wrapper around worker-specific network calls.
 #[derive(Clone, Debug)]
 pub struct WorkerNetworkHandle {
+    /// The handle to the node's network.
     handle: NetworkHandle<Req, Res>,
+    /// The type to spawn tasks.
+    task_spawner: TaskSpawner,
 }
 
 impl WorkerNetworkHandle {
-    pub fn new(handle: NetworkHandle<Req, Res>) -> Self {
-        Self { handle }
+    pub fn new(handle: NetworkHandle<Req, Res>, task_spawner: TaskSpawner) -> Self {
+        Self { handle, task_spawner }
     }
 
     //// Convenience method for creating a new Self for tests- sends events no-where and does
     //// nothing.
     pub fn new_for_test() -> Self {
         let (tx, _rx) = mpsc::channel(5);
-        Self { handle: NetworkHandle::new(tx) }
+        let tm = TaskManager::default();
+        Self { handle: NetworkHandle::new(tx), task_spawner: tm.get_spawner() }
     }
 
     /// Return a reference to the inner handle.
@@ -102,12 +104,21 @@ impl WorkerNetworkHandle {
         &self,
         peer_ids: Vec<PeerId>,
         sealed_batch: SealedBatch,
-    ) -> Vec<JoinHandle<NetworkResult<()>>> {
+    ) -> Vec<oneshot::Receiver<NetworkResult<()>>> {
         let mut result = vec![];
         for peer_id in peer_ids {
             let handle = self.clone();
             let batch = sealed_batch.clone();
-            result.push(tokio::spawn(async move { handle.report_batch(peer_id, batch).await }));
+            let task_name = format!("ReportBatchToPeer-{peer_id}");
+            let (tx, rx) = oneshot::channel();
+            self.task_spawner.spawn_task(task_name, async move {
+                let res = handle.report_batch(peer_id, batch).await;
+                if let Err(e) = tx.send(res) {
+                    error!(target: "worker::network", ?e, "failed to send result for `handle.report_batch()` on oneshot channel.");
+                }
+            });
+
+            result.push(rx);
         }
         result
     }
@@ -239,6 +250,11 @@ impl WorkerNetworkHandle {
     /// Retrieve a collection of connected peers.
     pub async fn connected_peers(&self) -> NetworkResult<Vec<PeerId>> {
         self.handle.connected_peers().await
+    }
+
+    /// Update the task spawner at the epoch boundary.
+    pub fn update_task_spawner(&mut self, task_spawner: TaskSpawner) {
+        self.task_spawner = task_spawner
     }
 }
 

@@ -3,18 +3,15 @@
 //! These are used to spawn execution components for the node and maintain compatibility with reth's
 //! API.
 
-use crate::RethEnv;
+use crate::{evm_config::TnEvmConfig, RethEnv};
 use reth_chainspec::ChainSpec;
 pub use reth_consensus::{Consensus, ConsensusError};
 use reth_consensus::{FullConsensus, HeaderValidator, PostExecutionInput};
 use reth_db::DatabaseEnv;
 use reth_engine_primitives::PayloadValidator;
 use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
-use reth_evm_ethereum::EthEvmConfig;
 use reth_node_builder::{NodeTypes, NodeTypesWithDB, NodeTypesWithEngine};
-use reth_node_ethereum::{
-    BasicBlockExecutorProvider, EthEngineTypes, EthExecutionStrategyFactory, EthExecutorProvider,
-};
+use reth_node_ethereum::{BasicBlockExecutorProvider, EthEngineTypes, EthExecutionStrategyFactory};
 use reth_provider::EthStorage;
 use reth_trie_db::MerklePatriciaTrie;
 use serde::{Deserialize, Serialize};
@@ -60,15 +57,18 @@ impl NodeTypesWithDB for TelcoinNode {
 }
 
 impl TelcoinNodeTypes for TelcoinNode {
-    type Executor = BasicBlockExecutorProvider<EthExecutionStrategyFactory>;
-    type EvmConfig = EthEvmConfig;
+    type Executor = BasicBlockExecutorProvider<EthExecutionStrategyFactory<TnEvmConfig>>;
+    type EvmConfig = TnEvmConfig;
 
     fn create_evm_config(chain: Arc<ChainSpec>) -> Self::EvmConfig {
-        EthEvmConfig::new(chain)
+        TnEvmConfig::new(chain)
     }
 
     fn create_executor(chain: Arc<ChainSpec>) -> Self::Executor {
-        EthExecutorProvider::ethereum(chain)
+        BasicBlockExecutorProvider::new(EthExecutionStrategyFactory::new(
+            chain.clone(),
+            TnEvmConfig::new(chain),
+        ))
     }
 }
 

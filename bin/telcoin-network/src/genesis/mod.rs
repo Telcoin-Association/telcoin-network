@@ -110,7 +110,7 @@ impl Initialize {
 /// Take a string and return the deterministic account derived from it.  This is be used
 /// with similiar functionality in the test client to allow easy testing using simple strings
 /// for accounts.
-fn account_from_word(key_word: &str) -> Address {
+pub(crate) fn account_from_word(key_word: &str) -> Address {
     if key_word.starts_with("0x") {
         key_word.parse().expect("not a valid account!")
     } else {

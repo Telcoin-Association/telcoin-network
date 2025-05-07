@@ -292,7 +292,7 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
         send_term(child);
     }
 
-    // kill children before returnin final_result
+    // kill children before returning final_result
     for child in children.iter_mut() {
         let child = child.as_mut().expect("missing a child");
         kill_child(child);
@@ -306,6 +306,84 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restartstt() -> eyre::Result<()> {
     do_restarts(2)
+}
+
+/// Run some test to make sure an observer is participating in the network.
+fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<()> {
+    network_advancing(client_urls)?;
+    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
+
+    let key = get_key("test-source");
+    let to_account = address_from_word("testing");
+
+    test_blocks_same(client_urls)?;
+    // Send to observer, validator confirms.
+    send_and_confirm(&obs_url, &client_urls[2], &key, to_account, 0)?;
+    // Send to observer, validator confirms- second time.
+    send_and_confirm(&obs_url, &client_urls[3], &key, to_account, 1)?;
+
+    // Send to a validator, observer sees transfer.
+    send_and_confirm(&client_urls[0], &obs_url, &key, to_account, 2)?;
+
+    test_blocks_same(client_urls)?;
+    Ok(())
+}
+
+/// Test an observer node can submit txns.
+#[test]
+#[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
+fn test_restarts_observer() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
+    init_test_tracing();
+    info!(target: "restart-test", "do_restarts_observer");
+    // the tmp dir should be removed once tmp_quard is dropped
+    let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");
+    // create temp path for test
+    let temp_path = tmp_guard.path().to_path_buf();
+    {
+        let rt = Runtime::new()?;
+        rt.block_on(config_local_testnet(temp_path.clone(), Some("restart_test".to_string())))
+            .expect("failed to config");
+    }
+    let mut exe_path =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("Missing CARGO_MANIFEST_DIR!"));
+    exe_path.push("../../target/debug/telcoin-network");
+    let mut children: [Option<Child>; 4] = [None, None, None, None];
+    let mut client_urls = [
+        "http://127.0.0.1".to_string(),
+        "http://127.0.0.1".to_string(),
+        "http://127.0.0.1".to_string(),
+        "http://127.0.0.1".to_string(),
+    ];
+    let mut rpc_ports: [u16; 4] = [0, 0, 0, 0];
+    for (i, child) in children.iter_mut().enumerate() {
+        let rpc_port = get_available_tcp_port("127.0.0.1")
+            .expect("Failed to get an ephemeral rpc port for child!");
+        rpc_ports[i] = rpc_port;
+        client_urls[i].push_str(&format!(":{rpc_port}"));
+        *child = Some(start_validator(i, &exe_path, &temp_path, rpc_port));
+    }
+    let obs_rpc_port = get_available_tcp_port("127.0.0.1")
+        .expect("Failed to get an ephemeral rpc port for child!");
+    let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
+    let mut obs_child = start_observer(4, &exe_path, &temp_path, obs_rpc_port);
+    let res = run_observer_tests(&client_urls, &obs_url);
+
+    // SIGTERM children so they can shutdown in parrellel.
+    for child in children.iter_mut() {
+        let child = child.as_mut().expect("missing a child");
+        send_term(child);
+    }
+    send_term(&mut obs_child);
+
+    // kill children before returning final_result
+    for child in children.iter_mut() {
+        let child = child.as_mut().expect("missing a child");
+        kill_child(child);
+        info!(target: "restart-test", "kill and wait on child complete for final result");
+    }
+    kill_child(&mut obs_child);
+    res
 }
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
@@ -322,13 +400,15 @@ fn start_validator(instance: usize, exe_path: &Path, base_dir: &Path, mut rpc_po
     // The instance option will still change a set port so account for that.
     rpc_port += instance as u16;
     let mut command = Command::new(exe_path);
+    let genesis_json_path = data_dir.join("genesis/genesis.json");
+
     command
         .env("TN_BLS_PASSPHRASE", "restart_test")
         .arg("node")
         .arg("--datadir")
         .arg(&*data_dir.to_string_lossy())
-        .arg("--chain")
-        .arg("adiri")
+        .arg("--genesis")
+        .arg(&genesis_json_path)
         .arg("--disable-discovery")
         .arg("--instance")
         .arg(format!("{}", instance + 1))
@@ -341,6 +421,29 @@ fn start_validator(instance: usize, exe_path: &Path, base_dir: &Path, mut rpc_po
         .arg("--public-key") // If the binary is built with the faucet need this to start...
         .arg("0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99");
 
+    command.spawn().expect("failed to execute")
+}
+
+/// Start a process running an observer node.
+fn start_observer(instance: usize, exe_path: &Path, base_dir: &Path, mut rpc_port: u16) -> Child {
+    let data_dir = base_dir.join("observer".to_string());
+    // The instance option will still change a set port so account for that.
+    rpc_port += instance as u16;
+    let mut command = Command::new(exe_path);
+    command
+        .env("TN_BLS_PASSPHRASE", "restart_test")
+        .arg("node")
+        .arg("--observer")
+        .arg("--datadir")
+        .arg(&*data_dir.to_string_lossy())
+        .arg("--chain")
+        .arg("adiri")
+        .arg("--disable-discovery")
+        .arg("--instance")
+        .arg(format!("{}", instance + 1))
+        .arg("--http")
+        .arg("--http.port")
+        .arg(format!("{rpc_port}"));
     command.spawn().expect("failed to execute")
 }
 

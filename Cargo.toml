@@ -155,6 +155,7 @@ revm-primitives = { version = "9.0", features = [
 # eth
 alloy = { version = "0.9", features = ["full"] }
 alloy-rlp = "0.3.4"
+alloy-consensus = "0.9"
 
 tn-batch-validator = { path = "crates/execution/batch-validator" }
 tn-engine = { path = "crates/engine" }

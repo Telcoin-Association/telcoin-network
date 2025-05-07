@@ -120,7 +120,15 @@ else
         cp "${GENESIS_JSON_PATH}" "${DATADIR}/genesis"
     done
 
-    target/${RELEASE}/telcoin-network genesis init --datadir "${ROOTDIR}"
+    echo "creating datadir for observer"
+    DATADIR="${ROOTDIR}/observer"
+    mkdir -p "${DATADIR}/genesis"
+    target/${RELEASE}/telcoin-network keytool generate observer \
+        --datadir "${DATADIR}" \
+        --dev-funded-account $DEV_FUNDS
+    cp "${COMMITTEE_PATH}" "${DATADIR}/genesis"
+    cp "${WORKER_CACHE_PATH}" "${DATADIR}/genesis"
+    cp "${GENESIS_JSON_PATH}" "${DATADIR}/genesis"
 fi
 
 if [ "$START" = true ]; then
@@ -144,8 +152,23 @@ if [ "$START" = true ]; then
            --log.stdout.format log-fmt \
            -vvv \
            --http > "${ROOTDIR}/${VALIDATOR}.log" &
-
     done
+
+    DATADIR="${ROOTDIR}/observer"
+    METRICS="127.0.0.1:9094"
+    CONSENSUS_METRICS="127.0.0.1:9104"
+    echo "Starting Observer in background, rpc endpoint http://localhost:8541"
+    target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
+       --genesis "${DATADIR}/genesis/genesis.json" \
+       --observer \
+       --disable-discovery \
+       --instance 5 \
+       --metrics "${METRICS}" \
+       --consensus-metrics "${CONSENSUS_METRICS}" \
+       --log.stdout.format log-fmt \
+       -vvv \
+       --http > "${ROOTDIR}/observer.log" &
+
     echo "$LENGTH validators started in background, \
     use 'killall telcoin-network' to bring the test network down"
 fi

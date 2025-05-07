@@ -1,11 +1,9 @@
 //! Implement thin wrappers around BLST crates public keys.
 
+use blst::{min_sig::PublicKey as CorePublicKey, BLST_ERROR};
 use core::fmt;
-use std::ops::Deref;
-
 use serde::{Deserialize, Serialize};
-
-use blst::min_sig::PublicKey as CorePublicKey;
+use std::ops::Deref;
 
 /// Byte representation of validator's main protocol public key.
 /// This should ONLY be created from a valid key and comtain valid bytes.
@@ -76,8 +74,18 @@ impl From<CorePublicKey> for BlsPublicKey {
 }
 
 impl BlsPublicKey {
+    /// Encode the public key to base58. This is used for serialize/deserialize.
     pub fn encode_base58(&self) -> String {
         self.to_string()
+    }
+
+    /// Decode the public key from bytes on-chain and return result to caller.
+    ///
+    /// WARNING: do not use this method to deserialize bytes from filesystem.
+    /// This method is only used to convert the bytes read from ConsensusRegistry
+    /// smart contract on-chain.
+    pub fn from_bytes_on_chain(bytes: &[u8]) -> Result<Self, BLST_ERROR> {
+        CorePublicKey::from_bytes(bytes).map(|key| key.into())
     }
 }
 

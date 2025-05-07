@@ -35,11 +35,10 @@ use tracing::debug;
 async fn test_genesis_with_its() -> eyre::Result<()> {
     // create genesis with a proxy
     let genesis = adiri_genesis();
-    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
     // spawn testnet for RPC calls
     spawn_local_testnet(
-        chain,
+        genesis,
         #[cfg(feature = "faucet")]
         "0x0000000000000000000000000000000000000000",
     )
@@ -165,11 +164,10 @@ async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
 
     // create genesis with a proxy
     let genesis = genesis_with_proxy(registry_impl_deployed_bytecode.clone())?;
-    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
     // spawn testnet for RPC calls
     spawn_local_testnet(
-        chain,
+        genesis,
         #[cfg(feature = "faucet")]
         "0x0000000000000000000000000000000000000000",
     )

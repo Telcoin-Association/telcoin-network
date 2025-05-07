@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 
 /// Information for the Primary.
 ///
-/// TODO: update AuthorityFixture, etc. to use this instead.
 /// Currently, Primary details are fanned out in authority details.
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct PrimaryInfo {
@@ -15,7 +14,6 @@ pub struct PrimaryInfo {
     pub network_address: Multiaddr,
     /// The worker public network key.
     ///
-    /// TODO: should each worker have their own key?
     /// Adding this for CLI - expects only 1 worker for now.
     pub worker_network_key: NetworkPublicKey,
     /// The workers for this primary.

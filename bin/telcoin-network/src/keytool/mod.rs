@@ -110,6 +110,16 @@ impl KeyArgs {
                         debug!("{config:?}");
                         Config::store_path(self.config_path(), config, ConfigFmt::YAML)?;
                     }
+                    NodeType::ObserverKeys(args) => {
+                        let authority_key_path = datadir.validator_keys_path();
+                        // initialize path and warn users if overwriting keys
+                        self.init_path(&authority_key_path, args.force)?;
+                        // execute and store keypath
+                        args.execute(&mut config, &datadir, passphrase)?;
+
+                        debug!("{config:?}");
+                        Config::store_path(self.config_path(), config, ConfigFmt::YAML)?;
+                    }
                 }
             }
 

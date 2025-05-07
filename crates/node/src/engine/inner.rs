@@ -11,6 +11,7 @@ use tn_config::Config;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
 use tn_reth::{
+    system_calls::ConsensusRegistry,
     worker::{WorkerComponents, WorkerNetwork},
     RethEnv, RpcServerHandle, WorkerTxPool,
 };
@@ -292,5 +293,10 @@ impl ExecutionNodeInner {
     ) -> eyre::Result<Option<SocketAddr>> {
         let addr = self.worker_rpc_handle(worker_id)?.http_local_addr();
         Ok(addr)
+    }
+
+    /// Read the current committee from state.
+    pub fn read_committee_from_chain(&self) -> eyre::Result<Vec<ConsensusRegistry::ValidatorInfo>> {
+        self.reth_env.read_committee_from_chain()
     }
 }

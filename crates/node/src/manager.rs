@@ -20,8 +20,8 @@ use tn_primary::{
 use tn_reth::{RethDb, RethEnv};
 use tn_storage::{open_db, tables::ConsensusBlocks, DatabaseType};
 use tn_types::{
-    BatchValidation, ConsensusHeader, Database as TNDatabase, Multiaddr, Noticer, Notifier,
-    SealedBlock, TaskManager, TaskSpawner,
+    BatchValidation, BlsPublicKey, ConsensusHeader, Database as TNDatabase, Multiaddr, Noticer,
+    Notifier, SealedBlock, TaskManager, TaskSpawner,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::{
@@ -221,7 +221,9 @@ where
             )
         });
 
-        self.worker_network_handle = Some(WorkerNetworkHandle::new(network_handle));
+        // set temporary task spawner - this is updated with each epoch
+        self.worker_network_handle =
+            Some(WorkerNetworkHandle::new(network_handle, node_task_spawner.clone()));
 
         Ok(())
     }
@@ -397,6 +399,9 @@ where
         network_config: &NetworkConfig,
         initialize_networks: &mut bool,
     ) -> eyre::Result<(PrimaryNode<DatabaseType>, WorkerNode<DatabaseType>)> {
+        // send these to the swarm for validator discovery
+        let _committee_bls_keys = self.create_committee_from_state(engine).await?;
+
         // create config for consensus
         let consensus_config = ConsensusConfig::new(
             self.builder.tn_config.clone(),
@@ -449,6 +454,26 @@ where
         Ok((primary, worker))
     }
 
+    /// Create the [Committee] for the current epoch.
+    ///
+    /// This is the first step for configuring consensus.
+    async fn create_committee_from_state(
+        &self,
+        engine: &ExecutionNode,
+    ) -> eyre::Result<Vec<BlsPublicKey>> {
+        info!(target: "epoch-manager", "creating committee from state");
+
+        // retrieve the committee from state
+        let validator_infos = engine.read_committee_from_chain().await?;
+        let committee_bls_keys = validator_infos
+            .iter()
+            .map(|v| BlsPublicKey::from_bytes_on_chain(v.blsPubkey.as_ref()))
+            .collect::<Result<_, _>>()
+            .map_err(|err| eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
+
+        Ok(committee_bls_keys)
+    }
+
     /// Create a [PrimaryNode].
     ///
     /// This also creates the [PrimaryNetwork].
@@ -495,6 +520,16 @@ where
     ) -> eyre::Result<WorkerNode<DB>> {
         // only support one worker for now - otherwise, loop here
         let (worker_id, _worker_info) = consensus_config.config().workers().first_worker()?;
+
+        // update the network handle's task spawner for reporting batches in the epoch
+        {
+            let network_handle = self
+                .worker_network_handle
+                .as_mut()
+                .ok_or_eyre("worker network handle missing from epoch manager")?;
+            network_handle.update_task_spawner(epoch_task_spawner.clone());
+        }
+
         let network_handle = self
             .worker_network_handle
             .as_ref()
@@ -511,8 +546,12 @@ where
         )
         .await?;
 
-        let worker =
-            WorkerNode::new(*worker_id, consensus_config.clone(), network_handle, validator);
+        let worker = WorkerNode::new(
+            *worker_id,
+            consensus_config.clone(),
+            network_handle.clone(),
+            validator,
+        );
 
         Ok(worker)
     }
@@ -670,10 +709,7 @@ where
         // update the authorized publishers for gossip every epoch
         network_handle
             .inner_handle()
-            .subscribe_with_publishers(
-                consensus_config.network_config().libp2p_config().worker_txn_topic(),
-                consensus_config.worker_cache().all_workers().keys().copied().collect(),
-            )
+            .subscribe(consensus_config.network_config().libp2p_config().worker_txn_topic())
             .await?;
 
         // spawn worker network
