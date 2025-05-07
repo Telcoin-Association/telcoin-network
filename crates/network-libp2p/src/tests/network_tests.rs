@@ -879,7 +879,7 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
     assert!(score_after_penalty < default_score);
 
     // Wait for scores to recover through heartbeats
-    tokio::time::sleep(Duration::from_secs(3 * TEST_HEARTBEAT_INTERVAL)).await;
+    tokio::time::sleep(Duration::from_secs(2 * TEST_HEARTBEAT_INTERVAL)).await;
 
     // Check score improved
     let score_after_decay = peer1.peer_score(peer2_id).await?.unwrap();

@@ -322,13 +322,15 @@ fn start_validator(instance: usize, exe_path: &Path, base_dir: &Path, mut rpc_po
     // The instance option will still change a set port so account for that.
     rpc_port += instance as u16;
     let mut command = Command::new(exe_path);
+    let genesis_json_path = data_dir.join("genesis/genesis.json");
+
     command
         .env("TN_BLS_PASSPHRASE", "restart_test")
         .arg("node")
         .arg("--datadir")
         .arg(&*data_dir.to_string_lossy())
-        .arg("--chain")
-        .arg("adiri")
+        .arg("--genesis")
+        .arg(&genesis_json_path)
         .arg("--disable-discovery")
         .arg("--instance")
         .arg(format!("{}", instance + 1))

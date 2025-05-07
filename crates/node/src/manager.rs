@@ -459,6 +459,8 @@ where
         &self,
         engine: &ExecutionNode,
     ) -> eyre::Result<Vec<BlsPublicKey>> {
+        info!(target: "epoch-manager", "creating committee from state");
+
         // retrieve the committee from state
         let validator_infos = engine.read_committee_from_chain().await?;
         let committee_bls_keys = validator_infos

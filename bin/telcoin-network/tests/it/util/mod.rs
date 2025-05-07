@@ -105,6 +105,10 @@ pub async fn config_local_testnet(
             shared_genesis_dir.join("genesis/worker_cache.yaml"),
             dir.join("genesis/worker_cache.yaml"),
         )?;
+
+        // use genesis file
+        let genesis_json_path = dir.join("genesis/genesis.json");
+        std::fs::copy(shared_genesis_dir.join("genesis/genesis.json"), &genesis_json_path)?;
     }
 
     Ok(())
