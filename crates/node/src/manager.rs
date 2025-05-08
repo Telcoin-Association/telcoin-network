@@ -10,8 +10,7 @@ use crate::{
 };
 use consensus_metrics::start_prometheus_server;
 use eyre::{eyre, OptionExt};
-use futures::future::join_all;
-use std::{str::FromStr as _, sync::Arc, time::Duration};
+use std::{collections::HashMap, str::FromStr as _, sync::Arc, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{
     types::{NetworkHandle, NetworkInfo},
@@ -24,8 +23,8 @@ use tn_primary::{
 use tn_reth::{RethDb, RethEnv};
 use tn_storage::{open_db, tables::ConsensusBlocks, DatabaseType};
 use tn_types::{
-    BatchValidation, BlsPublicKey, CommitteeBuilder, ConsensusHeader, Database as TNDatabase,
-    Multiaddr, Noticer, Notifier, SealedBlock, TaskManager, TaskSpawner,
+    BatchValidation, BlsPublicKey, Committee, CommitteeBuilder, ConsensusHeader,
+    Database as TNDatabase, Multiaddr, Noticer, Notifier, SealedBlock, TaskManager, TaskSpawner,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::{
@@ -462,18 +461,18 @@ where
     /// Create the [Committee] for the current epoch.
     ///
     /// This is the first step for configuring consensus.
-    async fn create_committee_from_state(
-        &self,
-        engine: &ExecutionNode,
-    ) -> eyre::Result<Vec<BlsPublicKey>> {
+    async fn create_committee_from_state(&self, engine: &ExecutionNode) -> eyre::Result<Committee> {
         info!(target: "epoch-manager", "creating committee from state");
 
         // retrieve the committee from state
         let validator_infos = engine.read_committee_from_chain().await?;
-        let committee_bls_keys = validator_infos
+        let validators = validator_infos
             .iter()
-            .map(|v| BlsPublicKey::from_bytes_on_chain(v.blsPubkey.as_ref()))
-            .collect::<Result<_, _>>()
+            .map(|v| {
+                let decoded_bls = BlsPublicKey::from_bytes_on_chain(v.blsPubkey.as_ref());
+                decoded_bls.map(|decoded| (decoded, v))
+            })
+            .collect::<Result<HashMap<_, _>, _>>()
             .map_err(|err| eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
 
         // retrieve network information for committee
@@ -482,8 +481,10 @@ where
             .as_ref()
             .ok_or_eyre("missing primary network handle for epoch manager")?;
 
-        let primary_network_infos =
-            primary_handle.inner_handle().find_authorities(committee_bls_keys).await?;
+        let mut primary_network_infos = primary_handle
+            .inner_handle()
+            .find_authorities(validators.keys().cloned().collect())
+            .await?;
 
         // TODO: get these from self? eL?
         let epoch = 0;
@@ -491,21 +492,28 @@ where
         let stake = 0;
 
         // build the committee
-        let committee_builder = CommitteeBuilder::new(epoch, epoch_duration);
+        let mut committee_builder = CommitteeBuilder::new(epoch, epoch_duration);
         while let Some(info) = primary_network_infos.next().await {
             // TODO: multiaddrs can be more than one, but info only takes one
-            let (protocol_key, NetworkInfo { pubkey, multiaddrs, hostname }) = info??;
+            let (protocol_key, NetworkInfo { pubkey, multiaddr, hostname }) = info??;
+            let validator = validators
+                .get(&protocol_key)
+                .ok_or_eyre("network returned validator that isn't in the committee")?;
+            let execution_address = validator.validatorAddress;
+
             committee_builder.add_authority(
                 protocol_key,
-                stake, // TODO: from validator infos?
-                multiaddrs.first().cloned().expect("multiaddrs not empty"),
-                validator_infos.filter(),
+                stake,
+                multiaddr,
+                execution_address,
                 pubkey,
-                hostname, // TODO: default for now?
+                hostname,
             );
         }
 
-        Ok(committee_bls_keys)
+        let committee = committee_builder.build();
+
+        Ok(committee)
     }
 
     /// Create a [PrimaryNode].

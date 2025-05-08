@@ -21,6 +21,8 @@ pub struct NetworkConfig {
     quic_config: QuicConfig,
     /// The configuration for managing peers.
     peer_config: PeerConfig,
+    /// The hostname for the validator.
+    hostname: String,
 }
 
 impl NetworkConfig {
@@ -42,6 +44,11 @@ impl NetworkConfig {
     /// Return a reference to the [PeerConfig].
     pub fn peer_config(&self) -> &PeerConfig {
         &self.peer_config
+    }
+
+    /// The human-readable identity for this node.
+    pub fn hostname(&self) -> &str {
+        &self.hostname
     }
 
     /// Return a mutable reference to the [PeerConfig].

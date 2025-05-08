@@ -29,7 +29,7 @@ use libp2p::{
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
 use tn_types::{encode, try_decode, BlsPublicKey, BlsSigner, NetworkKeypair};
@@ -124,8 +124,9 @@ where
     inbound_requests: HashMap<InboundRequestId, oneshot::Sender<()>>,
     /// The collection of kademlia record requests.
     ///
-    /// When the application layer makes a request, the swarm stores the kad::QueryId and the reply channel
-    /// to the caller. On the `Event::OutboundQueryProgressed`, the result is sent through the oneshot channel.
+    /// When the application layer makes a request, the swarm stores the kad::QueryId and the reply
+    /// channel to the caller. On the `Event::OutboundQueryProgressed`, the result is sent
+    /// through the oneshot channel.
     kad_requests: HashMap<QueryId, oneshot::Sender<NetworkResult<(BlsPublicKey, NetworkInfo)>>>,
     /// The configurables for the libp2p consensus network implementation.
     config: LibP2pConfig,
@@ -138,6 +139,10 @@ where
     key_config: KeyConfig,
     /// If true then add peers to kademlia- useful for testing to set false.
     kad_add_peers: bool,
+    /// The hostname for the node provided by the [NetworkConfig].
+    ///
+    /// This is a human-readable representation for a node identity.
+    hostname: String,
 }
 
 impl<Req, Res> ConsensusNetwork<Req, Res>
@@ -240,6 +245,7 @@ where
             pending_px_disconnects,
             key_config,
             kad_add_peers: true,
+            hostname: network_config.hostname().to_string(),
         })
     }
 
@@ -261,19 +267,20 @@ where
         if multiaddrs.is_empty() {
             return None;
         }
-        let peer_id = *self.swarm.local_peer_id();
 
-        // TODO: how does this get republished?
-        let expires = Instant::now().checked_add(Duration::from_secs(60 * 60 * 24)); // one day
-        let node_record =
-            NodeRecord::build(self.key_config.primary_network_public_key(), multiaddrs, |data| {
-                self.key_config.request_signature_direct(data)
-            });
+        let multiaddr = multiaddrs.first().cloned().expect("multiaddrs is not empty");
+        let peer_id = *self.swarm.local_peer_id();
+        let node_record = NodeRecord::build(
+            self.key_config.primary_network_public_key(),
+            multiaddr,
+            self.hostname.clone(),
+            |data| self.key_config.request_signature_direct(data),
+        );
         Some(kad::Record {
             key: key.clone(),
             value: encode(&node_record),
             publisher: Some(peer_id),
-            expires,
+            expires: None, // never expire
         })
     }
 

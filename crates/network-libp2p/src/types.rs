@@ -539,11 +539,16 @@ pub struct NodeRecord {
 
 impl NodeRecord {
     /// Helper method to build a signed node record.
-    pub fn build<F>(pubkey: NetworkPublicKey, multiaddrs: Vec<Multiaddr>, signer: F) -> NodeRecord
+    pub fn build<F>(
+        pubkey: NetworkPublicKey,
+        multiaddr: Multiaddr,
+        hostname: String,
+        signer: F,
+    ) -> NodeRecord
     where
         F: FnOnce(&[u8]) -> BlsSignature,
     {
-        let info = NetworkInfo { pubkey, multiaddrs };
+        let info = NetworkInfo { pubkey, multiaddr, hostname };
         let data = Self::encode_data(&info);
         let signature = signer(&data);
         Self { info, signature }
@@ -575,8 +580,8 @@ impl NodeRecord {
 pub struct NetworkInfo {
     /// The node's [NetworkPublicKey].
     pub pubkey: NetworkPublicKey,
-    /// Vector of libp2p network addresses for node.
-    pub multiaddrs: Multiaddr,
+    /// etwork address for node.
+    pub multiaddr: Multiaddr,
     /// The hostname.
     pub hostname: String,
 }
