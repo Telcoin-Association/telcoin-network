@@ -10,9 +10,13 @@ use crate::{
 };
 use consensus_metrics::start_prometheus_server;
 use eyre::{eyre, OptionExt};
+use futures::future::join_all;
 use std::{str::FromStr as _, sync::Arc, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs};
-use tn_network_libp2p::{types::NetworkHandle, ConsensusNetwork, PeerId, TNMessage};
+use tn_network_libp2p::{
+    types::{NetworkHandle, NetworkInfo},
+    ConsensusNetwork, PeerId, TNMessage,
+};
 use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
     ConsensusBus, NodeMode, StateSynchronizer,
@@ -20,14 +24,15 @@ use tn_primary::{
 use tn_reth::{RethDb, RethEnv};
 use tn_storage::{open_db, tables::ConsensusBlocks, DatabaseType};
 use tn_types::{
-    BatchValidation, BlsPublicKey, ConsensusHeader, Database as TNDatabase, Multiaddr, Noticer,
-    Notifier, SealedBlock, TaskManager, TaskSpawner,
+    BatchValidation, BlsPublicKey, CommitteeBuilder, ConsensusHeader, Database as TNDatabase,
+    Multiaddr, Noticer, Notifier, SealedBlock, TaskManager, TaskSpawner,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::{
     mpsc::{self},
     oneshot,
 };
+use tokio_stream::StreamExt as _;
 use tracing::{debug, info};
 
 /// The long-running task manager name.
@@ -470,6 +475,35 @@ where
             .map(|v| BlsPublicKey::from_bytes_on_chain(v.blsPubkey.as_ref()))
             .collect::<Result<_, _>>()
             .map_err(|err| eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
+
+        // retrieve network information for committee
+        let primary_handle = self
+            .primary_network_handle
+            .as_ref()
+            .ok_or_eyre("missing primary network handle for epoch manager")?;
+
+        let primary_network_infos =
+            primary_handle.inner_handle().find_authorities(committee_bls_keys).await?;
+
+        // TODO: get these from self? eL?
+        let epoch = 0;
+        let epoch_duration = 60 * 60 * 24;
+        let stake = 0;
+
+        // build the committee
+        let committee_builder = CommitteeBuilder::new(epoch, epoch_duration);
+        while let Some(info) = primary_network_infos.next().await {
+            // TODO: multiaddrs can be more than one, but info only takes one
+            let (protocol_key, NetworkInfo { pubkey, multiaddrs, hostname }) = info??;
+            committee_builder.add_authority(
+                protocol_key,
+                stake, // TODO: from validator infos?
+                multiaddrs.first().cloned().expect("multiaddrs not empty"),
+                validator_infos.filter(),
+                pubkey,
+                hostname, // TODO: default for now?
+            );
+        }
 
         Ok(committee_bls_keys)
     }

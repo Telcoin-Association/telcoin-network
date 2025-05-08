@@ -8,8 +8,8 @@ use crate::{
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     types::{
-        AuthorityInfoRequest, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult,
-        NodeRecord,
+        AuthorityInfoRequest, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo,
+        NetworkResult, NodeRecord,
     },
     PeerExchangeMap,
 };
@@ -126,7 +126,7 @@ where
     ///
     /// When the application layer makes a request, the swarm stores the kad::QueryId and the reply channel
     /// to the caller. On the `Event::OutboundQueryProgressed`, the result is sent through the oneshot channel.
-    kad_requests: HashMap<QueryId, oneshot::Sender<NetworkResult<NodeRecord>>>,
+    kad_requests: HashMap<QueryId, oneshot::Sender<NetworkResult<(BlsPublicKey, NetworkInfo)>>>,
     /// The configurables for the libp2p consensus network implementation.
     config: LibP2pConfig,
     /// Track peers we have a connection with.
@@ -265,9 +265,10 @@ where
 
         // TODO: how does this get republished?
         let expires = Instant::now().checked_add(Duration::from_secs(60 * 60 * 24)); // one day
-        let node_record = NodeRecord::build(peer_id, multiaddrs, |data| {
-            self.key_config.request_signature_direct(data)
-        });
+        let node_record =
+            NodeRecord::build(self.key_config.primary_network_public_key(), multiaddrs, |data| {
+                self.key_config.request_signature_direct(data)
+            });
         Some(kad::Record {
             key: key.clone(),
             value: encode(&node_record),
@@ -519,16 +520,8 @@ where
                 self.event_stream = new_event_stream;
             }
             NetworkCommand::FindAuthorities { requests } => {
-                // check peer manager first, if not found try kademlia
-                //
-                // TODO:!!! check peer manager
-
-                // this is only used for discovery, so will hang indefinitely
-                for AuthorityInfoRequest { bls_key, reply } in requests {
-                    let key = kad::RecordKey::new(&bls_key);
-                    let request_id = self.swarm.behaviour_mut().kademlia.get_record(key);
-                    self.kad_requests.insert(request_id, reply);
-                }
+                // this will trigger a PeerEvent to fetch records through kad if not in the peer map
+                self.swarm.behaviour_mut().peer_manager.find_authorities(requests);
             }
         }
 
@@ -818,6 +811,13 @@ where
                 // remove blacklist gossipsub
                 self.swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&peer_id);
             }
+            PeerEvent::MissingAuthorities(missing) => {
+                for AuthorityInfoRequest { bls_key, reply } in missing {
+                    let key = kad::RecordKey::new(&bls_key);
+                    let request_id = self.swarm.behaviour_mut().kademlia.get_record(key);
+                    self.kad_requests.insert(request_id, reply);
+                }
+            }
         }
 
         Ok(())
@@ -857,7 +857,7 @@ where
                             trace!(target: "network-kad", "Got record {key} {value:?}");
 
                             // TODO: what happens with stale records?
-                            self.return_kad_result(&query_id, Ok(value));
+                            self.return_kad_result(&query_id, Ok((key, value.info.clone())));
                         } else {
                             error!(target: "network-kad", "Recieved invalid peer record!");
 
@@ -936,7 +936,11 @@ where
     }
 
     /// Return the kademlia result to application layer.
-    fn return_kad_result(&mut self, query_id: &QueryId, result: NetworkResult<NodeRecord>) {
+    fn return_kad_result(
+        &mut self,
+        query_id: &QueryId,
+        result: NetworkResult<(BlsPublicKey, NetworkInfo)>,
+    ) {
         // ignore multiple query results
         if let Some(reply) = self.kad_requests.remove(query_id) {
             send_or_log_error!(reply, result, "kad");

@@ -11,7 +11,7 @@ use crate::{
     error::NetworkError,
     peers::{score::Reputation, status::NewConnectionStatus, types::PeerAction},
     send_or_log_error,
-    types::NetworkResult,
+    types::{NetworkInfo, NetworkResult},
 };
 use libp2p::{Multiaddr, PeerId};
 use rand::seq::SliceRandom as _;
@@ -21,6 +21,7 @@ use std::{
     net::IpAddr,
     time::{Duration, Instant},
 };
+use tn_types::BlsPublicKey;
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 #[cfg(test)]
@@ -34,6 +35,8 @@ mod peers;
 pub(super) struct AllPeers {
     /// The collection of known connected peers, their status and reputation
     peers: HashMap<PeerId, Peer>,
+    /// The map of authority keys to peer id.
+    authorities: HashMap<BlsPublicKey, PeerId>,
     /// The collection of staked current_committee at the beginning of each epoch.
     current_committee: HashSet<PeerId>,
     /// Information for peers that scored poorly enough to become banned.
@@ -59,6 +62,7 @@ impl AllPeers {
     ) -> Self {
         Self {
             peers: Default::default(),
+            authorities: Default::default(),
             current_committee: Default::default(),
             banned_peers: Default::default(),
             disconnected_peers: 0,
@@ -801,7 +805,7 @@ impl AllPeers {
 
         let mut actions = Vec::with_capacity(committee.len());
         for (peer_id, addr) in committee.into_iter() {
-            // the new connection status doesn't affect this call
+            // the NewConnectionStatus doesn't affect this call
             let status = self.ensure_peer_exists(&peer_id, &NewConnectionStatus::Unbanned);
 
             match status {
@@ -837,5 +841,28 @@ impl AllPeers {
 
         // return any unban actions for committee peers
         actions
+    }
+
+    /// Add an authority to the network.
+    ///
+    /// Validators are unbanned at the beginning of each epoch when they are in the committee.
+    /// This method is called at the end of each epoch to give the peer manager time (2 epochs)
+    /// to find the committee nodes.
+    // TODO: ensure flow is handled for:
+    // - too many peers
+    // - validator is known but disconnected
+    // - epoch arrives, need to engage with this validator (both nodes in committee)
+    pub(super) fn find_authority(&self, bls_key: &BlsPublicKey) -> Option<NetworkInfo> {
+        if let Some(peer_id) = self.authorities.get(bls_key) {
+            //
+            // TODO: this should be a filter map and return `None` if the multiaddrs are empty
+            //
+            self.get_peer(peer_id).map(|peer| NetworkInfo {
+                peer_id: *peer_id,
+                multiaddrs: peer.exchange_info().drain().collect(),
+            })
+        } else {
+            None
+        }
     }
 }
