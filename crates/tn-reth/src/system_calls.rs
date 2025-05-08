@@ -80,34 +80,31 @@ sol!(
             uint32 epochDuration;
         }
 
-        /// Incentives applied to validators.
+        /// Struct used by storage ledger to record outstanding validator balances.
         #[derive(Debug)]
-        struct IncentiveInfo {
+        struct StakeInfo {
             /// The governance-issued consensus NFT token id.
             uint24 tokenId;
-            /// The amount of rewards applied.
-            /// NOTE: if this is passed into `concludeEpoch` it applies slashes.
-            uint232 stakingRewards;
+            /// The validator balance.
+            uint232 balance;
         }
 
         /// The configuration for consensus.
         #[derive(Debug)]
         struct StakeConfig {
             /// The fixed stake amount.
-            uint256 stakeAmount;
+            uint232 stakeAmount;
             /// The min amount allowed to withdraw.
-            uint256 minWithdrawAmount;
+            uint232 minWithdrawAmount;
             /// The total amount issued per epoch.
-            uint256 epochIssuance;
+            uint232 epochIssuance;
             /// The duration for the epoch (in secs).
             uint32 epochDuration;
         }
 
         /// Initialize the contract.
         #[derive(Debug)]
-        function initialize(
-            /// The InterchainTEL contract address.
-            address iTEL_,
+        constructor(
             /// The configuration for staking.
             StakeConfig memory genesisConfig_,
             /// The initial validators with stake.
@@ -128,7 +125,7 @@ sol!(
         /// Return the current epoch.
         function getCurrentEpoch() public view returns (uint32) ;
         /// Conclude the current epoch. Caller must pass a new committee of eligible validators.
-        function concludeEpoch(address[] calldata newCommittee, IncentiveInfo[] calldata slashes) external;
+        function concludeEpoch(address[] calldata newCommittee) external;
         /// Helper function to get the epoch info from the current epoch.
         function getCurrentEpochInfo() external view returns (EpochInfo memory currentEpochInfo);
     }
