@@ -11,7 +11,7 @@ use crate::{
     error::NetworkError,
     peers::{score::Reputation, status::NewConnectionStatus, types::PeerAction},
     send_or_log_error,
-    types::NetworkResult,
+    types::{NetworkInfo, NetworkResult},
 };
 use libp2p::{Multiaddr, PeerId};
 use rand::seq::SliceRandom as _;
@@ -21,6 +21,7 @@ use std::{
     net::IpAddr,
     time::{Duration, Instant},
 };
+use tn_types::BlsPublicKey;
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 #[cfg(test)]
@@ -801,7 +802,7 @@ impl AllPeers {
 
         let mut actions = Vec::with_capacity(committee.len());
         for (peer_id, addr) in committee.into_iter() {
-            // the new connection status doesn't affect this call
+            // the NewConnectionStatus doesn't affect this call
             let status = self.ensure_peer_exists(&peer_id, &NewConnectionStatus::Unbanned);
 
             match status {
@@ -837,5 +838,19 @@ impl AllPeers {
 
         // return any unban actions for committee peers
         actions
+    }
+
+    /// Add an authority to the network.
+    ///
+    /// Validators are unbanned at the beginning of each epoch when they are in the committee.
+    /// This method is called at the end of each epoch to give the peer manager time (2 epochs)
+    /// to find the committee nodes.
+    // TODO: ensure flow is handled for:
+    // - too many peers
+    // - validator is known but disconnected
+    // - epoch arrives, need to engage with this validator (both nodes in committee)
+    pub(super) fn find_authority(&self, _: &BlsPublicKey) -> Option<NetworkInfo> {
+        // TODO: see issue 301
+        None
     }
 }

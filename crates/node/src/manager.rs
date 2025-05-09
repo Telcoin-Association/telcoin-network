@@ -10,9 +10,12 @@ use crate::{
 };
 use consensus_metrics::start_prometheus_server;
 use eyre::{eyre, OptionExt};
-use std::{str::FromStr as _, sync::Arc, time::Duration};
+use std::{collections::HashMap, str::FromStr as _, sync::Arc, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs};
-use tn_network_libp2p::{types::NetworkHandle, ConsensusNetwork, PeerId, TNMessage};
+use tn_network_libp2p::{
+    types::{NetworkHandle, NetworkInfo},
+    ConsensusNetwork, PeerId, TNMessage,
+};
 use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
     ConsensusBus, NodeMode, StateSynchronizer,
@@ -20,14 +23,15 @@ use tn_primary::{
 use tn_reth::{RethDb, RethEnv};
 use tn_storage::{open_db, tables::ConsensusBlocks, DatabaseType};
 use tn_types::{
-    BatchValidation, BlsPublicKey, ConsensusHeader, Database as TNDatabase, Multiaddr, Noticer,
-    Notifier, SealedBlock, TaskManager, TaskSpawner,
+    BatchValidation, BlsPublicKey, Committee, CommitteeBuilder, ConsensusHeader,
+    Database as TNDatabase, Multiaddr, Noticer, Notifier, SealedBlock, TaskManager, TaskSpawner,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::{
     mpsc::{self},
     oneshot,
 };
+use tokio_stream::StreamExt as _;
 use tracing::{debug, info};
 
 /// The long-running task manager name.
@@ -457,21 +461,63 @@ where
     /// Create the [Committee] for the current epoch.
     ///
     /// This is the first step for configuring consensus.
-    async fn create_committee_from_state(
-        &self,
-        engine: &ExecutionNode,
-    ) -> eyre::Result<Vec<BlsPublicKey>> {
+    async fn create_committee_from_state(&self, engine: &ExecutionNode) -> eyre::Result<Committee> {
         info!(target: "epoch-manager", "creating committee from state");
 
         // retrieve the committee from state
-        let validator_infos = engine.read_committee_from_chain().await?;
-        let committee_bls_keys = validator_infos
+        let epoch_state = engine.read_committee_from_chain().await?;
+        let validators = epoch_state
+            .validators
             .iter()
-            .map(|v| BlsPublicKey::from_bytes_on_chain(v.blsPubkey.as_ref()))
-            .collect::<Result<_, _>>()
+            .map(|v| {
+                let decoded_bls = BlsPublicKey::from_bytes_on_chain(v.blsPubkey.as_ref());
+                decoded_bls.map(|decoded| (decoded, v))
+            })
+            .collect::<Result<HashMap<_, _>, _>>()
             .map_err(|err| eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
 
-        Ok(committee_bls_keys)
+        // retrieve network information for committee
+        let primary_handle = self
+            .primary_network_handle
+            .as_ref()
+            .ok_or_eyre("missing primary network handle for epoch manager")?;
+
+        let mut primary_network_infos = primary_handle
+            .inner_handle()
+            .find_authorities(validators.keys().cloned().collect())
+            .await?;
+
+        // build the committee
+        let mut committee_builder =
+            CommitteeBuilder::new(epoch_state.epoch_info.??, epoch_state.epoch_info.epochDuration);
+        // TODO: how to set the epoch duration?
+        // - need to include `prev_epoch: Option<EpochInfo>` on EpochState
+        // - if on the first epoch (is that 0 or 1 ?) return `None`, otherwise `Some(prev_epoch)`
+        // - also include epoch_num from tn_reth call for architecture reasons
+        // - the canonical tip will have the epoch number, so easier to parse in engine level
+
+
+        while let Some(info) = primary_network_infos.next().await {
+            // TODO: multiaddrs can be more than one, but info only takes one
+            let (protocol_key, NetworkInfo { pubkey, multiaddr, hostname }) = info??;
+            let validator = validators
+                .get(&protocol_key)
+                .ok_or_eyre("network returned validator that isn't in the committee")?;
+            let execution_address = validator.validatorAddress;
+
+            committee_builder.add_authority(
+                protocol_key,
+                stake,
+                multiaddr,
+                execution_address,
+                pubkey,
+                hostname,
+            );
+        }
+
+        let committee = committee_builder.build();
+
+        Ok(committee)
     }
 
     /// Create a [PrimaryNode].

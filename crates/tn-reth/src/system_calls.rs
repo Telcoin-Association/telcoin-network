@@ -133,3 +133,12 @@ sol!(
         function getCurrentEpochInfo() external view returns (EpochInfo memory currentEpochInfo);
     }
 );
+
+/// The state of consensus retrieved from chain.
+#[derive(Debug)]
+pub struct EpochState {
+    /// The [EpochInfo].
+    pub epoch_info: ConsensusRegistry::EpochInfo,
+    /// The collection of validator info.
+    pub validators: Vec<ConsensusRegistry::ValidatorInfo>,
+}

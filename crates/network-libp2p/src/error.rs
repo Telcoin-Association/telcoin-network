@@ -86,6 +86,9 @@ pub enum NetworkError {
     /// Fatal error - the swarm is not connected to any listeners.
     #[error("All swarm listeners closed. Network shutting down...")]
     AllListenersClosed,
+    /// The retrieved peer record is invalid.
+    #[error("Invalid bls signature for peer record.")]
+    InvalidPeerRecord,
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {

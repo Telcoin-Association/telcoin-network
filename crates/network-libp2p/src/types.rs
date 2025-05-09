@@ -3,6 +3,7 @@
 use crate::{
     codec::TNMessage, error::NetworkError, peers::Penalty, GossipMessage, PeerExchangeMap,
 };
+use futures::stream::FuturesUnordered;
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
     core::transport::ListenerId,
@@ -12,8 +13,12 @@ use libp2p::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use tn_types::BlsSignature;
+use tn_types::{encode, BlsPublicKey, BlsSignature, NetworkPublicKey};
 use tokio::sync::{mpsc, oneshot};
+
+#[cfg(test)]
+#[path = "tests/types.rs"]
+mod network_types;
 
 /// The result for network operations.
 pub type NetworkResult<T> = Result<T, NetworkError>;
@@ -241,6 +246,11 @@ where
         committee: HashMap<PeerId, Multiaddr>,
         /// The new sender for events.
         new_event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
+    },
+    /// Find authorities for a future committee by bls key and return to sender.
+    FindAuthorities {
+        /// The collection of requests.
+        requests: Vec<AuthorityInfoRequest>,
     },
 }
 
@@ -487,20 +497,103 @@ where
         self.sender.send(NetworkCommand::NewEpoch { committee, new_event_stream }).await?;
         Ok(())
     }
+
+    /// Return network information for authorities by bls pubkey on kad.
+    pub async fn find_authorities(
+        &self,
+        bls_keys: Vec<BlsPublicKey>,
+        // ) -> NetworkResult<Vec<oneshot::Receiver<NetworkResult<NodeRecord>>>> {
+    ) -> NetworkResult<
+        FuturesUnordered<oneshot::Receiver<NetworkResult<(BlsPublicKey, NetworkInfo)>>>,
+    > {
+        // let mut results = Vec::with_capacity(bls_keys.len());
+        let results = FuturesUnordered::new();
+        let requests = bls_keys
+            .into_iter()
+            .map(|bls_key| {
+                let (reply, rx) = oneshot::channel();
+                results.push(rx);
+                // create the request
+                AuthorityInfoRequest { bls_key, reply }
+            })
+            .collect();
+
+        self.sender.send(NetworkCommand::FindAuthorities { requests }).await?;
+        Ok(results)
+    }
 }
 
 /// List of addresses for a node, signature will be the nodes BLS signature
 /// over the addresses to verify they are from the node in question.
 /// Used to publish this to kademlia.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct AddrList {
+pub struct NodeRecord {
+    /// The network information contained within the record.
+    pub info: NetworkInfo,
     /// Signature of the value field with the nodes BLS key.
     /// This is part of a kademlia record keyed on a BLS public key
     /// that can be used for verifiction.  Intended to stop malicious
     /// nodes from poisoning the routing table.
     pub signature: BlsSignature,
-    /// Vector of libp2p network addresses for node.
-    pub value: Vec<Multiaddr>,
+}
+
+impl NodeRecord {
+    /// Helper method to build a signed node record.
+    pub fn build<F>(
+        pubkey: NetworkPublicKey,
+        multiaddr: Multiaddr,
+        hostname: String,
+        signer: F,
+    ) -> NodeRecord
+    where
+        F: FnOnce(&[u8]) -> BlsSignature,
+    {
+        let info = NetworkInfo { pubkey, multiaddr, hostname };
+        let data = Self::encode_data(&info);
+        let signature = signer(&data);
+        Self { info, signature }
+    }
+
+    /// Return the encoded data to sign. This is useful for verifying records.
+    pub fn encode_data(info: &NetworkInfo) -> Vec<u8> {
+        encode(info)
+    }
+
+    /// Verify if a signature matches the record.
+    pub fn verify(self, pubkey: &BlsPublicKey) -> Option<(BlsPublicKey, NodeRecord)> {
+        let data = Self::encode_data(&self.info);
+        if self.signature.verify_raw(&data, pubkey) {
+            Some((*pubkey, self))
+        } else {
+            None
+        }
+    }
+
+    /// Return a reference to the record's [NetworkInfo].
+    pub fn info(&self) -> &NetworkInfo {
+        &self.info
+    }
+}
+
+/// The network information needed for consensus.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NetworkInfo {
+    /// The node's [NetworkPublicKey].
+    pub pubkey: NetworkPublicKey,
+    /// etwork address for node.
+    pub multiaddr: Multiaddr,
+    /// The hostname.
+    pub hostname: String,
+}
+
+/// The request from the application layer to lookup a validator's network information
+/// using their BLS key.
+#[derive(Debug)]
+pub struct AuthorityInfoRequest {
+    /// The [BlsPublicKey] for the authority (on-chain).
+    pub bls_key: BlsPublicKey,
+    /// The reply to requestor with authority information.
+    pub reply: oneshot::Sender<NetworkResult<(BlsPublicKey, NetworkInfo)>>,
 }
 
 /// Helper macro for sending oneshot replies and logging errors.

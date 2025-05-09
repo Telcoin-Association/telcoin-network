@@ -9,7 +9,10 @@ use super::{
     PeerEvent, PeerExchangeMap, Penalty,
 };
 use crate::{
-    error::NetworkError, peers::status::ConnectionStatus, send_or_log_error, types::NetworkResult,
+    error::NetworkError,
+    peers::status::ConnectionStatus,
+    send_or_log_error,
+    types::{AuthorityInfoRequest, NetworkResult},
 };
 use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
 use std::{
@@ -510,5 +513,30 @@ impl PeerManager {
         for (peer_id, action) in unban_actions {
             self.apply_peer_action(peer_id, action);
         }
+    }
+
+    /// Find future authorities for the epoch manager.
+    pub(crate) fn find_authorities(&mut self, authorities: Vec<AuthorityInfoRequest>) {
+        // find authorities
+        // - check peerdb
+        // - initiate kad request
+        // -
+
+        let mut missing = Vec::new();
+
+        // check all peers for authority and track missing
+        for AuthorityInfoRequest { bls_key, reply } in authorities {
+            if let Some(info) = self.peers.find_authority(&bls_key) {
+                // reply.send(info)
+                send_or_log_error!(reply, Ok((bls_key, info)), "find authority");
+                continue;
+            }
+
+            // add to missing authorities
+            missing.push(AuthorityInfoRequest { bls_key, reply });
+        }
+
+        // emit event for kad to try to discover
+        self.events.push_back(PeerEvent::MissingAuthorities(missing));
     }
 }

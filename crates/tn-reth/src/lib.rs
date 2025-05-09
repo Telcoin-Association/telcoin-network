@@ -89,7 +89,7 @@ use std::{
 };
 use system_calls::{
     ConsensusRegistry::{self, ValidatorStatus},
-    CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
+    EpochState, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
 };
 use tempfile::TempDir;
 use tn_config::{ValidatorInfo, CONSENSUS_REGISTRY_JSON};
@@ -1435,7 +1435,7 @@ impl RethEnv {
     /// - get current epoch info
     /// - getValidator token id by address
     /// - getValidator info by token id
-    pub fn read_committee_from_chain(&self) -> eyre::Result<Vec<ConsensusRegistry::ValidatorInfo>> {
+    pub fn read_committee_from_chain(&self) -> eyre::Result<EpochState> {
         // create EVM with latest state
         let latest = self.latest()?;
         let state = StateProviderDatabase::new(latest);
@@ -1479,8 +1479,8 @@ impl RethEnv {
         let mut evm = self.evm_config.evm_with_env(&mut db, tn_env);
 
         // current epoch info
-        let current_epoch_info = self.get_current_epoch_info(&mut evm)?;
-        let token_ids = current_epoch_info
+        let epoch_info = self.get_current_epoch_info(&mut evm)?;
+        let token_ids = epoch_info
             .committee
             .iter()
             .map(|address| {
@@ -1488,7 +1488,7 @@ impl RethEnv {
                 self.get_validator_token_id(*address, &mut evm)
             })
             .collect::<eyre::Result<Vec<_>, _>>()?;
-        let validator_infos = token_ids
+        let validators = token_ids
             .into_iter()
             .map(|token_id| {
                 // read validator info
@@ -1496,7 +1496,9 @@ impl RethEnv {
             })
             .collect::<eyre::Result<Vec<_>, _>>()?;
 
-        Ok(validator_infos)
+        let epoch_state = EpochState { epoch_info, validators };
+
+        Ok(epoch_state)
     }
 
     /// Read the curret epoch info from the [ConsensusRegistry] on-chain.
@@ -1832,11 +1834,12 @@ mod tests {
         debug!(target: "engine", "bundle from execution:\n{:#?}", bundle);
 
         // assert committee read matches expected
-        let infos = reth_env.read_committee_from_chain()?;
-        debug!(target: "engine", "validator infos:\n{:#?}", infos);
+        let consensus_state = reth_env.read_committee_from_chain()?;
+        debug!(target: "engine", "consensus state:\n{:#?}", consensus_state);
 
         for v in validators {
-            let on_chain = infos
+            let on_chain = consensus_state
+                .validators
                 .iter()
                 .find(|info| info.validatorAddress == v.execution_address)
                 .expect("validator on-chain");
