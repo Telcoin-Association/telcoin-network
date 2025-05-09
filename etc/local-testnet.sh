@@ -145,7 +145,6 @@ if [ "$START" = true ]; then
         # start validator
         target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
            --genesis "${DATADIR}/genesis/genesis.json" \
-           --disable-discovery \
            --instance "${INSTANCE}" \
            --metrics "${METRICS}" \
            --consensus-metrics "${CONSENSUS_METRICS}" \
@@ -161,7 +160,6 @@ if [ "$START" = true ]; then
     target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
        --genesis "${DATADIR}/genesis/genesis.json" \
        --observer \
-       --disable-discovery \
        --instance 5 \
        --metrics "${METRICS}" \
        --consensus-metrics "${CONSENSUS_METRICS}" \

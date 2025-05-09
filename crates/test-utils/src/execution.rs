@@ -71,7 +71,7 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     opt_args: Option<Vec<&str>>,
     tmp_dir: &Path,
 ) -> eyre::Result<(TnBuilder, CliExt)> {
-    let default_args = ["telcoin-network", "--dev", "--chain", "adiri"];
+    let default_args = ["telcoin-network", "--http", "--chain", "adiri"];
 
     // extend faucet args if provided
     let cli_args = if let Some(args) = opt_args {
@@ -84,15 +84,12 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     let command = NodeCommand::<CliExt>::try_parse_from(cli_args)?;
 
     let NodeCommand { config: _, instance, ext, reth, datadir: _, .. } = command;
-    let RethCommand {
-        chain, metrics, network, rpc, txpool, builder, debug, db, dev, pruning, ..
-    } = reth;
+    let RethCommand { chain, metrics, rpc, txpool, db, .. } = reth;
 
     // overwrite chain spec if passed in
     let chain = opt_chain.unwrap_or(chain);
 
-    let reth_command =
-        RethCommand { chain, metrics, network, rpc, txpool, builder, debug, db, dev, pruning };
+    let reth_command = RethCommand { chain, metrics, rpc, txpool, db };
 
     let mut tn_config = Config::default();
 

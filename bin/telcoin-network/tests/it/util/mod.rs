@@ -214,7 +214,7 @@ pub fn spawn_local_testnet(
         #[cfg(feature = "faucet")]
         let mut command = NodeCommand::<tn_faucet::FaucetArgs>::parse_from([
             "tn",
-            "--dev",
+            "--http",
             "--datadir",
             datadir,
             //
@@ -234,9 +234,9 @@ pub fn spawn_local_testnet(
         #[cfg(not(feature = "faucet"))]
         let command = NodeCommand::parse_from([
             "tn",
+            "--http",
             "--public-key",
             "0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99",
-            "--dev",
             "--datadir",
             datadir,
             //
