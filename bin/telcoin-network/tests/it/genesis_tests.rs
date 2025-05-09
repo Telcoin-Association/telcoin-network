@@ -33,6 +33,7 @@ use tracing::debug;
 
 #[tokio::test]
 async fn test_genesis_with_its() -> eyre::Result<()> {
+    tn_test_utils::init_test_tracing();
     // create genesis with a proxy
     let genesis = adiri_genesis();
 
@@ -155,6 +156,8 @@ async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
+    tn_test_utils::init_test_tracing();
+
     // fetch registry impl bytecode from compiled output in tn-contracts
     let registry_impl_json = fetch_file_content_relative_to_manifest(
         "../../tn-contracts/artifacts/ConsensusRegistry.json",

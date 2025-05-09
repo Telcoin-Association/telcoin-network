@@ -11,7 +11,7 @@ use tn_config::Config;
 use tn_engine::ExecutorEngine;
 use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
 use tn_reth::{
-    system_calls::ConsensusRegistry,
+    system_calls::EpochState,
     worker::{WorkerComponents, WorkerNetwork},
     RethEnv, RpcServerHandle, WorkerTxPool,
 };
@@ -296,7 +296,7 @@ impl ExecutionNodeInner {
     }
 
     /// Read the current committee from state.
-    pub fn read_committee_from_chain(&self) -> eyre::Result<Vec<ConsensusRegistry::ValidatorInfo>> {
+    pub fn read_committee_from_chain(&self) -> eyre::Result<EpochState> {
         self.reth_env.read_committee_from_chain()
     }
 }

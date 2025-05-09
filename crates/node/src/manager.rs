@@ -465,8 +465,9 @@ where
         info!(target: "epoch-manager", "creating committee from state");
 
         // retrieve the committee from state
-        let validator_infos = engine.read_committee_from_chain().await?;
-        let validators = validator_infos
+        let epoch_state = engine.read_committee_from_chain().await?;
+        let validators = epoch_state
+            .validators
             .iter()
             .map(|v| {
                 let decoded_bls = BlsPublicKey::from_bytes_on_chain(v.blsPubkey.as_ref());
@@ -486,13 +487,16 @@ where
             .find_authorities(validators.keys().cloned().collect())
             .await?;
 
-        // TODO: get these from self? eL?
-        let epoch = 0;
-        let epoch_duration = 60 * 60 * 24;
-        let stake = 0;
-
         // build the committee
-        let mut committee_builder = CommitteeBuilder::new(epoch, epoch_duration);
+        let mut committee_builder =
+            CommitteeBuilder::new(epoch_state.epoch_info.??, epoch_state.epoch_info.epochDuration);
+        // TODO: how to set the epoch duration?
+        // - need to include `prev_epoch: Option<EpochInfo>` on EpochState
+        // - if on the first epoch (is that 0 or 1 ?) return `None`, otherwise `Some(prev_epoch)`
+        // - also include epoch_num from tn_reth call for architecture reasons
+        // - the canonical tip will have the epoch number, so easier to parse in engine level
+
+
         while let Some(info) = primary_network_infos.next().await {
             // TODO: multiaddrs can be more than one, but info only takes one
             let (protocol_key, NetworkInfo { pubkey, multiaddr, hostname }) = info??;
