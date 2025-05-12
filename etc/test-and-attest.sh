@@ -85,7 +85,7 @@ echo "clippy for workspace: default and all features passed"
 # run tests
 #
 # default features
-cargo test --workspace --no-fail-fast -- --show-output
+RUST_LOG=epoch-manager=debug,info cargo test --workspace --no-fail-fast -- --show-output
 # Run tests that require credentials.
 cargo test test_with_creds -- --ignored
 # faucet it test

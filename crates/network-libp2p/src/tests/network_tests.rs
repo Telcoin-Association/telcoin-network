@@ -830,6 +830,8 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
+    tn_test_utils::init_test_tracing();
+
     // Create a custom config with short halflife for quicker testing
     let mut network_config = NetworkConfig::default();
     network_config.peer_config_mut().score_config.score_halflife = 0.5;
@@ -868,6 +870,7 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
     // Verify connection established
     let connected_peers = peer1.connected_peers().await?;
     assert!(connected_peers.contains(&peer2_id), "Peer2 should be connected");
+    debug!(target: "peer-manager", "peers connected! Reporting medium penalties...");
 
     // Apply medium penalties to lower score but not ban
     for _ in 0..3 {
@@ -877,12 +880,14 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
     // Check peer2's score is lower but still connected
     let score_after_penalty = peer1.peer_score(peer2_id).await?.unwrap();
     assert!(score_after_penalty < default_score);
+    debug!(target: "peer-manager", ?default_score, ?score_after_penalty, "peer2 scores\nsleeping for 2 heartbeats...");
 
     // Wait for scores to recover through heartbeats
     tokio::time::sleep(Duration::from_secs(2 * TEST_HEARTBEAT_INTERVAL)).await;
 
     // Check score improved
     let score_after_decay = peer1.peer_score(peer2_id).await?.unwrap();
+    debug!(target: "peer-manager", ?score_after_decay, ?score_after_penalty, "peer2 scores after heartbeats");
     assert!(score_after_decay > score_after_penalty);
 
     // Peer should still be connected
