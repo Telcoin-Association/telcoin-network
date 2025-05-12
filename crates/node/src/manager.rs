@@ -634,11 +634,7 @@ where
                 let (protocol_key, NetworkInfo { pubkey, multiaddr, .. }) = info??;
                 let worker_index = WorkerIndex(BTreeMap::from([(
                     worker_id,
-                    WorkerInfo {
-                        name: pubkey,
-                        transactions: multiaddr.clone(),
-                        worker_address: multiaddr.clone(),
-                    },
+                    WorkerInfo { name: pubkey, worker_address: multiaddr.clone() },
                 )]));
                 workers.push((protocol_key, worker_index));
             }
