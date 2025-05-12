@@ -502,7 +502,6 @@ where
     pub async fn find_authorities(
         &self,
         bls_keys: Vec<BlsPublicKey>,
-        // ) -> NetworkResult<Vec<oneshot::Receiver<NetworkResult<NodeRecord>>>> {
     ) -> NetworkResult<
         FuturesUnordered<oneshot::Receiver<NetworkResult<(BlsPublicKey, NetworkInfo)>>>,
     > {

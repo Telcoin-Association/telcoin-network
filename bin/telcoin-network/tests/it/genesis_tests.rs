@@ -124,8 +124,6 @@ async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
         .iter()
         .filter_map(|(key, value)| value.as_str().map(|address| (key, address)))
         .for_each(|(key, address)| {
-            println!("{key}");
-            println!("{address}");
             assert!(
                 is_address_present(address, precompiles.clone()),
                 "{key} is not present in precompiles"

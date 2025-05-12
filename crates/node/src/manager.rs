@@ -16,7 +16,9 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tn_config::{ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs};
+use tn_config::{
+    Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs,
+};
 use tn_network_libp2p::{
     types::{NetworkHandle, NetworkInfo},
     ConsensusNetwork, PeerId, TNMessage,
@@ -549,46 +551,53 @@ where
     ) -> eyre::Result<Committee> {
         info!(target: "epoch-manager", "creating committee from state");
 
-        // retrieve network information for committee
-        let primary_handle = self
-            .primary_network_handle
-            .as_ref()
-            .ok_or_eyre("missing primary network handle for epoch manager")?;
-
-        let mut primary_network_infos = primary_handle
-            .inner_handle()
-            .find_authorities(validators.keys().cloned().collect())
-            .await?;
-
-        // build the committee
-        let mut committee_builder = CommitteeBuilder::new(epoch, epoch_boundary);
         // TODO: how to set the epoch duration?
         // - need to include `prev_epoch: Option<EpochInfo>` on EpochState
         // - if on the first epoch (is that 0 or 1 ?) return `None`, otherwise `Some(prev_epoch)`
         // - also include epoch_num from tn_reth call for architecture reasons
         // - the canonical tip will have the epoch number, so easier to parse in engine level
 
-        // loop through the primary info returned from network query
-        while let Some(info) = primary_network_infos.next().await {
-            debug!(target: "epoch-manager", ?info, "awaited next primary network info");
-            // TODO: multiaddrs can be more than one, but info only takes one
-            let (protocol_key, NetworkInfo { pubkey, multiaddr, hostname }) = info??;
-            let validator = validators
-                .get(&protocol_key)
-                .ok_or_eyre("network returned validator that isn't in the committee")?;
-            let execution_address = validator.validatorAddress;
+        let committee = if epoch == 0 {
+            // read from fs
+            Config::load_from_path::<Committee>(self.tn_datadir.committee_path(), ConfigFmt::YAML)?
+        } else {
+            // retrieve network information for committee
+            let primary_handle = self
+                .primary_network_handle
+                .as_ref()
+                .ok_or_eyre("missing primary network handle for epoch manager")?;
 
-            committee_builder.add_authority(
-                protocol_key,
-                1, // set stake so every authority's weight is equal
-                multiaddr,
-                execution_address,
-                pubkey,
-                hostname,
-            );
-        }
+            let mut primary_network_infos = primary_handle
+                .inner_handle()
+                .find_authorities(validators.keys().cloned().collect())
+                .await?;
 
-        let committee = committee_builder.build();
+            // build the committee using kad network
+            let mut committee_builder = CommitteeBuilder::new(epoch, epoch_boundary);
+
+            // loop through the primary info returned from network query
+            while let Some(info) = primary_network_infos.next().await {
+                debug!(target: "epoch-manager", ?info, "awaited next primary network info");
+                // TODO: multiaddrs can be more than one, but info only takes one
+                let (protocol_key, NetworkInfo { pubkey, multiaddr, hostname }) = info??;
+                let validator = validators
+                    .get(&protocol_key)
+                    .ok_or_eyre("network returned validator that isn't in the committee")?;
+                let execution_address = validator.validatorAddress;
+
+                committee_builder.add_authority(
+                    protocol_key,
+                    1, // set stake so every authority's weight is equal
+                    multiaddr,
+                    execution_address,
+                    pubkey,
+                    hostname,
+                );
+            }
+
+            committee_builder.build()
+        };
+
         Ok(committee)
     }
 
@@ -602,32 +611,40 @@ where
     ) -> eyre::Result<WorkerCache> {
         info!(target: "epoch-manager", "creating worker cache from state");
 
-        // create worker cache
-        let worker_handle = self
-            .worker_network_handle
-            .as_ref()
-            .ok_or_eyre("missing primary network handle for epoch manager")?;
+        let worker_cache = if epoch == 0 {
+            Config::load_from_path::<WorkerCache>(
+                self.tn_datadir.worker_cache_path(),
+                ConfigFmt::YAML,
+            )?
+        } else {
+            // create worker cache
+            let worker_handle = self
+                .worker_network_handle
+                .as_ref()
+                .ok_or_eyre("missing primary network handle for epoch manager")?;
 
-        let mut workers = Vec::with_capacity(validators.len());
-        let mut worker_network_infos =
-            worker_handle.inner_handle().find_authorities(validators).await?;
+            let mut workers = Vec::with_capacity(validators.len());
+            let mut worker_network_infos =
+                worker_handle.inner_handle().find_authorities(validators).await?;
 
-        // only one worker per authority for now
-        let worker_id = 0;
-        // loop through the worker info returned from network query
-        while let Some(info) = worker_network_infos.next().await {
-            let (protocol_key, NetworkInfo { pubkey, multiaddr, .. }) = info??;
-            let worker_index = WorkerIndex(BTreeMap::from([(
-                worker_id,
-                WorkerInfo {
-                    name: pubkey,
-                    transactions: multiaddr.clone(),
-                    worker_address: multiaddr.clone(),
-                },
-            )]));
-            workers.push((protocol_key, worker_index));
-        }
-        let worker_cache = WorkerCache { epoch, workers: Arc::new(workers.into_iter().collect()) };
+            // only one worker per authority for now
+            let worker_id = 0;
+            // loop through the worker info returned from network query
+            while let Some(info) = worker_network_infos.next().await {
+                let (protocol_key, NetworkInfo { pubkey, multiaddr, .. }) = info??;
+                let worker_index = WorkerIndex(BTreeMap::from([(
+                    worker_id,
+                    WorkerInfo {
+                        name: pubkey,
+                        transactions: multiaddr.clone(),
+                        worker_address: multiaddr.clone(),
+                    },
+                )]));
+                workers.push((protocol_key, worker_index));
+            }
+
+            WorkerCache { epoch, workers: Arc::new(workers.into_iter().collect()) }
+        };
 
         Ok(worker_cache)
     }

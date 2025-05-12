@@ -145,6 +145,7 @@ pub struct EpochState {
     pub validators: Vec<ConsensusRegistry::ValidatorInfo>,
     /// The timestamp for when the previous epoch closed.
     ///
-    /// This time plus the `EpochInfo::epochDuration` creates the timestamp for the next epoch boundary.
+    /// This time plus the `EpochInfo::epochDuration` creates the timestamp for the next epoch
+    /// boundary.
     pub epoch_start: u64,
 }
