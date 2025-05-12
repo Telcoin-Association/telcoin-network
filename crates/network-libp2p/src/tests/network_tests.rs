@@ -834,19 +834,25 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
 
     // Create a custom config with short halflife for quicker testing
     let mut network_config = NetworkConfig::default();
-    network_config.peer_config_mut().score_config.score_halflife = 0.5;
+    network_config.peer_config_mut().score_config.score_halflife = 0.1;
     network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
     let default_score = network_config.peer_config_mut().score_config.default_score;
 
-    let TestTypes { peer1, peer2 } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
-    let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
+    // Set up multiple peers with the custom config
+    let (peer1, mut other_peers) = create_test_peers::<TestWorkerRequest, TestWorkerResponse>(
+        NonZeroUsize::new(4).unwrap(),
+        Some(network_config.clone()),
+    );
+
+    let peer2 = other_peers.remove(0);
+    let TestPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
     tokio::spawn(async move {
-        network.run().await.expect("network run failed!");
+        network.expect("peer1 network available").run().await.expect("network run failed!");
     });
 
-    let NetworkPeer { config: config_2, network_handle: peer2, network, .. } = peer2;
+    let TestPeer { config: config_2, network_handle: peer2, network, .. } = peer2;
     tokio::spawn(async move {
-        network.run().await.expect("network run failed!");
+        network.expect("peer2 network available").run().await.expect("network run failed!");
     });
 
     // Start listeners and establish connection
@@ -883,7 +889,7 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
     debug!(target: "peer-manager", ?default_score, ?score_after_penalty, "peer2 scores\nsleeping for 2 heartbeats...");
 
     // Wait for scores to recover through heartbeats
-    tokio::time::sleep(Duration::from_secs(2 * TEST_HEARTBEAT_INTERVAL)).await;
+    tokio::time::sleep(Duration::from_secs(4 * TEST_HEARTBEAT_INTERVAL)).await;
 
     // Check score improved
     let score_after_decay = peer1.peer_score(peer2_id).await?.unwrap();
