@@ -1,8 +1,8 @@
 //! Worker peer information.
 
 use crate::{
-    error::ConfigError, get_available_tcp_port, get_available_udp_port, BlsPublicKey, Epoch,
-    Multiaddr, NetworkKeypair, NetworkPublicKey,
+    error::ConfigError, get_available_udp_port, BlsPublicKey, Epoch, Multiaddr, NetworkKeypair,
+    NetworkPublicKey,
 };
 use eyre::ContextCompat;
 use libp2p::PeerId;
@@ -12,13 +12,11 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     fmt,
     str::FromStr,
     sync::Arc,
 };
-
-use super::DEFAULT_WORKER_PORT;
 
 /// The unique identifier for a worker (per primary).
 ///
@@ -33,10 +31,6 @@ pub type WorkerId = u16;
 pub struct WorkerInfo {
     /// The network public key of this worker used to sign worker messages (ie - batches).
     pub name: NetworkPublicKey,
-    /// Address to receive client transactions (WAN).
-    ///
-    /// AKA) RPC multiaddress.
-    pub transactions: Multiaddr,
     /// Address to receive messages from other workers (WAN) and our primary.
     pub worker_address: Multiaddr,
 }
@@ -48,13 +42,6 @@ impl Default for WorkerInfo {
 
         Self {
             name: NetworkKeypair::generate_ed25519().public().into(),
-            transactions: format!(
-                "/ip4/{}/tcp/{}/http",
-                &host,
-                get_available_tcp_port(&host).unwrap_or(DEFAULT_WORKER_PORT)
-            )
-            .parse()
-            .expect("multiaddress parsed for worker txs"),
             worker_address: format!("/ip4/{}/udp/{}/quic-v1", &host, worker_udp_port)
                 .parse()
                 .expect("multiaddr parsed for worker consensus"),
@@ -270,23 +257,6 @@ impl WorkerCache {
             .filter(|(name, _)| *name != myself)
             .map(|(name, auth)| (*name, auth))
             .flat_map(|(name, authority)| authority.0.iter().map(move |v| (name, v.1.clone())))
-            .collect()
-    }
-
-    /// Return the network addresses that are present in the current worker cache
-    /// that are from a primary key that are no longer in the committee. Current
-    /// committee keys provided as an argument.
-    pub fn network_diff(&self, keys: Vec<&BlsPublicKey>) -> HashSet<&Multiaddr> {
-        self.workers
-            .iter()
-            .filter(|(name, _)| !keys.contains(name))
-            .flat_map(|(_, authority)| {
-                authority
-                    .0
-                    .values()
-                    .map(|address| &address.transactions)
-                    .chain(authority.0.values().map(|address| &address.worker_address))
-            })
             .collect()
     }
 }

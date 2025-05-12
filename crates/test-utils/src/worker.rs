@@ -29,12 +29,7 @@ impl WorkerFixture {
         let worker_name = key_config.worker_network_public_key();
         let host = "127.0.0.1";
         let worker_address = format!("/ip4/{}/udp/{}", host, get_port(host)).parse().unwrap();
-        let transactions = format!("/ip4/{}/tcp/{}/http", host, get_port(host)).parse().unwrap();
 
-        Self {
-            key_config,
-            id,
-            info: WorkerInfo { name: worker_name, worker_address, transactions },
-        }
+        Self { key_config, id, info: WorkerInfo { name: worker_name, worker_address } }
     }
 }

@@ -409,7 +409,6 @@ fn start_validator(instance: usize, exe_path: &Path, base_dir: &Path, mut rpc_po
         .arg(&*data_dir.to_string_lossy())
         .arg("--genesis")
         .arg(&genesis_json_path)
-        .arg("--disable-discovery")
         .arg("--instance")
         .arg(format!("{}", instance + 1))
         .arg("--http")
@@ -429,6 +428,7 @@ fn start_observer(instance: usize, exe_path: &Path, base_dir: &Path, mut rpc_por
     let data_dir = base_dir.join("observer");
     // The instance option will still change a set port so account for that.
     rpc_port += instance as u16;
+    let genesis_json_path = data_dir.join("genesis/genesis.json");
     let mut command = Command::new(exe_path);
     command
         .env("TN_BLS_PASSPHRASE", "restart_test")
@@ -436,9 +436,10 @@ fn start_observer(instance: usize, exe_path: &Path, base_dir: &Path, mut rpc_por
         .arg("--observer")
         .arg("--datadir")
         .arg(&*data_dir.to_string_lossy())
+        .arg("--genesis")
+        .arg(&genesis_json_path)
         .arg("--chain")
         .arg("adiri")
-        .arg("--disable-discovery")
         .arg("--instance")
         .arg(format!("{}", instance + 1))
         .arg("--http")
