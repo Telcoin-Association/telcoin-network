@@ -271,7 +271,7 @@ where
 
         // single worker for now
         let (worker_id, _worker_info) = bootstrap_config.config().workers().first_worker()?;
-        let worker_address = bootstrap_config.worker_address(&worker_id);
+        let worker_address = bootstrap_config.worker_address(worker_id);
 
         // start listening for p2p messages
         let worker_multiaddr =

@@ -318,12 +318,12 @@ fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<
 
     test_blocks_same(client_urls)?;
     // Send to observer, validator confirms.
-    send_and_confirm(&obs_url, &client_urls[2], &key, to_account, 0)?;
+    send_and_confirm(obs_url, &client_urls[2], &key, to_account, 0)?;
     // Send to observer, validator confirms- second time.
-    send_and_confirm(&obs_url, &client_urls[3], &key, to_account, 1)?;
+    send_and_confirm(obs_url, &client_urls[3], &key, to_account, 1)?;
 
     // Send to a validator, observer sees transfer.
-    send_and_confirm(&client_urls[0], &obs_url, &key, to_account, 2)?;
+    send_and_confirm(&client_urls[0], obs_url, &key, to_account, 2)?;
 
     test_blocks_same(client_urls)?;
     Ok(())
@@ -426,7 +426,7 @@ fn start_validator(instance: usize, exe_path: &Path, base_dir: &Path, mut rpc_po
 
 /// Start a process running an observer node.
 fn start_observer(instance: usize, exe_path: &Path, base_dir: &Path, mut rpc_port: u16) -> Child {
-    let data_dir = base_dir.join("observer".to_string());
+    let data_dir = base_dir.join("observer");
     // The instance option will still change a set port so account for that.
     rpc_port += instance as u16;
     let mut command = Command::new(exe_path);

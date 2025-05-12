@@ -253,7 +253,7 @@ pub fn spawn_local_testnet(
             if #[cfg(feature = "faucet")] {
                 // extend genesis accounts
                 let consensus_accounts: Vec<_> =
-                    command.reth.chain.genesis.alloc.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    command.reth.chain.genesis.alloc.iter().map(|(k, v)| (*k, v.clone())).collect();
                 command.reth.chain =
                     Arc::new(_genesis.clone().extend_accounts(consensus_accounts.into_iter()).into());
             }
