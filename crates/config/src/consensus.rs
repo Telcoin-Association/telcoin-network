@@ -84,6 +84,25 @@ where
         )
     }
 
+    /// Configuration for the next epoch.
+    pub fn new_for_epoch(
+        config: Config,
+        node_storage: DB,
+        key_config: KeyConfig,
+        committee: Committee,
+        worker_cache: WorkerCache,
+        network_config: NetworkConfig,
+    ) -> eyre::Result<Self> {
+        Self::new_with_committee(
+            config,
+            node_storage,
+            key_config,
+            committee,
+            worker_cache,
+            network_config,
+        )
+    }
+
     /// Create a new config with a committe.
     ///
     /// This should only be called by `Self::new` or by the testing wrapper.

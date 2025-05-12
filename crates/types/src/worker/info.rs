@@ -74,7 +74,6 @@ impl Default for WorkerIndex {
     }
 }
 
-// TODO: abandon TOML for config
 // Custom serilaization impl for WorkerIndex bc int types are invalid keys for TOML files.
 impl Serialize for WorkerIndex {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
