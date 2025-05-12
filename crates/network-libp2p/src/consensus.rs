@@ -200,6 +200,8 @@ where
             request_response::Config::default(),
         );
         let peer_id: PeerId = keypair.public().into();
+
+        // TODO: set publication, query timeout, etc. from config vars
         let kademlia = kad::Behaviour::new(peer_id, MemoryStore::new(peer_id));
 
         // create custom behavior
@@ -821,8 +823,8 @@ where
             PeerEvent::MissingAuthorities(missing) => {
                 for AuthorityInfoRequest { bls_key, reply } in missing {
                     let key = kad::RecordKey::new(&bls_key);
-                    let request_id = self.swarm.behaviour_mut().kademlia.get_record(key);
-                    self.kad_requests.insert(request_id, reply);
+                    let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
+                    self.kad_requests.insert(query_id, reply);
                 }
             }
         }
@@ -888,6 +890,7 @@ where
                     kad::QueryResult::GetRecord(Ok(_)) => {}
                     kad::QueryResult::GetRecord(Err(err)) => {
                         error!(target: "network-kad", "Failed to get record: {err:?}");
+                        self.return_kad_result(&query_id, Err(err.into()));
                     }
                     kad::QueryResult::PutRecord(Ok(kad::PutRecordOk { key })) => {
                         match try_decode::<BlsPublicKey>(key.as_ref()) {

@@ -96,7 +96,7 @@ use tn_config::{ValidatorInfo, CONSENSUS_REGISTRY_JSON};
 use tn_types::{
     adiri_chain_spec_arc, calculate_transaction_root, keccak256, Address, Block, BlockBody,
     BlockExt as _, BlockHashOrNumber, BlockNumHash, BlockNumber, BlockWithSenders, BlsSignature,
-    ExecHeader, Genesis, GenesisAccount, Receipt, SealedBlock, SealedBlockWithSenders,
+    Epoch, ExecHeader, Genesis, GenesisAccount, Receipt, SealedBlock, SealedBlockWithSenders,
     SealedHeader, TaskManager, TransactionSigned, TxKind, B256, EMPTY_OMMER_ROOT_HASH,
     EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, U256,
 };
@@ -1441,6 +1441,12 @@ impl RethEnv {
         let state = StateProviderDatabase::new(latest);
         let mut db = State::builder().with_database(state).with_bundle_update().build();
         let last_block_num = self.blockchain_provider.last_block_number()?;
+        // read current epoch number from chain
+        let canonical_tip = self.header_by_number(last_block_num)?.ok_or_eyre(
+            "Canonical tip missing from blockchain provider reading committee from chain",
+        )?;
+
+        let epoch = Self::extract_epoch_from_header(&canonical_tip);
 
         // from self.tn_env_for_evm
         let spec_id = reth_revm::primitives::SpecId::SHANGHAI;
@@ -1480,6 +1486,12 @@ impl RethEnv {
 
         // current epoch info
         let epoch_info = self.get_current_epoch_info(&mut evm)?;
+
+        // retrieve closing timestamp for previous epoch
+        let epoch_start = self
+            .header_by_number(epoch_info.blockHeight.saturating_sub(1))?
+            .ok_or_eyre("failed to retrieve closing epoch information")?
+            .timestamp;
         let token_ids = epoch_info
             .committee
             .iter()
@@ -1496,9 +1508,15 @@ impl RethEnv {
             })
             .collect::<eyre::Result<Vec<_>, _>>()?;
 
-        let epoch_state = EpochState { epoch_info, validators };
+        let epoch_state = EpochState { epoch, epoch_info, validators, epoch_start };
 
         Ok(epoch_state)
+    }
+
+    /// Extract the epoch number from a header's nonce.
+    pub fn extract_epoch_from_header(header: &ExecHeader) -> Epoch {
+        let nonce: u64 = header.nonce.into();
+        (nonce >> 32) as u32
     }
 
     /// Read the curret epoch info from the [ConsensusRegistry] on-chain.

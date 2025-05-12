@@ -4,7 +4,7 @@
 //! System Calls.
 
 use alloy::{primitives::address, sol};
-use tn_types::Address;
+use tn_types::{Address, Epoch};
 
 /// The system address.
 pub(super) const SYSTEM_ADDRESS: Address = address!("fffffffffffffffffffffffffffffffffffffffe");
@@ -137,8 +137,14 @@ sol!(
 /// The state of consensus retrieved from chain.
 #[derive(Debug)]
 pub struct EpochState {
+    /// The epoch number.
+    pub epoch: Epoch,
     /// The [EpochInfo].
     pub epoch_info: ConsensusRegistry::EpochInfo,
     /// The collection of validator info.
     pub validators: Vec<ConsensusRegistry::ValidatorInfo>,
+    /// The timestamp for when the previous epoch closed.
+    ///
+    /// This time plus the `EpochInfo::epochDuration` creates the timestamp for the next epoch boundary.
+    pub epoch_start: u64,
 }

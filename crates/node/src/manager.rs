@@ -487,17 +487,18 @@ where
             .find_authorities(validators.keys().cloned().collect())
             .await?;
 
+        let epoch_boundary = epoch_state.epoch_start + epoch_state.epoch_info.epochDuration as u64;
+
         // build the committee
-        let mut committee_builder =
-            CommitteeBuilder::new(epoch_state.epoch_info.??, epoch_state.epoch_info.epochDuration);
+        let mut committee_builder = CommitteeBuilder::new(epoch_state.epoch, epoch_boundary);
         // TODO: how to set the epoch duration?
         // - need to include `prev_epoch: Option<EpochInfo>` on EpochState
         // - if on the first epoch (is that 0 or 1 ?) return `None`, otherwise `Some(prev_epoch)`
         // - also include epoch_num from tn_reth call for architecture reasons
         // - the canonical tip will have the epoch number, so easier to parse in engine level
 
-
         while let Some(info) = primary_network_infos.next().await {
+            debug!(target: "epoch-manager", ?info, "awaited next primary network info");
             // TODO: multiaddrs can be more than one, but info only takes one
             let (protocol_key, NetworkInfo { pubkey, multiaddr, hostname }) = info??;
             let validator = validators
@@ -507,7 +508,7 @@ where
 
             committee_builder.add_authority(
                 protocol_key,
-                stake,
+                1, // set stake so every authority's weight is equal
                 multiaddr,
                 execution_address,
                 pubkey,
@@ -725,7 +726,6 @@ where
     ) -> eyre::Result<()> {
         // create event streams for the worker network handler
         let (event_stream, rx_event_stream) = mpsc::channel(1000);
-
         let worker_address = consensus_config.worker_address(worker_id);
 
         network_handle

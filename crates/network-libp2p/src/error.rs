@@ -2,6 +2,7 @@
 
 use libp2p::{
     gossipsub::{ConfigBuilderError, PublishError, SubscriptionError},
+    kad::GetRecordError,
     request_response::OutboundFailure,
     swarm::DialError,
     TransportError,
@@ -89,6 +90,9 @@ pub enum NetworkError {
     /// The retrieved peer record is invalid.
     #[error("Invalid bls signature for peer record.")]
     InvalidPeerRecord,
+    /// Kademlia error.
+    #[error("Kad error: {0}")]
+    Kademlia(String),
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {
@@ -118,5 +122,11 @@ impl<T> From<mpsc::error::TrySendError<T>> for NetworkError {
 impl From<&DialError> for NetworkError {
     fn from(e: &DialError) -> Self {
         Self::Dial(e.to_string())
+    }
+}
+
+impl From<GetRecordError> for NetworkError {
+    fn from(e: GetRecordError) -> Self {
+        Self::Kademlia(e.to_string())
     }
 }
