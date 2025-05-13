@@ -500,7 +500,7 @@ where
         let validators = validators
             .iter()
             .map(|v| {
-                let decoded_bls = BlsPublicKey::from_bytes_on_chain(v.blsPubkey.as_ref());
+                let decoded_bls = BlsPublicKey::from_literal_bytes(v.blsPubkey.as_ref());
                 decoded_bls.map(|decoded| (decoded, v))
             })
             .collect::<Result<HashMap<_, _>, _>>()

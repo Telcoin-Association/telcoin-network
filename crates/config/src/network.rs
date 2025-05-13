@@ -124,13 +124,23 @@ impl LibP2pConfig {
     pub fn worker_txn_topic(&self) -> String {
         String::from("tn-txn")
     }
+
+    /// Protocol for identify behavior.
+    pub fn identify_protocol(&self) -> &'static str {
+        Self::protocol()
+    }
+
+    /// Return the protocol string.
+    pub fn protocol() -> &'static str {
+        "/telcoin-network/0.0.0"
+    }
 }
 
 impl Default for LibP2pConfig {
     fn default() -> Self {
         Self {
             supported_req_res_protocols: vec![(
-                StreamProtocol::new("/telcoin-network/0.0.0"),
+                StreamProtocol::new(Self::protocol()),
                 ProtocolSupport::Full,
             )],
             max_rpc_message_size: 1024 * 1024, // 1 MiB

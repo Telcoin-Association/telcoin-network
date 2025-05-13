@@ -100,8 +100,11 @@ pub enum NetworkError {
     #[error("Invalid bls signature for peer record.")]
     InvalidPeerRecord,
     /// Kademlia error.
-    #[error("Kad error: {0}")]
-    Kademlia(String),
+    #[error("Failed to get kad record: {0}")]
+    GetKademliaRecord(#[from] GetRecordError),
+    /// Kademlia error that peers were queried but no record was returned.
+    #[error("Failed to get kad record, but found peers close to the record key.")]
+    FinishedWithNoAdditionalRecord,
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {
@@ -131,11 +134,5 @@ impl<T> From<mpsc::error::TrySendError<T>> for NetworkError {
 impl From<&DialError> for NetworkError {
     fn from(e: &DialError) -> Self {
         Self::Dial(e.to_string())
-    }
-}
-
-impl From<GetRecordError> for NetworkError {
-    fn from(e: GetRecordError) -> Self {
-        Self::Kademlia(e.to_string())
     }
 }

@@ -82,9 +82,8 @@ impl BlsPublicKey {
     /// Decode the public key from bytes on-chain and return result to caller.
     ///
     /// WARNING: do not use this method to deserialize bytes from filesystem.
-    /// This method is only used to convert the bytes read from ConsensusRegistry
-    /// smart contract on-chain.
-    pub fn from_bytes_on_chain(bytes: &[u8]) -> Result<Self, BLST_ERROR> {
+    /// This method is only used to convert the literal bytes for the pubkey.
+    pub fn from_literal_bytes(bytes: &[u8]) -> Result<Self, BLST_ERROR> {
         CorePublicKey::from_bytes(bytes).map(|key| key.into())
     }
 }

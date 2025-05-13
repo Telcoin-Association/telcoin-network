@@ -168,7 +168,6 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         tn_config.observer = observer; // Set observer mode from the config.
 
         debug!(target: "cli", "node command genesis: {:#?}", reth.chain.genesis());
-        info!(target: "cli", "node command genesis hash: {:?}", reth.chain.genesis_hash());
 
         // set up reth node config for engine components
         let node_config = RethConfig::new(
