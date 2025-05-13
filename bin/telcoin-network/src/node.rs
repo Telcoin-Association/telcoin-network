@@ -142,7 +142,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // overwrite all genesis if `genesis` was passed to CLI
         if let Some(chain) = self.genesis.take() {
-            info!(target: "cli", ?chain, "Overwriting TN config with specified chain");
+            debug!(target: "cli", ?chain, "Overwriting TN config with specified chain");
             // Copy over any initial allocations.  This is for testing (and testnets).
             let mut chain = Arc::unwrap_or_clone(chain);
             chain

@@ -20,6 +20,7 @@ use tn_config::{
     Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs,
 };
 use tn_network_libp2p::{
+    error::NetworkError,
     types::{NetworkHandle, NetworkInfo},
     ConsensusNetwork, PeerId, TNMessage,
 };
@@ -43,7 +44,7 @@ use tokio::sync::{
     oneshot,
 };
 use tokio_stream::StreamExt as _;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// The long-running task manager name.
 const NODE_TASK_MANAGER: &str = "Node Task Manager";
@@ -214,30 +215,11 @@ where
                     Ok(())
                 },
                 res = primary_network.run() => {
+                    warn!(target: "epoch-manager", ?res, "primary network stopped");
                     res
                 },
             )
         });
-
-        // start listening for p2p messages
-        let primary_address = bootstrap_config.primary_address();
-        let primary_multiaddr =
-            Self::get_multiaddr_from_env_or_config("PRIMARY_MULTIADDR", primary_address);
-        primary_network_handle.start_listening(primary_multiaddr).await?;
-
-        // bootstrap primary peers
-        for (authority_id, addr, _) in bootstrap_config
-            .committee()
-            .others_primaries_by_id(bootstrap_config.authority_id().as_ref())
-        {
-            let peer_id = authority_id.peer_id();
-            self.dial_peer(
-                primary_network_handle.clone(),
-                peer_id,
-                addr,
-                node_task_spawner.clone(),
-            );
-        }
 
         // primary network handle
         self.primary_network_handle = Some(PrimaryNetworkHandle::new(primary_network_handle));
@@ -264,35 +246,17 @@ where
                     Ok(())
                 }
                 res = worker_network.run() => {
+                    warn!(target: "epoch-manager", ?res, "worker network stopped");
                     res
                 }
             )
         });
 
-        // single worker for now
-        let (worker_id, _worker_info) = bootstrap_config.config().workers().first_worker()?;
-        let worker_address = bootstrap_config.worker_address(worker_id);
-
-        // start listening for p2p messages
-        let worker_multiaddr =
-            Self::get_multiaddr_from_env_or_config("WORKER_MULTIADDR", worker_address.clone());
-        worker_network_handle.start_listening(worker_multiaddr).await?;
-
-        // bootstrap worker peers
-        for (peer_id, addr) in bootstrap_config.worker_cache().all_workers() {
-            if addr != worker_address {
-                self.dial_peer(
-                    worker_network_handle.clone(),
-                    peer_id,
-                    addr,
-                    node_task_spawner.clone(),
-                );
-            }
-        }
-
         // set temporary task spawner - this is updated with each epoch
         self.worker_network_handle =
             Some(WorkerNetworkHandle::new(worker_network_handle, node_task_spawner.clone()));
+
+        info!(target: "epoch-manager", auth=?bootstrap_config.authority_id(), "node networks started. tmp_rx dropped D:");
         Ok(())
     }
 
@@ -308,6 +272,9 @@ where
         let mut epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
         let mut running = true;
 
+        // initialize networks to start listening for the first epoch
+        let mut initialize_networks = true;
+
         // start the epoch
         while running {
             running = {
@@ -317,6 +284,7 @@ where
                         consensus_db.clone(),
                         &mut epoch_task_manager,
                         &network_config,
+                        &mut initialize_networks,
                     )
                     .await;
 
@@ -346,6 +314,7 @@ where
         consensus_db: DatabaseType,
         epoch_task_manager: &mut TaskManager,
         network_config: &NetworkConfig,
+        initialize_networks: &mut bool,
     ) -> eyre::Result<bool> {
         info!(target: "epoch-manager", "Starting epoch");
 
@@ -367,7 +336,13 @@ where
 
         // create primary and worker nodes
         let (primary, worker_node) = self
-            .create_consensus(&engine, consensus_db, epoch_task_manager, network_config)
+            .create_consensus(
+                &engine,
+                consensus_db,
+                epoch_task_manager,
+                network_config,
+                initialize_networks,
+            )
             .await?;
 
         // create receiving channel before spawning primary to ensure messages are not lost
@@ -457,13 +432,18 @@ where
         consensus_db: DatabaseType,
         epoch_task_manager: &TaskManager,
         network_config: &NetworkConfig,
+        initialize_networks: &mut bool,
     ) -> eyre::Result<(PrimaryNode<DatabaseType>, WorkerNode<DatabaseType>)> {
         // create config for consensus
         let consensus_config =
             self.configure_consensus(engine, network_config, &consensus_db).await?;
 
         let primary = self
-            .create_primary_node_components(&consensus_config, epoch_task_manager.get_spawner())
+            .create_primary_node_components(
+                &consensus_config,
+                epoch_task_manager.get_spawner(),
+                initialize_networks,
+            )
             .await?;
 
         // only spawns one worker for now
@@ -472,12 +452,19 @@ where
                 &consensus_config,
                 engine.new_batch_validator().await,
                 epoch_task_manager.get_spawner(),
+                initialize_networks,
             )
             .await?;
+
+        // ensure initialized networks is false after the first run
+        *initialize_networks = false;
 
         // set execution state for consensus
         let consensus_bus = primary.consensus_bus().await;
         self.try_restore_state(&consensus_bus, &consensus_db, engine).await?;
+
+        // here????????
+        debug!(target: "epoch-manager", "identifying node mode...");
 
         let primary_network_handle = primary.network_handle().await;
         let _mode = self
@@ -652,6 +639,7 @@ where
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
         epoch_task_spawner: TaskSpawner,
+        initialize_networks: &mut bool,
     ) -> eyre::Result<PrimaryNode<DB>> {
         let consensus_bus =
             ConsensusBus::new_with_args(consensus_config.config().parameters.gc_depth);
@@ -669,6 +657,7 @@ where
             state_sync.clone(),
             epoch_task_spawner.clone(),
             &network_handle,
+            initialize_networks,
         )
         .await?;
 
@@ -685,6 +674,7 @@ where
         consensus_config: &ConsensusConfig<DB>,
         validator: Arc<dyn BatchValidation>,
         epoch_task_spawner: TaskSpawner,
+        initialize_networks: &mut bool,
     ) -> eyre::Result<WorkerNode<DB>> {
         // only support one worker for now - otherwise, loop here
         let (worker_id, _worker_info) = consensus_config.config().workers().first_worker()?;
@@ -710,6 +700,7 @@ where
             validator.clone(),
             epoch_task_spawner,
             &network_handle,
+            initialize_networks,
         )
         .await?;
 
@@ -733,15 +724,27 @@ where
         state_sync: StateSynchronizer<DB>,
         epoch_task_spawner: TaskSpawner,
         network_handle: &PrimaryNetworkHandle,
+        initialize_networks: &bool,
     ) -> eyre::Result<()> {
         // create event streams for the primary network handler
         let (event_stream, rx_event_stream) = mpsc::channel(1000);
 
         // set committee for network to prevent banning
+        debug!(target: "epoch-manager", auth=?consensus_config.authority_id(), "spawning primary network for epoch");
         network_handle
             .inner_handle()
             .new_epoch(consensus_config.primary_network_map(), event_stream)
             .await?;
+        debug!(target: "epoch-manager", auth=?consensus_config.authority_id(), "event stream updated!");
+
+        // start listening if the network needs to be initialized
+        if *initialize_networks {
+            // start listening for p2p messages
+            let primary_address = consensus_config.primary_address();
+            let primary_multiaddr =
+                Self::get_multiaddr_from_env_or_config("PRIMARY_MULTIADDR", primary_address);
+            network_handle.inner_handle().start_listening(primary_multiaddr).await?;
+        }
 
         // update the authorized publishers for gossip every epoch
         network_handle
@@ -809,16 +812,24 @@ where
         let task_name = format!("DialPeer {peer_id}");
         node_task_spawner.spawn_task(task_name, async move {
             let mut backoff = 1;
+
+            // skip dialing already connected peers
+            if let Ok(peers) = handle.connected_peers().await {
+                if peers.contains(&peer_id) {
+                    return;
+                };
+            }
+
             while let Err(e) = handle.dial(peer_id, peer_addr.clone()).await {
-                tracing::warn!(target: "node", "failed to dial {peer_id} at {peer_addr}: {e}");
+                // ignore errors for peers that are already connected or being dialed
+                if matches!(e, NetworkError::AlreadyConnected(_)) || matches!(e, NetworkError::AlreadyDialing(_)) {
+                    return;
+                }
+
+                tracing::warn!(target: "epoch-manager", "failed to dial {peer_id} at {peer_addr}: {e}");
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                 if backoff < 120 {
                     backoff += backoff;
-                }
-                if let Ok(peers) = handle.connected_peers().await {
-                    if peers.contains(&peer_id) {
-                        return;
-                    };
                 }
             }
         });
@@ -832,6 +843,7 @@ where
         validator: Arc<dyn BatchValidation>,
         epoch_task_spawner: TaskSpawner,
         network_handle: &WorkerNetworkHandle,
+        initialize_networks: &bool,
     ) -> eyre::Result<()> {
         // create event streams for the worker network handler
         let (event_stream, rx_event_stream) = mpsc::channel(1000);
@@ -841,6 +853,13 @@ where
             .inner_handle()
             .new_epoch(consensus_config.worker_network_map(), event_stream)
             .await?;
+
+        // start listening if the network needs to be initialized
+        if *initialize_networks {
+            let worker_multiaddr =
+                Self::get_multiaddr_from_env_or_config("WORKER_MULTIADDR", worker_address.clone());
+            network_handle.inner_handle().start_listening(worker_multiaddr).await?;
+        }
 
         // always dial peers for the new epoch
         for (peer_id, addr) in consensus_config.worker_cache().all_workers() {
@@ -906,6 +925,7 @@ where
         consensus_config: &ConsensusConfig<DB>,
         primary_network_handle: &PrimaryNetworkHandle,
     ) -> eyre::Result<NodeMode> {
+        debug!(target: "epoch-manager", "identifying node mode...");
         let mode = if self.builder.tn_config.observer {
             NodeMode::Observer
         } else if state_sync::can_cvv(consensus_bus, consensus_config, primary_network_handle).await
@@ -915,6 +935,7 @@ where
             NodeMode::CvvInactive
         };
 
+        debug!(target: "epoch-manager", ?mode, "node mode identified");
         // update consensus bus
         consensus_bus.node_mode().send_modify(|v| *v = mode);
 

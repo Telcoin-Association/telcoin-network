@@ -119,21 +119,22 @@ impl PeerManager {
             match peer.connection_status() {
                 ConnectionStatus::Banned { .. } => {
                     // report error - dial banned peer
-                    let error = NetworkError::Dial(format!("Peer {peer_id} is banned"));
+                    let error = NetworkError::DialBannedPeer(format!("Peer {peer_id} is banned"));
                     warn!(target: "peer-manager", ?error, "invalid dial request");
                     send_or_log_error!(reply, Err(error), "DialPeer", peer = peer_id);
                     return;
                 }
                 ConnectionStatus::Dialing { .. } => {
                     // report error - dialing already in progress
-                    let error = NetworkError::Dial(format!("Already dialing {peer_id}"));
+                    let error = NetworkError::AlreadyDialing(format!("Already dialing {peer_id}"));
                     warn!(target: "peer-manager", ?error, "invalid dial request");
                     send_or_log_error!(reply, Err(error), "DialPeer", peer = peer_id);
                     return;
                 }
                 ConnectionStatus::Connected { .. } => {
                     // report error - dialing already connected
-                    let error = NetworkError::Dial(format!("Peer {peer_id} is already connected"));
+                    let error =
+                        NetworkError::AlreadyConnected(format!("Already connected {peer_id}"));
                     warn!(target: "peer-manager", ?error, "invalid dial request");
                     send_or_log_error!(reply, Err(error), "DialPeer", peer = peer_id);
                     return;

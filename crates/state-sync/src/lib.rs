@@ -341,7 +341,7 @@ async fn max_consensus_header_from_committee<DB: Database>(
             }
             Err(e) => {
                 // An error with one peer should not derail us...  But log it.
-                tracing::error!(target: "telcoin::state-sync", "error requesting peer consensus {e:?}")
+                tracing::error!(target: "telcoin::state-sync", "error awaiting peer consensus {e:?}")
             }
         }
     }

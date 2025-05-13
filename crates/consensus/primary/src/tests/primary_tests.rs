@@ -26,7 +26,10 @@ use tn_types::{
     now, AuthorityIdentifier, BlockNumHash, Certificate, Committee, Database, ExecHeader,
     Hash as _, SealedHeader, SignatureVerificationState, TaskManager,
 };
-use tokio::{sync::mpsc, time::timeout};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::timeout,
+};
 
 fn get_bus_and_primary<DB: Database>(
     config: ConsensusConfig<DB>,

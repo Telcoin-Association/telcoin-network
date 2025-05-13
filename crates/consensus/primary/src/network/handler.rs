@@ -463,6 +463,7 @@ where
         number: Option<u64>,
         hash: Option<BlockHash>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
+        tracing::debug!(target: "epoch-manager", ?number, ?hash, "retrieving consensus header...");
         let header = match (number, hash) {
             (_, Some(hash)) => self.get_header_by_hash(hash)?,
             (Some(number), _) => self.get_header_by_number(number)?,

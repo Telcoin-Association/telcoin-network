@@ -522,11 +522,15 @@ where
                 //
                 // for now, this only supports the current committee for the epoch
 
+                // DELETE THISSSSSSSS
+                debug!(target: "epoch-manager", "NetworkCommand::NewEpoch - updating committee and event stream");
+                info!(target: "epoch-manager", "network update for next committee - ensure all committee members not banned");
                 // ensure that the next committee isn't banned
                 self.swarm.behaviour_mut().peer_manager.new_epoch(committee);
 
                 // update the stream to forward events
                 self.event_stream = new_event_stream;
+                debug!(target: "epoch-manager", "NetworkCommand::NewEpoch - successfully updated event stream");
             }
             NetworkCommand::FindAuthorities { requests } => {
                 // this will trigger a PeerEvent to fetch records through kad if not in the peer map
@@ -561,6 +565,7 @@ where
                     // TODO: Issue #253
                     //
                     // forward gossip to handler
+                    debug!(target: "epoch-manager", "preparing to send gossip to event stream");
                     if let Err(e) = self
                         .event_stream
                         .try_send(NetworkEvent::Gossip(message, propagation_source))
@@ -610,6 +615,7 @@ where
                 match message {
                     request_response::Message::Request { request_id, request, channel } => {
                         let (notify, cancel) = oneshot::channel();
+                        debug!(target: "epoch-manager", ?request, "preparing to send request to event stream");
                         // forward request to handler without blocking other events
                         if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
                             peer,

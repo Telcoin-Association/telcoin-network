@@ -21,6 +21,15 @@ pub enum NetworkError {
     /// Dial attempt currently ongoing for peer.
     #[error("Peer already dialed")]
     RedialAttempt,
+    /// Dialing an already connected peer.
+    #[error("{0}")]
+    DialBannedPeer(String),
+    /// Dialing an already connected peer.
+    #[error("{0}")]
+    AlreadyConnected(String),
+    /// The peer is already being dialed.
+    #[error("{0}")]
+    AlreadyDialing(String),
     /// Gossipsub error publishing message.
     #[error(transparent)]
     Publish(#[from] PublishError),

@@ -189,7 +189,9 @@ fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
         next_num = get_block_number(&client_urls[0])?;
         i += 1;
         if i > 30 {
-            return Err(eyre::eyre!("Network not advancing within 30 seconds after restart!"));
+            return Err(eyre::eyre!(
+                "Network not advancing past {next_num} within 30 seconds after restart!"
+            ));
         }
     }
     Ok(())
