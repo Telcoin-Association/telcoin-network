@@ -5,7 +5,6 @@ use crate::{
     WORKER_NETWORK_SEED_FILE,
 };
 use aes_gcm_siv::{aead::Aead as _, Aes256GcmSiv, Key, KeyInit, Nonce};
-use blake2::Digest;
 use pbkdf2::pbkdf2_hmac;
 use rand::{rngs::StdRng, Rng as _, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -228,9 +227,10 @@ impl KeyConfig {
     /// This is deterministic for a given keypair and seed_str.
     fn generate_network_keypair(primary_keypair: &BlsKeypair, seed_str: &str) -> NetworkKeypair {
         let mut hasher = DefaultHashFunction::new();
-        hasher.update(primary_keypair.sign(seed_str.as_bytes()).to_bytes());
+        hasher.update(&primary_keypair.sign(seed_str.as_bytes()).to_bytes());
         let hash = hasher.finalize();
-        NetworkKeypair::ed25519_from_bytes(hash[0..32].to_vec()).expect("invalid network key bytes")
+        NetworkKeypair::ed25519_from_bytes(hash.as_bytes()[0..32].to_vec())
+            .expect("invalid network key bytes")
     }
 }
 

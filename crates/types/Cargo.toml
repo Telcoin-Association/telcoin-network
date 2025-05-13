@@ -43,7 +43,7 @@ serde_yaml = { workspace = true }
 secp256k1 = { workspace = true }
 libp2p = { workspace = true, features = ["serde"] }
 bs58 = { workspace = true }
-blake2 = { workspace = true }
+blake3 = { workspace = true }
 blst = { workspace = true, features = ["serde"] }
 alloy = { workspace = true, features = ["genesis"] }
 hex = { workspace = true }

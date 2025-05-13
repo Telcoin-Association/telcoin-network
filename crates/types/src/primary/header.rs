@@ -5,7 +5,6 @@ use crate::{
     Epoch, Hash, Round, TimestampSec, VoteDigest, WorkerCache, WorkerId,
 };
 use base64::{engine::general_purpose, Engine};
-use blake2::Digest as _;
 use derive_builder::Builder;
 use indexmap::IndexMap;
 use once_cell::sync::OnceCell;
@@ -253,7 +252,7 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for Header {
 
     fn digest(&self) -> HeaderDigest {
         let mut hasher = crypto::DefaultHashFunction::new();
-        hasher.update(encode(&self));
+        hasher.update(encode(&self).as_ref());
         HeaderDigest(hasher.finalize().into())
     }
 }

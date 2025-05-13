@@ -8,7 +8,6 @@ use crate::{
     Address, Batch, BlockHash, Certificate, Committee, Digest, Epoch, Hash, ReputationScores,
     Round, TimestampSec, B256,
 };
-use blake2::Digest as _;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},
@@ -258,11 +257,11 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for CommittedSubDag {
         // Instead of hashing serialized CommittedSubDag, hash the certificate digests instead.
         // Signatures in the certificates are not part of the commitment.
         for cert in &self.certificates {
-            hasher.update(cert.digest());
+            hasher.update(cert.digest().as_ref());
         }
-        hasher.update(self.leader.digest());
+        hasher.update(self.leader.digest().as_ref());
         // skip reputation for stable hashes
-        hasher.update(encode(&self.commit_timestamp));
+        hasher.update(encode(&self.commit_timestamp).as_ref());
         ConsensusDigest(hasher.finalize().into())
     }
 }

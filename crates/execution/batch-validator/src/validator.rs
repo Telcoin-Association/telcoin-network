@@ -265,7 +265,7 @@ mod tests {
         // intentionally used hard-coded values
         SealedBatch::new(
             batch,
-            hex!("9f0a6a575088d4aa97eb832e8486a5647109d82e90747c735285393db1d65271").into(),
+            hex!("de2de28fdeefa93b5f68c5b007d645d273c4e52d05a282a961c98a655b364995").into(),
         )
     }
 
@@ -296,6 +296,10 @@ mod tests {
         let task_manager = TaskManager::default();
         let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
         let result = validator.validate_batch(valid_batch.clone());
+        eprintln!(
+            "XXXXX result: {result:?}, batch: {}",
+            valid_batch.batch.clone().seal_slow().digest.to_string()
+        );
         assert!(result.is_ok());
 
         // ensure non-serialized data does not affect validity

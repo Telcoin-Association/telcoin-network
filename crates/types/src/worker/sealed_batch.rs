@@ -7,7 +7,6 @@ use crate::{
     adiri_chain_spec, crypto, encode, now, Address, BlockHash, ExecHeader, TimestampSec,
     MIN_PROTOCOL_BASE_FEE,
 };
-use blake2::Digest as _;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use thiserror::Error;
@@ -111,9 +110,9 @@ impl Batch {
     /// NOTE: `Self::received_at` is skipped during serialization and is excluded from the digest.
     pub fn digest(&self) -> BlockHash {
         let mut hasher = crypto::DefaultHashFunction::new();
-        hasher.update(encode(self));
+        hasher.update(encode(self).as_ref());
         // finalize
-        BlockHash::from_slice(&hasher.finalize()[..])
+        BlockHash::from_slice(hasher.finalize().as_bytes())
     }
 
     /// Timestamp of this batch header.

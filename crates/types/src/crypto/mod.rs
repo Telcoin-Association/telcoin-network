@@ -9,7 +9,6 @@
 
 use std::{fmt, future::Future};
 
-use blake2::digest::consts::U32;
 use libp2p::PeerId;
 // This re-export allows using the trait-defined APIs
 mod bls_keypair;
@@ -130,7 +129,7 @@ pub type ExecutionPublicKey = secp256k1::PublicKey;
 pub type ExecutionKeypair = secp256k1::Keypair;
 
 /// Type alias selecting the default hash function for the code base.
-pub type DefaultHashFunction = blake2::Blake2b<U32>;
+pub type DefaultHashFunction = blake3::Hasher;
 pub const DIGEST_LENGTH: usize = 32;
 pub const INTENT_MESSAGE_LENGTH: usize = INTENT_PREFIX_LENGTH + DIGEST_LENGTH;
 

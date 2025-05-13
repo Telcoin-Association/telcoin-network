@@ -3,7 +3,6 @@
 use crate::consensus::{
     Bullshark, ConsensusMetrics, ConsensusState, LeaderSchedule, LeaderSwapTable,
 };
-use blake2::Digest as _;
 use futures::{stream::FuturesUnordered, StreamExt};
 use rand::{
     distributions::{Bernoulli, Distribution},
@@ -61,7 +60,7 @@ impl ExecutionPlan {
     fn hash(&self) -> [u8; tn_types::DIGEST_LENGTH] {
         let mut hasher = tn_types::DefaultHashFunction::new();
         self.certificates.iter().for_each(|c| {
-            hasher.update(c.digest());
+            hasher.update(c.digest().as_ref());
         });
         hasher.finalize().into()
     }

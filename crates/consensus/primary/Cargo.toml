@@ -34,7 +34,6 @@ tower = { workspace = true }
 tracing = { workspace = true }
 tap = { workspace = true }
 
-blake2 = { workspace = true }
 tn-network-types = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }

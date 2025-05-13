@@ -30,7 +30,6 @@ reth-chainspec = { workspace = true }
 humantime-serde = { workspace = true }
 libp2p = { workspace = true, features = ["request-response"] }
 backoff = { workspace = true }
-blake2 = { workspace = true }
 bs58 = { workspace = true }
 
 # Crypto specific to key wrapping, not used elsewhere.

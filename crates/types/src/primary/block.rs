@@ -8,7 +8,6 @@
 
 use super::{CommittedSubDag, ConsensusOutput};
 use crate::{crypto, error::CertificateResult, BlockHash, Certificate, Committee, Hash, B256};
-use blake2::Digest as _;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -47,10 +46,10 @@ impl ConsensusHeader {
         number: u64,
     ) -> BlockHash {
         let mut hasher = crypto::DefaultHashFunction::new();
-        hasher.update(parent_hash);
-        hasher.update(sub_dag.digest());
-        hasher.update(number.to_le_bytes());
-        BlockHash::from_slice(&hasher.finalize()[..])
+        hasher.update(parent_hash.as_slice());
+        hasher.update(sub_dag.digest().as_ref());
+        hasher.update(number.to_le_bytes().as_ref());
+        BlockHash::from_slice(hasher.finalize().as_bytes())
     }
 
     /// Verify that all of the contained certificates are valid and signed by a quorum of committee.
