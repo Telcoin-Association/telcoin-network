@@ -494,9 +494,7 @@ where
         committee: HashMap<PeerId, Multiaddr>,
         new_event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
     ) -> NetworkResult<()> {
-        tracing::debug!(target: "epoch-manager", "inside new_epoch!");
         self.sender.send(NetworkCommand::NewEpoch { committee, new_event_stream }).await?;
-        tracing::debug!(target: "epoch-manager", "made it here??");
         Ok(())
     }
 

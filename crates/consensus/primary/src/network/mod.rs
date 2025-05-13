@@ -341,7 +341,6 @@ where
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
         let task_name = format!("ConsensusOutputReq-{peer}");
-        tracing::debug!(target: "epoch-manager", ?task_name, "spawning task for primary network");
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
                 header =

@@ -545,7 +545,7 @@ where
         // - the canonical tip will have the epoch number, so easier to parse in engine level
 
         let committee = if epoch == 0 {
-            // read from fs
+            // read from fs for genesis
             Config::load_from_path::<Committee>(self.tn_datadir.committee_path(), ConfigFmt::YAML)?
         } else {
             // retrieve network information for committee
@@ -584,6 +584,9 @@ where
 
             committee_builder.build()
         };
+
+        // load committee
+        committee.load();
 
         Ok(committee)
     }
