@@ -34,15 +34,17 @@ tn-node = { workspace = true }
 tn-faucet = { workspace = true, optional = true }
 alloy = { workspace = true }
 tn-reth = { workspace = true }
-
-# config
 tn-config = { workspace = true }
 rayon = { workspace = true }
+
+# main
+rpassword = { workspace = true }
 
 [dev-dependencies]
 reth = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+rand_chacha = { workspace = true }
 
 # Used for integration testing.
 ethereum-tx-sign = "6.1.3"

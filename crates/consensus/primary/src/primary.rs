@@ -108,7 +108,6 @@ impl<DB: Database> Primary<DB> {
                 authority_id,
                 consensus_bus,
                 config.shutdown().subscribe(),
-                self.primary_network.clone(),
                 task_manager,
             );
         }

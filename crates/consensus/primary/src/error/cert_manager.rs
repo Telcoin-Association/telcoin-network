@@ -63,6 +63,9 @@ pub(crate) enum CertManagerError {
     /// Fetch certificates failed.
     #[error("No peer can be reached for fetching certificates! Check if network is healthy.")]
     NoCertificateFetched,
+    /// Network error.
+    #[error("Failed to set the bounds for MissingCertificatesRequest: {0}")]
+    RequestBounds(String),
 }
 
 impl<T: std::fmt::Debug> From<SendError<T>> for CertManagerError {

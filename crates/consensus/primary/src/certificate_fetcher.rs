@@ -2,7 +2,7 @@
 
 use crate::{
     error::{CertManagerError, CertManagerResult},
-    network::PrimaryNetworkHandle,
+    network::{MissingCertificatesRequest, PrimaryNetworkHandle},
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
@@ -16,7 +16,7 @@ use std::{
 };
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::PeerId;
-use tn_network_types::{FetchCertificatesRequest, FetchCertificatesResponse};
+use tn_network_types::FetchCertificatesResponse;
 use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::CertificateStore;
 use tn_types::{
@@ -89,8 +89,6 @@ struct CertificateFetcherState<DB> {
     state_sync: StateSynchronizer<DB>,
     /// The metrics handler
     metrics: Arc<PrimaryMetrics>,
-    /// The config.
-    config: ConsensusConfig<DB>,
 }
 
 impl<DB: Database> CertificateFetcher<DB> {
@@ -110,7 +108,6 @@ impl<DB: Database> CertificateFetcher<DB> {
             network,
             state_sync,
             metrics: consensus_bus.primary_metrics().node_metrics.clone(),
-            config: config.clone(),
         });
 
         task_manager.spawn_task(
@@ -317,8 +314,9 @@ async fn run_fetch_task<DB: Database>(
     written_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>>,
 ) -> CertManagerResult<()> {
     // Send request to fetch certificates.
-    let request = FetchCertificatesRequest::default()
+    let request = MissingCertificatesRequest::default()
         .set_bounds(gc_round, written_rounds)
+        .map_err(|e| CertManagerError::RequestBounds(e.to_string()))?
         .set_max_items(MAX_CERTIFICATES_TO_FETCH);
     let Some(response) = fetch_certificates_helper(
         state.authority_id.as_ref(),
@@ -348,7 +346,7 @@ async fn fetch_certificates_helper(
     name: Option<&AuthorityIdentifier>,
     network: PrimaryNetworkHandle,
     committee: &Committee,
-    request: FetchCertificatesRequest,
+    request: MissingCertificatesRequest,
 ) -> Option<FetchCertificatesResponse> {
     let _scope = monitored_scope("FetchingCertificatesFromPeers");
     trace!(target: "primary::cert_fetcher", "Start sending fetch certificates requests");

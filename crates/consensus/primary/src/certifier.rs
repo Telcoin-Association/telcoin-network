@@ -49,8 +49,6 @@ pub struct Certifier<DB> {
     rx_shutdown: Noticer,
     /// Consensus channels.
     consensus_bus: ConsensusBus,
-    /// Consensus config.
-    config: ConsensusConfig<DB>,
     /// A network sender to send the batches to the other workers.
     network: PrimaryNetworkHandle,
     /// Metrics handler
@@ -129,7 +127,6 @@ impl<DB: Database> Certifier<DB> {
                     signature_service: config.key_config().clone(),
                     rx_shutdown,
                     consensus_bus,
-                    config: config.clone(),
                     network: primary_network,
                     metrics: primary_metrics,
                     tx_own_certificate_broadcast: tx_own_certificate_broadcast.clone(),

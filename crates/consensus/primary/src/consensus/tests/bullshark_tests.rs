@@ -73,14 +73,14 @@ async fn commit_one_with_leader_schedule_change() {
     struct TestCase {
         description: String,
         rounds: Round,
-        expected_leaders: VecDeque<AuthorityIdentifier>,
+        _expected_leaders: VecDeque<AuthorityIdentifier>,
     }
 
     let test_cases: Vec<TestCase> = vec![
         TestCase {
             description: "When schedule change is enabled, then authority 0 is bad node and swapped with authority 3".to_string(),
             rounds: 11,
-            expected_leaders: VecDeque::from(vec![
+            _expected_leaders: VecDeque::from(vec![
                 AuthorityIdentifier::dummy_for_test(0),
                 AuthorityIdentifier::dummy_for_test(1),
                 AuthorityIdentifier::dummy_for_test(2),

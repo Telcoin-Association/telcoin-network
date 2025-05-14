@@ -8,8 +8,7 @@ use crate::{
     ConsensusBus,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use tn_config::ConsensusConfig;
-use tn_types::{Certificate, CertificateDigest, Database, Hash as _, Round};
+use tn_types::{Certificate, CertificateDigest, Hash as _, Round};
 use tracing::debug;
 
 /// A certificate that is missing parents and pending approval.
@@ -50,7 +49,7 @@ impl PendingCertificate {
 ///
 /// NOTE: all pending certificates must be verified.
 #[derive(Debug)]
-pub struct PendingCertificateManager<DB> {
+pub struct PendingCertificateManager {
     /// Each certificate entry tracks both the certificate itself and its dependency state
     ///
     /// Pending certificates that cannot be accepted yet.
@@ -60,24 +59,14 @@ pub struct PendingCertificateManager<DB> {
     ///
     /// The keys are (round, digest) to enable garbage collection by round.
     missing_for_pending: BTreeMap<(Round, CertificateDigest), HashSet<CertificateDigest>>,
-    /// The configuration for consensus.
-    config: ConsensusConfig<DB>,
     /// Consensus channels.
     consensus_bus: ConsensusBus,
 }
 
-impl<DB> PendingCertificateManager<DB>
-where
-    DB: Database,
-{
+impl PendingCertificateManager {
     /// Create a new instance of Self.
-    pub fn new(config: ConsensusConfig<DB>, consensus_bus: ConsensusBus) -> Self {
-        Self {
-            pending: Default::default(),
-            missing_for_pending: Default::default(),
-            config,
-            consensus_bus,
-        }
+    pub fn new(consensus_bus: ConsensusBus) -> Self {
+        Self { pending: Default::default(), missing_for_pending: Default::default(), consensus_bus }
     }
 
     /// Attempts to insert a new pending certificate.

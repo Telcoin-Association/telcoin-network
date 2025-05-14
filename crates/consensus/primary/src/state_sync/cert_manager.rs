@@ -39,7 +39,7 @@ pub struct CertificateManager<DB> {
     /// The configuration for consensus.
     config: ConsensusConfig<DB>,
     /// State for pending certificate.
-    pending: PendingCertificateManager<DB>,
+    pending: PendingCertificateManager,
     /// Collection of parents to advance the round.
     ///
     /// This is shared with the `GarbageCollector`.
@@ -69,7 +69,7 @@ where
         highest_received_round: AtomicRound,
     ) -> Self {
         let parents = CertificatesAggregatorManager::new(consensus_bus.clone());
-        let pending = PendingCertificateManager::new(config.clone(), consensus_bus.clone());
+        let pending = PendingCertificateManager::new(consensus_bus.clone());
         let garbage_collector =
             GarbageCollector::new(config.clone(), consensus_bus.clone(), gc_round.clone());
 

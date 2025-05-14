@@ -88,6 +88,7 @@ impl From<PrimaryNetworkError> for Option<Penalty> {
                 | CertManagerError::JoinError
                 | CertManagerError::Pending(_)
                 | CertManagerError::Storage(_)
+                | CertManagerError::RequestBounds(_)
                 | CertManagerError::TNSend(_) => None,
             },
             // mild

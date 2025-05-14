@@ -12,8 +12,6 @@ use tn_types::{Certificate, Hash as _, SignatureVerificationState};
 struct TestTypes<DB = MemDatabase> {
     /// The CertificateManager
     manager: CertificateManager<DB>,
-    /// The consensus bus.
-    cb: ConsensusBus,
     /// The committee fixture.
     fixture: CommitteeFixture<DB>,
 }
@@ -31,13 +29,13 @@ fn create_test_types() -> TestTypes<MemDatabase> {
 
     let manager = CertificateManager::new(
         config,
-        cb.clone(),
+        cb,
         gc_round,
         highest_processed_round,
         highest_received_round,
     );
 
-    TestTypes { manager, cb, fixture }
+    TestTypes { manager, fixture }
 }
 
 #[tokio::test]
