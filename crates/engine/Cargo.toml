@@ -26,4 +26,9 @@ tracing = { workspace = true }
 eyre = { workspace = true }
 tn-test-utils = { workspace = true }
 tn-batch-builder = { workspace = true, features = ["test-utils"] }
+tn-engine = { workspace = true, features = ["test-utils"] }
 tempfile = { workspace = true }
+
+[features]
+default = []
+test-utils = []
