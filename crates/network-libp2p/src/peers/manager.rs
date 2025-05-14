@@ -516,13 +516,8 @@ impl PeerManager {
         }
     }
 
-    /// Find future authorities for the epoch manager.
+    /// Find authorities for the epoch manager.
     pub(crate) fn find_authorities(&mut self, authorities: Vec<AuthorityInfoRequest>) {
-        // find authorities
-        // - check peerdb
-        // - initiate kad request
-        // -
-
         let mut missing = Vec::new();
 
         // check all peers for authority and track missing

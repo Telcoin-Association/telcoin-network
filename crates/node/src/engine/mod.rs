@@ -149,9 +149,9 @@ impl ExecutionNode {
         guard.worker_http_local_address(worker_id)
     }
 
-    /// Read the current committee from state.
-    pub async fn read_committee_from_chain(&self) -> eyre::Result<EpochState> {
+    /// Read [EpochState] from the canonical tip.
+    pub async fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
         let guard = self.internal.read().await;
-        guard.read_committee_from_chain()
+        guard.epoch_state_from_canonical_tip()
     }
 }

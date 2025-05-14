@@ -840,17 +840,15 @@ impl AllPeers {
         actions
     }
 
-    /// Add an authority to the network.
+    /// Find an authority to dial.
     ///
     /// Validators are unbanned at the beginning of each epoch when they are in the committee.
     /// This method is called at the end of each epoch to give the peer manager time (2 epochs)
-    /// to find the committee nodes.
-    // TODO: ensure flow is handled for:
-    // - too many peers
-    // - validator is known but disconnected
-    // - epoch arrives, need to engage with this validator (both nodes in committee)
+    /// to find the committee peers.
+    ///
+    /// The peer manager tracks connections through kad and keeps track of peers of interest.
     pub(super) fn find_authority(&self, _: &BlsPublicKey) -> Option<NetworkInfo> {
-        // TODO: see issue 301
+        // TODO: see issue #301
         None
     }
 }

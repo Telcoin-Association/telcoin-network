@@ -1503,7 +1503,7 @@ impl RethEnv {
     /// - get current epoch info
     /// - getValidator token id by address
     /// - getValidator info by token id
-    pub fn read_committee_from_chain(&self) -> eyre::Result<EpochState> {
+    pub fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
         // create EVM with latest state
         let latest = self.latest()?;
         let state = StateProviderDatabase::new(latest);
@@ -1920,7 +1920,7 @@ mod tests {
         debug!(target: "engine", "bundle from execution:\n{:#?}", bundle);
 
         // assert committee read matches expected
-        let consensus_state = reth_env.read_committee_from_chain()?;
+        let consensus_state = reth_env.epoch_state_from_canonical_tip()?;
         debug!(target: "engine", "consensus state:\n{:#?}", consensus_state);
 
         for v in validators {

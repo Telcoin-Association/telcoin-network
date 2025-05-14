@@ -21,6 +21,7 @@ use libp2p::{
     },
     identify::{self, Event as IdentifyEvent, Info as IdentifyInfo},
     kad::{self, store::MemoryStore, Mode, QueryId},
+    multiaddr::Protocol,
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
         InboundRequestId, OutboundRequestId,
@@ -276,7 +277,6 @@ where
     /// Return None if we don't have any confirmed external addresses yet.
     fn get_peer_record(&self) -> Option<kad::Record> {
         let key = kad::RecordKey::new(&self.key_config.primary_public_key());
-        debug!(target: "network-kad", ?key, "inside get peer record");
         let multiaddrs: Vec<Multiaddr> = self.swarm.external_addresses().cloned().collect();
 
         if multiaddrs.is_empty() {
@@ -284,20 +284,38 @@ where
             return None;
         }
 
-        let multiaddr = multiaddrs.first().cloned().expect("multiaddrs is not empty");
-        let peer_id = *self.swarm.local_peer_id();
-        let node_record = NodeRecord::build(
-            self.key_config.primary_network_public_key(),
-            multiaddr,
-            self.hostname.clone(),
-            |data| self.key_config.request_signature_direct(data),
-        );
-        Some(kad::Record {
-            key: key.clone(),
-            value: encode(&node_record),
-            publisher: Some(peer_id),
-            expires: None, // never expire
-        })
+        // use ipv4 or ipv6 multiaddr
+        let multiaddr = multiaddrs
+            .iter()
+            .find(|addr| addr.iter().any(|p| matches!(p, Protocol::Ip4(_))))
+            .or_else(|| {
+                // If no IPv4 address found, try to find an IPv6 address
+                multiaddrs.iter().find(|addr| addr.iter().any(|p| matches!(p, Protocol::Ip6(_))))
+            })
+            .or_else(|| {
+                // Fallback to first address if neither IPv4 nor IPv6 found (shouldn't happen)
+                multiaddrs.first()
+            })
+            .cloned();
+
+        if let Some(addr) = multiaddr {
+            let peer_id = *self.swarm.local_peer_id();
+            let node_record = NodeRecord::build(
+                self.key_config.primary_network_public_key(),
+                addr,
+                self.hostname.clone(),
+                |data| self.key_config.request_signature_direct(data),
+            );
+            Some(kad::Record {
+                key: key.clone(),
+                value: encode(&node_record),
+                publisher: Some(peer_id),
+                expires: None, // never expire
+            })
+        } else {
+            warn!(target: "network-kad", "No suitable multiaddr found for get_peer_record");
+            None
+        }
     }
 
     /// Verify the address list in Record was signed by the key.
@@ -371,7 +389,6 @@ where
                 TNBehaviorEvent::Kademlia(event) => self.process_kad_event(event)?,
             },
             SwarmEvent::ExternalAddrConfirmed { address: _ } => {
-                debug!(target: "network-kad", "\n\nEXTERNALaddrCONFRIMED\n\n");
                 // New confirmed address so lets publish/update or kademlia address rocord.
                 self.provide_our_data();
             }
@@ -927,8 +944,6 @@ where
                     ))) => {
                         if let Some((key, value)) = self.peer_record_valid(&record) {
                             trace!(target: "network-kad", "Got record {key} {value:?}");
-
-                            // TODO: what happens with stale records?
                             self.return_kad_result(&query_id, Ok((key, value.info.clone())));
                         } else {
                             error!(target: "network-kad", "Received invalid peer record!");
@@ -953,7 +968,9 @@ where
                     kad::QueryResult::GetRecord(Ok(
                         kad::GetRecordOk::FinishedWithNoAdditionalRecord { cache_candidates },
                     )) => {
-                        // TODO: see issue #301
+                        // TODO: configure caching and see issue #301
+                        // self.swarm.behaviour_mut().kademlia.put_record_to(record, peers, quorum);
+
                         debug!(target: "network-kad", ?cache_candidates, "FinishedWithNoAdditionalRecord - failed to find record");
                     }
                     kad::QueryResult::GetRecord(Err(err)) => {
@@ -997,7 +1014,7 @@ where
                 }
                 debug!(target: "network-kad", "routing updated peer {peer:?} new {is_new_peer} addrs {addresses:?} bucketr {bucket_range:?} old {old_peer:?}")
 
-                // TODO: ADD TO PEER MANAGER
+                // TODO: add to peer manager - see issue #301
             }
             kad::Event::UnroutablePeer { peer } => {
                 debug!(target: "network-kad", "unroutable peer {peer:?}")

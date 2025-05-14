@@ -102,9 +102,6 @@ pub enum NetworkError {
     /// Kademlia error.
     #[error("Failed to get kad record: {0}")]
     GetKademliaRecord(#[from] GetRecordError),
-    /// Kademlia error that peers were queried but no record was returned.
-    #[error("Failed to get kad record, but found peers close to the record key.")]
-    FinishedWithNoAdditionalRecord,
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {

@@ -463,9 +463,6 @@ where
         let consensus_bus = primary.consensus_bus().await;
         self.try_restore_state(&consensus_bus, &consensus_db, engine).await?;
 
-        // here????????
-        debug!(target: "epoch-manager", "identifying node mode...");
-
         let primary_network_handle = primary.network_handle().await;
         let _mode = self
             .identify_node_mode(&consensus_bus, &consensus_config, &primary_network_handle)
@@ -496,7 +493,7 @@ where
     ) -> eyre::Result<ConsensusConfig<DatabaseType>> {
         // retrieve epoch information from canonical tip
         let EpochState { epoch, epoch_info, validators, epoch_start } =
-            engine.read_committee_from_chain().await?;
+            engine.epoch_state_from_canonical_tip().await?;
         let validators = validators
             .iter()
             .map(|v| {
@@ -538,12 +535,7 @@ where
     ) -> eyre::Result<Committee> {
         info!(target: "epoch-manager", "creating committee from state");
 
-        // TODO: how to set the epoch duration?
-        // - need to include `prev_epoch: Option<EpochInfo>` on EpochState
-        // - if on the first epoch (is that 0 or 1 ?) return `None`, otherwise `Some(prev_epoch)`
-        // - also include epoch_num from tn_reth call for architecture reasons
-        // - the canonical tip will have the epoch number, so easier to parse in engine level
-
+        // the network must be live
         let committee = if epoch == 0 {
             // read from fs for genesis
             Config::load_from_path::<Committee>(self.tn_datadir.committee_path(), ConfigFmt::YAML)?
@@ -565,7 +557,6 @@ where
             // loop through the primary info returned from network query
             while let Some(info) = primary_network_infos.next().await {
                 debug!(target: "epoch-manager", ?info, "awaited next primary network info");
-                // TODO: multiaddrs can be more than one, but info only takes one
                 let (protocol_key, NetworkInfo { pubkey, multiaddr, hostname }) = info??;
                 let validator = validators
                     .get(&protocol_key)
