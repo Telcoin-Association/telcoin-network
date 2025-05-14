@@ -1,6 +1,5 @@
 //! Authority fixture for the cluster
 
-use crate::WorkerFixture;
 use std::num::NonZeroUsize;
 use tn_config::{Config, ConsensusConfig, KeyConfig, NetworkConfig};
 use tn_types::{
@@ -8,6 +7,7 @@ use tn_types::{
     Database, Hash as _, Header, HeaderBuilder, Multiaddr, NetworkKeypair, NetworkPublicKey, Round,
     Vote, WorkerCache,
 };
+use tn_worker::test_utils::WorkerFixture;
 
 /// Fixture representing an validator node within the network.
 ///

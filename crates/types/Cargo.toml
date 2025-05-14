@@ -48,5 +48,10 @@ blst = { workspace = true, features = ["serde"] }
 alloy = { workspace = true, features = ["genesis"] }
 hex = { workspace = true }
 
-[dev-dependencies]
-tempfile = { workspace = true }
+# test-utils
+tempfile = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[features]
+default = []
+test-utils = ["tempfile", "tracing-subscriber"]

@@ -5,8 +5,8 @@ use crate::{
     ConsensusBus,
 };
 use std::{collections::BTreeSet, sync::Arc};
+use tn_primary::CommitteeFixture;
 use tn_storage::{mem_db::MemDatabase, CertificateStore, ConsensusStore};
-use tn_test_utils::CommitteeFixture;
 use tn_types::{
     Certificate, ExecHeader, Hash as _, ReputationScores, SealedHeader, TaskManager, TnReceiver,
     TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -41,7 +41,7 @@ async fn test_consensus_recovery_with_bullshark() {
     let genesis =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
     let (certificates, _next_parents) =
-        tn_test_utils::make_optimal_certificates(&committee, 1..=7, &genesis, &ids);
+        tn_primary::make_optimal_certificates(&committee, 1..=7, &genesis, &ids);
 
     let metrics = Arc::new(ConsensusMetrics::default());
     let leader_schedule = LeaderSchedule::from_store(

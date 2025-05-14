@@ -3,8 +3,8 @@
 use crate::consensus::{Dag, LeaderSchedule, LeaderSwapTable};
 use std::{collections::BTreeSet, num::NonZeroUsize};
 use tempfile::TempDir;
+use tn_primary::{mock_certificate, CommitteeFixture};
 use tn_storage::{mem_db::MemDatabase, open_db, ConsensusStore};
-use tn_test_utils::{mock_certificate, CommitteeFixture};
 use tn_types::{AuthorityIdentifier, Certificate, CommittedSubDag, ReputationScores, Round};
 
 #[tokio::test]

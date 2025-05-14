@@ -1,7 +1,5 @@
 //! The builder responsible for creating all aspects of the committee fixture.
 
-use crate::WorkerFixture;
-
 use super::{AuthorityFixture, CommitteeFixture};
 use rand::{
     rngs::{OsRng, StdRng},
@@ -19,7 +17,9 @@ use tn_types::{
     Database, Epoch, Multiaddr, TimestampSec, VotingPower, WorkerCache, WorkerIndex,
     DEFAULT_PRIMARY_PORT, DEFAULT_WORKER_PORT,
 };
+use tn_worker::test_utils::WorkerFixture;
 
+/// The committee builder for tests.
 pub struct Builder<DB, F, R = OsRng> {
     rng: R,
     committee_size: NonZeroUsize,

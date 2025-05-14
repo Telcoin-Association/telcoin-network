@@ -9,8 +9,8 @@ use crate::{
 use assert_matches::assert_matches;
 use std::collections::{BTreeMap, BTreeSet};
 use tn_network_libp2p::PeerId;
+use tn_primary::CommitteeFixture;
 use tn_storage::mem_db::MemDatabase;
-use tn_test_utils::CommitteeFixture;
 use tn_types::{
     error::HeaderError, network_public_key_to_libp2p, now, AuthorityIdentifier, BlockHash,
     BlockHeader, BlockNumHash, Certificate, CertificateDigest, ExecHeader, Hash as _, SealedHeader,

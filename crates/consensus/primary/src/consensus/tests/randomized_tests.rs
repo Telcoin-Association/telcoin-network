@@ -16,8 +16,8 @@ use std::{
     ops::RangeInclusive,
     sync::Arc,
 };
+use tn_primary::{mock_certificate_with_rand, CommitteeFixture};
 use tn_storage::{mem_db::MemDatabase, open_db, ConsensusStore};
-use tn_test_utils::{mock_certificate_with_rand, CommitteeFixture};
 use tn_types::{
     Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Hash as _, Round,
     VotingPower,
@@ -157,7 +157,7 @@ async fn bullshark_randomised_tests() {
 
     // Create a single store to be re-used across Bullshark instances to avoid hitting
     // a "too many files open" issue.
-    let store = open_db(tn_test_utils::temp_dir());
+    let store = open_db(tn_primary::temp_dir());
 
     // Run the actual tests via separate tasks
     loop {
@@ -355,7 +355,7 @@ pub fn make_certificates_with_parameters(
                 .collect();
 
             let mut parent_digests: BTreeSet<CertificateDigest> =
-                tn_test_utils::this_cert_parents_with_slow_nodes(
+                tn_primary::this_cert_parents_with_slow_nodes(
                     &authority.id(),
                     current_parents.clone(),
                     ids.as_slice(),

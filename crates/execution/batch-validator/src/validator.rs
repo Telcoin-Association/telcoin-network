@@ -298,7 +298,7 @@ mod tests {
         let result = validator.validate_batch(valid_batch.clone());
         eprintln!(
             "XXXXX result: {result:?}, batch: {}",
-            valid_batch.batch.clone().seal_slow().digest.to_string()
+            valid_batch.batch.clone().seal_slow().digest
         );
         assert!(result.is_ok());
 

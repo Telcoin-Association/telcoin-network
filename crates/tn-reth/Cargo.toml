@@ -62,5 +62,8 @@ tempfile = { workspace = true }
 serde_json = { workspace = true }
 alloy-consensus = { workspace = true }
 
-[dev-dependencies]
-tracing-subscriber = { workspace = true }
+secp256k1 = { workspace = true, optional = true }
+
+[features]
+default = []
+test-utils = ["secp256k1"]

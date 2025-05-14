@@ -15,3 +15,6 @@ pub use crate::worker::{new_worker, Worker, CHANNEL_CAPACITY};
 
 /// The number of shutdown receivers to create on startup. We need one per component loop.
 pub const NUM_SHUTDOWN_RECEIVERS: u64 = 26;
+
+#[cfg(feature = "test-utils")]
+pub mod test_utils;

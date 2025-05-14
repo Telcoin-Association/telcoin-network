@@ -25,7 +25,7 @@ once_cell = { workspace = true }
 tn-network-libp2p = { workspace = true }
 tn-network-types = { workspace = true }
 tn-node = { workspace = true }
-tn-reth = { workspace = true }
+tn-reth = { workspace = true, features = ["test-utils"] }
 tn-primary = { workspace = true }
 tn-types = { workspace = true }
 tn-faucet = { workspace = true }

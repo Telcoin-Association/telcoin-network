@@ -46,6 +46,7 @@ tn-network-libp2p = { workspace = true }
 roaring = { workspace = true }
 serde = { workspace = true }
 async-trait = { workspace = true }
+tn-worker = { workspace = true, optional = true, features = ["test-utils"] }
 
 [dev-dependencies]
 async-trait = { workspace = true }
@@ -58,11 +59,15 @@ mockall = { workspace = true }
 tn-node = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
-tn-test-utils = { workspace = true }
 tracing = { workspace = true }
-tn-worker = { workspace = true }
 tn-storage = { workspace = true }
 reqwest = { workspace = true }
 bytes = { workspace = true }
 tn-batch-validator = { workspace = true, features = ["test-utils"] }
 assert_matches = { workspace = true }
+tn-types = { workspace = true, features = ["test-utils"] }
+tn-primary = { workspace = true, features = ["test-utils"] }
+
+[features]
+default = []
+test-utils = ["tn-worker"]

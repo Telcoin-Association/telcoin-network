@@ -11,8 +11,8 @@ use assert_matches::assert_matches;
 use itertools::Itertools;
 use std::{collections::BTreeSet, time::Duration};
 use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
+use tn_primary::CommitteeFixture;
 use tn_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
-use tn_test_utils::CommitteeFixture;
 use tn_types::{
     BlsSignature, Certificate, Hash as _, Header, SignatureVerificationState, TaskManager,
 };

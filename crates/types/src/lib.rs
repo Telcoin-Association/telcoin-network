@@ -26,6 +26,8 @@ pub use primary::*;
 pub use sync::*;
 pub use task_manager::*;
 pub use worker::*;
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
 
 // re-exports for easier maintainability
 pub use alloy::{

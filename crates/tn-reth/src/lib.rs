@@ -136,6 +136,9 @@ mod evm_config;
 pub mod system_calls;
 pub mod worker;
 
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
+
 /// Rpc Server type, used for getting the node started.
 pub type RpcServer = TransportRpcModules<()>;
 
@@ -1755,13 +1758,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_validator_shuffle() -> eyre::Result<()> {
-        // remove this
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::ACTIVE)
-            .with_writer(std::io::stdout)
-            .try_init();
-
         let validator_1 = Address::from_slice(&[0x11; 20]);
         let validator_2 = Address::from_slice(&[0x22; 20]);
         let validator_3 = Address::from_slice(&[0x33; 20]);

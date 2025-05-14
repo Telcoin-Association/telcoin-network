@@ -18,10 +18,10 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::ConsensusNetwork;
 use tn_network_types::MockPrimaryToWorkerClient;
-use tn_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
-use tn_test_utils::{
+use tn_primary::{
     fixture_batch_with_transactions, make_optimal_signed_certificates, CommitteeFixture,
 };
+use tn_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
 use tn_types::{
     now, AuthorityIdentifier, BlockNumHash, Certificate, Committee, Database, ExecHeader,
     Hash as _, SealedHeader, SignatureVerificationState, TaskManager,

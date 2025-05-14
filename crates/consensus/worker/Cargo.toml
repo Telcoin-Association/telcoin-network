@@ -46,3 +46,7 @@ tn-test-utils = { workspace = true }
 tn-node = { workspace = true }
 tn-primary = { workspace = true }
 bytes = { workspace = true }
+
+[features]
+default = []
+test-utils = []

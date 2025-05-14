@@ -29,3 +29,6 @@ pub use consensus_bus::*;
 
 mod recent_blocks;
 pub use recent_blocks::*;
+
+#[cfg(feature = "test-utils")]
+pub mod test_utils;

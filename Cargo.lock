@@ -11820,9 +11820,9 @@ dependencies = [
  "tn-network-libp2p",
  "tn-network-types",
  "tn-node",
+ "tn-primary",
  "tn-primary-metrics",
  "tn-storage",
- "tn-test-utils",
  "tn-types",
  "tn-utils",
  "tn-worker",
@@ -11881,6 +11881,7 @@ dependencies = [
  "reth-tracing",
  "reth-transaction-pool",
  "reth-trie-db",
+ "secp256k1 0.29.1",
  "serde",
  "serde_json",
  "tempfile",
@@ -11889,7 +11890,6 @@ dependencies = [
  "tn-types",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -12011,6 +12011,7 @@ dependencies = [
  "tn-utils",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

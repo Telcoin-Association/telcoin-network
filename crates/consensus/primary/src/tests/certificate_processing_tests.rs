@@ -12,10 +12,10 @@ use crate::{
 };
 use assert_matches::assert_matches;
 use std::{collections::BTreeSet, time::Duration};
-use tn_storage::{mem_db::MemDatabase, CertificateStore};
-use tn_test_utils::{
+use tn_primary::{
     make_optimal_signed_certificates, signed_cert_for_test, AuthorityFixture, CommitteeFixture,
 };
+use tn_storage::{mem_db::MemDatabase, CertificateStore};
 use tn_types::{
     error::CertificateError, Certificate, CertificateDigest, Database, Hash as _, Round,
     TaskManager, TnReceiver as _, TnSender,

@@ -1,6 +1,5 @@
 //! Helper methods for creating useful structs during tests.
 
-use crate::execution::TransactionFactory;
 use indexmap::IndexMap;
 use rand::{
     distributions::Bernoulli, prelude::Distribution, rngs::StdRng, thread_rng, Rng, RngCore,
@@ -10,6 +9,7 @@ use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     ops::RangeInclusive,
 };
+use tn_reth::test_utils::TransactionFactory;
 use tn_types::{
     adiri_chain_spec_arc, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash,
     BlsKeypair, BlsSignature, Bytes, Certificate, CertificateDigest, Committee, Epoch, ExecHeader,
