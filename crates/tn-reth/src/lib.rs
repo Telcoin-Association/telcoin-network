@@ -21,8 +21,8 @@
 use crate::traits::TNExecution;
 use alloy::{
     hex,
-    primitives::{Bytes, ChainId},
-    sol_types::SolCall,
+    primitives::{aliases::U232, Bytes, ChainId},
+    sol_types::{SolCall, SolConstructor},
 };
 use clap::Parser;
 use dirs::path_to_datadir;
@@ -82,6 +82,7 @@ use reth_revm::{
     Database, DatabaseCommit, Evm, State,
 };
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
+use serde_json::Value;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::RangeInclusive,
@@ -902,10 +903,9 @@ impl RethEnv {
         let new_committee = self.shuffle_new_committee(evm, randomness)?;
 
         // encode the call to bytes with method selector and args
-        let bytes =
-            ConsensusRegistry::concludeEpochCall { newCommittee: new_committee, slashes: vec![] }
-                .abi_encode()
-                .into();
+        let bytes = ConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
+            .abi_encode()
+            .into();
 
         Ok(bytes)
     }
@@ -1348,7 +1348,6 @@ impl RethEnv {
         genesis: Genesis,
         initial_stake_config: ConsensusRegistry::StakeConfig,
         owner_address: Address,
-        itel_address: Address,
     ) -> eyre::Result<Genesis> {
         let validators: Vec<_> = validators
             .iter()
@@ -1366,44 +1365,37 @@ impl RethEnv {
 
         let total_stake_balance = initial_stake_config
             .stakeAmount
-            .checked_mul(U256::from(validators.len()))
+            .checked_mul(U232::from(validators.len()))
             .ok_or_eyre("Failed to calculate total stake for consensus registry at genesis")?;
 
-        let registry_bytecode =
-            Self::parse_deployed_bytecode_from_json_str(CONSENSUS_REGISTRY_JSON)?;
-
-        // extend accounts for initial execution
-        let tmp_genesis = genesis.clone().extend_accounts([(
-            CONSENSUS_REGISTRY_ADDRESS,
-            GenesisAccount::default()
-                .with_balance(total_stake_balance)
-                .with_code(Some(registry_bytecode.clone().into())),
-        )]);
-
-        let chain: Arc<RethChainSpec> = Arc::new(tmp_genesis.into());
-
+        let tmp_chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
         // create temporary reth env for execution
         let task_manager = TaskManager::new("Test Task Manager");
         let tmp_dir = TempDir::new().unwrap();
         let reth_env =
-            RethEnv::new_for_test_with_chain(chain.clone(), tmp_dir.path(), &task_manager)?;
+            RethEnv::new_for_test_with_chain(tmp_chain.clone(), tmp_dir.path(), &task_manager)?;
 
-        // generate calldata for initialization call
-        let init_calldata = ConsensusRegistry::initializeCall {
-            iTEL_: itel_address,
+        let constructor_args = ConsensusRegistry::constructorCall {
             genesisConfig_: initial_stake_config,
             initialValidators_: validators,
             owner_: owner_address,
         }
-        .abi_encode()
-        .into();
+        .abi_encode();
+
+        // generate calldata for creation
+        let bytecode_binding =
+            Self::fetch_value_from_json_str(CONSENSUS_REGISTRY_JSON, Some("bytecode.object"))?;
+        let registry_initcode =
+            hex::decode(bytecode_binding.as_str().ok_or_eyre("invalid registry json")?)?;
+        let mut create_registry = registry_initcode.clone();
+        create_registry.extend(constructor_args);
+
+        let tx = CreateRequest::new(owner_address, create_registry.clone().into());
 
         // execute the transaction
-        let tx = CallRequest::new(CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS, init_calldata);
-
         let BundleState { state, contracts, reverts, state_size, reverts_size } = reth_env
             .execute_call_tx_for_test_bypass_evm_checks(
-                &chain.sealed_genesis_header(),
+                &tmp_chain.sealed_genesis_header(),
                 vec![tx.into()],
             )?;
 
@@ -1412,50 +1404,50 @@ impl RethEnv {
         debug!(target: "engine", "state_size:{:#?}", state_size);
         debug!(target: "engine", "reverts_size:{:#?}", reverts_size);
 
-        // place initialized bytecode in genesis
-        let storage = state.get(&CONSENSUS_REGISTRY_ADDRESS).map(|account| {
+        // copy tmp values to real genesis
+        let tmp_address = owner_address.create(0);
+        let tmp_storage = state.get(&tmp_address).map(|account| {
             account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
         });
 
+        let deployed_bytecode_binding = Self::fetch_value_from_json_str(
+            CONSENSUS_REGISTRY_JSON,
+            Some("deployedBytecode.object"),
+        )?;
+        let registry_runtimecode =
+            hex::decode(deployed_bytecode_binding.as_str().ok_or_eyre("invalid registry json")?)?;
         let genesis = genesis.extend_accounts([(
             CONSENSUS_REGISTRY_ADDRESS,
             GenesisAccount::default()
-                .with_balance(total_stake_balance)
-                .with_code(Some(registry_bytecode.into()))
-                .with_storage(storage),
+                .with_balance(U256::from(total_stake_balance))
+                .with_code(Some(registry_runtimecode.into()))
+                .with_storage(tmp_storage),
         )]);
 
         Ok(genesis)
     }
 
-    /// Parse bytecode from a `&str`.
-    pub fn parse_bytecode_from_json_str(json_content: &str) -> eyre::Result<Vec<u8>> {
-        // parse as generic JSON Value
-        let json: serde_json::Value = serde_json::from_str(json_content)?;
+    /// Fetches json info from the given string
+    ///
+    /// If a key is specified, return the corresponding nested object.
+    /// Otherwise return the entire JSON
+    /// With a generic this could be adjused to handle YAML also
+    pub fn fetch_value_from_json_str(json_content: &str, key: Option<&str>) -> eyre::Result<Value> {
+        let json: Value = serde_json::from_str(json_content)?;
+        let result = match key {
+            Some(path) => {
+                let key: Vec<&str> = path.split('.').collect();
+                let mut current_value = &json;
+                for &k in &key {
+                    current_value =
+                        current_value.get(k).ok_or_else(|| eyre::eyre!("key '{}' not found", k))?;
+                }
+                current_value.clone()
+            }
+            None => json,
+        };
 
-        // extract the specific field we want
-        let abi = json["bytecode"]["object"]
-            .as_str()
-            .ok_or_eyre("Invalid json abi format for bytecode")?;
-
-        // convert hex to bytes
-        let bytecode = hex::decode(abi)?;
-        Ok(bytecode)
-    }
-
-    /// Parse deployed bytecode from a `&str`.
-    pub fn parse_deployed_bytecode_from_json_str(json_content: &str) -> eyre::Result<Vec<u8>> {
-        // parse as generic JSON Value
-        let json: serde_json::Value = serde_json::from_str(json_content)?;
-
-        // extract the specific field we want
-        let abi = json["deployedBytecode"]["object"]
-            .as_str()
-            .ok_or_eyre("Invalid json abi format for bytecode")?;
-
-        // convert hex to bytes
-        let bytecode = hex::decode(abi)?;
-        Ok(bytecode)
+        Ok(result)
     }
 
     /// Create a tx environment with all evm checks disabled.
@@ -1746,11 +1738,10 @@ mod tests {
     use crate::traits::TNPayloadAttributes;
     use alloy::primitives::utils::parse_ether;
     use rand_chacha::ChaCha8Rng;
-    use std::str::FromStr as _;
     use tempfile::TempDir;
     use tn_types::{
         adiri_genesis, BlsKeypair, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput,
-        PrimaryInfo, ReputationScores,
+        FromHex, PrimaryInfo, ReputationScores,
     };
 
     /// Helper function for creating a consensus output for tests.
@@ -1760,7 +1751,7 @@ mod tests {
         leader.header.round = sub_dag_index as u32;
         let reputation_scores = ReputationScores::default();
         let previous_sub_dag = None;
-        let beneficiary = Address::from_str("0x5555555555555555555555555555555555555555")
+        let beneficiary = Address::from_hex("0x5555555555555555555555555555555555555555")
             .expect("beneficiary address from str");
         ConsensusOutput {
             sub_dag: CommittedSubDag::new(
@@ -1823,11 +1814,10 @@ mod tests {
 
         let epoch_duration = 60 * 60 * 24; // 24hrs
         let initial_stake_config = ConsensusRegistry::StakeConfig {
-            stakeAmount: U256::try_from(parse_ether("1_000_000").unwrap()).unwrap(),
-            minWithdrawAmount: U256::try_from(parse_ether("1_000").unwrap()).unwrap(),
-            epochIssuance: U256::try_from(parse_ether("20_000_000").unwrap())
-                .unwrap()
-                .checked_div(U256::from(28))
+            stakeAmount: U232::from(parse_ether("1_000_000").unwrap()),
+            minWithdrawAmount: U232::from(parse_ether("1_000").unwrap()),
+            epochIssuance: U232::from(parse_ether("20_000_000").unwrap())
+                .checked_div(U232::from(28))
                 .expect("u256 div checked"),
             epochDuration: epoch_duration,
         };
@@ -1838,7 +1828,6 @@ mod tests {
             adiri_genesis(),
             initial_stake_config,
             owner,
-            Address::random(), // itel
         )?;
 
         // create new env with initialized consensus registry for tests

@@ -1,9 +1,8 @@
 //! Create a committee from the validators in genesis.
 
-use crate::args::{clap_address_parser, clap_genesis_parser};
-use alloy::primitives::utils::parse_ether;
+use crate::args::{clap_address_parser, clap_genesis_parser, clap_u232_parser};
+use alloy::primitives::{aliases::U232, ruint::aliases::U256};
 use clap::Args;
-use core::panic;
 use std::{path::PathBuf, str::FromStr, sync::Arc};
 use tn_config::{
     Config, ConfigFmt, ConfigTrait, NetworkGenesis, TelcoinDirs as _, DEPLOYMENTS_JSON,
@@ -13,7 +12,7 @@ use tn_reth::{
     system_calls::ConsensusRegistry,
     MaybePlatformPath, RethChainSpec, RethEnv,
 };
-use tn_types::{Address, U256};
+use tn_types::Address;
 use tracing::{debug, info};
 
 /// Add the validator to the node
@@ -79,30 +78,33 @@ pub struct CreateCommitteeArgs {
         long = "initial-stake-per-validator",
         alias = "stake",
         help_heading = "The initial stake credited to each validator in genesis. The default is 1mil TEL.",
-        default_value_t = U256::try_from(parse_ether("1_000_000").expect("parse_ether")).expect("initial stake"),
+        value_parser = clap_u232_parser,
+        default_value = "1_000_000",
         verbatim_doc_comment
     )]
-    pub initial_stake: U256,
+    pub initial_stake: U232,
 
     /// The minimum amount a validator can withdraw.
     #[arg(
         long = "min-withdraw-amount",
         alias = "min_withdraw",
         help_heading = "The minimal amount a validator can withdraw. The default is 1_000 TEL.",
-        default_value_t = U256::try_from(parse_ether("1_000").expect("parse_ether")).expect("min withdraw"),
+        value_parser = clap_u232_parser,
+        default_value = "1_000",
         verbatim_doc_comment
     )]
-    pub min_withdrawal: U256,
+    pub min_withdrawal: U232,
 
     /// The amount of block rewards per epoch starting in genesis.
     #[arg(
         long = "epoch-block-rewards",
         alias = "block_rewards_per_epoch",
-        help_heading = "The amount of TEL (incl 18 decimals) for the committee starting at genesis.",
-        default_value_t = U256::try_from(parse_ether("20_000_000").expect("parse_ether")).expect("block rewards").checked_div(U256::from(28)).expect("U256 div works"),
+        help_heading = "The per block reward (int) for each epoch. Ex) 20mil rewards per month / 31 days / 25 hour epoch interval. It's best to use conservative values.",
+        value_parser = clap_u232_parser,
+        default_value = "25_806",
         verbatim_doc_comment
     )]
-    pub epoch_rewards: U256,
+    pub epoch_rewards: U232,
 
     /// The duration of each epoch (in secs) starting in genesis.
     #[arg(
@@ -146,16 +148,6 @@ impl CreateCommitteeArgs {
             epochIssuance: self.epoch_rewards,
             epochDuration: self.epoch_duration,
         };
-        let itel_address = match NetworkGenesis::fetch_from_json_str(
-            DEPLOYMENTS_JSON,
-            Some("its.InterchainTEL"),
-        ) {
-            Ok(res) => match res {
-                serde_json::Value::String(s) => Address::from_str(&s).expect("ITEL addr incorrect"),
-                _ => panic!("ITEL address not a string"),
-            },
-            _ => panic!("ITEL address not found"),
-        };
 
         // try to create a runtime if one doesn't already exist
         // this is a workaround for executing committees pre-genesis during tests and normal CLI
@@ -167,7 +159,6 @@ impl CreateCommitteeArgs {
                 genesis.clone(),
                 initial_stake_config.clone(),
                 self.consensus_registry_owner,
-                itel_address,
             )?
         } else {
             // no runtime exists (normal CLI operation)
@@ -181,19 +172,22 @@ impl CreateCommitteeArgs {
                     genesis,
                     initial_stake_config,
                     self.consensus_registry_owner,
-                    itel_address,
                 )
             })?
         };
         // use embedded ITS config from submodule, passing in decremented ITEL balance
         let genesis_stake = self
             .initial_stake
-            .checked_mul(U256::from(validators.clone().len()))
+            .checked_mul(U232::from(validators.len()))
             .expect("initial validators' stake");
-        let itel_balance = U256::try_from(parse_ether("100_000_000_000").expect("itel parse"))
-            .expect("itel bal")
-            - genesis_stake;
+        let itel_balance = U256::from(clap_u232_parser("100_000_000_000")? - genesis_stake);
 
+        let itel_address_str: String =
+            RethEnv::fetch_value_from_json_str(DEPLOYMENTS_JSON, Some("its.InterchainTEL"))?
+                .as_str()
+                .expect("invalid json string")
+                .to_string();
+        let itel_address = Address::from_str(&itel_address_str)?;
         let precompiles =
             NetworkGenesis::fetch_precompile_genesis_accounts(itel_address, itel_balance)
                 .expect("precompile fetch error");
