@@ -183,7 +183,7 @@ mod tests {
     use clap::Parser;
     use secp256k1::PublicKey;
     use std::str::FromStr;
-    use tn_test_utils::CommandParser;
+    use tn_types::test_utils::CommandParser;
 
     #[test]
     fn test_pem_pubkey_parses() {

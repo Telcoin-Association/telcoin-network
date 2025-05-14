@@ -486,7 +486,6 @@ mod tests {
     use tn_network_libp2p::types::{MessageId, NetworkCommand};
     use tn_network_types::MockPrimaryToWorkerClient;
     use tn_primary::consensus::{Bullshark, Consensus, LeaderSchedule};
-    use tn_primary_metrics::ConsensusMetrics;
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils::CommitteeFixture;
     use tn_types::{
@@ -503,7 +502,7 @@ mod tests {
         let mut batches = HashMap::with_capacity(number_of_batches);
 
         for _ in 0..number_of_batches {
-            let batch = tn_test_utils::batch();
+            let batch = tn_reth::test_utils::batch();
             let batch_digest = batch.digest();
 
             payload.insert(batch_digest, (0, 0));
@@ -617,7 +616,6 @@ mod tests {
         let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
         config.local_network().set_primary_to_worker_local_handler(mock_client);
 
-        let metrics = Arc::new(ConsensusMetrics::default());
         let leader_schedule = LeaderSchedule::from_store(
             committee.clone(),
             consensus_store.clone(),
@@ -626,7 +624,8 @@ mod tests {
         let bullshark = Bullshark::new(
             committee.clone(),
             consensus_store.clone(),
-            metrics.clone(),
+            // metrics.clone(),
+            Arc::new(Default::default()),
             num_sub_dags_per_schedule,
             leader_schedule.clone(),
             DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -725,7 +724,6 @@ mod tests {
         let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
         config.local_network().set_primary_to_worker_local_handler(mock_client);
 
-        let metrics = Arc::new(ConsensusMetrics::default());
         let leader_schedule = LeaderSchedule::from_store(
             committee.clone(),
             consensus_store.clone(),
@@ -734,7 +732,7 @@ mod tests {
         let bullshark = Bullshark::new(
             committee.clone(),
             consensus_store.clone(),
-            metrics.clone(),
+            Arc::new(Default::default()),
             num_sub_dags_per_schedule,
             leader_schedule.clone(),
             DEFAULT_BAD_NODES_STAKE_THRESHOLD,

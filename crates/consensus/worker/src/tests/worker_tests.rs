@@ -11,12 +11,12 @@ use prometheus::Registry;
 use std::time::Duration;
 use tempfile::TempDir;
 use tn_batch_validator::NoopBatchValidator;
+use tn_primary::test_utils::CommitteeFixture;
 use tn_primary::{
     consensus::{LeaderSchedule, LeaderSwapTable},
     Primary,
 };
 use tn_storage::mem_db::MemDatabase;
-use tn_test_utils::CommitteeFixture;
 use tn_types::SealedBatch;
 
 // A test validator that rejects every batch

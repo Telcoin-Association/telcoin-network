@@ -1,38 +1,24 @@
 //! Test-utilities for execution/engine node.
 
-use alloy::signers::{k256::FieldBytes, local::PrivateKeySigner};
-use clap::{Args, Parser};
+use clap::Parser as _;
 use core::fmt;
-use rand::{rngs::StdRng, Rng, SeedableRng};
-use secp256k1::Secp256k1;
 use std::{path::Path, str::FromStr, sync::Arc};
 use telcoin_network::{node::NodeCommand, NoArgs};
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
 use tn_node::engine::{ExecutionNode, TnBuilder};
 use tn_reth::{
-    recover_raw_transaction, sign_message, test_utils::TransactionFactory, ExecutionOutcome,
-    RethChainSpec, RethCommand, RethConfig, RethEnv, WorkerTxPool,
+    recover_raw_transaction, ExecutionOutcome, RethChainSpec, RethCommand, RethConfig, RethEnv,
 };
 use tn_types::{
-    adiri_genesis, calculate_transaction_root, now, public_key_to_address, AccessList, Address,
-    Batch, Block, BlockBody, BlockExt as _, Bytes, Encodable2718 as _, EthSignature, ExecHeader,
-    ExecutionKeypair, Genesis, GenesisAccount, SealedHeader,
-    SignedTransactionIntoRecoveredExt as _, TaskManager, TimestampSec, Transaction,
-    TransactionSigned, TxEip1559, TxHash, TxKind, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH,
-    EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE, U256,
+    calculate_transaction_root, now, Address, Batch, Block, BlockBody, BlockExt as _, ExecHeader,
+    Genesis, GenesisAccount, SealedHeader, TaskManager, TimestampSec, TransactionSigned,
+    Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS,
+    ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE, U256,
 };
-use tracing::debug;
 
-/// Convnenience type for testing Execution Node.
+/// Convenience type for testing Execution Node.
 pub type TestExecutionNode = ExecutionNode;
-
-/// A helper type to parse Args more easily.
-#[derive(Parser, Debug)]
-pub struct CommandParser<T: Args> {
-    #[clap(flatten)]
-    pub args: T,
-}
 
 /// Convenience function for creating engine node using tempdir and optional args.
 /// Defaults if params not provided:
@@ -156,30 +142,6 @@ pub fn faucet_test_execution_node(
     )?;
 
     Ok(engine)
-}
-
-/// Adiri genesis with funded [TransactionFactory] default account.
-pub fn test_genesis() -> Genesis {
-    let genesis = adiri_genesis();
-    let default_address = TransactionFactory::default().address();
-    let default_factory_account =
-        vec![(default_address, GenesisAccount::default().with_balance(U256::MAX))];
-    genesis.extend_accounts(default_factory_account)
-}
-
-/// Helper function to seed addresses within adiri genesis.
-///
-/// Each address is funded with 99_000_000 TEL at genesis.
-pub fn adiri_genesis_seeded(accounts: Vec<Address>) -> Genesis {
-    let accounts = accounts.into_iter().map(|acc| {
-        (
-            acc,
-            GenesisAccount::default().with_balance(
-                U256::from_str("0x51E410C0F93FE543000000").expect("account balance is parsed"),
-            ),
-        )
-    });
-    adiri_genesis().extend_accounts(accounts)
 }
 
 /// Helper function to seed an instance of Genesis with accounts from a random batch.

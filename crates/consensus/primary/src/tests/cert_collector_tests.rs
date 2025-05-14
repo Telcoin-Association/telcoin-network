@@ -2,8 +2,8 @@
 
 use crate::{network::MissingCertificatesRequest, state_sync::CertificateCollector};
 use std::{collections::BTreeSet, num::NonZeroUsize};
-use tn_primary::CommitteeFixture;
 use tn_storage::{mem_db::MemDatabase, CertificateStore};
+use tn_test_utils::CommitteeFixture;
 use tn_types::{AuthorityIdentifier, Certificate, Hash as _, SignatureVerificationState};
 
 #[test]

@@ -6,8 +6,9 @@ use crate::{
     ConsensusBus,
 };
 use std::collections::BTreeSet;
-use tn_primary::{make_optimal_signed_certificates, CommitteeFixture};
+use tn_primary::test_utils::make_optimal_signed_certificates;
 use tn_storage::mem_db::MemDatabase;
+use tn_test_utils::CommitteeFixture;
 use tn_types::{
     BlsSignature, Certificate, Hash as _, Round, SignatureVerificationState, TnReceiver as _,
     TnSender,

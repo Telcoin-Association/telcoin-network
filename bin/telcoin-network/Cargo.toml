@@ -14,15 +14,8 @@ authors = [
 [dependencies]
 clap = { workspace = true, features = ["derive", "env"] }
 eyre = { workspace = true }
-futures = { workspace = true }
 const-str = "0.5.6"
 fdlimit = { workspace = true }
-humantime = { workspace = true }
-metrics-exporter-prometheus = "0.12.1"
-hyper = "0.14.25"
-metrics-util = "0.15.0"
-metrics-process = "1.0.9"
-serde_json = { workspace = true }
 secp256k1 = { workspace = true, features = [
     "global-context",
     "rand-std",
@@ -35,27 +28,21 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
 ] }
 tracing = { workspace = true }
-pin-project = { workspace = true }
-metrics = { workspace = true }
 rand = { workspace = true }
-rand_chacha = { workspace = true }
-prometheus = { workspace = true }
 tn-types = { workspace = true }
 tn-node = { workspace = true }
-consensus-metrics = { workspace = true }
 tn-faucet = { workspace = true, optional = true }
 alloy = { workspace = true }
 tn-reth = { workspace = true }
-rpassword = { workspace = true }
 
 # config
 tn-config = { workspace = true }
-serde_yaml = { workspace = true }
 rayon = { workspace = true }
 
 [dev-dependencies]
 reth = { workspace = true }
 tempfile = { workspace = true }
+serde_json = { workspace = true }
 
 # Used for integration testing.
 ethereum-tx-sign = "6.1.3"
@@ -70,7 +57,6 @@ gcloud-sdk = { version = "=0.24.6", default-features = false, features = [
 ] }
 jsonrpsee = { workspace = true }
 k256 = "0.13.3"
-tn-test-utils = { workspace = true }
 tonic = { workspace = true }
 nix = { version = "0.29", features = ["signal"] }
 cfg-if = { workspace = true }

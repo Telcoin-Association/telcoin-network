@@ -1,7 +1,8 @@
 //! Randomized tests
 
-use crate::consensus::{
-    Bullshark, ConsensusMetrics, ConsensusState, LeaderSchedule, LeaderSwapTable,
+use crate::{
+    consensus::{Bullshark, ConsensusMetrics, ConsensusState, LeaderSchedule, LeaderSwapTable},
+    test_utils::{temp_dir, this_cert_parents_with_slow_nodes},
 };
 use futures::{stream::FuturesUnordered, StreamExt};
 use rand::{
@@ -16,8 +17,9 @@ use std::{
     ops::RangeInclusive,
     sync::Arc,
 };
-use tn_primary::{mock_certificate_with_rand, CommitteeFixture};
+use tn_primary::test_utils::mock_certificate_with_rand;
 use tn_storage::{mem_db::MemDatabase, open_db, ConsensusStore};
+use tn_test_utils::CommitteeFixture;
 use tn_types::{
     Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Hash as _, Round,
     VotingPower,
@@ -157,7 +159,7 @@ async fn bullshark_randomised_tests() {
 
     // Create a single store to be re-used across Bullshark instances to avoid hitting
     // a "too many files open" issue.
-    let store = open_db(tn_primary::temp_dir());
+    let store = open_db(temp_dir());
 
     // Run the actual tests via separate tasks
     loop {
@@ -354,14 +356,13 @@ pub fn make_certificates_with_parameters(
                 .map(|(a, inclusion_probability)| (a.id(), *inclusion_probability))
                 .collect();
 
-            let mut parent_digests: BTreeSet<CertificateDigest> =
-                tn_primary::this_cert_parents_with_slow_nodes(
-                    &authority.id(),
-                    current_parents.clone(),
-                    ids.as_slice(),
-                    &mut rand,
-                    committee,
-                );
+            let mut parent_digests: BTreeSet<CertificateDigest> = this_cert_parents_with_slow_nodes(
+                &authority.id(),
+                current_parents.clone(),
+                ids.as_slice(),
+                &mut rand,
+                committee,
+            );
 
             // We want to ensure that we always refer to "our" certificate of the previous round -
             // assuming that exist, so we can re-add it later.

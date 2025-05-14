@@ -2,9 +2,10 @@
 
 use super::{AuthorityFixture, Builder};
 use std::collections::{BTreeMap, BTreeSet};
+use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_types::{
-    fixture_batch_with_transactions, AuthorityIdentifier, Certificate, CertificateDigest,
-    Committee, Database, Hash as _, Header, HeaderBuilder, Round, Vote, WorkerCache,
+    AuthorityIdentifier, Certificate, CertificateDigest, Committee, Database, Hash as _, Header,
+    HeaderBuilder, Round, Vote, WorkerCache,
 };
 
 /// Fixture representing a committee to reach consensus.

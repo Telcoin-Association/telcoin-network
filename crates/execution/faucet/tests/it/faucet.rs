@@ -24,11 +24,10 @@ use tempfile::TempDir;
 use tn_config::fetch_file_content_relative_to_manifest;
 use tn_faucet::Drip;
 use tn_network_types::local::LocalNetwork;
-use tn_reth::{RethChainSpec, RethEnv};
+use tn_reth::{test_utils::TransactionFactory, RethChainSpec, RethEnv};
 use tn_storage::open_db;
-use tn_test_utils::{
-    faucet_test_execution_node, get_contract_state_for_genesis, TransactionFactory,
-};
+use tn_test_utils::{faucet_test_execution_node, get_contract_state_for_genesis};
+
 use tn_types::{
     adiri_genesis, error::BlockSealError, hex, public_key_to_address, sol, Address, GenesisAccount,
     Notifier, SealedBatch, SolType, SolValue, TaskManager, TransactionSigned,

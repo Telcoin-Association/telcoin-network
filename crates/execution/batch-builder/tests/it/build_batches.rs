@@ -10,9 +10,11 @@ use tn_batch_builder::{test_utils::execute_test_batch, BatchBuilder};
 use tn_batch_validator::BatchValidator;
 use tn_engine::execute_consensus_output;
 use tn_network_types::{local::LocalNetwork, MockWorkerToPrimary};
-use tn_reth::{recover_raw_transaction, traits::BuildArguments, RethChainSpec, RethEnv};
+use tn_reth::{
+    recover_raw_transaction, test_utils::test_genesis, test_utils::TransactionFactory,
+    traits::BuildArguments, RethChainSpec, RethEnv,
+};
 use tn_storage::{open_db, tables::Batches};
-use tn_test_utils::{test_genesis, TransactionFactory};
 use tn_types::{
     Address, Batch, BatchValidation, Bytes, Certificate, CommittedSubDag, ConsensusHeader,
     ConsensusOutput, Database, Encodable2718 as _, ReputationScores, SealedBatch, TaskManager,

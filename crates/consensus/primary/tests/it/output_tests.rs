@@ -1,11 +1,10 @@
 use indexmap::IndexMap;
 use std::{collections::BTreeSet, num::NonZeroUsize};
 use tn_storage::mem_db::MemDatabase;
+use tn_test_utils::CommitteeFixture;
 use tn_types::{
     AuthorityIdentifier, Certificate, CommittedSubDag, HeaderBuilder, ReputationScores,
 };
-
-use crate::CommitteeFixture;
 
 #[test]
 fn test_zero_timestamp_in_sub_dag() {

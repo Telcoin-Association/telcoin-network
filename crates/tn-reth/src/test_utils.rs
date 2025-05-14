@@ -1,5 +1,6 @@
 //! Transaction factory to create legit transactions for execution.
 
+use crate::{RethEnv, WorkerTxPool};
 use alloy::signers::local::PrivateKeySigner;
 use enr::k256::FieldBytes;
 use reth_chainspec::ChainSpec as RethChainSpec;
@@ -10,13 +11,12 @@ use secp256k1::{
 };
 use std::sync::Arc;
 use tn_types::{
-    public_key_to_address, AccessList, Address, Bytes, Encodable2718, EthSignature,
-    ExecutionKeypair, SignedTransactionIntoRecoveredExt as _, Transaction, TransactionSigned,
-    TxEip1559, TxHash, TxKind, B256, MIN_PROTOCOL_BASE_FEE, U256,
+    adiri_chain_spec_arc, adiri_genesis, public_key_to_address, AccessList, Address, Batch, Bytes,
+    Encodable2718, EthSignature, ExecHeader, ExecutionKeypair, Genesis, GenesisAccount,
+    SignedTransactionIntoRecoveredExt as _, Transaction, TransactionSigned, TxEip1559, TxHash,
+    TxKind, B256, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tracing::debug;
-
-use crate::{RethEnv, WorkerTxPool};
 
 /// Transaction factory
 #[derive(Clone, Copy, Debug)]
@@ -234,4 +234,69 @@ impl TransactionFactory {
 /// Helper to get the gas price based on the provider's latest header.
 pub fn get_gas_price(reth_env: &RethEnv) -> u128 {
     reth_env.get_gas_price().expect("gas price")
+}
+
+/// Create a random encoded transaction.
+pub fn transaction() -> Vec<u8> {
+    let mut tx_factory = TransactionFactory::new_random();
+    let chain = adiri_chain_spec_arc();
+    let gas_price = 100_000;
+    let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
+
+    // random transaction
+    tx_factory.create_eip1559_encoded(
+        chain,
+        None,
+        gas_price,
+        Some(Address::ZERO),
+        value,
+        Bytes::new(),
+    )
+}
+
+/// will create a batch with randomly formed transactions
+/// dictated by the parameter number_of_transactions
+pub fn fixture_batch_with_transactions(number_of_transactions: u32) -> Batch {
+    let transactions = (0..number_of_transactions).map(|_v| transaction()).collect();
+
+    // Put some random bytes in the header so that tests will have unique headers.
+    Batch { transactions, beneficiary: Address::random(), ..Default::default() }
+}
+
+/// Create a batch with two random, valid transactions. The rest of the [Batch] uses defaults.
+pub fn batch() -> Batch {
+    let transactions = vec![transaction(), transaction()];
+    Batch { transactions, ..Default::default() }
+}
+
+/// generate multiple fixture batches. The number of generated batches
+/// are dictated by the parameter num_of_batches.
+pub fn batches(num_of_batches: usize) -> Vec<Batch> {
+    let mut batches = Vec::new();
+
+    for i in 1..num_of_batches + 1 {
+        batches.push(batch_with_transactions(i));
+    }
+
+    batches
+}
+
+/// Create a batch with the specified number of transactions.
+pub fn batch_with_transactions(num_of_transactions: usize) -> Batch {
+    let mut transactions = Vec::new();
+
+    for _ in 0..num_of_transactions {
+        transactions.push(transaction());
+    }
+
+    Batch::new_for_test(transactions, ExecHeader::default())
+}
+
+/// Adiri genesis with funded [TransactionFactory] default account.
+pub fn test_genesis() -> Genesis {
+    let genesis = adiri_genesis();
+    let default_address = TransactionFactory::default().address();
+    let default_factory_account =
+        vec![(default_address, GenesisAccount::default().with_balance(U256::MAX))];
+    genesis.extend_accounts(default_factory_account)
 }

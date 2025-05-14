@@ -1,11 +1,12 @@
+//! Utilities for it tests.
+
 use clap::Parser;
 use std::path::PathBuf;
 #[cfg(feature = "faucet")]
 use std::sync::Arc;
 use telcoin_network::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
 use tn_node::launch_node;
-use tn_test_utils::CommandParser;
-use tn_types::{Address, Genesis};
+use tn_types::{test_utils::CommandParser, Address, Genesis};
 use tracing::error;
 
 /// Limit potential for port collisions.

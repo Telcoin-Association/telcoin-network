@@ -4,8 +4,9 @@ use std::collections::HashMap;
 
 use crate::{consensus::ConsensusRound, state_sync::HeaderValidator, ConsensusBus};
 use assert_matches::assert_matches;
-use tn_primary::{fixture_batch_with_transactions, CommitteeFixture};
+use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
+use tn_test_utils::CommitteeFixture;
 use tn_types::{error::HeaderError, Hash as _};
 
 #[tokio::test]

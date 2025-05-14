@@ -24,9 +24,9 @@ use tn_reth::{
         ConsensusRegistry::{self, getCurrentEpochInfoReturn, getValidatorsReturn},
         CONSENSUS_REGISTRY_ADDRESS,
     },
+    test_utils::TransactionFactory,
     CreateRequest, RethChainSpec, RethEnv,
 };
-use tn_test_utils::TransactionFactory;
 use tn_types::{
     adiri_genesis, hex, Address, BlsKeypair, Bytes, FromHex, Genesis, GenesisAccount, TaskManager,
     U256,

@@ -22,7 +22,6 @@ use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
 use tn_config::fetch_file_content_relative_to_manifest;
 use tn_reth::{RethChainSpec, RethEnv};
-use tn_test_utils::{get_contract_state_for_genesis, TransactionFactory};
 use tn_types::{
     adiri_genesis, hex, public_key_to_address, sol, Address, Encodable2718 as _, GenesisAccount,
     SolValue, B256, U256,

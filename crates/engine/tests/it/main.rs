@@ -283,8 +283,8 @@ async fn test_empty_output_executes_late_finalize() -> eyre::Result<()> {
 async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Result<()> {
     let tmp_dir = TempDir::new().expect("temp dir");
     // create batches for consensus output
-    let mut batches_1 = tn_test_utils::batches(4); // create 4 batches
-    let mut batches_2 = tn_test_utils::batches(4); // create 4 batches
+    let mut batches_1 = tn_reth::test_utils::batches(4); // create 4 batches
+    let mut batches_2 = tn_reth::test_utils::batches(4); // create 4 batches
 
     // okay to clone these because they are only used to seed genesis, decode transactions, and
     // recover signers
@@ -583,8 +583,8 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
 async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<()> {
     let tmp_dir = TempDir::new().unwrap();
     // create batches for consensus output
-    let mut batches_1 = tn_test_utils::batches(4); // create 4 batches
-    let mut batches_2 = tn_test_utils::batches(4); // create 4 batches
+    let mut batches_1 = tn_reth::test_utils::batches(4); // create 4 batches
+    let mut batches_2 = tn_reth::test_utils::batches(4); // create 4 batches
 
     // duplicate transactions in last batch for each round
     //
@@ -913,8 +913,8 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
 async fn test_max_round_terminates_early() -> eyre::Result<()> {
     let tmp_dir = TempDir::new().unwrap();
     // create batches for consensus output
-    let mut batches_1 = tn_test_utils::batches(4); // create 4 batches
-    let mut batches_2 = tn_test_utils::batches(4); // create 4 batches
+    let mut batches_1 = tn_reth::test_utils::batches(4); // create 4 batches
+    let mut batches_2 = tn_reth::test_utils::batches(4); // create 4 batches
 
     // okay to clone these because they are only used to seed genesis, decode transactions, and
     // recover signers

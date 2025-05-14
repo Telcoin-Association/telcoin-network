@@ -15,11 +15,7 @@ eyre = { workspace = true }
 backoff = { workspace = true }
 cfg-if = { workspace = true }
 futures = { workspace = true }
-governor = { workspace = true }
-itertools = { workspace = true }
-once_cell = { workspace = true }
 parking_lot = { workspace = true }
-prometheus = { workspace = true }
 rand = { workspace = true, features = ["small_rng"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
@@ -29,45 +25,36 @@ tokio = { workspace = true, features = [
     "time",
     "test-util",
 ] }
-tokio-stream = { workspace = true }
-tower = { workspace = true }
 tracing = { workspace = true }
-tap = { workspace = true }
-
 tn-network-types = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
 tn-storage = { workspace = true }
-tn-utils = { workspace = true }
 consensus-metrics = { workspace = true }
 tn-primary-metrics = { workspace = true }
-
 tn-network-libp2p = { workspace = true }
 roaring = { workspace = true }
 serde = { workspace = true }
 async-trait = { workspace = true }
-tn-worker = { workspace = true, optional = true, features = ["test-utils"] }
+
+# test-utils
+tn-reth = { workspace = true, features = ["test-utils"], optional = true }
+indexmap = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
-criterion = { workspace = true }
 futures = { workspace = true }
-tn-executor = { workspace = true }
-indexmap = { workspace = true }
 itertools = { workspace = true }
-mockall = { workspace = true }
-tn-node = { workspace = true }
 proptest = { workspace = true }
-tempfile = { workspace = true }
 tracing = { workspace = true }
 tn-storage = { workspace = true }
-reqwest = { workspace = true }
-bytes = { workspace = true }
 tn-batch-validator = { workspace = true, features = ["test-utils"] }
 assert_matches = { workspace = true }
 tn-types = { workspace = true, features = ["test-utils"] }
 tn-primary = { workspace = true, features = ["test-utils"] }
+tn-test-utils = { workspace = true }
 
 [features]
 default = []
-test-utils = ["tn-worker"]
+test-utils = ["tn-reth", "indexmap", "tempfile"]

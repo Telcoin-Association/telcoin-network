@@ -53,3 +53,5 @@ tn-storage = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 tn-config = { workspace = true }
+tn-reth = { workspace = true, features = ["test-utils"] }
+tn-types = { workspace = true, features = ["test-utils"] }

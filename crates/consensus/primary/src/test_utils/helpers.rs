@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     ops::RangeInclusive,
 };
-use tn_reth::test_utils::TransactionFactory;
+use tn_reth::test_utils::{batch, TransactionFactory};
 use tn_types::{
     adiri_chain_spec_arc, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash,
     BlsKeypair, BlsSignature, Bytes, Certificate, CertificateDigest, Committee, Epoch, ExecHeader,
@@ -41,15 +41,6 @@ pub fn fixture_payload(number_of_batches: u8) -> IndexMap<BlockHash, (WorkerId, 
     }
 
     payload
-}
-
-/// will create a batch with randomly formed transactions
-/// dictated by the parameter number_of_transactions
-pub fn fixture_batch_with_transactions(number_of_transactions: u32) -> Batch {
-    let transactions = (0..number_of_transactions).map(|_v| transaction()).collect();
-
-    // Put some random bytes in the header so that tests will have unique headers.
-    Batch { transactions, beneficiary: Address::random(), ..Default::default() }
 }
 
 pub fn fixture_payload_with_rand<R: Rng + ?Sized>(
@@ -93,55 +84,9 @@ pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Batch {
     )
 }
 
-/// Create a random encoded transaction.
-pub fn transaction() -> Vec<u8> {
-    let mut tx_factory = TransactionFactory::new_random();
-    let chain = adiri_chain_spec_arc();
-    let gas_price = 100_000;
-    let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
-
-    // random transaction
-    tx_factory.create_eip1559_encoded(
-        chain,
-        None,
-        gas_price,
-        Some(Address::ZERO),
-        value,
-        Bytes::new(),
-    )
-}
-
 ////////////////////////////////////////////////////////////////
 // Batches
 ////////////////////////////////////////////////////////////////
-
-// Fixture
-pub fn batch() -> Batch {
-    let transactions = vec![transaction(), transaction()];
-    Batch { transactions, ..Default::default() }
-}
-
-/// generate multiple fixture batches. The number of generated batches
-/// are dictated by the parameter num_of_batches.
-pub fn batches(num_of_batches: usize) -> Vec<Batch> {
-    let mut batches = Vec::new();
-
-    for i in 1..num_of_batches + 1 {
-        batches.push(batch_with_transactions(i));
-    }
-
-    batches
-}
-
-pub fn batch_with_transactions(num_of_transactions: usize) -> Batch {
-    let mut transactions = Vec::new();
-
-    for _ in 0..num_of_transactions {
-        transactions.push(transaction());
-    }
-
-    Batch::new_for_test(transactions, ExecHeader::default())
-}
 
 /// Creates one certificate per authority starting and finishing at the specified rounds
 /// (inclusive).

@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 //! Persistent storage types
 
-#![warn(future_incompatible, nonstandard_style, rust_2018_idioms, rust_2021_compatibility)]
+#![warn(
+    future_incompatible,
+    nonstandard_style,
+    rust_2018_idioms,
+    rust_2021_compatibility,
+    unused_crate_dependencies
+)]
 
 mod stores;
 use layered_db::LayeredDatabase;
@@ -24,6 +30,7 @@ pub mod mem_db;
 pub mod redb;
 #[cfg(feature = "rocksdb")]
 pub mod rocks;
+
 pub use tn_types::error::StoreError;
 
 pub type ProposerKey = u32;
@@ -485,3 +492,7 @@ mod test {
         }
     }
 }
+
+// prevent clippy unused deps warning
+// `rocks` feature uses this
+use serde as _;

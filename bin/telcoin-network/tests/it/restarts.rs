@@ -14,8 +14,7 @@ use std::{
     process::{Child, Command},
     time::Duration,
 };
-use tn_test_utils::init_test_tracing;
-use tn_types::{get_available_tcp_port, keccak256, Address};
+use tn_types::{get_available_tcp_port, keccak256, test_utils::init_test_tracing, Address};
 use tokio::runtime::Runtime;
 use tracing::{error, info};
 

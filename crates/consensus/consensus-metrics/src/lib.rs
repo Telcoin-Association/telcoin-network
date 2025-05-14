@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Consensus metrics are used throughout consensus to capture metrics while using async channels.
 
+#![warn(
+    future_incompatible,
+    nonstandard_style,
+    rust_2018_idioms,
+    rust_2021_compatibility,
+    unused_crate_dependencies
+)]
+
 use axum::{http::StatusCode, routing::get, Router};
 use std::{
     future::Future,

@@ -11,47 +11,13 @@ authors = [
 publish = false
 
 [dependencies]
-fdlimit = { workspace = true }
-indexmap = { workspace = true }
-itertools = { workspace = true }
-prometheus = { workspace = true }
-rand = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["sync", "rt", "macros"] }
-tonic = { workspace = true }
-tracing = { workspace = true }
-once_cell = { workspace = true }
-
-tn-network-libp2p = { workspace = true }
-tn-network-types = { workspace = true }
+eyre = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+rand = { workspace = true }
 tn-node = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
-tn-primary = { workspace = true }
 tn-types = { workspace = true }
 tn-faucet = { workspace = true }
 tn-config = { workspace = true }
-tn-worker = { workspace = true }
-consensus-metrics = { workspace = true }
-tn-primary-metrics = { workspace = true }
-secp256k1 = { workspace = true }
-
-# execution
-eyre = { workspace = true }
-tn-batch-builder = { workspace = true }
-tn-batch-validator = { workspace = true }
-tn-engine = { workspace = true }
-jsonrpsee = { workspace = true }
-clap = { workspace = true, features = ["env"] }
-tn-storage = { workspace = true }
 telcoin-network = { path = "../../bin/telcoin-network" }
-alloy = { workspace = true, features = [
-    "contract",
-    "signers",
-    "signer-local",
-    "network",
-] }
-tracing-subscriber = { workspace = true }
-
-[dev-dependencies]
-criterion = { workspace = true }
-futures.workspace = true

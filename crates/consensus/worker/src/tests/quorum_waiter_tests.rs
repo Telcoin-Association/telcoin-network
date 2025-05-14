@@ -1,11 +1,11 @@
 //! Unit tests for the worker's quorum waiter.
 
-use crate::{WorkerRequest, WorkerResponse};
-
 use super::*;
+use crate::{WorkerRequest, WorkerResponse};
 use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
+use tn_reth::test_utils::batch;
 use tn_storage::mem_db::MemDatabase;
-use tn_test_utils::{batch, CommitteeFixture};
+use tn_test_utils::CommitteeFixture;
 use tn_types::TaskManager;
 use tokio::sync::mpsc;
 

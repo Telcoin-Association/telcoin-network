@@ -4,8 +4,8 @@ use crate::quorum_waiter::QuorumWaiterError;
 use std::sync::Mutex;
 use tempfile::TempDir;
 use tn_network_types::MockWorkerToPrimary;
+use tn_reth::test_utils::transaction;
 use tn_storage::open_db;
-use tn_test_utils::transaction;
 use tn_types::Batch;
 
 #[derive(Clone, Debug)]

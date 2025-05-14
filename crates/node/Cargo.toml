@@ -13,52 +13,32 @@ authors = [
 ]
 
 [dependencies]
-cfg-if = { workspace = true }
-futures = { workspace = true }
-rand = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }
 url = { version = "2.3.1", optional = true }
-enr = { workspace = true, default-features = false, features = [
-    "rust-secp256k1",
-] }
-
 tn-executor = { workspace = true }
 tn-primary = { workspace = true }
 prometheus = { workspace = true }
 tn-storage = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
-tn-network-types = { workspace = true }
 tn-worker = { workspace = true }
 tn-rpc = { workspace = true }
 eyre = { workspace = true }
 tn-network-libp2p = { workspace = true }
 tn-reth = { workspace = true }
-
 consensus-metrics = { workspace = true }
 tn-primary-metrics = { workspace = true }
-
-reqwest = { workspace = true }
 state-sync = { workspace = true }
-dirs-next = "2.0.0"
-
 tn-engine = { workspace = true }
 tn-batch-builder = { workspace = true }
 tn-batch-validator = { workspace = true }
 jsonrpsee = { workspace = true }
-fdlimit = { workspace = true }
 
 # TODO: temporary solution until reth supports public rpc hooks
 tn-faucet = { workspace = true }
 
 [dev-dependencies]
-serde-reflection = { workspace = true }
-serde_yaml = { workspace = true }
-tn-test-utils = { workspace = true }
 tn-primary = { workspace = true }
-assert_matches = { workspace = true }
-tempfile = { workspace = true }
-clap = { workspace = true, features = ["derive", "env"] }

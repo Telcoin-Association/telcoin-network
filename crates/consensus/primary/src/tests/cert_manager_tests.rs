@@ -4,8 +4,9 @@ use super::CertificateManager;
 use crate::{error::CertManagerError, state_sync::AtomicRound, ConsensusBus};
 use assert_matches::assert_matches;
 use std::collections::BTreeSet;
-use tn_primary::{make_optimal_signed_certificates, CommitteeFixture};
+use tn_primary::test_utils::make_optimal_signed_certificates;
 use tn_storage::mem_db::MemDatabase;
+use tn_test_utils::CommitteeFixture;
 use tn_types::{Certificate, Hash as _, SignatureVerificationState};
 
 struct TestTypes<DB = MemDatabase> {

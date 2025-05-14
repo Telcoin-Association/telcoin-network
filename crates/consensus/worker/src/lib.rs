@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Worker components to create and sync batches.
 
-#![warn(future_incompatible, nonstandard_style, rust_2018_idioms, rust_2021_compatibility)]
+#![warn(
+    future_incompatible,
+    nonstandard_style,
+    rust_2018_idioms,
+    rust_2021_compatibility,
+    unused_crate_dependencies
+)]
 
 mod batch_fetcher;
 mod network;
@@ -15,6 +21,3 @@ pub use crate::worker::{new_worker, Worker, CHANNEL_CAPACITY};
 
 /// The number of shutdown receivers to create on startup. We need one per component loop.
 pub const NUM_SHUTDOWN_RECEIVERS: u64 = 26;
-
-#[cfg(feature = "test-utils")]
-pub mod test_utils;
