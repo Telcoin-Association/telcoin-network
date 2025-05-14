@@ -229,7 +229,7 @@ impl PeerManager {
                 self.push_event(PeerEvent::DisconnectPeer(peer_id));
             }
             PeerAction::DisconnectWithPX => {
-                debug!(target: "peer-manager", ?peer_id, "reputation update results in temp ban");
+                debug!(target: "peer-manager", ?peer_id, "reputation update results in temp ban with PX");
                 // prevent immediate reconnection attempts
                 self.temporarily_banned.insert(peer_id);
                 let exchange = self.peers.peer_exchange();
@@ -277,6 +277,12 @@ impl PeerManager {
     /// This is called before accepting new connections. Also checks that the peer
     /// wasn't temporarily banned due to excess peers connections.
     pub(crate) fn peer_banned(&self, peer_id: &PeerId) -> bool {
+        debug!(
+            target: "peer-manager",
+            ?peer_id,
+            "checking if peer banned...current banned peers:\n{:#?}",
+            self.temporarily_banned
+        );
         self.temporarily_banned.contains(peer_id) || self.peers.peer_banned(peer_id)
     }
 
@@ -348,6 +354,8 @@ impl PeerManager {
             &peer_id,
             NewConnectionStatus::Disconnecting { banned: false },
         );
+
+        debug!(target: "peer-manager", ?action, "disconnect peer results in:");
         self.apply_peer_action(peer_id, action);
     }
 

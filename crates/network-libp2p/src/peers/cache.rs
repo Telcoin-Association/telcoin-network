@@ -10,6 +10,7 @@ use std::{
 mod cache_peers;
 
 /// The element representing a temporarily banend peer
+#[derive(Debug)]
 struct Element<Key> {
     /// The key being inserted.
     key: Key,
@@ -21,6 +22,7 @@ struct Element<Key> {
 ///
 /// This implementation requires manually managing the cache.
 /// The cache is intended to only be updated during the peer manager's heartbeat interval.
+#[derive(Debug)]
 pub(super) struct BannedPeerCache<Key> {
     /// The duplicate cache.
     map: HashSet<Key>,

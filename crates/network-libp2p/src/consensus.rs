@@ -185,7 +185,10 @@ where
         let identify_config = identify::Config::new(
             network_config.libp2p_config().identify_protocol().to_string(),
             keypair.public(),
-        );
+        )
+        // disable discovery to prevent auto redials to disconnected peers
+        .with_cache_size(0);
+
         let identify = identify::Behaviour::new(identify_config);
 
         let gossipsub_config = gossipsub::ConfigBuilder::default()
@@ -589,6 +592,7 @@ where
             } => {
                 debug!(
                     target: "network",
+                    ?peer_id,
                     ?public_key,
                     ?protocol_version,
                     ?agent_version,
@@ -610,7 +614,8 @@ where
                 debug!(target: "network", ?peer_id, ?info, "pushed identify to peer:");
             }
             IdentifyEvent::Error { peer_id, error, .. } => {
-                error!(target: "network", ?peer_id, ?error, "identify error:");
+                // errors appear when connection is closed
+                debug!(target: "network", ?peer_id, ?error, "identify error:");
             }
         }
 
@@ -812,7 +817,7 @@ where
             PeerEvent::DisconnectPeer(peer_id) => {
                 debug!(target: "network", ?peer_id, "peer manager: disconnect peer");
                 // remove from request-response
-                // NOTE: gossipsub handles `FromSwarm::ConnectionClosed`
+                // NOTE: gossipsub/identify handle `FromSwarm::ConnectionClosed`
                 let _ = self.swarm.disconnect_peer_id(peer_id);
             }
             PeerEvent::PeerDisconnected(peer_id) => {

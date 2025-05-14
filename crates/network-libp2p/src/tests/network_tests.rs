@@ -665,7 +665,7 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
 async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     // Create a custom config with very low peer limits for testing
     let mut network_config = NetworkConfig::default();
-    network_config.peer_config_mut().target_num_peers = 3;
+    network_config.peer_config_mut().target_num_peers = 4;
     network_config.peer_config_mut().peer_excess_factor = 0.1; // Small excess factor
     network_config.peer_config_mut().excess_peers_reconnection_timeout = Duration::from_secs(10);
 
@@ -708,6 +708,8 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
         .expect("target peer listen addr")
         .clone();
     let target_peer_id = target_peer.network_handle.local_peer_id().await?;
+
+    debug!(target: "network", ?target_peer_id, "target peer");
 
     // Start other peers and connect them one by one to the target
     for peer in other_peers.iter_mut() {
@@ -795,7 +797,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     }
 
     // allow dial attempts to be made
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 2)).await;
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
 
     // assert nvv is connected with other peers
     let connected = nvv.connected_peers().await?;
@@ -814,15 +816,24 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     target_peer.network_handle.publish(TEST_TOPIC.into(), expected_msg.clone()).await?;
 
     // wait for gossip from disconnected peer
-    match timeout(Duration::from_secs(5), nvv_events.recv()).await {
-        Ok(Some(NetworkEvent::Gossip(msg, _))) => {
-            let GossipMessage { source, data, .. } = msg;
-            assert_eq!(source, Some(target_peer_id));
-            assert_eq!(data, expected_msg);
+    loop {
+        match timeout(Duration::from_secs(5), nvv_events.recv()).await {
+            Ok(Some(NetworkEvent::Gossip(msg, _))) => {
+                let GossipMessage { source, data, .. } = msg;
+                assert_eq!(source, Some(target_peer_id));
+                assert_eq!(data, expected_msg);
+                break;
+            }
+            Ok(Some(NetworkEvent::Request {
+                request: TestWorkerRequest::PeerExchange(_), ..
+            })) => {
+                // ignore peer exchanges
+                continue;
+            }
+            Ok(None) => return Err(eyre!("Channel closed without receiving event")),
+            Err(_) => return Err(eyre!("Timeout waiting for peer exchange event")),
+            e => return Err(eyre!("wrong event type: {:?}", e)),
         }
-        Ok(None) => return Err(eyre!("Channel closed without receiving event")),
-        Err(_) => return Err(eyre!("Timeout waiting for peer exchange event")),
-        e => return Err(eyre!("wrong event type: {:?}", e)),
     }
 
     Ok(())
@@ -1459,8 +1470,6 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
 /// Test kad records available to new node joining the network.
 #[tokio::test]
 async fn test_get_kad_records() -> eyre::Result<()> {
-    tn_test_utils::init_test_tracing();
-
     // used later
     let num_network_peers = 5;
 
