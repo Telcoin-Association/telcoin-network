@@ -10677,7 +10677,6 @@ dependencies = [
  "futures",
  "tn-config",
  "tn-network-libp2p",
- "tn-network-types",
  "tn-primary",
  "tn-storage",
  "tn-types",
@@ -11221,7 +11220,6 @@ name = "tn-faucet"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "cfg-if",
  "clap",
  "consensus-metrics",
  "ecdsa",
@@ -11238,7 +11236,6 @@ dependencies = [
  "reth-tasks",
  "reth-transaction-pool",
  "secp256k1 0.29.1",
- "serde",
  "serde_json",
  "tempfile",
  "tn-config",
@@ -11250,7 +11247,6 @@ dependencies = [
  "tn-worker",
  "tokio",
  "tokio-stream",
- "tonic 0.13.1",
  "tracing",
 ]
 
@@ -11284,19 +11280,13 @@ name = "tn-network-types"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bcs",
- "bytes",
  "eyre",
- "indexmap 2.9.0",
  "libp2p",
- "mockall",
  "parking_lot",
  "roaring",
  "rustversion",
  "serde",
- "snap",
  "tn-types",
- "tonic 0.13.1",
  "tracing",
 ]
 

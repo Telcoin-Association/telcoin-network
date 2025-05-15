@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 //! Persistent storage types
 
-#![warn(
-    future_incompatible,
-    nonstandard_style,
-    rust_2018_idioms,
-    rust_2021_compatibility,
-    unused_crate_dependencies
-)]
+#![warn(future_incompatible, nonstandard_style, rust_2018_idioms, rust_2021_compatibility)]
 
 mod stores;
 use layered_db::LayeredDatabase;
