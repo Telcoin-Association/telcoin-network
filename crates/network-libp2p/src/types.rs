@@ -529,7 +529,7 @@ where
 pub struct NodeRecord {
     /// The network information contained within the record.
     pub info: NetworkInfo,
-    /// Signature of the value field with the nodes BLS key.
+    /// Signature of the info field with the node's BLS key.
     /// This is part of a kademlia record keyed on a BLS public key
     /// that can be used for verifiction.  Intended to stop malicious
     /// nodes from poisoning the routing table.
@@ -548,19 +548,14 @@ impl NodeRecord {
         F: FnOnce(&[u8]) -> BlsSignature,
     {
         let info = NetworkInfo { pubkey, multiaddr, hostname };
-        let data = Self::encode_data(&info);
+        let data = encode(&info);
         let signature = signer(&data);
         Self { info, signature }
     }
 
-    /// Return the encoded data to sign. This is useful for verifying records.
-    pub fn encode_data(info: &NetworkInfo) -> Vec<u8> {
-        encode(info)
-    }
-
     /// Verify if a signature matches the record.
     pub fn verify(self, pubkey: &BlsPublicKey) -> Option<(BlsPublicKey, NodeRecord)> {
-        let data = Self::encode_data(&self.info);
+        let data = encode(&self.info);
         if self.signature.verify_raw(&data, pubkey) {
             Some((*pubkey, self))
         } else {
@@ -579,7 +574,7 @@ impl NodeRecord {
 pub struct NetworkInfo {
     /// The node's [NetworkPublicKey].
     pub pubkey: NetworkPublicKey,
-    /// etwork address for node.
+    /// Network address for node.
     pub multiaddr: Multiaddr,
     /// The hostname.
     pub hostname: String,

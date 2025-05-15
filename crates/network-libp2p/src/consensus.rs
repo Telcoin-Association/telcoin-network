@@ -53,7 +53,7 @@ pub(crate) struct TNBehavior<C>
 where
     C: Codec + Send + Clone + 'static,
 {
-    /// Th identify behavior.
+    /// The identify behavior used to confirm externally observed addresses.
     pub(crate) identify: identify::Behaviour,
     /// The gossipsub network behavior.
     pub(crate) gossipsub: gossipsub::Behaviour,

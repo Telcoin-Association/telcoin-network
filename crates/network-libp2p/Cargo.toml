@@ -41,6 +41,7 @@ eyre = { workspace = true }
 assert_matches = { workspace = true }
 tn-storage = { workspace = true }
 tn-test-utils = { workspace = true }
+tn-types = { workspace = true, features = ["test-utils"] }
 
 [lints]
 workspace = true

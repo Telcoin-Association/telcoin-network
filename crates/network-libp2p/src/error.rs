@@ -16,12 +16,11 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 pub enum NetworkError {
     /// Swarm error dialing a peer.
     #[error("{0}")]
-    // Dial(#[from] DialError),
     Dial(String),
-    /// Dial attempt currently ongoing for peer.
+    /// Redial attempt.
     #[error("Peer already dialed")]
     RedialAttempt,
-    /// Dialing an already connected peer.
+    /// Dialing an banned peer.
     #[error("{0}")]
     DialBannedPeer(String),
     /// Dialing an already connected peer.

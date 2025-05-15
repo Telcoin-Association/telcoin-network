@@ -633,7 +633,7 @@ where
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
         epoch_task_spawner: TaskSpawner,
-        initialize_networks: &mut bool,
+        initialize_networks: &bool,
     ) -> eyre::Result<PrimaryNode<DB>> {
         let consensus_bus =
             ConsensusBus::new_with_args(consensus_config.config().parameters.gc_depth);
@@ -668,7 +668,7 @@ where
         consensus_config: &ConsensusConfig<DB>,
         validator: Arc<dyn BatchValidation>,
         epoch_task_spawner: TaskSpawner,
-        initialize_networks: &mut bool,
+        initialize_networks: &bool,
     ) -> eyre::Result<WorkerNode<DB>> {
         // only support one worker for now - otherwise, loop here
         let (worker_id, _worker_info) = consensus_config.config().workers().first_worker()?;
