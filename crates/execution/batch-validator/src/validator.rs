@@ -205,8 +205,10 @@ mod tests {
     use assert_matches::assert_matches;
     use std::{path::Path, str::FromStr, sync::Arc};
     use tempfile::TempDir;
-    use tn_reth::RethChainSpec;
-    use tn_test_utils::{test_genesis, TransactionFactory};
+    use tn_reth::{
+        test_utils::{test_genesis, TransactionFactory},
+        RethChainSpec,
+    };
     use tn_types::{
         adiri_genesis, hex_literal::hex, max_batch_gas, Address, Batch, Bytes, Encodable2718 as _,
         GenesisAccount, TaskManager, B256, MIN_PROTOCOL_BASE_FEE, U256,
@@ -282,7 +284,7 @@ mod tests {
         // genesis with default TransactionFactory funded
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let validator = BatchValidator::new(
-            RethEnv::new_for_test_with_chain(chain.clone(), path, task_manager).unwrap(),
+            RethEnv::new_for_temp_chain(chain.clone(), path, task_manager).unwrap(),
         );
         let valid_batch = next_valid_sealed_batch();
 

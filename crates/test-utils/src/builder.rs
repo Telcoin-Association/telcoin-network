@@ -20,6 +20,7 @@ use tn_types::{
     DEFAULT_PRIMARY_PORT, DEFAULT_WORKER_PORT,
 };
 
+/// The committee builder for tests.
 pub struct Builder<DB, F, R = OsRng> {
     rng: R,
     committee_size: NonZeroUsize,

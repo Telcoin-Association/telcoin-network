@@ -4,6 +4,7 @@ use std::{collections::BTreeSet, sync::Arc};
 use tn_executor::get_restored_consensus_output;
 use tn_primary::{
     consensus::{Bullshark, Consensus, ConsensusMetrics, LeaderSchedule, LeaderSwapTable},
+    test_utils::{make_optimal_certificates, mock_certificate},
     ConsensusBus,
 };
 use tn_storage::{mem_db::MemDatabase, CertificateStore, ConsensusStore};
@@ -27,18 +28,14 @@ async fn test_recovery() {
     let genesis =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
     let (mut certificates, next_parents) =
-        tn_test_utils::make_optimal_certificates(&committee, 1..=4, &genesis, &ids);
+        make_optimal_certificates(&committee, 1..=4, &genesis, &ids);
 
     // Make two certificate (f+1) with round 5 to trigger the commits.
-    let (_, certificate) = tn_test_utils::mock_certificate(
-        &committee,
-        ids.first().unwrap().clone(),
-        5,
-        next_parents.clone(),
-    );
+    let (_, certificate) =
+        mock_certificate(&committee, ids.first().unwrap().clone(), 5, next_parents.clone());
     certificates.push_back(certificate);
     let (_, certificate) =
-        tn_test_utils::mock_certificate(&committee, ids.get(1).unwrap().clone(), 5, next_parents);
+        mock_certificate(&committee, ids.get(1).unwrap().clone(), 5, next_parents);
     certificates.push_back(certificate);
 
     const NUM_SUB_DAGS_PER_SCHEDULE: u32 = 100;

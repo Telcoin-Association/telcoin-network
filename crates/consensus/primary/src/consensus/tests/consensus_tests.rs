@@ -2,6 +2,7 @@
 
 use crate::{
     consensus::{Bullshark, Consensus, ConsensusMetrics, LeaderSchedule, LeaderSwapTable},
+    test_utils::make_optimal_certificates,
     ConsensusBus,
 };
 use std::{collections::BTreeSet, sync::Arc};
@@ -41,7 +42,7 @@ async fn test_consensus_recovery_with_bullshark() {
     let genesis =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
     let (certificates, _next_parents) =
-        tn_test_utils::make_optimal_certificates(&committee, 1..=7, &genesis, &ids);
+        make_optimal_certificates(&committee, 1..=7, &genesis, &ids);
 
     let metrics = Arc::new(ConsensusMetrics::default());
     let leader_schedule = LeaderSchedule::from_store(

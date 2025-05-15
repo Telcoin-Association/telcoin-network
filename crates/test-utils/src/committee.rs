@@ -1,8 +1,8 @@
 //! Committe fixture for all authorities and their workers within a committee for a specific epoch.
 
 use super::{AuthorityFixture, Builder};
-use crate::fixture_batch_with_transactions;
 use std::collections::{BTreeMap, BTreeSet};
+use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_types::{
     AuthorityIdentifier, Certificate, CertificateDigest, Committee, Database, Hash as _, Header,
     HeaderBuilder, Round, Vote, WorkerCache,

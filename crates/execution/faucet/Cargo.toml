@@ -27,7 +27,6 @@ eyre = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }
 lru_time_cache = { version = "0.11.11" }
 jsonrpsee = { workspace = true, features = ["macros"] }
-serde = { workspace = true }
 # still needed for jsonrpsee 0.24.3
 async-trait = { workspace = true }
 
@@ -39,17 +38,15 @@ gcloud-sdk = { version = "=0.24.6", default-features = false, features = [
 k256 = "0.13.3"
 ecdsa = { version = "0.16.9", features = ["pem"] }
 secp256k1 = { workspace = true }
-tonic = { workspace = true }
-cfg-if = { workspace = true }
 tn-types = { workspace = true }
 
 [dev-dependencies]
-prometheus = { workspace = true }
 consensus-metrics = { workspace = true }
 tn-test-utils = { workspace = true }
 tn-network-types = { workspace = true }
 tn-worker = { workspace = true }
 tn-storage = { workspace = true }
 tempfile = { workspace = true }
-serde_json = { workspace = true }
 tn-config = { workspace = true }
+tn-reth = { workspace = true, features = ["test-utils"] }
+tn-types = { workspace = true, features = ["test-utils"] }

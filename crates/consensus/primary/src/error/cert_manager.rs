@@ -17,13 +17,9 @@ pub(crate) enum CertManagerError {
     /// Error from garbage collection task.
     #[error(transparent)]
     GC(#[from] GarbageCollectorError),
-
     /// The certificate's signature verification state is unverified.
     #[error("Unverified signature verification state {0}")]
     UnverifiedSignature(CertificateDigest),
-    /// The parent was not found.
-    #[error("Error accepting certificate. Parent not found: {0}")]
-    MissingParent(CertificateDigest),
     /// Oneshot channel dropped for certificate manager.
     #[error("Failed to return certificate manager's result.")]
     CertificateManagerOneshot,
@@ -63,6 +59,9 @@ pub(crate) enum CertManagerError {
     /// Fetch certificates failed.
     #[error("No peer can be reached for fetching certificates! Check if network is healthy.")]
     NoCertificateFetched,
+    /// Network error.
+    #[error("Failed to set the bounds for MissingCertificatesRequest: {0}")]
+    RequestBounds(String),
 }
 
 impl<T: std::fmt::Debug> From<SendError<T>> for CertManagerError {

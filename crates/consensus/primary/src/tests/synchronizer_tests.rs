@@ -13,11 +13,11 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tn_storage::{mem_db::MemDatabase, traits::Database};
-use tn_test_utils::{
+use tn_primary::{
     fixture_batch_with_transactions, make_optimal_signed_certificates, signed_cert_for_test,
     CommitteeFixture,
 };
+use tn_storage::{mem_db::MemDatabase, traits::Database};
 use tn_types::{
     error::{CertificateError, HeaderError},
     BlsAggregateSignatureBytes, Certificate, Committee, Hash as _, Round,

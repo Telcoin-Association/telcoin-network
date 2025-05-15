@@ -11,7 +11,6 @@ publish = false
 edition = "2021"
 
 [dependencies]
-eyre = { workspace = true }
 axum = { workspace = true }
 tracing = { workspace = true }
 scopeguard = { workspace = true }
@@ -19,11 +18,8 @@ prometheus = { workspace = true }
 once_cell = { workspace = true }
 tap = { workspace = true }
 tokio = { workspace = true }
-uuid = { workspace = true }
 parking_lot = { workspace = true }
 futures = { workspace = true }
-protobuf = { workspace = true }
-async-trait = { workspace = true }
 tn-types = { workspace = true }
 
 [lints.rust]

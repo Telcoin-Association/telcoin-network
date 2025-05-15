@@ -41,8 +41,6 @@ if [[ "${ALREADY_ATTESTED: -1}" == "1" ]]; then
     exit 0
 fi
 
-# TODO: ensure enough balance for estimated cost
-
 # Navigate to the project root directory for workspace, .rustfmt.toml, etc.
 cd "$(dirname "$0")/.."
 

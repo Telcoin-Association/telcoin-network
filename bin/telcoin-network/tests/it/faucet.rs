@@ -21,11 +21,10 @@ use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicK
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
 use tn_config::fetch_file_content_relative_to_manifest;
-use tn_reth::{RethChainSpec, RethEnv};
-use tn_test_utils::{get_contract_state_for_genesis, TransactionFactory};
+use tn_reth::{test_utils::TransactionFactory, RethChainSpec, RethEnv};
 use tn_types::{
     adiri_genesis, hex, public_key_to_address, sol, Address, Encodable2718 as _, GenesisAccount,
-    SolValue, B256, U256,
+    SolValue, TaskManager, B256, U256,
 };
 use tokio::{task::JoinHandle, time::timeout};
 use tracing::{debug, info};
@@ -257,9 +256,12 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
         vec![faucet_tx_raw, stablecoin_tx_raw, role_tx_raw, updatexyz_tx_raw, minter_tx_raw];
 
     let tmp_dir = tempfile::TempDir::new().unwrap();
+    let task_manager = TaskManager::new("Temp Task Manager");
+    let tmp_reth_env =
+        RethEnv::new_for_temp_chain(pre_genesis_chain.clone(), tmp_dir.path(), &task_manager)?;
     // fetch state to be set on the faucet proxy address
-    let execution_outcome =
-        get_contract_state_for_genesis(pre_genesis_chain, raw_txs, tmp_dir.path()).await?;
+    let execution_outcome = tmp_reth_env
+        .execution_outcome_for_tests(raw_txs, &pre_genesis_chain.sealed_genesis_header());
     let execution_bundle = execution_outcome.bundle;
     let execution_storage_faucet = &execution_bundle
         .state

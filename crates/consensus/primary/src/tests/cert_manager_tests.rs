@@ -4,15 +4,14 @@ use super::CertificateManager;
 use crate::{error::CertManagerError, state_sync::AtomicRound, ConsensusBus};
 use assert_matches::assert_matches;
 use std::collections::BTreeSet;
+use tn_primary::test_utils::make_optimal_signed_certificates;
 use tn_storage::mem_db::MemDatabase;
-use tn_test_utils::{make_optimal_signed_certificates, CommitteeFixture};
+use tn_test_utils::CommitteeFixture;
 use tn_types::{Certificate, Hash as _, SignatureVerificationState};
 
 struct TestTypes<DB = MemDatabase> {
     /// The CertificateManager
     manager: CertificateManager<DB>,
-    /// The consensus bus.
-    cb: ConsensusBus,
     /// The committee fixture.
     fixture: CommitteeFixture<DB>,
 }
@@ -26,17 +25,10 @@ fn create_test_types() -> TestTypes<MemDatabase> {
     let config = primary.consensus_config();
     let gc_round = AtomicRound::new(0);
     let highest_processed_round = AtomicRound::new(0);
-    let highest_received_round = AtomicRound::new(0);
 
-    let manager = CertificateManager::new(
-        config,
-        cb.clone(),
-        gc_round,
-        highest_processed_round,
-        highest_received_round,
-    );
+    let manager = CertificateManager::new(config, cb, gc_round, highest_processed_round);
 
-    TestTypes { manager, cb, fixture }
+    TestTypes { manager, fixture }
 }
 
 #[tokio::test]

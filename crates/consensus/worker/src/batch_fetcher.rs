@@ -171,8 +171,8 @@ mod tests {
         types::{NetworkCommand, NetworkHandle},
         PeerId,
     };
+    use tn_reth::test_utils::transaction;
     use tn_storage::open_db;
-    use tn_test_utils::transaction;
     use tn_types::{NetworkKeypair, TaskManager};
     use tokio::sync::{mpsc, Mutex};
 

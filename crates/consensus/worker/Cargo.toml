@@ -11,16 +11,10 @@ edition = "2021"
 publish = false
 
 [dependencies]
-arc-swap = { workspace = true }
 async-trait = { workspace = true }
-byteorder = { workspace = true }
 futures = { workspace = true }
-governor = { workspace = true }
-rand = { workspace = true, features = ["small_rng"] }
-tap = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }
-tonic = { workspace = true }
 tracing = { workspace = true }
 itertools = { workspace = true }
 
@@ -29,20 +23,19 @@ tn-network-types = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
 prometheus = { workspace = true }
-consensus-metrics = { workspace = true }
-tn-primary-metrics = { workspace = true }
 
 eyre = { workspace = true }
-anyhow = { workspace = true }
-tn-batch-validator = { workspace = true }
 tn-network-libp2p = { workspace = true }
 serde = { workspace = true }
+consensus-metrics = { workspace = true }
 
 [dev-dependencies]
 tn-batch-validator = { workspace = true, features = ["test-utils"] }
 rand = { workspace = true }
 tempfile = { workspace = true }
+tn-reth = { workspace = true, features = ["test-utils"] }
 tn-test-utils = { workspace = true }
-tn-node = { workspace = true }
-tn-primary = { workspace = true }
-bytes = { workspace = true }
+
+[features]
+default = []
+test-utils = []

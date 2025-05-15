@@ -5,7 +5,6 @@ use tempfile::TempDir;
 use tn_batch_validator::NoopBatchValidator;
 use tn_network_types::{MockWorkerToWorker, WorkerToWorkerServer};
 use tn_storage::{mem_db::MemDatabase, open_db};
-use tn_test_utils::{batch, CommitteeFixture};
 
 #[tokio::test]
 async fn synchronize() {

@@ -39,7 +39,7 @@ pub struct CertificateManager<DB> {
     /// The configuration for consensus.
     config: ConsensusConfig<DB>,
     /// State for pending certificate.
-    pending: PendingCertificateManager<DB>,
+    pending: PendingCertificateManager,
     /// Collection of parents to advance the round.
     ///
     /// This is shared with the `GarbageCollector`.
@@ -52,8 +52,6 @@ pub struct CertificateManager<DB> {
     gc_round: AtomicRound,
     /// Highest round of certificate accepted into the certificate store.
     highest_processed_round: AtomicRound,
-    /// Highest round of verfied certificate that has been received.
-    highest_received_round: AtomicRound,
 }
 
 impl<DB> CertificateManager<DB>
@@ -66,10 +64,9 @@ where
         consensus_bus: ConsensusBus,
         gc_round: AtomicRound,
         highest_processed_round: AtomicRound,
-        highest_received_round: AtomicRound,
     ) -> Self {
         let parents = CertificatesAggregatorManager::new(consensus_bus.clone());
-        let pending = PendingCertificateManager::new(config.clone(), consensus_bus.clone());
+        let pending = PendingCertificateManager::new(consensus_bus.clone());
         let garbage_collector =
             GarbageCollector::new(config.clone(), consensus_bus.clone(), gc_round.clone());
 
@@ -81,7 +78,6 @@ where
             garbage_collector,
             gc_round,
             highest_processed_round,
-            highest_received_round,
         }
     }
 
@@ -280,6 +276,9 @@ where
     async fn process_gc_round(&mut self) -> CertManagerResult<()> {
         // load latest gc round
         let gc_round = self.gc_round.load();
+
+        // clear certificate aggregators for expired rounds
+        self.parents.garbage_collect(&gc_round);
 
         // iterate one round at a time to preserver causal order
         while let Some((round, digest)) = self.pending.next_for_gc_round(gc_round) {

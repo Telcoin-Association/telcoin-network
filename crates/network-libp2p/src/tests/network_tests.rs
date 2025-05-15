@@ -9,8 +9,9 @@ use assert_matches::assert_matches;
 use eyre::eyre;
 use std::num::NonZeroUsize;
 use tn_config::{ConsensusConfig, NetworkConfig};
+use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::mem_db::MemDatabase;
-use tn_test_utils::{fixture_batch_with_transactions, CommitteeFixture};
+use tn_test_utils::CommitteeFixture;
 use tn_types::{Certificate, Header};
 use tokio::{sync::mpsc, time::timeout};
 

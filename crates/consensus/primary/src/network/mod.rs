@@ -15,10 +15,7 @@ use tn_network_libp2p::{
     types::{IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
     GossipMessage, Multiaddr, PeerExchangeMap, PeerId, Penalty, ResponseChannel,
 };
-use tn_network_types::{
-    FetchCertificatesRequest, WorkerOthersBatchMessage, WorkerOwnBatchMessage,
-    WorkerToPrimaryClient,
-};
+use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::PayloadStore;
 use tn_types::{
     encode, BlockHash, Certificate, CertificateDigest, ConsensusHeader, Database, Header,
@@ -123,12 +120,9 @@ impl PrimaryNetworkHandle {
     pub async fn fetch_certificates(
         &self,
         peer: PeerId,
-        request: FetchCertificatesRequest,
+        request: MissingCertificatesRequest,
     ) -> NetworkResult<Vec<Certificate>> {
-        let FetchCertificatesRequest { exclusive_lower_bound, skip_rounds, max_items } = request;
-        let request = PrimaryRequest::MissingCertificates {
-            inner: MissingCertificatesRequest { exclusive_lower_bound, skip_rounds, max_items },
-        };
+        let request = PrimaryRequest::MissingCertificates { inner: request };
         let res = self.handle.send_request(request, peer).await?;
         let res = res.await??;
         match res {
@@ -221,12 +215,8 @@ where
         state_sync: StateSynchronizer<DB>,
         task_spawner: TaskSpawner,
     ) -> Self {
-        let request_handler = RequestHandler::new(
-            consensus_config,
-            consensus_bus,
-            state_sync.clone(),
-            task_spawner.clone(),
-        );
+        let request_handler =
+            RequestHandler::new(consensus_config, consensus_bus, state_sync.clone());
         Self { network_events, network_handle, request_handler, task_spawner }
     }
 

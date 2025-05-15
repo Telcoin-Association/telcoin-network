@@ -9,6 +9,7 @@
 //! are limited by a time-based LRU also specified in the faucet config.
 //!
 //! WARNING: DO NOT ENABLE THIS FEATURE ON MAINNET.
+#![warn(missing_debug_implementations, missing_docs, unreachable_pub, rustdoc::all)]
 
 use gcloud_sdk::{
     google::cloud::kms::v1::key_management_service_client::KeyManagementServiceClient, GoogleApi,
@@ -43,6 +44,7 @@ pub type Secp256k1PubKeyBytes = [u8; PUBLIC_KEY_SIZE];
 pub type Drip = tn_types::sol! { (address, address) };
 
 /// Configure the faucet with a wait period between transfers and the amount of TEL to transfer.
+#[derive(Debug)]
 pub struct FaucetConfig {
     /// The amount of time recipients must wait between transfers
     /// specified in seconds.
@@ -61,6 +63,7 @@ pub struct FaucetConfig {
 /// The account details used by the faucet to create and sign transactions.
 ///
 /// The FaucetWallet sends a request to Google KMS service for a signature.
+#[derive(Debug)]
 pub struct FaucetWallet {
     /// The faucet's address.
     ///
@@ -99,6 +102,7 @@ impl FaucetWallet {
 ///
 /// This is the frontend for the async caching service which manages cached data
 /// on a different task.
+#[derive(Debug)]
 pub(crate) struct Faucet {
     /// Channel to service task.
     to_service: UnboundedSender<(Address, Option<Address>, oneshot::Sender<EthResult<TxHash>>)>,

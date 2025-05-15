@@ -1,4 +1,5 @@
-//! Worker fixture for the cluster
+//! Test fixture for worker.
+//! Feature-flag only.
 
 use tn_config::KeyConfig;
 use tn_types::{NetworkKeypair, WorkerId, WorkerInfo};
@@ -22,7 +23,7 @@ impl WorkerFixture {
         &self.info
     }
 
-    pub(crate) fn generate<P>(key_config: KeyConfig, id: WorkerId, mut get_port: P) -> Self
+    pub fn generate<P>(key_config: KeyConfig, id: WorkerId, mut get_port: P) -> Self
     where
         P: FnMut(&str) -> u16,
     {

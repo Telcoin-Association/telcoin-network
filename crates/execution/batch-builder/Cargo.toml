@@ -16,23 +16,16 @@ tn-types = { workspace = true }
 tn-reth = { workspace = true }
 futures-util = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
-tracing = { workspace = true }
-
-metrics = { workspace = true }
 thiserror = { workspace = true }
-alloy-rlp = { workspace = true }
-async-trait = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 # unit tests
-tn-test-utils = { workspace = true }
 assert_matches = { workspace = true }
 tempfile = { workspace = true }
-eyre = { workspace = true }
-tn-network-libp2p = { workspace = true }
+tn-reth = { workspace = true, features = ["test-utils"] }
 
 # integration tests
-prometheus = { workspace = true }
 tn-worker = { workspace = true }
 tn-network-types = { workspace = true }
 tn-storage = { workspace = true }

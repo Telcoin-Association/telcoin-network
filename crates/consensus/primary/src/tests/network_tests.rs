@@ -77,9 +77,7 @@ fn create_test_types() -> TestTypes {
         .send(recent)
         .expect("watch channel updates for default parent in primary handler tests");
 
-    let task_manager = TaskManager::default();
-    let handler =
-        RequestHandler::new(config.clone(), cb.clone(), synchronizer, task_manager.get_spawner());
+    let handler = RequestHandler::new(config.clone(), cb.clone(), synchronizer);
     TestTypes { committee, handler, parent }
 }
 

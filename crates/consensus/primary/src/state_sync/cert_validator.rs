@@ -79,7 +79,6 @@ where
             self.consensus_bus.clone(),
             self.gc_round.clone(),
             self.highest_processed_round.clone(),
-            self.highest_received_round.clone(),
         )
     }
 

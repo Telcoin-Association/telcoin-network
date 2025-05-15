@@ -10,9 +10,13 @@ use tn_batch_builder::{test_utils::execute_test_batch, BatchBuilder};
 use tn_batch_validator::BatchValidator;
 use tn_engine::execute_consensus_output;
 use tn_network_types::{local::LocalNetwork, MockWorkerToPrimary};
-use tn_reth::{recover_raw_transaction, traits::BuildArguments, RethChainSpec, RethEnv};
+use tn_reth::{
+    recover_raw_transaction,
+    test_utils::{test_genesis, TransactionFactory},
+    traits::BuildArguments,
+    RethChainSpec, RethEnv,
+};
 use tn_storage::{open_db, tables::Batches};
-use tn_test_utils::{test_genesis, TransactionFactory};
 use tn_types::{
     Address, Batch, BatchValidation, Bytes, Certificate, CommittedSubDag, ConsensusHeader,
     ConsensusOutput, Database, Encodable2718 as _, ReputationScores, SealedBatch, TaskManager,
@@ -78,7 +82,7 @@ async fn test_make_batch_el_to_cl() {
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
     let reth_env =
-        RethEnv::new_for_test_with_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
+        RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
     let txpool = reth_env.worker_txn_pool().clone();
     let address = Address::from(U160::from(333));
 
@@ -218,7 +222,7 @@ async fn test_batch_builder_produces_valid_batchess() {
     let tmp_dir = TempDir::new().unwrap();
     let task_manager = TaskManager::default();
     let reth_env =
-        RethEnv::new_for_test_with_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
+        RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
     let txpool = reth_env.worker_txn_pool().clone();
 
     let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
@@ -366,16 +370,11 @@ async fn test_canonical_notification_updates_pool() {
     //
     // adiri genesis with TxFactory funded
     let genesis = test_genesis();
-    // let first_round_blocks = tn_types::test_utils::batches(4); // create 4 batches
-    // let (genesis, _txs, _signers) =
-    //     seeded_genesis_from_random_batches(genesis, first_round_blocks.iter());
-
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
-
     let tmp_dir = TempDir::new().unwrap();
     let task_manager = TaskManager::default();
     let reth_env =
-        RethEnv::new_for_test_with_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
+        RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
     let txpool = reth_env.worker_txn_pool().clone();
     let address = Address::from(U160::from(333));
 
