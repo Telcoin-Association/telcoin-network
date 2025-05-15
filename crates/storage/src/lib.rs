@@ -185,6 +185,10 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db
 }
 
+// prevent clippy unused deps warning
+// `rocks` feature uses this
+use serde as _;
+
 #[cfg(test)]
 mod test {
     use tn_types::{Database, DbTxMut};
@@ -486,7 +490,3 @@ mod test {
         }
     }
 }
-
-// prevent clippy unused deps warning
-// `rocks` feature uses this
-use serde as _;

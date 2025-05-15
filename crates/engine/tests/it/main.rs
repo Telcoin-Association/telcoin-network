@@ -4,8 +4,8 @@ use std::{collections::VecDeque, str::FromStr as _, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tn_batch_builder::test_utils::execute_test_batch;
 use tn_engine::ExecutorEngine;
-use tn_reth::{FixedBytes, RethChainSpec};
-use tn_test_utils::{default_test_execution_node, seeded_genesis_from_random_batches};
+use tn_reth::{test_utils::seeded_genesis_from_random_batches, FixedBytes, RethChainSpec};
+use tn_test_utils::default_test_execution_node;
 use tn_types::{
     adiri_chain_spec_arc, adiri_genesis, max_batch_gas, now, Address, BlockHash, BlockHashOrNumber,
     Bloom, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, Hash as _, Notifier,

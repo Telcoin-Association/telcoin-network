@@ -162,7 +162,7 @@ pub fn parse_u256_from_decimal_value(value: &str) -> eyre::Result<U256> {
 }
 
 /// Parse public key from pem or hex slice.
-pub fn parse_pubkey(value: &str) -> eyre::Result<PublicKey> {
+fn parse_pubkey(value: &str) -> eyre::Result<PublicKey> {
     // google kms uses pem key formatting
     let public_key = if value.contains("-----BEGIN PUBLIC KEY-----") {
         // k256 public key to convert from pem

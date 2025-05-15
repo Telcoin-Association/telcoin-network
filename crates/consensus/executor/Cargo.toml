@@ -27,11 +27,8 @@ tn-primary = { workspace = true }
 
 [dev-dependencies]
 indexmap.workspace = true
-tempfile.workspace = true
 eyre = { workspace = true }
-tn-node = { workspace = true }
 tn-test-utils = { workspace = true }
-bytes = { workspace = true }
 tn-primary = { workspace = true, features = ["test-utils"] }
 tn-network-libp2p = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }

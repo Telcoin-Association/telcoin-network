@@ -23,18 +23,16 @@ tn-network-types = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
 prometheus = { workspace = true }
-consensus-metrics = { workspace = true }
 
 eyre = { workspace = true }
 tn-network-libp2p = { workspace = true }
 serde = { workspace = true }
+consensus-metrics = { workspace = true }
 
 [dev-dependencies]
 tn-batch-validator = { workspace = true, features = ["test-utils"] }
 rand = { workspace = true }
 tempfile = { workspace = true }
-tn-node = { workspace = true }
-bytes = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 tn-test-utils = { workspace = true }
 

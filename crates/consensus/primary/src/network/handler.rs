@@ -466,9 +466,7 @@ where
     fn get_header_by_number(&self, number: u64) -> PrimaryNetworkResult<ConsensusHeader> {
         match self.consensus_config.node_storage().get::<ConsensusBlocks>(&number)? {
             Some(header) => Ok(header),
-            None => {
-                Err(PrimaryNetworkError::InvalidRequest("consensus header unknown".to_string()))
-            }
+            None => Err(PrimaryNetworkError::UnknowConsensusHeaderNumber(number)),
         }
     }
 

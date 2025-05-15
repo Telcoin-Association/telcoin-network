@@ -25,15 +25,8 @@ fn create_test_types() -> TestTypes<MemDatabase> {
     let config = primary.consensus_config();
     let gc_round = AtomicRound::new(0);
     let highest_processed_round = AtomicRound::new(0);
-    let highest_received_round = AtomicRound::new(0);
 
-    let manager = CertificateManager::new(
-        config,
-        cb,
-        gc_round,
-        highest_processed_round,
-        highest_received_round,
-    );
+    let manager = CertificateManager::new(config, cb, gc_round, highest_processed_round);
 
     TestTypes { manager, fixture }
 }

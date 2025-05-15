@@ -10904,6 +10904,7 @@ dependencies = [
  "ethereum-tx-sign",
  "eyre",
  "fdlimit",
+ "futures",
  "gcloud-sdk",
  "jsonrpc",
  "jsonrpsee",
@@ -11116,7 +11117,6 @@ name = "tn-batch-builder"
 version = "0.1.0"
 dependencies = [
  "assert_matches",
- "eyre",
  "futures-util",
  "tempfile",
  "thiserror 1.0.69",
@@ -11193,19 +11193,16 @@ name = "tn-executor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bytes",
  "consensus-metrics",
  "eyre",
  "futures",
  "indexmap 2.9.0",
  "mockall",
  "state-sync",
- "tempfile",
  "thiserror 1.0.69",
  "tn-config",
  "tn-network-libp2p",
  "tn-network-types",
- "tn-node",
  "tn-primary",
  "tn-reth",
  "tn-storage",
@@ -11230,13 +11227,11 @@ dependencies = [
  "jsonrpsee",
  "k256",
  "lru_time_cache",
- "prometheus",
  "reth",
  "reth-primitives",
  "reth-tasks",
  "reth-transaction-pool",
  "secp256k1 0.29.1",
- "serde_json",
  "tempfile",
  "tn-config",
  "tn-network-types",
@@ -11266,7 +11261,6 @@ dependencies = [
  "snap",
  "thiserror 1.0.69",
  "tn-config",
- "tn-primary",
  "tn-reth",
  "tn-storage",
  "tn-test-utils",
@@ -11283,7 +11277,6 @@ dependencies = [
  "eyre",
  "libp2p",
  "parking_lot",
- "roaring",
  "rustversion",
  "serde",
  "tn-types",
@@ -11317,7 +11310,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
- "url",
 ]
 
 [[package]]
@@ -11340,7 +11332,6 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 1.0.69",
- "tn-batch-validator",
  "tn-config",
  "tn-network-libp2p",
  "tn-network-types",
@@ -11524,7 +11515,6 @@ name = "tn-worker"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bytes",
  "consensus-metrics",
  "eyre",
  "futures",
@@ -11538,7 +11528,6 @@ dependencies = [
  "tn-config",
  "tn-network-libp2p",
  "tn-network-types",
- "tn-node",
  "tn-reth",
  "tn-storage",
  "tn-test-utils",

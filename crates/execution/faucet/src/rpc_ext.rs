@@ -16,7 +16,9 @@ pub trait FaucetRpcExtApi {
 }
 
 /// The type that implements Faucet namespace trait.
+#[derive(Debug)]
 pub struct FaucetRpcExt {
+    /// Type to interact with the faucet service task.
     faucet: Faucet,
 }
 

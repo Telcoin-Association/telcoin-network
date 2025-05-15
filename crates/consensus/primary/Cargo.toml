@@ -49,7 +49,6 @@ itertools = { workspace = true }
 proptest = { workspace = true }
 tracing = { workspace = true }
 tn-storage = { workspace = true }
-tn-batch-validator = { workspace = true, features = ["test-utils"] }
 assert_matches = { workspace = true }
 tn-types = { workspace = true, features = ["test-utils"] }
 tn-primary = { workspace = true, features = ["test-utils"] }

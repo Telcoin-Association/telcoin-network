@@ -352,7 +352,6 @@ impl<DB: Database> Certifier<DB> {
         authority_id: AuthorityIdentifier,
         mut rx_own_certificate_broadcast: broadcast::Receiver<Certificate>,
     ) {
-        const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
         // Older broadcasts return early, so the last broadcast must be the latest certificate.
         // This will contain at most certificates created within the last PUSH_TIMEOUT.
         let mut requests = FuturesOrdered::new();

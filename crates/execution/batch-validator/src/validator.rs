@@ -284,7 +284,7 @@ mod tests {
         // genesis with default TransactionFactory funded
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let validator = BatchValidator::new(
-            RethEnv::new_for_test_with_chain(chain.clone(), path, task_manager).unwrap(),
+            RethEnv::new_for_temp_chain(chain.clone(), path, task_manager).unwrap(),
         );
         let valid_batch = next_valid_sealed_batch();
 

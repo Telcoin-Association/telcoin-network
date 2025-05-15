@@ -1,22 +1,124 @@
 //! Transaction factory to create legit transactions for execution.
 
-use crate::{RethEnv, WorkerTxPool};
+use crate::{error::TnRethResult, recover_raw_transaction, RethEnv, WorkerTxPool};
 use alloy::signers::local::PrivateKeySigner;
 use enr::k256::FieldBytes;
 use reth_chainspec::ChainSpec as RethChainSpec;
+use reth_evm::execute::{BlockExecutorProvider as _, Executor as _};
 use reth_primitives::sign_message;
+use reth_provider::{BlockExecutionOutput, ExecutionOutcome};
+use reth_revm::{database::StateProviderDatabase, db::BundleState};
 use secp256k1::{
     rand::{self, rngs::StdRng, Rng, SeedableRng as _},
     Secp256k1,
 };
-use std::sync::Arc;
+use std::{path::Path, str::FromStr, sync::Arc};
 use tn_types::{
-    adiri_chain_spec_arc, adiri_genesis, public_key_to_address, AccessList, Address, Batch, Bytes,
-    Encodable2718, EthSignature, ExecHeader, ExecutionKeypair, Genesis, GenesisAccount,
-    SignedTransactionIntoRecoveredExt as _, Transaction, TransactionSigned, TxEip1559, TxHash,
-    TxKind, B256, MIN_PROTOCOL_BASE_FEE, U256,
+    adiri_chain_spec_arc, adiri_genesis, calculate_transaction_root, now, public_key_to_address,
+    AccessList, Address, Batch, Block, BlockBody, BlockExt as _, BlockWithSenders, Bytes,
+    Encodable2718, EthSignature, ExecHeader, ExecutionKeypair, Genesis, GenesisAccount, Receipt,
+    SealedHeader, SignedTransactionIntoRecoveredExt as _, TaskManager, Transaction,
+    TransactionSigned, TxEip1559, TxHash, TxKind, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS,
+    EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tracing::debug;
+
+// methods for tests
+impl RethEnv {
+    /// Create a new RethEnv for testing only.
+    pub fn new_for_test<P: AsRef<Path>>(
+        db_path: P,
+        task_manager: &TaskManager,
+    ) -> eyre::Result<Self> {
+        Self::new_for_temp_chain(adiri_chain_spec_arc(), db_path, task_manager)
+    }
+
+    /// Execute a block for testing.
+    pub fn execute_for_test(
+        &self,
+        block: &BlockWithSenders,
+    ) -> TnRethResult<(BundleState, Vec<Receipt>)> {
+        // create execution db
+        let mut db = StateProviderDatabase::new(
+            self.latest().expect("provider retrieves latest during test batch execution"),
+        );
+        // execute the block
+        let BlockExecutionOutput { state, receipts, .. } =
+            self.evm_executor.executor(&mut db).execute(block)?;
+        Ok((state, receipts))
+    }
+
+    /// Test utility to execute batch and return execution outcome.
+    ///
+    /// This is useful for simulating execution results for account state changes.
+    /// Currently only used by faucet tests to obtain faucet contract account info
+    /// by simulating deploying proxy contract. The results are then put into genesis.
+    pub fn execution_outcome_for_tests(
+        &self,
+        txs: Vec<Vec<u8>>,
+        parent: &SealedHeader,
+    ) -> ExecutionOutcome {
+        // create "empty" header with default values
+        let mut header = ExecHeader {
+            parent_hash: parent.hash(),
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            beneficiary: Address::ZERO,
+            state_root: Default::default(),
+            transactions_root: Default::default(),
+            receipts_root: Default::default(),
+            withdrawals_root: Some(EMPTY_WITHDRAWALS),
+            logs_bloom: Default::default(),
+            difficulty: U256::ZERO,
+            number: parent.number + 1,
+            gas_limit: ETHEREUM_BLOCK_GAS_LIMIT,
+            gas_used: 0,
+            timestamp: now(),
+            mix_hash: B256::random(),
+            nonce: 0_u64.into(),
+            base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
+            blob_gas_used: None,
+            excess_blob_gas: None,
+            extra_data: Default::default(),
+            parent_beacon_block_root: None,
+            requests_hash: None,
+        };
+
+        // decode transactions
+        let mut decoded_txs = vec![];
+        for tx_bytes in &txs {
+            let tx = recover_raw_transaction(tx_bytes)
+                .expect("raw transaction recovered for test")
+                .into_tx();
+            decoded_txs.push(tx);
+        }
+
+        // update header's transactions root
+        header.transactions_root = if txs.is_empty() {
+            EMPTY_TRANSACTIONS
+        } else {
+            calculate_transaction_root(&decoded_txs)
+        };
+
+        // recover senders from block
+        let block = Block {
+            header,
+            body: BlockBody {
+                transactions: decoded_txs,
+                ommers: vec![],
+                withdrawals: Some(Default::default()),
+            },
+        }
+        .with_recovered_senders()
+        .expect("unable to recover senders while executing test batch");
+
+        // convenience
+        let block_number = block.number;
+
+        let (state, receipts) =
+            self.execute_for_test(&block).expect("executor can execute test batch transactions");
+        ExecutionOutcome::new(state, receipts.into(), block_number, vec![])
+    }
+}
 
 /// Transaction factory
 #[derive(Clone, Copy, Debug)]
@@ -299,4 +401,53 @@ pub fn test_genesis() -> Genesis {
     let default_factory_account =
         vec![(default_address, GenesisAccount::default().with_balance(U256::MAX))];
     genesis.extend_accounts(default_factory_account)
+}
+
+/// Helper function to seed an instance of Genesis with accounts from a random batch.
+pub fn seeded_genesis_from_random_batch(
+    genesis: Genesis,
+    batch: &Batch,
+) -> (Genesis, Vec<TransactionSigned>, Vec<Address>) {
+    let max_capacity = batch.transactions.len();
+    let mut decoded_txs = Vec::with_capacity(max_capacity);
+    let mut senders = Vec::with_capacity(max_capacity);
+    let mut accounts_to_seed = Vec::with_capacity(max_capacity);
+
+    // loop through the transactions
+    for tx_bytes in &batch.transactions {
+        let (tx, address) =
+            recover_raw_transaction(tx_bytes).expect("raw transaction recovered").into_parts();
+        decoded_txs.push(tx);
+        senders.push(address);
+        // fund account with 99mil TEL
+        let account = (
+            address,
+            GenesisAccount::default().with_balance(
+                U256::from_str("0x51E410C0F93FE543000000").expect("account balance is parsed"),
+            ),
+        );
+        accounts_to_seed.push(account);
+    }
+    (genesis.extend_accounts(accounts_to_seed), decoded_txs, senders)
+}
+
+/// Helper function to seed an instance of Genesis with random batches.
+///
+/// The transactions in the randomly generated batches are decoded and their signers are recovered.
+///
+/// The function returns the new Genesis, the signed transactions by batch, and the addresses for
+/// further use it testing.
+pub fn seeded_genesis_from_random_batches<'a>(
+    mut genesis: Genesis,
+    batches: impl IntoIterator<Item = &'a Batch>,
+) -> (Genesis, Vec<Vec<TransactionSigned>>, Vec<Vec<Address>>) {
+    let mut txs = vec![];
+    let mut senders = vec![];
+    for batch in batches {
+        let (g, t, s) = seeded_genesis_from_random_batch(genesis, batch);
+        genesis = g;
+        txs.push(t);
+        senders.push(s);
+    }
+    (genesis, txs, senders)
 }

@@ -59,7 +59,6 @@ fn create_core_test_types<DB: Database>(
         cb.clone(),
         gc_round.clone(),
         highest_processed_round.clone(),
-        highest_received_round.clone(),
     );
 
     // validator

@@ -26,7 +26,7 @@ use tn_faucet::Drip;
 use tn_network_types::local::LocalNetwork;
 use tn_reth::{test_utils::TransactionFactory, RethChainSpec, RethEnv};
 use tn_storage::open_db;
-use tn_test_utils::{faucet_test_execution_node, get_contract_state_for_genesis};
+use tn_test_utils::faucet_test_execution_node;
 
 use tn_types::{
     adiri_genesis, error::BlockSealError, hex, public_key_to_address, sol, Address, GenesisAccount,
@@ -213,9 +213,13 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
     let raw_txs = vec![faucet_tx_raw, role_tx_raw];
 
     let tmp_dir = TempDir::new().expect("temp dir");
+
+    let task_manager = TaskManager::new("Temp Task Manager");
+    let tmp_reth_env =
+        RethEnv::new_for_temp_chain(pre_genesis_chain.clone(), tmp_dir.path(), &task_manager)?;
     // fetch state to be set on the faucet proxy address
-    let execution_outcome =
-        get_contract_state_for_genesis(pre_genesis_chain, raw_txs, tmp_dir.path()).await?;
+    let execution_outcome = tmp_reth_env
+        .execution_outcome_for_tests(raw_txs, &pre_genesis_chain.sealed_genesis_header());
     let execution_bundle = execution_outcome.bundle;
     let execution_storage = &execution_bundle
         .state
@@ -551,9 +555,12 @@ async fn test_with_creds_faucet_transfers_stablecoin_with_google_kms() -> eyre::
     let raw_txs = vec![faucet_tx_raw, role_tx_raw, minter_tx_raw];
 
     let tmp_dir = TempDir::new().expect("temp dir");
+    let task_manager = TaskManager::new("Temp Task Manager");
+    let tmp_reth_env =
+        RethEnv::new_for_temp_chain(pre_genesis_chain.clone(), tmp_dir.path(), &task_manager)?;
     // fetch state to be set on the faucet proxy address
-    let execution_outcome =
-        get_contract_state_for_genesis(pre_genesis_chain, raw_txs, tmp_dir.path()).await?;
+    let execution_outcome = tmp_reth_env
+        .execution_outcome_for_tests(raw_txs, &pre_genesis_chain.sealed_genesis_header());
     let execution_bundle = execution_outcome.bundle;
     let execution_storage = &execution_bundle
         .state

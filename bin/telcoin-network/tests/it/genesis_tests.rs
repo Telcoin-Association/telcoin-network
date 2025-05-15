@@ -281,8 +281,7 @@ fn genesis_with_registry(registry_deployed_bytecode: Vec<u8>) -> eyre::Result<Ge
     let tmp_dir = TempDir::new().unwrap();
 
     let tmp_chain: Arc<RethChainSpec> = Arc::new(adiri_genesis().into());
-    let reth_env =
-        RethEnv::new_for_test_with_chain(tmp_chain.clone(), tmp_dir.path(), &task_manager)?;
+    let reth_env = RethEnv::new_for_temp_chain(tmp_chain.clone(), tmp_dir.path(), &task_manager)?;
     let bundle = reth_env
         .execute_call_tx_for_test_bypass_evm_checks(&tmp_chain.sealed_genesis_header(), txs)?;
     let tmp_storage = bundle.state.get(&tmp_address).map(|account| {

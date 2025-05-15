@@ -47,6 +47,7 @@ impl std::fmt::Debug for Inner {
 }
 
 impl LocalNetwork {
+    /// Create a new instance of [Self].
     pub fn new(primary_peer_id: PeerId) -> Self {
         Self {
             inner: Arc::new(RwLock::new(Inner {
@@ -57,6 +58,7 @@ impl LocalNetwork {
         }
     }
 
+    /// Create a new instance of [Self] using a primary network keypair.
     pub fn new_from_keypair(primary_network_keypair: &NetworkKeypair) -> Self {
         Self::new(primary_network_keypair.public().to_peer_id())
     }
@@ -66,25 +68,30 @@ impl LocalNetwork {
         Self::new(network_public_key_to_libp2p(primary_network_public_key))
     }
 
+    /// Create a new instance of [Self] with a randomly generated ed25519 key.
     pub fn new_with_empty_id() -> Self {
         Self::new(network_public_key_to_libp2p(&NetworkKeypair::generate_ed25519().public().into()))
     }
 
+    /// Set the handler for worker to primary messages.
     pub fn set_worker_to_primary_local_handler(&self, handler: Arc<dyn WorkerToPrimaryClient>) {
         let mut inner = self.inner.write();
         inner.worker_to_primary_handler = Some(handler);
     }
 
+    /// Set the handler for primary to worker messages.
     pub fn set_primary_to_worker_local_handler(&self, handler: Arc<dyn PrimaryToWorkerClient>) {
         let mut inner = self.inner.write();
         inner.primary_to_worker_handler = Some(handler);
     }
 
+    /// Get the handler for worker to primary messages.
     async fn get_primary_to_worker_handler(&self) -> Option<Arc<dyn PrimaryToWorkerClient>> {
         let inner = self.inner.read();
         inner.primary_to_worker_handler.clone()
     }
 
+    /// Get the handler for primary to worker messages.
     async fn get_worker_to_primary_handler(&self) -> Option<Arc<dyn WorkerToPrimaryClient>> {
         let inner = self.inner.read();
         inner.worker_to_primary_handler.clone()

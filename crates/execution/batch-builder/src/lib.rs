@@ -376,7 +376,7 @@ mod tests {
         let task_manager = TaskManager::new("Test Task Manager");
         let tmp_dir = TempDir::new().unwrap();
         let reth_env =
-            RethEnv::new_for_test_with_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
         let txpool = reth_env.worker_txn_pool().clone();
         let address = Address::from(U160::from(33));
         let client = LocalNetwork::new_with_empty_id();
@@ -528,8 +528,7 @@ mod tests {
 
         // task manger
         let task_manager = TaskManager::new("Test Task Manager");
-        let reth_env =
-            RethEnv::new_for_test_with_chain(chain.clone(), path, &task_manager).unwrap();
+        let reth_env = RethEnv::new_for_temp_chain(chain.clone(), path, &task_manager).unwrap();
         let txpool = reth_env.worker_txn_pool().clone();
 
         let execution_components =

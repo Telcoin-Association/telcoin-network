@@ -39,7 +39,6 @@ tn-reth = { workspace = true, features = ["test-utils"] }
 eyre = { workspace = true }
 assert_matches = { workspace = true }
 tn-storage = { workspace = true }
-tn-primary = { workspace = true, features = ["test-utils"] }
 tn-test-utils = { workspace = true }
 
 [lints]

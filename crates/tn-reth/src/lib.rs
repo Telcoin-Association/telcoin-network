@@ -56,16 +56,12 @@ use reth_db::{init_db, DatabaseEnv};
 use reth_db_common::init::init_genesis;
 use reth_discv4::NatResolver;
 use reth_eth_wire::BlockHashNumber;
-use reth_evm::{
-    env::EvmEnv,
-    execute::{BlockExecutorProvider, Executor as _},
-    ConfigureEvm, ConfigureEvmEnv as _,
-};
+use reth_evm::{env::EvmEnv, ConfigureEvm, ConfigureEvmEnv as _};
 use reth_node_ethereum::{BasicBlockExecutorProvider, EthExecutionStrategyFactory};
 use reth_primitives::{Log, TxType};
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
-    BlockExecutionOutput, BlockIdReader as _, BlockNumReader, BlockReader, CanonChainTracker,
+    BlockIdReader as _, BlockNumReader, BlockReader, CanonChainTracker,
     CanonStateSubscriptions as _, ChainStateBlockReader, DatabaseProviderFactory,
     HeaderProvider as _, ProviderFactory, StateProviderBox, StateProviderFactory,
     TransactionVariant,
@@ -429,34 +425,6 @@ impl RethEnv {
         let tx_pool =
             WorkerTxPool::new(&node_config, task_manager, &provider_factory, &blockchain_provider)?;
         Ok(Self { node_config, blockchain_provider, evm_config, evm_executor, tx_pool })
-    }
-
-    /// Create a new RethEnv for testing only.
-    pub fn new_for_test_with_chain<P: AsRef<Path>>(
-        chain: Arc<RethChainSpec>,
-        db_path: P,
-        task_manager: &TaskManager,
-    ) -> eyre::Result<Self> {
-        let node_config = NodeConfig {
-            datadir: DatadirArgs {
-                datadir: MaybePlatformPath::from(db_path.as_ref().to_path_buf()),
-                // default static path should resolve to: `DEFAULT_ROOT_DIR/<CHAIN_ID>/static_files`
-                static_files_path: None,
-            },
-            chain,
-            ..NodeConfig::default()
-        };
-        let reth_config = RethConfig(node_config);
-        let database = Self::new_database(&reth_config, db_path)?;
-        Self::new(&reth_config, task_manager, database)
-    }
-
-    /// Create a new RethEnv for testing only.
-    pub fn new_for_test<P: AsRef<Path>>(
-        db_path: P,
-        task_manager: &TaskManager,
-    ) -> eyre::Result<Self> {
-        Self::new_for_test_with_chain(adiri_chain_spec_arc(), db_path, task_manager)
     }
 
     /// Initialize the provider factory and related components
@@ -1244,21 +1212,6 @@ impl RethEnv {
         Ok(self.blockchain_provider.latest()?)
     }
 
-    /// Execute a block for testing.
-    pub fn execute_for_test(
-        &self,
-        block: &BlockWithSenders,
-    ) -> TnRethResult<(BundleState, Vec<Receipt>)> {
-        // create execution db
-        let mut db = StateProviderDatabase::new(
-            self.latest().expect("provider retrieves latest during test batch execution"),
-        );
-        // execute the block
-        let BlockExecutionOutput { state, receipts, .. } =
-            self.evm_executor.executor(&mut db).execute(block)?;
-        Ok((state, receipts))
-    }
-
     /// Create an EVM tx enviornment that bypasses certain checks.
     ///
     /// This method is useful for executing transactions pre-genesis.
@@ -1345,6 +1298,26 @@ impl RethEnv {
         EnvWithHandlerCfg::new_with_cfg_env(cfg.clone(), block_env.clone(), TxEnv::default())
     }
 
+    /// Create a new temp RethEnv using a specified chain spec.
+    pub fn new_for_temp_chain<P: AsRef<Path>>(
+        chain: Arc<RethChainSpec>,
+        db_path: P,
+        task_manager: &TaskManager,
+    ) -> eyre::Result<Self> {
+        let node_config = NodeConfig {
+            datadir: DatadirArgs {
+                datadir: MaybePlatformPath::from(db_path.as_ref().to_path_buf()),
+                // default static path should resolve to: `DEFAULT_ROOT_DIR/<CHAIN_ID>/static_files`
+                static_files_path: None,
+            },
+            chain,
+            ..NodeConfig::default()
+        };
+        let reth_config = RethConfig(node_config);
+        let database = Self::new_database(&reth_config, db_path)?;
+        Self::new(&reth_config, task_manager, database)
+    }
+
     /// Convenience method for compiling storage and bytecode to include genesis.
     pub fn create_consensus_registry_genesis_account(
         validators: Vec<ValidatorInfo>,
@@ -1373,10 +1346,10 @@ impl RethEnv {
 
         let tmp_chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
         // create temporary reth env for execution
-        let task_manager = TaskManager::new("Test Task Manager");
+        let task_manager = TaskManager::new("Temp Task Manager");
         let tmp_dir = TempDir::new().unwrap();
         let reth_env =
-            RethEnv::new_for_test_with_chain(tmp_chain.clone(), tmp_dir.path(), &task_manager)?;
+            RethEnv::new_for_temp_chain(tmp_chain.clone(), tmp_dir.path(), &task_manager)?;
 
         let constructor_args = ConsensusRegistry::constructorCall {
             genesisConfig_: initial_stake_config,
@@ -1811,7 +1784,7 @@ mod tests {
         let task_manager = TaskManager::new("Test Task Manager");
         let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
         let reth_env =
-            RethEnv::new_for_test_with_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
 
         // create execution db
         let state = StateProviderDatabase::new(

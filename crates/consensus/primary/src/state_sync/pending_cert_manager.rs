@@ -28,18 +28,6 @@ impl PendingCertificate {
     fn new(certificate: Certificate, missing_parents: HashSet<CertificateDigest>) -> Self {
         Self { certificate, missing_parent_digests: missing_parents }
     }
-
-    /// Helper method if pending certificate should be validated again after all missing parents
-    /// obtained.
-    fn is_ready(&self) -> bool {
-        self.missing_parent_digests.is_empty()
-    }
-
-    /// Remove a missing parent, either due to gc round or because missing parent was successfully
-    /// retrieved.
-    fn remove_parent(&mut self, parent_digest: &CertificateDigest) {
-        self.missing_parent_digests.remove(parent_digest);
-    }
 }
 
 /// Manages certificate dependencies and tracks their readiness status.

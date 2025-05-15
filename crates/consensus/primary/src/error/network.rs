@@ -74,9 +74,7 @@ impl From<PrimaryNetworkError> for Option<Penalty> {
                     Some(Penalty::Severe)
                 }
                 // fatal
-                CertManagerError::MissingParent(_) | CertManagerError::UnverifiedSignature(_) => {
-                    Some(Penalty::Fatal)
-                }
+                CertManagerError::UnverifiedSignature(_) => Some(Penalty::Fatal),
                 // ignore
                 CertManagerError::PendingCertificateNotFound(_)
                 | CertManagerError::PendingParentsMismatch(_)
