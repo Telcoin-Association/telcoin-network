@@ -154,4 +154,10 @@ impl ExecutionNode {
         let guard = self.internal.read().await;
         guard.epoch_state_from_canonical_tip()
     }
+
+    /// Close the worker components for the epoch.
+    pub async fn close_epoch_components(&self) {
+        let mut guard = self.internal.write().await;
+        guard.close_epoch_components().await;
+    }
 }

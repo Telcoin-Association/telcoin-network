@@ -44,6 +44,11 @@ impl WorkerComponents {
     pub fn pool(&self) -> WorkerTxPool {
         self.pool.clone()
     }
+
+    /// Shutdown the components.
+    pub fn shutdown(self) {
+        let _ = self.rpc_handle.stop();
+    }
 }
 
 /// A type that implements all network trait that does nothing.

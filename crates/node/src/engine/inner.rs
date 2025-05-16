@@ -4,7 +4,7 @@
 
 use crate::error::ExecutionError;
 use jsonrpsee::http_client::HttpClient;
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 use tn_batch_builder::BatchBuilder;
 use tn_batch_validator::BatchValidator;
 use tn_config::Config;
@@ -36,10 +36,10 @@ pub(super) struct ExecutionNodeInner {
     pub(super) tn_config: Config,
     /// Reth execution environment.
     pub(super) reth_env: RethEnv,
-    /// TODO: temporary solution until upstream reth supports public rpc hooks
+    /// Optional args to turn on faucet (for testnet only).
     pub(super) opt_faucet_args: Option<FaucetArgs>,
     /// Collection of execution components by worker.
-    pub(super) workers: HashMap<WorkerId, WorkerComponents>,
+    pub(super) workers: BTreeMap<WorkerId, WorkerComponents>,
 }
 
 impl ExecutionNodeInner {
@@ -84,13 +84,9 @@ impl ExecutionNodeInner {
         task_manager: &TaskManager,
         rx_shutdown: Noticer,
     ) -> eyre::Result<()> {
-        // inspired by reth's default eth tx pool:
-        // - `EthereumPoolBuilder::default()`
-        // - `components_builder.build_components()`
-        // - `pool_builder.build_pool(&ctx)`
         let transaction_pool = self.reth_env.worker_txn_pool().clone();
 
-        // TODO: WorkerNetwork is basically noop and missing some functionality
+        // TODO: update WorkerNetwork - issue #189
         let network = WorkerNetwork::new(self.reth_env.chainspec());
         let mut tx_pool_latest = transaction_pool.block_info();
         tx_pool_latest.pending_basefee = MIN_PROTOCOL_BASE_FEE;
@@ -298,5 +294,14 @@ impl ExecutionNodeInner {
     /// Read [EpochState] from the canonical tip.
     pub fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
         self.reth_env.epoch_state_from_canonical_tip()
+    }
+
+    /// Close the worker components for the epoch.
+    pub async fn close_epoch_components(&mut self) {
+        // try stop rpcs
+        for worker in self.workers.values_mut().into_iter() {
+            worker.shutdown();
+        }
+        self.workers.clear();
     }
 }

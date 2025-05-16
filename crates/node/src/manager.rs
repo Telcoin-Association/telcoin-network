@@ -335,6 +335,9 @@ where
 
                 info!(target: "epoch-manager", ?epoch_result, "aborting epoch tasks for next epoch");
 
+                // close epoch engine components
+                engine.close_epoch_components().await;
+
                 // abort all epoch-related tasks
                 epoch_task_manager.abort_all_tasks();
 

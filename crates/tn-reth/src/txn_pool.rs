@@ -83,10 +83,6 @@ impl WorkerTxPool {
         blockchain_provider: &BlockchainProvider<TelcoinNode>,
     ) -> eyre::Result<Self> {
         let head = node_config.lookup_head(provider_factory)?;
-        // inspired by reth's default eth tx pool:
-        // - `EthereumPoolBuilder::default()`
-        // - `components_builder.build_components()`
-        // - `pool_builder.build_pool(&ctx)`
         let data_dir = node_config.datadir();
         let pool_config = node_config.txpool.pool_config();
         let blob_store = DiskFileBlobStore::open(data_dir.blobstore(), Default::default())?;
@@ -107,7 +103,7 @@ impl WorkerTxPool {
         info!(target: "tn::execution", "Transaction pool initialized");
 
         /* TODO: replace this functionality to save and load the txn pool on start/stop
-           The reth function backup_local_tranractions_task's shutdown param can not be easily created.
+           The reth function backup_local_transactions_task's shutdown param can not be easily created.
            The internal functions are not easy to just copy.
            Basically this interface does not work when using your own TaskManager.  Best solution may be to
            open a PR with Reth to fix this.
