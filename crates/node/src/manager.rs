@@ -34,12 +34,13 @@ use tn_reth::{
 };
 use tn_storage::{open_db, tables::ConsensusBlocks, DatabaseType};
 use tn_types::{
-    BatchValidation, BlsPublicKey, Committee, CommitteeBuilder, ConsensusHeader,
+    BatchValidation, BlsPublicKey, Committee, CommitteeBuilder, ConsensusHeader, ConsensusOutput,
     Database as TNDatabase, Epoch, Multiaddr, Noticer, Notifier, SealedBlock, TaskManager,
     TaskSpawner, TimestampSec, WorkerCache, WorkerIndex, WorkerInfo,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::{
+    broadcast,
     mpsc::{self},
     oneshot,
 };
@@ -83,6 +84,8 @@ pub struct EpochManager<P> {
     /// and returns the ack that the first epoch has started. At this point,
     /// the node manager has other tasks to await and will run normally.
     node_ready: Option<oneshot::Sender<()>>,
+    /// Output channel for consensus blocks to be executed.
+    consensus_output: broadcast::Sender<ConsensusOutput>,
 }
 
 impl<P> EpochManager<P>
@@ -110,6 +113,7 @@ where
 
         // shutdown long-running node components
         let node_shutdown = Notifier::new();
+        let (consensus_output, _rx_consensus_output) = broadcast::channel(100);
 
         Ok(Self {
             builder,
@@ -119,6 +123,7 @@ where
             key_config,
             node_shutdown,
             node_ready: None,
+            consensus_output,
         })
     }
 
@@ -151,14 +156,54 @@ where
 
         // track the status for when the node is ready
         self.node_ready = Some(start);
-        // ensure task is tracked
-        node_task_manager.update_tasks();
 
         info!(target: "epoch-manager", "starting node and launching first epoch");
 
         // read the network config or use the default
         let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
         self.spawn_node_networks(node_task_spawner, &network_config, &consensus_db).await?;
+
+        // create submanager for engine tasks
+        let engine_task_manager = TaskManager::new(ENGINE_TASK_MANAGER);
+
+        // create the engine
+        let engine = self.create_engine(&engine_task_manager, reth_db)?;
+        engine
+            .start_engine(
+                self.consensus_output.subscribe(),
+                &engine_task_manager,
+                self.node_shutdown.subscribe(),
+            )
+            .await?;
+
+        node_task_manager.add_task_manager(engine_task_manager);
+        node_task_manager.update_tasks();
+
+        info!(target: "epoch-manager", tasks=?node_task_manager, "NODE TASKS\n");
+
+        //
+        //
+        // - spawn execution engine and batch builder on separate task managers
+        //   - NodeTaskManager
+        //      - EpochTaskManager
+        //          - Batch Builder
+        //          - Primary Network
+        //          - Worker Network
+        //      - P2P Networks
+        //      - Execution Engine
+        //
+        // - need to update CL => EL channel
+        //      - consensus_bus::subscribe_consensus_output()
+        //
+        // - epoch manager -> EL steady
+        //      - epoch boundary, replace the output
+        //
+        // COMMITS;
+        // - spawn engine on startup
+        // - consensus_bus::new_with_engine_channel()
+        // - spawn epoch task to subscribe to consensus output
+        //      - update node-task to receive consensus output
+        //      -
 
         // await all tasks on epoch-task-manager or node shutdown
         tokio::select! {
@@ -168,7 +213,7 @@ where
             }
 
             // loop through short-term epochs
-            epoch_result = self.run_epochs(reth_db, consensus_db, network_config) => epoch_result
+            epoch_result = self.run_epochs(&engine, consensus_db, network_config) => epoch_result
         }
     }
 
@@ -263,7 +308,7 @@ where
     /// Execute a loop to start new epochs until shutdown.
     async fn run_epochs(
         &mut self,
-        reth_db: RethDb,
+        engine: &ExecutionNode,
         consensus_db: DatabaseType,
         network_config: NetworkConfig,
     ) -> eyre::Result<()> {
@@ -280,7 +325,7 @@ where
             running = {
                 let epoch_result = self
                     .run_epoch(
-                        reth_db.clone(),
+                        engine,
                         consensus_db.clone(),
                         &mut epoch_task_manager,
                         &network_config,
@@ -310,7 +355,7 @@ where
     /// is required.
     async fn run_epoch(
         &mut self,
-        reth_db: RethDb,
+        engine: &ExecutionNode,
         consensus_db: DatabaseType,
         epoch_task_manager: &mut TaskManager,
         network_config: &NetworkConfig,
@@ -328,16 +373,10 @@ where
             );
         }
 
-        // create submanager for engine tasks
-        let mut engine_task_manager = TaskManager::new(ENGINE_TASK_MANAGER);
-
-        // create the engine
-        let engine = self.create_engine(&engine_task_manager, reth_db)?;
-
         // create primary and worker nodes
         let (primary, worker_node) = self
             .create_consensus(
-                &engine,
+                engine,
                 consensus_db,
                 epoch_task_manager,
                 network_config,
@@ -347,7 +386,6 @@ where
 
         // create receiving channel before spawning primary to ensure messages are not lost
         let consensus_bus = primary.consensus_bus().await;
-        let consensus_output_rx = consensus_bus.subscribe_consensus_output();
 
         // start primary
         let mut primary_task_manager = primary.start().await?;
@@ -358,33 +396,22 @@ where
         // consensus config for shutdown subscribers
         let consensus_config = primary.consensus_config().await;
 
-        // start engine
-        engine
-            .start_engine(
-                consensus_output_rx,
-                &engine_task_manager,
-                consensus_config.shutdown().subscribe(),
-            )
-            .await?;
-
         engine
             .start_batch_builder(
                 worker.id(),
                 worker.batches_tx(),
-                &engine_task_manager,
+                epoch_task_manager,
                 consensus_config.shutdown().subscribe(),
             )
             .await?;
 
         // update tasks
         primary_task_manager.update_tasks();
-        engine_task_manager.update_tasks();
         worker_task_manager.update_tasks();
 
         // add epoch-specific tasks to manager
         epoch_task_manager.add_task_manager(primary_task_manager);
         epoch_task_manager.add_task_manager(worker_task_manager);
-        epoch_task_manager.add_task_manager(engine_task_manager);
 
         info!(target: "epoch-manager", tasks=?epoch_task_manager, "EPOCH TASKS\n");
 
@@ -635,8 +662,10 @@ where
         epoch_task_spawner: TaskSpawner,
         initialize_networks: &bool,
     ) -> eyre::Result<PrimaryNode<DB>> {
-        let consensus_bus =
-            ConsensusBus::new_with_args(consensus_config.config().parameters.gc_depth);
+        let consensus_bus = ConsensusBus::new_with_args(
+            consensus_config.config().parameters.gc_depth,
+            self.consensus_output.clone(),
+        );
         let state_sync = StateSynchronizer::new(consensus_config.clone(), consensus_bus.clone());
         let network_handle = self
             .primary_network_handle

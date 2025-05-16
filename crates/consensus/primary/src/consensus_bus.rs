@@ -168,12 +168,17 @@ impl ConsensusBus {
         // (some testing liked this).  Using the default to not overly complicate
         // creation of the bus.
         // This is basically for testing.
-        Self::new_with_args(Parameters::default_gc_depth())
+        let (consensus_output, _rx_consensus_output) = broadcast::channel(CHANNEL_CAPACITY);
+
+        Self::new_with_args(Parameters::default_gc_depth(), consensus_output)
     }
 
     /// Create a new consensus bus.
     /// Store recent_blocks number of the last generated execution blocks.
-    pub fn new_with_args(recent_blocks: u32) -> Self {
+    pub fn new_with_args(
+        recent_blocks: u32,
+        consensus_output: broadcast::Sender<ConsensusOutput>,
+    ) -> Self {
         let consensus_metrics = Arc::new(ConsensusMetrics::default());
         let primary_metrics = Arc::new(Metrics::default()); // Initialize the metrics
         let channel_metrics = Arc::new(ChannelMetrics::default());
@@ -238,7 +243,6 @@ impl ConsensusBus {
         let sequence =
             metered_channel::channel_sender(CHANNEL_CAPACITY, &channel_metrics.tx_sequence);
 
-        let (consensus_output, _rx_consensus_output) = broadcast::channel(CHANNEL_CAPACITY);
         let (consensus_header, _rx_consensus_header) = broadcast::channel(CHANNEL_CAPACITY);
 
         Self {
