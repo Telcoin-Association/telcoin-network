@@ -10,8 +10,6 @@ use mdbx::MdbxDatabase;
 pub use stores::*;
 // Always build redb, we use it as the default for persistant consensus data.
 pub use redb::database::ReDB;
-#[cfg(feature = "rocksdb")]
-use rocks::database::RocksDatabase;
 use tables::{
     Batches, CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
     ConsensusBlockNumbersByDigest, ConsensusBlocks, KadProviderRecords, KadRecords, LastProposed,
@@ -23,8 +21,6 @@ pub mod layered_db;
 pub mod mdbx;
 pub mod mem_db;
 pub mod redb;
-#[cfg(feature = "rocksdb")]
-pub mod rocks;
 
 pub use tn_types::error::StoreError;
 
@@ -93,25 +89,20 @@ pub mod tables {
     );
 }
 
-// mdbx is  the default, if redb is set then is used and otherwise if rocksdb is set it is used (so
-// proirity is mdbx -> redb -> rocks)
-#[cfg(all(feature = "reth-libmdbx", not(feature = "redb"), not(feature = "rocksdb")))]
+// mdbx is  the default, if redb is set then is used (so proirity is mdbx -> redb)
+#[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
 pub type DatabaseType = LayeredDatabase<MdbxDatabase>;
-#[cfg(all(feature = "rocksdb", not(feature = "redb")))]
-pub type DatabaseType = LayeredDatabase<RocksDatabase>;
 #[cfg(feature = "redb")]
 pub type DatabaseType = LayeredDatabase<ReDB>;
 
 /// Open the configured DB with the required tables.
 /// This will return a concrete type for the currently configured Database.
-#[allow(unreachable_code)] // Need this so it compiles cleanly with or either redb or rocks.
+#[allow(unreachable_code)] // Need this so it compiles cleanly with redb.
 pub fn open_db<Path: AsRef<std::path::Path> + Send>(store_path: Path) -> DatabaseType {
-    // Open the right DB based on feature flags.  The default is ReDB unless the rocksdb flag is
+    // Open the right DB based on feature flags.  The default is MDBX unless the redb flag is
     // set.
-    #[cfg(all(feature = "reth-libmdbx", not(feature = "redb"), not(feature = "rocksdb")))]
+    #[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
     return _open_mdbx(store_path);
-    #[cfg(all(feature = "rocksdb", not(feature = "redb")))]
-    return _open_rocks(store_path);
     #[cfg(feature = "redb")]
     return _open_redb(store_path);
     panic!("No DB configured!")
@@ -135,25 +126,6 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<KadRecords>().expect("failed to open table!");
     db.open_table::<KadProviderRecords>().expect("failed to open table!");
 
-    let db = LayeredDatabase::open(db);
-    db.open_table::<LastProposed>();
-    db.open_table::<Votes>();
-    db.open_table::<Certificates>();
-    db.open_table::<CertificateDigestByRound>();
-    db.open_table::<CertificateDigestByOrigin>();
-    db.open_table::<Payload>();
-    db.open_table::<Batches>();
-    db.open_table::<ConsensusBlocks>();
-    db.open_table::<ConsensusBlockNumbersByDigest>();
-    db.open_table::<KadRecords>();
-    db.open_table::<KadProviderRecords>();
-    db
-}
-
-/// Open or reopen all the storage of the node backed by rocks DB.
-#[cfg(feature = "rocksdb")]
-fn _open_rocks<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabase<RocksDatabase> {
-    let db = RocksDatabase::open_db(store_path).expect("Can not open database.");
     let db = LayeredDatabase::open(db);
     db.open_table::<LastProposed>();
     db.open_table::<Votes>();
@@ -200,10 +172,6 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db
 }
 
-// prevent clippy unused deps warning
-// `rocks` feature uses this
-use serde as _;
-
 #[cfg(test)]
 mod test {
     use tn_types::{Database, DbTxMut};
@@ -218,7 +186,7 @@ mod test {
     }
 
     /// Runs a simple bench/test for the provided DB.  Can use it for larger dataset tests as well
-    /// as comparing backends. For example run ```cargo test dbsimpbench --features rocksdb --
+    /// as comparing backends. For example run ```cargo test dbsimpbench --features redb --
     /// --nocapture --test-threads 1``` to run each backend through the bench one at a time.
     pub fn db_simp_bench<DB: Database>(db: DB, name: &str) {
         use tn_types::{DbTx, DbTxMut};
