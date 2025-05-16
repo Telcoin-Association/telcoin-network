@@ -322,7 +322,7 @@ where
 
         // start consensus metrics for the epoch
         let metrics_shutdown = Notifier::new();
-        if let Some(metrics_socket) = self.builder.consensus_metrics {
+        if let Some(metrics_socket) = self.builder.metrics {
             start_prometheus_server(
                 metrics_socket,
                 epoch_task_manager,

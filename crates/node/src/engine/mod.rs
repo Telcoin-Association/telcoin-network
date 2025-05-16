@@ -38,10 +38,10 @@ pub struct TnBuilder {
     /// TODO: temporary solution until upstream reth
     /// rpc hooks are publicly available.
     pub opt_faucet_args: Option<FaucetArgs>,
-    /// Enable Prometheus consensus metrics.
+    /// Enable Prometheus metrics.
     ///
     /// The metrics will be served at the given interface and port.
-    pub consensus_metrics: Option<SocketAddr>,
+    pub metrics: Option<SocketAddr>,
 }
 
 /// Wrapper for the inner execution node components.
