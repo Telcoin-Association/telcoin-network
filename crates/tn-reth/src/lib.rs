@@ -96,7 +96,7 @@ use tn_types::{
     adiri_chain_spec_arc, calculate_transaction_root, keccak256, Address, Block, BlockBody,
     BlockExt as _, BlockHashOrNumber, BlockNumHash, BlockNumber, BlockWithSenders, BlsSignature,
     Epoch, ExecHeader, Genesis, GenesisAccount, Receipt, SealedBlock, SealedBlockWithSenders,
-    SealedHeader, TaskManager, TransactionSigned, TxKind, B256, EMPTY_OMMER_ROOT_HASH,
+    SealedHeader, TaskManager, TaskSpawner, TransactionSigned, TxKind, B256, EMPTY_OMMER_ROOT_HASH,
     EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, U256,
 };
 use tokio::sync::mpsc::{self, unbounded_channel};
@@ -339,8 +339,8 @@ pub struct RethEnv {
     evm_executor: BasicBlockExecutorProvider<EthExecutionStrategyFactory<TnEvmConfig>>,
     /// The type to configure the EVM for execution.
     evm_config: TnEvmConfig,
-    /// The transaction pool.
-    tx_pool: WorkerTxPool,
+    /// The type to spawn tasks.
+    task_spawner: TaskSpawner,
 }
 
 impl std::fmt::Debug for RethEnv {
@@ -422,9 +422,8 @@ impl RethEnv {
         let provider_factory = Self::init_provider_factory(&node_config, database)?;
         let blockchain_provider =
             Self::init_blockchain_provider(task_manager, &provider_factory, evm_executor.clone())?;
-        let tx_pool =
-            WorkerTxPool::new(&node_config, task_manager, &provider_factory, &blockchain_provider)?;
-        Ok(Self { node_config, blockchain_provider, evm_config, evm_executor, tx_pool })
+        let task_spawner = task_manager.get_spawner();
+        Ok(Self { node_config, blockchain_provider, evm_config, evm_executor, task_spawner })
     }
 
     /// Initialize the provider factory and related components
@@ -485,9 +484,9 @@ impl RethEnv {
         (evm_executor, evm_config)
     }
 
-    /// Return the transaction pool for this Reth instance.
-    pub fn worker_txn_pool(&self) -> &WorkerTxPool {
-        &self.tx_pool
+    /// Initialize a new transaction pool for worker.
+    pub fn init_txn_pool(&self) -> eyre::Result<WorkerTxPool> {
+        WorkerTxPool::new(&self.node_config, &self.task_spawner, &self.blockchain_provider)
     }
 
     /// Return a channel reciever that will return each canonical block in turn.
@@ -503,6 +502,11 @@ impl RethEnv {
             }
         });
         rx
+    }
+
+    /// Return a reference to the [TaskSpawner] for spawning tasks.
+    pub fn get_task_spawner(&self) -> &TaskSpawner {
+        &self.task_spawner
     }
 
     /// Return the chainspec for this instance.
@@ -1172,7 +1176,6 @@ impl RethEnv {
         &self,
         transaction_pool: WorkerTxPool,
         network: WorkerNetwork,
-        task_manager: &TaskManager,
         other: impl Into<Methods>,
     ) -> RpcServer {
         let transaction_pool: EthTransactionPool<
@@ -1184,7 +1187,7 @@ impl RethEnv {
             .with_provider(self.blockchain_provider.clone())
             .with_pool(transaction_pool)
             .with_network(network)
-            .with_executor(task_manager.get_spawner())
+            .with_executor(self.task_spawner.clone())
             .with_evm_config(self.evm_config.clone())
             .with_events(self.blockchain_provider.clone())
             .with_block_executor(self.evm_executor.clone())

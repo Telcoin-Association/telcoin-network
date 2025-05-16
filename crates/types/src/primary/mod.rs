@@ -17,6 +17,9 @@ pub use output::*;
 pub use reputation::*;
 pub use vote::*;
 
+/// The default primary udp port for consensus messages.
+pub const DEFAULT_PRIMARY_PORT: u16 = 44894;
+
 /// For now, use 0 to prevent any removal of bad nodes since validator sets are static.
 ///
 /// The following note is quoted from sui regarding a default of `20`:

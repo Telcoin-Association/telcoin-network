@@ -169,11 +169,7 @@ where
         // create the engine
         let engine = self.create_engine(&engine_task_manager, reth_db)?;
         engine
-            .start_engine(
-                self.consensus_output.subscribe(),
-                &engine_task_manager,
-                self.node_shutdown.subscribe(),
-            )
+            .start_engine(self.consensus_output.subscribe(), self.node_shutdown.subscribe())
             .await?;
 
         node_task_manager.add_task_manager(engine_task_manager);
@@ -394,16 +390,9 @@ where
         let (mut worker_task_manager, worker) = worker_node.start().await?;
 
         // consensus config for shutdown subscribers
-        let consensus_config = primary.consensus_config().await;
+        let consensus_shutdown = primary.shutdown_signal().await;
 
-        engine
-            .start_batch_builder(
-                worker.id(),
-                worker.batches_tx(),
-                epoch_task_manager,
-                consensus_config.shutdown().subscribe(),
-            )
-            .await?;
+        engine.start_batch_builder(worker.id(), worker.batches_tx()).await?;
 
         // update tasks
         primary_task_manager.update_tasks();
@@ -421,7 +410,7 @@ where
             debug!(target: "epoch-manager", ?_res, "sent ack for node startup");
         }
 
-        epoch_task_manager.join_until_exit(consensus_config.shutdown().clone()).await;
+        epoch_task_manager.join_until_exit(consensus_shutdown).await;
 
         // epoch complete
         let running = consensus_bus.restart();
@@ -477,7 +466,7 @@ where
         let worker = self
             .spawn_worker_node_components(
                 &consensus_config,
-                engine.new_batch_validator().await,
+                engine,
                 epoch_task_manager.get_spawner(),
                 initialize_networks,
             )
@@ -695,7 +684,7 @@ where
     async fn spawn_worker_node_components<DB: TNDatabase>(
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
-        validator: Arc<dyn BatchValidation>,
+        engine: &ExecutionNode,
         epoch_task_spawner: TaskSpawner,
         initialize_networks: &bool,
     ) -> eyre::Result<WorkerNode<DB>> {
@@ -717,6 +706,7 @@ where
             .ok_or_eyre("worker network handle missing from epoch manager")?
             .clone();
 
+        let validator = engine.new_batch_validator(worker_id).await;
         self.spawn_worker_network_for_epoch(
             consensus_config,
             worker_id,

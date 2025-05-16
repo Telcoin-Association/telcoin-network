@@ -9,7 +9,9 @@ use tn_primary::{
     ConsensusBus, Primary, StateSynchronizer,
 };
 use tn_primary_metrics::Metrics;
-use tn_types::{Database as ConsensusDatabase, TaskManager, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
+use tn_types::{
+    Database as ConsensusDatabase, Notifier, TaskManager, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+};
 use tokio::sync::RwLock;
 use tracing::instrument;
 
@@ -156,8 +158,8 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
         self.internal.read().await.primary.state_sync()
     }
 
-    /// Return the [ConsensusConfig].
-    pub async fn consensus_config(&self) -> ConsensusConfig<CDB> {
-        self.internal.read().await.consensus_config.clone()
+    /// Return the [Noticer] shutdown for consensus.
+    pub async fn shutdown_signal(&self) -> Notifier {
+        self.internal.read().await.consensus_config.shutdown().clone()
     }
 }

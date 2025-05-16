@@ -83,7 +83,7 @@ async fn test_make_batch_el_to_cl() {
 
     let reth_env =
         RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
-    let txpool = reth_env.worker_txn_pool().clone();
+    let txpool = reth_env.init_txn_pool().unwrap().clone();
     let address = Address::from(U160::from(333));
 
     // build execution block proposer
@@ -164,7 +164,7 @@ async fn test_make_batch_el_to_cl() {
     let sealed_batch = sealed_batch.unwrap();
 
     // ensure batch validator succeeds
-    let batch_validator = BatchValidator::new(reth_env.clone());
+    let batch_validator = BatchValidator::new(reth_env.clone(), Some(txpool.clone()));
 
     let valid_batch_result = batch_validator.validate_batch(sealed_batch.clone());
     assert!(valid_batch_result.is_ok());
@@ -223,7 +223,7 @@ async fn test_batch_builder_produces_valid_batchess() {
     let task_manager = TaskManager::default();
     let reth_env =
         RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
-    let txpool = reth_env.worker_txn_pool().clone();
+    let txpool = reth_env.init_txn_pool().unwrap().clone();
 
     let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
 
@@ -312,7 +312,7 @@ async fn test_batch_builder_produces_valid_batchess() {
     let _ = ack.send(Ok(()));
 
     // validate first batch
-    let batch_validator = BatchValidator::new(reth_env.clone());
+    let batch_validator = BatchValidator::new(reth_env.clone(), Some(txpool.clone()));
 
     let valid_batch_result = batch_validator.validate_batch(first_batch.clone());
     assert!(valid_batch_result.is_ok());
@@ -375,7 +375,7 @@ async fn test_canonical_notification_updates_pool() {
     let task_manager = TaskManager::default();
     let reth_env =
         RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
-    let txpool = reth_env.worker_txn_pool().clone();
+    let txpool = reth_env.init_txn_pool().unwrap().clone();
     let address = Address::from(U160::from(333));
 
     let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
@@ -501,7 +501,7 @@ async fn test_canonical_notification_updates_pool() {
     let _ = ack.send(Ok(()));
 
     // validate batch
-    let batch_validator = BatchValidator::new(reth_env);
+    let batch_validator = BatchValidator::new(reth_env.clone(), Some(txpool.clone()));
 
     let valid_batch_result = batch_validator.validate_batch(first_batch.clone());
     assert!(valid_batch_result.is_ok());

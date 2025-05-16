@@ -4,7 +4,7 @@
 
 use crate::error::ExecutionError;
 use jsonrpsee::http_client::HttpClient;
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 use tn_batch_builder::BatchBuilder;
 use tn_batch_validator::BatchValidator;
 use tn_config::Config;
@@ -18,7 +18,7 @@ use tn_reth::{
 use tn_rpc::{TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
     Address, BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, SealedHeader,
-    TaskManager, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
+    WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
@@ -36,10 +36,10 @@ pub(super) struct ExecutionNodeInner {
     pub(super) tn_config: Config,
     /// Reth execution environment.
     pub(super) reth_env: RethEnv,
-    /// TODO: temporary solution until upstream reth supports public rpc hooks
+    /// Optional args to turn on faucet (for testnet only).
     pub(super) opt_faucet_args: Option<FaucetArgs>,
     /// Collection of execution components by worker.
-    pub(super) workers: HashMap<WorkerId, WorkerComponents>,
+    pub(super) workers: BTreeMap<WorkerId, WorkerComponents>,
 }
 
 impl ExecutionNodeInner {
@@ -50,7 +50,6 @@ impl ExecutionNodeInner {
     pub(super) async fn start_engine(
         &self,
         from_consensus: broadcast::Receiver<ConsensusOutput>,
-        task_manager: &TaskManager,
         rx_shutdown: Noticer,
     ) -> eyre::Result<()> {
         let parent_header = self.reth_env.lookup_head()?;
@@ -65,7 +64,7 @@ impl ExecutionNodeInner {
         );
 
         // spawn tn engine
-        task_manager.spawn_task("consensus engine", async move {
+        self.reth_env.get_task_spawner().spawn_critical_task("consensus engine", async move {
             let res = tn_engine.await;
             match res {
                 Ok(_) => info!(target: "engine", "TN Engine exited gracefully"),
@@ -81,24 +80,15 @@ impl ExecutionNodeInner {
         &mut self,
         worker_id: WorkerId,
         block_provider_sender: BatchSender,
-        task_manager: &TaskManager,
-        rx_shutdown: Noticer,
     ) -> eyre::Result<()> {
-        // inspired by reth's default eth tx pool:
-        // - `EthereumPoolBuilder::default()`
-        // - `components_builder.build_components()`
-        // - `pool_builder.build_pool(&ctx)`
-        let transaction_pool = self.reth_env.worker_txn_pool().clone();
+        // check for worker components and initialize if they're missing
+        let transaction_pool = if let Some(worker_components) = self.workers.get(&worker_id) {
+            worker_components.pool()
+        } else {
+            self.initialize_worker_components(worker_id).await?
+        };
 
-        // TODO: WorkerNetwork is basically noop and missing some functionality
-        let network = WorkerNetwork::new(self.reth_env.chainspec());
-        let mut tx_pool_latest = transaction_pool.block_info();
-        tx_pool_latest.pending_basefee = MIN_PROTOCOL_BASE_FEE;
-        let last_seen = self.reth_env.finalized_block_hash_number()?;
-        tx_pool_latest.last_seen_block_hash = last_seen.hash;
-        tx_pool_latest.last_seen_block_number = last_seen.number;
-        transaction_pool.set_block_info(tx_pool_latest);
-
+        // create the batch builder for this epoch
         let batch_builder = BatchBuilder::new(
             &self.reth_env,
             transaction_pool.clone(),
@@ -108,25 +98,35 @@ impl ExecutionNodeInner {
         );
 
         // spawn block builder task
-        task_manager.spawn_task("batch builder", async move {
-            tokio::select!(
-                _ = &rx_shutdown => {
-                }
-                res = batch_builder => {
-                    info!(target: "tn::execution", ?res, "batch builder task exited");
-                }
-            )
+        self.reth_env.get_task_spawner().spawn_critical_task("batch builder", async move {
+            let res = batch_builder.await;
+            info!(target: "tn::execution", ?res, "batch builder task exited");
         });
+
+        Ok(())
+    }
+
+    /// Initialize the worker's transaction pool and public RPC.
+    async fn initialize_worker_components(
+        &mut self,
+        worker_id: WorkerId,
+    ) -> eyre::Result<WorkerTxPool> {
+        let transaction_pool = self.reth_env.init_txn_pool()?;
+
+        // TODO: update WorkerNetwork - issue #189
+        let network = WorkerNetwork::new(self.reth_env.chainspec());
+        let mut tx_pool_latest = transaction_pool.block_info();
+        tx_pool_latest.pending_basefee = MIN_PROTOCOL_BASE_FEE;
+        let last_seen = self.reth_env.finalized_block_hash_number()?;
+        tx_pool_latest.last_seen_block_hash = last_seen.hash;
+        tx_pool_latest.last_seen_block_number = last_seen.number;
+        transaction_pool.set_block_info(tx_pool_latest);
 
         // extend TN namespace
         let engine_to_primary = (); // TODO: pass client/server here
         let tn_ext = TelcoinNetworkRpcExt::new(self.reth_env.chainspec(), engine_to_primary);
-        let mut server = self.reth_env.get_rpc_server(
-            transaction_pool.clone(),
-            network,
-            task_manager,
-            tn_ext.into_rpc(),
-        );
+        let mut server =
+            self.reth_env.get_rpc_server(transaction_pool.clone(), network, tn_ext.into_rpc());
 
         info!(target: "tn::execution", "tn rpc extension successfully merged");
 
@@ -153,16 +153,17 @@ impl ExecutionNodeInner {
         let rpc_handle = self.reth_env.start_rpc(&server).await?;
 
         // take ownership of worker components
-        let components = WorkerComponents::new(rpc_handle, transaction_pool);
+        let components = WorkerComponents::new(rpc_handle, transaction_pool.clone());
         self.workers.insert(worker_id, components);
-
-        Ok(())
+        Ok(transaction_pool)
     }
 
     /// Create a new block validator.
-    pub(super) fn new_batch_validator(&self) -> Arc<dyn BatchValidation> {
-        // batch validator
-        Arc::new(BatchValidator::new(self.reth_env.clone()))
+    pub(super) fn new_batch_validator(&self, worker_id: &WorkerId) -> Arc<dyn BatchValidation> {
+        // retrieve handle to transaction pool to submit gossip transactions to validators
+        let tx_pool = self.workers.get(worker_id).map(|w| w.pool());
+
+        Arc::new(BatchValidator::new(self.reth_env.clone(), tx_pool))
     }
 
     /// Fetch the last executed state from the database.

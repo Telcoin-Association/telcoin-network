@@ -322,16 +322,16 @@ impl<DB: Database> Certifier<DB> {
             // Log detailed header info if we failed to form a certificate.
             if enabled!(tracing::Level::WARN) {
                 let mut msg = format!(
-                    "Failed to form certificate from header {header:?} with parent certificates:\n"
+                    "Failed to form certificate from header {header:#?} with parent certificates:"
                 );
                 for parent_digest in header.parents().iter() {
                     let parent_msg = match self.certificate_store.read(*parent_digest) {
-                        Ok(Some(cert)) => format!("{cert:?}\n"),
+                        Ok(Some(cert)) => format!("{cert:#?}\n"),
                         Ok(None) => {
-                            format!("!!!missing certificate for digest {parent_digest:?}!!!\n")
+                            format!("missing certificate for digest {parent_digest:?}")
                         }
                         Err(e) => format!(
-                            "!!!error retrieving certificate for digest {parent_digest:?}: {e:?}\n"
+                            "error retrieving certificate for digest {parent_digest:?}: {e:?}"
                         ),
                     };
                     msg.push_str(&parent_msg);

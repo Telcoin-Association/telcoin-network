@@ -1,7 +1,7 @@
 //! Builder for engine to mantain generics.
 
 use super::{inner::ExecutionNodeInner, TnBuilder};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
 use tn_reth::RethEnv;
@@ -9,12 +9,13 @@ use tn_reth::RethEnv;
 /// A builder that handles component initialization for the execution node.
 /// Separates initialization concerns from runtime behavior.
 pub struct ExecutionNodeBuilder {
+    /// The protocol configuration.
     tn_config: Config,
 
-    // Reth environment
+    /// Reth environment for executing transactions.
     reth_env: RethEnv,
 
-    // Optional components
+    /// Optional components (for testnet only).
     opt_faucet_args: Option<FaucetArgs>,
 }
 
@@ -36,7 +37,7 @@ impl ExecutionNodeBuilder {
             address: *self.tn_config.execution_address(),
             opt_faucet_args: self.opt_faucet_args,
             tn_config: self.tn_config,
-            workers: HashMap::default(),
+            workers: BTreeMap::default(),
         })
     }
 }

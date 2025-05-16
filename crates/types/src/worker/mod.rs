@@ -1,7 +1,6 @@
 //! Worker types.
 
 use tokio::sync::{mpsc::Sender, oneshot};
-#[allow(clippy::mutable_key_type)]
 mod info;
 pub use info::*;
 mod sealed_batch;
@@ -18,5 +17,5 @@ pub use pending_batch::*;
 /// The receiving half (CL) broadcasts to peers and tries to reach quorum.
 pub type BatchSender = Sender<(SealedBatch, oneshot::Sender<Result<(), BlockSealError>>)>;
 
+/// The default worker udp port for consensus messages.
 pub const DEFAULT_WORKER_PORT: u16 = 44895;
-pub const DEFAULT_PRIMARY_PORT: u16 = 44894;

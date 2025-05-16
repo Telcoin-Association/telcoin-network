@@ -1,7 +1,7 @@
 //! Block validator
 
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
-use tn_reth::{bytes_to_txn, recover_signed_transaction, RethEnv};
+use tn_reth::{bytes_to_txn, recover_signed_transaction, RethEnv, WorkerTxPool};
 use tn_types::{
     max_batch_gas, max_batch_size, BatchValidation, BatchValidationError, BlockHash, ExecHeader,
     SealedBatch, TransactionSigned, TransactionTrait as _, PARALLEL_SENDER_RECOVERY_THRESHOLD,
@@ -15,6 +15,8 @@ type BatchValidationResult<T> = Result<T, BatchValidationError>;
 pub struct BatchValidator {
     /// Database provider to encompass tree and provider factory.
     reth_env: RethEnv,
+    /// A handle to the transaction pool for submitting gossipped transactions.
+    tx_pool: Option<WorkerTxPool>,
 }
 
 impl BatchValidation for BatchValidator {
@@ -62,15 +64,19 @@ impl BatchValidation for BatchValidator {
         Ok(())
     }
 
+    /// Submit a transaction received from the gossip pool to the worker's transaction pool.
+    /// This method is only active if the node is part of the committee.
     fn submit_txn_if_mine(&self, tx_bytes: &[u8], committee_size: u64, committee_slot: u64) {
-        let reth_env = self.reth_env.clone();
         if let Ok(tx) = bytes_to_txn(tx_bytes) {
-            let mut bytes = [0_u8; 8];
-            bytes.copy_from_slice(&tx.hash()[0..8]);
-            if (u64::from_ne_bytes(bytes) % committee_size) == committee_slot {
-                tokio::task::spawn(async move {
-                    let _ = reth_env.worker_txn_pool().add_raw_transaction_external(tx).await;
-                });
+            if let Some(tx_pool) = &self.tx_pool {
+                let tx_pool = tx_pool.clone();
+                let mut bytes = [0_u8; 8];
+                bytes.copy_from_slice(&tx.hash()[0..8]);
+                if (u64::from_ne_bytes(bytes) % committee_size) == committee_slot {
+                    tokio::task::spawn(async move {
+                        let _ = tx_pool.add_raw_transaction_external(tx).await;
+                    });
+                }
             }
         }
     }
@@ -78,8 +84,8 @@ impl BatchValidation for BatchValidator {
 
 impl BatchValidator {
     /// Create a new instance of [Self]
-    pub fn new(reth_env: RethEnv) -> Self {
-        Self { reth_env }
+    pub fn new(reth_env: RethEnv, tx_pool: Option<WorkerTxPool>) -> Self {
+        Self { reth_env, tx_pool }
     }
 
     /// Validates the timestamp against the parent to make sure it is in the past.
@@ -283,9 +289,9 @@ mod tests {
     async fn test_tools(path: &Path, task_manager: &TaskManager) -> TestTools {
         // genesis with default TransactionFactory funded
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
-        let validator = BatchValidator::new(
-            RethEnv::new_for_temp_chain(chain.clone(), path, task_manager).unwrap(),
-        );
+        let reth_env = RethEnv::new_for_temp_chain(chain.clone(), path, task_manager).unwrap();
+        let tx_pool = reth_env.init_txn_pool().unwrap();
+        let validator = BatchValidator::new(reth_env, Some(tx_pool));
         let valid_batch = next_valid_sealed_batch();
 
         // block validator

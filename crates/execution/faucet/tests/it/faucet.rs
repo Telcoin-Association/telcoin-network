@@ -30,8 +30,8 @@ use tn_test_utils::faucet_test_execution_node;
 
 use tn_types::{
     adiri_genesis, error::BlockSealError, hex, public_key_to_address, sol, Address, GenesisAccount,
-    Notifier, SealedBatch, SolType, SolValue, TaskManager, TransactionSigned,
-    TransactionTrait as _, B256, U160, U256,
+    SealedBatch, SolType, SolValue, TaskManager, TransactionSigned, TransactionTrait as _, B256,
+    U160, U256,
 };
 use tn_worker::{
     metrics::WorkerMetrics,
@@ -282,16 +282,8 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
         &mut task_manager,
     );
 
-    let shutdown = Notifier::default();
     // start batch maker
-    execution_node
-        .start_batch_builder(
-            worker_id,
-            batch_provider.batches_tx(),
-            &TaskManager::default(),
-            shutdown.subscribe(),
-        )
-        .await?;
+    execution_node.start_batch_builder(worker_id, batch_provider.batches_tx()).await?;
 
     // create client
     let client = execution_node.worker_http_client(&worker_id).await?.expect("worker rpc client");
@@ -611,13 +603,10 @@ async fn test_with_creds_faucet_transfers_stablecoin_with_google_kms() -> eyre::
     let execution_node =
         faucet_test_execution_node(true, Some(chain), None, faucet_proxy_address, tmp_dir.path())?;
 
-    let shutdown = Notifier::default();
     // start batch maker
     let worker_id = 0;
     let (to_worker, mut next_batch) = tokio::sync::mpsc::channel(2);
-    execution_node
-        .start_batch_builder(worker_id, to_worker, &TaskManager::default(), shutdown.subscribe())
-        .await?;
+    execution_node.start_batch_builder(worker_id, to_worker).await?;
 
     let user_address = Address::random();
     let client = execution_node.worker_http_client(&worker_id).await?.expect("worker rpc client");

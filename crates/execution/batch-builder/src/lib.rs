@@ -56,7 +56,6 @@ type BuildResult = oneshot::Receiver<BatchBuilderResult<Vec<TxHash>>>;
 /// - listens for canonical state changes and updates the tx pool
 /// - polls the transaction pool for pending transactions
 ///     - tries to build the next batch when there transactions are available
-/// -
 #[derive(Debug)]
 pub struct BatchBuilder {
     /// Single active future that executes consensus output on a blocking thread and then returns
@@ -232,13 +231,7 @@ impl Future for BatchBuilder {
 
             // only propose one block at a time
             if this.pending_task.is_none() {
-                // TODO: is there a more efficient approach? only need pending pool stats
-                // create upstream PR for reth?
-                //
                 // check for pending transactions
-                //
-                // considered using: pool.pool_size().pending
-                // but that calculates size for all sub-pools
                 if this.pool.pending_transactions().is_empty() {
                     // reset interval to wake up after some time
                     //
@@ -281,8 +274,7 @@ impl Future for BatchBuilder {
                             .last_canonical_update
                             .base_fee_per_gas
                             .unwrap_or_else(|| this.pool.get_pending_base_fee());
-                        // TODO: should this be a spawned blocking task?
-                        //
+
                         // update pool to remove mined transactions
                         this.pool.update_canonical_state(
                             &this.last_canonical_update,
@@ -377,7 +369,7 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
-        let txpool = reth_env.worker_txn_pool().clone();
+        let txpool = reth_env.init_txn_pool().unwrap().clone();
         let address = Address::from(U160::from(33));
         let client = LocalNetwork::new_with_empty_id();
         let worker_to_primary = Arc::new(MockWorkerToPrimaryHang {});
@@ -529,7 +521,7 @@ mod tests {
         // task manger
         let task_manager = TaskManager::new("Test Task Manager");
         let reth_env = RethEnv::new_for_temp_chain(chain.clone(), path, &task_manager).unwrap();
-        let txpool = reth_env.worker_txn_pool().clone();
+        let txpool = reth_env.init_txn_pool().unwrap().clone();
 
         let execution_components =
             TestExecutionComponents { reth_env, txpool, chain, _manager: task_manager };

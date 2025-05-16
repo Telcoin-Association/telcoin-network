@@ -12,7 +12,7 @@ use reth_chainspec::ChainSpec;
 use reth_node_builder::{NodeConfig, RethTransactionPoolConfig};
 use reth_provider::{
     providers::BlockchainProvider, CanonStateNotification, CanonStateSubscriptions as _, Chain,
-    ChangedAccount, ProviderFactory,
+    ChangedAccount,
 };
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
@@ -24,7 +24,7 @@ use reth_transaction_pool::{
 };
 use tn_types::{
     Address, EnvKzgSettings, RecoveredTx, SealedBlock, SignedTransactionIntoRecoveredExt as _,
-    TaskManager, TransactionSigned, TxHash, MIN_PROTOCOL_BASE_FEE,
+    TaskSpawner, TransactionSigned, TxHash, MIN_PROTOCOL_BASE_FEE,
 };
 use tracing::{debug, info, trace};
 
@@ -76,17 +76,13 @@ impl From<WorkerTxPool> for EthTransactionPool<BlockchainProvider<TelcoinNode>, 
 }
 
 impl WorkerTxPool {
-    pub(crate) fn new(
+    /// Create a new instance of `Self`.
+    pub fn new(
         node_config: &NodeConfig<ChainSpec>,
-        task_manager: &TaskManager,
-        provider_factory: &ProviderFactory<TelcoinNode>,
+        task_spawner: &TaskSpawner,
         blockchain_provider: &BlockchainProvider<TelcoinNode>,
     ) -> eyre::Result<Self> {
-        let head = node_config.lookup_head(provider_factory)?;
-        // inspired by reth's default eth tx pool:
-        // - `EthereumPoolBuilder::default()`
-        // - `components_builder.build_components()`
-        // - `pool_builder.build_pool(&ctx)`
+        let head = node_config.lookup_head(blockchain_provider)?;
         let data_dir = node_config.datadir();
         let pool_config = node_config.txpool.pool_config();
         let blob_store = DiskFileBlobStore::open(data_dir.blobstore(), Default::default())?;
@@ -97,7 +93,7 @@ impl WorkerTxPool {
             .with_additional_tasks(node_config.txpool.additional_validation_tasks)
             .build_with_tasks(
                 blockchain_provider.clone(),
-                task_manager.get_spawner(),
+                task_spawner.clone(),
                 blob_store.clone(),
             );
 
@@ -107,7 +103,7 @@ impl WorkerTxPool {
         info!(target: "tn::execution", "Transaction pool initialized");
 
         /* TODO: replace this functionality to save and load the txn pool on start/stop
-           The reth function backup_local_tranractions_task's shutdown param can not be easily created.
+           The reth function backup_local_transactions_task's shutdown param can not be easily created.
            The internal functions are not easy to just copy.
            Basically this interface does not work when using your own TaskManager.  Best solution may be to
            open a PR with Reth to fix this.
@@ -132,7 +128,7 @@ impl WorkerTxPool {
         let this = Self(transaction_pool);
         let txn_pool_clone = this.clone();
         // Update the txn pool as the canonical tip changes.
-        task_manager.spawn_task("canonical txn pool", async move {
+        task_spawner.spawn_critical_task("canonical txn pool", async move {
             while let Some(update) = state_stream.next().await {
                 match update {
                     CanonStateNotification::Commit { new } => {
