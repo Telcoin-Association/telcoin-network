@@ -15,12 +15,12 @@ authors = [
 tn-types = { workspace = true }
 tn-reth = { workspace = true }
 rayon = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 assert_matches = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 
 [features]
 default = []

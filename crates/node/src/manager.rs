@@ -177,30 +177,6 @@ where
 
         info!(target: "epoch-manager", tasks=?node_task_manager, "NODE TASKS\n");
 
-        //
-        //
-        // - spawn execution engine and batch builder on separate task managers
-        //   - NodeTaskManager
-        //      - EpochTaskManager
-        //          - Batch Builder
-        //          - Primary Network
-        //          - Worker Network
-        //      - P2P Networks
-        //      - Execution Engine
-        //
-        // - need to update CL => EL channel
-        //      - consensus_bus::subscribe_consensus_output()
-        //
-        // - epoch manager -> EL steady
-        //      - epoch boundary, replace the output
-        //
-        // COMMITS;
-        // - spawn engine on startup
-        // - consensus_bus::new_with_engine_channel()
-        // - spawn epoch task to subscribe to consensus output
-        //      - update node-task to receive consensus output
-        //      -
-
         // await all tasks on epoch-task-manager or node shutdown
         tokio::select! {
             // run long-living node tasks

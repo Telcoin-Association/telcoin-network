@@ -71,9 +71,11 @@ impl BatchValidation for BatchValidator {
             if let Some(tx_pool) = &self.tx_pool {
                 let tx_pool = tx_pool.clone();
                 let mut bytes = [0_u8; 8];
-                bytes.copy_from_slice(&tx.hash()[0..8]);
+                let hash = tx.hash();
+                bytes.copy_from_slice(&hash[0..8]);
                 if (u64::from_ne_bytes(bytes) % committee_size) == committee_slot {
-                    tokio::task::spawn(async move {
+                    let task_name = format!("submit-tx-{hash}");
+                    self.reth_env.get_task_spawner().spawn_task(task_name, async move {
                         let _ = tx_pool.add_raw_transaction_external(tx).await;
                     });
                 }
