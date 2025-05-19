@@ -11,17 +11,15 @@ authors = [
 publish = false
 
 [dependencies]
-async-trait.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
-tracing.workspace = true
+tracing = { workspace = true }
 tn-storage = { workspace = true }
 tn-network-types = { workspace = true }
 state-sync = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
-mockall.workspace = true
 consensus-metrics.workspace = true
 tn-primary = { workspace = true }
 
