@@ -12,10 +12,10 @@ use std::{
 use thiserror::Error;
 use tn_network_libp2p::error::NetworkError;
 use tn_types::{
-    network_public_key_to_libp2p, Authority, Committee, SealedBatch, VotingPower, WorkerCache,
-    WorkerId,
+    network_public_key_to_libp2p, Authority, Committee, SealedBatch, TaskSpawner, VotingPower,
+    WorkerCache, WorkerId,
 };
-use tokio::{sync::oneshot, task::JoinHandle};
+use tokio::sync::oneshot;
 
 #[cfg(test)]
 #[path = "tests/quorum_waiter_tests.rs"]
@@ -39,7 +39,8 @@ pub trait QuorumWaiterTrait: Send + Sync + Clone + Unpin + 'static {
         &self,
         batch: SealedBatch,
         timeout: Duration,
-    ) -> JoinHandle<Result<(), QuorumWaiterError>>;
+        task_spawner: &TaskSpawner,
+    ) -> oneshot::Receiver<Result<(), QuorumWaiterError>>;
 }
 
 /// Basically BoxFuture but without the unneeded lifetime.
@@ -118,9 +119,13 @@ impl QuorumWaiterTrait for QuorumWaiter {
         &self,
         sealed_batch: SealedBatch,
         timeout: Duration,
-    ) -> JoinHandle<Result<(), QuorumWaiterError>> {
+        task_spawner: &TaskSpawner,
+    ) -> oneshot::Receiver<Result<(), QuorumWaiterError>> {
         let inner = self.inner.clone();
-        tokio::spawn(async move {
+        let task_name = format!("verifying-batch-{}", sealed_batch.digest());
+        let (tx, rx) = oneshot::channel();
+        let spawner_clone = task_spawner.clone();
+        task_spawner.spawn_task(task_name, async move {
             let timeout_res = tokio::time::timeout(timeout, async move {
                 let start_time = Instant::now();
                 // Broadcast the batch to the other workers.
@@ -180,7 +185,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                                         // time.
                                         // These are fire and forget, they will timeout soon so no
                                         // big deal.
-                                        tokio::spawn(async move {
+                                        spawner_clone.spawn_task("quorum-remainder", async move {
                                             let _ =
                                                 tokio::time::timeout(remaining_time, async move {
                                                     while (wait_for_quorum.next().await).is_some() {
@@ -218,14 +223,19 @@ impl QuorumWaiterTrait for QuorumWaiter {
                 }
             })
             .await;
-            match timeout_res {
+
+            let res = match timeout_res {
                 Ok(res) => match res {
                     Ok(()) => Ok(()),
                     Err(e) => Err(e),
                 },
                 Err(_elapsed) => Err(QuorumWaiterError::Timeout),
-            }
-        })
+            };
+
+            // forward result
+            tx.send(res)
+        });
+        rx
     }
 }
 

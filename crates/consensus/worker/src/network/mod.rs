@@ -41,8 +41,14 @@ pub struct WorkerNetworkHandle {
 }
 
 impl WorkerNetworkHandle {
+    /// Create a new instance of [Self].
     pub fn new(handle: NetworkHandle<Req, Res>, task_spawner: TaskSpawner) -> Self {
         Self { handle, task_spawner }
+    }
+
+    /// Return a reference to the task spawner.
+    pub fn get_task_spawner(&self) -> &TaskSpawner {
+        &self.task_spawner
     }
 
     //// Convenience method for creating a new Self for tests- sends events no-where and does
@@ -331,7 +337,8 @@ where
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        tokio::spawn(async move {
+        let task_name = format!("process-report-batch-{}", sealed_batch.digest());
+        self.network_handle.get_task_spawner().spawn_task(task_name, async move {
             tokio::select! {
                 res = request_handler.process_report_batch(sealed_batch) => {
                     let response = match res {
@@ -349,7 +356,7 @@ where
     /// Attempt to return requested batches.
     fn process_request_batches(
         &self,
-        _peer: PeerId,
+        peer: PeerId,
         batch_digests: Vec<BlockHash>,
         channel: ResponseChannel<WorkerResponse>,
         cancel: oneshot::Receiver<()>,
@@ -357,7 +364,8 @@ where
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        tokio::spawn(async move {
+        let task_name = format!("process-request-batches-{peer}");
+        self.network_handle.get_task_spawner().spawn_task(task_name, async move {
             tokio::select! {
                 res = request_handler.process_request_batches(batch_digests) => {
                     let response = match res {
@@ -380,7 +388,8 @@ where
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        tokio::spawn(async move {
+        let task_name = format!("process-gossip-{source}");
+        self.network_handle.get_task_spawner().spawn_task(task_name, async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "worker::network", ?e, "process_gossip");
                 if let Err(e) = request_handler.process_gossip(&msg).await {
@@ -403,7 +412,7 @@ where
         let network_handle = self.network_handle.clone();
 
         // notify peer manager and respond with ack
-        tokio::spawn(async move {
+        self.network_handle.get_task_spawner().spawn_task("process-peer-exchange", async move {
             network_handle.process_peer_exchange(peers, channel).await;
         });
     }

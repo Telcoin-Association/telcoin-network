@@ -219,7 +219,11 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             .with_label_values(&["latest batch size"])
             .observe(size as f64);
 
-        let batch_attest_handle = quorum_waiter.verify_batch(sealed_batch.clone(), self.timeout);
+        let batch_attest_handle = quorum_waiter.verify_batch(
+            sealed_batch.clone(),
+            self.timeout,
+            &self.network_handle.get_task_spawner(),
+        );
 
         // Wait for our batch to reach quorum or fail to do so.
         match batch_attest_handle.await {
