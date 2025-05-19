@@ -1,7 +1,7 @@
 //! Builder for engine to mantain generics.
 
 use super::{inner::ExecutionNodeInner, TnBuilder};
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
 use tn_reth::RethEnv;
@@ -37,7 +37,7 @@ impl ExecutionNodeBuilder {
             address: *self.tn_config.execution_address(),
             opt_faucet_args: self.opt_faucet_args,
             tn_config: self.tn_config,
-            workers: BTreeMap::default(),
+            workers: HashMap::default(),
         })
     }
 }

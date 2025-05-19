@@ -68,6 +68,14 @@ impl ExecutionNode {
         guard.start_engine(from_consensus, rx_shutdown).await
     }
 
+    /// Initialize the worker's transaction pool and public RPC.
+    ///
+    /// This method should be called on node startup.
+    pub async fn initialize_worker_components(&self, worker_id: WorkerId) -> eyre::Result<()> {
+        let mut guard = self.internal.write().await;
+        guard.initialize_worker_components(worker_id).await
+    }
+
     /// Batch maker
     pub async fn start_batch_builder(
         &self,

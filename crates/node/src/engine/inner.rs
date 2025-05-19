@@ -3,8 +3,9 @@
 //! This module contains the logic for execution.
 
 use crate::error::ExecutionError;
+use eyre::OptionExt;
 use jsonrpsee::http_client::HttpClient;
-use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tn_batch_builder::BatchBuilder;
 use tn_batch_validator::BatchValidator;
 use tn_config::Config;
@@ -39,7 +40,7 @@ pub(super) struct ExecutionNodeInner {
     /// Optional args to turn on faucet (for testnet only).
     pub(super) opt_faucet_args: Option<FaucetArgs>,
     /// Collection of execution components by worker.
-    pub(super) workers: BTreeMap<WorkerId, WorkerComponents>,
+    pub(super) workers: HashMap<WorkerId, WorkerComponents>,
 }
 
 impl ExecutionNodeInner {
@@ -82,11 +83,11 @@ impl ExecutionNodeInner {
         block_provider_sender: BatchSender,
     ) -> eyre::Result<()> {
         // check for worker components and initialize if they're missing
-        let transaction_pool = if let Some(worker_components) = self.workers.get(&worker_id) {
-            worker_components.pool()
-        } else {
-            self.initialize_worker_components(worker_id).await?
-        };
+        let transaction_pool = self
+            .workers
+            .get(&worker_id)
+            .ok_or_eyre("worker components missing for {worker_id}")?
+            .pool();
 
         // create the batch builder for this epoch
         let batch_builder = BatchBuilder::new(
@@ -107,10 +108,10 @@ impl ExecutionNodeInner {
     }
 
     /// Initialize the worker's transaction pool and public RPC.
-    async fn initialize_worker_components(
+    pub(super) async fn initialize_worker_components(
         &mut self,
         worker_id: WorkerId,
-    ) -> eyre::Result<WorkerTxPool> {
+    ) -> eyre::Result<()> {
         let transaction_pool = self.reth_env.init_txn_pool()?;
 
         // TODO: update WorkerNetwork - issue #189
@@ -153,9 +154,9 @@ impl ExecutionNodeInner {
         let rpc_handle = self.reth_env.start_rpc(&server).await?;
 
         // take ownership of worker components
-        let components = WorkerComponents::new(rpc_handle, transaction_pool.clone());
+        let components = WorkerComponents::new(rpc_handle, transaction_pool);
         self.workers.insert(worker_id, components);
-        Ok(transaction_pool)
+        Ok(())
     }
 
     /// Create a new block validator.

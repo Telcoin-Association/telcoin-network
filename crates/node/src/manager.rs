@@ -691,6 +691,11 @@ where
         // only support one worker for now - otherwise, loop here
         let (worker_id, _worker_info) = consensus_config.config().workers().first_worker()?;
 
+        // initialize worker components on startup
+        if *initialize_networks {
+            engine.initialize_worker_components(*worker_id).await?;
+        }
+
         // update the network handle's task spawner for reporting batches in the epoch
         {
             let network_handle = self

@@ -283,6 +283,7 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
     );
 
     // start batch maker
+    execution_node.initialize_worker_components(worker_id).await?;
     execution_node.start_batch_builder(worker_id, batch_provider.batches_tx()).await?;
 
     // create client
@@ -606,6 +607,7 @@ async fn test_with_creds_faucet_transfers_stablecoin_with_google_kms() -> eyre::
     // start batch maker
     let worker_id = 0;
     let (to_worker, mut next_batch) = tokio::sync::mpsc::channel(2);
+    execution_node.initialize_worker_components(worker_id).await?;
     execution_node.start_batch_builder(worker_id, to_worker).await?;
 
     let user_address = Address::random();
