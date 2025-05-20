@@ -1,6 +1,6 @@
 //! Unit tests for the worker's batch provider.
 use super::*;
-use crate::{quorum_waiter::QuorumWaiterError, test_utils::TestMakeBlockQuorumWaiter};
+use crate::test_utils::TestMakeBlockQuorumWaiter;
 use tempfile::TempDir;
 use tn_network_types::MockWorkerToPrimary;
 use tn_reth::test_utils::transaction;

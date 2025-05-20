@@ -493,7 +493,9 @@ impl RethEnv {
     pub fn canonical_block_stream(&self) -> mpsc::Receiver<SealedBlock> {
         let mut stream = self.blockchain_provider.canonical_state_stream();
         let (tx, rx) = mpsc::channel(100);
-        tokio::spawn(async move {
+
+        // non-critical: batch builder uses this task for each epoch
+        self.task_spawner.spawn_task("canonical-block-stream", async move {
             while let Some(latest) = stream.next().await {
                 let block = latest.tip().block.clone();
                 if let Err(_e) = tx.send(block).await {
