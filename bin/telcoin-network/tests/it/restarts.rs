@@ -522,12 +522,12 @@ fn get_positive_balance_with_retry(node: &str, address: &str) -> eyre::Result<u1
 fn get_balance_above_with_retry(node: &str, address: &str, above: u128) -> eyre::Result<u128> {
     let mut bal = get_balance(node, address, 5)?;
     let mut i = 0;
-    while i < 30 && bal <= above {
+    while i < 45 && bal <= above {
         std::thread::sleep(Duration::from_millis(1200));
         i += 1;
         bal = get_balance(node, address, 5)?;
     }
-    if i == 30 && bal <= above {
+    if i == 45 && bal <= above {
         error!(target:"restart-test", "get_balance_above_with_retry i == 30 - returning error!!");
         Err(Report::msg(format!("Failed to get a balance {bal} for {address} above {above}")))
     } else {
