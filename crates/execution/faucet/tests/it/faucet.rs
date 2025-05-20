@@ -56,8 +56,7 @@ impl QuorumWaiterTrait for TestChanQuorumWaiter {
         let chan = self.0.clone();
         let (tx, rx) = oneshot::channel();
         let task_name = format!("verify-batch-{}", batch.digest());
-        // task_spawner.spawn_task(task_name, async move {
-        tokio::spawn(async move {
+        task_spawner.spawn_task(task_name, async move {
             chan.send(batch).await.unwrap();
             tx.send(Ok(()))
         });

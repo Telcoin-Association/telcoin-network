@@ -223,6 +223,7 @@ where
             network_config,
             tmp_event_stream,
             self.key_config.clone(),
+            node_task_spawner.clone(),
         )?;
         let primary_network_handle = primary_network.network_handle();
         let node_shutdown = self.node_shutdown.subscribe();
@@ -254,6 +255,7 @@ where
             network_config,
             tmp_event_stream,
             self.key_config.clone(),
+            node_task_spawner.clone(),
         )?;
         let worker_network_handle = worker_network.network_handle();
         let node_shutdown = self.node_shutdown.subscribe();

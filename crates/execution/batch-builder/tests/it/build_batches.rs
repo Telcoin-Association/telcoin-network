@@ -20,15 +20,12 @@ use tn_storage::{open_db, tables::Batches};
 use tn_types::{
     Address, Batch, BatchValidation, Bytes, Certificate, CommittedSubDag, ConsensusHeader,
     ConsensusOutput, Database, Encodable2718 as _, ReputationScores, SealedBatch, TaskManager,
-    TaskSpawner, U160, U256,
+    U160, U256,
 };
 use tn_worker::{
-    metrics::WorkerMetrics,
-    quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
-    test_utils::TestMakeBlockQuorumWaiter,
-    Worker, WorkerNetworkHandle,
+    metrics::WorkerMetrics, test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle,
 };
-use tokio::{sync::oneshot, time::timeout};
+use tokio::time::timeout;
 use tracing::debug;
 
 #[tokio::test]

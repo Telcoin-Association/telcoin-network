@@ -34,7 +34,7 @@ use std::{
     time::Duration,
 };
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
-use tn_types::{encode, try_decode, BlsPublicKey, BlsSigner, NetworkKeypair};
+use tn_types::{encode, try_decode, BlsPublicKey, BlsSigner, NetworkKeypair, TaskSpawner};
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot,
@@ -148,6 +148,8 @@ where
     ///
     /// This is a human-readable representation for a node identity.
     hostname: String,
+    /// The type to spawn tasks.
+    task_spawner: TaskSpawner,
 }
 
 impl<Req, Res> ConsensusNetwork<Req, Res>
@@ -160,9 +162,10 @@ where
         network_config: &NetworkConfig,
         event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
         key_config: KeyConfig,
+        task_manager: TaskSpawner,
     ) -> NetworkResult<Self> {
         let network_key = key_config.primary_network_keypair().clone();
-        Self::new(network_config, event_stream, key_config, network_key)
+        Self::new(network_config, event_stream, key_config, network_key, task_manager)
     }
 
     /// Convenience method for spawning a worker network instance.
@@ -170,9 +173,10 @@ where
         network_config: &NetworkConfig,
         event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
         key_config: KeyConfig,
+        task_manager: TaskSpawner,
     ) -> NetworkResult<Self> {
         let network_key = key_config.worker_network_keypair().clone();
-        Self::new(network_config, event_stream, key_config, network_key)
+        Self::new(network_config, event_stream, key_config, network_key, task_manager)
     }
 
     /// Create a new instance of Self.
@@ -181,6 +185,7 @@ where
         event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
         key_config: KeyConfig,
         keypair: NetworkKeypair,
+        task_spawner: TaskSpawner,
     ) -> NetworkResult<Self> {
         let identify_config = identify::Config::new(
             network_config.libp2p_config().identify_protocol().to_string(),
@@ -263,6 +268,7 @@ where
             key_config,
             kad_add_peers: true,
             hostname: network_config.hostname().to_string(),
+            task_spawner,
         })
     }
 
@@ -862,7 +868,8 @@ where
                     let handle = self.network_handle();
 
                     // spawn task
-                    tokio::spawn(async move {
+                    let task_name = format!("peer-exchange-{peer_id}");
+                    self.task_spawner.spawn_task(task_name, async move {
                         // ignore errors and disconnect after px attempt
                         let _res = tokio::time::timeout(timeout, done).await;
                         let _ = handle.disconnect_peer(peer_id).await;
