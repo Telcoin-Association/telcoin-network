@@ -85,6 +85,8 @@ pub struct EpochManager<P> {
     /// the node manager has other tasks to await and will run normally.
     node_ready: Option<oneshot::Sender<()>>,
     /// Output channel for consensus blocks to be executed.
+    ///
+    /// This should only be accessed elsewhere through the epoch's [ConsensusBus].
     consensus_output: broadcast::Sender<ConsensusOutput>,
 }
 

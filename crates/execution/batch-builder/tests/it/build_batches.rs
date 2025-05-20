@@ -83,7 +83,7 @@ async fn test_make_batch_el_to_cl() {
 
     let reth_env =
         RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
-    let txpool = reth_env.init_txn_pool().unwrap().clone();
+    let txpool = reth_env.init_txn_pool().unwrap();
     let address = Address::from(U160::from(333));
 
     // build execution block proposer
@@ -223,7 +223,7 @@ async fn test_batch_builder_produces_valid_batchess() {
     let task_manager = TaskManager::default();
     let reth_env =
         RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
-    let txpool = reth_env.init_txn_pool().unwrap().clone();
+    let txpool = reth_env.init_txn_pool().unwrap();
 
     let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
 
@@ -375,7 +375,7 @@ async fn test_canonical_notification_updates_pool() {
     let task_manager = TaskManager::default();
     let reth_env =
         RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
-    let txpool = reth_env.init_txn_pool().unwrap().clone();
+    let txpool = reth_env.init_txn_pool().unwrap();
     let address = Address::from(U160::from(333));
 
     let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);

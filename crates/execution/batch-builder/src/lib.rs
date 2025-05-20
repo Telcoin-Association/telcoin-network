@@ -369,7 +369,7 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
-        let txpool = reth_env.init_txn_pool().unwrap().clone();
+        let txpool = reth_env.init_txn_pool().unwrap();
         let address = Address::from(U160::from(33));
         let client = LocalNetwork::new_with_empty_id();
         let worker_to_primary = Arc::new(MockWorkerToPrimaryHang {});
@@ -521,7 +521,7 @@ mod tests {
         // task manger
         let task_manager = TaskManager::new("Test Task Manager");
         let reth_env = RethEnv::new_for_temp_chain(chain.clone(), path, &task_manager).unwrap();
-        let txpool = reth_env.init_txn_pool().unwrap().clone();
+        let txpool = reth_env.init_txn_pool().unwrap();
 
         let execution_components =
             TestExecutionComponents { reth_env, txpool, chain, _manager: task_manager };
