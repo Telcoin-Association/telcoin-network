@@ -36,11 +36,13 @@ fn create_test_peers<Req: TNMessage, Res: TNMessage>(
             let config = a.consensus_config();
             let (tx, network_events) = mpsc::channel(10);
             let network_key = config.key_config().primary_network_keypair().clone();
-            let network = ConsensusNetwork::<Req, Res>::new(
+            let db = MemDatabase::default();
+            let network = ConsensusNetwork::<Req, Res, MemDatabase>::new(
                 config.network_config(),
                 tx,
                 config.key_config().clone(),
                 network_key,
+                db,
                 task_manager.get_spawner(),
             )
             .expect("peer1 network created");
@@ -74,7 +76,7 @@ where
     /// Network handle to send commands.
     network_handle: NetworkHandle<Req, Res>,
     /// The network task.
-    network: Option<ConsensusNetwork<Req, Res>>,
+    network: Option<ConsensusNetwork<Req, Res, MemDatabase>>,
 }
 /// A peer on TN
 struct NetworkPeer<Req, Res, DB = MemDatabase>
@@ -89,7 +91,7 @@ where
     /// Network handle to send commands.
     network_handle: NetworkHandle<Req, Res>,
     /// The network task.
-    network: ConsensusNetwork<Req, Res>,
+    network: ConsensusNetwork<Req, Res, MemDatabase>,
 }
 
 /// The type for holding testng components.
@@ -130,11 +132,12 @@ where
 
     // peer1
     let network_key_1 = config_1.key_config().primary_network_keypair().clone();
-    let peer1_network = ConsensusNetwork::<Req, Res>::new(
+    let peer1_network = ConsensusNetwork::<Req, Res, MemDatabase>::new(
         config_1.network_config(),
         tx1,
         config_1.key_config().clone(),
         network_key_1,
+        MemDatabase::default(),
         task_manager.get_spawner(),
     )
     .expect("peer1 network created");
@@ -148,11 +151,12 @@ where
 
     // peer2
     let network_key_2 = config_2.key_config().primary_network_keypair().clone();
-    let peer2_network = ConsensusNetwork::<Req, Res>::new(
+    let peer2_network = ConsensusNetwork::<Req, Res, MemDatabase>::new(
         config_2.network_config(),
         tx2,
         config_2.key_config().clone(),
         network_key_2,
+        MemDatabase::default(),
         task_manager.get_spawner(),
     )
     .expect("peer2 network created");

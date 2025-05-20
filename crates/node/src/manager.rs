@@ -195,11 +195,11 @@ where
     /// epoch.
     ///
     /// This will create the long-running primary/worker [ConsensusNetwork]s for p2p swarm.
-    async fn spawn_node_networks(
+    async fn spawn_node_networks<DB: TNDatabase>(
         &mut self,
         node_task_spawner: TaskSpawner,
         network_config: &NetworkConfig,
-        consensus_db: &DatabaseType,
+        consensus_db: &DB,
     ) -> eyre::Result<()> {
         // dial bootnodes on startup
         //
@@ -223,6 +223,7 @@ where
             network_config,
             tmp_event_stream,
             self.key_config.clone(),
+            consensus_db.clone(),
             node_task_spawner.clone(),
         )?;
         let primary_network_handle = primary_network.network_handle();
@@ -255,6 +256,7 @@ where
             network_config,
             tmp_event_stream,
             self.key_config.clone(),
+            consensus_db.clone(),
             node_task_spawner.clone(),
         )?;
         let worker_network_handle = worker_network.network_handle();

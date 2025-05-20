@@ -306,10 +306,6 @@ mod tests {
         let task_manager = TaskManager::default();
         let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
         let result = validator.validate_batch(valid_batch.clone());
-        eprintln!(
-            "XXXXX result: {result:?}, batch: {}",
-            valid_batch.batch.clone().seal_slow().digest
-        );
         assert!(result.is_ok());
 
         // ensure non-serialized data does not affect validity

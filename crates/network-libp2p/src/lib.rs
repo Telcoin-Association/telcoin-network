@@ -19,6 +19,7 @@
 mod codec;
 mod consensus;
 pub mod error;
+pub mod kad;
 mod peers;
 pub mod types;
 

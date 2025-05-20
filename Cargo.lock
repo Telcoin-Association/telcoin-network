@@ -11184,6 +11184,7 @@ dependencies = [
  "serde",
  "serde_with 2.3.3",
  "snap",
+ "tempfile",
  "thiserror 1.0.69",
  "tn-config",
  "tn-reth",
