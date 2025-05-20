@@ -11457,6 +11457,7 @@ dependencies = [
  "tn-storage",
  "tn-test-utils",
  "tn-types",
+ "tn-worker",
  "tokio",
  "tracing",
 ]

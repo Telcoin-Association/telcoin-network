@@ -19,7 +19,7 @@ use tn_reth::{
 use tn_rpc::{TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
     Address, BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, SealedHeader,
-    WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
+    TaskSpawner, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
@@ -81,6 +81,7 @@ impl ExecutionNodeInner {
         &mut self,
         worker_id: WorkerId,
         block_provider_sender: BatchSender,
+        epoch_task_spawner: &TaskSpawner,
     ) -> eyre::Result<()> {
         // check for worker components and initialize if they're missing
         let transaction_pool = self
@@ -96,10 +97,11 @@ impl ExecutionNodeInner {
             block_provider_sender,
             self.address,
             self.tn_config.parameters.max_batch_delay,
+            epoch_task_spawner.clone(),
         );
 
         // spawn block builder task
-        self.reth_env.get_task_spawner().spawn_critical_task("batch builder", async move {
+        epoch_task_spawner.spawn_critical_task("batch builder", async move {
             let res = batch_builder.await;
             info!(target: "tn::execution", ?res, "batch builder task exited");
         });

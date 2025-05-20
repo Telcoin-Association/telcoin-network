@@ -18,7 +18,7 @@ use tn_faucet::FaucetArgs;
 use tn_reth::{system_calls::EpochState, RethConfig, RethEnv, WorkerTxPool};
 use tn_types::{
     BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, SealedBlock, SealedHeader,
-    WorkerId, B256,
+    TaskSpawner, WorkerId, B256,
 };
 use tokio::sync::{broadcast, mpsc, RwLock};
 mod builder;
@@ -81,9 +81,10 @@ impl ExecutionNode {
         &self,
         worker_id: WorkerId,
         block_provider_sender: BatchSender,
+        task_spawner: &TaskSpawner,
     ) -> eyre::Result<()> {
         let mut guard = self.internal.write().await;
-        guard.start_batch_builder(worker_id, block_provider_sender).await
+        guard.start_batch_builder(worker_id, block_provider_sender, task_spawner).await
     }
 
     /// Batch validator

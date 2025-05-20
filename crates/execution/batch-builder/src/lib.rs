@@ -34,7 +34,7 @@ use std::{
 use tn_reth::{RethEnv, TxPool as _, WorkerTxPool};
 use tn_types::{
     error::BlockSealError, Address, BatchBuilderArgs, BatchSender, PendingBatchConfig, SealedBlock,
-    TxHash,
+    TaskSpawner, TxHash,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -84,6 +84,8 @@ pub struct BatchBuilder {
     state_changed: mpsc::Receiver<SealedBlock>,
     /// The last canonical update, saved when state_changed sends a new update.
     last_canonical_update: SealedBlock,
+    /// The type to spawn tasks.
+    task_spawner: TaskSpawner,
 }
 
 impl BatchBuilder {
@@ -94,6 +96,7 @@ impl BatchBuilder {
         to_worker: BatchSender,
         address: Address,
         max_delay: Duration,
+        task_spawner: TaskSpawner,
     ) -> Self {
         let max_delay_interval = tokio::time::interval(max_delay);
         let state_changed = reth_env.canonical_block_stream();
@@ -106,6 +109,7 @@ impl BatchBuilder {
             max_delay_interval,
             state_changed,
             last_canonical_update,
+            task_spawner,
         }
     }
 
@@ -131,7 +135,7 @@ impl BatchBuilder {
         let (result, done) = oneshot::channel();
 
         // spawn block building task and forward to worker
-        tokio::spawn(async move {
+        self.task_spawner.spawn_task("next-batch", async move {
             // ack once worker reaches quorum
             let (ack, rx) = oneshot::channel();
 
@@ -326,26 +330,12 @@ mod tests {
     use tn_storage::{open_db, tables::Batches};
     use tn_types::{
         adiri_genesis, Bytes, CommittedSubDag, ConsensusHeader, ConsensusOutput, Database,
-        GenesisAccount, SealedBatch, TaskManager, U160, U256,
+        GenesisAccount, TaskManager, U160, U256,
     };
     use tn_worker::{
-        metrics::WorkerMetrics,
-        quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
-        Worker, WorkerNetworkHandle,
+        metrics::WorkerMetrics, test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle,
     };
     use tokio::time::timeout;
-
-    #[derive(Clone, Debug)]
-    struct TestMakeBlockQuorumWaiter();
-    impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
-        fn verify_batch(
-            &self,
-            _batch: SealedBatch,
-            _timeout: Duration,
-        ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
-            tokio::spawn(async move { Ok(()) })
-        }
-    }
 
     #[tokio::test]
     async fn test_make_block_no_ack_txs_in_pool_still() {
@@ -376,7 +366,7 @@ mod tests {
         client.set_worker_to_primary_local_handler(worker_to_primary);
         let temp_dir = TempDir::new().unwrap();
         let store = open_db(temp_dir.path());
-        let qw = TestMakeBlockQuorumWaiter();
+        let qw = TestMakeBlockQuorumWaiter::new_test();
         let node_metrics = WorkerMetrics::default();
         let timeout = Duration::from_secs(5);
         let mut task_manager = TaskManager::new("Batch Builder Test");
@@ -398,6 +388,7 @@ mod tests {
             block_provider.batches_tx(),
             address,
             Duration::from_secs(1),
+            task_manager.get_spawner(),
         );
 
         let gas_price = reth_env.get_gas_price().unwrap();
@@ -539,6 +530,8 @@ mod tests {
         let TestExecutionComponents { reth_env, txpool, chain, .. } = execution_components;
         let address = Address::from(U160::from(33));
         let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
+        let task_manager = TaskManager::default();
+
         // build execution block proposer
         let batch_builder = BatchBuilder::new(
             &reth_env,
@@ -546,6 +539,7 @@ mod tests {
             to_worker,
             address,
             Duration::from_millis(1),
+            task_manager.get_spawner(),
         );
 
         // expected to be 7 wei for first block
@@ -697,6 +691,7 @@ mod tests {
         let TestExecutionComponents { reth_env, txpool, chain, .. } = execution_components;
         let address = Address::from(U160::from(33));
         let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
+        let task_manager = TaskManager::default();
 
         // build execution block proposer
         let batch_builder = BatchBuilder::new(
@@ -705,6 +700,7 @@ mod tests {
             to_worker,
             address,
             Duration::from_secs(1),
+            task_manager.get_spawner(),
         );
 
         // expected to be 7 wei for first block

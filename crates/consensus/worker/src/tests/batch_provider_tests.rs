@@ -1,33 +1,11 @@
 //! Unit tests for the worker's batch provider.
 use super::*;
-use crate::quorum_waiter::QuorumWaiterError;
-use std::sync::Mutex;
+use crate::{quorum_waiter::QuorumWaiterError, test_utils::TestMakeBlockQuorumWaiter};
 use tempfile::TempDir;
 use tn_network_types::MockWorkerToPrimary;
 use tn_reth::test_utils::transaction;
 use tn_storage::open_db;
 use tn_types::Batch;
-
-#[derive(Clone, Debug)]
-struct TestMakeBlockQuorumWaiter(Arc<Mutex<Option<SealedBatch>>>);
-impl TestMakeBlockQuorumWaiter {
-    fn new_test() -> Self {
-        Self(Arc::new(Mutex::new(None)))
-    }
-}
-impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
-    fn verify_batch(
-        &self,
-        batch: SealedBatch,
-        _timeout: Duration,
-    ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
-        let data = self.0.clone();
-        tokio::spawn(async move {
-            *data.lock().unwrap() = Some(batch);
-            Ok(())
-        })
-    }
-}
 
 #[tokio::test]
 async fn make_batch() {

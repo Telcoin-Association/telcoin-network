@@ -370,7 +370,10 @@ where
         // consensus config for shutdown subscribers
         let consensus_shutdown = primary.shutdown_signal().await;
 
-        engine.start_batch_builder(worker.id(), worker.batches_tx()).await?;
+        let batch_builder_task_spawner = epoch_task_manager.get_spawner();
+        engine
+            .start_batch_builder(worker.id(), worker.batches_tx(), &batch_builder_task_spawner)
+            .await?;
 
         // update tasks
         primary_task_manager.update_tasks();

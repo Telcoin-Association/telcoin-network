@@ -222,7 +222,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         let batch_attest_handle = quorum_waiter.verify_batch(
             sealed_batch.clone(),
             self.timeout,
-            &self.network_handle.get_task_spawner(),
+            self.network_handle.get_task_spawner(),
         );
 
         // Wait for our batch to reach quorum or fail to do so.

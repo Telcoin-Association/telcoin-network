@@ -26,7 +26,7 @@ tempfile = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 
 # integration tests
-tn-worker = { workspace = true }
+tn-worker = { workspace = true, features = ["test-utils"] }
 tn-network-types = { workspace = true }
 tn-storage = { workspace = true }
 tn-batch-validator = { workspace = true }

@@ -30,8 +30,8 @@ use tn_test_utils::faucet_test_execution_node;
 
 use tn_types::{
     adiri_genesis, error::BlockSealError, hex, public_key_to_address, sol, Address, GenesisAccount,
-    SealedBatch, SolType, SolValue, TaskManager, TransactionSigned, TransactionTrait as _, B256,
-    U160, U256,
+    SealedBatch, SolType, SolValue, TaskManager, TaskSpawner, TransactionSigned,
+    TransactionTrait as _, B256, U160, U256,
 };
 use tn_worker::{
     metrics::WorkerMetrics,
@@ -51,12 +51,17 @@ impl QuorumWaiterTrait for TestChanQuorumWaiter {
         &self,
         batch: SealedBatch,
         _timeout: Duration,
-    ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
+        task_spawner: &TaskSpawner,
+    ) -> oneshot::Receiver<Result<(), QuorumWaiterError>> {
         let chan = self.0.clone();
+        let (tx, rx) = oneshot::channel();
+        let task_name = format!("verify-batch-{}", batch.digest());
+        // task_spawner.spawn_task(task_name, async move {
         tokio::spawn(async move {
             chan.send(batch).await.unwrap();
-            Ok(())
-        })
+            tx.send(Ok(()))
+        });
+        rx
     }
 }
 
@@ -284,7 +289,8 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
 
     // start batch maker
     execution_node.initialize_worker_components(worker_id).await?;
-    execution_node.start_batch_builder(worker_id, batch_provider.batches_tx()).await?;
+    let spawner = task_manager.get_spawner();
+    execution_node.start_batch_builder(worker_id, batch_provider.batches_tx(), &spawner).await?;
 
     // create client
     let client = execution_node.worker_http_client(&worker_id).await?.expect("worker rpc client");
@@ -607,8 +613,9 @@ async fn test_with_creds_faucet_transfers_stablecoin_with_google_kms() -> eyre::
     // start batch maker
     let worker_id = 0;
     let (to_worker, mut next_batch) = tokio::sync::mpsc::channel(2);
+    let spawner = task_manager.get_spawner();
     execution_node.initialize_worker_components(worker_id).await?;
-    execution_node.start_batch_builder(worker_id, to_worker).await?;
+    execution_node.start_batch_builder(worker_id, to_worker, &spawner).await?;
 
     let user_address = Address::random();
     let client = execution_node.worker_http_client(&worker_id).await?.expect("worker rpc client");

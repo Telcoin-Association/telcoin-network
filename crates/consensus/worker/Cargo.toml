@@ -35,6 +35,7 @@ rand = { workspace = true }
 tempfile = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 tn-test-utils = { workspace = true }
+tn-worker = { workspace = true, features = ["test-utils"] }
 
 [features]
 default = []

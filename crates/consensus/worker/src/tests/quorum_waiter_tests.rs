@@ -35,7 +35,11 @@ async fn wait_for_quorum() {
     let sealed_batch = batch().seal_slow();
 
     // Forward the batch along with the handlers to the `QuorumWaiter`.
-    let attest_handle = quorum_waiter.verify_batch(sealed_batch.clone(), Duration::from_secs(10));
+    let attest_handle = quorum_waiter.verify_batch(
+        sealed_batch.clone(),
+        Duration::from_secs(10),
+        &task_manager.get_spawner(),
+    );
 
     for _i in 0..3 {
         match network_rx.recv().await {
@@ -58,7 +62,11 @@ async fn wait_for_quorum() {
     let sealed_batch2 = batch().seal_slow();
 
     // Forward the batch along with the handlers to the `QuorumWaiter`.
-    let attest2_handle = quorum_waiter.verify_batch(sealed_batch2.clone(), Duration::from_secs(10));
+    let attest2_handle = quorum_waiter.verify_batch(
+        sealed_batch2.clone(),
+        Duration::from_secs(10),
+        &task_manager.get_spawner(),
+    );
 
     // Ensure the other listeners correctly received the batches.
     for _i in 0..3 {

@@ -20,27 +20,16 @@ use tn_storage::{open_db, tables::Batches};
 use tn_types::{
     Address, Batch, BatchValidation, Bytes, Certificate, CommittedSubDag, ConsensusHeader,
     ConsensusOutput, Database, Encodable2718 as _, ReputationScores, SealedBatch, TaskManager,
-    U160, U256,
+    TaskSpawner, U160, U256,
 };
 use tn_worker::{
     metrics::WorkerMetrics,
     quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
+    test_utils::TestMakeBlockQuorumWaiter,
     Worker, WorkerNetworkHandle,
 };
-use tokio::time::timeout;
+use tokio::{sync::oneshot, time::timeout};
 use tracing::debug;
-
-#[derive(Clone, Debug)]
-struct TestMakeBlockQuorumWaiter();
-impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
-    fn verify_batch(
-        &self,
-        _batch: SealedBatch,
-        _timeout: Duration,
-    ) -> tokio::task::JoinHandle<Result<(), QuorumWaiterError>> {
-        tokio::spawn(async move { Ok(()) })
-    }
-}
 
 #[tokio::test]
 async fn test_make_batch_el_to_cl() {
@@ -58,7 +47,7 @@ async fn test_make_batch_el_to_cl() {
     let mock_server = MockWorkerToPrimary();
     network_client.set_worker_to_primary_local_handler(Arc::new(mock_server));
 
-    let qw = TestMakeBlockQuorumWaiter();
+    let qw = TestMakeBlockQuorumWaiter::new_test();
     let timeout = Duration::from_secs(5);
     let batch_provider = Worker::new(
         0,
@@ -93,6 +82,7 @@ async fn test_make_batch_el_to_cl() {
         batch_provider.batches_tx(),
         address,
         Duration::from_secs(1),
+        task_manager.get_spawner(),
     );
 
     let gas_price = reth_env.get_gas_price().unwrap();
@@ -228,8 +218,14 @@ async fn test_batch_builder_produces_valid_batchess() {
     let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
 
     // build execution block proposer
-    let batch_builder =
-        BatchBuilder::new(&reth_env, txpool.clone(), to_worker, address, Duration::from_secs(1));
+    let batch_builder = BatchBuilder::new(
+        &reth_env,
+        txpool.clone(),
+        to_worker,
+        address,
+        Duration::from_secs(1),
+        task_manager.get_spawner(),
+    );
 
     let gas_price = reth_env.get_gas_price().unwrap();
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
@@ -381,8 +377,14 @@ async fn test_canonical_notification_updates_pool() {
     let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
 
     // build execution block proposer
-    let batch_builder =
-        BatchBuilder::new(&reth_env, txpool.clone(), to_worker, address, Duration::from_secs(1));
+    let batch_builder = BatchBuilder::new(
+        &reth_env,
+        txpool.clone(),
+        to_worker,
+        address,
+        Duration::from_secs(1),
+        task_manager.get_spawner(),
+    );
 
     let gas_price = reth_env.get_gas_price().unwrap();
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
