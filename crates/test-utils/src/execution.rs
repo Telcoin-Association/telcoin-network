@@ -63,12 +63,12 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     let command = NodeCommand::<CliExt>::try_parse_from(cli_args)?;
 
     let NodeCommand { config: _, instance, ext, reth, datadir: _, .. } = command;
-    let RethCommand { chain, metrics, rpc, txpool, db, .. } = reth;
+    let RethCommand { chain, rpc, txpool, db, .. } = reth;
 
     // overwrite chain spec if passed in
     let chain = opt_chain.unwrap_or(chain);
 
-    let reth_command = RethCommand { chain, metrics, rpc, txpool, db };
+    let reth_command = RethCommand { chain, rpc, txpool, db };
 
     let mut tn_config = Config::default();
 
@@ -86,7 +86,7 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
         node_config: RethConfig::new(reth_command, instance, None, tmp_dir, true),
         tn_config,
         opt_faucet_args,
-        consensus_metrics: None,
+        metrics: None,
     };
 
     Ok((builder, ext))
@@ -124,7 +124,7 @@ pub fn faucet_test_execution_node(
         node_config: node_config.clone(),
         tn_config,
         opt_faucet_args: Some(faucet),
-        consensus_metrics: None,
+        metrics: None,
     };
 
     // create engine node

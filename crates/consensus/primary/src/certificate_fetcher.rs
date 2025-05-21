@@ -110,7 +110,7 @@ impl<DB: Database> CertificateFetcher<DB> {
             metrics: consensus_bus.primary_metrics().node_metrics.clone(),
         });
 
-        task_manager.spawn_task(
+        task_manager.spawn_critical_task(
             "certificate fetcher task",
             monitored_future!(
                 async move {

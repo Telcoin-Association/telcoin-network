@@ -260,7 +260,7 @@ pub fn start_prometheus_server(addr: SocketAddr, task_manager: &TaskManager, shu
 
     let app = Router::new().route(METRICS_ROUTE, get(metrics));
 
-    task_manager.spawn_task("ConsensusMetrics", async move {
+    task_manager.spawn_critical_task("ConsensusMetrics", async move {
         if let Err(e) = axum::Server::bind(&addr)
             .serve(app.into_make_service())
             .with_graceful_shutdown(shutdown)

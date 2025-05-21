@@ -83,7 +83,7 @@ pub fn spawn_subscriber<DB: Database>(
     match mode {
         // If we are active then partcipate in consensus.
         NodeMode::CvvActive => {
-            task_manager.spawn_task(
+            task_manager.spawn_critical_task(
                 "subscriber consensus",
                 monitored_future!(
                     async move {
@@ -99,7 +99,7 @@ pub fn spawn_subscriber<DB: Database>(
         NodeMode::CvvInactive => {
             let clone = task_manager.get_spawner();
             // If we are not active but are a CVV then catch up and rejoin.
-            task_manager.spawn_task(
+            task_manager.spawn_critical_task(
                 "subscriber catch up and rejoin consensus",
                 monitored_future!(
                     async move {
@@ -115,7 +115,7 @@ pub fn spawn_subscriber<DB: Database>(
         NodeMode::Observer => {
             let clone = task_manager.get_spawner();
             // If we are not active then just follow consensus.
-            task_manager.spawn_task(
+            task_manager.spawn_critical_task(
                 "subscriber follow consensus",
                 monitored_future!(
                     async move {

@@ -97,7 +97,6 @@ impl<DB: Database> Certifier<DB> {
 
         let highest_created_certificate = Self::highest_created_certificate(&config);
 
-        // TODO- these tasks to send to each peer should be replaced with a libp2p pub/sub topic.
         for (name, rx_own_certificate_broadcast) in broadcast_targets.into_iter() {
             trace!(target: "primary::synchronizer::broadcast_certificates", ?name, "spawning sender for peer");
             task_manager.spawn_task(
@@ -109,6 +108,7 @@ impl<DB: Database> Certifier<DB> {
                 ),
             );
         }
+
         if let Some(cert) = highest_created_certificate {
             // Error can be ignored.
             if let Err(e) = tx_own_certificate_broadcast.send(cert) {
@@ -116,7 +116,7 @@ impl<DB: Database> Certifier<DB> {
             }
         }
 
-        task_manager.spawn_task("certifier task", monitored_future!(
+        task_manager.spawn_critical_task("certifier task", monitored_future!(
             async move {
                 info!(target: "primary::certifier", "Certifier on node {:?} has started successfully.", authority_id);
                 Self {

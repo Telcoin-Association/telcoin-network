@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use tempfile::{tempdir, TempDir};
 use tn_config::TelcoinDirs;
+use tn_types::Epoch;
 
 #[derive(Debug)]
 pub struct TelcoinTempDirs(TempDir);
@@ -42,6 +43,11 @@ impl TelcoinDirs for TelcoinTempDirs {
 
     fn consensus_db_path(&self) -> PathBuf {
         self.0.path().join("consensus-db")
+    }
+
+    fn epoch_db_path(&self, epoch: Epoch) -> PathBuf {
+        let extension = format!("epoch_{epoch}");
+        self.consensus_db_path().join(extension)
     }
 
     fn reth_db_path(&self) -> PathBuf {

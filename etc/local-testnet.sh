@@ -137,7 +137,6 @@ if [ "$START" = true ]; then
         DATADIR="${ROOTDIR}/${VALIDATOR}"
         INSTANCE=$((i+1))
         RPC_PORT=$((8545-i))
-        METRICS="127.0.0.1:909$i"
         CONSENSUS_METRICS="127.0.0.1:910$i"
 
         echo "Starting ${VALIDATOR} in background, rpc endpoint http://localhost:$RPC_PORT"
@@ -146,23 +145,20 @@ if [ "$START" = true ]; then
         target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
            --genesis "${DATADIR}/genesis/genesis.json" \
            --instance "${INSTANCE}" \
-           --metrics "${METRICS}" \
-           --consensus-metrics "${CONSENSUS_METRICS}" \
+           --metrics "${CONSENSUS_METRICS}" \
            --log.stdout.format log-fmt \
            -vvv \
            --http > "${ROOTDIR}/${VALIDATOR}.log" &
     done
 
     DATADIR="${ROOTDIR}/observer"
-    METRICS="127.0.0.1:9094"
     CONSENSUS_METRICS="127.0.0.1:9104"
     echo "Starting Observer in background, rpc endpoint http://localhost:8541"
     target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
        --genesis "${DATADIR}/genesis/genesis.json" \
        --observer \
        --instance 5 \
-       --metrics "${METRICS}" \
-       --consensus-metrics "${CONSENSUS_METRICS}" \
+       --metrics "${CONSENSUS_METRICS}" \
        --log.stdout.format log-fmt \
        -vvv \
        --http > "${ROOTDIR}/observer.log" &

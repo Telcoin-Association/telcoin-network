@@ -40,7 +40,7 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     ///
     /// The metrics will be served at the given interface and port.
     #[arg(long, value_name = "SOCKET", value_parser = parse_socket_address, help_heading = "Consensus Metrics")]
-    pub consensus_metrics: Option<SocketAddr>,
+    pub metrics: Option<SocketAddr>,
 
     /// Add a new instance of a node.
     ///
@@ -157,7 +157,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             datadir: _, // Used above
             config: _,  // Used above
             genesis: _, // Used above
-            consensus_metrics,
+            metrics,
             instance,
             with_unused_ports,
             reth,
@@ -178,8 +178,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             with_unused_ports,
         );
 
-        let builder =
-            TnBuilder { node_config, tn_config, opt_faucet_args: None, consensus_metrics };
+        let builder = TnBuilder { node_config, tn_config, opt_faucet_args: None, metrics };
 
         launcher(builder, ext, tn_datadir, passphrase)
     }

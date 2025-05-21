@@ -258,5 +258,5 @@ async fn test_shutdown_core() {
 
     // Shutdown the core.
     fixture.notify_shutdown();
-    task_manager.join(Notifier::default()).await;
+    let _ = task_manager.join(Notifier::default()).await;
 }

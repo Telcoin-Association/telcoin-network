@@ -11,6 +11,7 @@ use std::{
     str::FromStr as _,
 };
 use tn_config::TelcoinDirs;
+use tn_types::Epoch;
 
 /// The path to join for the directory that stores validator keys.
 pub const VALIDATOR_KEYS_DIR: &str = "validator-keys";
@@ -132,6 +133,11 @@ impl TelcoinDirs for DataDirChainPath {
 
     fn consensus_db_path(&self) -> PathBuf {
         self.0.as_ref().join("consensus-db")
+    }
+
+    fn epoch_db_path(&self, epoch: Epoch) -> PathBuf {
+        let extension = format!("epoch_{epoch}");
+        self.consensus_db_path().join(extension)
     }
 
     fn reth_db_path(&self) -> PathBuf {
