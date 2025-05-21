@@ -849,7 +849,7 @@ async fn committed_round_after_restart() {
 
         // Shutdown consensus and wait for it to stop.
         fixture.notify_shutdown();
-        task_manager.join(Notifier::default()).await;
+        let _ = task_manager.join(Notifier::default()).await;
     }
 }
 
@@ -1114,7 +1114,7 @@ async fn restart_with_new_committee() {
         config.shutdown().notify();
 
         // Ensure consensus stopped.
-        task_manager.join(Notifier::default()).await;
+        let _ = task_manager.join(Notifier::default()).await;
     }
 }
 

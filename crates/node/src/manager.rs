@@ -42,7 +42,6 @@ use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::{
     broadcast,
     mpsc::{self},
-    oneshot,
 };
 use tokio_stream::StreamExt as _;
 use tracing::{debug, info, warn};
@@ -77,13 +76,6 @@ pub struct EpochManager<P> {
     key_config: KeyConfig,
     /// The epoch manager's [Notifier] to shutdown all node processes.
     node_shutdown: Notifier,
-    /// The oneshot sender to acknowledge the start of the first epoch.
-    ///
-    /// The node manager needs at least one task to await. This is an option
-    /// that is held for the first epoch. The first epoch spawns node operatons,
-    /// and returns the ack that the first epoch has started. At this point,
-    /// the node manager has other tasks to await and will run normally.
-    node_ready: Option<oneshot::Sender<()>>,
     /// Output channel for consensus blocks to be executed.
     ///
     /// This should only be accessed elsewhere through the epoch's [ConsensusBus].
@@ -124,7 +116,6 @@ where
             worker_network_handle: None,
             key_config,
             node_shutdown,
-            node_ready: None,
             consensus_output,
         })
     }
@@ -153,11 +144,6 @@ where
         let mut node_task_manager = TaskManager::new(NODE_TASK_MANAGER);
         let node_task_spawner = node_task_manager.get_spawner();
         // create oneshot channel to await the first epoch to start
-        let (start, ready) = oneshot::channel();
-        node_task_spawner.spawn_task("epoch-started", ready);
-
-        // track the status for when the node is ready
-        self.node_ready = Some(start);
 
         info!(target: "epoch-manager", "starting node and launching first epoch");
 
@@ -182,8 +168,11 @@ where
         // await all tasks on epoch-task-manager or node shutdown
         tokio::select! {
             // run long-living node tasks
-            _ = node_task_manager.join_until_exit(self.node_shutdown.clone()) => {
-                Err(eyre!("Node task shutdown"))
+            res = node_task_manager.join_until_exit(self.node_shutdown.clone()) => {
+                match res {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(eyre!("Node task shutdown: {e}")),
+                }
             }
 
             // loop through short-term epochs
@@ -343,7 +332,7 @@ where
 
         // start consensus metrics for the epoch
         let metrics_shutdown = Notifier::new();
-        if let Some(metrics_socket) = self.builder.consensus_metrics {
+        if let Some(metrics_socket) = self.builder.metrics {
             start_prometheus_server(
                 metrics_socket,
                 epoch_task_manager,
@@ -389,13 +378,8 @@ where
 
         info!(target: "epoch-manager", tasks=?epoch_task_manager, "EPOCH TASKS\n");
 
-        // indicate node is ready if this is the first epoch
-        if let Some(ack) = self.node_ready.take() {
-            let _res = ack.send(());
-            debug!(target: "epoch-manager", ?_res, "sent ack for node startup");
-        }
-
-        epoch_task_manager.join_until_exit(consensus_shutdown).await;
+        // Errors should have been logged already.
+        let _ = epoch_task_manager.join_until_exit(consensus_shutdown).await;
 
         // epoch complete
         let running = consensus_bus.restart();

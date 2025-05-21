@@ -22,8 +22,7 @@ pub struct ExecutionNodeBuilder {
 impl ExecutionNodeBuilder {
     /// Start the builder with required components
     pub fn new(tn_builder: &TnBuilder, reth_env: RethEnv) -> Self {
-        let TnBuilder { node_config: _, tn_config, opt_faucet_args, consensus_metrics: _ } =
-            tn_builder;
+        let TnBuilder { node_config: _, tn_config, opt_faucet_args, metrics: _ } = tn_builder;
 
         Self { reth_env, tn_config: tn_config.clone(), opt_faucet_args: opt_faucet_args.clone() }
     }

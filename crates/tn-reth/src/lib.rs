@@ -42,7 +42,6 @@ use reth::{
         BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
     },
     builder::NodeConfig,
-    prometheus_exporter::install_prometheus_recorder,
     rpc::{
         builder::{config::RethRpcServerConfig, RpcModuleBuilder, TransportRpcModules},
         eth::EthApi,
@@ -80,7 +79,7 @@ use reth_revm::{
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
 use serde_json::Value;
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr},
     ops::RangeInclusive,
     path::{Path, PathBuf},
     sync::Arc,
@@ -99,7 +98,7 @@ use tn_types::{
     SealedHeader, TaskManager, TaskSpawner, TransactionSigned, TxKind, B256, EMPTY_OMMER_ROOT_HASH,
     EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, U256,
 };
-use tokio::sync::mpsc::{self, unbounded_channel};
+use tokio::sync::mpsc::{self};
 use tracing::{debug, error, info, warn};
 use traits::{TNPayload, TelcoinNode, TelcoinNodeTypes as _};
 
@@ -169,12 +168,6 @@ pub struct RethCommand {
     )]
     pub chain: Arc<RethChainSpec>,
 
-    /// Enable Prometheus execution metrics.
-    ///
-    /// The metrics will be served at the given interface and port.
-    #[arg(long, value_name = "SOCKET", value_parser = parse_socket_address, help_heading = "Execution Metrics")]
-    pub metrics: Option<SocketAddr>,
-
     /// All rpc related arguments
     #[clap(flatten)]
     pub rpc: RpcServerArgs,
@@ -206,7 +199,7 @@ impl RethConfig {
         // create a reth DatadirArgs from tn datadir
         let datadir = path_to_datadir(datadir.as_ref());
 
-        let RethCommand { chain, metrics, rpc, txpool, db } = reth_config;
+        let RethCommand { chain, rpc, txpool, db } = reth_config;
         // We don't just use Default for these Reth args.
         // This will force us to look at new options and make sure they are good for our use.
         // We DO NOT use the Reth networking so these settings should reflect that.
@@ -299,7 +292,7 @@ impl RethConfig {
         let mut this = NodeConfig {
             config,
             chain,
-            metrics,
+            metrics: None,
             instance,
             datadir,
             network,
@@ -394,19 +387,8 @@ impl RethEnv {
         db_path: P,
     ) -> eyre::Result<RethDb> {
         let db_path = db_path.as_ref();
-        // Register the prometheus recorder before creating the database,
-        // then start metrics
-        //
-        // reth calls this in node command for CLI
-        // to capture db startup metrics
-        // metrics for TN are unrefined and outside the scope of this PR
-        //
-        // this is a best-guess attempt to capture data from the exectuion layer
-        // but more work is needed to ensure proper metric collection
-        let _ = install_prometheus_recorder();
-
         info!(target: "tn::reth", path = ?db_path, "opening database");
-        Ok(Arc::new(init_db(db_path, reth_config.0.db.database_args())?.with_metrics()))
+        Ok(Arc::new(init_db(db_path, reth_config.0.db.database_args())?))
     }
 
     /// Produce a new wrapped Reth environment from a config, DB path and task manager.
@@ -421,7 +403,7 @@ impl RethEnv {
         let (evm_executor, evm_config) = Self::init_evm_components(&node_config);
         let provider_factory = Self::init_provider_factory(&node_config, database)?;
         let blockchain_provider =
-            Self::init_blockchain_provider(task_manager, &provider_factory, evm_executor.clone())?;
+            Self::init_blockchain_provider(&provider_factory, evm_executor.clone())?;
         let task_spawner = task_manager.get_spawner();
         Ok(Self { node_config, blockchain_provider, evm_config, evm_executor, task_spawner })
     }
@@ -437,8 +419,7 @@ impl RethEnv {
             database,
             Arc::clone(&node_config.chain),
             StaticFileProvider::read_write(datadir.static_files())?,
-        )
-        .with_static_files_metrics();
+        );
 
         // Initialize genesis if needed
         let genesis_hash = init_genesis(&provider_factory)?;
@@ -449,15 +430,9 @@ impl RethEnv {
 
     /// Initialize the blockchain provider and tree
     fn init_blockchain_provider(
-        task_manager: &TaskManager,
         provider_factory: &ProviderFactory<TelcoinNode>,
         evm_executor: BasicBlockExecutorProvider<EthExecutionStrategyFactory<TnEvmConfig>>,
     ) -> eyre::Result<BlockchainProvider<TelcoinNode>> {
-        // Set up metrics listener
-        let (sync_metrics_tx, sync_metrics_rx) = unbounded_channel();
-        let sync_metrics_listener = reth_stages::MetricsListener::new(sync_metrics_rx);
-        task_manager.spawn_critical_task("stages metrics listener task", sync_metrics_listener);
-
         // Initialize consensus implementation
         let tn_execution: Arc<dyn FullConsensus> = Arc::new(TNExecution);
 
@@ -465,8 +440,7 @@ impl RethEnv {
         let tree_config = BlockchainTreeConfig::default();
         let tree_externals =
             TreeExternals::new(provider_factory.clone(), tn_execution, evm_executor);
-        let tree =
-            BlockchainTree::new(tree_externals, tree_config)?.with_sync_metrics_tx(sync_metrics_tx);
+        let tree = BlockchainTree::new(tree_externals, tree_config)?;
 
         let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
         let blockchain_db = BlockchainProvider::new(provider_factory.clone(), blockchain_tree)?;

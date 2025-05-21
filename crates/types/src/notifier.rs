@@ -61,6 +61,13 @@ impl Default for Notifier {
 }
 
 impl Noticer {
+    /// Return true of this Noticer has been noticed.
+    /// I.e. the future has or will resolve.
+    pub fn noticed(&self) -> bool {
+        let guard = self.lock.lock();
+        guard.0
+    }
+
     fn poll_int(&self, cx: &mut Context<'_>) -> Poll<()> {
         let mut guard = self.lock.lock();
         if guard.0 {
