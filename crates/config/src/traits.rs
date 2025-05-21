@@ -7,6 +7,7 @@ use std::{
     io::{ErrorKind::NotFound, Read, Write},
     path::{Path, PathBuf},
 };
+use tn_types::Epoch;
 use tracing::info;
 
 /// The serialization format for the config.
@@ -118,27 +119,32 @@ pub trait TelcoinDirs: std::fmt::Debug + Send + Sync + 'static {
     fn genesis_file_path(&self) -> PathBuf;
     /// Return the path to consensus's node storage.
     fn consensus_db_path(&self) -> PathBuf;
+    /// Return the path to consensus's epoch storage for a specific epoch.
+    fn epoch_db_path(&self, epoch: Epoch) -> PathBuf;
     /// Return the path to reth's node storage.
     fn reth_db_path(&self) -> PathBuf;
     /// Return the path to `network_config` file.
     fn network_config_path(&self) -> PathBuf;
 }
 
-impl TelcoinDirs for PathBuf {
+impl<P> TelcoinDirs for P
+where
+    P: AsRef<Path> + std::fmt::Debug + Send + Sync + 'static,
+{
     fn node_config_path(&self) -> PathBuf {
-        self.join("telcoin-network.yaml")
+        self.as_ref().join("telcoin-network.yaml")
     }
 
     fn validator_keys_path(&self) -> PathBuf {
-        self.join("validator-keys")
+        self.as_ref().join("validator-keys")
     }
 
     fn validator_info_path(&self) -> PathBuf {
-        self.join("validator")
+        self.as_ref().join("validator")
     }
 
     fn genesis_path(&self) -> PathBuf {
-        self.join("genesis")
+        self.as_ref().join("genesis")
     }
 
     fn committee_path(&self) -> PathBuf {
@@ -154,98 +160,19 @@ impl TelcoinDirs for PathBuf {
     }
 
     fn consensus_db_path(&self) -> PathBuf {
-        self.join("consensus-db")
+        self.as_ref().join("consensus-db")
+    }
+
+    fn epoch_db_path(&self, epoch: Epoch) -> PathBuf {
+        let extension = format!("epoch_{epoch}");
+        self.consensus_db_path().join(extension)
     }
 
     fn reth_db_path(&self) -> PathBuf {
-        self.join("db")
+        self.as_ref().join("db")
     }
 
     fn network_config_path(&self) -> PathBuf {
-        self.join("network-config")
-    }
-}
-
-impl TelcoinDirs for Path {
-    fn node_config_path(&self) -> PathBuf {
-        self.join("telcoin-network.yaml")
-    }
-
-    fn validator_keys_path(&self) -> PathBuf {
-        self.join("validator-keys")
-    }
-
-    fn validator_info_path(&self) -> PathBuf {
-        self.join("validator")
-    }
-
-    fn genesis_path(&self) -> PathBuf {
-        self.join("genesis")
-    }
-
-    fn committee_path(&self) -> PathBuf {
-        self.genesis_path().join("committee.yaml")
-    }
-
-    fn worker_cache_path(&self) -> PathBuf {
-        self.genesis_path().join("worker_cache.yaml")
-    }
-
-    fn genesis_file_path(&self) -> PathBuf {
-        self.genesis_path().join("genesis.json")
-    }
-
-    fn consensus_db_path(&self) -> PathBuf {
-        self.join("consensus-db")
-    }
-
-    fn reth_db_path(&self) -> PathBuf {
-        self.join("db")
-    }
-
-    fn network_config_path(&self) -> PathBuf {
-        self.join("network-config")
-    }
-}
-
-impl TelcoinDirs for &'static Path {
-    fn node_config_path(&self) -> PathBuf {
-        self.join("telcoin-network.yaml")
-    }
-
-    fn validator_keys_path(&self) -> PathBuf {
-        self.join("validator-keys")
-    }
-
-    fn validator_info_path(&self) -> PathBuf {
-        self.join("validator")
-    }
-
-    fn genesis_path(&self) -> PathBuf {
-        self.join("genesis")
-    }
-
-    fn committee_path(&self) -> PathBuf {
-        self.genesis_path().join("committee.yaml")
-    }
-
-    fn worker_cache_path(&self) -> PathBuf {
-        self.genesis_path().join("worker_cache.yaml")
-    }
-
-    fn genesis_file_path(&self) -> PathBuf {
-        self.genesis_path().join("genesis.json")
-    }
-
-    fn consensus_db_path(&self) -> PathBuf {
-        self.join("consensus-db")
-    }
-
-    fn reth_db_path(&self) -> PathBuf {
-        self.join("db")
-    }
-
-    fn network_config_path(&self) -> PathBuf {
-        self.join("network-config")
+        self.as_ref().join("network-config")
     }
 }
