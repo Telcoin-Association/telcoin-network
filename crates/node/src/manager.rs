@@ -32,7 +32,7 @@ use tn_reth::{
     system_calls::{ConsensusRegistry, EpochState},
     RethDb, RethEnv,
 };
-use tn_storage::{open_db, tables::ConsensusBlocks, DatabaseType};
+use tn_storage::{open_db, open_network_db, tables::ConsensusBlocks, DatabaseType};
 use tn_types::{
     BatchValidation, BlsPublicKey, Committee, CommitteeBuilder, ConsensusHeader, ConsensusOutput,
     Database as TNDatabase, Epoch, Multiaddr, Noticer, Notifier, SealedBlock, TaskManager,
@@ -132,13 +132,6 @@ where
         let reth_db =
             RethEnv::new_database(&self.builder.node_config, self.tn_datadir.reth_db_path())?;
 
-        // open the consensus db for this epoch
-        //
-        // TODO: consensus db should be epoch-specific - see issue #269
-        let consensus_db_path = self.tn_datadir.consensus_db_path();
-        info!(target: "epoch-manager", ?consensus_db_path, "node storage opened for epoch");
-        let consensus_db = open_db(consensus_db_path);
-
         // Main task manager that manages tasks across epochs.
         // Long-running tasks for the lifetime of the node.
         let mut node_task_manager = TaskManager::new(NODE_TASK_MANAGER);
@@ -146,10 +139,6 @@ where
         // create oneshot channel to await the first epoch to start
 
         info!(target: "epoch-manager", "starting node and launching first epoch");
-
-        // read the network config or use the default
-        let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
-        self.spawn_node_networks(node_task_spawner, &network_config, &consensus_db).await?;
 
         // create submanager for engine tasks
         let engine_task_manager = TaskManager::new(ENGINE_TASK_MANAGER);
@@ -164,6 +153,20 @@ where
         node_task_manager.update_tasks();
 
         info!(target: "epoch-manager", tasks=?node_task_manager, "NODE TASKS\n");
+
+        // retrieve epoch information from canonical tip
+        let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
+
+        // read last epoch db for consensus data
+        let consensus_db_path = self.tn_datadir.epoch_db_path(epoch);
+        // ensure dir exists
+        let _ = std::fs::create_dir_all(&consensus_db_path);
+        info!(target: "epoch-manager", ?consensus_db_path, "opening node storage for epoch");
+        let consensus_db = open_db(consensus_db_path);
+
+        // read the network config or use the default
+        let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
+        self.spawn_node_networks(node_task_spawner, &network_config).await?;
 
         // await all tasks on epoch-task-manager or node shutdown
         tokio::select! {
@@ -184,35 +187,29 @@ where
     /// epoch.
     ///
     /// This will create the long-running primary/worker [ConsensusNetwork]s for p2p swarm.
-    async fn spawn_node_networks<DB: TNDatabase>(
+    async fn spawn_node_networks(
         &mut self,
         node_task_spawner: TaskSpawner,
         network_config: &NetworkConfig,
-        consensus_db: &DB,
     ) -> eyre::Result<()> {
-        // dial bootnodes on startup
-        //
-        // for now, read the committee from fs to bootstrap network
-        let bootstrap_config = ConsensusConfig::new(
-            self.builder.tn_config.clone(),
-            &self.tn_datadir,
-            consensus_db.clone(),
-            self.key_config.clone(),
-            network_config.clone(),
-        )?;
-
         //
         //=== PRIMARY
         //
         // this is a temporary event stream - replaced at the start of every epoch
         let (tmp_event_stream, _temp_rx) = mpsc::channel(1000);
 
+        // create network db
+        let primary_network_db = self.tn_datadir.network_db_path().join("primary");
+        let _ = std::fs::create_dir_all(&primary_network_db);
+        info!(target: "epoch-manager", ?primary_network_db, "opening primary network storage at:");
+        let primary_network_db = open_network_db(primary_network_db);
+
         // create long-running network task for primary
         let primary_network = ConsensusNetwork::new_for_primary(
             network_config,
             tmp_event_stream,
             self.key_config.clone(),
-            consensus_db.clone(),
+            primary_network_db,
             node_task_spawner.clone(),
         )?;
         let primary_network_handle = primary_network.network_handle();
@@ -240,12 +237,18 @@ where
         // this is a temporary event stream - replaced at the start of every epoch
         let (tmp_event_stream, _temp_rx) = mpsc::channel(1000);
 
+        // create network db
+        let worker_network_db = self.tn_datadir.network_db_path().join("worker");
+        let _ = std::fs::create_dir_all(&worker_network_db);
+        info!(target: "epoch-manager", ?worker_network_db, "opening primary network storage at:");
+        let worker_network_db = open_network_db(worker_network_db);
+
         // create long-running network task for worker
         let worker_network = ConsensusNetwork::new_for_worker(
             network_config,
             tmp_event_stream,
             self.key_config.clone(),
-            consensus_db.clone(),
+            worker_network_db,
             node_task_spawner.clone(),
         )?;
         let worker_network_handle = worker_network.network_handle();
@@ -268,7 +271,6 @@ where
         self.worker_network_handle =
             Some(WorkerNetworkHandle::new(worker_network_handle, node_task_spawner.clone()));
 
-        info!(target: "epoch-manager", auth=?bootstrap_config.authority_id(), "node networks started. tmp_rx dropped D:");
         Ok(())
     }
 
@@ -284,8 +286,8 @@ where
         let mut epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
         let mut running = true;
 
-        // initialize networks to start listening for the first epoch
-        let mut initialize_networks = true;
+        // initialize long-running components for the first epoch
+        let mut initial_epoch = true;
 
         // start the epoch
         while running {
@@ -296,7 +298,7 @@ where
                         consensus_db.clone(),
                         &mut epoch_task_manager,
                         &network_config,
-                        &mut initialize_networks,
+                        &mut initial_epoch,
                     )
                     .await;
 
@@ -326,7 +328,7 @@ where
         consensus_db: DatabaseType,
         epoch_task_manager: &mut TaskManager,
         network_config: &NetworkConfig,
-        initialize_networks: &mut bool,
+        initial_epoch: &mut bool,
     ) -> eyre::Result<bool> {
         info!(target: "epoch-manager", "Starting epoch");
 
@@ -347,7 +349,7 @@ where
                 consensus_db,
                 epoch_task_manager,
                 network_config,
-                initialize_networks,
+                initial_epoch,
             )
             .await?;
 
@@ -417,7 +419,7 @@ where
         consensus_db: DatabaseType,
         epoch_task_manager: &TaskManager,
         network_config: &NetworkConfig,
-        initialize_networks: &mut bool,
+        initial_epoch: &mut bool,
     ) -> eyre::Result<(PrimaryNode<DatabaseType>, WorkerNode<DatabaseType>)> {
         // create config for consensus
         let consensus_config =
@@ -427,7 +429,7 @@ where
             .create_primary_node_components(
                 &consensus_config,
                 epoch_task_manager.get_spawner(),
-                initialize_networks,
+                initial_epoch,
             )
             .await?;
 
@@ -437,12 +439,12 @@ where
                 &consensus_config,
                 engine,
                 epoch_task_manager.get_spawner(),
-                initialize_networks,
+                initial_epoch,
             )
             .await?;
 
         // ensure initialized networks is false after the first run
-        *initialize_networks = false;
+        *initial_epoch = false;
 
         // set execution state for consensus
         let consensus_bus = primary.consensus_bus().await;
@@ -618,7 +620,7 @@ where
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
         epoch_task_spawner: TaskSpawner,
-        initialize_networks: &bool,
+        initial_epoch: &bool,
     ) -> eyre::Result<PrimaryNode<DB>> {
         let consensus_bus = ConsensusBus::new_with_args(
             consensus_config.config().parameters.gc_depth,
@@ -638,7 +640,7 @@ where
             state_sync.clone(),
             epoch_task_spawner.clone(),
             &network_handle,
-            initialize_networks,
+            initial_epoch,
         )
         .await?;
 
@@ -655,13 +657,13 @@ where
         consensus_config: &ConsensusConfig<DB>,
         engine: &ExecutionNode,
         epoch_task_spawner: TaskSpawner,
-        initialize_networks: &bool,
+        initial_epoch: &bool,
     ) -> eyre::Result<WorkerNode<DB>> {
         // only support one worker for now - otherwise, loop here
         let (worker_id, _worker_info) = consensus_config.config().workers().first_worker()?;
 
         // initialize worker components on startup
-        if *initialize_networks {
+        if *initial_epoch {
             engine.initialize_worker_components(*worker_id).await?;
         }
 
@@ -687,7 +689,7 @@ where
             validator.clone(),
             epoch_task_spawner,
             &network_handle,
-            initialize_networks,
+            initial_epoch,
         )
         .await?;
 
@@ -711,7 +713,7 @@ where
         state_sync: StateSynchronizer<DB>,
         epoch_task_spawner: TaskSpawner,
         network_handle: &PrimaryNetworkHandle,
-        initialize_networks: &bool,
+        initial_epoch: &bool,
     ) -> eyre::Result<()> {
         // create event streams for the primary network handler
         let (event_stream, rx_event_stream) = mpsc::channel(1000);
@@ -725,7 +727,7 @@ where
         debug!(target: "epoch-manager", auth=?consensus_config.authority_id(), "event stream updated!");
 
         // start listening if the network needs to be initialized
-        if *initialize_networks {
+        if *initial_epoch {
             // start listening for p2p messages
             let primary_address = consensus_config.primary_address();
             let primary_multiaddr =
@@ -830,7 +832,7 @@ where
         validator: Arc<dyn BatchValidation>,
         epoch_task_spawner: TaskSpawner,
         network_handle: &WorkerNetworkHandle,
-        initialize_networks: &bool,
+        initial_epoch: &bool,
     ) -> eyre::Result<()> {
         // create event streams for the worker network handler
         let (event_stream, rx_event_stream) = mpsc::channel(1000);
@@ -842,7 +844,7 @@ where
             .await?;
 
         // start listening if the network needs to be initialized
-        if *initialize_networks {
+        if *initial_epoch {
             let worker_multiaddr =
                 Self::get_multiaddr_from_env_or_config("WORKER_MULTIADDR", worker_address.clone());
             network_handle.inner_handle().start_listening(worker_multiaddr).await?;

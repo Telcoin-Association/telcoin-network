@@ -30,14 +30,6 @@ pub fn launch_node<P>(
 where
     P: TelcoinDirs + 'static,
 {
-    let consensus_db_path = tn_datadir.consensus_db_path();
-
-    tracing::info!(target: "telcoin::node", "opening node storage at {:?}", consensus_db_path);
-
-    // open storage for consensus
-    // In case the DB dir does not yet exist.
-    let _ = std::fs::create_dir_all(&consensus_db_path);
-
     let runtime = Builder::new_multi_thread()
         .thread_name("telcoin-network")
         .enable_io()

@@ -36,7 +36,7 @@ fn create_test_peers<Req: TNMessage, Res: TNMessage>(
             let config = a.consensus_config();
             let (tx, network_events) = mpsc::channel(10);
             let network_key = config.key_config().primary_network_keypair().clone();
-            let db = MemDatabase::default();
+            let db = MemDatabase::new_for_network();
             let network = ConsensusNetwork::<Req, Res, MemDatabase>::new(
                 config.network_config(),
                 tx,
@@ -137,7 +137,7 @@ where
         tx1,
         config_1.key_config().clone(),
         network_key_1,
-        MemDatabase::default(),
+        MemDatabase::new_for_network(),
         task_manager.get_spawner(),
     )
     .expect("peer1 network created");
@@ -156,7 +156,7 @@ where
         tx2,
         config_2.key_config().clone(),
         network_key_2,
-        MemDatabase::default(),
+        MemDatabase::new_for_network(),
         task_manager.get_spawner(),
     )
     .expect("peer2 network created");

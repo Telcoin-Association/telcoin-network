@@ -119,12 +119,20 @@ pub trait TelcoinDirs: std::fmt::Debug + Send + Sync + 'static {
     fn genesis_file_path(&self) -> PathBuf;
     /// Return the path to consensus's node storage.
     fn consensus_db_path(&self) -> PathBuf;
-    /// Return the path to consensus's epoch storage for a specific epoch.
-    fn epoch_db_path(&self, epoch: Epoch) -> PathBuf;
     /// Return the path to reth's node storage.
     fn reth_db_path(&self) -> PathBuf;
     /// Return the path to `network_config` file.
     fn network_config_path(&self) -> PathBuf;
+
+    /// Return the path to consensus's epoch storage for a specific epoch.
+    fn epoch_db_path(&self, epoch: Epoch) -> PathBuf {
+        let extension = format!("epoch_{epoch}");
+        self.consensus_db_path().join(extension)
+    }
+    /// Return the path to `network_db` file.
+    fn network_db_path(&self) -> PathBuf {
+        self.consensus_db_path().join("network_db")
+    }
 }
 
 impl<P> TelcoinDirs for P
@@ -161,11 +169,6 @@ where
 
     fn consensus_db_path(&self) -> PathBuf {
         self.as_ref().join("consensus-db")
-    }
-
-    fn epoch_db_path(&self, epoch: Epoch) -> PathBuf {
-        let extension = format!("epoch_{epoch}");
-        self.consensus_db_path().join(extension)
     }
 
     fn reth_db_path(&self) -> PathBuf {

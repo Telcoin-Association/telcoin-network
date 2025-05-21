@@ -294,7 +294,7 @@ mod test {
     };
     use tempfile::TempDir;
     use tn_config::KeyConfig;
-    use tn_storage::open_db;
+    use tn_storage::open_network_db;
     use tn_types::{decode, encode, BlsKeypair};
 
     use super::*;
@@ -384,7 +384,7 @@ mod test {
     #[test]
     fn test_kad_store() {
         let tmp_dir = TempDir::new().expect("temp dir");
-        let db = open_db(tmp_dir.path());
+        let db = open_network_db(tmp_dir.path());
         let key_config = KeyConfig::new_with_testing_key(BlsKeypair::generate(
             &mut StdRng::from_rng(OsRng).unwrap(),
         ));
