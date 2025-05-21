@@ -86,7 +86,7 @@ async fn test_accept_valid_certs() -> eyre::Result<()> {
     let certificate_store = primary.consensus_config().node_storage().clone();
 
     // spawn manager task
-    task_manager.spawn_task("manager", manager.run());
+    task_manager.spawn_critical_task("manager", manager.run());
 
     // receive parent updates (proposer)
     let mut rx_parents = cb.parents().subscribe();
@@ -134,7 +134,7 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
     let TestTypes { validator, manager, cb, fixture, task_manager, .. } = create_all_test_types();
 
     // spawn manager task
-    task_manager.spawn_task("manager", manager.run());
+    task_manager.spawn_critical_task("manager", manager.run());
 
     let committee = fixture.committee();
     let num_authorities = fixture.num_authorities();
@@ -211,7 +211,7 @@ async fn test_gc_pending_certs() -> eyre::Result<()> {
     let certificate_store = primary.consensus_config().node_storage().clone();
 
     // spawn manager task
-    task_manager.spawn_task("manager", manager.run());
+    task_manager.spawn_critical_task("manager", manager.run());
 
     let committee = fixture.committee();
     let num_authorities = fixture.num_authorities();
@@ -279,7 +279,7 @@ async fn test_node_restart_syncs_state() -> eyre::Result<()> {
     let certificate_store = primary.consensus_config().node_storage().clone();
 
     // spawn manager task
-    task_manager.spawn_task("manager", manager.run());
+    task_manager.spawn_critical_task("manager", manager.run());
 
     // create 3 certs
     // NOTE: test types uses the last authority
@@ -307,7 +307,7 @@ async fn test_node_restart_syncs_state() -> eyre::Result<()> {
     let (manager_first_recovery, validator_first_recovery, cb_first_recovery) =
         create_core_test_types(primary);
 
-    task_manager.spawn_task("recovered manager", manager_first_recovery.run());
+    task_manager.spawn_critical_task("recovered manager", manager_first_recovery.run());
 
     // assert proposer receives parents for round after recovery
     let mut rx_parents_first_recovery = cb_first_recovery.parents().subscribe();
@@ -335,7 +335,7 @@ async fn test_node_restart_syncs_state() -> eyre::Result<()> {
 
     let (manager_second_recovery, _validator, cb_second_recovery) = create_core_test_types(primary);
 
-    task_manager.spawn_task("recovered manager", manager_second_recovery.run());
+    task_manager.spawn_critical_task("recovered manager", manager_second_recovery.run());
 
     // assert proposer receives parents for round after recovery
     let mut rx_parents_second_recovery = cb_second_recovery.parents().subscribe();
@@ -366,7 +366,7 @@ async fn test_filter_unknown_parents() -> eyre::Result<()> {
     let primary = fixture.authorities().last().unwrap();
 
     // spawn manager task
-    task_manager.spawn_task("manager", manager.run());
+    task_manager.spawn_critical_task("manager", manager.run());
 
     let committee = fixture.committee();
     let num_authorities = fixture.num_authorities();

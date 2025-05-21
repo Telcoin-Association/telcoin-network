@@ -754,7 +754,7 @@ impl<DB: Database> Proposer<DB> {
 
     pub fn spawn(mut self, task_manager: &TaskManager) {
         if self.consensus_bus.node_mode().borrow().is_active_cvv() {
-            task_manager.spawn_task(
+            task_manager.spawn_critical_task(
                 "proposer task",
                 monitored_future!(
                     async move {

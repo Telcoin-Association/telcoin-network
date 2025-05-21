@@ -26,7 +26,7 @@ impl StateHandler {
     ) {
         let state_handler =
             Self { authority_id, consensus_bus: consensus_bus.clone(), rx_shutdown };
-        task_manager.spawn_task(
+        task_manager.spawn_critical_task(
             "state handler task",
             monitored_future!(
                 async move {

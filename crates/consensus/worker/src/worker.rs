@@ -178,7 +178,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         let this_clone = this.clone();
         // Spawn a little task to accept batches from a channel and seal them that way.
         // Allows the engine to remain removed from the worker.
-        task_manager.spawn_task("batch-builder", async move {
+        task_manager.spawn_critical_task("batch-builder", async move {
             while let Some((batch, tx)) = rx_batches.recv().await {
                 let res = this_clone.seal(batch).await;
                 if tx.send(res).is_err() {

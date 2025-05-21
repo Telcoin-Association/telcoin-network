@@ -955,7 +955,7 @@ where
         epoch_task_manager: &TaskManager,
     ) {
         // spawn epoch-specific task to forward blocks from the engine to consensus
-        epoch_task_manager.spawn_task("latest execution block", async move {
+        epoch_task_manager.spawn_critical_task("latest execution block", async move {
             loop {
                 tokio::select!(
                     _ = &shutdown => {

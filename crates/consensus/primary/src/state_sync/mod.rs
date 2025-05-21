@@ -61,7 +61,7 @@ where
     /// Spawn the certificate manager and synchronize state between peers.
     pub(crate) fn spawn(&self, task_manager: &TaskManager) {
         let certificate_manager = self.certificate_validator.new_cert_manager();
-        task_manager.spawn_task("certificate-manager", certificate_manager.run());
+        task_manager.spawn_critical_task("certificate-manager", certificate_manager.run());
     }
 
     //

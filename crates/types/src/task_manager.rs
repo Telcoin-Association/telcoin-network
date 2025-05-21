@@ -197,8 +197,31 @@ impl TaskManager {
         }
     }
 
-    /// Spawns a critical task on tokio and records it's JoinHandle and name.
+    /// Spawns a non-critical task on tokio and records it's JoinHandle and name. Other tasks are
+    /// unaffected when this task resolves.
     pub fn spawn_task<F, S: ToString>(&self, name: S, future: F)
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.create_task(name, future, false);
+    }
+
+    /// Spawns a critical task on tokio and records it's JoinHandle and name.
+    ///
+    /// The task is tracked as "critical". When the task resolves, other tasks
+    /// will shutdown.
+    pub fn spawn_critical_task<F, S: ToString>(&self, name: S, future: F)
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.create_task(name, future, true);
+    }
+
+    /// The main function to spawn tasks on the `tokio` runtime. These tasks are tracked by the
+    /// manager.
+    fn create_task<F, S: ToString>(&self, name: S, future: F, critical: bool)
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
@@ -207,7 +230,7 @@ impl TaskManager {
         let handle = tokio::spawn(async move {
             future.await;
         });
-        self.tasks.push(TaskHandle::new(name, handle, true));
+        self.tasks.push(TaskHandle::new(name, handle, critical));
     }
 
     /// Return a clonable spawner (also implements Reth's TaskSpawner trait).

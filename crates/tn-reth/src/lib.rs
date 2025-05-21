@@ -456,7 +456,7 @@ impl RethEnv {
         // Set up metrics listener
         let (sync_metrics_tx, sync_metrics_rx) = unbounded_channel();
         let sync_metrics_listener = reth_stages::MetricsListener::new(sync_metrics_rx);
-        task_manager.spawn_task("stages metrics listener task", sync_metrics_listener);
+        task_manager.spawn_critical_task("stages metrics listener task", sync_metrics_listener);
 
         // Initialize consensus implementation
         let tn_execution: Arc<dyn FullConsensus> = Arc::new(TNExecution);
