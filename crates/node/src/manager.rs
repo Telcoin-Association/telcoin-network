@@ -43,7 +43,7 @@ use tokio::sync::{
     broadcast,
     mpsc::{self},
 };
-use tokio_stream::StreamExt as _;
+use tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
 
 /// The long-running task manager name.
@@ -143,11 +143,12 @@ where
         // create submanager for engine tasks
         let engine_task_manager = TaskManager::new(ENGINE_TASK_MANAGER);
 
+        // create channels for engine that survive the lifetime of the node
+        let (to_engine, for_engine) = mpsc::channel(1000);
+
         // create the engine
         let engine = self.create_engine(&engine_task_manager, reth_db)?;
-        engine
-            .start_engine(self.consensus_output.subscribe(), self.node_shutdown.subscribe())
-            .await?;
+        engine.start_engine(for_engine, self.node_shutdown.subscribe()).await?;
 
         // retrieve epoch information from canonical tip on startup
         let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
@@ -174,21 +175,28 @@ where
             }
 
             // loop through short-term epochs
-            epoch_result = self.run_epochs(&engine, consensus_db, network_config) => epoch_result
+            epoch_result = self.run_epochs(&engine, consensus_db, network_config, to_engine) => epoch_result
         }
     }
 
     /// Create the epoch directory for consensus data if it doesn't exist and open the consensus database connection.
     async fn open_consensus_db(&self, epoch: Epoch) -> eyre::Result<DatabaseType> {
-        // read last epoch db for consensus data
-        let consensus_db_path = self.tn_datadir.epoch_db_path(epoch);
+        //
+        // TODO: read from execution state here??
+        // //
+        //
+        //
+        //
+        // ?????
+
+        let epoch_db_path = self.tn_datadir.epoch_db_path(epoch);
 
         // ensure dir exists
-        let _ = std::fs::create_dir_all(&consensus_db_path);
+        let _ = std::fs::create_dir_all(&epoch_db_path);
+        let db = open_db(&epoch_db_path);
 
-        info!(target: "epoch-manager", ?consensus_db_path, "opening node storage for epoch");
+        info!(target: "epoch-manager", ?epoch_db_path, "opened consensus storage for epoch {}", epoch);
 
-        let db = open_db(consensus_db_path);
         Ok(db)
     }
 
@@ -289,6 +297,7 @@ where
         engine: &ExecutionNode,
         consensus_db: DatabaseType,
         network_config: NetworkConfig,
+        to_engine: mpsc::Sender<ConsensusOutput>,
     ) -> eyre::Result<()> {
         // The task manager that resets every epoch.
         // Short-running tasks for the lifetime of the epoch.
@@ -307,6 +316,7 @@ where
                         consensus_db.clone(),
                         &mut epoch_task_manager,
                         &network_config,
+                        &to_engine,
                         &mut initial_epoch,
                     )
                     .await;
@@ -341,6 +351,7 @@ where
         consensus_db: DatabaseType,
         epoch_task_manager: &mut TaskManager,
         network_config: &NetworkConfig,
+        to_engine: &mpsc::Sender<ConsensusOutput>,
         initial_epoch: &mut bool,
     ) -> eyre::Result<RestartReason> {
         info!(target: "epoch-manager", "Starting epoch");
@@ -393,8 +404,12 @@ where
 
         info!(target: "epoch-manager", tasks=?epoch_task_manager, "EPOCH TASKS\n");
 
-        // Errors should have been logged already.
-        let _ = epoch_task_manager.join_until_exit(consensus_shutdown).await;
+        tokio::select! {
+            _ = self.wait_for_epoch_boundary(to_engine, &engine) => (),
+
+            // Errors should have been logged already.
+            _ = epoch_task_manager.join_until_exit(consensus_shutdown) => (),
+        }
 
         // epoch complete
         let restart_reason = consensus_bus.restart_reason().borrow().clone();
@@ -405,6 +420,42 @@ where
         info!(target: "epoch-manager", "TASKS complete, restart: {restart_reason}");
 
         Ok(restart_reason)
+    }
+
+    async fn wait_for_epoch_boundary(
+        &self,
+        to_engine: &mpsc::Sender<ConsensusOutput>,
+        engine: &ExecutionNode,
+    ) -> eyre::Result<()> {
+        let mut consensus_output = self.consensus_output.subscribe();
+
+        // receive output from consensus and forward to engine
+        while let Ok(output) = consensus_output.recv().await {
+            //
+            // TODO: epoch manager should close epoch, not subscriber
+            //
+            if output.close_epoch {
+                let target_hash = output.consensus_header_hash();
+                // forward the output to the engine
+                to_engine.send(output).await?;
+
+                // TODO: don't wait for execution complete - shutdown consensus
+
+                // wait for execution result before proceeding
+                let mut executed_output = engine.canonical_block_stream().await;
+                while let Some(output) = executed_output.recv().await {
+                    // wait for execution result
+                    if output.parent_beacon_block_root == Some(target_hash) {
+                        // wait for the execution to complete
+                        // so canonical tip is updated
+                    }
+                }
+            }
+        }
+
+        // Err means all senders have dropped
+
+        Ok(())
     }
 
     /// Helper method to create all engine components.

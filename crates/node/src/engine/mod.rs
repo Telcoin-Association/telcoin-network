@@ -20,7 +20,7 @@ use tn_types::{
     BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, SealedBlock, SealedHeader,
     TaskSpawner, WorkerId, B256,
 };
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{mpsc, RwLock};
 mod builder;
 mod inner;
 pub use tn_reth::worker::*;
@@ -61,11 +61,11 @@ impl ExecutionNode {
     /// Execution engine to produce blocks after consensus.
     pub async fn start_engine(
         &self,
-        from_consensus: broadcast::Receiver<ConsensusOutput>,
+        rx_output: mpsc::Receiver<ConsensusOutput>,
         rx_shutdown: Noticer,
     ) -> eyre::Result<()> {
         let guard = self.internal.read().await;
-        guard.start_engine(from_consensus, rx_shutdown).await
+        guard.start_engine(rx_output, rx_shutdown).await
     }
 
     /// Initialize the worker's transaction pool and public RPC.
@@ -116,6 +116,7 @@ impl ExecutionNode {
         guard.last_executed_output_blocks(number)
     }
 
+    /// Return a receiver for canonical blocks.
     pub async fn canonical_block_stream(&self) -> mpsc::Receiver<SealedBlock> {
         let guard = self.internal.read().await;
         let reth_env = guard.get_reth_env();

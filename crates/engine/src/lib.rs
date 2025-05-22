@@ -25,8 +25,8 @@ use std::{
 };
 use tn_reth::{traits::BuildArguments, RethEnv};
 use tn_types::{ConsensusOutput, Noticer, SealedHeader};
-use tokio::sync::oneshot;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, trace, warn};
 
 /// Type alias for the blocking task that executes consensus output and returns the finalized
@@ -58,7 +58,7 @@ pub struct ExecutorEngine {
     max_round: Option<u64>,
     /// Receiving end from CL's `Executor`. The `ConsensusOutput` is sent
     /// to the mining task here.
-    consensus_output_stream: BroadcastStream<ConsensusOutput>,
+    consensus_output_stream: ReceiverStream<ConsensusOutput>,
     /// The [SealedHeader] of the last fully-executed block.
     ///
     /// This information reflects the current finalized block number and hash.
@@ -74,14 +74,15 @@ impl ExecutorEngine {
     /// The engine waits for CL to broadcast output then tries to execute.
     ///
     /// Propagates any database related error.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         reth_env: RethEnv,
         max_round: Option<u64>,
-        consensus_output_stream: BroadcastStream<ConsensusOutput>,
+        rx_consensus_output: mpsc::Receiver<ConsensusOutput>,
         parent_header: SealedHeader,
         rx_shutdown: Noticer,
     ) -> Self {
+        let consensus_output_stream = ReceiverStream::new(rx_consensus_output);
+
         Self {
             queued: Default::default(),
             pending_task: None,
@@ -185,12 +186,9 @@ impl Future for ExecutorEngine {
         loop {
             // check if output is available from consensus to keep broadcast stream from "lagging"
             match this.consensus_output_stream.poll_next_unpin(cx) {
-                Poll::Ready(Some(Ok(output))) => {
+                Poll::Ready(Some(output)) => {
                     // queue the output for local execution
                     this.queued.push_back(output)
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    error!(target: "engine", ?e, "for consensus output stream");
                 }
                 Poll::Ready(None) => {
                     // the stream has ended
