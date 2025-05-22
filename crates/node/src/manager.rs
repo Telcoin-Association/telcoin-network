@@ -26,7 +26,7 @@ use tn_network_libp2p::{
 };
 use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
-    ConsensusBus, NodeMode, StateSynchronizer,
+    ConsensusBus, NodeMode, RestartReason, StateSynchronizer,
 };
 use tn_reth::{
     system_calls::{ConsensusRegistry, EpochState},
@@ -149,24 +149,19 @@ where
             .start_engine(self.consensus_output.subscribe(), self.node_shutdown.subscribe())
             .await?;
 
-        node_task_manager.add_task_manager(engine_task_manager);
-        node_task_manager.update_tasks();
-
-        info!(target: "epoch-manager", tasks=?node_task_manager, "NODE TASKS\n");
-
-        // retrieve epoch information from canonical tip
+        // retrieve epoch information from canonical tip on startup
         let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
-
-        // read last epoch db for consensus data
-        let consensus_db_path = self.tn_datadir.epoch_db_path(epoch);
-        // ensure dir exists
-        let _ = std::fs::create_dir_all(&consensus_db_path);
-        info!(target: "epoch-manager", ?consensus_db_path, "opening node storage for epoch");
-        let consensus_db = open_db(consensus_db_path);
+        let consensus_db = self.open_consensus_db(epoch).await?;
 
         // read the network config or use the default
         let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
         self.spawn_node_networks(node_task_spawner, &network_config).await?;
+
+        // add engine task manager
+        node_task_manager.add_task_manager(engine_task_manager);
+        node_task_manager.update_tasks();
+
+        info!(target: "epoch-manager", tasks=?node_task_manager, "NODE TASKS\n");
 
         // await all tasks on epoch-task-manager or node shutdown
         tokio::select! {
@@ -181,6 +176,20 @@ where
             // loop through short-term epochs
             epoch_result = self.run_epochs(&engine, consensus_db, network_config) => epoch_result
         }
+    }
+
+    /// Create the epoch directory for consensus data if it doesn't exist and open the consensus database connection.
+    async fn open_consensus_db(&self, epoch: Epoch) -> eyre::Result<DatabaseType> {
+        // read last epoch db for consensus data
+        let consensus_db_path = self.tn_datadir.epoch_db_path(epoch);
+
+        // ensure dir exists
+        let _ = std::fs::create_dir_all(&consensus_db_path);
+
+        info!(target: "epoch-manager", ?consensus_db_path, "opening node storage for epoch");
+
+        let db = open_db(consensus_db_path);
+        Ok(db)
     }
 
     /// Startup for the node. This creates all components on startup before starting the first
@@ -311,7 +320,11 @@ where
                 epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
 
                 // return result after aborting all tasks
-                epoch_result?
+                match epoch_result? {
+                    RestartReason::Sync => true,     // loop again,
+                    RestartReason::Epoch => true,    // start new epoch,
+                    RestartReason::Unknown => false, // break and shutdown,
+                }
             }
         }
 
@@ -329,7 +342,7 @@ where
         epoch_task_manager: &mut TaskManager,
         network_config: &NetworkConfig,
         initial_epoch: &mut bool,
-    ) -> eyre::Result<bool> {
+    ) -> eyre::Result<RestartReason> {
         info!(target: "epoch-manager", "Starting epoch");
 
         // start consensus metrics for the epoch
@@ -384,17 +397,14 @@ where
         let _ = epoch_task_manager.join_until_exit(consensus_shutdown).await;
 
         // epoch complete
-        let running = consensus_bus.restart();
-
-        // reset to default - this is updated during restart sequence
-        consensus_bus.clear_restart();
+        let restart_reason = consensus_bus.restart_reason().borrow().clone();
 
         // shutdown consensus metrics
         metrics_shutdown.notify();
 
-        info!(target: "epoch-manager", "TASKS complete, restart: {running}");
+        info!(target: "epoch-manager", "TASKS complete, restart: {restart_reason}");
 
-        Ok(running)
+        Ok(restart_reason)
     }
 
     /// Helper method to create all engine components.

@@ -7,10 +7,7 @@ use crate::{
     proposer::OurDigestMessage, state_sync::CertificateManagerCommand, RecentBlocks,
 };
 use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
-use std::{
-    error::Error,
-    sync::{atomic::AtomicBool, Arc},
-};
+use std::{error::Error, fmt, sync::Arc};
 use tn_config::Parameters;
 use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
 use tn_types::{
@@ -54,6 +51,33 @@ impl NodeMode {
     /// True if this node is only an obsever and will never participate in an committee.
     pub fn is_observer(&self) -> bool {
         matches!(self, NodeMode::Observer)
+    }
+}
+
+/// The type to indicate node progress during an epoch.
+///
+/// The node's consensus occasionally returns when:
+/// - epoch boundary reached
+/// - syncing progress to rejoin consensus
+/// - errors
+///
+/// This value is read from the consensus bus when the task manager resolves all futures
+/// and is used by the epoch manager to decide the next action to take.
+#[derive(Clone, Default, Debug)]
+pub enum RestartReason {
+    /// The default status. If consensus exits and this is the status, it indicates an
+    /// unexpected event caused consensus to shutdown. (error)
+    #[default]
+    Unknown,
+    /// The status indicates the node was syncing and is ready to rejoin consensus.
+    Sync,
+    /// The status to indicate the epoch boundary was reached.
+    Epoch,
+}
+
+impl fmt::Display for RestartReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self)
     }
 }
 
@@ -138,7 +162,9 @@ struct ConsensusBusInner {
     executor_metrics: Arc<ExecutorMetrics>,
 
     /// Flag to indicate a node should restart after a shutdown.
-    restart: AtomicBool,
+    ///
+    /// Nodes restart at epoch boundaries and when syncing.
+    tx_restart_reason: watch::Sender<RestartReason>,
 }
 
 /// The type that holds the collection of send/sync channels for
@@ -245,6 +271,8 @@ impl ConsensusBus {
 
         let (consensus_header, _rx_consensus_header) = broadcast::channel(CHANNEL_CAPACITY);
 
+        let (tx_restart_reason, _rx_restart_reason) = watch::channel(RestartReason::default());
+
         Self {
             inner: Arc::new(ConsensusBusInner {
                 new_certificates,
@@ -277,7 +305,7 @@ impl ConsensusBus {
                 primary_metrics,
                 channel_metrics,
                 executor_metrics,
-                restart: AtomicBool::new(false),
+                tx_restart_reason,
             }),
         }
     }
@@ -426,19 +454,9 @@ impl ConsensusBus {
         &self.inner.executor_metrics
     }
 
-    /// Set the restart flag to indicate node restart after shutdown.
-    pub fn set_restart(&self) {
-        self.inner.restart.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Clear the restart flag to indicate node NOT restart after shutdown.
-    pub fn clear_restart(&self) {
-        self.inner.restart.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// True if the node should restart after shutdown.
-    pub fn restart(&self) -> bool {
-        self.inner.restart.load(std::sync::atomic::Ordering::SeqCst)
+    /// Set the restart reason to indicate node restart after shutdown.
+    pub fn restart_reason(&self) -> &watch::Sender<RestartReason> {
+        &self.inner.tx_restart_reason
     }
 
     /// Update consensus round watch channels.

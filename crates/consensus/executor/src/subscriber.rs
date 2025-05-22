@@ -15,7 +15,7 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, PrimaryToWorkerClient};
 use tn_primary::{
-    consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, NodeMode,
+    consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, NodeMode, RestartReason,
 };
 use tn_storage::CertificateStore;
 use tn_types::{
@@ -190,7 +190,10 @@ impl<DB: Database> Subscriber<DB> {
                 // We are caught up enough so try to jump back into consensus
                 info!(target: "subscriber", "attempting to rejoin consensus, consensus block height {consensus_header_number}");
                 // Set restart flag and trigger shutdown by returning.
-                self.consensus_bus.set_restart();
+                if let Err(e) = self.consensus_bus.restart_reason().send(RestartReason::Sync) {
+                    error!(target: "subscriber", ?e, "failed to send restart reason on consensus bus.");
+                    return Err(SubscriberError::ClosedChannel("restart-reason-sync".to_string()));
+                };
                 let _ = self.consensus_bus.node_mode().send(NodeMode::CvvActive);
                 return Ok(());
             }
