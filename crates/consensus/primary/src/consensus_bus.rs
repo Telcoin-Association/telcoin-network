@@ -77,7 +77,12 @@ pub enum RestartReason {
 
 impl fmt::Display for RestartReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
+        let s = match self {
+            Self::Unknown => "unknown",
+            Self::Sync => "sync",
+            Self::Epoch => "epoch",
+        };
+        write!(f, "{s}")
     }
 }
 

@@ -26,17 +26,17 @@ use tn_network_libp2p::{
 };
 use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
-    ConsensusBus, NodeMode, RestartReason, StateSynchronizer,
+    ConsensusBus, NodeMode, StateSynchronizer,
 };
 use tn_reth::{
     system_calls::{ConsensusRegistry, EpochState},
-    RethDb, RethEnv,
+    CanonStateNotificationStream, RethDb, RethEnv,
 };
 use tn_storage::{open_db, open_network_db, tables::ConsensusBlocks, DatabaseType};
 use tn_types::{
     BatchValidation, BlsPublicKey, Committee, CommitteeBuilder, ConsensusHeader, ConsensusOutput,
-    Database as TNDatabase, Epoch, Multiaddr, Noticer, Notifier, SealedBlock, TaskManager,
-    TaskSpawner, TimestampSec, WorkerCache, WorkerIndex, WorkerInfo,
+    Database as TNDatabase, Epoch, Multiaddr, Noticer, Notifier, TaskManager, TaskSpawner,
+    TimestampSec, WorkerCache, WorkerIndex, WorkerInfo,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::{
@@ -44,7 +44,7 @@ use tokio::sync::{
     mpsc::{self},
 };
 use tokio_stream::StreamExt;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// The long-running task manager name.
 const NODE_TASK_MANAGER: &str = "Node Task Manager";
@@ -80,6 +80,12 @@ pub struct EpochManager<P> {
     ///
     /// This should only be accessed elsewhere through the epoch's [ConsensusBus].
     consensus_output: broadcast::Sender<ConsensusOutput>,
+    /// The timestamp to close the current epoch.
+    ///
+    /// The manager monitors leader timestamps for the epoch boundary.
+    /// If the timestamp of the leader is >= the epoch_boundary then the
+    /// manager closes the epoch after the engine executes all data.
+    epoch_boundary: TimestampSec,
 }
 
 impl<P> EpochManager<P>
@@ -117,6 +123,7 @@ where
             key_config,
             node_shutdown,
             consensus_output,
+            epoch_boundary: Default::default(),
         })
     }
 
@@ -179,7 +186,8 @@ where
         }
     }
 
-    /// Create the epoch directory for consensus data if it doesn't exist and open the consensus database connection.
+    /// Create the epoch directory for consensus data if it doesn't exist and open the consensus
+    /// database connection.
     async fn open_consensus_db(&self, epoch: Epoch) -> eyre::Result<DatabaseType> {
         //
         // TODO: read from execution state here??
@@ -299,46 +307,39 @@ where
         network_config: NetworkConfig,
         to_engine: mpsc::Sender<ConsensusOutput>,
     ) -> eyre::Result<()> {
-        // The task manager that resets every epoch.
-        // Short-running tasks for the lifetime of the epoch.
+        // The task manager that resets every epoch and manages
+        // short-running tasks for the lifetime of the epoch.
         let mut epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
-        let mut running = true;
 
-        // initialize long-running components for the first epoch
+        // initialize long-running components for node startup
         let mut initial_epoch = true;
 
-        // start the epoch
-        while running {
-            running = {
-                let epoch_result = self
-                    .run_epoch(
-                        engine,
-                        consensus_db.clone(),
-                        &mut epoch_task_manager,
-                        &network_config,
-                        &to_engine,
-                        &mut initial_epoch,
-                    )
-                    .await;
+        // loop through epochs
+        loop {
+            let epoch_result = self
+                .run_epoch(
+                    engine,
+                    consensus_db.clone(),
+                    &mut epoch_task_manager,
+                    &network_config,
+                    &to_engine,
+                    &mut initial_epoch,
+                )
+                .await;
 
-                info!(target: "epoch-manager", ?epoch_result, "aborting epoch tasks for next epoch");
+            // abort all epoch-related tasks
+            epoch_task_manager.abort_all_tasks();
 
-                // abort all epoch-related tasks
-                epoch_task_manager.abort_all_tasks();
+            // create new manager for next epoch
+            epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
 
-                // create new manager for next epoch
-                epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
+            // ensure no errors
+            epoch_result.inspect_err(|e| {
+                error!(target: "epoch-manager", ?e, "epoch returned error");
+            })?;
 
-                // return result after aborting all tasks
-                match epoch_result? {
-                    RestartReason::Sync => true,     // loop again,
-                    RestartReason::Epoch => true,    // start new epoch,
-                    RestartReason::Unknown => false, // break and shutdown,
-                }
-            }
+            info!(target: "epoch-manager", "looping next epoch");
         }
-
-        Ok(())
     }
 
     /// Run a single epoch.
@@ -353,7 +354,7 @@ where
         network_config: &NetworkConfig,
         to_engine: &mpsc::Sender<ConsensusOutput>,
         initial_epoch: &mut bool,
-    ) -> eyre::Result<RestartReason> {
+    ) -> eyre::Result<()> {
         info!(target: "epoch-manager", "Starting epoch");
 
         // start consensus metrics for the epoch
@@ -366,6 +367,9 @@ where
             );
         }
 
+        // subscribe to output early to prevent missed messages
+        let consensus_output = self.consensus_output.subscribe();
+
         // create primary and worker nodes
         let (primary, worker_node) = self
             .create_consensus(
@@ -376,9 +380,6 @@ where
                 initial_epoch,
             )
             .await?;
-
-        // create receiving channel before spawning primary to ensure messages are not lost
-        let consensus_bus = primary.consensus_bus().await;
 
         // start primary
         let mut primary_task_manager = primary.start().await?;
@@ -404,56 +405,80 @@ where
 
         info!(target: "epoch-manager", tasks=?epoch_task_manager, "EPOCH TASKS\n");
 
+        // await the epoch boundary or the epoch task manager exiting
+        // this can also happen due to committee nodes re-syncing and errors
         tokio::select! {
-            _ = self.wait_for_epoch_boundary(to_engine, &engine) => (),
+            // wait for epoch boundary to transition
+            res = self.wait_for_epoch_boundary(to_engine, engine, consensus_output, consensus_shutdown.clone()) => {
+                res.inspect_err(|e| {
+                    error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
+                })?;
 
-            // Errors should have been logged already.
-            _ = epoch_task_manager.join_until_exit(consensus_shutdown) => (),
+                info!(target: "epoch-manager", "epoch boundary reached");
+            },
+
+            // return any errors
+            res = epoch_task_manager.join_until_exit(consensus_shutdown) => {
+                res.inspect_err(|e| {
+                    error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
+                })?;
+                info!(target: "epoch-manager", "epoch task manager exited - likely syncing with committee");
+            },
         }
 
-        // epoch complete
-        let restart_reason = consensus_bus.restart_reason().borrow().clone();
-
-        // shutdown consensus metrics
+        // shutdown metrics
         metrics_shutdown.notify();
 
-        info!(target: "epoch-manager", "TASKS complete, restart: {restart_reason}");
-
-        Ok(restart_reason)
+        Ok(())
     }
 
+    /// Monitor consensus output for the last block of the epoch.
+    ///
+    /// This method forwards all consensus output to the engine for execution.
+    /// Once the epoch boundary is reached, the manager initiates the epoch transitions.
     async fn wait_for_epoch_boundary(
         &self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
         engine: &ExecutionNode,
+        mut consensus_output: broadcast::Receiver<ConsensusOutput>,
+        shutdown_consensus: Notifier,
     ) -> eyre::Result<()> {
-        let mut consensus_output = self.consensus_output.subscribe();
-
         // receive output from consensus and forward to engine
-        while let Ok(output) = consensus_output.recv().await {
-            //
-            // TODO: epoch manager should close epoch, not subscriber
-            //
-            if output.close_epoch {
+        'epoch: while let Ok(mut output) = consensus_output.recv().await {
+            // observe epoch boundary to initiate epoch transition
+            if output.committed_at() >= self.epoch_boundary {
+                // subscribe to engine blocks to confirm epoch closed on-chain
+                let mut executed_output = engine.canonical_block_stream().await;
+
+                // update output so engine closes epoch
+                output.close_epoch = true;
+
+                // obtain hash to monitor execution progress
                 let target_hash = output.consensus_header_hash();
+
                 // forward the output to the engine
                 to_engine.send(output).await?;
 
-                // TODO: don't wait for execution complete - shutdown consensus
+                // begin consensus shutdown while engine executes
+                shutdown_consensus.notify();
 
                 // wait for execution result before proceeding
-                let mut executed_output = engine.canonical_block_stream().await;
-                while let Some(output) = executed_output.recv().await {
-                    // wait for execution result
-                    if output.parent_beacon_block_root == Some(target_hash) {
-                        // wait for the execution to complete
-                        // so canonical tip is updated
+                while let Some(output) = executed_output.next().await {
+                    // ensure canonical tip is updated with closing epoch info
+                    if output.tip().block.parent_beacon_block_root == Some(target_hash) {
+                        // return
+                        break 'epoch;
                     }
                 }
+
+                // `None` indicates all senders have dropped
+                error!(
+                    target: "epoch-manager",
+                    "canon state notifications dropped while awaiting engine execution for closing epoch",
+                );
+                return Err(eyre!("engine failed to report output for closing epoch"));
             }
         }
-
-        // Err means all senders have dropped
 
         Ok(())
     }
@@ -534,7 +559,7 @@ where
     /// This method reads the canonical tip to read the epoch information needed
     /// to create the current committee and the consensus config.
     async fn configure_consensus(
-        &self,
+        &mut self,
         engine: &ExecutionNode,
         network_config: &NetworkConfig,
         consensus_db: &DatabaseType,
@@ -551,11 +576,11 @@ where
             .collect::<Result<HashMap<_, _>, _>>()
             .map_err(|err| eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
 
-        let epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
+        self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
 
         // send these to the swarm for validator discovery
         let keys_for_worker_cache = validators.keys().cloned().collect();
-        let committee = self.create_committee_from_state(epoch, epoch_boundary, validators).await?;
+        let committee = self.create_committee_from_state(epoch, validators).await?;
         let worker_cache =
             self.create_worker_cache_from_state(epoch, keys_for_worker_cache).await?;
 
@@ -578,7 +603,6 @@ where
     async fn create_committee_from_state(
         &self,
         epoch: Epoch,
-        epoch_boundary: TimestampSec,
         validators: HashMap<BlsPublicKey, &ConsensusRegistry::ValidatorInfo>,
     ) -> eyre::Result<Committee> {
         info!(target: "epoch-manager", "creating committee from state");
@@ -600,7 +624,7 @@ where
                 .await?;
 
             // build the committee using kad network
-            let mut committee_builder = CommitteeBuilder::new(epoch, epoch_boundary);
+            let mut committee_builder = CommitteeBuilder::new(epoch, self.epoch_boundary);
 
             // loop through the primary info returned from network query
             while let Some(info) = primary_network_infos.next().await {
@@ -998,7 +1022,7 @@ where
         &self,
         shutdown: Noticer,
         consensus_bus: ConsensusBus,
-        mut engine_state: mpsc::Receiver<SealedBlock>,
+        mut engine_state: CanonStateNotificationStream,
         epoch_task_manager: &TaskManager,
     ) {
         // spawn epoch-specific task to forward blocks from the engine to consensus
@@ -1009,9 +1033,9 @@ where
                         info!(target: "engine", "received shutdown from consensus to stop updating consensus bus recent blocks");
                         break;
                     }
-                    latest = engine_state.recv() => {
+                    latest = engine_state.next() => {
                         if let Some(latest) = latest {
-                            consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(latest.header));
+                            consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(latest.tip().block.header.clone()));
                         } else {
                             break;
                         }

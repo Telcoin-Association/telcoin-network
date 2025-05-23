@@ -24,22 +24,19 @@
 
 pub use batch::{build_batch, BatchBuilderOutput};
 use error::{BatchBuilderError, BatchBuilderResult};
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
 use std::{
     future::Future,
-    pin::{self, Pin},
+    pin::Pin,
     task::{Context, Poll},
     time::Duration,
 };
-use tn_reth::{RethEnv, TxPool as _, WorkerTxPool};
+use tn_reth::{CanonStateNotificationStream, RethEnv, TxPool as _, WorkerTxPool};
 use tn_types::{
     error::BlockSealError, Address, BatchBuilderArgs, BatchSender, PendingBatchConfig, SealedBlock,
     TaskSpawner, TxHash,
 };
-use tokio::{
-    sync::{mpsc, oneshot},
-    time::Interval,
-};
+use tokio::{sync::oneshot, time::Interval};
 use tracing::{debug, error, warn};
 
 mod batch;
@@ -81,7 +78,7 @@ pub struct BatchBuilder {
 
     /// This channel will receive a header on canonical update.  We use it to wakeup the future and
     /// save the canonical update.
-    state_changed: mpsc::Receiver<SealedBlock>,
+    state_changed: CanonStateNotificationStream,
     /// The last canonical update, saved when state_changed sends a new update.
     last_canonical_update: SealedBlock,
     /// The type to spawn tasks.
@@ -229,8 +226,8 @@ impl Future for BatchBuilder {
         // loop when a successful block is built
         loop {
             // This is used as a "wake up" when canonical state updates.
-            while let Poll::Ready(Some(block)) = pin::pin!(this.state_changed.recv()).poll(cx) {
-                this.last_canonical_update = block
+            while let Poll::Ready(Some(latest)) = this.state_changed.poll_next_unpin(cx) {
+                this.last_canonical_update = latest.tip().block.clone()
             }
 
             // only propose one block at a time

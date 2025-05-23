@@ -15,10 +15,12 @@ use builder::ExecutionNodeBuilder;
 use std::{net::SocketAddr, sync::Arc};
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
-use tn_reth::{system_calls::EpochState, RethConfig, RethEnv, WorkerTxPool};
+use tn_reth::{
+    system_calls::EpochState, CanonStateNotificationStream, RethConfig, RethEnv, WorkerTxPool,
+};
 use tn_types::{
-    BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, SealedBlock, SealedHeader,
-    TaskSpawner, WorkerId, B256,
+    BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, SealedHeader, TaskSpawner,
+    WorkerId, B256,
 };
 use tokio::sync::{mpsc, RwLock};
 mod builder;
@@ -117,7 +119,7 @@ impl ExecutionNode {
     }
 
     /// Return a receiver for canonical blocks.
-    pub async fn canonical_block_stream(&self) -> mpsc::Receiver<SealedBlock> {
+    pub async fn canonical_block_stream(&self) -> CanonStateNotificationStream {
         let guard = self.internal.read().await;
         let reth_env = guard.get_reth_env();
         reth_env.canonical_block_stream()
