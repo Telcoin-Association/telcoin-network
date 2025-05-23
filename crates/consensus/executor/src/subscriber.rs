@@ -15,13 +15,13 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, PrimaryToWorkerClient};
 use tn_primary::{
-    consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, NodeMode,
+    consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, NodeMode, RestartReason,
 };
 use tn_storage::CertificateStore;
 use tn_types::{
     AuthorityIdentifier, Batch, BlockHash, CommittedSubDag, Committee, ConsensusHeader,
-    ConsensusOutput, Database, Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp,
-    TimestampSec, TnReceiver, TnSender, B256,
+    ConsensusOutput, Database, Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp, TnReceiver,
+    TnSender, B256,
 };
 use tracing::{debug, error, info};
 
@@ -52,12 +52,6 @@ struct Inner {
     committee: Committee,
     /// The client to request worker batches and build consensus output.
     client: LocalNetwork,
-    /// The timestamp for when this epoch closes.
-    ///
-    /// The subscriber monitors leader timestamps for the epoch boundary.
-    /// If the timestamp of the leader is >= the epoch_boundary then the
-    /// subscriber indicates that the epoch should close.
-    epoch_boundary: TimestampSec,
 }
 
 /// Spawn the subscriber in the correct mode based on the validator status for the current epoch.
@@ -67,7 +61,6 @@ pub fn spawn_subscriber<DB: Database>(
     consensus_bus: ConsensusBus,
     task_manager: &TaskManager,
     network_handle: PrimaryNetworkHandle,
-    epoch_boundary: TimestampSec,
 ) {
     let authority_id = config.authority_id();
     let committee = config.committee().clone();
@@ -78,7 +71,7 @@ pub fn spawn_subscriber<DB: Database>(
         consensus_bus,
         config,
         network_handle,
-        inner: Arc::new(Inner { authority_id, committee, client, epoch_boundary }),
+        inner: Arc::new(Inner { authority_id, committee, client }),
     };
     match mode {
         // If we are active then partcipate in consensus.
@@ -190,7 +183,10 @@ impl<DB: Database> Subscriber<DB> {
                 // We are caught up enough so try to jump back into consensus
                 info!(target: "subscriber", "attempting to rejoin consensus, consensus block height {consensus_header_number}");
                 // Set restart flag and trigger shutdown by returning.
-                self.consensus_bus.set_restart();
+                if let Err(e) = self.consensus_bus.restart_reason().send(RestartReason::Sync) {
+                    error!(target: "subscriber", ?e, "failed to send restart reason on consensus bus.");
+                    return Err(SubscriberError::ClosedChannel("restart-reason-sync".to_string()));
+                };
                 let _ = self.consensus_bus.node_mode().send(NodeMode::CvvActive);
                 return Ok(());
             }
@@ -337,9 +333,6 @@ impl<DB: Database> Subscriber<DB> {
             false
         };
 
-        // logic to indicate engine should conclude epoch
-        let close_epoch = deliver.commit_timestamp() >= self.inner.epoch_boundary;
-
         if num_blocks == 0 {
             debug!(target: "subscriber", "No blocks to fetch, payload is empty");
             return Ok(ConsensusOutput {
@@ -351,8 +344,7 @@ impl<DB: Database> Subscriber<DB> {
                 number,
                 extra: B256::default(),
                 early_finalize,
-                // always false for now
-                close_epoch,
+                close_epoch: false, // epoch manager will update
             });
         }
 
@@ -366,7 +358,7 @@ impl<DB: Database> Subscriber<DB> {
             number,
             extra: B256::default(),
             early_finalize,
-            close_epoch,
+            close_epoch: false, // epoch manager will update
         };
 
         let mut batch_set: HashSet<BlockHash> = HashSet::new();
@@ -482,7 +474,7 @@ impl<DB: Database> Subscriber<DB> {
 mod tests {
     use super::*;
     use indexmap::IndexMap;
-    use std::{collections::BTreeSet, ops::RangeInclusive, time::Duration};
+    use std::{collections::BTreeSet, ops::RangeInclusive};
     use tn_network_libp2p::types::{MessageId, NetworkCommand};
     use tn_network_types::MockPrimaryToWorkerClient;
     use tn_primary::consensus::{Bullshark, Consensus, LeaderSchedule};
@@ -492,7 +484,7 @@ mod tests {
         now, Certificate, CertificateDigest, ExecHeader, HeaderBuilder, Round, SealedHeader,
         TimestampSec, WorkerId, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     };
-    use tokio::{sync::mpsc, time::timeout};
+    use tokio::sync::mpsc;
 
     fn random_batches(
         number_of_batches: usize,
@@ -591,8 +583,6 @@ mod tests {
             }
         });
         let network = PrimaryNetworkHandle::new_for_test(tx);
-        // ensure epoch boundary is not reached
-        let epoch_boundary = u64::MAX;
 
         // spawn the executor
         spawn_subscriber(
@@ -601,7 +591,6 @@ mod tests {
             consensus_bus.clone(),
             &task_manager,
             network,
-            epoch_boundary,
         );
 
         // yield for subscriber to spawn
@@ -667,99 +656,6 @@ mod tests {
             last_header.digest(),
             consensus_headers_seen.last().expect("last consensus header").digest()
         );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_epoch_boundary() -> eyre::Result<()> {
-        let num_sub_dags_per_schedule = 3;
-
-        // create committee with epoch boundary `now`
-        let epoch_boundary = now();
-        // note: setting epoch boundary here doesn't actually affect the test
-        let fixture =
-            CommitteeFixture::builder(MemDatabase::default).with_epoch_boundary(now()).build();
-        let committee = fixture.committee();
-        let primary = fixture.authorities().next().unwrap();
-        let config = primary.consensus_config().clone();
-        let consensus_store = config.node_storage().clone();
-        let task_manager = TaskManager::new("subscriber tests");
-        let rx_shutdown = config.shutdown().subscribe();
-        let consensus_bus = ConsensusBus::new();
-
-        // subscribe to channels early
-        let rx_consensus_headers = consensus_bus.last_consensus_header().subscribe();
-        let mut consensus_output = consensus_bus.consensus_output().subscribe();
-
-        let (tx, mut rx) = mpsc::channel(5);
-        tokio::spawn(async move {
-            while let Some(com) = rx.recv().await {
-                if let NetworkCommand::Publish { topic: _, msg: _, reply } = com {
-                    reply.send(Ok(MessageId::new(&[0]))).unwrap();
-                }
-            }
-        });
-        let network = PrimaryNetworkHandle::new_for_test(tx);
-
-        // spawn the executor
-        spawn_subscriber(
-            config.clone(),
-            rx_shutdown,
-            consensus_bus.clone(),
-            &task_manager,
-            network,
-            epoch_boundary,
-        );
-
-        // yield for subscriber to spawn
-        tokio::task::yield_now().await;
-
-        // make certificates for rounds 1 to 3 (inclusive)
-        let (certificates, _next_parents, batches) = create_test_data(1..=3, &fixture);
-
-        // Set up mock worker.
-        let worker = primary.worker();
-        let _worker_address = &worker.info().worker_address;
-        let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
-        config.local_network().set_primary_to_worker_local_handler(mock_client);
-
-        let leader_schedule = LeaderSchedule::from_store(
-            committee.clone(),
-            consensus_store.clone(),
-            DEFAULT_BAD_NODES_STAKE_THRESHOLD,
-        );
-        let bullshark = Bullshark::new(
-            committee.clone(),
-            consensus_store.clone(),
-            Arc::new(Default::default()),
-            num_sub_dags_per_schedule,
-            leader_schedule.clone(),
-            DEFAULT_BAD_NODES_STAKE_THRESHOLD,
-        );
-
-        let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-        consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-        let task_manager = TaskManager::default();
-        Consensus::spawn(config.clone(), &consensus_bus, bullshark, &task_manager);
-
-        // forward certificates to trigger subdag commit
-        for certificate in certificates.iter() {
-            consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();
-        }
-
-        let output = timeout(Duration::from_secs(5), consensus_output.recv())
-            .await
-            .expect("dag commits")
-            .expect("recv consensus output");
-        let last_header = rx_consensus_headers.borrow().clone();
-
-        // NOTE: output.consensus_header() creates the consensus header and should be the same
-        // result
-        assert_eq!(last_header.digest(), output.consensus_header().digest());
-
-        // assert epoch boundary reached
-        assert!(output.close_epoch);
 
         Ok(())
     }
