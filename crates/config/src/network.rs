@@ -65,7 +65,7 @@ impl NetworkConfig {
     /// Write the current network config to file.
     pub fn write_config<TND: TelcoinDirs>(&self, tn_datadir: &TND) -> eyre::Result<()> {
         let path = tn_datadir.network_config_path();
-        Self::store_path(path, self, ConfigFmt::YAML)
+        Self::write_to_path(path, self, ConfigFmt::YAML)
     }
 }
 

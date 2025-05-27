@@ -1,7 +1,6 @@
 //! Genesis information used when configuring a node.
 use crate::{Config, ConfigFmt, ConfigTrait, TelcoinDirs};
 use eyre::Context;
-use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -33,7 +32,7 @@ pub const ITS_CFG_YAML: &str =
 /// The struct for starting a network at genesis.
 pub struct NetworkGenesis {
     /// Execution data
-    chain: ChainSpec,
+    genesis: Genesis,
     /// Validator signatures
     validators: BTreeMap<BlsPublicKey, ValidatorInfo>,
 }
@@ -47,17 +46,17 @@ impl Default for NetworkGenesis {
 impl NetworkGenesis {
     /// Create new version of [NetworkGenesis] using the adiri genesis [ChainSpec].
     pub fn new() -> Self {
-        Self { chain: adiri_genesis().into(), validators: Default::default() }
+        Self { genesis: adiri_genesis(), validators: Default::default() }
     }
 
     /// Return the current genesis.
     pub fn genesis(&self) -> &Genesis {
-        &self.chain.genesis
+        &self.genesis
     }
 
     /// Create new version of [NetworkGenesis] using the adiri genesis [ChainSpec].
-    pub fn with_chain_spec(chain: ChainSpec) -> Self {
-        Self { chain, validators: Default::default() }
+    pub fn with_genesis(genesis: Genesis) -> Self {
+        Self { genesis, validators: Default::default() }
     }
 
     /// Add validator information to the genesis directory.
@@ -69,8 +68,8 @@ impl NetworkGenesis {
     }
 
     /// Update chain spec with executed values for genesis.
-    pub fn update_chain(&mut self, new_chain: ChainSpec) {
-        self.chain = new_chain;
+    pub fn update_genesis(&mut self, genesis: Genesis) {
+        self.genesis = genesis;
     }
 
     /// Generate a [NetworkGenesis] by reading files in a directory.
@@ -110,7 +109,7 @@ impl NetworkGenesis {
             Config::load_from_path(telcoin_paths.node_config_path(), ConfigFmt::YAML)?;
 
         let network_genesis = Self {
-            chain: tn_config.chain_spec(),
+            genesis: tn_config.genesis,
             validators,
             // signatures,
         };
@@ -141,17 +140,12 @@ impl NetworkGenesis {
         Ok(())
     }
 
-    /// Return a reference to `Self::chain`.
-    pub fn chain_info(&self) -> &ChainSpec {
-        &self.chain
-    }
-
     /// Validate each validator:
     /// - verify proof of possession
     pub fn validate(&self) -> eyre::Result<()> {
         for (pubkey, validator) in self.validators.iter() {
             info!(target: "genesis::validate", "verifying validator: {}", pubkey);
-            verify_proof_of_possession_bls(&validator.proof_of_possession, pubkey, &self.chain)?;
+            verify_proof_of_possession_bls(&validator.proof_of_possession, pubkey, self.genesis())?;
         }
         info!(target: "genesis::validate", "all validators valid for genesis");
         Ok(())
@@ -356,7 +350,7 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
     use std::collections::BTreeMap;
     use tn_types::{
-        adiri_chain_spec, generate_proof_of_possession_bls, Address, BlsKeypair, Multiaddr,
+        adiri_genesis, generate_proof_of_possession_bls, Address, BlsKeypair, Multiaddr,
         NetworkKeypair, PrimaryInfo, WorkerIndex, WorkerInfo,
     };
 
@@ -369,7 +363,7 @@ mod tests {
             let network_keypair = NetworkKeypair::generate_ed25519();
             let address = Address::from_raw_public_key(&[0; 64]);
             let proof_of_possession =
-                generate_proof_of_possession_bls(&bls_keypair, &adiri_chain_spec()).unwrap();
+                generate_proof_of_possession_bls(&bls_keypair, &adiri_genesis()).unwrap();
             let primary_network_address = Multiaddr::empty();
             let worker_info = WorkerInfo::default();
             let worker_index = WorkerIndex(BTreeMap::from([(0, worker_info)]));
@@ -406,8 +400,8 @@ mod tests {
             let address = Address::from_raw_public_key(&[0; 64]);
 
             // create wrong chain spec
-            let mut wrong_chain = adiri_chain_spec();
-            wrong_chain.genesis.timestamp = 0;
+            let mut wrong_chain = adiri_genesis();
+            wrong_chain.timestamp = 0;
 
             // generate proof with wrong chain spec
             let proof_of_possession =

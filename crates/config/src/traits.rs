@@ -56,7 +56,7 @@ pub trait ConfigTrait {
                     fs::create_dir_all(parent).with_context(|| "Directory creation failed")?;
                 }
                 let cfg = T::default();
-                Self::store_path(path, &cfg, fmt)?;
+                Self::write_to_path(path, &cfg, fmt)?;
                 Ok(cfg)
             }
             Err(e) => eyre::bail!("Failed to open file: {e}"),
@@ -70,7 +70,7 @@ pub trait ConfigTrait {
     /// and behavior, see [`store`]'s documentation.
     ///
     /// [`store`]: fn.store.html
-    fn store_path<T: Serialize>(
+    fn write_to_path<T: Serialize>(
         path: impl AsRef<Path>,
         cfg: T,
         fmt: ConfigFmt,

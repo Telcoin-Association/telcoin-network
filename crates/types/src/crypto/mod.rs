@@ -7,9 +7,8 @@
 //! - use generic schemes (avoid using the algo's `Struct`` impl functions)
 //! - change type aliases to update codebase with new crypto
 
-use std::{fmt, future::Future};
-
 use libp2p::PeerId;
+use std::{fmt, future::Future};
 // This re-export allows using the trait-defined APIs
 mod bls_keypair;
 mod bls_public_key;
@@ -163,7 +162,7 @@ pub fn network_public_key_to_libp2p(public_key: &NetworkPublicKey) -> PeerId {
 #[cfg(test)]
 mod tests {
     use super::{generate_proof_of_possession_bls, verify_proof_of_possession_bls};
-    use crate::{adiri_chain_spec_arc, adiri_genesis, BlsKeypair};
+    use crate::{adiri_genesis, BlsKeypair};
     use rand::{
         rngs::{OsRng, StdRng},
         SeedableRng,
@@ -172,36 +171,36 @@ mod tests {
     #[test]
     fn test_proof_of_possession_success() {
         let keypair = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
-        let chain_spec = adiri_chain_spec_arc();
-        let proof = generate_proof_of_possession_bls(&keypair, &chain_spec).unwrap();
-        assert!(verify_proof_of_possession_bls(&proof, keypair.public(), &chain_spec).is_ok())
+        let genesis = adiri_genesis();
+        let proof = generate_proof_of_possession_bls(&keypair, &genesis).unwrap();
+        assert!(verify_proof_of_possession_bls(&proof, keypair.public(), &genesis).is_ok())
     }
 
     #[test]
     fn test_proof_of_possession_fails_wrong_signature() {
         let keypair = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
         let malicious_key = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
-        let chain_spec = adiri_chain_spec_arc();
-        let proof = generate_proof_of_possession_bls(&malicious_key, &chain_spec).unwrap();
-        assert!(verify_proof_of_possession_bls(&proof, keypair.public(), &chain_spec).is_err())
+        let genesis = adiri_genesis();
+        let proof = generate_proof_of_possession_bls(&malicious_key, &genesis).unwrap();
+        assert!(verify_proof_of_possession_bls(&proof, keypair.public(), &genesis).is_err())
     }
 
     #[test]
     fn test_proof_of_possession_fails_wrong_public_key() {
         let keypair = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
         let malicious_key = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
-        let chain_spec = adiri_chain_spec_arc();
-        let proof = generate_proof_of_possession_bls(&keypair, &chain_spec).unwrap();
-        assert!(verify_proof_of_possession_bls(&proof, malicious_key.public(), &chain_spec).is_err())
+        let genesis = adiri_genesis();
+        let proof = generate_proof_of_possession_bls(&keypair, &genesis).unwrap();
+        assert!(verify_proof_of_possession_bls(&proof, malicious_key.public(), &genesis).is_err())
     }
 
     #[test]
     fn test_proof_of_possession_fails_wrong_message() {
         let keypair = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
-        let chain_spec = adiri_chain_spec_arc();
+        let genesis = adiri_genesis();
         let mut wrong = adiri_genesis();
         wrong.timestamp = 0;
         let proof = generate_proof_of_possession_bls(&keypair, &wrong.into()).unwrap();
-        assert!(verify_proof_of_possession_bls(&proof, keypair.public(), &chain_spec).is_err())
+        assert!(verify_proof_of_possession_bls(&proof, keypair.public(), &genesis).is_err())
     }
 }

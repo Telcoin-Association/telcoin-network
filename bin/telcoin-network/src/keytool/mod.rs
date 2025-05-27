@@ -4,7 +4,7 @@ mod generate;
 use self::generate::NodeType;
 use crate::args::clap_genesis_parser;
 use clap::{value_parser, Args, Subcommand};
-use eyre::Context;
+use eyre::{eyre, Context};
 
 use generate::GenerateKeys;
 use std::{
@@ -108,7 +108,7 @@ impl KeyArgs {
                         args.execute(&mut config, &datadir, passphrase)?;
 
                         debug!("{config:?}");
-                        Config::store_path(self.config_path(), config, ConfigFmt::YAML)?;
+                        Config::write_to_path(self.config_path(), config, ConfigFmt::YAML)?;
                     }
                     NodeType::ObserverKeys(args) => {
                         let authority_key_path = datadir.validator_keys_path();
@@ -118,7 +118,7 @@ impl KeyArgs {
                         args.execute(&mut config, &datadir, passphrase)?;
 
                         debug!("{config:?}");
-                        Config::store_path(self.config_path(), config, ConfigFmt::YAML)?;
+                        Config::write_to_path(self.config_path(), config, ConfigFmt::YAML)?;
                     }
                 }
             }
@@ -141,28 +141,8 @@ impl KeyArgs {
                 format!("Could not create authority key directory {}", rpath.display())
             })?;
         } else if !force {
-            warn!("overwriting keys for validator")
-            // TODO: this causes an infinite recursion of the question
-            // when run from the adiri genesis makefile
-
-            // // ask user if they want to continue generating new keys
-            // let answer =
-            //     Question::new("Keys might already exist. Do you want to generate new keys?
-            // (y/n)")         .confirm();
-
-            // if answer != Answer::YES {
-            //     // TODO: something better than panic here
-            //     panic!("Abandoning new key generation.")
-            // }
-
-            // // double-check
-            // let answer = Question::new("Warning: this action is irreversable. Are you sure you
-            // want to overwrite authority keys? (y/n)")     .confirm();
-
-            // if answer != Answer::YES {
-            //     // TODO: something better than panic here
-            //     panic!("Abandoning new key generation.")
-            // }
+            warn!("pass `force` to overwrite keys for validator");
+            return Err(eyre!("cannot overwrite validator keys without passing --force"));
         }
 
         Ok(())

@@ -35,8 +35,8 @@ use tracing::debug;
 
 #[tokio::test]
 async fn test_genesis_with_its() -> eyre::Result<()> {
-    // create genesis with a proxy
-    let genesis = adiri_genesis();
+    // create genesis with current timestamp to prevent immediate epoch boundary
+    let genesis = adiri_genesis().with_timestamp(tn_types::now());
 
     // spawn testnet for RPC calls
     spawn_local_testnet(

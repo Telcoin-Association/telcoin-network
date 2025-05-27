@@ -819,9 +819,6 @@ impl RethEnv {
 
         debug!(target: "engine", "committing closing epoch state:\n{:#?}", res.state);
 
-        // commit the changes
-        evm.db_mut().commit(res.state);
-
         Ok(closing_epoch_logs)
     }
 
@@ -944,7 +941,7 @@ impl RethEnv {
         evm: &mut Evm<'_, EXT, DB>,
         prev_env: Box<Env>,
     ) where
-        DB: Database,
+        DB: Database + DatabaseCommit,
     {
         // NOTE: revm marks these accounts as "touched" after the contract call
         // and includes them in the result
@@ -952,6 +949,9 @@ impl RethEnv {
         // remove the state changes for system call
         res.state.remove(&SYSTEM_ADDRESS);
         res.state.remove(&evm.block().coinbase);
+
+        // commit the changes
+        evm.db_mut().commit(res.state.clone());
 
         // restore the previous env
         evm.context.evm.env = prev_env;

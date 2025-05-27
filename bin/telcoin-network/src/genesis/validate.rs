@@ -61,8 +61,6 @@ impl ValidateArgs {
     /// Process:
     /// - loop through validators within the genesis directory
     /// - ensure valid state for validators
-    ///
-    /// TODO: `validate` only verifies proof of possession for now
     pub fn execute(&self) -> eyre::Result<()> {
         info!(target: "genesis::validate", "validating validators nominated for committee");
 

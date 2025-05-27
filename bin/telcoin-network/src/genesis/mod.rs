@@ -19,10 +19,10 @@ use tn_reth::{
     MaybePlatformPath, RethChainSpec,
 };
 use tn_types::{keccak256, Address, GenesisAccount, U256};
+use tracing::debug;
 
 /// Generate keypairs and save them to a file.
 #[derive(Debug, Args)]
-#[command(args_conflicts_with_subcommands = true)]
 pub struct GenesisArgs {
     /// Read and write to committe file.
     ///
@@ -38,10 +38,6 @@ pub struct GenesisArgs {
     #[arg(long, value_name = "COMMITTEE_FILE", verbatim_doc_comment)]
     pub committee_file: Option<PathBuf>,
 
-    // TODO: support custom genesis path
-    // /// The path to the genesis directory with validator information to build the committee.
-    // #[arg(long, value_name = "GENESIS_DIR", verbatim_doc_comment)]
-    // pub genesis_dir: Option<PathBuf>,
     /// The chain this node is running.
     ///
     /// The value parser matches either a known chain, the path
@@ -77,10 +73,6 @@ pub enum CeremonySubcommand {
     /// Create a committee from genesis.
     #[command(name = "create-committee", alias = "finalize")]
     CreateCommittee(CreateCommitteeArgs),
-    // TODO: add more commands
-    // - list validators (print peers)
-    // - verify and sign (sign EL Genesis)
-    // - finalize (todo)
 }
 
 /// Capture an optional test account for development.
@@ -134,11 +126,14 @@ impl GenesisArgs {
                     .datadir
                     .unwrap_or_chain_default(self.chain.chain, default_datadir_args())
                     .into();
-
-                // TODO: use config or CLI chain spec?
                 let config_path = self.config.clone().unwrap_or(datadir.node_config_path());
 
                 let mut tn_config: Config = Config::load_from_path(&config_path, ConfigFmt::YAML)?;
+
+                // initialize genesis
+                tn_config.genesis = self.chain.genesis().clone();
+                debug!(target: "init", ?config_path, "load config from path:\n{:#?}", tn_config);
+
                 if !init.is_empty() {
                     // Changed a default config setting so update and save.
                     if let Some(acct_str) = &init.dev_funded_account {
@@ -157,10 +152,13 @@ impl GenesisArgs {
                         tn_config.parameters.min_header_delay =
                             Duration::from_millis(min_header_delay_ms);
                     }
-                    Config::store_path(config_path, tn_config.clone(), ConfigFmt::YAML)?;
+
+                    Config::write_to_path(config_path, tn_config.clone(), ConfigFmt::YAML)?;
                 }
 
-                let network_genesis = NetworkGenesis::with_chain_spec(tn_config.chain_spec());
+                tracing::debug!(target: "init", genesis_path=?datadir.genesis_path(), "writing network genesis to path");
+
+                let network_genesis = NetworkGenesis::with_genesis(tn_config.genesis().clone());
                 network_genesis.write_to_path(datadir.genesis_path())?;
             }
             // add validator to the committee file
