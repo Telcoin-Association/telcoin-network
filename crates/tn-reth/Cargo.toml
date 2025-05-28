@@ -15,10 +15,12 @@ jsonrpsee = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 tn-config = { workspace = true }
 tn-types = { workspace = true }
+tn-worker = { workspace = true }
 dirs-next = "2.0.0"
 enr = { workspace = true, default-features = false, features = [
     "rust-secp256k1",
 ] }
+parking_lot = { workspace = true }
 
 reth = { workspace = true }
 reth-db = { workspace = true }

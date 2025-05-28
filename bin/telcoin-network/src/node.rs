@@ -166,6 +166,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         } = self;
 
         tn_config.observer = observer; // Set observer mode from the config.
+        tn_config.version = SHORT_VERSION; // Set the app version string.
 
         debug!(target: "cli", "node command genesis: {:#?}", reth.chain.genesis());
 
