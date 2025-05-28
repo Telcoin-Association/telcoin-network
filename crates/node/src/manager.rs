@@ -476,6 +476,9 @@ where
                     "canon state notifications dropped while awaiting engine execution for closing epoch",
                 );
                 return Err(eyre!("engine failed to report output for closing epoch"));
+            } else {
+                // only forward the output to the engine
+                to_engine.send(output).await?;
             }
         }
 

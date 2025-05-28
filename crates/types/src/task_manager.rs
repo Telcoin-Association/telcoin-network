@@ -128,7 +128,7 @@ impl TaskSpawner {
     /// Other tasks are unaffected when this task resolves.
     pub fn spawn_blocking_task<F, S: ToString>(&self, name: S, task: F)
     where
-        F: FnOnce() -> () + Send + 'static,
+        F: FnOnce() + Send + 'static,
     {
         let name = name.to_string();
         let handle = tokio::task::spawn_blocking(task);

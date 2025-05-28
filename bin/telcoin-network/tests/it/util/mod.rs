@@ -1,9 +1,7 @@
 //! Utilities for it tests.
 
 use clap::Parser;
-use std::path::PathBuf;
-#[cfg(feature = "faucet")]
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use telcoin_network::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, TelcoinDirs};
 use tn_node::launch_node;
@@ -15,7 +13,7 @@ pub static IT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Execute genesis ceremony inside tempdir
 pub fn create_validator_info(
-    dir: &PathBuf,
+    dir: &Path,
     address: &str,
     passphrase: Option<String>,
     genesis: &str,
@@ -287,17 +285,6 @@ pub fn spawn_local_testnet(
             "--instance",
             &instance,
         ]);
-
-        // // update faucet genesis
-        // cfg_if::cfg_if! {
-        //     if #[cfg(feature = "faucet")] {
-        //         // extend genesis accounts
-        //         let consensus_accounts: Vec<_> =
-        //             command.reth.chain.genesis.alloc.iter().map(|(k, v)| (*k, v.clone())).collect();
-        //         command.reth.chain =
-        //             Arc::new(genesis.clone().extend_accounts(consensus_accounts.into_iter()).with_timestamp(tn_types::now()).into());
-        //     }
-        // }
 
         std::thread::spawn(|| {
             let err = command.execute(

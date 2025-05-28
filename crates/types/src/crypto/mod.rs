@@ -200,7 +200,7 @@ mod tests {
         let genesis = adiri_genesis();
         let mut wrong = adiri_genesis();
         wrong.timestamp = 0;
-        let proof = generate_proof_of_possession_bls(&keypair, &wrong.into()).unwrap();
+        let proof = generate_proof_of_possession_bls(&keypair, &wrong).unwrap();
         assert!(verify_proof_of_possession_bls(&proof, keypair.public(), &genesis).is_err())
     }
 }
