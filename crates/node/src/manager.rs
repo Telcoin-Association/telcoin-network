@@ -159,6 +159,7 @@ where
 
         // retrieve epoch information from canonical tip on startup
         let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
+        debug!(target: "epoch-manager", ?epoch, "retrieved epoch state from canonical tip");
         let consensus_db = self.open_consensus_db(epoch).await?;
 
         // read the network config or use the default
@@ -189,14 +190,6 @@ where
     /// Create the epoch directory for consensus data if it doesn't exist and open the consensus
     /// database connection.
     async fn open_consensus_db(&self, epoch: Epoch) -> eyre::Result<DatabaseType> {
-        //
-        // TODO: read from execution state here??
-        // //
-        //
-        //
-        //
-        // ?????
-
         let epoch_db_path = self.tn_datadir.epoch_db_path(epoch);
 
         // ensure dir exists
@@ -447,6 +440,12 @@ where
         'epoch: while let Ok(mut output) = consensus_output.recv().await {
             // observe epoch boundary to initiate epoch transition
             if output.committed_at() >= self.epoch_boundary {
+                info!(
+                    target: "epoch-manager",
+                    commit=?output.committed_at(),
+                    epoch_boundary=?self.epoch_boundary,
+                    "epoch boundary reached",
+                );
                 // subscribe to engine blocks to confirm epoch closed on-chain
                 let mut executed_output = engine.canonical_block_stream().await;
 
@@ -477,6 +476,9 @@ where
                     "canon state notifications dropped while awaiting engine execution for closing epoch",
                 );
                 return Err(eyre!("engine failed to report output for closing epoch"));
+            } else {
+                // only forward the output to the engine
+                to_engine.send(output).await?;
             }
         }
 

@@ -61,11 +61,8 @@ alloy = { workspace = true, features = ["genesis"] }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 alloy-consensus = { workspace = true }
-
+tokio = { workspace = true, features = ["macros", "time"] }
 secp256k1 = { workspace = true, optional = true }
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros"] }
 
 [features]
 default = []

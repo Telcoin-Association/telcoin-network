@@ -89,6 +89,12 @@ impl Config {
         Ok(())
     }
 
+    /// Update genesis.
+    pub fn with_genesis(mut self, genesis: Genesis) -> Self {
+        self.genesis = genesis;
+        self
+    }
+
     /// Return a reference to the
     pub fn genesis(&self) -> &Genesis {
         &self.genesis

@@ -32,17 +32,6 @@ pub struct CreateCommitteeArgs {
     #[arg(long, value_name = "CONFIG_FILE", verbatim_doc_comment)]
     pub config: Option<PathBuf>,
 
-    /// The path to the genesis directory.
-    ///
-    /// The GENESIS_DIRECTORY contains more directories:
-    /// - committee
-    /// - todo
-    ///
-    /// Validators add their information to the directory using VCS like
-    /// github. Using individual files prevents merge conflicts.
-    #[arg(long, value_name = "GENESIS_DIRECTORY", verbatim_doc_comment)]
-    pub genesis: Option<PathBuf>,
-
     /// The chain this node is running.
     ///
     /// Possible values are either a built-in chain or the path to a chain specification file.
@@ -133,6 +122,9 @@ impl CreateCommitteeArgs {
             self.datadir.unwrap_or_chain_default(self.chain.chain, default_datadir_args()).into();
         let mut network_genesis = NetworkGenesis::load_from_path(&data_dir)?;
 
+        // update genesis with the provided chain
+        network_genesis.update_genesis(self.chain.genesis().clone());
+
         // validate only checks proof of possession for now
         //
         // the signatures must match the expected genesis file before consensus registry is added
@@ -140,7 +132,6 @@ impl CreateCommitteeArgs {
 
         // execute data so committee is on-chain and in genesis
         let validators: Vec<_> = network_genesis.validators().values().cloned().collect();
-        let genesis = network_genesis.genesis().clone();
 
         let initial_stake_config = ConsensusRegistry::StakeConfig {
             stakeAmount: self.initial_stake,
@@ -149,6 +140,8 @@ impl CreateCommitteeArgs {
             epochDuration: self.epoch_duration,
         };
 
+        let genesis = self.chain.genesis().clone();
+
         // try to create a runtime if one doesn't already exist
         // this is a workaround for executing committees pre-genesis during tests and normal CLI
         // operations
@@ -156,7 +149,7 @@ impl CreateCommitteeArgs {
             // use the current runtime (ie - tests)
             RethEnv::create_consensus_registry_genesis_account(
                 validators.clone(),
-                genesis.clone(),
+                genesis,
                 initial_stake_config.clone(),
                 self.consensus_registry_owner,
             )?
@@ -195,7 +188,7 @@ impl CreateCommitteeArgs {
         let updated_genesis = genesis_with_consensus_registry.extend_accounts(precompiles);
 
         // updated genesis with registry information
-        network_genesis.update_chain(updated_genesis.into());
+        network_genesis.update_genesis(updated_genesis);
 
         // update the config with new genesis information
         let config_path = self.config.clone().unwrap_or(data_dir.node_config_path());
@@ -207,15 +200,16 @@ impl CreateCommitteeArgs {
         // write genesis and config to file
         //
         // NOTE: CLI parser only supports JSON format for genesis
-        Config::store_path(data_dir.genesis_file_path(), tn_config.genesis(), ConfigFmt::JSON)?;
-        Config::store_path(config_path, tn_config, ConfigFmt::YAML)?;
+        Config::write_to_path(data_dir.genesis_file_path(), tn_config.genesis(), ConfigFmt::JSON)?;
+        Config::write_to_path(config_path, tn_config, ConfigFmt::YAML)?;
 
         // generate committee and worker cache
         let committee = network_genesis.create_committee()?;
         let worker_cache = network_genesis.create_worker_cache()?;
 
         // write to file
-        Config::store_path(data_dir.committee_path(), committee, ConfigFmt::YAML)?;
-        Config::store_path(data_dir.worker_cache_path(), worker_cache, ConfigFmt::YAML)
+        network_genesis.write_to_path(data_dir.genesis_path())?;
+        Config::write_to_path(data_dir.committee_path(), committee, ConfigFmt::YAML)?;
+        Config::write_to_path(data_dir.worker_cache_path(), worker_cache, ConfigFmt::YAML)
     }
 }

@@ -27,17 +27,6 @@ pub struct ValidateArgs {
     #[arg(long, value_name = "CONFIG_FILE", verbatim_doc_comment)]
     pub config: Option<PathBuf>,
 
-    /// The path to the genesis directory.
-    ///
-    /// The GENESIS_DIRECTORY contains more directories:
-    /// - committee
-    /// - todo
-    ///
-    /// Validators add their information to the directory using VCS like
-    /// github. Using individual files prevents merge conflicts.
-    #[arg(long, value_name = "GENESIS_DIRECTORY", verbatim_doc_comment)]
-    pub genesis: Option<PathBuf>,
-
     /// The chain this node is running.
     ///
     /// Possible values are either a built-in chain or the path to a chain specification file.
@@ -61,8 +50,6 @@ impl ValidateArgs {
     /// Process:
     /// - loop through validators within the genesis directory
     /// - ensure valid state for validators
-    ///
-    /// TODO: `validate` only verifies proof of possession for now
     pub fn execute(&self) -> eyre::Result<()> {
         info!(target: "genesis::validate", "validating validators nominated for committee");
 

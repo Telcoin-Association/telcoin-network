@@ -71,6 +71,7 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
         from_consensus,
         genesis_header.clone(),
         shutdown.subscribe(),
+        task_manager.get_spawner(),
     );
 
     // send output
@@ -228,6 +229,7 @@ async fn test_empty_output_executes_late_finalize() -> eyre::Result<()> {
         from_consensus,
         genesis_header.clone(),
         shutdown.subscribe(),
+        task_manager.get_spawner(),
     );
 
     // send output
@@ -423,6 +425,7 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
         from_consensus,
         parent,
         shutdown.subscribe(),
+        task_manager.get_spawner(),
     );
 
     // assert beneficiary account balances 0
@@ -749,6 +752,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         from_consensus,
         parent,
         shutdown.subscribe(),
+        task_manager.get_spawner(),
     );
 
     // queue the first output - simulate already received from channel
@@ -1046,6 +1050,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         from_consensus,
         parent,
         shutdown.subscribe(),
+        task_manager.get_spawner(),
     );
 
     // queue both output - simulate already received from channel

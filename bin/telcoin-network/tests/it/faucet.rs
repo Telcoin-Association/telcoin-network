@@ -315,7 +315,8 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
 
     // start canonical adiri chain with fetched storage
     let real_genesis = adiri_genesis();
-    let genesis = real_genesis.extend_accounts(genesis_accounts.into_iter());
+    let genesis =
+        real_genesis.extend_accounts(genesis_accounts.into_iter()).with_timestamp(tn_types::now());
     let chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
 
     // create and launch validator nodes on local network,

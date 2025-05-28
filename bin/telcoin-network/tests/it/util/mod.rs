@@ -1,12 +1,11 @@
 //! Utilities for it tests.
 
 use clap::Parser;
-use std::path::PathBuf;
-#[cfg(feature = "faucet")]
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use telcoin_network::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
+use tn_config::{Config, ConfigFmt, ConfigTrait as _, TelcoinDirs};
 use tn_node::launch_node;
-use tn_types::{test_utils::CommandParser, Address, Genesis};
+use tn_types::{adiri_genesis, test_utils::CommandParser, Address, Genesis};
 use tracing::error;
 
 /// Limit potential for port collisions.
@@ -14,17 +13,21 @@ pub static IT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Execute genesis ceremony inside tempdir
 pub fn create_validator_info(
-    datadir: &str,
+    dir: &Path,
     address: &str,
     passphrase: Option<String>,
+    genesis: &str,
 ) -> eyre::Result<()> {
-    // init genesis
+    let datadir = dir.to_str().expect("validator temp dir");
+
     // Note, we speed up block times for tests.
     let init_command = CommandParser::<GenesisArgs>::parse_from([
         "tn",
-        "init",
         "--datadir",
         datadir,
+        "--chain",
+        genesis,
+        "init",
         "--dev-funded-account",
         "test-source",
         "--max-header-delay-ms",
@@ -41,19 +44,31 @@ pub fn create_validator_info(
         "validator",
         "--datadir",
         datadir,
+        "--chain",
+        genesis,
         "--address",
         address,
     ]);
     keys_command.args.execute(passphrase)?;
 
     // add validator
-    let add_validator_command =
-        CommandParser::<GenesisArgs>::parse_from(["tn", "add-validator", "--datadir", datadir]);
+    let add_validator_command = CommandParser::<GenesisArgs>::parse_from([
+        "tn",
+        "add-validator",
+        "--datadir",
+        datadir,
+        "--chain",
+        genesis,
+    ]);
     add_validator_command.args.execute()
 }
 
 /// Execute observer config inside tempdir
-pub fn create_observer_info(datadir: &str, passphrase: Option<String>) -> eyre::Result<()> {
+pub fn create_observer_info(
+    datadir: &str,
+    passphrase: Option<String>,
+    genesis: &str,
+) -> eyre::Result<()> {
     // keytool
     let keys_command = CommandParser::<KeyArgs>::parse_from([
         "tn",
@@ -61,6 +76,8 @@ pub fn create_observer_info(datadir: &str, passphrase: Option<String>) -> eyre::
         "observer",
         "--datadir",
         datadir,
+        "--chain",
+        genesis,
         "--dev-funded-account",
         "test-source",
     ]);
@@ -83,13 +100,18 @@ pub async fn config_local_testnet(
     let shared_genesis_dir = temp_path.join("shared-genesis");
     let copy_path = shared_genesis_dir.join("genesis/validators");
     std::fs::create_dir_all(&copy_path)?;
+    let genesis_json_path = temp_path.genesis_file_path();
+    let genesis_json_path_str = genesis_json_path.to_str().expect("genesis path to str");
+    let genesis = adiri_genesis().with_timestamp(tn_types::now());
+
+    // write genesis to fs
+    Config::write_to_path(&genesis_json_path, genesis, ConfigFmt::JSON)?;
 
     // create validator info and copy to shared genesis dir
     for (v, addr) in validators.into_iter() {
         let dir = temp_path.join(v);
-        let datadir = dir.to_str().expect("validator temp dir");
         // init genesis ceremony to create committee / worker_cache files
-        create_validator_info(datadir, addr, passphrase.clone())?;
+        create_validator_info(&dir, addr, passphrase.clone(), genesis_json_path_str)?;
 
         // copy to shared genesis dir
         let copy = dir.join("genesis/validators");
@@ -103,7 +125,7 @@ pub async fn config_local_testnet(
     let dir = temp_path.join("observer");
     let datadir = dir.to_str().expect("observer temp dir");
     // init config ceremony for observer
-    create_observer_info(datadir, passphrase.clone())?;
+    create_observer_info(datadir, passphrase.clone(), genesis_json_path_str)?;
 
     // create committee from shared genesis dir
     let create_committee_command = CommandParser::<GenesisArgs>::parse_from([
@@ -111,6 +133,8 @@ pub async fn config_local_testnet(
         "create-committee",
         "--datadir",
         shared_genesis_dir.to_str().expect("shared genesis dir"),
+        "--chain",
+        genesis_json_path_str,
         "--consensus-registry-owner",
         "0x00000000000000000000000000000000000007e1", // doesn't matter for tests
     ]);
@@ -152,13 +176,17 @@ pub async fn config_local_testnet(
 
 /// Create validator info, genesis ceremony, and spawn node command with faucet active.
 pub fn spawn_local_testnet(
-    _genesis: Genesis, // only needed for faucet tests
+    genesis: Genesis,
     #[cfg(feature = "faucet")] faucet_contract_address: &str,
 ) -> eyre::Result<()> {
     // create temp path for test
     let temp_path = tempfile::TempDir::new().expect("tempdir is okay").into_path();
-
     let validators = ["validator-1", "validator-2", "validator-3", "validator-4"];
+    let genesis_json_path = temp_path.genesis_file_path();
+    let genesis_json_path_str = genesis_json_path.to_str().expect("genesis path to str");
+
+    // write genesis to fs
+    Config::write_to_path(&genesis_json_path, &genesis, ConfigFmt::JSON)?;
 
     // create shared genesis dir
     let shared_genesis_dir = temp_path.join("shared-genesis");
@@ -168,10 +196,14 @@ pub fn spawn_local_testnet(
     // create validator info and copy to shared genesis dir
     for v in validators.into_iter() {
         let dir = temp_path.join(v);
-        let datadir = dir.to_str().expect("validator temp dir");
         let address = Address::random().to_string();
         // init genesis ceremony to create committee / worker_cache files
-        create_validator_info(datadir, &address, Some("it_test_pass".to_string()))?;
+        create_validator_info(
+            &dir,
+            &address,
+            Some("it_test_pass".to_string()),
+            genesis_json_path_str,
+        )?;
 
         // copy to shared genesis dir
         let copy = dir.join("genesis/validators");
@@ -187,6 +219,8 @@ pub fn spawn_local_testnet(
         "create-committee",
         "--datadir",
         shared_genesis_dir.to_str().expect("shared genesis dir"),
+        "--chain",
+        genesis_json_path_str,
         "--consensus-registry-owner",
         "0x00000000000000000000000000000000000007e1", // doesn't matter for tests
     ]);
@@ -206,14 +240,14 @@ pub fn spawn_local_testnet(
             dir.join("genesis/worker_cache.yaml"),
         )?;
 
-        // use genesis file
+        // copy final genesis file
         let genesis_json_path = dir.join("genesis/genesis.json");
         std::fs::copy(shared_genesis_dir.join("genesis/genesis.json"), &genesis_json_path)?;
 
         let instance = v.chars().last().expect("validator instance").to_string();
 
         #[cfg(feature = "faucet")]
-        let mut command = NodeCommand::<tn_faucet::FaucetArgs>::parse_from([
+        let command = NodeCommand::<tn_faucet::FaucetArgs>::parse_from([
             "tn",
             "--http",
             "--datadir",
@@ -247,21 +281,10 @@ pub fn spawn_local_testnet(
             // "5",
             // "--debug.terminate",
             "--chain",
-            genesis_json_path.to_str().expect("genesis_json_path casts to &str"),
+            genesis_json_path.to_str().expect("genesis path to str"),
             "--instance",
             &instance,
         ]);
-
-        // update faucet genesis
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "faucet")] {
-                // extend genesis accounts
-                let consensus_accounts: Vec<_> =
-                    command.reth.chain.genesis.alloc.iter().map(|(k, v)| (*k, v.clone())).collect();
-                command.reth.chain =
-                    Arc::new(_genesis.clone().extend_accounts(consensus_accounts.into_iter()).into());
-            }
-        }
 
         std::thread::spawn(|| {
             let err = command.execute(

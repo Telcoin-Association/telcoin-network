@@ -36,9 +36,6 @@ pub enum NodeType {
     /// Generate all observer (non-validator) keys and write them to file.
     #[command(name = "observer")]
     ObserverKeys(ObserverArgs),
-    // primary keys
-    // worker key
-    // execution key
 }
 
 #[derive(Debug, Clone, Args)]
@@ -83,7 +80,7 @@ pub struct ValidatorArgs {
         long = "address",
         alias = "execution-address",
         help_heading = "The address that should receive block rewards. Pass `0` to use the zero address.",
-        env = "EXECUTION_ADDRESS", // TODO: this doesn't work like it should
+        env = "EXECUTION_ADDRESS",
         value_parser = clap_address_parser,
         verbatim_doc_comment
     )]
@@ -97,7 +94,7 @@ fn update_keys<TND: TelcoinDirs>(
     passphrase: Option<String>,
 ) -> eyre::Result<()> {
     let key_config = KeyConfig::generate_and_save(tn_datadir, passphrase)?;
-    let proof = key_config.generate_proof_of_possession_bls(chain)?;
+    let proof = key_config.generate_proof_of_possession_bls(chain.genesis())?;
     config.update_protocol_key(key_config.primary_public_key())?;
     config.update_proof_of_possession(proof)?;
 

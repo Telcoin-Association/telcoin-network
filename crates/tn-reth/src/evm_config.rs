@@ -66,6 +66,7 @@ impl TnEvmConfig {
                 basefee_account.data.info.balance =
                     basefee_account.data.info.balance.saturating_add(basefee * gas_used);
             }
+
             Ok(())
         });
     }
