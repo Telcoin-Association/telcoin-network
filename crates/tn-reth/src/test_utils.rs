@@ -1,10 +1,10 @@
 //! Transaction factory to create legit transactions for execution.
 
 use crate::{error::TnRethResult, recover_raw_transaction, RethEnv, WorkerTxPool};
-use alloy::signers::local::PrivateKeySigner;
+use alloy::{consensus::SignableTransaction as _, signers::local::PrivateKeySigner};
 use enr::k256::FieldBytes;
 use reth_chainspec::ChainSpec as RethChainSpec;
-use reth_evm::execute::{BlockExecutorProvider as _, Executor as _};
+use reth_evm::execute::Executor as _;
 use reth_primitives::sign_message;
 use reth_provider::{BlockExecutionOutput, ExecutionOutcome};
 use reth_revm::{database::StateProviderDatabase, db::BundleState};
@@ -15,11 +15,11 @@ use secp256k1::{
 use std::{path::Path, str::FromStr, sync::Arc};
 use tn_types::{
     adiri_chain_spec_arc, adiri_genesis, calculate_transaction_root, now, public_key_to_address,
-    AccessList, Address, Batch, Block, BlockBody, BlockExt as _, BlockWithSenders, Bytes,
-    Encodable2718, EthSignature, ExecHeader, ExecutionKeypair, Genesis, GenesisAccount, Receipt,
-    SealedHeader, SignedTransactionIntoRecoveredExt as _, TaskManager, Transaction,
-    TransactionSigned, TxEip1559, TxHash, TxKind, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS,
-    EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE, U256,
+    AccessList, Address, Batch, Block, BlockBody, Bytes, Encodable2718, EthSignature, ExecHeader,
+    ExecutionKeypair, Genesis, GenesisAccount, Receipt, RecoveredBlock, SealedHeader, TaskManager,
+    Transaction, TransactionSigned, TxEip1559, TxHash, TxKind, B256, EMPTY_OMMER_ROOT_HASH,
+    EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE,
+    U256,
 };
 use tracing::debug;
 
@@ -36,16 +36,18 @@ impl RethEnv {
     /// Execute a block for testing.
     pub fn execute_for_test(
         &self,
-        block: &BlockWithSenders,
+        block: &RecoveredBlock<reth_ethereum_primitives::Block>,
     ) -> TnRethResult<(BundleState, Vec<Receipt>)> {
         // create execution db
         let mut db = StateProviderDatabase::new(
             self.latest().expect("provider retrieves latest during test batch execution"),
         );
         // execute the block
-        let BlockExecutionOutput { state, receipts, .. } =
-            self.evm_executor.executor(&mut db).execute(block)?;
-        Ok((state, receipts))
+        // let BlockExecutionOutput { state, result } =
+        //     self.evm_executor.executor(&mut db).execute(block)?;
+
+        // Ok((state, result.receipts))
+        todo!()
     }
 
     /// Test utility to execute batch and return execution outcome.
@@ -70,7 +72,7 @@ impl RethEnv {
             logs_bloom: Default::default(),
             difficulty: U256::ZERO,
             number: parent.number + 1,
-            gas_limit: ETHEREUM_BLOCK_GAS_LIMIT,
+            gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_30M,
             gas_used: 0,
             timestamp: now(),
             mix_hash: B256::random(),

@@ -3,39 +3,41 @@
 //! These are used to spawn execution components for the node and maintain compatibility with reth's
 //! API.
 
-use crate::{evm_config::TnEvmConfig, RethEnv};
+use crate::{evm::TnEvmConfig, RethEnv};
+use reth::rpc::types::engine::ExecutionData;
 use reth_chainspec::ChainSpec;
 pub use reth_consensus::{Consensus, ConsensusError};
-use reth_consensus::{FullConsensus, HeaderValidator, PostExecutionInput};
+use reth_consensus::{FullConsensus, HeaderValidator};
 use reth_db::DatabaseEnv;
 use reth_engine_primitives::PayloadValidator;
-use reth_evm::{execute::BlockExecutorProvider, ConfigureEvm};
-use reth_node_builder::{NodeTypes, NodeTypesWithDB, NodeTypesWithEngine};
-use reth_node_ethereum::{BasicBlockExecutorProvider, EthEngineTypes, EthExecutionStrategyFactory};
-use reth_provider::EthStorage;
+use reth_evm::ConfigureEvm;
+use reth_node_builder::{NewPayloadError, NodeTypes, NodeTypesWithDB};
+use reth_node_ethereum::EthEngineTypes;
+use reth_primitives_traits::Block;
+use reth_provider::{BlockExecutionResult, EthStorage};
 use reth_trie_db::MerklePatriciaTrie;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tn_types::{
-    Address, BlockExt as _, BlockWithSenders, BlsSignature, ConsensusOutput, EthPrimitives,
-    ExecHeader, Hash as _, NodePrimitives, SealedBlock, SealedHeader, TransactionSigned,
-    Withdrawals, B256, MIN_PROTOCOL_BASE_FEE, U256,
+    Address, BlsSignature, ConsensusOutput, EthPrimitives, ExecHeader, Hash as _, NodePrimitives,
+    RecoveredBlock, SealedBlock, SealedHeader, TransactionSigned, Withdrawals, B256,
+    MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tracing::error;
 
-/// Telcoin Network specific node types for reth compatibility.
-pub trait TelcoinNodeTypes: NodeTypesWithEngine + NodeTypesWithDB {
-    /// The EVM executor type
-    type Executor: BlockExecutorProvider<Primitives = EthPrimitives>;
+// /// Telcoin Network specific node types for reth compatibility.
+// pub trait TelcoinNodeTypes: NodeTypesWithEngine + NodeTypesWithDB {
+//     /// The EVM executor type
+//     type Executor: BlockExecutorProvider<Primitives = EthPrimitives>;
 
-    /// The EVM configuration type
-    type EvmConfig: ConfigureEvm<Transaction = TransactionSigned, Header = ExecHeader>;
+//     /// The EVM configuration type
+//     type EvmConfig: ConfigureEvm<Transaction = TransactionSigned, Header = ExecHeader>;
 
-    /// Create the Reth evm config.
-    fn create_evm_config(chain: Arc<ChainSpec>) -> Self::EvmConfig;
-    /// Create the Reth executor.
-    fn create_executor(chain: Arc<ChainSpec>) -> Self::Executor;
-}
+//     /// Create the Reth evm config.
+//     fn create_evm_config(chain: Arc<ChainSpec>) -> Self::EvmConfig;
+//     /// Create the Reth executor.
+//     fn create_executor(chain: Arc<ChainSpec>) -> Self::Executor;
+// }
 
 /// Empty struct that implements Reth traits to supply GATs and functionality for Reth integration.
 #[derive(Clone, Debug)]
@@ -46,31 +48,28 @@ impl NodeTypes for TelcoinNode {
     type ChainSpec = ChainSpec;
     type StateCommitment = MerklePatriciaTrie;
     type Storage = EthStorage;
-}
-
-impl NodeTypesWithEngine for TelcoinNode {
-    type Engine = EthEngineTypes;
+    type Payload = EthEngineTypes;
 }
 
 impl NodeTypesWithDB for TelcoinNode {
     type DB = Arc<DatabaseEnv>;
 }
 
-impl TelcoinNodeTypes for TelcoinNode {
-    type Executor = BasicBlockExecutorProvider<EthExecutionStrategyFactory<TnEvmConfig>>;
-    type EvmConfig = TnEvmConfig;
+// impl TelcoinNodeTypes for TelcoinNode {
+//     type Executor = BasicBlockExecutorProvider<EthExecutionStrategyFactory<TnEvmConfig>>;
+//     type EvmConfig = TnEvmConfig;
 
-    fn create_evm_config(chain: Arc<ChainSpec>) -> Self::EvmConfig {
-        TnEvmConfig::new(chain)
-    }
+//     fn create_evm_config(chain: Arc<ChainSpec>) -> Self::EvmConfig {
+//         TnEvmConfig::new(chain)
+//     }
 
-    fn create_executor(chain: Arc<ChainSpec>) -> Self::Executor {
-        BasicBlockExecutorProvider::new(EthExecutionStrategyFactory::new(
-            chain.clone(),
-            TnEvmConfig::new(chain),
-        ))
-    }
-}
+//     fn create_executor(chain: Arc<ChainSpec>) -> Self::Executor {
+//         BasicBlockExecutorProvider::new(EthExecutionStrategyFactory::new(
+//             chain.clone(),
+//             TnEvmConfig::new(chain),
+//         ))
+//     }
+// }
 
 /// Compatibility type to easily integrate with reth.
 ///
@@ -92,29 +91,20 @@ impl<H> HeaderValidator<H> for TNExecution {
     ) -> Result<(), ConsensusError> {
         Ok(())
     }
-
-    fn validate_header_with_total_difficulty(
-        &self,
-        _header: &H,
-        _total_difficulty: U256,
-    ) -> Result<(), ConsensusError> {
-        Ok(())
-    }
 }
 
-impl<H, B> Consensus<H, B> for TNExecution {
+impl<B: Block> Consensus<B> for TNExecution {
+    type Error = ConsensusError;
+
     fn validate_body_against_header(
         &self,
-        _body: &B,
-        _header: &SealedHeader<H>,
-    ) -> Result<(), ConsensusError> {
+        _body: &B::Body,
+        _header: &SealedHeader<B::Header>,
+    ) -> Result<(), Self::Error> {
         Ok(())
     }
 
-    fn validate_block_pre_execution(
-        &self,
-        _block: &SealedBlock<H, B>,
-    ) -> Result<(), ConsensusError> {
+    fn validate_block_pre_execution(&self, _block: &SealedBlock<B>) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -122,8 +112,8 @@ impl<H, B> Consensus<H, B> for TNExecution {
 impl<N: NodePrimitives> FullConsensus<N> for TNExecution {
     fn validate_block_post_execution(
         &self,
-        _block: &BlockWithSenders<N::Block>,
-        _input: PostExecutionInput<'_, N::Receipt>,
+        _block: &RecoveredBlock<N::Block>,
+        _result: &BlockExecutionResult<N::Receipt>,
     ) -> Result<(), ConsensusError> {
         Ok(())
     }
@@ -134,14 +124,13 @@ impl<N: NodePrimitives> FullConsensus<N> for TNExecution {
 // NOTE: this should never be called because there is no beacon API
 impl PayloadValidator for TNExecution {
     type Block = tn_types::Block;
+    type ExecutionData = ExecutionData;
 
     fn ensure_well_formed_payload(
         &self,
-        payload: alloy::rpc::types::engine::ExecutionPayload,
-        sidecar: alloy::rpc::types::engine::ExecutionPayloadSidecar,
-    ) -> Result<reth_primitives::SealedBlockFor<Self::Block>, alloy::rpc::types::engine::PayloadError>
-    {
-        Ok(payload.try_into_block_with_sidecar(&sidecar)?.seal_slow())
+        _payload: ExecutionData,
+    ) -> Result<RecoveredBlock<Self::Block>, NewPayloadError> {
+        Ok(Default::default())
     }
 }
 

@@ -41,10 +41,9 @@ reth-trie-db = { workspace = true }
 reth-primitives-traits = { workspace = true }
 reth-transaction-pool = { workspace = true }
 
-reth-blockchain-tree = { workspace = true }
+# reth-blockchain-tree = { workspace = true }
 reth-errors = { workspace = true }
 reth-rpc-eth-types = { workspace = true }
-
 reth-network-peers = { workspace = true }
 reth-network-api = { workspace = true }
 reth-discv4 = { workspace = true }
@@ -59,12 +58,13 @@ tokio = { workspace = true, features = ["sync", "rt", "macros", "signal"] }
 tracing = { workspace = true }
 eyre = { workspace = true }
 alloy = { workspace = true, features = ["genesis"] }
+alloy-evm = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
-alloy-consensus = { workspace = true }
 
 secp256k1 = { workspace = true, optional = true }
+reth-ethereum-primitives = { workspace = true, optional = true }
 
 [features]
 default = []
-test-utils = ["secp256k1"]
+test-utils = ["secp256k1", "reth-ethereum-primitives"]
