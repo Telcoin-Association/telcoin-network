@@ -123,6 +123,20 @@ impl TaskSpawner {
         }
     }
 
+    /// Spawns a non-critical, blocking task on tokio and records the JoinHandle and name.
+    ///
+    /// Other tasks are unaffected when this task resolves.
+    pub fn spawn_blocking_task<F, S: ToString>(&self, name: S, task: F)
+    where
+        F: FnOnce() -> () + Send + 'static,
+    {
+        let name = name.to_string();
+        let handle = tokio::task::spawn_blocking(task);
+        if let Err(err) = self.new_task_tx.try_send(TaskHandle::new(name.clone(), handle, false)) {
+            tracing::error!(target: "tn::tasks", "Task error sending joiner for {name}: {err}");
+        }
+    }
+
     /// Internal method to spawn and manage tasks. Critical and blocking bools are used to spawn and
     /// track the correct type.
     fn spawn_reth_task(

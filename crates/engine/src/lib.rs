@@ -24,7 +24,7 @@ use std::{
     task::{Context, Poll},
 };
 use tn_reth::{traits::BuildArguments, RethEnv};
-use tn_types::{ConsensusOutput, Noticer, SealedHeader};
+use tn_types::{ConsensusOutput, Noticer, SealedHeader, TaskSpawner};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, trace, warn};
@@ -65,6 +65,8 @@ pub struct ExecutorEngine {
     parent_header: SealedHeader,
     /// Used to receive shutdown notification.
     rx_shutdown: Noticer,
+    /// The type to spawn tasks.
+    task_spawner: TaskSpawner,
 }
 
 impl ExecutorEngine {
@@ -80,6 +82,7 @@ impl ExecutorEngine {
         rx_consensus_output: mpsc::Receiver<ConsensusOutput>,
         parent_header: SealedHeader,
         rx_shutdown: Noticer,
+        task_spawner: TaskSpawner,
     ) -> Self {
         let consensus_output_stream = ReceiverStream::new(rx_consensus_output);
 
@@ -91,6 +94,7 @@ impl ExecutorEngine {
             consensus_output_stream,
             parent_header,
             rx_shutdown,
+            task_spawner,
         }
     }
 
@@ -105,18 +109,18 @@ impl ExecutorEngine {
         if let Some(output) = self.queued.pop_front() {
             let reth_env = self.reth_env.clone();
             let parent = self.parent_header.clone();
+            let task_name = format!("execution-output-{}", output.consensus_header_hash());
             let build_args = BuildArguments::new(reth_env, output, parent);
 
             // spawn blocking task and return future
-            tokio::task::spawn_blocking(move || {
+            self.task_spawner.spawn_blocking_task(task_name, move || {
                 // this is safe to call on blocking thread without a semaphore bc it's held in
                 // Self::pending_tesk as a single `Option`
-                let result = execute_consensus_output(build_args);
-                match tx.send(result) {
-                    Ok(()) => (),
-                    Err(e) => {
-                        error!(target: "engine", ?e, "error sending result from execute_consensus_output")
-                    }
+                let result = execute_consensus_output(build_args).inspect_err(|e| {
+                    error!(target: "engine", ?e, "error executing consensus output");
+                });
+                if let Err(e) = tx.send(result) {
+                    error!(target: "engine", ?e, "error sending result from execute_consensus_output")
                 }
             });
         } else {

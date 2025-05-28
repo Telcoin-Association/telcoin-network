@@ -32,6 +32,7 @@ use tracing::{debug, info};
 #[tokio::test]
 async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result<()> {
     let _guard = IT_TEST_MUTEX.lock();
+    tn_types::test_utils::init_test_tracing();
 
     // create google env and temp chain spec for state initialization
     let (tmp_chain, kms_address) = prepare_google_kms_env().await?;
@@ -315,7 +316,8 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
 
     // start canonical adiri chain with fetched storage
     let real_genesis = adiri_genesis();
-    let genesis = real_genesis.extend_accounts(genesis_accounts.into_iter());
+    let genesis =
+        real_genesis.extend_accounts(genesis_accounts.into_iter()).with_timestamp(tn_types::now());
     let chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
 
     // create and launch validator nodes on local network,

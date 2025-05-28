@@ -61,6 +61,7 @@ impl ExecutionNodeInner {
             rx_output,
             parent_header,
             rx_shutdown,
+            self.reth_env.get_task_spawner().clone(),
         );
 
         // spawn tn engine

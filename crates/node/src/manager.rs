@@ -190,14 +190,6 @@ where
     /// Create the epoch directory for consensus data if it doesn't exist and open the consensus
     /// database connection.
     async fn open_consensus_db(&self, epoch: Epoch) -> eyre::Result<DatabaseType> {
-        //
-        // TODO: read from execution state here??
-        // //
-        //
-        //
-        //
-        // ?????
-
         let epoch_db_path = self.tn_datadir.epoch_db_path(epoch);
 
         // ensure dir exists

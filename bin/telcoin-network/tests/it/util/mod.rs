@@ -66,7 +66,11 @@ pub fn create_validator_info(
 }
 
 /// Execute observer config inside tempdir
-pub fn create_observer_info(datadir: &str, passphrase: Option<String>) -> eyre::Result<()> {
+pub fn create_observer_info(
+    datadir: &str,
+    passphrase: Option<String>,
+    genesis: &str,
+) -> eyre::Result<()> {
     // keytool
     let keys_command = CommandParser::<KeyArgs>::parse_from([
         "tn",
@@ -74,6 +78,8 @@ pub fn create_observer_info(datadir: &str, passphrase: Option<String>) -> eyre::
         "observer",
         "--datadir",
         datadir,
+        "--chain",
+        genesis,
         "--dev-funded-account",
         "test-source",
     ]);
@@ -121,7 +127,7 @@ pub async fn config_local_testnet(
     let dir = temp_path.join("observer");
     let datadir = dir.to_str().expect("observer temp dir");
     // init config ceremony for observer
-    create_observer_info(datadir, passphrase.clone())?;
+    create_observer_info(datadir, passphrase.clone(), genesis_json_path_str)?;
 
     // create committee from shared genesis dir
     let create_committee_command = CommandParser::<GenesisArgs>::parse_from([
@@ -129,6 +135,8 @@ pub async fn config_local_testnet(
         "create-committee",
         "--datadir",
         shared_genesis_dir.to_str().expect("shared genesis dir"),
+        "--chain",
+        genesis_json_path_str,
         "--consensus-registry-owner",
         "0x00000000000000000000000000000000000007e1", // doesn't matter for tests
     ]);
@@ -241,7 +249,7 @@ pub fn spawn_local_testnet(
         let instance = v.chars().last().expect("validator instance").to_string();
 
         #[cfg(feature = "faucet")]
-        let mut command = NodeCommand::<tn_faucet::FaucetArgs>::parse_from([
+        let command = NodeCommand::<tn_faucet::FaucetArgs>::parse_from([
             "tn",
             "--http",
             "--datadir",
@@ -280,16 +288,16 @@ pub fn spawn_local_testnet(
             &instance,
         ]);
 
-        // update faucet genesis
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "faucet")] {
-                // extend genesis accounts
-                let consensus_accounts: Vec<_> =
-                    command.reth.chain.genesis.alloc.iter().map(|(k, v)| (*k, v.clone())).collect();
-                command.reth.chain =
-                    Arc::new(genesis.clone().extend_accounts(consensus_accounts.into_iter()).into());
-            }
-        }
+        // // update faucet genesis
+        // cfg_if::cfg_if! {
+        //     if #[cfg(feature = "faucet")] {
+        //         // extend genesis accounts
+        //         let consensus_accounts: Vec<_> =
+        //             command.reth.chain.genesis.alloc.iter().map(|(k, v)| (*k, v.clone())).collect();
+        //         command.reth.chain =
+        //             Arc::new(genesis.clone().extend_accounts(consensus_accounts.into_iter()).with_timestamp(tn_types::now()).into());
+        //     }
+        // }
 
         std::thread::spawn(|| {
             let err = command.execute(
