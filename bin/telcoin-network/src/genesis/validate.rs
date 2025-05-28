@@ -27,17 +27,6 @@ pub struct ValidateArgs {
     #[arg(long, value_name = "CONFIG_FILE", verbatim_doc_comment)]
     pub config: Option<PathBuf>,
 
-    /// The path to the genesis directory.
-    ///
-    /// The GENESIS_DIRECTORY contains more directories:
-    /// - committee
-    /// - todo
-    ///
-    /// Validators add their information to the directory using VCS like
-    /// github. Using individual files prevents merge conflicts.
-    #[arg(long, value_name = "GENESIS_DIRECTORY", verbatim_doc_comment)]
-    pub genesis: Option<PathBuf>,
-
     /// The chain this node is running.
     ///
     /// Possible values are either a built-in chain or the path to a chain specification file.

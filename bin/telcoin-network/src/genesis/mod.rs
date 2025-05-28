@@ -132,7 +132,7 @@ impl GenesisArgs {
 
                 // initialize genesis
                 tn_config.genesis = self.chain.genesis().clone();
-                debug!(target: "init", ?config_path, "load config from path:\n{:#?}", tn_config);
+                debug!(target: "cli", ?config_path, "load config from path:\n{:#?}", tn_config);
 
                 if !init.is_empty() {
                     // Changed a default config setting so update and save.
@@ -155,8 +155,6 @@ impl GenesisArgs {
 
                     Config::write_to_path(config_path, tn_config.clone(), ConfigFmt::YAML)?;
                 }
-
-                tracing::debug!(target: "init", genesis_path=?datadir.genesis_path(), "writing network genesis to path");
 
                 let network_genesis = NetworkGenesis::with_genesis(tn_config.genesis().clone());
                 network_genesis.write_to_path(datadir.genesis_path())?;
