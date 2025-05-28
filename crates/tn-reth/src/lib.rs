@@ -28,20 +28,18 @@ use clap::Parser;
 use dirs::path_to_datadir;
 use enr::secp256k1::rand::Rng as _;
 use error::{TnRethError, TnRethResult};
-use evm_config::TnEvmConfig;
+use evm::TnEvmConfig;
 use eyre::OptionExt;
 use futures::StreamExt as _;
 use jsonrpsee::Methods;
 use rand_chacha::rand_core::SeedableRng as _;
 use reth::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, DiscoveryArgs, NetworkArgs,
+        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, DiscoveryArgs, EngineArgs, NetworkArgs,
         PayloadBuilderArgs, PruningArgs, RpcServerArgs, TxPoolArgs,
     },
-    blockchain_tree::{
-        BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
-    },
     builder::NodeConfig,
+    network::transactions::config::TransactionPropagationKind,
     rpc::{
         builder::{
             config::RethRpcServerConfig, RethRpcModule, RpcModuleBuilder, RpcModuleSelection,
@@ -51,15 +49,21 @@ use reth::{
         server_types::eth::utils::recover_raw_transaction as reth_recover_raw_transaction,
     },
 };
-use reth_blockchain_tree::{BlockValidationKind, BlockchainTreeEngine};
 use reth_chainspec::{BaseFeeParams, EthChainSpec};
-use reth_consensus::FullConsensus;
 use reth_db::{init_db, DatabaseEnv};
 use reth_db_common::init::init_genesis;
 use reth_discv4::NatResolver;
 use reth_eth_wire::BlockHashNumber;
-use reth_evm::{env::EvmEnv, ConfigureEvm, ConfigureEvmEnv as _};
-use reth_node_ethereum::{BasicBlockExecutorProvider, EthExecutionStrategyFactory};
+use reth_evm::{
+    env::EvmEnv,
+    execute::{BlockBuilder, BlockBuilderOutcome},
+    ConfigureEvm, NextBlockEnvAttributes,
+};
+use reth_node_builder::{
+    DEFAULT_MAX_PROOF_TASK_CONCURRENCY, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET,
+    DEFAULT_RESERVED_CPU_CORES,
+};
+use reth_node_core::node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB;
 use reth_primitives::{Log, TxType};
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
@@ -73,11 +77,7 @@ use reth_revm::{
     database::StateProviderDatabase,
     db::{states::bundle_state::BundleRetention, BundleState},
     interpreter::Host,
-    primitives::{
-        BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, EVMError, Env,
-        EnvWithHandlerCfg, ExecutionResult, ResultAndState, TxEnv,
-    },
-    Database, DatabaseCommit, Evm, State,
+    Database, DatabaseCommit, State,
 };
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
 use serde_json::Value;
@@ -97,14 +97,14 @@ use tempfile::TempDir;
 use tn_config::{ValidatorInfo, CONSENSUS_REGISTRY_JSON};
 use tn_types::{
     adiri_chain_spec_arc, calculate_transaction_root, keccak256, Address, Block, BlockBody,
-    BlockExt as _, BlockHashOrNumber, BlockNumHash, BlockNumber, BlockWithSenders, BlsSignature,
-    Epoch, ExecHeader, Genesis, GenesisAccount, Receipt, SealedBlock, SealedBlockWithSenders,
-    SealedHeader, TaskManager, TaskSpawner, TransactionSigned, TxKind, B256, EMPTY_OMMER_ROOT_HASH,
-    EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, U256,
+    BlockHashOrNumber, BlockNumHash, BlockNumber, BlsSignature, Epoch, ExecHeader, Genesis,
+    GenesisAccount, Receipt, Recovered, RecoveredBlock, SealedBlock, SealedHeader, TaskManager,
+    TaskSpawner, TransactionSigned, TxKind, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_RECEIPTS,
+    EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
 };
 use tokio::sync::mpsc::{self};
 use tracing::{debug, error, info, warn};
-use traits::{TNPayload, TelcoinNode, TelcoinNodeTypes as _};
+use traits::{TNPayload, TelcoinNode};
 
 // Reth stuff we are just re-exporting.  Need to reduce this over time.
 pub use alloy::primitives::FixedBytes;
@@ -113,8 +113,8 @@ pub use reth::{
 };
 pub use reth_chainspec::ChainSpec as RethChainSpec;
 pub use reth_cli_util::{parse_duration_from_secs, parse_socket_address};
-pub use reth_errors::{CanonicalError, ProviderError, RethError};
-pub use reth_node_core::args::LogArgs;
+pub use reth_errors::{ProviderError, RethError};
+pub use reth_node_core::{args::LogArgs, node_config::DEFAULT_PERSISTENCE_THRESHOLD};
 pub use reth_primitives_traits::crypto::secp256k1::sign_message;
 pub use reth_provider::ExecutionOutcome;
 pub use reth_rpc_eth_types::EthApiError;
@@ -131,7 +131,7 @@ pub mod txn_pool;
 pub use txn_pool::*;
 use worker::WorkerNetwork;
 pub mod error;
-mod evm_config;
+mod evm;
 pub mod system_calls;
 pub mod worker;
 
@@ -233,7 +233,7 @@ impl RethConfig {
     /// Create a new RethConfig wrapper.
     pub fn new<P: AsRef<Path>>(
         reth_config: RethCommand,
-        instance: u16,
+        instance: Option<u16>,
         config: Option<PathBuf>,
         datadir: P,
         with_unused_ports: bool,
@@ -285,12 +285,13 @@ impl RethConfig {
             soft_limit_byte_size_pooled_transactions_response_on_pack_request: 0,
             max_capacity_cache_txns_pending_fetch: 0,
             net_if: None,
+            tx_propagation_policy: TransactionPropagationKind::Trusted,
         };
 
         // Not using the Reth payload builder.
         let builder = PayloadBuilderArgs {
             extra_data: "tn-reth-na".to_string(),
-            gas_limit: 30_000_000,
+            gas_limit: Some(ETHEREUM_BLOCK_GAS_LIMIT_30M),
             interval: Duration::from_secs(1),
             deadline: Duration::from_secs(1),
             max_payload_tasks: 0,
@@ -330,7 +331,23 @@ impl RethConfig {
             storage_history_full: false,
             storage_history_distance: None,
             storage_history_before: None,
-            receipts_log_filter: vec![],
+            receipts_log_filter: None,
+        };
+
+        // Parameters for configuring the engine driver.
+        let engine = EngineArgs {
+            persistence_threshold: DEFAULT_PERSISTENCE_THRESHOLD,
+            memory_block_buffer_target: DEFAULT_MEMORY_BLOCK_BUFFER_TARGET,
+            legacy_state_root_task_enabled: false,
+            state_root_task_compare_updates: false,
+            caching_and_prewarming_enabled: true,
+            caching_and_prewarming_disabled: false,
+            state_provider_metrics: false,
+            cross_block_cache_size: DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB,
+            accept_execution_requests_hash: false,
+            max_proof_task_concurrency: DEFAULT_MAX_PROOF_TASK_CONCURRENCY,
+            reserved_cpu_cores: DEFAULT_RESERVED_CPU_CORES,
+            precompile_cache_enabled: false,
         };
 
         let mut this = NodeConfig {
@@ -347,6 +364,7 @@ impl RethConfig {
             db,
             dev,
             pruning,
+            engine,
         };
         if with_unused_ports {
             this = this.with_unused_ports();
@@ -372,8 +390,8 @@ pub struct RethEnv {
     node_config: NodeConfig<RethChainSpec>,
     /// Type that fetches data from the database.
     blockchain_provider: BlockchainProvider<TelcoinNode>,
-    /// The Evm configuration type.
-    evm_executor: BasicBlockExecutorProvider<EthExecutionStrategyFactory<TnEvmConfig>>,
+    // /// The Evm configuration type.
+    // evm_executor: BasicBlockExecutorProvider<EthExecutionStrategyFactory<TnEvmConfig>>,
     /// The type to configure the EVM for execution.
     evm_config: TnEvmConfig,
     /// The type to spawn tasks.
@@ -408,7 +426,8 @@ impl ChainSpec {
 
     /// Return the sealed block for genesis.
     pub fn sealed_genesis_block(&self) -> SealedBlock {
-        SealedBlock::new(self.0.sealed_genesis_header(), BlockBody::default())
+        // SealedBlock::from_parts_unhashed(self.0.sealed_genesis_header(), BlockBody::default())
+        todo!()
     }
 
     /// Return the chain id.
@@ -444,12 +463,12 @@ impl RethEnv {
         database: RethDb,
     ) -> eyre::Result<Self> {
         let node_config = reth_config.0.clone();
-        let (evm_executor, evm_config) = Self::init_evm_components(&node_config);
+        // let (evm_executor, evm_config) = Self::init_evm_components(&node_config);
+        let evm_config = TnEvmConfig::new(reth_config.0.chain.clone());
         let provider_factory = Self::init_provider_factory(&node_config, database)?;
-        let blockchain_provider =
-            Self::init_blockchain_provider(&provider_factory, evm_executor.clone())?;
+        let blockchain_provider = Self::init_blockchain_provider(provider_factory.clone())?;
         let task_spawner = task_manager.get_spawner();
-        Ok(Self { node_config, blockchain_provider, evm_config, evm_executor, task_spawner })
+        Ok(Self { node_config, blockchain_provider, evm_config, task_spawner })
     }
 
     /// Initialize the provider factory and related components
@@ -474,33 +493,33 @@ impl RethEnv {
 
     /// Initialize the blockchain provider and tree
     fn init_blockchain_provider(
-        provider_factory: &ProviderFactory<TelcoinNode>,
-        evm_executor: BasicBlockExecutorProvider<EthExecutionStrategyFactory<TnEvmConfig>>,
+        provider_factory: ProviderFactory<TelcoinNode>,
+        // evm_executor: BasicBlockExecutorProvider<EthExecutionStrategyFactory<TnEvmConfig>>,
     ) -> eyre::Result<BlockchainProvider<TelcoinNode>> {
         // Initialize consensus implementation
-        let tn_execution: Arc<dyn FullConsensus> = Arc::new(TNExecution);
+        // let tn_execution: Arc<dyn FullConsensus> = Arc::new(TNExecution);
 
-        // Set up blockchain tree
-        let tree_config = BlockchainTreeConfig::default();
-        let tree_externals =
-            TreeExternals::new(provider_factory.clone(), tn_execution, evm_executor);
-        let tree = BlockchainTree::new(tree_externals, tree_config)?;
+        // // Set up blockchain tree
+        // let tree_config = BlockchainTreeConfig::default();
+        // let tree_externals =
+        //     TreeExternals::new(provider_factory.clone(), tn_execution, evm_executor);
+        // let tree = BlockchainTree::new(tree_externals, tree_config)?;
 
-        let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
-        let blockchain_db = BlockchainProvider::new(provider_factory.clone(), blockchain_tree)?;
+        // let blockchain_tree = Arc::new(ShareableBlockchainTree::new(tree));
+        let blockchain_db = BlockchainProvider::new(provider_factory)?;
 
         Ok(blockchain_db)
     }
 
-    /// Initialize EVM components
-    fn init_evm_components(
-        node_config: &NodeConfig<RethChainSpec>,
-    ) -> (BasicBlockExecutorProvider<EthExecutionStrategyFactory<TnEvmConfig>>, TnEvmConfig) {
-        let evm_config = TelcoinNode::create_evm_config(Arc::clone(&node_config.chain));
-        let evm_executor = TelcoinNode::create_executor(Arc::clone(&node_config.chain));
+    // /// Initialize EVM components
+    // fn init_evm_components(
+    //     node_config: &NodeConfig<RethChainSpec>,
+    // ) -> (BasicBlockExecutorProvider<EthExecutionStrategyFactory<TnEvmConfig>>, TnEvmConfig) {
+    //     let evm_config = TelcoinNode::create_evm_config(Arc::clone(&node_config.chain));
+    //     let evm_executor = TelcoinNode::create_executor(Arc::clone(&node_config.chain));
 
-        (evm_executor, evm_config)
-    }
+    //     (evm_executor, evm_config)
+    // }
 
     /// Initialize a new transaction pool for worker.
     pub fn init_txn_pool(&self) -> eyre::Result<WorkerTxPool> {
@@ -515,7 +534,7 @@ impl RethEnv {
         // non-critical: batch builder uses this task for each epoch
         self.task_spawner.spawn_task("canonical-block-stream", async move {
             while let Some(latest) = stream.next().await {
-                let block = latest.tip().block.clone();
+                let block = latest.tip().sealed_block().clone();
                 if let Err(_e) = tx.send(block).await {
                     break;
                 }
@@ -540,10 +559,10 @@ impl RethEnv {
         payload: TNPayload,
         transactions: Vec<Vec<u8>>,
         consensus_header_hash: B256,
-    ) -> TnRethResult<SealedBlockWithSenders> {
-        let state_provider = self
-            .blockchain_provider
-            .state_by_block_hash(payload.attributes.parent_header.hash())?;
+    ) -> TnRethResult<RecoveredBlock<reth_ethereum_primitives::Block>> {
+        let parent_header = payload.attributes.parent_header;
+
+        let state_provider = self.blockchain_provider.state_by_block_hash(parent_header.hash())?;
         let state = StateProviderDatabase::new(state_provider);
 
         // NOTE: using same approach as reth here bc I can't find the State::builder()'s methods
@@ -559,8 +578,8 @@ impl RethEnv {
 
         debug!(
             target: "payload_builder",
-            parent_hash = ?payload.attributes.parent_header.hash(),
-            parent_number = payload.attributes.parent_header.number,
+            parent_hash = ?parent_header.hash(),
+            parent_number = parent_header.number,
             "building new payload"
         );
         // collect these totals to report at the end
@@ -601,6 +620,18 @@ impl RethEnv {
 
         // TODO: parallelize tx recovery when it's worth it (see
         // TransactionSigned::recover_signers())
+        let mut builder = self.evm_config.builder_for_next_block(
+            &mut db,
+            &parent_header,
+            NextBlockEnvAttributes {
+                timestamp: payload.timestamp(),
+                suggested_fee_recipient: payload.suggested_fee_recipient(),
+                prev_randao: payload.prev_randao(),
+                gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_30M,
+                parent_beacon_block_root: None,
+                withdrawals: Some(payload.withdrawals().clone()),
+            },
+        )?;
 
         let mut evm = self.evm_config.evm_with_env(&mut db, tn_env);
 
@@ -614,35 +645,38 @@ impl RethEnv {
                     "failed to recover signer: {e}")
                 })?;
 
-            // Configure the environment for the tx.
-            *evm.tx_mut() = self.evm_config.tx_env(recovered.tx(), recovered.signer());
+            // // Configure the environment for the tx.
+            // *evm.tx_mut() = self.evm_config.tx_env(recovered.tx(), recovered.signer());
 
-            let ResultAndState { result, state } = match evm.transact() {
-                Ok(res) => res,
-                Err(err) => {
-                    match err {
-                        // allow transaction errors (ie - duplicates)
-                        //
-                        // it's possible that another worker's batch included this transaction
-                        EVMError::Transaction(err) => {
-                            warn!(target: "engine", tx_hash=?recovered.hash(), ?err);
-                            continue;
-                        }
-                        err => {
-                            // this is an error that we should treat as fatal
-                            // - invalid header resulting from misconfigured BlockEnv
-                            // - Database error
-                            // - custom error (unsure)
-                            return Err(err.into());
-                        }
-                    }
-                }
+            // let ResultAndState { result, state } = match evm.transact() {
+            //     Ok(res) => res,
+            //     Err(err) => {
+            //         match err {
+            //             // allow transaction errors (ie - duplicates)
+            //             //
+            //             // it's possible that another worker's batch included this transaction
+            //             EVMError::Transaction(err) => {
+            //                 warn!(target: "engine", tx_hash=?recovered.hash(), ?err);
+            //                 continue;
+            //             }
+            //             err => {
+            //                 // this is an error that we should treat as fatal
+            //                 // - invalid header resulting from misconfigured BlockEnv
+            //                 // - Database error
+            //                 // - custom error (unsure)
+            //                 return Err(err.into());
+            //             }
+            //         }
+            //     }
+            // };
+
+            let gas_used = match builder.execute_transaction(recovered.clone()) {
+                Ok(gas) => gas,
+                Err(err) => match err {},
             };
 
-            // commit changes
-            evm.db_mut().commit(state);
-
-            let gas_used = result.gas_used();
+            let BlockBuilderOutcome { execution_result, block, .. } =
+                builder.finish(&state_provider)?;
 
             // add gas used by the transaction to cumulative gas used, before creating the receipt
             cumulative_gas_used += gas_used;
@@ -650,9 +684,9 @@ impl RethEnv {
             // Push transaction changeset and calculate header bloom filter for receipt.
             receipts.push(Some(Receipt {
                 tx_type: recovered.tx_type(),
-                success: result.is_success(),
+                success: execution_result.is_success(),
                 cumulative_gas_used,
-                logs: result.into_logs().into_iter().collect(),
+                logs: execution_result.into_logs().into_iter().collect(),
             }));
 
             // update add to total fees
@@ -749,8 +783,8 @@ impl RethEnv {
         };
 
         let sealed_block = block.seal_slow();
-        let sealed_block_with_senders = SealedBlockWithSenders::new(sealed_block, senders)
-            .ok_or(TnRethError::SealBlockWithSenders)?;
+        let sealed_block_with_senders =
+            RecoveredBlock::new(sealed_block, senders).ok_or(TnRethError::SealBlockWithSenders)?;
 
         Ok(sealed_block_with_senders)
     }
@@ -761,7 +795,7 @@ impl RethEnv {
         &self,
         payload: TNPayload,
         consensus_header_digest: B256,
-    ) -> TnRethResult<SealedBlockWithSenders> {
+    ) -> TnRethResult<RecoveredBlock<reth_ethereum_primitives::Block>> {
         let state = self
             .blockchain_provider
             .state_by_block_hash(payload.attributes.parent_header.hash())
@@ -834,8 +868,8 @@ impl RethEnv {
 
         let sealed_block = block.seal_slow();
 
-        let sealed_block_with_senders = SealedBlockWithSenders::new(sealed_block, vec![])
-            .ok_or(TnRethError::SealBlockWithSenders)?;
+        let sealed_block_with_senders =
+            RecoveredBlock::new(sealed_block, vec![]).ok_or(TnRethError::SealBlockWithSenders)?;
 
         Ok(sealed_block_with_senders)
     }
@@ -1017,10 +1051,7 @@ impl RethEnv {
     }
 
     /// Adds block to the tree and skips state root validation.
-    pub fn insert_block(
-        &self,
-        sealed_block_with_senders: SealedBlockWithSenders,
-    ) -> TnRethResult<()> {
+    pub fn insert_block(&self, sealed_block_with_senders: RecoveredBlock) -> TnRethResult<()> {
         self.blockchain_provider.insert_block(
             sealed_block_with_senders,
             BlockValidationKind::SkipStateRootValidation,
@@ -1093,7 +1124,7 @@ impl RethEnv {
     pub fn sealed_block_with_senders(
         &self,
         id: BlockHashOrNumber,
-    ) -> TnRethResult<Option<SealedBlockWithSenders>> {
+    ) -> TnRethResult<Option<RecoveredBlock>> {
         Ok(self.blockchain_provider.sealed_block_with_senders(id, TransactionVariant::NoHash)?)
     }
 

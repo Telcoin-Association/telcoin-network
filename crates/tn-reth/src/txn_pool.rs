@@ -10,6 +10,7 @@ use reth::transaction_pool::{
 };
 use reth_chainspec::ChainSpec;
 use reth_node_builder::{NodeConfig, RethTransactionPoolConfig};
+use reth_primitives_traits::SignerRecoverable;
 use reth_provider::{
     providers::BlockchainProvider, CanonStateNotification, CanonStateSubscriptions as _, Chain,
     ChangedAccount,
@@ -18,13 +19,13 @@ use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_trans
 use reth_transaction_pool::{
     error::{InvalidPoolTransactionError, PoolError},
     identifier::TransactionId,
-    BestTransactions, CanonicalStateUpdate, EthPooledTransaction, PoolSize, PoolUpdateKind,
-    TransactionEvents, TransactionOrigin, TransactionPool as _, TransactionPoolExt as _,
-    ValidPoolTransaction,
+    BestTransactions, CanonicalStateUpdate, EthPooledTransaction, PoolSize, PoolTransaction,
+    PoolUpdateKind, TransactionEvents, TransactionOrigin, TransactionPool as _,
+    TransactionPoolExt as _, ValidPoolTransaction,
 };
 use tn_types::{
-    Address, EnvKzgSettings, RecoveredTx, SealedBlock, SignedTransactionIntoRecoveredExt as _,
-    TaskSpawner, TransactionSigned, TxHash, MIN_PROTOCOL_BASE_FEE,
+    Address, EnvKzgSettings, Recovered, SealedBlock, TaskSpawner, TransactionSigned, TxHash,
+    MIN_PROTOCOL_BASE_FEE,
 };
 use tracing::{debug, info, trace};
 
@@ -35,7 +36,7 @@ pub type PoolTxnId = TransactionId;
 /// A pooled transaction.
 pub type PoolTxn = ValidPoolTransaction<EthPooledTransaction>;
 /// A recovered pooled transaction.
-pub type RecoveredPoolTxn = RecoveredTx<EthPooledTransaction>;
+pub type RecoveredPoolTxn = Recovered<EthPooledTransaction>;
 
 pub use reth_primitives_traits::InMemorySize as TxnSize;
 
@@ -47,14 +48,17 @@ pub fn new_pool_txn(transaction: EthPooledTransaction, transaction_id: PoolTxnId
         propagate: false,
         timestamp: Instant::now(),
         origin: TransactionOrigin::External,
+        authority_ids: None,
     }
 }
 
 /// Decode transaction bytes back to a ['TransactionSigned'].
 pub fn bytes_to_txn(tx_bytes: &[u8]) -> eyre::Result<TransactionSigned> {
-    Ok(reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
-        .map_err(|_| eyre::eyre!("failed to recover transaction"))?
-        .into())
+    todo!()
+
+    // Ok(reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
+    //     .map_err(|_| eyre::eyre!("failed to recover transaction"))?
+    //     .into())
 }
 
 /// Trait on a transaction pool to produce the best transaction.
@@ -86,16 +90,12 @@ impl WorkerTxPool {
         let data_dir = node_config.datadir();
         let pool_config = node_config.txpool.pool_config();
         let blob_store = DiskFileBlobStore::open(data_dir.blobstore(), Default::default())?;
-        let validator = TransactionValidationTaskExecutor::eth_builder(node_config.chain.clone())
+        let validator = TransactionValidationTaskExecutor::eth_builder(blockchain_provider.clone())
             .with_head_timestamp(head.timestamp)
             .kzg_settings(EnvKzgSettings::Default)
             .with_local_transactions_config(pool_config.local_transactions_config.clone())
             .with_additional_tasks(node_config.txpool.additional_validation_tasks)
-            .build_with_tasks(
-                blockchain_provider.clone(),
-                task_spawner.clone(),
-                blob_store.clone(),
-            );
+            .build_with_tasks(task_spawner.clone(), blob_store.clone());
 
         let transaction_pool =
             reth_transaction_pool::Pool::eth_pool(validator, blob_store, pool_config);
@@ -207,7 +207,7 @@ impl WorkerTxPool {
         let base_fee_per_gas = tip.base_fee_per_gas.unwrap_or_else(|| self.get_pending_base_fee());
         // sync fn so self will block until all pool updates are complete
         self.update_canonical_state(
-            &tip.block,
+            tip.sealed_block(),
             base_fee_per_gas,
             None,
             mined_transactions,
@@ -243,14 +243,15 @@ impl WorkerTxPool {
         &self,
         tx: TransactionSigned,
     ) -> Result<TxHash, crate::PoolError> {
-        let hash = tx.hash();
+        let hash = *tx.hash();
         let pooled_tx = tx
             .try_into_pooled()
             .map_err(|_| PoolError::other(hash, "Not into pooled".to_string()))?;
         let recovered = pooled_tx
-            .try_into_ecrecovered()
-            .map_err(|_| PoolError::other(hash, "Not ec recovered".to_string()))?;
-        self.0.add_transaction(TransactionOrigin::External, recovered.into()).await
+            .try_into_recovered()
+            .map_err(|_| PoolError::other(hash, "Failed to recover ec tx".to_string()))?;
+        let eth_tx = EthPooledTransaction::from_pooled(recovered);
+        self.0.add_transaction(TransactionOrigin::External, eth_tx).await
     }
 
     /// Adds a local (NOT external) transaction to the pool and subscribes to transaction events.
@@ -332,7 +333,7 @@ impl Iterator for BestTxns {
 }
 
 /// Recover bytes into a transaction.
-pub fn recover_raw_transaction(tx: &[u8]) -> TnRethResult<RecoveredTx<TransactionSigned>> {
+pub fn recover_raw_transaction(tx: &[u8]) -> TnRethResult<Recovered<TransactionSigned>> {
     let recovered = reth_recover_raw_transaction::<TransactionSigned>(tx)?;
     Ok(recovered)
 }
@@ -340,5 +341,5 @@ pub fn recover_raw_transaction(tx: &[u8]) -> TnRethResult<RecoveredTx<Transactio
 /// Recover bytes into a signed transaction.
 pub fn recover_signed_transaction(tx: &[u8]) -> TnRethResult<TransactionSigned> {
     let recovered = reth_recover_raw_transaction::<TransactionSigned>(tx)?;
-    Ok(recovered.into_tx())
+    Ok(recovered.into_inner())
 }

@@ -8,8 +8,8 @@
 //! generic over it.
 
 use crate::{ChainSpec, WorkerTxPool};
-use enr::{secp256k1::SecretKey, Enr};
 use parking_lot::RwLock;
+use reth::network::config::SecretKey;
 use reth::rpc::builder::RpcServerHandle;
 use reth_chainspec::ChainSpec as RethChainSpec;
 use reth_discv4::DEFAULT_DISCOVERY_PORT;
@@ -18,6 +18,7 @@ use reth_network_api::{
     EthProtocolInfo, NetworkError, NetworkInfo, NetworkStatus, PeerInfo, PeerKind, Peers,
     PeersInfo, Reputation, ReputationChangeKind,
 };
+use reth_network_peers::Enr;
 use reth_network_peers::{NodeRecord, PeerId};
 use std::{
     net::{IpAddr, SocketAddr},
