@@ -9,6 +9,7 @@
 
 use crate::{ChainSpec, WorkerTxPool};
 use enr::{secp256k1::SecretKey, Enr};
+use parking_lot::RwLock;
 use reth::rpc::builder::RpcServerHandle;
 use reth_chainspec::ChainSpec as RethChainSpec;
 use reth_discv4::DEFAULT_DISCOVERY_PORT;
@@ -18,7 +19,12 @@ use reth_network_api::{
     PeersInfo, Reputation, ReputationChangeKind,
 };
 use reth_network_peers::{NodeRecord, PeerId};
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
+use tn_worker::WorkerNetworkHandle;
 
 /// Execution components on a per-worker basis.
 #[derive(Debug)]
@@ -27,12 +33,14 @@ pub struct WorkerComponents {
     rpc_handle: RpcServerHandle,
     /// The worker's transaction pool.
     pool: WorkerTxPool,
+    /// Keep the WorkerNetwork around so we can update it's task(s).
+    network: WorkerNetwork,
 }
 
 impl WorkerComponents {
     /// Create a new instance of [Self].
-    pub fn new(rpc_handle: RpcServerHandle, pool: WorkerTxPool) -> Self {
-        Self { rpc_handle, pool }
+    pub fn new(rpc_handle: RpcServerHandle, pool: WorkerTxPool, network: WorkerNetwork) -> Self {
+        Self { rpc_handle, pool, network }
     }
 
     /// Return a reference to the rpc handle
@@ -44,26 +52,69 @@ impl WorkerComponents {
     pub fn pool(&self) -> WorkerTxPool {
         self.pool.clone()
     }
+
+    /// Return the worker network inteface (RPC helper) for this worker.
+    pub fn worker_network(&self) -> &WorkerNetwork {
+        &self.network
+    }
 }
 
-/// A type that implements all network trait that does nothing.
-///
-/// Intended for testing purposes where network is not used.
+/// A type that implements traits used by Reth for it's RPC.
+/// Traits are filled out to provide data for net, web3 and eth namespaces when available.
+/// Much of these traits are NO-OPS are not used, they support the admin namespace for
+/// instance which TN does not use or support.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct WorkerNetwork {
     /// Chainspec
     chain_spec: RethChainSpec,
+    /// Track our peer count for queries.
+    peer_count: Arc<RwLock<usize>>,
+    /// App version.
+    version: &'static str,
 }
 
 impl WorkerNetwork {
     /// Create a new instance of self.
-    pub fn new(chain_spec: ChainSpec) -> Self {
-        Self { chain_spec: chain_spec.reth_chain_spec() }
+    pub fn new(
+        chain_spec: ChainSpec,
+        worker_network: WorkerNetworkHandle,
+        version: &'static str,
+    ) -> Self {
+        let peer_count = Arc::new(RwLock::new(0));
+        let peer_count_clone = peer_count.clone();
+        let spawner = worker_network.get_task_spawner().clone();
+        spawner.spawn_task("Worker Network Peers", async move {
+            loop {
+                if let Ok(peers) = worker_network.connected_peers().await {
+                    let mut guard = peer_count_clone.write();
+                    *guard = peers.len();
+                }
+                tokio::time::sleep(Duration::from_secs(15)).await;
+            }
+        });
+        Self { chain_spec: chain_spec.reth_chain_spec(), peer_count, version }
+    }
+
+    /// Spawn a new task to keep up with peer counts.
+    /// Use this when the epoch rolls over and the worker_network gets a new task manager.
+    pub fn respawn_peer_count(&self, worker_network: WorkerNetworkHandle) {
+        let peer_count = self.peer_count.clone();
+        let spawner = worker_network.get_task_spawner().clone();
+        spawner.spawn_task("Worker Network Peers", async move {
+            loop {
+                if let Ok(peers) = worker_network.connected_peers().await {
+                    let mut guard = peer_count.write();
+                    *guard = peers.len();
+                }
+                tokio::time::sleep(Duration::from_secs(15)).await;
+            }
+        });
     }
 }
 
 impl NetworkInfo for WorkerNetwork {
+    // TN Unused
     fn local_addr(&self) -> SocketAddr {
         (IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED), DEFAULT_DISCOVERY_PORT).into()
     }
@@ -71,8 +122,8 @@ impl NetworkInfo for WorkerNetwork {
     #[allow(deprecated, reason = "EthProtocolInfo::difficulty is deprecated")]
     async fn network_status(&self) -> Result<NetworkStatus, NetworkError> {
         Ok(NetworkStatus {
-            client_version: "v0.0.1".to_string(),
-            protocol_version: 1,
+            client_version: self.version.to_string(), // web3_clientVersion
+            protocol_version: 1,                      // eth_protocolVersion
             eth_protocol_info: EthProtocolInfo {
                 difficulty: None,
                 network: self.chain_id(),
@@ -83,6 +134,7 @@ impl NetworkInfo for WorkerNetwork {
         })
     }
 
+    // eth_chainId AND net_version
     fn chain_id(&self) -> u64 {
         self.chain_spec.chain().id()
     }
@@ -97,21 +149,24 @@ impl NetworkInfo for WorkerNetwork {
 }
 
 impl PeersInfo for WorkerNetwork {
+    // net_peerCount
     fn num_connected_peers(&self) -> usize {
-        0
+        *self.peer_count.read()
     }
 
+    // TN Unused
     fn local_node_record(&self) -> NodeRecord {
         NodeRecord::new(self.local_addr(), PeerId::random())
     }
 
-    // TODO: this is not supported
+    // TN Unused
     fn local_enr(&self) -> Enr<SecretKey> {
         let sk = SecretKey::from_slice(&[0xcd; 32]).expect("secret key derived from static slice");
         Enr::builder().build(&sk).expect("ENR builds from key")
     }
 }
 
+// These appear to support Reth's admin namespace- TN does not use this.
 impl Peers for WorkerNetwork {
     fn add_trusted_peer_id(&self, _peer: PeerId) {}
 

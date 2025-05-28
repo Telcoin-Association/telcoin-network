@@ -193,6 +193,11 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         self.id
     }
 
+    /// Return the network handle for this worker.
+    pub fn network_handle(&self) -> WorkerNetworkHandle {
+        self.network_handle.clone()
+    }
+
     pub fn batches_tx(&self) -> BatchSender {
         self.tx_batches.clone()
     }

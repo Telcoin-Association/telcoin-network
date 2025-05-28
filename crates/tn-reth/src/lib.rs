@@ -41,7 +41,10 @@ use reth::{
     },
     builder::NodeConfig,
     rpc::{
-        builder::{config::RethRpcServerConfig, RpcModuleBuilder, TransportRpcModules},
+        builder::{
+            config::RethRpcServerConfig, RethRpcModule, RpcModuleBuilder, RpcModuleSelection,
+            TransportRpcModules,
+        },
         eth::EthApi,
         server_types::eth::utils::recover_raw_transaction as reth_recover_raw_transaction,
     },
@@ -77,6 +80,7 @@ use reth_revm::{
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     net::{IpAddr, Ipv4Addr},
     ops::RangeInclusive,
     path::{Path, PathBuf},
@@ -184,7 +188,45 @@ pub struct RethConfig(NodeConfig<RethChainSpec>);
 
 const DEFAULT_UNUSED_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
+/// All the rpc modules we allow.
+/// Disallow admin, txpool.
+const ALL_MODULES: [RethRpcModule; 6] = [
+    RethRpcModule::Eth,
+    RethRpcModule::Net,
+    RethRpcModule::Web3,
+    RethRpcModule::Debug,
+    RethRpcModule::Trace,
+    RethRpcModule::Rpc,
+];
+
 impl RethConfig {
+    /// Make sure that some modules are not selected, primarily they won't work as expected with TN
+    /// (or at all).
+    fn validate_rpc_modules(mods: &mut Option<RpcModuleSelection>) {
+        match &mods {
+            Some(RpcModuleSelection::All) => {
+                *mods = Some(RpcModuleSelection::Selection(HashSet::from(ALL_MODULES)));
+            }
+            Some(RpcModuleSelection::Standard) => {}
+            Some(RpcModuleSelection::Selection(hash_set)) => {
+                let mut new_set = HashSet::new();
+                for r in ALL_MODULES {
+                    if hash_set.contains(&r) {
+                        new_set.insert(r);
+                    }
+                }
+                if hash_set.contains(&RethRpcModule::Admin) {
+                    warn!(target: "tn::reth", "Attempted to configure unsupported admin RPC module!");
+                }
+                if hash_set.contains(&RethRpcModule::Txpool) {
+                    warn!(target: "tn::reth", "Attempted to configure unsupported txpool RPC module!");
+                }
+                *mods = Some(RpcModuleSelection::Selection(new_set));
+            }
+            None => {}
+        }
+    }
+
     /// Create a new RethConfig wrapper.
     pub fn new<P: AsRef<Path>>(
         reth_config: RethCommand,
@@ -196,7 +238,9 @@ impl RethConfig {
         // create a reth DatadirArgs from tn datadir
         let datadir = path_to_datadir(datadir.as_ref());
 
-        let RethCommand { chain, rpc, txpool, db } = reth_config;
+        let RethCommand { chain, mut rpc, txpool, db } = reth_config;
+        Self::validate_rpc_modules(&mut rpc.http_api);
+        Self::validate_rpc_modules(&mut rpc.ws_api);
         // We don't just use Default for these Reth args.
         // This will force us to look at new options and make sure they are good for our use.
         // We DO NOT use the Reth networking so these settings should reflect that.
@@ -1855,5 +1899,36 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_rpc_validator() {
+        let mut mods: Option<RpcModuleSelection> = None;
+        RethConfig::validate_rpc_modules(&mut mods);
+        assert!(mods.is_none());
+        let mut mods = Some(RpcModuleSelection::All);
+        RethConfig::validate_rpc_modules(&mut mods);
+        if let Some(RpcModuleSelection::Selection(mods)) = &mut mods {
+            for r in ALL_MODULES {
+                assert!(mods.remove(&r));
+            }
+            assert!(mods.is_empty());
+        } else {
+            panic!("all mods not handled!");
+        }
+
+        let mut mods_set = HashSet::from_iter(ALL_MODULES.iter().copied());
+        mods_set.insert(RethRpcModule::Admin);
+        mods_set.insert(RethRpcModule::Txpool);
+        let mut mods = Some(RpcModuleSelection::Selection(mods_set));
+        RethConfig::validate_rpc_modules(&mut mods);
+        if let Some(RpcModuleSelection::Selection(mods)) = &mut mods {
+            for r in ALL_MODULES {
+                assert!(mods.remove(&r));
+            }
+            assert!(mods.is_empty());
+        } else {
+            panic!("all mods not handled!");
+        }
     }
 }

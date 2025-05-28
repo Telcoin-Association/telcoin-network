@@ -746,18 +746,23 @@ where
         // only support one worker for now - otherwise, loop here
         let (worker_id, _worker_info) = consensus_config.config().workers().first_worker()?;
 
-        // initialize worker components on startup
-        if *initial_epoch {
-            engine.initialize_worker_components(*worker_id).await?;
-        }
-
         // update the network handle's task spawner for reporting batches in the epoch
         {
             let network_handle = self
                 .worker_network_handle
                 .as_mut()
                 .ok_or_eyre("worker network handle missing from epoch manager")?;
+
             network_handle.update_task_spawner(epoch_task_spawner.clone());
+            // initialize worker components on startup
+            // This will use the new epoch_task_spawner on network_handle.
+            if *initial_epoch {
+                engine.initialize_worker_components(*worker_id, network_handle.clone()).await?;
+            } else {
+                // We updated our epoch task spawner so make sure worker network tasks are
+                // restarted.
+                engine.respawn_worker_network_tasks(network_handle.clone()).await;
+            }
         }
 
         let network_handle = self

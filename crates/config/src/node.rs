@@ -33,6 +33,10 @@ pub struct Config {
 
     /// Is this an observer node?
     pub observer: bool,
+
+    /// Refernce to the apps version string.
+    #[serde(skip)]
+    pub version: &'static str,
 }
 
 impl Default for Config {
@@ -44,6 +48,7 @@ impl Default for Config {
             // specify adiri chain spec
             genesis: adiri_genesis(),
             observer: false,
+            version: "UNKNOWN",
         }
     }
 }
