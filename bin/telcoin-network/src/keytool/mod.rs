@@ -2,23 +2,19 @@
 
 mod generate;
 use self::generate::NodeType;
-use crate::args::clap_genesis_parser;
-use clap::{value_parser, Args, Subcommand};
+use clap::{Args, Subcommand};
 use eyre::{eyre, Context};
 
 use generate::GenerateKeys;
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
-use tn_config::{Config, ConfigFmt, ConfigTrait, TelcoinDirs as _};
+use std::path::Path;
+use tn_config::{Config, ConfigFmt, ConfigTrait, TelcoinDirs as _, ValidatorInfo};
 use tn_reth::{
     dirs::{default_datadir_args, DataDirChainPath, DataDirPath},
     MaybePlatformPath, RethChainSpec,
 };
-use tracing::{debug, info, warn};
+use tracing::warn;
 
-/// Generate keypairs and save them to a file.
+/// Generate keypairs and validator info to go with them and save them to a file.
 #[derive(Debug, Args)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct KeyArgs {
@@ -29,25 +25,6 @@ pub struct KeyArgs {
     #[arg(long, value_name = "DATA_DIR", verbatim_doc_comment, default_value_t, global = true)]
     pub datadir: MaybePlatformPath<DataDirPath>,
 
-    /// The path to the configuration file to use.
-    #[arg(long, value_name = "FILE", verbatim_doc_comment)]
-    pub config: Option<PathBuf>,
-
-    /// The chain this node is running.
-    ///
-    /// The value parser matches either a known chain, the path
-    /// to a json file, or a json formatted string in-memory. The json can be either
-    /// a serialized [ChainSpec] or Genesis struct.
-    #[arg(
-        long,
-        value_name = "CHAIN_OR_PATH",
-        verbatim_doc_comment,
-        default_value = "adiri",
-        value_parser = clap_genesis_parser,
-        required = false,
-    )]
-    chain: Arc<RethChainSpec>,
-
     /// Generate command that creates keypairs and writes to file.
     ///
     /// TODO: rename this key "command".
@@ -55,22 +32,6 @@ pub struct KeyArgs {
     /// patterns in clap.
     #[command(subcommand)]
     pub read_or_write: KeySubcommand,
-
-    /// Add a new instance of a node.
-    ///
-    /// Configures the ports of the node to avoid conflicts with the defaults.
-    /// This is useful for running multiple nodes on the same machine.
-    ///
-    /// Max number of instances is 200. It is chosen in a way so that it's not possible to have
-    /// port numbers that conflict with each other.
-    ///
-    /// Changes to the following port numbers:
-    /// - DISCOVERY_PORT: default + `instance` - 1
-    /// - AUTH_PORT: default + `instance` * 100 - 100
-    /// - HTTP_RPC_PORT: default - `instance` + 1
-    /// - WS_RPC_PORT: default + `instance` * 2 - 2
-    #[arg(long, value_name = "INSTANCE", global = true, default_value_t = 1, value_parser = value_parser!(u16).range(..=200))]
-    pub instance: u16,
 }
 
 ///Subcommand to either generate keys or read public keys.
@@ -79,52 +40,34 @@ pub enum KeySubcommand {
     /// Generate keys and write to file.
     #[command(name = "generate")]
     Generate(GenerateKeys),
-    /// Read public keys from file.
-    #[command(name = "read")]
-    Read,
 }
-
-/// Read arg that reads from file.
-#[derive(Debug, Args)]
-pub struct Read; // public keys for: bls, network, execution, address
 
 impl KeyArgs {
     /// Execute command
     pub fn execute(&self, passphrase: Option<String>) -> eyre::Result<()> {
         // create datadir
         let datadir = self.data_dir();
-        // creates a default config if none exists
-        let mut config = self.load_config()?;
 
         match &self.read_or_write {
             // generate keys
             KeySubcommand::Generate(args) => {
-                match &args.node_type {
-                    NodeType::ValidatorKeys(args) => {
-                        let authority_key_path = datadir.validator_keys_path();
-                        // initialize path and warn users if overwriting keys
-                        self.init_path(&authority_key_path, args.force)?;
-                        // execute and store keypath
-                        args.execute(&mut config, &datadir, passphrase)?;
+                let args = match &args.node_type {
+                    NodeType::ValidatorKeys(args) => args,
+                    NodeType::ObserverKeys(args) => args,
+                };
+                let authority_key_path = datadir.validator_keys_path();
+                // initialize path and warn users if overwriting keys
+                self.init_path(&authority_key_path, args.force)?;
+                let mut validator_info = ValidatorInfo::default();
+                // execute and store keypath
+                args.execute(&mut validator_info, &datadir, passphrase)?;
 
-                        debug!("{config:?}");
-                        Config::write_to_path(self.config_path(), config, ConfigFmt::YAML)?;
-                    }
-                    NodeType::ObserverKeys(args) => {
-                        let authority_key_path = datadir.validator_keys_path();
-                        // initialize path and warn users if overwriting keys
-                        self.init_path(&authority_key_path, args.force)?;
-                        // execute and store keypath
-                        args.execute(&mut config, &datadir, passphrase)?;
-
-                        debug!("{config:?}");
-                        Config::write_to_path(self.config_path(), config, ConfigFmt::YAML)?;
-                    }
-                }
+                Config::write_to_path(
+                    datadir.validator_info_path(),
+                    &validator_info,
+                    ConfigFmt::YAML,
+                )?;
             }
-
-            // read public key from file
-            KeySubcommand::Read => todo!(),
         }
 
         Ok(())
@@ -163,26 +106,9 @@ impl KeyArgs {
 
     /// Returns the chain specific path to the data dir.
     fn data_dir(&self) -> DataDirChainPath {
-        self.datadir.unwrap_or_chain_default(self.chain.chain, default_datadir_args()).into()
-    }
-
-    /// Returns the path to the config file.
-    fn config_path(&self) -> PathBuf {
-        self.config.clone().unwrap_or_else(|| self.data_dir().node_config_path())
-    }
-
-    /// Loads the reth config with the given datadir root
-    fn load_config(&self) -> eyre::Result<Config> {
-        debug!("loading config...");
-        let config_path = self.config_path();
-        debug!(?config_path);
-        let config =
-            Config::load_from_path::<Config>(&config_path, ConfigFmt::YAML).unwrap_or_default();
-        debug!("{:?}", config);
-
-        info!(target: "tn::cli", path = ?config_path, "Configuration loaded");
-
-        Ok(config)
+        self.datadir
+            .unwrap_or_chain_default(RethChainSpec::default().chain, default_datadir_args())
+            .into()
     }
 }
 
@@ -191,7 +117,7 @@ mod tests {
     use crate::{cli::Cli, NoArgs};
     use clap::Parser;
     use tempfile::tempdir;
-    use tn_config::{Config, ConfigFmt, ConfigTrait};
+    use tn_config::{Config, ConfigFmt, ConfigTrait, ValidatorInfo};
 
     /// Test that generate keys command works.
     /// This test also ensures that confy is able to
@@ -220,8 +146,8 @@ mod tests {
         tn.run(Some("gen_keys_test".to_string()), |_, _, _, _| Ok(()))
             .expect("generate keys command");
 
-        Config::load_from_path::<Config>(
-            tempdir.join("telcoin-network.yaml").as_path(),
+        Config::load_from_path_or_default::<ValidatorInfo>(
+            tempdir.join("validator.yaml").as_path(),
             ConfigFmt::YAML,
         )
         .expect("config loaded yaml okay");

@@ -39,16 +39,39 @@ pub trait ConfigTrait {
         fmt: ConfigFmt,
     ) -> eyre::Result<T> {
         info!(target: "tn::config", path = ?path.as_ref(), "Loading configuration");
-        match File::open(&path) {
+        let mut file = File::open(path.as_ref())?;
+        let mut cfg_string = String::new();
+        file.read_to_string(&mut cfg_string)?;
+
+        // return deserialized data in specified format
+        match fmt {
+            ConfigFmt::YAML => serde_yaml::from_str(&cfg_string).with_context(|| "bad yaml data"),
+            ConfigFmt::JSON => serde_json::from_str(&cfg_string).with_context(|| "bad json data"),
+        }
+    }
+
+    /// Load an application configuration from a specified path.
+    ///
+    /// A new configuration file is created with default values if none
+    /// exists.
+    fn load_from_path_or_default<T: Serialize + DeserializeOwned + Default>(
+        path: impl AsRef<Path>,
+        fmt: ConfigFmt,
+    ) -> eyre::Result<T> {
+        info!(target: "tn::config", path = ?path.as_ref(), "Loading configuration");
+        match File::open(path.as_ref()) {
             Ok(mut file) => {
                 let mut cfg_string = String::new();
                 file.read_to_string(&mut cfg_string)?;
 
                 // return deserialized data in specified format
-                if fmt.is_json() {
-                    serde_json::from_str(&cfg_string).with_context(|| "bad json data")
-                } else {
-                    serde_yaml::from_str(&cfg_string).with_context(|| "bad yaml data")
+                match fmt {
+                    ConfigFmt::YAML => {
+                        serde_yaml::from_str(&cfg_string).with_context(|| "bad yaml data")
+                    }
+                    ConfigFmt::JSON => {
+                        serde_json::from_str(&cfg_string).with_context(|| "bad json data")
+                    }
                 }
             }
             Err(ref e) if e.kind() == NotFound => {
@@ -103,6 +126,8 @@ pub trait ConfigTrait {
 pub trait TelcoinDirs: std::fmt::Debug + Send + Sync + 'static {
     /// Return the path to `configuration` yaml file.
     fn node_config_path(&self) -> PathBuf;
+    /// Return the path to parameters yaml file.
+    fn node_config_parameters_path(&self) -> PathBuf;
     /// Return the path to the directory that holds
     /// private keys for the validator operating this node.
     fn validator_keys_path(&self) -> PathBuf;
@@ -143,12 +168,16 @@ where
         self.as_ref().join("telcoin-network.yaml")
     }
 
+    fn node_config_parameters_path(&self) -> PathBuf {
+        self.as_ref().join("parameters.yaml")
+    }
+
     fn validator_keys_path(&self) -> PathBuf {
         self.as_ref().join("validator-keys")
     }
 
     fn validator_info_path(&self) -> PathBuf {
-        self.as_ref().join("validator")
+        self.as_ref().join("validator.yaml")
     }
 
     fn genesis_path(&self) -> PathBuf {
@@ -164,7 +193,7 @@ where
     }
 
     fn genesis_file_path(&self) -> PathBuf {
-        self.genesis_path().join("genesis.json")
+        self.genesis_path().join("genesis.yaml")
     }
 
     fn consensus_db_path(&self) -> PathBuf {

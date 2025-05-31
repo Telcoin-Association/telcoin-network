@@ -73,62 +73,60 @@ else
     # make local directory for all validators
     mkdir -p $SHARED_GENESISDIR
 
+    # Loop through all the validators and generate their keys and validator infos.
     for ((i=0; i<$LENGTH; i++)); do
         VALIDATOR="${VALIDATORS[$i]}"
         ADDRESS="${ADDRESSES[$i]}"
         DATADIR="${ROOTDIR}/${VALIDATOR}"
-
-
-        echo "creating datadir for ${VALIDATOR}"
-        target/${RELEASE}/telcoin-network genesis init --datadir "${DATADIR}" \
-            --dev-funded-account $DEV_FUNDS \
-            --max-header-delay-ms 1000 \
-            --min-header-delay-ms 1000
-			# The min|max_header_delay_ms options above cause blocks to be generated
-			# faster for testing.  Remove then to build blocks at "default" speed.
-			# With these blocks are built every couple seconds, without them every ten seconds.
-			# This is just to make local testing faster.
-            # NOTE: this has to happen at genesis to have any effect.
-
-        echo "creating validator keys"
+        echo "creating validator keys/info for ${VALIDATOR}"
         target/${RELEASE}/telcoin-network keytool generate validator \
             --datadir "${DATADIR}" \
             --address "${ADDRESS}"
 
-        echo "creating validator info for genesis"
-        target/${RELEASE}/telcoin-network genesis add-validator --datadir "${DATADIR}"
-
         # cp validator info into shared genesis dir
         echo "copying validator info to shared genesis dir"
-        ls "${DATADIR}/${VALIDATORSDIR}"
-        cp "${DATADIR}/${VALIDATORSDIR}"/* "${SHARED_GENESISDIR}"
+        cp "${DATADIR}/validator.yaml" "${SHARED_GENESISDIR}/${VALIDATOR}.yaml"
         echo ""
         echo ""
     done
 
-    # create committee and worker cache yamls
-    target/${RELEASE}/telcoin-network genesis create-committee \
+    # Use the validator infos to Create genesis, committee and worker cache yamls.
+    # Speed up blocks for testing, use a bogus chain id
+    target/${RELEASE}/telcoin-network genesis \
         --datadir "${ROOTDIR}" \
+        --chain-id 0x1e7 \
+        --dev-funded-account $DEV_FUNDS \
+        --max-header-delay-ms 1000 \
+        --min-header-delay-ms 1000 \
         --consensus-registry-owner $DEV_FUNDS
 
-    # copy config files to each validator
+    # Copy the generated genesis, committee, worker_cache and parameters to each validator.
     for ((i=0; i<$LENGTH; i++)); do
         VALIDATOR="${VALIDATORS[$i]}"
         DATADIR="${ROOTDIR}/${VALIDATOR}"
-        cp "${COMMITTEE_PATH}" "${DATADIR}/genesis"
-        cp "${WORKER_CACHE_PATH}" "${DATADIR}/genesis"
-        cp "${GENESIS_JSON_PATH}" "${DATADIR}/genesis"
+        mkdir "${DATADIR}/genesis"
+        # cp validator info into shared genesis dir
+        echo "copying validator info to shared genesis dir"
+        cp "${ROOTDIR}/${GENESISDIR}/genesis.yaml" "${DATADIR}/genesis"
+        cp "${ROOTDIR}/${GENESISDIR}/committee.yaml" "${DATADIR}/genesis"
+        cp "${ROOTDIR}/${GENESISDIR}/worker_cache.yaml" "${DATADIR}/genesis"
+        cp "${ROOTDIR}/parameters.yaml" "${DATADIR}/"
+        echo ""
+        echo ""
     done
 
     echo "creating datadir for observer"
     DATADIR="${ROOTDIR}/observer"
     mkdir -p "${DATADIR}/genesis"
+    # Generate an observers "validator info"- still needs this for it's p2p netork settings and keys.
     target/${RELEASE}/telcoin-network keytool generate observer \
         --datadir "${DATADIR}" \
-        --dev-funded-account $DEV_FUNDS
-    cp "${COMMITTEE_PATH}" "${DATADIR}/genesis"
-    cp "${WORKER_CACHE_PATH}" "${DATADIR}/genesis"
-    cp "${GENESIS_JSON_PATH}" "${DATADIR}/genesis"
+        --address 0x4444444444444444444444444444444444444444
+        # Copy the chain config files over to the new observer config directories.
+    cp "${ROOTDIR}/${GENESISDIR}/genesis.yaml" "${DATADIR}/genesis"
+    cp "${ROOTDIR}/${GENESISDIR}/committee.yaml" "${DATADIR}/genesis"
+    cp "${ROOTDIR}/${GENESISDIR}/worker_cache.yaml" "${DATADIR}/genesis"
+    cp "${ROOTDIR}/parameters.yaml" "${DATADIR}/"
 fi
 
 if [ "$START" = true ]; then
@@ -143,7 +141,6 @@ if [ "$START" = true ]; then
         # -vvv for INFO, -vvvvv for TRACE, etc
         # start validator
         target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
-           --genesis "${DATADIR}/genesis/genesis.json" \
            --instance "${INSTANCE}" \
            --metrics "${CONSENSUS_METRICS}" \
            --log.stdout.format log-fmt \
@@ -155,7 +152,6 @@ if [ "$START" = true ]; then
     CONSENSUS_METRICS="127.0.0.1:9104"
     echo "Starting Observer in background, rpc endpoint http://localhost:8541"
     target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
-       --genesis "${DATADIR}/genesis/genesis.json" \
        --observer \
        --instance 5 \
        --metrics "${CONSENSUS_METRICS}" \

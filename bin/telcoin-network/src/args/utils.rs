@@ -2,27 +2,17 @@
 
 use alloy::primitives::aliases::U232;
 use eyre::OptionExt;
-use std::{str::FromStr, sync::Arc};
-use tn_reth::{chain_value_parser, dirs::DataDirPath, MaybePlatformPath, RethChainSpec};
-use tn_types::{adiri_chain_spec_arc, Address};
+use std::str::FromStr;
+use tn_reth::{dirs::DataDirPath, MaybePlatformPath};
+use tn_types::Address;
+
+pub use tn_reth::clap_genesis_parser;
 
 /// Create a default path for the node.
 pub fn tn_platform_path(value: &str) -> eyre::Result<MaybePlatformPath<DataDirPath>> {
     let path = if value.is_empty() { "telcoin-network" } else { value };
 
     Ok(MaybePlatformPath::<DataDirPath>::from_str(path)?)
-}
-
-/// Defaults for chain spec clap parser.
-///
-/// Wrapper to intercept "adiri" chain spec. If not adiri, try reth's genesis_value_parser.
-pub fn clap_genesis_parser(value: &str) -> eyre::Result<Arc<RethChainSpec>, eyre::Error> {
-    let chain = match value {
-        "adiri" => adiri_chain_spec_arc(),
-        _ => chain_value_parser(value)?,
-    };
-
-    Ok(chain)
 }
 
 /// Parse address from string for execution layer.
@@ -44,4 +34,27 @@ pub fn clap_u232_parser(value: &str) -> eyre::Result<U232> {
         .ok_or_eyre("U232 parsing")?;
 
     Ok(parsed_val)
+}
+
+/// Parse a u64 as base 10 or base 16 (hex) if prefixed with 0x.
+pub fn maybe_hex(s: &str) -> eyre::Result<u64> {
+    let result = if let Some(stripped) = s.strip_prefix("0x") {
+        u64::from_str_radix(stripped, 16)?
+    } else {
+        s.parse::<u64>()?
+    };
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::args::maybe_hex;
+
+    #[test]
+    fn test_maybe_hex() {
+        assert_eq!(maybe_hex("0x1e7").unwrap(), 487);
+        assert_eq!(maybe_hex("487").unwrap(), 487);
+        assert_eq!(maybe_hex("0x7e1").unwrap(), 2017);
+        assert_eq!(maybe_hex("2017").unwrap(), 2017);
+    }
 }

@@ -2,7 +2,7 @@
 
 use super::{BlsKeypair, BlsPublicKey, Intent, IntentMessage, IntentScope, Signer, DST_G1};
 use crate::encode;
-use alloy::genesis::Genesis;
+use alloy::primitives::Address;
 use blst::min_sig::{
     AggregateSignature as CoreBlsAggregateSignature, Signature as CoreBlsSignature,
 };
@@ -147,11 +147,11 @@ impl std::fmt::Display for BlsAggregateSignature {
 /// The message is constructed as: [BlsPublicKey] || [Genesis].
 pub fn generate_proof_of_possession_bls(
     keypair: &BlsKeypair,
-    genesis: &Genesis,
+    address: &Address,
 ) -> eyre::Result<BlsSignature> {
     let mut msg = keypair.public().to_bytes().to_vec();
-    let genesis_bytes = encode(genesis);
-    msg.extend_from_slice(genesis_bytes.as_slice());
+    let address_bytes = encode(address);
+    msg.extend_from_slice(address_bytes.as_slice());
     let sig = BlsSignature::new_secure(
         &IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg),
         keypair,
@@ -166,12 +166,12 @@ pub fn generate_proof_of_possession_bls(
 pub fn verify_proof_of_possession_bls(
     proof: &BlsSignature,
     public_key: &BlsPublicKey,
-    genesis: &Genesis,
+    address: &Address,
 ) -> eyre::Result<()> {
     public_key.validate().map_err(|_| eyre::eyre!("Bls Publkic Key not valid!"))?;
     let mut msg = public_key.to_bytes().to_vec();
-    let genesis_bytes = encode(&genesis);
-    msg.extend_from_slice(genesis_bytes.as_slice());
+    let address_bytes = encode(&address);
+    msg.extend_from_slice(address_bytes.as_slice());
     if proof.verify_secure(
         &IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg),
         public_key,

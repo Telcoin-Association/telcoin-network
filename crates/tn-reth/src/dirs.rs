@@ -106,12 +106,16 @@ impl TelcoinDirs for DataDirChainPath {
         self.0.as_ref().join("telcoin-network.yaml")
     }
 
+    fn node_config_parameters_path(&self) -> PathBuf {
+        self.0.as_ref().join("parameters.yaml")
+    }
+
     fn validator_keys_path(&self) -> PathBuf {
         self.0.as_ref().join(VALIDATOR_KEYS_DIR)
     }
 
     fn validator_info_path(&self) -> PathBuf {
-        self.0.as_ref().join("validator")
+        self.0.as_ref().join("validator.yaml")
     }
 
     fn genesis_path(&self) -> PathBuf {
@@ -127,7 +131,7 @@ impl TelcoinDirs for DataDirChainPath {
     }
 
     fn genesis_file_path(&self) -> PathBuf {
-        self.genesis_path().join("genesis.json")
+        self.genesis_path().join("genesis.yaml")
     }
 
     fn consensus_db_path(&self) -> PathBuf {

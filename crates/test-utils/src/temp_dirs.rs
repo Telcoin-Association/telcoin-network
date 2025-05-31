@@ -16,12 +16,16 @@ impl TelcoinDirs for TelcoinTempDirs {
         self.0.path().join("telcoin-network.yaml")
     }
 
+    fn node_config_parameters_path(&self) -> PathBuf {
+        self.0.as_ref().join("parameters.yaml")
+    }
+
     fn validator_keys_path(&self) -> PathBuf {
         self.0.path().join("validator-keys")
     }
 
     fn validator_info_path(&self) -> PathBuf {
-        self.0.path().join("validator")
+        self.0.path().join("validator.yaml")
     }
 
     fn genesis_path(&self) -> PathBuf {
@@ -37,7 +41,7 @@ impl TelcoinDirs for TelcoinTempDirs {
     }
 
     fn genesis_file_path(&self) -> PathBuf {
-        self.genesis_path().join("genesis.json")
+        self.genesis_path().join("genesis.yaml")
     }
 
     fn consensus_db_path(&self) -> PathBuf {

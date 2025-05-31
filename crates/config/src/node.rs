@@ -1,6 +1,6 @@
 //! Configurations for the Telcoin Network.
 
-use crate::{ConfigTrait, ValidatorInfo};
+use crate::{ConfigFmt, ConfigTrait, TelcoinDirs, ValidatorInfo};
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -56,6 +56,41 @@ impl Default for Config {
 impl ConfigTrait for Config {}
 
 impl Config {
+    /// Load a config from it's component parts.
+    /// Fallback to defaults if files are missing.
+    pub fn load_or_default<P: TelcoinDirs>(
+        tn_datadir: &P,
+        observer: bool,
+        version: &'static str,
+    ) -> eyre::Result<Self> {
+        let validator_info: ValidatorInfo =
+            Config::load_from_path_or_default(tn_datadir.validator_info_path(), ConfigFmt::YAML)?;
+        let parameters: Parameters = Config::load_from_path_or_default(
+            tn_datadir.node_config_parameters_path(),
+            ConfigFmt::YAML,
+        )?;
+        let genesis: Genesis =
+            Config::load_from_path_or_default(tn_datadir.genesis_file_path(), ConfigFmt::YAML)?;
+
+        Ok(Config { validator_info, parameters, genesis, observer, version })
+    }
+
+    /// Load a config from it's component parts.
+    pub fn load<P: TelcoinDirs>(
+        tn_datadir: &P,
+        observer: bool,
+        version: &'static str,
+    ) -> eyre::Result<Self> {
+        let validator_info: ValidatorInfo =
+            Config::load_from_path(tn_datadir.validator_info_path(), ConfigFmt::YAML)?;
+        let parameters: Parameters =
+            Config::load_from_path(tn_datadir.node_config_parameters_path(), ConfigFmt::YAML)?;
+        let genesis: Genesis =
+            Config::load_from_path(tn_datadir.genesis_file_path(), ConfigFmt::YAML)?;
+
+        Ok(Config { validator_info, parameters, genesis, observer, version })
+    }
+
     /// Update the authority protocol key.
     pub fn update_protocol_key(&mut self, value: BlsPublicKey) -> eyre::Result<()> {
         self.validator_info.bls_public_key = value;
@@ -166,9 +201,6 @@ pub struct Parameters {
     /// The maximum number of concurrent requests for messages accepted from an un-trusted entity
     #[serde(default = "Parameters::default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
-    /// Properties for the prometheus metrics
-    #[serde(default = "PrometheusMetricsParameters::default")]
-    pub prometheus_metrics: PrometheusMetricsParameters,
     /// Worker timeout when request vote from peers.
     #[serde(default = "Parameters::default_batch_vote_timeout")]
     pub batch_vote_timeout: Duration,
@@ -260,15 +292,6 @@ impl Default for PrometheusMetricsParameters {
     }
 }
 
-impl PrometheusMetricsParameters {
-    fn with_available_port(&self) -> Self {
-        let mut params = self.clone();
-        let default = Self::default();
-        params.socket_addr = default.socket_addr;
-        params
-    }
-}
-
 impl Default for Parameters {
     fn default() -> Self {
         Self {
@@ -281,21 +304,12 @@ impl Default for Parameters {
             sync_retry_nodes: Parameters::default_sync_retry_nodes(),
             max_batch_delay: Parameters::default_max_batch_delay(),
             max_concurrent_requests: Parameters::default_max_concurrent_requests(),
-            prometheus_metrics: PrometheusMetricsParameters::default(),
             batch_vote_timeout: Parameters::default_batch_vote_timeout(),
         }
     }
 }
 
 impl Parameters {
-    /// Set prometheus metrics and network admin server ports based on what's availalbe
-    /// on the OS.
-    pub fn with_available_ports(&self) -> Self {
-        let mut params = self.clone();
-        params.prometheus_metrics = params.prometheus_metrics.with_available_port();
-        params
-    }
-
     /// Tracing::info! for [Self].
     pub fn tracing(&self) {
         info!("Header number of batches threshold set to {}", self.header_num_of_batches_threshold);
@@ -307,6 +321,5 @@ impl Parameters {
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
         info!("Max batch delay set to {} ms", self.max_batch_delay.as_millis());
         info!("Max concurrent requests set to {}", self.max_concurrent_requests);
-        info!("Prometheus metrics server will run on {}", self.prometheus_metrics.socket_addr);
     }
 }

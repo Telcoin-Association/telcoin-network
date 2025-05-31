@@ -59,7 +59,7 @@ impl NetworkConfig {
     /// Read a network config file.
     pub fn read_config<TND: TelcoinDirs>(tn_datadir: &TND) -> eyre::Result<Self> {
         let path = tn_datadir.network_config_path();
-        Self::load_from_path(path, ConfigFmt::YAML)
+        Self::load_from_path_or_default(path, ConfigFmt::YAML)
     }
 
     /// Write the current network config to file.

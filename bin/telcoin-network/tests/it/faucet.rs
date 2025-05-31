@@ -20,11 +20,11 @@ use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_param
 use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicKey as PubKey};
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
-use tn_config::fetch_file_content_relative_to_manifest;
+use tn_config::{fetch_file_content_relative_to_manifest, Config, ConfigFmt, ConfigTrait};
 use tn_reth::{test_utils::TransactionFactory, RethChainSpec, RethEnv};
 use tn_types::{
-    adiri_genesis, hex, public_key_to_address, sol, Address, Encodable2718 as _, GenesisAccount,
-    SolValue, TaskManager, B256, U256,
+    adiri_genesis, hex, public_key_to_address, sol, Address, Encodable2718 as _, Genesis,
+    GenesisAccount, SolValue, TaskManager, B256, U256,
 };
 use tokio::{task::JoinHandle, time::timeout};
 use tracing::{debug, info};
@@ -313,15 +313,18 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
         ),
     ];
 
-    // start canonical adiri chain with fetched storage
-    let real_genesis = adiri_genesis();
-    let genesis =
-        real_genesis.extend_accounts(genesis_accounts.into_iter()).with_timestamp(tn_types::now());
-    let chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
-
     // create and launch validator nodes on local network,
     // use expected faucet contract address from `TransactionFactory::default` with nonce == 0
-    spawn_local_testnet(genesis, &faucet_proxy_address.to_string())?;
+    let faucet_tmp_dir = tempfile::TempDir::new().unwrap();
+    spawn_local_testnet(
+        faucet_tmp_dir.path(),
+        &faucet_proxy_address.to_string(),
+        Some(genesis_accounts),
+    )
+    .await?;
+    let genesis_file = faucet_tmp_dir.path().join("shared-genesis/genesis/genesis.yaml");
+    let genesis: Genesis = Config::load_from_path(&genesis_file, ConfigFmt::YAML)?;
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
 
     info!(target: "faucet-test", "nodes started - sleeping for 10s...");
 

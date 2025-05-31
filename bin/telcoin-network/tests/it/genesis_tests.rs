@@ -4,20 +4,12 @@
 //! however, the RPC calls don't work. The beginning of the test is left
 //! because the proxy version may be re-prioritized later.
 use crate::util::spawn_local_testnet;
-use alloy::{
-    network::EthereumWallet,
-    primitives::{aliases::U232, utils::parse_ether},
-    providers::ProviderBuilder,
-    sol_types::SolConstructor,
-};
+use alloy::{network::EthereumWallet, primitives::utils::parse_ether, providers::ProviderBuilder};
 use core::panic;
 use eyre::OptionExt;
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
-use rand::SeedableRng;
-use rand_chacha::ChaCha8Rng;
 use serde_json::Value;
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use tempfile::TempDir;
+use std::time::Duration;
 use tn_config::{NetworkGenesis, CONSENSUS_REGISTRY_JSON, DEPLOYMENTS_JSON};
 use tn_reth::{
     system_calls::{
@@ -25,25 +17,22 @@ use tn_reth::{
         CONSENSUS_REGISTRY_ADDRESS,
     },
     test_utils::TransactionFactory,
-    CreateRequest, RethChainSpec, RethEnv,
+    RethEnv,
 };
-use tn_types::{
-    adiri_genesis, hex, Address, BlsKeypair, Bytes, FromHex, Genesis, GenesisAccount, TaskManager,
-    U256,
-};
+use tn_types::{Address, Bytes, FromHex, GenesisAccount, U256};
 use tracing::debug;
 
 #[tokio::test]
 async fn test_genesis_with_its() -> eyre::Result<()> {
-    // create genesis with current timestamp to prevent immediate epoch boundary
-    let genesis = adiri_genesis().with_timestamp(tn_types::now());
-
     // spawn testnet for RPC calls
+    let temp_path = tempfile::TempDir::new().expect("tempdir is okay");
     spawn_local_testnet(
-        genesis,
+        temp_path.path(),
         #[cfg(feature = "faucet")]
         "0x0000000000000000000000000000000000000000",
+        None,
     )
+    .await
     .expect("failed to spawn testnet");
     // allow time for nodes to start
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -162,15 +151,15 @@ async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
     )?;
     let registry_deployed_bytecode = json_val.as_str().ok_or_eyre("Couldn't fetch bytecode")?;
 
-    // create genesis with a proxy
-    let genesis = genesis_with_registry(hex::decode(registry_deployed_bytecode).unwrap())?;
-
     // spawn testnet for RPC calls
+    let temp_path = tempfile::TempDir::new().expect("tempdir is okay");
     spawn_local_testnet(
-        genesis,
+        temp_path.path(),
         #[cfg(feature = "faucet")]
         "0x0000000000000000000000000000000000000000",
+        None,
     )
+    .await
     .expect("failed to spawn testnet");
     // allow time for nodes to start
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -216,96 +205,4 @@ async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
     debug!(target: "bundle", "active validators??\n{:?}", validators);
 
     Ok(())
-}
-
-/// This executes registry creation for inclusion in genesis.
-/// This is not currently used in the test, but is expected to become useful soon.
-fn genesis_with_registry(registry_deployed_bytecode: Vec<u8>) -> eyre::Result<Genesis> {
-    // construct array of 4 validators with 1-indexed `validatorIndex`
-    let active_status = ConsensusRegistry::ValidatorStatus::Active;
-    let initial_validators: Vec<ConsensusRegistry::ValidatorInfo> = (1..=4)
-        .map(|i| {
-            // generate deterministic values
-            let byte = i * 52;
-            let mut rng = ChaCha8Rng::seed_from_u64(byte as u64);
-            let bls_keypair = BlsKeypair::generate(&mut rng);
-            let bls_pubkey = bls_keypair.public().to_bytes();
-            let addr = Address::from_slice(&[byte; 20]);
-
-            ConsensusRegistry::ValidatorInfo {
-                blsPubkey: bls_pubkey.into(),
-                validatorAddress: addr,
-                activationEpoch: 0,
-                exitEpoch: 0,
-                currentStatus: active_status,
-                isRetired: false,
-                isDelegated: false,
-                stakeVersion: 0,
-            }
-        })
-        .collect();
-
-    let epoch_duration = 60 * 60 * 24; // 24-hours
-    let stake_amount = U232::from(parse_ether("1_000_000").unwrap());
-    let initial_stake_config = ConsensusRegistry::StakeConfig {
-        stakeAmount: stake_amount,
-        minWithdrawAmount: U232::from(parse_ether("1_000").unwrap()),
-        epochIssuance: U232::from(parse_ether("20_000_000").unwrap())
-            .checked_div(U232::from(28))
-            .expect("u256 div checked"),
-        epochDuration: epoch_duration,
-    };
-
-    // generate constructor calldata
-    let owner = Address::random();
-    let constructor_args = ConsensusRegistry::constructorCall {
-        genesisConfig_: initial_stake_config,
-        initialValidators_: initial_validators.clone(),
-        owner_: owner,
-    }
-    .abi_encode();
-
-    let json_val =
-        RethEnv::fetch_value_from_json_str(CONSENSUS_REGISTRY_JSON, Some("bytecode.object"))?;
-    let registry_abi = json_val.as_str().ok_or_eyre("invalid registry json")?;
-    let registry_bytecode = hex::decode(registry_abi)?;
-    let mut create_registry = registry_bytecode.clone();
-    create_registry.extend(constructor_args);
-
-    // simulate owner deploying registry
-    let txs = vec![CreateRequest::new(owner, create_registry.into()).into()];
-    let tmp_address = owner.create(0);
-    debug!(target: "bundle", "expected proxy address: {:?}", tmp_address);
-    // create temporary reth env for execution
-    let task_manager = TaskManager::new("Test Task Manager");
-    let tmp_dir = TempDir::new().unwrap();
-
-    let tmp_chain: Arc<RethChainSpec> = Arc::new(adiri_genesis().into());
-    let reth_env = RethEnv::new_for_temp_chain(tmp_chain.clone(), tmp_dir.path(), &task_manager)?;
-    let bundle = reth_env
-        .execute_call_tx_for_test_bypass_evm_checks(&tmp_chain.sealed_genesis_header(), txs)?;
-    let tmp_storage = bundle.state.get(&tmp_address).map(|account| {
-        account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
-    });
-
-    // assert storage is set
-    assert!(tmp_storage.as_ref().map(|tree: &BTreeMap<_, _>| !tree.is_empty()).unwrap());
-
-    // perform canonical adiri chain genesis with fetched storage
-    let test_cr_address = Address::random();
-    let genesis_accounts = [(
-        test_cr_address,
-        GenesisAccount::default()
-            .with_code(Some(registry_deployed_bytecode.clone().into()))
-            .with_balance(
-                U256::from(4)
-                    .checked_mul(U256::from(stake_amount))
-                    .expect("U256 checked mul for total stake"),
-            )
-            .with_storage(tmp_storage),
-    )];
-
-    let real_genesis = adiri_genesis();
-    let genesis = real_genesis.extend_accounts(genesis_accounts);
-    Ok(genesis)
 }

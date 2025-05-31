@@ -46,11 +46,11 @@ where
     ) -> eyre::Result<Self> {
         // load committee from file
         let committee: Committee =
-            Config::load_from_path(tn_datadir.committee_path(), ConfigFmt::YAML)?;
+            Config::load_from_path_or_default(tn_datadir.committee_path(), ConfigFmt::YAML)?;
         committee.load();
         info!(target: "telcoin", "committee loaded");
         let worker_cache: WorkerCache =
-            Config::load_from_path(tn_datadir.worker_cache_path(), ConfigFmt::YAML)?;
+            Config::load_from_path_or_default(tn_datadir.worker_cache_path(), ConfigFmt::YAML)?;
 
         info!(target: "telcoin", "worker cache loaded");
         Self::new_with_committee(

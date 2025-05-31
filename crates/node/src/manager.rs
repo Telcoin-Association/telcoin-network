@@ -616,7 +616,10 @@ where
         // the network must be live
         let committee = if epoch == 0 {
             // read from fs for genesis
-            Config::load_from_path::<Committee>(self.tn_datadir.committee_path(), ConfigFmt::YAML)?
+            Config::load_from_path_or_default::<Committee>(
+                self.tn_datadir.committee_path(),
+                ConfigFmt::YAML,
+            )?
         } else {
             // retrieve network information for committee
             let primary_handle = self
@@ -671,7 +674,7 @@ where
         info!(target: "epoch-manager", "creating worker cache from state");
 
         let worker_cache = if epoch == 0 {
-            Config::load_from_path::<WorkerCache>(
+            Config::load_from_path_or_default::<WorkerCache>(
                 self.tn_datadir.worker_cache_path(),
                 ConfigFmt::YAML,
             )?

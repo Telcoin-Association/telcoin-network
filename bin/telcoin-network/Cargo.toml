@@ -43,7 +43,6 @@ rpassword = { workspace = true }
 [dev-dependencies]
 tn-types = { workspace = true, features = ["test-utils"] }
 tn-reth = { workspace = true, features = ["test-utils"] }
-reth = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 rand_chacha = { workspace = true }

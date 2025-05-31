@@ -1,14 +1,13 @@
 //! CLI definition and entrypoint to executable
 use crate::{
-    args::clap_genesis_parser,
     genesis, keytool, node,
     version::{LONG_VERSION, SHORT_VERSION},
     NoArgs,
 };
-use clap::{value_parser, Parser, Subcommand};
-use std::{ffi::OsString, fmt, sync::Arc};
+use clap::{Parser, Subcommand};
+use std::{ffi::OsString, fmt};
 use tn_node::engine::TnBuilder;
-use tn_reth::{dirs::DataDirChainPath, FileWorkerGuard, LogArgs, RethChainSpec};
+use tn_reth::{dirs::DataDirChainPath, FileWorkerGuard, LogArgs};
 
 /// How do we want to get the BLS key passphrase?
 #[derive(Debug, Copy, Clone, clap::ValueEnum)]
@@ -41,41 +40,6 @@ pub struct Cli<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[clap(subcommand)]
     pub command: Commands<Ext>,
 
-    /// The chain this node is running.
-    ///
-    /// The value parser matches either a known chain, the path
-    /// to a json file, or a json formatted string in-memory. The json can be either
-    /// a serialized [ChainSpec] or Genesis struct.
-    #[arg(
-        long,
-        value_name = "CHAIN_OR_PATH",
-        verbatim_doc_comment,
-        default_value = "adiri",
-        value_parser = clap_genesis_parser,
-        global = true,
-    )]
-    pub chain: Arc<RethChainSpec>,
-
-    /// Add a new instance of a node.
-    ///
-    /// Configures the ports of the node to avoid conflicts with the defaults.
-    /// This is useful for running multiple nodes on the same machine.
-    ///
-    /// Max number of instances is 200. It is chosen in a way so that it's not possible to have
-    /// port numbers that conflict with each other.
-    ///
-    /// Changes to the following port numbers:
-    /// - DISCOVERY_PORT: default + `instance` - 1
-    /// - AUTH_PORT: default + `instance` * 100 - 100
-    /// - HTTP_RPC_PORT: default - `instance` + 1
-    /// - WS_RPC_PORT: default + `instance` * 2 - 2
-    #[arg(long, value_name = "INSTANCE", global = true, default_value_t = 1, value_parser = value_parser!(u16).range(..=200))]
-    pub instance: u16,
-
-    /// The log configuration.
-    #[clap(flatten)]
-    pub logs: LogArgs,
-
     /// How to get the BLS key passphrase.
     ///
     /// The default is to use the env variable TN_BLS_PASSPHRASE
@@ -88,6 +52,10 @@ pub struct Cli<Ext: clap::Args + fmt::Debug = NoArgs> {
         global = true
     )]
     pub bls_passphrase_source: PassSource,
+
+    /// The log configuration.
+    #[clap(flatten)]
+    pub logs: LogArgs,
 }
 
 impl Cli {
@@ -141,14 +109,13 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
         L: FnOnce(TnBuilder, Ext, DataDirChainPath, Option<String>) -> eyre::Result<()>,
     {
         // add network name to logs dir
-        self.logs.log_file_directory =
-            self.logs.log_file_directory.join(self.chain.chain.to_string());
+        self.logs.log_file_directory = self.logs.log_file_directory.join("telcoin-network-logs");
 
         let _guard = self.init_tracing()?;
 
         match self.command {
             Commands::Genesis(command) => command.execute(),
-            Commands::Node(command) => command.execute(passphrase, true, launcher),
+            Commands::Node(command) => command.execute(passphrase, launcher),
             Commands::Keytool(command) => command.execute(passphrase),
         }
     }
@@ -184,7 +151,8 @@ pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
-    use reth::args::ColorMode;
+    use tn_config::Config;
+    use tn_reth::ColorMode;
 
     #[test]
     fn parse_color_mode() {
@@ -229,6 +197,8 @@ mod tests {
     async fn parse_env_filter_directives() {
         let temp_dir = tempfile::tempdir().unwrap();
 
+        // Create config files or the run() below will fail.
+        Config::load_or_default(&temp_dir.path().to_path_buf(), true, "test").unwrap();
         std::env::set_var("RUST_LOG", "info,evm=debug");
         let tn = Cli::try_parse_args_from([
             "tn",

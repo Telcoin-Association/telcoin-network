@@ -6,8 +6,9 @@ use clap::{value_parser, Parser};
 use core::fmt;
 use fdlimit::raise_fd_limit;
 use rayon::ThreadPoolBuilder;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, thread::available_parallelism};
-use tn_config::{Config, ConfigFmt, ConfigTrait, TelcoinDirs as _};
+use std::{net::SocketAddr, sync::Arc, thread::available_parallelism};
+use tn_config::Config;
+
 use tn_node::engine::TnBuilder;
 use tn_reth::{
     clap_genesis_parser,
@@ -19,10 +20,6 @@ use tracing::*;
 /// Start the node
 #[derive(Debug, Parser)]
 pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
-    /// The path to the configuration file to use.
-    #[arg(long, value_name = "FILE", verbatim_doc_comment)]
-    pub config: Option<PathBuf>,
-
     /// Overwrite the chain this node is running.
     ///
     /// The value parser matches either a known chain, the path
@@ -92,13 +89,7 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
 impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
     /// Execute `node` command
     #[instrument(level = "info", skip_all)]
-    pub fn execute<L>(
-        mut self,
-        passphrase: Option<String>,
-        load_config: bool, /* If false will not attempt to load a previously saved config-
-                            * useful for testing. */
-        launcher: L,
-    ) -> eyre::Result<()>
+    pub fn execute<L>(mut self, passphrase: Option<String>, launcher: L) -> eyre::Result<()>
     where
         L: FnOnce(TnBuilder, Ext, DataDirChainPath, Option<String>) -> eyre::Result<()>,
     {
@@ -129,55 +120,37 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             .into();
 
         // use config for chain spec
-        let config_path = self.config.clone().unwrap_or(tn_datadir.node_config_path());
-        let mut tn_config: Config = Config::load_from_path(&config_path, ConfigFmt::YAML)?;
-        debug!(target: "cli", validator = ?tn_config.validator_info.name, "config path for node command: {config_path:?}");
+        let mut tn_config = Config::load(&tn_datadir, self.observer, SHORT_VERSION)?;
         debug!(target: "cli", validator = ?tn_config.validator_info.name, "tn datadir for node command: {tn_datadir:?}");
-
-        if load_config {
-            // Make sure we are using the chain from config not just the default.
-            self.reth.chain = Arc::new(tn_config.chain_spec());
-            info!(target: "cli", validator = ?tn_config.validator_info.name, "config loaded");
-        }
+        // Make sure we are using the chain from config not just the default.
+        self.reth.chain = Arc::new(tn_config.chain_spec());
+        info!(target: "cli", validator = ?tn_config.validator_info.name, "config loaded");
 
         // overwrite all genesis if `genesis` was passed to CLI
         if let Some(chain) = self.genesis.take() {
-            debug!(target: "cli", ?chain, "Overwriting TN config with specified chain");
+            info!(target: "cli", "Overwriting TN config with specified chain");
             // Copy over any initial allocations.  This is for testing (and testnets).
-            let mut chain = Arc::unwrap_or_clone(chain);
-            chain
-                .genesis
-                .alloc
-                .extend(self.reth.chain.genesis.alloc.iter().map(|(k, v)| (*k, v.clone())));
+            let chain = Arc::unwrap_or_clone(chain);
             self.reth.chain = Arc::new(chain);
+            tn_config.genesis = self.reth.chain.genesis().clone();
         }
 
         // get the worker's transaction address from the config
         let Self {
-            datadir: _, // Used above
-            config: _,  // Used above
-            genesis: _, // Used above
+            datadir: _,  // Used above
+            genesis: _,  // Used above
+            observer: _, // Used above
             metrics,
             instance,
             with_unused_ports,
             reth,
             ext,
-            observer,
         } = self;
-
-        tn_config.observer = observer; // Set observer mode from the config.
-        tn_config.version = SHORT_VERSION; // Set the app version string.
 
         debug!(target: "cli", "node command genesis: {:#?}", reth.chain.genesis());
 
         // set up reth node config for engine components
-        let node_config = RethConfig::new(
-            reth,
-            instance,
-            Some(config_path),
-            tn_datadir.as_ref(),
-            with_unused_ports,
-        );
+        let node_config = RethConfig::new(reth, instance, tn_datadir.as_ref(), with_unused_ports);
 
         let builder = TnBuilder { node_config, tn_config, opt_faucet_args: None, metrics };
 

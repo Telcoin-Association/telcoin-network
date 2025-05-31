@@ -83,7 +83,7 @@ use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr},
     ops::RangeInclusive,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
     time::Duration,
 };
@@ -92,7 +92,7 @@ use system_calls::{
     EpochState, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
 };
 use tempfile::TempDir;
-use tn_config::{ValidatorInfo, CONSENSUS_REGISTRY_JSON};
+use tn_config::{Config, ConfigFmt, ConfigTrait, ValidatorInfo, CONSENSUS_REGISTRY_JSON};
 use tn_types::{
     adiri_chain_spec_arc, calculate_transaction_root, keccak256, Address, Block, BlockBody,
     BlockExt as _, BlockHashOrNumber, BlockNumHash, BlockNumber, BlockWithSenders, BlsSignature,
@@ -111,7 +111,7 @@ pub use reth::{
 pub use reth_chainspec::ChainSpec as RethChainSpec;
 pub use reth_cli_util::{parse_duration_from_secs, parse_socket_address};
 pub use reth_errors::{CanonicalError, ProviderError, RethError};
-pub use reth_node_core::args::LogArgs;
+pub use reth_node_core::args::{ColorMode, LogArgs};
 pub use reth_primitives_traits::crypto::secp256k1::sign_message;
 pub use reth_provider::{CanonStateNotificationStream, ExecutionOutcome};
 pub use reth_rpc_eth_types::EthApiError;
@@ -135,16 +135,22 @@ pub mod worker;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
+/// A helper to parse a [`Genesis`](alloy_genesis::Genesis) as argument or from disk.
+fn parse_genesis(s: &str) -> eyre::Result<RethChainSpec> {
+    let genesis: Genesis = Config::load_from_path_or_default(Path::new(s), ConfigFmt::YAML)?;
+    Ok(genesis.into())
+}
+
 /// Rpc Server type, used for getting the node started.
 pub type RpcServer = TransportRpcModules<()>;
 
 /// Defaults for chain spec clap parser.
 ///
-/// Wrapper to intercept "adiri" chain spec. If not adiri, try reth's genesis_value_parser.
+/// Wrapper to intercept "adiri" chain spec. If not adiri, load provided genesis.
 pub fn clap_genesis_parser(value: &str) -> eyre::Result<Arc<RethChainSpec>, eyre::Error> {
     let chain = match value {
         "adiri" => adiri_chain_spec_arc(),
-        _ => chain_value_parser(value)?,
+        _ => Arc::new(parse_genesis(value)?),
     };
 
     Ok(chain)
@@ -231,7 +237,6 @@ impl RethConfig {
     pub fn new<P: AsRef<Path>>(
         reth_config: RethCommand,
         instance: u16,
-        config: Option<PathBuf>,
         datadir: P,
         with_unused_ports: bool,
     ) -> Self {
@@ -331,7 +336,7 @@ impl RethConfig {
         };
 
         let mut this = NodeConfig {
-            config,
+            config: None,
             chain,
             metrics: None,
             instance,

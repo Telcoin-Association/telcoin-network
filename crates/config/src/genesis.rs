@@ -72,8 +72,10 @@ impl NetworkGenesis {
         self.genesis = genesis;
     }
 
-    /// Generate a [NetworkGenesis] by reading files in a directory.
-    pub fn load_from_path<P>(telcoin_paths: &P) -> eyre::Result<Self>
+    /// Load a list of validators by reading files in a directory.
+    pub fn load_validators_from_path<P>(
+        telcoin_paths: &P,
+    ) -> eyre::Result<Vec<(BlsPublicKey, ValidatorInfo)>>
     where
         P: TelcoinDirs,
     {
@@ -102,19 +104,34 @@ impl NetworkGenesis {
                 warn!("skipping dir: {}\ndirs should not be in validators dir", path.display());
             }
         }
+        Ok(validators)
+    }
 
+    /// Generate a [NetworkGenesis] by reading validators from files in a directory with genesis.
+    pub fn new_from_path_and_genesis<P>(telcoin_paths: &P, genesis: Genesis) -> eyre::Result<Self>
+    where
+        P: TelcoinDirs,
+    {
+        // Load validator information
+        let validators = Self::load_validators_from_path(telcoin_paths)?;
+        let validators = BTreeMap::from_iter(validators);
+
+        Ok(Self { genesis, validators })
+    }
+
+    /// Generate a [NetworkGenesis] by reading files in a directory.
+    pub fn load_from_path<P>(telcoin_paths: &P) -> eyre::Result<Self>
+    where
+        P: TelcoinDirs,
+    {
+        // Load validator information
+        let validators = Self::load_validators_from_path(telcoin_paths)?;
         let validators = BTreeMap::from_iter(validators);
 
         let tn_config: Config =
-            Config::load_from_path(telcoin_paths.node_config_path(), ConfigFmt::YAML)?;
+            Config::load_from_path_or_default(telcoin_paths.node_config_path(), ConfigFmt::YAML)?;
 
-        let network_genesis = Self {
-            genesis: tn_config.genesis,
-            validators,
-            // signatures,
-        };
-
-        Ok(network_genesis)
+        Ok(Self { genesis: tn_config.genesis, validators })
     }
 
     /// Write [NetworkGenesis] to path (genesis directory) as individual validator files.
@@ -145,7 +162,11 @@ impl NetworkGenesis {
     pub fn validate(&self) -> eyre::Result<()> {
         for (pubkey, validator) in self.validators.iter() {
             info!(target: "genesis::validate", "verifying validator: {}", pubkey);
-            verify_proof_of_possession_bls(&validator.proof_of_possession, pubkey, self.genesis())?;
+            verify_proof_of_possession_bls(
+                &validator.proof_of_possession,
+                pubkey,
+                &validator.execution_address,
+            )?;
         }
         info!(target: "genesis::validate", "all validators valid for genesis");
         Ok(())
@@ -350,8 +371,8 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
     use std::collections::BTreeMap;
     use tn_types::{
-        adiri_genesis, generate_proof_of_possession_bls, Address, BlsKeypair, Multiaddr,
-        NetworkKeypair, PrimaryInfo, WorkerIndex, WorkerInfo,
+        generate_proof_of_possession_bls, Address, BlsKeypair, Multiaddr, NetworkKeypair,
+        PrimaryInfo, WorkerIndex, WorkerInfo,
     };
 
     #[test]
@@ -363,7 +384,7 @@ mod tests {
             let network_keypair = NetworkKeypair::generate_ed25519();
             let address = Address::from_raw_public_key(&[0; 64]);
             let proof_of_possession =
-                generate_proof_of_possession_bls(&bls_keypair, &adiri_genesis()).unwrap();
+                generate_proof_of_possession_bls(&bls_keypair, &address).unwrap();
             let primary_network_address = Multiaddr::empty();
             let worker_info = WorkerInfo::default();
             let worker_index = WorkerIndex(BTreeMap::from([(0, worker_info)]));
@@ -398,14 +419,11 @@ mod tests {
             let bls_keypair = BlsKeypair::generate(&mut StdRng::from_seed([0; 32]));
             let network_keypair = NetworkKeypair::generate_ed25519();
             let address = Address::from_raw_public_key(&[0; 64]);
-
-            // create wrong chain spec
-            let mut wrong_chain = adiri_genesis();
-            wrong_chain.timestamp = 0;
+            let wrong_address = Address::from_raw_public_key(&[1; 64]);
 
             // generate proof with wrong chain spec
             let proof_of_possession =
-                generate_proof_of_possession_bls(&bls_keypair, &wrong_chain).unwrap();
+                generate_proof_of_possession_bls(&bls_keypair, &wrong_address).unwrap();
             let primary_network_address = Multiaddr::empty();
             let worker_info = WorkerInfo::default();
             let worker_index = WorkerIndex(BTreeMap::from([(0, worker_info)]));

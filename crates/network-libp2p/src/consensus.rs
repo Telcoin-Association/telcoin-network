@@ -5,7 +5,7 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
-    kad::{KadRecord, KadStore},
+    kad::KadStore,
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     types::{
@@ -371,13 +371,10 @@ where
 
     /// Publish our network addresses and peer id under our BLS public key for discovery.
     fn publish_our_data(&mut self) {
-        if let Some(kad_record) = self.get_peer_record() {
-            // Convert to KadRecord for a "cleaner" debug print.  Do we really need this record in
-            // log?
-            let record: KadRecord = kad_record.clone().into();
-            info!(target: "network-kad", ?record, "Publishing our record to kademlia");
+        if let Some(record) = self.get_peer_record() {
+            info!(target: "network-kad", "Publishing our record to kademlia");
             if let Err(err) =
-                self.swarm.behaviour_mut().kademlia.put_record(kad_record, kad::Quorum::One)
+                self.swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One)
             {
                 error!(target: "network-kad", "Failed to publish record: {err}");
             }

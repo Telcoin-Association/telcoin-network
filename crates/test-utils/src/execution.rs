@@ -50,7 +50,7 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     opt_args: Option<Vec<&str>>,
     tmp_dir: &Path,
 ) -> eyre::Result<(TnBuilder, CliExt)> {
-    let default_args = ["telcoin-network", "--http", "--chain", "adiri"];
+    let default_args = ["telcoin-network", "--http", "--genesis", "adiri"];
 
     // extend faucet args if provided
     let cli_args = if let Some(args) = opt_args {
@@ -62,7 +62,7 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     // use same approach as telcoin-network binary
     let command = NodeCommand::<CliExt>::try_parse_from(cli_args)?;
 
-    let NodeCommand { config: _, instance, ext, reth, datadir: _, .. } = command;
+    let NodeCommand { instance, ext, reth, datadir: _, .. } = command;
     let RethCommand { chain, rpc, txpool, db, .. } = reth;
 
     // overwrite chain spec if passed in
@@ -83,7 +83,7 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     // TODO: this a temporary approach until upstream reth supports public rpc hooks
     let opt_faucet_args = None;
     let builder = TnBuilder {
-        node_config: RethConfig::new(reth_command, instance, None, tmp_dir, true),
+        node_config: RethConfig::new(reth_command, instance, tmp_dir, true),
         tn_config,
         opt_faucet_args,
         metrics: None,
