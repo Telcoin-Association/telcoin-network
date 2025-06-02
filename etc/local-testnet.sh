@@ -94,7 +94,7 @@ else
     # Speed up blocks for testing, use a bogus chain id
     target/${RELEASE}/telcoin-network genesis \
         --datadir "${ROOTDIR}" \
-        --chain-id 0x1e7 \
+        --chain-id 0x7e1 \
         --dev-funded-account $DEV_FUNDS \
         --max-header-delay-ms 1000 \
         --min-header-delay-ms 1000 \
