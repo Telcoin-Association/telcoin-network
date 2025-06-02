@@ -493,7 +493,9 @@ where
         reth_db: RethDb,
     ) -> eyre::Result<ExecutionNode> {
         // create execution components (ie - reth env)
-        let reth_env = RethEnv::new(&self.builder.node_config, engine_task_manager, reth_db)?;
+        let basefee_address = self.builder.tn_config.parameters.basefee_address;
+        let reth_env =
+            RethEnv::new(&self.builder.node_config, engine_task_manager, reth_db, basefee_address)?;
         let engine = ExecutionNode::new(&self.builder, reth_env)?;
 
         Ok(engine)

@@ -32,9 +32,13 @@ pub trait TelcoinNodeTypes: NodeTypesWithEngine + NodeTypesWithDB {
     type EvmConfig: ConfigureEvm<Transaction = TransactionSigned, Header = ExecHeader>;
 
     /// Create the Reth evm config.
-    fn create_evm_config(chain: Arc<ChainSpec>) -> Self::EvmConfig;
+    fn create_evm_config(
+        chain: Arc<ChainSpec>,
+        basefee_address: Option<Address>,
+    ) -> Self::EvmConfig;
+
     /// Create the Reth executor.
-    fn create_executor(chain: Arc<ChainSpec>) -> Self::Executor;
+    fn create_executor(chain: Arc<ChainSpec>, evm_config: TnEvmConfig) -> Self::Executor;
 }
 
 /// Empty struct that implements Reth traits to supply GATs and functionality for Reth integration.
@@ -60,15 +64,15 @@ impl TelcoinNodeTypes for TelcoinNode {
     type Executor = BasicBlockExecutorProvider<EthExecutionStrategyFactory<TnEvmConfig>>;
     type EvmConfig = TnEvmConfig;
 
-    fn create_evm_config(chain: Arc<ChainSpec>) -> Self::EvmConfig {
-        TnEvmConfig::new(chain)
+    fn create_evm_config(
+        chain: Arc<ChainSpec>,
+        basefee_address: Option<Address>,
+    ) -> Self::EvmConfig {
+        TnEvmConfig::new(chain, basefee_address)
     }
 
-    fn create_executor(chain: Arc<ChainSpec>) -> Self::Executor {
-        BasicBlockExecutorProvider::new(EthExecutionStrategyFactory::new(
-            chain.clone(),
-            TnEvmConfig::new(chain),
-        ))
+    fn create_executor(chain: Arc<ChainSpec>, evm_config: TnEvmConfig) -> Self::Executor {
+        BasicBlockExecutorProvider::new(EthExecutionStrategyFactory::new(chain.clone(), evm_config))
     }
 }
 

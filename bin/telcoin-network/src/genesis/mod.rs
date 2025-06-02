@@ -44,6 +44,20 @@ pub struct GenesisArgs {
     )]
     pub consensus_registry_owner: Address,
 
+    /// The address recieves all transaction base fees.
+    ///
+    /// This should probably be a conbtract address that will distrubute/manage basefees.
+    ///
+    /// Address doesn't have to start with "0x", but the CLI supports the "0x" format too.
+    #[arg(
+        long = "basefee-address",
+        alias = "basefee_address",
+        help_heading = "The recipient of base fees",
+        value_parser = clap_address_parser,
+        verbatim_doc_comment
+    )]
+    pub basefee_address: Option<Address>,
+
     /// The initial stake credited to each validator in genesis.
     #[arg(
         long = "initial-stake-per-validator",
@@ -88,8 +102,8 @@ pub struct GenesisArgs {
     pub epoch_duration: u32,
 
     /// Used to add a funded account (by simple text string).  Use this on a dev cluster
-    /// (must provide on all validator genesis inits) to have an account with a deterministically
-    /// derived key. This is ONLY for dev testing, never use this for other chains.
+    /// to have an account with a deterministically derived key. This is ONLY for dev
+    /// testing, never use this for other chains.
     #[arg(long)]
     pub dev_funded_account: Option<String>,
     /// Max delay for a node to produce a new header.
@@ -239,6 +253,7 @@ impl GenesisArgs {
         if let Some(min_header_delay_ms) = self.min_header_delay_ms {
             parameters.min_header_delay = Duration::from_millis(min_header_delay_ms);
         }
+        parameters.basefee_address = self.basefee_address;
 
         // write genesis and config to file
         Config::write_to_path(

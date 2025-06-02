@@ -16,12 +16,13 @@ use tn_types::{Address, Bytes, TransactionSigned, U256};
 #[derive(Debug, Clone)]
 pub struct TnEvmConfig {
     inner: EthEvmConfig,
+    basefee_address: Option<Address>,
 }
 
 impl TnEvmConfig {
     /// Creates a new TN EVM configuration with the given chain spec.
-    pub const fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { inner: EthEvmConfig::new(chain_spec) }
+    pub const fn new(chain_spec: Arc<ChainSpec>, basefee_address: Option<Address>) -> Self {
+        Self { inner: EthEvmConfig::new(chain_spec), basefee_address }
     }
 
     /// Returns the chain spec associated with this configuration.
@@ -31,11 +32,7 @@ impl TnEvmConfig {
 
     /// Provide a custom reward beneficiary callback to handle base fees for telcoin network.
     fn set_base_fee_handler<DB: Database>(&self, evm: &mut Evm<'_, (), DB>) {
-        // TODO- send the base fee to safe or contract to be managed offchain.
-        let basefee_address: Option<Address> = None;
-        // DO NOT use this testing default in mainnet.
-        //    Some(Address::parse_checksummed("0x29615F9e735932580f699C494C11fB81296AfE8F", None)
-        //    .expect("valid account"));
+        let basefee_address: Option<Address> = self.basefee_address;
         evm.handler.post_execution.reward_beneficiary = Arc::new(move |ctx, gas| {
             // code lifted from revm mainnet/post_execution.rs and modified to do something with
             // base fee.

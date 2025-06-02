@@ -204,6 +204,8 @@ pub struct Parameters {
     /// Worker timeout when request vote from peers.
     #[serde(default = "Parameters::default_batch_vote_timeout")]
     pub batch_vote_timeout: Duration,
+    /// If set the Address that will recieve basefees.
+    pub basefee_address: Option<Address>,
 }
 
 impl Parameters {
@@ -305,6 +307,7 @@ impl Default for Parameters {
             max_batch_delay: Parameters::default_max_batch_delay(),
             max_concurrent_requests: Parameters::default_max_concurrent_requests(),
             batch_vote_timeout: Parameters::default_batch_vote_timeout(),
+            basefee_address: None,
         }
     }
 }
