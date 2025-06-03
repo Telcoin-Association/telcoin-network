@@ -2,7 +2,6 @@
 //!
 //! The genesis ceremony is how networks are started.
 
-use alloy::primitives::aliases::U232;
 use clap::Args;
 use rand::{rngs::StdRng, SeedableRng};
 use secp256k1::Secp256k1;
@@ -18,7 +17,7 @@ use tn_reth::{
 use tn_types::{keccak256, now, Address, GenesisAccount, U256};
 use tracing::info;
 
-use crate::args::{clap_address_parser, clap_u232_parser, maybe_hex};
+use crate::args::{clap_address_parser, clap_u256_parser, maybe_hex};
 
 /// Generate a new chain genesis.
 #[derive(Debug, Args)]
@@ -49,33 +48,33 @@ pub struct GenesisArgs {
         long = "initial-stake-per-validator",
         alias = "stake",
         help_heading = "The initial stake credited to each validator in genesis. The default is 1mil TEL.",
-        value_parser = clap_u232_parser,
+        value_parser = clap_u256_parser,
         default_value = "1_000_000",
         verbatim_doc_comment
     )]
-    pub initial_stake: U232,
+    pub initial_stake: U256,
 
     /// The minimum amount a validator can withdraw.
     #[arg(
         long = "min-withdraw-amount",
         alias = "min_withdraw",
         help_heading = "The minimal amount a validator can withdraw. The default is 1_000 TEL.",
-        value_parser = clap_u232_parser,
+        value_parser = clap_u256_parser,
         default_value = "1_000",
         verbatim_doc_comment
     )]
-    pub min_withdrawal: U232,
+    pub min_withdrawal: U256,
 
     /// The amount of block rewards per epoch starting in genesis.
     #[arg(
         long = "epoch-block-rewards",
         alias = "block_rewards_per_epoch",
         help_heading = "The per block reward (int) for each epoch. Ex) 20mil rewards per month / 31 days / 25 hour epoch interval. It's best to use conservative values.",
-        value_parser = clap_u232_parser,
+        value_parser = clap_u256_parser,
         default_value = "25_806",
         verbatim_doc_comment
     )]
-    pub epoch_rewards: U232,
+    pub epoch_rewards: U256,
 
     /// The duration of each epoch (in secs) starting in genesis.
     #[arg(
@@ -204,9 +203,9 @@ impl GenesisArgs {
         // use embedded ITS config from submodule, passing in decremented ITEL balance
         let genesis_stake = self
             .initial_stake
-            .checked_mul(U232::from(validators.len()))
+            .checked_mul(U256::from(validators.len()))
             .expect("initial validators' stake");
-        let itel_balance = U256::from(clap_u232_parser("100_000_000_000")? - genesis_stake);
+        let itel_balance = clap_u256_parser("100_000_000_000")? - genesis_stake;
 
         let itel_address_str: String =
             RethEnv::fetch_value_from_json_str(DEPLOYMENTS_JSON, Some("its.InterchainTEL"))?

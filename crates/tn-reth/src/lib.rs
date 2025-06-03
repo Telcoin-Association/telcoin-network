@@ -20,7 +20,7 @@
 use crate::traits::TNExecution;
 use alloy::{
     hex,
-    primitives::{aliases::U232, Bytes, ChainId},
+    primitives::{aliases::U256, Bytes, ChainId},
     sol_types::{SolCall, SolConstructor},
 };
 use clap::Parser;
@@ -98,7 +98,7 @@ use tn_types::{
     BlockExt as _, BlockHashOrNumber, BlockNumHash, BlockNumber, BlockWithSenders, BlsSignature,
     Epoch, ExecHeader, Genesis, GenesisAccount, Receipt, SealedBlock, SealedBlockWithSenders,
     SealedHeader, TaskManager, TaskSpawner, TransactionSigned, TxKind, B256, EMPTY_OMMER_ROOT_HASH,
-    EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, U256,
+    EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS,
 };
 use tracing::{debug, error, info, warn};
 use traits::{TNPayload, TelcoinNode, TelcoinNodeTypes as _};
@@ -1354,7 +1354,7 @@ impl RethEnv {
 
         let total_stake_balance = initial_stake_config
             .stakeAmount
-            .checked_mul(U232::from(validators.len()))
+            .checked_mul(U256::from(validators.len()))
             .ok_or_eyre("Failed to calculate total stake for consensus registry at genesis")?;
 
         let tmp_chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
@@ -1582,16 +1582,16 @@ impl RethEnv {
     }
 
     /// Read the a validator's token id from the [ConsensusRegistry] on-chain.
-    pub fn get_validator_token_id<EXT, DB>(
+    pub fn get_validator<EXT, DB>(
         &self,
         address: Address,
         evm: &mut Evm<'_, EXT, DB>,
-    ) -> eyre::Result<U256>
+    ) -> eyre::Result<ValidatorInfo>
     where
         DB: Database,
         DB::Error: core::fmt::Display,
     {
-        let calldata = ConsensusRegistry::getValidatorTokenIdCall { validatorAddress: address }
+        let calldata = ConsensusRegistry::getValidatorCall { validatorAddress: address }
             .abi_encode()
             .into();
         self.call_consensus_registry::<_, _, U256>(evm, calldata)
@@ -1601,15 +1601,15 @@ impl RethEnv {
     /// id.
     pub fn get_validator_by_token_id<EXT, DB>(
         &self,
-        token_id: U256,
+        epoch: u32,
         evm: &mut Evm<'_, EXT, DB>,
-    ) -> eyre::Result<ConsensusRegistry::ValidatorInfo>
+    ) -> eyre::Result<Vec<ConsensusRegistry::ValidatorInfo>>
     where
         DB: Database,
         DB::Error: core::fmt::Display,
     {
         let calldata =
-            ConsensusRegistry::getValidatorByTokenIdCall { tokenId: token_id }.abi_encode().into();
+            ConsensusRegistry::getCommitteeValidatorsCall { epoch: epoch }.abi_encode().into();
         self.call_consensus_registry::<_, _, ConsensusRegistry::ValidatorInfo>(evm, calldata)
     }
 
@@ -1796,10 +1796,10 @@ mod tests {
 
         let epoch_duration = 60 * 60 * 24; // 24hrs
         let initial_stake_config = ConsensusRegistry::StakeConfig {
-            stakeAmount: U232::from(parse_ether("1_000_000").unwrap()),
-            minWithdrawAmount: U232::from(parse_ether("1_000").unwrap()),
-            epochIssuance: U232::from(parse_ether("20_000_000").unwrap())
-                .checked_div(U232::from(28))
+            stakeAmount: parse_ether("1_000_000").unwrap(),
+            minWithdrawAmount: parse_ether("1_000").unwrap(),
+            epochIssuance: parse_ether("20_000_000").unwrap()
+                .checked_div(U256::from(28))
                 .expect("u256 div checked"),
             epochDuration: epoch_duration,
         };

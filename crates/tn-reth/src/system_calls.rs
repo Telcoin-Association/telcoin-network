@@ -80,24 +80,29 @@ sol!(
             uint32 epochDuration;
         }
 
-        /// Struct used by storage ledger to record outstanding validator balances.
-        #[derive(Debug)]
-        struct StakeInfo {
-            /// The governance-issued consensus NFT token id.
-            uint24 tokenId;
-            /// The validator balance.
-            uint232 balance;
+        /// Per validator share of the epoch issuance amount based on performance
+        /// Not enabled during MNO pilot
+        struct RewardInfo {
+            address validatorAddress;
+            uint256 consensusHeaderCount;
+        }
+
+        /// Slash information for system calls to decrement outstanding validator balances
+        /// Not enabled during MNO pilot
+        struct Slash {
+            address validatorAddress;
+            uint256 amount;
         }
 
         /// The configuration for consensus.
         #[derive(Debug)]
         struct StakeConfig {
             /// The fixed stake amount.
-            uint232 stakeAmount;
+            uint256 stakeAmount;
             /// The min amount allowed to withdraw.
-            uint232 minWithdrawAmount;
+            uint256 minWithdrawAmount;
             /// The total amount issued per epoch.
-            uint232 epochIssuance;
+            uint256 epochIssuance;
             /// The duration for the epoch (in secs).
             uint32 epochDuration;
         }
@@ -115,11 +120,10 @@ sol!(
 
         /// Return the validators by status. Pass `0` for status to return all validators.
         function getValidators(uint8 status) public view returns (ValidatorInfo[] memory);
-        /// @dev Fetches the `tokenId` for a given validator validatorAddress
-        function getValidatorTokenId(address validatorAddress) external view returns (uint256);
-        /// @dev Fetches the `ValidatorInfo` for a given ConsensusNFT tokenId
-        /// @notice To enable checks against storage slots initialized to zero by the EVM, `tokenId` cannot be `0`
-        function getValidatorByTokenId(uint256 tokenId) external view returns (ValidatorInfo memory);
+        /// Fetches the committee for a given epoch
+        function getCommitteeValidators(uint32 epoch) external view returns (ValidatorInfo[] memory);
+        /// Fetch validator by address
+        function getValidator(address validatorAddress) external view returns (ValidatorInfo memory);
         /// Return committee epoch info for a specific epoch.
         function getEpochInfo(uint32 epoch) public view returns (EpochInfo memory epochInfo);
         /// Return the current epoch.
