@@ -4,8 +4,10 @@
 
 use alloy::primitives::aliases::U232;
 use clap::Args;
-use rand::{rngs::StdRng, SeedableRng};
-use secp256k1::Secp256k1;
+use secp256k1::{
+    rand::{rngs::StdRng, SeedableRng},
+    Secp256k1,
+};
 use std::{str::FromStr as _, time::Duration};
 use tn_config::{
     Config, ConfigFmt, ConfigTrait, NetworkGenesis, Parameters, TelcoinDirs as _, DEPLOYMENTS_JSON,

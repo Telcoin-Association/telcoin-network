@@ -682,7 +682,7 @@ impl AllPeers {
         let mut connected_peers: Vec<_> =
             self.peers.iter().filter(|(_, peer)| peer.connection_status().is_connected()).collect();
 
-        connected_peers.shuffle(&mut rand::thread_rng());
+        connected_peers.shuffle(&mut rand::rng());
         connected_peers.sort_by_key(|(_, peer)| peer.score());
         connected_peers
     }

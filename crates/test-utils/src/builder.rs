@@ -3,10 +3,7 @@
 use crate::WorkerFixture;
 
 use super::{AuthorityFixture, CommitteeFixture};
-use rand::{
-    rngs::{OsRng, StdRng},
-    SeedableRng,
-};
+use rand::{rngs::StdRng, SeedableRng};
 use std::{
     collections::{BTreeMap, VecDeque},
     marker::PhantomData,
@@ -21,7 +18,7 @@ use tn_types::{
 };
 
 /// The committee builder for tests.
-pub struct Builder<DB, F, R = OsRng> {
+pub struct Builder<DB, F, R = StdRng> {
     rng: R,
     committee_size: NonZeroUsize,
     number_of_workers: NonZeroUsize,
@@ -41,8 +38,8 @@ where
 {
     pub fn new(new_db: F) -> Self {
         Self {
+            rng: StdRng::from_os_rng(),
             epoch: Epoch::default(),
-            rng: OsRng,
             committee_size: NonZeroUsize::new(4).unwrap(),
             number_of_workers: NonZeroUsize::new(1).unwrap(),
             randomize_ports: false,
@@ -55,7 +52,7 @@ where
     }
 }
 
-impl<R, DB, F> Builder<DB, F, R>
+impl<DB, F, R> Builder<DB, F, R>
 where
     DB: Database,
     F: Fn() -> DB,
@@ -91,7 +88,8 @@ where
         self
     }
 
-    pub fn rng<N: rand::RngCore + rand::CryptoRng>(self, rng: N) -> Builder<DB, F, N> {
+    /// Use a provided rng. This is useful for deterministic testing.
+    pub fn with_rng<RNG: rand::RngCore + rand::CryptoRng>(self, rng: RNG) -> Builder<DB, F, RNG> {
         Builder {
             rng,
             epoch: self.epoch,
@@ -107,9 +105,8 @@ where
     }
 }
 
-impl<R, DB, F> Builder<DB, F, R>
+impl<DB, F> Builder<DB, F>
 where
-    R: rand::RngCore + rand::CryptoRng,
     DB: Database,
     F: Fn() -> DB,
 {
@@ -120,7 +117,7 @@ where
         let committee_size = self.committee_size.get();
         let network_config = self.network_config.unwrap_or_default();
 
-        let mut rng = StdRng::from_rng(&mut self.rng).unwrap();
+        let mut rng = StdRng::from_rng(&mut self.rng);
         let mut committee_info = Vec::with_capacity(committee_size);
         #[allow(clippy::mutable_key_type)]
         let mut authorities = BTreeMap::new();

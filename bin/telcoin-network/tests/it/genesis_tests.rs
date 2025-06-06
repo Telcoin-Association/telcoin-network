@@ -12,10 +12,7 @@ use serde_json::Value;
 use std::time::Duration;
 use tn_config::{NetworkGenesis, CONSENSUS_REGISTRY_JSON, DEPLOYMENTS_JSON};
 use tn_reth::{
-    system_calls::{
-        ConsensusRegistry::{self, getCurrentEpochInfoReturn, getValidatorsReturn},
-        CONSENSUS_REGISTRY_ADDRESS,
-    },
+    system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS},
     test_utils::TransactionFactory,
     RethEnv,
 };
@@ -180,21 +177,20 @@ async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
     let signer = tx_factory.get_default_signer().expect("failed to fetch signer");
     let wallet = EthereumWallet::from(signer);
     let provider = ProviderBuilder::new()
-        .with_recommended_fillers()
         .wallet(wallet)
-        .on_http(rpc_url.parse().expect("rpc url parse error"));
+        .connect_http(rpc_url.parse().expect("rpc url parse error"));
 
     // test rpc calls for registry in genesis - this is not the one deployed for the test
     let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, provider.clone());
-    let getCurrentEpochInfoReturn { currentEpochInfo } =
+    let current_epoch_info =
         consensus_registry.getCurrentEpochInfo().call().await.expect("get current epoch result");
 
-    debug!(target: "bundle", "consensus_registry: {:#?}", currentEpochInfo);
-    let ConsensusRegistry::EpochInfo { committee, blockHeight, epochDuration } = currentEpochInfo;
+    debug!(target: "bundle", "consensus_registry: {:#?}", current_epoch_info);
+    let ConsensusRegistry::EpochInfo { committee, blockHeight, epochDuration } = current_epoch_info;
     assert_eq!(blockHeight, 0);
     assert_eq!(epochDuration, 86400);
 
-    let getValidatorsReturn { _0: validators } = consensus_registry
+    let validators = consensus_registry
         .getValidators(ConsensusRegistry::ValidatorStatus::Active.into())
         .call()
         .await

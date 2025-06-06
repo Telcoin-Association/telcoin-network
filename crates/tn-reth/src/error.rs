@@ -1,10 +1,8 @@
 //! Error type to wrap various Reth errors.
 
 use reth::rpc::{builder::error::RpcError, server_types::eth::EthApiError};
-use reth_blockchain_tree::error::InsertBlockError;
-use reth_errors::{BlockExecutionError, CanonicalError};
+use reth_errors::BlockExecutionError;
 use reth_provider::ProviderError;
-use reth_revm::primitives::EVMError;
 
 /// Result alias for [`TNRethError`].
 pub type TnRethResult<T> = Result<T, TnRethError>;
@@ -15,18 +13,9 @@ pub enum TnRethError {
     /// Error retrieving data from Provider.
     #[error(transparent)]
     Provider(#[from] ProviderError),
-    /// Error during EVM execution.
-    #[error("evm execution error: {0}")]
-    EvmExecution(#[from] EVMError<ProviderError>),
     /// Error recovering transaction from bytes.
     #[error(transparent)]
     RecoverTransactionBytes(#[from] EthApiError),
-    /// The block could not be inserted into the tree.
-    #[error(transparent)]
-    InsertNextCanonicalBlock(#[from] InsertBlockError),
-    /// The executed block failed to become part of the canonical chain.
-    #[error("Blockchain tree failed to make_canonical: {0}")]
-    Canonical(#[from] CanonicalError),
     /// The block body and senders lengths don't match.
     #[error("Failed to seal block with senders - lengths don't match")]
     SealBlockWithSenders,
@@ -39,6 +28,15 @@ pub enum TnRethError {
     /// Error decoding alloy abi.
     #[error("Error encoding/decoding abi for sol type: {0}")]
     SolAbi(#[from] alloy::sol_types::Error),
+    /// Error with EVM calls.
+    #[error("{0}")]
+    EVMCustom(String),
+    /// Error forwarding executed block to tree.
+    #[error("Failed to forward executed block to tree.")]
+    TreeChannelClosed,
+    /// Executed output must always contain at least one block.
+    #[error("Empty execution output from engine.")]
+    EmptyExecutionOutput,
 }
 
 impl From<TnRethError> for EthApiError {
@@ -48,5 +46,11 @@ impl From<TnRethError> for EthApiError {
         } else {
             EthApiError::EvmCustom(value.to_string())
         }
+    }
+}
+
+impl<T> From<std::sync::mpsc::SendError<T>> for TnRethError {
+    fn from(_: std::sync::mpsc::SendError<T>) -> Self {
+        Self::TreeChannelClosed
     }
 }

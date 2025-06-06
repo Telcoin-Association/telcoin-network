@@ -7,8 +7,8 @@ use tn_engine::ExecutorEngine;
 use tn_reth::{test_utils::seeded_genesis_from_random_batches, FixedBytes, RethChainSpec};
 use tn_test_utils::default_test_execution_node;
 use tn_types::{
-    adiri_chain_spec_arc, adiri_genesis, max_batch_gas, now, Address, BlockHash, BlockHashOrNumber,
-    Bloom, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, Hash as _, Notifier,
+    adiri_chain_spec_arc, adiri_genesis, max_batch_gas, now, Address, BlockHash, Bloom, Bytes,
+    Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, Hash as _, Notifier,
     ReputationScores, TaskManager, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS,
     MIN_PROTOCOL_BASE_FEE, U256,
 };
@@ -83,6 +83,9 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
 
     let (tx, rx) = oneshot::channel();
 
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+
     // spawn engine task
     task_manager.spawn_blocking(Box::pin(async move {
         let res = engine.await;
@@ -92,26 +95,26 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     let engine_task = timeout(Duration::from_secs(10), rx).await?;
     assert!(engine_task.is_ok());
 
+    // assert memory is clean after execution
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
     let last_block_num = reth_env.last_block_number()?;
     let canonical_tip = reth_env.canonical_tip();
     let final_block = reth_env.finalized_block_num_hash()?.expect("finalized block");
 
-    assert_eq!(canonical_tip, final_block);
     assert_eq!(last_block_num, final_block.number);
 
     let expected_block_height = 1;
     // assert 1 empty block was executed for consensus
     assert_eq!(last_block_num, expected_block_height);
     // assert canonical tip and finalized block are equal
-    assert_eq!(canonical_tip, final_block);
+    assert_eq!(canonical_tip.hash(), final_block.hash);
     // assert last executed output is correct and finalized
     let last_output = execution_node.last_executed_output().await?;
     assert_eq!(last_output, consensus_output_hash);
 
     // pull newly executed block from database (skip genesis)
-    let expected_block = reth_env
-        .block_with_senders(BlockHashOrNumber::Number(1))?
-        .expect("block 1 successfully executed");
+    let expected_block =
+        reth_env.sealed_block_by_number(1)?.expect("block 1 successfully executed");
     assert_eq!(expected_block_height, expected_block.number);
 
     // min basefee in genesis
@@ -122,8 +125,8 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     assert_eq!(expected_block.base_fee_per_gas, Some(expected_base_fee));
 
     // assert blocks are executed as expected
-    assert!(expected_block.senders.is_empty());
-    assert!(expected_block.body.transactions.is_empty());
+    assert!(expected_block.senders()?.is_empty());
+    assert!(expected_block.body().transactions.is_empty());
 
     // assert basefee is same as worker's block
     assert_eq!(expected_block.base_fee_per_gas, Some(expected_base_fee));
@@ -134,7 +137,7 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     assert_eq!(<FixedBytes<8> as Into<u64>>::into(expected_block.nonce), consensus_output.nonce());
 
     // ommers root
-    assert_eq!(expected_block.header.ommers_hash, EMPTY_OMMER_ROOT_HASH,);
+    assert_eq!(expected_block.header().ommers_hash, EMPTY_OMMER_ROOT_HASH,);
     // timestamp
     assert_eq!(expected_block.timestamp, consensus_output.committed_at());
     // parent beacon block root is output digest
@@ -164,8 +167,10 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     assert_eq!(expected_block.gas_used, 0);
     // difficulty should be 0 to indicate first (and only) block from round
     assert_eq!(expected_block.difficulty, U256::ZERO);
-    // assert extra data is empty 32-bytes (B256::ZERO)
-    assert_eq!(expected_block.extra_data.as_ref(), &[0; 32]);
+    // assert extra data is default bytes
+    assert_eq!(expected_block.extra_data, Bytes::default());
+    // assert batch digest match requests hash
+    assert!(expected_block.requests_hash.is_none());
     // assert withdrawals are empty
     //
     // NOTE: this is currently always empty
@@ -428,8 +433,9 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
         task_manager.get_spawner(),
     );
 
-    // assert beneficiary account balances 0
-    // reth_env.p
+    // assert the canonical chain in-memory is empty
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
 
     // queue the first output - simulate already received from channel
     engine.push_back_queued_for_test(consensus_output_1.clone());
@@ -464,10 +470,12 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
     debug!("final block num {final_block:?}");
 
     let expected_block_height = 8;
+    // assert canonical memory is cleaned up
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
     // assert all 8 batches were executed
     assert_eq!(last_block_num, expected_block_height);
     // assert canonical tip and finalized block are equal
-    assert_eq!(canonical_tip, final_block);
+    assert_eq!(canonical_tip.hash(), final_block.hash);
     // assert last executed output is correct and finalized
     let last_output = execution_node.last_executed_output().await?;
     assert_eq!(last_output, consensus_output_2_hash); // round of consensus
@@ -494,8 +502,8 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
     for (idx, txs) in txs_by_block.iter().enumerate() {
         let block = &executed_blocks[idx];
         let signers = &signers_by_block[idx];
-        assert_eq!(&block.senders, signers);
-        assert_eq!(&block.body.transactions, txs);
+        assert_eq!(&block.senders(), signers);
+        assert_eq!(&block.body().transactions, txs);
 
         // basefee was increased for each batch
         expected_base_fee += idx as u64;
@@ -540,7 +548,7 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
             assert_eq!(block.number, 1);
         } else {
             // assert parents executed in order (sanity check)
-            let expected_parent = executed_blocks[idx - 1].header.hash_slow();
+            let expected_parent = executed_blocks[idx - 1].header().hash_slow();
             assert_eq!(block.parent_hash, expected_parent);
             // expect block numbers NOT the same as batch's headers
             assert_ne!(block.number, 1);
@@ -559,7 +567,9 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
         // difficulty should match the batch's index within consensus output
         assert_eq!(block.difficulty, U256::from(expected_batch_index));
         // assert batch digest match extra data
-        assert_eq!(&block.extra_data, all_batch_digests[idx].as_slice());
+        assert_eq!(block.extra_data, Bytes::default());
+        // assert batch digest match requests hash
+        assert_eq!(block.requests_hash, Some(all_batch_digests[idx]));
         // assert batch's withdrawals match
         //
         // NOTE: this is currently always empty
@@ -795,7 +805,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     // assert all 8 batches were executed
     assert_eq!(last_block_num, expected_block_height);
     // assert canonical tip and finalized block are equal
-    assert_eq!(canonical_tip, final_block);
+    assert_eq!(canonical_tip.hash(), final_block.hash);
     // assert last executed output is correct and finalized
     let last_output = execution_node.last_executed_output().await?;
     assert_eq!(last_output, consensus_output_2_hash); // round of consensus
@@ -828,15 +838,15 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         if idx == expected_duplicate_block_num_round_1 - 1
             || idx == expected_duplicate_block_num_round_2 - 1
         {
-            assert!(block.senders.is_empty());
-            assert!(block.body.transactions.is_empty());
+            assert!(block.senders().is_empty());
+            assert!(block.body().transactions.is_empty());
             // gas used should NOT be the same as bc duplicate transaction are ignored
             assert_ne!(block.gas_used, max_batch_gas(block.number));
             // gas used should be zero bc all transactions were duplicates
             assert_eq!(block.gas_used, 0);
         } else {
-            assert_eq!(&block.senders, signers);
-            assert_eq!(&block.body.transactions, txs);
+            assert_eq!(&block.senders(), signers);
+            assert_eq!(&block.body().transactions, txs);
         }
 
         // basefee was increased for each batch
@@ -881,7 +891,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
             assert_eq!(block.parent_hash, chain.genesis_hash());
         } else {
             // assert parents executed in order (sanity check)
-            let expected_parent = executed_blocks[idx - 1].header.hash_slow();
+            let expected_parent = executed_blocks[idx - 1].header().hash_slow();
             assert_eq!(block.parent_hash, expected_parent);
         }
 
@@ -898,7 +908,9 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         // difficulty should match the batch's index within consensus output
         assert_eq!(block.difficulty, U256::from(expected_batch_index));
         // assert batch digest match extra data
-        assert_eq!(&block.extra_data, all_batch_digests[idx].as_slice());
+        assert_eq!(block.extra_data, Bytes::default());
+        // assert batch digest match requests hash
+        assert_eq!(block.requests_hash, Some(all_batch_digests[idx]));
         // assert batch's withdrawals match
         //
         // NOTE: this is currently always empty
@@ -1086,7 +1098,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     // assert all 4 batches were executed from round 1
     assert_eq!(last_block_num, expected_block_height);
     // assert canonical tip and finalized block are equal
-    assert_eq!(canonical_tip, final_block);
+    assert_eq!(canonical_tip.hash(), final_block.hash);
     // assert last executed output is correct and finalized
     let last_output = execution_node.last_executed_output().await?;
     assert_eq!(last_output, consensus_output_1_hash);

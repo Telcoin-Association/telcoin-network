@@ -1,6 +1,8 @@
 //! Error types for Telcoin Network Block Builder.
 
-use tn_reth::{CanonicalError, PoolTransactionError, ProviderError, RethError};
+use std::any::Any;
+
+use tn_reth::{PoolTransactionError, ProviderError, RethError};
 use tokio::sync::{mpsc, oneshot};
 
 /// Result alias for [`TNEngineError`].
@@ -21,9 +23,6 @@ pub enum BatchBuilderError {
     /// The block body and senders lengths don't match.
     #[error("Failed to seal block with senders - lengths don't match")]
     SealBlockWithSenders,
-    /// The executed block failed to become part of the canonical chain.
-    #[error("Blockchain tree failed to make_canonical: {0}")]
-    Canonical(#[from] CanonicalError),
     /// The oneshot channel that receives the ack that the block was persisted and being proposed.
     #[error("Fatal error: failed to receive ack reply that new block was built. Shutting down...")]
     AckChannelClosed,
@@ -60,5 +59,9 @@ impl PoolTransactionError for BatchBuilderError {
     fn is_bad_transaction(&self) -> bool {
         // no peer penalty
         false
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

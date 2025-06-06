@@ -104,18 +104,18 @@ impl From<PeerExchangeMap> for TestPrimaryResponse {
 /// Helper function to create a random IPV4 address.
 #[allow(dead_code)]
 pub(crate) fn random_ip_addr() -> IpAddr {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     // random between IPv4 and IPv6 (80% v4, 20% v6)
-    if rng.gen_bool(0.8) {
+    if rng.random_bool(0.8) {
         // random IPv4
-        let a = rng.gen_range(1..255);
-        let b = rng.gen_range(0..255);
-        let c = rng.gen_range(0..255);
-        let d = rng.gen_range(1..255);
+        let a = rng.random_range(1..255);
+        let b = rng.random_range(0..255);
+        let c = rng.random_range(0..255);
+        let d = rng.random_range(1..255);
         IpAddr::V4(Ipv4Addr::new(a, b, c, d))
     } else {
         // random IPv6
-        let random: Vec<u16> = [(); 8].iter().map(|_| rng.gen_range(0..255)).collect();
+        let random: Vec<u16> = [(); 8].iter().map(|_| rng.random_range(0..255)).collect();
         IpAddr::V6(Ipv6Addr::new(
             random[0], random[1], random[2], random[3], random[4], random[5], random[6], random[7],
         ))

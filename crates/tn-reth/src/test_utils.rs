@@ -1,27 +1,26 @@
 //! Transaction factory to create legit transactions for execution.
 
-use crate::{error::TnRethResult, recover_raw_transaction, RethEnv, WorkerTxPool};
-use alloy::signers::local::PrivateKeySigner;
-use enr::k256::FieldBytes;
+use crate::{recover_raw_transaction, RethEnv, WorkerTxPool};
+use alloy::{consensus::SignableTransaction as _, signers::local::PrivateKeySigner};
 use reth_chainspec::ChainSpec as RethChainSpec;
-use reth_evm::execute::{BlockExecutorProvider as _, Executor as _};
+use reth_evm::{execute::Executor as _, ConfigureEvm};
 use reth_primitives::sign_message;
-use reth_provider::{BlockExecutionOutput, ExecutionOutcome};
+use reth_primitives_traits::SignerRecoverable;
 use reth_revm::{database::StateProviderDatabase, db::BundleState};
+use reth_transaction_pool::{EthPooledTransaction, PoolTransaction};
 use secp256k1::{
-    rand::{self, rngs::StdRng, Rng, SeedableRng as _},
+    rand::{rngs::StdRng, Rng, SeedableRng as _},
     Secp256k1,
 };
 use std::{path::Path, str::FromStr, sync::Arc};
 use tn_types::{
-    adiri_chain_spec_arc, adiri_genesis, calculate_transaction_root, now, public_key_to_address,
-    AccessList, Address, Batch, Block, BlockBody, BlockExt as _, BlockWithSenders, Bytes,
-    Encodable2718, EthSignature, ExecHeader, ExecutionKeypair, Genesis, GenesisAccount, Receipt,
-    SealedHeader, SignedTransactionIntoRecoveredExt as _, TaskManager, Transaction,
-    TransactionSigned, TxEip1559, TxHash, TxKind, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS,
-    EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT, MIN_PROTOCOL_BASE_FEE, U256,
+    adiri_chain_spec_arc, adiri_genesis, calculate_transaction_root, keccak256, now, AccessList,
+    Address, Batch, Block, BlockBody, Bytes, Encodable2718, EthSignature, ExecHeader,
+    ExecutionKeypair, Genesis, GenesisAccount, RecoveredBlock, SealedHeader, TaskManager,
+    Transaction, TransactionSigned, TxEip1559, TxHash, TxKind, B256, EMPTY_OMMER_ROOT_HASH,
+    EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE,
+    U256,
 };
-use tracing::debug;
 
 // methods for tests
 impl RethEnv {
@@ -33,21 +32,6 @@ impl RethEnv {
         Self::new_for_temp_chain(adiri_chain_spec_arc(), db_path, task_manager)
     }
 
-    /// Execute a block for testing.
-    pub fn execute_for_test(
-        &self,
-        block: &BlockWithSenders,
-    ) -> TnRethResult<(BundleState, Vec<Receipt>)> {
-        // create execution db
-        let mut db = StateProviderDatabase::new(
-            self.latest().expect("provider retrieves latest during test batch execution"),
-        );
-        // execute the block
-        let BlockExecutionOutput { state, receipts, .. } =
-            self.evm_executor.executor(&mut db).execute(block)?;
-        Ok((state, receipts))
-    }
-
     /// Test utility to execute batch and return execution outcome.
     ///
     /// This is useful for simulating execution results for account state changes.
@@ -57,7 +41,7 @@ impl RethEnv {
         &self,
         txs: Vec<Vec<u8>>,
         parent: &SealedHeader,
-    ) -> ExecutionOutcome {
+    ) -> BundleState {
         // create "empty" header with default values
         let mut header = ExecHeader {
             parent_hash: parent.hash(),
@@ -70,7 +54,7 @@ impl RethEnv {
             logs_bloom: Default::default(),
             difficulty: U256::ZERO,
             number: parent.number + 1,
-            gas_limit: ETHEREUM_BLOCK_GAS_LIMIT,
+            gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_30M,
             gas_used: 0,
             timestamp: now(),
             mix_hash: B256::random(),
@@ -84,11 +68,13 @@ impl RethEnv {
         };
 
         // decode transactions
-        let mut decoded_txs = vec![];
+        let mut decoded_txs = Vec::with_capacity(txs.len());
+        let mut signers = Vec::with_capacity(txs.len());
         for tx_bytes in &txs {
             let tx = recover_raw_transaction(tx_bytes)
                 .expect("raw transaction recovered for test")
-                .into_tx();
+                .into_inner();
+            signers.push(tx.recover_signer().expect("recover signer for test tx"));
             decoded_txs.push(tx);
         }
 
@@ -107,16 +93,18 @@ impl RethEnv {
                 ommers: vec![],
                 withdrawals: Some(Default::default()),
             },
-        }
-        .with_recovered_senders()
-        .expect("unable to recover senders while executing test batch");
+        };
 
-        // convenience
-        let block_number = block.number;
+        // create execution db
+        let mut db = StateProviderDatabase::new(
+            self.latest().expect("provider retrieves latest during test batch execution"),
+        );
+        let executor = self.evm_config.executor(&mut db);
+        let res = executor
+            .execute(&RecoveredBlock::new_unhashed(block, signers))
+            .expect("execute one block");
 
-        let (state, receipts) =
-            self.execute_for_test(&block).expect("executor can execute test batch transactions");
-        ExecutionOutcome::new(state, receipts.into(), block_number, vec![])
+        res.state
     }
 }
 
@@ -159,7 +147,7 @@ impl TransactionFactory {
     /// create a new instance of self from a random seed.
     pub fn new_random() -> Self {
         let secp = Secp256k1::new();
-        let (secret_key, _public_key) = secp.generate_keypair(&mut rand::thread_rng());
+        let (secret_key, _public_key) = secp.generate_keypair(&mut StdRng::from_os_rng());
         let keypair = ExecutionKeypair::from_secret_key(&secp, &secret_key);
         Self { keypair, nonce: 0 }
     }
@@ -167,7 +155,10 @@ impl TransactionFactory {
     /// Return the address of the signer.
     pub fn address(&self) -> Address {
         let public_key = self.keypair.public_key();
-        public_key_to_address(public_key)
+        // strip out the first byte because that should be the SECP256K1_TAG_PUBKEY_UNCOMPRESSED
+        // tag returned by libsecp's uncompressed pubkey serialization
+        let hash = keccak256(&public_key.serialize_uncompressed()[1..]);
+        Address::from_slice(&hash[12..])
     }
 
     /// Change the nonce for the next transaction.
@@ -289,10 +280,6 @@ impl TransactionFactory {
 
     /// Sign the transaction hash with the key in memory
     fn sign_hash(&self, hash: B256) -> EthSignature {
-        // let env = std::env::var("WALLET_SECRET_KEY")
-        //     .expect("Wallet address is set through environment variable");
-        // let secret: B256 = env.parse().expect("WALLET_SECRET_KEY must start with 0x");
-        // let secret = B256::from_slice(self.keypair.secret.as_ref());
         let secret = B256::from_slice(&self.keypair.secret_bytes());
         let signature = sign_message(secret, hash);
         signature.expect("failed to sign transaction")
@@ -302,8 +289,8 @@ impl TransactionFactory {
     pub fn get_default_signer(&self) -> eyre::Result<PrivateKeySigner> {
         // circumvent Secp256k1 <> k256 type incompatibility via FieldBytes intermediary
         let binding = self.keypair.secret_key().secret_bytes();
-        let secret_bytes_array = FieldBytes::from_slice(&binding);
-        Ok(PrivateKeySigner::from_field_bytes(secret_bytes_array)?)
+        let signer = PrivateKeySigner::from_bytes(&binding.into())?;
+        Ok(signer)
     }
 
     /// Create and submit the next transaction to the provided [TransactionPool].
@@ -316,20 +303,20 @@ impl TransactionFactory {
         pool: WorkerTxPool,
     ) -> TxHash {
         let tx = self.create_eip1559(chain, None, gas_price, Some(to), value, Bytes::new());
-        let pooled_tx = tx.try_into_pooled().expect("tx valid for pool");
-        let recovered = pooled_tx.try_into_ecrecovered().expect("tx is recovered");
+        let recovered = tx.try_into_recovered().expect("recovered tx");
+        let pooled_tx = EthPooledTransaction::try_from_consensus(recovered)
+            .expect("recovered into eth pooled tx");
 
-        pool.add_transaction_local(recovered.into()).await.expect("recovered tx added to pool")
+        pool.add_transaction_local(pooled_tx).await.expect("recovered tx added to pool")
     }
 
     /// Submit a transaction to the provided pool.
     pub async fn submit_tx_to_pool(&self, tx: TransactionSigned, pool: WorkerTxPool) -> TxHash {
-        let pooled_tx = tx.try_into_pooled().expect("tx valid for pool");
-        let recovered = pooled_tx.try_into_ecrecovered().expect("tx is recovered");
+        let recovered = tx.try_into_recovered().expect("recovered tx");
+        let pooled_tx = EthPooledTransaction::try_from_consensus(recovered)
+            .expect("recovered into eth pooled tx");
 
-        debug!("transaction: \n{recovered:?}\n");
-
-        pool.add_transaction_local(recovered.into()).await.expect("recovered tx added to pool")
+        pool.add_transaction_local(pooled_tx).await.expect("recovered tx added to pool")
     }
 }
 

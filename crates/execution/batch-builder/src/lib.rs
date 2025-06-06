@@ -227,7 +227,7 @@ impl Future for BatchBuilder {
         loop {
             // This is used as a "wake up" when canonical state updates.
             while let Poll::Ready(Some(latest)) = this.state_changed.poll_next_unpin(cx) {
-                this.last_canonical_update = latest.tip().block.clone()
+                this.last_canonical_update = latest.tip().sealed_block().clone()
             }
 
             // only propose one block at a time
@@ -321,7 +321,7 @@ mod tests {
     use tn_engine::execute_consensus_output;
     use tn_network_types::{local::LocalNetwork, MockWorkerToPrimaryHang};
     use tn_reth::{
-        recover_raw_transaction, test_utils::TransactionFactory, traits::BuildArguments,
+        payload::BuildArguments, recover_raw_transaction, test_utils::TransactionFactory,
         RethChainSpec,
     };
     use tn_storage::{open_db, tables::Batches};
@@ -420,13 +420,13 @@ mod tests {
         );
 
         let added_result = tx_factory.submit_tx_to_pool(transaction1.clone(), txpool.clone()).await;
-        assert_matches!(added_result, hash if hash == transaction1.hash());
+        assert_matches!(added_result, hash if &hash == transaction1.hash());
 
         let added_result = tx_factory.submit_tx_to_pool(transaction2.clone(), txpool.clone()).await;
-        assert_matches!(added_result, hash if hash == transaction2.hash());
+        assert_matches!(added_result, hash if &hash == transaction2.hash());
 
         let added_result = tx_factory.submit_tx_to_pool(transaction3.clone(), txpool.clone()).await;
-        assert_matches!(added_result, hash if hash == transaction3.hash());
+        assert_matches!(added_result, hash if &hash == transaction3.hash());
 
         // txpool size
         let pending_pool_len = txpool.pool_size().pending;
@@ -457,7 +457,7 @@ mod tests {
         // ensure decoded block transaction is transaction1
         let block_tx_bytes = block_txs.first().expect("one tx in block");
         let block_tx =
-            recover_raw_transaction(block_tx_bytes).expect("recover raw tx for test").into_tx();
+            recover_raw_transaction(block_tx_bytes).expect("recover raw tx for test").into_inner();
 
         assert_eq!(block_tx, transaction1);
 
@@ -572,13 +572,13 @@ mod tests {
         );
 
         let added_result = tx_factory.submit_tx_to_pool(transaction1.clone(), txpool.clone()).await;
-        assert_matches!(added_result, hash if hash == transaction1.hash());
+        assert_matches!(added_result, hash if &hash == transaction1.hash());
 
         let added_result = tx_factory.submit_tx_to_pool(transaction2.clone(), txpool.clone()).await;
-        assert_matches!(added_result, hash if hash == transaction2.hash());
+        assert_matches!(added_result, hash if &hash == transaction2.hash());
 
         let added_result = tx_factory.submit_tx_to_pool(transaction3.clone(), txpool.clone()).await;
-        assert_matches!(added_result, hash if hash == transaction3.hash());
+        assert_matches!(added_result, hash if &hash == transaction3.hash());
 
         // txpool size
         let pending_pool_len = txpool.pool_size().pending;
@@ -733,13 +733,13 @@ mod tests {
         );
 
         let added_result = tx_factory.submit_tx_to_pool(transaction1.clone(), txpool.clone()).await;
-        assert_matches!(added_result, hash if hash == transaction1.hash());
+        assert_matches!(added_result, hash if &hash == transaction1.hash());
 
         let added_result = tx_factory.submit_tx_to_pool(transaction2.clone(), txpool.clone()).await;
-        assert_matches!(added_result, hash if hash == transaction2.hash());
+        assert_matches!(added_result, hash if &hash == transaction2.hash());
 
         let added_result = tx_factory.submit_tx_to_pool(transaction3.clone(), txpool.clone()).await;
-        assert_matches!(added_result, hash if hash == transaction3.hash());
+        assert_matches!(added_result, hash if &hash == transaction3.hash());
 
         // txpool size
         let pending_pool_len = txpool.pool_size().pending;
@@ -793,7 +793,7 @@ mod tests {
         let tx_bytes =
             sealed_batch.batch().transactions().first().expect("block transactions length is one");
         let tx = recover_raw_transaction(tx_bytes).expect("recover raw tx for test");
-        assert_eq!(tx.hash(), expected_tx_hash);
+        assert_eq!(tx.hash(), &expected_tx_hash);
 
         // yield to try and give pool a chance to update
         tokio::task::yield_now().await;

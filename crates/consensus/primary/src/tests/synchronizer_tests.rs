@@ -6,7 +6,6 @@ use crate::{
     synchronizer::Synchronizer,
     ConsensusBus,
 };
-use itertools::Itertools;
 use std::{
     collections::{BTreeSet, HashMap},
     num::NonZeroUsize,
@@ -113,7 +112,7 @@ async fn accept_suspended_certificates() {
     let keys: Vec<_> = fixture.authorities().map(|a| (a.id(), a.keypair().copy())).collect();
     let (certificates, next_parents) =
         make_optimal_signed_certificates(1..=5, &genesis, &committee, keys.as_slice());
-    let certificates = certificates.into_iter().collect_vec();
+    let certificates = certificates.into_iter().collect::<Vec<_>>();
 
     // Try to accept certificates from round 2 to 5. All of them should be suspended.
     for cert in &certificates[NUM_AUTHORITIES..] {
@@ -427,7 +426,7 @@ async fn sanitize_fetched_certificates() {
 
     // Able to verify a batch of certificates with good signatures.
     synchronizer
-        .sanitize_fetched_certificates(verified_certificates.iter().cloned().collect_vec())
+        .sanitize_fetched_certificates(verified_certificates.iter().cloned().collect::<Vec<_>>())
         .await
         .unwrap();
 
@@ -565,7 +564,7 @@ async fn gc_suspended_certificates() {
     let keys: Vec<_> = fixture.authorities().map(|a| (a.id(), a.keypair().copy())).collect();
     let (certificates, _next_parents) =
         make_optimal_signed_certificates(1..=5, &genesis, &committee, keys.as_slice());
-    let certificates = certificates.into_iter().collect_vec();
+    let certificates = certificates.into_iter().collect::<Vec<_>>();
 
     // Try to aceept certificates from round 2 and above. All of them should be suspended.
     for cert in &certificates[NUM_AUTHORITIES..] {

@@ -138,7 +138,8 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
 
 #[tokio::test]
 async fn test_certificate_store_write_and_read() {
-    let db = open_db(temp_dir());
+    let db = temp_dir();
+    let db = open_db(db.path());
     test_write_and_read_by_store_type(db).await;
 }
 
@@ -180,7 +181,8 @@ async fn test_write_and_read_by_store_type<DB: CertificateStore>(store: DB) {
 
 #[tokio::test]
 async fn test_certificate_store_write_all_and_read_all() {
-    let db = open_db(temp_dir());
+    let db = temp_dir();
+    let db = open_db(db.path());
     test_write_all_and_read_all_by_store_type(db).await;
 }
 
@@ -209,7 +211,8 @@ async fn test_write_all_and_read_all_by_store_type<DB: CertificateStore>(store: 
 #[tokio::test]
 async fn test_certificate_store_next_round_number() {
     // GIVEN
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
 
     // Create certificates for round 1, 2, 4, 6, 9, 10.
     let cert = certificates(1).first().unwrap().clone();
@@ -237,7 +240,8 @@ async fn test_certificate_store_next_round_number() {
 #[tokio::test]
 async fn test_certificate_store_last_two_rounds() {
     // GIVEN
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
 
     // create certificates for 50 rounds
     let certs = certificates(50);
@@ -268,7 +272,8 @@ async fn test_certificate_store_last_two_rounds() {
 #[tokio::test]
 async fn test_certificate_store_last_round_in_empty_store() {
     // GIVEN
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
 
     // WHEN
     let result = store.last_two_rounds_certs().unwrap();
@@ -286,7 +291,8 @@ async fn test_certificate_store_last_round_in_empty_store() {
 #[tokio::test]
 async fn test_certificate_store_after_round() {
     // GIVEN
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
     let total_rounds = 100;
 
     // create certificates for 50 rounds
@@ -350,7 +356,8 @@ async fn test_certificate_store_after_round() {
 
 #[tokio::test]
 async fn test_certificate_store_notify_read() {
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
 
     // run the tests a few times
     for _ in 0..10 {
@@ -403,7 +410,8 @@ async fn test_certificate_store_notify_read() {
 
 #[tokio::test]
 async fn test_certificate_store_write_all_and_clear() {
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
 
     // create certificates for 10 rounds
     let certs = certificates(10);
@@ -430,7 +438,8 @@ async fn test_certificate_store_write_all_and_clear() {
 /// ```
 #[tokio::test]
 async fn test_certificate_store_delete_store() {
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
     // GIVEN
     // create certificates for 10 rounds
     let certs = certificates(10);
@@ -451,7 +460,8 @@ async fn test_certificate_store_delete_store() {
 
 #[tokio::test]
 async fn test_certificate_store_delete_all_store() {
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
     // GIVEN
     // create certificates for 10 rounds
     let certs = certificates(10);

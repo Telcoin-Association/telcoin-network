@@ -18,7 +18,7 @@ use tracing::warn;
 #[derive(Debug, Args)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct KeyArgs {
-    /// Save an encoded keypair (Base64 encoded `privkey`) to file.
+    /// Save an encoded keypair (Base58 encoded `privkey`) to file.
     /// - bls (bls12381)
     /// - network (ed25519)
     /// - execution (secp256k1)
@@ -116,7 +116,6 @@ impl KeyArgs {
 mod tests {
     use crate::{cli::Cli, NoArgs};
     use clap::Parser;
-    use tempfile::tempdir;
     use tn_config::{Config, ConfigFmt, ConfigTrait, ValidatorInfo};
 
     /// Test that generate keys command works.
@@ -128,7 +127,8 @@ mod tests {
     #[tokio::test]
     async fn test_generate_keypairs() {
         // use tempdir
-        let tempdir = tempdir().expect("tempdir created").into_path();
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let temp_path = tempdir.path();
         let tn = Cli::<NoArgs>::try_parse_from([
             "telcoin-network",
             "keytool",
@@ -137,7 +137,7 @@ mod tests {
             "--workers",
             "1",
             "--datadir",
-            tempdir.to_str().expect("tempdir path clean"),
+            temp_path.to_str().expect("tempdir path clean"),
             "--address",
             "0",
         ])
@@ -147,7 +147,7 @@ mod tests {
             .expect("generate keys command");
 
         Config::load_from_path_or_default::<ValidatorInfo>(
-            tempdir.join("validator.yaml").as_path(),
+            temp_path.join("validator.yaml").as_path(),
             ConfigFmt::YAML,
         )
         .expect("config loaded yaml okay");
