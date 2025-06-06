@@ -1,7 +1,7 @@
 //! Certificate order
 
 use indexmap::IndexMap;
-use rand::{rngs::OsRng, seq::SliceRandom};
+use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 use std::{collections::BTreeSet, num::NonZeroUsize};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{AuthorityFixture, CommitteeFixture};
@@ -52,7 +52,7 @@ async fn test_certificate_signers_are_ordered() {
     }
 
     // Just shuffle to ensure that any underlying sorting will work correctly
-    votes.shuffle(&mut OsRng);
+    votes.shuffle(&mut StdRng::from_os_rng());
 
     // Create a certificate
     let certificate = Certificate::new_unverified(&committee, header, votes).unwrap();

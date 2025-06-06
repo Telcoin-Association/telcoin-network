@@ -1,5 +1,6 @@
 //! Helpers for starting a node
 
+use secp256k1::PublicKey;
 use std::net::{TcpListener, UdpSocket};
 
 const MAX_RETRIES: u32 = 1000;
@@ -76,4 +77,13 @@ pub fn get_available_udp_port(host: &str) -> Option<u16> {
     };
 
     get_available_port(&config).ok()
+}
+
+/// Converts a public key into an ethereum address by hashing the encoded public key with
+/// keccak256.
+pub fn public_key_to_address(public: PublicKey) -> crate::Address {
+    // strip out the first byte because that should be the SECP256K1_TAG_PUBKEY_UNCOMPRESSED
+    // tag returned by libsecp's uncompressed pubkey serialization
+    let hash = crate::keccak256(&public.serialize_uncompressed()[1..]);
+    crate::Address::from_slice(&hash[12..])
 }

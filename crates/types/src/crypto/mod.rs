@@ -233,14 +233,11 @@ mod tests {
     use super::{generate_proof_of_possession_bls, verify_proof_of_possession_bls};
     use crate::BlsKeypair;
     use alloy::primitives::Address;
-    use rand::{
-        rngs::{OsRng, StdRng},
-        SeedableRng,
-    };
+    use rand::{rngs::StdRng, SeedableRng};
 
     #[test]
     fn test_proof_of_possession_success() {
-        let keypair = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
+        let keypair = BlsKeypair::generate(&mut StdRng::from_os_rng());
         let address = Address::from_raw_public_key(&[0; 64]);
         let proof = generate_proof_of_possession_bls(&keypair, &address).unwrap();
         assert!(verify_proof_of_possession_bls(&proof, keypair.public(), &address).is_ok())
@@ -248,8 +245,8 @@ mod tests {
 
     #[test]
     fn test_proof_of_possession_fails_wrong_signature() {
-        let keypair = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
-        let malicious_key = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
+        let keypair = BlsKeypair::generate(&mut StdRng::from_os_rng());
+        let malicious_key = BlsKeypair::generate(&mut StdRng::from_os_rng());
         let address = Address::from_raw_public_key(&[0; 64]);
         let proof = generate_proof_of_possession_bls(&malicious_key, &address).unwrap();
         assert!(verify_proof_of_possession_bls(&proof, keypair.public(), &address).is_err())
@@ -257,8 +254,8 @@ mod tests {
 
     #[test]
     fn test_proof_of_possession_fails_wrong_public_key() {
-        let keypair = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
-        let malicious_key = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
+        let keypair = BlsKeypair::generate(&mut StdRng::from_os_rng());
+        let malicious_key = BlsKeypair::generate(&mut StdRng::from_os_rng());
         let address = Address::from_raw_public_key(&[0; 64]);
         let proof = generate_proof_of_possession_bls(&keypair, &address).unwrap();
         assert!(verify_proof_of_possession_bls(&proof, malicious_key.public(), &address).is_err())
@@ -266,7 +263,7 @@ mod tests {
 
     #[test]
     fn test_proof_of_possession_fails_wrong_message() {
-        let keypair = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
+        let keypair = BlsKeypair::generate(&mut StdRng::from_os_rng());
         let address = Address::from_raw_public_key(&[0; 64]);
         let wrong = Address::from_raw_public_key(&[1; 64]);
         let proof = generate_proof_of_possession_bls(&keypair, &wrong).unwrap();

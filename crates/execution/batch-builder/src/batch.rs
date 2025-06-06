@@ -103,7 +103,7 @@ pub fn build_batch<P: TxPool>(args: BatchBuilderArgs<P>) -> BatchBuilderOutput {
 
         // append transaction to the list of executed transactions
         mined_transactions.push(*pool_tx.hash());
-        transactions.push(tx.into_tx().encoded_2718());
+        transactions.push(tx.into_inner().encoded_2718());
     }
 
     // sometimes batch are produced too quickly in certain configs (<1s diff)

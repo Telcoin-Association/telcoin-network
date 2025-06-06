@@ -17,9 +17,6 @@ tn-config = { workspace = true }
 tn-types = { workspace = true }
 tn-worker = { workspace = true }
 dirs-next = "2.0.0"
-enr = { workspace = true, default-features = false, features = [
-    "rust-secp256k1",
-] }
 parking_lot = { workspace = true }
 
 reth = { workspace = true }
@@ -28,11 +25,13 @@ reth-db-common = { workspace = true }
 reth-node-core = { workspace = true }
 reth-node-ethereum = { workspace = true }
 reth-chainspec = { workspace = true }
+reth-chain-state = { workspace = true }
 reth-cli-util = { workspace = true }
 reth-primitives = { workspace = true }
 reth-consensus = { workspace = true }
 reth-evm-ethereum = { workspace = true }
 reth-engine-primitives = { workspace = true }
+reth-engine-tree = { workspace = true }
 reth-revm = { workspace = true }
 reth-evm = { workspace = true }
 reth-node-builder = { workspace = true }
@@ -41,29 +40,28 @@ reth-trie-db = { workspace = true }
 reth-primitives-traits = { workspace = true }
 reth-transaction-pool = { workspace = true }
 
-reth-blockchain-tree = { workspace = true }
 reth-errors = { workspace = true }
 reth-rpc-eth-types = { workspace = true }
-
 reth-network-peers = { workspace = true }
 reth-network-api = { workspace = true }
 reth-discv4 = { workspace = true }
 reth-eth-wire = { workspace = true }
 reth-tracing = { workspace = true }
 
-rand_chacha = { workspace = true }
+rand = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 eyre = { workspace = true }
 alloy = { workspace = true, features = ["genesis"] }
+alloy-evm = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
-alloy-consensus = { workspace = true }
 tokio = { workspace = true, features = ["macros", "time"] }
-secp256k1 = { workspace = true, optional = true }
+secp256k1 = { workspace = true }
+reth-ethereum-primitives = { workspace = true }
 
 [features]
 default = []
-test-utils = ["secp256k1"]
+test-utils = []

@@ -7,7 +7,6 @@ use tn_worker::{
     metrics::Metrics, new_worker, quorum_waiter::QuorumWaiter, Worker, WorkerNetworkHandle,
 };
 use tokio::sync::RwLock;
-use tracing::instrument;
 
 #[derive(Debug)]
 /// The inner-worker type.
@@ -28,7 +27,6 @@ impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
     /// If the node is already running then this method will return an error instead.
     ///
     /// Return the task manager for the worker and the [Worker] struct for spawning execution tasks.
-    #[instrument(name = "worker", skip_all)]
     async fn start(&mut self) -> eyre::Result<(TaskManager, Worker<CDB, QuorumWaiter>)> {
         let task_manager_name = worker_task_manager_name(self.id);
         let mut task_manager = TaskManager::new(task_manager_name);

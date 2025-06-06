@@ -7,7 +7,6 @@ use crate::{
 use aes_gcm_siv::{aead::Aead as _, Aes256GcmSiv, Key, KeyInit, Nonce};
 use pbkdf2::pbkdf2_hmac;
 use rand::{rngs::StdRng, Rng as _, SeedableRng};
-use rand_chacha::ChaCha20Rng;
 use sha2::Sha256;
 use std::sync::Arc;
 use tn_types::{
@@ -50,9 +49,9 @@ impl KeyConfig {
     /// key.
     fn wrap_bls_key(primary_keypair: &BlsKeypair, passphrase: &str) -> eyre::Result<String> {
         let mut salt = [0_u8; 12];
-        rand::thread_rng().fill(&mut salt);
+        rand::rng().fill(&mut salt);
         let mut nonce_bytes = [0_u8; 12];
-        rand::thread_rng().fill(&mut nonce_bytes);
+        rand::rng().fill(&mut nonce_bytes);
         let mut passphrase_bytes = [0_u8; 32];
         pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), &salt, 1_000, &mut passphrase_bytes);
         let key = Key::<Aes256GcmSiv>::from_slice(&passphrase_bytes);
@@ -125,9 +124,8 @@ impl KeyConfig {
         tn_datadir: &TND,
         passphrase: Option<String>,
     ) -> eyre::Result<Self> {
-        let rng = ChaCha20Rng::from_entropy();
         // note: StdRng uses ChaCha12
-        let primary_keypair = BlsKeypair::generate(&mut StdRng::from_rng(rng)?);
+        let primary_keypair = BlsKeypair::generate(&mut StdRng::from_os_rng());
         let primary_seed = "primary network keypair";
         let worker_seed = "worker network keypair";
         let primary_network_keypair =

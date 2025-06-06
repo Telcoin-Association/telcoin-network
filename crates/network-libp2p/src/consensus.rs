@@ -611,6 +611,7 @@ where
                         listen_addrs,
                         protocols,
                         observed_addr,
+                        signed_peer_record,
                     },
                 .. // connection_id
             } => {
@@ -623,6 +624,7 @@ where
                     ?listen_addrs,
                     ?protocols,
                     ?observed_addr,
+                    ?signed_peer_record,
                     "identify event received",
                 );
 

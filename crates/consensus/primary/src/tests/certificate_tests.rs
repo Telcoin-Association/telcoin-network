@@ -1,9 +1,6 @@
 //! Certificate tests
 
-use rand::{
-    rngs::{OsRng, StdRng},
-    SeedableRng,
-};
+use rand::{rngs::StdRng, SeedableRng};
 use std::num::NonZeroUsize;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
@@ -107,7 +104,7 @@ fn test_unknown_signature_in_certificate() {
         signatures.push((vote.author().clone(), *vote.signature()));
     }
 
-    let malicious_key = BlsKeypair::generate(&mut StdRng::from_rng(OsRng).unwrap());
+    let malicious_key = BlsKeypair::generate(&mut StdRng::from_os_rng());
     let malicious_id: AuthorityIdentifier = AuthorityIdentifier::dummy_for_test(50u8);
 
     let vote = Vote::new_with_signer(&header, malicious_id, &malicious_key);

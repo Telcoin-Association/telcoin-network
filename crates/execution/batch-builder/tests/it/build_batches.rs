@@ -11,9 +11,9 @@ use tn_batch_validator::BatchValidator;
 use tn_engine::execute_consensus_output;
 use tn_network_types::{local::LocalNetwork, MockWorkerToPrimary};
 use tn_reth::{
+    payload::BuildArguments,
     recover_raw_transaction,
     test_utils::{test_genesis, TransactionFactory},
-    traits::BuildArguments,
     RethChainSpec, RethEnv,
 };
 use tn_storage::{open_db, tables::Batches};
@@ -118,13 +118,13 @@ async fn test_make_batch_el_to_cl() {
     debug!("transaction 3: {transaction3:?}");
 
     let added_result = tx_factory.submit_tx_to_pool(transaction1.clone(), txpool.clone()).await;
-    assert_matches!(added_result, hash if hash == transaction1.hash());
+    assert_matches!(added_result, hash if &hash == transaction1.hash());
 
     let added_result = tx_factory.submit_tx_to_pool(transaction2.clone(), txpool.clone()).await;
-    assert_matches!(added_result, hash if hash == transaction2.hash());
+    assert_matches!(added_result, hash if &hash == transaction2.hash());
 
     let added_result = tx_factory.submit_tx_to_pool(transaction3.clone(), txpool.clone()).await;
-    assert_matches!(added_result, hash if hash == transaction3.hash());
+    assert_matches!(added_result, hash if &hash == transaction3.hash());
 
     // txpool size
     let pending_pool_len = txpool.pool_size().pending;
@@ -257,13 +257,13 @@ async fn test_batch_builder_produces_valid_batchess() {
     );
 
     let added_result = tx_factory.submit_tx_to_pool(transaction1.clone(), txpool.clone()).await;
-    assert_matches!(added_result, hash if hash == transaction1.hash());
+    assert_matches!(added_result, hash if &hash == transaction1.hash());
 
     let added_result = tx_factory.submit_tx_to_pool(transaction2.clone(), txpool.clone()).await;
-    assert_matches!(added_result, hash if hash == transaction2.hash());
+    assert_matches!(added_result, hash if &hash == transaction2.hash());
 
     let added_result = tx_factory.submit_tx_to_pool(transaction3.clone(), txpool.clone()).await;
-    assert_matches!(added_result, hash if hash == transaction3.hash());
+    assert_matches!(added_result, hash if &hash == transaction3.hash());
 
     // txpool size
     let pending_pool_len = txpool.pool_size().pending;
@@ -342,7 +342,7 @@ async fn test_batch_builder_produces_valid_batchess() {
     let tx_bytes =
         next_batch.batch().transactions().first().expect("block transactions length is one");
     let tx = recover_raw_transaction(tx_bytes).expect("recover raw tx for test");
-    assert_eq!(tx.hash(), expected_tx_hash);
+    assert_eq!(tx.hash(), &expected_tx_hash);
 
     // yield to try and give pool a chance to update
     tokio::task::yield_now().await;

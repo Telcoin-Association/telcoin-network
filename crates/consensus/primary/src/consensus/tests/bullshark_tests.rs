@@ -40,7 +40,8 @@ async fn order_leaders() {
         state.try_insert(&certificate).unwrap();
     }
 
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
     let bullshark = Bullshark::new(
         committee,
@@ -108,7 +109,8 @@ async fn commit_one_with_leader_schedule_change() {
         let gc_depth = 50;
         let sub_dags_per_schedule = 3;
         let mut state = ConsensusState::new(metrics.clone(), gc_depth);
-        let store = open_db(temp_dir());
+        let db = temp_dir();
+        let store = open_db(db.path());
         let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
         let bad_nodes_stake_threshold = 33;
         let mut bullshark = Bullshark::new(
@@ -215,7 +217,8 @@ async fn not_enough_support_with_leader_schedule_change() {
     let gc_depth = 50;
     let sub_dags_per_schedule = 4;
     let mut state = ConsensusState::new(metrics.clone(), gc_depth);
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
 
     let bad_nodes_stake_threshold = 33;
@@ -334,7 +337,8 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
     let gc_depth = 50;
     let sub_dags_per_schedule = 4;
     let mut state = ConsensusState::new(metrics.clone(), gc_depth);
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
 
     let bad_nodes_stake_threshold = 33;
@@ -869,7 +873,8 @@ async fn delayed_certificates_are_rejected() {
     let metrics = Arc::new(ConsensusMetrics::default());
     let (certificates, _) = make_certificates_with_epoch(&committee, 1..=5, epoch, &genesis, &ids);
 
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
     let mut state = ConsensusState::new(metrics.clone(), gc_depth);
 
     let mut bullshark = Bullshark::new(
@@ -917,7 +922,8 @@ async fn submitting_equivocating_certificate_should_error() {
     let metrics = Arc::new(ConsensusMetrics::default());
     let (certificates, _) = make_certificates_with_epoch(&committee, 1..=1, epoch, &genesis, &ids);
 
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
     let mut state = ConsensusState::new(metrics.clone(), gc_depth);
     let mut bullshark = Bullshark::new(
         committee.clone(),
@@ -971,7 +977,8 @@ async fn reset_consensus_scores_on_every_schedule_change() {
     let metrics = Arc::new(ConsensusMetrics::default());
     let (certificates, _) = make_certificates_with_epoch(&committee, 1..=50, epoch, &genesis, &ids);
 
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
     let mut state = ConsensusState::new(metrics.clone(), gc_depth);
     let mut bullshark = Bullshark::new(
         committee.clone(),
@@ -1147,7 +1154,8 @@ async fn garbage_collection_basic() {
         make_certificates_with_slow_nodes(&committee, 1..=7, genesis, &ids, slow_nodes.as_slice());
 
     // Create Bullshark consensus engine
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
 
     let metrics = Arc::new(ConsensusMetrics::default());
     let mut state = ConsensusState::new(metrics.clone(), GC_DEPTH);
@@ -1236,7 +1244,8 @@ async fn slow_node() {
     });
 
     // Create Bullshark consensus engine
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
     let metrics = Arc::new(ConsensusMetrics::default());
     let mut state = ConsensusState::new(metrics.clone(), GC_DEPTH);
     let mut bullshark = Bullshark::new(
@@ -1394,7 +1403,8 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
     certificates.extend(certificates_5_to_7);
 
     // Create Bullshark consensus engine
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
     let metrics = Arc::new(ConsensusMetrics::default());
     let mut state = ConsensusState::new(metrics.clone(), GC_DEPTH);
     let mut bullshark = Bullshark::new(

@@ -6,7 +6,7 @@ use crate::{
 };
 use libp2p::{multihash::Multihash, PeerId};
 use parking_lot::RwLock;
-use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
+use rand::{rngs::StdRng, seq::IndexedRandom as _, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -560,13 +560,13 @@ mod tests {
     use crate::{
         now, Address, Authority, BlsKeypair, BlsPublicKey, Committee, Multiaddr, NetworkKeypair,
     };
-    use rand::thread_rng;
+    use rand::rng;
     use std::collections::BTreeMap;
 
     #[test]
     fn committee_load() {
         // GIVEN
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let num_of_authorities = 10;
 
         let authorities = (0..num_of_authorities)

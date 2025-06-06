@@ -23,7 +23,6 @@ use once_cell::sync::OnceCell;
 use prometheus::{
     default_registry, register_int_gauge_vec_with_registry, IntGaugeVec, Registry, TextEncoder,
 };
-use tap::TapFallible;
 use tracing::warn;
 
 pub use scopeguard;
@@ -96,7 +95,7 @@ static METRICS: OnceCell<Metrics> = OnceCell::new();
 /// Set the inner [Metrics] for [OnceCell].
 fn init_metrics() {
     if let Ok(metrics) = Metrics::try_new(default_registry()) {
-        let _ = METRICS.set(metrics).tap_err(|_| warn!("init_metrics registry overwritten"));
+        let _ = METRICS.set(metrics).inspect_err(|_| warn!("init_metrics registry overwritten"));
     }
 }
 

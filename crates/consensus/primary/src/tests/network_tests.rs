@@ -68,7 +68,7 @@ fn create_test_types() -> TestTypes {
     synchronizer.spawn(&task_manager);
 
     // last execution result
-    let parent = SealedHeader::seal(ExecHeader::default());
+    let parent = SealedHeader::seal_slow(ExecHeader::default());
 
     // set the latest execution result to genesis - test headers are proposed for round 1
     let mut recent = RecentBlocks::new(1);

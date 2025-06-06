@@ -8,7 +8,6 @@ use crate::{
     ConsensusBus,
 };
 use assert_matches::assert_matches;
-use itertools::Itertools;
 use std::{collections::BTreeSet, time::Duration};
 use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
 use tn_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
@@ -177,8 +176,12 @@ async fn fetch_certificates_basic() {
 
         // Send back another 62 certificates.
         first_batch_len = 62;
-        first_batch_resp =
-            certificates.iter().skip(num_written).take(first_batch_len).cloned().collect_vec();
+        first_batch_resp = certificates
+            .iter()
+            .skip(num_written)
+            .take(first_batch_len)
+            .cloned()
+            .collect::<Vec<_>>();
         reply.send(Ok(PrimaryResponse::RequestedCertificates(first_batch_resp.clone()))).unwrap();
     }
 
@@ -214,8 +217,11 @@ async fn fetch_certificates_basic() {
                 let (_, skip_rounds) = inner.get_bounds().unwrap();
                 assert_eq!(skip_rounds.len(), fixture.authorities().count());
                 for (_, rounds) in skip_rounds {
-                    let rounds = rounds.into_iter().collect_vec();
-                    assert!(rounds == (1..=16).collect_vec() || rounds == (1..=17).collect_vec());
+                    let rounds = rounds.into_iter().collect::<Vec<_>>();
+                    assert!(
+                        rounds == (1..=16).collect::<Vec<_>>()
+                            || rounds == (1..=17).collect::<Vec<_>>()
+                    );
                 }
 
                 // Send back another 123 + 1 - 66 = 58 certificates.
@@ -225,7 +231,7 @@ async fn fetch_certificates_basic() {
                     .skip(num_written)
                     .take(second_batch_len)
                     .cloned()
-                    .collect_vec();
+                    .collect::<Vec<_>>();
                 reply
                     .send(Ok(PrimaryResponse::RequestedCertificates(second_batch_resp.clone())))
                     .unwrap();

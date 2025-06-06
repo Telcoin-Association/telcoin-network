@@ -260,9 +260,8 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
     let tmp_reth_env =
         RethEnv::new_for_temp_chain(pre_genesis_chain.clone(), tmp_dir.path(), &task_manager)?;
     // fetch state to be set on the faucet proxy address
-    let execution_outcome = tmp_reth_env
+    let execution_bundle = tmp_reth_env
         .execution_outcome_for_tests(raw_txs, &pre_genesis_chain.sealed_genesis_header());
-    let execution_bundle = execution_outcome.bundle;
     let execution_storage_faucet = &execution_bundle
         .state
         .get(&faucet_proxy_address)
@@ -438,11 +437,10 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
     // assert starting stablecoin balance is 0
     let signer = random_tx_factory.get_default_signer()?;
     let wallet = EthereumWallet::from(signer);
-    let provider =
-        ProviderBuilder::new().with_recommended_fillers().wallet(wallet).on_http(rpc_url.parse()?);
+    let provider = ProviderBuilder::new().wallet(wallet).connect_http(rpc_url.parse()?);
     let stablecoin_contract = Stablecoin::new(stablecoin_address, provider.clone());
     let starting_xyz_balance: U256 =
-        U256::from(stablecoin_contract.balanceOf(new_random_address).call().await?._0);
+        U256::from(stablecoin_contract.balanceOf(new_random_address).call().await?);
     debug!(target: "faucet-test", "starting balance: {starting_xyz_balance:?}");
     assert_eq!(starting_xyz_balance, U256::ZERO);
 
@@ -458,7 +456,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
     let result = timeout(duration, async {
         loop {
             let actual_xyz_balance: U256 =
-                stablecoin_contract.balanceOf(new_random_address).call().await?._0;
+                stablecoin_contract.balanceOf(new_random_address).call().await?;
             debug!(target: "faucet-test", "actual balance: {:?}", actual_xyz_balance);
 
             if actual_xyz_balance == expected_xyz_balance {

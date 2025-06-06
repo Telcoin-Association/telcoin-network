@@ -8,7 +8,7 @@ use tn_types::{BlsKeypair, BlsSigner};
 #[test]
 fn test_node_record() {
     let multiaddr = create_multiaddr(None);
-    let bls_keypair = BlsKeypair::generate(&mut rand::thread_rng());
+    let bls_keypair = BlsKeypair::generate(&mut rand::rng());
     let pubkey = *bls_keypair.public();
     let key_config = KeyConfig::new_with_testing_key(bls_keypair);
 
@@ -25,6 +25,6 @@ fn test_node_record() {
     assert!(record.verify(&bls_pubkey).is_some());
 
     // assert incorrect pubkey fails
-    let bad_keypair = BlsKeypair::generate(&mut rand::thread_rng());
+    let bad_keypair = BlsKeypair::generate(&mut rand::rng());
     assert!(node_record.verify(bad_keypair.public()).is_none());
 }
