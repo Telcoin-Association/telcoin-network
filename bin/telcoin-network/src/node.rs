@@ -120,10 +120,10 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // use config for chain spec
         let mut tn_config = Config::load(&tn_datadir, self.observer, SHORT_VERSION)?;
-        debug!(target: "cli", validator = ?tn_config.validator_info.name, "tn datadir for node command: {tn_datadir:?}");
+        debug!(target: "cli", validator = ?tn_config.node_info.name, "tn datadir for node command: {tn_datadir:?}");
         // Make sure we are using the chain from config not just the default.
         self.reth.chain = Arc::new(tn_config.chain_spec());
-        info!(target: "cli", validator = ?tn_config.validator_info.name, "config loaded");
+        info!(target: "cli", validator = ?tn_config.node_info.name, "config loaded");
 
         // overwrite all genesis if `genesis` was passed to CLI
         if let Some(chain) = self.genesis.take() {

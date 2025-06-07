@@ -85,21 +85,19 @@ impl KeyConfig {
         passphrase: Option<String>,
     ) -> eyre::Result<Self> {
         // load keys to start the primary
-        let validator_keypath = tn_datadir.validator_keys_path();
+        let validator_keypath = tn_datadir.node_keys_path();
         tracing::info!(target: "telcoin::consensus_config", "loading validator keys at {:?}", validator_keypath);
         let contents = if passphrase.is_some() {
-            std::fs::read_to_string(tn_datadir.validator_keys_path().join(BLS_WRAPPED_KEYFILE))?
+            std::fs::read_to_string(tn_datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE))?
         } else {
-            std::fs::read_to_string(tn_datadir.validator_keys_path().join(BLS_KEYFILE))?
+            std::fs::read_to_string(tn_datadir.node_keys_path().join(BLS_KEYFILE))?
         };
-        let primary_seed = std::fs::read_to_string(
-            tn_datadir.validator_keys_path().join(PRIMARY_NETWORK_SEED_FILE),
-        )
-        .unwrap_or_else(|_| "primary network keypair".to_string());
-        let worker_seed = std::fs::read_to_string(
-            tn_datadir.validator_keys_path().join(WORKER_NETWORK_SEED_FILE),
-        )
-        .unwrap_or_else(|_| "worker network keypair".to_string());
+        let primary_seed =
+            std::fs::read_to_string(tn_datadir.node_keys_path().join(PRIMARY_NETWORK_SEED_FILE))
+                .unwrap_or_else(|_| "primary network keypair".to_string());
+        let worker_seed =
+            std::fs::read_to_string(tn_datadir.node_keys_path().join(WORKER_NETWORK_SEED_FILE))
+                .unwrap_or_else(|_| "worker network keypair".to_string());
         let bytes = bs58::decode(contents.as_str().trim()).into_vec()?;
         let primary_keypair = if let Some(passphrase) = passphrase {
             Self::unwrap_bls_key(&bytes, &passphrase)?
@@ -133,22 +131,16 @@ impl KeyConfig {
         let worker_network_keypair = Self::generate_network_keypair(&primary_keypair, worker_seed);
         // Make sure we have the validator dir.
         // Don't error out if path exists.
-        let _ = std::fs::create_dir(tn_datadir.validator_keys_path());
+        let _ = std::fs::create_dir(tn_datadir.node_keys_path());
         if let Some(passphrase) = passphrase {
             let contents = Self::wrap_bls_key(&primary_keypair, &passphrase)?;
-            std::fs::write(tn_datadir.validator_keys_path().join(BLS_WRAPPED_KEYFILE), contents)?;
+            std::fs::write(tn_datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE), contents)?;
         } else {
             let contents = bs58::encode(primary_keypair.to_bytes()).into_string();
-            std::fs::write(tn_datadir.validator_keys_path().join(BLS_KEYFILE), contents)?;
+            std::fs::write(tn_datadir.node_keys_path().join(BLS_KEYFILE), contents)?;
         }
-        std::fs::write(
-            tn_datadir.validator_keys_path().join(PRIMARY_NETWORK_SEED_FILE),
-            primary_seed,
-        )?;
-        std::fs::write(
-            tn_datadir.validator_keys_path().join(WORKER_NETWORK_SEED_FILE),
-            worker_seed,
-        )?;
+        std::fs::write(tn_datadir.node_keys_path().join(PRIMARY_NETWORK_SEED_FILE), primary_seed)?;
+        std::fs::write(tn_datadir.node_keys_path().join(WORKER_NETWORK_SEED_FILE), worker_seed)?;
         Ok(Self {
             inner: Arc::new(KeyConfigInner {
                 primary_keypair,

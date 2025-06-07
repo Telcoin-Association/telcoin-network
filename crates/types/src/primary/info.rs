@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Currently, Primary details are fanned out in authority details.
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
-pub struct PrimaryInfo {
+pub struct NodeP2pInfo {
     /// The primary's public network key. Used to sign messages (ie - headers, certs, votes)
     pub network_key: NetworkPublicKey,
     /// The WAN address for the primary.
@@ -20,7 +20,7 @@ pub struct PrimaryInfo {
     pub worker_index: WorkerIndex,
 }
 
-impl PrimaryInfo {
+impl NodeP2pInfo {
     /// Create a new instance of [PrimaryInfo].
     pub fn new(
         network_key: NetworkPublicKey,
@@ -37,7 +37,7 @@ impl PrimaryInfo {
     }
 }
 
-impl Default for PrimaryInfo {
+impl Default for NodeP2pInfo {
     fn default() -> Self {
         let host = std::env::var("NARWHAL_HOST").unwrap_or("127.0.0.1".to_string());
         let primary_udp_port = get_available_udp_port(&host).unwrap_or(49590).to_string();

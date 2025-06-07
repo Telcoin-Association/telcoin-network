@@ -73,7 +73,7 @@ pub async fn config_local_testnet(
         create_validator_info(&dir, addr, passphrase.clone())?;
 
         // copy to shared genesis dir
-        std::fs::copy(dir.join("validator.yaml"), copy_path.join(format!("{v}.yaml")))?;
+        std::fs::copy(dir.join("node-info.yaml"), copy_path.join(format!("{v}.yaml")))?;
     }
 
     // Create an observer config.

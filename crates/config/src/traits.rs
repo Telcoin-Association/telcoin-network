@@ -129,13 +129,12 @@ pub trait TelcoinDirs: std::fmt::Debug + Send + Sync + 'static {
     /// Return the path to parameters yaml file.
     fn node_config_parameters_path(&self) -> PathBuf;
     /// Return the path to the directory that holds
-    /// private keys for the validator operating this node.
-    fn validator_keys_path(&self) -> PathBuf;
+    /// private keys for this node.
+    fn node_keys_path(&self) -> PathBuf;
     /// Return the path to `genesis` dir.
     fn genesis_path(&self) -> PathBuf;
-    /// Return the path to the directory where individual and public validator information is
-    /// collected for genesis.
-    fn validator_info_path(&self) -> PathBuf;
+    /// Return the path to the directory where individual and public node information stored.
+    fn node_info_path(&self) -> PathBuf;
     /// Return the path to the committee file.
     fn committee_path(&self) -> PathBuf;
     /// Return the path to the worker cache file.
@@ -172,12 +171,12 @@ where
         self.as_ref().join("parameters.yaml")
     }
 
-    fn validator_keys_path(&self) -> PathBuf {
-        self.as_ref().join("validator-keys")
+    fn node_keys_path(&self) -> PathBuf {
+        self.as_ref().join("node-keys")
     }
 
-    fn validator_info_path(&self) -> PathBuf {
-        self.as_ref().join("validator.yaml")
+    fn node_info_path(&self) -> PathBuf {
+        self.as_ref().join("node-info.yaml")
     }
 
     fn genesis_path(&self) -> PathBuf {

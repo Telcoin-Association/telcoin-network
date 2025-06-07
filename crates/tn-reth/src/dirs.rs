@@ -12,8 +12,8 @@ use std::{
 };
 use tn_config::TelcoinDirs;
 
-/// The path to join for the directory that stores validator keys.
-pub const VALIDATOR_KEYS_DIR: &str = "validator-keys";
+/// The path to join for the directory that stores node keys.
+pub const NODE_KEYS_DIR: &str = "node-keys";
 /// The constant for default root directory.
 /// This is a workaround for using TN default dir instead of "reth".
 pub const DEFAULT_ROOT_DIR: &str = "telcoin-network";
@@ -110,12 +110,12 @@ impl TelcoinDirs for DataDirChainPath {
         self.0.as_ref().join("parameters.yaml")
     }
 
-    fn validator_keys_path(&self) -> PathBuf {
-        self.0.as_ref().join(VALIDATOR_KEYS_DIR)
+    fn node_keys_path(&self) -> PathBuf {
+        self.0.as_ref().join(NODE_KEYS_DIR)
     }
 
-    fn validator_info_path(&self) -> PathBuf {
-        self.0.as_ref().join("validator.yaml")
+    fn node_info_path(&self) -> PathBuf {
+        self.0.as_ref().join("node-info.yaml")
     }
 
     fn genesis_path(&self) -> PathBuf {

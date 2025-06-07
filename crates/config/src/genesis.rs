@@ -13,7 +13,7 @@ use std::{
 use tn_types::{
     adiri_genesis, verify_proof_of_possession_bls, Address, BlsPublicKey, BlsSignature, Committee,
     CommitteeBuilder, Epoch, Genesis, GenesisAccount, Intent, IntentMessage, Multiaddr,
-    NetworkPublicKey, PrimaryInfo, ProtocolSignature, Signer, WorkerCache, WorkerIndex,
+    NetworkPublicKey, NodeP2pInfo, ProtocolSignature, Signer, WorkerCache, WorkerIndex,
 };
 use tracing::{info, warn};
 
@@ -34,7 +34,7 @@ pub struct NetworkGenesis {
     /// Execution data
     genesis: Genesis,
     /// Validator signatures
-    validators: BTreeMap<BlsPublicKey, ValidatorInfo>,
+    validators: BTreeMap<BlsPublicKey, NodeInfo>,
 }
 
 impl Default for NetworkGenesis {
@@ -59,7 +59,7 @@ impl NetworkGenesis {
     /// Adding [ValidatorInfo] to the genesis directory allows other
     /// validators to discover peers using VCS (ie - github).
     #[cfg(test)]
-    fn add_validator(&mut self, validator: ValidatorInfo) {
+    fn add_validator(&mut self, validator: NodeInfo) {
         self.validators.insert(*validator.public_key(), validator);
     }
 
@@ -71,7 +71,7 @@ impl NetworkGenesis {
     /// Load a list of validators by reading files in a directory.
     fn load_validators_from_path<P>(
         telcoin_paths: &P,
-    ) -> eyre::Result<Vec<(BlsPublicKey, ValidatorInfo)>>
+    ) -> eyre::Result<Vec<(BlsPublicKey, NodeInfo)>>
     where
         P: TelcoinDirs,
     {
@@ -93,7 +93,7 @@ impl NetworkGenesis {
                 && path.file_name().and_then(OsStr::to_str).is_none_or(|s| !s.starts_with('.'))
             {
                 let info_bytes = fs::read(&path)?;
-                let validator: ValidatorInfo = serde_yaml::from_slice(&info_bytes)
+                let validator: NodeInfo = serde_yaml::from_slice(&info_bytes)
                     .with_context(|| format!("validator failed to load from {}", path.display()))?;
                 validators.push((validator.bls_public_key, validator));
             } else {
@@ -162,7 +162,7 @@ impl NetworkGenesis {
     }
 
     /// Return a reference to the validators.
-    pub fn validators(&self) -> &BTreeMap<BlsPublicKey, ValidatorInfo> {
+    pub fn validators(&self) -> &BTreeMap<BlsPublicKey, NodeInfo> {
         &self.validators
     }
 
@@ -198,7 +198,7 @@ impl NetworkGenesis {
 
 /// information needed for every validator:
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
-pub struct ValidatorInfo {
+pub struct NodeInfo {
     /// The name for the validator. The default value
     /// is the hashed value of the validator's
     /// execution address. The operator can overwrite
@@ -210,21 +210,23 @@ pub struct ValidatorInfo {
     pub bls_public_key: BlsPublicKey,
     /// Information for this validator's primary,
     /// including worker details.
-    pub primary_info: PrimaryInfo,
+    pub primary_info: NodeP2pInfo,
     /// The address for suggested fee recipient.
     ///
     /// Validator rewards are sent to this address.
+    /// Note, non-validators can also have an address but do not earn rewards (it is informational
+    /// only).
     pub execution_address: Address,
     /// Proof
     pub proof_of_possession: BlsSignature,
 }
 
-impl ValidatorInfo {
+impl NodeInfo {
     /// Create a new instance of [ValidatorInfo] using the provided data.
     pub fn new(
         name: String,
         bls_public_key: BlsPublicKey,
-        primary_info: PrimaryInfo,
+        primary_info: NodeP2pInfo,
         execution_address: Address,
         proof_of_possession: BlsSignature,
     ) -> Self {
@@ -252,7 +254,7 @@ impl ValidatorInfo {
     }
 }
 
-impl Default for ValidatorInfo {
+impl Default for NodeInfo {
     fn default() -> Self {
         Self {
             name: "DEFAULT".to_string(),
@@ -325,12 +327,12 @@ pub fn fetch_file_content_relative_to_manifest<P: AsRef<Path>>(relative_path: P)
 #[cfg(test)]
 mod tests {
     use super::NetworkGenesis;
-    use crate::ValidatorInfo;
+    use crate::NodeInfo;
     use rand::{rngs::StdRng, SeedableRng};
     use std::collections::BTreeMap;
     use tn_types::{
         generate_proof_of_possession_bls, Address, BlsKeypair, Multiaddr, NetworkKeypair,
-        PrimaryInfo, WorkerIndex, WorkerInfo,
+        NodeP2pInfo, WorkerIndex, WorkerInfo,
     };
 
     #[test]
@@ -346,7 +348,7 @@ mod tests {
             let primary_network_address = Multiaddr::empty();
             let worker_info = WorkerInfo::default();
             let worker_index = WorkerIndex(BTreeMap::from([(0, worker_info)]));
-            let primary_info = PrimaryInfo::new(
+            let primary_info = NodeP2pInfo::new(
                 network_keypair.public().clone().into(),
                 primary_network_address,
                 network_keypair.public().clone().into(),
@@ -354,7 +356,7 @@ mod tests {
             );
             let name = format!("validator-{v}");
             // create validator
-            let validator = ValidatorInfo::new(
+            let validator = NodeInfo::new(
                 name,
                 *bls_keypair.public(),
                 primary_info,
@@ -385,7 +387,7 @@ mod tests {
             let primary_network_address = Multiaddr::empty();
             let worker_info = WorkerInfo::default();
             let worker_index = WorkerIndex(BTreeMap::from([(0, worker_info)]));
-            let primary_info = PrimaryInfo::new(
+            let primary_info = NodeP2pInfo::new(
                 network_keypair.public().clone().into(),
                 primary_network_address,
                 network_keypair.public().clone().into(),
@@ -393,7 +395,7 @@ mod tests {
             );
             let name = format!("validator-{v}");
             // create validator
-            let validator = ValidatorInfo::new(
+            let validator = NodeInfo::new(
                 name,
                 *bls_keypair.public(),
                 primary_info,

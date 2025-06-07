@@ -2,7 +2,7 @@
 
 use crate::args::clap_address_parser;
 use clap::{value_parser, Args, Subcommand};
-use tn_config::{KeyConfig, TelcoinDirs, ValidatorInfo};
+use tn_config::{KeyConfig, NodeInfo, TelcoinDirs};
 use tn_types::Address;
 use tracing::info;
 
@@ -63,7 +63,7 @@ pub struct KeygenArgs {
 impl KeygenArgs {
     fn update_keys<TND: TelcoinDirs>(
         &self,
-        validator_info: &mut ValidatorInfo,
+        validator_info: &mut NodeInfo,
         tn_datadir: &TND,
         passphrase: Option<String>,
     ) -> eyre::Result<()> {
@@ -88,7 +88,7 @@ impl KeygenArgs {
     /// Create all necessary information needed for validator and save to file.
     pub fn execute<TND: TelcoinDirs>(
         &self,
-        validator_info: &mut ValidatorInfo,
+        validator_info: &mut NodeInfo,
         tn_datadir: &TND,
         passphrase: Option<String>,
     ) -> eyre::Result<()> {

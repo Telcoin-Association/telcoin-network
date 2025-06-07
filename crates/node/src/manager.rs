@@ -99,15 +99,14 @@ where
         tn_datadir: P,
         passphrase: Option<String>,
     ) -> eyre::Result<Self> {
-        let passphrase = if std::fs::exists(
-            tn_datadir.validator_keys_path().join(tn_config::BLS_WRAPPED_KEYFILE),
-        )
-        .unwrap_or(false)
-        {
-            passphrase
-        } else {
-            None
-        };
+        let passphrase =
+            if std::fs::exists(tn_datadir.node_keys_path().join(tn_config::BLS_WRAPPED_KEYFILE))
+                .unwrap_or(false)
+            {
+                passphrase
+            } else {
+                None
+            };
 
         // create key config for lifetime of the app
         let key_config = KeyConfig::read_config(&tn_datadir, passphrase)?;

@@ -85,7 +85,7 @@ else
 
         # cp validator info into shared genesis dir
         echo "copying validator info to shared genesis dir"
-        cp "${DATADIR}/validator.yaml" "${SHARED_GENESISDIR}/${VALIDATOR}.yaml"
+        cp "${DATADIR}/node-info.yaml" "${SHARED_GENESISDIR}/${VALIDATOR}.yaml"
         echo ""
         echo ""
     done

@@ -78,7 +78,7 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     });
 
     // update execution address
-    tn_config.validator_info.execution_address = address;
+    tn_config.node_info.execution_address = address;
 
     // TODO: this a temporary approach until upstream reth supports public rpc hooks
     let opt_faucet_args = None;

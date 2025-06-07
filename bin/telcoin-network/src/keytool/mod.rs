@@ -1,4 +1,4 @@
-//! Key command to generate all keys for running a full validator node.
+//! Key command to generate all keys for running a node.
 
 mod generate;
 use self::generate::NodeType;
@@ -7,14 +7,14 @@ use eyre::{eyre, Context};
 
 use generate::GenerateKeys;
 use std::path::Path;
-use tn_config::{Config, ConfigFmt, ConfigTrait, TelcoinDirs as _, ValidatorInfo};
+use tn_config::{Config, ConfigFmt, ConfigTrait, NodeInfo, TelcoinDirs as _};
 use tn_reth::{
     dirs::{default_datadir_args, DataDirChainPath, DataDirPath},
     MaybePlatformPath, RethChainSpec,
 };
 use tracing::warn;
 
-/// Generate keypairs and validator info to go with them and save them to a file.
+/// Generate keypairs and node info to go with them and save them to a file.
 #[derive(Debug, Args)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct KeyArgs {
@@ -55,18 +55,14 @@ impl KeyArgs {
                     NodeType::ValidatorKeys(args) => args,
                     NodeType::ObserverKeys(args) => args,
                 };
-                let authority_key_path = datadir.validator_keys_path();
+                let authority_key_path = datadir.node_keys_path();
                 // initialize path and warn users if overwriting keys
                 self.init_path(&authority_key_path, args.force)?;
-                let mut validator_info = ValidatorInfo::default();
+                let mut node_info = NodeInfo::default();
                 // execute and store keypath
-                args.execute(&mut validator_info, &datadir, passphrase)?;
+                args.execute(&mut node_info, &datadir, passphrase)?;
 
-                Config::write_to_path(
-                    datadir.validator_info_path(),
-                    &validator_info,
-                    ConfigFmt::YAML,
-                )?;
+                Config::write_to_path(datadir.node_info_path(), &node_info, ConfigFmt::YAML)?;
             }
         }
 
@@ -84,8 +80,8 @@ impl KeyArgs {
                 format!("Could not create authority key directory {}", rpath.display())
             })?;
         } else if !force {
-            warn!("pass `force` to overwrite keys for validator");
-            return Err(eyre!("cannot overwrite validator keys without passing --force"));
+            warn!("pass `force` to overwrite keys for node");
+            return Err(eyre!("cannot overwrite node keys without passing --force"));
         }
 
         Ok(())
@@ -116,7 +112,7 @@ impl KeyArgs {
 mod tests {
     use crate::{cli::Cli, NoArgs};
     use clap::Parser;
-    use tn_config::{Config, ConfigFmt, ConfigTrait, ValidatorInfo};
+    use tn_config::{Config, ConfigFmt, ConfigTrait, NodeInfo};
 
     /// Test that generate keys command works.
     /// This test also ensures that confy is able to
@@ -146,8 +142,8 @@ mod tests {
         tn.run(Some("gen_keys_test".to_string()), |_, _, _, _| Ok(()))
             .expect("generate keys command");
 
-        Config::load_from_path_or_default::<ValidatorInfo>(
-            temp_path.join("validator.yaml").as_path(),
+        Config::load_from_path_or_default::<NodeInfo>(
+            temp_path.join("node-info.yaml").as_path(),
             ConfigFmt::YAML,
         )
         .expect("config loaded yaml okay");

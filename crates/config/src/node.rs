@@ -1,6 +1,6 @@
 //! Configurations for the Telcoin Network.
 
-use crate::{ConfigFmt, ConfigTrait, TelcoinDirs, ValidatorInfo};
+use crate::{ConfigFmt, ConfigTrait, NodeInfo, TelcoinDirs};
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -23,7 +23,7 @@ pub const WORKER_NETWORK_SEED_FILE: &str = "worker.seed";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// [ValidatorInfo] for the node
-    pub validator_info: ValidatorInfo,
+    pub node_info: NodeInfo,
 
     /// Parameters for the network.
     pub parameters: Parameters,
@@ -43,7 +43,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             // defaults
-            validator_info: Default::default(),
+            node_info: Default::default(),
             parameters: Default::default(),
             // specify adiri chain spec
             genesis: adiri_genesis(),
@@ -63,8 +63,8 @@ impl Config {
         observer: bool,
         version: &'static str,
     ) -> eyre::Result<Self> {
-        let validator_info: ValidatorInfo =
-            Config::load_from_path_or_default(tn_datadir.validator_info_path(), ConfigFmt::YAML)?;
+        let node_info: NodeInfo =
+            Config::load_from_path_or_default(tn_datadir.node_info_path(), ConfigFmt::YAML)?;
         let parameters: Parameters = Config::load_from_path_or_default(
             tn_datadir.node_config_parameters_path(),
             ConfigFmt::YAML,
@@ -72,7 +72,7 @@ impl Config {
         let genesis: Genesis =
             Config::load_from_path_or_default(tn_datadir.genesis_file_path(), ConfigFmt::YAML)?;
 
-        Ok(Config { validator_info, parameters, genesis, observer, version })
+        Ok(Config { node_info, parameters, genesis, observer, version })
     }
 
     /// Load a config from it's component parts.
@@ -81,38 +81,38 @@ impl Config {
         observer: bool,
         version: &'static str,
     ) -> eyre::Result<Self> {
-        let validator_info: ValidatorInfo =
-            Config::load_from_path(tn_datadir.validator_info_path(), ConfigFmt::YAML)?;
+        let validator_info: NodeInfo =
+            Config::load_from_path(tn_datadir.node_info_path(), ConfigFmt::YAML)?;
         let parameters: Parameters =
             Config::load_from_path(tn_datadir.node_config_parameters_path(), ConfigFmt::YAML)?;
         let genesis: Genesis =
             Config::load_from_path(tn_datadir.genesis_file_path(), ConfigFmt::YAML)?;
 
-        Ok(Config { validator_info, parameters, genesis, observer, version })
+        Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
     }
 
     /// Update the authority protocol key.
     pub fn update_protocol_key(&mut self, value: BlsPublicKey) -> eyre::Result<()> {
-        self.validator_info.bls_public_key = value;
+        self.node_info.bls_public_key = value;
         Ok(())
     }
 
     /// Update the authority execution address.
     pub fn update_proof_of_possession(&mut self, value: BlsSignature) -> eyre::Result<()> {
-        self.validator_info.proof_of_possession = value;
+        self.node_info.proof_of_possession = value;
         Ok(())
     }
 
     /// Update the authority network key.
     pub fn update_primary_network_key(&mut self, value: NetworkPublicKey) -> eyre::Result<()> {
-        self.validator_info.primary_info.network_key = value;
+        self.node_info.primary_info.network_key = value;
         Ok(())
     }
 
     /// Update the worker network key.
     pub fn update_worker_network_key(&mut self, value: NetworkPublicKey) -> eyre::Result<()> {
-        self.validator_info.primary_info.worker_network_key = value.clone();
-        for worker in self.validator_info.primary_info.worker_index.0.iter_mut() {
+        self.node_info.primary_info.worker_network_key = value.clone();
+        for worker in self.node_info.primary_info.worker_index.0.iter_mut() {
             worker.1.name = value.clone();
         }
         Ok(())
@@ -120,7 +120,7 @@ impl Config {
 
     /// Update the authority execution address.
     pub fn update_execution_address(&mut self, value: Address) -> eyre::Result<()> {
-        self.validator_info.execution_address = value;
+        self.node_info.execution_address = value;
         Ok(())
     }
 
@@ -142,19 +142,19 @@ impl Config {
 
     /// Return a reference to the exeuction address for suggested fee recipient.
     pub fn execution_address(&self) -> &Address {
-        &self.validator_info.execution_address
+        &self.node_info.execution_address
     }
 
     /// Return a reference to the primary's public BLS key.
     pub fn primary_bls_key(&self) -> &BlsPublicKey {
-        self.validator_info.public_key()
+        self.node_info.public_key()
     }
 
     /// Return a reference to the primary's [WorkerIndex].
     ///
     /// The [WorkerIndex] contains all workers for this validator.
     pub fn workers(&self) -> &WorkerIndex {
-        self.validator_info.worker_index()
+        self.node_info.worker_index()
     }
 }
 
