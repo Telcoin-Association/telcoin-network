@@ -3,8 +3,9 @@
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use tn_reth::{bytes_to_txn, recover_signed_transaction, RethEnv, WorkerTxPool};
 use tn_types::{
-    max_batch_gas, max_batch_size, BatchValidation, BatchValidationError, BlockHash, ExecHeader,
-    SealedBatch, TransactionSigned, TransactionTrait as _,
+    gas_accumulator::BaseFeeContainer, max_batch_gas, max_batch_size, BatchValidation,
+    BatchValidationError, BlockHash, ExecHeader, SealedBatch, TransactionSigned,
+    TransactionTrait as _, WorkerId,
 };
 
 /// Type convenience for implementing block validation errors.
@@ -17,6 +18,10 @@ pub struct BatchValidator {
     reth_env: RethEnv,
     /// A handle to the transaction pool for submitting gossipped transactions.
     tx_pool: Option<WorkerTxPool>,
+    /// Worker id for this validator.
+    worker_id: WorkerId,
+    /// Current base fee for this validators worker.
+    base_fee: BaseFeeContainer,
 }
 
 impl BatchValidation for BatchValidator {
@@ -29,6 +34,14 @@ impl BatchValidation for BatchValidator {
         let verified_hash = batch.clone().seal_slow().digest();
         if digest != verified_hash {
             return Err(BatchValidationError::InvalidDigest);
+        }
+
+        // A validator belongs to a worker and that worker only handles batches with it's id.
+        if batch.worker_id != self.worker_id {
+            return Err(BatchValidationError::InvalidWorkerId {
+                expected_worker_id: self.worker_id,
+                worker_id: batch.worker_id,
+            });
         }
 
         // TODO: validate individual transactions against parent
@@ -59,8 +72,8 @@ impl BatchValidation for BatchValidator {
         // validate gas limit
         self.validate_batch_gas(&decoded_txs, batch.timestamp)?;
 
-        // no-op
-        self.validate_basefee()?;
+        // validate base fee- all batches for a worker and epoch have the same base fee.
+        self.validate_basefee(batch.base_fee_per_gas)?;
         Ok(())
     }
 
@@ -86,8 +99,13 @@ impl BatchValidation for BatchValidator {
 
 impl BatchValidator {
     /// Create a new instance of [Self]
-    pub fn new(reth_env: RethEnv, tx_pool: Option<WorkerTxPool>) -> Self {
-        Self { reth_env, tx_pool }
+    pub fn new(
+        reth_env: RethEnv,
+        tx_pool: Option<WorkerTxPool>,
+        worker_id: WorkerId,
+        base_fee: BaseFeeContainer,
+    ) -> Self {
+        Self { reth_env, tx_pool, worker_id, base_fee }
     }
 
     /// Validates the timestamp against the parent to make sure it is in the past.
@@ -172,7 +190,13 @@ impl BatchValidator {
     }
 
     /// TODO: Validate the block's basefee
-    fn validate_basefee(&self) -> BatchValidationResult<()> {
+    fn validate_basefee(&self, base_fee: Option<u64>) -> BatchValidationResult<()> {
+        if let Some(base_fee) = base_fee {
+            let expected_base_fee = self.base_fee.base_fee();
+            if base_fee != expected_base_fee {
+                return Err(BatchValidationError::InvalidBaseFee { expected_base_fee, base_fee });
+            }
+        }
         Ok(())
     }
 
@@ -260,6 +284,7 @@ mod tests {
             beneficiary: Address::ZERO,
             timestamp,
             base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
+            worker_id: 0,
             received_at: None,
         };
 
@@ -268,7 +293,7 @@ mod tests {
         // intentionally used hard-coded values
         SealedBatch::new(
             batch,
-            hex!("de2de28fdeefa93b5f68c5b007d645d273c4e52d05a282a961c98a655b364995").into(),
+            hex!("84979a2d10637e86c2dd76d2029639f81d27303930721b6f48fb9a345b8813d8").into(),
         )
     }
 
@@ -286,7 +311,8 @@ mod tests {
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let reth_env = RethEnv::new_for_temp_chain(chain.clone(), path, task_manager).unwrap();
         let tx_pool = reth_env.init_txn_pool().unwrap();
-        let validator = BatchValidator::new(reth_env, Some(tx_pool));
+        let validator =
+            BatchValidator::new(reth_env, Some(tx_pool), 0, BaseFeeContainer::default());
         let valid_batch = next_valid_sealed_batch();
 
         // block validator
@@ -328,6 +354,7 @@ mod tests {
             beneficiary,
             timestamp,
             base_fee_per_gas,
+            worker_id: 0,
             received_at,
         };
         assert_matches!(
@@ -393,6 +420,7 @@ mod tests {
             beneficiary,
             timestamp,
             base_fee_per_gas,
+            worker_id: 0,
             received_at,
         };
 

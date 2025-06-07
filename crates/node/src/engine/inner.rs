@@ -5,7 +5,7 @@
 use crate::error::ExecutionError;
 use eyre::OptionExt;
 use jsonrpsee::http_client::HttpClient;
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 use tn_batch_builder::BatchBuilder;
 use tn_batch_validator::BatchValidator;
 use tn_config::Config;
@@ -18,6 +18,7 @@ use tn_reth::{
 };
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
+    gas_accumulator::{BaseFeeContainer, GasAccumulator},
     Address, BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, SealedHeader,
     TaskSpawner, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
 };
@@ -40,7 +41,8 @@ pub(super) struct ExecutionNodeInner {
     /// Optional args to turn on faucet (for testnet only).
     pub(super) opt_faucet_args: Option<FaucetArgs>,
     /// Collection of execution components by worker.
-    pub(super) workers: HashMap<WorkerId, WorkerComponents>,
+    /// Index of vec is worker id.
+    pub(super) workers: Vec<WorkerComponents>,
 }
 
 impl ExecutionNodeInner {
@@ -52,6 +54,7 @@ impl ExecutionNodeInner {
         &self,
         rx_output: mpsc::Receiver<ConsensusOutput>,
         rx_shutdown: Noticer,
+        gas_accumulator: GasAccumulator,
     ) -> eyre::Result<()> {
         let parent_header = self.reth_env.lookup_head()?;
 
@@ -63,6 +66,7 @@ impl ExecutionNodeInner {
             parent_header,
             rx_shutdown,
             self.reth_env.get_task_spawner().clone(),
+            gas_accumulator,
         );
 
         // spawn tn engine
@@ -83,11 +87,12 @@ impl ExecutionNodeInner {
         worker_id: WorkerId,
         block_provider_sender: BatchSender,
         epoch_task_spawner: &TaskSpawner,
+        base_fee: BaseFeeContainer,
     ) -> eyre::Result<()> {
         // check for worker components and initialize if they're missing
         let transaction_pool = self
             .workers
-            .get(&worker_id)
+            .get(worker_id as usize)
             .ok_or_eyre("worker components missing for {worker_id}")?
             .pool();
 
@@ -99,6 +104,8 @@ impl ExecutionNodeInner {
             self.address,
             self.tn_config.parameters.max_batch_delay,
             epoch_task_spawner.clone(),
+            worker_id,
+            base_fee,
         );
 
         // spawn block builder task
@@ -111,6 +118,8 @@ impl ExecutionNodeInner {
     }
 
     /// Initialize the worker's transaction pool and public RPC.
+    /// Must call this function in accending worker_id order or will panic,
+    /// for instance call for worker id 0, then 1, etc.
     pub(super) async fn initialize_worker_components<EP>(
         &mut self,
         worker_id: WorkerId,
@@ -165,7 +174,11 @@ impl ExecutionNodeInner {
 
         // take ownership of worker components
         let components = WorkerComponents::new(rpc_handle, transaction_pool, network);
-        self.workers.insert(worker_id, components);
+        // Must call this function in accending worker_id order or will panic.
+        if worker_id as usize != self.workers.len() {
+            panic!("initialize_worker_components not called with sequencial worker ids!")
+        }
+        self.workers.push(components);
         Ok(())
     }
 
@@ -174,17 +187,21 @@ impl ExecutionNodeInner {
     /// This method should be called on epoch rollover.
     /// Will take care of all workers.
     pub async fn respawn_worker_network_tasks(&self, network_handle: WorkerNetworkHandle) {
-        for worker in self.workers.values() {
+        for worker in &self.workers {
             worker.worker_network().respawn_peer_count(network_handle.clone());
         }
     }
 
     /// Create a new block validator.
-    pub(super) fn new_batch_validator(&self, worker_id: &WorkerId) -> Arc<dyn BatchValidation> {
+    pub(super) fn new_batch_validator(
+        &self,
+        worker_id: &WorkerId,
+        base_fee: BaseFeeContainer,
+    ) -> Arc<dyn BatchValidation> {
         // retrieve handle to transaction pool to submit gossip transactions to validators
-        let tx_pool = self.workers.get(worker_id).map(|w| w.pool());
+        let tx_pool = self.workers.get(*worker_id as usize).map(|w| w.pool());
 
-        Arc::new(BatchValidator::new(self.reth_env.clone(), tx_pool))
+        Arc::new(BatchValidator::new(self.reth_env.clone(), tx_pool, *worker_id, base_fee))
     }
 
     /// Fetch the last executed state from the database.
@@ -279,7 +296,7 @@ impl ExecutionNodeInner {
     pub(super) fn worker_rpc_handle(&self, worker_id: &WorkerId) -> eyre::Result<&RpcServerHandle> {
         let handle = self
             .workers
-            .get(worker_id)
+            .get(*worker_id as usize)
             .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
             .rpc_handle();
         Ok(handle)
@@ -301,7 +318,7 @@ impl ExecutionNodeInner {
     ) -> eyre::Result<WorkerTxPool> {
         let tx_pool = self
             .workers
-            .get(worker_id)
+            .get(*worker_id as usize)
             .ok_or(ExecutionError::WorkerNotFound(worker_id.to_owned()))?
             .pool();
 

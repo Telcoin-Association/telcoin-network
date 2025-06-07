@@ -22,7 +22,7 @@ pub type SequenceNumber = u64;
 
 /// The output of Consensus, which includes all the blocks for each certificate in the sub dag
 /// It is sent to the the ExecutionState handle_consensus_transaction
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ConsensusOutput {
     pub sub_dag: Arc<CommittedSubDag>,
     /// Matches certificates in the `sub_dag` one-to-one.
@@ -143,7 +143,7 @@ impl Display for ConsensusOutput {
     }
 }
 
-#[derive(PartialEq, Serialize, Deserialize, Clone, Debug)]
+#[derive(PartialEq, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct CommittedSubDag {
     /// The sequence of committed certificates.
     pub certificates: Vec<Certificate>,

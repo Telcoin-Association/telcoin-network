@@ -32,7 +32,6 @@ tokio = { workspace = true, features = ["sync", "rt", "macros", "signal"] }
 tracing = { workspace = true }
 eyre = { workspace = true }
 once_cell = { workspace = true }
-match_opt = { workspace = true }
 tn-utils = { workspace = true }
 parking_lot = { workspace = true }
 secp256k1 = { workspace = true }

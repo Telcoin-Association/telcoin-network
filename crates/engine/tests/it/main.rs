@@ -7,9 +7,9 @@ use tn_engine::ExecutorEngine;
 use tn_reth::{test_utils::seeded_genesis_from_random_batches, FixedBytes, RethChainSpec};
 use tn_test_utils::default_test_execution_node;
 use tn_types::{
-    adiri_chain_spec_arc, adiri_genesis, max_batch_gas, now, Address, BlockHash, Bloom, Bytes,
-    Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, Hash as _, Notifier,
-    ReputationScores, TaskManager, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS,
+    adiri_chain_spec_arc, adiri_genesis, gas_accumulator::GasAccumulator, max_batch_gas, now,
+    Address, BlockHash, Bloom, Bytes, Certificate, CommittedSubDag, ConsensusOutput, Hash as _,
+    Notifier, ReputationScores, TaskManager, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS,
     MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tokio::{sync::oneshot, time::timeout};
@@ -41,14 +41,9 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
             previous_sub_dag,
         )
         .into(),
-        close_epoch: false,
-        batches: Default::default(), // empty
         beneficiary,
-        batch_digests: Default::default(), // empty
-        parent_hash: ConsensusHeader::default().digest(),
-        number: 0,
-        extra: Default::default(),
         early_finalize: true,
+        ..Default::default()
     };
     let consensus_output_hash = consensus_output.consensus_header_hash();
 
@@ -72,6 +67,7 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
         genesis_header.clone(),
         shutdown.subscribe(),
         task_manager.get_spawner(),
+        GasAccumulator::default(),
     );
 
     // send output
@@ -205,14 +201,9 @@ async fn test_empty_output_executes_late_finalize() -> eyre::Result<()> {
             previous_sub_dag,
         )
         .into(),
-        close_epoch: false,
-        batches: Default::default(), // empty
         beneficiary,
-        batch_digests: Default::default(), // empty
-        parent_hash: ConsensusHeader::default().digest(),
-        number: 0,
-        extra: Default::default(),
         early_finalize: false,
+        ..Default::default()
     };
 
     let chain = adiri_chain_spec_arc();
@@ -235,6 +226,7 @@ async fn test_empty_output_executes_late_finalize() -> eyre::Result<()> {
         genesis_header.clone(),
         shutdown.subscribe(),
         task_manager.get_spawner(),
+        GasAccumulator::default(),
     );
 
     // send output
@@ -372,11 +364,8 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
         batches: vec![batches_1],
         beneficiary: beneficiary_1,
         batch_digests: batch_digests_1.clone(),
-        parent_hash: ConsensusHeader::default().digest(),
-        number: 0,
-        extra: Default::default(),
         early_finalize: true,
-        close_epoch: false,
+        ..Default::default()
     };
 
     // create second output
@@ -405,9 +394,8 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
         batch_digests: batch_digests_2.clone(),
         parent_hash: consensus_output_1.consensus_header_hash(),
         number: 1,
-        extra: Default::default(),
         early_finalize: true,
-        close_epoch: false,
+        ..Default::default()
     };
     let consensus_output_2_hash = consensus_output_2.consensus_header_hash();
 
@@ -431,6 +419,7 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
         parent,
         shutdown.subscribe(),
         task_manager.get_spawner(),
+        GasAccumulator::default(),
     );
 
     // assert the canonical chain in-memory is empty
@@ -702,11 +691,8 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         batches: vec![batches_1],
         beneficiary: beneficiary_1,
         batch_digests: batch_digests_1.clone(),
-        parent_hash: ConsensusHeader::default().digest(),
-        number: 0,
-        extra: Default::default(),
         early_finalize: true,
-        close_epoch: false,
+        ..Default::default()
     };
 
     // create second output
@@ -737,9 +723,8 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         batch_digests: batch_digests_2.clone(),
         parent_hash: consensus_output_1.consensus_header_hash(),
         number: 1,
-        extra: Default::default(),
         early_finalize: true,
-        close_epoch: false,
+        ..Default::default()
     };
     let consensus_output_2_hash = consensus_output_2.consensus_header_hash();
 
@@ -763,6 +748,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         parent,
         shutdown.subscribe(),
         task_manager.get_spawner(),
+        GasAccumulator::default(),
     );
 
     // queue the first output - simulate already received from channel
@@ -1007,11 +993,8 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         batches: vec![batches_1],
         beneficiary: beneficiary_1,
         batch_digests: batch_digests_1,
-        parent_hash: ConsensusHeader::default().digest(),
-        number: 0,
-        extra: Default::default(),
         early_finalize: true,
-        close_epoch: false,
+        ..Default::default()
     };
     let consensus_output_1_hash = consensus_output_1.consensus_header_hash();
 
@@ -1041,9 +1024,8 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         batch_digests: batch_digests_2,
         parent_hash: consensus_output_1.consensus_header_hash(),
         number: 1,
-        extra: Default::default(),
         early_finalize: true,
-        close_epoch: false,
+        ..Default::default()
     };
 
     //=== Execution
@@ -1063,6 +1045,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         parent,
         shutdown.subscribe(),
         task_manager.get_spawner(),
+        GasAccumulator::default(),
     );
 
     // queue both output - simulate already received from channel

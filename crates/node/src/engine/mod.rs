@@ -20,6 +20,7 @@ use tn_reth::{
 };
 use tn_rpc::EngineToPrimary;
 use tn_types::{
+    gas_accumulator::{BaseFeeContainer, GasAccumulator},
     BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, SealedHeader, TaskSpawner,
     WorkerId, B256,
 };
@@ -67,9 +68,10 @@ impl ExecutionNode {
         &self,
         rx_output: mpsc::Receiver<ConsensusOutput>,
         rx_shutdown: Noticer,
+        gas_accumulator: GasAccumulator,
     ) -> eyre::Result<()> {
         let guard = self.internal.read().await;
-        guard.start_engine(rx_output, rx_shutdown).await
+        guard.start_engine(rx_output, rx_shutdown, gas_accumulator).await
     }
 
     /// Initialize the worker's transaction pool and public RPC.
@@ -102,15 +104,20 @@ impl ExecutionNode {
         worker_id: WorkerId,
         block_provider_sender: BatchSender,
         task_spawner: &TaskSpawner,
+        base_fee: BaseFeeContainer,
     ) -> eyre::Result<()> {
         let mut guard = self.internal.write().await;
-        guard.start_batch_builder(worker_id, block_provider_sender, task_spawner).await
+        guard.start_batch_builder(worker_id, block_provider_sender, task_spawner, base_fee).await
     }
 
     /// Batch validator
-    pub async fn new_batch_validator(&self, worker_id: &WorkerId) -> Arc<dyn BatchValidation> {
+    pub async fn new_batch_validator(
+        &self,
+        worker_id: &WorkerId,
+        base_fee: BaseFeeContainer,
+    ) -> Arc<dyn BatchValidation> {
         let guard = self.internal.read().await;
-        guard.new_batch_validator(worker_id)
+        guard.new_batch_validator(worker_id, base_fee)
     }
 
     /// Retrieve the last executed block from the database to restore consensus.

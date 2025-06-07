@@ -39,6 +39,8 @@ impl From<WorkerNetworkError> for Option<Penalty> {
                     BatchValidationError::RecoverTransaction(_, _) => Some(Penalty::Severe),
                     // fatal
                     BatchValidationError::EmptyBatch
+                    | BatchValidationError::InvalidBaseFee { .. }
+                    | BatchValidationError::InvalidWorkerId { .. }
                     | BatchValidationError::InvalidDigest
                     | BatchValidationError::TimestampIsInPast { .. }
                     | BatchValidationError::CalculateMaxPossibleGas

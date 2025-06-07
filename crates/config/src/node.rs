@@ -113,7 +113,7 @@ impl Config {
     pub fn update_worker_network_key(&mut self, value: NetworkPublicKey) -> eyre::Result<()> {
         self.node_info.primary_info.worker_network_key = value.clone();
         for worker in self.node_info.primary_info.worker_index.0.iter_mut() {
-            worker.1.name = value.clone();
+            worker.name = value.clone();
         }
         Ok(())
     }

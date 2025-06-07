@@ -7,7 +7,9 @@ use tn_reth::{
     payload::{BuildArguments, TNPayload},
     CanonicalInMemoryState, ExecutedBlockWithTrieUpdates, NewCanonicalChain, RethEnv,
 };
-use tn_types::{max_batch_gas, ConsensusOutput, Hash as _, SealedHeader, B256};
+use tn_types::{
+    gas_accumulator::GasAccumulator, max_batch_gas, ConsensusOutput, Hash as _, SealedHeader, B256,
+};
 use tracing::{debug, error};
 
 /// Set the latest sealed header that was signed by a quorum of validators as `finalized`.
@@ -45,8 +47,12 @@ fn finalize_signed_blocks(
 /// Execute output from consensus to extend the canonical chain.
 ///
 /// The function handles all types of output, included multiple blocks and empty blocks.
-pub fn execute_consensus_output(args: BuildArguments) -> EngineResult<SealedHeader> {
-    let BuildArguments { reth_env, mut output, parent_header } = args;
+pub fn execute_consensus_output(
+    args: BuildArguments,
+    gas_accumulator: GasAccumulator,
+) -> EngineResult<SealedHeader> {
+    // rename canonical header for clarity
+    let BuildArguments { reth_env, mut output, parent_header: mut canonical_header } = args;
     debug!(target: "engine", ?output, "executing output");
 
     // output digest returns the `ConsensusHeader` digest
@@ -60,8 +66,6 @@ pub fn execute_consensus_output(args: BuildArguments) -> EngineResult<SealedHead
         "uneven number of sealed blocks from batches and batch digests"
     );
 
-    // rename canonical header for clarity
-    let mut canonical_header = parent_header;
     // ensure at least 1 block for empty output with no batches
     let mut executed_blocks = Vec::with_capacity(batches.len().max(1));
     let canonical_in_memory_state = reth_env.canonical_in_memory_state();
@@ -128,6 +132,11 @@ pub fn execute_consensus_output(args: BuildArguments) -> EngineResult<SealedHead
                 &reth_env,
                 &canonical_in_memory_state,
             )?;
+            gas_accumulator.inc_block(
+                batch.worker_id,
+                canonical_header.gas_used,
+                canonical_header.gas_limit,
+            );
         }
     } // end block execution for round
 

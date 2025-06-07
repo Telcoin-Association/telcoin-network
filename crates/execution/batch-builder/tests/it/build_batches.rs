@@ -18,9 +18,9 @@ use tn_reth::{
 };
 use tn_storage::{open_db, tables::Batches};
 use tn_types::{
-    Address, Batch, BatchValidation, Bytes, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusOutput, Database, Encodable2718 as _, ReputationScores, SealedBatch, TaskManager,
-    U160, U256,
+    gas_accumulator::{BaseFeeContainer, GasAccumulator},
+    Address, Batch, BatchValidation, Bytes, Certificate, CommittedSubDag, ConsensusOutput,
+    Database, Encodable2718 as _, ReputationScores, SealedBatch, TaskManager, U160, U256,
 };
 use tn_worker::{
     metrics::WorkerMetrics, test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle,
@@ -80,6 +80,8 @@ async fn test_make_batch_el_to_cl() {
         address,
         Duration::from_secs(1),
         task_manager.get_spawner(),
+        0,
+        BaseFeeContainer::default(),
     );
 
     let gas_price = reth_env.get_gas_price().unwrap();
@@ -151,7 +153,8 @@ async fn test_make_batch_el_to_cl() {
     let sealed_batch = sealed_batch.unwrap();
 
     // ensure batch validator succeeds
-    let batch_validator = BatchValidator::new(reth_env.clone(), Some(txpool.clone()));
+    let batch_validator =
+        BatchValidator::new(reth_env.clone(), Some(txpool.clone()), 0, BaseFeeContainer::default());
 
     let valid_batch_result = batch_validator.validate_batch(sealed_batch.clone());
     assert!(valid_batch_result.is_ok());
@@ -222,6 +225,8 @@ async fn test_batch_builder_produces_valid_batchess() {
         address,
         Duration::from_secs(1),
         task_manager.get_spawner(),
+        0,
+        BaseFeeContainer::default(),
     );
 
     let gas_price = reth_env.get_gas_price().unwrap();
@@ -305,7 +310,8 @@ async fn test_batch_builder_produces_valid_batchess() {
     let _ = ack.send(Ok(()));
 
     // validate first batch
-    let batch_validator = BatchValidator::new(reth_env.clone(), Some(txpool.clone()));
+    let batch_validator =
+        BatchValidator::new(reth_env.clone(), Some(txpool.clone()), 0, BaseFeeContainer::default());
 
     let valid_batch_result = batch_validator.validate_batch(first_batch.clone());
     assert!(valid_batch_result.is_ok());
@@ -381,6 +387,8 @@ async fn test_canonical_notification_updates_pool() {
         address,
         Duration::from_secs(1),
         task_manager.get_spawner(),
+        0,
+        BaseFeeContainer::default(),
     );
 
     let gas_price = reth_env.get_gas_price().unwrap();
@@ -465,19 +473,17 @@ async fn test_canonical_notification_updates_pool() {
             None,
         )
         .into(),
-        batches: vec![vec![first_batch]],
         beneficiary: address,
-        batch_digests,
-        parent_hash: ConsensusHeader::default().digest(),
-        number: 0,
-        extra: Default::default(),
         early_finalize: true,
-        close_epoch: false,
+        batch_digests,
+        batches: vec![vec![first_batch]],
+        ..Default::default()
     };
 
     // execute output to trigger canonical update
     let args = BuildArguments::new(reth_env.clone(), output, chain.sealed_genesis_header());
-    let _final_header = execute_consensus_output(args).expect("output executed");
+    let _final_header =
+        execute_consensus_output(args, GasAccumulator::default()).expect("output executed");
 
     // sleep to ensure canonical update received before ack
     let _ = tokio::time::sleep(Duration::from_secs(1)).await;
@@ -500,7 +506,8 @@ async fn test_canonical_notification_updates_pool() {
     let _ = ack.send(Ok(()));
 
     // validate batch
-    let batch_validator = BatchValidator::new(reth_env.clone(), Some(txpool.clone()));
+    let batch_validator =
+        BatchValidator::new(reth_env.clone(), Some(txpool.clone()), 0, BaseFeeContainer::default());
 
     let valid_batch_result = batch_validator.validate_batch(first_batch.clone());
     assert!(valid_batch_result.is_ok());

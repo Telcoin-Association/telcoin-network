@@ -28,9 +28,9 @@ use tn_storage::open_db;
 use tn_test_utils::faucet_test_execution_node;
 
 use tn_types::{
-    adiri_genesis, error::BlockSealError, hex, public_key_to_address, sol, Address,
-    ConsensusHeader, GenesisAccount, SealedBatch, SolType, SolValue, TaskManager, TaskSpawner,
-    TransactionSigned, TransactionTrait as _, B256, U160, U256,
+    adiri_genesis, error::BlockSealError, gas_accumulator::BaseFeeContainer, hex,
+    public_key_to_address, sol, Address, ConsensusHeader, GenesisAccount, SealedBatch, SolType,
+    SolValue, TaskManager, TaskSpawner, TransactionSigned, TransactionTrait as _, B256, U160, U256,
 };
 use tn_worker::{
     metrics::WorkerMetrics,
@@ -308,7 +308,14 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
         .initialize_worker_components(worker_id, worker_network, EmptyEngToPrimary())
         .await?;
     let spawner = task_manager.get_spawner();
-    execution_node.start_batch_builder(worker_id, batch_provider.batches_tx(), &spawner).await?;
+    execution_node
+        .start_batch_builder(
+            worker_id,
+            batch_provider.batches_tx(),
+            &spawner,
+            BaseFeeContainer::default(),
+        )
+        .await?;
 
     // create client
     let client = execution_node.worker_http_client(&worker_id).await?.expect("worker rpc client");
@@ -638,7 +645,9 @@ async fn test_with_creds_faucet_transfers_stablecoin_with_google_kms() -> eyre::
             EmptyEngToPrimary(),
         )
         .await?;
-    execution_node.start_batch_builder(worker_id, to_worker, &spawner).await?;
+    execution_node
+        .start_batch_builder(worker_id, to_worker, &spawner, BaseFeeContainer::default())
+        .await?;
 
     let user_address = Address::random();
     let client = execution_node.worker_http_client(&worker_id).await?.expect("worker rpc client");

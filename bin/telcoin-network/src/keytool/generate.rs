@@ -80,7 +80,7 @@ impl KeygenArgs {
         let network_publickey = key_config.worker_network_public_key();
         validator_info.primary_info.worker_network_key = network_publickey.clone();
         for worker in validator_info.primary_info.worker_index.0.iter_mut() {
-            worker.1.name = network_publickey.clone();
+            worker.name = network_publickey.clone();
         }
         Ok(())
     }

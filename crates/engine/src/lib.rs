@@ -24,7 +24,9 @@ use std::{
     task::{Context, Poll},
 };
 use tn_reth::{payload::BuildArguments, RethEnv};
-use tn_types::{ConsensusOutput, Noticer, SealedHeader, TaskSpawner};
+use tn_types::{
+    gas_accumulator::GasAccumulator, ConsensusOutput, Noticer, SealedHeader, TaskSpawner,
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, trace, warn};
@@ -67,6 +69,8 @@ pub struct ExecutorEngine {
     rx_shutdown: Noticer,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
+    /// Accumulator for epoch gas usage.
+    gas_accumulator: GasAccumulator,
 }
 
 impl ExecutorEngine {
@@ -83,6 +87,7 @@ impl ExecutorEngine {
         parent_header: SealedHeader,
         rx_shutdown: Noticer,
         task_spawner: TaskSpawner,
+        gas_accumulator: GasAccumulator,
     ) -> Self {
         let consensus_output_stream = ReceiverStream::new(rx_consensus_output);
 
@@ -95,6 +100,7 @@ impl ExecutorEngine {
             parent_header,
             rx_shutdown,
             task_spawner,
+            gas_accumulator,
         }
     }
 
@@ -112,11 +118,12 @@ impl ExecutorEngine {
             let task_name = format!("execution-output-{}", output.consensus_header_hash());
             let build_args = BuildArguments::new(reth_env, output, parent);
 
+            let gas_accumulator = self.gas_accumulator.clone();
             // spawn blocking task and return future
             self.task_spawner.spawn_blocking_task(task_name, move || {
                 // this is safe to call on blocking thread without a semaphore bc it's held in
                 // Self::pending_tesk as a single `Option`
-                let result = execute_consensus_output(build_args).inspect_err(|e| {
+                let result = execute_consensus_output(build_args, gas_accumulator).inspect_err(|e| {
                     error!(target: "engine", ?e, "error executing consensus output");
                 });
                 if let Err(e) = tx.send(result) {

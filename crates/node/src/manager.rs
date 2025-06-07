@@ -11,12 +11,7 @@ use crate::{
 };
 use consensus_metrics::start_prometheus_server;
 use eyre::{eyre, OptionExt};
-use std::{
-    collections::{BTreeMap, HashMap},
-    str::FromStr as _,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, str::FromStr as _, sync::Arc, time::Duration};
 use tn_config::{
     Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs,
 };
@@ -35,9 +30,9 @@ use tn_reth::{
 };
 use tn_storage::{open_db, open_network_db, tables::ConsensusBlocks, DatabaseType};
 use tn_types::{
-    BatchValidation, BlsPublicKey, Committee, CommitteeBuilder, ConsensusHeader, ConsensusOutput,
-    Database as TNDatabase, Epoch, Multiaddr, Noticer, Notifier, TaskManager, TaskSpawner,
-    TimestampSec, WorkerCache, WorkerIndex, WorkerInfo,
+    gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, Committee, CommitteeBuilder,
+    ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, Multiaddr, Noticer, Notifier,
+    TaskManager, TaskSpawner, TimestampSec, WorkerCache, WorkerIndex, WorkerInfo,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::{
@@ -155,7 +150,12 @@ where
 
         // create the engine
         let engine = self.create_engine(&engine_task_manager, reth_db)?;
-        engine.start_engine(for_engine, self.node_shutdown.subscribe()).await?;
+        // Create our epoch gas accumulator, we currently have one worker.
+        // All nodes have to agree on the worker count, do not change this for an existing chain.
+        let gas_accumulator = GasAccumulator::new(1);
+        engine
+            .start_engine(for_engine, self.node_shutdown.subscribe(), gas_accumulator.clone())
+            .await?;
 
         // retrieve epoch information from canonical tip on startup
         let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
@@ -183,7 +183,7 @@ where
             }
 
             // loop through short-term epochs
-            epoch_result = self.run_epochs(&engine, consensus_db, network_config, to_engine) => epoch_result
+            epoch_result = self.run_epochs(&engine, consensus_db, network_config, to_engine, gas_accumulator) => epoch_result
         }
     }
 
@@ -299,6 +299,7 @@ where
         consensus_db: DatabaseType,
         network_config: NetworkConfig,
         to_engine: mpsc::Sender<ConsensusOutput>,
+        gas_accumulator: GasAccumulator,
     ) -> eyre::Result<()> {
         // The task manager that resets every epoch and manages
         // short-running tasks for the lifetime of the epoch.
@@ -317,6 +318,7 @@ where
                     &network_config,
                     &to_engine,
                     &mut initial_epoch,
+                    gas_accumulator.clone(),
                 )
                 .await;
 
@@ -339,6 +341,7 @@ where
     ///
     /// If it returns Ok(true) this indicates a mode change occurred and a restart
     /// is required.
+    #[allow(clippy::too_many_arguments)]
     async fn run_epoch(
         &mut self,
         engine: &ExecutionNode,
@@ -347,6 +350,7 @@ where
         network_config: &NetworkConfig,
         to_engine: &mpsc::Sender<ConsensusOutput>,
         initial_epoch: &mut bool,
+        gas_accumulator: GasAccumulator,
     ) -> eyre::Result<()> {
         info!(target: "epoch-manager", "Starting epoch");
 
@@ -371,6 +375,7 @@ where
                 epoch_task_manager,
                 network_config,
                 initial_epoch,
+                gas_accumulator.clone(),
             )
             .await?;
 
@@ -385,7 +390,12 @@ where
 
         let batch_builder_task_spawner = epoch_task_manager.get_spawner();
         engine
-            .start_batch_builder(worker.id(), worker.batches_tx(), &batch_builder_task_spawner)
+            .start_batch_builder(
+                worker.id(),
+                worker.batches_tx(),
+                &batch_builder_task_spawner,
+                gas_accumulator.base_fee(worker.id()),
+            )
             .await?;
 
         // update tasks
@@ -402,7 +412,7 @@ where
         // this can also happen due to committee nodes re-syncing and errors
         tokio::select! {
             // wait for epoch boundary to transition
-            res = self.wait_for_epoch_boundary(to_engine, engine, consensus_output, consensus_shutdown.clone()) => {
+            res = self.wait_for_epoch_boundary(to_engine, engine, consensus_output, consensus_shutdown.clone(), gas_accumulator) => {
                 res.inspect_err(|e| {
                     error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
                 })?;
@@ -435,6 +445,7 @@ where
         engine: &ExecutionNode,
         mut consensus_output: broadcast::Receiver<ConsensusOutput>,
         shutdown_consensus: Notifier,
+        gas_accumulator: GasAccumulator,
     ) -> eyre::Result<()> {
         // receive output from consensus and forward to engine
         'epoch: while let Ok(mut output) = consensus_output.recv().await {
@@ -451,6 +462,15 @@ where
 
                 // update output so engine closes epoch
                 output.close_epoch = true;
+
+                // Use accumulated gas information to set each workers base fee for the epoch.
+                for worker_id in 0..gas_accumulator.num_workers() {
+                    let worker_id = worker_id as u16;
+                    let (_blocks, _gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
+                    // Change this base fee to update base fee in batches workers create.
+                    let _base_fee = gas_accumulator.base_fee(worker_id);
+                }
+                gas_accumulator.clear(); // Clear the accumlated values for next epoch.
 
                 // obtain hash to monitor execution progress
                 let target_hash = output.consensus_header_hash();
@@ -508,6 +528,7 @@ where
         epoch_task_manager: &TaskManager,
         network_config: &NetworkConfig,
         initial_epoch: &mut bool,
+        gas_accumulator: GasAccumulator,
     ) -> eyre::Result<(PrimaryNode<DatabaseType>, WorkerNode<DatabaseType>)> {
         // create config for consensus
         let consensus_config =
@@ -531,6 +552,7 @@ where
                 epoch_task_manager.get_spawner(),
                 initial_epoch,
                 engine_to_primary,
+                gas_accumulator,
             )
             .await?;
 
@@ -688,15 +710,14 @@ where
             let mut worker_network_infos =
                 worker_handle.inner_handle().find_authorities(validators).await?;
 
-            // only one worker per authority for now
-            let worker_id = 0;
             // loop through the worker info returned from network query
             while let Some(info) = worker_network_infos.next().await {
                 let (protocol_key, NetworkInfo { pubkey, multiaddr, .. }) = info??;
-                let worker_index = WorkerIndex(BTreeMap::from([(
-                    worker_id,
-                    WorkerInfo { name: pubkey, worker_address: multiaddr.clone() },
-                )]));
+                // only one worker per authority for now
+                let worker_index = WorkerIndex(vec![WorkerInfo {
+                    name: pubkey,
+                    worker_address: multiaddr.clone(),
+                }]);
                 workers.push((protocol_key, worker_index));
             }
 
@@ -752,9 +773,11 @@ where
         epoch_task_spawner: TaskSpawner,
         initial_epoch: &bool,
         engine_to_primary: EngineToPrimaryRpc<DB>,
+        gas_accumulator: GasAccumulator,
     ) -> eyre::Result<WorkerNode<DB>> {
-        // only support one worker for now - otherwise, loop here
-        let (worker_id, _worker_info) = consensus_config.config().workers().first_worker()?;
+        // only support one worker for now (with id 0) - otherwise, loop here
+        let worker_id = 0;
+        let base_fee = gas_accumulator.base_fee(worker_id);
 
         // update the network handle's task spawner for reporting batches in the epoch
         {
@@ -769,7 +792,7 @@ where
             if *initial_epoch {
                 engine
                     .initialize_worker_components(
-                        *worker_id,
+                        worker_id,
                         network_handle.clone(),
                         engine_to_primary,
                     )
@@ -787,10 +810,10 @@ where
             .ok_or_eyre("worker network handle missing from epoch manager")?
             .clone();
 
-        let validator = engine.new_batch_validator(worker_id).await;
+        let validator = engine.new_batch_validator(&worker_id, base_fee).await;
         self.spawn_worker_network_for_epoch(
             consensus_config,
-            worker_id,
+            &worker_id,
             validator.clone(),
             epoch_task_spawner,
             &network_handle,
@@ -798,12 +821,8 @@ where
         )
         .await?;
 
-        let worker = WorkerNode::new(
-            *worker_id,
-            consensus_config.clone(),
-            network_handle.clone(),
-            validator,
-        );
+        let worker =
+            WorkerNode::new(worker_id, consensus_config.clone(), network_handle.clone(), validator);
 
         Ok(worker)
     }

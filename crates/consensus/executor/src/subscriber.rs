@@ -8,9 +8,8 @@ use state_sync::{
     stream_missing_consensus,
 };
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     sync::Arc,
-    vec,
 };
 use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, PrimaryToWorkerClient};
@@ -337,14 +336,11 @@ impl<DB: Database> Subscriber<DB> {
             debug!(target: "subscriber", "No blocks to fetch, payload is empty");
             return Ok(ConsensusOutput {
                 sub_dag: Arc::new(deliver),
-                batches: vec![],
                 beneficiary: address,
-                batch_digests: VecDeque::new(),
                 parent_hash,
                 number,
-                extra: B256::default(),
                 early_finalize,
-                close_epoch: false, // epoch manager will update
+                ..Default::default()
             });
         }
 
@@ -353,12 +349,10 @@ impl<DB: Database> Subscriber<DB> {
             sub_dag: sub_dag.clone(),
             batches: Vec::with_capacity(num_certs),
             beneficiary: address,
-            batch_digests: VecDeque::new(),
             parent_hash,
             number,
-            extra: B256::default(),
             early_finalize,
-            close_epoch: false, // epoch manager will update
+            ..Default::default()
         };
 
         let mut batch_set: HashSet<BlockHash> = HashSet::new();
@@ -474,7 +468,10 @@ impl<DB: Database> Subscriber<DB> {
 mod tests {
     use super::*;
     use indexmap::IndexMap;
-    use std::{collections::BTreeSet, ops::RangeInclusive};
+    use std::{
+        collections::{BTreeSet, VecDeque},
+        ops::RangeInclusive,
+    };
     use tn_network_libp2p::types::{MessageId, NetworkCommand};
     use tn_network_types::MockPrimaryToWorkerClient;
     use tn_primary::consensus::{Bullshark, Consensus, LeaderSchedule};

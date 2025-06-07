@@ -33,8 +33,8 @@ use std::{
 };
 use tn_reth::{CanonStateNotificationStream, RethEnv, TxPool as _, WorkerTxPool};
 use tn_types::{
-    error::BlockSealError, Address, BatchBuilderArgs, BatchSender, PendingBatchConfig, SealedBlock,
-    TaskSpawner, TxHash,
+    error::BlockSealError, gas_accumulator::BaseFeeContainer, Address, BatchBuilderArgs,
+    BatchSender, PendingBatchConfig, SealedBlock, TaskSpawner, TxHash, WorkerId,
 };
 use tokio::{sync::oneshot, time::Interval};
 use tracing::{debug, error, warn};
@@ -83,10 +83,15 @@ pub struct BatchBuilder {
     last_canonical_update: SealedBlock,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
+    /// Worker id this batch builder belongs too.
+    worker_id: WorkerId,
+    /// The current base fee for this worker.
+    base_fee: BaseFeeContainer,
 }
 
 impl BatchBuilder {
     /// Create a new instance of [Self].
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         reth_env: &RethEnv,
         pool: WorkerTxPool,
@@ -94,6 +99,8 @@ impl BatchBuilder {
         address: Address,
         max_delay: Duration,
         task_spawner: TaskSpawner,
+        worker_id: WorkerId,
+        base_fee: BaseFeeContainer,
     ) -> Self {
         let max_delay_interval = tokio::time::interval(max_delay);
         let state_changed = reth_env.canonical_block_stream();
@@ -107,6 +114,8 @@ impl BatchBuilder {
             state_changed,
             last_canonical_update,
             task_spawner,
+            worker_id,
+            base_fee,
         }
     }
 
@@ -130,6 +139,8 @@ impl BatchBuilder {
         let config = PendingBatchConfig::new(self.address, self.last_canonical_update.clone());
         let build_args = BatchBuilderArgs::new(pool.clone(), config);
         let (result, done) = oneshot::channel();
+        let worker_id = self.worker_id;
+        let base_fee = self.base_fee.base_fee();
 
         // spawn block building task and forward to worker
         self.task_spawner.spawn_task("next-batch", async move {
@@ -137,7 +148,7 @@ impl BatchBuilder {
             let (ack, rx) = oneshot::channel();
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
-            let BatchBuilderOutput { batch, mined_transactions } = build_batch(build_args);
+            let BatchBuilderOutput { batch, mined_transactions } = build_batch(build_args, worker_id, base_fee);
 
             // forward to worker and wait for ack that quorum was reached
             if let Err(e) = to_worker.send((batch.seal_slow(), ack)).await {
@@ -326,7 +337,7 @@ mod tests {
     };
     use tn_storage::{open_db, tables::Batches};
     use tn_types::{
-        adiri_genesis, Bytes, CommittedSubDag, ConsensusHeader, ConsensusOutput, Database,
+        adiri_genesis, gas_accumulator::GasAccumulator, Bytes, ConsensusOutput, Database,
         GenesisAccount, TaskManager, U160, U256,
     };
     use tn_worker::{
@@ -386,6 +397,8 @@ mod tests {
             address,
             Duration::from_secs(1),
             task_manager.get_spawner(),
+            0,
+            BaseFeeContainer::default(),
         );
 
         let gas_price = reth_env.get_gas_price().unwrap();
@@ -537,6 +550,8 @@ mod tests {
             address,
             Duration::from_millis(1),
             task_manager.get_spawner(),
+            0,
+            BaseFeeContainer::default(),
         );
 
         // expected to be 7 wei for first block
@@ -628,26 +643,14 @@ mod tests {
 
             // canonical update to wake up task
             let output = ConsensusOutput {
-                sub_dag: CommittedSubDag::new(
-                    vec![Default::default()],
-                    Default::default(),
-                    subdag_index as u64,
-                    Default::default(),
-                    None,
-                )
-                .into(),
-                batches: vec![vec![]],
                 beneficiary: address,
-                batch_digests: Default::default(),
-                parent_hash: ConsensusHeader::default().digest(),
-                number: 0,
-                extra: Default::default(),
                 early_finalize: true,
-                close_epoch: false,
+                ..Default::default()
             };
             // execute output to trigger canonical update
             let args = BuildArguments::new(reth_env.clone(), output, parent);
-            let final_header = execute_consensus_output(args).expect("output executed");
+            let final_header =
+                execute_consensus_output(args, GasAccumulator::default()).expect("output executed");
 
             // update values for next loop
             parent = final_header;
@@ -698,6 +701,8 @@ mod tests {
             address,
             Duration::from_secs(1),
             task_manager.get_spawner(),
+            0,
+            BaseFeeContainer::default(),
         );
 
         // expected to be 7 wei for first block

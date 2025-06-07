@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use thiserror::Error;
 
+use super::WorkerId;
+
 /// The batch for workers to communicate for consensus.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct SealedBatch {
@@ -77,6 +79,11 @@ pub struct Batch {
     /// above the gas target, and decreasing when batchs are below the gas target. The base fee per
     /// gas is burned.
     pub base_fee_per_gas: Option<u64>,
+    /// The worker id for the worker that orginated this batch.
+    /// Worker ids will be consistent accross validators (i.e. worker 0 talks to othere worker 0s,
+    /// etc). We can use this for tracking to support base fee calculations.
+    /// Note: worker id 0 is the default.
+    pub worker_id: WorkerId,
     /// Timestamp of when the entity was received by another node. This will help
     /// calculate latencies that are not affected by clock drift or network
     /// delays. This field is not set for own batchs.
@@ -89,13 +96,18 @@ impl Batch {
     /// Create a new batch for testing only!
     ///
     /// This is NOT a valid batch for consensus.
-    pub fn new_for_test(transactions: Vec<Vec<u8>>, header: ExecHeader) -> Self {
+    pub fn new_for_test(
+        transactions: Vec<Vec<u8>>,
+        header: ExecHeader,
+        worker_id: WorkerId,
+    ) -> Self {
         Self {
             transactions,
             parent_hash: header.parent_hash,
             beneficiary: header.beneficiary,
             timestamp: header.timestamp,
             base_fee_per_gas: header.base_fee_per_gas,
+            worker_id,
             received_at: None,
         }
     }
@@ -167,6 +179,7 @@ impl Default for Batch {
             parent_hash: adiri_chain_spec().genesis_hash(),
             beneficiary: Address::ZERO,
             timestamp: now(),
+            worker_id: 0,
             base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
         }
     }
@@ -251,4 +264,10 @@ pub enum BatchValidationError {
     /// If any transaction fails to decode, the entire batch validation fails.
     #[error("Failed to decode transaction for batch {0}: {1}")]
     RecoverTransaction(BlockHash, String),
+    /// Error, invalid base fee set.
+    #[error("Invalid base fee, expected {expected_base_fee} got {base_fee}")]
+    InvalidBaseFee { expected_base_fee: u64, base_fee: u64 },
+    /// Error, wrong worker id.
+    #[error("Invalid worker id, expected {expected_worker_id} got {worker_id}")]
+    InvalidWorkerId { expected_worker_id: WorkerId, worker_id: WorkerId },
 }

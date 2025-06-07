@@ -52,7 +52,7 @@ pub fn fixture_payload_with_rand<R: Rng + ?Sized>(
     let mut payload: IndexMap<BlockHash, (WorkerId, TimestampSec)> = IndexMap::new();
 
     for _ in 0..number_of_batches {
-        let batch_digest = batch_with_rand(rand).digest();
+        let batch_digest = batch_with_rand(rand, 0).digest();
 
         payload.insert(batch_digest, (0, 0));
     }
@@ -79,10 +79,11 @@ pub fn transaction_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Vec<u8> {
     )
 }
 
-pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Batch {
+pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R, worker_id: WorkerId) -> Batch {
     Batch::new_for_test(
         vec![transaction_with_rand(rand), transaction_with_rand(rand)],
         ExecHeader::default(),
+        worker_id,
     )
 }
 

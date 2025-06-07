@@ -17,6 +17,7 @@ use tn_types::{
 /// Attempt to update batch with accurate header information.
 ///
 /// NOTE: this is loosely based on reth's auto-seal consensus
+/// NOTE2: this assumes worker 0.
 pub fn execute_test_batch(test_batch: &mut Batch, parent: &SealedHeader) {
     let pool = TestPool::new(&test_batch.transactions);
 
@@ -24,7 +25,7 @@ pub fn execute_test_batch(test_batch: &mut Batch, parent: &SealedHeader) {
 
     let batch_config = PendingBatchConfig::new(test_batch.beneficiary, parent_info);
     let args = BatchBuilderArgs { pool, batch_config };
-    let BatchBuilderOutput { batch, .. } = build_batch(args);
+    let BatchBuilderOutput { batch, .. } = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
     test_batch.parent_hash = batch.parent_hash;
     test_batch.beneficiary = batch.beneficiary;
     test_batch.timestamp = batch.timestamp;

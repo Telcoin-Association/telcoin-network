@@ -7,6 +7,7 @@ mod codec;
 mod committee;
 mod crypto;
 pub mod database_traits;
+pub mod gas_accumulator;
 mod genesis;
 mod helpers;
 mod notifier;

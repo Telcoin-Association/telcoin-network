@@ -329,7 +329,6 @@ mod tests {
     use super::NetworkGenesis;
     use crate::NodeInfo;
     use rand::{rngs::StdRng, SeedableRng};
-    use std::collections::BTreeMap;
     use tn_types::{
         generate_proof_of_possession_bls, Address, BlsKeypair, Multiaddr, NetworkKeypair,
         NodeP2pInfo, WorkerIndex, WorkerInfo,
@@ -347,7 +346,7 @@ mod tests {
                 generate_proof_of_possession_bls(&bls_keypair, &address).unwrap();
             let primary_network_address = Multiaddr::empty();
             let worker_info = WorkerInfo::default();
-            let worker_index = WorkerIndex(BTreeMap::from([(0, worker_info)]));
+            let worker_index = WorkerIndex(vec![worker_info]);
             let primary_info = NodeP2pInfo::new(
                 network_keypair.public().clone().into(),
                 primary_network_address,
@@ -386,7 +385,7 @@ mod tests {
                 generate_proof_of_possession_bls(&bls_keypair, &wrong_address).unwrap();
             let primary_network_address = Multiaddr::empty();
             let worker_info = WorkerInfo::default();
-            let worker_index = WorkerIndex(BTreeMap::from([(0, worker_info)]));
+            let worker_index = WorkerIndex(vec![worker_info]);
             let primary_info = NodeP2pInfo::new(
                 network_keypair.public().clone().into(),
                 primary_network_address,

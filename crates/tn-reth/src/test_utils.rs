@@ -17,9 +17,9 @@ use tn_types::{
     adiri_chain_spec_arc, adiri_genesis, calculate_transaction_root, keccak256, now, AccessList,
     Address, Batch, Block, BlockBody, Bytes, Encodable2718, EthSignature, ExecHeader,
     ExecutionKeypair, Genesis, GenesisAccount, RecoveredBlock, SealedHeader, TaskManager,
-    Transaction, TransactionSigned, TxEip1559, TxHash, TxKind, B256, EMPTY_OMMER_ROOT_HASH,
-    EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE,
-    U256,
+    Transaction, TransactionSigned, TxEip1559, TxHash, TxKind, WorkerId, B256,
+    EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT_30M,
+    MIN_PROTOCOL_BASE_FEE, U256,
 };
 
 // methods for tests
@@ -364,21 +364,21 @@ pub fn batches(num_of_batches: usize) -> Vec<Batch> {
     let mut batches = Vec::new();
 
     for i in 1..num_of_batches + 1 {
-        batches.push(batch_with_transactions(i));
+        batches.push(batch_with_transactions(i, 0));
     }
 
     batches
 }
 
 /// Create a batch with the specified number of transactions.
-pub fn batch_with_transactions(num_of_transactions: usize) -> Batch {
+pub fn batch_with_transactions(num_of_transactions: usize, worker_id: WorkerId) -> Batch {
     let mut transactions = Vec::new();
 
     for _ in 0..num_of_transactions {
         transactions.push(transaction());
     }
 
-    Batch::new_for_test(transactions, ExecHeader::default())
+    Batch::new_for_test(transactions, ExecHeader::default(), worker_id)
 }
 
 /// Adiri genesis with funded [TransactionFactory] default account.

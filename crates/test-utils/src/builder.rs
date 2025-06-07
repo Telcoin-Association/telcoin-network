@@ -177,9 +177,8 @@ where
                 committee_info
                     .iter()
                     .map(|(primary_keypair, _key_config, _authority, worker, _network_config)| {
-                        let mut worker_index = BTreeMap::new();
-                        worker_index.insert(0, worker.info().clone());
-                        (*primary_keypair.public(), WorkerIndex(worker_index.clone()))
+                        let worker_index = vec![worker.info().clone()];
+                        (*primary_keypair.public(), WorkerIndex(worker_index))
                     })
                     .collect(),
             ),

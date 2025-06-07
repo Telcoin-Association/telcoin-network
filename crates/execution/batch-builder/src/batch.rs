@@ -9,7 +9,7 @@
 use tn_reth::TxPool;
 use tn_types::{
     max_batch_gas, max_batch_size, now, Batch, BatchBuilderArgs, Encodable2718 as _,
-    PendingBatchConfig, TransactionTrait as _, TxHash,
+    PendingBatchConfig, TransactionTrait as _, TxHash, WorkerId,
 };
 use tracing::{debug, warn};
 
@@ -43,11 +43,15 @@ pub struct BatchBuilderOutput {
 /// with very high gas limits. It's impossible to know the amount of gas a transaction
 /// will use without executing it, and the worker does not execute transactions.
 #[inline]
-pub fn build_batch<P: TxPool>(args: BatchBuilderArgs<P>) -> BatchBuilderOutput {
+pub fn build_batch<P: TxPool>(
+    args: BatchBuilderArgs<P>,
+    worker_id: WorkerId,
+    base_fee: u64,
+) -> BatchBuilderOutput {
     let BatchBuilderArgs { pool, batch_config } = args;
     let gas_limit = max_batch_gas(batch_config.parent_info.timestamp);
     let max_size = max_batch_size(batch_config.parent_info.timestamp);
-    let base_fee_per_gas = batch_config.parent_info.base_fee_per_gas;
+    let base_fee_per_gas = Some(base_fee);
     let PendingBatchConfig { beneficiary, parent_info } = batch_config;
 
     // NOTE: this obtains a `read` lock on the tx pool
@@ -123,6 +127,7 @@ pub fn build_batch<P: TxPool>(args: BatchBuilderArgs<P>) -> BatchBuilderOutput {
         beneficiary,
         timestamp,
         base_fee_per_gas,
+        worker_id,
         received_at: None,
     };
 

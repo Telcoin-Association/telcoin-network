@@ -5708,12 +5708,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "match_opt"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "405ba1524a1e6ae755334d6966380c60ec40157e0155f9032dd3c294b6384da9"
-
-[[package]]
 name = "matchers"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12025,7 +12019,6 @@ dependencies = [
  "hex",
  "indexmap 2.9.0",
  "libp2p",
- "match_opt",
  "once_cell",
  "parking_lot",
  "rand 0.9.1",
