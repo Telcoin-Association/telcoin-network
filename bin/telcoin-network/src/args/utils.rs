@@ -1,10 +1,10 @@
 //! Utilities for parsing args
 
-use alloy::primitives::aliases::U232;
 use eyre::OptionExt;
 use std::str::FromStr;
 use tn_reth::{dirs::DataDirPath, MaybePlatformPath};
 use tn_types::Address;
+use tn_types::U256;
 
 pub use tn_reth::clap_genesis_parser;
 
@@ -27,11 +27,11 @@ pub fn clap_address_parser(value: &str) -> eyre::Result<Address> {
     Ok(address)
 }
 
-/// Parse 18 decimal U232 from string for ConsensusRegistry.
-pub fn clap_u232_parser(value: &str) -> eyre::Result<U232> {
-    let parsed_val = U232::from_str_radix(value, 10)?
-        .checked_mul(U232::from(10).checked_pow(U232::from(18)).expect("1e18 exponentiation"))
-        .ok_or_eyre("U232 parsing")?;
+/// Parse 18 decimal U256 from string for ConsensusRegistry.
+pub fn clap_u256_parser_to_18_decimals(value: &str) -> eyre::Result<U256> {
+    let parsed_val = U256::from_str_radix(value, 10)?
+        .checked_mul(U256::from(10).checked_pow(U256::from(18)).expect("1e18 exponentiation"))
+        .ok_or_eyre("U256 parsing")?;
 
     Ok(parsed_val)
 }
