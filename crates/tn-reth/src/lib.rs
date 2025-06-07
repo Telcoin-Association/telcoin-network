@@ -24,7 +24,7 @@ use crate::{
 use alloy::{
     consensus::Transaction as _,
     hex,
-    primitives::{address, aliases::U232, Bytes, ChainId},
+    primitives::{address, Bytes, ChainId},
     sol_types::{SolCall, SolConstructor},
 };
 use alloy_evm::Evm;
@@ -952,7 +952,7 @@ impl RethEnv {
 
         let total_stake_balance = initial_stake_config
             .stakeAmount
-            .checked_mul(U232::from(validators.len()))
+            .checked_mul(U256::from(validators.len()))
             .ok_or_eyre("Failed to calculate total stake for consensus registry at genesis")?;
 
         let tmp_chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
@@ -1084,22 +1084,9 @@ impl RethEnv {
             .header_by_number(epoch_info.blockHeight.saturating_sub(1))?
             .ok_or_eyre("failed to retrieve closing epoch information")?
             .timestamp;
-        let token_ids = epoch_info
-            .committee
-            .iter()
-            .map(|address| {
-                // obtain the validator's token id
-                self.get_validator_token_id(*address, &mut tn_evm)
-            })
-            .collect::<eyre::Result<Vec<_>, _>>()?;
-        let validators = token_ids
-            .into_iter()
-            .map(|token_id| {
-                // read validator info
-                self.get_validator_by_token_id(token_id, &mut tn_evm)
-            })
-            .collect::<eyre::Result<Vec<_>, _>>()?;
 
+        // retrieve the committee
+        let validators = self.get_committee_validators_by_epoch(epoch, &mut tn_evm)?;
         let epoch_state = EpochState { epoch, epoch_info, validators, epoch_start };
         debug!(target: "engine", ?epoch_state, "returning epoch state from canonical tip");
 
@@ -1124,34 +1111,17 @@ impl RethEnv {
         self.call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(evm, calldata)
     }
 
-    /// Read the a validator's token id from the [ConsensusRegistry] on-chain.
-    pub fn get_validator_token_id<DB>(
+    /// Retrieve all `ValidatorInfo` in the committee for the provided epoch.
+    pub fn get_committee_validators_by_epoch<DB>(
         &self,
-        address: Address,
+        epoch: Epoch,
         evm: &mut TNEvm<DB>,
-    ) -> eyre::Result<U256>
+    ) -> eyre::Result<Vec<ConsensusRegistry::ValidatorInfo>>
     where
         DB: alloy_evm::Database,
     {
-        let calldata = ConsensusRegistry::getValidatorTokenIdCall { validatorAddress: address }
-            .abi_encode()
-            .into();
-        self.call_consensus_registry::<_, U256>(evm, calldata)
-    }
-
-    /// Retrieve the [ValidatorInfo] from the [ConsensusRegistry] on-chain using a validator's token
-    /// id.
-    pub fn get_validator_by_token_id<DB>(
-        &self,
-        token_id: U256,
-        evm: &mut TNEvm<DB>,
-    ) -> eyre::Result<ConsensusRegistry::ValidatorInfo>
-    where
-        DB: alloy_evm::Database,
-    {
-        let calldata =
-            ConsensusRegistry::getValidatorByTokenIdCall { tokenId: token_id }.abi_encode().into();
-        self.call_consensus_registry::<_, ConsensusRegistry::ValidatorInfo>(evm, calldata)
+        let calldata = ConsensusRegistry::getCommitteeValidatorsCall { epoch }.abi_encode().into();
+        self.call_consensus_registry::<_, Vec<ConsensusRegistry::ValidatorInfo>>(evm, calldata)
     }
 
     /// Helper function to call `ConsensusRegistry` state on-chain.
@@ -1288,10 +1258,10 @@ mod tests {
 
         let epoch_duration = 60 * 60 * 24; // 24hrs
         let initial_stake_config = ConsensusRegistry::StakeConfig {
-            stakeAmount: U232::from(parse_ether("1_000_000").unwrap()),
-            minWithdrawAmount: U232::from(parse_ether("1_000").unwrap()),
-            epochIssuance: U232::from(parse_ether("20_000_000").unwrap())
-                .checked_div(U232::from(28))
+            stakeAmount: U256::from(parse_ether("1_000_000").unwrap()),
+            minWithdrawAmount: U256::from(parse_ether("1_000").unwrap()),
+            epochIssuance: U256::from(parse_ether("20_000_000").unwrap())
+                .checked_div(U256::from(28))
                 .expect("u256 div checked"),
             epochDuration: epoch_duration,
         };
@@ -1300,7 +1270,7 @@ mod tests {
         let genesis = RethEnv::create_consensus_registry_genesis_account(
             validators.clone(),
             adiri_genesis(),
-            initial_stake_config,
+            initial_stake_config.clone(),
             owner,
         )?;
 
@@ -1316,6 +1286,8 @@ mod tests {
             committee: expected_committee,
             blockHeight: 0,
             epochDuration: epoch_duration,
+            epochIssuance: initial_stake_config.epochIssuance,
+            stakeVersion: 0,
         };
 
         // assert epoch state is correct
@@ -1387,6 +1359,9 @@ mod tests {
             blockHeight: 0,
             // epoch duration set at the start
             epochDuration: Default::default(),
+            // values should remain the same
+            epochIssuance: initial_stake_config.epochIssuance,
+            stakeVersion: 0,
         };
 
         debug!(target: "engine", "new epoch info:{:#?}", new_epoch_info);

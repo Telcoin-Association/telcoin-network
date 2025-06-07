@@ -186,9 +186,17 @@ async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
         consensus_registry.getCurrentEpochInfo().call().await.expect("get current epoch result");
 
     debug!(target: "bundle", "consensus_registry: {:#?}", current_epoch_info);
-    let ConsensusRegistry::EpochInfo { committee, blockHeight, epochDuration } = current_epoch_info;
+    let ConsensusRegistry::EpochInfo {
+        committee,
+        blockHeight,
+        epochDuration,
+        epochIssuance,
+        stakeVersion,
+    } = current_epoch_info;
     assert_eq!(blockHeight, 0);
     assert_eq!(epochDuration, 86400);
+    assert_eq!(epochIssuance, U256::ZERO);
+    assert_eq!(stakeVersion, 0);
 
     let validators = consensus_registry
         .getValidators(ConsensusRegistry::ValidatorStatus::Active.into())

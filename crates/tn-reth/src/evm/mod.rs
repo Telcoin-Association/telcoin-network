@@ -282,3 +282,8 @@ where
         res
     }
 }
+
+// TODO: tests
+// - epoch close receipt is present
+// - basefees go to address
+// - block reward is sent to beneficiary
