@@ -164,7 +164,6 @@ impl RequestBatchesNetwork for WorkerNetworkHandle {
 mod tests {
     use super::*;
     use crate::{WorkerRequest, WorkerResponse};
-    use itertools::Itertools as _;
     use rand::{rngs::StdRng, RngCore};
     use tempfile::TempDir;
     use tn_network_libp2p::{
@@ -420,7 +419,7 @@ mod tests {
                             let digests_chunks = digests
                                 .chunks(MAX_READ_BLOCK_DIGESTS)
                                 .map(|chunk| chunk.to_vec())
-                                .collect_vec();
+                                .collect::<Vec<_>>();
                             for digests_chunk in digests_chunks {
                                 for digest in digests_chunk {
                                     if let Some(batch) =

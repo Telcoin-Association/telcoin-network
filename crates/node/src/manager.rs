@@ -465,7 +465,7 @@ where
                 // wait for execution result before proceeding
                 while let Some(output) = executed_output.next().await {
                     // ensure canonical tip is updated with closing epoch info
-                    if output.tip().block.parent_beacon_block_root == Some(target_hash) {
+                    if output.tip().sealed_header().parent_beacon_block_root == Some(target_hash) {
                         // return
                         break 'epoch;
                     }
@@ -1056,7 +1056,7 @@ where
                     }
                     latest = engine_state.next() => {
                         if let Some(latest) = latest {
-                            consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(latest.tip().block.header.clone()));
+                            consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(latest.tip().clone_sealed_header()));
                         } else {
                             break;
                         }

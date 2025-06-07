@@ -16,7 +16,6 @@ futures = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 tracing = { workspace = true }
-itertools = { workspace = true }
 
 tn-storage = { workspace = true }
 tn-network-types = { workspace = true }

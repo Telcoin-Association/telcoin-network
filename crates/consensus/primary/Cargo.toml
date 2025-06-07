@@ -45,7 +45,6 @@ tempfile = { workspace = true, optional = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 futures = { workspace = true }
-itertools = { workspace = true }
 proptest = { workspace = true }
 tracing = { workspace = true }
 tn-storage = { workspace = true }

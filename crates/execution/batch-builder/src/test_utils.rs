@@ -6,11 +6,11 @@ use std::{
     sync::Arc,
 };
 use tn_reth::{
-    new_pool_txn, BestTransactions, EthPooledTransaction, InvalidPoolTransactionError, PoolTxn,
-    PoolTxnId, SenderIdentifiers, TxPool,
+    new_pool_txn, BestTransactions, InvalidPoolTransactionError, PoolTxn, PoolTxnId,
+    SenderIdentifiers, TxPool,
 };
 use tn_types::{
-    Batch, BatchBuilderArgs, BlockBody, PendingBatchConfig, RecoveredTx, SealedBlock, SealedHeader,
+    Batch, BatchBuilderArgs, BlockBody, PendingBatchConfig, Recovered, SealedBlock, SealedHeader,
     TransactionTrait as _, TxHash, MIN_PROTOCOL_BASE_FEE,
 };
 
@@ -20,7 +20,7 @@ use tn_types::{
 pub fn execute_test_batch(test_batch: &mut Batch, parent: &SealedHeader) {
     let pool = TestPool::new(&test_batch.transactions);
 
-    let parent_info = SealedBlock::new(parent.clone(), BlockBody::default());
+    let parent_info = SealedBlock::from_sealed_parts(parent.clone(), BlockBody::default());
 
     let batch_config = PendingBatchConfig::new(test_batch.beneficiary, parent_info);
     let args = BatchBuilderArgs { pool, batch_config };
@@ -55,13 +55,14 @@ impl TestPool {
         let transactions = txs
             .iter()
             .map(|tx| {
-                let ecrecovered: RecoveredTx<_> =
+                let ecrecovered: Recovered<_> =
                     tn_reth::recover_raw_transaction(tx).expect("tx into ecrecovered");
                 let nonce = ecrecovered.nonce();
                 // add to sender ids
                 let id = sender_ids.sender_id_or_create(ecrecovered.signer());
-                let transaction = EthPooledTransaction::try_from(ecrecovered)
-                    .expect("ecrecovered into pooled tx");
+                let transaction =
+                    tn_reth::recover_pooled_transaction(tx).expect("pooled tx from recovered");
+
                 let transaction_id = PoolTxnId::new(id, nonce);
 
                 let valid_tx = Arc::new(new_pool_txn(transaction, transaction_id));
@@ -155,7 +156,7 @@ impl Iterator for BestTestTransactions {
             let hash = best.transaction.transaction().hash();
 
             // skip transactions that were marked as invalid
-            if self.invalid.contains(&hash) {
+            if self.invalid.contains(hash) {
                 tracing::debug!(
                     target: "test-txpool",
                     "[{:?}] skipping invalid transaction",

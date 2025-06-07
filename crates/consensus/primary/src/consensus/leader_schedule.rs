@@ -2,7 +2,7 @@
 
 use super::Dag;
 use parking_lot::RwLock;
-use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
+use rand::{rngs::StdRng, seq::IndexedRandom as _, SeedableRng};
 use std::{
     collections::HashMap,
     fmt::{Debug, Formatter},

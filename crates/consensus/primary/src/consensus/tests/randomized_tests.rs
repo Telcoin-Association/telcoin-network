@@ -6,10 +6,10 @@ use crate::{
 };
 use futures::{stream::FuturesUnordered, StreamExt};
 use rand::{
-    distributions::{Bernoulli, Distribution},
+    distr::{Bernoulli, Distribution as _},
     prelude::SliceRandom,
     rngs::StdRng,
-    Rng, SeedableRng,
+    Rng, SeedableRng as _,
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
@@ -159,7 +159,8 @@ async fn bullshark_randomised_tests() {
 
     // Create a single store to be re-used across Bullshark instances to avoid hitting
     // a "too many files open" issue.
-    let store = open_db(temp_dir());
+    let db = temp_dir();
+    let store = open_db(db.path());
 
     // Run the actual tests via separate tasks
     loop {
@@ -259,12 +260,10 @@ fn generate_randomised_dag(
     seed: u64,
     modes: FailureModes,
 ) -> (VecDeque<Certificate>, Committee) {
-    // Create an RNG to share for the committee creation
-    let rand = StdRng::seed_from_u64(seed);
-
+    // use an RNG to share for deterministic committee creation
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .committee_size(NonZeroUsize::new(committee_size).unwrap())
-        .rng(rand)
+        .with_rng(StdRng::seed_from_u64(seed))
         .build();
     let committee: Committee = fixture.committee();
     let genesis = Certificate::genesis(&committee);
@@ -288,7 +287,8 @@ pub fn make_certificates_with_parameters(
     initial_parents: Vec<Certificate>,
     modes: FailureModes,
 ) -> (VecDeque<Certificate>, Vec<Certificate>) {
-    let mut rand = StdRng::seed_from_u64(seed);
+    // secp256k1 uses older version of rand
+    let mut rand = rand::rngs::StdRng::seed_from_u64(seed);
 
     // Pick the slow nodes - ensure we don't have more than 33% of slow nodes
     assert!(modes.slow_nodes_percentage <= 0.33, "Slow nodes can't be more than 33% of total nodes - otherwise we'll basically simulate a consensus stall");
@@ -381,7 +381,7 @@ pub fn make_certificates_with_parameters(
             // Now from the rest of current_parents, pick a random number - uniform - to how many
             // should create references to. It should strictly be between [2f+1..3f+1].
             let num_of_parents_to_pick =
-                rand.gen_range(committee.quorum_threshold()..=committee.total_voting_power());
+                rand.random_range(committee.quorum_threshold()..=committee.total_voting_power());
 
             // shuffle the parents
             parent_digests.shuffle(&mut rand);
@@ -544,7 +544,7 @@ fn create_execution_plan(
     seed: u64,
 ) -> ExecutionPlan {
     // Initialise the source of randomness
-    let mut rand = StdRng::seed_from_u64(seed);
+    let mut rand = rand::rngs::StdRng::seed_from_u64(seed);
 
     // Create a map of digest -> certificate
     let digest_to_certificate: HashMap<CertificateDigest, Certificate> =
@@ -579,7 +579,7 @@ fn create_execution_plan(
 
     while !nodes_without_dependencies.is_empty() {
         // randomize the pick from nodes_without_dependencies to get a different result
-        let index = rand.gen_range(0..nodes_without_dependencies.len());
+        let index = rand.random_range(0..nodes_without_dependencies.len());
 
         let node = nodes_without_dependencies.remove(index);
         sorted.push(node);

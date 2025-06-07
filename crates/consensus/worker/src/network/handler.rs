@@ -3,7 +3,6 @@ use super::{
     message::WorkerGossip,
     WorkerNetworkHandle,
 };
-use itertools::Itertools;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::GossipMessage;
@@ -132,7 +131,7 @@ where
         let digests_chunks = batch_digests
             .chunks(BATCH_DIGESTS_READ_CHUNK_SIZE)
             .map(|chunk| chunk.to_vec())
-            .collect_vec();
+            .collect::<Vec<_>>();
         let mut batches = Vec::new();
         let mut total_size = 0;
 

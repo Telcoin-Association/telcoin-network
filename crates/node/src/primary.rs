@@ -13,7 +13,6 @@ use tn_types::{
     Database as ConsensusDatabase, Notifier, TaskManager, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::sync::RwLock;
-use tracing::instrument;
 
 #[derive(Debug)]
 struct PrimaryNodeInner<CDB> {
@@ -33,7 +32,6 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
 
     /// Starts the primary node with the provided info. If the node is already running then this
     /// method will return an error instead.
-    #[instrument(name = "primary_node", skip_all)]
     async fn start(&mut self) -> eyre::Result<TaskManager> {
         let task_manager = TaskManager::new(PRIMARY_TASK_MANAGER);
         // spawn primary and update `self`

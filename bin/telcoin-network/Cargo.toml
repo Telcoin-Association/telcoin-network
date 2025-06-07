@@ -18,7 +18,7 @@ const-str = "0.5.6"
 fdlimit = { workspace = true }
 secp256k1 = { workspace = true, features = [
     "global-context",
-    "rand-std",
+    "rand",
     "recovery",
 ] }
 tokio = { workspace = true, features = [

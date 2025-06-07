@@ -2,13 +2,15 @@
 
 use indexmap::IndexMap;
 use rand::{
-    distributions::Bernoulli, prelude::Distribution, rngs::StdRng, thread_rng, Rng, RngCore,
-    SeedableRng,
+    distr::{Bernoulli, Distribution as _},
+    rngs::StdRng,
+    Rng, RngCore, SeedableRng as _,
 };
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     ops::RangeInclusive,
 };
+use tempfile::TempDir;
 use tn_reth::test_utils::{batch, TransactionFactory};
 use tn_types::{
     adiri_chain_spec_arc, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash,
@@ -16,8 +18,8 @@ use tn_types::{
     Hash as _, HeaderBuilder, ProtocolSignature, Round, TimestampSec, VotingPower, WorkerId, U256,
 };
 
-pub fn temp_dir() -> std::path::PathBuf {
-    tempfile::tempdir().expect("Failed to open temporary directory").into_path()
+pub fn temp_dir() -> TempDir {
+    tempfile::tempdir().expect("Failed to open temporary directory")
 }
 
 ////////////////////////////////////////////////////////////////
@@ -25,7 +27,7 @@ pub fn temp_dir() -> std::path::PathBuf {
 ////////////////////////////////////////////////////////////////
 
 pub fn random_key() -> BlsKeypair {
-    BlsKeypair::generate(&mut thread_rng())
+    BlsKeypair::generate(&mut rand::rngs::StdRng::from_os_rng())
 }
 
 ////////////////////////////////////////////////////////////////
@@ -120,7 +122,7 @@ fn this_cert_parents(
     failure_prob: f64,
 ) -> BTreeSet<CertificateDigest> {
     std::iter::from_fn(|| {
-        let f: f64 = rand::thread_rng().gen();
+        let f: f64 = rand::rng().random();
         Some(f > failure_prob)
     })
     .take(ancestors.len())

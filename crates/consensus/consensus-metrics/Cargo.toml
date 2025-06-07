@@ -16,7 +16,6 @@ tracing = { workspace = true }
 scopeguard = { workspace = true }
 prometheus = { workspace = true }
 once_cell = { workspace = true }
-tap = { workspace = true }
 tokio = { workspace = true }
 parking_lot = { workspace = true }
 futures = { workspace = true }

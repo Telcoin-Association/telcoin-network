@@ -15,6 +15,12 @@ pub const CONSENSUS_REGISTRY_ADDRESS: Address =
 
 // ConsensusRegistry interface. See tn-contracts submodule.
 sol!(
+
+    /// The stake manager.
+    contract StakeManager {
+
+    }
+
     /// Consensus registry.
     #[sol(rpc)]
     contract ConsensusRegistry {
@@ -70,7 +76,12 @@ sol!(
         struct EpochInfo {
             /// The committee of validators responsible for the epoch.
             address[] committee;
-            /// The block height when the epoch started and the
+            /// The amount of TEL divied up between all leaders
+            /// that produced blocks for the epochs.
+            /// This amount is distributed based on the amount of blocks
+            /// each leader produced.
+            uint256 epochIssuance;
+            /// The execution block height when the epoch started and the
             /// committee became active.
             uint64 blockHeight;
             /// The duration for the epoch (in secs).
@@ -78,6 +89,8 @@ sol!(
             /// NOTE: this is set at the start of each epoch based on the
             /// current value of the `StakeConfig`.
             uint32 epochDuration;
+            /// The stake version to use for rewards calculations.
+            uint8 stakeVersion;
         }
 
         /// Struct used by storage ledger to record outstanding validator balances.
@@ -86,18 +99,36 @@ sol!(
             /// The governance-issued consensus NFT token id.
             uint24 tokenId;
             /// The validator balance.
-            uint232 balance;
+            uint256 balance;
+        }
+
+        /// The rewards applied right before concluding the epoch.
+        /// This is provided by the protocol.
+        ///
+        /// NOTE: this is part of the StakeManager contract.
+        #[derive(Debug)]
+        struct RewardInfo {
+            address validatorAddress;
+            uint256 consensusHeaderCount;
+        }
+
+        /// Slash information for system calls to decrement outstanding validator balances
+        /// Currently disabled during MNO pilot.
+        #[derive(Debug)]
+        struct Slash {
+            address validatorAddress;
+            uint256 amount;
         }
 
         /// The configuration for consensus.
         #[derive(Debug)]
         struct StakeConfig {
             /// The fixed stake amount.
-            uint232 stakeAmount;
+            uint256 stakeAmount;
             /// The min amount allowed to withdraw.
-            uint232 minWithdrawAmount;
+            uint256 minWithdrawAmount;
             /// The total amount issued per epoch.
-            uint232 epochIssuance;
+            uint256 epochIssuance;
             /// The duration for the epoch (in secs).
             uint32 epochDuration;
         }
@@ -113,21 +144,24 @@ sol!(
             address owner_
         ) external;
 
-        /// Return the validators by status. Pass `0` for status to return all validators.
-        function getValidators(uint8 status) public view returns (ValidatorInfo[] memory);
-        /// @dev Fetches the `tokenId` for a given validator validatorAddress
-        function getValidatorTokenId(address validatorAddress) external view returns (uint256);
-        /// @dev Fetches the `ValidatorInfo` for a given ConsensusNFT tokenId
-        /// @notice To enable checks against storage slots initialized to zero by the EVM, `tokenId` cannot be `0`
-        function getValidatorByTokenId(uint256 tokenId) external view returns (ValidatorInfo memory);
-        /// Return committee epoch info for a specific epoch.
-        function getEpochInfo(uint32 epoch) public view returns (EpochInfo memory epochInfo);
-        /// Return the current epoch.
-        function getCurrentEpoch() public view returns (uint32) ;
         /// Conclude the current epoch. Caller must pass a new committee of eligible validators.
         function concludeEpoch(address[] calldata newCommittee) external;
+        /// Apply incentives for the epoch. This must be called before `concludeEpoch`.
+        function applyIncentives(RewardInfo[] calldata rewardInfos) external;
+        /// Apply negative incentives for the epoch. This must be called before `concludeEpoch`.
+        function applySlashes(Slash[] calldata slashes) external;
+        /// Return the current epoch.
+        function getCurrentEpoch() public view returns (uint32) ;
         /// Helper function to get the epoch info from the current epoch.
         function getCurrentEpochInfo() external view returns (EpochInfo memory currentEpochInfo);
+        /// Return committee epoch info for a specific epoch.
+        function getEpochInfo(uint32 epoch) public view returns (EpochInfo memory epochInfo);
+        /// Return the validators by status. Pass `0` for status to return all validators.
+        function getValidators(uint8 status) public view returns (ValidatorInfo[] memory);
+        /// Fetch the committee for a given epoch.
+        function getCommitteeValidators(uint32 epoch) external view returns (ValidatorInfo[] memory);
+        /// Fetch the `ValidatorInfo` for a give address.
+        function getValidator(address validatorAddress) external view returns (ValidatorInfo memory);
     }
 );
 

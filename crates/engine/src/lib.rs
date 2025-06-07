@@ -23,11 +23,11 @@ use std::{
     pin::{pin, Pin},
     task::{Context, Poll},
 };
-use tn_reth::{traits::BuildArguments, RethEnv};
+use tn_reth::{payload::BuildArguments, RethEnv};
 use tn_types::{ConsensusOutput, Noticer, SealedHeader, TaskSpawner};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Type alias for the blocking task that executes consensus output and returns the finalized
 /// `SealedHeader`.
@@ -230,6 +230,7 @@ impl Future for ExecutorEngine {
             if let Some(mut receiver) = this.pending_task.take() {
                 match receiver.poll_unpin(cx) {
                     Poll::Ready(res) => {
+                        debug!(target: "engine", ?res, "reciever for execution result polled ready");
                         let finalized_header = res.map_err(Into::into).and_then(|res| res)?;
                         // store last executed header in memory
                         this.parent_header = finalized_header;

@@ -5,7 +5,6 @@ use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
 };
-use rand::{rngs::StdRng, SeedableRng};
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::{value::RawValue, Value};
 use std::{
@@ -560,7 +559,8 @@ fn get_block_number(node: &str) -> eyre::Result<u64> {
 /// for accounts.
 fn address_from_word(key_word: &str) -> Address {
     let seed = keccak256(key_word.as_bytes());
-    let mut rand = <StdRng as SeedableRng>::from_seed(seed.0);
+    let mut rand =
+        <secp256k1::rand::rngs::StdRng as secp256k1::rand::SeedableRng>::from_seed(seed.0);
     let secp = Secp256k1::new();
     let (_, public_key) = secp.generate_keypair(&mut rand);
     // strip out the first byte because that should be the SECP256K1_TAG_PUBKEY_UNCOMPRESSED
@@ -572,7 +572,8 @@ fn address_from_word(key_word: &str) -> Address {
 /// Return the (account, public key, secret key) generated from key_word.
 fn account_from_word(key_word: &str) -> (String, String, String) {
     let seed = keccak256(key_word.as_bytes());
-    let mut rand = rand::rngs::StdRng::from_seed(seed.0);
+    let mut rand =
+        <secp256k1::rand::rngs::StdRng as secp256k1::rand::SeedableRng>::from_seed(seed.0);
     let secp = Secp256k1::new();
     let (secret_key, public_key) = secp.generate_keypair(&mut rand);
     let keypair = Keypair::from_secret_key(&secp, &secret_key);
