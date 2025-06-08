@@ -17,12 +17,6 @@ use std::sync::Arc;
 use tn_types::{BlockHeader as _, Bytes, SealedBlock, SealedHeader, B256, U256};
 
 /// TN-related EVM configuration.
-///
-/// TODO: consider constructing this each time with the `ConsensusOutput`?????
-/// ??!!!!!
-///
-///
-/// ??
 #[derive(Debug, Clone)]
 pub struct TnEvmConfig {
     /// Inner [`TNBlockExecutorFactory`].

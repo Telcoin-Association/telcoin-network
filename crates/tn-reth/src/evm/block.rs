@@ -30,6 +30,7 @@ use reth_primitives::{logs_bloom, TxType};
 use reth_provider::BlockExecutionResult;
 use reth_revm::{
     context::result::{ExecutionResult, ResultAndState},
+    db::states::bundle_state::BundleRetention,
     DatabaseCommit as _, State,
 };
 use std::sync::Arc;
@@ -88,8 +89,6 @@ where
         Tx: FromRecoveredTx<R::Transaction> + FromTxWithEncoded<R::Transaction>,
     >,
     Spec: EthereumHardforks,
-    // R: ReceiptBuilder,
-    // R: ReceiptBuilder<Transaction: Transaction + Encodable2718, Receipt: TxReceipt<Log = Log>>,
     R: ReceiptBuilder<Transaction = TransactionSigned, Receipt = Receipt>,
 {
     /// Creates a new [`TNBlockExecutor`]
@@ -122,7 +121,7 @@ where
 
     /// Apply the closing epoch call to ConsensusRegistry.
     fn apply_closing_epoch_contract_call(&mut self, randomness: B256) -> TnRethResult<()> {
-        // let prev_env = Box::new(evm.context.env().clone());
+        debug!(target: "engine", ?randomness, "applying closing contract call");
         let calldata = self.generate_conclude_epoch_calldata(randomness)?;
 
         // execute system call to consensus registry
@@ -145,9 +144,6 @@ where
 
         debug!(target: "engine", "committing closing epoch state:\n{:#?}", res.state);
 
-        // commit the changes
-        self.evm.db_mut().commit(res.state);
-
         // append receipt
         self.receipts.push(Receipt {
             logs: closing_epoch_logs,
@@ -155,6 +151,9 @@ where
             success: true,
             cumulative_gas_used: 0,
         });
+
+        // commit the changes
+        self.evm.db_mut().commit(res.state);
 
         Ok(())
     }
@@ -327,6 +326,9 @@ where
             self.apply_closing_epoch_contract_call(randomness).map_err(|e| {
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
             })?;
+
+            // merge transitions into bundle state
+            self.evm.db_mut().merge_transitions(BundleRetention::PlainState);
         }
 
         Ok((

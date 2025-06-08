@@ -27,20 +27,6 @@ use tn_types::{EthPrimitives, NodePrimitives, RecoveredBlock, SealedBlock, Seale
 /// Type for primitives.
 pub type TNPrimitives = EthPrimitives;
 
-// /// Telcoin Network specific node types for reth compatibility.
-// pub trait TelcoinNodeTypes: NodeTypesWithEngine + NodeTypesWithDB {
-//     /// The EVM executor type
-//     type Executor: BlockExecutorProvider<Primitives = TNPrimitives>;
-
-//     /// The EVM configuration type
-//     type EvmConfig: ConfigureEvm<Transaction = TransactionSigned, Header = ExecHeader>;
-
-//     /// Create the Reth evm config.
-//     fn create_evm_config(chain: Arc<ChainSpec>) -> Self::EvmConfig;
-//     /// Create the Reth executor.
-//     fn create_executor(chain: Arc<ChainSpec>) -> Self::Executor;
-// }
-
 /// Empty struct that implements Reth traits to supply GATs and functionality for Reth integration.
 #[derive(Clone, Debug)]
 pub struct TelcoinNode {}
@@ -56,22 +42,6 @@ impl NodeTypes for TelcoinNode {
 impl NodeTypesWithDB for TelcoinNode {
     type DB = Arc<DatabaseEnv>;
 }
-
-// impl TelcoinNodeTypes for TelcoinNode {
-//     type Executor = BasicBlockExecutorProvider<EthExecutionStrategyFactory<TnEvmConfig>>;
-//     type EvmConfig = TnEvmConfig;
-
-//     fn create_evm_config(chain: Arc<ChainSpec>) -> Self::EvmConfig {
-//         TnEvmConfig::new(chain)
-//     }
-
-//     fn create_executor(chain: Arc<ChainSpec>) -> Self::Executor {
-//         BasicBlockExecutorProvider::new(EthExecutionStrategyFactory::new(
-//             chain.clone(),
-//             TnEvmConfig::new(chain),
-//         ))
-//     }
-// }
 
 /// Compatibility type to easily integrate with reth.
 ///

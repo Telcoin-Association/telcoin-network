@@ -11,11 +11,6 @@ use reth_revm::{
 };
 
 /// The Telcoin Network EVM context.
-///
-///
-///
-/// TODO: this could also be a way to pass information to close epoch through `BlockEnv`
-//
 pub(crate) type TNEvmContext<DB> = Context<BlockEnv, TxEnv, CfgEnv, DB>;
 
 // TODO: rename thissss

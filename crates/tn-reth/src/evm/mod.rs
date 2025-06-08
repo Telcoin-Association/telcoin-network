@@ -9,10 +9,11 @@ use reth_revm::{
         result::{EVMError, HaltReason, ResultAndState},
         BlockEnv, Evm as RevmEvm, TxEnv,
     },
-    handler::{instructions::EthInstructions, PrecompileProvider},
+    handler::{instructions::EthInstructions, Handler as _, PrecompileProvider},
+    inspector::{InspectorHandler, NoOpInspector},
     interpreter::{interpreter::EthInterpreter, InterpreterResult},
     primitives::hardfork::SpecId,
-    Context, ExecuteEvm as _, InspectEvm as _, Inspector,
+    Context, ExecuteEvm as _, Inspector,
 };
 use std::ops::{Deref, DerefMut};
 use tn_types::{Address, Bytes, TxKind, U256};
@@ -20,28 +21,26 @@ mod block;
 mod config;
 mod context;
 mod factory;
+mod handler;
 pub(crate) use block::*;
 pub(crate) use config::*;
 pub(crate) use context::*;
 pub(crate) use factory::*;
+
+use crate::evm::handler::TNEvmHandler;
 
 /// TN EVM implementation.
 ///
 /// This is a wrapper type around the `revm` ethereum evm with optional [`Inspector`] (tracing)
 /// support. [`Inspector`] support is configurable at runtime because it's part of the underlying
 /// [`RevmEvm`] type.
-///
-/// TODO: review EthInstructions, EthInterpreter, etc. and update comment!!!
-/// !!!
-/// !!!!!!!1!
 #[expect(missing_debug_implementations)]
-pub struct TNEvm<DB: Database, I, PRECOMPILE = PrecompilesMap> {
+pub struct TNEvm<DB: Database, I = NoOpInspector, PRECOMPILE = PrecompilesMap> {
     inner:
         RevmEvm<TNEvmContext<DB>, I, EthInstructions<EthInterpreter, TNEvmContext<DB>>, PRECOMPILE>,
     inspect: bool,
 }
 
-// MISSING METHODSAAAAAAAA
 impl<DB: Database, I, PRECOMPILE> TNEvm<DB, I, PRECOMPILE> {
     /// Creates a new Ethereum EVM instance.
     ///
@@ -76,48 +75,6 @@ impl<DB: Database, I, PRECOMPILE> TNEvm<DB, I, PRECOMPILE> {
     pub fn ctx_mut(&mut self) -> &mut TNEvmContext<DB> {
         &mut self.inner.ctx
     }
-
-    // /// Provide a custom reward beneficiary callback to handle base fees for telcoin network.
-    // fn set_base_fee_handler(&mut self) {
-    //     // TODO- send the base fee to safe or contract to be managed offchain.
-    //     let basefee_address: Option<Address> = None;
-    //     // DO NOT use this testing default in mainnet.
-    //     //    Some(Address::parse_checksummed("0x29615F9e735932580f699C494C11fB81296AfE8F", None)
-    //     //    .expect("valid account"));
-    //     evm.handler.post_execution.reward_beneficiary = Arc::new(move |ctx, gas| {
-    //         // code lifted from revm mainnet/post_execution.rs and modified to do something with
-    //         // base fee.
-    //         let beneficiary = ctx.evm.env.block.coinbase;
-    //         let effective_gas_price = ctx.evm.env.effective_gas_price();
-
-    //         // transfer fee to coinbase/beneficiary.
-    //         // Basefee amount of gas is redirected.
-    //         let coinbase_gas_price =
-    // effective_gas_price.saturating_sub(ctx.evm.env.block.basefee);
-
-    //         let coinbase_account =
-    //             ctx.evm.inner.journaled_state.load_account(beneficiary, &mut ctx.evm.inner.db)?;
-
-    //         coinbase_account.data.mark_touch();
-    //         let gas_used = U256::from(gas.spent() - gas.refunded() as u64);
-    //         coinbase_account.data.info.balance =
-    //             coinbase_account.data.info.balance.saturating_add(coinbase_gas_price * gas_used);
-
-    //         if let Some(basefee_address) = basefee_address {
-    //             // Send the base fee portion to a basefee account for later processing
-    // (offchain).             let basefee = ctx.evm.env.block.basefee;
-    //             let basefee_account = ctx
-    //                 .evm
-    //                 .inner
-    //                 .journaled_state
-    //                 .load_account(basefee_address, &mut ctx.evm.inner.db)?;
-    //             basefee_account.data.mark_touch();
-    //             basefee_account.data.info.balance =
-    //                 basefee_account.data.info.balance.saturating_add(basefee * gas_used);
-    //         }
-    //         Ok(())
-    //     });
-    // }
 }
 
 impl<DB: Database, I, PRECOMPILE> Deref for TNEvm<DB, I, PRECOMPILE> {
@@ -160,11 +117,13 @@ where
     }
 
     fn transact_raw(&mut self, tx: Self::Tx) -> Result<ResultAndState, Self::Error> {
+        let mut handler = TNEvmHandler::default();
         if self.inspect {
             self.inner.set_tx(tx);
-            self.inner.inspect_replay()
+            handler.inspect_run(&mut self.inner)
         } else {
-            self.inner.transact(tx)
+            self.inner.set_tx(tx);
+            handler.run(&mut self.inner)
         }
     }
 
@@ -261,6 +220,7 @@ where
         &mut self.inner.inspector
     }
 }
+
 // Add a new impl block AFTER the Evm trait implementation
 impl<DB, I, PRECOMPILE> TNEvm<DB, I, PRECOMPILE>
 where

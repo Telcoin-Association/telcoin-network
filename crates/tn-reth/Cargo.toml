@@ -59,9 +59,12 @@ alloy-evm = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "time"] }
-secp256k1 = { workspace = true }
 reth-ethereum-primitives = { workspace = true }
+secp256k1 = { workspace = true, optional = true }
+
+[dev-dependencies]
+tn-types = { workspace = true, features = ["test-utils"] }
 
 [features]
 default = []
-test-utils = []
+test-utils = ["secp256k1"]

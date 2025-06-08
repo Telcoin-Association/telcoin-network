@@ -27,11 +27,7 @@ fn finalize_signed_blocks(
 
     if last_executed.number <= canonical_header.number {
         if let Some(block) = reth_env.sealed_header_by_hash(last_executed.hash)? {
-            // finalize the last block from a cert in consensus output and update chain info
-            //
-            // this removes canonical blocks from the tree, stores the finalized block number in the
-            // database, but still need to set_finalized afterwards for utilization in-memory for
-            // components, like RPC
+            // remove blocks from memory and stores them in the database
             reth_env.finalize_block(block)?;
         } else {
             error!(target: "engine", ?output, "missing the block to finalize!");
@@ -131,30 +127,13 @@ pub fn execute_consensus_output(args: BuildArguments) -> EngineResult<SealedHead
         }
     } // end block execution for round
 
-    // broadcast new base_fee after executing round
-    //
-    // ensure this value is updated before making the round canonical
-    // because pool maintenance task needs the protocol's new base fee
-    // before it can accurately process the canon_state_notification update
-
-    // NOTE: this makes all blocks canonical, commits them to the database,
-    // and broadcasts new chain on `canon_state_notification_sender`
-    //
-    // the canon_state_notifications include every block executed in this round
-    //
-    // the worker's pool maintenance task subcribes to these events
-    // reth_env.make_canonical(canonical_header.clone())?;
     reth_env.finish_executing_output(executed_blocks)?;
 
     if output.early_finalize {
-        // finalize the last block executed from consensus output and update chain info
-        //
-        // this removes canonical blocks from the tree, stores the finalized block number in the
-        // database, but still need to set_finalized afterwards for utilization in-memory for
-        // components, like RPC
-        debug!(target: "engine", "early finalize");
+        // remove blocks from memory and stores them in the database
         reth_env.finalize_block(canonical_header.clone())?;
     } else {
+        // wait until the block appears in a signed certificate before finalizing
         finalize_signed_blocks(&reth_env, &output, &canonical_header)?;
     }
 
@@ -164,7 +143,6 @@ pub fn execute_consensus_output(args: BuildArguments) -> EngineResult<SealedHead
 
 /// Execute the transaction and update canon chain in-memory.
 fn execute_payload(
-    // canonical_header: &mut SealedHeader,
     payload: TNPayload,
     transactions: Vec<Vec<u8>>,
     executed_blocks: &mut Vec<ExecutedBlockWithTrieUpdates>,
@@ -173,24 +151,10 @@ fn execute_payload(
 ) -> EngineResult<SealedHeader> {
     // execute
     let next_canonical_block = reth_env.build_block_from_batch_payload(payload, transactions)?;
-
-    // tree flow:
-    // - try receive eng message
-    //      - set_pending_block
-    //      - insert_executed
-    // - store to disk
-    //      - collect and store in group
-    //          - see Persistence::on_save_block
-    //
-    // TODO:
-    //  - check BeaconConsensusEngineEvents to ensure nothing missed
-    //  - still need to broadcast canonical update
-    //  - ensure read/write access isn't a problem
-
     debug!(target: "engine", ?next_canonical_block, "worker's block executed");
 
     // update header for next block execution in loop
-    let canonical_header = next_canonical_block.recovered_block.sealed_header().clone();
+    let canonical_header = next_canonical_block.recovered_block.clone_sealed_header();
     canonical_in_memory_state.set_pending_block(next_canonical_block.clone());
     canonical_in_memory_state
         .update_chain(NewCanonicalChain::Commit { new: vec![next_canonical_block.clone()] });

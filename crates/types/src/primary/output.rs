@@ -116,7 +116,7 @@ impl ConsensusOutput {
     ///
     /// This is used by the engine to apply system calls at the end of the epoch.
     pub fn epoch_closing_index(&self) -> Option<usize> {
-        // handle edge case for no transactions
+        // handle edge case for no batches at epoch boundary
         self.close_epoch.then(|| self.batch_digests.len().saturating_sub(1))
     }
 }
