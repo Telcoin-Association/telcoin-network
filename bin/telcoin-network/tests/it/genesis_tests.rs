@@ -21,6 +21,7 @@ use tracing::debug;
 
 #[tokio::test]
 async fn test_genesis_with_its() -> eyre::Result<()> {
+    tn_types::test_utils::init_test_tracing();
     // spawn testnet for RPC calls
     let temp_path = tempfile::TempDir::new().expect("tempdir is okay");
     spawn_local_testnet(
@@ -141,6 +142,7 @@ async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
+    tn_types::test_utils::init_test_tracing();
     // fetch registry impl bytecode from compiled output in tn-contracts
     let json_val = RethEnv::fetch_value_from_json_str(
         CONSENSUS_REGISTRY_JSON,
@@ -188,9 +190,9 @@ async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
     debug!(target: "bundle", "consensus_registry: {:#?}", current_epoch_info);
     let ConsensusRegistry::EpochInfo {
         committee,
+        epochIssuance,
         blockHeight,
         epochDuration,
-        epochIssuance,
         stakeVersion,
     } = current_epoch_info;
     assert_eq!(blockHeight, 0);

@@ -962,6 +962,8 @@ impl RethEnv {
         let reth_env =
             RethEnv::new_for_temp_chain(tmp_chain.clone(), tmp_dir.path(), &task_manager)?;
 
+        debug!(target: "engine", ?initial_stake_config, "calling constructor for consensus registry");
+
         let constructor_args = ConsensusRegistry::constructorCall {
             genesisConfig_: initial_stake_config,
             initialValidators_: validators,
@@ -1078,6 +1080,8 @@ impl RethEnv {
 
         // current epoch info
         let epoch_info = self.get_current_epoch_info(&mut tn_evm)?;
+
+        debug!(target: "engine", ?epoch_info, "retrieving closing timestamp for previous epoch...");
 
         // retrieve closing timestamp for previous epoch
         let epoch_start = self

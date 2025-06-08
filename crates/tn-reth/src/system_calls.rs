@@ -16,11 +16,6 @@ pub const CONSENSUS_REGISTRY_ADDRESS: Address =
 // ConsensusRegistry interface. See tn-contracts submodule.
 sol!(
 
-    /// The stake manager.
-    contract StakeManager {
-
-    }
-
     /// Consensus registry.
     #[sol(rpc)]
     contract ConsensusRegistry {
@@ -108,7 +103,9 @@ sol!(
         /// NOTE: this is part of the StakeManager contract.
         #[derive(Debug)]
         struct RewardInfo {
+            /// The validator to receive rewards.
             address validatorAddress;
+            /// The number of consensus blocks for which they were the leader.
             uint256 consensusHeaderCount;
         }
 
@@ -116,7 +113,9 @@ sol!(
         /// Currently disabled during MNO pilot.
         #[derive(Debug)]
         struct Slash {
+            /// The validator to slash.
             address validatorAddress;
+            /// The amount to slash.
             uint256 amount;
         }
 
