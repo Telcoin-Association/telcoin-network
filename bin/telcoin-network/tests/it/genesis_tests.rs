@@ -10,6 +10,7 @@ use eyre::OptionExt;
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
 use serde_json::Value;
 use std::time::Duration;
+use telcoin_network::args::clap_u256_parser_to_18_decimals;
 use tn_config::{NetworkGenesis, CONSENSUS_REGISTRY_JSON, DEPLOYMENTS_JSON};
 use tn_reth::{
     system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS},
@@ -21,7 +22,6 @@ use tracing::debug;
 
 #[tokio::test]
 async fn test_genesis_with_its() -> eyre::Result<()> {
-    tn_types::test_utils::init_test_tracing();
     // spawn testnet for RPC calls
     let temp_path = tempfile::TempDir::new().expect("tempdir is okay");
     spawn_local_testnet(
@@ -142,7 +142,6 @@ async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
-    tn_types::test_utils::init_test_tracing();
     // fetch registry impl bytecode from compiled output in tn-contracts
     let json_val = RethEnv::fetch_value_from_json_str(
         CONSENSUS_REGISTRY_JSON,
@@ -186,6 +185,7 @@ async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
     let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, provider.clone());
     let current_epoch_info =
         consensus_registry.getCurrentEpochInfo().call().await.expect("get current epoch result");
+    let expected_epoch_issuance = clap_u256_parser_to_18_decimals("25_806")?; // CLI default
 
     debug!(target: "bundle", "consensus_registry: {:#?}", current_epoch_info);
     let ConsensusRegistry::EpochInfo {
@@ -197,7 +197,7 @@ async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
     } = current_epoch_info;
     assert_eq!(blockHeight, 0);
     assert_eq!(epochDuration, 86400);
-    assert_eq!(epochIssuance, U256::ZERO);
+    assert_eq!(epochIssuance, expected_epoch_issuance);
     assert_eq!(stakeVersion, 0);
 
     let validators = consensus_registry

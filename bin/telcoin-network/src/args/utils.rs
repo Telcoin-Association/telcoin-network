@@ -3,8 +3,7 @@
 use eyre::OptionExt;
 use std::str::FromStr;
 use tn_reth::{dirs::DataDirPath, MaybePlatformPath};
-use tn_types::Address;
-use tn_types::U256;
+use tn_types::{Address, U256};
 
 pub use tn_reth::clap_genesis_parser;
 
