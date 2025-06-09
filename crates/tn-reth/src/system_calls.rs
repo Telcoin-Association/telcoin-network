@@ -88,15 +88,6 @@ sol!(
             uint8 stakeVersion;
         }
 
-        /// Struct used by storage ledger to record outstanding validator balances.
-        #[derive(Debug)]
-        struct StakeInfo {
-            /// The governance-issued consensus NFT token id.
-            uint24 tokenId;
-            /// The validator balance.
-            uint256 balance;
-        }
-
         /// The rewards applied right before concluding the epoch.
         /// This is provided by the protocol.
         ///
