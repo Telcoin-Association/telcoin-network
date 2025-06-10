@@ -161,7 +161,11 @@ where
     /// Generate calldata for updating the ConsensusRegistry to conclude the epoch.
     fn generate_conclude_epoch_calldata(&mut self, randomness: B256) -> TnRethResult<Bytes> {
         // shuffle all validators for new committee
-        let new_committee = self.shuffle_new_committee(randomness)?;
+        let mut new_committee = self.shuffle_new_committee(randomness)?;
+
+        // sort addresses
+        new_committee.sort();
+        debug!(target: "evm", ?new_committee, "new committee sorted by address");
 
         // encode the call to bytes with method selector and args
         let bytes = ConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
@@ -322,7 +326,10 @@ where
     ) -> Result<(Self::Evm, BlockExecutionResult<R::Receipt>), BlockExecutionError> {
         // don't support prague deposit requests
         let requests = Requests::default();
+
+        // potentially close epoch boundary
         if let Some(randomness) = self.ctx.close_epoch {
+            debug!(target: "evm", ?randomness, "ctx indicates close epoch");
             self.apply_closing_epoch_contract_call(randomness).map_err(|e| {
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
             })?;

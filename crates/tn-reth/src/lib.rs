@@ -1067,8 +1067,6 @@ impl RethEnv {
 
         debug!(target: "engine", ?canonical_tip, "retrieving epoch state from canonical tip");
 
-        let epoch = Self::extract_epoch_from_header(&canonical_tip);
-
         // create EVM with latest state
         let latest = self.latest()?;
         let state = StateProviderDatabase::new(latest);
@@ -1077,6 +1075,9 @@ impl RethEnv {
             .evm_config
             .evm_factory()
             .create_evm(&mut db, self.evm_config.evm_env(&canonical_tip));
+
+        // current epoch number
+        let epoch = self.get_current_epoch_number(&mut tn_evm)?;
 
         // current epoch info
         let epoch_info = self.get_current_epoch_info(&mut tn_evm)?;
@@ -1101,6 +1102,15 @@ impl RethEnv {
     pub fn extract_epoch_from_header(header: &ExecHeader) -> Epoch {
         let nonce: u64 = header.nonce.into();
         (nonce >> 32) as u32
+    }
+
+    /// Read the curret epoch number from the [ConsensusRegistry] on-chain.
+    pub fn get_current_epoch_number<DB>(&self, evm: &mut TNEvm<DB>) -> eyre::Result<u32>
+    where
+        DB: alloy_evm::Database,
+    {
+        let calldata = ConsensusRegistry::getCurrentEpochCall {}.abi_encode().into();
+        self.call_consensus_registry::<_, u32>(evm, calldata)
     }
 
     /// Read the curret epoch info from the [ConsensusRegistry] on-chain.
@@ -1226,10 +1236,8 @@ mod tests {
         }
     }
 
-    #[ignore = "fix in follow up PR"]
     #[tokio::test]
     async fn test_validator_shuffle() -> eyre::Result<()> {
-        tn_types::test_utils::init_test_tracing();
         let validator_1 = Address::from_slice(&[0x11; 20]);
         let validator_2 = Address::from_slice(&[0x22; 20]);
         let validator_3 = Address::from_slice(&[0x33; 20]);
@@ -1286,7 +1294,7 @@ mod tests {
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
         let expected_epoch = 0;
         let expected_committee = validators.iter().map(|v| v.execution_address).collect();
-        let expected_epoch_info = ConsensusRegistry::EpochInfo {
+        let mut expected_epoch_info = ConsensusRegistry::EpochInfo {
             committee: expected_committee,
             blockHeight: 0,
             epochDuration: epoch_duration,
@@ -1297,6 +1305,7 @@ mod tests {
         // assert epoch state is correct
         let EpochState { epoch, epoch_info, validators: committee, epoch_start } =
             reth_env.epoch_state_from_canonical_tip()?;
+        debug!(target:"evm", ?epoch, ?epoch_info, ?committee, ?epoch, "original epoch state from canonical tip in genesis");
         assert_eq!(epoch, expected_epoch);
         assert_eq!(epoch_start, chain.genesis_timestamp());
         assert_eq!(epoch_info, expected_epoch_info);
@@ -1316,25 +1325,29 @@ mod tests {
         }
 
         // close epoch with deterministic signature as source of randomness
-        let payload =
-            TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output_for_tests());
+        // and execute the first block
+        let consensus_output = consensus_output_for_tests();
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
         debug!(target:"evm", "payload for test: {:#?}", payload);
-        let block = reth_env.build_block_from_batch_payload(payload, vec![])?;
+        let block1 = reth_env.build_block_from_batch_payload(payload, vec![])?;
         // update chain state - normally handled by tn_engine::payload_builder
-        let canonical_header = block.recovered_block.clone_sealed_header();
+        let canonical_header = block1.recovered_block.clone_sealed_header();
         let canonical_in_memory_state = reth_env.blockchain_provider.canonical_in_memory_state();
-        canonical_in_memory_state.set_canonical_head(canonical_header.clone());
         canonical_in_memory_state
-            .update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
-        reth_env.finish_executing_output(vec![block])?;
+            .update_chain(NewCanonicalChain::Commit { new: vec![block1.clone()] });
+        canonical_in_memory_state.set_canonical_head(canonical_header.clone());
+        reth_env.finish_executing_output(vec![block1])?;
+        reth_env.finalize_block(canonical_header.clone())?;
 
         // read new epoch state
         let EpochState { epoch, epoch_info, validators: committee, epoch_start } =
             reth_env.epoch_state_from_canonical_tip()?;
+        debug!(target:"evm", ?epoch, ?epoch_info, ?committee, ?epoch, "new epoch state from canonical tip");
         // assert epoch info updated
         let expected_epoch = expected_epoch + 1;
+        expected_epoch_info.blockHeight = 2;
         assert_eq!(expected_epoch, epoch);
-        assert_eq!(epoch_start, chain.genesis_timestamp());
+        assert_eq!(epoch_start, canonical_header.timestamp);
         assert_eq!(epoch_info, expected_epoch_info);
 
         // create evm to read custom contract call
@@ -1350,13 +1363,13 @@ mod tests {
             .create_evm(&mut db, reth_env.evm_config.evm_env(canonical_header.header()));
 
         // read new committee (always 2 epochs ahead)
-        let calldata = ConsensusRegistry::getEpochInfoCall { epoch: epoch + 2 }.abi_encode().into();
+        let calldata = ConsensusRegistry::getEpochInfoCall { epoch: epoch + 1 }.abi_encode().into();
         let new_epoch_info = reth_env
             .call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut tn_evm, calldata)?;
 
-        // ensure shuffle is deterministic
+        // ensure validators in increasing order by address
         let expected_new_committee =
-            vec![validator_1, validator_4, validator_3, validator_2, validator_5];
+            vec![validator_1, validator_2, validator_3, validator_4, validator_5];
 
         let expected = ConsensusRegistry::EpochInfo {
             committee: expected_new_committee,
@@ -1364,7 +1377,7 @@ mod tests {
             // epoch duration set at the start
             epochDuration: Default::default(),
             // values should remain the same
-            epochIssuance: initial_stake_config.epochIssuance,
+            epochIssuance: Default::default(),
             stakeVersion: 0,
         };
 
@@ -1379,7 +1392,7 @@ mod tests {
                 .find(|info| info.validatorAddress == v.execution_address)
                 .expect("validator on-chain");
             assert_eq!(on_chain.blsPubkey.as_ref(), v.bls_public_key.to_bytes());
-            assert_eq!(on_chain.activationEpoch, epoch);
+            assert_eq!(on_chain.activationEpoch, 0);
             assert_eq!(on_chain.exitEpoch, 0);
             assert!(!on_chain.isRetired);
             assert!(!on_chain.isDelegated);
