@@ -26,6 +26,14 @@ struct ConsensusConfigInner<DB> {
     genesis: HashMap<CertificateDigest, Certificate>,
 }
 
+/// The configuration for consensus.
+///
+/// This structure holds all necessary configuration data for both primary and worker
+/// consensus components. It manages committee membership, cryptographic keys, network
+/// topology, and genesis state required for consensus participation.
+///
+/// The configuration is designed to be shared across consensus components and provides
+/// both authority-specific and network-wide configuration access.
 #[derive(Debug, Clone)]
 pub struct ConsensusConfig<DB> {
     inner: Arc<ConsensusConfigInner<DB>>,
@@ -37,6 +45,10 @@ impl<DB> ConsensusConfig<DB>
 where
     DB: Database,
 {
+    /// Creates a new consensus configuration by loading committee and worker cache from disk.
+    ///
+    /// This is the primary constructor that loads configuration from the filesystem,
+    /// including committee membership and worker topology from YAML files.
     pub fn new<TND: TelcoinDirs + 'static>(
         config: Config,
         tn_datadir: &TND,
@@ -63,9 +75,10 @@ where
         )
     }
 
-    /// Create a new config with a committe.
+    /// Creates a new configuration with a pre-loaded committee for testing purposes.
     ///
-    /// The method is exposed publicly for testing ONLY.
+    /// **WARNING: This method is exposed publicly for testing ONLY.**
+    /// Production code should use `new()` or `new_for_epoch()` to ensure proper configuration loading.
     pub fn new_with_committee_for_test(
         config: Config,
         node_storage: DB,
@@ -84,7 +97,10 @@ where
         )
     }
 
-    /// Configuration for the next epoch.
+    /// Creates configuration for the next consensus epoch.
+    ///
+    /// This constructor is used during epoch transitions to initialize configuration
+    /// with updated committee membership and worker topology for the new epoch.
     pub fn new_for_epoch(
         config: Config,
         node_storage: DB,
@@ -103,9 +119,13 @@ where
         )
     }
 
-    /// Create a new config with a committe.
+    /// Internal constructor that initializes consensus configuration with provided committee.
     ///
-    /// This should only be called by `Self::new` or by the testing wrapper.
+    /// This method performs the core initialization logic including:
+    /// - Setting up local network identity
+    /// - Resolving authority status within the committee
+    /// - Creating genesis certificates
+    /// - Initializing shutdown notification system
     fn new_with_committee(
         config: Config,
         node_storage: DB,
@@ -142,56 +162,85 @@ where
         })
     }
 
-    /// Returns a reference to the shutdown Noticer.
-    /// Can use this subscribe to the shutdown event or send it.
+    /// Returns a reference to the shutdown notifier.
+    ///
+    /// The shutdown notifier can be used to either subscribe to shutdown events
+    /// or trigger shutdown across consensus components.
     pub fn shutdown(&self) -> &Notifier {
         &self.shutdown
     }
 
+    /// Returns a reference to the inner config parameters.
     pub fn config(&self) -> &Config {
         &self.inner.config
     }
 
+    /// Returns a reference to the genesis certificate collection.
+    ///
+    /// Genesis certificates establish the initial state and authority set
+    /// for the consensus protocol to produce the first primary `Header`.
     pub fn genesis(&self) -> &HashMap<CertificateDigest, Certificate> {
         &self.inner.genesis
     }
 
+    /// Returns a reference to the current committee membership.
+    ///
+    /// The committee defines the set of authorities participating in consensus
+    /// for the current epoch.
     pub fn committee(&self) -> &Committee {
         &self.inner.committee
     }
 
+    /// Returns a reference to the worker cache.
+    ///
+    /// The worker cache contains network topology information for all worker
+    /// processes across the committee.
     pub fn worker_cache(&self) -> &WorkerCache {
         &self.worker_cache
     }
 
-    pub fn worker_cache_clone(&self) -> WorkerCache {
-        self.worker_cache.clone()
-    }
-
+    /// Returns a reference to the node's persistent storage database for the current epoch.
     pub fn node_storage(&self) -> &DB {
         &self.inner.node_storage
     }
 
+    /// Returns a reference to the cryptographic key configuration.
+    ///
+    /// Contains both primary and worker cryptographic keys used for
+    /// consensus participation and network communication.
     pub fn key_config(&self) -> &KeyConfig {
         &self.inner.key_config
     }
 
+    /// Returns the authority information for this node. Optional if it is a committee member or not.
     pub fn authority(&self) -> &Option<Authority> {
         &self.inner.authority
     }
 
+    /// Returns the authority identifier for this node, if it is a committee member.
     pub fn authority_id(&self) -> Option<AuthorityIdentifier> {
         self.inner.authority.as_ref().map(|a| a.id())
     }
 
+    /// Returns a reference to the consensus protocol parameters.
+    ///
+    /// Parameters include timing constraints, batch sizes, and other
+    /// protocol-specific configuration values.
     pub fn parameters(&self) -> &Parameters {
         &self.inner.config.parameters
     }
 
+    /// Returns a reference to the local network configuration.
+    ///
+    /// Contains network identity and local networking setup information.
+    /// This is how Primary <-> Workers communicate.
     pub fn local_network(&self) -> &LocalNetwork {
         &self.inner.local_network
     }
 
+    /// Returns a reference to the network configuration.
+    ///
+    /// Contains p2p settings and connectivity parameters for libp2p.
     pub fn network_config(&self) -> &NetworkConfig {
         &self.inner.network_config
     }
