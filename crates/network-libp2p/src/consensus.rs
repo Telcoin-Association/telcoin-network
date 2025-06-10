@@ -751,6 +751,7 @@ where
                 }
             }
             ReqResEvent::OutboundFailure { peer, request_id, error, connection_id: _ } => {
+                debug!(target: "network", ?peer, ?error, "Outbound failure for req/res");
                 // handle px disconnects
                 //
                 // px attempts to support peer discovery, but failures are okay
@@ -758,9 +759,6 @@ where
                 if self.pending_px_disconnects.remove(&request_id).is_some() {
                     return Ok(());
                 }
-
-                // log errors for other outbound failures
-                // warn!(target: "network", ?peer, ?error, "outbound failure");
 
                 // apply penalty
                 self.swarm.behaviour_mut().peer_manager.process_penalty(peer, Penalty::Medium);
@@ -923,7 +921,7 @@ where
                 }
             }
             PeerEvent::Banned(peer_id) => {
-                debug!(target: "network", ?peer_id, "peer banned");
+                warn!(target: "network", ?peer_id, "peer banned");
                 // blacklist gossipsub
                 self.swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
             }

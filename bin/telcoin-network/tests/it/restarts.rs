@@ -90,7 +90,7 @@ fn run_restart_tests1(
 ) -> eyre::Result<Child> {
     network_advancing(client_urls).inspect_err(|e| {
         kill_child(child2);
-        error!(target: "restart-test", ?e);
+        error!(target: "restart-test", ?e, "failed to advance network in restart_tests1");
     })?;
     std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
 
@@ -101,7 +101,7 @@ fn run_restart_tests1(
     // Try once more then fail test.
     send_and_confirm(&client_urls[1], &client_urls[2], &key, to_account, 0).inspect_err(|e| {
         kill_child(child2);
-        error!(target: "restart-test", ?e);
+        error!(target: "restart-test", ?e, "failed to send and confirm in restart_tests1");
     })?;
 
     info!(target: "restart-test", "killing child2...");
@@ -121,7 +121,7 @@ fn run_restart_tests1(
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
         .inspect_err(|e| {
             kill_child(&mut child2);
-            error!(target: "restart-test", ?e);
+            error!(target: "restart-test", ?e, "failed to get positive balance with retry in restart_tests1");
         })?;
     if 10 * WEI_PER_TEL != bal {
         error!(target: "restart-test", "tests1 after restart: 10 * WEI_PER_TEL != bal - returning error!");
@@ -133,6 +133,8 @@ fn run_restart_tests1(
         kill_child(&mut child2);
         error!(target: "restart-test", ?e);
     })?;
+
+    info!(target: "restart-test", "testing blocks same in restart_tests1");
 
     test_blocks_same(client_urls).inspect_err(|e| {
         kill_child(&mut child2);
@@ -277,6 +279,8 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
     assert!(get_balance(&client_urls[1], &to_account.to_string(), 5).is_err());
     assert!(get_balance(&client_urls[2], &to_account.to_string(), 5).is_err());
     assert!(get_balance(&client_urls[3], &to_account.to_string(), 5).is_err());
+
+    info!(target: "restart-test", "all nodes shutdown...restarting network");
     // Restart network
     for (i, child) in children.iter_mut().enumerate() {
         *child = Some(start_validator(i, &exe_path, &temp_path, rpc_ports[i]));
