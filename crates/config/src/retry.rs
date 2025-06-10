@@ -1,7 +1,7 @@
 use std::{future::Future, time::Duration};
 
 /// Retry configurations for establishing connections and sending messages.
-/// Determines the retry behaviour of requests, by setting the back off strategy used.
+/// Determines the retry behavior of requests, by setting the back off strategy used.
 #[derive(Clone, Debug, Copy)]
 pub struct RetryConfig {
     /// The initial retry interval.

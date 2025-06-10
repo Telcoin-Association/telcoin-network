@@ -187,9 +187,7 @@ impl NetworkGenesis {
     }
 }
 
-// deserialize into HashMap<Account, GenesisAccount>
-
-/// information needed for every validator:
+/// Information needed for every validator:
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct NodeInfo {
     /// The name for the validator. The default value

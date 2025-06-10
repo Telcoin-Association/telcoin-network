@@ -22,7 +22,7 @@ pub const WORKER_NETWORK_SEED_FILE: &str = "worker.seed";
 /// Configuration for the Telcoin Network node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// [ValidatorInfo] for the node
+    /// [NodeInfo] for the node
     pub node_info: NodeInfo,
 
     /// Parameters for the network.

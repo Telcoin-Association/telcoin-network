@@ -26,7 +26,7 @@ See `bin/telcoin-network/genesis` for more information on how this is used.
 
 ### KeyConfig
 
-The most critical config for a node.
+The most critical config for a node's security.
 This contains the node's keys used to authenticate protocol messages.
 
 The protocol requires access to three keys in the current version:
@@ -45,22 +45,48 @@ Signatures are requested using the trait `tn_types::crypto::BlsSigner`.
 The method `request_signature_direct` is used when publishing node records to the kademlia store in `network-libp2p/src/consensus.rs` and when the primary node votes on a header in `types/src/primary/vote.rs`.
 The goal is to keep private keys in memory and provide a secure API for obtaining signatures rapidly.
 
+### NetworkConfig
+
+The network config holds various configurations for the p2p networking.
+Nodes operate two networks based on libp2p behaviours.
+The network config is used to create the network in `crates/network-libp2p/consensus.rs`.
+
+The network config also contains qualities for peer manager behaviour (see `crates/network-libp2p/peers`).
+The peer manager is responsible for banning peers who are identified as bad actors.
+
+### Node `Config`
+
+Node information used to configure Narwhal/Bullshark parameters and information exchanged between peers.
+
+### RetryConfig
+
+Configurations for retrying state sync requests.
+Only used in `crates/consensus/primary/src/state_sync/header_validator.rs` when syncing missing batches during primary header validation.
+
+### Traits
+
+Generic traits for interacting with the underlying filesystem.
+This trait is implemented on types that are written/read from the filesystem in YAML or JSON format.
+
 ## Security Considerations
 
 ### Threat Models
 
 #### Key Management
 
-Keys are paramount for security.
+Keys are paramount for security and should never be available to outsiders.
 
-#### Invalid Transactions
+#### Network Configuration
 
-Transactions are suppose to extend the canonical tip.
-The `BatchValidator` attempts to retrieve the batch's canonical header from the database, but uses its own finalized header as a fallback.
-Transactions may revert at execution, but this is considered a non-fatal error handled by `tn-engine`.
+The network configuration has implications for banning peers and applying their scores.
+
+#### Node Configuration
+
+The configurations are designed to keep nodes secure and live.
 
 ### Trust Assumptions
 
+- Keys are stored using the best practices
 - Network keys are generated securely as long as the node operator treats their BLS signature of the seed phrase as a password
 
 ### Critical Invariants
@@ -69,15 +95,3 @@ Transactions may revert at execution, but this is considered a non-fatal error h
 - The engine gracefully ignores invalid transactions
 - Basefees only adjust at the start of a new epoch
 - Batch validators are only valid within a single epoch
-
-## Dependencies & Interfaces
-
-### Dependencies
-
-- **Worker**: Source of batches to validate
-- **Canonical Chain State**: Current canonical tip updates from `tn-engine`
-- **Epoch Management**: Basefee and epoch information
-
-### Interfaces
-
-- **Owned by Worker**: Each worker owns an instance of a `BatchValidator`. Workers only support one execution environment and one basefee.
