@@ -62,7 +62,7 @@ Future iterations are planned to address this inefficiency.
 
 ### Critical Invariants
 
-- Batch mining only occurs after successful quorum achievement
+- Transactions are only mined from the transaction pool if the batch reaches quorum
 - Transaction pool state remains consistent with canonical chain execution AND batch execution
   - Transactions in a batch must always extend the canonical tip, not the preceeding batch
 - Basefees only adjust at the start of a new epoch
@@ -78,6 +78,6 @@ Future iterations are planned to address this inefficiency.
 
 ### Interfaces
 
-- **Outbound to Worker**: Sealed batches (batch with hashed digest) is sent for consensus processing
+- **Outbound to Worker**: Sealed batches (batch with hashed digest) are sent to the worker for consensus processing
 - **Inbound from Consensus**: Quorum achievement signals that trigger mining operations
 - **Validation**: Peers validate batches from other peers (with matching `WorkerId`s) using logic in the `batch-validator` lib
