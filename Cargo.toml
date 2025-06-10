@@ -23,8 +23,8 @@ members = [
     "crates/consensus/primary-metrics",
 
     # execution
-    "crates/execution/batch-builder",
-    "crates/execution/batch-validator",
+    "crates/batch-builder",
+    "crates/batch-validator",
     "crates/execution/faucet",
     "crates/execution/tn-rpc",
 ]
@@ -144,11 +144,11 @@ alloy = { version = "1.0.9", features = ["full"] }
 alloy-rlp = "0.3.10"
 alloy-evm = { version = "0.10" }
 
-tn-batch-validator = { path = "crates/execution/batch-validator" }
+tn-batch-validator = { path = "crates/batch-validator" }
 tn-engine = { path = "crates/engine" }
 
 # batch maker
-tn-batch-builder = { path = "crates/execution/batch-builder" }
+tn-batch-builder = { path = "crates/batch-builder" }
 futures-util = "0.3.25"
 jsonrpsee = { version = "0.25.1" }
 jsonrpsee-types = { version = "0.25.1" }
