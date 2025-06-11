@@ -134,6 +134,7 @@ sol!(
             address owner_
         ) external;
 
+
         /// Conclude the current epoch. Caller must pass a new committee of eligible validators.
         function concludeEpoch(address[] calldata newCommittee) external;
         /// Apply incentives for the epoch. This must be called before `concludeEpoch`.
@@ -152,7 +153,21 @@ sol!(
         function getCommitteeValidators(uint32 epoch) external view returns (ValidatorInfo[] memory);
         /// Fetch the `ValidatorInfo` for a give address.
         function getValidator(address validatorAddress) external view returns (ValidatorInfo memory);
+
+        #[cfg(any(feature = "test-utils", test))]
+        /// Mint an NFT for validator to stake.
+        function mint(address validatorAddress) external override onlyOwner;
+
+        #[cfg(any(feature = "test-utils", test))]
+        /// Stake to the consensus registry.
+        function stake(bytes calldata blsPubkey) external override onlyOwner;
+
+        #[cfg(any(feature = "test-utils", test))]
+        /// Activate node for committee selection.
+        /// Normally called by staker after node is synced.
+        function activate() external override whenNotPaused;
     }
+
 );
 
 /// The state of consensus retrieved from chain.
