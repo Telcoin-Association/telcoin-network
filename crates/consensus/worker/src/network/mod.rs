@@ -20,7 +20,7 @@ use tn_types::{
     TaskSpawner, WorkerId,
 };
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, trace, warn};
 
 mod error;
 mod handler;
@@ -119,9 +119,8 @@ impl WorkerNetworkHandle {
             let (tx, rx) = oneshot::channel();
             self.task_spawner.spawn_task(task_name, async move {
                 let res = handle.report_batch(peer_id, batch).await;
-                if let Err(e) = tx.send(res) {
-                    error!(target: "worker::network", ?e, "failed to send result for `handle.report_batch()` on oneshot channel.");
-                }
+                // ignore error bc quorum waiter will move on once quorum is reached
+                let _ = tx.send(res);
             });
 
             result.push(rx);

@@ -669,8 +669,6 @@ where
 
                 // process gossip in application layer
                 if valid {
-                    // TODO: Issue #253
-                    //
                     // forward gossip to handler
                     if let Err(e) = self
                         .event_stream
@@ -845,6 +843,20 @@ where
                 let _ = self.swarm.disconnect_peer_id(peer_id);
             }
             PeerEvent::PeerDisconnected(peer_id) => {
+                debug!(target: "network", ?peer_id, "peer disconnected event from peer manager");
+                // // remove peer from connection pool to override QUIC timeout
+                // let _ = self.swarm.disconnect_peer_id(peer_id);
+
+                // Check if there are any connections still in the pool
+                if self.swarm.is_connected(&peer_id) {
+                    warn!(
+                        target: "network",
+                        ?peer_id,
+                        "PeerDisconnected event but swarm still has connections - forcing disconnect"
+                    );
+                    let _ = self.swarm.disconnect_peer_id(peer_id);
+                }
+
                 // remove from connected peers
                 self.connected_peers.retain(|peer| *peer != peer_id);
 
