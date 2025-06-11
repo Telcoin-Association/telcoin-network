@@ -1282,7 +1282,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_close_epochs() -> eyre::Result<()> {
-        tn_types::test_utils::init_test_tracing();
         let validator_1 = Address::from_slice(&[0x11; 20]);
         let validator_2 = Address::from_slice(&[0x22; 20]);
         let validator_3 = Address::from_slice(&[0x33; 20]);
@@ -1401,7 +1400,6 @@ mod tests {
         // create new env with initialized consensus registry for tests
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::new("Test Task Manager");
-        // let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
         let mut expected_epoch = 0;
@@ -1441,7 +1439,6 @@ mod tests {
         let mut consensus_output = consensus_output_for_tests();
         consensus_output.close_epoch = false;
         let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
-        tracing::warn!(target: "evm", "executing block1");
         let block1 = execute_payload_and_update_canonical_chain(
             &reth_env,
             payload,
@@ -1454,14 +1451,12 @@ mod tests {
         let consensus_output = consensus_output_for_tests();
         let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
         let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
-        tracing::warn!(target: "evm", "executing block2");
         let canonical_header = block2.recovered_block.clone_sealed_header();
 
         // now close the second epoch so the new validator is active
         let consensus_output = consensus_output_for_tests();
         let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
         let block3 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
-        tracing::warn!(target: "evm", "executing block3");
         let canonical_header = block3.recovered_block.clone_sealed_header();
 
         // read new epoch state
