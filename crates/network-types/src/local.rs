@@ -8,24 +8,11 @@ use parking_lot::RwLock;
 use std::{collections::HashSet, sync::Arc};
 use tn_types::{network_public_key_to_libp2p, BlockHash, NetworkKeypair, NetworkPublicKey};
 
-// // //
-//
-// TODO: replace the `LocalNetwork` with worker/primary implementations and add engine.
-// and get rid of this stupid loop crap with retry attempts. the only reason this is here
-// is because LocalNetwork does too much. code doesn't know if/when primary/worker start
-// so there's options and confusing logic. Just create the clients with the config on node startup.
-//
-// This is not so simple.
-//
-// // //
-
 /// LocalNetwork provides the interface to send requests to other nodes, and call other components
 /// directly if they live in the same process. It is used by both primary and worker(s).
 ///
 /// Currently this only supports local direct calls, and it will be extended to support remote
 /// network calls.
-///
-/// TODO: investigate splitting this into Primary and Worker specific clients.
 #[derive(Debug, Clone)]
 pub struct LocalNetwork {
     inner: Arc<RwLock<Inner>>,

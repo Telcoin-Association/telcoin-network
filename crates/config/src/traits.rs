@@ -26,9 +26,9 @@ impl ConfigFmt {
     }
 }
 
+/// A trait to read/write types to the filesystem in the specified [ConfigFmt].
+///
 /// Based on `confy` crate.
-/// Problem: reth uses TOML and TN uses yaml, so must replicate the necessary code as a trait.
-/// Can't use confy crate with two different `cfg`s.
 pub trait ConfigTrait {
     /// Load an application configuration from a specified path.
     ///

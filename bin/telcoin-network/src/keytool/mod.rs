@@ -27,7 +27,6 @@ pub struct KeyArgs {
 
     /// Generate command that creates keypairs and writes to file.
     ///
-    /// TODO: rename this key "command".
     /// Intentionally leaving this here to help others identify
     /// patterns in clap.
     #[command(subcommand)]
@@ -118,8 +117,6 @@ mod tests {
     /// This test also ensures that confy is able to
     /// load the default config.toml, update the file,
     /// and save it.
-    ///
-    /// TODO: better unit test for arg methods.
     #[tokio::test]
     async fn test_generate_keypairs() {
         // use tempdir

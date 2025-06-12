@@ -59,9 +59,6 @@ impl Default for WorkerIndex {
 
 /// The collection of all workers organized by authority public keys
 /// that comprise the [Committee] for a specific [Epoch].
-///
-/// TODO: why isn't this a part of [Committee]?
-/// It's always needed by members of the committee.
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct WorkerCache {
     /// The epoch number for workers
