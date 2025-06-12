@@ -844,8 +844,6 @@ where
             }
             PeerEvent::PeerDisconnected(peer_id) => {
                 debug!(target: "network", ?peer_id, "peer disconnected event from peer manager");
-                // // remove peer from connection pool to override QUIC timeout
-                // let _ = self.swarm.disconnect_peer_id(peer_id);
 
                 // Check if there are any connections still in the pool
                 if self.swarm.is_connected(&peer_id) {

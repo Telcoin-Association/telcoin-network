@@ -444,41 +444,17 @@ fn start_observer(instance: usize, exe_path: &Path, base_dir: &Path, mut rpc_por
     command.spawn().expect("failed to execute")
 }
 
-// fn test_numbers_within_one(client_urls: &[String; 4]) -> eyre::Result<()> {
-//     let num0 = get_block_number(&client_urls[0])?;
-//     let num1 = get_block_number(&client_urls[1])?;
-//     let num2 = get_block_number(&client_urls[2])?;
-//     let num3 = get_block_number(&client_urls[3])?;
-//     if num0.saturating_sub(num1) > 1 || num1.saturating_sub(num0) > 1 {
-//         return Err(eyre::eyre!(
-//             "Nodes are not within one block of each other, delta found {}",
-//             num0 as i64 - num1 as i64
-//         ));
-//     }
-//     if num0.saturating_sub(num2) > 1 || num2.saturating_sub(num0) > 1 {
-//         return Err(eyre::eyre!(
-//             "Nodes are not within one block of each other, delta found {}",
-//             num0 as i64 - num2 as i64
-//         ));
-//     }
-//     if num0.saturating_sub(num3) > 1 || num3.saturating_sub(num0) > 1 {
-//         return Err(eyre::eyre!(
-//             "Nodes are not within one block of each other, delta found {}",
-//             num0 as i64 - num3 as i64
-//         ));
-//     }
-//     Ok(())
-// }
-
 fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
-    // test_numbers_within_one(client_urls)?;
+    info!(target: "restart-test", "calling get_block for {:?}", &client_urls[0]);
     let block0 = get_block(&client_urls[0], None)?;
     let number = u64::from_str_radix(&block0["number"].as_str().unwrap_or("0x100_000")[2..], 16)?;
+    info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[1]);
     let block = get_block(&client_urls[1], Some(number))?;
     if block0["hash"] != block["hash"] {
         return Err(Report::msg("Blocks between validators not the same!".to_string()));
     }
     let number = u64::from_str_radix(&block["number"].as_str().unwrap_or_default()[2..], 16)?;
+    info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[2]);
     let block = get_block(&client_urls[2], Some(number))?;
     if block0["hash"] != block["hash"] {
         return Err(Report::msg(format!(
@@ -487,10 +463,12 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
         )));
     }
     let number = u64::from_str_radix(&block["number"].as_str().unwrap_or_default()[2..], 16)?;
+    info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[3]);
     let block = get_block(&client_urls[3], Some(number))?;
     if block0["hash"] != block["hash"] {
         return Err(Report::msg("Blocks between validators not the same!".to_string()));
     }
+    info!(target: "restart-test", "all rpcs returned same block hash");
     Ok(())
 }
 
