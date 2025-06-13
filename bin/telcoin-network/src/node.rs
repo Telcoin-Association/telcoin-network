@@ -8,7 +8,6 @@ use fdlimit::raise_fd_limit;
 use rayon::ThreadPoolBuilder;
 use std::{net::SocketAddr, sync::Arc, thread::available_parallelism};
 use tn_config::Config;
-
 use tn_node::engine::TnBuilder;
 use tn_reth::{
     clap_genesis_parser,

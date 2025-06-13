@@ -1375,7 +1375,7 @@ mod tests {
             calldata,
         );
         let calldata = ConsensusRegistry::stakeCall {
-            blsPubkey: new_validator.bls_public_key.clone().compress().into(),
+            blsPubkey: new_validator.bls_public_key.compress().into(),
         }
         .abi_encode()
         .into();

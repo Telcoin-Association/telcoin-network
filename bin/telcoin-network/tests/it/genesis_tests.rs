@@ -30,7 +30,6 @@ async fn test_genesis_with_its() -> eyre::Result<()> {
         "0x0000000000000000000000000000000000000000",
         None,
     )
-    .await
     .expect("failed to spawn testnet");
     // allow time for nodes to start
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -157,7 +156,6 @@ async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
         "0x0000000000000000000000000000000000000000",
         None,
     )
-    .await
     .expect("failed to spawn testnet");
     // allow time for nodes to start
     tokio::time::sleep(Duration::from_secs(10)).await;

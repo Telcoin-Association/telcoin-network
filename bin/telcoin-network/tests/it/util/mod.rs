@@ -12,7 +12,7 @@ use tracing::error;
 pub static IT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Execute genesis ceremony inside tempdir
-fn create_validator_info(
+pub fn create_validator_info(
     dir: &Path,
     address: &str,
     passphrase: Option<String>,
@@ -50,7 +50,7 @@ fn create_observer_info(datadir: &str, passphrase: Option<String>) -> eyre::Resu
 }
 
 /// Create validator info, genesis ceremony, and spawn node command with faucet active.
-pub async fn config_local_testnet(
+pub fn config_local_testnet(
     temp_path: &Path,
     passphrase: Option<String>,
     accounts: Option<Vec<(Address, GenesisAccount)>>,
@@ -67,7 +67,7 @@ pub async fn config_local_testnet(
     let copy_path = shared_genesis_dir.join("genesis/validators");
     std::fs::create_dir_all(&copy_path)?;
     // create validator info and copy to shared genesis dir
-    for (v, addr) in validators.into_iter() {
+    for (v, addr) in validators.iter() {
         let dir = temp_path.join(v);
         // init genesis ceremony to create committee / worker_cache files
         create_validator_info(&dir, addr, passphrase.clone())?;
@@ -90,13 +90,13 @@ pub async fn config_local_testnet(
         "--basefee-address",
         "0x9999999999999999999999999999999999999999",
         "--consensus-registry-owner",
-        "0x00000000000000000000000000000000000007e1", // doesn't matter for tests
+        "0x00000000000000000000000000000000000007e1", // doesn't matter for these tests
         "--dev-funded-account",
         "test-source",
         "--max-header-delay-ms",
         "1000",
         "--min-header-delay-ms",
-        "1000",
+        "500",
     ]);
     create_committee_command.args.execute()?;
     // If provided optional accounts then hack them into genesis now...
@@ -107,7 +107,7 @@ pub async fn config_local_testnet(
         Config::write_to_path(&data_dir, &genesis, ConfigFmt::YAML)?;
     }
 
-    for (v, _addr) in validators.into_iter() {
+    for (v, _addr) in validators.iter() {
         let dir = temp_path.join(v);
         std::fs::create_dir_all(dir.join("genesis"))?;
         // copy genesis files back to validator dirs
@@ -146,12 +146,12 @@ pub async fn config_local_testnet(
 }
 
 /// Create validator info, genesis ceremony, and spawn node command with faucet active.
-pub async fn spawn_local_testnet(
+pub fn spawn_local_testnet(
     temp_path: &Path,
     #[cfg(feature = "faucet")] faucet_contract_address: &str,
     accounts: Option<Vec<(Address, GenesisAccount)>>,
 ) -> eyre::Result<()> {
-    config_local_testnet(temp_path, None, accounts).await?;
+    config_local_testnet(temp_path, None, accounts)?;
 
     let validators = ["validator-1", "validator-2", "validator-3", "validator-4"];
     for v in validators.into_iter() {
@@ -170,13 +170,13 @@ pub async fn spawn_local_testnet(
             "--google-kms",
             "--faucet-contract",
             faucet_contract_address,
+            "--public-key",
+            "0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99",
         ]);
         #[cfg(not(feature = "faucet"))]
         let command = NodeCommand::parse_from([
             "tn",
             "--http",
-            "--public-key",
-            "0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99",
             "--datadir",
             datadir,
             "--instance",

@@ -15,7 +15,6 @@ use std::{
     time::Duration,
 };
 use tn_types::{get_available_tcp_port, keccak256, test_utils::init_test_tracing, Address};
-use tokio::runtime::Runtime;
 use tracing::{error, info};
 
 /// One unit of TEL (10^18) measured in wei.
@@ -222,8 +221,7 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
     // create temp path for test
     let temp_path = tmp_guard.path().to_path_buf();
     {
-        let rt = Runtime::new()?;
-        rt.block_on(config_local_testnet(&temp_path, Some("restart_test".to_string()), None))
+        config_local_testnet(&temp_path, Some("restart_test".to_string()), None)
             .expect("failed to config");
     }
     let mut exe_path =
@@ -361,8 +359,7 @@ fn test_restarts_observer() -> eyre::Result<()> {
     // create temp path for test
     let temp_path = tmp_guard.path().to_path_buf();
     {
-        let rt = Runtime::new()?;
-        rt.block_on(config_local_testnet(&temp_path, Some("restart_test".to_string()), None))
+        config_local_testnet(&temp_path, Some("restart_test".to_string()), None)
             .expect("failed to config");
     }
     let mut exe_path =

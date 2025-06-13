@@ -81,7 +81,7 @@ pub struct GenesisArgs {
     )]
     pub min_withdrawal: U256,
 
-    /// The amount of block rewards per epoch starting in genesis.
+    /// The total amount of block rewards per epoch starting in genesis.
     #[arg(
         long = "epoch-block-rewards",
         alias = "block_rewards_per_epoch",
