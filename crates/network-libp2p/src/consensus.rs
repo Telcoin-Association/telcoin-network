@@ -728,7 +728,8 @@ where
                         }) {
                             error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
                             // fatal - unable to process requests
-                            return Err(e.into());
+                            // return Err(e.into());
+                            return Ok(());
                         }
 
                         self.inbound_requests.insert(request_id, notify);

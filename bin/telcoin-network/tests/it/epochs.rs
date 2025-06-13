@@ -101,6 +101,14 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
     let current_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
     info!(target: "epoch-test", "current epoch info: {:#?}", current_epoch_info);
 
+    // retrieve current committee
+    for _ in 0..=5 {
+        let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
+        let current_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+        info!(target: "epoch-test", "current epoch info: {:#?}", current_epoch_info);
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION as u64)).await;
+    }
+
     Ok(())
 }
 
@@ -262,6 +270,7 @@ fn start_nodes(temp_path: &Path, validators: Vec<(&str, Address)>) -> eyre::Resu
         // assign instance for "new-validator"
         if instance == "r" {
             instance = "6".to_string();
+            info!(target: "epoch-test", ?v, "starting new validator");
         }
 
         // for debugging errors

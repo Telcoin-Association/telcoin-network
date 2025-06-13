@@ -183,11 +183,6 @@ where
             .start_engine(for_engine, self.node_shutdown.subscribe(), gas_accumulator.clone())
             .await?;
 
-        // retrieve epoch information from canonical tip on startup
-        let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
-        debug!(target: "epoch-manager", ?epoch, "retrieved epoch state from canonical tip");
-        let consensus_db = self.open_consensus_db(epoch).await?;
-
         // read the network config or use the default
         let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
         self.spawn_node_networks(node_task_spawner, &network_config).await?;
@@ -209,7 +204,7 @@ where
             }
 
             // loop through short-term epochs
-            epoch_result = self.run_epochs(&engine, consensus_db, network_config, to_engine, gas_accumulator) => epoch_result
+            epoch_result = self.run_epochs(&engine, network_config, to_engine, gas_accumulator) => epoch_result
         }
     }
 
@@ -284,7 +279,7 @@ where
         // create network db
         let worker_network_db = self.tn_datadir.network_db_path().join("worker");
         let _ = std::fs::create_dir_all(&worker_network_db);
-        info!(target: "epoch-manager", ?worker_network_db, "opening primary network storage at:");
+        info!(target: "epoch-manager", ?worker_network_db, "opening worker network storage at:");
         let worker_network_db = open_network_db(worker_network_db);
 
         // create long-running network task for worker
@@ -322,7 +317,7 @@ where
     async fn run_epochs(
         &mut self,
         engine: &ExecutionNode,
-        consensus_db: DatabaseType,
+        // epoch: Epoch,
         network_config: NetworkConfig,
         to_engine: mpsc::Sender<ConsensusOutput>,
         gas_accumulator: GasAccumulator,
@@ -339,7 +334,6 @@ where
             let epoch_result = self
                 .run_epoch(
                     engine,
-                    consensus_db.clone(),
                     &mut epoch_task_manager,
                     &network_config,
                     &to_engine,
@@ -371,7 +365,6 @@ where
     async fn run_epoch(
         &mut self,
         engine: &ExecutionNode,
-        consensus_db: DatabaseType,
         epoch_task_manager: &mut TaskManager,
         network_config: &NetworkConfig,
         to_engine: &mpsc::Sender<ConsensusOutput>,
@@ -397,7 +390,6 @@ where
         let (primary, worker_node) = self
             .create_consensus(
                 engine,
-                consensus_db,
                 epoch_task_manager,
                 network_config,
                 initial_epoch,
@@ -552,15 +544,21 @@ where
     async fn create_consensus(
         &mut self,
         engine: &ExecutionNode,
-        consensus_db: DatabaseType,
         epoch_task_manager: &TaskManager,
         network_config: &NetworkConfig,
         initial_epoch: &mut bool,
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<(PrimaryNode<DatabaseType>, WorkerNode<DatabaseType>)> {
+        // retrieve epoch information from canonical tip
+        let epoch_state = engine.epoch_state_from_canonical_tip().await?;
+        debug!(target: "epoch-manager", epoch=?epoch_state.epoch, "retrieved epoch state from canonical tip");
+
+        // open epoch-specific database
+        let consensus_db = self.open_consensus_db(epoch_state.epoch).await?;
+
         // create config for consensus
         let consensus_config =
-            self.configure_consensus(engine, network_config, &consensus_db).await?;
+            self.configure_consensus(network_config, &consensus_db, epoch_state).await?;
 
         let primary = self
             .create_primary_node_components(
@@ -615,13 +613,12 @@ where
     /// to create the current committee and the consensus config.
     async fn configure_consensus(
         &mut self,
-        engine: &ExecutionNode,
         network_config: &NetworkConfig,
         consensus_db: &DatabaseType,
+        epoch_state: EpochState,
     ) -> eyre::Result<ConsensusConfig<DatabaseType>> {
-        // retrieve epoch information from canonical tip
-        let EpochState { epoch, epoch_info, validators, epoch_start } =
-            engine.epoch_state_from_canonical_tip().await?;
+        // use epoch information from canonical tip
+        let EpochState { epoch, epoch_info, validators, epoch_start } = epoch_state;
         let validators = validators
             .iter()
             .map(|v| {
@@ -1066,8 +1063,12 @@ where
         consensus_config: &ConsensusConfig<DB>,
         primary_network_handle: &PrimaryNetworkHandle,
     ) -> eyre::Result<NodeMode> {
-        debug!(target: "epoch-manager", "identifying node mode...");
-        let mode = if self.builder.tn_config.observer {
+        debug!(target: "epoch-manager", authority_id=?consensus_config.authority_id(), "identifying node mode..." );
+        let in_committee = consensus_config
+            .authority_id()
+            .map(|id| consensus_config.in_committee(&id))
+            .unwrap_or(false);
+        let mode = if !in_committee || self.builder.tn_config.observer {
             NodeMode::Observer
         } else if state_sync::can_cvv(consensus_bus, consensus_config, primary_network_handle).await
         {

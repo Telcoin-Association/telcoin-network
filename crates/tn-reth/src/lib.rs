@@ -736,12 +736,15 @@ impl RethEnv {
         // see reth::EngineApiTreeHandler::on_canonical_chain_update
         let chain_update = NewCanonicalChain::Commit { new: blocks };
         let canonical_head = chain_update.tip();
+        let (epoch, round) =
+            Self::deconstruct_nonce(<FixedBytes<8> as Into<u64>>::into(canonical_head.nonce));
         info!(
             target: "engine",
-            "canonical head for round {:?}: {:?} - {:?}",
-            <FixedBytes<8> as Into<u64>>::into(canonical_head.nonce),
+            "canonical head for epoch {:?} round {:?}: {:?} - {:?}",
+            epoch,
+            round,
             canonical_head.number,
-            canonical_head.hash()
+            canonical_head.hash(),
         );
 
         let notification = chain_update.to_chain_notification();
@@ -750,6 +753,13 @@ impl RethEnv {
         self.canonical_in_memory_state().notify_canon_state(notification);
 
         Ok(())
+    }
+
+    /// Helper to deconstruct block nonce into epoch and round.
+    pub fn deconstruct_nonce(nonce: u64) -> (u32, u32) {
+        let epoch = (nonce >> 32) as u32; // Extract the upper 32 bits
+        let round = nonce as u32; // Extract the lower 32 bits (truncates upper bits)
+        (epoch, round)
     }
 
     /// Look up and return the sealed header for hash.

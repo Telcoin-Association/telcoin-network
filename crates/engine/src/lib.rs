@@ -203,16 +203,13 @@ impl Future for ExecutorEngine {
                 }
                 Poll::Ready(None) => {
                     // the stream has ended
-                    //
-                    // this could indicate an error but it's also how the Primary signals engine to
-                    // shutdown
-                    info!(target: "engine", "ConsensusOutput channel closed. Shutting down...");
+                    error!(target: "engine", "ConsensusOutput channel closed. Shutting down...");
 
                     // only return if there are no current tasks and the queue is empty
                     // otherwise, let the loop continue so any remaining tasks and queued output is
                     // executed
                     if this.pending_task.is_none() && this.queued.is_empty() {
-                        return Poll::Ready(Ok(()));
+                        return Poll::Ready(Err(TnEngineError::ConsensusOutputStreamClosed));
                     }
                 }
 
