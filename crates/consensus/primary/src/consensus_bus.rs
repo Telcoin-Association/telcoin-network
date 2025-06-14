@@ -26,14 +26,17 @@ use tokio::{
 #[derive(Copy, Clone, Debug, Default)]
 pub enum NodeMode {
     /// This is a full CVV that can participate in consensus.
+    /// The mode indicates fully-synced and actively voting
+    /// in the current committee.
     #[default]
     CvvActive,
     /// This node can only follow consensus via consensus output.
-    /// It is staked and can be a CVV but is either currently not in the
-    /// committee or is "catching up" to participate after a failure.
+    /// It is staked and is "catching up" to participate after a failure
+    /// during the epoch. This mode allows the node to sync past the
+    /// garbage collection window and rejoin the committee.
     CvvInactive,
-    /// Node that is following consensus output but is not staked and will never
-    /// join a committee.
+    /// Node that is following consensus output. This may or may not be a
+    /// staked node. The defining characteristic is it's NOT in the current committee.
     Observer,
 }
 

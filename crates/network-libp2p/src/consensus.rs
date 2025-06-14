@@ -496,7 +496,8 @@ where
                 send_or_log_error!(reply, res, "Subscribe");
             }
             NetworkCommand::ConnectedPeers { reply } => {
-                let res = self.swarm.connected_peers().cloned().collect();
+                let res = self.swarm.behaviour().peer_manager.connected_or_dialing_peers();
+                debug!(target: "epoch-manager", ?res, "peer manager connected peers:");
                 send_or_log_error!(reply, res, "ConnectedPeers");
             }
             NetworkCommand::PeerScore { peer_id, reply } => {

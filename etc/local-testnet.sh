@@ -106,7 +106,7 @@ else
             --max-header-delay-ms 1000 \
             --min-header-delay-ms 1000 \
             --consensus-registry-owner $DEV_FUNDS \
-            --epoch-duration-in-secs 60
+            --epoch-duration-in-secs 30
     else
         target/${RELEASE}/telcoin-network genesis \
             --datadir "${ROOTDIR}" \
@@ -158,7 +158,7 @@ if [ "$START" = true ]; then
         echo "Starting ${VALIDATOR} in background, rpc endpoint http://localhost:$RPC_PORT"
         # -vvv for INFO, -vvvvv for TRACE, etc
         # start validator
-        target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
+        RUST_LOG=epoch-manager=debug,peer-manager=debug,info target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
            --instance "${INSTANCE}" \
            --metrics "${CONSENSUS_METRICS}" \
            --log.stdout.format log-fmt \
@@ -169,7 +169,7 @@ if [ "$START" = true ]; then
     DATADIR="${ROOTDIR}/observer"
     CONSENSUS_METRICS="127.0.0.1:9104"
     echo "Starting Observer in background, rpc endpoint http://localhost:8541"
-    target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
+    RUST_LOG=epoch-manager=debug,peer-manager=debug,info target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
        --observer \
        --instance 5 \
        --metrics "${CONSENSUS_METRICS}" \

@@ -280,7 +280,7 @@ impl PeerManager {
         debug!(
             target: "peer-manager",
             ?peer_id,
-            "checking if peer banned...current banned peers:\n{:#?}",
+            "checking if peer banned...current banned peers:\n{:?}",
             self.temporarily_banned
         );
         self.temporarily_banned.contains(peer_id) || self.peers.peer_banned(peer_id)
@@ -293,13 +293,14 @@ impl PeerManager {
             self.peers.connected_peer_ids().count() >= self.config.max_outbound_dialing_peers()
         } else {
             // peer dialed this node
-            self.connected_or_dialing_peers() >= self.config.max_peers()
+            self.connected_or_dialing_peers().len() >= self.config.max_peers()
         }
     }
 
     /// Return an iterator of peers that are connected or dialed.
-    pub(crate) fn connected_or_dialing_peers(&self) -> usize {
-        self.peers.connected_or_dialing_peers().count()
+    pub(crate) fn connected_or_dialing_peers(&self) -> Vec<PeerId> {
+        debug!(target: "peer-manager", "all peers:\n{:?}", self.peers);
+        self.peers.connected_or_dialing_peers()
     }
 
     /// Process a penalty from the application layer.

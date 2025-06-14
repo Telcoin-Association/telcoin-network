@@ -140,9 +140,10 @@ impl AllPeers {
             // initialize unknown peer and log warning if status update is invalid for unknown peers
             if !new_status.valid_initial_state() {
                 warn!(target: "peer-manager",
-                    ?peer_id,
-                    ?new_status,
-                    "Attempt to update connection status for unknown peer"
+                    "Attempt to update {:?} for unknown peer {:?}. Current peers:\n{:?}",
+                    new_status,
+                    peer_id,
+                    self.peers,
                 );
             }
 
@@ -638,14 +639,15 @@ impl AllPeers {
     }
 
     /// Return an iterator of peers that are connected or dialed.
-    pub(super) fn connected_or_dialing_peers(&self) -> impl Iterator<Item = &PeerId> {
+    pub(super) fn connected_or_dialing_peers(&self) -> Vec<PeerId> {
         self.peers
             .iter()
             .filter(|(_, peer)| {
                 let status = peer.connection_status();
                 status.is_connected() || status.is_dialing()
             })
-            .map(|(peer_id, _)| peer_id)
+            .map(|(peer_id, _)| peer_id.clone())
+            .collect()
     }
 
     /// Returns a boolean indicating if a peer is already connected or disconnecting.
