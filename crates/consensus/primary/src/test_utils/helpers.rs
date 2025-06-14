@@ -13,7 +13,7 @@ use std::{
 use tempfile::TempDir;
 use tn_reth::test_utils::{batch, TransactionFactory};
 use tn_types::{
-    adiri_chain_spec_arc, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash,
+    test_chain_spec_arc, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash,
     BlsKeypair, BlsSignature, Bytes, Certificate, CertificateDigest, Committee, Epoch, ExecHeader,
     Hash as _, HeaderBuilder, ProtocolSignature, Round, TimestampSec, VotingPower, WorkerId, U256,
 };
@@ -63,7 +63,7 @@ pub fn fixture_payload_with_rand<R: Rng + ?Sized>(
 /// Create a transaction with a randomly generated keypair.
 pub fn transaction_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Vec<u8> {
     let mut tx_factory = TransactionFactory::new_random_from_seed(rand);
-    let chain = adiri_chain_spec_arc();
+    let chain = test_chain_spec_arc();
     // TODO: this is excessively high, but very unlikely to ever fail
     let gas_price = 875000000;
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");

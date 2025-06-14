@@ -6,25 +6,14 @@ use clap::{Args, Subcommand};
 use eyre::{eyre, Context};
 
 use generate::GenerateKeys;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tn_config::{Config, ConfigFmt, ConfigTrait, NodeInfo, TelcoinDirs as _};
-use tn_reth::{
-    dirs::{default_datadir_args, DataDirChainPath, DataDirPath},
-    MaybePlatformPath, RethChainSpec,
-};
 use tracing::warn;
 
 /// Generate keypairs and node info to go with them and save them to a file.
 #[derive(Debug, Args)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct KeyArgs {
-    /// Save an encoded keypair (Base58 encoded `privkey`) to file.
-    /// - bls (bls12381)
-    /// - network (ed25519)
-    /// - execution (secp256k1)
-    #[arg(long, value_name = "DATA_DIR", verbatim_doc_comment, default_value_t, global = true)]
-    pub datadir: MaybePlatformPath<DataDirPath>,
-
     /// Generate command that creates keypairs and writes to file.
     ///
     /// TODO: rename this key "command".
@@ -44,10 +33,7 @@ pub enum KeySubcommand {
 
 impl KeyArgs {
     /// Execute command
-    pub fn execute(&self, passphrase: Option<String>) -> eyre::Result<()> {
-        // create datadir
-        let datadir = self.data_dir();
-
+    pub fn execute(&self, datadir: PathBuf, passphrase: Option<String>) -> eyre::Result<()> {
         match &self.read_or_write {
             // generate keys
             KeySubcommand::Generate(args) => {
@@ -98,13 +84,6 @@ impl KeyArgs {
         } else {
             true
         }
-    }
-
-    /// Returns the chain specific path to the data dir.
-    fn data_dir(&self) -> DataDirChainPath {
-        self.datadir
-            .unwrap_or_chain_default(RethChainSpec::default().chain, default_datadir_args())
-            .into()
     }
 }
 

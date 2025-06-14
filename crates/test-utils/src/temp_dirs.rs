@@ -12,10 +12,6 @@ impl Default for TelcoinTempDirs {
 }
 
 impl TelcoinDirs for TelcoinTempDirs {
-    fn node_config_path(&self) -> PathBuf {
-        self.0.path().join("telcoin-network.yaml")
-    }
-
     fn node_config_parameters_path(&self) -> PathBuf {
         self.0.as_ref().join("parameters.yaml")
     }

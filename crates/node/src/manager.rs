@@ -31,16 +31,16 @@ use tn_reth::{
 use tn_storage::{
     open_db, open_network_db,
     tables::{
-        CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusBlocks,
-        LastProposed, Payload, Votes,
+        CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
+        ConsensusBlockNumbersByDigest, ConsensusBlocks, LastProposed, Payload, Votes,
     },
     DatabaseType,
 };
 use tn_types::{
-    gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, Committee, CommitteeBuilder,
-    ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, Multiaddr, Noticer, Notifier,
-    TaskManager, TaskSpawner, TimestampSec, WorkerCache, WorkerIndex, WorkerInfo,
-    MIN_PROTOCOL_BASE_FEE,
+    gas_accumulator::GasAccumulator, AuthorityIdentifier, BatchValidation, BlsPublicKey, Committee,
+    CommitteeBuilder, ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, Multiaddr,
+    Noticer, Notifier, TaskManager, TaskSpawner, TimestampSec, WorkerCache, WorkerIndex,
+    WorkerInfo, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::{
@@ -93,7 +93,11 @@ pub struct EpochManager<P> {
 }
 
 /// When rejoining a network mid epoch this will accumulate any gas state for previous epoch blocks.
-fn catchup_accumulator(reth_env: RethEnv, gas_accumulator: &GasAccumulator) -> eyre::Result<()> {
+fn catchup_accumulator<DB: TNDatabase>(
+    db: &DB,
+    reth_env: RethEnv,
+    gas_accumulator: &GasAccumulator,
+) -> eyre::Result<()> {
     if let Some(block) = reth_env.finalized_header()? {
         let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
 
@@ -104,12 +108,26 @@ fn catchup_accumulator(reth_env: RethEnv, gas_accumulator: &GasAccumulator) -> e
             .set_base_fee(block.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE));
 
         let blocks = reth_env.blocks_for_range(epoch_state.epoch_start..=block.number)?;
+        let mut consensus_leaders: HashMap<B256, AuthorityIdentifier> = HashMap::default();
         for current in blocks {
             let gas = current.gas_used;
             let limit = current.gas_limit;
             let lower64 = current.difficulty.into_limbs()[0];
             let worker_id = (lower64 & 0xffff) as u16;
             gas_accumulator.inc_block(worker_id, gas, limit);
+            // increment or leader counts.
+            if let Some(hash) = current.parent_beacon_block_root {
+                if let Some(leader) = consensus_leaders.get(&hash) {
+                    gas_accumulator.rewards_counter().inc_leader_count(leader);
+                } else if let Some(number) = db.get::<ConsensusBlockNumbersByDigest>(&hash)? {
+                    if let Some(consensus_header) = db.get::<ConsensusBlocks>(&number)? {
+                        let leader = consensus_header.sub_dag.leader.origin();
+                        gas_accumulator.rewards_counter().inc_leader_count(leader);
+                        // Cache the leader.
+                        consensus_leaders.insert(hash, leader.clone());
+                    }
+                }
+            }
         }
     };
     Ok(())
@@ -179,12 +197,11 @@ where
         // create channels for engine that survive the lifetime of the node
         let (to_engine, for_engine) = mpsc::channel(1000);
 
-        // create the engine
-        let engine = self.create_engine(&engine_task_manager, reth_db)?;
         // Create our epoch gas accumulator, we currently have one worker.
         // All nodes have to agree on the worker count, do not change this for an existing chain.
         let gas_accumulator = GasAccumulator::new(1);
-        catchup_accumulator(engine.get_reth_env().await, &gas_accumulator)?;
+        // create the engine
+        let engine = self.create_engine(&engine_task_manager, reth_db, &gas_accumulator)?;
 
         engine
             .start_engine(for_engine, self.node_shutdown.subscribe(), gas_accumulator.clone())
@@ -194,6 +211,7 @@ where
         let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
         debug!(target: "epoch-manager", ?epoch, "retrieved epoch state from canonical tip");
         let consensus_db = self.open_consensus_db().await?;
+        catchup_accumulator(&consensus_db, engine.get_reth_env().await, &gas_accumulator)?;
 
         // read the network config or use the default
         let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
@@ -413,6 +431,7 @@ where
             )
             .await?;
 
+        gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
         // start primary
         let mut primary_task_manager = primary.start().await?;
 
@@ -498,18 +517,10 @@ where
                 // update output so engine closes epoch
                 output.close_epoch = true;
 
-                // Use accumulated gas information to set each workers base fee for the epoch.
-                for worker_id in 0..gas_accumulator.num_workers() {
-                    let worker_id = worker_id as u16;
-                    let (_blocks, _gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
-                    // Change this base fee to update base fee in batches workers create.
-                    let _base_fee = gas_accumulator.base_fee(worker_id);
-                }
-                gas_accumulator.clear(); // Clear the accumlated values for next epoch.
-
                 // obtain hash to monitor execution progress
                 let target_hash = output.consensus_header_hash();
 
+                gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
                 // forward the output to the engine
                 to_engine.send(output).await?;
 
@@ -532,10 +543,19 @@ where
                 );
                 return Err(eyre!("engine failed to report output for closing epoch"));
             } else {
+                gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
                 // only forward the output to the engine
                 to_engine.send(output).await?;
             }
         }
+        // Use accumulated gas information to set each workers base fee for the epoch.
+        for worker_id in 0..gas_accumulator.num_workers() {
+            let worker_id = worker_id as u16;
+            let (_blocks, _gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
+            // Change this base fee to update base fee in batches workers create.
+            let _base_fee = gas_accumulator.base_fee(worker_id);
+        }
+        gas_accumulator.clear(); // Clear the accumlated values for next epoch.
 
         Ok(())
     }
@@ -545,11 +565,17 @@ where
         &self,
         engine_task_manager: &TaskManager,
         reth_db: RethDb,
+        gas_accumulator: &GasAccumulator,
     ) -> eyre::Result<ExecutionNode> {
         // create execution components (ie - reth env)
         let basefee_address = self.builder.tn_config.parameters.basefee_address;
-        let reth_env =
-            RethEnv::new(&self.builder.node_config, engine_task_manager, reth_db, basefee_address)?;
+        let reth_env = RethEnv::new(
+            &self.builder.node_config,
+            engine_task_manager,
+            reth_db,
+            basefee_address,
+            gas_accumulator.rewards_counter(),
+        )?;
         let engine = ExecutionNode::new(&self.builder, reth_env)?;
 
         Ok(engine)

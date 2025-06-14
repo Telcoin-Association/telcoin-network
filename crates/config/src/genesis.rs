@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 use tn_types::{
-    adiri_genesis, verify_proof_of_possession_bls, Address, BlsPublicKey, BlsSignature, Committee,
+    test_genesis, verify_proof_of_possession_bls, Address, BlsPublicKey, BlsSignature, Committee,
     CommitteeBuilder, Epoch, Genesis, GenesisAccount, Intent, IntentMessage, Multiaddr,
     NetworkPublicKey, NodeP2pInfo, ProtocolSignature, Signer, WorkerCache, WorkerIndex,
 };
@@ -37,16 +37,10 @@ pub struct NetworkGenesis {
     validators: BTreeMap<BlsPublicKey, NodeInfo>,
 }
 
-impl Default for NetworkGenesis {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl NetworkGenesis {
     /// Create new version of [NetworkGenesis] using the adiri genesis [ChainSpec].
-    pub fn new() -> Self {
-        Self { genesis: adiri_genesis(), validators: Default::default() }
+    pub fn new_for_test() -> Self {
+        Self { genesis: test_genesis(), validators: Default::default() }
     }
 
     /// Return the current genesis.
@@ -336,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_validate_genesis() {
-        let mut network_genesis = NetworkGenesis::new();
+        let mut network_genesis = NetworkGenesis::new_for_test();
         // create keys and information for validators
         for v in 0..4 {
             let bls_keypair = BlsKeypair::generate(&mut StdRng::from_seed([0; 32]));
@@ -372,7 +366,7 @@ mod tests {
     #[test]
     fn test_validate_genesis_fails() {
         // this uses `adiri_genesis`
-        let mut network_genesis = NetworkGenesis::new();
+        let mut network_genesis = NetworkGenesis::new_for_test();
         // create keys and information for validators
         for v in 0..4 {
             let bls_keypair = BlsKeypair::generate(&mut StdRng::from_seed([0; 32]));

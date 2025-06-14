@@ -5,9 +5,9 @@ use crate::{
     NoArgs,
 };
 use clap::{Parser, Subcommand};
-use std::{ffi::OsString, fmt};
+use std::{ffi::OsString, fmt, path::PathBuf, str::FromStr};
 use tn_node::engine::TnBuilder;
-use tn_reth::{dirs::DataDirChainPath, FileWorkerGuard, LogArgs};
+use tn_reth::{dirs::DEFAULT_ROOT_DIR, FileWorkerGuard, LogArgs};
 
 /// How do we want to get the BLS key passphrase?
 #[derive(Debug, Copy, Clone, clap::ValueEnum)]
@@ -52,6 +52,16 @@ pub struct Cli<Ext: clap::Args + fmt::Debug = NoArgs> {
         global = true
     )]
     pub bls_passphrase_source: PassSource,
+
+    /// The path to the data dir for all telcoin-network files and subdirectories.
+    ///
+    /// Defaults to the OS-specific data directory:
+    ///
+    /// - Linux: `$XDG_DATA_HOME/telcoin-network/` or `$HOME/.local/share/telcoin-network/`
+    /// - Windows: `{FOLDERID_RoamingAppData}/telcoin-network/`
+    /// - macOS: `$HOME/Library/Application Support/telcoin-network/`
+    #[arg(long, value_name = "DATA_DIR", verbatim_doc_comment, global = true)]
+    pub datadir: Option<PathBuf>,
 
     /// The log configuration.
     #[clap(flatten)]
@@ -106,17 +116,22 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     /// ```
     pub fn run<L>(mut self, passphrase: Option<String>, launcher: L) -> eyre::Result<()>
     where
-        L: FnOnce(TnBuilder, Ext, DataDirChainPath, Option<String>) -> eyre::Result<()>,
+        L: FnOnce(TnBuilder, Ext, PathBuf, Option<String>) -> eyre::Result<()>,
     {
+        let datadir: PathBuf = self.datadir.take().unwrap_or_else(|| {
+            dirs_next::data_dir().map(|root| root.join(DEFAULT_ROOT_DIR)).unwrap_or_else(|| {
+                PathBuf::from_str(&format!("./{DEFAULT_ROOT_DIR}")).expect("data dir")
+            })
+        });
         // add network name to logs dir
         self.logs.log_file_directory = self.logs.log_file_directory.join("telcoin-network-logs");
 
         let _guard = self.init_tracing()?;
 
         match self.command {
-            Commands::Genesis(command) => command.execute(),
-            Commands::Node(command) => command.execute(passphrase, launcher),
-            Commands::Keytool(command) => command.execute(passphrase),
+            Commands::Genesis(command) => command.execute(datadir),
+            Commands::Node(command) => command.execute(datadir, passphrase, launcher),
+            Commands::Keytool(command) => command.execute(datadir, passphrase),
         }
     }
 

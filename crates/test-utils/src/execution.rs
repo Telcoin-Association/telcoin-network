@@ -8,7 +8,9 @@ use tn_config::Config;
 use tn_faucet::FaucetArgs;
 use tn_node::engine::{ExecutionNode, TnBuilder};
 use tn_reth::{RethChainSpec, RethCommand, RethConfig, RethEnv};
-use tn_types::{Address, TaskManager, TimestampSec, Withdrawals, B256};
+use tn_types::{
+    gas_accumulator::RewardsCounter, Address, TaskManager, TimestampSec, Withdrawals, B256,
+};
 
 /// Convenience type for testing Execution Node.
 pub type TestExecutionNode = ExecutionNode;
@@ -44,13 +46,13 @@ pub fn default_test_execution_node(
 }
 
 /// Create CLI command for tests calling `ExecutionNode::new`.
-pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
+fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     opt_chain: Option<Arc<RethChainSpec>>,
     opt_address: Option<Address>,
     opt_args: Option<Vec<&str>>,
     tmp_dir: &Path,
 ) -> eyre::Result<(TnBuilder, CliExt)> {
-    let default_args = ["telcoin-network", "--http", "--genesis", "adiri"];
+    let default_args = ["telcoin-network", "--http", "--chain", "adiri"];
 
     // extend faucet args if provided
     let cli_args = if let Some(args) = opt_args {
@@ -62,15 +64,16 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     // use same approach as telcoin-network binary
     let command = NodeCommand::<CliExt>::try_parse_from(cli_args)?;
 
-    let NodeCommand { instance, ext, reth, datadir: _, .. } = command;
-    let RethCommand { chain, rpc, txpool, db, .. } = reth;
+    let NodeCommand { instance, ext, reth, .. } = command;
+    let RethCommand { rpc, txpool, db, .. } = reth;
 
-    // overwrite chain spec if passed in
-    let chain = opt_chain.unwrap_or(chain);
+    let reth_command = RethCommand { rpc, txpool, db };
 
-    let reth_command = RethCommand { chain, rpc, txpool, db };
-
-    let mut tn_config = Config::default();
+    let mut tn_config = Config::default_for_test();
+    if let Some(chain) = opt_chain {
+        // overwrite chain spec if passed in
+        tn_config.genesis = chain.genesis().clone();
+    }
 
     // check args then use test defaults
     let address = opt_address.unwrap_or_else(|| {
@@ -83,7 +86,13 @@ pub fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     // TODO: this a temporary approach until upstream reth supports public rpc hooks
     let opt_faucet_args = None;
     let builder = TnBuilder {
-        node_config: RethConfig::new(reth_command, instance, tmp_dir, true),
+        node_config: RethConfig::new(
+            reth_command,
+            instance,
+            tmp_dir,
+            true,
+            Arc::new(tn_config.chain_spec()),
+        ),
         tn_config,
         opt_faucet_args,
         metrics: None,
@@ -131,7 +140,13 @@ pub fn faucet_test_execution_node(
     let reth_db = RethEnv::new_database(&node_config, tmp_dir.join("db"))?;
     let engine = ExecutionNode::new(
         &builder,
-        RethEnv::new(&node_config, &TaskManager::default(), reth_db, None)?,
+        RethEnv::new(
+            &node_config,
+            &TaskManager::default(),
+            reth_db,
+            None,
+            RewardsCounter::default(),
+        )?,
     )?;
 
     Ok(engine)

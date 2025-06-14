@@ -36,7 +36,8 @@ use std::{
 };
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
 use tn_types::{
-    encode, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair, TaskSpawner,
+    encode, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair, NetworkPublicKey,
+    TaskSpawner,
 };
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
@@ -151,6 +152,8 @@ where
     key_config: KeyConfig,
     /// If true then add peers to kademlia- useful for testing to set false.
     kad_add_peers: bool,
+    /// The public network key for this node.
+    network_pubkey: NetworkPublicKey,
     /// The hostname for the node provided by the [NetworkConfig].
     ///
     /// This is a human-readable representation for a node identity.
@@ -244,6 +247,7 @@ where
         // create custom behavior
         let behavior =
             TNBehavior::new(identify, gossipsub, req_res, kademlia, network_config.peer_config());
+        let network_pubkey = keypair.public().into();
 
         // create swarm
         let swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -285,6 +289,7 @@ where
             pending_px_disconnects,
             key_config,
             kad_add_peers: true,
+            network_pubkey,
             hostname: network_config.hostname().to_string(),
             task_spawner,
         })
@@ -328,7 +333,7 @@ where
         if let Some(addr) = multiaddr {
             let peer_id = *self.swarm.local_peer_id();
             let node_record = NodeRecord::build(
-                self.key_config.primary_network_public_key(),
+                self.network_pubkey.clone(),
                 addr,
                 self.hostname.clone(),
                 |data| self.key_config.request_signature_direct(data),

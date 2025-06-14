@@ -208,8 +208,6 @@ fn config_committee(
     // create committee from shared genesis dir
     let create_committee_command = CommandParser::<GenesisArgs>::parse_from([
         "tn",
-        "--datadir",
-        shared_genesis_dir.to_str().expect("shared genesis dir"),
         "--basefee-address",
         "0x9999999999999999999999999999999999999999",
         "--consensus-registry-owner",
@@ -229,7 +227,7 @@ fn config_committee(
         "--min-header-delay-ms",
         "500",
     ]);
-    create_committee_command.args.execute()?;
+    create_committee_command.args.execute(shared_genesis_dir.clone())?;
 
     // update genesis with funded accounts
     let data_dir = shared_genesis_dir.join("genesis/genesis.yaml");
@@ -264,7 +262,6 @@ fn config_committee(
 fn start_nodes(temp_path: &Path, validators: Vec<(&str, Address)>) -> eyre::Result<()> {
     for (v, _) in validators.into_iter() {
         let dir = temp_path.join(v);
-        let datadir = dir.to_str().expect("validator temp dir");
         let mut instance = v.chars().last().expect("validator instance").to_string();
 
         // assign instance for "new-validator"
@@ -280,8 +277,6 @@ fn start_nodes(temp_path: &Path, validators: Vec<(&str, Address)>) -> eyre::Resu
         let command = NodeCommand::<tn_faucet::FaucetArgs>::parse_from([
             "tn",
             "--http",
-            "--datadir",
-            datadir,
             "--instance",
             &instance,
             "--google-kms",
@@ -291,17 +286,11 @@ fn start_nodes(temp_path: &Path, validators: Vec<(&str, Address)>) -> eyre::Resu
             "0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99",
         ]);
         #[cfg(not(feature = "faucet"))]
-        let command = NodeCommand::parse_from([
-            "tn",
-            "--http",
-            "--datadir",
-            datadir,
-            "--instance",
-            &instance,
-        ]);
+        let command = NodeCommand::parse_from(["tn", "--http", "--instance", &instance]);
 
         std::thread::spawn(move || {
             let err = command.execute(
+                dir,
                 Some(NODE_PASSWORD.to_string()),
                 |mut builder, faucet_args, tn_datadir, passphrase| {
                     builder.opt_faucet_args = Some(faucet_args);

@@ -23,7 +23,7 @@ use tracing::debug;
 #[tokio::test]
 async fn test_genesis_with_its() -> eyre::Result<()> {
     // spawn testnet for RPC calls
-    let temp_path = tempfile::TempDir::new().expect("tempdir is okay");
+    let temp_path = tempfile::TempDir::with_suffix("genesis_with_its").expect("tempdir is okay");
     spawn_local_testnet(
         temp_path.path(),
         #[cfg(feature = "faucet")]
@@ -149,7 +149,8 @@ async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
     let registry_deployed_bytecode = json_val.as_str().ok_or_eyre("Couldn't fetch bytecode")?;
 
     // spawn testnet for RPC calls
-    let temp_path = tempfile::TempDir::new().expect("tempdir is okay");
+    let temp_path =
+        tempfile::TempDir::with_suffix("genesis_with_consensus_registry").expect("tempdir is okay");
     spawn_local_testnet(
         temp_path.path(),
         #[cfg(feature = "faucet")]

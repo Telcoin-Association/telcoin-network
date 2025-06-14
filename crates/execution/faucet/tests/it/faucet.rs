@@ -28,9 +28,9 @@ use tn_storage::open_db;
 use tn_test_utils::faucet_test_execution_node;
 
 use tn_types::{
-    adiri_genesis, error::BlockSealError, gas_accumulator::BaseFeeContainer, hex,
-    public_key_to_address, sol, Address, ConsensusHeader, GenesisAccount, SealedBatch, SolType,
-    SolValue, TaskManager, TaskSpawner, TransactionSigned, TransactionTrait as _, B256, U160, U256,
+    error::BlockSealError, gas_accumulator::BaseFeeContainer, hex, public_key_to_address, sol,
+    test_genesis, Address, ConsensusHeader, GenesisAccount, SealedBatch, SolType, SolValue,
+    TaskManager, TaskSpawner, TransactionSigned, TransactionTrait as _, B256, U160, U256,
 };
 use tn_worker::{
     metrics::WorkerMetrics,
@@ -105,7 +105,7 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
     let kms_address = public_key_to_address(public_key);
 
     // create genesis and fund account
-    let tmp_genesis = adiri_genesis();
+    let tmp_genesis = test_genesis();
 
     // faucet interface
     sol!(
@@ -268,7 +268,7 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
     ];
 
     // start canonical adiri chain with fetched storage
-    let real_genesis = adiri_genesis();
+    let real_genesis = test_genesis();
     let genesis = real_genesis.extend_accounts(genesis_accounts.into_iter());
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
@@ -398,7 +398,7 @@ async fn test_with_creds_faucet_transfers_stablecoin_with_google_kms() -> eyre::
     let kms_address = public_key_to_address(public_key);
 
     // create genesis and fund account
-    let tmp_genesis = adiri_genesis();
+    let tmp_genesis = test_genesis();
 
     // faucet interface
     sol!(
@@ -625,7 +625,7 @@ async fn test_with_creds_faucet_transfers_stablecoin_with_google_kms() -> eyre::
     ];
 
     // start canonical adiri chain with fetched storage
-    let real_genesis = adiri_genesis();
+    let real_genesis = test_genesis();
     let genesis = real_genesis.extend_accounts(genesis_accounts.into_iter());
     let chain = Arc::new(genesis.into());
 

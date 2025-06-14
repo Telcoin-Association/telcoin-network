@@ -169,7 +169,7 @@ struct CommitteeInner {
 
 impl CommitteeInner {
     /// Updates the committee internal secondary indexes.
-    pub fn load(&mut self) {
+    fn load(&mut self) {
         self.authorities_by_id = self
             .authorities
             .values()

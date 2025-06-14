@@ -4,8 +4,7 @@
 //! have reached quorum.
 
 use crate::{
-    adiri_chain_spec, crypto, encode, now, Address, BlockHash, ExecHeader, TimestampSec,
-    MIN_PROTOCOL_BASE_FEE,
+    crypto, encode, now, Address, BlockHash, ExecHeader, TimestampSec, MIN_PROTOCOL_BASE_FEE,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -176,7 +175,7 @@ impl Default for Batch {
         Self {
             transactions: vec![],
             received_at: None,
-            parent_hash: adiri_chain_spec().genesis_hash(),
+            parent_hash: BlockHash::default(),
             beneficiary: Address::ZERO,
             timestamp: now(),
             worker_id: 0,

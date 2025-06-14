@@ -7,7 +7,7 @@ use tn_engine::ExecutorEngine;
 use tn_reth::{test_utils::seeded_genesis_from_random_batches, FixedBytes, RethChainSpec};
 use tn_test_utils::default_test_execution_node;
 use tn_types::{
-    adiri_chain_spec_arc, adiri_genesis, gas_accumulator::GasAccumulator, max_batch_gas, now,
+    gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc, test_genesis,
     Address, BlockHash, Bloom, Bytes, Certificate, CommittedSubDag, ConsensusOutput, Hash as _,
     Notifier, ReputationScores, TaskManager, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS,
     MIN_PROTOCOL_BASE_FEE, U256,
@@ -47,7 +47,7 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     };
     let consensus_output_hash = consensus_output.consensus_header_hash();
 
-    let chain = adiri_chain_spec_arc();
+    let chain = test_chain_spec_arc();
 
     let tmp_dir = TempDir::new().expect("temp dir");
     // execution node components
@@ -206,7 +206,7 @@ async fn test_empty_output_executes_late_finalize() -> eyre::Result<()> {
         ..Default::default()
     };
 
-    let chain = adiri_chain_spec_arc();
+    let chain = test_chain_spec_arc();
 
     let tmp_dir = TempDir::new().expect("temp dir");
     // execution node components
@@ -287,7 +287,7 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
     let all_batches = [batches_1.clone(), batches_2.clone()].concat();
 
     // use default genesis and seed accounts to execute batches
-    let genesis = adiri_genesis();
+    let genesis = test_genesis();
     let (genesis, txs_by_block, signers_by_block) =
         seeded_genesis_from_random_batches(genesis, all_batches.iter());
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
@@ -597,7 +597,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let all_batches = [batches_1.clone(), batches_2.clone()].concat();
 
     // use default genesis and seed accounts to execute batches
-    let genesis = adiri_genesis();
+    let genesis = test_genesis();
     let (genesis, txs_by_block, signers_by_block) =
         seeded_genesis_from_random_batches(genesis, all_batches.iter());
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
@@ -918,7 +918,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     let all_batches = [batches_1.clone(), batches_2.clone()].concat();
 
     // use default genesis and seed accounts to execute batches
-    let genesis = adiri_genesis();
+    let genesis = test_genesis();
     let (genesis, _txs_by_block, _signers_by_block) =
         seeded_genesis_from_random_batches(genesis, all_batches.iter());
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());

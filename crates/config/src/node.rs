@@ -3,10 +3,12 @@
 use crate::{ConfigFmt, ConfigTrait, NodeInfo, TelcoinDirs};
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{fs::File, io::Write, time::Duration};
 use tn_types::{
-    adiri_genesis, get_available_tcp_port, get_available_udp_port, Address, BlsPublicKey,
-    BlsSignature, Genesis, Multiaddr, NetworkPublicKey, WorkerIndex,
+    get_available_tcp_port, get_available_udp_port, test_genesis, Address, BlsPublicKey,
+    BlsSignature, Genesis, Multiaddr, NetworkPublicKey, WorkerIndex, MAINNET_COMMITTEE,
+    MAINNET_GENESIS, MAINNET_PARAMETERS, MAINNET_WORKER_CACHE, TESTNET_COMMITTEE, TESTNET_GENESIS,
+    TESTNET_PARAMETERS, TESTNET_WORKER_CACHE,
 };
 use tracing::info;
 
@@ -39,23 +41,21 @@ pub struct Config {
     pub version: &'static str,
 }
 
-impl Default for Config {
-    fn default() -> Self {
+impl ConfigTrait for Config {}
+
+impl Config {
+    /// Create a Config for testing.
+    pub fn default_for_test() -> Self {
         Self {
             // defaults
             node_info: Default::default(),
             parameters: Default::default(),
-            // specify adiri chain spec
-            genesis: adiri_genesis(),
+            genesis: test_genesis(),
             observer: false,
             version: "UNKNOWN",
         }
     }
-}
 
-impl ConfigTrait for Config {}
-
-impl Config {
     /// Load a config from it's component parts.
     /// Fallback to defaults if files are missing.
     pub fn load_or_default<P: TelcoinDirs>(
@@ -87,6 +87,58 @@ impl Config {
             Config::load_from_path(tn_datadir.node_config_parameters_path(), ConfigFmt::YAML)?;
         let genesis: Genesis =
             Config::load_from_path(tn_datadir.genesis_file_path(), ConfigFmt::YAML)?;
+
+        Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
+    }
+
+    /// Load a config from it's component parts.
+    pub fn load_adiri<P: TelcoinDirs>(
+        tn_datadir: &P,
+        observer: bool,
+        version: &'static str,
+    ) -> eyre::Result<Self> {
+        let validator_info: NodeInfo =
+            Config::load_from_path(tn_datadir.node_info_path(), ConfigFmt::YAML)?;
+        let parameters: Parameters =
+            serde_yaml::from_str(TESTNET_PARAMETERS).expect("bad adiri parameters yaml data");
+        let genesis: Genesis =
+            serde_yaml::from_str(TESTNET_GENESIS).expect("bad adiri genesis yaml data");
+        // If the default committee file does not exist then save it.
+        let committee_path = tn_datadir.committee_path();
+        if !committee_path.exists() {
+            File::create_new(committee_path)?.write_all(TESTNET_COMMITTEE.as_bytes())?
+        }
+        // If the default worker cache file does not exist then save it.
+        let worker_cache_path = tn_datadir.worker_cache_path();
+        if !worker_cache_path.exists() {
+            File::create_new(worker_cache_path)?.write_all(TESTNET_WORKER_CACHE.as_bytes())?
+        }
+
+        Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
+    }
+
+    /// Load a config from it's component parts.
+    pub fn load_mainnet<P: TelcoinDirs>(
+        tn_datadir: &P,
+        observer: bool,
+        version: &'static str,
+    ) -> eyre::Result<Self> {
+        let validator_info: NodeInfo =
+            Config::load_from_path(tn_datadir.node_info_path(), ConfigFmt::YAML)?;
+        let parameters: Parameters =
+            serde_yaml::from_str(MAINNET_PARAMETERS).expect("bad adiri parameters yaml data");
+        let genesis: Genesis =
+            serde_yaml::from_str(MAINNET_GENESIS).expect("bad adiri genesis yaml data");
+        // If the default committee file does not exist then save it.
+        let committee_path = tn_datadir.committee_path();
+        if !committee_path.exists() {
+            File::create_new(committee_path)?.write_all(MAINNET_COMMITTEE.as_bytes())?
+        }
+        // If the default worker cache file does not exist then save it.
+        let worker_cache_path = tn_datadir.worker_cache_path();
+        if !worker_cache_path.exists() {
+            File::create_new(worker_cache_path)?.write_all(MAINNET_WORKER_CACHE.as_bytes())?
+        }
 
         Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
     }

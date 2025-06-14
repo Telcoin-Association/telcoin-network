@@ -120,7 +120,7 @@ impl<DB: Database> AuthorityFixture<DB> {
         // Currently only support one worker per node.
         // If/when this is relaxed then the key_config below will need to change.
         assert_eq!(number_of_workers.get(), 1);
-        let mut config = Config::default();
+        let mut config = Config::default_for_test();
         // These key updates don't return errors...
         let _ = config.update_protocol_key(key_config.primary_public_key());
         let _ = config.update_primary_network_key(key_config.primary_network_public_key());

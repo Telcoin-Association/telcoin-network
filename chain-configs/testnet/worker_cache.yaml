@@ -1,0 +1,15 @@
+---
+epoch: 0
+workers:
+  yBWc3pW4bXPmYyADsoPhspx6UnFEhx5ByRpU8mEvGYftVcHMC4cXL1ZQAgkyjqE7XHowKtf8Z7Cf1yUghYFBtS72WfDjzg51ZaQ85ohvQwAWDhgTBffrtPhmJqMd83J51Yb:
+    - name: 4XTTMD58oercWiPk4uzXbUFTUXcauQXiUEokovAhPKQxSN8u3
+      worker_address: /ip4/127.0.0.1/udp/65446/quic-v1
+  zBQdXVGmxWUxfhy9duvzjiDv56hv29WeLu3xXaz1avEuWjuXzoxWMzyLumj8cDpYTcwdGa1JPSiVw6bvnar7Kin7XkXnhNr2TpnnVwsb1ed1AV8KefKPX2znLFbox1iJapP:
+    - name: 4XTTM4FjpDBqjez6GScdg6rFA1Q1kA6y4HDAoWGz5Dy2cCj9w
+      worker_address: /ip4/127.0.0.1/udp/49566/quic-v1
+  21hzU2TDXhFz51jUsT84wcoqkHpQ9kvh1mjbtEea7uhau117AnCKpHF6u4btSf3sU5nmsRfJk1smncvnQ87HS2R352P2rPnjjGK1DEt5xWVs6r6QjieLqHNN4KiNwcKioERs:
+    - name: 4XTTMEdVSWKEYZt8R9uRi9e1QWDitQxxbszrn5GgANoVUnpH8
+      worker_address: /ip4/127.0.0.1/udp/58273/quic-v1
+  23Ko9s3RYvJyWzm8BekCSpGYPgRFuLQD4mLTHEtW5XZDKSaDptBSqN5B3KSfUuNgWRTjTj7XffX6rWk3bioqrTFmiXwGPnzGWNyZ9TXHBdyuuQH3WYxfPgZ927kuB1YvuSZq:
+    - name: 4XTTM9SCe6hxwKCPgp4K7u4AwopDUJdu5qYKQRC9ctwHN4kXh
+      worker_address: /ip4/127.0.0.1/udp/60532/quic-v1

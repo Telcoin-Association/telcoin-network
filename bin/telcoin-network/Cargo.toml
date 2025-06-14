@@ -36,6 +36,8 @@ alloy = { workspace = true }
 tn-reth = { workspace = true }
 tn-config = { workspace = true }
 rayon = { workspace = true }
+dirs-next = { workspace = true }
+serde_yaml = { workspace = true }
 
 # main
 rpassword = { workspace = true }
