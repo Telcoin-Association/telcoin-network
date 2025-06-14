@@ -11,8 +11,8 @@ use std::{
     sync::Arc,
 };
 use tn_types::{
-    test_genesis, verify_proof_of_possession_bls, Address, BlsPublicKey, BlsSignature, Committee,
-    CommitteeBuilder, Epoch, Genesis, GenesisAccount, Intent, IntentMessage, Multiaddr,
+    address, test_genesis, verify_proof_of_possession_bls, Address, BlsPublicKey, BlsSignature,
+    Committee, CommitteeBuilder, Epoch, Genesis, GenesisAccount, Intent, IntentMessage, Multiaddr,
     NetworkPublicKey, NodeP2pInfo, ProtocolSignature, Signer, WorkerCache, WorkerIndex,
 };
 use tracing::{info, warn};
@@ -28,6 +28,7 @@ pub const ERC1967PROXY_JSON: &str =
     include_str!("../../../tn-contracts/artifacts/ERC1967Proxy.json");
 pub const ITS_CFG_YAML: &str =
     include_str!("../../../tn-contracts/deployments/genesis/its-config.yaml");
+pub const GOVERNANCE_SAFE_ADDRESS: Address = address!("00000000000000000000000000000000000007a0");
 
 /// The struct for starting a network at genesis.
 pub struct NetworkGenesis {
@@ -171,10 +172,18 @@ impl NetworkGenesis {
         let yaml_content = ITS_CFG_YAML;
         let config: std::collections::HashMap<Address, GenesisAccount> =
             serde_yaml::from_str(yaml_content).expect("yaml parsing failure");
+        let governance_balance = config
+            .get(&GOVERNANCE_SAFE_ADDRESS)
+            .expect("base fee recipient governance safe missing")
+            .balance;
+        let final_itel_balance = itel_balance - governance_balance;
         let mut accounts = Vec::new();
         for (address, precompile_config) in config {
-            let bal =
-                if address == itel_address { itel_balance } else { precompile_config.balance };
+            let bal = if address == itel_address {
+                final_itel_balance
+            } else {
+                precompile_config.balance
+            };
             let account = GenesisAccount::default()
                 .with_nonce(precompile_config.nonce)
                 .with_balance(bal)
