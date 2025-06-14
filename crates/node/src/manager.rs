@@ -723,6 +723,7 @@ where
             while let Some(info) = primary_network_infos.next().await {
                 debug!(target: "epoch-manager", ?info, "awaited next primary network info");
                 let (protocol_key, NetworkInfo { pubkey, multiaddr, hostname }) = info??;
+                debug!(target: "epoch-manager", peer_id=?pubkey.to_peer_id(), "awaited next primary network info");
                 let validator = validators
                     .get(&protocol_key)
                     .ok_or_eyre("network returned validator that isn't in the committee")?;
@@ -779,10 +780,8 @@ where
             while let Some(info) = worker_network_infos.next().await {
                 let (protocol_key, NetworkInfo { pubkey, multiaddr, .. }) = info??;
                 // only one worker per authority for now
-                let worker_index = WorkerIndex(vec![WorkerInfo {
-                    name: pubkey,
-                    worker_address: multiaddr.clone(),
-                }]);
+                let worker_index =
+                    WorkerIndex(vec![WorkerInfo { name: pubkey, worker_address: multiaddr }]);
                 workers.push((protocol_key, worker_index));
             }
 
@@ -922,11 +921,6 @@ where
             let primary_multiaddr =
                 Self::get_multiaddr_from_env_or_config("PRIMARY_MULTIADDR", primary_address);
             network_handle.inner_handle().start_listening(primary_multiaddr).await?;
-        } else {
-            let connected_peers = network_handle.connected_peers().await?;
-            debug!(target: "epoch-manager", "connected peers:\n{:?}", connected_peers);
-            // let peers = network_handle.inner_handle().
-            panic!("stopping here");
         }
 
         // update the authorized publishers for gossip every epoch
@@ -1000,7 +994,6 @@ where
 
             // skip dialing already connected peers
             if let Ok(peers) = handle.connected_peers().await {
-                debug!(target: "epoch-manager", ?peers, "swarm connected peers");
                 if peers.contains(&peer_id) {
                     debug!(target: "epoch-manager", ?peer_id, "skipping dial for peer");
                     return;
@@ -1035,7 +1028,7 @@ where
     ) -> eyre::Result<()> {
         // create event streams for the worker network handler
         let (event_stream, rx_event_stream) = mpsc::channel(1000);
-        let worker_address = consensus_config.worker_address(worker_id);
+        debug!(target: "epoch-manager", "spawning worker network for epoch");
 
         network_handle
             .inner_handle()
@@ -1044,14 +1037,17 @@ where
 
         // start listening if the network needs to be initialized
         if *initial_epoch {
+            let worker_address = consensus_config.worker_address(worker_id);
             let worker_multiaddr =
                 Self::get_multiaddr_from_env_or_config("WORKER_MULTIADDR", worker_address.clone());
             network_handle.inner_handle().start_listening(worker_multiaddr).await?;
         }
 
-        // always dial peers for the new epoch
+        // always attempt to dial peers for the new epoch
+        let worker_address = network_handle.inner_handle().listeners().await?;
+        debug!(target: "epoch-manager", ?worker_address, "spawning worker network for epoch");
         for (peer_id, addr) in consensus_config.worker_cache().all_workers() {
-            if addr != worker_address {
+            if !worker_address.contains(&addr) {
                 self.dial_peer(
                     network_handle.inner_handle().clone(),
                     peer_id,

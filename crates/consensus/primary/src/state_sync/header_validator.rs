@@ -86,6 +86,7 @@ where
         let mut committed_round = *rx_committed_round_updates.borrow();
         let max_round = committed_round.saturating_sub(max_age);
         if header.round() < max_round {
+            debug!(target: "epoch-manager", ?max_round, header_round=?header.round(), "returning error for syncing header batches");
             return Err(HeaderError::TooOld {
                 digest: header.digest(),
                 header_round: header.round(),

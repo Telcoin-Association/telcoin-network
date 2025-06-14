@@ -651,7 +651,6 @@ impl<DB: Database> Proposer<DB> {
         let current_epoch = self.committee.epoch();
         let current_round = self.round;
 
-        // TODO: is this an unnecessary call for every proposal?
         // check if proposer store's last header is from this round
         let last_proposed = self
             .proposer_store

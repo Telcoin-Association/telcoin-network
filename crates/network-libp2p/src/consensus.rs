@@ -309,11 +309,12 @@ where
     /// Return None if we don't have any confirmed external addresses yet.
     fn get_peer_record(&self) -> Option<kad::Record> {
         let key = kad::RecordKey::new(&self.key_config.primary_public_key());
-        let multiaddrs: Vec<Multiaddr> = self.swarm.external_addresses().cloned().collect();
+        let mut multiaddrs: Vec<Multiaddr> = self.swarm.external_addresses().cloned().collect();
 
         if multiaddrs.is_empty() {
-            warn!(target: "network-kad", ?multiaddrs, "call to create peer record, but external addresses are empty");
-            return None;
+            warn!(target: "network-kad", ?multiaddrs, "call to create peer record, but external addresses are empty - using self-reported listeners");
+            // fallback to listeners
+            multiaddrs = self.swarm.listeners().cloned().collect();
         }
 
         // use ipv4 or ipv6 multiaddr
@@ -361,7 +362,7 @@ where
     /// discovery.
     fn provide_our_data(&mut self) {
         if let Some(record) = self.get_peer_record() {
-            info!(target: "network-kad", ?record, "Providing our record to kademlia");
+            info!(target: "network-kad", ?record, "Providing our record to kademlia for peer {:?}", self.swarm.local_peer_id());
             let key = record.key.clone();
             if let Err(err) =
                 self.swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One)
@@ -588,7 +589,7 @@ where
                 //
                 // for now, this only supports the current committee for the epoch
 
-                info!(target: "epoch-manager", "network update for next committee - ensuring no committee members are banned");
+                info!(target: "epoch-manager", this_node=?self.swarm.local_peer_id(), "network update for next committee - ensuring no committee members are banned");
                 // ensure that the next committee isn't banned
                 self.swarm.behaviour_mut().peer_manager.new_epoch(committee);
 
@@ -1021,7 +1022,8 @@ where
                         debug!(target: "network-kad", ?cache_candidates, "FinishedWithNoAdditionalRecord - failed to find record");
                     }
                     kad::QueryResult::GetRecord(Err(err)) => {
-                        error!(target: "network-kad", "Failed to get record: {err:?}");
+                        let key = BlsPublicKey::from_literal_bytes(err.key().as_ref());
+                        error!(target: "network-kad", ?key, "Failed to get record: {err:?}");
                         self.return_kad_result(&query_id, Err(err.into()));
                     }
                     kad::QueryResult::PutRecord(Ok(kad::PutRecordOk { key })) => {

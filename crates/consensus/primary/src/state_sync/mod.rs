@@ -40,12 +40,12 @@ where
     pub fn new(config: ConsensusConfig<DB>, consensus_bus: ConsensusBus) -> Self {
         let header_validator = HeaderValidator::new(config.clone(), consensus_bus.clone());
         // load highest round number from the certificate store
-        let highest_process_round = if let Some(subdag) = config.node_storage().get_latest_sub_dag()
-        {
-            subdag.leader.round()
-        } else {
-            0
-        };
+        let highest_process_round =
+            if let Some(subdag) = config.node_storage().get_latest_sub_dag(config.epoch()) {
+                subdag.leader.round()
+            } else {
+                0
+            };
 
         let certificate_validator = CertificateValidator::new(
             config,

@@ -96,6 +96,11 @@ impl<DB: Database> Certifier<DB> {
             .collect();
 
         let highest_created_certificate = Self::highest_created_certificate(&config);
+        debug!(
+            target: "epoch-manager",
+            ?highest_created_certificate,
+            "restoring certifier with highest created certificate"
+        );
 
         for (name, rx_own_certificate_broadcast) in broadcast_targets.into_iter() {
             trace!(target: "primary::synchronizer::broadcast_certificates", ?name, "spawning sender for peer");

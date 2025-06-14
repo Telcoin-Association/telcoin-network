@@ -6,7 +6,8 @@ use crate::{
 };
 use std::{cmp::max, collections::HashMap};
 use tn_types::{
-    AuthorityIdentifier, CommittedSubDag, ConsensusHeader, Database, DbTxMut, Round, SequenceNumber,
+    AuthorityIdentifier, CommittedSubDag, ConsensusHeader, Database, DbTxMut, Epoch, Round,
+    SequenceNumber,
 };
 use tracing::debug;
 
@@ -25,12 +26,12 @@ pub trait ConsensusStore: Clone {
     /// Will panic on an error.
     fn clear_consensus_chain_for_test(&self);
 
-    /// Load the last committed round of each validator.
-    fn read_last_committed(&self) -> HashMap<AuthorityIdentifier, Round>;
+    /// Load the last committed round of each validator for the current epoch.
+    fn read_last_committed(&self, epoch: Epoch) -> HashMap<AuthorityIdentifier, Round>;
 
     /// Returns the latest subdag committed. If none is committed yet, then
     /// None is returned instead.
-    fn get_latest_sub_dag(&self) -> Option<CommittedSubDag>;
+    fn get_latest_sub_dag(&self, epoch: Epoch) -> Option<CommittedSubDag>;
 
     /// Load all the sub dags committed with sequence number of at least `from`.
     fn read_committed_sub_dags_from(
@@ -40,7 +41,10 @@ pub trait ConsensusStore: Clone {
 
     /// Reads from storage the latest commit sub dag where its ReputationScores are marked as
     /// "final". If none exists yet then this method will return None.
-    fn read_latest_commit_with_final_reputation_scores(&self) -> Option<CommittedSubDag>;
+    fn read_latest_commit_with_final_reputation_scores(
+        &self,
+        epoch: Epoch,
+    ) -> Option<CommittedSubDag>;
 }
 impl<DB: Database> ConsensusStore for DB {
     fn write_subdag_for_test(&self, number: u64, sub_dag: CommittedSubDag) {
@@ -63,15 +67,19 @@ impl<DB: Database> ConsensusStore for DB {
         txn.commit().expect("failed to clear consensus blocks");
     }
 
-    fn read_last_committed(&self) -> HashMap<AuthorityIdentifier, Round> {
+    fn read_last_committed(&self, epoch: Epoch) -> HashMap<AuthorityIdentifier, Round> {
         let mut res = HashMap::new();
         for (id, round, certs) in
-            self.reverse_iter::<ConsensusBlocks>().take(50).map(|(_, block)| {
-                (
-                    block.sub_dag.leader.origin().clone(),
-                    block.sub_dag.leader_round(),
-                    block.sub_dag.certificates,
-                )
+            self.reverse_iter::<ConsensusBlocks>().take(50).filter_map(|(_, block)| {
+                if block.sub_dag.leader_epoch() == epoch {
+                    Some((
+                        block.sub_dag.leader.origin().clone(),
+                        block.sub_dag.leader_round(),
+                        block.sub_dag.certificates,
+                    ))
+                } else {
+                    None
+                }
             })
         {
             res.entry(id).and_modify(|r| *r = max(*r, round)).or_insert_with(|| round);
@@ -84,8 +92,10 @@ impl<DB: Database> ConsensusStore for DB {
         res
     }
 
-    fn get_latest_sub_dag(&self) -> Option<CommittedSubDag> {
-        self.last_record::<ConsensusBlocks>().map(|(_, block)| block.sub_dag)
+    fn get_latest_sub_dag(&self, epoch: Epoch) -> Option<CommittedSubDag> {
+        self.last_record::<ConsensusBlocks>()
+            .map(|(_, block)| block.sub_dag)
+            .filter(|subdag| subdag.leader_epoch() == epoch)
     }
 
     fn read_committed_sub_dags_from(
@@ -98,8 +108,16 @@ impl<DB: Database> ConsensusStore for DB {
             .collect::<Vec<CommittedSubDag>>())
     }
 
-    fn read_latest_commit_with_final_reputation_scores(&self) -> Option<CommittedSubDag> {
+    fn read_latest_commit_with_final_reputation_scores(
+        &self,
+        epoch: Epoch,
+    ) -> Option<CommittedSubDag> {
         for commit in self.reverse_iter::<ConsensusBlocks>().map(|(_, block)| block.sub_dag) {
+            // ignore past epochs
+            if commit.leader_epoch() < epoch {
+                return None;
+            }
+
             // found a final of schedule score, so we'll return that
             if commit.reputation_score.final_of_schedule {
                 debug!(

@@ -13,7 +13,7 @@ use tn_primary::{
 };
 use tn_storage::tables::{Batches, ConsensusBlockNumbersByDigest, ConsensusBlocks};
 use tn_types::{ConsensusHeader, ConsensusOutput, Database, DbTxMut, TaskSpawner, TnSender};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// Return true if this node should be able to participate as a CVV, false otherwise.
 ///
@@ -43,21 +43,22 @@ pub async fn can_cvv<DB: Database>(
     let max_consensus_header = max_consensus_header_from_committee(network, config)
         .await
         .unwrap_or_else(|| last_executed_block.clone());
+    debug!(target: "epoch-manager", ?max_consensus_header, "max consensus header from committee");
     let max_epoch = max_consensus_header.sub_dag.leader.epoch();
     let max_round = max_consensus_header.sub_dag.leader.round();
     let _ = consensus_bus.last_consensus_header().send(max_consensus_header);
-    tracing::info!(target: "telcoin::subscriber",
+    info!(target: "telcoin::subscriber",
         "CATCH UP params {max_epoch}, {max_round}, leader epoch: {last_consensus_epoch}, leader round: {last_consensus_round}, gc: {}",
         config.parameters().gc_depth
     );
     if max_epoch == last_consensus_epoch
         && (last_consensus_round + config.parameters().gc_depth) > max_round
     {
-        tracing::info!(target: "telcoin::subscriber", "Node is attempting to rejoin consensus.");
+        info!(target: "telcoin::subscriber", "Node is attempting to rejoin consensus.");
         // We should be able to pick up consensus where we left off.
         true
     } else {
-        tracing::info!(target: "telcoin::subscriber", "Node has fallen to far behind to rejoin consensus, just following now.");
+        info!(target: "telcoin::subscriber", "Node has fallen to far behind to rejoin consensus, just following now.");
         false
     }
 }
@@ -117,28 +118,28 @@ pub fn save_consensus<DB: Database>(
         Ok(mut txn) => {
             for batch in consensus_output.batches.iter().flatten() {
                 if let Err(e) = txn.insert::<Batches>(&batch.digest(), batch) {
-                    tracing::error!(target: "telcoin::state-sync", ?e, "error saving a batch to persistant storage!");
+                    error!(target: "telcoin::state-sync", ?e, "error saving a batch to persistant storage!");
                     return Err(e);
                 }
             }
             let header: ConsensusHeader = consensus_output.into();
             if let Err(e) = txn.insert::<ConsensusBlocks>(&header.number, &header) {
-                tracing::error!(target: "telcoin::state-sync", ?e, "error saving a consensus header to persistant storage!");
+                error!(target: "telcoin::state-sync", ?e, "error saving a consensus header to persistant storage!");
                 return Err(e);
             }
             if let Err(e) =
                 txn.insert::<ConsensusBlockNumbersByDigest>(&header.digest(), &header.number)
             {
-                tracing::error!(target: "telcoin::state-sync", ?e, "error saving a consensus header number to persistant storage!");
+                error!(target: "telcoin::state-sync", ?e, "error saving a consensus header number to persistant storage!");
                 return Err(e);
             }
             if let Err(e) = txn.commit() {
-                tracing::error!(target: "telcoin::state-sync", ?e, "error saving committing to persistant storage!");
+                error!(target: "telcoin::state-sync", ?e, "error saving committing to persistant storage!");
                 return Err(e);
             }
         }
         Err(e) => {
-            tracing::error!(target: "telcoin::state-sync", ?e, "error getting a transaction on persistant storage!");
+            error!(target: "telcoin::state-sync", ?e, "error getting a transaction on persistant storage!");
             return Err(e);
         }
     }
@@ -146,29 +147,23 @@ pub fn save_consensus<DB: Database>(
 }
 
 /// Returns the ConsensusHeader that created the last executed block if can be found.
-/// If we are not starting up then not finding this indicates a database issue.
+/// If we are not starting at genesis or a new epoch, then not finding this indicates a database issue.
 pub fn last_executed_consensus_block<DB: Database>(
     consensus_bus: &ConsensusBus,
     config: &ConsensusConfig<DB>,
 ) -> Option<ConsensusHeader> {
-    if let Some(last_executed_consensus_hash) =
-        consensus_bus.recent_blocks().borrow().latest_block().header().parent_beacon_block_root
-    {
-        let db = config.node_storage();
-        if let Ok(Some(number)) =
-            db.get::<ConsensusBlockNumbersByDigest>(&last_executed_consensus_hash)
-        {
-            if let Ok(Some(block)) = db.get::<ConsensusBlocks>(&number) {
-                Some(block)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    }
+    let db = config.node_storage();
+    let last = consensus_bus
+        .recent_blocks()
+        .borrow()
+        .latest_block()
+        .header()
+        .parent_beacon_block_root
+        .and_then(|hash| db.get::<ConsensusBlockNumbersByDigest>(&hash).ok()?)
+        .and_then(|num| db.get::<ConsensusBlocks>(&num).ok()?)
+        .filter(|block| block.sub_dag.leader_epoch() == config.epoch());
+    debug!(target: "epoch-manager", ?last, epoch=?config.epoch(), "last executed consensus block");
+    last
 }
 
 /// Send any consensus headers that were not executed before last shutdown to the consensus header
@@ -243,7 +238,7 @@ async fn spawn_track_recent_consensus<DB: Database>(
                             }
                         }
                         Err(e) => {
-                            tracing::error!(target: "telcoin::state-sync", "recieved a consensus header with invalid certs: {e}");
+                            error!(target: "telcoin::state-sync", "recieved a consensus header with invalid certs: {e}");
                         }
                     }
                 }
@@ -337,15 +332,17 @@ async fn max_consensus_header_from_committee<DB: Database>(
             }
             Ok(Err(e)) => {
                 // An error with one peer should not derail us...  But log it.
-                tracing::error!(target: "telcoin::state-sync", "error requesting peer consensus {e:?}")
+                error!(target: "telcoin::state-sync", "error requesting peer consensus {e:?}")
             }
             Err(e) => {
                 // An error with one peer should not derail us...  But log it.
-                tracing::error!(target: "telcoin::state-sync", "error awaiting peer consensus {e:?}")
+                error!(target: "telcoin::state-sync", "error awaiting peer consensus {e:?}")
             }
         }
     }
-    result
+
+    // only return block if it greater than or equal to the current epoch
+    result.filter(|block| block.sub_dag.leader_epoch() >= config.epoch())
 }
 
 /// Get a vector of ids for each peer.
@@ -380,7 +377,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
     let db = config.node_storage();
     let mut result_header = from;
     for number in last_consensus_height + 1..=max_consensus_height {
-        tracing::debug!(target: "telcoin::state-sync", "trying to get consensus block {number}");
+        debug!(target: "telcoin::state-sync", "trying to get consensus block {number}");
         // Check if we already have this consensus output in our local DB.
         // This will also allow us to pre load other consensus blocks as a future
         // optimization.
@@ -399,7 +396,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
                 match header.verify_certificates(config.committee()) {
                     Ok(header) => break header,
                     Err(e) => {
-                        tracing::error!(target: "telcoin::state-sync", "received an invalid consensus header {e:?}");
+                        error!(target: "telcoin::state-sync", "received an invalid consensus header {e:?}");
                         try_num += 1;
                     }
                 }
@@ -409,7 +406,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
         last_parent =
             ConsensusHeader::digest_from_parts(parent_hash, &consensus_header.sub_dag, number);
         if last_parent != consensus_header.digest() {
-            tracing::error!(target: "telcoin::state-sync", "consensus header digest mismatch!");
+            error!(target: "telcoin::state-sync", "consensus header digest mismatch!");
             return Err(eyre::eyre!("consensus header digest mismatch!"));
         }
 

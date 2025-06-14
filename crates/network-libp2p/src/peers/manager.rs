@@ -22,7 +22,7 @@ use std::{
 };
 use tn_config::PeerConfig;
 use tokio::sync::oneshot;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
 #[cfg(test)]
 #[path = "../tests/peer_manager.rs"]
@@ -299,7 +299,7 @@ impl PeerManager {
 
     /// Return an iterator of peers that are connected or dialed.
     pub(crate) fn connected_or_dialing_peers(&self) -> Vec<PeerId> {
-        debug!(target: "peer-manager", "all peers:\n{:?}", self.peers);
+        trace!(target: "peer-manager", "all peers:\n{:?}", self.peers);
         self.peers.connected_or_dialing_peers()
     }
 
