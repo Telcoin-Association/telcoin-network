@@ -1,13 +1,9 @@
 //! NOTE: tests for this module are in test-utils storage_tests.rs to avoid circular dependancies.
 
-use crate::{
-    tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
-    StoreResult,
-};
+use crate::tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks};
 use std::{cmp::max, collections::HashMap};
 use tn_types::{
     AuthorityIdentifier, CommittedSubDag, ConsensusHeader, Database, DbTxMut, Epoch, Round,
-    SequenceNumber,
 };
 use tracing::debug;
 
@@ -26,26 +22,22 @@ pub trait ConsensusStore: Clone {
     /// Will panic on an error.
     fn clear_consensus_chain_for_test(&self);
 
-    /// Load the last committed round of each validator for the current epoch.
+    /// Load the last committed round of each validator.
     fn read_last_committed(&self, epoch: Epoch) -> HashMap<AuthorityIdentifier, Round>;
 
     /// Returns the latest subdag committed. If none is committed yet, then
     /// None is returned instead.
-    fn get_latest_sub_dag(&self, epoch: Epoch) -> Option<CommittedSubDag>;
+    fn get_latest_sub_dag(&self) -> Option<CommittedSubDag>;
 
-    /// Load all the sub dags committed with sequence number of at least `from`.
-    fn read_committed_sub_dags_from(
-        &self,
-        from: &SequenceNumber,
-    ) -> StoreResult<Vec<CommittedSubDag>>;
-
-    /// Reads from storage the latest commit sub dag where its ReputationScores are marked as
-    /// "final". If none exists yet then this method will return None.
+    /// Reads from storage the latest commit sub dag from the epoch where its
+    /// ReputationScores are marked as "final". If none exists then this
+    /// method returns `None`.
     fn read_latest_commit_with_final_reputation_scores(
         &self,
         epoch: Epoch,
     ) -> Option<CommittedSubDag>;
 }
+
 impl<DB: Database> ConsensusStore for DB {
     fn write_subdag_for_test(&self, number: u64, sub_dag: CommittedSubDag) {
         let header = ConsensusHeader { number, sub_dag, ..Default::default() };
@@ -92,20 +84,8 @@ impl<DB: Database> ConsensusStore for DB {
         res
     }
 
-    fn get_latest_sub_dag(&self, epoch: Epoch) -> Option<CommittedSubDag> {
-        self.last_record::<ConsensusBlocks>()
-            .map(|(_, block)| block.sub_dag)
-            .filter(|subdag| subdag.leader_epoch() == epoch)
-    }
-
-    fn read_committed_sub_dags_from(
-        &self,
-        from: &SequenceNumber,
-    ) -> StoreResult<Vec<CommittedSubDag>> {
-        Ok(self
-            .skip_to::<ConsensusBlocks>(from)?
-            .map(|(_, block)| block.sub_dag)
-            .collect::<Vec<CommittedSubDag>>())
+    fn get_latest_sub_dag(&self) -> Option<CommittedSubDag> {
+        self.last_record::<ConsensusBlocks>().map(|(_, block)| block.sub_dag)
     }
 
     fn read_latest_commit_with_final_reputation_scores(
@@ -113,7 +93,7 @@ impl<DB: Database> ConsensusStore for DB {
         epoch: Epoch,
     ) -> Option<CommittedSubDag> {
         for commit in self.reverse_iter::<ConsensusBlocks>().map(|(_, block)| block.sub_dag) {
-            // ignore past epochs
+            // ignore previous epochs
             if commit.leader_epoch() < epoch {
                 return None;
             }

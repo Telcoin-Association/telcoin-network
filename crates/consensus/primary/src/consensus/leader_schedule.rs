@@ -200,11 +200,11 @@ impl LeaderSchedule {
     ) -> Self {
         let table = store
             .read_latest_commit_with_final_reputation_scores(committee.epoch())
-            .map_or(LeaderSwapTable::default(), |commit| {
+            .map_or(LeaderSwapTable::default(), |subdag| {
                 LeaderSwapTable::new(
                     &committee,
-                    commit.leader_round(),
-                    &commit.reputation_score,
+                    subdag.leader_round(),
+                    &subdag.reputation_score,
                     bad_nodes_stake_threshold,
                 )
             });

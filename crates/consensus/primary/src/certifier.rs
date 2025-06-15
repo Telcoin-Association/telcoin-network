@@ -99,7 +99,8 @@ impl<DB: Database> Certifier<DB> {
         debug!(
             target: "epoch-manager",
             ?highest_created_certificate,
-            "restoring certifier with highest created certificate"
+            "restoring certifier with highest created certificate for epoch {}",
+            config.epoch(),
         );
 
         for (name, rx_own_certificate_broadcast) in broadcast_targets.into_iter() {
@@ -453,7 +454,7 @@ impl<DB: Database> Certifier<DB> {
                 },
 
                 _ = &self.rx_shutdown => {
-                    warn!(target: "primary::certifier", "Certifier has shutdown");
+                    debug!(target: "primary::certifier", "Certifier received shutdown signal");
                     break;
                 }
             }

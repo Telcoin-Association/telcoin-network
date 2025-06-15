@@ -206,13 +206,16 @@ impl<DB: Database> Subscriber<DB> {
     }
 
     /// Return the block hash and number of the last executed consensus output.
+    ///
+    /// This method is called on startup to retrieve the needed information to build the next
+    /// `ConsensusHeader` off of this parent.
     async fn get_last_executed_consensus(&self) -> SubscriberResult<(BlockHash, u64)> {
         // Get the DB and load our last executed consensus block (note there may be unexecuted
         // blocks, catch up will execute them).
         let last_executed_block =
             last_executed_consensus_block(&self.consensus_bus, &self.config).unwrap_or_default();
 
-        info!(target: "subscriber", ?last_executed_block, "restoring last executed consensus:");
+        info!(target: "subscriber", ?last_executed_block, "restoring last executed consensus for constucting the next ConsensusHeader:");
 
         Ok((last_executed_block.digest(), last_executed_block.number))
     }

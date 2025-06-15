@@ -39,13 +39,17 @@ where
     /// Create a new instance of Self.
     pub fn new(config: ConsensusConfig<DB>, consensus_bus: ConsensusBus) -> Self {
         let header_validator = HeaderValidator::new(config.clone(), consensus_bus.clone());
-        // load highest round number from the certificate store
-        let highest_process_round =
-            if let Some(subdag) = config.node_storage().get_latest_sub_dag(config.epoch()) {
-                subdag.leader.round()
-            } else {
-                0
-            };
+        // load highest round number from the ConsensusBlock table
+        let highest_process_round = config
+            .node_storage()
+            .get_latest_sub_dag()
+            //
+            // TODO: should this be >= or just == ???
+            //
+            //
+            .filter(|subdag| subdag.leader_epoch() >= config.epoch())
+            .map(|subdag| subdag.leader_round())
+            .unwrap_or(0);
 
         let certificate_validator = CertificateValidator::new(
             config,

@@ -297,17 +297,24 @@ impl<DB: Database> Consensus<DB> {
         let metrics = consensus_bus.consensus_metrics();
         let rx_shutdown = consensus_config.shutdown().subscribe();
         // The consensus state (everything else is immutable).
-        let epoch = consensus_config.epoch();
-        let recovered_last_committed = consensus_config.node_storage().read_last_committed(epoch);
-        debug!(target: "epoch-manager", ?recovered_last_committed, "recovered last committed for: {}", epoch);
+        let current_epoch = consensus_config.epoch();
+        let recovered_last_committed =
+            consensus_config.node_storage().read_last_committed(current_epoch);
+
+        debug!(target: "epoch-manager", ?recovered_last_committed, "recovered last committed for epoch {}", current_epoch);
         let last_committed_round = recovered_last_committed
             .iter()
             .max_by(|a, b| a.1.cmp(b.1))
             .map(|(_k, v)| *v)
             .unwrap_or_else(|| 0);
-        let latest_sub_dag =
-            consensus_config.node_storage().get_latest_sub_dag(consensus_config.epoch());
-        debug!(target: "epoch-manager", ?latest_sub_dag, "recovering latest subdag:");
+
+        // ignore previous epochs
+        let latest_sub_dag = consensus_config
+            .node_storage()
+            .get_latest_sub_dag()
+            .filter(|subdag| subdag.leader_epoch() >= current_epoch);
+
+        debug!(target: "epoch-manager", ?latest_sub_dag, "recovered latest subdag:");
         if let Some(sub_dag) = &latest_sub_dag {
             assert_eq!(
                 sub_dag.leader_round(),
@@ -318,6 +325,7 @@ impl<DB: Database> Consensus<DB> {
             );
         }
 
+        // restore local dag
         let state = ConsensusState::new_from_store(
             metrics.clone(),
             last_committed_round,

@@ -344,7 +344,6 @@ where
             self.consensus_config.network_config().sync_config().max_proposed_header_age_limit,
         );
 
-        debug!(target: "epoch-manager", ?limit, header_round=?header.round(), "validating header result: {:?}", limit <= header.round());
         ensure!(
             limit <= header.round(),
             HeaderError::TooOld {

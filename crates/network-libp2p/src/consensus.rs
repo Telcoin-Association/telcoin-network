@@ -777,6 +777,7 @@ where
                     .send(Err(error.into()));
             }
             ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
+                debug!(target: "network", ?peer, ?error, "Inbound failure for req/res");
                 match error {
                     ReqResInboundFailure::Io(e) => {
                         // penalize peer since this is an attack surface
