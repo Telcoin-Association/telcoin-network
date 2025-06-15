@@ -33,7 +33,10 @@ use reth_revm::{
     db::states::bundle_state::BundleRetention,
     DatabaseCommit as _, State,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 use tn_types::{
     gas_accumulator::RewardsCounter, Address, Bytes, Encodable2718, ExecHeader, Receipt,
     TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS, U256,
@@ -105,7 +108,7 @@ where
     /// This must be called once per epoch, before the conclude epoch call.
     fn apply_consensus_block_rewards(
         &mut self,
-        rewards: HashMap<Address, u32>,
+        rewards: BTreeMap<Address, u32>,
     ) -> TnRethResult<()> {
         let calldata = self.generate_apply_incentives_calldata(
             rewards.iter().map(|(address, count)| (*address, *count)).collect(),
@@ -233,7 +236,7 @@ where
         let state =
             self.read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
 
-        trace!(target: "engine", "result after shuffle:\n{:?}", state);
+        trace!(target: "engine", "get validators call:\n{:?}", state);
 
         let mut eligible_validators: Vec<ConsensusRegistry::ValidatorInfo> =
             alloy::sol_types::SolValue::abi_decode(&state)?;
@@ -406,12 +409,13 @@ where
                 .map_err(|e| {
                     BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
                 })?;
+
             self.apply_closing_epoch_contract_call(randomness).map_err(|e| {
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
             })?;
 
             // merge transitions into bundle state
-            self.evm.db_mut().merge_transitions(BundleRetention::PlainState);
+            self.evm.db_mut().merge_transitions(BundleRetention::Reverts);
         }
 
         Ok((

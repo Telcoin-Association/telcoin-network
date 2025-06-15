@@ -2,7 +2,7 @@
 //! This can be used to adjust per worker base fees on the next epoch.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -45,9 +45,9 @@ impl RewardsCounter {
     }
 
     /// Returns a map of execution addresses to number of leader blocks they committed.
-    pub fn get_address_counts(&self) -> HashMap<Address, u32> {
+    pub fn get_address_counts(&self) -> BTreeMap<Address, u32> {
         let counts = self.leader_counts.lock();
-        let mut result = HashMap::default();
+        let mut result = BTreeMap::default();
         if let Some(committee) = self.committee.read().as_ref() {
             for (authority, count) in counts.iter() {
                 if let Some(auth) = committee.authority(authority) {

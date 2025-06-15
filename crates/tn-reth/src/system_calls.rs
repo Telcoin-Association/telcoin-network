@@ -134,7 +134,6 @@ sol!(
             address owner_
         ) external;
 
-
         /// Conclude the current epoch. Caller must pass a new committee of eligible validators.
         function concludeEpoch(address[] calldata newCommittee) external;
         /// Apply incentives for the epoch. This must be called before `concludeEpoch`.

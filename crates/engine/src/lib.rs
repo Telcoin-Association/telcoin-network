@@ -147,7 +147,7 @@ impl ExecutorEngine {
         let has_reached_max_round =
             self.max_round.map(|target| progress >= target).unwrap_or_default();
         if has_reached_max_round {
-            trace!(
+            tracing::trace!(
                 target: "engine",
                 ?progress,
                 max_round = ?self.max_round,
