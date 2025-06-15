@@ -448,7 +448,12 @@ impl<DB: Database> Certifier<DB> {
                             }
                         }
                         Err(e) => {
-                            error!(target: "primary::certifier", authority=?self.authority_id, "Certifier error on proposed header task: {e}");
+                            match e {
+                                // ignore errors when the propsal is cancelled - this is expected
+                                DagError::Canceled => debug!(target: "primary::certifier", authority=?self.authority_id, "Certifier error on proposed header task: {e}"),
+                                // log other errors
+                                e =>  error!(target: "primary::certifier", authority=?self.authority_id, "Certifier error on proposed header task: {e}"),
+                            }
                         }
                     }
                 },

@@ -29,7 +29,7 @@ use tn_types::{
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 /// Type alias for the blocking task that executes consensus output and returns the finalized
 /// `SealedHeader`.
@@ -142,6 +142,7 @@ impl ExecutorEngine {
     /// parameter.
     ///
     /// Note: this is mainly for testing and debugging purposes.
+    #[cfg(any(test, feature = "test-utils"))]
     fn has_reached_max_round(&self, progress: u64) -> bool {
         let has_reached_max_round =
             self.max_round.map(|target| progress >= target).unwrap_or_default();
@@ -159,7 +160,7 @@ impl ExecutorEngine {
     /// TESTING ONLY
     ///
     /// Push a consensus output to the back of `Self::queued`.
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn push_back_queued_for_test(&mut self, output: ConsensusOutput) {
         self.queued.push_back(output)
     }
@@ -239,7 +240,8 @@ impl Future for ExecutorEngine {
                         // store last executed header in memory
                         this.parent_header = finalized_header;
 
-                        // check max_round
+                        // check max_round to auto shutdown
+                        #[cfg(any(test, feature = "test-utils"))]
                         if this.max_round.is_some()
                             && this.has_reached_max_round(this.parent_header.nonce.into())
                         {

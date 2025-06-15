@@ -1057,7 +1057,7 @@ impl RethEnv {
         Ok(result)
     }
 
-    /// Read the latest committee from the [ConsensusRegistry] on-chain.
+    /// Read the latest committee and epoch information from the [ConsensusRegistry] on-chain.
     ///
     /// The protocol needs the BLS pubkey for the authorities.
     /// - get current epoch info
@@ -1065,17 +1065,24 @@ impl RethEnv {
     /// - getValidator info by token id
     pub fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
         // read current epoch number from chain
-        let last_block_num = self.blockchain_provider.last_block_number()?;
-        let canonical_tip = self.header_by_number(last_block_num)?.ok_or_eyre(
-            "Canonical tip missing from blockchain provider reading committee from chain",
-        )?;
+        // let last_block_num = self.blockchain_provider.last_block_number()?;
+        // let canonical_tip = self.header_by_number(last_block_num)?.ok_or_eyre(
+        //     "Canonical tip missing from blockchain provider reading committee from chain",
+        // )?;
+
+        let canonical_tip = self.canonical_tip();
 
         debug!(target: "engine", ?canonical_tip, "retrieving epoch state from canonical tip");
 
         // create EVM with latest state
-        let latest = self.latest()?;
-        let state = StateProviderDatabase::new(latest);
+        // let latest = self.latest()?;
+        // let state_provider = self.blockchain_provider.state_by_block_hash(parent_header.hash())?;
+        // let state = StateProviderDatabase::new(&state_provider);
+
+        let state_provider = self.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
+        let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(state).with_bundle_update().build();
+        debug!(target: "engine", state=?db.bundle_state, hashes=?db.block_hashes, "retrieving epoch state from canonical tip");
         let mut tn_evm = self
             .evm_config
             .evm_factory()
@@ -1087,7 +1094,7 @@ impl RethEnv {
         // current epoch info
         let epoch_info = self.get_current_epoch_info(&mut tn_evm)?;
 
-        debug!(target: "engine", ?epoch_info, "retrieving closing timestamp for previous epoch...");
+        debug!(target: "engine", ?epoch, ?epoch_info, "retrieved epoch info from canonical tip for next epoch");
 
         // retrieve closing timestamp for previous epoch
         let epoch_start = self
@@ -1188,7 +1195,9 @@ impl RethEnv {
             Err(e) => {
                 // fatal error
                 error!(target: "engine", ?caller, ?contract, "failed to read state: {}", e);
-                return Err(TnRethError::EVMCustom(format!("getValidatorsCall failed: {e}")));
+                return Err(TnRethError::EVMCustom(format!(
+                    "system call failed reading state: {e}"
+                )));
             }
         };
 

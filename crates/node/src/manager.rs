@@ -657,6 +657,7 @@ where
         // retrieve epoch information from canonical tip
         let EpochState { epoch, epoch_info, validators, epoch_start } =
             engine.epoch_state_from_canonical_tip().await?;
+        debug!(target: "epoch-manager", ?epoch_info, "epoch state from canonical tip for epoch {}", epoch);
         let validators = validators
             .iter()
             .map(|v| {
@@ -667,9 +668,11 @@ where
             .map_err(|err| eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
 
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
+        debug!(target: "epoch-manager", new_epoch_boundary=self.epoch_boundary, "resetting epoch boundary");
 
         // send these to the swarm for validator discovery
         let keys_for_worker_cache = validators.keys().cloned().collect();
+        debug!(target: "epoch-manager", ?validators, "creating committee for validators");
         let committee = self.create_committee_from_state(epoch, validators).await?;
         let worker_cache =
             self.create_worker_cache_from_state(epoch, keys_for_worker_cache).await?;
@@ -715,6 +718,8 @@ where
                 .inner_handle()
                 .find_authorities(validators.keys().cloned().collect())
                 .await?;
+
+            debug!(target: "epoch-manager", "requsting info validator info for {} authorities", primary_network_infos.len());
 
             // build the committee using kad network
             let mut committee_builder = CommitteeBuilder::new(epoch, self.epoch_boundary);

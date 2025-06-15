@@ -736,6 +736,7 @@ where
                             error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
                             // fatal - unable to process requests
                             // return Err(e.into());
+                            // TODO: swap event streams at epoch boundary to prevent this error
                             return Ok(());
                         }
 
@@ -751,7 +752,7 @@ where
                         let _ = self
                             .outbound_requests
                             .remove(&(peer, request_id))
-                            .ok_or(NetworkError::PendingRequestChannelLost)?
+                            .ok_or(NetworkError::PendingOutboundRequestChannelLost)?
                             .send(Ok(response));
                     }
                 }
@@ -773,7 +774,7 @@ where
                 let _ = self
                     .outbound_requests
                     .remove(&(peer, request_id))
-                    .ok_or(NetworkError::PendingRequestChannelLost)?
+                    .ok_or(NetworkError::PendingOutboundRequestChannelLost)?
                     .send(Err(error.into()));
             }
             ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
@@ -806,13 +807,12 @@ where
                     ReqResInboundFailure::ResponseOmission => { /* ignore local error */ }
                 }
 
-                // forward cancelation to handler
-                let _ = self
-                    .inbound_requests
-                    .remove(&request_id)
-                    .ok_or(NetworkError::PendingRequestChannelLost)?
-                    .send(());
+                // forward cancelation to handler and ignore errors
+                if let Some(channel) = self.inbound_requests.remove(&request_id) {
+                    let _ = channel.send(());
+                }
             }
+
             ReqResEvent::ResponseSent { .. } => {}
         }
 
@@ -886,7 +886,7 @@ where
                     let _ = self
                         .outbound_requests
                         .remove(&k)
-                        .ok_or(NetworkError::PendingRequestChannelLost)?
+                        .ok_or(NetworkError::PendingOutboundRequestChannelLost)?
                         .send(Err(NetworkError::Disconnected));
                 }
             }
