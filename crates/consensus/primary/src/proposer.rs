@@ -243,7 +243,8 @@ impl<DB: Database> Proposer<DB> {
         let mut total_inclusion_secs = 0.0;
         for digest in &digests {
             let batch_inclusion_secs =
-                Duration::from_secs(*header.created_at() - digest.timestamp).as_secs_f64();
+                Duration::from_secs(header.created_at().saturating_sub(digest.timestamp))
+                    .as_secs_f64();
             total_inclusion_secs += batch_inclusion_secs;
 
             // NOTE: this log entry is used to measure performance
@@ -259,7 +260,8 @@ impl<DB: Database> Proposer<DB> {
         // NOTE: this log entry is used to measure performance
         let (header_creation_secs, avg_inclusion_secs) = if let Some(digest) = digests.front() {
             (
-                Duration::from_secs(*header.created_at() - digest.timestamp).as_secs_f64(),
+                Duration::from_secs(header.created_at().saturating_sub(digest.timestamp))
+                    .as_secs_f64(),
                 total_inclusion_secs / digests.len() as f64,
             )
         } else {

@@ -7,8 +7,6 @@ use alloy::{
     sol_types::SolCall,
 };
 use clap::Parser as _;
-use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
-use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -30,12 +28,13 @@ use tracing::{debug, error, info};
 const NEW_VALIDATOR: &str = "new-validator";
 const NODE_PASSWORD: &str = "sup3rsecuur";
 const INITIAL_STAKE_AMOUNT: &str = "1_000_000";
-const EPOCH_DURATION: usize = 30;
+const MIN_EPOCHS_TO_TEST: usize = 6;
+// 3s is too aggressive
+const EPOCH_DURATION: u64 = 5;
 
 #[tokio::test]
+/// Test a new node joining the network and being shuffled into the committee.
 async fn test_epoch_boundary() -> eyre::Result<()> {
-    tn_types::test_utils::init_test_tracing();
-
     // create validator and governance wallets for adding new validator later
     let mut new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
     let mut governance_wallet =
@@ -64,19 +63,15 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
 
     // create transactions to make new validator eligible for future epochs
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
-    debug!(target: "epoch-test", chain_id=?chain.chain().id(), "genesis for test");
     let txs =
         generate_new_validator_txs(&temp_path, chain, &mut new_validator, &mut governance_wallet)?;
 
     // create rpc client for node1 default rpc address
     let rpc_url = "http://127.0.0.1:8545".to_string();
-    // let client = HttpClientBuilder::default().build(&rpc_url)?;
-    // let tx_hash: String = client.request("eth_sendRawTransaction", rpc_params![tx]).await?;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
 
     // wait for node rpc to become available
-    timeout(std::time::Duration::from_secs(15), async {
-        // wait for rpc call to work
+    timeout(std::time::Duration::from_secs(10), async {
         let mut result = provider.get_chain_id().await;
         while let Err(e) = result {
             debug!(target: "epoch-test", "provider error getting chain id: {e:?}");
@@ -85,8 +80,6 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
             // make next request
             result = provider.get_chain_id().await;
         }
-
-        info!(target: "epoch-test", "rpc for node1 available: {result:?}");
     })
     .await?;
 
@@ -98,18 +91,56 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
 
     // retrieve current committee
     let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
-    let current_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
-    info!(target: "epoch-test", "current epoch info: {:#?}", current_epoch_info);
+    let mut current_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
 
-    // retrieve current committee
-    for _ in 0..=5 {
-        let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
-        let current_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
-        info!(target: "epoch-test", "current epoch info: {:#?}", current_epoch_info);
-        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION as u64)).await;
+    let mut last_epoch_block_height = 0;
+    assert_eq!(current_epoch_info.blockHeight, last_epoch_block_height);
+
+    // track the number of times the new validator was in the epoch committee
+    let mut new_validator_in_committee_count = 0;
+    let min_epochs_to_transition = 6;
+    let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
+
+    // sleep for first epoch with 1s offset and begin assertions loop
+    tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+
+    // the new validator has a 1/6 chance of being selected for the new committee
+    //
+    // if the new validator hasn't been shuffled in by the minimum number of epochs to test,
+    // continue looping up to 99% probability that new validator is shuffled into committee
+    //
+    // probability (if purely random):
+    // 1 - (5/6)^n >= 0.99
+    // n ~= 25 iterations
+    for i in 0..25 {
+        let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+        assert!(new_epoch_info != current_epoch_info);
+        assert!(new_epoch_info.blockHeight > last_epoch_block_height);
+        assert_eq!(new_epoch_info.epochDuration, EPOCH_DURATION);
+
+        // count the number of times the new validator is in committee
+        if new_epoch_info.committee.contains(&new_validator.address()) {
+            new_validator_in_committee_count += 1;
+        }
+
+        // if min number of epochs have transitioned, assert new validator has been shuffled in
+        // at least once to end the test
+        if i > MIN_EPOCHS_TO_TEST {
+            if new_validator_in_committee_count > 0 {
+                return Ok(());
+            }
+        }
+
+        // store the last seen epoch info that is expected to change every epoch
+        last_epoch_block_height = new_epoch_info.blockHeight;
+        current_epoch_info = new_epoch_info;
+
+        // sleep for epoch duration
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION)).await;
     }
 
-    Ok(())
+    // return error if loop didn't return
+    Err(eyre::eyre!("new validator not shuffled into committee!"))
 }
 
 /// Create genesis for this test.

@@ -33,10 +33,7 @@ use reth_revm::{
     db::states::bundle_state::BundleRetention,
     DatabaseCommit as _, State,
 };
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 use tn_types::{
     gas_accumulator::RewardsCounter, Address, Bytes, Encodable2718, ExecHeader, Receipt,
     TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS, U256,
