@@ -125,7 +125,7 @@ impl<DB: Database> AuthorityFixture<DB> {
         let _ = config.update_protocol_key(key_config.primary_public_key());
         let _ = config.update_primary_network_key(key_config.primary_network_public_key());
         let _ = config.update_worker_network_key(key_config.worker_network_public_key());
-        config.node_info.primary_info.network_address = authority.primary_network_address().clone();
+        config.node_info.p2p_info.network_address = authority.primary_network_address().clone();
 
         let consensus_config = ConsensusConfig::new_with_committee_for_test(
             config,

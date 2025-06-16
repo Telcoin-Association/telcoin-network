@@ -37,6 +37,7 @@ tn-reth = { workspace = true }
 tn-config = { workspace = true }
 rayon = { workspace = true }
 dirs-next = { workspace = true }
+bs58 = { workspace = true }
 serde_yaml = { workspace = true }
 
 # main

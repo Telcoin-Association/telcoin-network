@@ -7,7 +7,7 @@ use eyre::{eyre, Context};
 
 use generate::GenerateKeys;
 use std::path::{Path, PathBuf};
-use tn_config::{Config, ConfigFmt, ConfigTrait, NodeInfo, TelcoinDirs as _};
+use tn_config::TelcoinDirs as _;
 use tracing::warn;
 
 /// Generate keypairs and node info to go with them and save them to a file.
@@ -16,11 +16,10 @@ use tracing::warn;
 pub struct KeyArgs {
     /// Generate command that creates keypairs and writes to file.
     ///
-    /// TODO: rename this key "command".
     /// Intentionally leaving this here to help others identify
     /// patterns in clap.
     #[command(subcommand)]
-    pub read_or_write: KeySubcommand,
+    pub command: KeySubcommand,
 }
 
 ///Subcommand to either generate keys or read public keys.
@@ -34,7 +33,7 @@ pub enum KeySubcommand {
 impl KeyArgs {
     /// Execute command
     pub fn execute(&self, datadir: PathBuf, passphrase: Option<String>) -> eyre::Result<()> {
-        match &self.read_or_write {
+        match &self.command {
             // generate keys
             KeySubcommand::Generate(args) => {
                 let args = match &args.node_type {
@@ -44,11 +43,8 @@ impl KeyArgs {
                 let authority_key_path = datadir.node_keys_path();
                 // initialize path and warn users if overwriting keys
                 self.init_path(&authority_key_path, args.force)?;
-                let mut node_info = NodeInfo::default();
                 // execute and store keypath
-                args.execute(&mut node_info, &datadir, passphrase)?;
-
-                Config::write_to_path(datadir.node_info_path(), &node_info, ConfigFmt::YAML)?;
+                args.execute(&datadir, passphrase)?;
             }
         }
 

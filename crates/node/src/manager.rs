@@ -11,7 +11,7 @@ use crate::{
 };
 use consensus_metrics::start_prometheus_server;
 use eyre::{eyre, OptionExt};
-use std::{collections::HashMap, str::FromStr as _, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tn_config::{
     Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs,
 };
@@ -76,6 +76,8 @@ pub struct EpochManager<P> {
     primary_network_handle: Option<PrimaryNetworkHandle>,
     /// Worker network handle.
     worker_network_handle: Option<WorkerNetworkHandle>,
+    /// Address of the worker network once it is set.
+    worker_network_addr: Option<Multiaddr>,
     /// Key config - loaded once for application lifetime.
     key_config: KeyConfig,
     /// The epoch manager's [Notifier] to shutdown all node processes.
@@ -164,6 +166,7 @@ where
             tn_datadir,
             primary_network_handle: None,
             worker_network_handle: None,
+            worker_network_addr: None,
             key_config,
             node_shutdown,
             consensus_output,
@@ -923,9 +926,7 @@ where
         if *initial_epoch {
             // start listening for p2p messages
             let primary_address = consensus_config.primary_address();
-            let primary_multiaddr =
-                Self::get_multiaddr_from_env_or_config("PRIMARY_MULTIADDR", primary_address);
-            network_handle.inner_handle().start_listening(primary_multiaddr).await?;
+            network_handle.inner_handle().start_listening(primary_address).await?;
         }
 
         // update the authorized publishers for gossip every epoch
@@ -970,16 +971,6 @@ where
         .spawn(&epoch_task_spawner);
 
         Ok(())
-    }
-
-    /// Check the environment to possibly overwrite the host.
-    fn get_multiaddr_from_env_or_config(env_var: &str, fallback: Multiaddr) -> Multiaddr {
-        let multiaddr = std::env::var(env_var)
-            .ok()
-            .and_then(|addr_str| Multiaddr::from_str(&addr_str).ok())
-            .unwrap_or(fallback);
-        info!(target: "node", ?multiaddr, env_var);
-        multiaddr
     }
 
     /// Dial peer.
@@ -1043,15 +1034,16 @@ where
         // start listening if the network needs to be initialized
         if *initial_epoch {
             let worker_address = consensus_config.worker_address(worker_id);
-            let worker_multiaddr =
-                Self::get_multiaddr_from_env_or_config("WORKER_MULTIADDR", worker_address.clone());
-            network_handle.inner_handle().start_listening(worker_multiaddr).await?;
+            self.worker_network_addr = Some(worker_address.clone());
+            network_handle.inner_handle().start_listening(worker_address).await?;
         }
+
+        let worker_address =
+            self.worker_network_addr.clone().expect("worker address set at this point");
 
         // always attempt to dial peers for the new epoch
         // the network's peer manager will intercept dial attempts for peers that are already
         // connected
-        let worker_address = network_handle.inner_handle().listeners().await?;
         debug!(target: "epoch-manager", ?worker_address, "spawning worker network for epoch");
         for (peer_id, addr) in consensus_config.worker_cache().all_workers() {
             if !worker_address.contains(&addr) {

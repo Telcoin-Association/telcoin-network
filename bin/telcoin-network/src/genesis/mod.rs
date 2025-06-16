@@ -10,6 +10,7 @@ use secp256k1::{
 use std::{collections::BTreeMap, path::PathBuf, str::FromStr as _, time::Duration};
 use tn_config::{
     Config, ConfigFmt, ConfigTrait, NetworkGenesis, Parameters, TelcoinDirs as _, DEPLOYMENTS_JSON,
+    GOVERNANCE_SAFE_ADDRESS,
 };
 use tn_reth::{system_calls::ConsensusRegistry, RethChainSpec, RethEnv};
 use tn_types::{keccak256, set_genesis_defaults, Address, GenesisAccount, U256};
@@ -31,13 +32,14 @@ pub struct GenesisArgs {
         alias = "consensus_registry_owner",
         help_heading = "The owner for ConsensusRegistry",
         value_parser = clap_address_parser,
+        default_value_t = GOVERNANCE_SAFE_ADDRESS,
         verbatim_doc_comment
     )]
     pub consensus_registry_owner: Address,
 
     /// The address recieves all transaction base fees.
     ///
-    /// This should probably be a conbtract address that will distrubute/manage basefees.
+    /// This is a governance safe contract that will distribute/manage basefees.
     ///
     /// Address doesn't have to start with "0x", but the CLI supports the "0x" format too.
     #[arg(
@@ -45,9 +47,10 @@ pub struct GenesisArgs {
         alias = "basefee_address",
         help_heading = "The recipient of base fees",
         value_parser = clap_address_parser,
+        default_value_t = GOVERNANCE_SAFE_ADDRESS,
         verbatim_doc_comment
     )]
-    pub basefee_address: Option<Address>,
+    pub basefee_address: Address,
 
     /// The initial stake credited to each validator in genesis.
     #[arg(
@@ -231,7 +234,7 @@ impl GenesisArgs {
         if let Some(min_header_delay_ms) = self.min_header_delay_ms {
             parameters.min_header_delay = Duration::from_millis(min_header_delay_ms);
         }
-        parameters.basefee_address = self.basefee_address;
+        parameters.basefee_address = Some(self.basefee_address);
 
         // write genesis and config to file
         Config::write_to_path(

@@ -102,6 +102,7 @@ else
         target/${RELEASE}/telcoin-network genesis \
             --datadir "${ROOTDIR}" \
             --chain-id 0x1e7 \
+            --epoch-duration-in-secs 60 \
             --dev-funded-account $DEV_FUNDS \
             --max-header-delay-ms 1000 \
             --min-header-delay-ms 1000 \
@@ -111,6 +112,7 @@ else
         target/${RELEASE}/telcoin-network genesis \
             --datadir "${ROOTDIR}" \
             --chain-id 0x1e7 \
+            --epoch-duration-in-secs 60 \
             --dev-funded-account $DEV_FUNDS \
             --basefee-address $BASEFEE_ADDRESS \
             --max-header-delay-ms 1000 \

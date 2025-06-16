@@ -8,10 +8,7 @@ use alloy::{
 };
 use clap::Parser as _;
 use rand::{rngs::StdRng, SeedableRng as _};
-use std::{
-    path::Path,
-    sync::Arc,
-};
+use std::{path::Path, sync::Arc};
 use telcoin_network::{genesis::GenesisArgs, node::NodeCommand};
 use tempfile::tempdir;
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};

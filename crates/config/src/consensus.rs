@@ -213,8 +213,9 @@ where
             authority.primary_network_address().clone()
         } else {
             let host = std::env::var("TN_PRIMARY_HOST").unwrap_or("0.0.0.0".to_string());
-            let primary_udp_port =
-                tn_types::get_available_udp_port(&host).unwrap_or(49584).to_string();
+            let primary_udp_port = std::env::var("TN_PRIMARY_PORT").unwrap_or_else(|_| {
+                tn_types::get_available_udp_port(&host).unwrap_or(49584).to_string()
+            });
             format!("/ip4/{}/udp/{}/quic-v1", &host, primary_udp_port)
                 .parse()
                 .expect("multiaddr parsed for primary consensus")
@@ -247,8 +248,9 @@ where
                 .worker_address
         } else {
             let host = std::env::var("TN_WORKER_HOST").unwrap_or("0.0.0.0".to_string());
-            let worker_udp_port =
-                tn_types::get_available_udp_port(&host).unwrap_or(49594).to_string();
+            let worker_udp_port = std::env::var("TN_WORKER_PORT").unwrap_or_else(|_| {
+                tn_types::get_available_udp_port(&host).unwrap_or(49594).to_string()
+            });
             format!("/ip4/{}/udp/{}/quic-v1", &host, worker_udp_port)
                 .parse()
                 .expect("multiaddr parsed for worker consensus")

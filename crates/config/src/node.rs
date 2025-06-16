@@ -157,14 +157,13 @@ impl Config {
 
     /// Update the authority network key.
     pub fn update_primary_network_key(&mut self, value: NetworkPublicKey) -> eyre::Result<()> {
-        self.node_info.primary_info.network_key = value;
+        self.node_info.p2p_info.network_key = value;
         Ok(())
     }
 
     /// Update the worker network key.
     pub fn update_worker_network_key(&mut self, value: NetworkPublicKey) -> eyre::Result<()> {
-        self.node_info.primary_info.worker_network_key = value.clone();
-        for worker in self.node_info.primary_info.worker_index.0.iter_mut() {
+        for worker in self.node_info.p2p_info.worker_index.0.iter_mut() {
             worker.name = value.clone();
         }
         Ok(())

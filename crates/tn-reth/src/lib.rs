@@ -1290,7 +1290,7 @@ mod tests {
                 NodeInfo {
                     name: format!("validator-{i}"),
                     bls_public_key: *bls_pubkey,
-                    primary_info: NodeP2pInfo::default(),
+                    p2p_info: NodeP2pInfo::default(),
                     execution_address: *addr,
                     proof_of_possession: BlsSignature::default(),
                 }

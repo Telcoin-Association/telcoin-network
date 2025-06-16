@@ -30,8 +30,10 @@ pub struct WorkerInfo {
 
 impl Default for WorkerInfo {
     fn default() -> Self {
-        let host = std::env::var("NARWHAL_HOST").unwrap_or("127.0.0.1".to_string());
-        let worker_udp_port = get_available_udp_port(&host).unwrap_or(49594).to_string();
+        // These defaults should only be used by tests.
+        // They need to work for tests though so localhost and a random port are good.
+        let host = "127.0.0.1".to_string();
+        let worker_udp_port = get_available_udp_port(&host).unwrap_or(49594);
 
         Self {
             name: NetworkKeypair::generate_ed25519().public().into(),
