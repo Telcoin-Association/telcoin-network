@@ -155,8 +155,6 @@ pub fn spawn_local_testnet(
             "--google-kms",
             "--faucet-contract",
             faucet_contract_address,
-            "--public-key",
-            "0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99",
         ]);
         #[cfg(not(feature = "faucet"))]
         let command = NodeCommand::parse_from(["tn", "--http", "--instance", &instance]);
