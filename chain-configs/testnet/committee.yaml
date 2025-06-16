@@ -1,32 +1,32 @@
 ---
 authorities:
-  yBWc3pW4bXPmYyADsoPhspx6UnFEhx5ByRpU8mEvGYftVcHMC4cXL1ZQAgkyjqE7XHowKtf8Z7Cf1yUghYFBtS72WfDjzg51ZaQ85ohvQwAWDhgTBffrtPhmJqMd83J51Yb:
-    protocol_key: yBWc3pW4bXPmYyADsoPhspx6UnFEhx5ByRpU8mEvGYftVcHMC4cXL1ZQAgkyjqE7XHowKtf8Z7Cf1yUghYFBtS72WfDjzg51ZaQ85ohvQwAWDhgTBffrtPhmJqMd83J51Yb
+  ntMdDcEAwcu6te3TFh2xhzvHHtKBdmjxN6pTdgq2w4a472fidfrhEzZR1H9Ap7kKvSJ5WXFQ6DHyhU1VkdWVSkSNh4Va4f7q3652ayvPcraa6wF9JLRzM1SXzBR6GHLLT8P:
+    protocol_key: ntMdDcEAwcu6te3TFh2xhzvHHtKBdmjxN6pTdgq2w4a472fidfrhEzZR1H9Ap7kKvSJ5WXFQ6DHyhU1VkdWVSkSNh4Va4f7q3652ayvPcraa6wF9JLRzM1SXzBR6GHLLT8P
     voting_power: 1
-    primary_network_address: /ip4/127.0.0.1/udp/49306/quic-v1
-    execution_address: "0x3333333333333333333333333333333333333333"
-    network_key: 4XTTM5jwBGTRXx25Lpna1SoMJZ4er4mzu472bYwwt7keN7QPk
+    primary_network_address: /ip4/35.245.21.245/udp/49590/quic-v1
+    execution_address: "0x7489025dfbaad94f2366d88a62989147d9c8b5d3"
+    network_key: 4XTTMFdkUuH278yA8B8ZQMw44FZQH2tztqKvoCYf6bWZcuGwT
     hostname: hostname
-  zBQdXVGmxWUxfhy9duvzjiDv56hv29WeLu3xXaz1avEuWjuXzoxWMzyLumj8cDpYTcwdGa1JPSiVw6bvnar7Kin7XkXnhNr2TpnnVwsb1ed1AV8KefKPX2znLFbox1iJapP:
-    protocol_key: zBQdXVGmxWUxfhy9duvzjiDv56hv29WeLu3xXaz1avEuWjuXzoxWMzyLumj8cDpYTcwdGa1JPSiVw6bvnar7Kin7XkXnhNr2TpnnVwsb1ed1AV8KefKPX2znLFbox1iJapP
+  rTQPRavx7nwamuBh5xvAf4xD26mP9kVbW7JMg1xRuPdebmiiXZXxKeP6HxszEoebjz2h8dT9mhkrGn2fbHfkmWhdYiVwzVajTurEnJSQKX8WdBVCZXCgGAyAnH7Pgp2epFP:
+    protocol_key: rTQPRavx7nwamuBh5xvAf4xD26mP9kVbW7JMg1xRuPdebmiiXZXxKeP6HxszEoebjz2h8dT9mhkrGn2fbHfkmWhdYiVwzVajTurEnJSQKX8WdBVCZXCgGAyAnH7Pgp2epFP
     voting_power: 1
-    primary_network_address: /ip4/127.0.0.1/udp/57230/quic-v1
-    execution_address: "0x2222222222222222222222222222222222222222"
-    network_key: 4XTTMEwMi4h1uTiRN9D5keb3L9Y1c1e29CoBSGjGCKT8BFRkK
+    primary_network_address: /ip4/34.102.122.126/udp/49590/quic-v1
+    execution_address: "0x3518b301b86ceb53b5a3dff62e55cd43ef59d024"
+    network_key: 4XTTM5j3jsKkKakyLTXWFZ25HjjGSoByk6H4JzhMYFvTEVibG
     hostname: hostname
-  21hzU2TDXhFz51jUsT84wcoqkHpQ9kvh1mjbtEea7uhau117AnCKpHF6u4btSf3sU5nmsRfJk1smncvnQ87HS2R352P2rPnjjGK1DEt5xWVs6r6QjieLqHNN4KiNwcKioERs:
-    protocol_key: 21hzU2TDXhFz51jUsT84wcoqkHpQ9kvh1mjbtEea7uhau117AnCKpHF6u4btSf3sU5nmsRfJk1smncvnQ87HS2R352P2rPnjjGK1DEt5xWVs6r6QjieLqHNN4KiNwcKioERs
+  rz7tBtvdatV8y5gvSVV9TR8YTqjgnVLjZ6tcidziJpYDEwSVioqxCHMAVzKDPiQgs3sfmLrJabxT7fgaWveC2dUhh63N8xujBhTUwMSU6aTYCN1P98zBLSk62HJVQopcCk3:
+    protocol_key: rz7tBtvdatV8y5gvSVV9TR8YTqjgnVLjZ6tcidziJpYDEwSVioqxCHMAVzKDPiQgs3sfmLrJabxT7fgaWveC2dUhh63N8xujBhTUwMSU6aTYCN1P98zBLSk62HJVQopcCk3
     voting_power: 1
-    primary_network_address: /ip4/127.0.0.1/udp/59229/quic-v1
-    execution_address: "0x1111111111111111111111111111111111111111"
-    network_key: 4XTTM3Xbb8dDjA8mYpignpcVYStkQyvgEAesKXZSgZmULePpx
+    primary_network_address: /ip4/34.162.82.82/udp/49590/quic-v1
+    execution_address: "0x0033a370616805b1fd275b7ffab83fc41d665ccb"
+    network_key: 4XTTMDcfv9EWetvSp1f9VmfAvi6tmFQhWfguSgCQV3x8hCSjx
     hostname: hostname
-  23Ko9s3RYvJyWzm8BekCSpGYPgRFuLQD4mLTHEtW5XZDKSaDptBSqN5B3KSfUuNgWRTjTj7XffX6rWk3bioqrTFmiXwGPnzGWNyZ9TXHBdyuuQH3WYxfPgZ927kuB1YvuSZq:
-    protocol_key: 23Ko9s3RYvJyWzm8BekCSpGYPgRFuLQD4mLTHEtW5XZDKSaDptBSqN5B3KSfUuNgWRTjTj7XffX6rWk3bioqrTFmiXwGPnzGWNyZ9TXHBdyuuQH3WYxfPgZ927kuB1YvuSZq
+  25qaTZ8mTkK9gRWLdhhm6VJG2YyGo4kx7hZjo76zYdzK5ThLu8Xbv2geYFScueR833iq7TiDK4bxDPYJsWNr1boBVge4toXTpxnQeypezP8YmDFqERAawDHSJKCCtpwUp2a6:
+    protocol_key: 25qaTZ8mTkK9gRWLdhhm6VJG2YyGo4kx7hZjo76zYdzK5ThLu8Xbv2geYFScueR833iq7TiDK4bxDPYJsWNr1boBVge4toXTpxnQeypezP8YmDFqERAawDHSJKCCtpwUp2a6
     voting_power: 1
-    primary_network_address: /ip4/127.0.0.1/udp/59078/quic-v1
-    execution_address: "0x4444444444444444444444444444444444444444"
-    network_key: 4XTTM1uTjoYQ3G8MjAtQDHB4V7cdXQkt51MFoKfBEXH3vTZZ6
+    primary_network_address: /ip4/35.188.45.1/udp/49590/quic-v1
+    execution_address: "0xefaacf04b92298a88200aa50aa6bb7bfce587b17"
+    network_key: 4XTTM4hv6LqPhY3tAN7qyNPHAjjoNZqySSgcmBiVHeSzu5uid
     hostname: hostname
 epoch: 0
 epoch_boundary: 18446744073709551615

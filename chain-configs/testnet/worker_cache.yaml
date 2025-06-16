@@ -1,15 +1,15 @@
 ---
 epoch: 0
 workers:
-  yBWc3pW4bXPmYyADsoPhspx6UnFEhx5ByRpU8mEvGYftVcHMC4cXL1ZQAgkyjqE7XHowKtf8Z7Cf1yUghYFBtS72WfDjzg51ZaQ85ohvQwAWDhgTBffrtPhmJqMd83J51Yb:
-    - name: 4XTTMD58oercWiPk4uzXbUFTUXcauQXiUEokovAhPKQxSN8u3
-      worker_address: /ip4/127.0.0.1/udp/65446/quic-v1
-  zBQdXVGmxWUxfhy9duvzjiDv56hv29WeLu3xXaz1avEuWjuXzoxWMzyLumj8cDpYTcwdGa1JPSiVw6bvnar7Kin7XkXnhNr2TpnnVwsb1ed1AV8KefKPX2znLFbox1iJapP:
-    - name: 4XTTM4FjpDBqjez6GScdg6rFA1Q1kA6y4HDAoWGz5Dy2cCj9w
-      worker_address: /ip4/127.0.0.1/udp/49566/quic-v1
-  21hzU2TDXhFz51jUsT84wcoqkHpQ9kvh1mjbtEea7uhau117AnCKpHF6u4btSf3sU5nmsRfJk1smncvnQ87HS2R352P2rPnjjGK1DEt5xWVs6r6QjieLqHNN4KiNwcKioERs:
-    - name: 4XTTMEdVSWKEYZt8R9uRi9e1QWDitQxxbszrn5GgANoVUnpH8
-      worker_address: /ip4/127.0.0.1/udp/58273/quic-v1
-  23Ko9s3RYvJyWzm8BekCSpGYPgRFuLQD4mLTHEtW5XZDKSaDptBSqN5B3KSfUuNgWRTjTj7XffX6rWk3bioqrTFmiXwGPnzGWNyZ9TXHBdyuuQH3WYxfPgZ927kuB1YvuSZq:
-    - name: 4XTTM9SCe6hxwKCPgp4K7u4AwopDUJdu5qYKQRC9ctwHN4kXh
-      worker_address: /ip4/127.0.0.1/udp/60532/quic-v1
+  ntMdDcEAwcu6te3TFh2xhzvHHtKBdmjxN6pTdgq2w4a472fidfrhEzZR1H9Ap7kKvSJ5WXFQ6DHyhU1VkdWVSkSNh4Va4f7q3652ayvPcraa6wF9JLRzM1SXzBR6GHLLT8P:
+    - name: 4XTTM1tHgytPdi2nW8isCkRqA3pMg1auVf8T3WCVCPJCddyPq
+      worker_address: /ip4/127.0.0.1/udp/46103/quic-v1
+  rTQPRavx7nwamuBh5xvAf4xD26mP9kVbW7JMg1xRuPdebmiiXZXxKeP6HxszEoebjz2h8dT9mhkrGn2fbHfkmWhdYiVwzVajTurEnJSQKX8WdBVCZXCgGAyAnH7Pgp2epFP:
+    - name: 4XTTM1KdswAHxDvh6tYLKsFMAN7PsMDE1Eag45Fg5e2kfQfse
+      worker_address: /ip4/127.0.0.1/udp/60249/quic-v1
+  rz7tBtvdatV8y5gvSVV9TR8YTqjgnVLjZ6tcidziJpYDEwSVioqxCHMAVzKDPiQgs3sfmLrJabxT7fgaWveC2dUhh63N8xujBhTUwMSU6aTYCN1P98zBLSk62HJVQopcCk3:
+    - name: 4XTTMCwhgJvxCvqMXy5aqHSjQf4JSWHxjM3m4pRxdQqggw6Fk
+      worker_address: /ip4/127.0.0.1/udp/34537/quic-v1
+  25qaTZ8mTkK9gRWLdhhm6VJG2YyGo4kx7hZjo76zYdzK5ThLu8Xbv2geYFScueR833iq7TiDK4bxDPYJsWNr1boBVge4toXTpxnQeypezP8YmDFqERAawDHSJKCCtpwUp2a6:
+    - name: 4XTTMFfesw3rfTFwnTWj9WcrHfjaTiAhGnWTLPoMkVG5GgEmi
+      worker_address: /ip4/127.0.0.1/udp/50054/quic-v1
