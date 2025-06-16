@@ -96,6 +96,12 @@ impl<DB: Database> Certifier<DB> {
             .collect();
 
         let highest_created_certificate = Self::highest_created_certificate(&config);
+        debug!(
+            target: "epoch-manager",
+            ?highest_created_certificate,
+            "restoring certifier with highest created certificate for epoch {}",
+            config.epoch(),
+        );
 
         for (name, rx_own_certificate_broadcast) in broadcast_targets.into_iter() {
             trace!(target: "primary::synchronizer::broadcast_certificates", ?name, "spawning sender for peer");
@@ -442,13 +448,18 @@ impl<DB: Database> Certifier<DB> {
                             }
                         }
                         Err(e) => {
-                            error!(target: "primary::certifier", authority=?self.authority_id, "Certifier error on proposed header task: {e}");
+                            match e {
+                                // ignore errors when the propsal is cancelled - this is expected
+                                DagError::Canceled => debug!(target: "primary::certifier", authority=?self.authority_id, "Certifier error on proposed header task: {e}"),
+                                // log other errors
+                                e =>  error!(target: "primary::certifier", authority=?self.authority_id, "Certifier error on proposed header task: {e}"),
+                            }
                         }
                     }
                 },
 
                 _ = &self.rx_shutdown => {
-                    warn!(target: "primary::certifier", "Certifier has shutdown");
+                    debug!(target: "primary::certifier", "Certifier received shutdown signal");
                     break;
                 }
             }

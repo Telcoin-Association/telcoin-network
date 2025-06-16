@@ -198,34 +198,18 @@ impl LeaderSchedule {
         store: DB,
         bad_nodes_stake_threshold: u64,
     ) -> Self {
-        let table = store.read_latest_commit_with_final_reputation_scores().map_or(
-            LeaderSwapTable::default(),
-            |commit| {
+        let table = store
+            .read_latest_commit_with_final_reputation_scores(committee.epoch())
+            .map_or(LeaderSwapTable::default(), |subdag| {
                 LeaderSwapTable::new(
                     &committee,
-                    commit.leader_round(),
-                    &commit.reputation_score,
+                    subdag.leader_round(),
+                    &subdag.reputation_score,
                     bad_nodes_stake_threshold,
                 )
-            },
-        );
+            });
         // create the schedule
         Self::new(committee, table)
-    }
-
-    pub fn reload_from_store<DB: ConsensusStore>(&self, store: DB, bad_nodes_stake_threshold: u64) {
-        let table = store.read_latest_commit_with_final_reputation_scores().map_or(
-            LeaderSwapTable::default(),
-            |commit| {
-                LeaderSwapTable::new(
-                    &self.committee,
-                    commit.leader_round(),
-                    &commit.reputation_score,
-                    bad_nodes_stake_threshold,
-                )
-            },
-        );
-        *self.leader_swap_table.write() = table;
     }
 
     /// Atomically updates the leader swap table with the new provided one. Any leader queried from

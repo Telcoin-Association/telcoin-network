@@ -84,6 +84,7 @@ pub mod tables {
         // These tables are for the consensus chain not the normal consensus.
         ConsensusBlocks;crate::CONSENSUS_BLOCK_CF;<u64, ConsensusHeader>,
         ConsensusBlockNumbersByDigest;crate::CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF;<BlockHash, u64>,
+        // These are used for network storage and separate from consensus
         KadRecords;crate::KAD_RECORD_CF;<BlockHash, Vec<u8>>,
         KadProviderRecords;crate::KAD_PROVIDER_RECORD_CF;<BlockHash, Vec<u8>>
     );

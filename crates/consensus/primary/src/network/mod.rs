@@ -132,6 +132,7 @@ impl PrimaryNetworkHandle {
         }
     }
 
+    /// Request consensus header from specific peer.
     pub async fn request_consensus_from_peer(
         &self,
         peer: PeerId,
@@ -150,6 +151,7 @@ impl PrimaryNetworkHandle {
         }
     }
 
+    /// Request consensus header from a random peer up to three times from three different peers.
     pub async fn request_consensus(
         &self,
         number: Option<u64>,

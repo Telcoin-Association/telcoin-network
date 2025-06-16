@@ -6,7 +6,7 @@
 use crate::{FaucetConfig, FaucetRpcExt, FaucetWallet};
 use clap::Args;
 use ecdsa::elliptic_curve::{pkcs8::DecodePublicKey as _, sec1::ToEncodedPoint};
-use eyre::ContextCompat;
+use eyre::{ContextCompat, OptionExt};
 use k256::PublicKey as PubKey;
 use secp256k1::PublicKey;
 use std::{str::FromStr, time::Duration};
@@ -40,8 +40,13 @@ pub struct FaucetArgs {
     ///
     /// Google KMS strategy:
     /// Use the startup script to retrieve this value and set the env variable in pem format.
-    #[clap(long, value_parser = parse_pubkey, env = "FAUCET_PUBLIC_KEY")]
-    pub(crate) public_key: PublicKey,
+    #[clap(
+        long,
+        value_parser = parse_pubkey,
+        env = "FAUCET_PUBLIC_KEY",
+        help_heading = "The public key for the faucet wallet.",
+    )]
+    pub(crate) public_key: Option<PublicKey>,
 
     /// Bool indicating Google KMS is in use for faucet signatures.
     ///
@@ -101,9 +106,10 @@ impl FaucetArgs {
         // only support google kms for now
         if self.google_kms {
             // calculate address from uncompressed public key
-            let address = public_key_to_address(self.public_key);
+            let public_key = self.public_key.ok_or_eyre("faucet public key required")?;
+            let address = public_key_to_address(public_key);
             // compressed public key bytes
-            let public_key_bytes = self.public_key.serialize();
+            let public_key_bytes = public_key.serialize();
 
             // set in arg
             let google_project_id = self.project_id.as_ref()
@@ -199,7 +205,7 @@ mod tests {
             "029bef8d556d80e43ae7e0becb3a7e6838b95defe45896ed6075bb9035d06c9964",
         )
         .unwrap();
-        assert_eq!(parsed.args.public_key, expected);
+        assert_eq!(parsed.args.public_key.unwrap(), expected);
 
         // test google kms active without setting required API info in the env
         let missing_env_parsed =
@@ -222,6 +228,6 @@ mod tests {
             "03ab3bfca522095e8dcf259b06bfe7de682649150a06dde779825d28fdda412adc",
         )
         .unwrap();
-        assert_eq!(pem_parsed.args.public_key, expected);
+        assert_eq!(pem_parsed.args.public_key.unwrap(), expected);
     }
 }

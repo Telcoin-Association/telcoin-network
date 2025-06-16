@@ -24,12 +24,15 @@ pub enum TnEngineError {
     /// The queued output that triggered the engine build was not found.
     #[error("Engine trying to build from empty queue.")]
     EmptyQueue,
-    // Failed to recover the signer for a transaction.
+    /// Failed to recover the signer for a transaction.
     #[error("Could not recover signer for transaction")]
     MissingSigner,
-    // Failed to find the block we need to finalize- forked?.
+    /// Failed to find the block we need to finalize- forked?.
     #[error("Could not finalize execution block- forked?")]
     MissingFinalBlock,
+    /// The consensus stream has closed.
+    #[error("Consensus output stream closed.")]
+    ConsensusOutputStreamClosed,
 }
 
 impl From<oneshot::error::RecvError> for TnEngineError {

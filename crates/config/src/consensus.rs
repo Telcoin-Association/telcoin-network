@@ -9,8 +9,8 @@ use std::{
 };
 use tn_network_types::local::LocalNetwork;
 use tn_types::{
-    Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Database, Hash as _,
-    Multiaddr, Notifier, WorkerCache, WorkerId,
+    Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Database, Epoch,
+    Hash as _, Multiaddr, Notifier, WorkerCache, WorkerId,
 };
 use tracing::info;
 
@@ -194,6 +194,10 @@ where
 
     pub fn network_config(&self) -> &NetworkConfig {
         &self.inner.network_config
+    }
+
+    pub fn epoch(&self) -> Epoch {
+        self.inner.committee.epoch()
     }
 
     /// Committee network peer ids.

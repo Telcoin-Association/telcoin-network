@@ -30,7 +30,10 @@ use tn_reth::{
 };
 use tn_storage::{
     open_db, open_network_db,
-    tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
+    tables::{
+        CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
+        ConsensusBlockNumbersByDigest, ConsensusBlocks, LastProposed, Payload, Votes,
+    },
     DatabaseType,
 };
 use tn_types::{
@@ -210,7 +213,7 @@ where
         // retrieve epoch information from canonical tip on startup
         let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
         debug!(target: "epoch-manager", ?epoch, "retrieved epoch state from canonical tip");
-        let consensus_db = self.open_consensus_db(epoch).await?;
+        let consensus_db = self.open_consensus_db().await?;
         catchup_accumulator(&consensus_db, engine.get_reth_env().await, &gas_accumulator)?;
 
         // read the network config or use the default
@@ -240,14 +243,14 @@ where
 
     /// Create the epoch directory for consensus data if it doesn't exist and open the consensus
     /// database connection.
-    async fn open_consensus_db(&self, epoch: Epoch) -> eyre::Result<DatabaseType> {
-        let epoch_db_path = self.tn_datadir.epoch_db_path(epoch);
+    async fn open_consensus_db(&self) -> eyre::Result<DatabaseType> {
+        let consensus_db_path = self.tn_datadir.consensus_db_path();
 
         // ensure dir exists
-        let _ = std::fs::create_dir_all(&epoch_db_path);
-        let db = open_db(&epoch_db_path);
+        let _ = std::fs::create_dir_all(&consensus_db_path);
+        let db = open_db(&consensus_db_path);
 
-        info!(target: "epoch-manager", ?epoch_db_path, "opened consensus storage for epoch {}", epoch);
+        info!(target: "epoch-manager", ?consensus_db_path, "opened consensus storage");
 
         Ok(db)
     }
@@ -309,7 +312,7 @@ where
         // create network db
         let worker_network_db = self.tn_datadir.network_db_path().join("worker");
         let _ = std::fs::create_dir_all(&worker_network_db);
-        info!(target: "epoch-manager", ?worker_network_db, "opening primary network storage at:");
+        info!(target: "epoch-manager", ?worker_network_db, "opening worker network storage at:");
         let worker_network_db = open_network_db(worker_network_db);
 
         // create long-running network task for worker
@@ -347,7 +350,7 @@ where
     async fn run_epochs(
         &mut self,
         engine: &ExecutionNode,
-        consensus_db: DatabaseType,
+        mut consensus_db: DatabaseType,
         network_config: NetworkConfig,
         to_engine: mpsc::Sender<ConsensusOutput>,
         gas_accumulator: GasAccumulator,
@@ -384,7 +387,8 @@ where
                 error!(target: "epoch-manager", ?e, "epoch returned error");
             })?;
 
-            info!(target: "epoch-manager", "looping next epoch");
+            info!(target: "epoch-manager", "clearing tables and looping for next epoch");
+            self.clear_consensus_db_for_next_epoch(&mut consensus_db)?;
         }
     }
 
@@ -469,7 +473,7 @@ where
                     error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
                 })?;
 
-                info!(target: "epoch-manager", "epoch boundary reached");
+                info!(target: "epoch-manager", "epoch boundary success");
             },
 
             // return any errors
@@ -505,9 +509,10 @@ where
             if output.committed_at() >= self.epoch_boundary {
                 info!(
                     target: "epoch-manager",
+                    epoch=?output.leader().epoch(),
                     commit=?output.committed_at(),
                     epoch_boundary=?self.epoch_boundary,
-                    "epoch boundary reached",
+                    "epoch boundary detected",
                 );
                 // subscribe to engine blocks to confirm epoch closed on-chain
                 let mut executed_output = engine.canonical_block_stream().await;
@@ -655,6 +660,7 @@ where
         // retrieve epoch information from canonical tip
         let EpochState { epoch, epoch_info, validators, epoch_start } =
             engine.epoch_state_from_canonical_tip().await?;
+        debug!(target: "epoch-manager", ?epoch_info, "epoch state from canonical tip for epoch {}", epoch);
         let validators = validators
             .iter()
             .map(|v| {
@@ -665,9 +671,11 @@ where
             .map_err(|err| eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
 
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
+        debug!(target: "epoch-manager", new_epoch_boundary=self.epoch_boundary, "resetting epoch boundary");
 
         // send these to the swarm for validator discovery
         let keys_for_worker_cache = validators.keys().cloned().collect();
+        debug!(target: "epoch-manager", ?validators, "creating committee for validators");
         let committee = self.create_committee_from_state(epoch, validators).await?;
         let worker_cache =
             self.create_worker_cache_from_state(epoch, keys_for_worker_cache).await?;
@@ -714,6 +722,8 @@ where
                 .find_authorities(validators.keys().cloned().collect())
                 .await?;
 
+            debug!(target: "epoch-manager", "requsting info validator info for {} authorities", primary_network_infos.len());
+
             // build the committee using kad network
             let mut committee_builder = CommitteeBuilder::new(epoch, self.epoch_boundary);
 
@@ -721,6 +731,7 @@ where
             while let Some(info) = primary_network_infos.next().await {
                 debug!(target: "epoch-manager", ?info, "awaited next primary network info");
                 let (protocol_key, NetworkInfo { pubkey, multiaddr, hostname }) = info??;
+                debug!(target: "epoch-manager", peer_id=?pubkey.to_peer_id(), "awaited next primary network info");
                 let validator = validators
                     .get(&protocol_key)
                     .ok_or_eyre("network returned validator that isn't in the committee")?;
@@ -756,11 +767,13 @@ where
         info!(target: "epoch-manager", "creating worker cache from state");
 
         let worker_cache = if epoch == 0 {
+            debug!(target: "epoch-manager", "loading worker cache from config for epoch 0");
             Config::load_from_path_or_default::<WorkerCache>(
                 self.tn_datadir.worker_cache_path(),
                 ConfigFmt::YAML,
             )?
         } else {
+            debug!(target: "epoch-manager", "creating worker cache from network records");
             // create worker cache
             let worker_handle = self
                 .worker_network_handle
@@ -775,10 +788,8 @@ where
             while let Some(info) = worker_network_infos.next().await {
                 let (protocol_key, NetworkInfo { pubkey, multiaddr, .. }) = info??;
                 // only one worker per authority for now
-                let worker_index = WorkerIndex(vec![WorkerInfo {
-                    name: pubkey,
-                    worker_address: multiaddr.clone(),
-                }]);
+                let worker_index =
+                    WorkerIndex(vec![WorkerInfo { name: pubkey, worker_address: multiaddr }]);
                 workers.push((protocol_key, worker_index));
             }
 
@@ -975,13 +986,17 @@ where
         node_task_spawner.spawn_task(task_name, async move {
             let mut backoff = 1;
 
+            debug!(target: "epoch-manager", ?peer_id, "dialing peer");
+
             // skip dialing already connected peers
             if let Ok(peers) = handle.connected_peers().await {
                 if peers.contains(&peer_id) {
+                    debug!(target: "epoch-manager", ?peer_id, "skipping dial for peer");
                     return;
                 };
             }
 
+            debug!(target: "epoch-manager", ?peer_id, "peer not connected - dialing peer");
             while let Err(e) = handle.dial(peer_id, peer_addr.clone()).await {
                 // ignore errors for peers that are already connected or being dialed
                 if matches!(e, NetworkError::AlreadyConnected(_)) || matches!(e, NetworkError::AlreadyDialing(_)) {
@@ -1009,6 +1024,7 @@ where
     ) -> eyre::Result<()> {
         // create event streams for the worker network handler
         let (event_stream, rx_event_stream) = mpsc::channel(1000);
+        debug!(target: "epoch-manager", "spawning worker network for epoch");
 
         network_handle
             .inner_handle()
@@ -1024,9 +1040,13 @@ where
 
         let worker_address =
             self.worker_network_addr.clone().expect("worker address set at this point");
-        // always dial peers for the new epoch
+
+        // always attempt to dial peers for the new epoch
+        // the network's peer manager will intercept dial attempts for peers that are already
+        // connected
+        debug!(target: "epoch-manager", ?worker_address, "spawning worker network for epoch");
         for (peer_id, addr) in consensus_config.worker_cache().all_workers() {
-            if addr != worker_address {
+            if worker_address != addr {
                 self.dial_peer(
                     network_handle.inner_handle().clone(),
                     peer_id,
@@ -1071,6 +1091,9 @@ where
         // prime the last consensus header from the DB
         let (_, last_db_block) =
             db.last_record::<ConsensusBlocks>().unwrap_or_else(|| (0, ConsensusHeader::default()));
+
+        // prime the watch channel with data from the db this will be updated by state-sync if this
+        // node can_cvv
         consensus_bus.last_consensus_header().send(last_db_block)?;
 
         Ok(())
@@ -1078,7 +1101,7 @@ where
 
     /// Helper method to identify the node's mode:
     /// - "Committee-voting Validator" (CVV)
-    /// - "Non-voting Validator" (NVV)
+    /// - "Committee-voting Validator Inactive" (CVVInactive - syncing to rejoin)
     /// - "Observer"
     ///
     /// This method also updates the `ConsensusBus::node_mode()`.
@@ -1088,8 +1111,12 @@ where
         consensus_config: &ConsensusConfig<DB>,
         primary_network_handle: &PrimaryNetworkHandle,
     ) -> eyre::Result<NodeMode> {
-        debug!(target: "epoch-manager", "identifying node mode...");
-        let mode = if self.builder.tn_config.observer {
+        debug!(target: "epoch-manager", authority_id=?consensus_config.authority_id(), "identifying node mode..." );
+        let in_committee = consensus_config
+            .authority_id()
+            .map(|id| consensus_config.in_committee(&id))
+            .unwrap_or(false);
+        let mode = if !in_committee || self.builder.tn_config.observer {
             NodeMode::Observer
         } else if state_sync::can_cvv(consensus_bus, consensus_config, primary_network_handle).await
         {
@@ -1132,5 +1159,22 @@ where
                 )
             }
         });
+    }
+
+    /// Clear the epoch-related tables for consensus.
+    ///
+    /// These tables are epoch-specific. Complete historic data is stored
+    /// in the `ConsensusBlocks` table.
+    fn clear_consensus_db_for_next_epoch(
+        &self,
+        consensus_db: &mut DatabaseType,
+    ) -> eyre::Result<()> {
+        consensus_db.clear_table::<LastProposed>()?;
+        consensus_db.clear_table::<Votes>()?;
+        consensus_db.clear_table::<Certificates>()?;
+        consensus_db.clear_table::<CertificateDigestByRound>()?;
+        consensus_db.clear_table::<CertificateDigestByOrigin>()?;
+        consensus_db.clear_table::<Payload>()?;
+        Ok(())
     }
 }

@@ -706,12 +706,15 @@ impl RethEnv {
         // see reth::EngineApiTreeHandler::on_canonical_chain_update
         let chain_update = NewCanonicalChain::Commit { new: blocks };
         let canonical_head = chain_update.tip();
+        let (epoch, round) =
+            Self::deconstruct_nonce(<FixedBytes<8> as Into<u64>>::into(canonical_head.nonce));
         info!(
             target: "engine",
-            "canonical head for round {:?}: {:?} - {:?}",
-            <FixedBytes<8> as Into<u64>>::into(canonical_head.nonce),
+            "canonical head for epoch {:?} round {:?}: {:?} - {:?}",
+            epoch,
+            round,
             canonical_head.number,
-            canonical_head.hash()
+            canonical_head.hash(),
         );
 
         let notification = chain_update.to_chain_notification();
@@ -720,6 +723,13 @@ impl RethEnv {
         self.canonical_in_memory_state().notify_canon_state(notification);
 
         Ok(())
+    }
+
+    /// Helper to deconstruct block nonce into epoch and round.
+    pub fn deconstruct_nonce(nonce: u64) -> (u32, u32) {
+        let epoch = (nonce >> 32) as u32; // Extract the upper 32 bits
+        let round = nonce as u32; // Extract the lower 32 bits (truncates upper bits)
+        (epoch, round)
     }
 
     /// Look up and return the sealed header for hash.
@@ -1047,25 +1057,20 @@ impl RethEnv {
         Ok(result)
     }
 
-    /// Read the latest committee from the [ConsensusRegistry] on-chain.
+    /// Read the latest committee and epoch information from the [ConsensusRegistry] on-chain.
     ///
     /// The protocol needs the BLS pubkey for the authorities.
     /// - get current epoch info
     /// - getValidator token id by address
     /// - getValidator info by token id
     pub fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
-        // read current epoch number from chain
-        let last_block_num = self.blockchain_provider.last_block_number()?;
-        let canonical_tip = self.header_by_number(last_block_num)?.ok_or_eyre(
-            "Canonical tip missing from blockchain provider reading committee from chain",
-        )?;
-
-        debug!(target: "engine", ?canonical_tip, "retrieving epoch state from canonical tip");
-
         // create EVM with latest state
-        let latest = self.latest()?;
-        let state = StateProviderDatabase::new(latest);
+        let canonical_tip = self.canonical_tip();
+        debug!(target: "engine", ?canonical_tip, "retrieving epoch state from canonical tip");
+        let state_provider = self.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
+        let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(state).with_bundle_update().build();
+        debug!(target: "engine", state=?db.bundle_state, hashes=?db.block_hashes, "retrieving epoch state from canonical tip");
         let mut tn_evm = self
             .evm_config
             .evm_factory()
@@ -1076,8 +1081,7 @@ impl RethEnv {
 
         // current epoch info
         let epoch_info = self.get_current_epoch_info(&mut tn_evm)?;
-
-        debug!(target: "engine", ?epoch_info, "retrieving closing timestamp for previous epoch...");
+        debug!(target: "engine", ?epoch, ?epoch_info, "retrieved epoch info from canonical tip for next epoch");
 
         // retrieve closing timestamp for previous epoch
         let epoch_start = self
@@ -1178,7 +1182,9 @@ impl RethEnv {
             Err(e) => {
                 // fatal error
                 error!(target: "engine", ?caller, ?contract, "failed to read state: {}", e);
-                return Err(TnRethError::EVMCustom(format!("getValidatorsCall failed: {e}")));
+                return Err(TnRethError::EVMCustom(format!(
+                    "system call failed reading state: {e}"
+                )));
             }
         };
 
@@ -1345,7 +1351,7 @@ mod tests {
             calldata,
         );
         let calldata = ConsensusRegistry::stakeCall {
-            blsPubkey: new_validator.bls_public_key.clone().compress().into(),
+            blsPubkey: new_validator.bls_public_key.compress().into(),
         }
         .abi_encode()
         .into();
