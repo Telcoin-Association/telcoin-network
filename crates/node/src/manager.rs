@@ -1046,7 +1046,7 @@ where
         // connected
         debug!(target: "epoch-manager", ?worker_address, "spawning worker network for epoch");
         for (peer_id, addr) in consensus_config.worker_cache().all_workers() {
-            if !worker_address.contains(&addr) {
+            if worker_address != addr {
                 self.dial_peer(
                     network_handle.inner_handle().clone(),
                     peer_id,
