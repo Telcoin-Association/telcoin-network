@@ -63,8 +63,7 @@ if [ -n "$MODIFIED_TRACKED_FILES" ]; then
     exit 1
 fi
 
-
-check cargo fmt first
+# check cargo fmt first
 cargo +nightly fmt -- --check
 
 echo "fmt passed"
