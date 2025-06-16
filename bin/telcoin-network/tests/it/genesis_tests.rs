@@ -3,7 +3,7 @@
 //! NOTE: this test contains code for executing a proxy/impl pre-genesis
 //! however, the RPC calls don't work. The beginning of the test is left
 //! because the proxy version may be re-prioritized later.
-use crate::util::spawn_local_testnet;
+use crate::util::{spawn_local_testnet, IT_TEST_MUTEX};
 use alloy::{network::EthereumWallet, primitives::utils::parse_ether, providers::ProviderBuilder};
 use core::panic;
 use eyre::OptionExt;
@@ -22,6 +22,7 @@ use tracing::debug;
 
 #[tokio::test]
 async fn test_genesis_with_its() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
     // spawn testnet for RPC calls
     let temp_path = tempfile::TempDir::with_suffix("genesis_with_its").expect("tempdir is okay");
     spawn_local_testnet(
@@ -80,6 +81,7 @@ async fn test_genesis_with_its() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
     // check that all addresses in expected_deployments are present in precompiles
     let is_address_present = |address: &str, genesis_config: Vec<(Address, GenesisAccount)>| {
         genesis_config
@@ -146,6 +148,8 @@ async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
+    tn_types::test_utils::init_test_tracing();
     // fetch registry impl bytecode from compiled output in tn-contracts
     let json_val = RethEnv::fetch_value_from_json_str(
         CONSENSUS_REGISTRY_JSON,
