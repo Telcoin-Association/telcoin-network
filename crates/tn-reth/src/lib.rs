@@ -1064,21 +1064,9 @@ impl RethEnv {
     /// - getValidator token id by address
     /// - getValidator info by token id
     pub fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
-        // read current epoch number from chain
-        // let last_block_num = self.blockchain_provider.last_block_number()?;
-        // let canonical_tip = self.header_by_number(last_block_num)?.ok_or_eyre(
-        //     "Canonical tip missing from blockchain provider reading committee from chain",
-        // )?;
-
-        let canonical_tip = self.canonical_tip();
-
-        debug!(target: "engine", ?canonical_tip, "retrieving epoch state from canonical tip");
-
         // create EVM with latest state
-        // let latest = self.latest()?;
-        // let state_provider = self.blockchain_provider.state_by_block_hash(parent_header.hash())?;
-        // let state = StateProviderDatabase::new(&state_provider);
-
+        let canonical_tip = self.canonical_tip();
+        debug!(target: "engine", ?canonical_tip, "retrieving epoch state from canonical tip");
         let state_provider = self.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(state).with_bundle_update().build();
@@ -1093,7 +1081,6 @@ impl RethEnv {
 
         // current epoch info
         let epoch_info = self.get_current_epoch_info(&mut tn_evm)?;
-
         debug!(target: "engine", ?epoch, ?epoch_info, "retrieved epoch info from canonical tip for next epoch");
 
         // retrieve closing timestamp for previous epoch
@@ -1329,7 +1316,7 @@ mod tests {
         let tmp_genesis = adiri_genesis().extend_accounts([
             (
                 governance,
-                GenesisAccount::default().with_balance(U256::from(50_000_000 * 10 ^ 18)), // 50mil TEL
+                GenesisAccount::default().with_balance(U256::from((50_000_000 * 10) ^ 18)), // 50mil TEL
             ),
             (
                 new_validator_eoa.address(),

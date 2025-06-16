@@ -343,7 +343,6 @@ where
         let limit = self.consensus_bus.primary_round_updates().borrow().saturating_sub(
             self.consensus_config.network_config().sync_config().max_proposed_header_age_limit,
         );
-
         ensure!(
             limit <= header.round(),
             HeaderError::TooOld {

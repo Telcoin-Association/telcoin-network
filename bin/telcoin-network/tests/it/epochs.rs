@@ -7,12 +7,12 @@ use alloy::{
     sol_types::SolCall,
 };
 use clap::Parser as _;
+use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
-use telcoin_network::genesis::GenesisArgs;
-use telcoin_network::node::NodeCommand;
+use telcoin_network::{genesis::GenesisArgs, node::NodeCommand};
 use tempfile::tempdir;
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
 use tn_node::launch_node;
@@ -51,7 +51,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
     let temp_dir = tempdir()?;
     let temp_path = temp_dir.path();
     let genesis = create_genesis_for_test(
-        &temp_path,
+        temp_path,
         new_validator.address(),
         governance_wallet.address(),
         &committee,
@@ -64,7 +64,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
     // create transactions to make new validator eligible for future epochs
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
     let txs =
-        generate_new_validator_txs(&temp_path, chain, &mut new_validator, &mut governance_wallet)?;
+        generate_new_validator_txs(temp_path, chain, &mut new_validator, &mut governance_wallet)?;
 
     // create rpc client for node1 default rpc address
     let rpc_url = "http://127.0.0.1:8545".to_string();
@@ -98,7 +98,6 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
 
     // track the number of times the new validator was in the epoch committee
     let mut new_validator_in_committee_count = 0;
-    let min_epochs_to_transition = 6;
     let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
 
     // sleep for first epoch with 1s offset and begin assertions loop
@@ -116,7 +115,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
         let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
         assert!(new_epoch_info != current_epoch_info);
         assert!(new_epoch_info.blockHeight > last_epoch_block_height);
-        assert_eq!(new_epoch_info.epochDuration, EPOCH_DURATION);
+        assert_eq!(new_epoch_info.epochDuration as u64, EPOCH_DURATION);
 
         // count the number of times the new validator is in committee
         if new_epoch_info.committee.contains(&new_validator.address()) {
@@ -125,10 +124,8 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
 
         // if min number of epochs have transitioned, assert new validator has been shuffled in
         // at least once to end the test
-        if i > MIN_EPOCHS_TO_TEST {
-            if new_validator_in_committee_count > 0 {
-                return Ok(());
-            }
+        if i > MIN_EPOCHS_TO_TEST && new_validator_in_committee_count > 0 {
+            return Ok(());
         }
 
         // store the last seen epoch info that is expected to change every epoch
@@ -164,11 +161,11 @@ fn create_genesis_for_test(
     let accounts = vec![
         (
             governance_wallet,
-            GenesisAccount::default().with_balance(U256::from(parse_ether("50_000_000")?)), // 50mil TEL
+            GenesisAccount::default().with_balance(U256::from(parse_ether("50_000_000")?)), /* 50mil TEL */
         ),
         (
             new_validator,
-            GenesisAccount::default().with_balance(U256::from(parse_ether("2_000_000")?)), // double stake
+            GenesisAccount::default().with_balance(U256::from(parse_ether("2_000_000")?)), /* double stake */
         ),
     ];
 
@@ -211,7 +208,7 @@ fn create_genesis_for_test(
 /// All data is written to file.
 fn config_committee(
     temp_path: &Path,
-    shared_genesis_dir: &PathBuf,
+    shared_genesis_dir: &Path,
     passphrase: Option<String>,
     consensus_registry_owner: Address,
     accounts: Vec<(Address, GenesisAccount)>,
@@ -258,7 +255,7 @@ fn config_committee(
         "--min-header-delay-ms",
         "500",
     ]);
-    create_committee_command.args.execute(shared_genesis_dir.clone())?;
+    create_committee_command.args.execute(shared_genesis_dir.to_path_buf())?;
 
     // update genesis with funded accounts
     let data_dir = shared_genesis_dir.join("genesis/genesis.yaml");
@@ -312,7 +309,7 @@ fn start_nodes(temp_path: &Path, validators: Vec<(&str, Address)>) -> eyre::Resu
             &instance,
             "--google-kms",
             "--faucet-contract",
-            faucet_contract_address,
+            "0x0000000000000000000000000000000000000000",
             "--public-key",
             "0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99",
         ]);

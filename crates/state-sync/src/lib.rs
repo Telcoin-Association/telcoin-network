@@ -170,7 +170,8 @@ pub fn save_consensus<DB: Database>(
 }
 
 /// Returns the ConsensusHeader that created the last executed block if can be found.
-/// If we are not starting at genesis or a new epoch, then not finding this indicates a database issue.
+/// If we are not starting at genesis or a new epoch, then not finding this indicates a database
+/// issue.
 pub fn last_executed_consensus_block<DB: Database>(
     consensus_bus: &ConsensusBus,
     config: &ConsensusConfig<DB>,

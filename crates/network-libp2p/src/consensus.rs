@@ -734,9 +734,7 @@ where
                             cancel,
                         }) {
                             error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
-                            // fatal - unable to process requests
-                            // return Err(e.into());
-                            // TODO: swap event streams at epoch boundary to prevent this error
+                            // ignore failures at the epoch boundary
                             return Ok(());
                         }
 

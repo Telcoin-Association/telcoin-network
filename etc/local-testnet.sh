@@ -158,7 +158,7 @@ if [ "$START" = true ]; then
         echo "Starting ${VALIDATOR} in background, rpc endpoint http://localhost:$RPC_PORT"
         # -vvv for INFO, -vvvvv for TRACE, etc
         # start validator
-        RUST_LOG=epoch-manager=debug,peer-manager=debug,network=debug,engine=trace,providers::blockchain=debug,info target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
+        target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
            --instance "${INSTANCE}" \
            --metrics "${CONSENSUS_METRICS}" \
            --log.stdout.format log-fmt \
@@ -169,7 +169,7 @@ if [ "$START" = true ]; then
     DATADIR="${ROOTDIR}/observer"
     CONSENSUS_METRICS="127.0.0.1:9104"
     echo "Starting Observer in background, rpc endpoint http://localhost:8541"
-    RUST_LOG=epoch-manager=debug,peer-manager=debug,network=debug,engine=trace,providers::blockchain=trace,info target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
+    target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
        --observer \
        --instance 5 \
        --metrics "${CONSENSUS_METRICS}" \

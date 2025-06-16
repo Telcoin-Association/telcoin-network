@@ -1049,6 +1049,8 @@ where
         }
 
         // always attempt to dial peers for the new epoch
+        // the network's peer manager will intercept dial attempts for peers that are already
+        // connected
         let worker_address = network_handle.inner_handle().listeners().await?;
         debug!(target: "epoch-manager", ?worker_address, "spawning worker network for epoch");
         for (peer_id, addr) in consensus_config.worker_cache().all_workers() {
@@ -1098,7 +1100,8 @@ where
         let (_, last_db_block) =
             db.last_record::<ConsensusBlocks>().unwrap_or_else(|| (0, ConsensusHeader::default()));
 
-        // prime the watch channel with data from the db this will be updated by state-sync if this node can_cvv
+        // prime the watch channel with data from the db this will be updated by state-sync if this
+        // node can_cvv
         consensus_bus.last_consensus_header().send(last_db_block)?;
 
         Ok(())

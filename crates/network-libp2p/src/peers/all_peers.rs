@@ -646,7 +646,7 @@ impl AllPeers {
                 let status = peer.connection_status();
                 status.is_connected() || status.is_dialing()
             })
-            .map(|(peer_id, _)| peer_id.clone())
+            .map(|(peer_id, _)| *peer_id)
             .collect()
     }
 

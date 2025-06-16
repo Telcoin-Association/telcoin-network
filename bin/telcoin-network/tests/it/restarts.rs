@@ -80,12 +80,11 @@ fn send_and_confirm(
     }
     let bal =
         get_balance_above_with_retry(node_test, &basefee_address.to_string(), current_basefee)?;
-    if nonce > 0 {
-        if bal != current_basefee + (current_basefee / (nonce)) {
+    if nonce > 0
+        && bal != current_basefee + (current_basefee / (nonce)) {
             error!(target: "restart-test", "basefee error!");
-            return Err(Report::msg(format!("Expected a basefee increment!")));
+            return Err(Report::msg("Expected a basefee increment!".to_string()));
         }
-    }
     Ok(())
 }
 
