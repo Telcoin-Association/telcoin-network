@@ -177,6 +177,10 @@ where
         // swap back to the previous nonce check flag
         core::mem::swap(&mut self.cfg.disable_nonce_check, &mut disable_nonce_check);
 
+        // NOTE: revm currently marks the caller and block beneficiary accounts as "touched"
+        // after the above transact calls, and includes them in the result.
+        //
+        // System calls are used by TN protocol to update more than just the contract.
         res
     }
 

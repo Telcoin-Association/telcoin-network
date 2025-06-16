@@ -820,6 +820,7 @@ async fn set_google_kms_public_key_env_var() -> eyre::Result<()> {
 
     // convert pem pubkey format
     let kms_pem_pubkey = kms_pubkey_response.into_inner().pem;
+    tracing::debug!(target: "faucet", ?kms_pem_pubkey, "kms pubkey");
     // store to env
     std::env::set_var("FAUCET_PUBLIC_KEY", kms_pem_pubkey);
 

@@ -29,7 +29,7 @@ use tn_types::{
 use tokio::{task::JoinHandle, time::timeout};
 use tracing::{debug, info};
 
-#[ignore]
+#[ignore = "internal test for devops - credentials required"]
 #[tokio::test]
 async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result<()> {
     let _guard = IT_TEST_MUTEX.lock();
