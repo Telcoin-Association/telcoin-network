@@ -2,12 +2,17 @@ use crate::util::{config_local_testnet, IT_TEST_MUTEX};
 use alloy::primitives::address;
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
+use jsonrpsee::{
+    core::{client::ClientT, DeserializeOwned},
+    http_client::HttpClientBuilder,
+    rpc_params,
+};
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
 };
 use secp256k1::{Keypair, Secp256k1, SecretKey};
-use serde_json::{value::RawValue, Value};
+use serde_json::Value;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -15,7 +20,7 @@ use std::{
     time::Duration,
 };
 use tn_types::{get_available_tcp_port, keccak256, test_utils::init_test_tracing, Address};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Builder, Runtime};
 use tracing::{error, info};
 
 /// One unit of TEL (10^18) measured in wei.
@@ -186,16 +191,20 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
 }
 
 fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
-    let mut start_num = get_block_number(&client_urls[0])?;
-    start_num = start_num.max(get_block_number(&client_urls[1])?);
-    start_num = start_num.max(get_block_number(&client_urls[2])?);
-    start_num = start_num.max(get_block_number(&client_urls[3])?);
+    fn max_start(client_urls: &[String; 4]) -> eyre::Result<u64> {
+        let mut start_num = get_block_number(&client_urls[0])?;
+        start_num = start_num.max(get_block_number(&client_urls[1])?);
+        start_num = start_num.max(get_block_number(&client_urls[2])?);
+        start_num = start_num.max(get_block_number(&client_urls[3])?);
+        Ok(start_num)
+    }
+    let start_num = max_start(client_urls)?;
     let mut next_num = start_num;
     let mut i = 0;
     // Wait until a node is advancing agian, network should be back now.
     while next_num <= start_num {
         std::thread::sleep(Duration::from_secs(1));
-        next_num = get_block_number(&client_urls[0])?;
+        next_num = max_start(client_urls)?;
         i += 1;
         if i > 45 {
             return Err(eyre::eyre!(
@@ -215,7 +224,7 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
     // create temp path for test
     let temp_path = tmp_guard.path().to_path_buf();
     {
-        let rt = Runtime::new()?;
+        let rt = Builder::new_current_thread().enable_io().enable_time().build()?;
         rt.block_on(config_local_testnet(&temp_path, Some("restart_test".to_string()), None))
             .expect("failed to config");
     }
@@ -462,7 +471,6 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
     if block0["hash"] != block["hash"] {
         return Err(Report::msg("Blocks between validators not the same!".to_string()));
     }
-    let number = u64::from_str_radix(&block["number"].as_str().unwrap_or_default()[2..], 16)?;
     info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[2]);
     let block = get_block(&client_urls[2], Some(number))?;
     if block0["hash"] != block["hash"] {
@@ -471,7 +479,6 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
             block0["hash"], block["hash"]
         )));
     }
-    let number = u64::from_str_radix(&block["number"].as_str().unwrap_or_default()[2..], 16)?;
     info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[3]);
     let block = get_block(&client_urls[3], Some(number))?;
     if block0["hash"] != block["hash"] {
@@ -485,8 +492,8 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
 /// Return a tuple of the TEL and remainder (any value left after dividing by 1_e18).
 /// Note, balance is in wei and must fit in an u128.
 fn get_balance(node: &str, address: &str, retries: usize) -> eyre::Result<u128> {
-    let params = RawValue::from_string(format!("[\"{address}\", \"latest\"]"))?;
-    let res_str = call_rpc(node, "eth_getBalance", Some(&params), retries)?;
+    let res_str: String =
+        call_rpc(node, "eth_getBalance", rpc_params!(address, "latest"), retries)?;
     info!(target: "restart-test", "get_balance for {node}: parsing string {res_str}");
     let tel = u128::from_str_radix(&res_str[2..], 16)?;
     info!(target: "restart-test", "get_balance for {node}: {tel:?}");
@@ -529,15 +536,11 @@ fn get_key(key: &str) -> String {
 
 fn get_block(node: &str, block_number: Option<u64>) -> eyre::Result<HashMap<String, Value>> {
     let params = if let Some(block_number) = block_number {
-        RawValue::from_string(format!("[\"0x{block_number:x}\", true]"))?
+        rpc_params!(format!("0x{block_number:x}"), true)
     } else {
-        RawValue::from_string("[\"latest\", true]".to_string())?
+        rpc_params!("latest", true)
     };
-    let mut block = call_rpc(node, "eth_getBlockByNumber", Some(&params), 5)?;
-    while block.is_empty() {
-        block = call_rpc(node, "eth_getBlockByNumber", Some(&params), 5)?;
-    }
-    Ok(serde_json::from_str(&block)?)
+    Ok(call_rpc(node, "eth_getBlockByNumber", params.clone(), 5)?)
 }
 
 fn get_block_number(node: &str) -> eyre::Result<u64> {
@@ -605,8 +608,12 @@ fn send_tel(
         .ecdsa(&secret_key.secret_bytes())
         .map_err(|_| Report::msg("Failed to get ecdsa"))?;
     let transaction_bytes = new_transaction.sign(&ecdsa);
-    let params = RawValue::from_string(format!("[\"{}\"]", const_hex::encode(transaction_bytes)))?;
-    let res_str = call_rpc(node, "eth_sendRawTransaction", Some(&params), 5)?;
+    let res_str: String = call_rpc(
+        node,
+        "eth_sendRawTransaction",
+        rpc_params!(const_hex::encode(transaction_bytes)),
+        1,
+    )?;
     info!(target: "restart-test", "Submitted TEL transfer from {from_account} to {to_account} for {amount}: {res_str}");
     Ok(())
 }
@@ -643,34 +650,27 @@ fn decode_key(key: &str) -> eyre::Result<(String, String, String)> {
 /// Wraps any Eyre otherwise returns the result as a String.
 /// This is for testing and will try up to retries times at one second intervals to send the
 /// request.
-fn call_rpc(
-    node: &str,
-    command: &str,
-    params: Option<&RawValue>,
-    retries: usize,
-) -> eyre::Result<String> {
-    match jsonrpc::simple_http::SimpleHttpTransport::builder().url(node) {
-        Ok(trans) => {
-            let client = jsonrpc::Client::with_transport(trans.build());
-            let req = client.build_request(command, params);
-            let mut resp = client.send_request(req.clone());
-            let mut i = 0;
-            while i < retries && resp.is_err() {
-                std::thread::sleep(Duration::from_millis(1000));
-                resp = client.send_request(req.clone());
-                i += 1;
-            }
-            let resp = resp?;
-            if let Some(err) = resp.error {
-                Err(Report::msg(format!("RPC error: {}", err.message)))
-            } else if let Ok(res) = resp.result() {
-                Ok(res)
-            } else if let Some(result) = resp.result {
-                Ok(result.get().to_string())
-            } else {
-                Ok("".to_string())
-            }
+fn call_rpc<R, Params>(node: &str, command: &str, params: Params, retries: usize) -> eyre::Result<R>
+where
+    R: DeserializeOwned,
+    Params: jsonrpsee::core::traits::ToRpcParams + Send + Clone,
+{
+    // jsonrpsee is async AND tokio specific so give it a runtime (and can't use a crate like
+    // pollster)...
+    let runtime = Builder::new_current_thread().enable_io().enable_time().build()?;
+
+    let resp = runtime.block_on(async move {
+        let client = HttpClientBuilder::default().build(node).expect("couldn't build rpc client");
+        let mut resp = client.request(command, params.clone()).await;
+        let mut i = 0;
+        while i < retries && resp.is_err() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let client =
+                HttpClientBuilder::default().build(node).expect("couldn't build rpc client");
+            resp = client.request(command, params.clone()).await;
+            i += 1;
         }
-        Err(e) => Err(Report::msg(format!("Error connecting to {node}: {e}"))),
-    }
+        resp
+    });
+    Ok(resp?)
 }
