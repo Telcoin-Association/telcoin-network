@@ -60,8 +60,10 @@ pub struct Certifier<DB> {
 impl<DB: Database> Certifier<DB> {
     fn highest_created_certificate(config: &ConsensusConfig<DB>) -> Option<Certificate> {
         if let Some(id) = config.authority_id() {
+            debug!(target: "epoch-manager", ?id, "reading last round for authority id");
             config.node_storage().last_round(&id).expect("certificate store available")
         } else {
+            debug!(target: "epoch-manager", "node is not an authority - returning `None` for highest created certificate");
             None
         }
     }

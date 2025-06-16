@@ -145,6 +145,8 @@ revert-submodule:
 # workspace tests that don't require faucet credentials
 public-tests:
 	cargo test --workspace --exclude tn-faucet --no-fail-fast -- --show-output ;
+	cargo test -p telcoin-network --test it test_epoch_boundary -- --ignored ;
+	cargo test test_restarts -- --ignored ;
 
 # local checks to ensure PR is ready
 pr:

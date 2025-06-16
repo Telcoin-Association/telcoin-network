@@ -44,7 +44,7 @@ where
             .node_storage()
             .get_latest_sub_dag()
             // it should be impossible to have a subdag that is greater than the current epoch
-            .filter(|subdag| subdag.leader_epoch() == config.epoch())
+            .filter(|subdag| subdag.leader_epoch() >= config.epoch())
             .map(|subdag| subdag.leader_round())
             .unwrap_or(0);
 

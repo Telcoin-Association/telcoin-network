@@ -88,6 +88,8 @@ cargo test --workspace --no-fail-fast -- --show-output
 cargo test test_with_creds -- --ignored
 # faucet it test
 cargo test -p telcoin-network --test it --features faucet --no-fail-fast -- faucet --show-output
+# run epoch boundary tests separately
+cargo test -p telcoin-network --test it test_epoch_boundary -- --ignored
 # run the restart tests, they are seperate to avoid any port/node confusion
 cargo test test_restarts -- --ignored
 

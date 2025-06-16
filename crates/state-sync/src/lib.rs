@@ -206,13 +206,20 @@ pub async fn stream_missing_consensus<DB: Database>(
     let (_, last_db_block) = db
         .last_record::<ConsensusBlocks>()
         .unwrap_or_else(|| (last_executed_block.number, last_executed_block.clone()));
+
+    debug!(target: "state-sync", ?last_executed_block, ?last_db_block, "comparing last executed block and last recorded consensus block");
+
+    // if the last recorded consensus block is larger than the last executed block,
+    // forward the stored consensus block to engine for execution
     if last_db_block.number > last_executed_block.number {
         for consensus_block_number in last_executed_block.number + 1..=last_db_block.number {
             if let Some(consensus_header) = db.get::<ConsensusBlocks>(&consensus_block_number)? {
+                debug!(target: "state-sync", ?consensus_header, "sending missed consensus block through consensus bus");
                 consensus_bus.consensus_header().send(consensus_header).await?;
             }
         }
     }
+
     Ok(())
 }
 
@@ -233,18 +240,21 @@ pub async fn get_missing_consensus<DB: Database>(
     let (_, last_db_block) = db
         .last_record::<ConsensusBlocks>()
         .unwrap_or_else(|| (last_executed_block.number, last_executed_block.clone()));
+
+    debug!(target: "state-sync", ?last_executed_block, ?last_db_block, "comparing last executed block and last recorded consensus block");
+
+    // if the last recorded consensus block is larger than the last executed block,
+    // forward the stored consensus block to engine for execution
     if last_db_block.number > last_executed_block.number {
         for consensus_block_number in last_executed_block.number + 1..=last_db_block.number {
             if let Some(consensus_header) = db.get::<ConsensusBlocks>(&consensus_block_number)? {
-                // return blocks > current epoch to force error
-                if consensus_header.sub_dag.leader_epoch() >= config.epoch() {
-                    result.push(consensus_header);
-                }
+                debug!(target: "state-sync", ?consensus_header, "collecting unexecuted consensus header");
+                result.push(consensus_header);
             }
         }
     }
 
-    debug!(target: "state-sync", ?result, "missing consensus:");
+    debug!(target: "state-sync", ?result, "missing consensus headers that need execution:");
     Ok(result)
 }
 

@@ -350,7 +350,7 @@ where
     async fn run_epochs(
         &mut self,
         engine: &ExecutionNode,
-        mut consensus_db: DatabaseType,
+        consensus_db: DatabaseType,
         network_config: NetworkConfig,
         to_engine: mpsc::Sender<ConsensusOutput>,
         gas_accumulator: GasAccumulator,
@@ -387,8 +387,7 @@ where
                 error!(target: "epoch-manager", ?e, "epoch returned error");
             })?;
 
-            info!(target: "epoch-manager", "clearing tables and looping for next epoch");
-            self.clear_consensus_db_for_next_epoch(&mut consensus_db)?;
+            info!(target: "epoch-manager", "looping run epoch");
         }
     }
 
@@ -400,7 +399,7 @@ where
     async fn run_epoch(
         &mut self,
         engine: &ExecutionNode,
-        consensus_db: DatabaseType,
+        mut consensus_db: DatabaseType,
         epoch_task_manager: &mut TaskManager,
         network_config: &NetworkConfig,
         to_engine: &mpsc::Sender<ConsensusOutput>,
@@ -426,7 +425,7 @@ where
         let (primary, worker_node) = self
             .create_consensus(
                 engine,
-                consensus_db,
+                consensus_db.clone(),
                 epoch_task_manager,
                 network_config,
                 initial_epoch,
@@ -473,7 +472,8 @@ where
                     error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
                 })?;
 
-                info!(target: "epoch-manager", "epoch boundary success");
+                info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
+                self.clear_consensus_db_for_next_epoch(&mut consensus_db)?;
             },
 
             // return any errors

@@ -105,6 +105,7 @@ fn run_restart_tests1(
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
 
+    info!(target: "restart-test", "testing blocks same first time in restart_tests1");
     test_blocks_same(client_urls)?;
     // Try once more then fail test.
     send_and_confirm(&client_urls[1], &client_urls[2], &key, to_account, 0).inspect_err(|e| {
@@ -142,7 +143,7 @@ fn run_restart_tests1(
         kill_child(&mut child2);
     })?;
 
-    info!(target: "restart-test", "testing blocks same in restart_tests1");
+    info!(target: "restart-test", "testing blocks same again in restart_tests1");
 
     test_blocks_same(client_urls).inspect_err(|e| {
         error!(target: "restart-test", ?e, "test blocks same failed - killing child2...");
@@ -530,9 +531,9 @@ fn get_block(node: &str, block_number: Option<u64>) -> eyre::Result<HashMap<Stri
     } else {
         RawValue::from_string("[\"latest\", true]".to_string())?
     };
-    let mut block = call_rpc(node, "eth_getBlockByNumber", Some(&params), 5)?;
+    let mut block = call_rpc(node, "eth_getBlockByNumber", Some(&params), 15)?;
     while block.is_empty() {
-        block = call_rpc(node, "eth_getBlockByNumber", Some(&params), 5)?;
+        block = call_rpc(node, "eth_getBlockByNumber", Some(&params), 15)?;
     }
     Ok(serde_json::from_str(&block)?)
 }

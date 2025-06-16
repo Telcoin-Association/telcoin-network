@@ -23,6 +23,8 @@ use tracing::debug;
 #[tokio::test]
 async fn test_genesis_with_its() -> eyre::Result<()> {
     let _guard = IT_TEST_MUTEX.lock();
+    // sleep for other tests to cleanup
+    std::thread::sleep(std::time::Duration::from_secs(5));
     // spawn testnet for RPC calls
     let temp_path = tempfile::TempDir::with_suffix("genesis_with_its").expect("tempdir is okay");
     spawn_local_testnet(
@@ -82,6 +84,8 @@ async fn test_genesis_with_its() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
     let _guard = IT_TEST_MUTEX.lock();
+    // sleep for other tests to cleanup
+    std::thread::sleep(std::time::Duration::from_secs(5));
     // check that all addresses in expected_deployments are present in precompiles
     let is_address_present = |address: &str, genesis_config: Vec<(Address, GenesisAccount)>| {
         genesis_config
@@ -149,7 +153,8 @@ async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
     let _guard = IT_TEST_MUTEX.lock();
-    tn_types::test_utils::init_test_tracing();
+    // sleep for other tests to cleanup
+    std::thread::sleep(std::time::Duration::from_secs(5));
     // fetch registry impl bytecode from compiled output in tn-contracts
     let json_val = RethEnv::fetch_value_from_json_str(
         CONSENSUS_REGISTRY_JSON,

@@ -255,8 +255,8 @@ impl Default for QuicConfig {
     fn default() -> Self {
         Self {
             handshake_timeout: Duration::from_secs(65),
-            max_idle_timeout: 65 * 1_000, // 65s
-            keep_alive_interval: Duration::from_secs(30),
+            max_idle_timeout: 30 * 1_000, // 30s
+            keep_alive_interval: Duration::from_secs(10),
             max_concurrent_stream_limit: 10_000,
             // may need to increase these based on RTT
             //
