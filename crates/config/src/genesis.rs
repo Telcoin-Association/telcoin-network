@@ -120,9 +120,7 @@ impl NetworkGenesis {
 
     /// Create a [Committee] from the validators in [NetworkGenesis].
     pub fn create_committee(&self) -> eyre::Result<Committee> {
-        // disable epochs for now
-        let epoch_boundary = u64::MAX;
-        let mut committee_builder = CommitteeBuilder::new(0, epoch_boundary);
+        let mut committee_builder = CommitteeBuilder::new(0);
         for (pubkey, validator) in self.validators.iter() {
             committee_builder.add_authority(
                 *pubkey,

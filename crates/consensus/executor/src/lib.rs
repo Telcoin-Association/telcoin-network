@@ -18,7 +18,8 @@ use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
 use tn_types::{Database, Noticer, TaskManager};
 use tracing::info;
 
-/// A client subscribing to the consensus output and forwarding every transaction to be executed by the engine.
+/// A client subscribing to the consensus output and forwarding every transaction to be executed by
+/// the engine.
 pub struct Executor;
 
 impl Executor {

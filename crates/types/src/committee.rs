@@ -2,7 +2,7 @@
 
 use crate::{
     crypto::{BlsPublicKey, NetworkPublicKey},
-    Address, Multiaddr, TimestampSec,
+    Address, Multiaddr,
 };
 use libp2p::{multihash::Multihash, PeerId};
 use parking_lot::RwLock;
@@ -156,9 +156,6 @@ struct CommitteeInner {
     authorities_by_id: BTreeMap<AuthorityIdentifier, Authority>,
     /// The epoch number of this committee
     epoch: Epoch,
-    /// The UNIX timestamp (in secs) when the epoch boundary starts.
-    /// This is when the committees should rotate.
-    epoch_boundary: TimestampSec,
     /// The quorum threshold (2f+1)
     #[serde(skip)]
     quorum_threshold: VotingPower,
@@ -295,18 +292,13 @@ impl From<&AuthorityIdentifier> for PeerId {
 impl Committee {
     /// Any committee should be created via the [CommitteeBuilder] - this is intentionally
     /// a private method.
-    fn new(
-        authorities: BTreeMap<BlsPublicKey, Authority>,
-        epoch: Epoch,
-        epoch_boundary: TimestampSec,
-    ) -> Self {
+    fn new(authorities: BTreeMap<BlsPublicKey, Authority>, epoch: Epoch) -> Self {
         let mut committee = CommitteeInner {
             authorities,
             epoch,
             authorities_by_id: Default::default(),
             validity_threshold: 0,
             quorum_threshold: 0,
-            epoch_boundary,
         };
         committee.load();
 
@@ -324,18 +316,13 @@ impl Committee {
     ///
     /// Pass an optional epoch_boundary timestamp. Defaults to u64::MAX to disable epoch
     /// transitions.
-    pub fn new_for_test(
-        authorities: BTreeMap<BlsPublicKey, Authority>,
-        epoch: Epoch,
-        epoch_boundary: Option<TimestampSec>,
-    ) -> Self {
+    pub fn new_for_test(authorities: BTreeMap<BlsPublicKey, Authority>, epoch: Epoch) -> Self {
         let mut committee = CommitteeInner {
             authorities,
             epoch,
             authorities_by_id: Default::default(),
             validity_threshold: 0,
             quorum_threshold: 0,
-            epoch_boundary: epoch_boundary.unwrap_or(TimestampSec::MAX),
         };
 
         committee.authorities_by_id = committee
@@ -360,13 +347,6 @@ impl Committee {
     /// Returns the current epoch.
     pub fn epoch(&self) -> Epoch {
         self.inner.read().epoch
-    }
-
-    /// The timestamp for the epoch boundary.
-    ///
-    /// This is the UNIX timestamp (in secs) when the committee should transition.
-    pub fn epoch_boundary(&self) -> TimestampSec {
-        self.inner.read().epoch_boundary
     }
 
     /// Provided an identifier it returns the corresponding authority
@@ -480,12 +460,8 @@ impl Committee {
 
     /// Used for testing - not recommended to use for any other case.
     /// It creates a new instance with updated epoch
-    pub fn advance_epoch_for_test(
-        &self,
-        new_epoch: Epoch,
-        epoch_boundary: Option<TimestampSec>,
-    ) -> Committee {
-        Committee::new_for_test(self.inner.read().authorities.clone(), new_epoch, epoch_boundary)
+    pub fn advance_epoch_for_test(&self, new_epoch: Epoch) -> Committee {
+        Committee::new_for_test(self.inner.read().authorities.clone(), new_epoch)
     }
 }
 
@@ -515,18 +491,14 @@ impl std::fmt::Display for Committee {
 pub struct CommitteeBuilder {
     /// The epoch for the committee.
     epoch: Epoch,
-    /// The epoch boundary.
-    ///
-    /// The UNIX timestamp for when the committee should rotate.
-    epoch_boundary: TimestampSec,
     /// The map of [BlsPublicKey] for each [Authority] in the committee.
     authorities: BTreeMap<BlsPublicKey, Authority>,
 }
 
 impl CommitteeBuilder {
     /// Create a new instance of [CommitteeBuilder] for making a new [Committee].
-    pub fn new(epoch: Epoch, epoch_boundary: TimestampSec) -> Self {
-        Self { epoch, authorities: BTreeMap::new(), epoch_boundary }
+    pub fn new(epoch: Epoch) -> Self {
+        Self { epoch, authorities: BTreeMap::new() }
     }
 
     /// Add an authority to the committee builder.
@@ -551,14 +523,14 @@ impl CommitteeBuilder {
     }
 
     pub fn build(self) -> Committee {
-        Committee::new(self.authorities, self.epoch, self.epoch_boundary)
+        Committee::new(self.authorities, self.epoch)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        now, Address, Authority, BlsKeypair, BlsPublicKey, Committee, Multiaddr, NetworkKeypair,
+        Address, Authority, BlsKeypair, BlsPublicKey, Committee, Multiaddr, NetworkKeypair,
     };
     use rand::rng;
     use std::collections::BTreeMap;
@@ -589,13 +561,11 @@ mod tests {
             .collect::<BTreeMap<BlsPublicKey, Authority>>();
 
         // WHEN
-        let epoch_boundary = now();
-        let committee = Committee::new(authorities, 10, epoch_boundary);
+        let committee = Committee::new(authorities, 10);
 
         // THEN
         assert_eq!(committee.inner.read().authorities_by_id.len() as u64, num_of_authorities);
         assert_eq!(committee.inner.read().authorities.len() as u64, num_of_authorities);
-        assert_eq!(committee.inner.read().epoch_boundary, epoch_boundary);
 
         for (identifier, authority) in committee.inner.read().authorities_by_id.iter() {
             assert_eq!(*identifier, authority.id());

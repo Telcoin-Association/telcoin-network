@@ -456,6 +456,11 @@ where
         // await the epoch boundary or the epoch task manager exiting
         // this can also happen due to committee nodes re-syncing and errors
         let consensus_shutdown_clone = consensus_shutdown.clone();
+
+        // indicate if the node is restarting to join the committe or if the epoch is changed and
+        // tables should be cleared
+        let mut clear_tables_for_next_epoch = false;
+
         tokio::select! {
             // wait for epoch boundary to transition
             res = self.wait_for_epoch_boundary(to_engine, engine, consensus_output, consensus_shutdown.clone(), gas_accumulator) => {
@@ -464,7 +469,9 @@ where
                 })?;
 
                 info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
-                self.clear_consensus_db_for_next_epoch(&mut consensus_db)?;
+
+                // toggle bool to clear tables
+                clear_tables_for_next_epoch = true;
             },
 
             // return any errors
@@ -486,6 +493,11 @@ where
             epoch_task_manager.join(consensus_shutdown),
         )
         .await?;
+
+        // clear tables
+        if clear_tables_for_next_epoch {
+            self.clear_consensus_db_for_next_epoch(&mut consensus_db)?;
+        }
 
         Ok(())
     }
@@ -724,7 +736,7 @@ where
             debug!(target: "epoch-manager", "requsting info validator info for {} authorities", primary_network_infos.len());
 
             // build the committee using kad network
-            let mut committee_builder = CommitteeBuilder::new(epoch, self.epoch_boundary);
+            let mut committee_builder = CommitteeBuilder::new(epoch);
 
             // loop through the primary info returned from network query
             while let Some(info) = primary_network_infos.next().await {

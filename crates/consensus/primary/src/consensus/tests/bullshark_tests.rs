@@ -1116,7 +1116,7 @@ async fn restart_with_new_committee() {
         assert_eq!(output.round(), 2);
 
         // Move to the next epoch.
-        committee = committee.advance_epoch_for_test(epoch + 1, None);
+        committee = committee.advance_epoch_for_test(epoch + 1);
         fixture.update_committee(committee.clone());
         config.shutdown().notify();
 
