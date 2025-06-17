@@ -12,8 +12,10 @@ services:
     depends_on:
       - telcoin-base
     environment:
-      - NARWHAL_HOST=10.10.0.21
+      - TN_PRIMARY_ADDR=/ip4/10.10.0.21/udp/49590/quic-v1
+      - TN_WORKER_ADDR=/ip4/10.10.0.21/udp/49595/quic-v1
       - EXECUTION_ADDRESS=0x1111111111111111111111111111111111111111
+      - TN_BLS_PASSPHRASE=local
     user: "root"
     command:
       - "bash"
@@ -26,8 +28,10 @@ services:
     depends_on:
       - telcoin-base
     environment:
-      - NARWHAL_HOST=10.10.0.22
+      - TN_PRIMARY_ADDR=/ip4/10.10.0.22/udp/49590/quic-v1
+      - TN_WORKER_ADDR=/ip4/10.10.0.22/udp/49595/quic-v1
       - EXECUTION_ADDRESS=0x2222222222222222222222222222222222222222
+      - TN_BLS_PASSPHRASE=local
     user: "root"
     command:
       - "bash"
@@ -40,8 +44,10 @@ services:
     depends_on:
       - telcoin-base
     environment:
-      - NARWHAL_HOST=10.10.0.23
+      - TN_PRIMARY_ADDR=/ip4/10.10.0.23/udp/49590/quic-v1
+      - TN_WORKER_ADDR=/ip4/10.10.0.23/udp/49595/quic-v1
       - EXECUTION_ADDRESS=0x3333333333333333333333333333333333333333
+      - TN_BLS_PASSPHRASE=local
     user: "root"
     command:
       - "bash"
@@ -54,8 +60,10 @@ services:
     depends_on:
       - telcoin-base
     environment:
-      - NARWHAL_HOST=10.10.0.24
+      - TN_PRIMARY_ADDR=/ip4/10.10.0.24/udp/49590/quic-v1
+      - TN_WORKER_ADDR=/ip4/10.10.0.24/udp/49595/quic-v1
       - EXECUTION_ADDRESS=0x4444444444444444444444444444444444444444
+      - TN_BLS_PASSPHRASE=local
     user: "root"
     command:
       - "bash"
@@ -67,39 +75,19 @@ services:
   # create and distribute committee / worker cache files
   comittee:
     image: local-telcoin-network:latest
+    environment:
+      - TN_BLS_PASSPHRASE=local
     user: "root"
-    command: >
-      bash -c "
-        whoami &&
-        mkdir -p /home/nonroot/data/genesis/validators &&
-        cp -r /home/nonroot/data/validator-1/node-info.yaml /home/nonroot/data/genesis/validators/validator-1.yaml &&
-        cp -r /home/nonroot/data/validator-2/node-info.yaml /home/nonroot/data/genesis/validators/validator-2.yaml &&
-        cp -r /home/nonroot/data/validator-3/node-info.yaml /home/nonroot/data/genesis/validators/validator-3.yaml &&
-        cp -r /home/nonroot/data/validator-4/node-info.yaml /home/nonroot/data/genesis/validators/validator-4.yaml &&
-        /usr/local/bin/telcoin genesis \
-            --datadir /home/nonroot/data/ \
-            --chain-id 0x1e7 \
-            --epoch-duration-in-secs 60 \
-            --dev-funded-account 0x3DCc9a6f3A71F0A6C8C659c65558321c374E917a \
-            --max-header-delay-ms 1000 \
-            --min-header-delay-ms 1000 \
-            --consensus-registry-owner 0x3DCc9a6f3A71F0A6C8C659c65558321c374E917a  &&
-        cp -r /home/nonroot/data/genesis/genesis.yaml /home/nonroot/data/genesis/committee.yaml /home/nonroot/data/genesis/worker_cache.yaml /home/nonroot/data/validator-1/genesis/ &&
-        cp -r /home/nonroot/data/parameters.yaml /home/nonroot/data/validator-1/ &&
-        cp -r /home/nonroot/data/genesis/genesis.yaml /home/nonroot/data/genesis/committee.yaml /home/nonroot/data/genesis/worker_cache.yaml /home/nonroot/data/validator-2/genesis/ &&
-        cp -r /home/nonroot/data/parameters.yaml /home/nonroot/data/validator-2/ &&
-        cp -r /home/nonroot/data/genesis/genesis.yaml /home/nonroot/data/genesis/committee.yaml /home/nonroot/data/genesis/worker_cache.yaml /home/nonroot/data/validator-3/genesis/ &&
-        cp -r /home/nonroot/data/parameters.yaml /home/nonroot/data/validator-3/ &&
-        cp -r /home/nonroot/data/genesis/genesis.yaml /home/nonroot/data/genesis/committee.yaml /home/nonroot/data/genesis/worker_cache.yaml /home/nonroot/data/validator-4/genesis/ &&
-        cp -r /home/nonroot/data/parameters.yaml /home/nonroot/data/validator-4/ &&
-        chown -R 1101:1101 /home/nonroot/data
-      "
+    command:
+      - "bash"
+      - "/genesis.sh"
     depends_on:
       - setup1
       - setup2
       - setup3
       - setup4
     volumes:
+      - ./genesis.sh:/genesis.sh
       - sharedgenesisdir:/home/nonroot/data/genesis
       - validator1-data:/home/nonroot/data/validator-1
       - validator2-data:/home/nonroot/data/validator-2
@@ -113,14 +101,14 @@ services:
       - comittee
     environment:
       - RUST_LOG=info,execution=debug
+      - TN_BLS_PASSPHRASE=local # must match value used in setup1 service
+    user: "1101:1101"
     command: >
       /usr/local/bin/telcoin node
       --datadir /home/nonroot/data
-      --dev
-      --chain adiri
       --http.addr 0.0.0.0
       --http.port 8545
-      --public-key 0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99
+      --metrics 127.0.0.1:9101
     ports:
       - 8545:8545
     volumes:
@@ -132,14 +120,16 @@ services:
     image: local-telcoin-network:latest
     depends_on:
       - comittee
+    environment:
+      - RUST_LOG=info,execution=debug
+      - TN_BLS_PASSPHRASE=local # must match value used in setup2 service
+    user: "1101:1101"
     command: >
       /usr/local/bin/telcoin node
       --datadir /home/nonroot/data
-      --dev
-      --chain adiri
       --http.addr 0.0.0.0
       --http.port 8545
-      --public-key 0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99
+      --metrics 127.0.0.1:9101
     ports:
       - 8544:8545
     volumes:
@@ -151,14 +141,16 @@ services:
     image: local-telcoin-network:latest
     depends_on:
       - comittee
+    environment:
+      - RUST_LOG=info,execution=debug
+      - TN_BLS_PASSPHRASE=local # must match value used in setup3 service
+    user: "1101:1101"
     command: >
       /usr/local/bin/telcoin node
       --datadir /home/nonroot/data
-      --dev
-      --chain adiri
       --http.addr 0.0.0.0
       --http.port 8545
-      --public-key 0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99
+      --metrics 127.0.0.1:9101
     ports:
       - 8543:8545
     volumes:
@@ -170,14 +162,16 @@ services:
     image: local-telcoin-network:latest
     depends_on:
       - comittee
+    environment:
+      - RUST_LOG=info,execution=debug
+      - TN_BLS_PASSPHRASE=local # must match value used in setup4 service
+    user: "1101:1101"
     command: >
       /usr/local/bin/telcoin node
       --datadir /home/nonroot/data
-      --dev
-      --chain adiri
       --http.addr 0.0.0.0
       --http.port 8545
-      --public-key 0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99
+      --metrics 127.0.0.1:9101
     ports:
       - 8542:8545
     volumes:

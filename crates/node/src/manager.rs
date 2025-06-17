@@ -184,7 +184,6 @@ where
         // Long-running tasks for the lifetime of the node.
         let mut node_task_manager = TaskManager::new(NODE_TASK_MANAGER);
         let node_task_spawner = node_task_manager.get_spawner();
-        // create oneshot channel to await the first epoch to start
 
         info!(target: "epoch-manager", "starting node and launching first epoch");
 
@@ -199,7 +198,6 @@ where
         let gas_accumulator = GasAccumulator::new(1);
         // create the engine
         let engine = self.create_engine(&engine_task_manager, reth_db, &gas_accumulator)?;
-
         engine
             .start_engine(for_engine, self.node_shutdown.subscribe(), gas_accumulator.clone())
             .await?;
