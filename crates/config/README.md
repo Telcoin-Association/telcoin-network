@@ -45,6 +45,14 @@ Signatures are requested using the trait `tn_types::crypto::BlsSigner`.
 The method `request_signature_direct` is used when publishing node records to the kademlia store in `network-libp2p/src/consensus.rs` and when the primary node votes on a header in `types/src/primary/vote.rs`.
 The goal is to keep private keys in memory and provide a secure API for obtaining signatures rapidly.
 
+To this end, BLS private keys are not exposed outside of the `KeyConfig`.
+However, the network's private key are exposed so they can be used with libp2p.
+
+The BLS key is the more important key to impersonate a validator and network keys can theoretically be rotated (although we don't do that yet).
+
+BLS keys must also be unique to stake on the `ConsensusRegistry`.
+Even after a validator node exits, the BLS key must be unique.
+
 ### NetworkConfig
 
 The network config holds various configurations for the p2p networking.
