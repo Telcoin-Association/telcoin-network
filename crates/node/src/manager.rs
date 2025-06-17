@@ -480,7 +480,7 @@ where
         // abort all epoch-related tasks
         epoch_task_manager.abort_all_tasks();
         // Expect complaints from join so swallow those errors...
-        // If we timeout here somethign is not playing nice and shutting down so return the timeout.
+        // If we timeout here something is not playing nice and shutting down so return the timeout.
         let _ = tokio::time::timeout(
             Duration::from_secs(5),
             epoch_task_manager.join(consensus_shutdown),
