@@ -682,8 +682,9 @@ where
                         .try_send(NetworkEvent::Gossip(message, propagation_source))
                     {
                         error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
-                        // fatal - unable to process gossip messages
-                        return Err(e.into());
+                        // ignore failures at the epoch boundary
+                        // During epoch change the event_stream reciever can be closed.
+                        return Ok(());
                     }
                 } else {
                     let GossipMessage { source, topic, .. } = message;
@@ -735,6 +736,7 @@ where
                         }) {
                             error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
                             // ignore failures at the epoch boundary
+                            // During epoch change the event_stream reciever can be closed.
                             return Ok(());
                         }
 
