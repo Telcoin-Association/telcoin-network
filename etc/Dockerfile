@@ -17,13 +17,14 @@ RUN apt-get update && \
 COPY Cargo* ./
 COPY bin/ ./bin/
 COPY crates/ ./crates/
+COPY chain-configs/ ./chain-configs/
 COPY tn-contracts/ ./tn-contracts/
 
 # move binary out of cache for subsequent build steps
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=./target \
-    cargo build --release --features faucet \
+    cargo build --bin telcoin-network --release \
     && mv ./target/release/telcoin-network /tmp/
 
 # production image
