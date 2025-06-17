@@ -17,6 +17,7 @@ RUN apt-get update && \
 COPY Cargo* ./
 COPY bin/ ./bin/
 COPY crates/ ./crates/
+COPY chain-configs/ ./chain-configs/
 COPY tn-contracts/ ./tn-contracts/
 
 # move binary out of cache for subsequent build steps
