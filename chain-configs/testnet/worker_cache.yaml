@@ -1,15 +1,15 @@
 ---
 epoch: 0
 workers:
-  yBWc3pW4bXPmYyADsoPhspx6UnFEhx5ByRpU8mEvGYftVcHMC4cXL1ZQAgkyjqE7XHowKtf8Z7Cf1yUghYFBtS72WfDjzg51ZaQ85ohvQwAWDhgTBffrtPhmJqMd83J51Yb:
-    - name: 4XTTMD58oercWiPk4uzXbUFTUXcauQXiUEokovAhPKQxSN8u3
-      worker_address: /ip4/127.0.0.1/udp/65446/quic-v1
-  zBQdXVGmxWUxfhy9duvzjiDv56hv29WeLu3xXaz1avEuWjuXzoxWMzyLumj8cDpYTcwdGa1JPSiVw6bvnar7Kin7XkXnhNr2TpnnVwsb1ed1AV8KefKPX2znLFbox1iJapP:
-    - name: 4XTTM4FjpDBqjez6GScdg6rFA1Q1kA6y4HDAoWGz5Dy2cCj9w
-      worker_address: /ip4/127.0.0.1/udp/49566/quic-v1
-  21hzU2TDXhFz51jUsT84wcoqkHpQ9kvh1mjbtEea7uhau117AnCKpHF6u4btSf3sU5nmsRfJk1smncvnQ87HS2R352P2rPnjjGK1DEt5xWVs6r6QjieLqHNN4KiNwcKioERs:
-    - name: 4XTTMEdVSWKEYZt8R9uRi9e1QWDitQxxbszrn5GgANoVUnpH8
-      worker_address: /ip4/127.0.0.1/udp/58273/quic-v1
-  23Ko9s3RYvJyWzm8BekCSpGYPgRFuLQD4mLTHEtW5XZDKSaDptBSqN5B3KSfUuNgWRTjTj7XffX6rWk3bioqrTFmiXwGPnzGWNyZ9TXHBdyuuQH3WYxfPgZ927kuB1YvuSZq:
-    - name: 4XTTM9SCe6hxwKCPgp4K7u4AwopDUJdu5qYKQRC9ctwHN4kXh
-      worker_address: /ip4/127.0.0.1/udp/60532/quic-v1
+  oyNzpeBbWHq8RZBhoTRAWCwKpNoM9Pq7SRuURpngT6ap17kuH55kbjhBfosCoeuXKeRDsCwTPawNPPrE8BG5SHGZzzFZNEzxBrXfuEVfoUvTdGh5Xyax9irdfm7o8aYRssM:
+    - name: 4XTTM4bNn1PtCXyp4HXpJXnHzTMqRT2TNPaDeK2qfpM5M5Dbi
+      worker_address: /ip4/35.245.21.245/udp/49594/quic-v1
+  pTupCvrQuaWcG2LJE1iCTsfBfPvJ8DcxN8oUJVpqgDGPBahADyadqJRd85U95ijxn3tbbNrURApxFA9dB7f4cAkLJxZrCCp6hWcyqD2rXFt2gUoUDbGghKfRwX8s9PZtVbZ:
+    - name: 4XTTMGTWdE19r8LqV5MsKyjNgu5UYVw3ZErKjoosP5uQufnwo
+      worker_address: /ip4/35.188.45.1/udp/49594/quic-v1
+  tXJoEjY7B588mo8QFYafa4oBEzJCYTVN256uGa9TEz1AvG5fwkTuNyJSUGJA9S3KnqVeornyCKKNs3SCQVZ6RxhYvXTYBU3urKwKKy6svrnWFVNPCaiq5wPk8mfLnZBTQjA:
+    - name: 4XTTM34H6pyLTqL8d1gV1upin5TKuti6ZeZwHpxF9XxHCJ96T
+      worker_address: /ip4/34.102.122.126/udp/49594/quic-v1
+  22XBXvtqV6C7ChH2756jD1YUp5Q4MsJHGx8tccN1V8mBMoTY2xJijERsj37PYrc9jdCTurYFZCosHTeuvQ11W2JiZs16v7CwDJ9hqvxaa6PFX4UBCefwRRrabCneQ5mtaaDK:
+    - name: 4XTTM1QvPwz5hNnGBbG8Q7NY2DzT6yJDiVah9SVE8JJaDVvn3
+      worker_address: /ip4/34.162.82.82/udp/49594/quic-v1
