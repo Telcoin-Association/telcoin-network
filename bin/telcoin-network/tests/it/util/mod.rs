@@ -1,7 +1,7 @@
 //! Utilities for it tests.
 
 use clap::Parser;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use telcoin_network::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
 use tn_config::{Config, ConfigFmt, ConfigTrait};
 use tn_node::launch_node;
@@ -12,45 +12,36 @@ use tracing::error;
 pub static IT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Execute genesis ceremony inside tempdir
-fn create_validator_info(
+pub fn create_validator_info(
     dir: &Path,
     address: &str,
     passphrase: Option<String>,
 ) -> eyre::Result<()> {
-    let datadir = dir.to_str().expect("validator temp dir");
+    let datadir = dir.to_path_buf();
 
     // keytool
-    let keys_command = CommandParser::<KeyArgs>::parse_from([
-        "tn",
-        "generate",
-        "validator",
-        "--datadir",
-        datadir,
-        "--address",
-        address,
-    ]);
-    keys_command.args.execute(passphrase)?;
+    let keys_command =
+        CommandParser::<KeyArgs>::parse_from(["tn", "generate", "validator", "--address", address]);
+    keys_command.args.execute(datadir, passphrase)?;
 
     Ok(())
 }
 
 /// Execute observer config inside tempdir
-fn create_observer_info(datadir: &str, passphrase: Option<String>) -> eyre::Result<()> {
+fn create_observer_info(datadir: PathBuf, passphrase: Option<String>) -> eyre::Result<()> {
     // keytool
     let keys_command = CommandParser::<KeyArgs>::parse_from([
         "tn",
         "generate",
         "observer",
-        "--datadir",
-        datadir,
         "--address",
         "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
     ]);
-    keys_command.args.execute(passphrase)
+    keys_command.args.execute(datadir, passphrase)
 }
 
 /// Create validator info, genesis ceremony, and spawn node command with faucet active.
-pub async fn config_local_testnet(
+pub fn config_local_testnet(
     temp_path: &Path,
     passphrase: Option<String>,
     accounts: Option<Vec<(Address, GenesisAccount)>>,
@@ -67,7 +58,7 @@ pub async fn config_local_testnet(
     let copy_path = shared_genesis_dir.join("genesis/validators");
     std::fs::create_dir_all(&copy_path)?;
     // create validator info and copy to shared genesis dir
-    for (v, addr) in validators.into_iter() {
+    for (v, addr) in validators.iter() {
         let dir = temp_path.join(v);
         // init genesis ceremony to create committee / worker_cache files
         create_validator_info(&dir, addr, passphrase.clone())?;
@@ -78,25 +69,24 @@ pub async fn config_local_testnet(
 
     // Create an observer config.
     let dir = temp_path.join("observer");
-    let datadir = dir.to_str().expect("observer temp dir");
     // init config ceremony for observer
-    create_observer_info(datadir, passphrase.clone())?;
+    create_observer_info(dir, passphrase.clone())?;
 
     // create committee from shared genesis dir
     let create_committee_command = CommandParser::<GenesisArgs>::parse_from([
         "tn",
-        "--datadir",
-        shared_genesis_dir.to_str().expect("shared genesis dir"),
+        "--basefee-address",
+        "0x9999999999999999999999999999999999999999",
         "--consensus-registry-owner",
-        "0x00000000000000000000000000000000000007e1", // doesn't matter for tests
+        "0x00000000000000000000000000000000000007e1", // doesn't matter for these tests
         "--dev-funded-account",
         "test-source",
         "--max-header-delay-ms",
         "1000",
         "--min-header-delay-ms",
-        "1000",
+        "500",
     ]);
-    create_committee_command.args.execute()?;
+    create_committee_command.args.execute(shared_genesis_dir.clone())?;
     // If provided optional accounts then hack them into genesis now...
     if let Some(accounts) = accounts {
         let data_dir = shared_genesis_dir.join("genesis/genesis.yaml");
@@ -105,7 +95,7 @@ pub async fn config_local_testnet(
         Config::write_to_path(&data_dir, &genesis, ConfigFmt::YAML)?;
     }
 
-    for (v, _addr) in validators.into_iter() {
+    for (v, _addr) in validators.iter() {
         let dir = temp_path.join(v);
         std::fs::create_dir_all(dir.join("genesis"))?;
         // copy genesis files back to validator dirs
@@ -144,25 +134,22 @@ pub async fn config_local_testnet(
 }
 
 /// Create validator info, genesis ceremony, and spawn node command with faucet active.
-pub async fn spawn_local_testnet(
+pub fn spawn_local_testnet(
     temp_path: &Path,
     #[cfg(feature = "faucet")] faucet_contract_address: &str,
     accounts: Option<Vec<(Address, GenesisAccount)>>,
 ) -> eyre::Result<()> {
-    config_local_testnet(temp_path, None, accounts).await?;
+    config_local_testnet(temp_path, None, accounts)?;
 
     let validators = ["validator-1", "validator-2", "validator-3", "validator-4"];
     for v in validators.into_iter() {
         let dir = temp_path.join(v);
-        let datadir = dir.to_str().expect("validator temp dir");
         let instance = v.chars().last().expect("validator instance").to_string();
 
         #[cfg(feature = "faucet")]
         let command = NodeCommand::<tn_faucet::FaucetArgs>::parse_from([
             "tn",
             "--http",
-            "--datadir",
-            datadir,
             "--instance",
             &instance,
             "--google-kms",
@@ -170,19 +157,11 @@ pub async fn spawn_local_testnet(
             faucet_contract_address,
         ]);
         #[cfg(not(feature = "faucet"))]
-        let command = NodeCommand::parse_from([
-            "tn",
-            "--http",
-            "--public-key",
-            "0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99",
-            "--datadir",
-            datadir,
-            "--instance",
-            &instance,
-        ]);
+        let command = NodeCommand::parse_from(["tn", "--http", "--instance", &instance]);
 
         std::thread::spawn(|| {
             let err = command.execute(
+                dir,
                 Some("it_test_pass".to_string()),
                 |mut builder, faucet_args, tn_datadir, passphrase| {
                     builder.opt_faucet_args = Some(faucet_args);

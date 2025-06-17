@@ -14,7 +14,9 @@ use reth_revm::{
     primitives::hardfork::SpecId,
 };
 use std::sync::Arc;
-use tn_types::{BlockHeader as _, Bytes, SealedBlock, SealedHeader, B256, U256};
+use tn_types::{
+    gas_accumulator::RewardsCounter, BlockHeader as _, Bytes, SealedBlock, SealedHeader, B256, U256,
+};
 
 /// TN-related EVM configuration.
 #[derive(Debug, Clone)]
@@ -23,11 +25,13 @@ pub struct TnEvmConfig {
     pub executor_factory: TNBlockExecutorFactory<RethReceiptBuilder, Arc<ChainSpec>, TNEvmFactory>,
     /// Ethereum block assembler.
     pub block_assembler: TNBlockAssembler<ChainSpec>,
+    /// Counter used to allocate rewards for block leaders.
+    pub rewards_counter: RewardsCounter,
 }
 
 impl TnEvmConfig {
     /// Creates a new TN EVM configuration with the given chain spec.
-    pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
+    pub fn new(chain_spec: Arc<ChainSpec>, rewards_counter: RewardsCounter) -> Self {
         Self {
             block_assembler: TNBlockAssembler::new(chain_spec.clone()),
             executor_factory: TNBlockExecutorFactory::new(
@@ -35,6 +39,7 @@ impl TnEvmConfig {
                 chain_spec,
                 TNEvmFactory::default(),
             ),
+            rewards_counter,
         }
     }
 
@@ -171,6 +176,7 @@ impl ConfigureEvm for TnEvmConfig {
             requests_hash: block.requests_hash,
             close_epoch,
             difficulty: block.difficulty,
+            rewards_counter: self.rewards_counter.clone(),
         }
     }
 
@@ -186,6 +192,7 @@ impl ConfigureEvm for TnEvmConfig {
             requests_hash: payload.batch_digest,
             close_epoch: payload.close_epoch,
             difficulty: U256::from(payload.batch_index << 16 | payload.worker_id as usize),
+            rewards_counter: self.rewards_counter.clone(),
         }
     }
 }

@@ -124,8 +124,6 @@ pub trait ConfigTrait {
 
 /// Telcoin Network specific directories.
 pub trait TelcoinDirs: std::fmt::Debug + Send + Sync + 'static {
-    /// Return the path to `configuration` yaml file.
-    fn node_config_path(&self) -> PathBuf;
     /// Return the path to parameters yaml file.
     fn node_config_parameters_path(&self) -> PathBuf;
     /// Return the path to the directory that holds
@@ -163,10 +161,6 @@ impl<P> TelcoinDirs for P
 where
     P: AsRef<Path> + std::fmt::Debug + Send + Sync + 'static,
 {
-    fn node_config_path(&self) -> PathBuf {
-        self.as_ref().join("telcoin-network.yaml")
-    }
-
     fn node_config_parameters_path(&self) -> PathBuf {
         self.as_ref().join("parameters.yaml")
     }

@@ -14,7 +14,7 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, PrimaryToWorkerClient};
 use tn_primary::{
-    consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, NodeMode, RestartReason,
+    consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, NodeMode,
 };
 use tn_storage::CertificateStore;
 use tn_types::{
@@ -181,11 +181,6 @@ impl<DB: Database> Subscriber<DB> {
             {
                 // We are caught up enough so try to jump back into consensus
                 info!(target: "subscriber", "attempting to rejoin consensus, consensus block height {consensus_header_number}");
-                // Set restart flag and trigger shutdown by returning.
-                if let Err(e) = self.consensus_bus.restart_reason().send(RestartReason::Sync) {
-                    error!(target: "subscriber", ?e, "failed to send restart reason on consensus bus.");
-                    return Err(SubscriberError::ClosedChannel("restart-reason-sync".to_string()));
-                };
                 let _ = self.consensus_bus.node_mode().send(NodeMode::CvvActive);
                 return Ok(());
             }
@@ -211,13 +206,16 @@ impl<DB: Database> Subscriber<DB> {
     }
 
     /// Return the block hash and number of the last executed consensus output.
+    ///
+    /// This method is called on startup to retrieve the needed information to build the next
+    /// `ConsensusHeader` off of this parent.
     async fn get_last_executed_consensus(&self) -> SubscriberResult<(BlockHash, u64)> {
         // Get the DB and load our last executed consensus block (note there may be unexecuted
         // blocks, catch up will execute them).
         let last_executed_block =
             last_executed_consensus_block(&self.consensus_bus, &self.config).unwrap_or_default();
 
-        info!(target: "subscriber", ?last_executed_block, "restoring last executed consensus:");
+        info!(target: "subscriber", ?last_executed_block, "restoring last executed consensus for constucting the next ConsensusHeader:");
 
         Ok((last_executed_block.digest(), last_executed_block.number))
     }
@@ -257,7 +255,7 @@ impl<DB: Database> Subscriber<DB> {
                     // Note we don't bother sending this to the consensus header channel since not needed when an active CVV.
                     if let Err(e) = self.consensus_bus.last_consensus_header().send(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() }) {
                         error!(target: "subscriber", "error sending latest consensus header for authority {:?}: {}", self.inner.authority_id, e);
-                        return Ok(());
+                        return Err(SubscriberError::ClosedChannel("failed to send last consensus header on bus".to_string()));
                     }
                     if let Err(e) = self.network_handle.publish_consensus(number, last_parent).await {
                         error!(target: "subscriber", "error publishing latest consensus to network {:?}: {}", self.inner.authority_id, e);
@@ -278,9 +276,9 @@ impl<DB: Database> Subscriber<DB> {
                             debug!(target: "subscriber", "broadcasting output...");
                             if let Err(e) = self.consensus_bus.consensus_output().send(output).await {
                                 error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
-                                return Ok(());
+                                return Err(SubscriberError::ClosedChannel("failed to broadcast consensus output".to_string()));
                             }
-                            debug!("output broadcast successfully");
+                            debug!(target: "subscriber", "output broadcast successfully");
                         }
                         Err(e) => {
                             error!(target: "subscriber", "error fetching batches: {e}");

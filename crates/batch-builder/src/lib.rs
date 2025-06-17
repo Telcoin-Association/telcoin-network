@@ -337,7 +337,7 @@ mod tests {
     };
     use tn_storage::{open_db, tables::Batches};
     use tn_types::{
-        adiri_genesis, gas_accumulator::GasAccumulator, Bytes, ConsensusOutput, Database,
+        gas_accumulator::GasAccumulator, test_genesis, Bytes, ConsensusOutput, Database,
         GenesisAccount, TaskManager, U160, U256,
     };
     use tn_worker::{
@@ -347,7 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_make_block_no_ack_txs_in_pool_still() {
-        let genesis = adiri_genesis();
+        let genesis = test_genesis();
         let mut tx_factory = TransactionFactory::new();
         let factory_address = tx_factory.address();
 
@@ -511,7 +511,7 @@ mod tests {
     fn get_test_tools(path: &Path) -> TestTools {
         let tx_factory = TransactionFactory::new();
         let factory_address = tx_factory.address();
-        let genesis = adiri_genesis().extend_accounts([(
+        let genesis = test_genesis().extend_accounts([(
             factory_address,
             GenesisAccount::default().with_balance(
                 U256::from_str("0x51E410C0F93FE543000000").expect("account balance is parsed"),

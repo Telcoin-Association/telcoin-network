@@ -6,32 +6,30 @@ use clap::{value_parser, Parser};
 use core::fmt;
 use fdlimit::raise_fd_limit;
 use rayon::ThreadPoolBuilder;
-use std::{net::SocketAddr, sync::Arc, thread::available_parallelism};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, thread::available_parallelism};
 use tn_config::Config;
-
 use tn_node::engine::TnBuilder;
-use tn_reth::{
-    clap_genesis_parser,
-    dirs::{default_datadir_args, DataDirChainPath, DataDirPath},
-    parse_socket_address, MaybePlatformPath, RethChainSpec, RethCommand, RethConfig,
-};
+use tn_reth::{parse_socket_address, RethCommand, RethConfig};
 use tracing::*;
+
+/// Avaliable "named" chains.
+/// These will have embedded config files and can be joined after gereating keys.
+#[derive(Debug, Copy, Clone, clap::ValueEnum)]
+pub enum NamedChain {
+    /// Adiri- alias for TestNet
+    Adiri,
+    /// TestNet or Adiri
+    TestNet,
+    /// MainNet
+    MainNet,
+}
 
 /// Start the node
 #[derive(Debug, Parser)]
 pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
-    /// Overwrite the chain this node is running.
-    ///
-    /// The value parser matches either a known chain, the path
-    /// to a json file, or a json formatted string in-memory. The json can be either
-    /// a serialized [ChainSpec] or Genesis struct.
-    #[arg(
-        long,
-        value_name = "GENESIS_OR_PATH",
-        verbatim_doc_comment,
-        value_parser = clap_genesis_parser,
-    )]
-    pub genesis: Option<Arc<RethChainSpec>>,
+    /// Join a named telcoin network (for instance test or main net).
+    #[arg(long, value_name = "NAMED_TN_NETWORK", verbatim_doc_comment)]
+    pub chain: Option<NamedChain>,
 
     /// Enable Prometheus consensus metrics.
     ///
@@ -66,16 +64,6 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(long, conflicts_with = "instance", global = true)]
     pub with_unused_ports: bool,
 
-    /// The path to the data dir for all telcoin-network files and subdirectories.
-    ///
-    /// Defaults to the OS-specific data directory:
-    ///
-    /// - Linux: `$XDG_DATA_HOME/telcoin-network/` or `$HOME/.local/share/telcoin-network/`
-    /// - Windows: `{FOLDERID_RoamingAppData}/telcoin-network/`
-    /// - macOS: `$HOME/Library/Application Support/telcoin-network/`
-    #[arg(long, value_name = "DATA_DIR", verbatim_doc_comment, default_value_t)]
-    pub datadir: MaybePlatformPath<DataDirPath>,
-
     /// Additional reth arguments
     #[clap(flatten)]
     pub reth: RethCommand,
@@ -88,9 +76,14 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
 impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
     /// Execute `node` command
     #[instrument(level = "info", skip_all)]
-    pub fn execute<L>(mut self, passphrase: Option<String>, launcher: L) -> eyre::Result<()>
+    pub fn execute<L>(
+        mut self,
+        tn_datadir: PathBuf,
+        passphrase: Option<String>,
+        launcher: L,
+    ) -> eyre::Result<()>
     where
-        L: FnOnce(TnBuilder, Ext, DataDirChainPath, Option<String>) -> eyre::Result<()>,
+        L: FnOnce(TnBuilder, Ext, PathBuf, Option<String>) -> eyre::Result<()>,
     {
         info!(target: "tn::cli", "telcoin-network {} starting", SHORT_VERSION);
 
@@ -111,33 +104,26 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             error!("Failed to initialize global thread pool for rayon: {}", err)
         }
 
-        // use TN-specific datadir for finding tn-config
-        let default_args = default_datadir_args();
-        let tn_datadir: DataDirChainPath = self
-            .datadir
-            .unwrap_or_chain_default(self.reth.chain.chain, default_args.clone())
-            .into();
-
-        // use config for chain spec
-        let mut tn_config = Config::load(&tn_datadir, self.observer, SHORT_VERSION)?;
-        debug!(target: "cli", validator = ?tn_config.node_info.name, "tn datadir for node command: {tn_datadir:?}");
-        // Make sure we are using the chain from config not just the default.
-        self.reth.chain = Arc::new(tn_config.chain_spec());
-        info!(target: "cli", validator = ?tn_config.node_info.name, "config loaded");
-
         // overwrite all genesis if `genesis` was passed to CLI
-        if let Some(chain) = self.genesis.take() {
-            info!(target: "cli", "Overwriting TN config with specified chain");
-            // Copy over any initial allocations.  This is for testing (and testnets).
-            let chain = Arc::unwrap_or_clone(chain);
-            self.reth.chain = Arc::new(chain);
-            tn_config.genesis = self.reth.chain.genesis().clone();
-        }
+        let tn_config = if let Some(chain) = self.chain.take() {
+            info!(target: "cli", "Overwriting TN config with named chain: {chain:?}");
+            match chain {
+                NamedChain::Adiri | NamedChain::TestNet => {
+                    Config::load_adiri(&tn_datadir, self.observer, SHORT_VERSION)?
+                }
+                NamedChain::MainNet => {
+                    Config::load_mainnet(&tn_datadir, self.observer, SHORT_VERSION)?
+                }
+            }
+        } else {
+            Config::load(&tn_datadir, self.observer, SHORT_VERSION)?
+        };
+        debug!(target: "cli", validator = ?tn_config.node_info.name, "tn datadir for node command: {tn_datadir:?}");
+        info!(target: "cli", validator = ?tn_config.node_info.name, "config loaded");
 
         // get the worker's transaction address from the config
         let Self {
-            datadir: _,  // Used above
-            genesis: _,  // Used above
+            chain: _,    // Used above
             observer: _, // Used above
             metrics,
             instance,
@@ -146,10 +132,16 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             ext,
         } = self;
 
-        debug!(target: "cli", "node command genesis: {:#?}", reth.chain.genesis());
+        debug!(target: "cli", "node command genesis: {:#?}", tn_config.genesis());
 
         // set up reth node config for engine components
-        let node_config = RethConfig::new(reth, instance, tn_datadir.as_ref(), with_unused_ports);
+        let node_config = RethConfig::new(
+            reth,
+            instance,
+            &tn_datadir,
+            with_unused_ports,
+            Arc::new(tn_config.chain_spec()),
+        );
 
         let builder = TnBuilder { node_config, tn_config, opt_faucet_args: None, metrics };
 

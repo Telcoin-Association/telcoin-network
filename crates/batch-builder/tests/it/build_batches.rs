@@ -11,16 +11,15 @@ use tn_batch_validator::BatchValidator;
 use tn_engine::execute_consensus_output;
 use tn_network_types::{local::LocalNetwork, MockWorkerToPrimary};
 use tn_reth::{
-    payload::BuildArguments,
-    recover_raw_transaction,
-    test_utils::{test_genesis, TransactionFactory},
+    payload::BuildArguments, recover_raw_transaction, test_utils::TransactionFactory,
     RethChainSpec, RethEnv,
 };
 use tn_storage::{open_db, tables::Batches};
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    Address, Batch, BatchValidation, Bytes, Certificate, CommittedSubDag, ConsensusOutput,
-    Database, Encodable2718 as _, ReputationScores, SealedBatch, TaskManager, U160, U256,
+    test_genesis, Address, Batch, BatchValidation, Bytes, Certificate, CommittedSubDag,
+    ConsensusOutput, Database, Encodable2718 as _, ReputationScores, SealedBatch, TaskManager,
+    U160, U256,
 };
 use tn_worker::{
     metrics::WorkerMetrics, test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle,

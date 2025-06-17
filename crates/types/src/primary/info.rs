@@ -12,10 +12,6 @@ pub struct NodeP2pInfo {
     /// The WAN address for the primary.
     /// This is where peers should send consensus messages for this primary to process.
     pub network_address: Multiaddr,
-    /// The worker public network key.
-    ///
-    /// Adding this for CLI - expects only 1 worker for now.
-    pub worker_network_key: NetworkPublicKey,
     /// The workers for this primary.
     pub worker_index: WorkerIndex,
 }
@@ -25,10 +21,9 @@ impl NodeP2pInfo {
     pub fn new(
         network_key: NetworkPublicKey,
         network_address: Multiaddr,
-        worker_network_key: NetworkPublicKey,
         worker_index: WorkerIndex,
     ) -> Self {
-        Self { network_key, network_address, worker_network_key, worker_index }
+        Self { network_key, network_address, worker_index }
     }
 
     /// Return a reference to the primary's [WorkerIndex].
@@ -39,15 +34,16 @@ impl NodeP2pInfo {
 
 impl Default for NodeP2pInfo {
     fn default() -> Self {
-        let host = std::env::var("NARWHAL_HOST").unwrap_or("127.0.0.1".to_string());
-        let primary_udp_port = get_available_udp_port(&host).unwrap_or(49590).to_string();
+        // These defaults should only be used by tests.
+        // They need to work for tests though so localhost and a random port are good.
+        let host = "127.0.0.1".to_string();
+        let primary_udp_port = get_available_udp_port(&host).unwrap_or(49584);
 
         Self {
             network_key: NetworkKeypair::generate_ed25519().public().into(),
             network_address: format!("/ip4/{}/udp/{}/quic-v1", &host, primary_udp_port)
                 .parse()
                 .expect("multiaddr parsed for primary"),
-            worker_network_key: NetworkKeypair::generate_ed25519().public().into(),
             worker_index: Default::default(),
         }
     }

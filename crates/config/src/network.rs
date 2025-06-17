@@ -91,6 +91,9 @@ pub struct LibP2pConfig {
     /// - (6 * 4)(300 + (5 * 32)) = 11,040
     pub max_gossip_message_size: usize,
     /// The maximum duration to keep an idle connection alive between peers.
+    ///
+    /// The strategy for TN is to rely on QUIC to send keep alive messages instead of adding
+    /// another behaviour to the swarm.
     pub max_idle_connection_timeout: Duration,
     /// The maximum number of pending peer-exchance disconnect messages before this node
     /// immediately disconnects.
@@ -145,7 +148,7 @@ impl Default for LibP2pConfig {
             )],
             max_rpc_message_size: 1024 * 1024, // 1 MiB
             max_gossip_message_size: 12_000,   // 12kb
-            max_idle_connection_timeout: Duration::from_secs(60 * 60), // 60min
+            max_idle_connection_timeout: Duration::from_secs(60 * 60 * 24), // 24hrs
             max_px_disconnects: 10,
             px_disconnect_timeout: Duration::from_secs(3),
         }
@@ -230,9 +233,6 @@ pub struct QuicConfig {
     /// The actual timeout is the minimum of this and the [`Config::max_idle_timeout`].
     pub handshake_timeout: Duration,
     /// Maximum duration of inactivity in ms to accept before timing out the connection.
-    ///
-    /// Recommended to have this timeout be longer than `LibP2pConfig::max_idle_connection_timeout`
-    /// so the swarm controls if the connection is closed.
     pub max_idle_timeout: u32,
     /// Period of inactivity before sending a keep-alive packet.
     /// Must be set lower than the idle_timeout of both
@@ -254,9 +254,9 @@ pub struct QuicConfig {
 impl Default for QuicConfig {
     fn default() -> Self {
         Self {
-            handshake_timeout: Duration::from_secs(300),
-            max_idle_timeout: 60 * 65 * 1_000,             // 65min
-            keep_alive_interval: Duration::from_secs(300), // 300s/5min
+            handshake_timeout: Duration::from_secs(65),
+            max_idle_timeout: 30 * 1_000, // 30s
+            keep_alive_interval: Duration::from_secs(10),
             max_concurrent_stream_limit: 10_000,
             // may need to increase these based on RTT
             //

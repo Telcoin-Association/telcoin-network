@@ -29,7 +29,7 @@ use tn_types::{
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 /// Type alias for the blocking task that executes consensus output and returns the finalized
 /// `SealedHeader`.
@@ -142,11 +142,12 @@ impl ExecutorEngine {
     /// parameter.
     ///
     /// Note: this is mainly for testing and debugging purposes.
+    #[cfg(any(test, feature = "test-utils"))]
     fn has_reached_max_round(&self, progress: u64) -> bool {
         let has_reached_max_round =
             self.max_round.map(|target| progress >= target).unwrap_or_default();
         if has_reached_max_round {
-            trace!(
+            tracing::trace!(
                 target: "engine",
                 ?progress,
                 max_round = ?self.max_round,
@@ -159,7 +160,7 @@ impl ExecutorEngine {
     /// TESTING ONLY
     ///
     /// Push a consensus output to the back of `Self::queued`.
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn push_back_queued_for_test(&mut self, output: ConsensusOutput) {
         self.queued.push_back(output)
     }
@@ -203,16 +204,13 @@ impl Future for ExecutorEngine {
                 }
                 Poll::Ready(None) => {
                     // the stream has ended
-                    //
-                    // this could indicate an error but it's also how the Primary signals engine to
-                    // shutdown
-                    info!(target: "engine", "ConsensusOutput channel closed. Shutting down...");
+                    error!(target: "engine", "ConsensusOutput channel closed. Shutting down...");
 
                     // only return if there are no current tasks and the queue is empty
                     // otherwise, let the loop continue so any remaining tasks and queued output is
                     // executed
                     if this.pending_task.is_none() && this.queued.is_empty() {
-                        return Poll::Ready(Ok(()));
+                        return Poll::Ready(Err(TnEngineError::ConsensusOutputStreamClosed));
                     }
                 }
 
@@ -242,7 +240,8 @@ impl Future for ExecutorEngine {
                         // store last executed header in memory
                         this.parent_header = finalized_header;
 
-                        // check max_round
+                        // check max_round to auto shutdown
+                        #[cfg(any(test, feature = "test-utils"))]
                         if this.max_round.is_some()
                             && this.has_reached_max_round(this.parent_header.nonce.into())
                         {

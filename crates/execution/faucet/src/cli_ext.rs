@@ -40,7 +40,13 @@ pub struct FaucetArgs {
     ///
     /// Google KMS strategy:
     /// Use the startup script to retrieve this value and set the env variable in pem format.
-    #[clap(long, value_parser = parse_pubkey, env = "FAUCET_PUBLIC_KEY")]
+    #[clap(
+        long,
+        value_parser = parse_pubkey,
+        env = "FAUCET_PUBLIC_KEY",
+        help_heading = "The public key for the faucet wallet.",
+        default_value = "0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99",
+    )]
     pub(crate) public_key: PublicKey,
 
     /// Bool indicating Google KMS is in use for faucet signatures.
@@ -101,9 +107,10 @@ impl FaucetArgs {
         // only support google kms for now
         if self.google_kms {
             // calculate address from uncompressed public key
-            let address = public_key_to_address(self.public_key);
+            let public_key = self.public_key;
+            let address = public_key_to_address(public_key);
             // compressed public key bytes
-            let public_key_bytes = self.public_key.serialize();
+            let public_key_bytes = public_key.serialize();
 
             // set in arg
             let google_project_id = self.project_id.as_ref()

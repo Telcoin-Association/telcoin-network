@@ -3,7 +3,7 @@
 use crate::{
     error::{TnRethError, TnRethResult},
     system_calls::{
-        ConsensusRegistry::{self, ValidatorStatus},
+        ConsensusRegistry::{self, RewardInfo, ValidatorStatus},
         CONSENSUS_REGISTRY_ADDRESS,
     },
     SYSTEM_ADDRESS,
@@ -26,19 +26,19 @@ use reth_evm::{
     execute::{BlockAssembler, BlockAssemblerInput},
     FromRecoveredTx, FromTxWithEncoded, OnStateHook,
 };
-use reth_primitives::{logs_bloom, TxType};
+use reth_primitives::logs_bloom;
 use reth_provider::BlockExecutionResult;
 use reth_revm::{
     context::result::{ExecutionResult, ResultAndState},
     db::states::bundle_state::BundleRetention,
     DatabaseCommit as _, State,
 };
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 use tn_types::{
-    Address, Bytes, Encodable2718, ExecHeader, Receipt, TransactionSigned, Withdrawals, B256,
-    EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS, U256,
+    gas_accumulator::RewardsCounter, Address, Bytes, Encodable2718, ExecHeader, Receipt,
+    TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS, U256,
 };
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 /// Context for TN block execution.
 #[derive(Debug, Clone)]
@@ -62,6 +62,8 @@ pub struct TNBlockExecutionCtx {
     pub close_epoch: Option<B256>,
     /// Difficulty- this will contain the worker id ancd batch index.
     pub difficulty: U256,
+    /// Counter used to allocate rewards for block leaders.
+    pub rewards_counter: RewardsCounter,
 }
 
 /// Block executor for Ethereum.
@@ -100,23 +102,45 @@ where
 
     /// Increase the beneficiary account balance and withdraw from governance safe.
     ///
-    /// see revm-database/src/states/state.rs
-    /// State::increment_balances
-    fn _apply_consensus_block_reward(&mut self) -> TnRethResult<()> {
-        let recipient = self.evm.block().beneficiary;
-        let _original_account = self.evm.db_mut().load_cache_account(recipient).map_err(|e| {
-            TnRethError::EVMCustom(format!("failed to load account for block reward: {e}"))
-        })?;
+    /// This must be called once per epoch, before the conclude epoch call.
+    fn apply_consensus_block_rewards(
+        &mut self,
+        rewards: BTreeMap<Address, u32>,
+    ) -> TnRethResult<()> {
+        let calldata = self.generate_apply_incentives_calldata(
+            rewards.iter().map(|(address, count)| (*address, *count)).collect(),
+        )?;
 
-        // TODO: this should be applyIncentives before closeEpoch
-        // see Issue #325
-        //
-        // if let Some(s) = self.evm.db_mut().transition_state.as_mut() {
-        //     s.add_transitions(vec![(
-        //         recipient,
-        //         original_account.increment_balance(balance).expect("balance is not 0"),
-        //     )]);
-        // }
+        trace!(target: "engine", ?calldata, "apply incentives calldata");
+
+        // execute system call to consensus registry
+        let res = match self.evm.transact_system_call(
+            SYSTEM_ADDRESS,
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+        ) {
+            Ok(res) => res,
+            Err(e) => {
+                // fatal error
+                error!(target: "engine", "error applying consensus block rewards contract call: {:?}", e);
+                return Err(TnRethError::EVMCustom(format!(
+                    "applying consensus block rewards failed: {e}"
+                )));
+            }
+        };
+
+        // return error if closing epoch call failed
+        if !res.result.is_success() {
+            // execution failed
+            error!(target: "engine", "failed applying consensus block rewards call: {:?}", res.result);
+            return Err(TnRethError::EVMCustom(
+                "failed applying consensus block rewards".to_string(),
+            ));
+        }
+        trace!(target: "engine", ?res, "applying consensus block rewards");
+
+        // commit the changes
+        self.evm.db_mut().commit(res.state);
 
         Ok(())
     }
@@ -125,6 +149,7 @@ where
     fn apply_closing_epoch_contract_call(&mut self, randomness: B256) -> TnRethResult<()> {
         debug!(target: "engine", ?randomness, "applying closing contract call");
         let calldata = self.generate_conclude_epoch_calldata(randomness)?;
+        trace!(target: "engine", ?calldata, "close epoch calldata");
 
         // execute system call to consensus registry
         let res = match self.evm.transact_system_call(
@@ -140,23 +165,19 @@ where
             }
         };
 
-        // capture closing epoch log
-        debug!(target: "engine", "closing epoch logs:\n{:#?}", res.result.logs());
-        let closing_epoch_logs = res.result.clone().into_logs();
+        trace!(target: "engine", ?res, "transact system call for conclude epoch");
 
-        debug!(target: "engine", "committing closing epoch state:\n{:#?}", res.state);
+        // return error if closing epoch call failed
+        if !res.result.is_success() {
+            // execution failed
+            error!(target: "engine", "failed to apply closing epoch call: {:?}", res.result);
+            return Err(TnRethError::EVMCustom("failed to close epoch".to_string()));
+        }
 
-        // append receipt
-        self.receipts.push(Receipt {
-            logs: closing_epoch_logs,
-            tx_type: TxType::Legacy,
-            success: true,
-            cumulative_gas_used: 0,
-        });
+        trace!(target: "engine", "closing epoch logs:\n{:?}", res.result.logs());
 
         // commit the changes
         self.evm.db_mut().commit(res.state);
-
         Ok(())
     }
 
@@ -165,9 +186,9 @@ where
         // shuffle all validators for new committee
         let mut new_committee = self.shuffle_new_committee(randomness)?;
 
-        // sort addresses
+        // sort addresses in ascending order (0x0...0xf)
         new_committee.sort();
-        debug!(target: "evm", ?new_committee, "new committee sorted by address");
+        debug!(target: "engine", ?new_committee, "new committee sorted by address");
 
         // encode the call to bytes with method selector and args
         let bytes = ConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
@@ -177,40 +198,54 @@ where
         Ok(bytes)
     }
 
+    /// Generate calldata for applying incentives when concluding the epoch.
+    fn generate_apply_incentives_calldata(
+        &mut self,
+        reward_infos: Vec<(Address, u32)>,
+    ) -> TnRethResult<Bytes> {
+        debug!(target: "engine", ?reward_infos, "applying incentives");
+
+        // encode the call to bytes with method selector and args
+        let bytes = ConsensusRegistry::applyIncentivesCall {
+            rewardInfos: reward_infos
+                .iter()
+                .map(|(address, count)| RewardInfo {
+                    validatorAddress: *address,
+                    consensusHeaderCount: U256::from(*count),
+                })
+                .collect(),
+        }
+        .abi_encode()
+        .into();
+
+        Ok(bytes)
+    }
+
     /// Read eligible validators from latest state and shuffle the committee deterministically.
     fn shuffle_new_committee(&mut self, randomness: B256) -> TnRethResult<Vec<Address>> {
+        let new_committee_size = self.next_committee_size()?;
+
         // read all active validators from consensus registry
         let calldata =
             ConsensusRegistry::getValidatorsCall { status: ValidatorStatus::Active.into() }
                 .abi_encode()
                 .into();
-        let read_state =
+        let state =
             self.read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
 
-        debug!(target: "engine", "result after shuffle:\n{:#?}", read_state);
+        trace!(target: "engine", "get validators call:\n{:?}", state);
 
-        // retrieve data from execution result
-        let data = match read_state.result {
-            ExecutionResult::Success { output, .. } => output.into_data(),
-            e => {
-                // fatal error
-                error!(target: "engine", "error reading state on chain: {:?}", e);
-                return Err(TnRethError::EVMCustom(format!("error reading state on chain: {e:?}")));
-            }
-        };
-
-        // Use SolValue to decode the result
         let mut eligible_validators: Vec<ConsensusRegistry::ValidatorInfo> =
-            alloy::sol_types::SolValue::abi_decode(&data)?;
+            alloy::sol_types::SolValue::abi_decode(&state)?;
 
-        debug!(target: "engine",  "validators pre-shuffle {:#?}", eligible_validators);
+        debug!(target: "engine",  "validators pre-shuffle {:?}", eligible_validators);
 
         // simple Fisher-Yates shuffle
         //
         // create seed from hashed bls agg signature
         let mut seed = [0; 32];
         seed.copy_from_slice(randomness.as_slice());
-        debug!(target: "engine", ?seed, "seed after");
+        trace!(target: "engine", ?seed, "seed after");
 
         let mut rng = StdRng::from_seed(seed);
         for i in (1..eligible_validators.len()).rev() {
@@ -218,9 +253,15 @@ where
             eligible_validators.swap(i, j);
         }
 
-        debug!(target: "engine",  "validators post-shuffle {:#?}", eligible_validators);
+        debug!(target: "engine",  "validators post-shuffle {:?}", eligible_validators);
 
-        let new_committee = eligible_validators.into_iter().map(|v| v.validatorAddress).collect();
+        let mut new_committee =
+            eligible_validators.into_iter().map(|v| v.validatorAddress).collect::<Vec<_>>();
+
+        // trim the shuffled committee to maintain correct size
+        new_committee.truncate(new_committee_size);
+
+        trace!(target: "engine",  ?new_committee_size, ?new_committee, "truncated shuffle for new committee");
 
         Ok(new_committee)
     }
@@ -231,7 +272,7 @@ where
         caller: Address,
         contract: Address,
         calldata: Bytes,
-    ) -> TnRethResult<ResultAndState<<Evm as alloy_evm::Evm>::HaltReason>> {
+    ) -> TnRethResult<Bytes> {
         // read from state
         let res = match self.evm.transact_system_call(caller, contract, calldata) {
             Ok(res) => res,
@@ -242,7 +283,42 @@ where
             }
         };
 
-        Ok(res)
+        // retrieve data from execution result
+        let data = match res.result {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            e => {
+                // fatal error
+                error!(target: "engine", "error reading state on chain: {:?}", e);
+                return Err(TnRethError::EVMCustom(format!("error reading state on chain: {e:?}")));
+            }
+        };
+
+        Ok(data)
+    }
+
+    /// Return the next committee size.
+    ///
+    /// This is isolated into a function and requires a fork to change.
+    fn next_committee_size(&mut self) -> TnRethResult<usize> {
+        // retrieve the current committee size
+        let epoch = self.extract_epoch_from_nonce(self.ctx.nonce);
+        let calldata = ConsensusRegistry::getCommitteeValidatorsCall { epoch }.abi_encode().into();
+        let state =
+            self.read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+        let current_committee: Vec<ConsensusRegistry::ValidatorInfo> =
+            alloy::sol_types::SolValue::abi_decode(&state)?;
+
+        trace!(target: "engine",  ?current_committee, "read current committee to get the next committee size");
+
+        // this will fail on-chain if incorrect
+        Ok(current_committee.len())
+    }
+
+    /// Extract the epoch number from a header's nonce.
+    fn extract_epoch_from_nonce(&self, nonce: u64) -> u32 {
+        // epochs are packed into nonce as 32 bits
+        let epoch = nonce >> 32;
+        epoch as u32
     }
 }
 
@@ -266,12 +342,6 @@ where
         let state_clear_flag =
             self.spec.is_spurious_dragon_active_at_block(self.evm.block().number);
         self.evm.db_mut().set_state_clear_flag(state_clear_flag);
-
-        // // TODO: requires prague fork
-        // self.system_caller.apply_blockhashes_contract_call(self.ctx.parent_hash, &mut self.evm)?;
-        // // TODO: requires cancun
-        // self.system_caller
-        //     .apply_beacon_root_contract_call(self.ctx.parent_beacon_block_root, &mut self.evm)?;
 
         Ok(())
     }
@@ -331,13 +401,18 @@ where
 
         // potentially close epoch boundary
         if let Some(randomness) = self.ctx.close_epoch {
-            debug!(target: "evm", ?randomness, "ctx indicates close epoch");
+            debug!(target: "engine", ?randomness, "ctx indicates close epoch");
+            self.apply_consensus_block_rewards(self.ctx.rewards_counter.get_address_counts())
+                .map_err(|e| {
+                    BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
+                })?;
+
             self.apply_closing_epoch_contract_call(randomness).map_err(|e| {
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
             })?;
 
             // merge transitions into bundle state
-            self.evm.db_mut().merge_transitions(BundleRetention::PlainState);
+            self.evm.db_mut().merge_transitions(BundleRetention::Reverts);
         }
 
         Ok((

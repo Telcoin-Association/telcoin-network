@@ -230,23 +230,19 @@ mod tests {
     use assert_matches::assert_matches;
     use std::{path::Path, str::FromStr, sync::Arc};
     use tempfile::TempDir;
-    use tn_reth::{
-        test_utils::{test_genesis, TransactionFactory},
-        RethChainSpec,
-    };
+    use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
     use tn_types::{
-        adiri_genesis, hex_literal::hex, max_batch_gas, Address, Batch, Bytes, Encodable2718 as _,
-        GenesisAccount, TaskManager, B256, MIN_PROTOCOL_BASE_FEE, U256,
+        max_batch_gas, test_genesis, Address, Batch, Bytes, Encodable2718 as _, GenesisAccount,
+        TaskManager, B256, MIN_PROTOCOL_BASE_FEE, U256,
     };
 
     /// Return the next valid sealed batch
-    fn next_valid_sealed_batch() -> SealedBatch {
-        let timestamp = 1701790139;
+    fn next_valid_sealed_batch(chain: Arc<RethChainSpec>) -> SealedBatch {
+        let timestamp = chain.genesis_timestamp() + 1;
         // create valid transactions
         let mut tx_factory = TransactionFactory::new();
         let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
         let gas_price = 7;
-        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let genesis_hash = chain.genesis_hash();
 
         // create 3 transactions
@@ -288,13 +284,7 @@ mod tests {
             received_at: None,
         };
 
-        // sealed batch
-        //
-        // intentionally used hard-coded values
-        SealedBatch::new(
-            batch,
-            hex!("84979a2d10637e86c2dd76d2029639f81d27303930721b6f48fb9a345b8813d8").into(),
-        )
+        batch.seal_slow()
     }
 
     /// Convenience type for creating test assets.
@@ -313,7 +303,7 @@ mod tests {
         let tx_pool = reth_env.init_txn_pool().unwrap();
         let validator =
             BatchValidator::new(reth_env, Some(tx_pool), 0, BaseFeeContainer::default());
-        let valid_batch = next_valid_sealed_batch();
+        let valid_batch = next_valid_sealed_batch(chain);
 
         // block validator
         TestTools { valid_batch, validator }
@@ -371,7 +361,7 @@ mod tests {
         let (mut batch, _) = valid_batch.split();
 
         // test batch timestamp same as parent
-        let wrong_timestamp = adiri_genesis().timestamp;
+        let wrong_timestamp = validator.reth_env.chainspec().genesis().timestamp;
         batch.timestamp = wrong_timestamp;
 
         assert_matches!(
@@ -445,7 +435,7 @@ mod tests {
         // create enough transactions to exceed 1MB
         // because validator uses provided with same genesis
         // and tx_factory needs funds
-        let genesis = adiri_genesis();
+        let genesis = test_genesis();
 
         // use new tx factory to ensure correct nonces are tracked
         let mut tx_factory = TransactionFactory::new();

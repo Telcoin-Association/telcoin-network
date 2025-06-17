@@ -312,11 +312,15 @@ where
             .into_inner()
             .signature;
 
+        debug!(target: "faucet", ?signed_data, "signed data returned from kms client");
+
         // ensure signature is compatible with ethereum (see EIP-155)
         let mut signature = Signature::from_der(&signed_data)?;
         signature.normalize_s();
         // retrieve r, s, and v values for EthSignature
         let compact = signature.serialize_compact();
+
+        debug!(target: "faucet", ?compact, "compact serialized signature");
 
         // calculate `v` for eth signature's `y_parity`
         let y_parity = Self::calculate_v(message, chain_id, &compact, &public_key_bytes)?;
@@ -381,12 +385,22 @@ where
         // recovery id must be 0 or 1
         for recovery_id in [0, 1] {
             let recid = RecoveryId::try_from(recovery_id).expect("Invalid recovery id");
+            debug!(target: "faucet", recovery_id, ?recid, "recovery id");
             let recoverable_signature =
                 RecoverableSignature::from_compact(compact_signature, recid).map_err(|e| {
                     EthApiError::InvalidParams(format!("failed to recover signature: {e}"))
                 })?;
-            if let Ok(recovered_key) = SECP256K1.recover_ecdsa(message, &recoverable_signature) {
+
+            debug!(target: "faucet", ?recoverable_signature, "recovered signature");
+
+            let recovery_result = SECP256K1.recover_ecdsa(message, &recoverable_signature);
+            debug!(target: "faucet", ?recovery_result, "attempt to recover ecdsa");
+
+            if let Ok(recovered_key) = recovery_result {
+                debug!(target: "faucet", ?recovered_key, "recovered ecdsa");
                 let recovered_pubkey = recovered_key.serialize();
+                debug!(target: "faucet", ?recovered_pubkey, "recovered pubkey");
+                debug!(target: "faucet", ?public_key_bytes, "pubic key bytes");
                 if recovered_pubkey == public_key_bytes.as_ref() {
                     // v is found when the recovered key matches the known public key
                     //
@@ -398,7 +412,7 @@ where
             }
         }
 
-        // TODO: better error type here
+        debug!(target: "faucet", "failed to recover v - returning error");
         Err(EthApiError::FailedToDecodeSignedTransaction)
     }
 }

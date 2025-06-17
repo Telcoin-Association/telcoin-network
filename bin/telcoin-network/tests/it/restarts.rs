@@ -1,12 +1,18 @@
 use crate::util::{config_local_testnet, IT_TEST_MUTEX};
+use alloy::primitives::address;
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
+use jsonrpsee::{
+    core::{client::ClientT, DeserializeOwned},
+    http_client::HttpClientBuilder,
+    rpc_params,
+};
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
 };
 use secp256k1::{Keypair, Secp256k1, SecretKey};
-use serde_json::{value::RawValue, Value};
+use serde_json::Value;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -14,7 +20,7 @@ use std::{
     time::Duration,
 };
 use tn_types::{get_available_tcp_port, keccak256, test_utils::init_test_tracing, Address};
-use tokio::runtime::Runtime;
+use tokio::runtime::Builder;
 use tracing::{error, info};
 
 /// One unit of TEL (10^18) measured in wei.
@@ -60,7 +66,9 @@ fn send_and_confirm(
     to_account: Address,
     nonce: u128,
 ) -> eyre::Result<()> {
+    let basefee_address = address!("0x9999999999999999999999999999999999999999");
     let current = get_balance(node, &to_account.to_string(), 1)?;
+    let current_basefee = get_balance(node, &basefee_address.to_string(), 1)?;
     let amount = 10 * WEI_PER_TEL; // 10 TEL
     let expected = current + amount;
     send_tel(node, key, to_account, amount, 250, 21000, nonce)?;
@@ -76,6 +84,12 @@ fn send_and_confirm(
         error!(target: "restart-test", "{expected} != {bal} - returning error!");
         return Err(Report::msg(format!("Expected a balance of {expected} got {bal}!")));
     }
+    let bal =
+        get_balance_above_with_retry(node_test, &basefee_address.to_string(), current_basefee)?;
+    if nonce > 0 && bal != current_basefee + (current_basefee / (nonce)) {
+        error!(target: "restart-test", "basefee error!");
+        return Err(Report::msg("Expected a basefee increment!".to_string()));
+    }
     Ok(())
 }
 
@@ -90,18 +104,19 @@ fn run_restart_tests1(
 ) -> eyre::Result<Child> {
     network_advancing(client_urls).inspect_err(|e| {
         kill_child(child2);
-        error!(target: "restart-test", ?e);
+        error!(target: "restart-test", ?e, "failed to advance network in restart_tests1");
     })?;
     std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
 
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
 
+    info!(target: "restart-test", "testing blocks same first time in restart_tests1");
     test_blocks_same(client_urls)?;
     // Try once more then fail test.
     send_and_confirm(&client_urls[1], &client_urls[2], &key, to_account, 0).inspect_err(|e| {
         kill_child(child2);
-        error!(target: "restart-test", ?e);
+        error!(target: "restart-test", ?e, "failed to send and confirm in restart_tests1");
     })?;
 
     info!(target: "restart-test", "killing child2...");
@@ -121,7 +136,7 @@ fn run_restart_tests1(
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
         .inspect_err(|e| {
             kill_child(&mut child2);
-            error!(target: "restart-test", ?e);
+            error!(target: "restart-test", ?e, "failed to get positive balance with retry in restart_tests1");
         })?;
     if 10 * WEI_PER_TEL != bal {
         error!(target: "restart-test", "tests1 after restart: 10 * WEI_PER_TEL != bal - returning error!");
@@ -130,13 +145,15 @@ fn run_restart_tests1(
     }
     // Try once more then fail test.
     send_and_confirm(&client_urls[0], &client_urls[2], &key, to_account, 1).inspect_err(|e| {
+        error!(target: "restart-test", ?e, "send and confirm nonce 1 failed - killing child2...");
         kill_child(&mut child2);
-        error!(target: "restart-test", ?e);
     })?;
 
+    info!(target: "restart-test", "testing blocks same again in restart_tests1");
+
     test_blocks_same(client_urls).inspect_err(|e| {
+        error!(target: "restart-test", ?e, "test blocks same failed - killing child2...");
         kill_child(&mut child2);
-        error!(target: "restart-test", ?e);
     })?;
     Ok(child2)
 }
@@ -175,16 +192,20 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
 }
 
 fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
-    let mut start_num = get_block_number(&client_urls[0])?;
-    start_num = start_num.max(get_block_number(&client_urls[1])?);
-    start_num = start_num.max(get_block_number(&client_urls[2])?);
-    start_num = start_num.max(get_block_number(&client_urls[3])?);
+    fn max_start(client_urls: &[String; 4]) -> eyre::Result<u64> {
+        let mut start_num = get_block_number(&client_urls[0])?;
+        start_num = start_num.max(get_block_number(&client_urls[1])?);
+        start_num = start_num.max(get_block_number(&client_urls[2])?);
+        start_num = start_num.max(get_block_number(&client_urls[3])?);
+        Ok(start_num)
+    }
+    let start_num = max_start(client_urls)?;
     let mut next_num = start_num;
     let mut i = 0;
     // Wait until a node is advancing agian, network should be back now.
     while next_num <= start_num {
         std::thread::sleep(Duration::from_secs(1));
-        next_num = get_block_number(&client_urls[0])?;
+        next_num = max_start(client_urls)?;
         i += 1;
         if i > 45 {
             return Err(eyre::eyre!(
@@ -204,8 +225,7 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
     // create temp path for test
     let temp_path = tmp_guard.path().to_path_buf();
     {
-        let rt = Runtime::new()?;
-        rt.block_on(config_local_testnet(&temp_path, Some("restart_test".to_string()), None))
+        config_local_testnet(&temp_path, Some("restart_test".to_string()), None)
             .expect("failed to config");
     }
     let mut exe_path =
@@ -277,6 +297,8 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
     assert!(get_balance(&client_urls[1], &to_account.to_string(), 5).is_err());
     assert!(get_balance(&client_urls[2], &to_account.to_string(), 5).is_err());
     assert!(get_balance(&client_urls[3], &to_account.to_string(), 5).is_err());
+
+    info!(target: "restart-test", "all nodes shutdown...restarting network");
     // Restart network
     for (i, child) in children.iter_mut().enumerate() {
         *child = Some(start_validator(i, &exe_path, &temp_path, rpc_ports[i]));
@@ -341,8 +363,7 @@ fn test_restarts_observer() -> eyre::Result<()> {
     // create temp path for test
     let temp_path = tmp_guard.path().to_path_buf();
     {
-        let rt = Runtime::new()?;
-        rt.block_on(config_local_testnet(&temp_path, Some("restart_test".to_string()), None))
+        config_local_testnet(&temp_path, Some("restart_test".to_string()), None)
             .expect("failed to config");
     }
     let mut exe_path =
@@ -440,41 +461,16 @@ fn start_observer(instance: usize, exe_path: &Path, base_dir: &Path, mut rpc_por
     command.spawn().expect("failed to execute")
 }
 
-fn test_numbers_within_one(client_urls: &[String; 4]) -> eyre::Result<()> {
-    let num0 = get_block_number(&client_urls[0])?;
-    let num1 = get_block_number(&client_urls[1])?;
-    let num2 = get_block_number(&client_urls[2])?;
-    let num3 = get_block_number(&client_urls[3])?;
-    if num0.saturating_sub(num1) > 1 || num1.saturating_sub(num0) > 1 {
-        return Err(eyre::eyre!(
-            "Nodes are not within one block of each other, delta found {}",
-            num0 as i64 - num1 as i64
-        ));
-    }
-    if num0.saturating_sub(num2) > 1 || num2.saturating_sub(num0) > 1 {
-        return Err(eyre::eyre!(
-            "Nodes are not within one block of each other, delta found {}",
-            num0 as i64 - num2 as i64
-        ));
-    }
-    if num0.saturating_sub(num3) > 1 || num3.saturating_sub(num0) > 1 {
-        return Err(eyre::eyre!(
-            "Nodes are not within one block of each other, delta found {}",
-            num0 as i64 - num3 as i64
-        ));
-    }
-    Ok(())
-}
-
 fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
-    test_numbers_within_one(client_urls)?;
+    info!(target: "restart-test", "calling get_block for {:?}", &client_urls[0]);
     let block0 = get_block(&client_urls[0], None)?;
     let number = u64::from_str_radix(&block0["number"].as_str().unwrap_or("0x100_000")[2..], 16)?;
+    info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[1]);
     let block = get_block(&client_urls[1], Some(number))?;
     if block0["hash"] != block["hash"] {
         return Err(Report::msg("Blocks between validators not the same!".to_string()));
     }
-    let number = u64::from_str_radix(&block["number"].as_str().unwrap_or_default()[2..], 16)?;
+    info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[2]);
     let block = get_block(&client_urls[2], Some(number))?;
     if block0["hash"] != block["hash"] {
         return Err(Report::msg(format!(
@@ -482,11 +478,12 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
             block0["hash"], block["hash"]
         )));
     }
-    let number = u64::from_str_radix(&block["number"].as_str().unwrap_or_default()[2..], 16)?;
+    info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[3]);
     let block = get_block(&client_urls[3], Some(number))?;
     if block0["hash"] != block["hash"] {
         return Err(Report::msg("Blocks between validators not the same!".to_string()));
     }
+    info!(target: "restart-test", "all rpcs returned same block hash");
     Ok(())
 }
 
@@ -494,8 +491,8 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
 /// Return a tuple of the TEL and remainder (any value left after dividing by 1_e18).
 /// Note, balance is in wei and must fit in an u128.
 fn get_balance(node: &str, address: &str, retries: usize) -> eyre::Result<u128> {
-    let params = RawValue::from_string(format!("[\"{address}\", \"latest\"]"))?;
-    let res_str = call_rpc(node, "eth_getBalance", Some(&params), retries)?;
+    let res_str: String =
+        call_rpc(node, "eth_getBalance", rpc_params!(address, "latest"), retries)?;
     info!(target: "restart-test", "get_balance for {node}: parsing string {res_str}");
     let tel = u128::from_str_radix(&res_str[2..], 16)?;
     info!(target: "restart-test", "get_balance for {node}: {tel:?}");
@@ -538,15 +535,11 @@ fn get_key(key: &str) -> String {
 
 fn get_block(node: &str, block_number: Option<u64>) -> eyre::Result<HashMap<String, Value>> {
     let params = if let Some(block_number) = block_number {
-        RawValue::from_string(format!("[\"0x{block_number:x}\", true]"))?
+        rpc_params!(format!("0x{block_number:x}"), true)
     } else {
-        RawValue::from_string("[\"latest\", true]".to_string())?
+        rpc_params!("latest", true)
     };
-    let mut block = call_rpc(node, "eth_getBlockByNumber", Some(&params), 5)?;
-    while block.is_empty() {
-        block = call_rpc(node, "eth_getBlockByNumber", Some(&params), 5)?;
-    }
-    Ok(serde_json::from_str(&block)?)
+    call_rpc(node, "eth_getBlockByNumber", params.clone(), 10)
 }
 
 fn get_block_number(node: &str) -> eyre::Result<u64> {
@@ -614,8 +607,12 @@ fn send_tel(
         .ecdsa(&secret_key.secret_bytes())
         .map_err(|_| Report::msg("Failed to get ecdsa"))?;
     let transaction_bytes = new_transaction.sign(&ecdsa);
-    let params = RawValue::from_string(format!("[\"{}\"]", const_hex::encode(transaction_bytes)))?;
-    let res_str = call_rpc(node, "eth_sendRawTransaction", Some(&params), 5)?;
+    let res_str: String = call_rpc(
+        node,
+        "eth_sendRawTransaction",
+        rpc_params!(const_hex::encode(transaction_bytes)),
+        1,
+    )?;
     info!(target: "restart-test", "Submitted TEL transfer from {from_account} to {to_account} for {amount}: {res_str}");
     Ok(())
 }
@@ -652,34 +649,27 @@ fn decode_key(key: &str) -> eyre::Result<(String, String, String)> {
 /// Wraps any Eyre otherwise returns the result as a String.
 /// This is for testing and will try up to retries times at one second intervals to send the
 /// request.
-fn call_rpc(
-    node: &str,
-    command: &str,
-    params: Option<&RawValue>,
-    retries: usize,
-) -> eyre::Result<String> {
-    match jsonrpc::simple_http::SimpleHttpTransport::builder().url(node) {
-        Ok(trans) => {
-            let client = jsonrpc::Client::with_transport(trans.build());
-            let req = client.build_request(command, params);
-            let mut resp = client.send_request(req.clone());
-            let mut i = 0;
-            while i < retries && resp.is_err() {
-                std::thread::sleep(Duration::from_millis(1000));
-                resp = client.send_request(req.clone());
-                i += 1;
-            }
-            let resp = resp?;
-            if let Some(err) = resp.error {
-                Err(Report::msg(format!("RPC error: {}", err.message)))
-            } else if let Ok(res) = resp.result() {
-                Ok(res)
-            } else if let Some(result) = resp.result {
-                Ok(result.get().to_string())
-            } else {
-                Ok("".to_string())
-            }
+fn call_rpc<R, Params>(node: &str, command: &str, params: Params, retries: usize) -> eyre::Result<R>
+where
+    R: DeserializeOwned,
+    Params: jsonrpsee::core::traits::ToRpcParams + Send + Clone,
+{
+    // jsonrpsee is async AND tokio specific so give it a runtime (and can't use a crate like
+    // pollster)...
+    let runtime = Builder::new_current_thread().enable_io().enable_time().build()?;
+
+    let resp = runtime.block_on(async move {
+        let client = HttpClientBuilder::default().build(node).expect("couldn't build rpc client");
+        let mut resp = client.request(command, params.clone()).await;
+        let mut i = 0;
+        while i < retries && resp.is_err() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let client =
+                HttpClientBuilder::default().build(node).expect("couldn't build rpc client");
+            resp = client.request(command, params.clone()).await;
+            i += 1;
         }
-        Err(e) => Err(Report::msg(format!("Error connecting to {node}: {e}"))),
-    }
+        resp
+    });
+    Ok(resp?)
 }

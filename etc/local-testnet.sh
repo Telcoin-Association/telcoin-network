@@ -10,6 +10,8 @@ START=false
 # must be prefixed with 0x and be a valid account.
 DEV_FUNDS=""
 
+BASEFEE_ADDRESS=""
+
 export TN_BLS_PASSPHRASE="local"
 
 while [ "$1" != "" ]; do
@@ -20,6 +22,10 @@ while [ "$1" != "" ]; do
         --dev-funds )
                 shift
                 DEV_FUNDS=$1
+                ;;
+        --basefee-address )
+                shift
+                BASEFEE_ADDRESS=$1
                 ;;
         * )     echo "Invalid option: $1"
                 exit 1
@@ -92,13 +98,26 @@ else
 
     # Use the validator infos to Create genesis, committee and worker cache yamls.
     # Speed up blocks for testing, use a bogus chain id
-    target/${RELEASE}/telcoin-network genesis \
-        --datadir "${ROOTDIR}" \
-        --chain-id 0x1e7 \
-        --dev-funded-account $DEV_FUNDS \
-        --max-header-delay-ms 1000 \
-        --min-header-delay-ms 1000 \
-        --consensus-registry-owner $DEV_FUNDS
+    if [ "$BASEFEE_ADDRESS" = "" ]; then
+        target/${RELEASE}/telcoin-network genesis \
+            --datadir "${ROOTDIR}" \
+            --chain-id 0x1e7 \
+            --epoch-duration-in-secs 60 \
+            --dev-funded-account $DEV_FUNDS \
+            --max-header-delay-ms 1000 \
+            --min-header-delay-ms 1000 \
+            --consensus-registry-owner $DEV_FUNDS
+    else
+        target/${RELEASE}/telcoin-network genesis \
+            --datadir "${ROOTDIR}" \
+            --chain-id 0x1e7 \
+            --epoch-duration-in-secs 60 \
+            --dev-funded-account $DEV_FUNDS \
+            --basefee-address $BASEFEE_ADDRESS \
+            --max-header-delay-ms 1000 \
+            --min-header-delay-ms 1000 \
+            --consensus-registry-owner $DEV_FUNDS
+    fi
 
     # Copy the generated genesis, committee, worker_cache and parameters to each validator.
     for ((i=0; i<$LENGTH; i++)); do

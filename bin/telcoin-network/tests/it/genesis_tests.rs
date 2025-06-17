@@ -3,7 +3,7 @@
 //! NOTE: this test contains code for executing a proxy/impl pre-genesis
 //! however, the RPC calls don't work. The beginning of the test is left
 //! because the proxy version may be re-prioritized later.
-use crate::util::spawn_local_testnet;
+use crate::util::{spawn_local_testnet, IT_TEST_MUTEX};
 use alloy::{network::EthereumWallet, primitives::utils::parse_ether, providers::ProviderBuilder};
 use core::panic;
 use eyre::OptionExt;
@@ -22,15 +22,17 @@ use tracing::debug;
 
 #[tokio::test]
 async fn test_genesis_with_its() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
+    // sleep for other tests to cleanup
+    std::thread::sleep(std::time::Duration::from_secs(5));
     // spawn testnet for RPC calls
-    let temp_path = tempfile::TempDir::new().expect("tempdir is okay");
+    let temp_path = tempfile::TempDir::with_suffix("genesis_with_its").expect("tempdir is okay");
     spawn_local_testnet(
         temp_path.path(),
         #[cfg(feature = "faucet")]
         "0x0000000000000000000000000000000000000000",
         None,
     )
-    .await
     .expect("failed to spawn testnet");
     // allow time for nodes to start
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -44,9 +46,10 @@ async fn test_genesis_with_its() -> eyre::Result<()> {
             .map(|hex_str| Address::from_hex(hex_str).unwrap())
             .unwrap();
     let tel_supply = U256::try_from(parse_ether("100_000_000_000").unwrap()).unwrap();
-    // 4 million tel staked at genesis for 4 validators
-    let itel_bal = tel_supply - U256::try_from(parse_ether("4_000_000").unwrap()).unwrap();
-
+    let initial_stake = U256::try_from(parse_ether("4_000_000").unwrap()).unwrap();
+    let governance_balance = U256::try_from(parse_ether("10").unwrap()).unwrap();
+    // account for governance safe allocation and 4 million tel staked at genesis for 4 validators
+    let itel_bal = tel_supply - initial_stake - governance_balance;
     let precompiles = NetworkGenesis::fetch_precompile_genesis_accounts(itel_address, itel_bal)
         .expect("its precompiles not found");
     for (address, genesis_account) in precompiles {
@@ -60,7 +63,7 @@ async fn test_genesis_with_its() -> eyre::Result<()> {
             let returned_bal: String = client
                 .request("eth_getBalance", rpc_params!(address))
                 .await
-                .expect("Failed to fetch RWTEL balance");
+                .expect("Failed to fetch iTEL balance");
             let returned_bal = returned_bal.trim_start_matches("0x");
             assert_eq!(U256::from_str_radix(returned_bal, 16)?, itel_bal);
         }
@@ -80,6 +83,9 @@ async fn test_genesis_with_its() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
+    // sleep for other tests to cleanup
+    std::thread::sleep(std::time::Duration::from_secs(5));
     // check that all addresses in expected_deployments are present in precompiles
     let is_address_present = |address: &str, genesis_config: Vec<(Address, GenesisAccount)>| {
         genesis_config
@@ -104,6 +110,8 @@ async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
         "GasService",
         "InterchainTokenService",
         "InterchainTokenFactory",
+        "SafeImpl",
+        "Safe",
     ]
     .iter()
     .filter_map(|&key| its_addresses.get(key).and_then(Value::as_str))
@@ -128,8 +136,10 @@ async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
                     );
 
                     if key == "InterchainTEL" {
+                        let governance_bal = U256::try_from(parse_ether("10").unwrap()).unwrap();
+                        let expected_bal = some_bal - governance_bal;
                         assert!(
-                            genesis_account.balance == some_bal,
+                            genesis_account.balance == expected_bal,
                             "ITEL balance should be 100 billion TEL minus genesis validator stake"
                         );
                     }
@@ -142,6 +152,9 @@ async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
+    // sleep for other tests to cleanup
+    std::thread::sleep(std::time::Duration::from_secs(5));
     // fetch registry impl bytecode from compiled output in tn-contracts
     let json_val = RethEnv::fetch_value_from_json_str(
         CONSENSUS_REGISTRY_JSON,
@@ -150,14 +163,14 @@ async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
     let registry_deployed_bytecode = json_val.as_str().ok_or_eyre("Couldn't fetch bytecode")?;
 
     // spawn testnet for RPC calls
-    let temp_path = tempfile::TempDir::new().expect("tempdir is okay");
+    let temp_path =
+        tempfile::TempDir::with_suffix("genesis_with_consensus_registry").expect("tempdir is okay");
     spawn_local_testnet(
         temp_path.path(),
         #[cfg(feature = "faucet")]
         "0x0000000000000000000000000000000000000000",
         None,
     )
-    .await
     .expect("failed to spawn testnet");
     // allow time for nodes to start
     tokio::time::sleep(Duration::from_secs(10)).await;

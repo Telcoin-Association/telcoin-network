@@ -4853,17 +4853,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jsonrpc"
-version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3662a38d341d77efecb73caf01420cfa5aa63c0253fd7bc05289ef9f6616e1bf"
-dependencies = [
- "base64 0.13.1",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "jsonrpsee"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11438,16 +11427,17 @@ name = "telcoin-network"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "bs58",
  "cfg-if",
  "clap",
  "const-hex",
  "const-str",
+ "dirs-next",
  "ethereum-tx-sign",
  "eyre",
  "fdlimit",
  "futures",
  "gcloud-sdk",
- "jsonrpc",
  "jsonrpsee",
  "k256",
  "nix 0.29.0",
@@ -11457,6 +11447,7 @@ dependencies = [
  "rpassword",
  "secp256k1 0.31.0",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "tn-config",
  "tn-faucet",
@@ -12028,9 +12019,9 @@ dependencies = [
  "roaring",
  "secp256k1 0.31.0",
  "serde",
- "serde_json",
  "serde_repr",
  "serde_with 2.3.3",
+ "serde_yaml",
  "thiserror 1.0.69",
  "tn-utils",
  "tokio",

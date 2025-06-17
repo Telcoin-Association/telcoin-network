@@ -342,10 +342,10 @@ fn test_connected_peer_methods() {
     assert!(connected_ids.contains(&&connected_peer_id));
 
     // Test connected_or_dialing_peers
-    let connected_or_dialing: Vec<_> = all_peers.connected_or_dialing_peers().collect();
+    let connected_or_dialing: Vec<_> = all_peers.connected_or_dialing_peers();
     assert_eq!(connected_or_dialing.len(), 2);
-    assert!(connected_or_dialing.contains(&&connected_peer_id));
-    assert!(connected_or_dialing.contains(&&dialing_peer_id));
+    assert!(connected_or_dialing.contains(&connected_peer_id));
+    assert!(connected_or_dialing.contains(&dialing_peer_id));
 
     // Test is_peer_connected_or_disconnecting
     assert!(all_peers.is_peer_connected_or_disconnecting(&connected_peer_id));

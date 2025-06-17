@@ -9,7 +9,7 @@ use tn_types::{Address, Epoch};
 /// The system address.
 pub(super) const SYSTEM_ADDRESS: Address = address!("fffffffffffffffffffffffffffffffffffffffe");
 
-/// The address for consensus registry impl.
+/// The address for consensus registry.
 pub const CONSENSUS_REGISTRY_ADDRESS: Address =
     address!("07E17e17E17e17E17e17E17E17E17e17e17E17e1");
 
@@ -152,7 +152,21 @@ sol!(
         function getCommitteeValidators(uint32 epoch) external view returns (ValidatorInfo[] memory);
         /// Fetch the `ValidatorInfo` for a give address.
         function getValidator(address validatorAddress) external view returns (ValidatorInfo memory);
+
+        #[cfg(any(feature = "test-utils", test))]
+        /// Mint an NFT for validator to stake.
+        function mint(address validatorAddress) external override onlyOwner;
+
+        #[cfg(any(feature = "test-utils", test))]
+        /// Stake to the consensus registry.
+        function stake(bytes calldata blsPubkey) external override onlyOwner;
+
+        #[cfg(any(feature = "test-utils", test))]
+        /// Activate node for committee selection.
+        /// Normally called by staker after node is synced.
+        function activate() external override whenNotPaused;
     }
+
 );
 
 /// The state of consensus retrieved from chain.

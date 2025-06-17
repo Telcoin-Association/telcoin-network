@@ -14,7 +14,7 @@ use secp256k1::{
 };
 use std::{path::Path, str::FromStr, sync::Arc};
 use tn_types::{
-    adiri_chain_spec_arc, adiri_genesis, calculate_transaction_root, keccak256, now, AccessList,
+    calculate_transaction_root, keccak256, now, test_chain_spec_arc, test_genesis, AccessList,
     Address, Batch, Block, BlockBody, Bytes, Encodable2718, EthSignature, ExecHeader,
     ExecutionKeypair, Genesis, GenesisAccount, RecoveredBlock, SealedHeader, TaskManager,
     Transaction, TransactionSigned, TxEip1559, TxHash, TxKind, WorkerId, B256,
@@ -29,7 +29,7 @@ impl RethEnv {
         db_path: P,
         task_manager: &TaskManager,
     ) -> eyre::Result<Self> {
-        Self::new_for_temp_chain(adiri_chain_spec_arc(), db_path, task_manager)
+        Self::new_for_temp_chain(test_chain_spec_arc(), db_path, task_manager)
     }
 
     /// Test utility to execute batch and return execution outcome.
@@ -328,7 +328,7 @@ pub fn get_gas_price(reth_env: &RethEnv) -> u128 {
 /// Create a random encoded transaction.
 pub fn transaction() -> Vec<u8> {
     let mut tx_factory = TransactionFactory::new_random();
-    let chain = adiri_chain_spec_arc();
+    let chain = Arc::new(test_genesis().into());
     let gas_price = 100_000;
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
 
@@ -379,15 +379,6 @@ pub fn batch_with_transactions(num_of_transactions: usize, worker_id: WorkerId) 
     }
 
     Batch::new_for_test(transactions, ExecHeader::default(), worker_id)
-}
-
-/// Adiri genesis with funded [TransactionFactory] default account.
-pub fn test_genesis() -> Genesis {
-    let genesis = adiri_genesis();
-    let default_address = TransactionFactory::default().address();
-    let default_factory_account =
-        vec![(default_address, GenesisAccount::default().with_balance(U256::MAX))];
-    genesis.extend_accounts(default_factory_account)
 }
 
 /// Helper function to seed an instance of Genesis with accounts from a random batch.

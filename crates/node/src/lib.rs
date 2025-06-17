@@ -40,11 +40,10 @@ where
         .enable_time()
         .build()?;
 
-    let res = runtime.block_on(async move {
-        // create the epoch manager
-        let mut epoch_manager = EpochManager::new(builder, tn_datadir, passphrase)?;
-        epoch_manager.run().await
-    });
+    // create the epoch manager
+    let mut epoch_manager = EpochManager::new(builder, tn_datadir, passphrase)?;
+    // run the node
+    let res = runtime.block_on(async move { epoch_manager.run().await });
 
     // shutdown background tasks
     runtime.shutdown_background();

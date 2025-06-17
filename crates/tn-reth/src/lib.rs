@@ -24,7 +24,7 @@ use crate::{
 use alloy::{
     consensus::Transaction as _,
     hex,
-    primitives::{address, Bytes, ChainId},
+    primitives::{Bytes, ChainId},
     sol_types::{SolCall, SolConstructor},
 };
 use alloy_evm::Evm;
@@ -37,7 +37,7 @@ use jsonrpsee::Methods;
 use reth::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, DiscoveryArgs, EngineArgs, NetworkArgs,
-        PayloadBuilderArgs, PruningArgs, RpcServerArgs, TxPoolArgs,
+        PayloadBuilderArgs, PruningArgs, TxPoolArgs,
     },
     builder::NodeConfig,
     network::transactions::config::TransactionPropagationKind,
@@ -87,13 +87,14 @@ use reth_revm::{
     DatabaseCommit, State,
 };
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
+use rpc_server_args::RpcServerArgs;
 use serde_json::Value;
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr},
     ops::RangeInclusive,
     path::Path,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 use system_calls::{
@@ -101,12 +102,12 @@ use system_calls::{
     EpochState, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
 };
 use tempfile::TempDir;
-use tn_config::{Config, ConfigFmt, ConfigTrait, NodeInfo, CONSENSUS_REGISTRY_JSON};
+use tn_config::{NodeInfo, CONSENSUS_REGISTRY_JSON};
 use tn_types::{
-    adiri_chain_spec_arc, Address, BlockBody, BlockHashOrNumber, BlockHeader as _, BlockNumHash,
-    BlockNumber, Epoch, ExecHeader, Genesis, GenesisAccount, RecoveredBlock, SealedBlock,
-    SealedHeader, TaskManager, TaskSpawner, TransactionSigned, B256, ETHEREUM_BLOCK_GAS_LIMIT_30M,
-    U256,
+    gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber, BlockHeader as _,
+    BlockNumHash, BlockNumber, Epoch, ExecHeader, Genesis, GenesisAccount, RecoveredBlock,
+    SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionSigned, B256,
+    ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
 };
 use tracing::{debug, error, info, warn};
 use traits::{TNPrimitives, TelcoinNode};
@@ -145,19 +146,29 @@ pub use txn_pool::*;
 use worker::WorkerNetwork;
 pub mod error;
 mod evm;
+pub mod rpc_server_args;
 pub mod system_calls;
 pub mod worker;
 
-#[cfg(feature = "test-utils")]
+#[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;
 
-/// The governance address.
-pub const GOVERNANCE_ADDRESS: Address = address!("fffffffffffffffffffffffffffffffffffff7e1");
+/// This will contain the address to receive base fees.  It is set per chain (or not if None)
+/// will not change.  Implemented as a static OnceLock to work around the Reth lib interface.
+static BASEFEE_ADDRESS: OnceLock<Option<Address>> = OnceLock::new();
 
-/// A helper to parse a [`Genesis`](alloy_genesis::Genesis) as argument or from disk.
-fn parse_genesis(s: &str) -> eyre::Result<RethChainSpec> {
-    let genesis: Genesis = Config::load_from_path_or_default(Path::new(s), ConfigFmt::YAML)?;
-    Ok(genesis.into())
+/// Return the chains basefee address if set.
+/// Note the basefee address is set once for the chain and will not change (outside of a hard fork).
+pub fn basefee_address() -> Option<Address> {
+    *BASEFEE_ADDRESS.get()?
+}
+
+/// Set the basefee address.  This will only work on the first call and should be during program
+/// initialization. Calling more than once will do nothing, not calling early can lead to an unset
+/// basefee address and a chain fork.
+fn set_basefee_address(address: Option<Address>) {
+    // Ignore the error.  Should probably panic on error but this will break some test environments.
+    let _ = BASEFEE_ADDRESS.set(address);
 }
 
 /// Rpc Server type, used for getting the node started.
@@ -187,37 +198,9 @@ pub type ToTree = std::sync::mpsc::Sender<
 /// This type is a SealedBlock with a list of senders that match the transactions in the block.
 pub type BlockWithSenders = RecoveredBlock<reth_ethereum_primitives::Block>;
 
-/// Defaults for chain spec clap parser.
-///
-/// Wrapper to intercept "adiri" chain spec. If not adiri, load provided genesis.
-pub fn clap_genesis_parser(value: &str) -> eyre::Result<Arc<RethChainSpec>, eyre::Error> {
-    let chain = match value {
-        "adiri" => adiri_chain_spec_arc(),
-        _ => Arc::new(parse_genesis(value)?),
-    };
-
-    Ok(chain)
-}
-
 /// Reth specific command line args.
 #[derive(Debug, Parser, Clone)]
 pub struct RethCommand {
-    /// The chain this node is running.
-    ///
-    /// Possible values are either a built-in chain or the path to a chain specification file.
-    ///
-    /// Defaults to the custom
-    #[arg(
-        long,
-        value_name = "CHAIN_OR_PATH",
-        verbatim_doc_comment,
-        default_value = "adiri",
-        default_value_if("dev", "true", "adiri"),
-        value_parser = clap_genesis_parser,
-        required = false,
-    )]
-    pub chain: Arc<RethChainSpec>,
-
     /// All rpc related arguments
     #[clap(flatten)]
     pub rpc: RpcServerArgs,
@@ -282,11 +265,12 @@ impl RethConfig {
         instance: Option<u16>,
         datadir: P,
         with_unused_ports: bool,
+        chain: Arc<RethChainSpec>,
     ) -> Self {
         // create a reth DatadirArgs from tn datadir
         let datadir = path_to_datadir(datadir.as_ref());
 
-        let RethCommand { chain, mut rpc, txpool, db } = reth_config;
+        let RethCommand { mut rpc, txpool, db } = reth_config;
         Self::validate_rpc_modules(&mut rpc.http_api);
         Self::validate_rpc_modules(&mut rpc.ws_api);
         // We don't just use Default for these Reth args.
@@ -403,7 +387,7 @@ impl RethConfig {
             instance,
             datadir,
             network,
-            rpc,
+            rpc: rpc.into(),
             txpool,
             builder,
             debug,
@@ -511,12 +495,15 @@ impl RethEnv {
         reth_config: &RethConfig,
         task_manager: &TaskManager,
         database: RethDb,
+        basefee_address: Option<Address>,
+        rewards_counter: RewardsCounter,
     ) -> eyre::Result<Self> {
         let node_config = reth_config.0.clone();
-        let evm_config = TnEvmConfig::new(reth_config.0.chain.clone());
+        let evm_config = TnEvmConfig::new(reth_config.0.chain.clone(), rewards_counter);
         let provider_factory = Self::init_provider_factory(&node_config, database)?;
         let blockchain_provider = BlockchainProvider::new(provider_factory.clone())?;
         let task_spawner = task_manager.get_spawner();
+        set_basefee_address(basefee_address);
 
         Ok(Self { node_config, blockchain_provider, evm_config, task_spawner })
     }
@@ -719,12 +706,15 @@ impl RethEnv {
         // see reth::EngineApiTreeHandler::on_canonical_chain_update
         let chain_update = NewCanonicalChain::Commit { new: blocks };
         let canonical_head = chain_update.tip();
+        let (epoch, round) =
+            Self::deconstruct_nonce(<FixedBytes<8> as Into<u64>>::into(canonical_head.nonce));
         info!(
             target: "engine",
-            "canonical head for round {:?}: {:?} - {:?}",
-            <FixedBytes<8> as Into<u64>>::into(canonical_head.nonce),
+            "canonical head for epoch {:?} round {:?}: {:?} - {:?}",
+            epoch,
+            round,
             canonical_head.number,
-            canonical_head.hash()
+            canonical_head.hash(),
         );
 
         let notification = chain_update.to_chain_notification();
@@ -733,6 +723,13 @@ impl RethEnv {
         self.canonical_in_memory_state().notify_canon_state(notification);
 
         Ok(())
+    }
+
+    /// Helper to deconstruct block nonce into epoch and round.
+    pub fn deconstruct_nonce(nonce: u64) -> (u32, u32) {
+        let epoch = (nonce >> 32) as u32; // Extract the upper 32 bits
+        let round = nonce as u32; // Extract the lower 32 bits (truncates upper bits)
+        (epoch, round)
     }
 
     /// Look up and return the sealed header for hash.
@@ -934,7 +931,7 @@ impl RethEnv {
         };
         let reth_config = RethConfig(node_config);
         let database = Self::new_database(&reth_config, db_path)?;
-        Self::new(&reth_config, task_manager, database)
+        Self::new(&reth_config, task_manager, database, None, RewardsCounter::default())
     }
 
     /// Convenience method for compiling storage and bytecode to include genesis.
@@ -1060,25 +1057,20 @@ impl RethEnv {
         Ok(result)
     }
 
-    /// Read the latest committee from the [ConsensusRegistry] on-chain.
+    /// Read the latest committee and epoch information from the [ConsensusRegistry] on-chain.
     ///
     /// The protocol needs the BLS pubkey for the authorities.
     /// - get current epoch info
     /// - getValidator token id by address
     /// - getValidator info by token id
     pub fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
-        // read current epoch number from chain
-        let last_block_num = self.blockchain_provider.last_block_number()?;
-        let canonical_tip = self.header_by_number(last_block_num)?.ok_or_eyre(
-            "Canonical tip missing from blockchain provider reading committee from chain",
-        )?;
-
-        debug!(target: "engine", ?canonical_tip, "retrieving epoch state from canonical tip");
-
         // create EVM with latest state
-        let latest = self.latest()?;
-        let state = StateProviderDatabase::new(latest);
+        let canonical_tip = self.canonical_tip();
+        debug!(target: "engine", ?canonical_tip, "retrieving epoch state from canonical tip");
+        let state_provider = self.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
+        let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(state).with_bundle_update().build();
+        debug!(target: "engine", state=?db.bundle_state, hashes=?db.block_hashes, "retrieving epoch state from canonical tip");
         let mut tn_evm = self
             .evm_config
             .evm_factory()
@@ -1089,8 +1081,7 @@ impl RethEnv {
 
         // current epoch info
         let epoch_info = self.get_current_epoch_info(&mut tn_evm)?;
-
-        debug!(target: "engine", ?epoch_info, "retrieving closing timestamp for previous epoch...");
+        debug!(target: "engine", ?epoch, ?epoch_info, "retrieved epoch info from canonical tip for next epoch");
 
         // retrieve closing timestamp for previous epoch
         let epoch_start = self
@@ -1191,7 +1182,9 @@ impl RethEnv {
             Err(e) => {
                 // fatal error
                 error!(target: "engine", ?caller, ?contract, "failed to read state: {}", e);
-                return Err(TnRethError::EVMCustom(format!("getValidatorsCall failed: {e}")));
+                return Err(TnRethError::EVMCustom(format!(
+                    "system call failed reading state: {e}"
+                )));
             }
         };
 
@@ -1202,6 +1195,7 @@ impl RethEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::TransactionFactory;
     use alloy::primitives::utils::parse_ether;
     use rand::{rngs::StdRng, SeedableRng as _};
     use tempfile::TempDir;
@@ -1244,19 +1238,48 @@ mod tests {
         }
     }
 
+    /// Build a block from TNPayload and transactions.
+    fn execute_payload_and_update_canonical_chain(
+        reth_env: &RethEnv,
+        payload: TNPayload,
+        transactions: Vec<Vec<u8>>,
+    ) -> eyre::Result<ExecutedBlockWithTrieUpdates> {
+        let block = reth_env.build_block_from_batch_payload(payload, transactions)?;
+        // update chain state - normally handled by tn_engine::payload_builder
+        let canonical_header = block.recovered_block.clone_sealed_header();
+        let canonical_in_memory_state = reth_env.blockchain_provider.canonical_in_memory_state();
+        canonical_in_memory_state
+            .update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
+        canonical_in_memory_state.set_canonical_head(canonical_header.clone());
+        reth_env.finish_executing_output(vec![block.clone()])?;
+        reth_env.finalize_block(canonical_header.clone())?;
+        Ok(block)
+    }
+
     #[tokio::test]
-    async fn test_validator_shuffle() -> eyre::Result<()> {
+    async fn test_close_epochs() -> eyre::Result<()> {
         let validator_1 = Address::from_slice(&[0x11; 20]);
         let validator_2 = Address::from_slice(&[0x22; 20]);
         let validator_3 = Address::from_slice(&[0x33; 20]);
         let validator_4 = Address::from_slice(&[0x44; 20]);
         let validator_5 = Address::from_slice(&[0x55; 20]);
 
+        // create validator wallet for staking later
+        let mut new_validator_eoa =
+            TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
+
         // create initial validators for testing
-        let initial_validators = [validator_1, validator_2, validator_3, validator_4, validator_5];
+        let all_validators = [
+            validator_1,
+            validator_2,
+            validator_3,
+            validator_4,
+            validator_5,
+            new_validator_eoa.address(),
+        ];
 
         // create validator info objects for each address
-        let validators: Vec<_> = initial_validators
+        let mut validators: Vec<_> = all_validators
             .iter()
             .enumerate()
             .map(|(i, addr)| {
@@ -1267,7 +1290,7 @@ mod tests {
                 NodeInfo {
                     name: format!("validator-{i}"),
                     bls_public_key: *bls_pubkey,
-                    primary_info: NodeP2pInfo::default(),
+                    p2p_info: NodeP2pInfo::default(),
                     execution_address: *addr,
                     proof_of_possession: BlsSignature::default(),
                 }
@@ -1286,21 +1309,76 @@ mod tests {
             epochDuration: epoch_duration,
         };
 
-        let owner = Address::random();
+        // create genesis with funded governance safe
+        let mut governance_multisig =
+            TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+        let governance = governance_multisig.address();
+        let tmp_genesis = adiri_genesis().extend_accounts([
+            (
+                governance,
+                GenesisAccount::default().with_balance(U256::from((50_000_000 * 10) ^ 18)), // 50mil TEL
+            ),
+            (
+                new_validator_eoa.address(),
+                GenesisAccount::default()
+                    .with_balance(initial_stake_config.stakeAmount.saturating_mul(U256::from(2))), // double stake
+            ),
+        ]);
+
+        // remove last validator so only 5 form the initial committees
+        let new_validator = validators.pop().expect("six validators");
+
+        // update genesis with consensus registry storage
         let genesis = RethEnv::create_consensus_registry_genesis_account(
             validators.clone(),
-            adiri_genesis(),
+            tmp_genesis,
             initial_stake_config.clone(),
-            owner,
+            governance,
         )?;
+
+        // update genesis again to include stake for new validator
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let calldata =
+            ConsensusRegistry::mintCall { validatorAddress: new_validator.execution_address }
+                .abi_encode()
+                .into();
+        let mint_nft = governance_multisig.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(CONSENSUS_REGISTRY_ADDRESS),
+            U256::ZERO,
+            calldata,
+        );
+        let calldata = ConsensusRegistry::stakeCall {
+            blsPubkey: new_validator.bls_public_key.compress().into(),
+        }
+        .abi_encode()
+        .into();
+        let stake_tx = new_validator_eoa.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(CONSENSUS_REGISTRY_ADDRESS),
+            initial_stake_config.stakeAmount,
+            calldata,
+        );
+        let calldata = ConsensusRegistry::activateCall {}.abi_encode().into();
+        let activate_tx = new_validator_eoa.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(CONSENSUS_REGISTRY_ADDRESS),
+            U256::ZERO,
+            calldata,
+        );
 
         // create new env with initialized consensus registry for tests
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::new("Test Task Manager");
-        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
-        let expected_epoch = 0;
+        let mut expected_epoch = 0;
         let expected_committee = validators.iter().map(|v| v.execution_address).collect();
         let mut expected_epoch_info = ConsensusRegistry::EpochInfo {
             committee: expected_committee,
@@ -1333,27 +1411,37 @@ mod tests {
         }
 
         // close epoch with deterministic signature as source of randomness
-        // and execute the first block
-        let consensus_output = consensus_output_for_tests();
+        // and execute the first block with txs for new validator to stake
+        let mut consensus_output = consensus_output_for_tests();
+        consensus_output.close_epoch = false;
         let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
-        debug!(target:"evm", "payload for test: {:#?}", payload);
-        let block1 = reth_env.build_block_from_batch_payload(payload, vec![])?;
-        // update chain state - normally handled by tn_engine::payload_builder
+        let block1 = execute_payload_and_update_canonical_chain(
+            &reth_env,
+            payload,
+            vec![mint_nft, stake_tx, activate_tx],
+        )?;
         let canonical_header = block1.recovered_block.clone_sealed_header();
-        let canonical_in_memory_state = reth_env.blockchain_provider.canonical_in_memory_state();
-        canonical_in_memory_state
-            .update_chain(NewCanonicalChain::Commit { new: vec![block1.clone()] });
-        canonical_in_memory_state.set_canonical_head(canonical_header.clone());
-        reth_env.finish_executing_output(vec![block1])?;
-        reth_env.finalize_block(canonical_header.clone())?;
+
+        // now close the first epoch
+        expected_epoch += 1;
+        let consensus_output = consensus_output_for_tests();
+        let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
+        let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let canonical_header = block2.recovered_block.clone_sealed_header();
+
+        // now close the second epoch so the new validator is active
+        let consensus_output = consensus_output_for_tests();
+        let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
+        let block3 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let canonical_header = block3.recovered_block.clone_sealed_header();
 
         // read new epoch state
         let EpochState { epoch, epoch_info, validators: committee, epoch_start } =
             reth_env.epoch_state_from_canonical_tip()?;
         debug!(target:"evm", ?epoch, ?epoch_info, ?committee, ?epoch, "new epoch state from canonical tip");
         // assert epoch info updated
-        let expected_epoch = expected_epoch + 1;
-        expected_epoch_info.blockHeight = 2;
+        expected_epoch += 1;
+        expected_epoch_info.blockHeight = 4;
         assert_eq!(expected_epoch, epoch);
         assert_eq!(epoch_start, canonical_header.timestamp);
         assert_eq!(epoch_info, expected_epoch_info);
@@ -1376,8 +1464,13 @@ mod tests {
             .call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut tn_evm, calldata)?;
 
         // ensure validators in increasing order by address
-        let expected_new_committee =
-            vec![validator_1, validator_2, validator_3, validator_4, validator_5];
+        let expected_new_committee = vec![
+            validator_1,
+            validator_2,
+            validator_3,
+            validator_4,
+            new_validator.execution_address,
+        ];
 
         let expected = ConsensusRegistry::EpochInfo {
             committee: expected_new_committee,

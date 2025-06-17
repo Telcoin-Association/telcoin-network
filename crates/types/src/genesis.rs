@@ -5,42 +5,100 @@
 //!
 //! adiri is the current name for multi-node testnet.
 
-use crate::{Genesis, MIN_PROTOCOL_BASE_FEE};
+use crate::{now, Genesis, MIN_PROTOCOL_BASE_FEE};
+use alloy::{
+    genesis::GenesisAccount,
+    primitives::{address, U256},
+};
 use reth_chainspec::ChainSpec;
 use std::sync::Arc;
 
-/// adiri genesis
+/// test genesis
 ///
-/// NOTE: reth does not support deserializing certain fields, including base_fee_per_gas.
-///
-/// After deserializing from string, update genesis with TN-specific values.
-pub fn adiri_genesis() -> Genesis {
-    let yaml = adiri_genesis_string();
-    let genesis: Genesis = serde_json::from_str(&yaml).expect("serde parse valid adiri yaml");
-    // set min base fee for genesis
-    //
-    // TODO: set blob gas here
-    genesis.with_base_fee(Some(MIN_PROTOCOL_BASE_FEE as u128))
+/// Provide a genesis for running tests.
+/// With funded [TransactionFactory] default account.
+/// This is usable for many unit tests but it lacks the genesis contracts and storage.
+/// Go throuigh ['GenesisArgs'] to generate a complete genesis.
+pub fn test_genesis() -> Genesis {
+    let mut genesis = Genesis { timestamp: now(), ..Default::default() };
+    set_genesis_defaults(&mut genesis);
+    genesis.config.chain_id = 2017;
+    let default_factory_account = vec![
+        (
+            // Default transaction factory
+            address!("0xb14d3c4f5fbfbcfb98af2d330000d49c95b93aa7"),
+            GenesisAccount::default().with_balance(U256::MAX),
+        ),
+        // Various accounts used by faucet.
+        (
+            address!("0xe626ce81714cb7777b1bf8ad2323963fb3398ad5"),
+            GenesisAccount::default().with_balance(U256::MAX),
+        ),
+        (
+            address!("0xb3fabbd1d2edde4d9ced3ce352859ce1bebf7907"),
+            GenesisAccount::default().with_balance(U256::MAX),
+        ),
+        (
+            address!("0xa3478861957661b2d8974d9309646a71271d98b9"),
+            GenesisAccount::default().with_balance(U256::MAX),
+        ),
+        (
+            address!("0xe69151677e5aec0b4fc0a94bfcaf20f6f0f975eb"),
+            GenesisAccount::default().with_balance(U256::MAX),
+        ),
+    ];
+    genesis.extend_accounts(default_factory_account)
 }
 
-/// adiri chain spec parsed from genesis.
-pub fn adiri_chain_spec() -> ChainSpec {
+/// Set the genesis default config.
+pub fn set_genesis_defaults(genesis: &mut Genesis) {
+    // Configure hardforks or Reth will be cross with us...
+    genesis.config.homestead_block = Some(0);
+    genesis.config.eip150_block = Some(0);
+    genesis.config.eip155_block = Some(0);
+    genesis.config.eip158_block = Some(0);
+    genesis.config.byzantium_block = Some(0);
+    genesis.config.constantinople_block = Some(0);
+    genesis.config.petersburg_block = Some(0);
+    genesis.config.istanbul_block = Some(0);
+    genesis.config.berlin_block = Some(0);
+    genesis.config.london_block = Some(0);
+    genesis.config.cancun_time = None; //Some(0);
+    genesis.config.shanghai_time = Some(0);
+    genesis.config.prague_time = None;
+    genesis.config.osaka_time = None;
+    // Configure some misc genesis stuff.
+    // chain_id and maybe timestamp should probably be a command line option...
+    genesis.timestamp = now();
+    genesis.config.terminal_total_difficulty_passed = true;
+    genesis.config.terminal_total_difficulty = Some(U256::from(0));
+    genesis.gas_limit = 30_000_000;
+    genesis.base_fee_per_gas = Some(MIN_PROTOCOL_BASE_FEE as u128);
+}
+
+/// test chain spec wrapped in [Arc].
+pub fn test_chain_spec_arc() -> Arc<ChainSpec> {
+    let chain: ChainSpec = test_genesis().into();
+    Arc::new(chain)
+}
+
+/// adiri (testnet) genesis
+pub fn adiri_genesis() -> Genesis {
+    serde_yaml::from_str(TESTNET_GENESIS).expect("serde parse valid adiri yaml")
+}
+
+/// adiri (testnet) chain spec parsed from genesis.
+fn _adiri_chain_spec() -> ChainSpec {
     adiri_genesis().into()
 }
 
-/// adiri chain spec parsed from genesis and wrapped in [Arc].
-pub fn adiri_chain_spec_arc() -> Arc<ChainSpec> {
-    Arc::new(adiri_chain_spec())
+/// adiri (testnet) chain spec parsed from genesis and wrapped in [Arc].
+fn _adiri_chain_spec_arc() -> Arc<ChainSpec> {
+    Arc::new(_adiri_chain_spec())
 }
 
-/// adiri genesis string in yaml format.
-///
-/// Seed "Bob" and [0; 32] seed addresses.
-fn adiri_genesis_string() -> String {
-    adiri_genesis_raw().to_string()
-}
-
-/// Static strig for adiri genesis.
+// The raw strings for the testnet genesis and config.
+/// Static strig for adiri (testnet) genesis.
 ///
 /// Used by CLI and other methods above.
 ///
@@ -54,74 +112,15 @@ fn adiri_genesis_string() -> String {
 /// - 0xb3fabbd1d2edde4d9ced3ce352859ce1bebf7907
 /// - 0xa3478861957661b2d8974d9309646a71271d98b9
 /// - 0xe69151677e5aec0b4fc0a94bfcaf20f6f0f975eb
-fn adiri_genesis_raw() -> &'static str {
-    r#"
-{
-    "nonce": "0x0",
-    "timestamp": "0x6553A8CC",
-    "gasLimit": "0x1c9c380",
-    "difficulty": "0x0",
-    "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
-    "coinbase": "0x0000000000000000000000000000000000000000",
-    "alloc": {
-        "0xe626ce81714cb7777b1bf8ad2323963fb3398ad5": {
-            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
-        },
-        "0xb3fabbd1d2edde4d9ced3ce352859ce1bebf7907": {
-            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
-        },
-        "0xa3478861957661b2d8974d9309646a71271d98b9": {
-            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
-        },
-        "0xe69151677e5aec0b4fc0a94bfcaf20f6f0f975eb": {
-            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
-        },
-        "0x781e3f2014d83dB831df4cAA3BA78aEc57396B50": {
-            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
-        },
-        "0x4f264cc3709f35f39b1fc0c2c1110141b8c44370": {
-            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
-        },
-        "0xc1612C97537c2CC62a11FC4516367AB6F62d4B23": {
-            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
-        },
-        "0x649a2C65C69130a2Bfe891965A267DD39233cb3a": {
-            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
-        },
-        "0x9F35A76bE2a3A84FF0c0A6365CD3C5CeB3a7FD97": {
-            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
-        },
-        "0x8133Be861AD5C9Dea396E5dE5BA1B0154E87e925": {
-            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
-        },
-        "0xDEC366b889A53B93CFa561076c03C18b0b4D6C93": {
-            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
-        },
-        "0x8903d35F5F941bc0C6977DBf40d0cB067473e8f2": {
-            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
-        },
-        "0x0e26AdE1F5A99Bd6B5D40f870a87bFE143Db68B6": {
-            "balance": "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
-        }
-    },
-    "number": "0x0",
-    "gasUsed": "0x0",
-    "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
-    "config": {
-        "chainId": 2017,
-        "homesteadBlock": 0,
-        "eip150Block": 0,
-        "eip155Block": 0,
-        "eip158Block": 0,
-        "byzantiumBlock": 0,
-        "constantinopleBlock": 0,
-        "petersburgBlock": 0,
-        "istanbulBlock": 0,
-        "berlinBlock": 0,
-        "londonBlock": 0,
-        "terminalTotalDifficulty": 0,
-        "terminalTotalDifficultyPassed": true,
-        "shanghaiTime": 0
-    }
-}"#
-}
+pub const TESTNET_GENESIS: &str = include_str!("../../../chain-configs/testnet/genesis.yaml");
+pub const TESTNET_COMMITTEE: &str = include_str!("../../../chain-configs/testnet/committee.yaml");
+pub const TESTNET_WORKER_CACHE: &str =
+    include_str!("../../../chain-configs/testnet/worker_cache.yaml");
+pub const TESTNET_PARAMETERS: &str = include_str!("../../../chain-configs/testnet/parameters.yaml");
+
+// The raw strings for the mainnet genesis and config.
+pub const MAINNET_GENESIS: &str = include_str!("../../../chain-configs/mainnet/genesis.yaml");
+pub const MAINNET_COMMITTEE: &str = include_str!("../../../chain-configs/mainnet/committee.yaml");
+pub const MAINNET_WORKER_CACHE: &str =
+    include_str!("../../../chain-configs/mainnet/worker_cache.yaml");
+pub const MAINNET_PARAMETERS: &str = include_str!("../../../chain-configs/mainnet/parameters.yaml");

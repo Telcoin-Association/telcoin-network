@@ -5,8 +5,6 @@ use std::str::FromStr;
 use tn_reth::{dirs::DataDirPath, MaybePlatformPath};
 use tn_types::{Address, U256};
 
-pub use tn_reth::clap_genesis_parser;
-
 /// Create a default path for the node.
 pub fn tn_platform_path(value: &str) -> eyre::Result<MaybePlatformPath<DataDirPath>> {
     let path = if value.is_empty() { "telcoin-network" } else { value };

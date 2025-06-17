@@ -36,6 +36,9 @@ alloy = { workspace = true }
 tn-reth = { workspace = true }
 tn-config = { workspace = true }
 rayon = { workspace = true }
+dirs-next = { workspace = true }
+bs58 = { workspace = true }
+serde_yaml = { workspace = true }
 
 # main
 rpassword = { workspace = true }
@@ -50,8 +53,6 @@ rand_chacha = { workspace = true }
 # Used for integration testing.
 ethereum-tx-sign = "6.1.3"
 const-hex = "1.12.0"
-# Alternate sync json rpc lib- just for integration testing.
-jsonrpc = "0.18.0"
 
 # faucet-specific
 gcloud-sdk = { version = "=0.24.6", default-features = false, features = [

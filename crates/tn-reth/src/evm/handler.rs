@@ -16,7 +16,7 @@ use reth_revm::{
 };
 use tn_types::Address;
 
-use crate::GOVERNANCE_ADDRESS;
+use crate::basefee_address;
 
 /// The handler that executes TN evm types.
 ///
@@ -35,7 +35,7 @@ impl<EVM> TNEvmHandler<EVM> {
 
 impl<EVM> Default for TNEvmHandler<EVM> {
     fn default() -> Self {
-        TNEvmHandler::new(Some(GOVERNANCE_ADDRESS))
+        TNEvmHandler::new(basefee_address())
     }
 }
 

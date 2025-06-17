@@ -4,8 +4,8 @@ use eyre::Context;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, ffi::OsStr, fs, path::Path, sync::Arc};
 use tn_types::{
-    adiri_genesis, verify_proof_of_possession_bls, Address, BlsPublicKey, BlsSignature, Committee,
-    CommitteeBuilder, Genesis, GenesisAccount, Multiaddr, NetworkPublicKey, NodeP2pInfo,
+    address, test_genesis, verify_proof_of_possession_bls, Address, BlsPublicKey, BlsSignature,
+    Committee, CommitteeBuilder, Genesis, GenesisAccount, Multiaddr, NetworkPublicKey, NodeP2pInfo,
     WorkerCache, WorkerIndex,
 };
 use tracing::{info, warn};
@@ -21,6 +21,7 @@ pub const ERC1967PROXY_JSON: &str =
     include_str!("../../../tn-contracts/artifacts/ERC1967Proxy.json");
 pub const ITS_CFG_YAML: &str =
     include_str!("../../../tn-contracts/deployments/genesis/its-config.yaml");
+pub const GOVERNANCE_SAFE_ADDRESS: Address = address!("00000000000000000000000000000000000007a0");
 
 /// The struct for starting a network at genesis.
 pub struct NetworkGenesis {
@@ -30,16 +31,10 @@ pub struct NetworkGenesis {
     validators: BTreeMap<BlsPublicKey, NodeInfo>,
 }
 
-impl Default for NetworkGenesis {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl NetworkGenesis {
     /// Create new version of [NetworkGenesis] using the adiri genesis [ChainSpec].
-    pub fn new() -> Self {
-        Self { genesis: adiri_genesis(), validators: Default::default() }
+    pub fn new_for_test() -> Self {
+        Self { genesis: test_genesis(), validators: Default::default() }
     }
 
     /// Return the current genesis.
@@ -146,7 +141,7 @@ impl NetworkGenesis {
         let workers = self
             .validators
             .iter()
-            .map(|(pubkey, validator)| (*pubkey, validator.primary_info.worker_index.clone()))
+            .map(|(pubkey, validator)| (*pubkey, validator.p2p_info.worker_index.clone()))
             .collect();
 
         let worker_cache = WorkerCache { epoch: 0, workers: Arc::new(workers) };
@@ -170,10 +165,18 @@ impl NetworkGenesis {
         let yaml_content = ITS_CFG_YAML;
         let config: std::collections::HashMap<Address, GenesisAccount> =
             serde_yaml::from_str(yaml_content).expect("yaml parsing failure");
+        let governance_balance = config
+            .get(&GOVERNANCE_SAFE_ADDRESS)
+            .expect("base fee recipient governance safe missing")
+            .balance;
+        let final_itel_balance = itel_balance - governance_balance;
         let mut accounts = Vec::new();
         for (address, precompile_config) in config {
-            let bal =
-                if address == itel_address { itel_balance } else { precompile_config.balance };
+            let bal = if address == itel_address {
+                final_itel_balance
+            } else {
+                precompile_config.balance
+            };
             let account = GenesisAccount::default()
                 .with_nonce(precompile_config.nonce)
                 .with_balance(bal)
@@ -201,7 +204,7 @@ pub struct NodeInfo {
     pub bls_public_key: BlsPublicKey,
     /// Information for this validator's primary,
     /// including worker details.
-    pub primary_info: NodeP2pInfo,
+    pub p2p_info: NodeP2pInfo,
     /// The address for suggested fee recipient.
     ///
     /// Validator rewards are sent to this address.
@@ -213,17 +216,6 @@ pub struct NodeInfo {
 }
 
 impl NodeInfo {
-    /// Create a new instance of [ValidatorInfo] using the provided data.
-    pub fn new(
-        name: String,
-        bls_public_key: BlsPublicKey,
-        primary_info: NodeP2pInfo,
-        execution_address: Address,
-        proof_of_possession: BlsSignature,
-    ) -> Self {
-        Self { name, bls_public_key, primary_info, execution_address, proof_of_possession }
-    }
-
     /// Return public key bytes.
     pub fn public_key(&self) -> &BlsPublicKey {
         &self.bls_public_key
@@ -231,26 +223,28 @@ impl NodeInfo {
 
     /// Return the primary's public network key.
     pub fn primary_network_key(&self) -> &NetworkPublicKey {
-        &self.primary_info.network_key
+        &self.p2p_info.network_key
     }
 
     /// Return the primary's network address.
     pub fn primary_network_address(&self) -> &Multiaddr {
-        &self.primary_info.network_address
+        &self.p2p_info.network_address
     }
 
     /// Return a reference to the primary's [WorkerIndex].
     pub fn worker_index(&self) -> &WorkerIndex {
-        self.primary_info.worker_index()
+        self.p2p_info.worker_index()
     }
 }
 
 impl Default for NodeInfo {
     fn default() -> Self {
+        let bls_public_key = BlsPublicKey::default();
+        let name = format!("node-{}", bs58::encode(&bls_public_key.to_bytes()[0..8]).into_string());
         Self {
-            name: "DEFAULT".to_string(),
-            bls_public_key: BlsPublicKey::default(),
-            primary_info: Default::default(),
+            name,
+            bls_public_key,
+            p2p_info: Default::default(),
             execution_address: Address::ZERO,
             proof_of_possession: BlsSignature::default(),
         }
@@ -282,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_validate_genesis() {
-        let mut network_genesis = NetworkGenesis::new();
+        let mut network_genesis = NetworkGenesis::new_for_test();
         // create keys and information for validators
         for v in 0..4 {
             let bls_keypair = BlsKeypair::generate(&mut StdRng::from_seed([0; 32]));
@@ -296,18 +290,17 @@ mod tests {
             let primary_info = NodeP2pInfo::new(
                 network_keypair.public().clone().into(),
                 primary_network_address,
-                network_keypair.public().clone().into(),
                 worker_index,
             );
             let name = format!("validator-{v}");
             // create validator
-            let validator = NodeInfo::new(
+            let validator = NodeInfo {
                 name,
-                *bls_keypair.public(),
-                primary_info,
-                address,
+                bls_public_key: *bls_keypair.public(),
+                p2p_info: primary_info,
+                execution_address: address,
                 proof_of_possession,
-            );
+            };
             // add validator
             network_genesis.add_validator(validator.clone());
         }
@@ -318,7 +311,7 @@ mod tests {
     #[test]
     fn test_validate_genesis_fails() {
         // this uses `adiri_genesis`
-        let mut network_genesis = NetworkGenesis::new();
+        let mut network_genesis = NetworkGenesis::new_for_test();
         // create keys and information for validators
         for v in 0..4 {
             let bls_keypair = BlsKeypair::generate(&mut StdRng::from_seed([0; 32]));
@@ -335,18 +328,17 @@ mod tests {
             let primary_info = NodeP2pInfo::new(
                 network_keypair.public().clone().into(),
                 primary_network_address,
-                network_keypair.public().clone().into(),
                 worker_index,
             );
             let name = format!("validator-{v}");
             // create validator
-            let validator = NodeInfo::new(
+            let validator = NodeInfo {
                 name,
-                *bls_keypair.public(),
-                primary_info,
-                address,
+                bls_public_key: *bls_keypair.public(),
+                p2p_info: primary_info,
+                execution_address: address,
                 proof_of_possession,
-            );
+            };
             // add validator
             network_genesis.add_validator(validator.clone());
         }

@@ -29,6 +29,7 @@ use tn_types::{
 use tokio::{task::JoinHandle, time::timeout};
 use tracing::{debug, info};
 
+#[ignore = "internal test for devops - credentials required"]
 #[tokio::test]
 async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result<()> {
     let _guard = IT_TEST_MUTEX.lock();
@@ -319,8 +320,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
         faucet_tmp_dir.path(),
         &faucet_proxy_address.to_string(),
         Some(genesis_accounts),
-    )
-    .await?;
+    )?;
     let genesis_file = faucet_tmp_dir.path().join("shared-genesis/genesis/genesis.yaml");
     let genesis: Genesis = Config::load_from_path(&genesis_file, ConfigFmt::YAML)?;
     let chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());

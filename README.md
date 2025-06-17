@@ -17,7 +17,7 @@ Check out the repo and update the submodules:
 Run the test network script to start four local validators and begin advancing the chain:
 `etc/local-testnet.sh --start --dev-funds 0xADDRESS`
 Note: the script will compile a release build, which may take a few minutes.
-This configures and create genesis for a new network and starts it. See the output for the RPC endpoints.
+This configures and creates genesis for a new network and starts it. See the output for the RPC endpoints.
 0xADDRESS above should be a valid address prepended with 0x. Make sure you have the key for this address,
 it will be funded with 1billion TEL on your test network. After configuration you can run the script with
 just the --start option (--dev-funds is only used when configuring and CAN NOT be used later to fund
@@ -28,10 +28,7 @@ it configures each node, brings together the configs to create genesis and then 
 This is the same basic procedure used to create nodes on diffent machines (NOTE- do not use the instance
 option if not running on the same machine, it is to avoid port conflicts).
 
-Note that network operation is under heavy dev and somewhat rough right now but it should be possible to
-bring up a reliable test network.
-
-Once started you can use the RPC endpoint for any node with you favorate Ethereum tooling to test.
+Once started you can use the RPC endpoint for any node with your favorate Ethereum tooling to test.
 You will have test funds in your dev funds account set during config. The network can be restarted
 by shutting down, `killall telcoin-network` is good for this, deleting ./local-validators/ and
 rerunning the script.
@@ -44,7 +41,14 @@ speed this up for testing.
 The CLI is used to create validator information, join a committee, and start the network.
 The following `.env` variables are useful but not required:
 
-- `NARWHAL_HOST`: The ipv4 address of the host running the node. Consensus uses this address for messages between peers.
+- `TN_PRIMARY_ADDR`: The multi address of the primary libp2p network.
+- `TN_WORKER_ADDRS`: The multi address(es) of the worker libp2p networks.  This is a comma seperated list.
+All of these multi addresses will default to /ip4/127.0.0.1/udp/[PORT]/quic-v1 with an unused port for PORT.  This is really only useful for tests (but is very useful for testing).
+You MUST supply quic-v1 and udp to work with the telcoin-network (although if you were setting up your own network other protocols may work but are untested).
+References for multiaddr:
+https://github.com/multiformats/multiaddr
+https://github.com/multiformats/rust-multiaddr
+These are used with libp2p2 so also see the Rust libp2p docs.
 
 ## Example RPC request
 

@@ -168,7 +168,7 @@ where
         // disable the nonce check
         core::mem::swap(&mut self.cfg.disable_nonce_check, &mut disable_nonce_check);
 
-        let mut res = self.transact(tx);
+        let res = self.transact(tx);
 
         // swap back to the previous gas limit
         core::mem::swap(&mut self.block.gas_limit, &mut gas_limit);
@@ -177,16 +177,10 @@ where
         // swap back to the previous nonce check flag
         core::mem::swap(&mut self.cfg.disable_nonce_check, &mut disable_nonce_check);
 
-        // NOTE: Only the contract storage should be modified. revm currently marks the
-        // caller and block beneficiary accounts as "touched" after the above transact calls,
-        // and includes them in the result.
+        // NOTE: revm currently marks the caller and block beneficiary accounts as "touched"
+        // after the above transact calls, and includes them in the result.
         //
-        // Cleanup state here to make sure that changeset only includes the changed
-        // contract storage.
-        if let Ok(res) = &mut res {
-            res.state.retain(|addr, _| *addr == contract);
-        }
-
+        // System calls are used by TN protocol to update more than just the contract.
         res
     }
 

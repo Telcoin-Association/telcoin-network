@@ -6,31 +6,20 @@ use clap::{Args, Subcommand};
 use eyre::{eyre, Context};
 
 use generate::GenerateKeys;
-use std::path::Path;
-use tn_config::{Config, ConfigFmt, ConfigTrait, NodeInfo, TelcoinDirs as _};
-use tn_reth::{
-    dirs::{default_datadir_args, DataDirChainPath, DataDirPath},
-    MaybePlatformPath, RethChainSpec,
-};
+use std::path::{Path, PathBuf};
+use tn_config::TelcoinDirs as _;
 use tracing::warn;
 
 /// Generate keypairs and node info to go with them and save them to a file.
 #[derive(Debug, Args)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct KeyArgs {
-    /// Save an encoded keypair (Base58 encoded `privkey`) to file.
-    /// - bls (bls12381)
-    /// - network (ed25519)
-    /// - execution (secp256k1)
-    #[arg(long, value_name = "DATA_DIR", verbatim_doc_comment, default_value_t, global = true)]
-    pub datadir: MaybePlatformPath<DataDirPath>,
-
     /// Generate command that creates keypairs and writes to file.
     ///
     /// Intentionally leaving this here to help others identify
     /// patterns in clap.
     #[command(subcommand)]
-    pub read_or_write: KeySubcommand,
+    pub command: KeySubcommand,
 }
 
 ///Subcommand to either generate keys or read public keys.
@@ -43,11 +32,8 @@ pub enum KeySubcommand {
 
 impl KeyArgs {
     /// Execute command
-    pub fn execute(&self, passphrase: Option<String>) -> eyre::Result<()> {
-        // create datadir
-        let datadir = self.data_dir();
-
-        match &self.read_or_write {
+    pub fn execute(&self, datadir: PathBuf, passphrase: Option<String>) -> eyre::Result<()> {
+        match &self.command {
             // generate keys
             KeySubcommand::Generate(args) => {
                 let args = match &args.node_type {
@@ -57,11 +43,8 @@ impl KeyArgs {
                 let authority_key_path = datadir.node_keys_path();
                 // initialize path and warn users if overwriting keys
                 self.init_path(&authority_key_path, args.force)?;
-                let mut node_info = NodeInfo::default();
                 // execute and store keypath
-                args.execute(&mut node_info, &datadir, passphrase)?;
-
-                Config::write_to_path(datadir.node_info_path(), &node_info, ConfigFmt::YAML)?;
+                args.execute(&datadir, passphrase)?;
             }
         }
 
@@ -97,13 +80,6 @@ impl KeyArgs {
         } else {
             true
         }
-    }
-
-    /// Returns the chain specific path to the data dir.
-    fn data_dir(&self) -> DataDirChainPath {
-        self.datadir
-            .unwrap_or_chain_default(RethChainSpec::default().chain, default_datadir_args())
-            .into()
     }
 }
 

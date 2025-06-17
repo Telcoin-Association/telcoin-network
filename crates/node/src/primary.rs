@@ -10,7 +10,8 @@ use tn_primary::{
 };
 use tn_primary_metrics::Metrics;
 use tn_types::{
-    Database as ConsensusDatabase, Notifier, TaskManager, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    Committee, Database as ConsensusDatabase, Notifier, TaskManager,
+    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::sync::RwLock;
 
@@ -158,5 +159,10 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
     /// Return the [Noticer] shutdown for consensus.
     pub async fn shutdown_signal(&self) -> Notifier {
         self.internal.read().await.consensus_config.shutdown().clone()
+    }
+
+    /// Returns the current committee.
+    pub async fn current_committee(&self) -> Committee {
+        self.internal.read().await.consensus_config.committee().clone()
     }
 }

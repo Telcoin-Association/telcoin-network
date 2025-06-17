@@ -71,14 +71,14 @@ impl HandshakeBuilder {
 mod tests {
     use super::*;
     use std::str::FromStr as _;
-    use tn_types::adiri_genesis;
+    use tn_types::test_genesis;
 
     #[test]
     fn test_handshake_proof() {
         let multiaddr: Multiaddr =
             Multiaddr::from_str("/ip4/10.10.10.33/udp/49590").expect("valid multiaddr");
         let network_keypair = NetworkKeypair::generate_ed25519();
-        let genesis = adiri_genesis();
+        let genesis = test_genesis();
 
         let mut handshake =
             HandshakeBuilder::new(network_keypair, multiaddr, genesis.clone()).build();

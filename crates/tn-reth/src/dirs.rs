@@ -20,8 +20,7 @@ pub const DEFAULT_ROOT_DIR: &str = "telcoin-network";
 
 /// Workaround for getting default DatadirArgs for reth node config.
 pub fn default_datadir_args() -> DatadirArgs {
-    // TODO: this is inefficient, but the only way to use "telcoin-network" as datadir instead of
-    // "reth"
+    // The only way to use "telcoin-network" as datadir instead of "reth"
     DatadirArgs {
         datadir: MaybePlatformPath::from_str(DEFAULT_ROOT_DIR)
             .expect("default datadir args always work"),
@@ -102,10 +101,6 @@ impl From<DataDirChainPath> for PathBuf {
 
 //impl TelcoinDirs for ['DataDirChainPath'] (wrapper around ['ChainPath<DataDirPath>']) {
 impl TelcoinDirs for DataDirChainPath {
-    fn node_config_path(&self) -> PathBuf {
-        self.0.as_ref().join("telcoin-network.yaml")
-    }
-
     fn node_config_parameters_path(&self) -> PathBuf {
         self.0.as_ref().join("parameters.yaml")
     }

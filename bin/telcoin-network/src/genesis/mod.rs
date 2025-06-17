@@ -7,16 +7,13 @@ use secp256k1::{
     rand::{rngs::StdRng, SeedableRng},
     Secp256k1,
 };
-use std::{str::FromStr as _, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, str::FromStr as _, time::Duration};
 use tn_config::{
     Config, ConfigFmt, ConfigTrait, NetworkGenesis, Parameters, TelcoinDirs as _, DEPLOYMENTS_JSON,
+    GOVERNANCE_SAFE_ADDRESS,
 };
-use tn_reth::{
-    dirs::{default_datadir_args, DataDirChainPath, DataDirPath},
-    system_calls::ConsensusRegistry,
-    MaybePlatformPath, RethChainSpec, RethEnv,
-};
-use tn_types::{keccak256, now, Address, GenesisAccount, U256};
+use tn_reth::{system_calls::ConsensusRegistry, RethChainSpec, RethEnv};
+use tn_types::{keccak256, set_genesis_defaults, Address, GenesisAccount, U256};
 use tracing::info;
 
 use crate::args::{clap_address_parser, clap_u256_parser_to_18_decimals, maybe_hex};
@@ -24,12 +21,6 @@ use crate::args::{clap_address_parser, clap_u256_parser_to_18_decimals, maybe_he
 /// Generate a new chain genesis.
 #[derive(Debug, Args)]
 pub struct GenesisArgs {
-    /// Read and write to committe file.
-    ///
-    /// [Committee] contains quorum of validators.
-    #[arg(long, value_name = "DATA_DIR", verbatim_doc_comment, default_value_t, global = true)]
-    pub datadir: MaybePlatformPath<DataDirPath>,
-
     /// The owner's address for initializing the `ConsensusRegistry` in genesis.
     ///
     /// This address is used to initialize the owner for `ConsensusRegistry`.
@@ -41,9 +32,25 @@ pub struct GenesisArgs {
         alias = "consensus_registry_owner",
         help_heading = "The owner for ConsensusRegistry",
         value_parser = clap_address_parser,
+        default_value_t = GOVERNANCE_SAFE_ADDRESS,
         verbatim_doc_comment
     )]
     pub consensus_registry_owner: Address,
+
+    /// The address recieves all transaction base fees.
+    ///
+    /// This is a governance safe contract that will distribute/manage basefees.
+    ///
+    /// Address doesn't have to start with "0x", but the CLI supports the "0x" format too.
+    #[arg(
+        long = "basefee-address",
+        alias = "basefee_address",
+        help_heading = "The recipient of base fees",
+        value_parser = clap_address_parser,
+        default_value_t = GOVERNANCE_SAFE_ADDRESS,
+        verbatim_doc_comment
+    )]
+    pub basefee_address: Address,
 
     /// The initial stake credited to each validator in genesis.
     #[arg(
@@ -67,7 +74,7 @@ pub struct GenesisArgs {
     )]
     pub min_withdrawal: U256,
 
-    /// The amount of block rewards per epoch starting in genesis.
+    /// The total amount of block rewards per epoch starting in genesis.
     #[arg(
         long = "epoch-block-rewards",
         alias = "block_rewards_per_epoch",
@@ -89,8 +96,8 @@ pub struct GenesisArgs {
     pub epoch_duration: u32,
 
     /// Used to add a funded account (by simple text string).  Use this on a dev cluster
-    /// (must provide on all validator genesis inits) to have an account with a deterministically
-    /// derived key. This is ONLY for dev testing, never use this for other chains.
+    /// to have an account with a deterministically derived key. This is ONLY for dev
+    /// testing, never use this for other chains.
     #[arg(long)]
     pub dev_funded_account: Option<String>,
     /// Max delay for a node to produce a new header.
@@ -103,6 +110,10 @@ pub struct GenesisArgs {
     /// Default is 0x7e1 (2017).
     #[arg(long, default_value_t = 2017, value_parser=maybe_hex)]
     pub chain_id: u64,
+    /// YAML file containing accounts to merge into genesis.
+    /// This is intended for dev and test nets.
+    #[arg(long, value_name = "YAML_FILE", verbatim_doc_comment)]
+    pub accounts: Option<PathBuf>,
 }
 
 /// Take a string and return the deterministic account derived from it.  This is be used
@@ -125,14 +136,11 @@ pub(crate) fn account_from_word(key_word: &str) -> Address {
 
 impl GenesisArgs {
     /// Execute command
-    pub fn execute(&self) -> eyre::Result<()> {
+    pub fn execute(&self, data_dir: PathBuf) -> eyre::Result<()> {
         info!(target: "genesis::ceremony", "Creating a new chain genesis with initial validators");
 
         let chain = RethChainSpec::default();
         // load network genesis
-        let data_dir: DataDirChainPath =
-            self.datadir.unwrap_or_chain_default(chain.chain, default_datadir_args()).into();
-        //let validators = NetworkGenesis::load_validators_from_path(&data_dir)?;
         let mut network_genesis =
             NetworkGenesis::new_from_path_and_genesis(&data_dir, chain.genesis().clone())?;
 
@@ -152,29 +160,8 @@ impl GenesisArgs {
         };
 
         let mut genesis = network_genesis.genesis().clone();
-        // Configure hardforks or Reth will be cross with us...
-        genesis.config.homestead_block = Some(0);
-        genesis.config.eip150_block = Some(0);
-        genesis.config.eip155_block = Some(0);
-        genesis.config.eip158_block = Some(0);
-        genesis.config.byzantium_block = Some(0);
-        genesis.config.constantinople_block = Some(0);
-        genesis.config.petersburg_block = Some(0);
-        genesis.config.istanbul_block = Some(0);
-        genesis.config.berlin_block = Some(0);
-        genesis.config.london_block = Some(0);
-        genesis.config.cancun_time = None; //Some(0);
-        genesis.config.shanghai_time = Some(0);
-        genesis.config.prague_time = None;
-        genesis.config.osaka_time = None;
-        // Configure some misc genesis stuff.
-        // chain_id and maybe timestamp should probably be a command line option...
-        genesis.timestamp = now();
+        set_genesis_defaults(&mut genesis);
         genesis.config.chain_id = self.chain_id;
-        genesis.config.terminal_total_difficulty_passed = true;
-        genesis.config.terminal_total_difficulty = Some(U256::from(0));
-        genesis.gas_limit = 30_000_000;
-        genesis.base_fee_per_gas = Some(tn_types::MIN_PROTOCOL_BASE_FEE as u128);
 
         // try to create a runtime if one doesn't already exist
         // this is a workaround for executing committees pre-genesis during tests and normal CLI
@@ -229,6 +216,12 @@ impl GenesisArgs {
                 GenesisAccount::default().with_balance(U256::from(10).pow(U256::from(27))), // One Billion TEL
             );
         }
+        // Extend genesis accounts with option account file.
+        if let Some(accounts) = &self.accounts {
+            let f = std::fs::File::open(accounts)?;
+            let accounts: BTreeMap<Address, GenesisAccount> = serde_yaml::from_reader(f)?;
+            updated_genesis.alloc.extend(accounts);
+        }
 
         // updated genesis with registry information
         network_genesis.update_genesis(updated_genesis);
@@ -241,6 +234,7 @@ impl GenesisArgs {
         if let Some(min_header_delay_ms) = self.min_header_delay_ms {
             parameters.min_header_delay = Duration::from_millis(min_header_delay_ms);
         }
+        parameters.basefee_address = Some(self.basefee_address);
 
         // write genesis and config to file
         Config::write_to_path(

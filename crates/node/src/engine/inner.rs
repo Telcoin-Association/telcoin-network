@@ -24,7 +24,7 @@ use tn_types::{
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// Inner type for holding execution layer types.
 #[derive(Debug)]
@@ -255,10 +255,11 @@ impl ExecutionNodeInner {
         &self,
         number: u64,
     ) -> eyre::Result<Vec<SealedHeader>> {
-        let finalized_block_num = self.reth_env.last_block_number()?;
+        let last_block_number = self.reth_env.last_block_number()?;
+        debug!(target: "epoch-manager", ?last_block_number, "restoring last executed output blocks");
         let mut result = Vec::with_capacity(number as usize);
         if number > 0 {
-            let mut block_num = finalized_block_num;
+            let mut block_num = last_block_number;
             let mut last_nonce;
             if let Some(header) = self.reth_env.sealed_header_by_number(block_num)? {
                 last_nonce = header.nonce;

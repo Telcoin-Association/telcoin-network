@@ -243,7 +243,8 @@ impl<DB: Database> Proposer<DB> {
         let mut total_inclusion_secs = 0.0;
         for digest in &digests {
             let batch_inclusion_secs =
-                Duration::from_secs(*header.created_at() - digest.timestamp).as_secs_f64();
+                Duration::from_secs(header.created_at().saturating_sub(digest.timestamp))
+                    .as_secs_f64();
             total_inclusion_secs += batch_inclusion_secs;
 
             // NOTE: this log entry is used to measure performance
@@ -259,7 +260,8 @@ impl<DB: Database> Proposer<DB> {
         // NOTE: this log entry is used to measure performance
         let (header_creation_secs, avg_inclusion_secs) = if let Some(digest) = digests.front() {
             (
-                Duration::from_secs(*header.created_at() - digest.timestamp).as_secs_f64(),
+                Duration::from_secs(header.created_at().saturating_sub(digest.timestamp))
+                    .as_secs_f64(),
                 total_inclusion_secs / digests.len() as f64,
             )
         } else {
@@ -651,7 +653,6 @@ impl<DB: Database> Proposer<DB> {
         let current_epoch = self.committee.epoch();
         let current_round = self.round;
 
-        // TODO: is this an unnecessary call for every proposal?
         // check if proposer store's last header is from this round
         let last_proposed = self
             .proposer_store
