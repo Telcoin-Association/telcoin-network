@@ -1,53 +1,15 @@
-# Telcoin Network Node Implementation
+# Telcoin Network Node
 
-The engine crate strives to maintain compatibility with Ethereum.
+This is the main crate for managing an active node on Telcoin Network.
 
-## Implementation Details
+## Node Types
 
-The `engine` mod uses `reth` as a library. Starting with reth's beta release, custom nodes are supported. This README is to document design decisions for the custom `TelcoinNode` implementation.
+Active validator nodes (in the current committee) are either in `CvvActive` or `CvvInactive` mode.
+If the validator is Inactive, it indicates that it crashed during the epoch and is syncing to rejoin consensus within the garbage collection window.
 
-### Worker and Primary Crossover
+Observer nodes subscribe to the committee's consensus output and execute the data independently.
 
-The worker and primary "nodes" need access to the same infromation at times. These are the components and why they need to stay in-sync.
+## Epoch Manager
 
-###### Blockchain Provider
-
-This type is how the worker/primary interact with the Blockchain Tree.
-
-The blockchain provider is the main type for interacting with the blockchain. This type serves as the main entry point for interacting with the blockchain and provides data from database storage and from the blockchain tree (pending state etc.) It is a simple wrapper type that holds an instance of the database and the blockchain tree.
-
-###### Blockchain Tree
-
-The blockchain tree is used to track the canonical chain.
-
-The primary adds "canonical" blocks to the tree after consensus is reached.
-
-The worker adds "uncle" blocks to the tree for each batch it produces and validates. The worker reads from the canonical tip for managing batches.
-
-The blockchain tree is owned by the Blockchain Provider.
-
-###### Provider
-
-The blockchain provider fetches data from a database or static file. This provider implements most provider or provider factory traits.
-
-### Worker and Primary Differences
-
-The worker and primary "nodes" need access to the different infromation at times. These are the components and why they need to remain isolated.
-
-###### Transaction Pool
-
-The worker needs the transaction pool to be full of user-submitted transactions.
-
-The primary does not need a transaction pool. It simply executes all transactions received from `ConsensusOutput`.
-
-###### Payload Builder
-
-The worker needs the payload builder to build from the transaction pool.
-
-The primary does not need a payload builder. It simply executes all transactions received from `ConsensusOutput`. The CL Executor is basically the payload
-
-###### RPC
-
-The worker needs the RPC for receiving transactions and responding to blockchain inquiries.
-
-The primary only facilitates consensus and does not need access to the RPC server.
+The epoch manager is responsible for identifying the epoch boundary and advancing the next epoch.
+It manages subtasks and sets the node's mode.
