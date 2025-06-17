@@ -27,7 +27,6 @@ pub struct Vote {
 }
 
 impl Vote {
-    // TODO: Add version number and match on that
     /// Create a new instance of [Vote]
     pub async fn new<BLS: BlsSigner>(
         header: &Header,

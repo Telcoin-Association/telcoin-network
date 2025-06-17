@@ -93,8 +93,6 @@ mod tests {
     /// This test also ensures that confy is able to
     /// load the default config.toml, update the file,
     /// and save it.
-    ///
-    /// TODO: better unit test for arg methods.
     #[tokio::test]
     async fn test_generate_keypairs() {
         // use tempdir

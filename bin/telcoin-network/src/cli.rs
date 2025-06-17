@@ -195,8 +195,6 @@ mod tests {
     }
 
     /// Tests that the log directory is parsed correctly.
-    ///
-    /// TODO: logs should be placed in TN DEFAULT_ROOT_DIR
     #[test]
     fn parse_logs_path() {
         let tn = Cli::try_parse_args_from(["tn", "node"]).unwrap();

@@ -2,18 +2,11 @@
 use crate::TelcoinDirs;
 use eyre::Context;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    ffi::OsStr,
-    fmt::{Display, Formatter},
-    fs,
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, ffi::OsStr, fs, path::Path, sync::Arc};
 use tn_types::{
     address, test_genesis, verify_proof_of_possession_bls, Address, BlsPublicKey, BlsSignature,
-    Committee, CommitteeBuilder, Epoch, Genesis, GenesisAccount, Intent, IntentMessage, Multiaddr,
-    NetworkPublicKey, NodeP2pInfo, ProtocolSignature, Signer, WorkerCache, WorkerIndex,
+    Committee, CommitteeBuilder, Genesis, GenesisAccount, Multiaddr, NetworkPublicKey, NodeP2pInfo,
+    WorkerCache, WorkerIndex,
 };
 use tracing::{info, warn};
 
@@ -162,7 +155,7 @@ impl NetworkGenesis {
     }
 
     /// Returns configurations for precompiles as genesis accounts
-    /// Precompiles configs yamls are generated using foundry in tn-Contracts
+    /// Precompiles configs yamls are generated using foundry in `tn-contracts` submodule.
     ///
     /// Overrides InterchainTEL genesis balance to reflect genesis validator stake
     pub fn fetch_precompile_genesis_accounts(
@@ -197,9 +190,7 @@ impl NetworkGenesis {
     }
 }
 
-// deserialize into HashMap<Account, GenesisAccount>
-
-/// information needed for every validator:
+/// Information needed for every validator:
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct NodeInfo {
     /// The name for the validator. The default value
@@ -257,51 +248,6 @@ impl Default for NodeInfo {
             execution_address: Address::ZERO,
             proof_of_possession: BlsSignature::default(),
         }
-    }
-}
-
-/// If using aggregate signatures for NetworkGenesis over chainspec.
-#[derive(Clone, Debug, Eq, Serialize, Deserialize)]
-pub struct ValidatorSignatureInfo {
-    pub epoch: Epoch,
-    pub authority: BlsPublicKey,
-    pub signature: BlsSignature,
-}
-
-impl ValidatorSignatureInfo {
-    pub fn new<T>(
-        epoch: Epoch,
-        value: &T,
-        intent: Intent,
-        authority: BlsPublicKey,
-        secret: &dyn Signer,
-    ) -> Self
-    where
-        T: Serialize,
-    {
-        Self {
-            epoch,
-            authority,
-            signature: BlsSignature::new_secure(&IntentMessage::new(intent, value), secret),
-        }
-    }
-}
-
-impl Display for ValidatorSignatureInfo {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "AuthoritySignatureInfo {{ epoch: {:?}, authority: {} }}",
-            self.epoch, self.authority,
-        )
-    }
-}
-
-impl PartialEq for ValidatorSignatureInfo {
-    fn eq(&self, other: &Self) -> bool {
-        // Do not compare the signature. It's possible to have multiple
-        // valid signatures for the same epoch and authority.
-        self.epoch == other.epoch && self.authority == other.authority
     }
 }
 

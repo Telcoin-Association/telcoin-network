@@ -539,7 +539,7 @@ fn get_block(node: &str, block_number: Option<u64>) -> eyre::Result<HashMap<Stri
     } else {
         rpc_params!("latest", true)
     };
-    Ok(call_rpc(node, "eth_getBlockByNumber", params.clone(), 10)?)
+    call_rpc(node, "eth_getBlockByNumber", params.clone(), 10)
 }
 
 fn get_block_number(node: &str) -> eyre::Result<u64> {

@@ -175,12 +175,6 @@ where
     }
 
     /// Run the node, handling epoch transitions.
-    ///
-    /// This will bring up a tokio runtime and start the app within it.
-    /// It also will shutdown this runtime, potentially violently, to make
-    /// sure any lefteover tasks are ended.  This allows it to be called more
-    /// than once per program execution to support changing modes of the
-    /// running node.
     pub async fn run(&mut self) -> eyre::Result<()> {
         // create dbs to survive between sync state transitions
         let reth_db =
@@ -220,6 +214,16 @@ where
         let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
         self.spawn_node_networks(node_task_spawner, &network_config).await?;
 
+        // start consensus metrics for the epoch
+        let metrics_shutdown = Notifier::new();
+        if let Some(metrics_socket) = self.builder.metrics {
+            start_prometheus_server(
+                metrics_socket,
+                &node_task_manager,
+                metrics_shutdown.subscribe(),
+            );
+        }
+
         // add engine task manager
         node_task_manager.add_task_manager(engine_task_manager);
         node_task_manager.update_tasks();
@@ -227,7 +231,7 @@ where
         info!(target: "epoch-manager", tasks=?node_task_manager, "NODE TASKS\n");
 
         // await all tasks on epoch-task-manager or node shutdown
-        tokio::select! {
+        let result = tokio::select! {
             // run long-living node tasks
             res = node_task_manager.join_until_exit(self.node_shutdown.clone()) => {
                 match res {
@@ -238,7 +242,12 @@ where
 
             // loop through short-term epochs
             epoch_result = self.run_epochs(&engine, consensus_db, network_config, to_engine, gas_accumulator) => epoch_result
-        }
+        };
+
+        // shutdown metrics
+        metrics_shutdown.notify();
+
+        result
     }
 
     /// Create the epoch directory for consensus data if it doesn't exist and open the consensus
@@ -355,10 +364,6 @@ where
         to_engine: mpsc::Sender<ConsensusOutput>,
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<()> {
-        // The task manager that resets every epoch and manages
-        // short-running tasks for the lifetime of the epoch.
-        let mut epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
-
         // initialize long-running components for node startup
         let mut initial_epoch = true;
 
@@ -368,19 +373,12 @@ where
                 .run_epoch(
                     engine,
                     consensus_db.clone(),
-                    &mut epoch_task_manager,
                     &network_config,
                     &to_engine,
                     &mut initial_epoch,
                     gas_accumulator.clone(),
                 )
                 .await;
-
-            // abort all epoch-related tasks
-            epoch_task_manager.abort_all_tasks();
-
-            // create new manager for next epoch
-            epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
 
             // ensure no errors
             epoch_result.inspect_err(|e| {
@@ -395,12 +393,10 @@ where
     ///
     /// If it returns Ok(true) this indicates a mode change occurred and a restart
     /// is required.
-    #[allow(clippy::too_many_arguments)]
     async fn run_epoch(
         &mut self,
         engine: &ExecutionNode,
         mut consensus_db: DatabaseType,
-        epoch_task_manager: &mut TaskManager,
         network_config: &NetworkConfig,
         to_engine: &mpsc::Sender<ConsensusOutput>,
         initial_epoch: &mut bool,
@@ -408,15 +404,9 @@ where
     ) -> eyre::Result<()> {
         info!(target: "epoch-manager", "Starting epoch");
 
-        // start consensus metrics for the epoch
-        let metrics_shutdown = Notifier::new();
-        if let Some(metrics_socket) = self.builder.metrics {
-            start_prometheus_server(
-                metrics_socket,
-                epoch_task_manager,
-                metrics_shutdown.subscribe(),
-            );
-        }
+        // The task manager that resets every epoch and manages
+        // short-running tasks for the lifetime of the epoch.
+        let mut epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
 
         // subscribe to output early to prevent missed messages
         let consensus_output = self.consensus_output.subscribe();
@@ -426,7 +416,7 @@ where
             .create_consensus(
                 engine,
                 consensus_db.clone(),
-                epoch_task_manager,
+                &epoch_task_manager,
                 network_config,
                 initial_epoch,
                 gas_accumulator.clone(),
@@ -465,6 +455,7 @@ where
 
         // await the epoch boundary or the epoch task manager exiting
         // this can also happen due to committee nodes re-syncing and errors
+        let consensus_shutdown_clone = consensus_shutdown.clone();
         tokio::select! {
             // wait for epoch boundary to transition
             res = self.wait_for_epoch_boundary(to_engine, engine, consensus_output, consensus_shutdown.clone(), gas_accumulator) => {
@@ -477,7 +468,7 @@ where
             },
 
             // return any errors
-            res = epoch_task_manager.join_until_exit(consensus_shutdown) => {
+            res = epoch_task_manager.join_until_exit(consensus_shutdown_clone) => {
                 res.inspect_err(|e| {
                     error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
                 })?;
@@ -485,8 +476,16 @@ where
             },
         }
 
-        // shutdown metrics
-        metrics_shutdown.notify();
+        consensus_shutdown.notify();
+        // abort all epoch-related tasks
+        epoch_task_manager.abort_all_tasks();
+        // Expect complaints from join so swallow those errors...
+        // If we timeout here something is not playing nice and shutting down so return the timeout.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            epoch_task_manager.join(consensus_shutdown),
+        )
+        .await?;
 
         Ok(())
     }
