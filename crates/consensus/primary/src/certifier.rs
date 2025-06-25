@@ -13,7 +13,7 @@ use futures::{
 };
 use std::{cmp::min, sync::Arc, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig};
-use tn_network_libp2p::{error::NetworkError, types::NetworkResult};
+use tn_network_libp2p::{error::NetworkError, types::NetworkResult, PeerId};
 use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::CertificateStore;
 use tn_types::{
@@ -154,9 +154,9 @@ impl<DB: Database> Certifier<DB> {
         &self,
         authority: AuthorityIdentifier,
         header: Header,
+        peer_id: PeerId,
     ) -> DagResult<Vote> {
         debug!(target: "primary::certifier", ?authority, ?header, "requesting vote for header...");
-        let peer_id = authority.peer_id();
 
         let mut missing_parents: Vec<CertificateDigest> = Vec::new();
         let mut attempt: u32 = 0;
@@ -289,9 +289,9 @@ impl<DB: Database> Certifier<DB> {
             .into_iter()
             .map(|(name, _, network_key)| (name, network_key));
         let mut requests: FuturesUnordered<_> = peers
-            .map(|(name, _target)| {
+            .map(|(name, target)| {
                 let header = header.clone();
-                self.request_vote(name, header)
+                self.request_vote(name, header, target.into())
             })
             .collect();
         loop {

@@ -522,7 +522,7 @@ async fn test_is_validator() {
     let authority_1 = authorities.next().expect("first authority");
     let config = authority_1.consensus_config();
     let mut peer_manager = PeerManager::new(config.network_config().peer_config());
-    let validator = authority_1.id().peer_id();
+    let validator = authority_1.authority().peer_id().unwrap();
     let random_peer_id = PeerId::random();
 
     // update epoch with random multiaddr

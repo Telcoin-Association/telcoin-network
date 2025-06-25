@@ -148,7 +148,7 @@ async fn test_vote_fails_wrong_authority_network_key() -> eyre::Result<()> {
     // process vote
     let res = handler.vote(random_peer_id, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
-    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownNetworkKey(peer_id))) if peer_id == random_peer_id);
+    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)));
     Ok(())
 }
 

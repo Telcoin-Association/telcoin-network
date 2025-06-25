@@ -139,7 +139,6 @@ where
                 primary_network_address,
                 Address::random_with(&mut rng),
                 key_config.primary_network_public_key(),
-                format!("authority{i}"),
             );
             authorities.insert(
                 *authority.protocol_key(),

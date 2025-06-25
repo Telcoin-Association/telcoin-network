@@ -252,6 +252,12 @@ where
         /// The collection of requests.
         requests: Vec<AuthorityInfoRequest>,
     },
+    /// Find an authority for a future committee by bls key and return to sender.
+    /// This only returns the authority if it is stored locally- i.e. will return fast.
+    FindLocalAuthority {
+        /// The requests.
+        request: AuthorityInfoRequest,
+    },
 }
 
 /// Network handle.
@@ -505,7 +511,6 @@ where
     ) -> NetworkResult<
         FuturesUnordered<oneshot::Receiver<NetworkResult<(BlsPublicKey, NetworkInfo)>>>,
     > {
-        // let mut results = Vec::with_capacity(bls_keys.len());
         let results = FuturesUnordered::new();
         let requests = bls_keys
             .into_iter()
@@ -519,6 +524,20 @@ where
 
         self.sender.send(NetworkCommand::FindAuthorities { requests }).await?;
         Ok(results)
+    }
+
+    /// Return network information for authorities by bls pubkey on kad.
+    /// This only returns the authority if it is stored locally- i.e. will return fast.
+    pub async fn find_local_authority(
+        &self,
+        bls_key: BlsPublicKey,
+    ) -> NetworkResult<(BlsPublicKey, NetworkInfo)> {
+        let (reply, rx) = oneshot::channel();
+        // create the request
+        let request = AuthorityInfoRequest { bls_key, reply };
+
+        self.sender.send(NetworkCommand::FindLocalAuthority { request }).await?;
+        rx.await?
     }
 }
 

@@ -110,12 +110,19 @@ where
             .certificates_in_votes
             .inc_by(num_parents as u64);
 
-        let committee_peer: AuthorityIdentifier = peer.into();
+        let committee_peer = header.author.clone();
         ensure!(
             self.consensus_config.in_committee(&committee_peer),
             HeaderError::UnknownNetworkKey(peer).into()
         );
-        ensure!(header.author() == &committee_peer, HeaderError::PeerNotAuthor.into());
+        if let Some(auth) = self.consensus_config.committee().authority(&committee_peer) {
+            // We err on the side of caution here, if auths peer id is not known fail but we should
+            // know it (got a vote request from them).
+            ensure!(Some(peer) == auth.peer_id(), HeaderError::PeerNotAuthor.into());
+        } else {
+            // The committee check above passed so this should not happen, but just in case.
+            return Err(HeaderError::UnknownNetworkKey(peer).into());
+        }
 
         // if peer is ahead, wait for execution to catch up
         // NOTE: this doesn't hurt since this node shouldn't vote until execution is caught up

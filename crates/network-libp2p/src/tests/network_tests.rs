@@ -195,12 +195,22 @@ async fn test_valid_req_res() -> eyre::Result<()> {
     // start swarm listening on default any address
     peer1
         .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_1
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
     peer2
         .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_2
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
     let peer2_id = peer2.local_peer_id().await?;
@@ -256,12 +266,22 @@ async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
     // start swarm listening on default any address
     peer1
         .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_1
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
     peer2
         .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_2
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
     let peer2_id = peer2.local_peer_id().await?;
@@ -331,12 +351,22 @@ async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
     // start swarm listening on default any address
     peer1
         .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_1
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
     peer2
         .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_2
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
     let peer2_id = peer2.local_peer_id().await?;
@@ -410,12 +440,22 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
     // start swarm listening on default any address
     malicious_peer
         .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_1
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
     honest_peer
         .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_2
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
 
@@ -487,12 +527,22 @@ async fn test_outbound_failure_malicious_response() -> eyre::Result<()> {
     // start swarm listening on default any address
     honest_peer
         .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_1
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
     malicious_peer
         .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_2
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
     let malicious_peer_id = malicious_peer.local_peer_id().await?;
@@ -557,11 +607,21 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
 
     // start swarm listening on default any address
     cvv.start_listening(
-        config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+        config_1
+            .authority()
+            .as_ref()
+            .expect("authority")
+            .primary_network_address()
+            .expect("address"),
     )
     .await?;
     nvv.start_listening(
-        config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+        config_2
+            .authority()
+            .as_ref()
+            .expect("authority")
+            .primary_network_address()
+            .expect("address"),
     )
     .await?;
     let cvv_id = cvv.local_peer_id().await?;
@@ -623,11 +683,21 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
 
     // start swarm listening on default any address
     cvv.start_listening(
-        config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+        config_1
+            .authority()
+            .as_ref()
+            .expect("authority")
+            .primary_network_address()
+            .expect("address"),
     )
     .await?;
     nvv.start_listening(
-        config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+        config_2
+            .authority()
+            .as_ref()
+            .expect("authority")
+            .primary_network_address()
+            .expect("address"),
     )
     .await?;
     let cvv_id = cvv.local_peer_id().await?;
@@ -699,7 +769,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     // Need to disable kademlia peers or the various networks will connect on their own and trip up
     // the test...
     target_network.no_kad_peers_for_test();
-    let id = target_peer.config.authority().as_ref().expect("authority").id().peer_id();
+    let id = target_peer.config.authority().as_ref().expect("authority").peer_id().unwrap();
     tokio::spawn(async move {
         let res = target_network.run().await;
         debug!(target: "network", ?id, ?res, "network shutdown");
@@ -715,7 +785,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
                 .as_ref()
                 .expect("authority")
                 .primary_network_address()
-                .clone(),
+                .expect("address"),
         )
         .await?;
     let target_addr = target_peer
@@ -734,7 +804,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
         // spawn peer network
         let mut peer_network = peer.network.take().expect("peer network is some");
         peer_network.no_kad_peers_for_test();
-        let id = peer.config.authority().as_ref().expect("authority").id().peer_id();
+        let id = peer.config.authority().as_ref().expect("authority").peer_id().unwrap();
         tokio::spawn(async move {
             let res = peer_network.run().await;
             debug!(target: "network", ?id, ?res, "network shutdown");
@@ -747,7 +817,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
                     .as_ref()
                     .expect("authority")
                     .primary_network_address()
-                    .clone(),
+                    .expect("address"),
             )
             .await?;
 
@@ -786,7 +856,12 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     });
 
     nvv.start_listening(
-        nvv_config.authority().as_ref().expect("authority").primary_network_address().clone(),
+        nvv_config
+            .authority()
+            .as_ref()
+            .expect("authority")
+            .primary_network_address()
+            .expect("address"),
     )
     .await?;
 
@@ -821,7 +896,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     let connected = nvv.connected_peers().await?;
     assert!(!connected.contains(&target_peer_id));
     for peer in other_peers.iter() {
-        let id = peer.config.authority().as_ref().expect("authority").id().peer_id();
+        let id = peer.config.authority().as_ref().expect("authority").peer_id().unwrap();
         assert!(connected.contains(&id));
     }
 
@@ -885,12 +960,22 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
     // Start listeners and establish connection
     peer1
         .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_1
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
     peer2
         .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_2
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
 
@@ -948,12 +1033,22 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
     // Start listeners
     honest_peer
         .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_1
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
     malicious_peer
         .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_2
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
 
@@ -1035,7 +1130,13 @@ async fn test_dial_timeout_behavior() -> eyre::Result<()> {
     peer1
         .network_handle
         .start_listening(
-            peer1.config.authority().as_ref().expect("authority").primary_network_address().clone(),
+            peer1
+                .config
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
 
@@ -1099,7 +1200,7 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
                 .as_ref()
                 .expect("authority")
                 .primary_network_address()
-                .clone(),
+                .expect("address"),
         )
         .await?;
 
@@ -1135,7 +1236,7 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
                     .as_ref()
                     .expect("authority")
                     .primary_network_address()
-                    .clone(),
+                    .expect("address"),
             )
             .await?;
 
@@ -1207,12 +1308,22 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     // Start swarm listening
     peer1
         .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_1
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
     peer2
         .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_2
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
 
@@ -1310,7 +1421,7 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
                 .as_ref()
                 .expect("authority")
                 .primary_network_address()
-                .clone(),
+                .expect("address"),
         )
         .await?;
 
@@ -1327,7 +1438,13 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
     peer1
         .network_handle
         .start_listening(
-            peer1.config.authority().as_ref().expect("authority").primary_network_address().clone(),
+            peer1
+                .config
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
     let peer1_id = peer1.network_handle.local_peer_id().await?;
@@ -1416,12 +1533,22 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     // Start swarm listening
     peer1
         .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_1
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
     peer2
         .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
+            config_2
+                .authority()
+                .as_ref()
+                .expect("authority")
+                .primary_network_address()
+                .expect("address"),
         )
         .await?;
 
@@ -1503,7 +1630,7 @@ async fn test_get_kad_records() -> eyre::Result<()> {
 
     // spawn target network
     let target_network = target_peer.network.take().expect("target network is some");
-    let id = target_peer.config.authority().as_ref().expect("authority").id().peer_id();
+    let id = target_peer.config.authority().as_ref().expect("authority").peer_id().unwrap();
     tokio::spawn(async move {
         let res = target_network.run().await;
         debug!(target: "network", ?id, ?res, "network shutdown");
@@ -1519,7 +1646,7 @@ async fn test_get_kad_records() -> eyre::Result<()> {
                 .as_ref()
                 .expect("authority")
                 .primary_network_address()
-                .clone(),
+                .expect("address"),
         )
         .await?;
     let target_addr = target_peer
@@ -1535,7 +1662,7 @@ async fn test_get_kad_records() -> eyre::Result<()> {
     for peer in committee.iter_mut() {
         // spawn peer network
         let peer_network = peer.network.take().expect("peer network is some");
-        let id = peer.config.authority().as_ref().expect("authority").id().peer_id();
+        let id = peer.config.authority().as_ref().expect("authority").peer_id().unwrap();
         tokio::spawn(async move {
             let res = peer_network.run().await;
             debug!(target: "network", ?id, ?res, "network shutdown");
@@ -1548,7 +1675,7 @@ async fn test_get_kad_records() -> eyre::Result<()> {
                     .as_ref()
                     .expect("authority")
                     .primary_network_address()
-                    .clone(),
+                    .expect("address"),
             )
             .await?;
 
@@ -1586,7 +1713,12 @@ async fn test_get_kad_records() -> eyre::Result<()> {
     });
 
     nvv.start_listening(
-        nvv_config.authority().as_ref().expect("authority").primary_network_address().clone(),
+        nvv_config
+            .authority()
+            .as_ref()
+            .expect("authority")
+            .primary_network_address()
+            .expect("address"),
     )
     .await?;
 
@@ -1632,7 +1764,7 @@ async fn test_get_kad_records() -> eyre::Result<()> {
     debug!(target: "network", ?connected, "nvv connected peers");
     assert!(connected.contains(&target_peer_id));
     for peer in committee.iter() {
-        let id = peer.config.authority().as_ref().expect("authority").id().peer_id();
+        let id = peer.config.authority().as_ref().expect("authority").peer_id().unwrap();
         assert!(connected.contains(&id));
     }
 

@@ -606,8 +606,9 @@ where
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<(PrimaryNode<DatabaseType>, WorkerNode<DatabaseType>)> {
         // create config for consensus
-        let consensus_config =
-            self.configure_consensus(engine, network_config, &consensus_db).await?;
+        let consensus_config = self
+            .configure_consensus(engine, network_config, &consensus_db, epoch_task_manager)
+            .await?;
 
         let primary = self
             .create_primary_node_components(
@@ -665,6 +666,7 @@ where
         engine: &ExecutionNode,
         network_config: &NetworkConfig,
         consensus_db: &DatabaseType,
+        epoch_task_manager: &TaskManager,
     ) -> eyre::Result<ConsensusConfig<DatabaseType>> {
         // retrieve epoch information from canonical tip
         let EpochState { epoch, epoch_info, validators, epoch_start } =
@@ -685,7 +687,8 @@ where
         // send these to the swarm for validator discovery
         let keys_for_worker_cache = validators.keys().cloned().collect();
         debug!(target: "epoch-manager", ?validators, "creating committee for validators");
-        let committee = self.create_committee_from_state(epoch, validators).await?;
+        let committee =
+            self.create_committee_from_state(epoch, validators, epoch_task_manager).await?;
         let worker_cache =
             self.create_worker_cache_from_state(epoch, keys_for_worker_cache).await?;
 
@@ -709,6 +712,7 @@ where
         &self,
         epoch: Epoch,
         validators: HashMap<BlsPublicKey, &ConsensusRegistry::ValidatorInfo>,
+        epoch_task_manager: &TaskManager,
     ) -> eyre::Result<Committee> {
         info!(target: "epoch-manager", "creating committee from state");
 
@@ -726,37 +730,66 @@ where
                 .as_ref()
                 .ok_or_eyre("missing primary network handle for epoch manager")?;
 
-            let mut primary_network_infos = primary_handle
-                .inner_handle()
-                .find_authorities(validators.keys().cloned().collect())
-                .await?;
-
-            debug!(target: "epoch-manager", "requsting info validator info for {} authorities", primary_network_infos.len());
-
             // build the committee using kad network
             let mut committee_builder = CommitteeBuilder::new(epoch);
 
-            // loop through the primary info returned from network query
-            while let Some(info) = primary_network_infos.next().await {
-                debug!(target: "epoch-manager", ?info, "awaited next primary network info");
-                let (protocol_key, NetworkInfo { pubkey, multiaddr, hostname }) = info??;
-                debug!(target: "epoch-manager", peer_id=?pubkey.to_peer_id(), "awaited next primary network info");
-                let validator = validators
-                    .get(&protocol_key)
-                    .ok_or_eyre("network returned validator that isn't in the committee")?;
-                let execution_address = validator.validatorAddress;
-
+            let mut missing: Vec<BlsPublicKey> = Vec::default();
+            for validator in validators {
+                // Get any network settings for knows committee members.
+                // We should probably know them all at this point but this code will not block
+                // or error out on the network.
+                let (address, netpubkey) = if let Ok(info) =
+                    primary_handle.inner_handle().find_local_authority(validator.0).await
+                {
+                    let (_, NetworkInfo { pubkey, multiaddr, hostname: _ }) = info;
+                    (Some(multiaddr), Some(pubkey))
+                } else {
+                    missing.push(validator.0);
+                    (None, None)
+                };
                 committee_builder.add_authority(
-                    protocol_key,
+                    validator.0,
                     1, // set stake so every authority's weight is equal
-                    multiaddr,
-                    execution_address,
-                    pubkey,
-                    hostname,
+                    address,
+                    validator.1.validatorAddress,
+                    netpubkey,
                 );
             }
+            let committee = committee_builder.build();
+            if !missing.is_empty() {
+                // If we don't have network settings for any committee members than request them in
+                // the background.
+                let committee_clone = committee.clone();
+                let mut primary_network_infos =
+                    primary_handle.inner_handle().find_authorities(missing).await?;
+                let primary_handle_clone = primary_handle.clone();
+                debug!(target: "epoch-manager", "requsting info validator info for {} authorities", primary_network_infos.len());
 
-            committee_builder.build()
+                let primary_topic = tn_config::LibP2pConfig::primary_topic();
+                // Spawn a task to get and update the committees network settings.
+                epoch_task_manager.spawn_task("find committee network", async move {
+                    while let Some(info) = primary_network_infos.next().await {
+                        debug!(target: "epoch-manager", ?info, "awaited next primary network info");
+                        if let Ok(Ok(info)) = info {
+                            let (protocol_key, NetworkInfo { pubkey, multiaddr, hostname: _ }) = info;
+                            debug!(target: "epoch-manager", peer_id=?pubkey.to_peer_id(), "awaited next primary network info");
+                            committee_clone.update_authority_network(protocol_key, multiaddr, pubkey);
+                            // We added a new committee peer so need to allow them to publish.
+                            if let Err(err) = primary_handle_clone
+                                .inner_handle()
+                                .subscribe_with_publishers(
+                                    primary_topic.clone(),
+                                    committee_clone.authorities().iter().filter_map(|a| a.peer_id()).collect()
+                                )
+                                .await {
+                                    error!(target: "epoch-manager", "Error updating subscribe publishers: {err}");
+                                }
+                        }
+                    }
+                });
+            }
+
+            committee
         };
 
         // load committee
@@ -942,17 +975,17 @@ where
         network_handle
             .inner_handle()
             .subscribe_with_publishers(
-                consensus_config.network_config().libp2p_config().primary_topic(),
+                tn_config::LibP2pConfig::primary_topic(),
                 consensus_config.committee_peer_ids(),
             )
             .await?;
 
         // always dial peers for the new epoch
-        for (authority_id, addr, _) in consensus_config
+        for (_authority_id, addr, key) in consensus_config
             .committee()
             .others_primaries_by_id(consensus_config.authority_id().as_ref())
         {
-            let peer_id = authority_id.peer_id();
+            let peer_id = key.into();
             self.dial_peer(
                 network_handle.inner_handle().clone(),
                 peer_id,

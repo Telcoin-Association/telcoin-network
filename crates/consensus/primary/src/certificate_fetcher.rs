@@ -352,11 +352,8 @@ async fn fetch_certificates_helper(
     trace!(target: "primary::cert_fetcher", "Start sending fetch certificates requests");
     // TODO: make this a config parameter.
     let request_interval = PARALLEL_FETCH_REQUEST_INTERVAL_SECS;
-    let mut peers: Vec<PeerId> = committee
-        .others_primaries_by_id(name)
-        .into_iter()
-        .map(|(auth_id, _, _)| auth_id.peer_id())
-        .collect();
+    let mut peers: Vec<PeerId> =
+        committee.others_primaries_by_id(name).into_iter().map(|(_, _, key)| key.into()).collect();
     peers.shuffle(&mut ThreadRng::default());
     let fetch_timeout = PARALLEL_FETCH_REQUEST_INTERVAL_SECS
         * peers.len().try_into().expect("usize into secs duration")

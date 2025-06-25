@@ -98,6 +98,9 @@ pub enum NetworkError {
     /// The retrieved peer record is invalid.
     #[error("Invalid bls signature for peer record.")]
     InvalidPeerRecord,
+    /// The requested peer is not on our local store.
+    #[error("Requested peer is not in our local store.")]
+    PeerNotLocal,
     /// Kademlia error.
     #[error("Failed to get kad record: {0}")]
     GetKademliaRecord(#[from] GetRecordError),

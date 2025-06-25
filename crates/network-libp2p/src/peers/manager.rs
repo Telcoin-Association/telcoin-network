@@ -532,7 +532,6 @@ impl PeerManager {
         // check all peers for authority and track missing
         for AuthorityInfoRequest { bls_key, reply } in authorities {
             if let Some(info) = self.peers.find_authority(&bls_key) {
-                // reply.send(info)
                 send_or_log_error!(reply, Ok((bls_key, info)), "find authority");
                 continue;
             }
@@ -543,5 +542,16 @@ impl PeerManager {
 
         // emit event for kad to try to discover
         self.events.push_back(PeerEvent::MissingAuthorities(missing));
+    }
+
+    /// Find authorities for the epoch manager.
+    pub(crate) fn find_local_authority(&mut self, authority: AuthorityInfoRequest) {
+        // check all peers for authority and track missing
+        let AuthorityInfoRequest { bls_key, reply } = authority;
+        if let Some(info) = self.peers.find_authority(&bls_key) {
+            send_or_log_error!(reply, Ok((bls_key, info)), "find authority");
+        } else {
+            send_or_log_error!(reply, Err(NetworkError::PeerNotLocal), "find authority");
+        }
     }
 }

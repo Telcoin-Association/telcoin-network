@@ -600,6 +600,10 @@ where
                 // this will trigger a PeerEvent to fetch records through kad if not in the peer map
                 self.swarm.behaviour_mut().peer_manager.find_authorities(requests);
             }
+            NetworkCommand::FindLocalAuthority { request } => {
+                // this will trigger a PeerEvent to fetch records through kad if not in the peer map
+                self.swarm.behaviour_mut().peer_manager.find_local_authority(request);
+            }
         }
 
         Ok(())

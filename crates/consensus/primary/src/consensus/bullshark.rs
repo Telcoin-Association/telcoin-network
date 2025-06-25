@@ -313,7 +313,7 @@ impl<DB: ConsensusStore> Bullshark<DB> {
                     (authority, None) => {
                         self.metrics
                             .leader_election
-                            .with_label_values(&["not_found", authority.hostname()])
+                            .with_label_values(&["not_found", &authority.id().to_string()])
                             .inc();
 
                         continue;
@@ -329,7 +329,7 @@ impl<DB: ConsensusStore> Bullshark<DB> {
             } else {
                 self.metrics
                     .leader_election
-                    .with_label_values(&["no_path", authority.hostname()])
+                    .with_label_values(&["no_path", &authority.id().to_string()])
                     .inc();
             }
         }
@@ -343,7 +343,10 @@ impl<DB: ConsensusStore> Bullshark<DB> {
                 .authority(certificate.origin())
                 .expect("verified certificate signed by authority in committee");
 
-            metrics.leader_election.with_label_values(&["committed", authority.hostname()]).inc();
+            metrics
+                .leader_election
+                .with_label_values(&["committed", &authority.id().to_string()])
+                .inc();
         });
 
         to_commit
@@ -414,12 +417,12 @@ impl<DB: ConsensusStore> Bullshark<DB> {
             if state.last_round.committed_round < previous_leader_round {
                 self.metrics
                     .leader_commit_accuracy
-                    .with_label_values(&["miss", authority.hostname()])
+                    .with_label_values(&["miss", &authority.id().to_string()])
                     .inc();
             } else {
                 self.metrics
                     .leader_commit_accuracy
-                    .with_label_values(&["hit", authority.hostname()])
+                    .with_label_values(&["hit", &authority.id().to_string()])
                     .inc();
             }
         }

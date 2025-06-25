@@ -252,8 +252,9 @@ where
     }
 
     /// Committee network peer ids.
+    /// If we do not know a committee member network address (including peer id) it is excluded.
     pub fn committee_peer_ids(&self) -> HashSet<PeerId> {
-        self.inner.committee.authorities().iter().map(|a| a.peer_id()).collect()
+        self.inner.committee.authorities().iter().filter_map(|a| a.peer_id()).collect()
     }
 
     /// Retrieve the primaries network address.
@@ -261,16 +262,17 @@ where
     /// system.
     pub fn primary_address(&self) -> Multiaddr {
         if let Some(authority) = self.authority() {
-            authority.primary_network_address().clone()
-        } else {
-            let host = std::env::var("TN_PRIMARY_HOST").unwrap_or("0.0.0.0".to_string());
-            let primary_udp_port = std::env::var("TN_PRIMARY_PORT").unwrap_or_else(|_| {
-                tn_types::get_available_udp_port(&host).unwrap_or(49584).to_string()
-            });
-            format!("/ip4/{}/udp/{}/quic-v1", &host, primary_udp_port)
-                .parse()
-                .expect("multiaddr parsed for primary consensus")
+            if let Some(addr) = authority.primary_network_address().clone() {
+                return addr;
+            }
         }
+        let host = std::env::var("TN_PRIMARY_HOST").unwrap_or("0.0.0.0".to_string());
+        let primary_udp_port = std::env::var("TN_PRIMARY_PORT").unwrap_or_else(|_| {
+            tn_types::get_available_udp_port(&host).unwrap_or(49584).to_string()
+        });
+        format!("/ip4/{}/udp/{}/quic-v1", &host, primary_udp_port)
+            .parse()
+            .expect("multiaddr parsed for primary consensus")
     }
 
     /// Map of primary peer ids and multiaddrs in the current committee.
@@ -279,7 +281,10 @@ where
             .committee
             .authorities()
             .iter()
-            .map(|a| (a.peer_id(), a.primary_network_address().clone()))
+            .filter_map(|a| match (a.peer_id(), a.primary_network_address().clone()) {
+                (Some(peer_id), Some(addr)) => Some((peer_id, addr)),
+                _ => None,
+            })
             .collect()
     }
 

@@ -125,10 +125,9 @@ impl NetworkGenesis {
             committee_builder.add_authority(
                 *pubkey,
                 1,
-                validator.primary_network_address().clone(),
+                Some(validator.primary_network_address().clone()),
                 validator.execution_address,
-                validator.primary_network_key().clone(),
-                "hostname".to_string(),
+                Some(validator.primary_network_key().clone()),
             );
         }
         Ok(committee_builder.build())

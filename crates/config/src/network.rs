@@ -114,7 +114,7 @@ pub struct LibP2pConfig {
 
 impl LibP2pConfig {
     /// Return topics for primary.
-    pub fn primary_topic(&self) -> String {
+    pub fn primary_topic() -> String {
         String::from("tn-primary")
     }
 
