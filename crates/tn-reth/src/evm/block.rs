@@ -10,7 +10,7 @@ use crate::{
 };
 use alloy::{
     consensus::{proofs, Block, BlockBody, Transaction, TxReceipt},
-    eips::eip7685::Requests,
+    eips::{eip4788::BEACON_ROOTS_ADDRESS, eip7685::Requests},
     sol_types::SolCall as _,
 };
 use alloy_evm::{Database, Evm};
@@ -60,10 +60,44 @@ pub struct TNBlockExecutionCtx {
     /// The hash is stored in the `extra_data` field so clients know when the
     /// closing epoch call was made.
     pub close_epoch: Option<B256>,
-    /// Difficulty- this will contain the worker id ancd batch index.
+    /// Difficulty- this contains the worker id and batch index:
+    /// `U256::from(payload.batch_index << 16 | payload.worker_id as usize)`
     pub difficulty: U256,
     /// Counter used to allocate rewards for block leaders.
     pub rewards_counter: RewardsCounter,
+}
+
+impl TNBlockExecutionCtx {
+    /// Checks if the batch_index stored in the difficulty field is zero
+    /// which indicates the first batch in the executed output from consensus.
+    ///
+    /// The difficulty field packs two values using bit operations:
+    /// `difficulty = U256::from(batch_index << 16 | worker_id as usize)`
+    ///
+    /// This creates a bit layout where:
+    /// - Bits 0-15 (lower 16 bits): worker_id (max value 65535)
+    /// - Bits 16+     (upper bits): batch_index
+    ///
+    /// Since worker_id can only occupy the lower 16 bits (max value 2^16 - 1 = 65535),
+    /// if the entire difficulty value is less than 2^16 (65536), then no bits are set
+    /// in positions 16 or higher. This mathematically guarantees that batch_index = 0.
+    ///
+    /// This approach avoids bit shifting operations and provides an efficient
+    /// zero-check without extracting the actual batch_index value.
+    ///
+    /// # Example
+    /// ```
+    /// // If difficulty = 0x00001234, then:
+    /// // - worker_id = 0x1234 (bits 0-15)
+    /// // - batch_index = 0x0000 (bits 16+)
+    /// // Since 0x1234 < 0x10000 (65536), batch_index is 0
+    /// ```
+    ///
+    /// This is used during execution to write the consensus header hash
+    /// to `BEACON_ROOTS` contract (eip4788).
+    fn first_batch(&self) -> bool {
+        self.difficulty < U256::from(65536)
+    }
 }
 
 /// Block executor for Ethereum.
@@ -320,6 +354,59 @@ where
         let epoch = nonce >> 32;
         epoch as u32
     }
+
+    /// Applies the pre-block call to the EIP-4788 consensus (beacon) root contract.
+    fn apply_consensus_root_contract_call(&mut self) -> Result<(), BlockExecutionError> {
+        trace!(target: "engine", "applying consensus root contract call");
+        if !self.spec.is_cancun_active_at_timestamp(self.evm.block().timestamp) {
+            return Ok(());
+        }
+
+        let parent_beacon_block_root = self
+            .ctx
+            .parent_beacon_block_root
+            .ok_or(BlockValidationError::MissingParentBeaconBlockRoot)?;
+
+        trace!(target: "engine", block_number=self.evm.block().number, ?parent_beacon_block_root, "evaluating parent root");
+
+        // if the block number is zero (genesis block) then the parent beacon block root must
+        // be 0x0 and no system transaction may occur as per EIP-4788
+        if self.evm.block().number == 0 {
+            if !parent_beacon_block_root.is_zero() {
+                return Err(BlockValidationError::CancunGenesisParentBeaconBlockRootNotZero {
+                    parent_beacon_block_root,
+                }
+                .into());
+            }
+
+            return Ok(());
+        }
+
+        let mut res = match self.evm.transact_system_call(
+            SYSTEM_ADDRESS,
+            BEACON_ROOTS_ADDRESS,
+            parent_beacon_block_root.0.into(),
+        ) {
+            Ok(res) => res,
+            Err(e) => {
+                return Err(BlockValidationError::BeaconRootContractCall {
+                    parent_beacon_block_root: Box::new(parent_beacon_block_root),
+                    message: e.to_string(),
+                }
+                .into())
+            }
+        };
+
+        // NOTE: revm currently marks the caller and block beneficiary accounts as "touched"
+        // after the above transact calls, and includes them in the result.
+        //
+        // Cleanup state here to make sure that changeset only includes the changed
+        // contract storage.
+        res.state.retain(|addr, _| *addr == BEACON_ROOTS_ADDRESS);
+        trace!(target: "engine", ?res, "retained state");
+        self.evm.db_mut().commit(res.state);
+        Ok(())
+    }
 }
 
 // alloy-evm
@@ -342,6 +429,12 @@ where
         let state_clear_flag =
             self.spec.is_spurious_dragon_active_at_block(self.evm.block().number);
         self.evm.db_mut().set_state_clear_flag(state_clear_flag);
+
+        // apply system calls and cleanup state
+        if self.ctx.first_batch() {
+            // only write consensus root once per ouptut
+            self.apply_consensus_root_contract_call()?;
+        }
 
         Ok(())
     }
@@ -480,9 +573,10 @@ where
         let withdrawals = Some(Withdrawals::default());
         let withdrawals_root = Some(EMPTY_WITHDRAWALS);
 
-        // cancun isn't active
-        let excess_blob_gas = None;
-        let blob_gas_used = None;
+        // set excess blob gas 0
+        let excess_blob_gas = Some(0);
+        let blob_gas_used =
+            Some(transactions.iter().map(|tx| tx.blob_gas_used().unwrap_or_default()).sum());
 
         // TN-specific values
         let requests_hash = ctx.requests_hash; // prague inactive

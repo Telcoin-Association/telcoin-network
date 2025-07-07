@@ -4,13 +4,16 @@ use std::{collections::VecDeque, str::FromStr as _, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tn_batch_builder::test_utils::execute_test_batch;
 use tn_engine::ExecutorEngine;
-use tn_reth::{test_utils::seeded_genesis_from_random_batches, FixedBytes, RethChainSpec};
+use tn_reth::{
+    test_utils::{seeded_genesis_from_random_batches, BEACON_ROOTS_ADDRESS},
+    FixedBytes, RethChainSpec,
+};
 use tn_test_utils::default_test_execution_node;
 use tn_types::{
-    gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc, test_genesis,
-    Address, BlockHash, Bloom, Bytes, Certificate, CommittedSubDag, ConsensusOutput, Hash as _,
-    Notifier, ReputationScores, TaskManager, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS,
-    MIN_PROTOCOL_BASE_FEE, U256,
+    adiri_genesis, gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc,
+    test_genesis, Address, BlockHash, Bloom, Bytes, Certificate, CommittedSubDag, ConsensusOutput,
+    Hash as _, Notifier, ReputationScores, TaskManager, B256, EMPTY_OMMER_ROOT_HASH,
+    EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tokio::{sync::oneshot, time::timeout};
 use tracing::debug;
@@ -25,9 +28,12 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     // are randomly generated
     //
     // for each tx, seed address with funds in genesis
+    let timestamp = now();
     let mut leader = Certificate::default();
     let sub_dag_index = 0;
     leader.header.round = sub_dag_index as u32;
+    // update timestamp so it's not default 0
+    leader.header.created_at = timestamp;
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let beneficiary = Address::from_str("0x5555555555555555555555555555555555555555")
@@ -47,8 +53,7 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     };
     let consensus_output_hash = consensus_output.consensus_header_hash();
 
-    let chain = test_chain_spec_arc();
-
+    let chain: Arc<RethChainSpec> = Arc::new(adiri_genesis().into());
     let tmp_dir = TempDir::new().expect("temp dir");
     // execution node components
     let execution_node = default_test_execution_node(Some(chain.clone()), None, tmp_dir.path())?;
@@ -143,8 +148,8 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     );
     // first block's parent is expected to be genesis
     assert_eq!(expected_block.parent_hash, chain.genesis_hash());
-    // expect state roots to be same because empty output has no state change
-    assert_eq!(expected_block.state_root, genesis_header.state_root);
+    // expect state roots are different after writing parent hash to BEACON_ROOT_CONTRACT
+    assert_ne!(expected_block.state_root, genesis_header.state_root);
     // expect header number genesis + 1
     assert_eq!(expected_block.number, expected_block_height);
 
@@ -171,6 +176,37 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     //
     // NOTE: this is currently always empty
     assert_eq!(expected_block.withdrawals_root, genesis_header.withdrawals_root);
+
+    // assert consensus output written to BEACON_ROOTS contract for eip4788
+    let state_provider = reth_env.latest()?;
+    // for EIP-4788, the storage slot is derived from the timestamp:
+    //  - timestamp_slot = to_uint256_be(evm.timestamp) % HISTORY_BUFFER_LENGTH
+    //  - root_slot = timestamp_idx + HISTORY_BUFFER_LENGTH
+    const HISTORY_BUFFER_LENGTH: u64 = 8191;
+
+    // assert the timestamp was correctly written to the contract
+    let expected_timestamp = expected_block.timestamp;
+    let timestamp_storage_slot = U256::from(expected_timestamp % HISTORY_BUFFER_LENGTH);
+    let stored_value = state_provider
+        .storage(BEACON_ROOTS_ADDRESS, timestamp_storage_slot.into())?
+        .unwrap_or_default();
+    assert_eq!(
+        stored_value,
+        U256::from(expected_timestamp),
+        "Timestamp should be written to beacon roots contract at slot {}",
+        timestamp_storage_slot
+    );
+
+    // assert the block hash was correctly written to the contract
+    let root_storage_slot = timestamp_storage_slot + U256::from(HISTORY_BUFFER_LENGTH);
+    let expected_blockhash = U256::from_be_bytes(consensus_output.consensus_header_hash().0);
+    let stored_value =
+        state_provider.storage(BEACON_ROOTS_ADDRESS, root_storage_slot.into())?.unwrap_or_default();
+    assert_eq!(
+        stored_value, expected_blockhash,
+        "Consensus header hash should be written to beacon roots contract at slot {}",
+        root_storage_slot
+    );
 
     Ok(())
 }

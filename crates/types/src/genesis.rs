@@ -63,8 +63,8 @@ pub fn set_genesis_defaults(genesis: &mut Genesis) {
     genesis.config.istanbul_block = Some(0);
     genesis.config.berlin_block = Some(0);
     genesis.config.london_block = Some(0);
-    genesis.config.cancun_time = None; //Some(0);
     genesis.config.shanghai_time = Some(0);
+    genesis.config.cancun_time = Some(0);
     genesis.config.prague_time = None;
     genesis.config.osaka_time = None;
     // Configure some misc genesis stuff.

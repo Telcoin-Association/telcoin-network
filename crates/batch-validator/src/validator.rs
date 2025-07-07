@@ -69,6 +69,9 @@ impl BatchValidation for BatchValidator {
         // validate txs decode
         let decoded_txs = self.decode_transactions(transactions, digest)?;
 
+        // validate no txs are eip4844
+        self.validate_no_blob_txs(&decoded_txs)?;
+
         // validate gas limit
         self.validate_batch_gas(&decoded_txs, batch.timestamp)?;
 
@@ -200,6 +203,17 @@ impl BatchValidator {
         Ok(())
     }
 
+    /// Validate the block's basefee
+    fn validate_no_blob_txs(
+        &self,
+        transactions: &[TransactionSigned],
+    ) -> BatchValidationResult<()> {
+        if let Some(blob_tx) = transactions.iter().find(|tx| tx.is_eip4844()) {
+            return Err(BatchValidationError::InvalidTx4844(*blob_tx.hash()));
+        }
+        Ok(())
+    }
+
     /// Helper function for decoding and recovering transactions.
     fn recover_and_validate(
         tx: &[u8],
@@ -232,8 +246,8 @@ mod tests {
     use tempfile::TempDir;
     use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
     use tn_types::{
-        max_batch_gas, test_genesis, Address, Batch, Bytes, Encodable2718 as _, GenesisAccount,
-        TaskManager, B256, MIN_PROTOCOL_BASE_FEE, U256,
+        max_batch_gas, test_genesis, Address, Batch, Bytes, Encodable2718 as _, FromHex,
+        GenesisAccount, TaskManager, B256, MIN_PROTOCOL_BASE_FEE, U256,
     };
 
     /// Return the next valid sealed batch
@@ -548,6 +562,38 @@ mod tests {
         assert_matches!(
             validator.validate_batch(batch.clone().seal_slow()),
             Err(BatchValidationError::RecoverTransaction(_, _))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_tx_eip4844() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
+        let (mut batch, _) = valid_batch.split();
+
+        // eip4844 transaction
+        let mut tx_factory = TransactionFactory::new_random();
+        // known versioned hash for zero blob `c00...000`
+        let blob_versioned_hash = vec![B256::from_hex(
+            "010657f37554c781402a22917dee2f75def7ab966d7b770905398eba3c444014",
+        )
+        .expect("known versioned hash is valid")];
+
+        // create signed tx
+        let signed_tx = tx_factory.create_eip4844(
+            validator.reth_env.chainspec().chain_id(),
+            None,
+            7,
+            blob_versioned_hash,
+        );
+
+        // test batch with eip4844 tx
+        batch.transactions = vec![signed_tx.encoded_2718()];
+
+        assert_matches!(
+            validator.validate_batch(batch.clone().seal_slow()),
+            Err(BatchValidationError::InvalidTx4844(_))
         );
     }
 }

@@ -13,7 +13,7 @@ use reth_revm::{
     context_interface::block::BlobExcessGasAndPrice,
     primitives::hardfork::SpecId,
 };
-use std::sync::Arc;
+use std::{sync::Arc, u128};
 use tn_types::{
     gas_accumulator::RewardsCounter, BlockHeader as _, Bytes, SealedBlock, SealedHeader, B256, U256,
 };
@@ -150,7 +150,10 @@ impl ConfigureEvm for TnEvmConfig {
             prevrandao: Some(payload.prev_randao()),
             gas_limit: payload.gas_limit,
             basefee: payload.base_fee_per_gas,
-            blob_excess_gas_and_price: None,
+            blob_excess_gas_and_price: Some(BlobExcessGasAndPrice {
+                excess_blob_gas: 0,       // no excess gas for blobs
+                blob_gasprice: u128::MAX, // eip4844 transactions are ignored
+            }),
         };
 
         let evm_env = EvmEnv::new(cfg, block_env);

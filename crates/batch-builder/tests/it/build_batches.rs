@@ -18,8 +18,8 @@ use tn_storage::{open_db, tables::Batches};
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
     test_genesis, Address, Batch, BatchValidation, Bytes, Certificate, CommittedSubDag,
-    ConsensusOutput, Database, Encodable2718 as _, ReputationScores, SealedBatch, TaskManager,
-    U160, U256,
+    ConsensusOutput, Database, Encodable2718, GenesisAccount, ReputationScores, SealedBatch,
+    TaskManager, U160, U256,
 };
 use tn_worker::{
     metrics::WorkerMetrics, test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle,
@@ -192,21 +192,29 @@ async fn test_make_batch_el_to_cl() {
     assert_eq!(pending_pool_len, 0);
 }
 
-/// Create 4 transactions.
+/// Create 5 transactions.
 ///
-/// First 3 mined in first batch.
-/// Before a canonical state change, mine the 4th transaction in the next batch.
+/// First 4 mined in first batch.
+/// One of the transactions is EIP-4844 blob which is discarded.
+/// (only 3 valid txs in first batch)
+/// Before a canonical state change, mine the 5th transaction in the next batch.
 #[tokio::test]
-async fn test_batch_builder_produces_valid_batchess() {
+async fn test_batch_builder_produces_valid_batches() {
     //
     //=== Execution Layer
     //
     // adiri genesis with TxFactory funded
     let genesis = test_genesis();
 
-    // let genesis = genesis.extend_accounts(account);
+    // create random tx factory for eip-4844 transaction reth does not allow
+    // different tx types in pool at same time from same address
+    // see Err: ExistingConflictingTransactionType
+    let mut blob_tx_factory = TransactionFactory::new_random();
+    let genesis = genesis.extend_accounts([(
+        blob_tx_factory.address(),
+        GenesisAccount::default().with_balance(U256::MAX),
+    )]);
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
-
     let address = Address::from(U160::from(333));
     let tmp_dir = TempDir::new().unwrap();
     let task_manager = TaskManager::default();
@@ -269,10 +277,16 @@ async fn test_batch_builder_produces_valid_batchess() {
     let added_result = tx_factory.submit_tx_to_pool(transaction3.clone(), txpool.clone()).await;
     assert_matches!(added_result, hash if &hash == transaction3.hash());
 
+    // submit eip-4844 blob transaction
+    let _ = blob_tx_factory
+        .create_and_submit_eip4844(chain.clone(), None, gas_price, txpool.clone())
+        .await;
+
     // txpool size
-    let pending_pool_len = txpool.pool_size().pending;
-    debug!("pool_size(): {:?}", txpool.pool_size());
-    assert_eq!(pending_pool_len, 3);
+    let pool_size = txpool.pool_size();
+    assert_eq!(pool_size.pending, 4);
+    // ensure blob is not under valued
+    assert_eq!(pool_size.blob, 0);
 
     // spawn batch_builder once worker is ready
     let _batch_builder = tokio::spawn(Box::pin(batch_builder));
@@ -301,9 +315,10 @@ async fn test_batch_builder_produces_valid_batchess() {
         )
         .await;
 
-    // assert all 4 txs in pending pool
-    let pending_pool_len = txpool.pool_size().pending;
-    assert_eq!(pending_pool_len, 4);
+    // assert 4 txs in pending pool - blob should be removed while creating first batch
+    let pool_size = txpool.pool_size();
+    assert_eq!(pool_size.pending, 4);
+    assert_eq!(pool_size.blob, 0);
 
     // send ack to mine first 3 transactions
     let _ = ack.send(Ok(()));
@@ -325,13 +340,14 @@ async fn test_batch_builder_produces_valid_batchess() {
         received_at: None,
         ..*first_batch.batch()
     };
+    // assert only 3 transactions in batch - blob should be discarded
     let batch_txs = first_batch.batch().transactions();
     assert_eq!(batch_txs, expected_batch.transactions());
 
-    // receive next block
+    // receive next batch
     let (next_batch, ack) = timeout(duration, from_batch_builder.recv())
         .await
-        .expect("block builder's sender didn't drop")
+        .expect("batch builder's sender didn't drop")
         .expect("batch was built");
     // send ack to mine block
     let _ = ack.send(Ok(()));
@@ -352,9 +368,10 @@ async fn test_batch_builder_produces_valid_batchess() {
     // yield to try and give pool a chance to update
     tokio::task::yield_now().await;
 
-    // assert all transactions mined
-    let pending_pool_len = txpool.pool_size().pending;
-    assert_eq!(pending_pool_len, 0);
+    // assert all transactions mined/removed
+    let pool_size = txpool.pool_size();
+    assert_eq!(pool_size.pending, 0);
+    assert_eq!(pool_size.blob, 0);
 }
 
 /// Create 4 transactions.

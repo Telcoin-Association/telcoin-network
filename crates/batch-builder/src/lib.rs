@@ -30,6 +30,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
+    u128,
 };
 use tn_reth::{CanonStateNotificationStream, RethEnv, TxPool as _, WorkerTxPool};
 use tn_types::{
@@ -291,7 +292,7 @@ impl Future for BatchBuilder {
                         this.pool.update_canonical_state(
                             &this.last_canonical_update,
                             base_fee_per_gas,
-                            None,
+                            Some(u128::MAX), // set max fee for blobs
                             mined_transactions,
                             vec![],
                         );
