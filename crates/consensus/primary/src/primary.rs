@@ -116,7 +116,7 @@ impl<DB: Database> Primary<DB> {
         info!(
             "Primary {:?} successfully booted on {:?}",
             config.authority_id(),
-            config.authority().as_ref().map(|a| a.primary_network_address())
+            config.config().node_info.p2p_info.network_address
         );
     }
 

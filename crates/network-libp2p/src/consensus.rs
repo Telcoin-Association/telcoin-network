@@ -114,7 +114,7 @@ where
     ///
     /// This set must be updated at the start of each epoch. It is used to verify messages
     /// published on certain topics. These are updated when the caller subscribes to a topic.
-    authorized_publishers: HashMap<String, Option<HashSet<PeerId>>>,
+    authorized_publishers: HashMap<String, Option<HashSet<BlsPublicKey>>>,
     /// The collection of pending _graceful_ disconnects.
     ///
     /// This node disconnects from new peers if it already has the target number of peers.
@@ -154,10 +154,6 @@ where
     kad_add_peers: bool,
     /// The public network key for this node.
     network_pubkey: NetworkPublicKey,
-    /// The hostname for the node provided by the [NetworkConfig].
-    ///
-    /// This is a human-readable representation for a node identity.
-    hostname: String,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
 }
@@ -290,7 +286,6 @@ where
             key_config,
             kad_add_peers: true,
             network_pubkey,
-            hostname: network_config.hostname().to_string(),
             task_spawner,
         })
     }
@@ -333,12 +328,9 @@ where
 
         if let Some(addr) = multiaddr {
             let peer_id = *self.swarm.local_peer_id();
-            let node_record = NodeRecord::build(
-                self.network_pubkey.clone(),
-                addr,
-                self.hostname.clone(),
-                |data| self.key_config.request_signature_direct(data),
-            );
+            let node_record = NodeRecord::build(self.network_pubkey.clone(), addr, |data| {
+                self.key_config.request_signature_direct(data)
+            });
             Some(kad::Record {
                 key: key.clone(),
                 value: encode(&node_record),
@@ -475,16 +467,37 @@ where
                 let addrs = self.swarm.listeners().cloned().collect();
                 send_or_log_error!(reply, addrs, "GetListeners");
             }
-            NetworkCommand::AddExplicitPeer { peer_id, addr, reply } => {
+            NetworkCommand::AddTrustedPeerAndDial { bls_pubkey, network_pubkey, addr, reply } => {
                 // update peer manager
-                self.swarm.behaviour_mut().peer_manager.add_explicit_peer(
-                    peer_id,
-                    addr.clone(),
+                self.swarm.behaviour_mut().peer_manager.add_trusted_peer_and_dial(
+                    bls_pubkey,
+                    NetworkInfo { pubkey: network_pubkey, multiaddr: addr },
                     reply,
                 );
             }
+            NetworkCommand::AddExplicitPeer { bls_pubkey, network_pubkey, addr, reply } => {
+                // update peer manager
+                self.swarm.behaviour_mut().peer_manager.add_known_peer(
+                    bls_pubkey,
+                    NetworkInfo { pubkey: network_pubkey, multiaddr: addr },
+                );
+                let _ = reply.send(Ok(()));
+            }
             NetworkCommand::Dial { peer_id, peer_addr, reply } => {
-                self.swarm.behaviour_mut().peer_manager.dial_peer(peer_id, peer_addr, reply);
+                self.swarm.behaviour_mut().peer_manager.dial_peer(peer_id, peer_addr, Some(reply));
+            }
+            NetworkCommand::DialBls { bls_key, reply } => {
+                if let Some((peer_id, peer_addr)) =
+                    self.swarm.behaviour().peer_manager.auth_to_peer(bls_key)
+                {
+                    self.swarm.behaviour_mut().peer_manager.dial_peer(
+                        peer_id,
+                        peer_addr,
+                        Some(reply),
+                    );
+                } else {
+                    let _ = reply.send(Err(NetworkError::PeerNotLocal));
+                }
             }
             NetworkCommand::LocalPeerId { reply } => {
                 let peer_id = *self.swarm.local_peer_id();
@@ -527,16 +540,29 @@ where
                 send_or_log_error!(reply, collection, "AllMeshPeers");
             }
             NetworkCommand::MeshPeers { topic, reply } => {
+                let topic: IdentTopic = Topic::new(&topic);
                 let collection = self
                     .swarm
                     .behaviour_mut()
                     .gossipsub
-                    .mesh_peers(&TopicHash::from_raw(topic))
+                    //.mesh_peers(&TopicHash::from_raw(topic))
+                    .mesh_peers(&topic.into())
                     .cloned()
                     .collect();
                 send_or_log_error!(reply, collection, "MeshPeers");
             }
             NetworkCommand::SendRequest { peer, request, reply } => {
+                if let Some((peer, _addr)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer)
+                {
+                    let request_id =
+                        self.swarm.behaviour_mut().req_res.send_request(&peer, request);
+                    self.outbound_requests.insert((peer, request_id), reply);
+                } else {
+                    // Best effort to return an error to caller.
+                    let _ = reply.send(Err(NetworkError::PeerNotLocal));
+                }
+            }
+            NetworkCommand::SendRequestDirect { peer, request, reply } => {
                 let request_id = self.swarm.behaviour_mut().req_res.send_request(&peer, request);
                 self.outbound_requests.insert((peer, request_id), reply);
             }
@@ -601,8 +627,15 @@ where
                 self.swarm.behaviour_mut().peer_manager.find_authorities(requests);
             }
             NetworkCommand::FindLocalAuthority { request } => {
-                // this will trigger a PeerEvent to fetch records through kad if not in the peer map
                 self.swarm.behaviour_mut().peer_manager.find_local_authority(request);
+            }
+            NetworkCommand::FindLocalPeer { peer_id, reply } => {
+                let bls = self.swarm.behaviour_mut().peer_manager.peer_to_bls(&peer_id);
+                if let Some(bls_key) = bls {
+                    send_or_log_error!(reply, Ok(bls_key), "find peer");
+                } else {
+                    send_or_log_error!(reply, Err(NetworkError::PeerNotLocal), "find peer");
+                }
             }
         }
 
@@ -836,9 +869,12 @@ where
 
         // ensure publisher is authorized
         if gossip.source.is_some_and(|id| {
-            self.authorized_publishers
-                .get(topic.as_str())
-                .is_some_and(|auth| auth.is_none() || auth.as_ref().expect("is some").contains(&id))
+            let bls_key = self.swarm.behaviour().peer_manager.peer_to_bls(&id);
+            self.authorized_publishers.get(topic.as_str()).is_some_and(|auth| {
+                auth.is_none()
+                    || (bls_key.is_some()
+                        && auth.as_ref().expect("is some").contains(&bls_key.expect("is some")))
+            })
         }) {
             GossipAcceptance::Accept
         } else {
@@ -1094,6 +1130,12 @@ where
     ) {
         // ignore multiple query results
         if let Some(reply) = self.kad_requests.remove(query_id) {
+            if let Ok((bls_key, info)) = &result {
+                // If we got a response to a specific bls key request then store it in the
+                // peer manager known peers.  This indicates it is a peer we care about (probably a
+                // validator) so keep it handy.
+                self.swarm.behaviour_mut().peer_manager.add_known_peer(*bls_key, info.clone());
+            }
             send_or_log_error!(reply, result, "kad");
         }
     }

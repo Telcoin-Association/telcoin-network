@@ -91,7 +91,7 @@ impl WorkerNetworkHandle {
         // TODO- issue 237- should we sign these batches and check the sig before accepting any
         // batches during consensus?
         let request = WorkerRequest::ReportBatch { sealed_batch };
-        let res = self.handle.send_request(request, peer_id).await?;
+        let res = self.handle.send_request_direct(request, peer_id).await?;
         let res = res.await??;
         match res {
             WorkerResponse::ReportBatch => Ok(()),
@@ -136,7 +136,7 @@ impl WorkerNetworkHandle {
         timeout: Duration,
     ) -> NetworkResult<Vec<Batch>> {
         let request = WorkerRequest::RequestBatches { batch_digests: batch_digests.clone() };
-        let res = self.handle.send_request(request, peer_id).await?;
+        let res = self.handle.send_request_direct(request, peer_id).await?;
         let res =
             tokio::time::timeout(timeout, res).await.map_err(|_| NetworkError::Timeout)???;
         match res {

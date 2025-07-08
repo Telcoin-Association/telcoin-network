@@ -110,10 +110,6 @@ impl<DB: Database> AuthorityFixture<DB> {
         let (primary_keypair, key_config) = keys;
         // Make sure our keys are correct.
         assert_eq!(&key_config.primary_public_key(), authority.protocol_key());
-        assert_eq!(
-            key_config.primary_network_public_key(),
-            authority.network_key().expect("network key")
-        );
         assert_eq!(primary_keypair.public(), &key_config.primary_public_key());
         // Currently only support one worker per node.
         // If/when this is relaxed then the key_config below will need to change.
@@ -123,8 +119,6 @@ impl<DB: Database> AuthorityFixture<DB> {
         let _ = config.update_protocol_key(key_config.primary_public_key());
         let _ = config.update_primary_network_key(key_config.primary_network_public_key());
         let _ = config.update_worker_network_key(key_config.worker_network_public_key());
-        config.node_info.p2p_info.network_address =
-            authority.primary_network_address().clone().expect("primary network address set");
 
         let consensus_config = ConsensusConfig::new_with_committee_for_test(
             config,

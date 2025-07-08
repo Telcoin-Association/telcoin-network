@@ -122,12 +122,12 @@ impl NetworkGenesis {
     pub fn create_committee(&self) -> eyre::Result<Committee> {
         let mut committee_builder = CommitteeBuilder::new(0);
         for (pubkey, validator) in self.validators.iter() {
-            committee_builder.add_authority(
+            committee_builder.add_authority_and_bootstrap(
                 *pubkey,
                 1,
-                Some(validator.primary_network_address().clone()),
+                validator.primary_network_address().clone(),
                 validator.execution_address,
-                Some(validator.primary_network_key().clone()),
+                validator.primary_network_key().clone(),
             );
         }
         Ok(committee_builder.build())

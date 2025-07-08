@@ -257,8 +257,8 @@ fn test_is_validator() {
     let validator_id = PeerId::random();
     let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
     all_peers.current_committee.insert(validator_id);
-    assert!(all_peers.is_validator(&validator_id));
-    assert!(!all_peers.is_validator(&PeerId::random()));
+    assert!(all_peers.is_peer_validator(&validator_id));
+    assert!(!all_peers.is_peer_validator(&PeerId::random()));
 }
 
 #[test]

@@ -403,7 +403,7 @@ mod tests {
                         NetworkCommand::ConnectedPeers { reply } => {
                             reply.send(data_clone.lock().await.keys().copied().collect()).unwrap();
                         }
-                        NetworkCommand::SendRequest {
+                        NetworkCommand::SendRequestDirect {
                             peer,
                             request: WorkerRequest::RequestBatches { batch_digests: digests },
                             reply,

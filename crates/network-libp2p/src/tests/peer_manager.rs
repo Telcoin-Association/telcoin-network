@@ -4,13 +4,15 @@ use super::*;
 use crate::common::{create_multiaddr, random_ip_addr};
 use assert_matches::assert_matches;
 use libp2p::swarm::{ConnectionId, NetworkBehaviour as _};
+use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
     collections::{HashMap, HashSet},
     time::Duration,
 };
-use tn_config::{NetworkConfig, ScoreConfig};
+use tn_config::{KeyConfig, NetworkConfig, ScoreConfig};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
+use tn_types::BlsKeypair;
 use tokio::time::{sleep, timeout};
 
 fn create_test_peer_manager(network_config: Option<NetworkConfig>) -> PeerManager {
@@ -121,14 +123,21 @@ async fn test_register_disconnected_with_banned_peer() {
 async fn test_add_trusted_peer() {
     let config = ScoreConfig::default();
     let mut peer_manager = create_test_peer_manager(None);
-    let peer_id = PeerId::random();
+    let keys = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+    let peer_bls = keys.primary_public_key();
+    let peer_netkey = keys.primary_network_public_key();
+    let peer_id: PeerId = peer_netkey.clone().into();
     let multiaddr = create_multiaddr(None);
 
     // Create a oneshot channel to simulate the reply channel
     let (sender, _receiver) = oneshot::channel();
 
     // Add trusted peer
-    peer_manager.add_explicit_peer(peer_id, multiaddr.clone(), sender);
+    peer_manager.add_trusted_peer_and_dial(
+        peer_bls,
+        NetworkInfo { pubkey: peer_netkey, multiaddr: multiaddr.clone() },
+        sender,
+    );
 
     let score = peer_manager.peer_score(&peer_id).unwrap();
     assert_eq!(score, config.max_score);
@@ -155,7 +164,7 @@ async fn test_dial_peer_success() {
     let (sender, receiver) = oneshot::channel();
 
     // Dial peer
-    peer_manager.dial_peer(peer_id, multiaddr.clone(), sender);
+    peer_manager.dial_peer(peer_id, multiaddr.clone(), Some(sender));
 
     // Verify a dial request was created
     let dial_request = peer_manager.next_dial_request();
@@ -185,7 +194,7 @@ async fn test_dial_peer_already_dialing_error() {
     let (sender, _receiver) = oneshot::channel();
 
     // Dial peer for the first time
-    peer_manager.dial_peer(peer_id, multiaddr.clone(), sender);
+    peer_manager.dial_peer(peer_id, multiaddr.clone(), Some(sender));
 
     // Verify a dial request was created
     let dial_request = peer_manager.next_dial_request().unwrap();
@@ -197,7 +206,7 @@ async fn test_dial_peer_already_dialing_error() {
     let (sender2, receiver2) = oneshot::channel();
 
     // Try to dial the same peer again
-    peer_manager.dial_peer(peer_id, multiaddr.clone(), sender2);
+    peer_manager.dial_peer(peer_id, multiaddr.clone(), Some(sender2));
 
     // Verify no new dial request was created (since we already dialing)
     assert!(peer_manager.next_dial_request().is_none());
@@ -222,7 +231,7 @@ async fn test_dial_peer_already_connected() {
     let (sender, receiver) = oneshot::channel();
 
     // Try to dial the already connected peer
-    peer_manager.dial_peer(peer_id, multiaddr.clone(), sender);
+    peer_manager.dial_peer(peer_id, multiaddr.clone(), Some(sender));
 
     // Verify no dial request was created
     assert!(peer_manager.next_dial_request().is_none());
@@ -522,19 +531,21 @@ async fn test_is_validator() {
     let authority_1 = authorities.next().expect("first authority");
     let config = authority_1.consensus_config();
     let mut peer_manager = PeerManager::new(config.network_config().peer_config());
-    let validator = authority_1.authority().peer_id().unwrap();
+    let validator = authority_1.authority().protocol_key().clone();
     let random_peer_id = PeerId::random();
 
+    let info = NetworkInfo {
+        pubkey: config.key_config().primary_network_public_key(),
+        multiaddr: config.config().node_info.p2p_info.network_address.clone(),
+    };
+    peer_manager.add_known_peer(validator.clone(), info);
+
     // update epoch with random multiaddr
-    let committee =
-        config.committee_peer_ids().into_iter().map(|id| (id, create_multiaddr(None))).collect();
+    let committee = config.committee_pub_keys();
     peer_manager.new_epoch(committee);
 
-    // Verify validator peer is recognized
-    assert!(peer_manager.is_validator(&validator));
-
     // Verify random peer is not a validator
-    assert!(!peer_manager.is_validator(&random_peer_id));
+    assert!(!peer_manager.is_peer_validator(&random_peer_id));
 }
 
 #[tokio::test]

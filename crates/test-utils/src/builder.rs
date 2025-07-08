@@ -12,8 +12,8 @@ use std::{
 };
 use tn_config::{KeyConfig, NetworkConfig};
 use tn_types::{
-    get_available_udp_port, Address, Authority, AuthorityIdentifier, BlsKeypair, Committee,
-    Database, Epoch, Multiaddr, TimestampSec, VotingPower, WorkerCache, WorkerIndex,
+    get_available_udp_port, Address, Authority, AuthorityIdentifier, BlsKeypair, BootstrapServer,
+    Committee, Database, Epoch, Multiaddr, TimestampSec, VotingPower, WorkerCache, WorkerIndex,
     DEFAULT_PRIMARY_PORT, DEFAULT_WORKER_PORT,
 };
 
@@ -121,6 +121,7 @@ where
         let mut committee_info = Vec::with_capacity(committee_size);
         #[allow(clippy::mutable_key_type)]
         let mut authorities = BTreeMap::new();
+        let mut bootstrap_servers = BTreeMap::new();
         // Pass 1 to make the authorities so we can make the committee struct we need later.
         for i in 0..committee_size {
             let primary_keypair = BlsKeypair::generate(&mut rng);
@@ -136,9 +137,14 @@ where
             let authority = Authority::new_for_test(
                 key_config.primary_public_key(),
                 *self.voting_power.get(i).unwrap_or(&1),
-                primary_network_address,
                 Address::random_with(&mut rng),
-                key_config.primary_network_public_key(),
+            );
+            bootstrap_servers.insert(
+                *authority.protocol_key(),
+                BootstrapServer::new(
+                    primary_network_address,
+                    key_config.primary_network_public_key(),
+                ),
             );
             authorities.insert(
                 *authority.protocol_key(),
@@ -167,6 +173,7 @@ where
         let committee = Committee::new_for_test(
             authorities.into_iter().map(|(k, (_, _, a))| (k, a)).collect(),
             0,
+            bootstrap_servers,
         );
         // Build our worker cache.  This is map of authorities to it's worker (one per authority).
         let worker_cache = WorkerCache {

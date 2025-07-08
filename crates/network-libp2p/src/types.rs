@@ -85,7 +85,7 @@ where
     /// Only valid for Subscriber implementations.
     UpdateAuthorizedPublishers {
         /// The unique set of authorized peers by topic.
-        authorities: HashMap<String, Option<HashSet<PeerId>>>,
+        authorities: HashMap<String, Option<HashSet<BlsPublicKey>>>,
         /// The acknowledgement that the set was updated.
         reply: oneshot::Sender<NetworkResult<()>>,
     },
@@ -103,12 +103,25 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<Vec<Multiaddr>>,
     },
-    /// Add explicit peer to add.
+    /// Add explicit peer and then dial it.
     ///
     /// This adds to the swarm's peers and the gossipsub's peers.
-    AddExplicitPeer {
+    AddTrustedPeerAndDial {
+        /// The Bls public key for this record.
+        bls_pubkey: BlsPublicKey,
         /// The peer's id.
-        peer_id: PeerId,
+        network_pubkey: NetworkPublicKey,
+        /// The peer's address.
+        addr: Multiaddr,
+        /// Reply for connection outcome.
+        reply: oneshot::Sender<NetworkResult<()>>,
+    },
+    /// Add explicit peer to internal bls to peer cache.
+    AddExplicitPeer {
+        /// The Bls public key for this record.
+        bls_pubkey: BlsPublicKey,
+        /// The peer's id.
+        network_pubkey: NetworkPublicKey,
         /// The peer's address.
         addr: Multiaddr,
         /// Reply for connection outcome.
@@ -123,6 +136,13 @@ where
         /// Oneshot for reply
         reply: oneshot::Sender<NetworkResult<()>>,
     },
+    /// Dial a peer by bls key to establish a connection.
+    DialBls {
+        /// The peer's bls public key.
+        bls_key: BlsPublicKey,
+        /// Oneshot for reply
+        reply: oneshot::Sender<NetworkResult<()>>,
+    },
     /// Return an owned copy of this node's [PeerId].
     LocalPeerId {
         /// Reply to caller.
@@ -134,6 +154,19 @@ where
     /// data. Peers that send messages that fail to decode must receive an application score
     /// penalty.
     SendRequest {
+        /// The destination peer.
+        peer: BlsPublicKey,
+        /// The request to send.
+        request: Req,
+        /// Channel for forwarding any responses.
+        reply: oneshot::Sender<NetworkResult<Res>>,
+    },
+    /// Send a request to a peer by PeerId.
+    ///
+    /// The caller is responsible for decoding message bytes and reporting peers who return bad
+    /// data. Peers that send messages that fail to decode must receive an application score
+    /// penalty.
+    SendRequestDirect {
         /// The destination peer.
         peer: PeerId,
         /// The request to send.
@@ -166,7 +199,7 @@ where
         /// The topic to subscribe to.
         topic: String,
         /// Authorized publishers.
-        publishers: Option<HashSet<PeerId>>,
+        publishers: Option<HashSet<BlsPublicKey>>,
         /// The reply to caller.
         reply: oneshot::Sender<Result<bool, SubscriptionError>>,
     },
@@ -243,7 +276,7 @@ where
     /// Start a new epoch.
     NewEpoch {
         /// The epoch committee.
-        committee: HashMap<PeerId, Multiaddr>,
+        committee: HashSet<BlsPublicKey>,
         /// The new sender for events.
         new_event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
     },
@@ -255,8 +288,16 @@ where
     /// Find an authority for a future committee by bls key and return to sender.
     /// This only returns the authority if it is stored locally- i.e. will return fast.
     FindLocalAuthority {
-        /// The requests.
+        /// The request.
         request: AuthorityInfoRequest,
+    },
+    /// Find the BlsPublicKey for a PeerId if in local cache.
+    /// This only returns the authority if it is stored locally- i.e. will return fast.
+    FindLocalPeer {
+        /// The peer id to look up.
+        peer_id: PeerId,
+        /// The reply to requestor with authority information.
+        reply: oneshot::Sender<NetworkResult<BlsPublicKey>>,
     },
 }
 
@@ -292,7 +333,7 @@ where
     /// Update the list of authorized publishers.
     pub async fn update_authorized_publishers(
         &self,
-        authorities: HashMap<String, Option<HashSet<PeerId>>>,
+        authorities: HashMap<String, Option<HashSet<BlsPublicKey>>>,
     ) -> NetworkResult<()> {
         let (reply, ack) = oneshot::channel();
         self.sender.send(NetworkCommand::UpdateAuthorizedPublishers { authorities, reply }).await?;
@@ -317,17 +358,35 @@ where
         listeners.await.map_err(Into::into)
     }
 
+    /// Add explicit "trusted" peer.
+    ///
+    /// These peers are considered "trusted" and do not receive penalties.
+    /// This does not unban ips and should only be called during initialization.
+    pub async fn add_trusted_peer_and_dial(
+        &self,
+        bls_pubkey: BlsPublicKey,
+        network_pubkey: NetworkPublicKey,
+        addr: Multiaddr,
+    ) -> NetworkResult<()> {
+        let (reply, rx) = oneshot::channel();
+        self.sender
+            .send(NetworkCommand::AddTrustedPeerAndDial { bls_pubkey, network_pubkey, addr, reply })
+            .await?;
+        rx.await?
+    }
+
     /// Add explicit peer.
     pub async fn add_explicit_peer(
         &self,
-        peer_id: PeerId,
+        bls_pubkey: BlsPublicKey,
+        network_pubkey: NetworkPublicKey,
         addr: Multiaddr,
-        reply: oneshot::Sender<NetworkResult<()>>,
     ) -> NetworkResult<()> {
+        let (reply, rx) = oneshot::channel();
         self.sender
-            .send(NetworkCommand::AddExplicitPeer { peer_id, addr, reply })
-            .await
-            .map_err(Into::into)
+            .send(NetworkCommand::AddExplicitPeer { bls_pubkey, network_pubkey, addr, reply })
+            .await?;
+        rx.await?
     }
 
     /// Dial a peer.
@@ -336,6 +395,15 @@ where
     pub async fn dial(&self, peer_id: PeerId, peer_addr: Multiaddr) -> NetworkResult<()> {
         let (reply, ack) = oneshot::channel();
         self.sender.send(NetworkCommand::Dial { peer_id, peer_addr, reply }).await?;
+        ack.await?
+    }
+
+    /// Dial a peer by Bls public key.
+    ///
+    /// Return swarm error to caller.
+    pub async fn dial_by_bls(&self, bls_key: BlsPublicKey) -> NetworkResult<()> {
+        let (reply, ack) = oneshot::channel();
+        self.sender.send(NetworkCommand::DialBls { bls_key, reply }).await?;
         ack.await?
     }
 
@@ -352,7 +420,7 @@ where
     pub async fn subscribe_with_publishers(
         &self,
         topic: String,
-        publishers: HashSet<PeerId>,
+        publishers: HashSet<BlsPublicKey>,
     ) -> NetworkResult<bool> {
         let (reply, already_subscribed) = oneshot::channel();
         self.sender
@@ -420,10 +488,24 @@ where
     pub async fn send_request(
         &self,
         request: Req,
-        peer: PeerId,
+        peer: BlsPublicKey,
     ) -> NetworkResult<oneshot::Receiver<NetworkResult<Res>>> {
         let (reply, to_caller) = oneshot::channel();
         self.sender.send(NetworkCommand::SendRequest { peer, request, reply }).await?;
+        Ok(to_caller)
+    }
+
+    /// Send a request to a peer by peer id.
+    ///
+    /// Returns a handle for the caller to await the peer's response.
+    /// For internal network use.
+    pub async fn send_request_direct(
+        &self,
+        request: Req,
+        peer: PeerId,
+    ) -> NetworkResult<oneshot::Receiver<NetworkResult<Res>>> {
+        let (reply, to_caller) = oneshot::channel();
+        self.sender.send(NetworkCommand::SendRequestDirect { peer, request, reply }).await?;
         Ok(to_caller)
     }
 
@@ -497,7 +579,7 @@ where
     /// Create a [PeerExchangeMap] for exchanging peers.
     pub async fn new_epoch(
         &self,
-        committee: HashMap<PeerId, Multiaddr>,
+        committee: HashSet<BlsPublicKey>,
         new_event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
     ) -> NetworkResult<()> {
         self.sender.send(NetworkCommand::NewEpoch { committee, new_event_stream }).await?;
@@ -539,6 +621,16 @@ where
         self.sender.send(NetworkCommand::FindLocalAuthority { request }).await?;
         rx.await?
     }
+
+    /// Return bls public key for a peer id if cached locally.
+    /// This only returns the bls key if it is stored locally- i.e. will return fast.
+    pub async fn find_local_peer(&self, peer_id: PeerId) -> NetworkResult<BlsPublicKey> {
+        let (reply, rx) = oneshot::channel();
+        // create the request
+
+        self.sender.send(NetworkCommand::FindLocalPeer { peer_id, reply }).await?;
+        rx.await?
+    }
 }
 
 /// List of addresses for a node, signature will be the nodes BLS signature
@@ -557,16 +649,11 @@ pub struct NodeRecord {
 
 impl NodeRecord {
     /// Helper method to build a signed node record.
-    pub fn build<F>(
-        pubkey: NetworkPublicKey,
-        multiaddr: Multiaddr,
-        hostname: String,
-        signer: F,
-    ) -> NodeRecord
+    pub fn build<F>(pubkey: NetworkPublicKey, multiaddr: Multiaddr, signer: F) -> NodeRecord
     where
         F: FnOnce(&[u8]) -> BlsSignature,
     {
-        let info = NetworkInfo { pubkey, multiaddr, hostname };
+        let info = NetworkInfo { pubkey, multiaddr };
         let data = encode(&info);
         let signature = signer(&data);
         Self { info, signature }
@@ -595,8 +682,6 @@ pub struct NetworkInfo {
     pub pubkey: NetworkPublicKey,
     /// Network address for node.
     pub multiaddr: Multiaddr,
-    /// The hostname.
-    pub hostname: String,
 }
 
 /// The request from the application layer to lookup a validator's network information
