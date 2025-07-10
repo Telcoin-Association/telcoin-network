@@ -91,7 +91,6 @@ use rpc_server_args::RpcServerArgs;
 use serde_json::Value;
 use std::{
     collections::HashSet,
-    io::Read,
     net::{IpAddr, Ipv4Addr},
     ops::RangeInclusive,
     path::Path,
