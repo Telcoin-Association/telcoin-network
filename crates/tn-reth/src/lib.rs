@@ -91,6 +91,7 @@ use rpc_server_args::RpcServerArgs;
 use serde_json::Value;
 use std::{
     collections::HashSet,
+    io::Read,
     net::{IpAddr, Ipv4Addr},
     ops::RangeInclusive,
     path::Path,
@@ -102,7 +103,7 @@ use system_calls::{
     EpochState, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
 };
 use tempfile::TempDir;
-use tn_config::{NodeInfo, CONSENSUS_REGISTRY_JSON};
+use tn_config::{NodeInfo, CONSENSUS_REGISTRY_JSON, ISSUANCE_ADDRESS, ISSUANCE_JSON};
 use tn_types::{
     gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber, BlockHeader as _,
     BlockNumHash, BlockNumber, Epoch, ExecHeader, Genesis, GenesisAccount, RecoveredBlock,
@@ -935,7 +936,7 @@ impl RethEnv {
     }
 
     /// Convenience method for compiling storage and bytecode to include genesis.
-    pub fn create_consensus_registry_genesis_account(
+    pub fn create_consensus_registry_genesis_accounts(
         validators: Vec<NodeInfo>,
         genesis: Genesis,
         initial_stake_config: ConsensusRegistry::StakeConfig,
@@ -1023,13 +1024,24 @@ impl RethEnv {
         )?;
         let registry_runtimecode =
             hex::decode(deployed_bytecode_binding.as_str().ok_or_eyre("invalid registry json")?)?;
-        let genesis = genesis.extend_accounts([(
-            CONSENSUS_REGISTRY_ADDRESS,
-            GenesisAccount::default()
-                .with_balance(U256::from(total_stake_balance))
-                .with_code(Some(registry_runtimecode.into()))
-                .with_storage(tmp_storage),
-        )]);
+
+        let issuance_json_binding =
+            Self::fetch_value_from_json_str(ISSUANCE_JSON, Some("deployedBytecode.object"))?;
+        let issuance_runtimecode =
+            hex::decode(issuance_json_binding.as_str().ok_or_eyre("invalid issuance json")?)?;
+        let genesis = genesis.extend_accounts([
+            (
+                CONSENSUS_REGISTRY_ADDRESS,
+                GenesisAccount::default()
+                    .with_balance(U256::from(total_stake_balance))
+                    .with_code(Some(registry_runtimecode.into()))
+                    .with_storage(tmp_storage),
+            ),
+            (
+                ISSUANCE_ADDRESS,
+                GenesisAccount::default().with_code(Some(issuance_runtimecode.into())),
+            ),
+        ]);
 
         Ok(genesis)
     }
@@ -1329,7 +1341,7 @@ mod tests {
         let new_validator = validators.pop().expect("six validators");
 
         // update genesis with consensus registry storage
-        let genesis = RethEnv::create_consensus_registry_genesis_account(
+        let genesis = RethEnv::create_consensus_registry_genesis_accounts(
             validators.clone(),
             tmp_genesis,
             initial_stake_config.clone(),
