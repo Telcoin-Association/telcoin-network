@@ -43,7 +43,7 @@ async fn wait_for_quorum() {
 
     for _i in 0..3 {
         match network_rx.recv().await {
-            Some(NetworkCommand::SendRequestDirect {
+            Some(NetworkCommand::SendRequest {
                 peer: _,
                 request: WorkerRequest::ReportBatch { sealed_batch: in_batch },
                 reply,
@@ -71,7 +71,7 @@ async fn wait_for_quorum() {
     // Ensure the other listeners correctly received the batches.
     for _i in 0..3 {
         match network_rx.recv().await {
-            Some(NetworkCommand::SendRequestDirect {
+            Some(NetworkCommand::SendRequest {
                 peer: _,
                 request: WorkerRequest::ReportBatch { sealed_batch: in_batch },
                 reply,

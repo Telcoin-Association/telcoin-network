@@ -12,8 +12,7 @@ use std::{
 use thiserror::Error;
 use tn_network_libp2p::error::NetworkError;
 use tn_types::{
-    network_public_key_to_libp2p, Authority, Committee, SealedBatch, TaskSpawner, VotingPower,
-    WorkerCache, WorkerId,
+    Authority, Committee, SealedBatch, TaskSpawner, VotingPower, WorkerCache, WorkerId,
 };
 use tokio::sync::oneshot;
 
@@ -131,16 +130,9 @@ impl QuorumWaiterTrait for QuorumWaiter {
                 // Broadcast the batch to the other workers.
                 let workers: Vec<_> = inner
                     .worker_cache
-                    .others_workers_by_id(inner.authority.protocol_key(), &inner.id)
-                    .into_iter()
-                    .map(|(name, info)| (name, info.name))
-                    .collect();
-                let (primary_names, worker_names): (Vec<_>, Vec<_>) = workers.into_iter().unzip();
+                    .others_workers_by_id(inner.authority.protocol_key(), &inner.id);
 
-                let handlers = inner.network.report_batch_to_peers(
-                    worker_names.iter().map(network_public_key_to_libp2p).collect(),
-                    sealed_batch,
-                );
+                let handlers = inner.network.report_batch_to_peers(&workers, sealed_batch);
                 let _timer = inner.metrics.batch_broadcast_quorum_latency.start_timer();
 
                 // Collect all the handlers to receive acknowledgements.
@@ -152,7 +144,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                 let mut available_stake = 0;
                 // Stake from a committee member that has rejected this batch.
                 let mut rejected_stake = 0;
-                primary_names
+                workers
                     .into_iter()
                     .zip(handlers.into_iter())
                     .map(|(name, handler)| {

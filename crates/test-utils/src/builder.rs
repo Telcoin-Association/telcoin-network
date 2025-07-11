@@ -14,7 +14,7 @@ use tn_config::{KeyConfig, NetworkConfig};
 use tn_types::{
     get_available_udp_port, Address, Authority, AuthorityIdentifier, BlsKeypair, BootstrapServer,
     Committee, Database, Epoch, Multiaddr, TimestampSec, VotingPower, WorkerCache, WorkerIndex,
-    DEFAULT_PRIMARY_PORT, DEFAULT_WORKER_PORT,
+    DEFAULT_WORKER_PORT,
 };
 
 /// The committee builder for tests.
@@ -134,6 +134,13 @@ where
             };
             let primary_network_address: Multiaddr =
                 format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap();
+            let port = if self.randomize_ports {
+                get_available_udp_port(host).unwrap_or(DEFAULT_WORKER_PORT)
+            } else {
+                0
+            };
+            let worker_network_address: Multiaddr =
+                format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap();
             let authority = Authority::new_for_test(
                 key_config.primary_public_key(),
                 *self.voting_power.get(i).unwrap_or(&1),
@@ -142,8 +149,8 @@ where
             bootstrap_servers.insert(
                 *authority.protocol_key(),
                 BootstrapServer::new(
-                    primary_network_address,
-                    key_config.primary_network_public_key(),
+                    (primary_network_address, key_config.primary_network_public_key()).into(),
+                    (worker_network_address, key_config.worker_network_public_key()).into(),
                 ),
             );
             authorities.insert(
@@ -154,13 +161,7 @@ where
         // Reset the authority ids so they are in sort order.  Some tests require this.
         for (i, (_, (primary_keypair, key_config, authority))) in authorities.iter_mut().enumerate()
         {
-            let worker = WorkerFixture::generate(key_config.clone(), i as u16, |host| {
-                if self.randomize_ports {
-                    get_available_udp_port(host).unwrap_or(DEFAULT_PRIMARY_PORT)
-                } else {
-                    0
-                }
-            });
+            let worker = WorkerFixture::generate(key_config.clone(), i as u16);
             committee_info.push((
                 primary_keypair.copy(),
                 key_config.clone(),
@@ -181,8 +182,8 @@ where
             workers: Arc::new(
                 committee_info
                     .iter()
-                    .map(|(primary_keypair, _key_config, _authority, worker, _network_config)| {
-                        let worker_index = vec![worker.info().clone()];
+                    .map(|(primary_keypair, _key_config, _authority, _worker, _network_config)| {
+                        let worker_index = vec![*primary_keypair.public()];
                         (*primary_keypair.public(), WorkerIndex(worker_index))
                     })
                     .collect(),

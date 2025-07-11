@@ -13,7 +13,7 @@ use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
     types::{IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
-    GossipMessage, PeerExchangeMap, PeerId, Penalty, ResponseChannel,
+    GossipMessage, PeerExchangeMap, Penalty, ResponseChannel,
 };
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::PayloadStore;
@@ -164,8 +164,8 @@ impl PrimaryNetworkHandle {
     }
 
     /// Report a penalty to the network's peer manager.
-    pub(crate) async fn report_penalty(&self, peer_id: PeerId, penalty: Penalty) {
-        self.handle.report_penalty(peer_id, penalty).await;
+    async fn report_penalty(&self, peer: BlsPublicKey, penalty: Penalty) {
+        self.handle.report_penalty(peer, penalty).await;
     }
 
     /// Notify peer manager of peer exchange information.
@@ -179,9 +179,9 @@ impl PrimaryNetworkHandle {
         }
     }
 
-    /// Retrieve a collection of connected peers.
+    /// Retrieve the count of connected peers.
     pub async fn connected_peers_count(&self) -> NetworkResult<usize> {
-        Ok(self.handle.connected_peers().await?.len())
+        self.handle.connected_peer_count().await
     }
 }
 
@@ -255,6 +255,13 @@ where
             NetworkEvent::Gossip(msg, source) => {
                 self.process_gossip(msg, source);
             }
+            NetworkEvent::Error(msg, channel) => {
+                let err = PrimaryResponse::Error(PrimaryRPCError(msg));
+                let network_handle = self.network_handle.clone();
+                self.task_spawner.spawn_task("report request error", async move {
+                    let _ = network_handle.handle.send_response(err, channel).await;
+                });
+            }
         }
     }
 
@@ -263,7 +270,7 @@ where
     /// Spawn a task to evaluate a peer's proposed header and return a response.
     fn process_vote_request(
         &self,
-        peer: PeerId,
+        peer: BlsPublicKey,
         header: Header,
         parents: Vec<Certificate>,
         channel: ResponseChannel<PrimaryResponse>,
@@ -275,24 +282,13 @@ where
         let task_name = format!("VoteRequest-{}", header.digest());
 
         self.task_spawner.spawn_task(task_name, async move {
-            match network_handle.handle.find_local_peer(peer).await {
-                Ok(bls_key) => tokio::select! {
-                    vote = request_handler.vote(Some(bls_key), header, parents) => {
-                        let response = vote.into_response();
-                        let _ = network_handle.handle.send_response(response, channel).await;
-                    }
-                    // cancel notification from network layer
-                    _ = cancel => (),
-                },
-                Err(err) => {
-                    let _ = network_handle
-                        .handle
-                        .send_response(
-                            PrimaryResponse::Error(PrimaryRPCError(err.to_string())),
-                            channel,
-                        )
-                        .await;
+            tokio::select! {
+                vote = request_handler.vote(Some(peer), header, parents) => {
+                    let response = vote.into_response();
+                    let _ = network_handle.handle.send_response(response, channel).await;
                 }
+                // cancel notification from network layer
+                _ = cancel => (),
             }
         });
     }
@@ -300,7 +296,7 @@ where
     /// Attempt to retrieve certificates for a peer that's missing them.
     fn process_request_for_missing_certs(
         &self,
-        peer: PeerId,
+        peer: BlsPublicKey,
         request: MissingCertificatesRequest,
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
@@ -328,7 +324,7 @@ where
     /// Attempt to retrieve consensus chain header from the database.
     fn process_consensus_output_request(
         &self,
-        peer: PeerId,
+        peer: BlsPublicKey,
         number: Option<u64>,
         hash: Option<BlockHash>,
         channel: ResponseChannel<PrimaryResponse>,
@@ -354,7 +350,7 @@ where
     }
 
     /// Process gossip from committee.
-    fn process_gossip(&self, msg: GossipMessage, source: PeerId) {
+    fn process_gossip(&self, msg: GossipMessage, source: BlsPublicKey) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();

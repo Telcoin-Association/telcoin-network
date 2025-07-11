@@ -15,8 +15,8 @@ use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::tables::Batches;
 use tn_types::{
-    error::BlockSealError, network_public_key_to_libp2p, BatchSender, BatchValidation, Database,
-    SealedBatch, TaskManager, WorkerId,
+    error::BlockSealError, BatchSender, BatchValidation, Database, SealedBatch, TaskManager,
+    WorkerId,
 };
 use tracing::{error, info};
 
@@ -38,9 +38,7 @@ pub fn new_worker<DB: Database>(
     network_handle: WorkerNetworkHandle,
     task_manager: &mut TaskManager,
 ) -> Worker<DB, QuorumWaiter> {
-    let worker_name = consensus_config.key_config().worker_network_public_key();
-    let worker_peer_id = network_public_key_to_libp2p(&worker_name);
-    info!(target: "worker::worker", "Boot worker node with id {} peer id {:?}", id, worker_peer_id,);
+    info!(target: "worker::worker", "Boot worker node with id {} key {:?}", id, consensus_config.key_config().primary_public_key());
 
     let node_metrics = metrics.worker_metrics.clone();
 
@@ -76,7 +74,6 @@ pub fn new_worker<DB: Database>(
                 .worker_cache()
                 .worker(authority.protocol_key(), &id)
                 .expect("Our public key or worker id is not in the worker cache")
-                .worker_address
         );
     } else {
         info!(target: "worker::worker",

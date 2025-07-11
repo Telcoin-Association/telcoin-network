@@ -60,7 +60,7 @@ pub enum NetworkEvent<Req, Res> {
     /// Direct request from peer.
     Request {
         /// The peer that made the request.
-        peer: PeerId,
+        peer: BlsPublicKey,
         /// The network request type.
         request: Req,
         /// The network response channel.
@@ -69,7 +69,9 @@ pub enum NetworkEvent<Req, Res> {
         cancel: oneshot::Receiver<()>,
     },
     /// Gossip message received and propagation source.
-    Gossip(GossipMessage, PeerId),
+    Gossip(GossipMessage, BlsPublicKey),
+    /// Send an error back the requester.
+    Error(String, ResponseChannel<Res>),
 }
 
 /// Commands for the swarm.
@@ -218,14 +220,14 @@ where
         reply: oneshot::Sender<HashMap<PeerId, Vec<TopicHash>>>,
     },
     /// Collection of this node's connected peers.
-    ConnectedPeers {
+    ConnectedPeerIds {
         /// Reply to caller.
         reply: oneshot::Sender<Vec<PeerId>>,
     },
-    /// Collection of all mesh peers.
-    AllMeshPeers {
+    /// Collection of this node's connected peers.
+    ConnectedPeers {
         /// Reply to caller.
-        reply: oneshot::Sender<Vec<PeerId>>,
+        reply: oneshot::Sender<Vec<BlsPublicKey>>,
     },
     /// Collection of all mesh peers by a certain topic hash.
     MeshPeers {
@@ -244,7 +246,7 @@ where
     /// Report penalty for peer.
     ReportPenalty {
         /// The peer's id.
-        peer_id: PeerId,
+        peer: BlsPublicKey,
         /// The penalty to apply to the peer.
         penalty: Penalty,
     },
@@ -389,15 +391,6 @@ where
         rx.await?
     }
 
-    /// Dial a peer.
-    ///
-    /// Return swarm error to caller.
-    pub async fn dial(&self, peer_id: PeerId, peer_addr: Multiaddr) -> NetworkResult<()> {
-        let (reply, ack) = oneshot::channel();
-        self.sender.send(NetworkCommand::Dial { peer_id, peer_addr, reply }).await?;
-        ack.await?
-    }
-
     /// Dial a peer by Bls public key.
     ///
     /// Return swarm error to caller.
@@ -405,13 +398,6 @@ where
         let (reply, ack) = oneshot::channel();
         self.sender.send(NetworkCommand::DialBls { bls_key, reply }).await?;
         ack.await?
-    }
-
-    /// Get local peer id.
-    pub async fn local_peer_id(&self) -> NetworkResult<PeerId> {
-        let (reply, peer_id) = oneshot::channel();
-        self.sender.send(NetworkCommand::LocalPeerId { reply }).await?;
-        peer_id.await.map_err(Into::into)
     }
 
     /// Subscribe to a topic with valid publishers.
@@ -448,38 +434,17 @@ where
     }
 
     /// Retrieve a collection of connected peers.
-    pub async fn connected_peers(&self) -> NetworkResult<Vec<PeerId>> {
+    pub async fn connected_peer_count(&self) -> NetworkResult<usize> {
+        let (reply, peers) = oneshot::channel();
+        self.sender.send(NetworkCommand::ConnectedPeerIds { reply }).await?;
+        Ok(peers.await?.len())
+    }
+
+    /// Retrieve a collection of connected peers.
+    pub async fn connected_peers(&self) -> NetworkResult<Vec<BlsPublicKey>> {
         let (reply, peers) = oneshot::channel();
         self.sender.send(NetworkCommand::ConnectedPeers { reply }).await?;
         peers.await.map_err(Into::into)
-    }
-
-    /// Map of all known peers and their associated subscribed topics.
-    pub async fn all_peers(&self) -> NetworkResult<HashMap<PeerId, Vec<TopicHash>>> {
-        let (reply, all_peers) = oneshot::channel();
-        self.sender.send(NetworkCommand::AllPeers { reply }).await?;
-        all_peers.await.map_err(Into::into)
-    }
-
-    /// Collection of all mesh peers.
-    pub async fn all_mesh_peers(&self) -> NetworkResult<Vec<PeerId>> {
-        let (reply, all_mesh_peers) = oneshot::channel();
-        self.sender.send(NetworkCommand::AllMeshPeers { reply }).await?;
-        all_mesh_peers.await.map_err(Into::into)
-    }
-
-    /// Collection of all mesh peers by a certain topic hash.
-    pub async fn mesh_peers(&self, topic: String) -> NetworkResult<Vec<PeerId>> {
-        let (reply, mesh_peers) = oneshot::channel();
-        self.sender.send(NetworkCommand::MeshPeers { topic, reply }).await?;
-        mesh_peers.await.map_err(Into::into)
-    }
-
-    /// Retrieve a specific peer's score, if it exists.
-    pub async fn peer_score(&self, peer_id: PeerId) -> NetworkResult<Option<f64>> {
-        let (reply, score) = oneshot::channel();
-        self.sender.send(NetworkCommand::PeerScore { peer_id, reply }).await?;
-        score.await.map_err(Into::into)
     }
 
     /// Send a request to a peer.
@@ -492,20 +457,6 @@ where
     ) -> NetworkResult<oneshot::Receiver<NetworkResult<Res>>> {
         let (reply, to_caller) = oneshot::channel();
         self.sender.send(NetworkCommand::SendRequest { peer, request, reply }).await?;
-        Ok(to_caller)
-    }
-
-    /// Send a request to a peer by peer id.
-    ///
-    /// Returns a handle for the caller to await the peer's response.
-    /// For internal network use.
-    pub async fn send_request_direct(
-        &self,
-        request: Req,
-        peer: PeerId,
-    ) -> NetworkResult<oneshot::Receiver<NetworkResult<Res>>> {
-        let (reply, to_caller) = oneshot::channel();
-        self.sender.send(NetworkCommand::SendRequestDirect { peer, request, reply }).await?;
         Ok(to_caller)
     }
 
@@ -545,7 +496,7 @@ where
     ///
     /// This method closes all connections to the peer without waiting for handlers
     /// to complete.
-    pub async fn disconnect_peer(&self, peer_id: PeerId) -> NetworkResult<()> {
+    pub(crate) async fn disconnect_peer(&self, peer_id: PeerId) -> NetworkResult<()> {
         let (reply, res) = oneshot::channel();
         self.sender.send(NetworkCommand::DisconnectPeer { peer_id, reply }).await?;
         res.await?.map_err(|_| NetworkError::DisconnectPeer)
@@ -565,8 +516,8 @@ where
     }
 
     /// Report a penalty to the peer manager.
-    pub async fn report_penalty(&self, peer_id: PeerId, penalty: Penalty) {
-        let _ = self.sender.send(NetworkCommand::ReportPenalty { peer_id, penalty }).await;
+    pub async fn report_penalty(&self, peer: BlsPublicKey, penalty: Penalty) {
+        let _ = self.sender.send(NetworkCommand::ReportPenalty { peer, penalty }).await;
     }
 
     /// Create a [PeerExchangeMap] for exchanging peers.
@@ -653,7 +604,7 @@ impl NodeRecord {
     where
         F: FnOnce(&[u8]) -> BlsSignature,
     {
-        let info = NetworkInfo { pubkey, multiaddr };
+        let info = NetworkInfo { pubkey, multiaddrs: vec![multiaddr] };
         let data = encode(&info);
         let signature = signer(&data);
         Self { info, signature }
@@ -681,7 +632,7 @@ pub struct NetworkInfo {
     /// The node's [NetworkPublicKey].
     pub pubkey: NetworkPublicKey,
     /// Network address for node.
-    pub multiaddr: Multiaddr,
+    pub multiaddrs: Vec<Multiaddr>,
 }
 
 /// The request from the application layer to lookup a validator's network information
@@ -716,4 +667,70 @@ macro_rules! send_or_log_error {
             error!(target: "network", ?e, $($field = ?$value,)+ $error_msg);
         }
     };
+}
+
+/// Some PeerId specific code only used for in-crate testing.
+#[cfg(test)]
+impl<Req, Res> NetworkHandle<Req, Res>
+where
+    Req: TNMessage,
+    Res: TNMessage,
+{
+    /// Dial a peer.
+    ///
+    /// Return swarm error to caller.
+    pub(crate) async fn dial(&self, peer_id: PeerId, peer_addr: Multiaddr) -> NetworkResult<()> {
+        let (reply, ack) = oneshot::channel();
+        self.sender.send(NetworkCommand::Dial { peer_id, peer_addr, reply }).await?;
+        ack.await?
+    }
+
+    /// Map of all known peers and their associated subscribed topics.
+    pub(crate) async fn all_peers(&self) -> NetworkResult<HashMap<PeerId, Vec<TopicHash>>> {
+        let (reply, all_peers) = oneshot::channel();
+        self.sender.send(NetworkCommand::AllPeers { reply }).await?;
+        all_peers.await.map_err(Into::into)
+    }
+
+    /// Collection of all mesh peers by a certain topic hash.
+    pub(crate) async fn mesh_peers(&self, topic: String) -> NetworkResult<Vec<PeerId>> {
+        let (reply, mesh_peers) = oneshot::channel();
+        self.sender.send(NetworkCommand::MeshPeers { topic, reply }).await?;
+        mesh_peers.await.map_err(Into::into)
+    }
+
+    /// Retrieve a specific peer's score, if it exists.
+    pub(crate) async fn peer_score(&self, peer_id: PeerId) -> NetworkResult<Option<f64>> {
+        let (reply, score) = oneshot::channel();
+        self.sender.send(NetworkCommand::PeerScore { peer_id, reply }).await?;
+        score.await.map_err(Into::into)
+    }
+
+    /// Get local peer id.
+    pub(crate) async fn local_peer_id(&self) -> NetworkResult<PeerId> {
+        let (reply, peer_id) = oneshot::channel();
+        self.sender.send(NetworkCommand::LocalPeerId { reply }).await?;
+        peer_id.await.map_err(Into::into)
+    }
+
+    /// Retrieve a collection of connected peers.
+    pub(crate) async fn connected_peer_ids(&self) -> NetworkResult<Vec<PeerId>> {
+        let (reply, peers) = oneshot::channel();
+        self.sender.send(NetworkCommand::ConnectedPeerIds { reply }).await?;
+        peers.await.map_err(Into::into)
+    }
+
+    /// Send a request to a peer by peer id.
+    ///
+    /// Returns a handle for the caller to await the peer's response.
+    /// For internal network use.
+    pub(crate) async fn send_request_direct(
+        &self,
+        request: Req,
+        peer: PeerId,
+    ) -> NetworkResult<oneshot::Receiver<NetworkResult<Res>>> {
+        let (reply, to_caller) = oneshot::channel();
+        self.sender.send(NetworkCommand::SendRequestDirect { peer, request, reply }).await?;
+        Ok(to_caller)
+    }
 }

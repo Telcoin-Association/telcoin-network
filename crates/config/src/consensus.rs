@@ -2,7 +2,6 @@
 use crate::{
     Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, Parameters, TelcoinDirs,
 };
-use libp2p::PeerId;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -10,7 +9,7 @@ use std::{
 use tn_network_types::local::LocalNetwork;
 use tn_types::{
     Authority, AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee,
-    Database, Epoch, Hash as _, Multiaddr, Notifier, WorkerCache, WorkerId,
+    Database, Epoch, Hash as _, Multiaddr, NetworkPublicKey, Notifier, WorkerCache,
 };
 use tracing::info;
 
@@ -135,8 +134,7 @@ where
         worker_cache: WorkerCache,
         network_config: NetworkConfig,
     ) -> eyre::Result<Self> {
-        let local_network =
-            LocalNetwork::new_from_public_key(&key_config.primary_network_public_key());
+        let local_network = LocalNetwork::new(key_config.primary_public_key());
 
         let primary_public_key = key_config.primary_public_key();
         let authority = committee.authority_by_key(&primary_public_key);
@@ -258,7 +256,12 @@ where
 
     /// Retrieve the primaries network address.
     pub fn primary_address(&self) -> Multiaddr {
-        self.inner.config.node_info.p2p_info.network_address.clone()
+        self.inner.config.node_info.p2p_info.primary.network_address.clone()
+    }
+
+    /// Retrieve the primaries network address.
+    pub fn primary_networkkey(&self) -> NetworkPublicKey {
+        self.inner.config.node_info.p2p_info.primary.network_key.clone()
     }
 
     /// Bool indicating if an authority identifier is in the current committee.
@@ -268,21 +271,7 @@ where
 
     /// Retrieve the worker's network address by id.
     /// Note, will panic if id is not valid.
-    pub fn worker_address(&self, id: &WorkerId) -> Multiaddr {
-        self.inner
-            .config
-            .node_info
-            .p2p_info
-            .worker_index
-            .0
-            .get(*id as usize)
-            .expect("Our public key or worker id is not in the worker cache")
-            .worker_address
-            .clone()
-    }
-
-    /// Map of worker peer ids and multiaddrs in the current committee.
-    pub fn worker_network_map(&self) -> HashMap<PeerId, Multiaddr> {
-        self.worker_cache().all_workers()
+    pub fn worker_address(&self) -> Multiaddr {
+        self.inner.config.node_info.p2p_info.worker.network_address.clone()
     }
 }

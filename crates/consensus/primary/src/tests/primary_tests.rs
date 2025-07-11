@@ -371,8 +371,6 @@ async fn test_request_vote_missing_batches() {
         .build();
 
     // Set up mock worker.
-    let worker = primary.worker();
-    let _worker_address = &worker.info().worker_address;
     let mock_server = MockPrimaryToWorkerClient::default();
 
     client.set_primary_to_worker_local_handler(Arc::new(mock_server));
@@ -427,8 +425,6 @@ async fn test_request_vote_already_voted() {
     }
 
     // Set up mock worker.
-    let worker = primary.worker();
-    let _worker_address = &worker.info().worker_address;
     let mock_server = MockPrimaryToWorkerClient::default();
 
     client.set_primary_to_worker_local_handler(Arc::new(mock_server));
@@ -627,8 +623,6 @@ async fn test_request_vote_created_at_in_future() {
     }
 
     // Set up mock worker.
-    let worker = primary.worker();
-    let _worker_address = &worker.info().worker_address;
     let mock_server = MockPrimaryToWorkerClient::default();
 
     client.set_primary_to_worker_local_handler(Arc::new(mock_server));

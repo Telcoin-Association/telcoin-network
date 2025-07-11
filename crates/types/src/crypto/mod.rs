@@ -7,7 +7,6 @@
 //! - use generic schemes (avoid using the algo's `Struct`` impl functions)
 //! - change type aliases to update codebase with new crypto
 
-use libp2p::PeerId;
 use std::{fmt, future::Future};
 // This re-export allows using the trait-defined APIs
 mod bls_keypair;
@@ -221,11 +220,6 @@ pub trait BlsSigner: Clone + Send + Sync + Unpin + 'static {
 /// IntentScope::ConsensusDigest and the app id is AppId::Consensus.
 pub fn to_intent_message<T>(value: T) -> IntentMessage<T> {
     IntentMessage::new(Intent::consensus(IntentScope::ConsensusDigest), value)
-}
-
-/// Convert an existing NetworkPublicKey into a libp2p PeerId.
-pub fn network_public_key_to_libp2p(public_key: &NetworkPublicKey) -> PeerId {
-    public_key.to_peer_id()
 }
 
 #[cfg(test)]

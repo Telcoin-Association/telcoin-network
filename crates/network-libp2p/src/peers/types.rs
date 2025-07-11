@@ -3,11 +3,11 @@
 use crate::types::{AuthorityInfoRequest, NetworkResult};
 use libp2p::{Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, DisplayFromStr};
 use std::{
     collections::{hash_map::IntoIter, HashMap, HashSet},
     net::IpAddr,
 };
+use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tokio::sync::oneshot;
 
 /// Events for the `PeerManager`.
@@ -121,24 +121,20 @@ pub(super) enum ConnectionDirection {
 ///
 /// This is a convenience wrapper because PeerId doesn't implement `Deserialize`.
 /// Peers exchange information to facilitate discovery.
-#[serde_as]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
-pub struct PeerExchangeMap(
-    #[serde_as(as = "HashMap<DisplayFromStr, HashSet<DisplayFromStr>>")]
-    pub  HashMap<PeerId, HashSet<Multiaddr>>,
-);
+pub struct PeerExchangeMap(pub HashMap<BlsPublicKey, (NetworkPublicKey, HashSet<Multiaddr>)>);
 
 impl IntoIterator for PeerExchangeMap {
-    type Item = (PeerId, HashSet<Multiaddr>);
-    type IntoIter = IntoIter<PeerId, HashSet<Multiaddr>>;
+    type Item = (BlsPublicKey, (NetworkPublicKey, HashSet<Multiaddr>));
+    type IntoIter = IntoIter<BlsPublicKey, (NetworkPublicKey, HashSet<Multiaddr>)>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
     }
 }
 
-impl From<HashMap<PeerId, HashSet<Multiaddr>>> for PeerExchangeMap {
-    fn from(value: HashMap<PeerId, HashSet<Multiaddr>>) -> Self {
+impl From<HashMap<BlsPublicKey, (NetworkPublicKey, HashSet<Multiaddr>)>> for PeerExchangeMap {
+    fn from(value: HashMap<BlsPublicKey, (NetworkPublicKey, HashSet<Multiaddr>)>) -> Self {
         Self(value)
     }
 }

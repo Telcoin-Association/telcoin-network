@@ -104,6 +104,9 @@ pub enum NetworkError {
     /// Kademlia error.
     #[error("Failed to get kad record: {0}")]
     GetKademliaRecord(#[from] GetRecordError),
+    /// Kademlia store write error.
+    #[error("Failed to store kad record: {0}")]
+    StoreKademliaRecord(String),
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {

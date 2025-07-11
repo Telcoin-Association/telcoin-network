@@ -12,7 +12,7 @@ use std::{
 use tn_config::{KeyConfig, NetworkConfig, ScoreConfig};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::BlsKeypair;
+use tn_types::{BlsKeypair, NetworkKeypair, NetworkPublicKey};
 use tokio::time::{sleep, timeout};
 
 fn create_test_peer_manager(network_config: Option<NetworkConfig>) -> PeerManager {
@@ -135,7 +135,7 @@ async fn test_add_trusted_peer() {
     // Add trusted peer
     peer_manager.add_trusted_peer_and_dial(
         peer_bls,
-        NetworkInfo { pubkey: peer_netkey, multiaddr: multiaddr.clone() },
+        NetworkInfo { pubkey: peer_netkey, multiaddrs: vec![multiaddr.clone()] },
         sender,
     );
 
@@ -164,7 +164,7 @@ async fn test_dial_peer_success() {
     let (sender, receiver) = oneshot::channel();
 
     // Dial peer
-    peer_manager.dial_peer(peer_id, multiaddr.clone(), Some(sender));
+    peer_manager.dial_peer(peer_id, vec![multiaddr.clone()], Some(sender));
 
     // Verify a dial request was created
     let dial_request = peer_manager.next_dial_request();
@@ -194,7 +194,7 @@ async fn test_dial_peer_already_dialing_error() {
     let (sender, _receiver) = oneshot::channel();
 
     // Dial peer for the first time
-    peer_manager.dial_peer(peer_id, multiaddr.clone(), Some(sender));
+    peer_manager.dial_peer(peer_id, vec![multiaddr.clone()], Some(sender));
 
     // Verify a dial request was created
     let dial_request = peer_manager.next_dial_request().unwrap();
@@ -206,7 +206,7 @@ async fn test_dial_peer_already_dialing_error() {
     let (sender2, receiver2) = oneshot::channel();
 
     // Try to dial the same peer again
-    peer_manager.dial_peer(peer_id, multiaddr.clone(), Some(sender2));
+    peer_manager.dial_peer(peer_id, vec![multiaddr.clone()], Some(sender2));
 
     // Verify no new dial request was created (since we already dialing)
     assert!(peer_manager.next_dial_request().is_none());
@@ -231,7 +231,7 @@ async fn test_dial_peer_already_connected() {
     let (sender, receiver) = oneshot::channel();
 
     // Try to dial the already connected peer
-    peer_manager.dial_peer(peer_id, multiaddr.clone(), Some(sender));
+    peer_manager.dial_peer(peer_id, vec![multiaddr.clone()], Some(sender));
 
     // Verify no dial request was created
     assert!(peer_manager.next_dial_request().is_none());
@@ -454,16 +454,19 @@ async fn test_process_peer_exchange() {
     let mut peer_manager = create_test_peer_manager(None);
 
     // Create peer exchange data
-    let peer_id1 = PeerId::random();
-    let peer_id2 = PeerId::random();
     let multiaddr1 = create_multiaddr(None);
     let multiaddr2 = create_multiaddr(None);
 
     let mut exchange_map = HashMap::new();
     let multiaddrs1 = HashSet::from([multiaddr1]);
     let multiaddrs2 = HashSet::from([multiaddr2]);
-    exchange_map.insert(peer_id1, multiaddrs1);
-    exchange_map.insert(peer_id2, multiaddrs2);
+    let mut rng = StdRng::from_seed([0; 32]);
+    let bls1 = BlsKeypair::generate(&mut rng).public().clone();
+    let bls2 = BlsKeypair::generate(&mut rng).public().clone();
+    let net1: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().clone().into();
+    let net2: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().clone().into();
+    exchange_map.insert(bls1, (net1, multiaddrs1));
+    exchange_map.insert(bls2, (net2, multiaddrs2));
 
     let exchange = PeerExchangeMap::from(exchange_map);
 
@@ -536,7 +539,7 @@ async fn test_is_validator() {
 
     let info = NetworkInfo {
         pubkey: config.key_config().primary_network_public_key(),
-        multiaddr: config.config().node_info.p2p_info.network_address.clone(),
+        multiaddrs: vec![config.primary_address()],
     };
     peer_manager.add_known_peer(validator.clone(), info);
 
@@ -599,8 +602,18 @@ async fn test_peers_for_exchange() {
     let mut peer_manager = create_test_peer_manager(None);
 
     // Register some peers
-    for _ in 0..5 {
-        register_peer(&mut peer_manager, None);
+    for i in 0..5 {
+        let network_key: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+        let peer_id: PeerId = network_key.clone().into();
+        let addr = create_multiaddr(None);
+
+        let multiaddr = addr.clone();
+        let connection = ConnectionType::IncomingConnection { multiaddr };
+        assert!(peer_manager.register_peer_connection(&peer_id, connection));
+        let mut rng = StdRng::from_seed([i; 32]);
+        let bls = BlsKeypair::generate(&mut rng).public().clone();
+        peer_manager
+            .add_known_peer(bls, NetworkInfo { pubkey: network_key, multiaddrs: vec![addr] });
     }
 
     // Get peers for exchange
@@ -610,7 +623,7 @@ async fn test_peers_for_exchange() {
     assert!(!exchange.0.is_empty(), "Should have peers for exchange");
 
     // Each peer should have their multiaddr in the exchange
-    for (_, addrs) in exchange.into_iter() {
+    for (_, (_, addrs)) in exchange.into_iter() {
         assert!(!addrs.is_empty(), "Each peer should have at least one multiaddr");
     }
 }

@@ -125,9 +125,17 @@ impl NetworkGenesis {
             committee_builder.add_authority_and_bootstrap(
                 *pubkey,
                 1,
-                validator.primary_network_address().clone(),
+                (
+                    validator.primary_network_address().clone(),
+                    validator.primary_network_key().clone(),
+                )
+                    .into(),
+                (
+                    validator.worker_network_address().clone(),
+                    validator.worker_network_key().clone(),
+                )
+                    .into(),
                 validator.execution_address,
-                validator.primary_network_key().clone(),
             );
         }
         Ok(committee_builder.build())
@@ -135,10 +143,11 @@ impl NetworkGenesis {
 
     /// Create a [WorkerCache] from the validators in [NetworkGenesis].
     pub fn create_worker_cache(&self) -> eyre::Result<WorkerCache> {
+        let worker_addrs: Vec<BlsPublicKey> = self.validators.keys().copied().collect();
         let workers = self
             .validators
-            .iter()
-            .map(|(pubkey, validator)| (*pubkey, validator.p2p_info.worker_index.clone()))
+            .keys()
+            .map(|pubkey| (*pubkey, WorkerIndex(worker_addrs.clone())))
             .collect();
 
         let worker_cache = WorkerCache { epoch: 0, workers: Arc::new(workers) };
@@ -220,17 +229,22 @@ impl NodeInfo {
 
     /// Return the primary's public network key.
     pub fn primary_network_key(&self) -> &NetworkPublicKey {
-        &self.p2p_info.network_key
+        &self.p2p_info.primary.network_key
     }
 
     /// Return the primary's network address.
     pub fn primary_network_address(&self) -> &Multiaddr {
-        &self.p2p_info.network_address
+        &self.p2p_info.primary.network_address
     }
 
-    /// Return a reference to the primary's [WorkerIndex].
-    pub fn worker_index(&self) -> &WorkerIndex {
-        self.p2p_info.worker_index()
+    /// Return the primary's public network key.
+    pub fn worker_network_key(&self) -> &NetworkPublicKey {
+        &self.p2p_info.worker.network_key
+    }
+
+    /// Return the primary's network address.
+    pub fn worker_network_address(&self) -> &Multiaddr {
+        &self.p2p_info.worker.network_address
     }
 }
 
@@ -268,7 +282,7 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
     use tn_types::{
         generate_proof_of_possession_bls, Address, BlsKeypair, Multiaddr, NetworkKeypair,
-        NodeP2pInfo, WorkerIndex, WorkerInfo,
+        NodeP2pInfo,
     };
 
     #[test]
@@ -278,16 +292,15 @@ mod tests {
         for v in 0..4 {
             let bls_keypair = BlsKeypair::generate(&mut StdRng::from_seed([0; 32]));
             let network_keypair = NetworkKeypair::generate_ed25519();
+            let worker_network_keypair = NetworkKeypair::generate_ed25519();
             let address = Address::from_raw_public_key(&[0; 64]);
             let proof_of_possession =
                 generate_proof_of_possession_bls(&bls_keypair, &address).unwrap();
             let primary_network_address = Multiaddr::empty();
-            let worker_info = WorkerInfo::default();
-            let worker_index = WorkerIndex(vec![worker_info]);
+            let worker_network_address = Multiaddr::empty();
             let primary_info = NodeP2pInfo::new(
-                network_keypair.public().clone().into(),
-                primary_network_address,
-                worker_index,
+                (network_keypair.public().clone().into(), primary_network_address).into(),
+                (worker_network_keypair.public().clone().into(), worker_network_address).into(),
             );
             let name = format!("validator-{v}");
             // create validator
@@ -313,6 +326,7 @@ mod tests {
         for v in 0..4 {
             let bls_keypair = BlsKeypair::generate(&mut StdRng::from_seed([0; 32]));
             let network_keypair = NetworkKeypair::generate_ed25519();
+            let worker_network_keypair = NetworkKeypair::generate_ed25519();
             let address = Address::from_raw_public_key(&[0; 64]);
             let wrong_address = Address::from_raw_public_key(&[1; 64]);
 
@@ -320,12 +334,10 @@ mod tests {
             let proof_of_possession =
                 generate_proof_of_possession_bls(&bls_keypair, &wrong_address).unwrap();
             let primary_network_address = Multiaddr::empty();
-            let worker_info = WorkerInfo::default();
-            let worker_index = WorkerIndex(vec![worker_info]);
+            let worker_network_address = Multiaddr::empty();
             let primary_info = NodeP2pInfo::new(
-                network_keypair.public().clone().into(),
-                primary_network_address,
-                worker_index,
+                (network_keypair.public().clone().into(), primary_network_address).into(),
+                (worker_network_keypair.public().clone().into(), worker_network_address).into(),
             );
             let name = format!("validator-{v}");
             // create validator

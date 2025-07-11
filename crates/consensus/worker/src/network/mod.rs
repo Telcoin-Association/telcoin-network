@@ -11,13 +11,13 @@ use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
     types::{NetworkEvent, NetworkHandle, NetworkResult},
-    GossipMessage, Multiaddr, PeerExchangeMap, PeerId, Penalty, ResponseChannel,
+    GossipMessage, PeerExchangeMap, Penalty, ResponseChannel,
 };
 use tn_network_types::{FetchBatchResponse, PrimaryToWorkerClient, WorkerSynchronizeMessage};
 use tn_storage::tables::Batches;
 use tn_types::{
-    encode, now, Batch, BatchValidation, BlockHash, Database, DbTxMut, SealedBatch, TaskManager,
-    TaskSpawner, WorkerId,
+    encode, now, Batch, BatchValidation, BlockHash, BlsPublicKey, Database, DbTxMut, SealedBatch,
+    TaskManager, TaskSpawner, WorkerId,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, trace, warn};
@@ -64,13 +64,6 @@ impl WorkerNetworkHandle {
         &self.handle
     }
 
-    /// Dial a peer.
-    ///
-    /// Return swarm error to caller.
-    pub async fn dial(&self, peer_id: PeerId, peer_addr: Multiaddr) -> NetworkResult<()> {
-        self.handle.dial(peer_id, peer_addr).await
-    }
-
     /// Publish a batch digest to the worker network.
     pub async fn publish_batch(&self, batch_digest: BlockHash) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Batch(batch_digest));
@@ -87,11 +80,15 @@ impl WorkerNetworkHandle {
     }
 
     /// Report a new batch to a peer.
-    async fn report_batch(&self, peer_id: PeerId, sealed_batch: SealedBatch) -> NetworkResult<()> {
+    async fn report_batch(
+        &self,
+        peer_bls: BlsPublicKey,
+        sealed_batch: SealedBatch,
+    ) -> NetworkResult<()> {
         // TODO- issue 237- should we sign these batches and check the sig before accepting any
         // batches during consensus?
         let request = WorkerRequest::ReportBatch { sealed_batch };
-        let res = self.handle.send_request_direct(request, peer_id).await?;
+        let res = self.handle.send_request(request, peer_bls).await?;
         let res = res.await??;
         match res {
             WorkerResponse::ReportBatch => Ok(()),
@@ -108,17 +105,18 @@ impl WorkerNetworkHandle {
     /// Report a new batch to peers.
     pub fn report_batch_to_peers(
         &self,
-        peer_ids: Vec<PeerId>,
+        peers: &[BlsPublicKey],
         sealed_batch: SealedBatch,
     ) -> Vec<oneshot::Receiver<NetworkResult<()>>> {
         let mut result = vec![];
-        for peer_id in peer_ids {
+        for peer in peers {
             let handle = self.clone();
             let batch = sealed_batch.clone();
-            let task_name = format!("ReportBatchToPeer-{peer_id}");
+            let task_name = format!("ReportBatchToPeer-{peer}");
             let (tx, rx) = oneshot::channel();
+            let peer = *peer;
             self.task_spawner.spawn_task(task_name, async move {
-                let res = handle.report_batch(peer_id, batch).await;
+                let res = handle.report_batch(peer, batch).await;
                 // ignore error bc quorum waiter will move on once quorum is reached
                 let _ = tx.send(res);
             });
@@ -131,12 +129,12 @@ impl WorkerNetworkHandle {
     /// Request a group of batches by hashes.
     async fn request_batches_from_peer(
         &self,
-        peer_id: PeerId,
+        peer: BlsPublicKey,
         batch_digests: Vec<BlockHash>,
         timeout: Duration,
     ) -> NetworkResult<Vec<Batch>> {
         let request = WorkerRequest::RequestBatches { batch_digests: batch_digests.clone() };
-        let res = self.handle.send_request_direct(request, peer_id).await?;
+        let res = self.handle.send_request(request, peer).await?;
         let res =
             tokio::time::timeout(timeout, res).await.map_err(|_| NetworkError::Timeout)???;
         match res {
@@ -151,7 +149,7 @@ impl WorkerNetworkHandle {
                     let batch_digest = batch.digest();
                     if !batch_digests.contains(&batch_digest) {
                         let msg = format!(
-                            "Peer {peer_id} returned batch with digest \
+                            "Peer {peer} returned batch with digest \
                             {batch_digest} which is not part of the requested digests: {batch_digests:?}"
                         );
                         return Err(NetworkError::ProtocolError(msg));
@@ -239,8 +237,8 @@ impl WorkerNetworkHandle {
     }
 
     /// Report penalty to peer manager.
-    pub(crate) async fn report_penalty(&self, peer_id: PeerId, penalty: Penalty) {
-        self.handle.report_penalty(peer_id, penalty).await;
+    async fn report_penalty(&self, peer: BlsPublicKey, penalty: Penalty) {
+        self.handle.report_penalty(peer, penalty).await;
     }
 
     /// Notify peer manager of peer exchange information.
@@ -252,9 +250,9 @@ impl WorkerNetworkHandle {
         let _ = self.handle.process_peer_exchange(peers, channel).await;
     }
 
-    /// Retrieve a collection of connected peers.
-    pub async fn connected_peers(&self) -> NetworkResult<Vec<PeerId>> {
-        self.handle.connected_peers().await
+    /// Retrieve the count of connected peers.
+    pub async fn connected_peers_count(&self) -> NetworkResult<usize> {
+        self.handle.connected_peer_count().await
     }
 
     /// Update the task spawner at the epoch boundary.
@@ -320,6 +318,16 @@ where
             NetworkEvent::Gossip(msg, source) => {
                 self.process_gossip(msg, source);
             }
+            NetworkEvent::Error(msg, channel) => {
+                let err = WorkerResponse::Error(message::WorkerRPCError(msg));
+                let network_handle = self.network_handle.clone();
+                self.network_handle.get_task_spawner().spawn_task(
+                    "report request error",
+                    async move {
+                        let _ = network_handle.handle.send_response(err, channel).await;
+                    },
+                );
+            }
         }
     }
 
@@ -328,7 +336,7 @@ where
     /// Spawn a task to evaluate a peer's proposed header and return a response.
     fn process_report_batch(
         &self,
-        _peer: PeerId,
+        _peer: BlsPublicKey,
         sealed_batch: SealedBatch,
         channel: ResponseChannel<WorkerResponse>,
         cancel: oneshot::Receiver<()>,
@@ -355,7 +363,7 @@ where
     /// Attempt to return requested batches.
     fn process_request_batches(
         &self,
-        peer: PeerId,
+        peer: BlsPublicKey,
         batch_digests: Vec<BlockHash>,
         channel: ResponseChannel<WorkerResponse>,
         cancel: oneshot::Receiver<()>,
@@ -383,7 +391,7 @@ where
     }
 
     /// Process gossip from a worker.
-    fn process_gossip(&self, msg: GossipMessage, source: PeerId) {
+    fn process_gossip(&self, msg: GossipMessage, source: BlsPublicKey) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();

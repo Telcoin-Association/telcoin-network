@@ -12,11 +12,16 @@ use libp2p::{
 };
 use std::{collections::HashSet, net::IpAddr, time::Instant};
 use tn_config::PeerConfig;
+use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tracing::error;
 
 /// Information about a given connected peer.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Peer {
+    /// The peers Bls public key.
+    bls_public_key: Option<BlsPublicKey>,
+    /// The peers network public key (libp2p public key).
+    network_key: Option<NetworkPublicKey>,
     /// The config
     config: PeerConfig,
     /// The peer's score - used to derive [Reputation].
@@ -39,9 +44,79 @@ pub(super) struct Peer {
 
 impl Peer {
     /// Create a new trusted peer.
-    pub(super) fn new_trusted(addr: Option<Multiaddr>) -> Peer {
-        let listening_addrs = addr.map(|multi| vec![multi]).unwrap_or_default();
-        Self { listening_addrs, score: Score::new_max(), is_trusted: true, ..Default::default() }
+    pub(super) fn new_trusted(
+        bls_public_key: BlsPublicKey,
+        network_key: NetworkPublicKey,
+        listening_addrs: Vec<Multiaddr>,
+    ) -> Peer {
+        Self {
+            bls_public_key: Some(bls_public_key),
+            network_key: Some(network_key),
+            listening_addrs,
+            score: Score::new_max(),
+            is_trusted: true,
+            config: Default::default(),
+            multiaddrs: Default::default(),
+            connection_status: Default::default(),
+            connection_direction: Default::default(),
+        }
+    }
+
+    /// Create a new trusted peer.
+    pub(super) fn new(
+        bls_public_key: BlsPublicKey,
+        network_key: NetworkPublicKey,
+        listening_addrs: Vec<Multiaddr>,
+    ) -> Peer {
+        Self {
+            bls_public_key: Some(bls_public_key),
+            network_key: Some(network_key),
+            listening_addrs,
+            score: Score::default(),
+            is_trusted: false,
+            config: Default::default(),
+            multiaddrs: Default::default(),
+            connection_status: Default::default(),
+            connection_direction: Default::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn default_for_test() -> Self {
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_types::{BlsKeypair, NetworkKeypair};
+        let mut rng = StdRng::from_seed([0; 32]);
+        let bls_public_key = BlsKeypair::generate(&mut rng).public().clone();
+        let network_key: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+        let listening_addrs = vec![Multiaddr::empty()];
+        Self {
+            bls_public_key: Some(bls_public_key),
+            network_key: Some(network_key),
+            listening_addrs,
+            score: Score::new_max(),
+            is_trusted: false,
+            config: Default::default(),
+            multiaddrs: Default::default(),
+            connection_status: Default::default(),
+            connection_direction: Default::default(),
+        }
+    }
+
+    /// Update keys and network address.
+    pub(super) fn update_net(
+        &mut self,
+        bls_public_key: BlsPublicKey,
+        network_key: NetworkPublicKey,
+        multiaddrs: Vec<Multiaddr>,
+    ) {
+        self.bls_public_key = Some(bls_public_key);
+        self.network_key = Some(network_key);
+        self.multiaddrs.extend(multiaddrs);
+    }
+
+    /// This peers Bls public key.
+    pub(super) fn bls_public_key(&self) -> Option<BlsPublicKey> {
+        self.bls_public_key
     }
 
     /// Return a peer's reputation based on the aggregate score.
@@ -156,6 +231,17 @@ impl Peer {
         Ok(())
     }
 
+    /// True if this peer can be dialed in it's current state.
+    pub(super) fn can_dial(&self) -> bool {
+        match self.connection_status {
+            ConnectionStatus::Connected { .. }
+            | ConnectionStatus::Dialing { .. }
+            | ConnectionStatus::Disconnecting { .. }
+            | ConnectionStatus::Banned { .. } => false,
+            ConnectionStatus::Disconnected { .. } | ConnectionStatus::Unknown => true,
+        }
+    }
+
     /// Filter banned peer's ip addresses against already known banned ip addresses.
     pub(super) fn filter_new_ips_to_ban(
         &self,
@@ -206,8 +292,8 @@ impl Peer {
     }
 
     /// Extract relevant information for peer exchange.
-    pub(super) fn exchange_info(&self) -> HashSet<Multiaddr> {
-        self.multiaddrs.clone()
+    pub(super) fn exchange_info(&self) -> Option<(NetworkPublicKey, HashSet<Multiaddr>)> {
+        self.network_key.as_ref().map(|network_key| (network_key.clone(), self.multiaddrs.clone()))
     }
 
     /// Update a peer record to make it trusted.
@@ -221,12 +307,14 @@ impl Peer {
     /// Update multiaddrs for the peer.
     ///
     /// Returns a boolean indicating if the multiaddr was newly recorded.
-    pub(super) fn update_listening_addrs(&mut self, multiaddr: Multiaddr) -> bool {
-        if !self.listening_addrs.contains(&multiaddr) {
-            self.listening_addrs.push(multiaddr);
-            true
-        } else {
-            false
+    pub(super) fn update_listening_addrs(&mut self, multiaddrs: Vec<Multiaddr>) -> bool {
+        let mut res = false;
+        for multiaddr in multiaddrs {
+            if !self.listening_addrs.contains(&multiaddr) {
+                self.listening_addrs.push(multiaddr);
+                res = true;
+            }
         }
+        res
     }
 }

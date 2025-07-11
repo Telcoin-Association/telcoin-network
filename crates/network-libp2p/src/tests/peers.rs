@@ -3,11 +3,13 @@
 use super::*;
 use crate::common::{create_multiaddr, ensure_score_config, random_ip_addr};
 use libp2p::PeerId;
+use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
     net::IpAddr,
     time::{Duration, Instant},
 };
 use tn_config::{PeerConfig, ScoreConfig};
+use tn_types::{BlsKeypair, NetworkKeypair};
 
 /// Helper function to create a test AllPeers instance
 fn create_all_peers(peer_config: Option<PeerConfig>) -> AllPeers {
@@ -21,10 +23,13 @@ fn create_all_peers(peer_config: Option<PeerConfig>) -> AllPeers {
 fn test_add_trusted_peer() {
     let config = ScoreConfig::default();
     let mut all_peers = create_all_peers(None);
-    let peer_id = PeerId::random();
     let addr = create_multiaddr(None);
 
-    all_peers.add_trusted_peer(peer_id, addr.clone());
+    let mut rng = StdRng::from_seed([0; 32]);
+    let bls = BlsKeypair::generate(&mut rng).public().clone();
+    let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = net.clone().into();
+    all_peers.add_trusted_peer(bls, net, vec![addr.clone()]);
 
     assert!(all_peers.peers.contains_key(&peer_id));
     let peer = all_peers.peers.get_mut(&peer_id).unwrap();
@@ -32,11 +37,11 @@ fn test_add_trusted_peer() {
     assert_eq!(peer.score().aggregate_score(), config.max_score);
 
     // assert that peer exchange doesn't include address for disconnected
-    assert!(!peer.exchange_info().iter().any(|a| a == &addr));
+    assert!(!peer.exchange_info().unwrap().1.iter().any(|a| a == &addr));
 
     // update connection and assert exchange info
     peer.register_outgoing(addr.clone());
-    assert!(peer.exchange_info().iter().any(|a| a == &addr));
+    assert!(peer.exchange_info().unwrap().1.iter().any(|a| a == &addr));
 }
 
 #[test]
@@ -46,7 +51,7 @@ fn test_process_penalty() {
     let peer_id = PeerId::random();
 
     // add connected peer first and set as this node dialed
-    let mut peer = Peer::default();
+    let mut peer = Peer::default_for_test();
     peer.set_connection_status(ConnectionStatus::Connected { num_in: 0, num_out: 1 });
     all_peers.peers.insert(peer_id, peer);
 
@@ -104,17 +109,21 @@ fn test_peer_exchange() {
     let mut all_peers = create_all_peers(None);
 
     // Add some connected peers
-    for _ in 1..4 {
-        let peer_id = PeerId::random();
+    for i in 1..4 {
+        let network_key: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+        let peer_id: PeerId = network_key.clone().into();
         let addr = create_multiaddr(None);
 
         all_peers.update_connection_status(
             &peer_id,
             NewConnectionStatus::Connected {
-                multiaddr: addr,
+                multiaddr: addr.clone(),
                 direction: ConnectionDirection::Incoming,
             },
         );
+        let mut rng = StdRng::from_seed([i; 32]);
+        let bls = BlsKeypair::generate(&mut rng).public().clone();
+        all_peers.upsert_peer(bls, network_key, vec![addr]);
     }
 
     // Add a disconnected peer
@@ -123,7 +132,9 @@ fn test_peer_exchange() {
 
     let exchange = all_peers.peer_exchange();
     assert_eq!(exchange.0.len(), 3);
-    assert!(!exchange.0.contains_key(&disc_peer_id));
+    let mut rng = StdRng::from_seed([0; 32]);
+    let bls = BlsKeypair::generate(&mut rng).public().clone();
+    assert!(!exchange.0.contains_key(&bls));
 }
 
 #[test]

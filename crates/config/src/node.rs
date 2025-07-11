@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::{fs::File, io::Write, time::Duration};
 use tn_types::{
     get_available_tcp_port, get_available_udp_port, test_genesis, Address, BlsPublicKey,
-    BlsSignature, Genesis, Multiaddr, NetworkPublicKey, WorkerIndex, MAINNET_COMMITTEE,
-    MAINNET_GENESIS, MAINNET_PARAMETERS, MAINNET_WORKER_CACHE, TESTNET_COMMITTEE, TESTNET_GENESIS,
+    BlsSignature, Genesis, Multiaddr, NetworkPublicKey, MAINNET_COMMITTEE, MAINNET_GENESIS,
+    MAINNET_PARAMETERS, MAINNET_WORKER_CACHE, TESTNET_COMMITTEE, TESTNET_GENESIS,
     TESTNET_PARAMETERS, TESTNET_WORKER_CACHE,
 };
 use tracing::info;
@@ -157,15 +157,13 @@ impl Config {
 
     /// Update the authority network key.
     pub fn update_primary_network_key(&mut self, value: NetworkPublicKey) -> eyre::Result<()> {
-        self.node_info.p2p_info.network_key = value;
+        self.node_info.p2p_info.primary.network_key = value;
         Ok(())
     }
 
     /// Update the worker network key.
     pub fn update_worker_network_key(&mut self, value: NetworkPublicKey) -> eyre::Result<()> {
-        for worker in self.node_info.p2p_info.worker_index.0.iter_mut() {
-            worker.name = value.clone();
-        }
+        self.node_info.p2p_info.worker.network_key = value;
         Ok(())
     }
 
@@ -199,13 +197,6 @@ impl Config {
     /// Return a reference to the primary's public BLS key.
     pub fn primary_bls_key(&self) -> &BlsPublicKey {
         self.node_info.public_key()
-    }
-
-    /// Return a reference to the primary's [WorkerIndex].
-    ///
-    /// The [WorkerIndex] contains all workers for this validator.
-    pub fn workers(&self) -> &WorkerIndex {
-        self.node_info.worker_index()
     }
 }
 

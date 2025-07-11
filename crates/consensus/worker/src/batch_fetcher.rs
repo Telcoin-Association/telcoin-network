@@ -164,15 +164,12 @@ impl RequestBatchesNetwork for WorkerNetworkHandle {
 mod tests {
     use super::*;
     use crate::{WorkerRequest, WorkerResponse};
-    use rand::{rngs::StdRng, RngCore};
+    use rand::rngs::StdRng;
     use tempfile::TempDir;
-    use tn_network_libp2p::{
-        types::{NetworkCommand, NetworkHandle},
-        PeerId,
-    };
+    use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
     use tn_reth::test_utils::transaction;
     use tn_storage::open_db;
-    use tn_types::{NetworkKeypair, TaskManager};
+    use tn_types::{BlsKeypair, BlsPublicKey, TaskManager};
     use tokio::sync::{mpsc, Mutex};
 
     #[tokio::test]
@@ -383,13 +380,13 @@ mod tests {
     #[derive(Clone)]
     struct TestRequestBatchesNetwork {
         // Worker name -> batch digests it has -> batches.
-        data: Arc<Mutex<HashMap<PeerId, HashMap<BlockHash, Batch>>>>,
+        data: Arc<Mutex<HashMap<BlsPublicKey, HashMap<BlockHash, Batch>>>>,
         handle: WorkerNetworkHandle,
     }
 
     impl TestRequestBatchesNetwork {
         pub fn new() -> Self {
-            let data: Arc<Mutex<HashMap<PeerId, HashMap<BlockHash, Batch>>>> =
+            let data: Arc<Mutex<HashMap<BlsPublicKey, HashMap<BlockHash, Batch>>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let data_clone = data.clone();
             let (tx, mut rx) = mpsc::channel(100);
@@ -403,7 +400,7 @@ mod tests {
                         NetworkCommand::ConnectedPeers { reply } => {
                             reply.send(data_clone.lock().await.keys().copied().collect()).unwrap();
                         }
-                        NetworkCommand::SendRequestDirect {
+                        NetworkCommand::SendRequest {
                             peer,
                             request: WorkerRequest::RequestBatches { batch_digests: digests },
                             reply,
@@ -458,14 +455,9 @@ mod tests {
         }
     }
 
-    fn test_pk(i: u8) -> PeerId {
+    fn test_pk(i: u8) -> BlsPublicKey {
         use rand::SeedableRng;
         let mut rng = StdRng::from_seed([i; 32]);
-        let mut bytes = [0_u8; 32];
-        rng.fill_bytes(&mut bytes);
-        NetworkKeypair::ed25519_from_bytes(bytes)
-            .expect("invalid network key bytes")
-            .public()
-            .to_peer_id()
+        BlsKeypair::generate(&mut rng).public().clone()
     }
 }

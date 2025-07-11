@@ -93,8 +93,9 @@ impl KeygenArgs {
 
         // network keypair for authority
         let network_publickey = key_config.primary_network_public_key();
-        node_info.p2p_info.network_key = network_publickey;
-        node_info.p2p_info.network_address = if let Some(primary_addr) = &self.primary_addr {
+        node_info.p2p_info.primary.network_key = network_publickey;
+        node_info.p2p_info.primary.network_address = if let Some(primary_addr) = &self.primary_addr
+        {
             primary_addr.clone()
         } else {
             let primary_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
@@ -103,20 +104,19 @@ impl KeygenArgs {
 
         // network keypair for workers
         let network_publickey = key_config.worker_network_public_key();
-        for (i, worker) in node_info.p2p_info.worker_index.0.iter_mut().enumerate() {
-            worker.name = network_publickey.clone();
-            worker.worker_address = if let Some(worker_addrs) = &self.worker_addrs {
-                if let Some(addr) = worker_addrs.get(i) {
-                    addr.clone()
-                } else {
-                    let udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584 + 1);
-                    format!("/ip4/127.0.0.1/udp/{udp_port}/quic-v1").parse()?
-                }
+        node_info.p2p_info.worker.network_key = network_publickey;
+        node_info.p2p_info.primary.network_address = if let Some(worker_addrs) = &self.worker_addrs
+        {
+            if let Some(worker_addr) = worker_addrs.first() {
+                worker_addr.clone()
             } else {
-                let udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584 + 1);
-                format!("/ip4/127.0.0.1/udp/{udp_port}/quic-v1").parse()?
-            };
-        }
+                let worker_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
+                format!("/ip4/127.0.0.1/udp/{worker_udp_port}/quic-v1").parse()?
+            }
+        } else {
+            let worker_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
+            format!("/ip4/127.0.0.1/udp/{worker_udp_port}/quic-v1").parse()?
+        };
         Ok(())
     }
 

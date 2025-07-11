@@ -21,7 +21,7 @@ use std::{
     net::IpAddr,
     time::{Duration, Instant},
 };
-use tn_types::BlsPublicKey;
+use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 #[cfg(test)]
@@ -77,10 +77,32 @@ impl AllPeers {
     /// Create a peer that is "trusted".
     ///
     /// This overwrites peer records and unbans ips.
-    pub(super) fn add_trusted_peer(&mut self, peer_id: PeerId, addr: Multiaddr) {
-        let trusted_peer = Peer::new_trusted(Some(addr));
+    pub(super) fn add_trusted_peer(
+        &mut self,
+        bls_public_key: BlsPublicKey,
+        network_key: NetworkPublicKey,
+        addr: Vec<Multiaddr>,
+    ) {
+        let peer_id: PeerId = network_key.clone().into();
+        let trusted_peer = Peer::new_trusted(bls_public_key, network_key, addr);
         let _ = self.banned_peers.remove_banned_peer(trusted_peer.known_ip_addresses());
         self.peers.insert(peer_id, trusted_peer);
+    }
+
+    /// Create a peer.
+    pub(super) fn upsert_peer(
+        &mut self,
+        bls_public_key: BlsPublicKey,
+        network_key: NetworkPublicKey,
+        addrs: Vec<Multiaddr>,
+    ) {
+        let peer_id: PeerId = network_key.clone().into();
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.update_net(bls_public_key, network_key, addrs);
+        } else {
+            let peer = Peer::new(bls_public_key, network_key, addrs);
+            self.peers.insert(peer_id, peer);
+        }
     }
 
     /// Handle reported action.
@@ -670,9 +692,9 @@ impl AllPeers {
     pub(super) fn peer_exchange(&self) -> PeerExchangeMap {
         self.peers
             .iter()
-            .filter_map(|(id, peer)| {
+            .filter_map(|(_id, peer)| {
                 if peer.connection_status().is_connected() {
-                    Some((*id, peer.exchange_info()))
+                    peer.bls_public_key().and_then(|key| peer.exchange_info().map(|ei| (key, ei)))
                 } else {
                     None
                 }
@@ -808,7 +830,7 @@ impl AllPeers {
         self.current_committee_keys.clear();
 
         let mut actions = Vec::with_capacity(committee.len());
-        for (bls_key, NetworkInfo { pubkey, multiaddr: addr }) in committee {
+        for (bls_key, NetworkInfo { pubkey, multiaddrs: addr }) in committee {
             let peer_id: PeerId = pubkey.into();
             self.current_committee.insert(peer_id);
             self.current_committee_keys.insert(bls_key, Some(peer_id));

@@ -21,18 +21,39 @@ pub type Epoch = u32;
 /// The voting power an authority has within the committee.
 pub type VotingPower = u64;
 
-/// Bootstrap p2p server info to join the network.
+/// A multiaddr and network public key for a libp2p node.
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
-pub struct BootstrapServer {
-    /// The network address of the primary.
-    pub primary_network_address: Multiaddr,
-    /// Network key of the primary.
+pub struct P2pNode {
+    /// The network address of the node.
+    pub network_address: Multiaddr,
+    /// Network key of the node.
     pub network_key: NetworkPublicKey,
 }
 
+impl From<(Multiaddr, NetworkPublicKey)> for P2pNode {
+    fn from(value: (Multiaddr, NetworkPublicKey)) -> Self {
+        Self { network_address: value.0, network_key: value.1 }
+    }
+}
+
+impl From<(NetworkPublicKey, Multiaddr)> for P2pNode {
+    fn from(value: (NetworkPublicKey, Multiaddr)) -> Self {
+        Self { network_address: value.1, network_key: value.0 }
+    }
+}
+
+/// Bootstrap p2p server info to join the network.
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct BootstrapServer {
+    /// The p2p info the primary.
+    pub primary: P2pNode,
+    /// The p2p info the worker.
+    pub worker: P2pNode,
+}
+
 impl BootstrapServer {
-    pub fn new(primary_network_address: Multiaddr, network_key: NetworkPublicKey) -> Self {
-        Self { primary_network_address, network_key }
+    pub fn new(primary_node: P2pNode, worker_node: P2pNode) -> Self {
+        Self { primary: primary_node, worker: worker_node }
     }
 }
 
@@ -483,13 +504,13 @@ impl CommitteeBuilder {
         &mut self,
         protocol_key: BlsPublicKey,
         stake: VotingPower,
-        primary_network_address: Multiaddr,
+        primary_node: P2pNode,
+        worker_node: P2pNode,
         execution_address: Address,
-        network_key: NetworkPublicKey,
     ) {
         let authority = Authority::new(protocol_key, stake, execution_address);
         self.authorities.insert(protocol_key, authority);
-        let bootstrap = BootstrapServer::new(primary_network_address, network_key);
+        let bootstrap = BootstrapServer::new(primary_node, worker_node);
         self.bootstrap_server.insert(protocol_key, bootstrap);
     }
 
@@ -508,10 +529,10 @@ impl CommitteeBuilder {
     pub fn add_bootstrap_server(
         &mut self,
         protocol_key: BlsPublicKey,
-        primary_network_address: Multiaddr,
-        network_key: NetworkPublicKey,
+        primary_node: P2pNode,
+        worker_node: P2pNode,
     ) {
-        let bootstrap = BootstrapServer::new(primary_network_address, network_key);
+        let bootstrap = BootstrapServer::new(primary_node, worker_node);
         self.bootstrap_server.insert(protocol_key, bootstrap);
     }
 
@@ -549,11 +570,12 @@ mod tests {
         let bootstrap_servers = authorities
             .keys()
             .map(|key| {
-                let network_keypair = NetworkKeypair::generate_ed25519();
+                let primary_keypair = NetworkKeypair::generate_ed25519();
+                let worker_keypair = NetworkKeypair::generate_ed25519();
 
                 let b = BootstrapServer::new(
-                    Multiaddr::empty(),
-                    network_keypair.public().clone().into(),
+                    (Multiaddr::empty(), primary_keypair.public().clone().into()).into(),
+                    (Multiaddr::empty(), worker_keypair.public().clone().into()).into(),
                 );
 
                 (*key, b)

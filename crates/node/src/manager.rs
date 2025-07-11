@@ -19,11 +19,7 @@ use std::{
 use tn_config::{
     Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs,
 };
-use tn_network_libp2p::{
-    error::NetworkError,
-    types::{NetworkHandle, NetworkInfo},
-    ConsensusNetwork, PeerId, TNMessage,
-};
+use tn_network_libp2p::{error::NetworkError, types::NetworkHandle, ConsensusNetwork, TNMessage};
 use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
     ConsensusBus, NodeMode, StateSynchronizer,
@@ -43,8 +39,8 @@ use tn_storage::{
 use tn_types::{
     gas_accumulator::GasAccumulator, AuthorityIdentifier, BatchValidation, BlsPublicKey, Committee,
     CommitteeBuilder, ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, Multiaddr,
-    Noticer, Notifier, TaskManager, TaskSpawner, TimestampSec, WorkerCache, WorkerIndex,
-    WorkerInfo, B256, MIN_PROTOCOL_BASE_FEE,
+    Noticer, Notifier, TaskManager, TaskSpawner, TimestampSec, WorkerCache, WorkerIndex, B256,
+    MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::{
@@ -777,10 +773,9 @@ where
 
             // loop through the worker info returned from network query
             while let Some(info) = worker_network_infos.next().await {
-                let (protocol_key, NetworkInfo { pubkey, multiaddr, .. }) = info??;
+                let (protocol_key, _) = info??;
                 // only one worker per authority for now
-                let worker_index =
-                    WorkerIndex(vec![WorkerInfo { name: pubkey, worker_address: multiaddr }]);
+                let worker_index = WorkerIndex(vec![protocol_key]);
                 workers.push((protocol_key, worker_index));
             }
 
@@ -923,8 +918,8 @@ where
                     .inner_handle()
                     .add_explicit_peer(
                         *bls_key,
-                        bootstrap_server.network_key.clone(),
-                        bootstrap_server.primary_network_address.clone(),
+                        bootstrap_server.primary.network_key.clone(),
+                        bootstrap_server.primary.network_address.clone(),
                     )
                     .await?;
             }
@@ -984,45 +979,6 @@ where
     }
 
     /// Dial peer.
-    fn dial_peer<Req: TNMessage, Res: TNMessage>(
-        &self,
-        handle: NetworkHandle<Req, Res>,
-        peer_id: PeerId,
-        peer_addr: Multiaddr,
-        node_task_spawner: TaskSpawner,
-    ) {
-        // spawn dials on long-running task manager
-        let task_name = format!("DialPeer {peer_id}");
-        node_task_spawner.spawn_task(task_name, async move {
-            let mut backoff = 1;
-
-            debug!(target: "epoch-manager", ?peer_id, "dialing peer");
-
-            // skip dialing already connected peers
-            if let Ok(peers) = handle.connected_peers().await {
-                if peers.contains(&peer_id) {
-                    debug!(target: "epoch-manager", ?peer_id, "skipping dial for peer");
-                    return;
-                };
-            }
-
-            debug!(target: "epoch-manager", ?peer_id, "peer not connected - dialing peer");
-            while let Err(e) = handle.dial(peer_id, peer_addr.clone()).await {
-                // ignore errors for peers that are already connected or being dialed
-                if matches!(e, NetworkError::AlreadyConnected(_)) || matches!(e, NetworkError::AlreadyDialing(_)) {
-                    return;
-                }
-
-                tracing::warn!(target: "epoch-manager", "failed to dial {peer_id} at {peer_addr}: {e}");
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
-                if backoff < 120 {
-                    backoff += backoff;
-                }
-            }
-        });
-    }
-
-    /// Dial peer.
     fn dial_peer_bls<Req: TNMessage, Res: TNMessage>(
         &self,
         handle: NetworkHandle<Req, Res>,
@@ -1078,9 +1034,22 @@ where
 
         // start listening if the network needs to be initialized
         if *initial_epoch {
-            let worker_address = consensus_config.worker_address(worker_id);
+            let worker_address = consensus_config.worker_address();
             self.worker_network_addr = Some(worker_address.clone());
             network_handle.inner_handle().start_listening(worker_address).await?;
+            for (bls_key, bootstrap_server) in
+                consensus_config.committee().bootstrap_servers().iter()
+            {
+                info!(target = "epoch-manager", "adding bootstrap {bls_key}: {bootstrap_server:?}");
+                network_handle
+                    .inner_handle()
+                    .add_explicit_peer(
+                        *bls_key,
+                        bootstrap_server.worker.network_key.clone(),
+                        bootstrap_server.worker.network_address.clone(),
+                    )
+                    .await?;
+            }
         }
 
         let worker_address =
@@ -1090,15 +1059,15 @@ where
         // the network's peer manager will intercept dial attempts for peers that are already
         // connected
         debug!(target: "epoch-manager", ?worker_address, "spawning worker network for epoch");
-        for (peer_id, addr) in consensus_config.worker_cache().all_workers() {
-            if worker_address != addr {
-                self.dial_peer(
-                    network_handle.inner_handle().clone(),
-                    peer_id,
-                    addr,
-                    epoch_task_spawner.clone(),
-                );
-            }
+        for (_, peer) in consensus_config
+            .committee()
+            .others_primaries_by_id(consensus_config.authority().as_ref().map(|a| a.id()).as_ref())
+        {
+            self.dial_peer_bls(
+                network_handle.inner_handle().clone(),
+                peer,
+                epoch_task_spawner.clone(),
+            );
         }
 
         // update the authorized publishers for gossip every epoch
