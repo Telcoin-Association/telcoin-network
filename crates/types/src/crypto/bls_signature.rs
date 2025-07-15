@@ -3,9 +3,9 @@
 use super::{BlsKeypair, BlsPublicKey, Intent, IntentMessage, IntentScope, Signer, DST_G1};
 use crate::encode;
 use alloy::primitives::Address;
-use blst::min_sig::{
+use blst::{blst_p1_affine, min_sig::{
     AggregateSignature as CoreBlsAggregateSignature, Signature as CoreBlsSignature,
-};
+}};
 use serde::{Deserialize, Serialize};
 use std::{fmt, ops::Deref};
 
@@ -28,6 +28,52 @@ impl BlsSignature {
     /// Verify a signature over a message (raw bytes) with public key.
     pub fn verify_raw(&self, message: &[u8], public_key: &BlsPublicKey) -> bool {
         self.verify(true, message, DST_G1, &[], public_key, true) == blst::BLST_ERROR::BLST_SUCCESS
+    }
+
+    /// Convert a BLS12-381 field element to EIP2537 EVM-padded format (64 bytes)
+    /// 
+    /// Accepts a field element represented as a G1 point coordinate (blst_p1_affine)
+    /// Returns 64-byte big-endian representation with 16 bytes of leading zeros a la EIP2537
+    pub fn field_element_to_eip2537_bytes(limbs: &[u64; 6]) -> [u8; 64] {
+        let mut padded_bytes = [0u8; 64];
+
+        // convert each u64 limb to big-endian bytes
+        for (i, limb) in limbs.iter().enumerate() {
+            let limb_bytes = limb.to_be_bytes();
+            // start at byte 16 for EVM padding according to EIP2537
+            let offset = 16 + (5 - i) * 8;
+            // blst uses little-endian limb order so reverse for big-endian
+            padded_bytes[offset..offset + 8].copy_from_slice(&limb_bytes);
+        }
+        
+        padded_bytes
+    }
+
+    /// Encode a BLS12-381 G1 point (signature) to EIP2537 format (128 bytes)
+    /// 
+    /// Converts a signature on the G1 curve to the format expected by Ethereum's
+    /// EIP2537 precompiles: two 64-byte padded field elements (x, y coordinates).
+    pub fn encode_g1_point_for_eip2537(signature: &CoreBlsSignature) -> Result<[u8; 128], String> {
+        // Convert to affine representation
+        let affine_point = blst_p1_affine::from(signature.into());
+
+        // Check for point at infinity (would be all zeros)
+        if affine_point.x.l.iter().all(|&limb| limb == 0) && 
+        affine_point.y.l.iter().all(|&limb| limb == 0) {
+            // encoding for point at infinity
+            return Ok([0u8; 128]);
+        }
+        
+        // Convert x and y coordinates to EIP2537 EVM-padded format
+        let x_padded = Self::field_element_to_eip2537_bytes(&affine_point.x.l);
+        let y_padded = Self::field_element_to_eip2537_bytes(&affine_point.y.l);
+        
+        // Concatenate x and y coordinates
+        let mut encoded = [0u8; 128];
+        encoded[0..64].copy_from_slice(&x_padded);
+        encoded[64..128].copy_from_slice(&y_padded);
+        
+        Ok(encoded)
     }
 }
 
