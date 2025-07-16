@@ -440,6 +440,22 @@ impl Committee {
             .collect()
     }
 
+    /// Returns the bls keys of all members except `myself`.
+    pub fn others_keys_except(&self, myself: &BlsPublicKey) -> Vec<BlsPublicKey> {
+        self.inner
+            .read()
+            .authorities
+            .iter()
+            .filter_map(|(_, authority)| {
+                if authority.protocol_key() == myself {
+                    None
+                } else {
+                    Some(*authority.protocol_key())
+                }
+            })
+            .collect()
+    }
+
     /// Return the bootstrap record for key if it exists.
     pub fn get_bootstrap(&self, key: &BlsPublicKey) -> Option<BootstrapServer> {
         self.inner.read().bootstrap_servers.get(key).cloned()
@@ -458,6 +474,14 @@ impl Committee {
             new_epoch,
             self.inner.read().bootstrap_servers.clone(),
         )
+    }
+
+    /// Return the number of workers that are in use for this committee.
+    /// This is a protocol level value, all nodes have to agree on this and be
+    /// running the required number of workers.
+    /// Currently 1 but may change with a future fork on an epoch boundary.
+    pub fn number_of_workers(&self) -> usize {
+        1
     }
 }
 

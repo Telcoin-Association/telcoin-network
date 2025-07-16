@@ -2,11 +2,10 @@
 use crate::TelcoinDirs;
 use eyre::Context;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, ffi::OsStr, fs, path::Path, sync::Arc};
+use std::{collections::BTreeMap, ffi::OsStr, fs, path::Path};
 use tn_types::{
     address, test_genesis, verify_proof_of_possession_bls, Address, BlsPublicKey, BlsSignature,
     Committee, CommitteeBuilder, Genesis, GenesisAccount, Multiaddr, NetworkPublicKey, NodeP2pInfo,
-    WorkerCache, WorkerIndex,
 };
 use tracing::{info, warn};
 
@@ -139,20 +138,6 @@ impl NetworkGenesis {
             );
         }
         Ok(committee_builder.build())
-    }
-
-    /// Create a [WorkerCache] from the validators in [NetworkGenesis].
-    pub fn create_worker_cache(&self) -> eyre::Result<WorkerCache> {
-        let worker_addrs: Vec<BlsPublicKey> = self.validators.keys().copied().collect();
-        let workers = self
-            .validators
-            .keys()
-            .map(|pubkey| (*pubkey, WorkerIndex(worker_addrs.clone())))
-            .collect();
-
-        let worker_cache = WorkerCache { epoch: 0, workers: Arc::new(workers) };
-
-        Ok(worker_cache)
     }
 
     /// Return a reference to the validators.

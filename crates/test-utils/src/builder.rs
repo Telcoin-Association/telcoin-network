@@ -8,13 +8,11 @@ use std::{
     collections::{BTreeMap, VecDeque},
     marker::PhantomData,
     num::NonZeroUsize,
-    sync::Arc,
 };
 use tn_config::{KeyConfig, NetworkConfig};
 use tn_types::{
     get_available_udp_port, Address, Authority, AuthorityIdentifier, BlsKeypair, BootstrapServer,
-    Committee, Database, Epoch, Multiaddr, TimestampSec, VotingPower, WorkerCache, WorkerIndex,
-    DEFAULT_WORKER_PORT,
+    Committee, Database, Epoch, Multiaddr, TimestampSec, VotingPower, DEFAULT_WORKER_PORT,
 };
 
 /// The committee builder for tests.
@@ -176,19 +174,6 @@ where
             0,
             bootstrap_servers,
         );
-        // Build our worker cache.  This is map of authorities to it's worker (one per authority).
-        let worker_cache = WorkerCache {
-            epoch: self.epoch,
-            workers: Arc::new(
-                committee_info
-                    .iter()
-                    .map(|(primary_keypair, _key_config, _authority, _worker, _network_config)| {
-                        let worker_index = vec![*primary_keypair.public()];
-                        (*primary_keypair.public(), WorkerIndex(worker_index))
-                    })
-                    .collect(),
-            ),
-        };
         // All the authorities use the same worker cache.
         let authorities: BTreeMap<AuthorityIdentifier, AuthorityFixture<DB>> = committee_info
             .into_iter()
@@ -202,7 +187,6 @@ where
                         committee.clone(),
                         (self.new_db)(),
                         worker,
-                        worker_cache.clone(),
                         network_config,
                     ),
                 )

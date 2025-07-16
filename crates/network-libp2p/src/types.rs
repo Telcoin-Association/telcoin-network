@@ -12,8 +12,8 @@ use libp2p::{
     Multiaddr, PeerId, TransportError,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use tn_types::{encode, BlsPublicKey, BlsSignature, NetworkPublicKey};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use tn_types::{encode, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode};
 use tokio::sync::{mpsc, oneshot};
 
 #[cfg(test)]
@@ -126,6 +126,14 @@ where
         network_pubkey: NetworkPublicKey,
         /// The peer's address.
         addr: Multiaddr,
+        /// Reply for connection outcome.
+        reply: oneshot::Sender<NetworkResult<()>>,
+    },
+    /// Add explicit peers to internal bls to peer cache.
+    /// Don't overwrite existing records.
+    AddBootstrapPeers {
+        /// The Bls public key for t.
+        peers: BTreeMap<BlsPublicKey, P2pNode>,
         /// Reply for connection outcome.
         reply: oneshot::Sender<NetworkResult<()>>,
     },
@@ -388,6 +396,16 @@ where
         self.sender
             .send(NetworkCommand::AddExplicitPeer { bls_pubkey, network_pubkey, addr, reply })
             .await?;
+        rx.await?
+    }
+
+    /// Add explicit bootstrap peers.
+    pub async fn add_bootstrap_peers(
+        &self,
+        peers: BTreeMap<BlsPublicKey, P2pNode>,
+    ) -> NetworkResult<()> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::AddBootstrapPeers { peers, reply }).await?;
         rx.await?
     }
 

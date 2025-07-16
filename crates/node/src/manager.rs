@@ -39,8 +39,7 @@ use tn_storage::{
 use tn_types::{
     gas_accumulator::GasAccumulator, AuthorityIdentifier, BatchValidation, BlsPublicKey, Committee,
     CommitteeBuilder, ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, Multiaddr,
-    Noticer, Notifier, TaskManager, TaskSpawner, TimestampSec, WorkerCache, WorkerIndex, B256,
-    MIN_PROTOCOL_BASE_FEE,
+    Noticer, Notifier, TaskManager, TaskSpawner, TimestampSec, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::{
@@ -684,13 +683,9 @@ where
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
         debug!(target: "epoch-manager", new_epoch_boundary=self.epoch_boundary, "resetting epoch boundary");
 
-        // send these to the swarm for validator discovery
-        let keys_for_worker_cache = validators.keys().cloned().collect();
         debug!(target: "epoch-manager", ?validators, "creating committee for validators");
         let committee =
             self.create_committee_from_state(epoch, validators, epoch_task_manager).await?;
-        let worker_cache =
-            self.create_worker_cache_from_state(epoch, keys_for_worker_cache).await?;
 
         // create config for consensus
         let consensus_config = ConsensusConfig::new_for_epoch(
@@ -698,7 +693,6 @@ where
             consensus_db.clone(),
             self.key_config.clone(),
             committee,
-            worker_cache,
             network_config.clone(),
         )?;
 
@@ -741,48 +735,6 @@ where
         committee.load();
 
         Ok(committee)
-    }
-
-    /// Create the [WorkerCache] for the current epoch.
-    ///
-    /// This is the first step for configuring consensus.
-    async fn create_worker_cache_from_state(
-        &self,
-        epoch: Epoch,
-        validators: Vec<BlsPublicKey>,
-    ) -> eyre::Result<WorkerCache> {
-        info!(target: "epoch-manager", "creating worker cache from state");
-
-        let worker_cache = if epoch == 0 {
-            debug!(target: "epoch-manager", "loading worker cache from config for epoch 0");
-            Config::load_from_path_or_default::<WorkerCache>(
-                self.tn_datadir.worker_cache_path(),
-                ConfigFmt::YAML,
-            )?
-        } else {
-            debug!(target: "epoch-manager", "creating worker cache from network records");
-            // create worker cache
-            let worker_handle = self
-                .worker_network_handle
-                .as_ref()
-                .ok_or_eyre("missing primary network handle for epoch manager")?;
-
-            let mut workers = Vec::with_capacity(validators.len());
-            let mut worker_network_infos =
-                worker_handle.inner_handle().find_authorities(validators).await?;
-
-            // loop through the worker info returned from network query
-            while let Some(info) = worker_network_infos.next().await {
-                let (protocol_key, _) = info??;
-                // only one worker per authority for now
-                let worker_index = WorkerIndex(vec![protocol_key]);
-                workers.push((protocol_key, worker_index));
-            }
-
-            WorkerCache { epoch, workers: Arc::new(workers.into_iter().collect()) }
-        };
-
-        Ok(worker_cache)
     }
 
     /// Create a [PrimaryNode].
@@ -910,19 +862,18 @@ where
             .collect();
 
         if *initial_epoch {
-            for (bls_key, bootstrap_server) in
-                consensus_config.committee().bootstrap_servers().iter()
-            {
-                info!(target = "epoch-manager", "adding bootstrap {bls_key}: {bootstrap_server:?}");
-                network_handle
-                    .inner_handle()
-                    .add_explicit_peer(
-                        *bls_key,
-                        bootstrap_server.primary.network_key.clone(),
-                        bootstrap_server.primary.network_address.clone(),
-                    )
-                    .await?;
-            }
+            // Make sure we at least hove bootstrap peers on first epoch.
+            network_handle
+                .inner_handle()
+                .add_bootstrap_peers(
+                    consensus_config
+                        .committee()
+                        .bootstrap_servers()
+                        .iter()
+                        .map(|(k, v)| (*k, v.primary.clone()))
+                        .collect(),
+                )
+                .await?;
         }
 
         network_handle.inner_handle().new_epoch(committee_keys.clone(), event_stream).await?;
@@ -1037,19 +988,18 @@ where
             let worker_address = consensus_config.worker_address();
             self.worker_network_addr = Some(worker_address.clone());
             network_handle.inner_handle().start_listening(worker_address).await?;
-            for (bls_key, bootstrap_server) in
-                consensus_config.committee().bootstrap_servers().iter()
-            {
-                info!(target = "epoch-manager", "adding bootstrap {bls_key}: {bootstrap_server:?}");
-                network_handle
-                    .inner_handle()
-                    .add_explicit_peer(
-                        *bls_key,
-                        bootstrap_server.worker.network_key.clone(),
-                        bootstrap_server.worker.network_address.clone(),
-                    )
-                    .await?;
-            }
+            // Make sure we at least hove bootstrap peers on first epoch.
+            network_handle
+                .inner_handle()
+                .add_bootstrap_peers(
+                    consensus_config
+                        .committee()
+                        .bootstrap_servers()
+                        .iter()
+                        .map(|(k, v)| (*k, v.worker.clone()))
+                        .collect(),
+                )
+                .await?;
         }
 
         let worker_address =

@@ -167,8 +167,7 @@ where
 
         // validate certificate and verify signatures
         // TODO: rename this method too
-        let verified_cert =
-            certificate.verify(self.config.committee(), self.config.worker_cache())?;
+        let verified_cert = certificate.verify(self.config.committee())?;
         Ok(verified_cert)
     }
 

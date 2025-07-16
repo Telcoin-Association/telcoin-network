@@ -96,7 +96,7 @@ where
         let committee = self.consensus_config.committee();
 
         // validate header
-        header.validate(committee, self.consensus_config.worker_cache())?;
+        header.validate(committee)?;
 
         // validate parents
         let num_parents = parents.len();

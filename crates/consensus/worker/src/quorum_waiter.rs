@@ -11,9 +11,7 @@ use std::{
 };
 use thiserror::Error;
 use tn_network_libp2p::error::NetworkError;
-use tn_types::{
-    Authority, Committee, SealedBatch, TaskSpawner, VotingPower, WorkerCache, WorkerId,
-};
+use tn_types::{Authority, BlsPublicKey, Committee, SealedBatch, TaskSpawner, VotingPower};
 use tokio::sync::oneshot;
 
 #[cfg(test)]
@@ -46,14 +44,10 @@ pub trait QuorumWaiterTrait: Send + Sync + Clone + Unpin + 'static {
 type QMBoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 struct QuorumWaiterInner {
-    /// This authority- if None we are not a validator and this won't do much...
+    /// This authority.
     authority: Authority,
-    /// The id of this worker.
-    id: WorkerId,
     /// The committee information.
     committee: Committee,
-    /// The worker information cache.
-    worker_cache: WorkerCache,
     /// A network sender to broadcast the batches to the other workers.
     network: WorkerNetworkHandle,
     /// Record metrics for quorum waiter.
@@ -70,26 +64,16 @@ impl QuorumWaiter {
     /// Create a new QuorumWaiter.
     pub fn new(
         authority: Authority,
-        id: WorkerId,
         committee: Committee,
-        worker_cache: WorkerCache,
         network: WorkerNetworkHandle,
         metrics: Arc<WorkerMetrics>,
     ) -> Self {
-        Self {
-            inner: Arc::new(QuorumWaiterInner {
-                authority,
-                id,
-                committee,
-                worker_cache,
-                network,
-                metrics,
-            }),
-        }
+        Self { inner: Arc::new(QuorumWaiterInner { authority, committee, network, metrics }) }
     }
 
     /// Helper function. It waits for a future to complete and then delivers a value.
     async fn waiter(
+        bls: BlsPublicKey,
         wait_for: oneshot::Receiver<Result<(), NetworkError>>,
         deliver: VotingPower,
     ) -> Result<VotingPower, WaiterError> {
@@ -98,12 +82,18 @@ impl QuorumWaiter {
                 match r {
                     Ok(_) => Ok(deliver),
                     Err(NetworkError::RPCError(msg)) => {
-                        tracing::error!(target = "worker::quorum_waiter", "RPCError: {msg}");
+                        tracing::error!(
+                            target = "worker::quorum_waiter",
+                            "RPCError, peer {bls}: {msg}"
+                        );
                         Err(WaiterError::Rejected(deliver))
                     }
                     // Non-exhaustive enum...
                     Err(err) => {
-                        tracing::error!(target = "worker::quorum_waiter", "Network error: {err}");
+                        tracing::error!(
+                            target = "worker::quorum_waiter",
+                            "Network error, peer {bls}: {err:?}"
+                        );
                         Err(WaiterError::Network(deliver))
                     }
                 }
@@ -128,9 +118,8 @@ impl QuorumWaiterTrait for QuorumWaiter {
             let timeout_res = tokio::time::timeout(timeout, async move {
                 let start_time = Instant::now();
                 // Broadcast the batch to the other workers.
-                let workers: Vec<_> = inner
-                    .worker_cache
-                    .others_workers_by_id(inner.authority.protocol_key(), &inner.id);
+                let workers: Vec<_> =
+                    inner.committee.others_keys_except(inner.authority.protocol_key());
 
                 let handlers = inner.network.report_batch_to_peers(&workers, sealed_batch);
                 let _timer = inner.metrics.batch_broadcast_quorum_latency.start_timer();
@@ -150,7 +139,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                     .map(|(name, handler)| {
                         let stake = inner.committee.voting_power(&name);
                         available_stake += stake;
-                        Box::pin(monitored_future!(Self::waiter(handler, stake)))
+                        Box::pin(monitored_future!(Self::waiter(name, handler, stake)))
                     })
                     .for_each(|f| wait_for_quorum.push(f));
 

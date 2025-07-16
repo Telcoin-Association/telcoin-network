@@ -1,8 +1,6 @@
 //! Worker types.
 
 use tokio::sync::{mpsc::Sender, oneshot};
-mod info;
-pub use info::*;
 mod sealed_batch;
 pub use sealed_batch::*;
 mod pending_batch;
@@ -19,3 +17,8 @@ pub type BatchSender = Sender<(SealedBatch, oneshot::Sender<Result<(), BlockSeal
 
 /// The default worker udp port for consensus messages.
 pub const DEFAULT_WORKER_PORT: u16 = 44895;
+
+/// The unique identifier for a worker (per primary).
+///
+/// Workers communicate with peers of the same `WorkerId`.
+pub type WorkerId = u16;

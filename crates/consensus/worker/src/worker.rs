@@ -65,22 +65,12 @@ pub fn new_worker<DB: Database>(
         task_manager,
     );
 
-    if let Some(authority) = consensus_config.authority() {
-        // NOTE: This log entry is used to compute performance.
-        info!(target: "worker::worker",
-            "Worker {} successfully booted on {}",
-            id,
-            consensus_config
-                .worker_cache()
-                .worker(authority.protocol_key(), &id)
-                .expect("Our public key or worker id is not in the worker cache")
-        );
-    } else {
-        info!(target: "worker::worker",
-            "Worker {} successfully booted",
-            id,
-        );
-    }
+    // NOTE: This log entry is used to compute performance.
+    info!(target: "worker::worker",
+        "Worker {} successfully booted on {}",
+        id,
+        consensus_config.config().node_info.p2p_info.worker.network_address
+    );
 
     batch_provider
 }
@@ -102,9 +92,7 @@ fn new_worker_internal<DB: Database>(
     let quorum_waiter = consensus_config.authority().clone().map(|authority| {
         QuorumWaiter::new(
             authority,
-            id,
             consensus_config.committee().clone(),
-            consensus_config.worker_cache().clone(),
             network_handle.clone(),
             node_metrics.clone(),
         )

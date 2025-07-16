@@ -5,7 +5,7 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
-    kad::KadStore,
+    kad::{KadRecord, KadStore},
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     types::{
@@ -21,7 +21,7 @@ use libp2p::{
         TopicHash,
     },
     identify::{self, Event as IdentifyEvent, Info as IdentifyInfo},
-    kad::{self, store::RecordStore, Mode, QueryId},
+    kad::{self, store::RecordStore, Mode, QueryId, Record},
     multiaddr::Protocol,
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
@@ -35,9 +35,10 @@ use std::{
     time::Duration,
 };
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
+use tn_storage::tables::KadRecords;
 use tn_types::{
-    encode, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair, NetworkPublicKey,
-    TaskSpawner,
+    decode, encode, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
+    NetworkPublicKey, TaskSpawner,
 };
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
@@ -238,12 +239,29 @@ where
             .set_publication_interval(twelve_hours)
             .set_query_timeout(Duration::from_secs(60))
             .set_provider_record_ttl(two_days);
-        let kad_store = KadStore::new(db, &key_config);
+        let kad_store = KadStore::new(db.clone(), &key_config);
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store, kad_config);
 
         // create custom behavior
-        let behavior =
+        let mut behavior =
             TNBehavior::new(identify, gossipsub, req_res, kademlia, network_config.peer_config());
+
+        // Load the Kad records from DB into the local peer cache.
+        for (_key, record) in db.iter::<KadRecords>() {
+            let record: KadRecord = decode(record.as_ref());
+            let record: Record = record.into();
+            match BlsPublicKey::from_literal_bytes(record.key.as_ref()) {
+                Ok(key) => {
+                    let record: NodeRecord = decode(&record.value);
+                    behavior.peer_manager.add_known_peer(key, record.info);
+                }
+                // How did we get a KAD record with a broken key?
+                Err(error) => {
+                    error!(target: "network-kad", ?error, "Invalid/corrupt KAD DB store!");
+                }
+            }
+        }
+
         let network_pubkey = keypair.public().into();
 
         // create swarm
@@ -308,9 +326,11 @@ where
         let mut multiaddrs: Vec<Multiaddr> = self.swarm.external_addresses().cloned().collect();
 
         if multiaddrs.is_empty() {
-            warn!(target: "network-kad", ?multiaddrs, "call to create peer record, but external addresses are empty - using self-reported listeners");
             // fallback to listeners
             multiaddrs = self.swarm.listeners().cloned().collect();
+            warn!(target: "network-kad", "call to create peer record, but external addresses are empty - using self-reported listeners {multiaddrs:?}");
+        } else {
+            info!(target: "network-kad", ?multiaddrs, "call to create peer record, using our confirmed external addresses");
         }
 
         // use ipv4 or ipv6 multiaddr
@@ -368,27 +388,24 @@ where
         }
     }
 
-    /// Publish our network addresses and peer id under our BLS public key for discovery.
-    fn _publish_our_data(&mut self) {
+    /// Publish our network addresses and peer id AND to the network under our BLS public key for
+    /// discovery.
+    fn publish_our_data_to_peer(&mut self, peer: PeerId) {
         if let Some(record) = self.get_peer_record() {
             info!(target: "network-kad", "Publishing our record to kademlia");
+            // Publish to the specified peer.
+            let _ = self.swarm.behaviour_mut().kademlia.put_record_to(
+                record.clone(),
+                vec![peer].into_iter(),
+                kad::Quorum::One,
+            );
+
+            // Also publish our record locally and to the network.
             if let Err(err) =
                 self.swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One)
             {
                 error!(target: "network-kad", "Failed to publish record: {err}");
             }
-        }
-    }
-
-    /// Publish our network addresses and peer id under our BLS public key for discovery.
-    fn publish_our_data_to_peer(&mut self, peer: PeerId) {
-        if let Some(record) = self.get_peer_record() {
-            info!(target: "network-kad", "Publishing our record to kademlia");
-            let _ = self.swarm.behaviour_mut().kademlia.put_record_to(
-                record,
-                vec![peer].into_iter(),
-                kad::Quorum::One,
-            );
         }
     }
 
@@ -496,6 +513,22 @@ where
                 );
                 let _ = reply.send(Ok(()));
             }
+            NetworkCommand::AddBootstrapPeers { peers, reply } => {
+                // update peer manager
+                let peer = &mut self.swarm.behaviour_mut().peer_manager;
+                for (bls, info) in peers {
+                    if peer.auth_to_peer(bls).is_none() {
+                        peer.add_known_peer(
+                            bls,
+                            NetworkInfo {
+                                pubkey: info.network_key,
+                                multiaddrs: vec![info.network_address],
+                            },
+                        );
+                    }
+                }
+                let _ = reply.send(Ok(()));
+            }
             NetworkCommand::Dial { peer_id, peer_addr, reply } => {
                 self.swarm.behaviour_mut().peer_manager.dial_peer(
                     peer_id,
@@ -576,10 +609,13 @@ where
                 send_or_log_error!(reply, collection, "MeshPeers");
             }
             NetworkCommand::SendRequest { peer, request, reply } => {
-                if let Some((peer, _addr)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer)
-                {
-                    let request_id =
-                        self.swarm.behaviour_mut().req_res.send_request(&peer, request);
+                if let Some((peer, addr)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
+                    debug!(target = "network", "trying to send to {peer} at {addr:?}");
+                    let request_id = self
+                        .swarm
+                        .behaviour_mut()
+                        .req_res
+                        .send_request_with_addresses(&peer, request, addr);
                     self.outbound_requests.insert((peer, request_id), reply);
                 } else {
                     // Best effort to return an error to caller.

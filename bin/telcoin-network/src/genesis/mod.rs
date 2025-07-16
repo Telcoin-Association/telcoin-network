@@ -246,11 +246,9 @@ impl GenesisArgs {
 
         // generate committee and worker cache
         let committee = network_genesis.create_committee()?;
-        let worker_cache = network_genesis.create_worker_cache()?;
 
         // write to file
         Config::write_to_path(data_dir.committee_path(), committee, ConfigFmt::YAML)?;
-        Config::write_to_path(data_dir.worker_cache_path(), worker_cache, ConfigFmt::YAML)?;
 
         Ok(())
     }
