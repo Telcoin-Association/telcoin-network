@@ -1097,6 +1097,31 @@ impl RethEnv {
         Ok(epoch_state)
     }
 
+    /// Read the latest committee and epoch information from the [ConsensusRegistry] on-chain.
+    ///
+    /// The protocol needs the BLS pubkey for the authorities.
+    /// - get current epoch info
+    /// - getValidator token id by address
+    /// - getValidator info by token id
+    pub fn validators_for_epoch(
+        &self,
+        epoch: u32,
+    ) -> eyre::Result<Vec<ConsensusRegistry::ValidatorInfo>> {
+        // create EVM with latest state
+        let canonical_tip = self.canonical_tip();
+        debug!(target: "engine", ?canonical_tip, "retrieving validators for epoch {epoch}");
+        let state_provider = self.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
+        let state = StateProviderDatabase::new(&state_provider);
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
+        debug!(target: "engine", state=?db.bundle_state, hashes=?db.block_hashes, "retrieving epoch state from canonical tip");
+        let mut tn_evm = self
+            .evm_config
+            .evm_factory()
+            .create_evm(&mut db, self.evm_config.evm_env(&canonical_tip));
+
+        self.get_committee_validators_by_epoch(epoch, &mut tn_evm)
+    }
+
     /// Extract the epoch number from a header's nonce.
     pub fn extract_epoch_from_header(header: &ExecHeader) -> Epoch {
         let nonce: u64 = header.nonce.into();
@@ -1104,7 +1129,7 @@ impl RethEnv {
     }
 
     /// Read the curret epoch number from the [ConsensusRegistry] on-chain.
-    pub fn get_current_epoch_number<DB>(&self, evm: &mut TNEvm<DB>) -> eyre::Result<u32>
+    fn get_current_epoch_number<DB>(&self, evm: &mut TNEvm<DB>) -> eyre::Result<u32>
     where
         DB: alloy_evm::Database,
     {
@@ -1113,7 +1138,7 @@ impl RethEnv {
     }
 
     /// Read the curret epoch info from the [ConsensusRegistry] on-chain.
-    pub fn get_current_epoch_info<DB>(
+    fn get_current_epoch_info<DB>(
         &self,
         evm: &mut TNEvm<DB>,
     ) -> eyre::Result<ConsensusRegistry::EpochInfo>
@@ -1125,7 +1150,7 @@ impl RethEnv {
     }
 
     /// Retrieve all `ValidatorInfo` in the committee for the provided epoch.
-    pub fn get_committee_validators_by_epoch<DB>(
+    fn get_committee_validators_by_epoch<DB>(
         &self,
         epoch: Epoch,
         evm: &mut TNEvm<DB>,

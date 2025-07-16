@@ -605,7 +605,7 @@ where
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<(PrimaryNode<DatabaseType>, WorkerNode<DatabaseType>)> {
         // create config for consensus
-        let consensus_config = self
+        let (consensus_config, preload_keys) = self
             .configure_consensus(engine, network_config, &consensus_db, epoch_task_manager)
             .await?;
 
@@ -652,7 +652,22 @@ where
             engine.canonical_block_stream().await,
             epoch_task_manager,
         );
-
+        let primary_handle = primary.network_handle().await;
+        let prefetches = preload_keys.clone();
+        epoch_task_manager.spawn_task("primary pre-load validators", async move {
+            // Attempt to pre-load the next couple of committee's network info.
+            if let Ok(tasks) = primary_handle.inner_handle().find_authorities(prefetches).await {
+                for _ in tasks {}
+            }
+        });
+        let worker_handle = worker.network_handle().await;
+        let prefetches = preload_keys.clone();
+        epoch_task_manager.spawn_task("worker pre-load validators", async move {
+            // Attempt to pre-load the next couple of committee's network info.
+            if let Ok(tasks) = worker_handle.inner_handle().find_authorities(prefetches).await {
+                for _ in tasks {}
+            }
+        });
         Ok((primary, worker))
     }
 
@@ -666,7 +681,7 @@ where
         network_config: &NetworkConfig,
         consensus_db: &DatabaseType,
         epoch_task_manager: &TaskManager,
-    ) -> eyre::Result<ConsensusConfig<DatabaseType>> {
+    ) -> eyre::Result<(ConsensusConfig<DatabaseType>, Vec<BlsPublicKey>)> {
         // retrieve epoch information from canonical tip
         let EpochState { epoch, epoch_info, validators, epoch_start } =
             engine.epoch_state_from_canonical_tip().await?;
@@ -684,8 +699,14 @@ where
         debug!(target: "epoch-manager", new_epoch_boundary=self.epoch_boundary, "resetting epoch boundary");
 
         debug!(target: "epoch-manager", ?validators, "creating committee for validators");
+
+        let mut next_vals: HashSet<BlsPublicKey> = HashSet::new();
+        next_vals.extend(validators.keys().copied());
         let committee =
             self.create_committee_from_state(epoch, validators, epoch_task_manager).await?;
+
+        next_vals.extend(engine.validators_for_epoch(epoch + 1).await?.into_iter());
+        next_vals.extend(engine.validators_for_epoch(epoch + 2).await?.into_iter());
 
         // create config for consensus
         let consensus_config = ConsensusConfig::new_for_epoch(
@@ -696,7 +717,7 @@ where
             network_config.clone(),
         )?;
 
-        Ok(consensus_config)
+        Ok((consensus_config, next_vals.into_iter().collect()))
     }
 
     /// Create the [Committee] for the current epoch.
