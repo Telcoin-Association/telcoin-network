@@ -602,7 +602,6 @@ where
                     .swarm
                     .behaviour_mut()
                     .gossipsub
-                    //.mesh_peers(&TopicHash::from_raw(topic))
                     .mesh_peers(&topic.into())
                     .cloned()
                     .collect();

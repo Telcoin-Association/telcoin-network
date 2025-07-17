@@ -234,9 +234,9 @@ impl Peer {
     /// True if this peer can be dialed in it's current state.
     pub(super) fn can_dial(&self) -> bool {
         match self.connection_status {
+            ConnectionStatus::Disconnecting { banned } => !banned,
             ConnectionStatus::Connected { .. }
             | ConnectionStatus::Dialing { .. }
-            | ConnectionStatus::Disconnecting { .. }
             | ConnectionStatus::Banned { .. } => false,
             ConnectionStatus::Disconnected { .. } | ConnectionStatus::Unknown => true,
         }

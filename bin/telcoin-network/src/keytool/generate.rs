@@ -105,8 +105,7 @@ impl KeygenArgs {
         // network keypair for workers
         let network_publickey = key_config.worker_network_public_key();
         node_info.p2p_info.worker.network_key = network_publickey;
-        node_info.p2p_info.primary.network_address = if let Some(worker_addrs) = &self.worker_addrs
-        {
+        node_info.p2p_info.worker.network_address = if let Some(worker_addrs) = &self.worker_addrs {
             if let Some(worker_addr) = worker_addrs.first() {
                 worker_addr.clone()
             } else {

@@ -605,9 +605,8 @@ where
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<(PrimaryNode<DatabaseType>, WorkerNode<DatabaseType>)> {
         // create config for consensus
-        let (consensus_config, preload_keys) = self
-            .configure_consensus(engine, network_config, &consensus_db, epoch_task_manager)
-            .await?;
+        let (consensus_config, preload_keys) =
+            self.configure_consensus(engine, network_config, &consensus_db).await?;
 
         let primary = self
             .create_primary_node_components(
@@ -680,7 +679,6 @@ where
         engine: &ExecutionNode,
         network_config: &NetworkConfig,
         consensus_db: &DatabaseType,
-        epoch_task_manager: &TaskManager,
     ) -> eyre::Result<(ConsensusConfig<DatabaseType>, Vec<BlsPublicKey>)> {
         // retrieve epoch information from canonical tip
         let EpochState { epoch, epoch_info, validators, epoch_start } =
@@ -702,8 +700,7 @@ where
 
         let mut next_vals: HashSet<BlsPublicKey> = HashSet::new();
         next_vals.extend(validators.keys().copied());
-        let committee =
-            self.create_committee_from_state(epoch, validators, epoch_task_manager).await?;
+        let committee = self.create_committee_from_state(epoch, validators).await?;
 
         next_vals.extend(engine.validators_for_epoch(epoch + 1).await?.into_iter());
         next_vals.extend(engine.validators_for_epoch(epoch + 2).await?.into_iter());
@@ -727,7 +724,6 @@ where
         &self,
         epoch: Epoch,
         validators: HashMap<BlsPublicKey, &ConsensusRegistry::ValidatorInfo>,
-        _epoch_task_manager: &TaskManager,
     ) -> eyre::Result<Committee> {
         info!(target: "epoch-manager", "creating committee from state");
 
