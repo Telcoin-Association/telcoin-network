@@ -3,7 +3,7 @@
 use super::{BlsKeypair, BlsPublicKey, Intent, IntentMessage, IntentScope, Signer, DST_G1};
 use crate::encode;
 use alloy::primitives::Address;
-use blst::{blst_p1_affine, min_sig::{
+use blst::{blst_p1_affine, blst_p2_affine, min_sig::{
     AggregateSignature as CoreBlsAggregateSignature, Signature as CoreBlsSignature,
 }};
 use serde::{Deserialize, Serialize};
@@ -28,52 +28,6 @@ impl BlsSignature {
     /// Verify a signature over a message (raw bytes) with public key.
     pub fn verify_raw(&self, message: &[u8], public_key: &BlsPublicKey) -> bool {
         self.verify(true, message, DST_G1, &[], public_key, true) == blst::BLST_ERROR::BLST_SUCCESS
-    }
-
-    /// Convert a BLS12-381 field element to EIP2537 EVM-padded format (64 bytes)
-    /// 
-    /// Accepts a field element represented as a G1 point coordinate (blst_p1_affine)
-    /// Returns 64-byte big-endian representation with 16 bytes of leading zeros a la EIP2537
-    pub fn field_element_to_eip2537_bytes(limbs: &[u64; 6]) -> [u8; 64] {
-        let mut padded_bytes = [0u8; 64];
-
-        // convert each u64 limb to big-endian bytes
-        for (i, limb) in limbs.iter().enumerate() {
-            let limb_bytes = limb.to_be_bytes();
-            // start at byte 16 for EVM padding according to EIP2537
-            let offset = 16 + (5 - i) * 8;
-            // blst uses little-endian limb order so reverse for big-endian
-            padded_bytes[offset..offset + 8].copy_from_slice(&limb_bytes);
-        }
-        
-        padded_bytes
-    }
-
-    /// Encode a BLS12-381 G1 point (signature) to EIP2537 format (128 bytes)
-    /// 
-    /// Converts a signature on the G1 curve to the format expected by Ethereum's
-    /// EIP2537 precompiles: two 64-byte padded field elements (x, y coordinates).
-    pub fn encode_g1_point_for_eip2537(signature: &CoreBlsSignature) -> Result<[u8; 128], String> {
-        // Convert to affine representation
-        let affine_point = blst_p1_affine::from(signature.into());
-
-        // Check for point at infinity (would be all zeros)
-        if affine_point.x.l.iter().all(|&limb| limb == 0) && 
-        affine_point.y.l.iter().all(|&limb| limb == 0) {
-            // encoding for point at infinity
-            return Ok([0u8; 128]);
-        }
-        
-        // Convert x and y coordinates to EIP2537 EVM-padded format
-        let x_padded = Self::field_element_to_eip2537_bytes(&affine_point.x.l);
-        let y_padded = Self::field_element_to_eip2537_bytes(&affine_point.y.l);
-        
-        // Concatenate x and y coordinates
-        let mut encoded = [0u8; 128];
-        encoded[0..64].copy_from_slice(&x_padded);
-        encoded[64..128].copy_from_slice(&y_padded);
-        
-        Ok(encoded)
     }
 }
 
@@ -226,6 +180,80 @@ pub fn verify_proof_of_possession_bls(
     } else {
         Err(eyre::eyre!("Failed to verify proof of possession!"))
     }
+}
+
+/// Encode a BLS12-381 G1 point (signature) to EIP2537 format (128 bytes)
+/// 
+/// Converts a signature of the G1 group to the format expected by Ethereum's
+/// EIP2537 precompiles: two 64-byte padded field elements (x, y coordinates).
+pub fn encode_g1_point_for_eip2537(signature: &CoreBlsSignature) -> eyre::Result<[u8; 128]> {
+    // convert to affine representation and check for point at infinity
+    let affine_point = blst_p1_affine::from(*signature);
+    if affine_point.x.l.iter().all(|&limb| limb == 0) && 
+    affine_point.y.l.iter().all(|&limb| limb == 0) {
+        // encoding for point at infinity
+        return Ok([0u8; 128]);
+    }
+    
+    // convert each Fp element to EIP2537 EVM-padded coordinates
+    let x_padded = field_element_to_eip2537_bytes(&affine_point.x.l);
+    let y_padded = field_element_to_eip2537_bytes(&affine_point.y.l);
+    
+    // concatenate x and y coordinates
+    let mut encoded = [0u8; 128];
+    encoded[0..64].copy_from_slice(&x_padded);
+    encoded[64..128].copy_from_slice(&y_padded);
+    
+    Ok(encoded)
+}
+
+/// Encode a BLS12-381 G2 point (public key) to EIP2537 format (256 bytes)
+/// 
+/// Converts a pubkey of the G2 group to the format expected by Ethereum's
+/// EIP2537 precompiles: two 128-byte padded field elements (x, y coordinates).
+pub fn encode_g2_point_for_eip2537(pubkey: &BlsPublicKey) -> eyre::Result<[u8; 256]> {
+    // convert to affine representation and check for point at infinity
+    let affine_point = blst_p2_affine::from(*pubkey.deref());
+    if affine_point.x.fp.iter().chain(affine_point.y.fp.iter())
+        .flat_map(|fp| fp.l.iter())
+        .all(|&limb| limb == 0) {
+            // encoding for point at infinity
+            return Ok([0u8; 256]);
+        }
+    
+    // convert each Fp element of the Fp2 coordinates to EIP2537 EVM-padded coordinates
+    let x_c0 = field_element_to_eip2537_bytes(&affine_point.x.fp[0].l);
+    let x_c1 = field_element_to_eip2537_bytes(&affine_point.x.fp[1].l);
+    let y_c0 = field_element_to_eip2537_bytes(&affine_point.y.fp[0].l);
+    let y_c1 = field_element_to_eip2537_bytes(&affine_point.y.fp[1].l);
+    
+    // concatenate x and y coordinates
+    let mut eip2537_encoded = [0u8; 256];
+    eip2537_encoded[0..64].copy_from_slice(&x_c0);
+    eip2537_encoded[64..128].copy_from_slice(&x_c1);
+    eip2537_encoded[128..192].copy_from_slice(&y_c0);
+    eip2537_encoded[192..256].copy_from_slice(&y_c1);
+    
+    Ok(eip2537_encoded)
+}
+
+/// Convert a BLS12-381 field element to EIP2537 EVM-padded format (64 bytes)
+/// 
+/// Accepts a field element represented as a G1 point coordinate (blst_p1_affine)
+/// Returns 64-byte big-endian representation with 16 bytes of leading zeros a la EIP2537
+pub fn field_element_to_eip2537_bytes(limbs: &[u64; 6]) -> [u8; 64] {
+    let mut padded_bytes = [0u8; 64];
+
+    // convert each u64 limb to big-endian bytes
+    for (i, limb) in limbs.iter().enumerate() {
+        let limb_bytes = limb.to_be_bytes();
+        // start at byte 16 for EVM padding according to EIP2537
+        let offset = 16 + (5 - i) * 8;
+        // blst uses little-endian limb order so reverse for big-endian
+        padded_bytes[offset..offset + 8].copy_from_slice(&limb_bytes);
+    }
+    
+    padded_bytes
 }
 
 /// A trait for sign and verify over an intent message, instead of the message itself. See more at
