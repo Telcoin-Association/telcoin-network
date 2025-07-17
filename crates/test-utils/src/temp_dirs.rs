@@ -32,10 +32,6 @@ impl TelcoinDirs for TelcoinTempDirs {
         self.genesis_path().join("committee.yaml")
     }
 
-    fn worker_cache_path(&self) -> PathBuf {
-        self.genesis_path().join("worker_cache.yaml")
-    }
-
     fn genesis_file_path(&self) -> PathBuf {
         self.genesis_path().join("genesis.yaml")
     }

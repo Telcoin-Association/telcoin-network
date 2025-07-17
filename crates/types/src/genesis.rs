@@ -114,13 +114,9 @@ fn _adiri_chain_spec_arc() -> Arc<ChainSpec> {
 /// - 0xe69151677e5aec0b4fc0a94bfcaf20f6f0f975eb
 pub const TESTNET_GENESIS: &str = include_str!("../../../chain-configs/testnet/genesis.yaml");
 pub const TESTNET_COMMITTEE: &str = include_str!("../../../chain-configs/testnet/committee.yaml");
-pub const TESTNET_WORKER_CACHE: &str =
-    include_str!("../../../chain-configs/testnet/worker_cache.yaml");
 pub const TESTNET_PARAMETERS: &str = include_str!("../../../chain-configs/testnet/parameters.yaml");
 
 // The raw strings for the mainnet genesis and config.
 pub const MAINNET_GENESIS: &str = include_str!("../../../chain-configs/mainnet/genesis.yaml");
 pub const MAINNET_COMMITTEE: &str = include_str!("../../../chain-configs/mainnet/committee.yaml");
-pub const MAINNET_WORKER_CACHE: &str =
-    include_str!("../../../chain-configs/mainnet/worker_cache.yaml");
 pub const MAINNET_PARAMETERS: &str = include_str!("../../../chain-configs/mainnet/parameters.yaml");

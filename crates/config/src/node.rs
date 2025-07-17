@@ -7,8 +7,7 @@ use std::{fs::File, io::Write, time::Duration};
 use tn_types::{
     get_available_tcp_port, get_available_udp_port, test_genesis, Address, BlsPublicKey,
     BlsSignature, Genesis, Multiaddr, NetworkPublicKey, MAINNET_COMMITTEE, MAINNET_GENESIS,
-    MAINNET_PARAMETERS, MAINNET_WORKER_CACHE, TESTNET_COMMITTEE, TESTNET_GENESIS,
-    TESTNET_PARAMETERS, TESTNET_WORKER_CACHE,
+    MAINNET_PARAMETERS, TESTNET_COMMITTEE, TESTNET_GENESIS, TESTNET_PARAMETERS,
 };
 use tracing::info;
 
@@ -108,11 +107,6 @@ impl Config {
         if !committee_path.exists() {
             File::create_new(committee_path)?.write_all(TESTNET_COMMITTEE.as_bytes())?
         }
-        // If the default worker cache file does not exist then save it.
-        let worker_cache_path = tn_datadir.worker_cache_path();
-        if !worker_cache_path.exists() {
-            File::create_new(worker_cache_path)?.write_all(TESTNET_WORKER_CACHE.as_bytes())?
-        }
 
         Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
     }
@@ -133,11 +127,6 @@ impl Config {
         let committee_path = tn_datadir.committee_path();
         if !committee_path.exists() {
             File::create_new(committee_path)?.write_all(MAINNET_COMMITTEE.as_bytes())?
-        }
-        // If the default worker cache file does not exist then save it.
-        let worker_cache_path = tn_datadir.worker_cache_path();
-        if !worker_cache_path.exists() {
-            File::create_new(worker_cache_path)?.write_all(MAINNET_WORKER_CACHE.as_bytes())?
         }
 
         Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
