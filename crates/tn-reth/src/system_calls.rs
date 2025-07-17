@@ -130,6 +130,8 @@ sol!(
             StakeConfig memory genesisConfig_,
             /// The initial validators with stake.
             ValidatorInfo[] memory initialValidators_,
+            /// The initial validators' EIP2537 proof of possession
+            bytes[] memory blsSignatures,
             /// The address of the owner.
             address owner_
         ) external;
@@ -152,6 +154,11 @@ sol!(
         function getCommitteeValidators(uint32 epoch) external view returns (ValidatorInfo[] memory);
         /// Fetch the `ValidatorInfo` for a give address.
         function getValidator(address validatorAddress) external view returns (ValidatorInfo memory);
+        /// Returns the BLS12-381 proof of possession message: `blsPubkey.validatorAddress`
+        function proofOfPossessionMessage(
+            bytes memory blsPubkey,
+            address validatorAddress
+        ) external pure returns (bytes memory);
 
         #[cfg(any(feature = "test-utils", test))]
         /// Mint an NFT for validator to stake.
