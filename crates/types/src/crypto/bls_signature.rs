@@ -3,8 +3,8 @@
 use super::{BlsKeypair, BlsPublicKey, Intent, IntentMessage, IntentScope, Signer, DST_G1};
 use crate::encode;
 use alloy::primitives::Address;
-use blst::{blst_p1_affine, blst_p2_affine, min_sig::{
-    AggregateSignature as CoreBlsAggregateSignature, Signature as CoreBlsSignature,
+use blst::{blst_p1_affine, blst_p2, blst_p2_affine, blst_p2_affine_compress, blst_p2_compress, blst_p2_to_affine, blst_p2_uncompress, min_sig::{
+    AggregateSignature as CoreBlsAggregateSignature, PublicKey, Signature as CoreBlsSignature
 }};
 use serde::{Deserialize, Serialize};
 use std::{fmt, ops::Deref};
@@ -186,23 +186,20 @@ pub fn verify_proof_of_possession_bls(
 /// 
 /// Converts a signature of the G1 group to the format expected by Ethereum's
 /// EIP2537 precompiles: two 64-byte padded field elements (x, y coordinates).
-pub fn encode_g1_point_for_eip2537(signature: &CoreBlsSignature) -> eyre::Result<[u8; 128]> {
-    // convert to affine representation and check for point at infinity
-    let affine_point = blst_p1_affine::from(*signature);
-    if affine_point.x.l.iter().all(|&limb| limb == 0) && 
-    affine_point.y.l.iter().all(|&limb| limb == 0) {
-        // encoding for point at infinity
+pub fn encode_g1_point_for_eip2537(signature: &blst::min_sig::Signature) -> eyre::Result<[u8; 128]> {
+    // serialize to uncompressed format
+    let serialized: [u8; 96] = signature.serialize();
+
+    // check for infinity
+    if serialized.iter().all(|&b| b == 0) {
         return Ok([0u8; 128]);
     }
     
-    // convert each Fp element to EIP2537 EVM-padded coordinates
-    let x_padded = field_element_to_eip2537_bytes(&affine_point.x.l);
-    let y_padded = field_element_to_eip2537_bytes(&affine_point.y.l);
-    
-    // concatenate x and y coordinates
     let mut encoded = [0u8; 128];
-    encoded[0..64].copy_from_slice(&x_padded);
-    encoded[64..128].copy_from_slice(&y_padded);
+    
+    // pad x and y coordinates with 16 zeroes to 64 bytes a la EIP2537
+    encoded[16..64].copy_from_slice(&serialized[0..48]);
+    encoded[80..128].copy_from_slice(&serialized[48..96]);
     
     Ok(encoded)
 }
@@ -211,49 +208,38 @@ pub fn encode_g1_point_for_eip2537(signature: &CoreBlsSignature) -> eyre::Result
 /// 
 /// Converts a pubkey of the G2 group to the format expected by Ethereum's
 /// EIP2537 precompiles: two 128-byte padded field elements (x, y coordinates).
-pub fn encode_g2_point_for_eip2537(pubkey: &BlsPublicKey) -> eyre::Result<[u8; 256]> {
-    // convert to affine representation and check for point at infinity
-    let affine_point = blst_p2_affine::from(*pubkey.deref());
-    if affine_point.x.fp.iter().chain(affine_point.y.fp.iter())
-        .flat_map(|fp| fp.l.iter())
-        .all(|&limb| limb == 0) {
-            // encoding for point at infinity
-            return Ok([0u8; 256]);
-        }
+pub fn encode_g2_point_for_eip2537(pubkey: &PublicKey) -> eyre::Result<[u8; 256]> {
+    // serialize to uncompressed format
+    let serialized: [u8; 192] = pubkey.serialize();
     
-    // convert each Fp element of the Fp2 coordinates to EIP2537 EVM-padded coordinates
-    let x_c0 = field_element_to_eip2537_bytes(&affine_point.x.fp[0].l);
-    let x_c1 = field_element_to_eip2537_bytes(&affine_point.x.fp[1].l);
-    let y_c0 = field_element_to_eip2537_bytes(&affine_point.y.fp[0].l);
-    let y_c1 = field_element_to_eip2537_bytes(&affine_point.y.fp[1].l);
+    // check for infinity (all zeros in serialized form)
+    if serialized.iter().all(|&b| b == 0) {
+        return Ok([0u8; 256]);
+    }
     
-    // concatenate x and y coordinates
-    let mut eip2537_encoded = [0u8; 256];
-    eip2537_encoded[0..64].copy_from_slice(&x_c0);
-    eip2537_encoded[64..128].copy_from_slice(&x_c1);
-    eip2537_encoded[128..192].copy_from_slice(&y_c0);
-    eip2537_encoded[192..256].copy_from_slice(&y_c1);
+    // EIP-2537 expects: x.c0 || x.c1 || y.c0 || y.c1
+    // But blst serializes as: x.c1 || x.c0 || y.c1 || y.c0
+    let mut encoded = [0u8; 256];
+    // x.c0 (second 48 bytes of x)
+    encoded[0..64].copy_from_slice(&field_element_to_eip2537_bytes(&serialized[48..96]));
+    // x.c1 (first 48 bytes of x)
+    encoded[64..128].copy_from_slice(&field_element_to_eip2537_bytes(&serialized[0..48]));
+    // y.c0 (second 48 bytes of y)
+    encoded[128..192].copy_from_slice(&field_element_to_eip2537_bytes(&serialized[144..192]));
+    // y.c1 (first 48 bytes of y)
+    encoded[192..256].copy_from_slice(&field_element_to_eip2537_bytes(&serialized[96..144]));
     
-    Ok(eip2537_encoded)
+    Ok(encoded)
 }
 
-/// Convert a BLS12-381 field element to EIP2537 EVM-padded format (64 bytes)
+/// Pads a BLS12-381 field element with 16 bytes to EIP2537 EVM format
 /// 
 /// Accepts a field element represented as a G1 point coordinate (blst_p1_affine)
 /// Returns 64-byte big-endian representation with 16 bytes of leading zeros a la EIP2537
-pub fn field_element_to_eip2537_bytes(limbs: &[u64; 6]) -> [u8; 64] {
-    let mut padded_bytes = [0u8; 64];
-
-    // convert each u64 limb to big-endian bytes
-    for (i, limb) in limbs.iter().enumerate() {
-        let limb_bytes = limb.to_be_bytes();
-        // start at byte 16 for EVM padding according to EIP2537
-        let offset = 16 + (5 - i) * 8;
-        // blst uses little-endian limb order so reverse for big-endian
-        padded_bytes[offset..offset + 8].copy_from_slice(&limb_bytes);
-    }
-    
-    padded_bytes
+pub fn field_element_to_eip2537_bytes(input: &[u8]) -> [u8; 64] {
+    let mut result = [0u8; 64];
+    result[16..64].copy_from_slice(input);
+    result
 }
 
 /// A trait for sign and verify over an intent message, instead of the message itself. See more at

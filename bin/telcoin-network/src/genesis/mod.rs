@@ -13,7 +13,7 @@ use tn_config::{
     GOVERNANCE_SAFE_ADDRESS,
 };
 use tn_reth::{system_calls::ConsensusRegistry, RethChainSpec, RethEnv};
-use tn_types::{encode_g1_point_for_eip2537, encode_g2_point_for_eip2537, keccak256, set_genesis_defaults, Address, GenesisAccount, U256};
+use tn_types::{keccak256, set_genesis_defaults, Address, GenesisAccount, U256};
 use tracing::info;
 
 use crate::args::{clap_address_parser, clap_u256_parser_to_18_decimals, maybe_hex};

@@ -942,7 +942,8 @@ impl RethEnv {
         let (validators, pops_eip2537): (Vec<_>, Vec<_>) = validators
             .iter()
             .map(|v| {
-                let pubkey_eip2537 = encode_g2_point_for_eip2537(&v.bls_public_key).expect("invalid pubkey").into();
+                let pubkey_eip2537: Bytes = encode_g2_point_for_eip2537(&v.bls_public_key).expect("invalid pubkey").into();
+                println!("{:?}", hex::encode(pubkey_eip2537.clone()));
                 let validator = ConsensusRegistry::ValidatorInfo {
                     blsPubkey: pubkey_eip2537,
                     validatorAddress: v.execution_address,
@@ -954,6 +955,7 @@ impl RethEnv {
                     stakeVersion: 0,
                 };
                 let pop_eip2537 = encode_g1_point_for_eip2537(&v.proof_of_possession).expect("invalid PoP");
+                println!("{:?}", hex::encode(pop_eip2537.clone()));
 
                 (validator, Bytes::from(pop_eip2537))
             })
