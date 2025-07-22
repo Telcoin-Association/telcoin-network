@@ -104,7 +104,10 @@ use system_calls::{
 use tempfile::TempDir;
 use tn_config::{NodeInfo, CONSENSUS_REGISTRY_JSON};
 use tn_types::{
-    encode_g1_point_for_eip2537, encode_g2_point_for_eip2537, gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber, BlockHeader as _, BlockNumHash, BlockNumber, Epoch, ExecHeader, Genesis, GenesisAccount, RecoveredBlock, SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionSigned, B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256
+    encode_g1_point_for_eip2537, encode_g2_point_for_eip2537, gas_accumulator::RewardsCounter,
+    Address, BlockBody, BlockHashOrNumber, BlockHeader as _, BlockNumHash, BlockNumber, Epoch,
+    ExecHeader, Genesis, GenesisAccount, RecoveredBlock, SealedBlock, SealedHeader, TaskManager,
+    TaskSpawner, TransactionSigned, B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
 };
 use tracing::{debug, error, info, warn};
 use traits::{TNPrimitives, TelcoinNode};
@@ -942,8 +945,8 @@ impl RethEnv {
         let (validators, pops_eip2537): (Vec<_>, Vec<_>) = validators
             .iter()
             .map(|v| {
-                let pubkey_eip2537: Bytes = encode_g2_point_for_eip2537(&v.bls_public_key).expect("invalid pubkey").into();
-                println!("{:?}", hex::encode(pubkey_eip2537.clone()));
+                let pubkey_eip2537: Bytes =
+                    encode_g2_point_for_eip2537(&v.bls_public_key).expect("invalid pubkey").into();
                 let validator = ConsensusRegistry::ValidatorInfo {
                     blsPubkey: pubkey_eip2537,
                     validatorAddress: v.execution_address,
@@ -954,8 +957,8 @@ impl RethEnv {
                     isDelegated: false,
                     stakeVersion: 0,
                 };
-                let pop_eip2537 = encode_g1_point_for_eip2537(&v.proof_of_possession).expect("invalid PoP");
-                println!("{:?}", hex::encode(pop_eip2537.clone()));
+                let pop_eip2537 =
+                    encode_g1_point_for_eip2537(&v.proof_of_possession).expect("invalid PoP");
 
                 (validator, Bytes::from(pop_eip2537))
             })

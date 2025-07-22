@@ -10,9 +10,9 @@ use rand::{rngs::StdRng, Rng as _, SeedableRng};
 use sha2::Sha256;
 use std::sync::Arc;
 use tn_types::{
-    encode, Address, BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner, DefaultHashFunction,
-    Intent, IntentMessage, IntentScope, NetworkKeypair, NetworkPublicKey, ProtocolSignature as _,
-    Signer,
+    construct_proof_of_possession_message, Address, BlsKeypair, BlsPublicKey, BlsSignature,
+    BlsSigner, DefaultHashFunction, Intent, IntentMessage, IntentScope, NetworkKeypair,
+    NetworkPublicKey, ProtocolSignature as _, Signer,
 };
 
 /// The work factor for PBKDF2 is implemented through an iteration count, which is based on the
@@ -213,18 +213,15 @@ impl KeyConfig {
     ///
     /// The proof of possession is a [BlsSignature] committed over the intent message
     /// `intent || message` (See more at [IntentMessage] and [Intent]).
-    /// The message is constructed as: [BlsPublicKey] || [Genesis].
+    /// The message is constructed as: EIP2537([BlsPublicKey]) || [Address].
+    /// Where the public key is uncompressed and its G2 point coordinates padded to 32-byte EVM
+    /// words
     pub fn generate_proof_of_possession_bls(
         &self,
         address: &Address,
     ) -> eyre::Result<BlsSignature> {
-        let mut msg = self.primary_public_key().as_ref().to_vec();
-        let address_bytes = encode(address);
-        msg.extend_from_slice(address_bytes.as_slice());
-        let sig = BlsSignature::new_secure(
-            &IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg),
-            &self.inner.primary_keypair,
-        );
+        let msg = construct_proof_of_possession_message(&self.primary_public_key(), address)?;
+        let sig = BlsSignature::new_secure(&msg.clone(), &self.inner.primary_keypair);
         Ok(sig)
     }
 

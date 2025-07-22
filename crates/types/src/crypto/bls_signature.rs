@@ -3,9 +3,9 @@
 use super::{BlsKeypair, BlsPublicKey, Intent, IntentMessage, IntentScope, Signer, DST_G1};
 use crate::encode;
 use alloy::primitives::Address;
-use blst::{blst_p1_affine, blst_p2, blst_p2_affine, blst_p2_affine_compress, blst_p2_compress, blst_p2_to_affine, blst_p2_uncompress, min_sig::{
-    AggregateSignature as CoreBlsAggregateSignature, PublicKey, Signature as CoreBlsSignature
-}};
+use blst::min_sig::{
+    AggregateSignature as CoreBlsAggregateSignature, PublicKey, Signature as CoreBlsSignature,
+};
 use serde::{Deserialize, Serialize};
 use std::{fmt, ops::Deref};
 
@@ -144,18 +144,14 @@ impl std::fmt::Display for BlsAggregateSignature {
 ///
 /// The proof of possession is a [BlsSignature] committed over the intent message
 /// `intent || message` (See more at [IntentMessage] and [Intent]).
-/// The message is constructed as: [BlsPublicKey] || [Genesis].
+/// The message is constructed as: EIP2537([BlsPublicKey]) || [Address].
+/// Where the public key is uncompressed with G2 point coordinates padded to 64-byte EVM words
 pub fn generate_proof_of_possession_bls(
     keypair: &BlsKeypair,
     address: &Address,
 ) -> eyre::Result<BlsSignature> {
-    let mut msg = keypair.public().to_bytes().to_vec();
-    let address_bytes = encode(address);
-    msg.extend_from_slice(address_bytes.as_slice());
-    let sig = BlsSignature::new_secure(
-        &IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg),
-        keypair,
-    );
+    let msg = construct_proof_of_possession_message(&keypair.public(), address)?;
+    let sig = BlsSignature::new_secure(&msg.clone(), keypair);
     Ok(sig)
 }
 
@@ -168,25 +164,35 @@ pub fn verify_proof_of_possession_bls(
     public_key: &BlsPublicKey,
     address: &Address,
 ) -> eyre::Result<()> {
-    public_key.validate().map_err(|_| eyre::eyre!("Bls Publkic Key not valid!"))?;
-    let mut msg = public_key.to_bytes().to_vec();
-    let address_bytes = encode(&address);
-    msg.extend_from_slice(address_bytes.as_slice());
-    if proof.verify_secure(
-        &IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg),
-        public_key,
-    ) {
+    public_key.validate().map_err(|_| eyre::eyre!("Bls Public Key not valid!"))?;
+    let msg = construct_proof_of_possession_message(&public_key, address)?;
+    if proof.verify_secure(&msg, public_key) {
         Ok(())
     } else {
         Err(eyre::eyre!("Failed to verify proof of possession!"))
     }
 }
 
+pub fn construct_proof_of_possession_message(
+    bls_pubkey: &BlsPublicKey,
+    address: &Address,
+) -> eyre::Result<IntentMessage<Vec<u8>>> {
+    let pubkey_eip2537 = encode_g2_point_for_eip2537(bls_pubkey).expect("invalid pubkey");
+    let mut msg_unprefixed = pubkey_eip2537.to_vec();
+    let address_bytes = encode(address);
+    msg_unprefixed.extend_from_slice(address_bytes.as_slice());
+    let msg = IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg_unprefixed);
+
+    Ok(msg)
+}
+
 /// Encode a BLS12-381 G1 point (signature) to EIP2537 format (128 bytes)
-/// 
+///
 /// Converts a signature of the G1 group to the format expected by Ethereum's
 /// EIP2537 precompiles: two 64-byte padded field elements (x, y coordinates).
-pub fn encode_g1_point_for_eip2537(signature: &blst::min_sig::Signature) -> eyre::Result<[u8; 128]> {
+pub fn encode_g1_point_for_eip2537(
+    signature: &blst::min_sig::Signature,
+) -> eyre::Result<[u8; 128]> {
     // serialize to uncompressed format
     let serialized: [u8; 96] = signature.serialize();
 
@@ -194,29 +200,29 @@ pub fn encode_g1_point_for_eip2537(signature: &blst::min_sig::Signature) -> eyre
     if serialized.iter().all(|&b| b == 0) {
         return Ok([0u8; 128]);
     }
-    
+
     let mut encoded = [0u8; 128];
-    
+
     // pad x and y coordinates with 16 zeroes to 64 bytes a la EIP2537
     encoded[16..64].copy_from_slice(&serialized[0..48]);
     encoded[80..128].copy_from_slice(&serialized[48..96]);
-    
+
     Ok(encoded)
 }
 
 /// Encode a BLS12-381 G2 point (public key) to EIP2537 format (256 bytes)
-/// 
+///
 /// Converts a pubkey of the G2 group to the format expected by Ethereum's
 /// EIP2537 precompiles: two 128-byte padded field elements (x, y coordinates).
 pub fn encode_g2_point_for_eip2537(pubkey: &PublicKey) -> eyre::Result<[u8; 256]> {
     // serialize to uncompressed format
     let serialized: [u8; 192] = pubkey.serialize();
-    
+
     // check for infinity (all zeros in serialized form)
     if serialized.iter().all(|&b| b == 0) {
         return Ok([0u8; 256]);
     }
-    
+
     // EIP-2537 expects: x.c0 || x.c1 || y.c0 || y.c1
     // But blst serializes as: x.c1 || x.c0 || y.c1 || y.c0
     let mut encoded = [0u8; 256];
@@ -228,12 +234,12 @@ pub fn encode_g2_point_for_eip2537(pubkey: &PublicKey) -> eyre::Result<[u8; 256]
     encoded[128..192].copy_from_slice(&field_element_to_eip2537_bytes(&serialized[144..192]));
     // y.c1 (first 48 bytes of y)
     encoded[192..256].copy_from_slice(&field_element_to_eip2537_bytes(&serialized[96..144]));
-    
+
     Ok(encoded)
 }
 
 /// Pads a BLS12-381 field element with 16 bytes to EIP2537 EVM format
-/// 
+///
 /// Accepts a field element represented as a G1 point coordinate (blst_p1_affine)
 /// Returns 64-byte big-endian representation with 16 bytes of leading zeros a la EIP2537
 pub fn field_element_to_eip2537_bytes(input: &[u8]) -> [u8; 64] {
