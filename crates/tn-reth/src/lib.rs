@@ -91,12 +91,7 @@ use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
 use rpc_server_args::RpcServerArgs;
 use serde_json::Value;
 use std::{
-    collections::HashSet,
-    net::{IpAddr, Ipv4Addr},
-    ops::RangeInclusive,
-    path::Path,
-    sync::{Arc, OnceLock},
-    time::Duration,
+    collections::HashSet, net::{IpAddr, Ipv4Addr}, ops::RangeInclusive, path::Path, str::FromStr, sync::{Arc, OnceLock}, time::Duration
 };
 use system_calls::{
     ConsensusRegistry::{self},
@@ -998,12 +993,13 @@ impl RethEnv {
         .abi_encode();
 
         // generate calldata for creation
-        let bytecode_binding =
-            Self::fetch_value_from_json_str(CONSENSUS_REGISTRY_JSON, Some("bytecode.object"))?;
-        let registry_initcode =
-            hex::decode(bytecode_binding.as_str().ok_or_eyre("invalid registry json")?)?;
-        let mut create_registry = registry_initcode.clone();
-        create_registry.extend(constructor_args);
+        let registry_initcode_binding = Self::fetch_value_from_json_str(CONSENSUS_REGISTRY_JSON, Some("bytecode.object"))?;
+        let registry_initcode_str = registry_initcode_binding
+            .as_str()
+            .ok_or_eyre("invalid registry json")?;
+        // let registry_initcode = hex::decode(registry_initcode_str)?;
+        // let mut create_registry = registry_initcode.clone(); //todo delete after linking, reorder to logical function flow
+        // create_registry.extend(constructor_args);
 
         let state = StateProviderDatabase::new(reth_env.latest()?);
         let mut cached_reads = CachedReads::default();
@@ -1012,44 +1008,58 @@ impl RethEnv {
             .with_bundle_update()
             .build();
 
-        let mut tn_evm = reth_env
-            .evm_config
-            .evm_factory()
-            .create_evm(&mut db, reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header()));
+        // deploy blsg1 library separately first, scoped to release borrow on db before registry
+        let tmp_lib_address = { //todo: no longer using this, need to refactor
+            let mut tn_evm = reth_env
+                .evm_config
+                .evm_factory()
+                .create_evm(&mut db, reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header()));
 
-        // deploy blsg1 library separately
-        let blsg1_initcode_binding = Self::fetch_value_from_json_str(BLSG1_JSON, Some("deployedBytecode.object"))?;
-        let blsg1_initcode = hex::decode(blsg1_initcode_binding.as_str().ok_or_eyre("invalid blsg1 json")?)?;
-        let ResultAndState { result, state } = tn_evm.transact_pre_genesis_create(owner_address, blsg1_initcode.into())?;
-        debug!(target: "engine", "create blsg1 library result:\n{:#?}", result);
+            let blsg1_initcode_binding = Self::fetch_value_from_json_str(BLSG1_JSON, Some("bytecode.object"))?;
+            let blsg1_initcode = hex::decode(blsg1_initcode_binding.as_str().ok_or_eyre("invalid blsg1 json")?)?;
+            let ResultAndState { result, state } = tn_evm.transact_pre_genesis_create(owner_address, blsg1_initcode.into())?;
+            debug!(target: "engine", "create blsg1 library result:\n{:#?}", result);
 
-        tn_evm.db_mut().commit(state);
+            // commit state to db so it persists
+            tn_evm.db_mut().commit(state);
+
+            // tmp BlsG1 library address is owner's first create tx on tmp chain
+            owner_address.create(0)
+        };
+
+        // merge transitions but keep the library state in db
         db.merge_transitions(BundleRetention::PlainState);
-        let BundleState { state, contracts, reverts, state_size, reverts_size } = db.take_bundle();
 
-
-        let ResultAndState { result, state } =
-            tn_evm.transact_pre_genesis_create(owner_address, create_registry.into())?;
-        debug!(target: "engine", "create consensus registry result:\n{:#?}", result);
+        // link the BlsG1 library address into the registry bytecode
+        let blsg1_addr_binding = Self::fetch_value_from_json_str(DEPLOYMENTS_JSON, Some("BlsG1"))?;
+        let blsg1_addr_str = blsg1_addr_binding
+            .as_str()
+            .expect("blsg1 from deployments json");
+        println!("HELLO"); //todo
+        let linked_registry_initcode = Self::link_solidity_library(registry_initcode_str, blsg1_addr_str)?;
+        println!("HELLO AGAIN"); //todo
         
-        //todo
-        println!("create consensus registry result:\n{:#?}", result);
+        let mut create_registry = linked_registry_initcode;
+        create_registry.extend(constructor_args);
 
-        tn_evm.db_mut().commit(state.clone());
+        // deploy registry now that it can use the previously deployed blsg1 lib
+        let tmp_registry_address = {
+            let mut tn_evm = reth_env.evm_config.evm_factory().create_evm(&mut db, reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header()));
+            let ResultAndState { result, state } =
+                tn_evm.transact_pre_genesis_create(owner_address, create_registry.into())?;
+            debug!(target: "engine", "create consensus registry result:\n{:#?}", result);
+            
+            //todo delete
+            println!("create consensus registry result:\n{:#?}", result);
+
+            tn_evm.db_mut().commit(state);
+
+            // tmp BlsG1 library address is owner's second create tx on tmp chain
+            owner_address.create(1)
+        };
+
+        // execute the transactions to get final bundle state
         db.merge_transitions(BundleRetention::PlainState);
-
-        let tmp_lib_address = owner_address.create(0);
-        let tmp_lib_code = state.get(&tmp_lib_address).map(|account| {
-            match &account.info.code {
-                Some(code) => Ok(code),
-                _ => Err(eyre::eyre!("failed to fetch blsg1 runtimecode"))
-            }
-        }).expect("blsg1 lib")?;
-
-        // todo: function to link tmp_lib_address into registry_runtimecode (string to handle $__ ?)
-        // once registry bytecode is linked, it can be deployed
-
-        // execute the transaction
         let BundleState { state, contracts, reverts, state_size, reverts_size } = db.take_bundle();
 
         debug!(target: "engine", "contracts:\n{:#?}", contracts);
@@ -1057,27 +1067,78 @@ impl RethEnv {
         debug!(target: "engine", "state_size:{:#?}", state_size);
         debug!(target: "engine", "reverts_size:{:#?}", reverts_size);
 
-        // copy tmp values to real genesis
-        let tmp_address = owner_address.create(0); //todo 1
-        let tmp_storage = state.get(&tmp_address).map(|account| {
+        // construct real genesis using known values & tmp chain storage result
+        let blsg1_addr = Address::from_str(blsg1_addr_str)?;
+        let blsg1_runtimecode_binding = Self::fetch_value_from_json_str(BLSG1_JSON, Some("deployedBytecode.object"))?;
+        let blsg1_runtimecode = hex::decode(blsg1_runtimecode_binding.as_str().ok_or_eyre("invalid blsg1 json")?)?;
+        let tmp_registry_storage = state.get(&tmp_registry_address).map(|account| {
             account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
         });
-
-        let deployed_bytecode_binding = Self::fetch_value_from_json_str(
+        let registry_runtimecode_binding = Self::fetch_value_from_json_str(
             CONSENSUS_REGISTRY_JSON,
             Some("deployedBytecode.object"),
         )?;
         let registry_runtimecode =
-            hex::decode(deployed_bytecode_binding.as_str().ok_or_eyre("invalid registry json")?)?;
-        let genesis = genesis.extend_accounts([(
-            CONSENSUS_REGISTRY_ADDRESS,
-            GenesisAccount::default()
-                .with_balance(U256::from(total_stake_balance))
-                .with_code(Some(registry_runtimecode.into()))
-                .with_storage(tmp_storage),
-        )]);
+            hex::decode(registry_runtimecode_binding.as_str().ok_or_eyre("invalid registry json")?)?;
+        let genesis = genesis.extend_accounts([
+            (
+                blsg1_addr,
+                GenesisAccount::default()
+                    .with_code(Some(blsg1_runtimecode.into()))
+            ),
+            (
+                CONSENSUS_REGISTRY_ADDRESS,
+                GenesisAccount::default()
+                    .with_balance(U256::from(total_stake_balance))
+                    .with_code(Some(registry_runtimecode.into()))
+                    .with_storage(tmp_registry_storage),
+            )
+        ]);
 
         Ok(genesis)
+    }
+
+    /// Links a library address into contract bytecode
+    /// 
+    /// Replaces Solidity's `__$<34 chars of library hash>$__` placeholder
+    pub fn link_solidity_library(bytecode_hex: &str, library_address: &str) -> eyre::Result<Vec<u8>> {
+        const PLACEHOLDER_PREFIX: &str = "__$";
+        const PLACEHOLDER_SUFFIX: &str = "$__";
+        const PLACEHOLDER_LEN: usize = 40; // __$ + 34 chars + $__
+        
+        let mut result = String::with_capacity(bytecode_hex.len());
+        let mut chars = bytecode_hex.chars().peekable();
+        
+        while let Some(ch) = chars.next() {
+            // check if we're at the start of a placeholder
+            if ch == '_' && chars.peek() == Some(&'_') {
+                let mut potential_placeholder = String::from("_");
+                
+                // Collect the next 39 characters (we already have the first _)
+                for _ in 1..PLACEHOLDER_LEN {
+                    if let Some(next_ch) = chars.next() {
+                        potential_placeholder.push(next_ch);
+                    } else {
+                        break;
+                    }
+                }
+                
+                // Check if it matches the placeholder pattern
+                if potential_placeholder.starts_with(PLACEHOLDER_PREFIX) 
+                    && potential_placeholder.ends_with(PLACEHOLDER_SUFFIX)
+                    && potential_placeholder.len() == PLACEHOLDER_LEN {
+                    // It's a valid placeholder, replace with address
+                    result.push_str(&library_address);
+                } else {
+                    // Not a placeholder, add the characters back
+                    result.push_str(&potential_placeholder);
+                }
+            } else {
+                result.push(ch);
+            }
+        }
+        
+        hex::decode(result).map_err(Into::into)
     }
 
     /// Fetches json info from the given string
