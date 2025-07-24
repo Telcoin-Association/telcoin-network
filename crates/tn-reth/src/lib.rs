@@ -23,7 +23,7 @@ use crate::{
 };
 use alloy::{
     consensus::Transaction as _,
-    hex,
+    hex::{self, ToHexExt},
     primitives::{Bytes, ChainId},
     sol_types::{SolCall, SolConstructor},
 };
@@ -71,6 +71,7 @@ use reth_node_builder::{
     DEFAULT_RESERVED_CPU_CORES,
 };
 use reth_node_core::node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB;
+use reth_primitives_traits::account;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     writer::UnifiedStorageWriter,
@@ -102,9 +103,9 @@ use system_calls::{
     EpochState, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
 };
 use tempfile::TempDir;
-use tn_config::{NodeInfo, CONSENSUS_REGISTRY_JSON};
+use tn_config::{NodeInfo, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, DEPLOYMENTS_JSON};
 use tn_types::{
-    encode_g1_point_for_eip2537, encode_g2_point_for_eip2537, gas_accumulator::RewardsCounter,
+    gas_accumulator::RewardsCounter,
     Address, BlockBody, BlockHashOrNumber, BlockHeader as _, BlockNumHash, BlockNumber, Epoch,
     ExecHeader, Genesis, GenesisAccount, RecoveredBlock, SealedBlock, SealedHeader, TaskManager,
     TaskSpawner, TransactionSigned, B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
@@ -942,13 +943,16 @@ impl RethEnv {
         initial_stake_config: ConsensusRegistry::StakeConfig,
         owner_address: Address,
     ) -> eyre::Result<Genesis> {
-        let (validators, pops_eip2537): (Vec<_>, Vec<_>) = validators
+        let (validators, proofs): (Vec<_>, Vec<_>) = validators
             .iter()
             .map(|v| {
-                let pubkey_eip2537: Bytes =
-                    encode_g2_point_for_eip2537(&v.bls_public_key).expect("invalid pubkey").into();
+
+                    let addr = v.execution_address;
+                    println!("address: {:?}", addr);     //todo
+                    // println!("96byte: {:?}", v.bls_public_key);
+                
                 let validator = ConsensusRegistry::ValidatorInfo {
-                    blsPubkey: pubkey_eip2537,
+                    blsPubkey: v.bls_public_key.to_bytes().into(),
                     validatorAddress: v.execution_address,
                     activationEpoch: 0,
                     exitEpoch: 0,
@@ -957,10 +961,12 @@ impl RethEnv {
                     isDelegated: false,
                     stakeVersion: 0,
                 };
-                let pop_eip2537 =
-                    encode_g1_point_for_eip2537(&v.proof_of_possession).expect("invalid PoP");
+                let proof = ConsensusRegistry::ProofOfPossession {
+                    uncompressedPubkey: v.bls_public_key.serialize().into(),
+                    uncompressedSignature: v.proof_of_possession.serialize().into()
+                };
 
-                (validator, Bytes::from(pop_eip2537))
+                (validator, proof)
             })
             .unzip();
 
@@ -978,10 +984,15 @@ impl RethEnv {
 
         debug!(target: "engine", ?initial_stake_config, "calling constructor for consensus registry");
 
+        for proof in &proofs {
+            println!("pubkey : {:?}", proof.uncompressedPubkey); //todo
+            println!("pop: {:x?}", Bytes::from(proof.clone().uncompressedSignature));//todo
+        }
+
         let constructor_args = ConsensusRegistry::constructorCall {
             genesisConfig_: initial_stake_config,
             initialValidators_: validators,
-            blsSignatures: pops_eip2537,
+            proofsOfPossession: proofs,
             owner_: owner_address,
         }
         .abi_encode();
@@ -1006,12 +1017,37 @@ impl RethEnv {
             .evm_factory()
             .create_evm(&mut db, reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header()));
 
-        let ResultAndState { result, state } =
-            tn_evm.transact_pre_genesis_create(owner_address, create_registry.into())?;
-        debug!(target: "engine", "create consensus registry result:\n{:#?}", result);
+        // deploy blsg1 library separately
+        let blsg1_initcode_binding = Self::fetch_value_from_json_str(BLSG1_JSON, Some("deployedBytecode.object"))?;
+        let blsg1_initcode = hex::decode(blsg1_initcode_binding.as_str().ok_or_eyre("invalid blsg1 json")?)?;
+        let ResultAndState { result, state } = tn_evm.transact_pre_genesis_create(owner_address, blsg1_initcode.into())?;
+        debug!(target: "engine", "create blsg1 library result:\n{:#?}", result);
 
         tn_evm.db_mut().commit(state);
         db.merge_transitions(BundleRetention::PlainState);
+        let BundleState { state, contracts, reverts, state_size, reverts_size } = db.take_bundle();
+
+
+        let ResultAndState { result, state } =
+            tn_evm.transact_pre_genesis_create(owner_address, create_registry.into())?;
+        debug!(target: "engine", "create consensus registry result:\n{:#?}", result);
+        
+        //todo
+        println!("create consensus registry result:\n{:#?}", result);
+
+        tn_evm.db_mut().commit(state.clone());
+        db.merge_transitions(BundleRetention::PlainState);
+
+        let tmp_lib_address = owner_address.create(0);
+        let tmp_lib_code = state.get(&tmp_lib_address).map(|account| {
+            match &account.info.code {
+                Some(code) => Ok(code),
+                _ => Err(eyre::eyre!("failed to fetch blsg1 runtimecode"))
+            }
+        }).expect("blsg1 lib")?;
+
+        // todo: function to link tmp_lib_address into registry_runtimecode (string to handle $__ ?)
+        // once registry bytecode is linked, it can be deployed
 
         // execute the transaction
         let BundleState { state, contracts, reverts, state_size, reverts_size } = db.take_bundle();
@@ -1022,7 +1058,7 @@ impl RethEnv {
         debug!(target: "engine", "reverts_size:{:#?}", reverts_size);
 
         // copy tmp values to real genesis
-        let tmp_address = owner_address.create(0);
+        let tmp_address = owner_address.create(0); //todo 1
         let tmp_storage = state.get(&tmp_address).map(|account| {
             account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
         });
@@ -1100,6 +1136,7 @@ impl RethEnv {
             .timestamp;
 
         // retrieve the committee
+        //todo: compress the BLS pubkey
         let validators = self.get_committee_validators_by_epoch(epoch, &mut tn_evm)?;
         let epoch_state = EpochState { epoch, epoch_info, validators, epoch_start };
         debug!(target: "engine", ?epoch_state, "returning epoch state from canonical tip");

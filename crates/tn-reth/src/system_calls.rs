@@ -123,6 +123,14 @@ sol!(
             uint32 epochDuration;
         }
 
+        /// Represents a proof of possession for a validator's BLS public key
+        /// Uses a 192-byte uncompressed public key and 96-byte uncompressed PoP
+        #[derive(Debug)]
+        struct ProofOfPossession {
+            bytes uncompressedPubkey;
+            bytes uncompressedSignature;
+        }
+
         /// Initialize the contract.
         #[derive(Debug)]
         constructor(
@@ -130,8 +138,8 @@ sol!(
             StakeConfig memory genesisConfig_,
             /// The initial validators with stake.
             ValidatorInfo[] memory initialValidators_,
-            /// The initial validators' EIP2537 proof of possession
-            bytes[] memory blsSignatures,
+            /// The initial validators' uncompressed proofs of possession
+            ProofOfPossession[] memory proofsOfPossession,
             /// The address of the owner.
             address owner_
         ) external;
@@ -154,7 +162,7 @@ sol!(
         function getCommitteeValidators(uint32 epoch) external view returns (ValidatorInfo[] memory);
         /// Fetch the `ValidatorInfo` for a give address.
         function getValidator(address validatorAddress) external view returns (ValidatorInfo memory);
-        /// Returns the BLS12-381 proof of possession message: `blsPubkey.validatorAddress`
+        /// Returns the BLS12-381 proof of possession message: `blsPubkey || validatorAddress`
         function proofOfPossessionMessage(
             bytes memory blsPubkey,
             address validatorAddress
