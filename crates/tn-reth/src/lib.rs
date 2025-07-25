@@ -934,14 +934,46 @@ impl RethEnv {
         initial_stake_config: ConsensusRegistry::StakeConfig,
         owner_address: Address,
     ) -> eyre::Result<Genesis> {
+        // create temporary reth env for execution
+        let tmp_chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
+        let task_manager = TaskManager::new("Temp Task Manager");
+        let tmp_dir = TempDir::new().unwrap();
+        let reth_env =
+            RethEnv::new_for_temp_chain(tmp_chain.clone(), tmp_dir.path(), &task_manager)?;
+
+        let state = StateProviderDatabase::new(reth_env.latest()?);
+        let mut cached_reads = CachedReads::default();
+        let mut db = State::builder()
+            .with_database(cached_reads.as_db_mut(state))
+            .with_bundle_update()
+            .build();
+
+        // deploy blsg1 library separately first, scoped to release borrow on db before registry
+        let blsg1_address = {
+            let mut tn_evm = reth_env
+                .evm_config
+                .evm_factory()
+                .create_evm(&mut db, reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header()));
+
+            let blsg1_initcode_binding = Self::fetch_value_from_json_str(BLSG1_JSON, Some("bytecode.object"))?;
+            let blsg1_initcode = hex::decode(blsg1_initcode_binding.as_str().ok_or_eyre("invalid blsg1 json")?)?;
+            let ResultAndState { result, state } = tn_evm.transact_pre_genesis_create(owner_address, blsg1_initcode.into())?;
+            debug!(target: "engine", "create blsg1 library result:\n{:#?}", result);
+
+            // commit state to db so it persists
+            tn_evm.db_mut().commit(state);
+
+            // tmp BlsG1 library address is owner's first create tx on tmp chain
+            owner_address.create(0)
+        };
+
+        // merge transitions but keep the library state in db
+        db.merge_transitions(BundleRetention::PlainState);
+
+        // prepare registry deployment
         let (validators, proofs): (Vec<_>, Vec<_>) = validators
             .iter()
-            .map(|v| {
-
-                    let addr = v.execution_address;
-                    println!("address: {:?}", addr);     //todo
-                    // println!("96byte: {:?}", v.bls_public_key);
-                
+            .map(|v| {                
                 let validator = ConsensusRegistry::ValidatorInfo {
                     blsPubkey: v.bls_public_key.to_bytes().into(),
                     validatorAddress: v.execution_address,
@@ -965,23 +997,7 @@ impl RethEnv {
             .stakeAmount
             .checked_mul(U256::from(validators.len()))
             .ok_or_eyre("Failed to calculate total stake for consensus registry at genesis")?;
-
-        let mut chain: RethChainSpec = genesis.clone().into();
-        chain.hardforks.remove(EthereumHardfork::SpuriousDragon);
-        let tmp_chain = Arc::new(chain);
-        // let tmp_chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
-        // create temporary reth env for execution
-        let task_manager = TaskManager::new("Temp Task Manager");
-        let tmp_dir = TempDir::new().unwrap();
-        let reth_env =
-            RethEnv::new_for_temp_chain(tmp_chain.clone(), tmp_dir.path(), &task_manager)?;
-
         debug!(target: "engine", ?initial_stake_config, "calling constructor for consensus registry");
-
-        for proof in &proofs {
-            println!("pubkey : {:?}", proof.uncompressedPubkey); //todo
-            println!("pop: {:x?}", Bytes::from(proof.clone().uncompressedSignature));//todo
-        }
 
         let constructor_args = ConsensusRegistry::constructorCall {
             genesisConfig_: initial_stake_config,
@@ -996,59 +1012,23 @@ impl RethEnv {
         let registry_initcode_str = registry_initcode_binding
             .as_str()
             .ok_or_eyre("invalid registry json")?;
-        // let registry_initcode = hex::decode(registry_initcode_str)?;
-        // let mut create_registry = registry_initcode.clone(); //todo delete after linking, reorder to logical function flow
-        // create_registry.extend(constructor_args);
-
-        let state = StateProviderDatabase::new(reth_env.latest()?);
-        let mut cached_reads = CachedReads::default();
-        let mut db = State::builder()
-            .with_database(cached_reads.as_db_mut(state))
-            .with_bundle_update()
-            .build();
-
-        // deploy blsg1 library separately first, scoped to release borrow on db before registry
-        let blsg1_address = { //todo: no longer using this, need to refactor
-            let mut tn_evm = reth_env
-                .evm_config
-                .evm_factory()
-                .create_evm(&mut db, reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header()));
-
-            let blsg1_initcode_binding = Self::fetch_value_from_json_str(BLSG1_JSON, Some("bytecode.object"))?;
-            let blsg1_initcode = hex::decode(blsg1_initcode_binding.as_str().ok_or_eyre("invalid blsg1 json")?)?;
-            let ResultAndState { result, state } = tn_evm.transact_pre_genesis_create(owner_address, blsg1_initcode.into())?;
-            debug!(target: "engine", "create blsg1 library result:\n{:#?}", result);
-
-            // commit state to db so it persists
-            tn_evm.db_mut().commit(state);
-
-            // tmp BlsG1 library address is owner's first create tx on tmp chain
-            owner_address.create(0)
-        };
-
-        // merge transitions but keep the library state in db
-        db.merge_transitions(BundleRetention::PlainState);
-
         // link the BlsG1 library address into the registry bytecode
         let linked_registry_initcode = Self::link_solidity_library(registry_initcode_str, &blsg1_address.encode_hex())?;
         
         let mut create_registry = linked_registry_initcode;
         create_registry.extend(constructor_args);
 
-        //todo: this works
-        let mut x = reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header());
-        x.cfg_env.limit_contract_code_size = Some(0x12000000);
+        // after adding bls proof of possession, registry precompile exceeds size limit so disable it for tmp chain
+        let mut tmp_evm_no_eip170 = reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header());
+        tmp_evm_no_eip170.cfg_env.limit_contract_code_size = Some(0x12000000);
 
         // deploy registry now that it can use the previously deployed blsg1 lib
         let tmp_registry_address = {
-            let mut tn_evm = reth_env.evm_config.evm_factory().create_evm(&mut db, x);//reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header())); //todo
+            let mut tn_evm = reth_env.evm_config.evm_factory().create_evm(&mut db, tmp_evm_no_eip170);
             let ResultAndState { result, state } =
                 tn_evm.transact_pre_genesis_create(owner_address, create_registry.into())?;
             debug!(target: "engine", "create consensus registry result:\n{:#?}", result);
             
-            //todo delete
-            println!("create consensus registry result:\n{:#?}", result);
-
             tn_evm.db_mut().commit(state);
 
             // tmp BlsG1 library address is owner's second create tx on tmp chain
@@ -1065,8 +1045,6 @@ impl RethEnv {
         debug!(target: "engine", "reverts_size:{:#?}", reverts_size);
 
         // construct real genesis using known values & tmp chain storage result
-        let blsg1_runtimecode_binding = Self::fetch_value_from_json_str(BLSG1_JSON, Some("deployedBytecode.object"))?;
-        let blsg1_runtimecode = hex::decode(blsg1_runtimecode_binding.as_str().ok_or_eyre("invalid blsg1 json")?)?;
         let tmp_registry_storage = state.get(&tmp_registry_address).map(|account| {
             account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
         });
@@ -1077,6 +1055,8 @@ impl RethEnv {
         let registry_runtimecode_str = registry_runtimecode_binding.as_str().ok_or_eyre("invalid registry json")?;
         let registry_runtimecode = Self::link_solidity_library(registry_runtimecode_str, &blsg1_address.encode_hex())?;
 
+        let blsg1_runtimecode_binding = Self::fetch_value_from_json_str(BLSG1_JSON, Some("deployedBytecode.object"))?;
+        let blsg1_runtimecode = hex::decode(blsg1_runtimecode_binding.as_str().ok_or_eyre("invalid blsg1 json")?)?;
         let genesis = genesis.extend_accounts([
             (
                 blsg1_address,
@@ -1196,7 +1176,6 @@ impl RethEnv {
             .timestamp;
 
         // retrieve the committee
-        //todo: compress the BLS pubkey
         let validators = self.get_committee_validators_by_epoch(epoch, &mut tn_evm)?;
         let epoch_state = EpochState { epoch, epoch_info, validators, epoch_start };
         debug!(target: "engine", ?epoch_state, "returning epoch state from canonical tip");

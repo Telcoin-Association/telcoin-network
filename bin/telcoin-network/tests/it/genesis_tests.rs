@@ -152,8 +152,6 @@ async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
-    tn_types::test_utils::init_test_tracing();//todo
-
     let _guard = IT_TEST_MUTEX.lock();
     // sleep for other tests to cleanup
     std::thread::sleep(std::time::Duration::from_secs(5));

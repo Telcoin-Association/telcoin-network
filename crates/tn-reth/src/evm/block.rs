@@ -307,23 +307,6 @@ where
         contract: Address,
         calldata: Bytes,
     ) -> TnRethResult<Bytes> {
-        // //todo
-        // let data =
-        //     ConsensusRegistry::getCurrentEpochInfoCall { }
-        //         .abi_encode()
-        //         .into();
-        // let test = match self.evm.transact_system_call(caller, contract, data) {
-        //     Ok(res) => res,
-        //     Err(e) => panic!()
-        // };
-        // let testy = match test.result {
-        //     ExecutionResult::Success { output, .. } => output.into_data(),
-        //     e => panic!()
-        // };
-        // let testyy: ConsensusRegistry::EpochInfo =
-        //     alloy::sol_types::SolValue::abi_decode(&testy.to_vec())?;
-        //     println!("EPOCHINFO {:?}", testyy); panic!();
-
         // read from state
         let res = match self.evm.transact_system_call(caller, contract, calldata) {
             Ok(res) => res,

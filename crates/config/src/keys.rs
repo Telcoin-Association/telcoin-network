@@ -217,12 +217,7 @@ impl KeyConfig {
         &self,
         address: &Address,
     ) -> eyre::Result<BlsSignature> {
-        let msg = construct_proof_of_possession_message(&self.primary_public_key(), address)?;
-        
-        //todo
-        let msg_log = tn_types::encode(&msg).encode_hex();
-        println!("message: {msg_log:?}");
-        
+        let msg = construct_proof_of_possession_message(&self.primary_public_key(), address)?;        
         let sig = BlsSignature::new_secure(
             &msg.clone(),
             &self.inner.primary_keypair,

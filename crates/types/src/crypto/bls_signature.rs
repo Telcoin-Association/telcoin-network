@@ -153,12 +153,9 @@ pub fn generate_proof_of_possession_bls(
     let mut msg = keypair.public().to_bytes().to_vec();
     let address_bytes = encode(address);
     msg.extend_from_slice(address_bytes.as_slice());
-
     let msg = IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg);
-    //todo:
-    // let msg = construct_proof_of_possession_message(&keypair.public(), address)?;
-
     let sig = BlsSignature::new_secure(&msg.clone(), keypair);
+
     Ok(sig)
 }
 
@@ -185,15 +182,10 @@ pub fn construct_proof_of_possession_message(
     address: &Address,
 ) -> eyre::Result<IntentMessage<Vec<u8>>> {
     let mut msg_unprefixed = PublicKey::serialize(bls_pubkey).to_vec();
-    // let mut msg_unprefixed = bls_pubkey.to_bytes().to_vec();
     let address_bytes = encode(address);
     msg_unprefixed.extend_from_slice(address_bytes.as_slice());
 
     let msg = IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg_unprefixed);
-    
-    //todo:
-    // let prepend = vec![0, 0, 0, 149, 2];
-    // let msg = msg_unprefixed.splice(0..0, prepend);
 
     Ok(msg)
 }
