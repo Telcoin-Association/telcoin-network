@@ -51,7 +51,7 @@ use reth::{
     },
 };
 use reth_chain_state::ExecutedTrieUpdates;
-use reth_chainspec::{BaseFeeParams, EthChainSpec, EthereumHardfork, Hardfork};
+use reth_chainspec::{BaseFeeParams, EthChainSpec};
 use reth_db::{init_db, DatabaseEnv};
 use reth_db_common::init::init_genesis;
 use reth_discv4::NatResolver;
@@ -71,7 +71,6 @@ use reth_node_builder::{
     DEFAULT_RESERVED_CPU_CORES,
 };
 use reth_node_core::node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB;
-use reth_primitives_traits::account;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     writer::UnifiedStorageWriter,
@@ -88,7 +87,6 @@ use reth_revm::{
     },
     database::StateProviderDatabase,
     db::{states::bundle_state::BundleRetention, BundleState},
-    primitives::hardfork::SpecId::SPURIOUS_DRAGON,
     DatabaseCommit, State,
 };
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
@@ -99,7 +97,6 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     ops::RangeInclusive,
     path::Path,
-    str::FromStr,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -108,7 +105,7 @@ use system_calls::{
     EpochState, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
 };
 use tempfile::TempDir;
-use tn_config::{NodeInfo, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, DEPLOYMENTS_JSON};
+use tn_config::{NodeInfo, BLSG1_JSON, CONSENSUS_REGISTRY_JSON};
 use tn_types::{
     gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber, BlockHeader as _,
     BlockNumHash, BlockNumber, Epoch, ExecHeader, Genesis, GenesisAccount, RecoveredBlock,
@@ -1130,7 +1127,7 @@ impl RethEnv {
                     && potential_placeholder.len() == PLACEHOLDER_LEN
                 {
                     // it's a valid placeholder, replace with address
-                    result.push_str(&library_address_unprefixed);
+                    result.push_str(library_address_unprefixed);
                 } else {
                     // not a placeholder, add the characters back
                     result.push_str(&potential_placeholder);

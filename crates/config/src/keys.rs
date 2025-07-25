@@ -10,7 +10,7 @@ use rand::{rngs::StdRng, Rng as _, SeedableRng};
 use sha2::Sha256;
 use std::sync::Arc;
 use tn_types::{
-    construct_proof_of_possession_message, hex::ToHexExt, Address, BlsKeypair, BlsPublicKey,
+    construct_proof_of_possession_message, Address, BlsKeypair, BlsPublicKey,
     BlsSignature, BlsSigner, DefaultHashFunction, NetworkKeypair, NetworkPublicKey,
     ProtocolSignature as _, Signer,
 };

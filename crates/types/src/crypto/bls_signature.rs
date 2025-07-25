@@ -169,7 +169,7 @@ pub fn verify_proof_of_possession_bls(
     address: &Address,
 ) -> eyre::Result<()> {
     public_key.validate().map_err(|_| eyre::eyre!("Bls Public Key not valid!"))?;
-    let msg = construct_proof_of_possession_message(&public_key, address)?;
+    let msg = construct_proof_of_possession_message(public_key, address)?;
     if proof.verify_secure(&msg, public_key) {
         Ok(())
     } else {
@@ -221,7 +221,7 @@ impl ProtocolSignature for BlsSignature {
     }
 
     fn new_secure_bytes(&self, msg: &[u8], secret: &dyn Signer) -> Self {
-        secret.sign(&msg)
+        secret.sign(msg)
     }
 
     fn verify_secure<T>(&self, value: &IntentMessage<T>, public_key: &BlsPublicKey) -> bool
@@ -233,7 +233,7 @@ impl ProtocolSignature for BlsSignature {
     }
 
     fn verify_secure_bytes(&self, value: &[u8], public_key: &BlsPublicKey) -> bool {
-        self.verify(false, &value, DST_G1, &[], public_key, true) == blst::BLST_ERROR::BLST_SUCCESS
+        self.verify(false, value, DST_G1, &[], public_key, true) == blst::BLST_ERROR::BLST_SUCCESS
     }
 }
 
