@@ -162,9 +162,11 @@ async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
     )?;
     let unlinked_runtimecode = json_val.as_str().ok_or_eyre("Couldn't fetch bytecode")?;
     let tao_address_binding = RethEnv::fetch_value_from_json_str(DEPLOYMENTS_JSON, Some("Safe"))?;
-    let tao_address = Address::from_hex(tao_address_binding.as_str().ok_or_eyre("Safe owner address")?)?;
+    let tao_address =
+        Address::from_hex(tao_address_binding.as_str().ok_or_eyre("Safe owner address")?)?;
     let blsg1_address = tao_address.create(0).to_string();
-    let registry_deployed_bytecode = RethEnv::link_solidity_library(unlinked_runtimecode, &blsg1_address)?;
+    let registry_deployed_bytecode =
+        RethEnv::link_solidity_library(unlinked_runtimecode, &blsg1_address)?;
 
     // spawn testnet for RPC calls
     let temp_path =

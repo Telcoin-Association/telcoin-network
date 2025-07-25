@@ -81,13 +81,27 @@ use reth_provider::{
     StateProviderFactory, StaticFileProviderFactory, TransactionVariant,
 };
 use reth_revm::{
-    cached::CachedReads, context::{result::{ExecutionResult, ResultAndState}, Cfg}, database::StateProviderDatabase, db::{states::bundle_state::BundleRetention, BundleState}, primitives::hardfork::SpecId::SPURIOUS_DRAGON, DatabaseCommit, State
+    cached::CachedReads,
+    context::{
+        result::{ExecutionResult, ResultAndState},
+        Cfg,
+    },
+    database::StateProviderDatabase,
+    db::{states::bundle_state::BundleRetention, BundleState},
+    primitives::hardfork::SpecId::SPURIOUS_DRAGON,
+    DatabaseCommit, State,
 };
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
 use rpc_server_args::RpcServerArgs;
 use serde_json::Value;
 use std::{
-    collections::HashSet, net::{IpAddr, Ipv4Addr}, ops::RangeInclusive, path::Path, str::FromStr, sync::{Arc, OnceLock}, time::Duration
+    collections::HashSet,
+    net::{IpAddr, Ipv4Addr},
+    ops::RangeInclusive,
+    path::Path,
+    str::FromStr,
+    sync::{Arc, OnceLock},
+    time::Duration,
 };
 use system_calls::{
     ConsensusRegistry::{self},
@@ -96,10 +110,10 @@ use system_calls::{
 use tempfile::TempDir;
 use tn_config::{NodeInfo, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, DEPLOYMENTS_JSON};
 use tn_types::{
-    gas_accumulator::RewardsCounter,
-    Address, BlockBody, BlockHashOrNumber, BlockHeader as _, BlockNumHash, BlockNumber, Epoch,
-    ExecHeader, Genesis, GenesisAccount, RecoveredBlock, SealedBlock, SealedHeader, TaskManager,
-    TaskSpawner, TransactionSigned, B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
+    gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber, BlockHeader as _,
+    BlockNumHash, BlockNumber, Epoch, ExecHeader, Genesis, GenesisAccount, RecoveredBlock,
+    SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionSigned, B256,
+    ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
 };
 use tracing::{debug, error, info, warn};
 use traits::{TNPrimitives, TelcoinNode};
@@ -950,14 +964,17 @@ impl RethEnv {
 
         // deploy blsg1 library separately first, scoped to release borrow on db before registry
         let blsg1_address = {
-            let mut tn_evm = reth_env
-                .evm_config
-                .evm_factory()
-                .create_evm(&mut db, reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header()));
+            let mut tn_evm = reth_env.evm_config.evm_factory().create_evm(
+                &mut db,
+                reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header()),
+            );
 
-            let blsg1_initcode_binding = Self::fetch_value_from_json_str(BLSG1_JSON, Some("bytecode.object"))?;
-            let blsg1_initcode = hex::decode(blsg1_initcode_binding.as_str().ok_or_eyre("invalid blsg1 json")?)?;
-            let ResultAndState { result, state } = tn_evm.transact_pre_genesis_create(owner_address, blsg1_initcode.into())?;
+            let blsg1_initcode_binding =
+                Self::fetch_value_from_json_str(BLSG1_JSON, Some("bytecode.object"))?;
+            let blsg1_initcode =
+                hex::decode(blsg1_initcode_binding.as_str().ok_or_eyre("invalid blsg1 json")?)?;
+            let ResultAndState { result, state } =
+                tn_evm.transact_pre_genesis_create(owner_address, blsg1_initcode.into())?;
             debug!(target: "engine", "create blsg1 library result:\n{:#?}", result);
 
             // commit state to db so it persists
@@ -973,7 +990,7 @@ impl RethEnv {
         // prepare registry deployment
         let (validators, proofs): (Vec<_>, Vec<_>) = validators
             .iter()
-            .map(|v| {                
+            .map(|v| {
                 let validator = ConsensusRegistry::ValidatorInfo {
                     blsPubkey: v.bls_public_key.to_bytes().into(),
                     validatorAddress: v.execution_address,
@@ -986,7 +1003,7 @@ impl RethEnv {
                 };
                 let proof = ConsensusRegistry::ProofOfPossession {
                     uncompressedPubkey: v.bls_public_key.serialize().into(),
-                    uncompressedSignature: v.proof_of_possession.serialize().into()
+                    uncompressedSignature: v.proof_of_possession.serialize().into(),
                 };
 
                 (validator, proof)
@@ -1008,27 +1025,30 @@ impl RethEnv {
         .abi_encode();
 
         // generate calldata for creation
-        let registry_initcode_binding = Self::fetch_value_from_json_str(CONSENSUS_REGISTRY_JSON, Some("bytecode.object"))?;
-        let registry_initcode_str = registry_initcode_binding
-            .as_str()
-            .ok_or_eyre("invalid registry json")?;
+        let registry_initcode_binding =
+            Self::fetch_value_from_json_str(CONSENSUS_REGISTRY_JSON, Some("bytecode.object"))?;
+        let registry_initcode_str =
+            registry_initcode_binding.as_str().ok_or_eyre("invalid registry json")?;
         // link the BlsG1 library address into the registry bytecode
-        let linked_registry_initcode = Self::link_solidity_library(registry_initcode_str, &blsg1_address.encode_hex())?;
-        
+        let linked_registry_initcode =
+            Self::link_solidity_library(registry_initcode_str, &blsg1_address.encode_hex())?;
+
         let mut create_registry = linked_registry_initcode;
         create_registry.extend(constructor_args);
 
-        // after adding bls proof of possession, registry precompile exceeds size limit so disable it for tmp chain
+        // after adding bls proof of possession, registry precompile exceeds size limit so disable
+        // it for tmp chain
         let mut tmp_evm_no_eip170 = reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header());
         tmp_evm_no_eip170.cfg_env.limit_contract_code_size = Some(0x12000000);
 
         // deploy registry now that it can use the previously deployed blsg1 lib
         let tmp_registry_address = {
-            let mut tn_evm = reth_env.evm_config.evm_factory().create_evm(&mut db, tmp_evm_no_eip170);
+            let mut tn_evm =
+                reth_env.evm_config.evm_factory().create_evm(&mut db, tmp_evm_no_eip170);
             let ResultAndState { result, state } =
                 tn_evm.transact_pre_genesis_create(owner_address, create_registry.into())?;
             debug!(target: "engine", "create consensus registry result:\n{:#?}", result);
-            
+
             tn_evm.db_mut().commit(state);
 
             // tmp BlsG1 library address is owner's second create tx on tmp chain
@@ -1052,47 +1072,49 @@ impl RethEnv {
             CONSENSUS_REGISTRY_JSON,
             Some("deployedBytecode.object"),
         )?;
-        let registry_runtimecode_str = registry_runtimecode_binding.as_str().ok_or_eyre("invalid registry json")?;
-        let registry_runtimecode = Self::link_solidity_library(registry_runtimecode_str, &blsg1_address.encode_hex())?;
+        let registry_runtimecode_str =
+            registry_runtimecode_binding.as_str().ok_or_eyre("invalid registry json")?;
+        let registry_runtimecode =
+            Self::link_solidity_library(registry_runtimecode_str, &blsg1_address.encode_hex())?;
 
-        let blsg1_runtimecode_binding = Self::fetch_value_from_json_str(BLSG1_JSON, Some("deployedBytecode.object"))?;
-        let blsg1_runtimecode = hex::decode(blsg1_runtimecode_binding.as_str().ok_or_eyre("invalid blsg1 json")?)?;
+        let blsg1_runtimecode_binding =
+            Self::fetch_value_from_json_str(BLSG1_JSON, Some("deployedBytecode.object"))?;
+        let blsg1_runtimecode =
+            hex::decode(blsg1_runtimecode_binding.as_str().ok_or_eyre("invalid blsg1 json")?)?;
         let genesis = genesis.extend_accounts([
-            (
-                blsg1_address,
-                GenesisAccount::default()
-                    .with_code(Some(blsg1_runtimecode.into()))
-            ),
+            (blsg1_address, GenesisAccount::default().with_code(Some(blsg1_runtimecode.into()))),
             (
                 CONSENSUS_REGISTRY_ADDRESS,
                 GenesisAccount::default()
                     .with_balance(U256::from(total_stake_balance))
                     .with_code(Some(registry_runtimecode.into()))
                     .with_storage(tmp_registry_storage),
-            )
+            ),
         ]);
 
         Ok(genesis)
     }
 
     /// Links a library address into contract bytecode
-    /// 
+    ///
     /// Replaces Solidity's `__$<34 chars of library hash>$__` placeholder
-    pub fn link_solidity_library(bytecode_hex: &str, library_address: &str) -> eyre::Result<Vec<u8>> {
+    pub fn link_solidity_library(
+        bytecode_hex: &str,
+        library_address: &str,
+    ) -> eyre::Result<Vec<u8>> {
         const PLACEHOLDER_PREFIX: &str = "__$";
         const PLACEHOLDER_SUFFIX: &str = "$__";
         const PLACEHOLDER_LEN: usize = 40; // __$ + 34 chars + $__
-        let library_address_unprefixed = library_address
-            .strip_prefix("0x")
-            .unwrap_or(library_address);
+        let library_address_unprefixed =
+            library_address.strip_prefix("0x").unwrap_or(library_address);
         let mut result = String::with_capacity(bytecode_hex.len());
         let mut chars = bytecode_hex.chars().peekable();
-        
+
         while let Some(ch) = chars.next() {
             // check if we're at the start of a placeholder
             if ch == '_' && chars.peek() == Some(&'_') {
                 let mut potential_placeholder = String::from("_");
-                
+
                 // collect the next 39 characters (we already have the first _)
                 for _ in 1..PLACEHOLDER_LEN {
                     if let Some(next_ch) = chars.next() {
@@ -1101,11 +1123,12 @@ impl RethEnv {
                         break;
                     }
                 }
-                
+
                 // check it matches the placeholder pattern
-                if potential_placeholder.starts_with(PLACEHOLDER_PREFIX) 
+                if potential_placeholder.starts_with(PLACEHOLDER_PREFIX)
                     && potential_placeholder.ends_with(PLACEHOLDER_SUFFIX)
-                    && potential_placeholder.len() == PLACEHOLDER_LEN {
+                    && potential_placeholder.len() == PLACEHOLDER_LEN
+                {
                     // it's a valid placeholder, replace with address
                     result.push_str(&library_address_unprefixed);
                 } else {
@@ -1116,7 +1139,7 @@ impl RethEnv {
                 result.push(ch);
             }
         }
-        
+
         hex::decode(result).map_err(Into::into)
     }
 

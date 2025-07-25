@@ -10,7 +10,9 @@ use rand::{rngs::StdRng, Rng as _, SeedableRng};
 use sha2::Sha256;
 use std::sync::Arc;
 use tn_types::{
-    construct_proof_of_possession_message, hex::ToHexExt, Address, BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner, DefaultHashFunction, NetworkKeypair, NetworkPublicKey, ProtocolSignature as _, Signer
+    construct_proof_of_possession_message, hex::ToHexExt, Address, BlsKeypair, BlsPublicKey,
+    BlsSignature, BlsSigner, DefaultHashFunction, NetworkKeypair, NetworkPublicKey,
+    ProtocolSignature as _, Signer,
 };
 
 /// The work factor for PBKDF2 is implemented through an iteration count, which is based on the
@@ -217,11 +219,8 @@ impl KeyConfig {
         &self,
         address: &Address,
     ) -> eyre::Result<BlsSignature> {
-        let msg = construct_proof_of_possession_message(&self.primary_public_key(), address)?;        
-        let sig = BlsSignature::new_secure(
-            &msg.clone(),
-            &self.inner.primary_keypair,
-        );
+        let msg = construct_proof_of_possession_message(&self.primary_public_key(), address)?;
+        let sig = BlsSignature::new_secure(&msg.clone(), &self.inner.primary_keypair);
 
         Ok(sig)
     }

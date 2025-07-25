@@ -203,7 +203,7 @@ pub trait ProtocolSignature {
     where
         T: Serialize;
 
-    /// Create a new signature over a raw byte array, 
+    /// Create a new signature over a raw byte array,
     /// such as one produced by `construct_proof_of_possession_message`
     fn new_secure_bytes(&self, msg: &[u8], secret: &dyn Signer) -> Self;
 
