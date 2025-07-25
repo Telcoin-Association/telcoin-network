@@ -51,7 +51,7 @@ use reth::{
     },
 };
 use reth_chain_state::ExecutedTrieUpdates;
-use reth_chainspec::{BaseFeeParams, EthChainSpec};
+use reth_chainspec::{BaseFeeParams, EthChainSpec, EthereumHardfork, Hardfork};
 use reth_db::{init_db, DatabaseEnv};
 use reth_db_common::init::init_genesis;
 use reth_discv4::NatResolver;
@@ -81,11 +81,7 @@ use reth_provider::{
     StateProviderFactory, StaticFileProviderFactory, TransactionVariant,
 };
 use reth_revm::{
-    cached::CachedReads,
-    context::result::{ExecutionResult, ResultAndState},
-    database::StateProviderDatabase,
-    db::{states::bundle_state::BundleRetention, BundleState},
-    DatabaseCommit, State,
+    cached::CachedReads, context::{result::{ExecutionResult, ResultAndState}, Cfg}, database::StateProviderDatabase, db::{states::bundle_state::BundleRetention, BundleState}, primitives::hardfork::SpecId::SPURIOUS_DRAGON, DatabaseCommit, State
 };
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
 use rpc_server_args::RpcServerArgs;
@@ -970,7 +966,10 @@ impl RethEnv {
             .checked_mul(U256::from(validators.len()))
             .ok_or_eyre("Failed to calculate total stake for consensus registry at genesis")?;
 
-        let tmp_chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
+        let mut chain: RethChainSpec = genesis.clone().into();
+        chain.hardforks.remove(EthereumHardfork::SpuriousDragon);
+        let tmp_chain = Arc::new(chain);
+        // let tmp_chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
         // create temporary reth env for execution
         let task_manager = TaskManager::new("Temp Task Manager");
         let tmp_dir = TempDir::new().unwrap();
@@ -1009,7 +1008,7 @@ impl RethEnv {
             .build();
 
         // deploy blsg1 library separately first, scoped to release borrow on db before registry
-        let tmp_lib_address = { //todo: no longer using this, need to refactor
+        let blsg1_address = { //todo: no longer using this, need to refactor
             let mut tn_evm = reth_env
                 .evm_config
                 .evm_factory()
@@ -1031,20 +1030,18 @@ impl RethEnv {
         db.merge_transitions(BundleRetention::PlainState);
 
         // link the BlsG1 library address into the registry bytecode
-        let blsg1_addr_binding = Self::fetch_value_from_json_str(DEPLOYMENTS_JSON, Some("BlsG1"))?;
-        let blsg1_addr_str = blsg1_addr_binding
-            .as_str()
-            .expect("blsg1 from deployments json");
-        println!("HELLO"); //todo
-        let linked_registry_initcode = Self::link_solidity_library(registry_initcode_str, blsg1_addr_str)?;
-        println!("HELLO AGAIN"); //todo
+        let linked_registry_initcode = Self::link_solidity_library(registry_initcode_str, &blsg1_address.encode_hex())?;
         
         let mut create_registry = linked_registry_initcode;
         create_registry.extend(constructor_args);
 
+        //todo: this works
+        let mut x = reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header());
+        x.cfg_env.limit_contract_code_size = Some(0x12000000);
+
         // deploy registry now that it can use the previously deployed blsg1 lib
         let tmp_registry_address = {
-            let mut tn_evm = reth_env.evm_config.evm_factory().create_evm(&mut db, reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header()));
+            let mut tn_evm = reth_env.evm_config.evm_factory().create_evm(&mut db, x);//reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header())); //todo
             let ResultAndState { result, state } =
                 tn_evm.transact_pre_genesis_create(owner_address, create_registry.into())?;
             debug!(target: "engine", "create consensus registry result:\n{:#?}", result);
@@ -1068,7 +1065,6 @@ impl RethEnv {
         debug!(target: "engine", "reverts_size:{:#?}", reverts_size);
 
         // construct real genesis using known values & tmp chain storage result
-        let blsg1_addr = Address::from_str(blsg1_addr_str)?;
         let blsg1_runtimecode_binding = Self::fetch_value_from_json_str(BLSG1_JSON, Some("deployedBytecode.object"))?;
         let blsg1_runtimecode = hex::decode(blsg1_runtimecode_binding.as_str().ok_or_eyre("invalid blsg1 json")?)?;
         let tmp_registry_storage = state.get(&tmp_registry_address).map(|account| {
@@ -1078,11 +1074,12 @@ impl RethEnv {
             CONSENSUS_REGISTRY_JSON,
             Some("deployedBytecode.object"),
         )?;
-        let registry_runtimecode =
-            hex::decode(registry_runtimecode_binding.as_str().ok_or_eyre("invalid registry json")?)?;
+        let registry_runtimecode_str = registry_runtimecode_binding.as_str().ok_or_eyre("invalid registry json")?;
+        let registry_runtimecode = Self::link_solidity_library(registry_runtimecode_str, &blsg1_address.encode_hex())?;
+
         let genesis = genesis.extend_accounts([
             (
-                blsg1_addr,
+                blsg1_address,
                 GenesisAccount::default()
                     .with_code(Some(blsg1_runtimecode.into()))
             ),
@@ -1105,7 +1102,9 @@ impl RethEnv {
         const PLACEHOLDER_PREFIX: &str = "__$";
         const PLACEHOLDER_SUFFIX: &str = "$__";
         const PLACEHOLDER_LEN: usize = 40; // __$ + 34 chars + $__
-        
+        let library_address_unprefixed = library_address
+            .strip_prefix("0x")
+            .unwrap_or(library_address);
         let mut result = String::with_capacity(bytecode_hex.len());
         let mut chars = bytecode_hex.chars().peekable();
         
@@ -1114,7 +1113,7 @@ impl RethEnv {
             if ch == '_' && chars.peek() == Some(&'_') {
                 let mut potential_placeholder = String::from("_");
                 
-                // Collect the next 39 characters (we already have the first _)
+                // collect the next 39 characters (we already have the first _)
                 for _ in 1..PLACEHOLDER_LEN {
                     if let Some(next_ch) = chars.next() {
                         potential_placeholder.push(next_ch);
@@ -1123,14 +1122,14 @@ impl RethEnv {
                     }
                 }
                 
-                // Check if it matches the placeholder pattern
+                // check it matches the placeholder pattern
                 if potential_placeholder.starts_with(PLACEHOLDER_PREFIX) 
                     && potential_placeholder.ends_with(PLACEHOLDER_SUFFIX)
                     && potential_placeholder.len() == PLACEHOLDER_LEN {
-                    // It's a valid placeholder, replace with address
-                    result.push_str(&library_address);
+                    // it's a valid placeholder, replace with address
+                    result.push_str(&library_address_unprefixed);
                 } else {
-                    // Not a placeholder, add the characters back
+                    // not a placeholder, add the characters back
                     result.push_str(&potential_placeholder);
                 }
             } else {
