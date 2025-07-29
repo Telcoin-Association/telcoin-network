@@ -80,6 +80,8 @@ pub struct PrimaryChannelMetrics {
     /// An internal synchronizer channel. Occupancy of the channel sending certificates to the
     /// internal task that accepts certificates.
     pub tx_certificate_acceptor: IntGauge,
+    /// occupancy of the channel from the primary for epoch certs
+    pub tx_new_epoch_certificates: IntGauge,
 
     // totals
     /// total received on channel from the `primary::WorkerReceiverHandler` to the
@@ -187,6 +189,11 @@ impl PrimaryChannelMetrics {
             tx_certificate_acceptor: register_int_gauge_with_registry!(
                 "tx_certificate_acceptor",
                 "occupancy of the internal synchronizer channel that is accepting new certificates.",
+                registry
+            )?,
+            tx_new_epoch_certificates: register_int_gauge_with_registry!(
+                "tx_new_epoch_certicates",
+                "new epoch certs as recieved",
                 registry
             )?,
 

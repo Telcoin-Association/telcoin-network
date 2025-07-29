@@ -19,7 +19,7 @@ use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerTo
 use tn_storage::PayloadStore;
 use tn_types::{
     encode, BlockHash, BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader, Database,
-    Header, TaskSpawner, TnSender, Vote,
+    Epoch, EpochCertificate, EpochRecord, Header, TaskSpawner, TnSender, Vote,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
@@ -70,13 +70,23 @@ impl PrimaryNetworkHandle {
         Ok(())
     }
 
-    /// Publish a onsensus block number and hash of the header.
+    /// Publish a consensus block number and hash of the header.
     pub async fn publish_consensus(
         &self,
         consensus_block_num: u64,
         consensus_header_hash: BlockHash,
     ) -> NetworkResult<()> {
         let data = encode(&PrimaryGossip::Consenus(consensus_block_num, consensus_header_hash));
+        self.handle.publish("tn-primary".into(), data).await?;
+        Ok(())
+    }
+
+    /// Publish a certificate to the consensus network.
+    pub async fn publish_epoch_certificate(
+        &self,
+        certificate: EpochCertificate,
+    ) -> NetworkResult<()> {
+        let data = encode(&PrimaryGossip::EpochCertificate(certificate));
         self.handle.publish("tn-primary".into(), data).await?;
         Ok(())
     }
@@ -103,6 +113,9 @@ impl PrimaryNetworkHandle {
             }
             PrimaryResponse::ConsensusHeader(_consensus_header) => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is consensus header!".to_string(),
+            )),
+            PrimaryResponse::EpochRecord { .. } => Err(NetworkError::RPCError(
+                "Got wrong response, not a vote is epoch record!".to_string(),
             )),
             PrimaryResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is peer exchange!".to_string(),
@@ -161,6 +174,25 @@ impl PrimaryNetworkHandle {
             }
         }
         Err(NetworkError::RPCError("Could not get the consensus header!".to_string()))
+    }
+
+    /// Request consensus header from a random peer up to three times from three different peers.
+    pub async fn request_epoch(
+        &self,
+        epoch: Option<Epoch>,
+        hash: Option<BlockHash>,
+    ) -> NetworkResult<(EpochRecord, EpochCertificate)> {
+        let request = PrimaryRequest::EpochRecord { epoch, hash };
+        // Try up to three times (from three peers) to get consensus.
+        // This could be a lot more complicated but this KISS method should work fine.
+        for _ in 0..3 {
+            let res = self.handle.send_request_any(request.clone()).await?;
+            let res = res.await?;
+            if let Ok(PrimaryResponse::EpochRecord { record, certificate }) = res {
+                return Ok((record, certificate));
+            }
+        }
+        Err(NetworkError::RPCError("Could not get the epoch record!".to_string()))
     }
 
     /// Report a penalty to the network's peer manager.
@@ -250,6 +282,9 @@ where
                 }
                 PrimaryRequest::PeerExchange { peers } => {
                     self.process_peer_exchange(peers, channel)
+                }
+                PrimaryRequest::EpochRecord { epoch, hash } => {
+                    self.process_epoch_record_request(peer, epoch, hash, channel, cancel)
                 }
             },
             NetworkEvent::Gossip(msg, source) => {
@@ -349,6 +384,34 @@ where
         });
     }
 
+    /// Attempt to retrieve consensus chain header from the database.
+    fn process_epoch_record_request(
+        &self,
+        peer: BlsPublicKey,
+        epoch: Option<Epoch>,
+        hash: Option<BlockHash>,
+        channel: ResponseChannel<PrimaryResponse>,
+        cancel: oneshot::Receiver<()>,
+    ) {
+        // clone for spawned tasks
+        let request_handler = self.request_handler.clone();
+        let network_handle = self.network_handle.clone();
+        let task_name = format!("ConsensusOutputReq-{peer}");
+        self.task_spawner.spawn_task(task_name, async move {
+            tokio::select! {
+                header =
+                    request_handler.retrieve_epoch_record(epoch, hash) => {
+                        let response = header.into_response();
+                        // TODO: penalize peer's reputation for bad request
+                        // if response.is_err() { }
+                        let _ = network_handle.handle.send_response(response, channel).await;
+                    }
+                // cancel notification from network layer
+                _ = cancel => (),
+            }
+        });
+    }
+
     /// Process gossip from committee.
     fn process_gossip(&self, msg: GossipMessage, source: BlsPublicKey) {
         // clone for spawned tasks
@@ -357,7 +420,7 @@ where
         let task_name = format!("ProcessGossip-{source}");
         // spawn task to process gossip
         self.task_spawner.spawn_task(task_name, async move {
-            if let Err(e) = request_handler.process_gossip(&msg).await {
+            if let Err(e) = request_handler.process_gossip(&msg, source).await {
                 warn!(target: "primary::network", ?e, "process_gossip");
                 // convert error into penalty to lower peer score
                 if let Some(penalty) = e.into() {

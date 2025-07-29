@@ -9,8 +9,8 @@ use std::{
 };
 use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, TNMessage};
 use tn_types::{
-    AuthorityIdentifier, BlockHash, Certificate, CertificateDigest, ConsensusHeader, Header, Round,
-    Vote,
+    AuthorityIdentifier, BlockHash, Certificate, CertificateDigest, ConsensusHeader, Epoch,
+    EpochCertificate, EpochRecord, Header, Round, Vote,
 };
 
 /// Primary messages on the gossip network.
@@ -26,6 +26,8 @@ pub enum PrimaryGossip {
     Certificate(Box<Certificate>),
     /// Consensus output reached- publish the consensus chain height and new block hash.
     Consenus(u64, BlockHash),
+    /// Signed hash sent out by committee memebers at epoch start.
+    EpochCertificate(EpochCertificate),
 }
 
 // impl TNMessage trait for types
@@ -64,6 +66,16 @@ pub enum PrimaryRequest {
     /// due to excess peers. The peer exchange is intended to support
     /// discovery.
     PeerExchange { peers: PeerExchangeMap },
+    /// Request an ['EpochRecord'] with ['EpochCertificate'].
+    ///
+    /// If both number and hash are set they should match (no need to set them both).
+    /// If neither number or hash are set then will return the latest epoch record the node has available.
+    EpochRecord {
+        /// Block number requesting if not None.
+        epoch: Option<Epoch>,
+        /// Block hash requesting if not None.
+        hash: Option<BlockHash>,
+    },
 }
 
 // unit test for this struct in primary::src::tests::network_tests::test_missing_certs_request
@@ -160,6 +172,8 @@ pub enum PrimaryResponse {
     MissingParents(Vec<CertificateDigest>),
     /// The requested consensus header.
     ConsensusHeader(Arc<ConsensusHeader>),
+    /// The requested epoch record and certificate.
+    EpochRecord { record: EpochRecord, certificate: EpochCertificate },
     /// Exchange peer information.
     PeerExchange { peers: PeerExchangeMap },
     /// RPC error while handling request.
