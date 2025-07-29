@@ -1326,8 +1326,8 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng as _};
     use tempfile::TempDir;
     use tn_types::{
-        generate_proof_of_possession_bls, BlsKeypair, BlsSignature, Certificate,
-        CommittedSubDag, ConsensusHeader, ConsensusOutput, FromHex, NodeP2pInfo, ReputationScores,
+        generate_proof_of_possession_bls, BlsKeypair, BlsSignature, Certificate, CommittedSubDag,
+        ConsensusHeader, ConsensusOutput, FromHex, NodeP2pInfo, ReputationScores,
         SignatureVerificationState,
     };
 
