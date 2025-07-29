@@ -150,11 +150,8 @@ pub fn generate_proof_of_possession_bls(
     keypair: &BlsKeypair,
     address: &Address,
 ) -> eyre::Result<BlsSignature> {
-    let mut msg = keypair.public().to_bytes().to_vec();
-    let address_bytes = encode(address);
-    msg.extend_from_slice(address_bytes.as_slice());
-    let msg = IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg);
-    let sig = BlsSignature::new_secure(&msg.clone(), keypair);
+    let msg = construct_proof_of_possession_message(keypair.public(), address)?;
+    let sig = BlsSignature::new_secure(&msg, keypair);
 
     Ok(sig)
 }

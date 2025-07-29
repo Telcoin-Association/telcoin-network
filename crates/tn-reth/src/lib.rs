@@ -1326,8 +1326,9 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng as _};
     use tempfile::TempDir;
     use tn_types::{
-        adiri_genesis, BlsKeypair, BlsSignature, Certificate, CommittedSubDag, ConsensusHeader,
-        ConsensusOutput, FromHex, NodeP2pInfo, ReputationScores, SignatureVerificationState,
+        adiri_genesis, generate_proof_of_possession_bls, BlsKeypair, BlsSignature, Certificate,
+        CommittedSubDag, ConsensusHeader, ConsensusOutput, FromHex, NodeP2pInfo, ReputationScores,
+        SignatureVerificationState,
     };
 
     /// Helper function for creating a consensus output for tests.
@@ -1413,12 +1414,14 @@ mod tests {
                 let mut rng = StdRng::seed_from_u64(i as u64);
                 let bls = BlsKeypair::generate(&mut rng);
                 let bls_pubkey = bls.public();
+                let pop =
+                    generate_proof_of_possession_bls(&bls, addr).expect("pop generation failed");
                 NodeInfo {
                     name: format!("validator-{i}"),
                     bls_public_key: *bls_pubkey,
                     p2p_info: NodeP2pInfo::default(),
                     execution_address: *addr,
-                    proof_of_possession: BlsSignature::default(),
+                    proof_of_possession: pop,
                 }
             })
             .collect();
@@ -1439,7 +1442,7 @@ mod tests {
         let mut governance_multisig =
             TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
         let governance = governance_multisig.address();
-        let tmp_genesis = adiri_genesis().extend_accounts([
+        let tmp_genesis = tn_types::test_genesis().extend_accounts([
             (
                 governance,
                 GenesisAccount::default().with_balance(U256::from((50_000_000 * 10) ^ 18)), // 50mil TEL
@@ -1476,8 +1479,13 @@ mod tests {
             U256::ZERO,
             calldata,
         );
+        let proof = ConsensusRegistry::ProofOfPossession {
+            uncompressedPubkey: new_validator.bls_public_key.serialize().into(),
+            uncompressedSignature: new_validator.proof_of_possession.serialize().into(),
+        };
         let calldata = ConsensusRegistry::stakeCall {
-            blsPubkey: new_validator.bls_public_key.compress().into(),
+            blsPubkey: new_validator.bls_public_key.to_bytes().into(),
+            proofOfPossession: proof,
         }
         .abi_encode()
         .into();

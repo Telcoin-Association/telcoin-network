@@ -174,7 +174,7 @@ sol!(
 
         #[cfg(any(feature = "test-utils", test))]
         /// Stake to the consensus registry.
-        function stake(bytes calldata blsPubkey) external override onlyOwner;
+        function stake(bytes calldata blsPubkey, ProofOfPossession calldata proofOfPossession) external override onlyOwner;
 
         #[cfg(any(feature = "test-utils", test))]
         /// Activate node for committee selection.
