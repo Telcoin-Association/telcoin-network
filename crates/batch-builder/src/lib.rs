@@ -30,7 +30,6 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
-    u128,
 };
 use tn_reth::{CanonStateNotificationStream, RethEnv, TxPool as _, WorkerTxPool};
 use tn_types::{

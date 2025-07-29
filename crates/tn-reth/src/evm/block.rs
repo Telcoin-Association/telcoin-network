@@ -10,7 +10,7 @@ use crate::{
 };
 use alloy::{
     consensus::{proofs, Block, BlockBody, Transaction, TxReceipt},
-    eips::{eip4788::BEACON_ROOTS_ADDRESS, eip7685::Requests},
+    eips::{eip2935::HISTORY_STORAGE_ADDRESS, eip4788::BEACON_ROOTS_ADDRESS, eip7685::Requests},
     sol_types::SolCall as _,
 };
 use alloy_evm::{Database, Evm};
@@ -355,9 +355,8 @@ where
         epoch as u32
     }
 
-    /// Applies the pre-block call to the EIP-4788 consensus (beacon) root contract.
+    /// Applies the pre-block call to the EIP-4788 consensus root contract (cancun).
     fn apply_consensus_root_contract_call(&mut self) -> Result<(), BlockExecutionError> {
-        trace!(target: "engine", "applying consensus root contract call");
         if !self.spec.is_cancun_active_at_timestamp(self.evm.block().timestamp) {
             return Ok(());
         }
@@ -405,6 +404,46 @@ where
         res.state.retain(|addr, _| *addr == BEACON_ROOTS_ADDRESS);
         trace!(target: "engine", ?res, "retained state");
         self.evm.db_mut().commit(res.state);
+
+        Ok(())
+    }
+
+    /// Applies the pre-block call to the EIP-2935 blockhashes contract (pectra).
+    fn apply_blockhashes_contract_call(&mut self) -> Result<(), BlockExecutionError> {
+        trace!(target: "engine", "applying blockhashes contract call");
+        if !self.spec.is_prague_active_at_timestamp(self.evm.block().timestamp) {
+            return Ok(());
+        }
+
+        // if the block number is zero (genesis block) then no system transaction may occur as per
+        // EIP-2935
+        if self.evm.block().number == 0 {
+            return Ok(());
+        }
+
+        let mut result_and_state = match self.evm.transact_system_call(
+            SYSTEM_ADDRESS,
+            HISTORY_STORAGE_ADDRESS,
+            self.ctx.parent_hash.into(),
+        ) {
+            Ok(res) => res,
+            Err(e) => {
+                return Err(
+                    BlockValidationError::BlockHashContractCall { message: e.to_string() }.into()
+                )
+            }
+        };
+
+        trace!(target: "engine", "result and state before: \n{:#?}", result_and_state);
+        // NOTE: revm currently marks the caller and block beneficiary accounts as "touched"
+        // after the above transact calls, and includes them in the result.
+        //
+        // Cleanup state here to make sure that changeset only includes the changed
+        // contract storage.
+        result_and_state.state.retain(|addr, _| *addr == HISTORY_STORAGE_ADDRESS);
+        trace!(target: "engine", "result and state after: \n{:#?}", result_and_state);
+        self.evm.db_mut().commit(result_and_state.state);
+
         Ok(())
     }
 }
@@ -432,9 +471,12 @@ where
 
         // apply system calls and cleanup state
         if self.ctx.first_batch() {
-            // only write consensus root once per ouptut
+            // only write consensus root once per output
             self.apply_consensus_root_contract_call()?;
         }
+
+        // apply blockhashes cleanup state after
+        self.apply_blockhashes_contract_call()?;
 
         Ok(())
     }

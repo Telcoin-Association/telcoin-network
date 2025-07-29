@@ -21,7 +21,7 @@ use reth_transaction_pool::{
     PoolUpdateKind, TransactionEvents, TransactionOrigin, TransactionPool as _,
     TransactionPoolExt as _, ValidPoolTransaction,
 };
-use std::{sync::Arc, time::Instant, u128};
+use std::{sync::Arc, time::Instant};
 use tn_types::{
     Address, EnvKzgSettings, Recovered, SealedBlock, TaskSpawner, TransactionSigned, TxHash,
     MIN_PROTOCOL_BASE_FEE,

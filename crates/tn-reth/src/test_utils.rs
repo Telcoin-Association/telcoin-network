@@ -1,6 +1,6 @@
 //! Transaction factory to create legit transactions for execution.
 
-use crate::{recover_raw_transaction, RethEnv, WorkerTxPool};
+use crate::{error::TnRethResult, recover_raw_transaction, RethEnv, WorkerTxPool};
 use alloy::{
     consensus::{SignableTransaction as _, TxEip4844, TxEip4844Variant},
     eips::eip7594::BlobTransactionSidecarVariant,
@@ -15,6 +15,7 @@ use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
 use reth_evm::{execute::Executor as _, ConfigureEvm};
 use reth_primitives::sign_message;
 use reth_primitives_traits::SignerRecoverable;
+use reth_provider::{StateProviderBox, StateProviderFactory};
 use reth_revm::{database::StateProviderDatabase, db::BundleState};
 use reth_transaction_pool::{EthPoolTransaction, EthPooledTransaction, PoolTransaction};
 use secp256k1::{
@@ -24,14 +25,14 @@ use secp256k1::{
 use std::{path::Path, str::FromStr, sync::Arc};
 use tn_types::{
     address, calculate_transaction_root, keccak256, now, test_chain_spec_arc, test_genesis,
-    AccessList, Address, Batch, BlobTransactionSidecar, Block, BlockBody, Bytes, Encodable2718,
-    EthSignature, ExecHeader, ExecutionKeypair, Genesis, GenesisAccount, RecoveredBlock,
-    SealedHeader, TaskManager, Transaction, TransactionSigned, TxEip1559, TxHash, TxKind, WorkerId,
-    B256, EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS,
+    AccessList, Address, Batch, BlobTransactionSidecar, Block, BlockBody, BlockHash, Bytes,
+    Encodable2718, EthSignature, ExecHeader, ExecutionKeypair, Genesis, GenesisAccount,
+    RecoveredBlock, SealedHeader, TaskManager, Transaction, TransactionSigned, TxEip1559, TxHash,
+    TxKind, WorkerId, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS,
     ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE, U256,
 };
 // re-export for engine tests
-pub use alloy::eips::eip4788::BEACON_ROOTS_ADDRESS;
+pub use alloy::eips::{eip2935::HISTORY_STORAGE_ADDRESS, eip4788::BEACON_ROOTS_ADDRESS};
 
 // methods for tests
 impl RethEnv {
@@ -41,6 +42,11 @@ impl RethEnv {
         task_manager: &TaskManager,
     ) -> eyre::Result<Self> {
         Self::new_for_temp_chain(test_chain_spec_arc(), db_path, task_manager)
+    }
+
+    /// Retrieve the state at the provided block hash.
+    pub fn state_by_block_hash(&self, hash: BlockHash) -> TnRethResult<StateProviderBox> {
+        Ok(self.blockchain_provider.state_by_block_hash(hash)?)
     }
 
     /// Test utility to execute batch and return execution outcome.
@@ -71,10 +77,10 @@ impl RethEnv {
             mix_hash: B256::random(),
             nonce: 0_u64.into(),
             base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
-            blob_gas_used: None,
-            excess_blob_gas: None,
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
             extra_data: Default::default(),
-            parent_beacon_block_root: None,
+            parent_beacon_block_root: Some(B256::ZERO),
             requests_hash: None,
         };
 

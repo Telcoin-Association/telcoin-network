@@ -13,7 +13,7 @@ use reth_revm::{
     context_interface::block::BlobExcessGasAndPrice,
     primitives::hardfork::SpecId,
 };
-use std::{sync::Arc, u128};
+use std::sync::Arc;
 use tn_types::{
     gas_accumulator::RewardsCounter, BlockHeader as _, Bytes, SealedBlock, SealedHeader, B256, U256,
 };

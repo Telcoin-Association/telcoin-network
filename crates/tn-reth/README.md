@@ -8,7 +8,7 @@ Telcoin Network uses EVM for executing transactions.
 The consensus layer is agnostic to the execution environment.
 System calls are used to apply incentives at the end of every epoch before calling `concludeEpoch` on the ConsensusRegistry.
 
-The current fork is `Cancun`.
+The current fork is `pectra`.
 
 ## Overview
 
