@@ -283,7 +283,7 @@ where
 
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
-                vote = request_handler.vote(Some(peer), header, parents) => {
+                vote = request_handler.vote(peer, header, parents) => {
                     let response = vote.into_response();
                     let _ = network_handle.handle.send_response(response, channel).await;
                 }

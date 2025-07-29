@@ -92,9 +92,10 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(1) // parent is 0
         .build();
+    let peer = *committee.last_authority().authority().protocol_key();
 
     // process vote
-    let res = handler.vote(None, header, parents).await;
+    let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert!(res.is_ok());
     Ok(())
@@ -116,9 +117,10 @@ async fn test_vote_fails_too_many_parents() -> eyre::Result<()> {
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(1) // parent is 0
         .build();
+    let peer = *committee.last_authority().authority().protocol_key();
 
     // process vote
-    let res = handler.vote(None, header, too_many_parents).await;
+    let res = handler.vote(peer, header, too_many_parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::TooManyParents(received, expected))) if received == 5 && expected == 4 );
     Ok(())
@@ -139,7 +141,7 @@ async fn test_vote_fails_wrong_authority_network_key() -> eyre::Result<()> {
     let random_key = BlsPublicKey::default();
 
     // process vote
-    let res = handler.vote(Some(random_key), header, parents).await;
+    let res = handler.vote(random_key, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)));
     Ok(())
@@ -166,9 +168,10 @@ async fn test_vote_fails_invalid_genesis_parent() -> eyre::Result<()> {
         .created_at(1) // parent is 0
         .parents(wrong_genesis)
         .build();
+    let peer = *committee.last_authority().authority().protocol_key();
 
     // process vote
-    let res = handler.vote(None, header, parents).await;
+    let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidGenesisParent(wrong))) if wrong == extra_parent);
     Ok(())
@@ -182,9 +185,10 @@ async fn test_vote_fails_unknown_execution_result() -> eyre::Result<()> {
     // create header proposed by last peer in the committee for round 1
     let header = committee.header_from_last_authority();
     let parents = Vec::new();
+    let peer = *committee.last_authority().authority().protocol_key();
 
     // process vote
-    let res = handler.vote(None, header, parents).await;
+    let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownExecutionResult(wrong_hash))) if wrong_hash.hash == BlockHash::ZERO);
     Ok(())
@@ -201,9 +205,10 @@ async fn test_vote_fails_invalid_header_digest() -> eyre::Result<()> {
     let mut header = committee.header_from_last_authority();
     // change values so digest doesn't match
     header.latest_execution_block = BlockNumHash::new(0, BlockHash::random());
+    let peer = *committee.last_authority().authority().protocol_key();
 
     // process vote
-    let res = handler.vote(None, header, parents).await;
+    let res = handler.vote(peer, header, parents).await;
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidHeaderDigest)));
     Ok(())
 }
@@ -222,9 +227,10 @@ async fn test_vote_fails_invalid_timestamp() -> eyre::Result<()> {
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(wrong_time)
         .build();
+    let peer = *committee.last_authority().authority().protocol_key();
 
     // process vote
-    let res = handler.vote(None, header, parents).await;
+    let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp{created: wrong, ..})) if wrong == wrong_time);
     Ok(())
@@ -245,9 +251,10 @@ async fn test_vote_fails_wrong_epoch() -> eyre::Result<()> {
         .created_at(1) // parent is 0
         .epoch(wrong_epoch)
         .build();
+    let peer = *committee.last_authority().authority().protocol_key();
 
     // process vote
-    let res = handler.vote(None, header, parents).await;
+    let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidEpoch{ theirs: wrong, ours: correct })) if wrong == wrong_epoch && correct == 0 );
     Ok(())
@@ -268,9 +275,10 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(1) // parent is 0
         .build();
+    let peer = *committee.last_authority().authority().protocol_key();
 
     // process vote
-    let res = handler.vote(None, header, parents).await;
+    let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(wrong))) if wrong == wrong_authority.to_string());
     Ok(())
