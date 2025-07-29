@@ -83,7 +83,6 @@ use reth_revm::{
     cached::CachedReads,
     context::{
         result::{ExecutionResult, ResultAndState},
-        Cfg,
     },
     database::StateProviderDatabase,
     db::{states::bundle_state::BundleRetention, BundleState},

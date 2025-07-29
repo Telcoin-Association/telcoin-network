@@ -19,7 +19,6 @@ tokio-stream = { workspace = true }
 tracing = { workspace = true }
 tn-executor = { workspace = true }
 tn-primary = { workspace = true }
-prometheus = { workspace = true }
 tn-storage = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
