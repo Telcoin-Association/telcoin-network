@@ -16,6 +16,10 @@ use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tracing::error;
 
 /// Information about a given connected peer.
+/// Note that bls_public_key and network_key are Optional.
+/// It is possible we need to track a peer before we have network settings.
+/// These are only used for peer exchange and if not set then this peer will not
+/// be exchaged (which is fine since we don't have this info yet).
 #[derive(Clone, Debug, Default)]
 pub(super) struct Peer {
     /// The peers Bls public key.

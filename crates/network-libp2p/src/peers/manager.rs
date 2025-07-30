@@ -137,16 +137,26 @@ impl PeerManager {
                     let error = NetworkError::DialBannedPeer(format!("Peer {peer_id} is banned"));
                     warn!(target: "peer-manager", ?error, "invalid dial request");
                     if let Some(reply) = reply {
-                        send_or_log_error!(reply, Err(error), "DialPeer", peer = peer_id);
+                        send_or_log_error!(
+                            reply,
+                            Err(error),
+                            "DialPeer- Peer Banned",
+                            peer = peer_id
+                        );
                     }
                     return;
                 }
                 ConnectionStatus::Dialing { .. } => {
                     // report error - dialing already in progress
                     let error = NetworkError::AlreadyDialing(format!("Already dialing {peer_id}"));
-                    warn!(target: "peer-manager", ?error, "invalid dial request");
+                    debug!(target: "peer-manager", ?error, "invalid dial request");
                     if let Some(reply) = reply {
-                        send_or_log_error!(reply, Err(error), "DialPeer", peer = peer_id);
+                        send_or_log_error!(
+                            reply,
+                            Err(error),
+                            "DialPeer- Already dialing",
+                            peer = peer_id
+                        );
                     }
                     return;
                 }
@@ -154,9 +164,14 @@ impl PeerManager {
                     // report error - dialing already connected
                     let error =
                         NetworkError::AlreadyConnected(format!("Already connected {peer_id}"));
-                    warn!(target: "peer-manager", ?error, "invalid dial request");
+                    debug!(target: "peer-manager", ?error, "invalid dial request");
                     if let Some(reply) = reply {
-                        send_or_log_error!(reply, Err(error), "DialPeer", peer = peer_id);
+                        send_or_log_error!(
+                            reply,
+                            Err(error),
+                            "DialPeer- Already connected",
+                            peer = peer_id
+                        );
                     }
                     return;
                 }
@@ -583,7 +598,8 @@ impl PeerManager {
         // check all peers for authority and track missing
         for AuthorityInfoRequest { bls_key, reply } in authorities {
             if let Some(info) = self.known_peers.get(&bls_key) {
-                send_or_log_error!(reply, Ok((bls_key, info.clone())), "find authority");
+                // ignore errors bc node manager is the only caller for now and drops receivers
+                let _ = reply.send(Ok((bls_key, info.clone())));
                 continue;
             }
 
@@ -593,17 +609,6 @@ impl PeerManager {
 
         // emit event for kad to try to discover
         self.events.push_back(PeerEvent::MissingAuthorities(missing));
-    }
-
-    /// Find authorities for the epoch manager.
-    pub(crate) fn find_local_authority(&mut self, authority: AuthorityInfoRequest) {
-        // check all peers for authority and track missing
-        let AuthorityInfoRequest { bls_key, reply } = authority;
-        if let Some(info) = self.known_peers.get(&bls_key) {
-            send_or_log_error!(reply, Ok((bls_key, info.clone())), "find authority");
-        } else {
-            send_or_log_error!(reply, Err(NetworkError::PeerNotLocal), "find authority");
-        }
     }
 
     /// Find the peer id for an authority.

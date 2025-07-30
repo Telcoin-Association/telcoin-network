@@ -189,7 +189,7 @@ impl AllPeers {
 
         self.peers
             .get(peer_id)
-            .map(|peer| peer.connection_status().clone())
+            .map(|peer| *peer.connection_status())
             .unwrap_or(ConnectionStatus::Unknown)
     }
 
@@ -831,11 +831,13 @@ impl AllPeers {
 
         let mut actions = Vec::with_capacity(committee.len());
         for (bls_key, NetworkInfo { pubkey, multiaddrs: addr }) in committee {
-            let peer_id: PeerId = pubkey.into();
+            let peer_id: PeerId = pubkey.clone().into();
             self.current_committee.insert(peer_id);
             self.current_committee_keys.insert(bls_key, Some(peer_id));
             // the NewConnectionStatus doesn't affect this call
             let status = self.ensure_peer_exists(&peer_id, &NewConnectionStatus::Unbanned);
+            // We have all our network settings so go ahead and make sure they are set.
+            self.upsert_peer(bls_key, pubkey, addr.clone());
 
             match status {
                 ConnectionStatus::Disconnecting { banned } => {

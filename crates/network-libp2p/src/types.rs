@@ -295,20 +295,6 @@ where
         /// The collection of requests.
         requests: Vec<AuthorityInfoRequest>,
     },
-    /// Find an authority for a future committee by bls key and return to sender.
-    /// This only returns the authority if it is stored locally- i.e. will return fast.
-    FindLocalAuthority {
-        /// The request.
-        request: AuthorityInfoRequest,
-    },
-    /// Find the BlsPublicKey for a PeerId if in local cache.
-    /// This only returns the authority if it is stored locally- i.e. will return fast.
-    FindLocalPeer {
-        /// The peer id to look up.
-        peer_id: PeerId,
-        /// The reply to requestor with authority information.
-        reply: oneshot::Sender<NetworkResult<BlsPublicKey>>,
-    },
 }
 
 /// Network handle.
@@ -577,9 +563,10 @@ where
         Ok(results)
     }
 
+    /*
     /// Return network information for authorities by bls pubkey on kad.
-    /// This only returns the authority if it is stored locally- i.e. will return fast.
-    pub async fn find_local_authority(
+    /// This only returns the authority if it is stored in local DB- i.e. will return fast.
+    pub async fn find_authority_in_db(
         &self,
         bls_key: BlsPublicKey,
     ) -> NetworkResult<(BlsPublicKey, NetworkInfo)> {
@@ -587,19 +574,19 @@ where
         // create the request
         let request = AuthorityInfoRequest { bls_key, reply };
 
-        self.sender.send(NetworkCommand::FindLocalAuthority { request }).await?;
+        self.sender.send(NetworkCommand::FindCachedAuthority { request }).await?;
         rx.await?
     }
 
     /// Return bls public key for a peer id if cached locally.
-    /// This only returns the bls key if it is stored locally- i.e. will return fast.
-    pub async fn find_local_peer(&self, peer_id: PeerId) -> NetworkResult<BlsPublicKey> {
+    /// This only returns the bls key if it is stored in local DB- i.e. will return fast.
+    pub async fn find_peer_in_db(&self, peer_id: PeerId) -> NetworkResult<BlsPublicKey> {
         let (reply, rx) = oneshot::channel();
         // create the request
 
         self.sender.send(NetworkCommand::FindLocalPeer { peer_id, reply }).await?;
         rx.await?
-    }
+    }*/
 }
 
 /// List of addresses for a node, signature will be the nodes BLS signature

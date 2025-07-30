@@ -1098,11 +1098,6 @@ impl RethEnv {
     }
 
     /// Read the latest committee and epoch information from the [ConsensusRegistry] on-chain.
-    ///
-    /// The protocol needs the BLS pubkey for the authorities.
-    /// - get current epoch info
-    /// - getValidator token id by address
-    /// - getValidator info by token id
     pub fn validators_for_epoch(
         &self,
         epoch: u32,
