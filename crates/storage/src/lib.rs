@@ -49,7 +49,7 @@ const CONSENSUS_BLOCK_CF: &str = "consensus_block";
 const CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF: &str = "consensus_block_number_by_digest";
 const EPOCH_RECORDS_CF: &str = "epoch_record_by_number";
 const EPOCH_CERTS_CF: &str = "epoch_cert_by_number";
-const EPOCH_RECORDS_INDEX_CF: &str = "epoch_cert_by_number";
+const EPOCH_RECORDS_INDEX_CF: &str = "epoch_records_index";
 const KAD_RECORD_CF: &str = "kad_record";
 const KAD_PROVIDER_RECORD_CF: &str = "kad_provider_record";
 
@@ -169,6 +169,8 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
 /// Open or reopen all the storage of the node backed by ReDB.
 #[cfg(feature = "redb")]
 fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabase<ReDB> {
+    use tables::{EpochCerts, EpochRecords, EpochRecordsIndex};
+
     let db = ReDB::open(store_path).expect("Cannot open database");
     db.open_table::<LastProposed>().expect("failed to open table!");
     db.open_table::<Votes>().expect("failed to open table!");

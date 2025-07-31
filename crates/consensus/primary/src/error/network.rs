@@ -43,7 +43,7 @@ pub(crate) enum PrimaryNetworkError {
     UnknowConsensusHeaderDigest(BlockHash),
     /// Peer that is not committee published invalid gosip.
     #[error("Peer {0} is not in the committee!")]
-    PeerNotInCommittee(BlsPublicKey),
+    PeerNotInCommittee(Box<BlsPublicKey>),
     /// Unavaliable epoch (either it is invalid or this node does not have it).
     #[error("Unknown epoch record: {0}")]
     UnavailableEpoch(Epoch),

@@ -457,13 +457,12 @@ where
         // tables should be cleared
         let mut clear_tables_for_next_epoch = false;
 
-        // XXXX
-        self.collect_epoch_certs(&primary, &engine, &epoch_task_manager).await?;
+        // New Epoch, should be able to collect the certs from the last epoch.
+        self.collect_epoch_certs(&primary, engine, &epoch_task_manager).await?;
 
-        let committee = primary.current_committee().await.clone();
         tokio::select! {
             // wait for epoch boundary to transition
-            res = self.wait_for_epoch_boundary(to_engine, engine, consensus_output, consensus_shutdown.clone(), gas_accumulator, committee) => {
+            res = self.wait_for_epoch_boundary(to_engine, engine, consensus_output, consensus_shutdown.clone(), gas_accumulator) => {
                 res.inspect_err(|e| {
                     error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
                 })?;
@@ -503,7 +502,8 @@ where
     }
 
     /// Start a task to collect the epoch record certs and load the previous epochs record.
-    /// This should run quickly at epoch start and make epoch records/certs available to syncing nodes.
+    /// This should run quickly at epoch start and make epoch records/certs available to syncing
+    /// nodes.
     async fn collect_epoch_certs(
         &mut self,
         primary: &PrimaryNode<DB>,
@@ -514,7 +514,9 @@ where
         let epoch = committee.epoch();
         let committee_keys = engine.validators_for_epoch(epoch).await?;
         let next_committee_keys = engine.validators_for_epoch(epoch + 1).await?;
-        let parent_hash = if let Some(prev) = self.consensus_db.get::<EpochRecords>(&(epoch - 1))? {
+        let parent_hash = if epoch == 0 {
+            B256::default()
+        } else if let Some(prev) = self.consensus_db.get::<EpochRecords>(&(epoch - 1))? {
             prev.digest()
         } else {
             error!(
@@ -536,71 +538,66 @@ where
             parent_state,
             parent_consensus: target_hash,
         };
-        let epoch_digest = epoch_rec.digest();
+        let epoch_hash = epoch_rec.digest();
 
         let mut committee_keys = committee.committee_keys();
+        let me = self.builder.tn_config.primary_bls_key();
+        if committee_keys.contains(me) {
+            committee_keys.remove(me);
+            let signed_authorities = self.key_config.request_signature_direct(epoch_hash.as_ref());
+            let epoch_cert = EpochCertificate { epoch_hash, signed_authorities };
+            self.consensus_db.insert::<EpochCerts>(&epoch_hash, &epoch_cert)?;
+            let primary_network = primary.network_handle().await;
+            // Publish the cert after a small delay.  The delay is to ease potential race conditions
+            // as nodes transition epochs.
+            epoch_task_manager.spawn_task("epoch certificate delayed publish", async move {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let _ = primary_network.publish_epoch_certificate(epoch_cert).await;
+            });
+        }
+
         let quorum = committee.quorum_threshold();
-        //XXXXlet primary_network = primary.network_handle().await;
         let consensus_db = self.consensus_db.clone();
-        //XXXXlet spawner = epoch_task_manager.get_spawner();
         epoch_task_manager.spawn_task("epoch certificate collector", async move {
             let mut rx = consensus_bus.new_epoch_certificates().subscribe();
             let mut certs: HashMap<B256, u64> = HashMap::default();
-            while let Some((source, cert)) = rx.recv().await {
+            while let Some((source, mut cert)) = rx.recv().await {
                 if committee_keys.contains(&source) && cert.check_signature(&source) {
                     committee_keys.remove(&source);
-                    if epoch_digest == cert.epoch_hash {
-                        if let Some(mut prev_cert) =
+                    if epoch_hash == cert.epoch_hash {
+                        if let Some(prev_cert) =
                             consensus_db.get::<EpochCerts>(&cert.epoch_hash).ok().flatten()
                         {
-                            prev_cert.aggregate(&cert.signed_authorities);
-                            let _ = consensus_db
-                                .insert::<EpochCerts>(&prev_cert.epoch_hash, &prev_cert);
-                        } else {
-                            let _ = consensus_db.insert::<EpochCerts>(&cert.epoch_hash, &cert);
+                            cert.aggregate(&prev_cert.signed_authorities);
                         }
+                        let _ = consensus_db.insert::<EpochCerts>(&cert.epoch_hash, &cert);
                         if let Some(v) = certs.get_mut(&cert.epoch_hash) {
                             *v += 1;
                             if *v >= quorum {
+                                // If we have not save EpochRecord to our DB do so now that it has a quorum of signatures.
                                 if consensus_db
                                     .get::<EpochRecordsIndex>(&cert.epoch_hash)
                                     .ok()
                                     .flatten()
                                     .is_none()
                                 {
-                                    //XXXXlet primary_network = primary_network.clone();
                                     let consensus_db = consensus_db.clone();
-                                    //XXXX
                                     let _ = consensus_db.insert::<EpochRecordsIndex>(
                                         &cert.epoch_hash,
                                         &epoch_rec.epoch,
                                     );
                                     let _ = consensus_db
                                         .insert::<EpochRecords>(&epoch_rec.epoch, &epoch_rec);
-                                    /*// XXXX get the epoch record and save it (if not in our store).
-                                    spawner.spawn_task("Request epoch", async move {
-                                        loop {
-                                            if let Ok((epoch, _cert)) = primary_network
-                                                .request_epoch(None, Some(cert.epoch_hash))
-                                                .await
-                                            {
-                                                //XXXX
-                                                let _ = consensus_db.insert::<EpochRecordsIndex>(
-                                                    &cert.epoch_hash,
-                                                    &epoch.epoch,
-                                                );
-                                                let _ = consensus_db
-                                                    .insert::<EpochRecords>(&epoch.epoch, &epoch);
-                                            }
-                                        }
-                                    });*/
                                 }
                             }
                         } else {
                             certs.insert(cert.epoch_hash, 1);
                         }
                     } else {
-                        // XXXX source sent wrong signed epoch hash....
+                        error!(
+                            target: "epoch-manager",
+                            "Recieved an epoch cert with incorrect hash {}, expected {}", cert.epoch_hash, epoch_hash
+                        );
                     }
                 }
                 if committee_keys.is_empty() {
@@ -622,7 +619,6 @@ where
         mut consensus_output: broadcast::Receiver<ConsensusOutput>,
         shutdown_consensus: Notifier,
         gas_accumulator: GasAccumulator,
-        committee: Committee,
     ) -> eyre::Result<()> {
         // receive output from consensus and forward to engine
         'epoch: while let Ok(mut output) = consensus_output.recv().await {
@@ -644,7 +640,6 @@ where
                 // obtain hash to monitor execution progress
                 let target_hash = output.consensus_header_hash();
 
-                let epoch = output.leader().epoch() + 1;
                 gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
                 // forward the output to the engine
                 to_engine.send(output).await?;
@@ -656,42 +651,6 @@ where
                 while let Some(output) = executed_output.next().await {
                     // ensure canonical tip is updated with closing epoch info
                     if output.tip().sealed_header().parent_beacon_block_root == Some(target_hash) {
-                        let me = self.builder.tn_config.primary_bls_key();
-                        if committee.authority_by_key(&me).is_some() {
-                            let committee = engine.validators_for_epoch(epoch).await?;
-                            let next_committee = engine.validators_for_epoch(epoch + 1).await?;
-                            let parent_hash = if let Some(prev) =
-                                self.consensus_db.get::<EpochRecords>(&(epoch - 1))?
-                            {
-                                prev.digest()
-                            } else {
-                                error!(
-                                    target: "epoch-manager",
-                                    "failed to find previous epoch record when closing epoch",
-                                );
-                                return Err(eyre!(
-                                    "failed to find previous epoch record when closing epoch"
-                                ));
-                            };
-                            // We are in the committee so sign and gossip the epoch record.
-                            let epoch_rec = EpochRecord {
-                                epoch,
-                                committee,
-                                next_committee,
-                                parent_hash,
-                                parent_state: output.tip().sealed_header().num_hash(),
-                                parent_consensus: target_hash,
-                            };
-                            let epoch_hash = epoch_rec.digest();
-                            self.consensus_db.insert::<EpochRecords>(&epoch, &epoch_rec)?;
-                            self.consensus_db.insert::<EpochRecordsIndex>(&epoch_hash, &epoch)?;
-                            let signed_authorities =
-                                self.key_config.request_signature_direct(epoch_hash.as_ref());
-                            let epoch_cert = EpochCertificate { epoch_hash, signed_authorities };
-                            self.consensus_db.insert::<EpochCerts>(&epoch_hash, &epoch_cert)?;
-                            // XXXX publish the cert.
-                        }
-
                         // return
                         break 'epoch;
                     }

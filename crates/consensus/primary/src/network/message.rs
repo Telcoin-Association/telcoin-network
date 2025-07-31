@@ -69,7 +69,8 @@ pub enum PrimaryRequest {
     /// Request an ['EpochRecord'] with ['EpochCertificate'].
     ///
     /// If both number and hash are set they should match (no need to set them both).
-    /// If neither number or hash are set then will return the latest epoch record the node has available.
+    /// If neither number or hash are set then will return the latest epoch record the node has
+    /// available.
     EpochRecord {
         /// Block number requesting if not None.
         epoch: Option<Epoch>,

@@ -457,7 +457,7 @@ impl Committee {
     }
 
     pub fn committee_keys(&self) -> HashSet<BlsPublicKey> {
-        self.inner.read().authorities.iter().map(|(key, _)| *key).collect()
+        self.inner.read().authorities.keys().copied().collect()
     }
 
     /// Return the bootstrap record for key if it exists.

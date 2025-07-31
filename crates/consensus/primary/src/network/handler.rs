@@ -86,7 +86,7 @@ where
             PrimaryGossip::Consenus(number, hash) => {
                 ensure!(
                     self.consensus_config.committee().authority_by_key(&source).is_some(),
-                    PrimaryNetworkError::PeerNotInCommittee(source)
+                    PrimaryNetworkError::PeerNotInCommittee(Box::new(source))
                 );
                 let (old_number, _old_hash) =
                     *self.consensus_bus.last_published_consensus_num_hash().borrow();
@@ -98,7 +98,6 @@ where
                 }
             }
             PrimaryGossip::EpochCertificate(cert) => {
-                // XXXX
                 let _ = self.consensus_bus.new_epoch_certificates().send((source, cert)).await;
             }
         }
