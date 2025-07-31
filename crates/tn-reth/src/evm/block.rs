@@ -388,11 +388,12 @@ where
         ) {
             Ok(res) => res,
             Err(e) => {
+                error!(target: "engine", "failed to apply consensus root contract call: {:?}", e);
                 return Err(BlockValidationError::BeaconRootContractCall {
                     parent_beacon_block_root: Box::new(parent_beacon_block_root),
                     message: e.to_string(),
                 }
-                .into())
+                .into());
             }
         };
 
@@ -428,9 +429,10 @@ where
         ) {
             Ok(res) => res,
             Err(e) => {
+                error!(target: "engine", "failed to apply blockhashes contract call: {:?}", e);
                 return Err(
                     BlockValidationError::BlockHashContractCall { message: e.to_string() }.into()
-                )
+                );
             }
         };
 
