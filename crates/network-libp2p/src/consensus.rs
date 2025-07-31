@@ -457,7 +457,7 @@ where
             SwarmEvent::ListenerError { listener_id, error } => {
                 // log listener errors
                 error!(
-                    target: "network::events",
+                    target: "network",
                     ?listener_id,
                     ?error,
                     "listener error"
@@ -546,7 +546,7 @@ where
                         Some(reply),
                     );
                 } else {
-                    let _ = reply.send(Err(NetworkError::PeerNotLocal));
+                    let _ = reply.send(Err(NetworkError::PeerMissing));
                 }
             }
             NetworkCommand::LocalPeerId { reply } => {
@@ -566,7 +566,7 @@ where
             }
             NetworkCommand::ConnectedPeerIds { reply } => {
                 let res = self.swarm.behaviour().peer_manager.connected_or_dialing_peers();
-                debug!(target: "epoch-manager", ?res, "peer manager connected peers:");
+                debug!(target: "network", ?res, "peer manager connected peers:");
                 send_or_log_error!(reply, res, "ConnectedPeers");
             }
             NetworkCommand::ConnectedPeers { reply } => {
@@ -578,7 +578,7 @@ where
                     .iter()
                     .flat_map(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id))
                     .collect();
-                debug!(target: "epoch-manager", ?peers, "peer manager connected peers:");
+                debug!(target: "network", ?peers, "peer manager connected peers:");
                 send_or_log_error!(reply, peers, "ConnectedPeers");
             }
             NetworkCommand::PeerScore { peer_id, reply } => {
@@ -609,7 +609,7 @@ where
             }
             NetworkCommand::SendRequest { peer, request, reply } => {
                 if let Some((peer, addr)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
-                    debug!(target = "network", "trying to send to {peer} at {addr:?}");
+                    debug!(target: "network", "trying to send to {peer} at {addr:?}");
                     let request_id = self
                         .swarm
                         .behaviour_mut()
@@ -618,7 +618,7 @@ where
                     self.outbound_requests.insert((peer, request_id), reply);
                 } else {
                     // Best effort to return an error to caller.
-                    let _ = reply.send(Err(NetworkError::PeerNotLocal));
+                    let _ = reply.send(Err(NetworkError::PeerMissing));
                 }
             }
             NetworkCommand::SendRequestDirect { peer, request, reply } => {
@@ -676,7 +676,7 @@ where
                 //
                 // for now, this only supports the current committee for the epoch
 
-                info!(target: "epoch-manager", this_node=?self.swarm.local_peer_id(), "network update for next committee - ensuring no committee members are banned");
+                info!(target: "network", this_node=?self.swarm.local_peer_id(), "network update for next committee - ensuring no committee members are banned");
                 // ensure that the next committee isn't banned
                 self.swarm.behaviour_mut().peer_manager.new_epoch(committee);
 
@@ -686,17 +686,6 @@ where
             NetworkCommand::FindAuthorities { requests } => {
                 // this will trigger a PeerEvent to fetch records through kad if not in the peer map
                 self.swarm.behaviour_mut().peer_manager.find_authorities(requests);
-            }
-            NetworkCommand::FindLocalAuthority { request } => {
-                self.swarm.behaviour_mut().peer_manager.find_local_authority(request);
-            }
-            NetworkCommand::FindLocalPeer { peer_id, reply } => {
-                let bls = self.swarm.behaviour_mut().peer_manager.peer_to_bls(&peer_id);
-                if let Some(bls_key) = bls {
-                    send_or_log_error!(reply, Ok(bls_key), "find peer");
-                } else {
-                    send_or_log_error!(reply, Err(NetworkError::PeerNotLocal), "find peer");
-                }
             }
         }
 

@@ -100,7 +100,7 @@ pub enum NetworkError {
     InvalidPeerRecord,
     /// The requested peer is not on our local store.
     #[error("Requested peer is not in our local store.")]
-    PeerNotLocal,
+    PeerMissing,
     /// Kademlia error.
     #[error("Failed to get kad record: {0}")]
     GetKademliaRecord(#[from] GetRecordError),

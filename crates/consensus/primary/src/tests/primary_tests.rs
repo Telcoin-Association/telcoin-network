@@ -32,6 +32,7 @@ async fn test_request_vote_has_missing_execution_block() {
     let target = fixture.authorities().next().unwrap();
     let author = fixture.authorities().nth(2).unwrap();
     let author_id = author.id();
+    let author_peer = *author.authority().protocol_key();
 
     let certificate_store = target.consensus_config().node_storage().clone();
     let payload_store = target.consensus_config().node_storage().clone();
@@ -77,7 +78,8 @@ async fn test_request_vote_has_missing_execution_block() {
     }
 
     // Trying to build on off of a missing execution block, will be an error.
-    let result = timeout(Duration::from_secs(5), handler.vote(None, test_header, Vec::new())).await;
+    let result =
+        timeout(Duration::from_secs(5), handler.vote(author_peer, test_header, Vec::new())).await;
     let result = result.unwrap();
     assert!(result.is_err(), "{result:?}");
 }
@@ -92,6 +94,7 @@ async fn test_request_vote_older_execution_block() {
     let target = fixture.authorities().next().unwrap();
     let author = fixture.authorities().nth(2).unwrap();
     let author_id = author.id();
+    let author_peer = *author.authority().protocol_key();
 
     let certificate_store = target.consensus_config().node_storage().clone();
     let payload_store = target.consensus_config().node_storage().clone();
@@ -144,7 +147,8 @@ async fn test_request_vote_older_execution_block() {
     }
 
     // Trying to build on off of a missing execution block, will be an error.
-    let result = timeout(Duration::from_secs(5), handler.vote(None, test_header, Vec::new())).await;
+    let result =
+        timeout(Duration::from_secs(5), handler.vote(author_peer, test_header, Vec::new())).await;
     let result = result.unwrap();
     assert!(result.is_ok(), "{result:?}");
 }
@@ -159,6 +163,7 @@ async fn test_request_vote_has_missing_parents() {
     let target = fixture.authorities().next().unwrap();
     let author = fixture.authorities().nth(2).unwrap();
     let author_id = author.id();
+    let author_peer = *author.authority().protocol_key();
 
     let certificate_store = target.consensus_config().node_storage().clone();
     let payload_store = target.consensus_config().node_storage().clone();
@@ -207,7 +212,7 @@ async fn test_request_vote_has_missing_parents() {
 
     // TEST PHASE 1: Handler should report missing parent certificates to caller.
     let missing = if let PrimaryResponse::MissingParents(missing) =
-        handler.vote(None, test_header.clone(), Vec::new()).await.unwrap()
+        handler.vote(author_peer, test_header.clone(), Vec::new()).await.unwrap()
     {
         missing
     } else {
@@ -221,7 +226,8 @@ async fn test_request_vote_has_missing_parents() {
     // TEST PHASE 2: Handler should not return additional unknown digests.
     // No additional missing parents will be requested.
     let result =
-        timeout(Duration::from_secs(5), handler.vote(None, test_header.clone(), Vec::new())).await;
+        timeout(Duration::from_secs(5), handler.vote(author_peer, test_header.clone(), Vec::new()))
+            .await;
     assert!(result.is_err(), "{result:?}");
 
     // TEST PHASE 3: Handler should return error if header is too old.
@@ -229,7 +235,9 @@ async fn test_request_vote_has_missing_parents() {
     let _ = cb.primary_round_updates().send(100);
     // Because round 1 certificates are not in store, the missing parents will not be accepted yet.
     let result =
-        timeout(Duration::from_secs(5), handler.vote(None, test_header, Vec::new())).await.unwrap();
+        timeout(Duration::from_secs(5), handler.vote(author_peer, test_header, Vec::new()))
+            .await
+            .unwrap();
     assert!(result.is_err(), "{result:?}");
 }
 
@@ -243,6 +251,7 @@ async fn test_request_vote_accept_missing_parents() {
     let target = fixture.authorities().next().unwrap();
     let author = fixture.authorities().nth(2).unwrap();
     let author_id = author.id();
+    let author_peer = *author.authority().protocol_key();
 
     let certificate_store = target.consensus_config().node_storage().clone();
     let payload_store = target.consensus_config().node_storage().clone();
@@ -303,7 +312,7 @@ async fn test_request_vote_accept_missing_parents() {
 
     // TEST PHASE 1: Handler should report missing parent certificates to caller.
     let missing = if let PrimaryResponse::MissingParents(missing) =
-        handler.vote(None, test_header.clone(), Vec::new()).await.unwrap()
+        handler.vote(author_peer, test_header.clone(), Vec::new()).await.unwrap()
     {
         missing
     } else {
@@ -315,9 +324,10 @@ async fn test_request_vote_accept_missing_parents() {
     assert_eq!(expected_missing, received_missing);
 
     // TEST PHASE 2: Handler should process missing parent certificates and succeed.
-    let result = timeout(Duration::from_secs(5), handler.vote(None, test_header, round_2_missing))
-        .await
-        .unwrap();
+    let result =
+        timeout(Duration::from_secs(5), handler.vote(author_peer, test_header, round_2_missing))
+            .await
+            .unwrap();
     assert!(result.is_ok(), "{result:?}");
 }
 
@@ -330,6 +340,7 @@ async fn test_request_vote_missing_batches() {
     let primary = fixture.authorities().next().unwrap();
     let authority_id = primary.id();
     let author = fixture.authorities().nth(2).unwrap();
+    let author_peer = *author.authority().protocol_key();
     let client = primary.consensus_config().local_network().clone();
 
     let certificate_store = primary.consensus_config().node_storage().clone();
@@ -376,7 +387,7 @@ async fn test_request_vote_missing_batches() {
     client.set_primary_to_worker_local_handler(Arc::new(mock_server));
 
     // Verify Handler synchronizes missing batches and generates a Vote.
-    let _vote = timeout(Duration::from_secs(5), handler.vote(None, test_header, Vec::new()))
+    let _vote = timeout(Duration::from_secs(5), handler.vote(author_peer, test_header, Vec::new()))
         .await
         .unwrap()
         .unwrap();
@@ -391,6 +402,7 @@ async fn test_request_vote_already_voted() {
     let primary = fixture.authorities().next().unwrap();
     let id = primary.id();
     let author = fixture.authorities().nth(2).unwrap();
+    let author_peer = *author.authority().protocol_key();
     let client = primary.consensus_config().local_network().clone();
 
     let certificate_store = primary.consensus_config().node_storage().clone();
@@ -440,7 +452,7 @@ async fn test_request_vote_already_voted() {
 
     let vote = if let PrimaryResponse::Vote(vote) = tokio::time::timeout(
         Duration::from_secs(10),
-        handler.vote(None, test_header.clone(), Vec::new()),
+        handler.vote(author_peer, test_header.clone(), Vec::new()),
     )
     .await
     .unwrap()
@@ -453,7 +465,7 @@ async fn test_request_vote_already_voted() {
 
     // Verify the same request gets the same vote back successfully.
     let vote2 = if let PrimaryResponse::Vote(vote) =
-        handler.vote(None, test_header, Vec::new()).await.unwrap()
+        handler.vote(author_peer, test_header, Vec::new()).await.unwrap()
     {
         vote
     } else {
@@ -470,7 +482,7 @@ async fn test_request_vote_already_voted() {
         .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
         .build();
 
-    let response = handler.vote(None, test_header, Vec::new()).await;
+    let response = handler.vote(author_peer, test_header, Vec::new()).await;
     assert!(response.is_err());
 }
 
@@ -589,6 +601,7 @@ async fn test_request_vote_created_at_in_future() {
     let primary = fixture.authorities().next().unwrap();
     let id = primary.id();
     let author = fixture.authorities().nth(2).unwrap();
+    let author_peer = *author.authority().protocol_key();
     let client = primary.consensus_config().local_network().clone();
 
     let certificate_store = primary.consensus_config().node_storage().clone();
@@ -642,7 +655,7 @@ async fn test_request_vote_created_at_in_future() {
         .build();
 
     // For such a future header we get back an error
-    assert!(handler.vote(None, test_header, Vec::new()).await.is_err());
+    assert!(handler.vote(author_peer, test_header, Vec::new()).await.is_err());
 
     // Verify Handler generates a Vote.
 
@@ -659,7 +672,7 @@ async fn test_request_vote_created_at_in_future() {
         .build();
 
     let _vote = if let PrimaryResponse::Vote(vote) =
-        handler.vote(None, test_header, Vec::new()).await.unwrap()
+        handler.vote(author_peer, test_header, Vec::new()).await.unwrap()
     {
         vote
     } else {

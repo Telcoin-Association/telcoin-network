@@ -40,8 +40,8 @@ use tn_storage::{
 use tn_types::{
     gas_accumulator::GasAccumulator, AuthorityIdentifier, BatchValidation, BlsPublicKey,
     BlsSigner as _, Committee, CommitteeBuilder, ConsensusHeader, ConsensusOutput,
-    Database as TNDatabase, Epoch, EpochCertificate, EpochRecord, Multiaddr, Noticer, Notifier,
-    TaskManager, TaskSpawner, TimestampSec, TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
+    Database as TNDatabase, Epoch, EpochCertificate, EpochRecord, Noticer, Notifier, TaskManager,
+    TaskSpawner, TimestampSec, TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::{
@@ -77,8 +77,6 @@ pub struct EpochManager<P, DB> {
     primary_network_handle: Option<PrimaryNetworkHandle>,
     /// Worker network handle.
     worker_network_handle: Option<WorkerNetworkHandle>,
-    /// Address of the worker network once it is set.
-    worker_network_addr: Option<Multiaddr>,
     /// Key config - loaded once for application lifetime.
     key_config: KeyConfig,
     /// The epoch manager's [Notifier] to shutdown all node processes.
@@ -191,7 +189,6 @@ where
             tn_datadir,
             primary_network_handle: None,
             worker_network_handle: None,
-            worker_network_addr: None,
             key_config,
             node_shutdown,
             consensus_output,
@@ -1109,8 +1106,6 @@ where
             let mut backoff = 1;
 
             debug!(target: "epoch-manager", ?bls_pubkey, "dialing peer");
-
-            debug!(target: "epoch-manager", ?bls_pubkey, "peer not connected - dialing peer");
             while let Err(e) = handle.dial_by_bls(bls_pubkey).await {
                 // ignore errors for peers that are already connected or being dialed
                 if matches!(e, NetworkError::AlreadyConnected(_))
@@ -1119,7 +1114,7 @@ where
                     return;
                 }
 
-                tracing::warn!(target: "epoch-manager", "failed to dial {bls_pubkey}: {e}");
+                warn!(target: "epoch-manager", "failed to dial {bls_pubkey}: {e}");
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                 if backoff < 120 {
                     backoff += backoff;
@@ -1153,7 +1148,6 @@ where
         // start listening if the network needs to be initialized
         if *initial_epoch {
             let worker_address = consensus_config.worker_address();
-            self.worker_network_addr = Some(worker_address.clone());
             network_handle.inner_handle().start_listening(worker_address).await?;
             // Make sure we at least hove bootstrap peers on first epoch.
             network_handle
@@ -1169,8 +1163,7 @@ where
                 .await?;
         }
 
-        let worker_address =
-            self.worker_network_addr.clone().expect("worker address set at this point");
+        let worker_address = consensus_config.worker_address();
 
         // always attempt to dial peers for the new epoch
         // the network's peer manager will intercept dial attempts for peers that are already

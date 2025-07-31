@@ -109,7 +109,7 @@ where
     /// Evaluate request to possibly issue a vote in support of peer's header.
     pub(crate) async fn vote(
         &self,
-        peer: Option<BlsPublicKey>,
+        peer: BlsPublicKey,
         header: Header,
         parents: Vec<Certificate>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
@@ -131,21 +131,19 @@ where
             .certificates_in_votes
             .inc_by(num_parents as u64);
 
-        if let Some(peer) = peer {
-            let committee_peer = header.author.clone();
-            ensure!(
-                self.consensus_config.in_committee(&committee_peer),
-                HeaderError::UnknownNetworkKey(Box::new(peer)).into()
-            );
-            let auth_id: AuthorityIdentifier = peer.into();
-            if let Some(auth) = self.consensus_config.committee().authority(&committee_peer) {
-                // We err on the side of caution here, if auths peer id is not known fail but we
-                // should know it (got a vote request from them).
-                ensure!(auth_id == auth.id(), HeaderError::PeerNotAuthor.into());
-            } else {
-                // The committee check above passed so this should not happen, but just in case.
-                return Err(HeaderError::UnknownNetworkKey(Box::new(peer)).into());
-            }
+        let committee_peer = header.author.clone();
+        ensure!(
+            self.consensus_config.in_committee(&committee_peer),
+            HeaderError::UnknownNetworkKey(Box::new(peer)).into()
+        );
+        let auth_id: AuthorityIdentifier = peer.into();
+        if let Some(auth) = self.consensus_config.committee().authority(&committee_peer) {
+            // We err on the side of caution here, if auths peer id is not known fail but we
+            // should know it (got a vote request from them).
+            ensure!(auth_id == auth.id(), HeaderError::PeerNotAuthor.into());
+        } else {
+            // The committee check above passed so this should not happen, but just in case.
+            return Err(HeaderError::UnknownNetworkKey(Box::new(peer)).into());
         }
 
         // if peer is ahead, wait for execution to catch up
