@@ -609,7 +609,7 @@ where
             }
             NetworkCommand::SendRequest { peer, request, reply } => {
                 if let Some((peer, addr)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
-                    debug!(target = "network", "trying to send to {peer} at {addr:?}");
+                    debug!(target: "network", "trying to send to {peer} at {addr:?}");
                     let request_id = self
                         .swarm
                         .behaviour_mut()

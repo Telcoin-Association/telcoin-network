@@ -562,31 +562,6 @@ where
         self.sender.send(NetworkCommand::FindAuthorities { requests }).await?;
         Ok(results)
     }
-
-    /*
-    /// Return network information for authorities by bls pubkey on kad.
-    /// This only returns the authority if it is stored in local DB- i.e. will return fast.
-    pub async fn find_authority_in_db(
-        &self,
-        bls_key: BlsPublicKey,
-    ) -> NetworkResult<(BlsPublicKey, NetworkInfo)> {
-        let (reply, rx) = oneshot::channel();
-        // create the request
-        let request = AuthorityInfoRequest { bls_key, reply };
-
-        self.sender.send(NetworkCommand::FindCachedAuthority { request }).await?;
-        rx.await?
-    }
-
-    /// Return bls public key for a peer id if cached locally.
-    /// This only returns the bls key if it is stored in local DB- i.e. will return fast.
-    pub async fn find_peer_in_db(&self, peer_id: PeerId) -> NetworkResult<BlsPublicKey> {
-        let (reply, rx) = oneshot::channel();
-        // create the request
-
-        self.sender.send(NetworkCommand::FindLocalPeer { peer_id, reply }).await?;
-        rx.await?
-    }*/
 }
 
 /// List of addresses for a node, signature will be the nodes BLS signature
