@@ -267,10 +267,3 @@ backoff = { version = "0.4.0", features = [
 libp2p = { git = "https://github.com/Telcoin-Association/rust-libp2p", rev = "7c2c28a186f6d22bcc4f21cfefc2b53122a53a47" }
 bs58 = { version = "0.5.1" }
 blake3 = { version = "1.8.2" }
-
-# On a panic, end entire app not just a thread.
-[profile.release]
-panic = 'abort'
-
-[profile.dev]
-panic = 'abort'
