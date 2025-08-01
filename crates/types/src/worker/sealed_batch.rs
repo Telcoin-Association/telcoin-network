@@ -269,4 +269,7 @@ pub enum BatchValidationError {
     /// Error, wrong worker id.
     #[error("Invalid worker id, expected {expected_worker_id} got {worker_id}")]
     InvalidWorkerId { expected_worker_id: WorkerId, worker_id: WorkerId },
+    /// The batch contains blob transactions EIP-4844.
+    #[error("Proposed batch contains blob transaction. Tx hash: {0}")]
+    InvalidTx4844(BlockHash),
 }

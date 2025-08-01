@@ -291,7 +291,7 @@ impl Future for BatchBuilder {
                         this.pool.update_canonical_state(
                             &this.last_canonical_update,
                             base_fee_per_gas,
-                            None,
+                            Some(u128::MAX), // set max fee for blobs
                             mined_transactions,
                             vec![],
                         );

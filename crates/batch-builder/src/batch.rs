@@ -6,7 +6,7 @@
 //!
 //! The mined transactions are returned with the built block so the worker can update the pool.
 
-use tn_reth::TxPool;
+use tn_reth::{TxPool, TxnSize};
 use tn_types::{
     max_batch_gas, max_batch_size, now, Batch, BatchBuilderArgs, Encodable2718 as _,
     PendingBatchConfig, TransactionTrait as _, TxHash, WorkerId,
@@ -48,7 +48,7 @@ pub fn build_batch<P: TxPool>(
     worker_id: WorkerId,
     base_fee: u64,
 ) -> BatchBuilderOutput {
-    let BatchBuilderArgs { pool, batch_config } = args;
+    let BatchBuilderArgs { mut pool, batch_config } = args;
     let gas_limit = max_batch_gas(batch_config.parent_info.timestamp);
     let max_size = max_batch_size(batch_config.parent_info.timestamp);
     let base_fee_per_gas = Some(base_fee);
@@ -67,12 +67,11 @@ pub fn build_batch<P: TxPool>(
     let mut total_possible_gas = 0;
     let mut transactions = Vec::new();
     let mut mined_transactions = Vec::new();
+    let mut blob_transactions = Vec::new();
 
     // begin loop through sorted "best" transactions in pending pool
     // and execute them to build the block
     while let Some(pool_tx) = best_txs.next() {
-        // filter best transactions against Arc<hashset<TxHash>>
-
         // ensure block has capacity (in gas) for this transaction
         if total_possible_gas + pool_tx.gas_limit() > gas_limit {
             // the tx could exceed max gas limit for the block
@@ -89,7 +88,14 @@ pub fn build_batch<P: TxPool>(
         // NOTE: `ValidPoolTransaction::size()` is private
         let tx = pool_tx.to_consensus();
 
-        use tn_reth::TxnSize;
+        // ignore blob transactions EIP-4844
+        if tx.is_eip4844() {
+            best_txs.ignore_eip4844(&pool_tx);
+            debug!(target: "worker::batch_builder", ?pool_tx, "marking eip4844 tx invalid");
+            blob_transactions.push(*tx.hash());
+            continue;
+        }
+
         // ensure block has capacity (in bytes) for this transaction
         if total_bytes_size + tx.size() > max_size {
             // the tx could exceed max gas limit for the block
@@ -130,6 +136,9 @@ pub fn build_batch<P: TxPool>(
         worker_id,
         received_at: None,
     };
+
+    // remove any blob transactions that were submitted
+    pool.remove_eip4844_txs(blob_transactions);
 
     // return output
     BatchBuilderOutput { batch, mined_transactions }
