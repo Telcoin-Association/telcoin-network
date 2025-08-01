@@ -160,7 +160,13 @@ async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
         CONSENSUS_REGISTRY_JSON,
         Some("deployedBytecode.object"),
     )?;
-    let registry_deployed_bytecode = json_val.as_str().ok_or_eyre("Couldn't fetch bytecode")?;
+    let unlinked_runtimecode = json_val.as_str().ok_or_eyre("Couldn't fetch bytecode")?;
+    let tao_address_binding = RethEnv::fetch_value_from_json_str(DEPLOYMENTS_JSON, Some("Safe"))?;
+    let tao_address =
+        Address::from_hex(tao_address_binding.as_str().ok_or_eyre("Safe owner address")?)?;
+    let blsg1_address = tao_address.create(0).to_string();
+    let registry_deployed_bytecode =
+        RethEnv::link_solidity_library(unlinked_runtimecode, &blsg1_address)?;
 
     // spawn testnet for RPC calls
     let temp_path =
@@ -185,7 +191,7 @@ async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
         .expect("Failed to fetch registry impl bytecode");
 
     // trim `0x` prefix
-    assert_eq!(&returned_impl_code, registry_deployed_bytecode);
+    assert_eq!(Bytes::from_hex(&returned_impl_code)?, Bytes::from(registry_deployed_bytecode));
 
     let tx_factory = TransactionFactory::default();
     let signer = tx_factory.get_default_signer().expect("failed to fetch signer");

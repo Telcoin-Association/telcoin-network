@@ -11824,7 +11824,6 @@ dependencies = [
  "consensus-metrics",
  "eyre",
  "jsonrpsee",
- "prometheus",
  "state-sync",
  "thiserror 1.0.69",
  "tn-batch-builder",

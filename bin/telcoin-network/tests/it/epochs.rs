@@ -350,8 +350,13 @@ fn generate_new_validator_txs(
     );
 
     // stake tx
+    let proof = ConsensusRegistry::ProofOfPossession {
+        uncompressedPubkey: new_validator_info.bls_public_key.serialize().into(),
+        uncompressedSignature: new_validator_info.proof_of_possession.serialize().into(),
+    };
     let calldata = ConsensusRegistry::stakeCall {
         blsPubkey: new_validator_info.bls_public_key.compress().into(),
+        proofOfPossession: proof,
     }
     .abi_encode()
     .into();

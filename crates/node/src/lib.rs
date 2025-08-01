@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Library for managing all components used by a full-node in a single process.
+// Library for managing all components used by a full-node in a single process.
 
 #![warn(unused_crate_dependencies)]
 
