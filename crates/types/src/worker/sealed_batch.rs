@@ -76,8 +76,8 @@ pub struct Batch {
     /// (batch gas limit divided by elasticity multiplier) of parent batch.
     /// The algorithm results in the base fee per gas increasing when batchs are
     /// above the gas target, and decreasing when batchs are below the gas target. The base fee per
-    /// gas is burned.
-    pub base_fee_per_gas: Option<u64>,
+    /// gas is sent to governance address.
+    pub base_fee_per_gas: u64,
     /// The worker id for the worker that orginated this batch.
     /// Worker ids will be consistent accross validators (i.e. worker 0 talks to othere worker 0s,
     /// etc). We can use this for tracking to support base fee calculations.
@@ -105,7 +105,7 @@ impl Batch {
             parent_hash: header.parent_hash,
             beneficiary: header.beneficiary,
             timestamp: header.timestamp,
-            base_fee_per_gas: header.base_fee_per_gas,
+            base_fee_per_gas: header.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE),
             worker_id,
             received_at: None,
         }
@@ -179,7 +179,7 @@ impl Default for Batch {
             beneficiary: Address::ZERO,
             timestamp: now(),
             worker_id: 0,
-            base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
+            base_fee_per_gas: MIN_PROTOCOL_BASE_FEE,
         }
     }
 }

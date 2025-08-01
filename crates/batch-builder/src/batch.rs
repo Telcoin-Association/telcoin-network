@@ -51,7 +51,7 @@ pub fn build_batch<P: TxPool>(
     let BatchBuilderArgs { mut pool, batch_config } = args;
     let gas_limit = max_batch_gas(batch_config.parent_info.timestamp);
     let max_size = max_batch_size(batch_config.parent_info.timestamp);
-    let base_fee_per_gas = Some(base_fee);
+    let base_fee_per_gas = base_fee;
     let PendingBatchConfig { beneficiary, parent_info } = batch_config;
 
     // NOTE: this obtains a `read` lock on the tx pool

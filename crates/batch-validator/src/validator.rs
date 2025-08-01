@@ -193,14 +193,13 @@ impl BatchValidator {
     }
 
     /// Validate the block's basefee
-    fn validate_basefee(&self, base_fee: Option<u64>) -> BatchValidationResult<()> {
-        if let Some(base_fee) = base_fee {
-            let expected_base_fee = self.base_fee.base_fee();
-            if base_fee != expected_base_fee {
-                return Err(BatchValidationError::InvalidBaseFee { expected_base_fee, base_fee });
-            }
+    fn validate_basefee(&self, base_fee: u64) -> BatchValidationResult<()> {
+        let expected_base_fee = self.base_fee.base_fee();
+        if base_fee != expected_base_fee {
+            Err(BatchValidationError::InvalidBaseFee { expected_base_fee, base_fee })
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
     /// Validate the block's basefee
@@ -293,7 +292,7 @@ mod tests {
             parent_hash: genesis_hash,
             beneficiary: Address::ZERO,
             timestamp,
-            base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
+            base_fee_per_gas: MIN_PROTOCOL_BASE_FEE,
             worker_id: 0,
             received_at: None,
         };
@@ -562,6 +561,30 @@ mod tests {
         assert_matches!(
             validator.validate_batch(batch.clone().seal_slow()),
             Err(BatchValidationError::RecoverTransaction(_, _))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_batch_base_fee_for_gas() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
+        // Note validator will use MIN_PROROCOL_BASE_FEE.
+        let (mut batch, _) = valid_batch.split();
+
+        assert_matches!(validator.validate_batch(batch.clone().seal_slow()), Ok(()));
+
+        batch.base_fee_per_gas = 0;
+        assert_matches!(
+            validator.validate_batch(batch.clone().seal_slow()),
+            Err(BatchValidationError::InvalidBaseFee { expected_base_fee: _, base_fee: _ })
+        );
+
+        let badfee = MIN_PROTOCOL_BASE_FEE * 100;
+        batch.base_fee_per_gas = badfee;
+        assert_matches!(
+            validator.validate_batch(batch.clone().seal_slow()),
+            Err(BatchValidationError::InvalidBaseFee { expected_base_fee: _, base_fee: _ })
         );
     }
 

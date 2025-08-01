@@ -379,7 +379,7 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
 
         // update basefee and set beneficiary
         batch.beneficiary = Address::random();
-        batch.base_fee_per_gas = Some(inc_base_fee);
+        batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the block now
         execute_test_batch(batch, &parent);
@@ -395,7 +395,7 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
 
         // update basefee and set beneficiary
         batch.beneficiary = Address::random();
-        batch.base_fee_per_gas = Some(inc_base_fee);
+        batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the block now
         execute_test_batch(batch, &parent);
@@ -695,7 +695,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
 
         // update basefee and set beneficiary
         batch.beneficiary = Address::random();
-        batch.base_fee_per_gas = Some(inc_base_fee);
+        batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the block now
         execute_test_batch(batch, &parent);
@@ -711,7 +711,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
 
         // update basefee and set beneficiary
         batch.beneficiary = Address::random();
-        batch.base_fee_per_gas = Some(inc_base_fee);
+        batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the block now
         execute_test_batch(batch, &parent);
@@ -1016,7 +1016,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
 
         // update basefee and set beneficiary
         batch.beneficiary = Address::random();
-        batch.base_fee_per_gas = Some(inc_base_fee);
+        batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the block now
         execute_test_batch(batch, &parent);
@@ -1032,7 +1032,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
 
         // update basefee and set beneficiary
         batch.beneficiary = Address::random();
-        batch.base_fee_per_gas = Some(inc_base_fee);
+        batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the block now
         execute_test_batch(batch, &parent);
