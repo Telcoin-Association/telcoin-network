@@ -1,8 +1,6 @@
 //! Implement an abstraction around the Reth transaction pool.
 //! This should insolate from shifting Reth internals, etc.
 
-use std::{sync::Arc, time::Instant};
-
 use futures::StreamExt as _;
 use reth::transaction_pool::{
     blobstore::DiskFileBlobStore, BlockInfo as RethBlockInfo, EthTransactionPool,
@@ -17,12 +15,13 @@ use reth_provider::{
 };
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
-    error::{InvalidPoolTransactionError, PoolError},
+    error::{Eip4844PoolTransactionError, InvalidPoolTransactionError, PoolError},
     identifier::TransactionId,
     BestTransactions, CanonicalStateUpdate, EthPooledTransaction, PoolSize, PoolTransaction,
     PoolUpdateKind, TransactionEvents, TransactionOrigin, TransactionPool as _,
     TransactionPoolExt as _, ValidPoolTransaction,
 };
+use std::{sync::Arc, time::Instant};
 use tn_types::{
     Address, EnvKzgSettings, Recovered, SealedBlock, TaskSpawner, TransactionSigned, TxHash,
     MIN_PROTOCOL_BASE_FEE,
@@ -66,6 +65,8 @@ pub trait TxPool {
     fn best_transactions(&self) -> BestTxns;
     /// Return the pending txn base fee.
     fn get_pending_base_fee(&self) -> u64;
+    /// Remove EIP-4844 blob transactions from the pool and delete the sidecars from blob store.
+    fn remove_eip4844_txs(&mut self, blobs: Vec<TxHash>);
 }
 
 /// A telcoin network transaction pool.
@@ -208,7 +209,7 @@ impl WorkerTxPool {
         self.update_canonical_state(
             tip.sealed_block(),
             base_fee_per_gas,
-            None,
+            Some(u128::MAX), // set max fee for blobs
             mined_transactions,
             changed_accounts,
         );
@@ -287,6 +288,11 @@ impl TxPool for WorkerTxPool {
         // for now, always use lowest base fee possible
         MIN_PROTOCOL_BASE_FEE
     }
+
+    fn remove_eip4844_txs(&mut self, blobs: Vec<TxHash>) {
+        self.0.remove_transactions_and_descendants(blobs.clone());
+        self.0.delete_blobs(blobs);
+    }
 }
 
 /// An iterator that produces the best transactions from a pool.
@@ -316,10 +322,18 @@ impl BestTxns {
         );
     }
 
-    /// When the best transactions are to large for a batch notify the pool.
+    /// When the best transactions are too large for a batch notify the pool.
     pub fn max_batch_size(&mut self, pool_tx: &Arc<PoolTxn>, tx_size: usize, max_size: usize) {
         self.inner
             .mark_invalid(pool_tx, InvalidPoolTransactionError::OversizedData(tx_size, max_size));
+    }
+
+    /// Mark the EIP-4844 transaction as invalid.
+    pub fn ignore_eip4844(&mut self, pool_tx: &Arc<PoolTxn>) {
+        self.inner.mark_invalid(
+            pool_tx,
+            InvalidPoolTransactionError::Eip4844(Eip4844PoolTransactionError::NoEip4844Blobs),
+        );
     }
 }
 

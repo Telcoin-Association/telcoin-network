@@ -1,26 +1,38 @@
 //! Transaction factory to create legit transactions for execution.
 
-use crate::{recover_raw_transaction, RethEnv, WorkerTxPool};
-use alloy::{consensus::SignableTransaction as _, signers::local::PrivateKeySigner};
-use reth_chainspec::ChainSpec as RethChainSpec;
+use crate::{error::TnRethResult, recover_raw_transaction, RethEnv, WorkerTxPool};
+use alloy::{
+    consensus::{SignableTransaction as _, TxEip4844, TxEip4844Variant},
+    eips::eip7594::BlobTransactionSidecarVariant,
+    hex,
+    primitives::ChainId,
+    signers::{
+        k256::sha2::{Digest as _, Sha256},
+        local::PrivateKeySigner,
+    },
+};
+use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
 use reth_evm::{execute::Executor as _, ConfigureEvm};
 use reth_primitives::sign_message;
 use reth_primitives_traits::SignerRecoverable;
+use reth_provider::{StateProviderBox, StateProviderFactory};
 use reth_revm::{database::StateProviderDatabase, db::BundleState};
-use reth_transaction_pool::{EthPooledTransaction, PoolTransaction};
+use reth_transaction_pool::{EthPoolTransaction, EthPooledTransaction, PoolTransaction};
 use secp256k1::{
     rand::{rngs::StdRng, Rng, SeedableRng as _},
     Secp256k1,
 };
 use std::{path::Path, str::FromStr, sync::Arc};
 use tn_types::{
-    calculate_transaction_root, keccak256, now, test_chain_spec_arc, test_genesis, AccessList,
-    Address, Batch, Block, BlockBody, Bytes, Encodable2718, EthSignature, ExecHeader,
-    ExecutionKeypair, Genesis, GenesisAccount, RecoveredBlock, SealedHeader, TaskManager,
-    Transaction, TransactionSigned, TxEip1559, TxHash, TxKind, WorkerId, B256,
-    EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT_30M,
-    MIN_PROTOCOL_BASE_FEE, U256,
+    address, calculate_transaction_root, keccak256, now, test_chain_spec_arc, test_genesis,
+    AccessList, Address, Batch, BlobTransactionSidecar, Block, BlockBody, BlockHash, Bytes,
+    Encodable2718, EthSignature, ExecHeader, ExecutionKeypair, Genesis, GenesisAccount,
+    RecoveredBlock, SealedHeader, TaskManager, Transaction, TransactionSigned, TxEip1559, TxHash,
+    TxKind, WorkerId, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS,
+    ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE, U256,
 };
+// re-export for engine tests
+pub use alloy::eips::{eip2935::HISTORY_STORAGE_ADDRESS, eip4788::BEACON_ROOTS_ADDRESS};
 
 // methods for tests
 impl RethEnv {
@@ -30,6 +42,11 @@ impl RethEnv {
         task_manager: &TaskManager,
     ) -> eyre::Result<Self> {
         Self::new_for_temp_chain(test_chain_spec_arc(), db_path, task_manager)
+    }
+
+    /// Retrieve the state at the provided block hash.
+    pub fn state_by_block_hash(&self, hash: BlockHash) -> TnRethResult<StateProviderBox> {
+        Ok(self.blockchain_provider.state_by_block_hash(hash)?)
     }
 
     /// Test utility to execute batch and return execution outcome.
@@ -60,10 +77,10 @@ impl RethEnv {
             mix_hash: B256::random(),
             nonce: 0_u64.into(),
             base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
-            blob_gas_used: None,
-            excess_blob_gas: None,
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
             extra_data: Default::default(),
-            parent_beacon_block_root: None,
+            parent_beacon_block_root: Some(B256::ZERO),
             requests_hash: None,
         };
 
@@ -220,6 +237,91 @@ impl TransactionFactory {
         self.inc_nonce();
 
         TransactionSigned::new_unhashed(transaction, signature)
+    }
+
+    /// Create a signed EIP4844 transaction using empty bytes.
+    pub fn create_eip4844(
+        &mut self,
+        chain_id: ChainId,
+        gas_limit: Option<u64>,
+        gas_price: u128,
+        blob_versioned_hashes: Vec<B256>,
+    ) -> TransactionSigned {
+        let gas_limit = gas_limit.unwrap_or(1_000_000);
+
+        // blob transaction
+        let tx = TxEip4844 {
+            chain_id,
+            nonce: self.nonce,
+            max_priority_fee_per_gas: 0,
+            max_fee_per_gas: gas_price,
+            gas_limit,
+            to: address!("a8cb082a5a689e0d594d7da1e2d72a3d63adc1bd"),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            access_list: Default::default(),
+            blob_versioned_hashes,
+            max_fee_per_blob_gas: 1,
+        };
+        let variant = TxEip4844Variant::<BlobTransactionSidecar>::TxEip4844(tx);
+        let tx_signature_hash = variant.signature_hash();
+
+        // construct transaction and sign
+        let signature = self.sign_hash(tx_signature_hash);
+
+        // increase nonce for next tx
+        self.inc_nonce();
+
+        TransactionSigned::new_unhashed(variant.into(), signature)
+    }
+
+    /// Create and sign an EIP4844 transaction.
+    pub async fn create_and_submit_eip4844(
+        &mut self,
+        chain: Arc<RethChainSpec>,
+        gas_limit: Option<u64>,
+        gas_price: u128,
+        pool: WorkerTxPool,
+    ) -> TxHash {
+        // Use the "zero blob" - a blob filled with zeros
+        // This has known valid KZG commitments and proofs
+        let blob_data = [0u8; 131072]; // 128KB of zeros
+
+        // Known valid KZG commitment for zero blob (from consensus tests)
+        let commitment: [u8; 48] = hex::decode("c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
+            .expect("valid hex commitment").try_into().expect("valid commitment length");
+
+        // Known valid KZG proof for zero blob (from consensus tests)
+        let proof: [u8; 48] = hex::decode("c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
+            .expect("valid hex proof").try_into().expect("valid proof length");
+
+        // Compute the versioned hash from the commitment
+        // EIP-4844: versioned_hash = 0x01 + sha256(commitment)[1:]
+        let mut hasher = Sha256::new();
+        hasher.update(commitment);
+        let commitment_hash = hasher.finalize();
+        let mut versioned_hash = [0u8; 32];
+        versioned_hash[0] = 0x01; // Version byte for KZG commitments
+        versioned_hash[1..].copy_from_slice(&commitment_hash[1..]);
+
+        // dummy blob data - not used anywhere
+        let sidecar = BlobTransactionSidecar {
+            blobs: vec![blob_data.into()],
+            commitments: vec![commitment.into()],
+            proofs: vec![proof.into()],
+        };
+        let sidecar: BlobTransactionSidecarVariant =
+            BlobTransactionSidecarVariant::Eip4844(sidecar);
+
+        // construct transaction, sign, and submit to pool
+        let blob_versioned_hashes = vec![versioned_hash.into()]; // use computed hash
+        let signed_tx =
+            self.create_eip4844(chain.chain_id(), gas_limit, gas_price, blob_versioned_hashes);
+        let recovered = signed_tx.try_into_recovered().expect("recovered tx");
+        let pooled_tx = EthPooledTransaction::try_from_eip4844(recovered, sidecar)
+            .expect("recovered into eth pooled tx");
+        let hash = pool.add_transaction_local(pooled_tx).await.expect("recovered tx added to pool");
+        hash
     }
 
     /// Create and sign an EIP1559 transaction with all possible parameters passed.

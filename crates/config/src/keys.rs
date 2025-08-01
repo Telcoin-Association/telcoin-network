@@ -15,6 +15,11 @@ use tn_types::{
     Signer,
 };
 
+/// The work factor for PBKDF2 is implemented through an iteration count, which is based on the
+/// internal hashing algorithm used. HMAC-SHA-256 is widely supported and is recommended by NIST.
+/// OWASP recommends 600,000 iterations for PBKDF2-HMAC-SHA256.
+const PBKDF2_HMAC_ROUNDS: u32 = 1_000_000;
+
 #[derive(Debug)]
 struct KeyConfigInner {
     // DO NOT expose the private key to other code.  Tests that need this will provide a primary
@@ -53,7 +58,12 @@ impl KeyConfig {
         let mut nonce_bytes = [0_u8; 12];
         rand::rng().fill(&mut nonce_bytes);
         let mut passphrase_bytes = [0_u8; 32];
-        pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), &salt, 1_000, &mut passphrase_bytes);
+        pbkdf2_hmac::<Sha256>(
+            passphrase.as_bytes(),
+            &salt,
+            PBKDF2_HMAC_ROUNDS,
+            &mut passphrase_bytes,
+        );
         let key = Key::<Aes256GcmSiv>::from_slice(&passphrase_bytes);
         let cipher = Aes256GcmSiv::new(key);
         let nonce = Nonce::from_slice(&nonce_bytes); // 96-bits
@@ -69,7 +79,12 @@ impl KeyConfig {
     /// key.
     fn unwrap_bls_key(bytes: &[u8], passphrase: &str) -> eyre::Result<BlsKeypair> {
         let mut passphrase_bytes = [0_u8; 32];
-        pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), &bytes[0..12], 1_000, &mut passphrase_bytes);
+        pbkdf2_hmac::<Sha256>(
+            passphrase.as_bytes(),
+            &bytes[0..12],
+            PBKDF2_HMAC_ROUNDS,
+            &mut passphrase_bytes,
+        );
         let nonce = Nonce::from_slice(&bytes[12..24]); // 96-bits
         let key = Key::<Aes256GcmSiv>::from_slice(&passphrase_bytes);
         let cipher = Aes256GcmSiv::new(key);

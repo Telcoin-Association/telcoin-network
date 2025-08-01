@@ -115,7 +115,8 @@ use traits::{TNPrimitives, TelcoinNode};
 // Reth stuff we are just re-exporting.  Need to reduce this over time.
 pub use alloy::primitives::FixedBytes;
 pub use reth::{
-    chainspec::chain_value_parser, dirs::MaybePlatformPath, rpc::builder::RpcServerHandle,
+    chainspec::chain_value_parser, dirs::MaybePlatformPath, payload::BlobSidecars,
+    rpc::builder::RpcServerHandle,
 };
 pub use reth_chain_state::{
     CanonicalInMemoryState, ExecutedBlockWithTrieUpdates, NewCanonicalChain,
@@ -134,7 +135,7 @@ pub use reth_tracing::FileWorkerGuard;
 pub use reth_transaction_pool::{
     error::{InvalidPoolTransactionError, PoolError, PoolTransactionError},
     identifier::SenderIdentifiers,
-    BestTransactions, EthPooledTransaction,
+    BestTransactions, EthPooledTransaction, TransactionPool as TransactionPoolT,
 };
 
 pub mod dirs;
