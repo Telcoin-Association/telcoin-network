@@ -18,7 +18,7 @@ fn test_empty_certificate_verification() {
 
     let certificate =
         Certificate::new_unsigned_for_test(&committee, header, votes).expect("new unsigned cert");
-    assert!(certificate.verify(&committee, &fixture.worker_cache()).is_err());
+    assert!(certificate.verify(&committee).is_err());
 }
 
 #[test]
@@ -36,7 +36,7 @@ fn test_valid_certificate_verification() {
     }
 
     let certificate = Certificate::new_unverified(&committee, header, signatures).unwrap();
-    let verified_certificate = certificate.verify(&committee, &fixture.worker_cache());
+    let verified_certificate = certificate.verify(&committee);
 
     assert!(verified_certificate.is_ok());
     assert!(matches!(
@@ -63,7 +63,7 @@ fn test_certificate_insufficient_signatures() {
 
     let certificate = Certificate::new_unsigned_for_test(&committee, header, signatures).unwrap();
 
-    assert!(certificate.verify(&committee, &fixture.worker_cache()).is_err());
+    assert!(certificate.verify(&committee).is_err());
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn test_certificate_validly_repeated_public_keys() {
     assert!(certificate_res.is_ok());
     let certificate = certificate_res.unwrap();
 
-    assert!(certificate.verify(&committee, &fixture.worker_cache()).is_ok());
+    assert!(certificate.verify(&committee).is_ok());
 }
 
 #[test]
@@ -136,7 +136,7 @@ proptest::proptest! {
         let certificate = Certificate::new_unverified(&committee, header, signatures).unwrap();
 
         assert!(certificate
-            .verify(&committee, &fixture.worker_cache())
+            .verify(&committee)
             .is_ok());
     }
 }

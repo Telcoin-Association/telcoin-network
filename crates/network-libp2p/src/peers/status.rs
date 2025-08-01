@@ -7,7 +7,7 @@ use libp2p::Multiaddr;
 use std::time::Instant;
 
 /// Connection status of the peer.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Copy, Clone, Default)]
 pub(super) enum ConnectionStatus {
     /// The peer is connected.
     Connected {

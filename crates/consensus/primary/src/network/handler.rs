@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::{GossipMessage, PeerId};
+use tn_network_libp2p::GossipMessage;
 use tn_storage::{
     tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
     VoteDigestStore,
@@ -22,7 +22,7 @@ use tn_storage::{
 use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
-    now, try_decode, AuthorityIdentifier, BlockHash, Certificate, CertificateDigest,
+    now, try_decode, AuthorityIdentifier, BlockHash, BlsPublicKey, Certificate, CertificateDigest,
     ConsensusHeader, Database, Hash as _, Header, Round, SignatureVerificationState, Vote,
 };
 use tracing::{debug, error, warn};
@@ -88,7 +88,7 @@ where
     /// Evaluate request to possibly issue a vote in support of peer's header.
     pub(crate) async fn vote(
         &self,
-        peer: PeerId,
+        peer: BlsPublicKey,
         header: Header,
         parents: Vec<Certificate>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
@@ -96,7 +96,7 @@ where
         let committee = self.consensus_config.committee();
 
         // validate header
-        header.validate(committee, self.consensus_config.worker_cache())?;
+        header.validate(committee)?;
 
         // validate parents
         let num_parents = parents.len();
@@ -110,12 +110,20 @@ where
             .certificates_in_votes
             .inc_by(num_parents as u64);
 
-        let committee_peer: AuthorityIdentifier = peer.into();
+        let committee_peer = header.author.clone();
         ensure!(
             self.consensus_config.in_committee(&committee_peer),
-            HeaderError::UnknownNetworkKey(peer).into()
+            HeaderError::UnknownNetworkKey(Box::new(peer)).into()
         );
-        ensure!(header.author() == &committee_peer, HeaderError::PeerNotAuthor.into());
+        let auth_id: AuthorityIdentifier = peer.into();
+        if let Some(auth) = self.consensus_config.committee().authority(&committee_peer) {
+            // We err on the side of caution here, if auths peer id is not known fail but we
+            // should know it (got a vote request from them).
+            ensure!(auth_id == auth.id(), HeaderError::PeerNotAuthor.into());
+        } else {
+            // The committee check above passed so this should not happen, but just in case.
+            return Err(HeaderError::UnknownNetworkKey(Box::new(peer)).into());
+        }
 
         // if peer is ahead, wait for execution to catch up
         // NOTE: this doesn't hurt since this node shouldn't vote until execution is caught up

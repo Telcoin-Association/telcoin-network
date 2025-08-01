@@ -19,8 +19,8 @@ use tn_reth::{
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    Address, BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, SealedHeader,
-    TaskSpawner, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
+    Address, BatchSender, BatchValidation, BlsPublicKey, ConsensusOutput, ExecHeader, Noticer,
+    SealedHeader, TaskSpawner, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
@@ -338,5 +338,15 @@ impl ExecutionNodeInner {
     /// Read [EpochState] from the canonical tip.
     pub fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
         self.reth_env.epoch_state_from_canonical_tip()
+    }
+
+    /// Read committee validator keys for epoch.
+    pub fn validators_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<BlsPublicKey>> {
+        Ok(self
+            .reth_env
+            .validators_for_epoch(epoch)?
+            .iter()
+            .filter_map(|v| BlsPublicKey::from_literal_bytes(v.blsPubkey.as_ref()).ok())
+            .collect())
     }
 }

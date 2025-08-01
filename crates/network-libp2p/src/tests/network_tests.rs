@@ -172,7 +172,7 @@ where
 }
 
 #[tokio::test]
-async fn test_valid_req_res() -> eyre::Result<()> {
+async fn test_valid_req_restt() -> eyre::Result<()> {
     // start honest peer1 network
     let TestTypes { peer1, peer2, .. } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
@@ -193,18 +193,8 @@ async fn test_valid_req_res() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    peer1
-        .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
-    peer2
-        .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
-    let peer2_id = peer2.local_peer_id().await?;
-    let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
+    peer1.start_listening(config_1.primary_address()).await?;
+    peer2.start_listening(config_2.primary_address()).await?;
 
     let missing_block = fixture_batch_with_transactions(3).seal_slow();
     let digests = vec![missing_block.digest()];
@@ -212,11 +202,22 @@ async fn test_valid_req_res() -> eyre::Result<()> {
     let batch_res = TestWorkerResponse::MissingBatches { batches: vec![missing_block] };
 
     // dial peer2
-    peer1.dial(peer2_id, peer2_addr).await?;
+    peer1
+        .add_explicit_peer(
+            config_2.key_config().primary_public_key(),
+            config_2.primary_networkkey(),
+            config_2.primary_address(),
+        )
+        .await?;
+    peer1.dial_by_bls(config_2.key_config().primary_public_key()).await?;
+
+    // Wait a beat for peer2 to recieve peer1 bls key.
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // send request and wait for response
     let max_time = Duration::from_secs(5);
-    let response_from_peer = peer1.send_request(batch_req.clone(), peer2_id).await?;
+    let response_from_peer =
+        peer1.send_request(batch_req.clone(), config_2.key_config().primary_public_key()).await?;
     let event =
         timeout(max_time, network_events_2.recv()).await?.expect("first network event received");
 
@@ -254,39 +255,37 @@ async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    peer1
-        .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
-    peer2
-        .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
+    peer1.start_listening(config_1.primary_address()).await?;
+    peer2.start_listening(config_2.primary_address()).await?;
     let peer2_id = peer2.local_peer_id().await?;
-    let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
 
     let missing_block = fixture_batch_with_transactions(3).seal_slow();
     let digests = vec![missing_block.digest()];
     let batch_req = TestWorkerRequest::MissingBatches(digests);
 
     // dial peer2
-    peer1.dial(peer2_id, peer2_addr).await?;
+    peer1
+        .add_explicit_peer(
+            config_2.key_config().primary_public_key(),
+            config_2.primary_networkkey(),
+            config_2.primary_address(),
+        )
+        .await?;
+    peer1.dial_by_bls(config_2.key_config().primary_public_key()).await?;
 
     // expect no pending requests yet
     let count = peer1.get_pending_request_count().await?;
     assert_eq!(count, 0);
 
     // send request and wait for response
-    let _reply = peer1.send_request(batch_req.clone(), peer2_id).await?;
+    let _reply = peer1.send_request_direct(batch_req.clone(), peer2_id).await?;
 
     // peer1 has a pending_request now
     let count = peer1.get_pending_request_count().await?;
     assert_eq!(count, 1);
 
     // another sanity check
-    let connected_peers = peer1.connected_peers().await?;
+    let connected_peers = peer1.connected_peer_ids().await?;
     assert_eq!(connected_peers.len(), 1);
 
     // simulate crashed peer 2
@@ -297,7 +296,7 @@ async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // assert peer is disconnected
-    let connected_peers = peer1.connected_peers().await?;
+    let connected_peers = peer1.connected_peer_ids().await?;
     assert_eq!(connected_peers.len(), 0);
 
     // peer1 removes pending requests
@@ -329,25 +328,23 @@ async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    peer1
-        .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
-    peer2
-        .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
+    peer1.start_listening(config_1.primary_address()).await?;
+    peer2.start_listening(config_2.primary_address()).await?;
     let peer2_id = peer2.local_peer_id().await?;
-    let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
 
     let missing_block = fixture_batch_with_transactions(3).seal_slow();
     let digests = vec![missing_block.digest()];
     let batch_req = TestWorkerRequest::MissingBatches(digests);
 
     // dial peer2
-    peer1.dial(peer2_id, peer2_addr).await?;
+    peer1
+        .add_explicit_peer(
+            config_2.key_config().primary_public_key(),
+            config_2.primary_networkkey(),
+            config_2.primary_address(),
+        )
+        .await?;
+    peer1.dial_by_bls(config_2.key_config().primary_public_key()).await?;
 
     // expect no pending requests yet
     let count = peer1.get_pending_request_count().await?;
@@ -355,14 +352,14 @@ async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
 
     // send request and wait for response
     let max_time = Duration::from_secs(5);
-    let _response = peer1.send_request(batch_req.clone(), peer2_id).await?;
+    let _response = peer1.send_request_direct(batch_req.clone(), peer2_id).await?;
 
     // peer1 has a pending_request now
     let count = peer1.get_pending_request_count().await?;
     assert_eq!(count, 1);
 
     // another sanity check
-    let connected_peers = peer1.connected_peers().await?;
+    let connected_peers = peer1.connected_peer_ids().await?;
     assert_eq!(connected_peers.len(), 1);
 
     // wait for peer2 to receive req
@@ -408,21 +405,13 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    malicious_peer
-        .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
-    honest_peer
-        .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
+    malicious_peer.start_listening(config_1.primary_address()).await?;
+    honest_peer.start_listening(config_2.primary_address()).await?;
 
     let malicious_peer_id = malicious_peer.local_peer_id().await?;
     let honest_peer_id = honest_peer.local_peer_id().await?;
-    let honest_peer_addr =
-        honest_peer.listeners().await?.first().expect("honest_peer listen addr").clone();
+    let honest_peer_addr = config_2.primary_address();
+    let honest_peer_net = config_2.primary_networkkey();
 
     // this type already impl `TNMessage` but this could be incorrect message type
     let malicious_msg = TestPrimaryRequest::Vote {
@@ -431,7 +420,9 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
     };
 
     // dial honest peer
-    malicious_peer.dial(honest_peer_id, honest_peer_addr).await?;
+    let honest_bls = config_2.key_config().primary_public_key();
+    malicious_peer.add_explicit_peer(honest_bls, honest_peer_net, honest_peer_addr.clone()).await?;
+    malicious_peer.dial_by_bls(honest_bls).await?;
 
     // sleep for heartbeat
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
@@ -439,7 +430,7 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
     let peer_score_before_msg = honest_peer.peer_score(malicious_peer_id).await?.unwrap();
 
     // honest peer returns `OutboundFailure` error
-    let response_from_peer = malicious_peer.send_request(malicious_msg, honest_peer_id).await?;
+    let response_from_peer = malicious_peer.send_request(malicious_msg, honest_bls).await?;
     let res = timeout(Duration::from_secs(2), response_from_peer)
         .await?
         .expect("first network event received");
@@ -485,22 +476,20 @@ async fn test_outbound_failure_malicious_response() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    honest_peer
-        .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
-    malicious_peer
-        .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
+    honest_peer.start_listening(config_1.primary_address()).await?;
+    malicious_peer.start_listening(config_2.primary_address()).await?;
     let malicious_peer_id = malicious_peer.local_peer_id().await?;
     let malicious_peer_addr =
         malicious_peer.listeners().await?.first().expect("malicious_peer listen addr").clone();
 
     // dial malicious_peer
-    honest_peer.dial(malicious_peer_id, malicious_peer_addr).await?;
+    let mal_bls = config_2.key_config().primary_public_key();
+    honest_peer
+        .add_explicit_peer(mal_bls, config_2.primary_networkkey(), malicious_peer_addr.clone())
+        .await?;
+    honest_peer.dial_by_bls(mal_bls).await?;
+    // Wait a beat for malicious to recieve honest's bls key.
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // send request and wait for malicious response
     let max_time = Duration::from_secs(2);
@@ -509,7 +498,7 @@ async fn test_outbound_failure_malicious_response() -> eyre::Result<()> {
         parents: vec![Certificate::default()],
     };
     let response_from_peer =
-        honest_peer.send_request(honest_req.clone(), malicious_peer_id).await?;
+        honest_peer.send_request_direct(honest_req.clone(), malicious_peer_id).await?;
     let event =
         timeout(max_time, network_events_2.recv()).await?.expect("first network event received");
 
@@ -556,22 +545,20 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
     });
 
     // start swarm listening on default any address
-    cvv.start_listening(
-        config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
-    )
-    .await?;
-    nvv.start_listening(
-        config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
-    )
-    .await?;
-    let cvv_id = cvv.local_peer_id().await?;
+    cvv.start_listening(config_1.primary_address()).await?;
+    nvv.start_listening(config_2.primary_address()).await?;
     let cvv_addr = cvv.listeners().await?.first().expect("peer2 listen addr").clone();
 
     // subscribe
-    nvv.subscribe_with_publishers(TEST_TOPIC.into(), config_1.committee_peer_ids()).await?;
+    nvv.subscribe_with_publishers(TEST_TOPIC.into(), config_1.committee_pub_keys()).await?;
 
     // dial cvv
-    nvv.dial(cvv_id, cvv_addr).await?;
+    nvv.add_trusted_peer_and_dial(
+        config_1.key_config().primary_public_key(),
+        config_1.key_config().primary_network_public_key(),
+        cvv_addr,
+    )
+    .await?;
 
     // publish random block
     let random_block = fixture_batch_with_transactions(10);
@@ -622,22 +609,19 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     });
 
     // start swarm listening on default any address
-    cvv.start_listening(
-        config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
-    )
-    .await?;
-    nvv.start_listening(
-        config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
-    )
-    .await?;
-    let cvv_id = cvv.local_peer_id().await?;
-    let cvv_addr = cvv.listeners().await?.first().expect("peer2 listen addr").clone();
+    cvv.start_listening(config_1.primary_address()).await?;
+    nvv.start_listening(config_2.primary_address()).await?;
 
+    let target_peer_bls = config_1.key_config().primary_public_key();
+    let target_peer_net = config_1.primary_networkkey();
+    let cvv_id: PeerId = target_peer_net.clone().into();
+    let target_addr = config_1.primary_address();
+    nvv.add_explicit_peer(target_peer_bls, target_peer_net, target_addr).await?;
     // subscribe
-    nvv.subscribe_with_publishers(TEST_TOPIC.into(), config_1.committee_peer_ids()).await?;
+    nvv.subscribe_with_publishers(TEST_TOPIC.into(), config_1.committee_pub_keys()).await?;
 
     // dial cvv
-    nvv.dial(cvv_id, cvv_addr).await?;
+    nvv.dial_by_bls(target_peer_bls).await?;
 
     // publish random block
     let random_block = fixture_batch_with_transactions(10);
@@ -699,33 +683,19 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     // Need to disable kademlia peers or the various networks will connect on their own and trip up
     // the test...
     target_network.no_kad_peers_for_test();
-    let id = target_peer.config.authority().as_ref().expect("authority").id().peer_id();
+    let id = target_peer.config.authority().as_ref().expect("authority").id();
     tokio::spawn(async move {
         let res = target_network.run().await;
         debug!(target: "network", ?id, ?res, "network shutdown");
     });
 
     // Start target peer listening
-    target_peer
-        .network_handle
-        .start_listening(
-            target_peer
-                .config
-                .authority()
-                .as_ref()
-                .expect("authority")
-                .primary_network_address()
-                .clone(),
-        )
-        .await?;
-    let target_addr = target_peer
-        .network_handle
-        .listeners()
-        .await?
-        .first()
-        .expect("target peer listen addr")
-        .clone();
+    target_peer.network_handle.start_listening(target_peer.config.primary_address()).await?;
+    let target_addr = target_peer.config.primary_address();
     let target_peer_id = target_peer.network_handle.local_peer_id().await?;
+    let target_peer_bls =
+        target_peer.config.authority().as_ref().expect("authority").protocol_key().clone();
+    let target_peer_net = target_peer.config.primary_networkkey();
 
     debug!(target: "network", ?target_peer_id, "target peer");
 
@@ -734,30 +704,33 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
         // spawn peer network
         let mut peer_network = peer.network.take().expect("peer network is some");
         peer_network.no_kad_peers_for_test();
-        let id = peer.config.authority().as_ref().expect("authority").id().peer_id();
+        let id = peer.config.authority().as_ref().expect("authority").id();
         tokio::spawn(async move {
             let res = peer_network.run().await;
             debug!(target: "network", ?id, ?res, "network shutdown");
         });
 
+        peer.network_handle.start_listening(peer.config.primary_address()).await?;
+
+        // No kademilia so need to add peers on both side explicitly.
         peer.network_handle
-            .start_listening(
-                peer.config
-                    .authority()
-                    .as_ref()
-                    .expect("authority")
-                    .primary_network_address()
-                    .clone(),
+            .add_explicit_peer(target_peer_bls, target_peer_net.clone(), target_addr.clone())
+            .await?;
+        target_peer
+            .network_handle
+            .add_explicit_peer(
+                peer.config.key_config().primary_public_key(),
+                peer.config.primary_networkkey(),
+                peer.config.primary_address(),
             )
             .await?;
-
         // subscribe to topic
         peer.network_handle
-            .subscribe_with_publishers(TEST_TOPIC.into(), peer.config.committee_peer_ids())
+            .subscribe_with_publishers(TEST_TOPIC.into(), peer.config.committee_pub_keys())
             .await?;
 
         // Connect to target
-        peer.network_handle.dial(target_peer_id, target_addr.clone()).await?;
+        peer.network_handle.dial_by_bls(target_peer_bls.clone()).await?;
 
         // Give time for connection to establish
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -767,7 +740,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
     // Check connected peers on target - should be limited based on config
-    let connected_peers = target_peer.network_handle.connected_peers().await?;
+    let connected_peers = target_peer.network_handle.connected_peer_ids().await?;
 
     // assert more connected peers than max peers (4)
     assert!(connected_peers.len() <= network_config.peer_config().max_peers());
@@ -785,17 +758,24 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
         network.run().await.expect("network run failed!");
     });
 
-    nvv.start_listening(
-        nvv_config.authority().as_ref().expect("authority").primary_network_address().clone(),
-    )
-    .await?;
+    target_peer
+        .network_handle
+        .add_explicit_peer(
+            nvv_config.key_config().primary_public_key(),
+            nvv_config.primary_networkkey(),
+            nvv_config.primary_address(),
+        )
+        .await?;
+    nvv.add_explicit_peer(target_peer_bls, target_peer_net, target_addr.clone()).await?;
+    nvv.start_listening(nvv_config.primary_address()).await?;
 
     // subscribe to topic
     // add target peer as authorized publisher
-    nvv.subscribe_with_publishers(TEST_TOPIC.into(), HashSet::from([target_peer_id])).await?;
+    nvv.subscribe_with_publishers(TEST_TOPIC.into(), vec![target_peer_bls].into_iter().collect())
+        .await?;
 
     // connect to target
-    nvv.dial(target_peer_id, target_addr.clone()).await?;
+    nvv.dial_by_bls(target_peer_bls).await?;
 
     // give time for connection to establish
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
@@ -818,10 +798,10 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
 
     // assert nvv is connected with other peers
-    let connected = nvv.connected_peers().await?;
+    let connected = nvv.connected_peer_ids().await?;
     assert!(!connected.contains(&target_peer_id));
     for peer in other_peers.iter() {
-        let id = peer.config.authority().as_ref().expect("authority").id().peer_id();
+        let id = peer.network_handle.local_peer_id().await?;
         assert!(connected.contains(&id));
     }
 
@@ -883,35 +863,41 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
     });
 
     // Start listeners and establish connection
-    peer1
-        .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
-    peer2
-        .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
+    peer1.start_listening(config_1.primary_address()).await?;
+    peer2.start_listening(config_2.primary_address()).await?;
 
-    let peer2_id = peer2.local_peer_id().await?;
-    let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
+    let peer2_id: PeerId = config_2.primary_networkkey().into();
+    let peer2_bls = config_2.key_config().primary_public_key();
+
+    peer1
+        .add_explicit_peer(
+            peer2_bls.clone(),
+            config_2.primary_networkkey(),
+            config_2.primary_address(),
+        )
+        .await?;
 
     // Connect peers
-    peer1.dial(peer2_id, peer2_addr.clone()).await?;
+    peer1.dial_by_bls(peer2_bls.clone()).await?;
+
+    // Wait a beat for peer2 to recieve peer1 bls key.
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Verify connection established
-    let connected_peers = peer1.connected_peers().await?;
+    let connected_peers = peer1.connected_peer_ids().await?;
     assert!(connected_peers.contains(&peer2_id), "Peer2 should be connected");
 
     // Apply medium penalties to lower score but not ban
     for _ in 0..3 {
-        peer1.report_penalty(peer2_id, Penalty::Medium).await;
+        peer1.report_penalty(peer2_bls, Penalty::Medium).await;
     }
 
     // Check peer2's score is lower but still connected
     let score_after_penalty = peer1.peer_score(peer2_id).await?.unwrap();
-    assert!(score_after_penalty < default_score);
+    assert!(
+        score_after_penalty < default_score,
+        "{score_after_penalty} not less than {default_score}"
+    );
 
     // Wait for scores to recover through heartbeats
     tokio::time::sleep(Duration::from_secs(4 * TEST_HEARTBEAT_INTERVAL)).await;
@@ -921,7 +907,7 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
     assert!(score_after_decay > score_after_penalty);
 
     // Peer should still be connected
-    let connected_peers = peer1.connected_peers().await?;
+    let connected_peers = peer1.connected_peer_ids().await?;
     assert!(
         connected_peers.contains(&peer2_id),
         "Peer2 should still be connected after score recovery"
@@ -946,38 +932,35 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
     });
 
     // Start listeners
-    honest_peer
-        .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
-    malicious_peer
-        .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
+    honest_peer.start_listening(config_1.primary_address()).await?;
+    malicious_peer.start_listening(config_2.primary_address()).await?;
 
-    let honest_id = honest_peer.local_peer_id().await?;
-    let malicious_id = malicious_peer.local_peer_id().await?;
+    let malicious_id: PeerId = config_2.primary_networkkey().into();
+    let malicious_bls = config_2.key_config().primary_public_key();
 
-    let honest_addr = honest_peer.listeners().await?.first().expect("honest listen addr").clone();
-    let malicious_addr =
-        malicious_peer.listeners().await?.first().expect("malicious listen addr").clone();
+    let malicious_addr = config_2.primary_address();
 
     // Connect malicious to honest
-    malicious_peer.dial(honest_id, honest_addr.clone()).await?;
+    malicious_peer
+        .add_explicit_peer(
+            config_1.key_config().primary_public_key(),
+            config_1.primary_networkkey(),
+            config_1.primary_address(),
+        )
+        .await?;
+    malicious_peer.dial_by_bls(config_1.key_config().primary_public_key()).await?;
 
     // Wait for connection to establish
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Report fatal penalty for malicious peer
-    honest_peer.report_penalty(malicious_id, Penalty::Fatal).await;
+    honest_peer.report_penalty(malicious_bls, Penalty::Fatal).await;
 
     // Wait for ban to take effect and disconnect
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 2)).await;
 
     // Verify malicious peer is disconnected
-    let connected_peers = honest_peer.connected_peers().await?;
+    let connected_peers = honest_peer.connected_peer_ids().await?;
     assert!(!connected_peers.contains(&malicious_id), "Malicious peer should be disconnected");
 
     // Verify peer is banned
@@ -986,7 +969,11 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
     assert!(score <= min_score, "Peer should have ban-level score");
 
     // Now try to reconnect from malicious peer
-    let dial_result = malicious_peer.dial(honest_id, honest_addr.clone()).await;
+    let honest_bls = config_1.key_config().primary_public_key();
+    malicious_peer
+        .add_explicit_peer(honest_bls, config_1.primary_networkkey(), config_1.primary_address())
+        .await?;
+    let dial_result = malicious_peer.dial_by_bls(honest_bls).await;
 
     // The dial command should succeed at the API level (the swarm will try to dial)
     assert!(dial_result.is_ok());
@@ -995,7 +982,7 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Verify connection is rejected
-    let connected_peers = honest_peer.connected_peers().await?;
+    let connected_peers = honest_peer.connected_peer_ids().await?;
     assert!(
         !connected_peers.contains(&malicious_id),
         "Banned peer should not be allowed to reconnect"
@@ -1008,7 +995,7 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Verify connection still not established
-    let connected_peers = honest_peer.connected_peers().await?;
+    let connected_peers = honest_peer.connected_peer_ids().await?;
     assert!(
         !connected_peers.contains(&malicious_id),
         "Honest peer should not connect to banned peer"
@@ -1032,12 +1019,7 @@ async fn test_dial_timeout_behavior() -> eyre::Result<()> {
     });
 
     // Start listener
-    peer1
-        .network_handle
-        .start_listening(
-            peer1.config.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
+    peer1.network_handle.start_listening(peer1.config.primary_address()).await?;
 
     // Create a peer ID that doesn't exist
     let nonexistent_peer = PeerId::random();
@@ -1059,7 +1041,7 @@ async fn test_dial_timeout_behavior() -> eyre::Result<()> {
     assert!(rx.await.unwrap().is_err());
 
     // Verify dialing peer has been cleaned up
-    let connected_peers = peer1.network_handle.connected_peers().await?;
+    let connected_peers = peer1.network_handle.connected_peer_ids().await?;
     assert!(!connected_peers.contains(&nonexistent_peer), "Failed dial should be cleaned up");
 
     Ok(())
@@ -1090,33 +1072,19 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
     });
 
     // Start target peer listening
-    target_peer
-        .network_handle
-        .start_listening(
-            target_peer
-                .config
-                .authority()
-                .as_ref()
-                .expect("authority")
-                .primary_network_address()
-                .clone(),
-        )
-        .await?;
+    target_peer.network_handle.start_listening(target_peer.config.primary_address()).await?;
 
-    let target_addr = target_peer
-        .network_handle
-        .listeners()
-        .await?
-        .first()
-        .expect("target peer listen addr")
-        .clone();
-
-    let target_peer_id = target_peer.network_handle.local_peer_id().await?;
+    let target_bls = target_peer.config.config().primary_bls_key().clone();
+    let target_addr = target_peer.config.primary_address();
+    let target_net_key = target_peer.config.primary_networkkey();
 
     // Subscribe target to test topic
     target_peer
         .network_handle
-        .subscribe_with_publishers(TEST_TOPIC.into(), target_peer.config.committee_peer_ids())
+        .subscribe_with_publishers(
+            TEST_TOPIC.into(),
+            other_peers.iter().next().unwrap().config.committee_pub_keys(),
+        )
         .await?;
 
     // Start other peers and connect them all to the target (star topology)
@@ -1128,34 +1096,28 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
         });
 
         // Start listener
-        peer.network_handle
-            .start_listening(
-                peer.config
-                    .authority()
-                    .as_ref()
-                    .expect("authority")
-                    .primary_network_address()
-                    .clone(),
-            )
-            .await?;
-
-        // subscribe to test topic with target peer as authorized publisher
-        peer.network_handle
-            .subscribe_with_publishers(TEST_TOPIC.into(), HashSet::from([target_peer_id]))
-            .await?;
+        peer.network_handle.start_listening(peer.config.primary_address()).await?;
 
         // Connect to target peer
-        peer.network_handle.dial(target_peer_id, target_addr.clone()).await?;
+        peer.network_handle
+            .add_explicit_peer(target_bls, target_net_key.clone(), target_addr.clone())
+            .await?;
+        peer.network_handle.dial_by_bls(target_bls).await?;
 
         // Give time for connection to establish
         tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // subscribe to test topic with target peer as authorized publisher
+        peer.network_handle
+            .subscribe_with_publishers(TEST_TOPIC.into(), vec![target_bls].into_iter().collect())
+            .await?;
     }
 
     // Wait for connections to stabilize
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 2)).await;
 
     // Verify all peers are connected to target
-    let connected_peers = target_peer.network_handle.connected_peers().await?;
+    let connected_peers = target_peer.network_handle.connected_peer_ids().await?;
     assert_eq!(connected_peers.len(), other_peers.len(), "All peers should be connected to target");
 
     // Check gossipsub mesh formation
@@ -1205,38 +1167,37 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     });
 
     // Start swarm listening
-    peer1
-        .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
-    peer2
-        .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
+    peer1.start_listening(config_1.primary_address()).await?;
+    peer2.start_listening(config_2.primary_address()).await?;
 
     let peer2_id = peer2.local_peer_id().await?;
     let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
 
     // Connect peers
-    peer1.dial(peer2_id, peer2_addr.clone()).await?;
+    peer1
+        .add_explicit_peer(
+            config_2.key_config().primary_public_key(),
+            config_2.key_config().primary_network_public_key(),
+            peer2_addr.clone(),
+        )
+        .await?;
+    peer1.dial_by_bls(config_2.key_config().primary_public_key()).await?;
 
     // Wait for connection to establish
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Verify connection established
-    let connected_peers = peer1.connected_peers().await?;
+    let connected_peers = peer1.connected_peer_ids().await?;
     assert!(connected_peers.contains(&peer2_id), "Peer2 should be connected initially");
 
     // Apply fatal penalty to peer2 - should ban it
-    peer1.report_penalty(peer2_id, Penalty::Fatal).await;
+    peer1.report_penalty(config_2.key_config().primary_public_key(), Penalty::Fatal).await;
 
     // Wait for ban to take effect
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
     // Verify peer2 is disconnected and banned
-    let connected_peers = peer1.connected_peers().await?;
+    let connected_peers = peer1.connected_peer_ids().await?;
     assert!(!connected_peers.contains(&peer2_id), "Peer2 should be disconnected after ban");
 
     let score = peer1.peer_score(peer2_id).await?.unwrap();
@@ -1244,7 +1205,9 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     assert_eq!(score, min_score, "Peer2 should have ban-level score");
 
     // Now simulate a new epoch where peer2 is in the committee
-    let committee = HashMap::from([(peer2_id, peer2_addr.clone())]);
+    let committee = vec![config_2.authority().as_ref().expect("authority").protocol_key().clone()]
+        .into_iter()
+        .collect();
 
     // Send NewEpoch command to peer1
     let handle = peer1.clone();
@@ -1269,7 +1232,7 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     );
 
     // Try reconnecting peer2
-    let dial_result = peer1.dial(peer2_id, peer2_addr).await;
+    let dial_result = peer1.dial_by_bls(config_2.key_config().primary_public_key()).await;
     warn!(target: "network", ?dial_result, "dial result??");
     assert!(dial_result.is_ok(), "Should be able to reconnect to peer2 after unban");
 
@@ -1277,7 +1240,7 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Verify connection reestablished
-    let connected_peers_after = peer1.connected_peers().await?;
+    let connected_peers_after = peer1.connected_peer_ids().await?;
     assert!(connected_peers_after.contains(&peer2_id), "Peer2 should be reconnected after unban");
 
     Ok(())
@@ -1301,18 +1264,7 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
     });
 
     // Start listening
-    target_peer
-        .network_handle
-        .start_listening(
-            target_peer
-                .config
-                .authority()
-                .as_ref()
-                .expect("authority")
-                .primary_network_address()
-                .clone(),
-        )
-        .await?;
+    target_peer.network_handle.start_listening(target_peer.config.primary_address()).await?;
 
     // Take peer1 and peer2 from other_peers
     let mut peer1 = other_peers.remove(0);
@@ -1324,15 +1276,9 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
         peer1_network.run().await.expect("network run failed!");
     });
 
-    peer1
-        .network_handle
-        .start_listening(
-            peer1.config.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
+    peer1.network_handle.start_listening(peer1.config.primary_address()).await?;
     let peer1_id = peer1.network_handle.local_peer_id().await?;
-    let peer1_addr =
-        peer1.network_handle.listeners().await?.first().expect("peer1 listen addr").clone();
+    let peer1_addr = peer1.config.primary_address();
 
     // Start peer2 network - this will be our future committee member
     // Use the SAME multiaddr as peer1 to simulate same IP
@@ -1347,19 +1293,30 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
     let peer2_id = peer2.network_handle.local_peer_id().await?;
 
     // Connect target to peer1
-    target_peer.network_handle.dial(peer1_id, peer1_addr.clone()).await?;
+    target_peer
+        .network_handle
+        .add_explicit_peer(
+            peer1.config.key_config().primary_public_key(),
+            peer1.config.primary_networkkey(),
+            peer1.config.primary_address(),
+        )
+        .await?;
+    target_peer.network_handle.dial_by_bls(peer1.config.key_config().primary_public_key()).await?;
 
     // Wait for connection to establish
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Apply fatal penalty to peer1 - should ban it and its IP
-    target_peer.network_handle.report_penalty(peer1_id, Penalty::Fatal).await;
+    target_peer
+        .network_handle
+        .report_penalty(peer1.config.key_config().primary_public_key(), Penalty::Fatal)
+        .await;
 
     // Wait for ban to take effect
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
     // Verify peer1 is disconnected and banned
-    let connected_peers = target_peer.network_handle.connected_peers().await?;
+    let connected_peers = target_peer.network_handle.connected_peer_ids().await?;
     assert!(!connected_peers.contains(&peer1_id), "Peer1 should be disconnected after ban");
 
     // shutdown peer1 network
@@ -1371,7 +1328,10 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
     peer2.network_handle.start_listening(peer2_addr.clone()).await?;
 
     // Now simulate a new epoch where peer2 is in the committee with the same IP as banned peer1
-    let committee = HashMap::from([(peer2_id, peer2_addr)]);
+    let committee =
+        vec![peer2.config.authority().as_ref().expect("authority").protocol_key().clone()]
+            .into_iter()
+            .collect();
     let handle = target_peer.network_handle.clone();
     let (new_event_stream, _rx) = mpsc::channel(100);
     tokio::spawn(async move {
@@ -1389,7 +1349,7 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Verify connection established with peer2
-    let connected_peers_after = target_peer.network_handle.connected_peers().await?;
+    let connected_peers_after = target_peer.network_handle.connected_peer_ids().await?;
     assert!(
         connected_peers_after.contains(&peer2_id),
         "Peer2 should be connected despite sharing IP with banned peer1"
@@ -1414,45 +1374,46 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     });
 
     // Start swarm listening
-    peer1
-        .start_listening(
-            config_1.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
-    peer2
-        .start_listening(
-            config_2.authority().as_ref().expect("authority").primary_network_address().clone(),
-        )
-        .await?;
+    peer1.start_listening(config_1.primary_address()).await?;
+    peer2.start_listening(config_2.primary_address()).await?;
 
     let peer2_id = peer2.local_peer_id().await?;
-    let peer2_addr = peer2.listeners().await?.first().expect("peer2 listen addr").clone();
 
+    let peer2_bls = config_2.key_config().primary_public_key();
+    peer1
+        .add_explicit_peer(
+            peer2_bls.clone(),
+            config_2.key_config().primary_network_public_key(),
+            config_2.primary_address(),
+        )
+        .await?;
     // Connect peers
-    peer1.dial(peer2_id, peer2_addr.clone()).await?;
+    peer1.dial_by_bls(peer2_bls.clone()).await?;
 
     // Wait for connection to establish
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Verify connection established
-    let connected_peers = peer1.connected_peers().await?;
+    let connected_peers = peer1.connected_peer_ids().await?;
     assert!(connected_peers.contains(&peer2_id), "Peer2 should be connected initially");
 
     // Apply severe penalties to put peer in a disconnecting state pending ban
     // We need to apply penalties but not enough to cause immediate ban
     // First apply medium penalties
     for _ in 0..3 {
-        peer1.report_penalty(peer2_id, Penalty::Medium).await;
+        peer1.report_penalty(peer2_bls.clone(), Penalty::Medium).await;
     }
 
     // Then apply a severe penalty - should trigger disconnect pending ban
-    peer1.report_penalty(peer2_id, Penalty::Severe).await;
+    peer1.report_penalty(peer2_bls, Penalty::Severe).await;
 
     // Wait for disconnect to begin but not complete
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Now simulate a new epoch where peer2 is in the committee
-    let committee = HashMap::from([(peer2_id, peer2_addr.clone())]);
+    let committee = vec![config_2.authority().as_ref().expect("authority").protocol_key().clone()]
+        .into_iter()
+        .collect();
 
     // Send NewEpoch command to peer1
     let handle = peer1.clone();
@@ -1473,8 +1434,8 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     assert!(score_after_epoch > 0.0, "Peer2 should have a positive score after new epoch");
 
     // Try reconnecting peer2 if it was disconnected during the process
-    if !peer1.connected_peers().await?.contains(&peer2_id) {
-        let dial_result = peer1.dial(peer2_id, peer2_addr).await;
+    if !peer1.connected_peer_ids().await?.contains(&peer2_id) {
+        let dial_result = peer1.dial_by_bls(peer2_bls.clone()).await;
         assert!(dial_result.is_ok(), "Should be able to reconnect to peer2 after new epoch");
 
         // Wait for connection to reestablish
@@ -1482,7 +1443,7 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     }
 
     // Verify connection is established
-    let connected_peers_after = peer1.connected_peers().await?;
+    let connected_peers_after = peer1.connected_peer_ids().await?;
     assert!(connected_peers_after.contains(&peer2_id), "Peer2 should be connected after new epoch");
 
     Ok(())
@@ -1503,72 +1464,62 @@ async fn test_get_kad_records() -> eyre::Result<()> {
 
     // spawn target network
     let target_network = target_peer.network.take().expect("target network is some");
-    let id = target_peer.config.authority().as_ref().expect("authority").id().peer_id();
+    let id = target_peer.config.authority().as_ref().expect("authority").id();
+    let target_peer_bls = target_peer.config.key_config().primary_public_key();
+    let target_peer_net = target_peer.config.primary_networkkey();
     tokio::spawn(async move {
         let res = target_network.run().await;
         debug!(target: "network", ?id, ?res, "network shutdown");
     });
 
     // Start target peer listening
-    target_peer
-        .network_handle
-        .start_listening(
-            target_peer
-                .config
-                .authority()
-                .as_ref()
-                .expect("authority")
-                .primary_network_address()
-                .clone(),
-        )
-        .await?;
-    let target_addr = target_peer
-        .network_handle
-        .listeners()
-        .await?
-        .first()
-        .expect("target peer listen addr")
-        .clone();
-    let target_peer_id = target_peer.network_handle.local_peer_id().await?;
+    let target_addr = target_peer.config.primary_address();
+    target_peer.network_handle.start_listening(target_addr.clone()).await?;
+    let target_peer_id: PeerId =
+        target_peer.config.config().node_info.primary_network_key().clone().into();
 
+    let mut peer_mapping = vec![(target_peer_bls, target_peer_net.clone(), target_addr.clone())];
     // Start other peers and connect them one by one to the target
     for peer in committee.iter_mut() {
         // spawn peer network
         let peer_network = peer.network.take().expect("peer network is some");
-        let id = peer.config.authority().as_ref().expect("authority").id().peer_id();
+        let id = peer.config.authority().as_ref().expect("authority").id();
         tokio::spawn(async move {
             let res = peer_network.run().await;
             debug!(target: "network", ?id, ?res, "network shutdown");
         });
 
+        let peer_addr = peer.config.primary_address();
+        peer.network_handle.start_listening(peer_addr).await?;
+
+        peer_mapping.push((
+            peer.config.key_config().primary_public_key(),
+            peer.config.key_config().primary_network_public_key(),
+            peer.config.config().node_info.primary_network_address().clone(),
+        ));
+
+        // Connect to target
         peer.network_handle
-            .start_listening(
-                peer.config
-                    .authority()
-                    .as_ref()
-                    .expect("authority")
-                    .primary_network_address()
-                    .clone(),
+            .add_trusted_peer_and_dial(
+                target_peer_bls.clone(),
+                target_peer_net.clone(),
+                target_addr.clone(),
             )
             .await?;
 
-        // subscribe to topic
-        peer.network_handle
-            .subscribe_with_publishers(TEST_TOPIC.into(), peer.config.committee_peer_ids())
-            .await?;
-
-        // Connect to target
-        peer.network_handle.dial(target_peer_id, target_addr.clone()).await?;
-
         // Give time for connection to establish
         tokio::time::sleep(Duration::from_millis(100)).await;
+
+        peer.network_handle
+            .subscribe_with_publishers(TEST_TOPIC.into(), peer.config.committee_pub_keys())
+            .await?;
     }
 
     // Allow time for heartbeats to happen
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
     // Check connected peers on target - should be limited based on config
-    let connected_peers = target_peer.network_handle.connected_peers().await?;
+    let connected_peers = target_peer.network_handle.connected_peer_ids().await?;
 
     // assert all peers connected (minus this node)
     assert_eq!(connected_peers.len(), num_network_peers - 1);
@@ -1585,33 +1536,28 @@ async fn test_get_kad_records() -> eyre::Result<()> {
         network.run().await.expect("network run failed!");
     });
 
-    nvv.start_listening(
-        nvv_config.authority().as_ref().expect("authority").primary_network_address().clone(),
-    )
-    .await?;
-
-    // subscribe to topic
-    // add target peer as authorized publisher
-    nvv.subscribe_with_publishers(TEST_TOPIC.into(), HashSet::from([target_peer_id])).await?;
+    nvv.start_listening(nvv_config.primary_address()).await?;
 
     // connect to target
-    nvv.dial(target_peer_id, target_addr.clone()).await?;
+    nvv.add_trusted_peer_and_dial(target_peer_bls, target_peer_net.clone(), target_addr.clone())
+        .await?;
+    // subscribe to topic
+    // add target peer as authorized publisher
+    nvv.subscribe_with_publishers(
+        TEST_TOPIC.into(),
+        vec![target_peer.config.authority().as_ref().expect("authority").protocol_key().clone()]
+            .into_iter()
+            .collect(),
+    )
+    .await?;
 
     // give time for connection to establish
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
     // find other committee members through kad
-    let authorities = committee
-        .iter()
-        .map(|peer| {
-            peer.config
-                .authority()
-                .as_ref()
-                .map(|a| *a.protocol_key())
-                .expect("only authorities in committee")
-        })
-        .collect();
-    let node_records = nvv.find_authorities(authorities).await?;
+    let authorities: Vec<BlsPublicKey> =
+        committee.iter().map(|peer| peer.config.key_config().primary_public_key()).collect();
+    let node_records = nvv.find_authorities(authorities.clone()).await?;
 
     for record in node_records {
         // wait for node records
@@ -1625,14 +1571,14 @@ async fn test_get_kad_records() -> eyre::Result<()> {
     }
 
     // allow dial attempts to be made
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
 
     // assert nvv is connected with other peers
-    let connected = nvv.connected_peers().await?;
+    let connected = nvv.connected_peer_ids().await?;
     debug!(target: "network", ?connected, "nvv connected peers");
     assert!(connected.contains(&target_peer_id));
     for peer in committee.iter() {
-        let id = peer.config.authority().as_ref().expect("authority").id().peer_id();
+        let id = peer.network_handle.local_peer_id().await?;
         assert!(connected.contains(&id));
     }
 

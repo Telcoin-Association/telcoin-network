@@ -66,6 +66,12 @@ impl<CDB: ConsensusDatabase> WorkerNode<CDB> {
         let mut guard = self.internal.write().await;
         guard.start().await
     }
+
+    /// Return the workers network handle.
+    pub async fn network_handle(&self) -> WorkerNetworkHandle {
+        let guard = self.internal.read().await;
+        guard.network_handle.clone()
+    }
 }
 
 /// Helper method to create a worker's task manager name by id.

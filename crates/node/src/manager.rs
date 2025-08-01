@@ -11,15 +11,15 @@ use crate::{
 };
 use consensus_metrics::start_prometheus_server;
 use eyre::{eyre, OptionExt};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 use tn_config::{
     Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs,
 };
-use tn_network_libp2p::{
-    error::NetworkError,
-    types::{NetworkHandle, NetworkInfo},
-    ConsensusNetwork, PeerId, TNMessage,
-};
+use tn_network_libp2p::{error::NetworkError, types::NetworkHandle, ConsensusNetwork, TNMessage};
 use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
     ConsensusBus, NodeMode, StateSynchronizer,
@@ -38,9 +38,8 @@ use tn_storage::{
 };
 use tn_types::{
     gas_accumulator::GasAccumulator, AuthorityIdentifier, BatchValidation, BlsPublicKey, Committee,
-    CommitteeBuilder, ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, Multiaddr,
-    Noticer, Notifier, TaskManager, TaskSpawner, TimestampSec, WorkerCache, WorkerIndex,
-    WorkerInfo, B256, MIN_PROTOCOL_BASE_FEE,
+    CommitteeBuilder, ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, Noticer,
+    Notifier, TaskManager, TaskSpawner, TimestampSec, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::{
@@ -76,8 +75,6 @@ pub struct EpochManager<P> {
     primary_network_handle: Option<PrimaryNetworkHandle>,
     /// Worker network handle.
     worker_network_handle: Option<WorkerNetworkHandle>,
-    /// Address of the worker network once it is set.
-    worker_network_addr: Option<Multiaddr>,
     /// Key config - loaded once for application lifetime.
     key_config: KeyConfig,
     /// The epoch manager's [Notifier] to shutdown all node processes.
@@ -166,7 +163,6 @@ where
             tn_datadir,
             primary_network_handle: None,
             worker_network_handle: None,
-            worker_network_addr: None,
             key_config,
             node_shutdown,
             consensus_output,
@@ -606,7 +602,7 @@ where
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<(PrimaryNode<DatabaseType>, WorkerNode<DatabaseType>)> {
         // create config for consensus
-        let consensus_config =
+        let (consensus_config, preload_keys) =
             self.configure_consensus(engine, network_config, &consensus_db).await?;
 
         let primary = self
@@ -652,7 +648,22 @@ where
             engine.canonical_block_stream().await,
             epoch_task_manager,
         );
-
+        let primary_handle = primary.network_handle().await;
+        let prefetches = preload_keys.clone();
+        epoch_task_manager.spawn_task("primary pre-load validators", async move {
+            // Attempt to pre-load the next couple of committee's network info.
+            if let Ok(tasks) = primary_handle.inner_handle().find_authorities(prefetches).await {
+                for _ in tasks {}
+            }
+        });
+        let worker_handle = worker.network_handle().await;
+        let prefetches = preload_keys.clone();
+        epoch_task_manager.spawn_task("worker pre-load validators", async move {
+            // Attempt to pre-load the next couple of committee's network info.
+            if let Ok(tasks) = worker_handle.inner_handle().find_authorities(prefetches).await {
+                for _ in tasks {}
+            }
+        });
         Ok((primary, worker))
     }
 
@@ -665,7 +676,7 @@ where
         engine: &ExecutionNode,
         network_config: &NetworkConfig,
         consensus_db: &DatabaseType,
-    ) -> eyre::Result<ConsensusConfig<DatabaseType>> {
+    ) -> eyre::Result<(ConsensusConfig<DatabaseType>, Vec<BlsPublicKey>)> {
         // retrieve epoch information from canonical tip
         let EpochState { epoch, epoch_info, validators, epoch_start } =
             engine.epoch_state_from_canonical_tip().await?;
@@ -682,12 +693,14 @@ where
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
         debug!(target: "epoch-manager", new_epoch_boundary=self.epoch_boundary, "resetting epoch boundary");
 
-        // send these to the swarm for validator discovery
-        let keys_for_worker_cache = validators.keys().cloned().collect();
         debug!(target: "epoch-manager", ?validators, "creating committee for validators");
+
+        let mut next_vals: HashSet<BlsPublicKey> = HashSet::new();
+        next_vals.extend(validators.keys().copied());
         let committee = self.create_committee_from_state(epoch, validators).await?;
-        let worker_cache =
-            self.create_worker_cache_from_state(epoch, keys_for_worker_cache).await?;
+
+        next_vals.extend(engine.validators_for_epoch(epoch + 1).await?.into_iter());
+        next_vals.extend(engine.validators_for_epoch(epoch + 2).await?.into_iter());
 
         // create config for consensus
         let consensus_config = ConsensusConfig::new_for_epoch(
@@ -695,11 +708,10 @@ where
             consensus_db.clone(),
             self.key_config.clone(),
             committee,
-            worker_cache,
             network_config.clone(),
         )?;
 
-        Ok(consensus_config)
+        Ok((consensus_config, next_vals.into_iter().collect()))
     }
 
     /// Create the [Committee] for the current epoch.
@@ -720,42 +732,16 @@ where
                 ConfigFmt::YAML,
             )?
         } else {
-            // retrieve network information for committee
-            let primary_handle = self
-                .primary_network_handle
-                .as_ref()
-                .ok_or_eyre("missing primary network handle for epoch manager")?;
-
-            let mut primary_network_infos = primary_handle
-                .inner_handle()
-                .find_authorities(validators.keys().cloned().collect())
-                .await?;
-
-            debug!(target: "epoch-manager", "requsting info validator info for {} authorities", primary_network_infos.len());
-
             // build the committee using kad network
             let mut committee_builder = CommitteeBuilder::new(epoch);
 
-            // loop through the primary info returned from network query
-            while let Some(info) = primary_network_infos.next().await {
-                debug!(target: "epoch-manager", ?info, "awaited next primary network info");
-                let (protocol_key, NetworkInfo { pubkey, multiaddr, hostname }) = info??;
-                debug!(target: "epoch-manager", peer_id=?pubkey.to_peer_id(), "awaited next primary network info");
-                let validator = validators
-                    .get(&protocol_key)
-                    .ok_or_eyre("network returned validator that isn't in the committee")?;
-                let execution_address = validator.validatorAddress;
-
+            for validator in validators {
                 committee_builder.add_authority(
-                    protocol_key,
+                    validator.0,
                     1, // set stake so every authority's weight is equal
-                    multiaddr,
-                    execution_address,
-                    pubkey,
-                    hostname,
+                    validator.1.validatorAddress,
                 );
             }
-
             committee_builder.build()
         };
 
@@ -763,49 +749,6 @@ where
         committee.load();
 
         Ok(committee)
-    }
-
-    /// Create the [WorkerCache] for the current epoch.
-    ///
-    /// This is the first step for configuring consensus.
-    async fn create_worker_cache_from_state(
-        &self,
-        epoch: Epoch,
-        validators: Vec<BlsPublicKey>,
-    ) -> eyre::Result<WorkerCache> {
-        info!(target: "epoch-manager", "creating worker cache from state");
-
-        let worker_cache = if epoch == 0 {
-            debug!(target: "epoch-manager", "loading worker cache from config for epoch 0");
-            Config::load_from_path_or_default::<WorkerCache>(
-                self.tn_datadir.worker_cache_path(),
-                ConfigFmt::YAML,
-            )?
-        } else {
-            debug!(target: "epoch-manager", "creating worker cache from network records");
-            // create worker cache
-            let worker_handle = self
-                .worker_network_handle
-                .as_ref()
-                .ok_or_eyre("missing primary network handle for epoch manager")?;
-
-            let mut workers = Vec::with_capacity(validators.len());
-            let mut worker_network_infos =
-                worker_handle.inner_handle().find_authorities(validators).await?;
-
-            // loop through the worker info returned from network query
-            while let Some(info) = worker_network_infos.next().await {
-                let (protocol_key, NetworkInfo { pubkey, multiaddr, .. }) = info??;
-                // only one worker per authority for now
-                let worker_index =
-                    WorkerIndex(vec![WorkerInfo { name: pubkey, worker_address: multiaddr }]);
-                workers.push((protocol_key, worker_index));
-            }
-
-            WorkerCache { epoch, workers: Arc::new(workers.into_iter().collect()) }
-        };
-
-        Ok(worker_cache)
     }
 
     /// Create a [PrimaryNode].
@@ -925,16 +868,36 @@ where
 
         // set committee for network to prevent banning
         debug!(target: "epoch-manager", auth=?consensus_config.authority_id(), "spawning primary network for epoch");
-        network_handle
-            .inner_handle()
-            .new_epoch(consensus_config.primary_network_map(), event_stream)
-            .await?;
+        let committee_keys: HashSet<BlsPublicKey> = consensus_config
+            .committee()
+            .authorities()
+            .into_iter()
+            .map(|a| *a.protocol_key())
+            .collect();
+
+        if *initial_epoch {
+            // Make sure we at least hove bootstrap peers on first epoch.
+            network_handle
+                .inner_handle()
+                .add_bootstrap_peers(
+                    consensus_config
+                        .committee()
+                        .bootstrap_servers()
+                        .iter()
+                        .map(|(k, v)| (*k, v.primary.clone()))
+                        .collect(),
+                )
+                .await?;
+        }
+
+        network_handle.inner_handle().new_epoch(committee_keys.clone(), event_stream).await?;
         debug!(target: "epoch-manager", auth=?consensus_config.authority_id(), "event stream updated!");
 
         // start listening if the network needs to be initialized
         if *initial_epoch {
             // start listening for p2p messages
             let primary_address = consensus_config.primary_address();
+            info!(target: "epoch-manager", ?primary_address, "listening to {primary_address}");
             network_handle.inner_handle().start_listening(primary_address).await?;
         }
 
@@ -942,30 +905,28 @@ where
         network_handle
             .inner_handle()
             .subscribe_with_publishers(
-                consensus_config.network_config().libp2p_config().primary_topic(),
-                consensus_config.committee_peer_ids(),
+                tn_config::LibP2pConfig::primary_topic(),
+                committee_keys.into_iter().collect(),
             )
             .await?;
 
         // always dial peers for the new epoch
-        for (authority_id, addr, _) in consensus_config
+        for (_authority_id, bls_pubkey) in consensus_config
             .committee()
             .others_primaries_by_id(consensus_config.authority_id().as_ref())
         {
-            let peer_id = authority_id.peer_id();
-            self.dial_peer(
+            self.dial_peer_bls(
                 network_handle.inner_handle().clone(),
-                peer_id,
-                addr,
+                bls_pubkey,
                 epoch_task_spawner.clone(),
             );
         }
 
         // wait until the primary has connected with at least 1 peer
-        let mut peers = network_handle.connected_peers().await.map(|p| p.len()).unwrap_or(0);
+        let mut peers = network_handle.connected_peers_count().await.unwrap_or(0);
         while peers == 0 {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            peers = network_handle.connected_peers().await.map(|p| p.len()).unwrap_or(0);
+            peers = network_handle.connected_peers_count().await.unwrap_or(0);
         }
 
         // spawn primary network
@@ -983,36 +944,27 @@ where
     }
 
     /// Dial peer.
-    fn dial_peer<Req: TNMessage, Res: TNMessage>(
+    fn dial_peer_bls<Req: TNMessage, Res: TNMessage>(
         &self,
         handle: NetworkHandle<Req, Res>,
-        peer_id: PeerId,
-        peer_addr: Multiaddr,
+        bls_pubkey: BlsPublicKey,
         node_task_spawner: TaskSpawner,
     ) {
         // spawn dials on long-running task manager
-        let task_name = format!("DialPeer {peer_id}");
+        let task_name = format!("DialPeer {bls_pubkey}");
         node_task_spawner.spawn_task(task_name, async move {
             let mut backoff = 1;
 
-            debug!(target: "epoch-manager", ?peer_id, "dialing peer");
-
-            // skip dialing already connected peers
-            if let Ok(peers) = handle.connected_peers().await {
-                if peers.contains(&peer_id) {
-                    debug!(target: "epoch-manager", ?peer_id, "skipping dial for peer");
-                    return;
-                };
-            }
-
-            debug!(target: "epoch-manager", ?peer_id, "peer not connected - dialing peer");
-            while let Err(e) = handle.dial(peer_id, peer_addr.clone()).await {
+            debug!(target: "epoch-manager", ?bls_pubkey, "dialing peer");
+            while let Err(e) = handle.dial_by_bls(bls_pubkey).await {
                 // ignore errors for peers that are already connected or being dialed
-                if matches!(e, NetworkError::AlreadyConnected(_)) || matches!(e, NetworkError::AlreadyDialing(_)) {
+                if matches!(e, NetworkError::AlreadyConnected(_))
+                    || matches!(e, NetworkError::AlreadyDialing(_))
+                {
                     return;
                 }
 
-                tracing::warn!(target: "epoch-manager", "failed to dial {peer_id} at {peer_addr}: {e}");
+                warn!(target: "epoch-manager", "failed to dial {bls_pubkey}: {e}");
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                 if backoff < 120 {
                     backoff += backoff;
@@ -1035,34 +987,47 @@ where
         let (event_stream, rx_event_stream) = mpsc::channel(1000);
         debug!(target: "epoch-manager", "spawning worker network for epoch");
 
-        network_handle
-            .inner_handle()
-            .new_epoch(consensus_config.worker_network_map(), event_stream)
-            .await?;
+        let committe_keys: HashSet<BlsPublicKey> = consensus_config
+            .committee()
+            .authorities()
+            .into_iter()
+            .map(|a| *a.protocol_key())
+            .collect();
+        network_handle.inner_handle().new_epoch(committe_keys, event_stream).await?;
 
         // start listening if the network needs to be initialized
         if *initial_epoch {
-            let worker_address = consensus_config.worker_address(worker_id);
-            self.worker_network_addr = Some(worker_address.clone());
+            let worker_address = consensus_config.worker_address();
             network_handle.inner_handle().start_listening(worker_address).await?;
+            // Make sure we at least hove bootstrap peers on first epoch.
+            network_handle
+                .inner_handle()
+                .add_bootstrap_peers(
+                    consensus_config
+                        .committee()
+                        .bootstrap_servers()
+                        .iter()
+                        .map(|(k, v)| (*k, v.worker.clone()))
+                        .collect(),
+                )
+                .await?;
         }
 
-        let worker_address =
-            self.worker_network_addr.clone().expect("worker address set at this point");
+        let worker_address = consensus_config.worker_address();
 
         // always attempt to dial peers for the new epoch
         // the network's peer manager will intercept dial attempts for peers that are already
         // connected
         debug!(target: "epoch-manager", ?worker_address, "spawning worker network for epoch");
-        for (peer_id, addr) in consensus_config.worker_cache().all_workers() {
-            if worker_address != addr {
-                self.dial_peer(
-                    network_handle.inner_handle().clone(),
-                    peer_id,
-                    addr,
-                    epoch_task_spawner.clone(),
-                );
-            }
+        for (_, peer) in consensus_config
+            .committee()
+            .others_primaries_by_id(consensus_config.authority().as_ref().map(|a| a.id()).as_ref())
+        {
+            self.dial_peer_bls(
+                network_handle.inner_handle().clone(),
+                peer,
+                epoch_task_spawner.clone(),
+            );
         }
 
         // update the authorized publishers for gossip every epoch

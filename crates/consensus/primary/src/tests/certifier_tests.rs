@@ -30,11 +30,10 @@ async fn propose_header_to_form_certificate() {
     // Set up remote primaries responding with votes.
     let mut peer_votes = HashMap::new();
     for peer in fixture.authorities().filter(|a| a.id() != id) {
-        let name = peer.id();
-        let vote =
-            Vote::new(&proposed_header, name.clone(), peer.consensus_config().key_config()).await;
-        let id = name.peer_id();
-        peer_votes.insert(id, vote);
+        let name = peer.authority().protocol_key();
+        let id = peer.authority().id();
+        let vote = Vote::new(&proposed_header, id, peer.consensus_config().key_config()).await;
+        peer_votes.insert(name, vote);
     }
 
     let cb = ConsensusBus::new();
@@ -183,7 +182,7 @@ async fn run_vote_aggregator_with_param(
         } else {
             Vote::new(&proposed_header, name.clone(), peer.consensus_config().key_config()).await
         };
-        let id = name.peer_id();
+        let id = peer.authority().protocol_key();
         peer_votes.insert(id, vote);
     }
 
