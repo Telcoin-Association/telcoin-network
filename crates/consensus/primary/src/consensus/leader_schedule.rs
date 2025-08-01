@@ -85,7 +85,7 @@ impl LeaderSwapTable {
             debug!(
                 "Good node on round {}: {} -> {}",
                 round,
-                good_node.hostname(),
+                good_node.id(),
                 reputation_scores
                     .scores_per_authority
                     .get(&good_node.id())
@@ -97,7 +97,7 @@ impl LeaderSwapTable {
             debug!(
                 "Bad node on round {}: {} -> {}",
                 round,
-                bad_node.hostname(),
+                bad_node.id(),
                 reputation_scores
                     .scores_per_authority
                     .get(&bad_node.id())

@@ -46,6 +46,11 @@ impl TxPool for TestPool {
     fn get_pending_base_fee(&self) -> u64 {
         MIN_PROTOCOL_BASE_FEE
     }
+    fn remove_eip4844_txs(&mut self, _blobs: Vec<TxHash>) {
+        // remove EIP-4844 transactions from the transactions vec and btreemap
+        self.transactions.retain(|tx| !tx.is_eip4844());
+        self.by_id.retain(|_, tx| !tx.is_eip4844());
+    }
 }
 
 impl TestPool {

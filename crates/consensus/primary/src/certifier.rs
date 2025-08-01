@@ -19,8 +19,8 @@ use tn_storage::CertificateStore;
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
-    AuthorityIdentifier, Certificate, CertificateDigest, Committee, Database, Header, Noticer,
-    TaskManager, TnReceiver, TnSender, Vote, CHANNEL_CAPACITY,
+    AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database, Header,
+    Noticer, TaskManager, TnReceiver, TnSender, Vote, CHANNEL_CAPACITY,
 };
 use tokio::sync::broadcast;
 use tracing::{debug, enabled, error, info, instrument, trace, warn};
@@ -94,7 +94,7 @@ impl<DB: Database> Certifier<DB> {
             .committee()
             .others_primaries_by_id(Some(&authority_id))
             .into_iter()
-            .map(|(name, _addr, _network_key)| (name, tx_own_certificate_broadcast.subscribe()))
+            .map(|(name, _bls_key)| (name, tx_own_certificate_broadcast.subscribe()))
             .collect();
 
         let highest_created_certificate = Self::highest_created_certificate(&config);
@@ -154,9 +154,9 @@ impl<DB: Database> Certifier<DB> {
         &self,
         authority: AuthorityIdentifier,
         header: Header,
+        peer_id: BlsPublicKey,
     ) -> DagResult<Vote> {
         debug!(target: "primary::certifier", ?authority, ?header, "requesting vote for header...");
-        let peer_id = authority.peer_id();
 
         let mut missing_parents: Vec<CertificateDigest> = Vec::new();
         let mut attempt: u32 = 0;
@@ -283,15 +283,11 @@ impl<DB: Database> Certifier<DB> {
         let mut certificate = votes_aggregator.append(vote, &self.committee, &header)?;
 
         // Trigger vote requests.
-        let peers = self
-            .committee
-            .others_primaries_by_id(Some(&self.authority_id))
-            .into_iter()
-            .map(|(name, _, network_key)| (name, network_key));
+        let peers = self.committee.others_primaries_by_id(Some(&self.authority_id)).into_iter();
         let mut requests: FuturesUnordered<_> = peers
-            .map(|(name, _target)| {
+            .map(|(name, target)| {
                 let header = header.clone();
-                self.request_vote(name, header)
+                self.request_vote(name, header, target)
             })
             .collect();
         loop {

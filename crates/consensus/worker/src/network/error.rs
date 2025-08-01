@@ -35,6 +35,8 @@ impl From<WorkerNetworkError> for Option<Penalty> {
                 match batch_validation_error {
                     // mild
                     BatchValidationError::CanonicalChain { .. } => Some(Penalty::Mild),
+                    // medium
+                    BatchValidationError::InvalidTx4844(_) => Some(Penalty::Medium),
                     // severe
                     BatchValidationError::RecoverTransaction(_, _) => Some(Penalty::Severe),
                     // fatal

@@ -29,6 +29,12 @@ impl From<NetworkPublicKey> for libp2p::identity::PublicKey {
     }
 }
 
+impl From<NetworkPublicKey> for libp2p::identity::PeerId {
+    fn from(value: NetworkPublicKey) -> Self {
+        value.0.into()
+    }
+}
+
 impl Deref for NetworkPublicKey {
     type Target = libp2p::identity::PublicKey;
 

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_types::{
     AuthorityIdentifier, Certificate, CertificateDigest, Committee, Database, Hash as _, Header,
-    HeaderBuilder, Round, Vote, WorkerCache,
+    HeaderBuilder, Round, Vote,
 };
 
 /// Fixture representing a committee to reach consensus.
@@ -42,18 +42,6 @@ impl<DB: Database> CommitteeFixture<DB> {
     /// Return the [Committee] for the fixture.
     pub fn committee(&self) -> Committee {
         self.committee.clone()
-    }
-
-    /// Return the [WorkerCache] for the committee.
-    pub fn worker_cache(&self) -> WorkerCache {
-        // All the authorities have the same work cache so just use the first one.
-        self.authorities
-            .values()
-            .next()
-            .expect("no authorities so no worker cache!")
-            .consensus_config()
-            .worker_cache()
-            .clone()
     }
 
     /// Return a reference to the first authority in the committee.

@@ -13,7 +13,7 @@ use crate::{
     now,
     serde::CertificateSignatures,
     AuthorityIdentifier, BlockHash, Committee, Digest, Epoch, Hash, Header, Round, TimestampSec,
-    VotingPower, WorkerCache,
+    VotingPower,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -206,11 +206,7 @@ impl Certificate {
     /// While storing signatures in both places uses more memory, the strong correctness guarantees
     /// outweigh the storage cost for certificate verification where maintaining cryptographic
     /// integrity is critical.
-    pub fn verify(
-        self,
-        committee: &Committee,
-        worker_cache: &WorkerCache,
-    ) -> CertificateResult<Certificate> {
+    pub fn verify(self, committee: &Committee) -> CertificateResult<Certificate> {
         // ensure the header is from the correct epoch
         ensure!(
             self.epoch() == committee.epoch(),
@@ -226,7 +222,7 @@ impl Certificate {
         }
 
         // Save signature verifications when the header is invalid.
-        self.header.validate(committee, worker_cache)?;
+        self.header.validate(committee)?;
 
         let (weight, pks) = self.signed_by(committee);
 

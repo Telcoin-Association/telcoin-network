@@ -114,7 +114,7 @@ pub struct LibP2pConfig {
 
 impl LibP2pConfig {
     /// Return topics for primary.
-    pub fn primary_topic(&self) -> String {
+    pub fn primary_topic() -> String {
         String::from("tn-primary")
     }
 
@@ -148,7 +148,7 @@ impl Default for LibP2pConfig {
             )],
             max_rpc_message_size: 1024 * 1024, // 1 MiB
             max_gossip_message_size: 12_000,   // 12kb
-            max_idle_connection_timeout: Duration::from_secs(60 * 60 * 24), // 24hrs
+            max_idle_connection_timeout: Duration::from_secs(65), // same as quic handshake
             max_px_disconnects: 10,
             px_disconnect_timeout: Duration::from_secs(3),
         }
@@ -256,7 +256,7 @@ impl Default for QuicConfig {
         Self {
             handshake_timeout: Duration::from_secs(65),
             max_idle_timeout: 30 * 1_000, // 30s
-            keep_alive_interval: Duration::from_secs(10),
+            keep_alive_interval: Duration::from_secs(5),
             max_concurrent_stream_limit: 10_000,
             // may need to increase these based on RTT
             //

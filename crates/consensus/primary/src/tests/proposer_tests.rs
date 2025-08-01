@@ -10,7 +10,6 @@ use tn_types::B256;
 async fn test_empty_proposal() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
-    let worker_cache = fixture.worker_cache();
     let primary = fixture.authorities().next().unwrap();
 
     let cb = ConsensusBus::new();
@@ -28,7 +27,7 @@ async fn test_empty_proposal() {
     let header = rx_headers.recv().await.unwrap();
     assert_eq!(header.round(), 1);
     assert!(header.payload().is_empty());
-    assert!(header.validate(&committee, &worker_cache).is_ok());
+    assert!(header.validate(&committee).is_ok());
 
     // TODO: assert header el state present
 }
@@ -37,7 +36,6 @@ async fn test_empty_proposal() {
 async fn test_equivocation_protection_after_restart() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
-    let worker_cache = fixture.worker_cache();
     let primary = fixture.authorities().next().unwrap();
 
     /* Old comments, note if test gets flakey:
@@ -80,7 +78,7 @@ async fn test_equivocation_protection_after_restart() {
     // Ensure the proposer makes a correct header from the provided payload.
     let header = rx_headers.recv().await.unwrap();
     assert_eq!(header.payload().get(&digest), Some(&(worker_id, created_at_ts)));
-    assert!(header.validate(&committee, &worker_cache).is_ok());
+    assert!(header.validate(&committee).is_ok());
 
     // TODO: assert header el state present
 

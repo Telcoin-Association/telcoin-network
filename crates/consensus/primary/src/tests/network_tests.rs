@@ -8,13 +8,11 @@ use crate::{
 };
 use assert_matches::assert_matches;
 use std::collections::{BTreeMap, BTreeSet};
-use tn_network_libp2p::PeerId;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
 use tn_types::{
-    error::HeaderError, network_public_key_to_libp2p, now, AuthorityIdentifier, BlockHash,
-    BlockHeader, BlockNumHash, Certificate, CertificateDigest, ExecHeader, Hash as _, SealedHeader,
-    TaskManager,
+    error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
+    BlsPublicKey, Certificate, CertificateDigest, ExecHeader, Hash as _, SealedHeader, TaskManager,
 };
 use tracing::debug;
 
@@ -87,8 +85,6 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
     let TestTypes { committee, handler, parent, .. } = create_test_types();
 
     let parents = Vec::new();
-    let peer_id =
-        network_public_key_to_libp2p(&committee.last_authority().primary_network_public_key());
 
     // create valid header proposed by last peer in the committee for round 1
     let header = committee
@@ -96,9 +92,10 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(1) // parent is 0
         .build();
+    let peer = *committee.last_authority().authority().protocol_key();
 
     // process vote
-    let res = handler.vote(peer_id, header, parents).await;
+    let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert!(res.is_ok());
     Ok(())
@@ -108,9 +105,6 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
 async fn test_vote_fails_too_many_parents() -> eyre::Result<()> {
     // common types
     let TestTypes { committee, handler, parent, .. } = create_test_types();
-
-    let peer_id =
-        network_public_key_to_libp2p(&committee.last_authority().primary_network_public_key());
 
     // last authority produced 2 certs for round 1
     let mut too_many_parents: Vec<_> = Certificate::genesis(&committee.committee());
@@ -123,9 +117,10 @@ async fn test_vote_fails_too_many_parents() -> eyre::Result<()> {
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(1) // parent is 0
         .build();
+    let peer = *committee.last_authority().authority().protocol_key();
 
     // process vote
-    let res = handler.vote(peer_id, header, too_many_parents).await;
+    let res = handler.vote(peer, header, too_many_parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::TooManyParents(received, expected))) if received == 5 && expected == 4 );
     Ok(())
@@ -136,7 +131,6 @@ async fn test_vote_fails_wrong_authority_network_key() -> eyre::Result<()> {
     // common types
     let TestTypes { committee, handler, parent, .. } = create_test_types();
     let parents = Vec::new();
-    let random_peer_id = PeerId::random();
 
     // create valid header proposed by last peer in the committee for round 1
     let header = committee
@@ -144,11 +138,12 @@ async fn test_vote_fails_wrong_authority_network_key() -> eyre::Result<()> {
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(1) // parent is 0
         .build();
+    let random_key = BlsPublicKey::default();
 
     // process vote
-    let res = handler.vote(random_peer_id, header, parents).await;
+    let res = handler.vote(random_key, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
-    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownNetworkKey(peer_id))) if peer_id == random_peer_id);
+    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)));
     Ok(())
 }
 
@@ -158,8 +153,6 @@ async fn test_vote_fails_invalid_genesis_parent() -> eyre::Result<()> {
     let TestTypes { committee, handler, parent, .. } = create_test_types();
 
     let parents = Vec::new();
-    let peer_id =
-        network_public_key_to_libp2p(&committee.last_authority().primary_network_public_key());
 
     // start with the expected parents in genesis
     let mut expected_parents: Vec<_> =
@@ -175,9 +168,10 @@ async fn test_vote_fails_invalid_genesis_parent() -> eyre::Result<()> {
         .created_at(1) // parent is 0
         .parents(wrong_genesis)
         .build();
+    let peer = *committee.last_authority().authority().protocol_key();
 
     // process vote
-    let res = handler.vote(peer_id, header, parents).await;
+    let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidGenesisParent(wrong))) if wrong == extra_parent);
     Ok(())
@@ -191,11 +185,10 @@ async fn test_vote_fails_unknown_execution_result() -> eyre::Result<()> {
     // create header proposed by last peer in the committee for round 1
     let header = committee.header_from_last_authority();
     let parents = Vec::new();
-    let peer_id =
-        network_public_key_to_libp2p(&committee.last_authority().primary_network_public_key());
+    let peer = *committee.last_authority().authority().protocol_key();
 
     // process vote
-    let res = handler.vote(peer_id, header, parents).await;
+    let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownExecutionResult(wrong_hash))) if wrong_hash.hash == BlockHash::ZERO);
     Ok(())
@@ -207,16 +200,15 @@ async fn test_vote_fails_invalid_header_digest() -> eyre::Result<()> {
     let TestTypes { committee, handler, .. } = create_test_types();
 
     let parents = Vec::new();
-    let peer_id =
-        network_public_key_to_libp2p(&committee.last_authority().primary_network_public_key());
 
     // create header proposed by last peer in the committee for round 1
     let mut header = committee.header_from_last_authority();
     // change values so digest doesn't match
     header.latest_execution_block = BlockNumHash::new(0, BlockHash::random());
+    let peer = *committee.last_authority().authority().protocol_key();
 
     // process vote
-    let res = handler.vote(peer_id, header, parents).await;
+    let res = handler.vote(peer, header, parents).await;
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidHeaderDigest)));
     Ok(())
 }
@@ -227,8 +219,6 @@ async fn test_vote_fails_invalid_timestamp() -> eyre::Result<()> {
     let TestTypes { committee, handler, parent, .. } = create_test_types();
 
     let parents = Vec::new();
-    let peer_id =
-        network_public_key_to_libp2p(&committee.last_authority().primary_network_public_key());
 
     // create valid header proposed by last peer in the committee for round 1
     let wrong_time = now() + 100000; // too far in the future
@@ -237,9 +227,10 @@ async fn test_vote_fails_invalid_timestamp() -> eyre::Result<()> {
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(wrong_time)
         .build();
+    let peer = *committee.last_authority().authority().protocol_key();
 
     // process vote
-    let res = handler.vote(peer_id, header, parents).await;
+    let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp{created: wrong, ..})) if wrong == wrong_time);
     Ok(())
@@ -251,8 +242,6 @@ async fn test_vote_fails_wrong_epoch() -> eyre::Result<()> {
     let TestTypes { committee, handler, parent, .. } = create_test_types();
 
     let parents = Vec::new();
-    let peer_id =
-        network_public_key_to_libp2p(&committee.last_authority().primary_network_public_key());
 
     // create valid header proposed by last peer in the committee for round 1
     let wrong_epoch = 3;
@@ -262,9 +251,10 @@ async fn test_vote_fails_wrong_epoch() -> eyre::Result<()> {
         .created_at(1) // parent is 0
         .epoch(wrong_epoch)
         .build();
+    let peer = *committee.last_authority().authority().protocol_key();
 
     // process vote
-    let res = handler.vote(peer_id, header, parents).await;
+    let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidEpoch{ theirs: wrong, ours: correct })) if wrong == wrong_epoch && correct == 0 );
     Ok(())
@@ -276,8 +266,6 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
     let TestTypes { committee, handler, parent, .. } = create_test_types();
 
     let parents = Vec::new();
-    let peer_id =
-        network_public_key_to_libp2p(&committee.last_authority().primary_network_public_key());
 
     // create valid header proposed by last peer in the committee for round 1
     let wrong_authority = AuthorityIdentifier::dummy_for_test(100);
@@ -287,9 +275,10 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(1) // parent is 0
         .build();
+    let peer = *committee.last_authority().authority().protocol_key();
 
     // process vote
-    let res = handler.vote(peer_id, header, parents).await;
+    let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(wrong))) if wrong == wrong_authority.to_string());
     Ok(())

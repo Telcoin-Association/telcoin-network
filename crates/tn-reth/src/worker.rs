@@ -17,7 +17,7 @@ use reth_network_api::{
     EthProtocolInfo, NetworkError, NetworkInfo, NetworkStatus, PeerInfo, PeerKind, Peers,
     PeersInfo, Reputation, ReputationChangeKind,
 };
-use reth_network_peers::{Enr, NodeRecord, PeerId};
+use reth_network_peers::{Enr, NodeRecord, PeerId as RethPeerId};
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -85,9 +85,9 @@ impl WorkerNetwork {
         let spawner = worker_network.get_task_spawner().clone();
         spawner.spawn_task("Worker Network Peers", async move {
             loop {
-                if let Ok(peers) = worker_network.connected_peers().await {
+                if let Ok(peers) = worker_network.connected_peers_count().await {
                     let mut guard = peer_count_clone.write();
-                    *guard = peers.len();
+                    *guard = peers;
                 }
                 tokio::time::sleep(Duration::from_secs(15)).await;
             }
@@ -102,9 +102,9 @@ impl WorkerNetwork {
         let spawner = worker_network.get_task_spawner().clone();
         spawner.spawn_task("Worker Network Peers", async move {
             loop {
-                if let Ok(peers) = worker_network.connected_peers().await {
+                if let Ok(peers) = worker_network.connected_peers_count().await {
                     let mut guard = peer_count.write();
-                    *guard = peers.len();
+                    *guard = peers;
                 }
                 tokio::time::sleep(Duration::from_secs(15)).await;
             }
@@ -155,7 +155,7 @@ impl PeersInfo for WorkerNetwork {
 
     // TN Unused
     fn local_node_record(&self) -> NodeRecord {
-        NodeRecord::new(self.local_addr(), PeerId::random())
+        NodeRecord::new(self.local_addr(), RethPeerId::random())
     }
 
     // TN Unused
@@ -167,11 +167,11 @@ impl PeersInfo for WorkerNetwork {
 
 // These appear to support Reth's admin namespace- TN does not use this.
 impl Peers for WorkerNetwork {
-    fn add_trusted_peer_id(&self, _peer: PeerId) {}
+    fn add_trusted_peer_id(&self, _peer: RethPeerId) {}
 
     fn add_peer_kind(
         &self,
-        _peer: PeerId,
+        _peer: RethPeerId,
         _kind: PeerKind,
         _tcp_addr: SocketAddr,
         _udp_addr: Option<SocketAddr>,
@@ -186,29 +186,35 @@ impl Peers for WorkerNetwork {
         Ok(vec![])
     }
 
-    async fn get_peer_by_id(&self, _peer_id: PeerId) -> Result<Option<PeerInfo>, NetworkError> {
+    async fn get_peer_by_id(&self, _peer_id: RethPeerId) -> Result<Option<PeerInfo>, NetworkError> {
         Ok(None)
     }
 
-    async fn get_peers_by_id(&self, _peer_id: Vec<PeerId>) -> Result<Vec<PeerInfo>, NetworkError> {
+    async fn get_peers_by_id(
+        &self,
+        _peer_id: Vec<RethPeerId>,
+    ) -> Result<Vec<PeerInfo>, NetworkError> {
         Ok(vec![])
     }
 
-    fn remove_peer(&self, _peer: PeerId, _kind: PeerKind) {}
+    fn remove_peer(&self, _peer: RethPeerId, _kind: PeerKind) {}
 
-    fn disconnect_peer(&self, _peer: PeerId) {}
+    fn disconnect_peer(&self, _peer: RethPeerId) {}
 
-    fn disconnect_peer_with_reason(&self, _peer: PeerId, _reason: DisconnectReason) {}
+    fn disconnect_peer_with_reason(&self, _peer: RethPeerId, _reason: DisconnectReason) {}
 
-    fn reputation_change(&self, _peer_id: PeerId, _kind: ReputationChangeKind) {}
+    fn reputation_change(&self, _peer_id: RethPeerId, _kind: ReputationChangeKind) {}
 
-    async fn reputation_by_id(&self, _peer_id: PeerId) -> Result<Option<Reputation>, NetworkError> {
+    async fn reputation_by_id(
+        &self,
+        _peer_id: RethPeerId,
+    ) -> Result<Option<Reputation>, NetworkError> {
         Ok(None)
     }
 
     fn connect_peer_kind(
         &self,
-        _peer: PeerId,
+        _peer: RethPeerId,
         _kind: PeerKind,
         _tcp_addr: SocketAddr,
         _udp_addr: Option<SocketAddr>,

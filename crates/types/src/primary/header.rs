@@ -2,7 +2,7 @@ use crate::{
     crypto, encode,
     error::{HeaderError, HeaderResult},
     now, AuthorityIdentifier, Batch, BlockHash, BlockNumHash, CertificateDigest, Committee, Digest,
-    Epoch, Hash, Round, TimestampSec, VoteDigest, WorkerCache, WorkerId,
+    Epoch, Hash, Round, TimestampSec, VoteDigest, WorkerId,
 };
 use derive_builder::Builder;
 use indexmap::IndexMap;
@@ -70,7 +70,7 @@ impl Header {
     /// Ensure the header is valid based on the current committee and workercache.
     ///
     /// The digest is calculated with the sealed header, so the EL data is also verified.
-    pub fn validate(&self, committee: &Committee, worker_cache: &WorkerCache) -> HeaderResult<()> {
+    pub fn validate(&self, committee: &Committee) -> HeaderResult<()> {
         // Ensure the header is from the correct epoch.
         if self.epoch != committee.epoch() {
             return Err(HeaderError::InvalidEpoch { theirs: self.epoch, ours: committee.epoch() });
@@ -89,15 +89,12 @@ impl Header {
 
         // Ensure all worker ids are correct.
         for (worker_id, _) in self.payload.values() {
-            worker_cache
-                .worker(
-                    committee
-                        .authority(&self.author)
-                        .ok_or(HeaderError::UnknownAuthority(self.author.to_string()))?
-                        .protocol_key(),
-                    worker_id,
-                )
-                .map_err(|_| HeaderError::UnkownWorkerId)?;
+            if *worker_id as usize >= committee.number_of_workers() {
+                return Err(HeaderError::UnkownWorkerId);
+            }
+            committee
+                .authority(&self.author)
+                .ok_or(HeaderError::UnknownAuthority(self.author.to_string()))?;
         }
 
         Ok(())
