@@ -81,9 +81,7 @@ use reth_provider::{
 };
 use reth_revm::{
     cached::CachedReads,
-    context::{
-        result::{ExecutionResult, ResultAndState},
-    },
+    context::result::{ExecutionResult, ResultAndState},
     database::StateProviderDatabase,
     db::{states::bundle_state::BundleRetention, BundleState},
     DatabaseCommit, State,
