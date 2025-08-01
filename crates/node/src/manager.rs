@@ -512,6 +512,13 @@ where
     ) -> eyre::Result<()> {
         let committee = primary.current_committee().await;
         let epoch = committee.epoch();
+        let consensus_db = self.consensus_db.clone();
+
+        // We already have a record for this epoch, nothing to do.
+        if consensus_db.get::<EpochRecords>(&epoch).ok().flatten().is_none() {
+            return Ok(());
+        }
+
         let committee_keys = engine.validators_for_epoch(epoch).await?;
         let next_committee_keys = engine.validators_for_epoch(epoch + 1).await?;
         let parent_hash = if epoch == 0 {
@@ -557,7 +564,6 @@ where
         }
 
         let quorum = committee.quorum_threshold();
-        let consensus_db = self.consensus_db.clone();
         epoch_task_manager.spawn_task("epoch certificate collector", async move {
             let mut rx = consensus_bus.new_epoch_certificates().subscribe();
             let mut certs: HashMap<B256, u64> = HashMap::default();
@@ -596,7 +602,7 @@ where
                     } else {
                         error!(
                             target: "epoch-manager",
-                            "Recieved an epoch cert with incorrect hash {}, expected {}", cert.epoch_hash, epoch_hash
+                            "Received an epoch cert with incorrect hash {}, expected {}", cert.epoch_hash, epoch_hash
                         );
                     }
                 }
