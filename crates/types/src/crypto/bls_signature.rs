@@ -7,7 +7,10 @@ use blst::min_sig::{
     AggregateSignature as CoreBlsAggregateSignature, Signature as CoreBlsSignature,
 };
 use serde::{Deserialize, Serialize};
-use std::{fmt, ops::Deref};
+use std::{
+    fmt,
+    ops::{Deref, DerefMut},
+};
 
 /// Validator's main protocol key signature.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -111,6 +114,11 @@ impl Deref for BlsAggregateSignature {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+impl DerefMut for BlsAggregateSignature {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
