@@ -170,7 +170,7 @@ impl GenesisArgs {
             // use the current runtime (ie - tests)
             RethEnv::create_consensus_registry_genesis_account(
                 validators.clone(),
-                genesis.clone(),
+                genesis,
                 initial_stake_config.clone(),
                 self.consensus_registry_owner,
             )?
@@ -183,7 +183,7 @@ impl GenesisArgs {
             runtime.block_on(async {
                 RethEnv::create_consensus_registry_genesis_account(
                     validators.clone(),
-                    genesis.clone(),
+                    genesis,
                     initial_stake_config,
                     self.consensus_registry_owner,
                 )

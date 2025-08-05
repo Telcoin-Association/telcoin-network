@@ -95,12 +95,6 @@ pub fn config_local_testnet(
         Config::write_to_path(&data_dir, &genesis, ConfigFmt::YAML)?;
     }
 
-    //todo
-    let data_dir = shared_genesis_dir.join("genesis/genesis.yaml");
-    let genesis: Genesis = Config::load_from_path(&data_dir, ConfigFmt::YAML)?;
-    let genesis = genesis.with_timestamp(tn_types::now());
-    Config::write_to_path(&data_dir, &genesis, ConfigFmt::YAML)?;
-
     for (v, _addr) in validators.iter() {
         let dir = temp_path.join(v);
         std::fs::create_dir_all(dir.join("genesis"))?;
