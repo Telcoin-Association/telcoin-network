@@ -106,7 +106,8 @@ fn catchup_accumulator<DB: TNDatabase>(
             .base_fee(0)
             .set_base_fee(block.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE));
 
-        let blocks = reth_env.blocks_for_range(epoch_state.epoch_start..=block.number)?;
+        let blocks =
+            reth_env.blocks_for_range(epoch_state.epoch_info.blockHeight..=block.number)?;
         let mut consensus_leaders: HashMap<B256, AuthorityIdentifier> = HashMap::default();
         for current in blocks {
             let gas = current.gas_used;
