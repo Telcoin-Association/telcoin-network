@@ -23,7 +23,7 @@ use crate::{
 };
 use alloy::{
     consensus::Transaction as _,
-    hex,
+    hex::{self, ToHexExt},
     primitives::{Bytes, ChainId},
     sol_types::{SolCall, SolConstructor},
 };
@@ -102,7 +102,7 @@ use system_calls::{
     EpochState, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
 };
 use tempfile::TempDir;
-use tn_config::{NodeInfo, CONSENSUS_REGISTRY_JSON};
+use tn_config::{NodeInfo, BLSG1_JSON, CONSENSUS_REGISTRY_JSON};
 use tn_types::{
     gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber, BlockHeader as _,
     BlockNumHash, BlockNumber, Epoch, ExecHeader, Genesis, GenesisAccount, RecoveredBlock,
@@ -942,48 +942,12 @@ impl RethEnv {
         initial_stake_config: ConsensusRegistry::StakeConfig,
         owner_address: Address,
     ) -> eyre::Result<Genesis> {
-        let validators: Vec<_> = validators
-            .iter()
-            .map(|v| ConsensusRegistry::ValidatorInfo {
-                blsPubkey: v.bls_public_key.to_bytes().into(),
-                validatorAddress: v.execution_address,
-                activationEpoch: 0,
-                exitEpoch: 0,
-                currentStatus: ConsensusRegistry::ValidatorStatus::Active,
-                isRetired: false,
-                isDelegated: false,
-                stakeVersion: 0,
-            })
-            .collect();
-
-        let total_stake_balance = initial_stake_config
-            .stakeAmount
-            .checked_mul(U256::from(validators.len()))
-            .ok_or_eyre("Failed to calculate total stake for consensus registry at genesis")?;
-
-        let tmp_chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
         // create temporary reth env for execution
+        let tmp_chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
         let task_manager = TaskManager::new("Temp Task Manager");
         let tmp_dir = TempDir::new().unwrap();
         let reth_env =
             RethEnv::new_for_temp_chain(tmp_chain.clone(), tmp_dir.path(), &task_manager)?;
-
-        debug!(target: "engine", ?initial_stake_config, "calling constructor for consensus registry");
-
-        let constructor_args = ConsensusRegistry::constructorCall {
-            genesisConfig_: initial_stake_config,
-            initialValidators_: validators,
-            owner_: owner_address,
-        }
-        .abi_encode();
-
-        // generate calldata for creation
-        let bytecode_binding =
-            Self::fetch_value_from_json_str(CONSENSUS_REGISTRY_JSON, Some("bytecode.object"))?;
-        let registry_initcode =
-            hex::decode(bytecode_binding.as_str().ok_or_eyre("invalid registry json")?)?;
-        let mut create_registry = registry_initcode.clone();
-        create_registry.extend(constructor_args);
 
         let state = StateProviderDatabase::new(reth_env.latest()?);
         let mut cached_reads = CachedReads::default();
@@ -992,19 +956,101 @@ impl RethEnv {
             .with_bundle_update()
             .build();
 
-        let mut tn_evm = reth_env
-            .evm_config
-            .evm_factory()
-            .create_evm(&mut db, reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header()));
+        // deploy blsg1 library separately first, scoped to release borrow on db before registry
+        let blsg1_address = {
+            let mut tn_evm = reth_env.evm_config.evm_factory().create_evm(
+                &mut db,
+                reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header()),
+            );
 
-        let ResultAndState { result, state } =
-            tn_evm.transact_pre_genesis_create(owner_address, create_registry.into())?;
-        debug!(target: "engine", "create consensus registry result:\n{:#?}", result);
+            let blsg1_initcode_binding =
+                Self::fetch_value_from_json_str(BLSG1_JSON, Some("bytecode.object"))?;
+            let blsg1_initcode =
+                hex::decode(blsg1_initcode_binding.as_str().ok_or_eyre("invalid blsg1 json")?)?;
+            let ResultAndState { result, state } =
+                tn_evm.transact_pre_genesis_create(owner_address, blsg1_initcode.into())?;
+            debug!(target: "engine", "create blsg1 library result:\n{:#?}", result);
 
-        tn_evm.db_mut().commit(state);
+            // commit state to db so it persists
+            tn_evm.db_mut().commit(state);
+
+            // tmp BlsG1 library address is owner's first create tx on tmp chain
+            owner_address.create(0)
+        };
+
+        // merge transitions but keep the library state in db
         db.merge_transitions(BundleRetention::PlainState);
 
-        // execute the transaction
+        // prepare registry deployment
+        let (validators, proofs): (Vec<_>, Vec<_>) = validators
+            .iter()
+            .map(|v| {
+                let validator = ConsensusRegistry::ValidatorInfo {
+                    blsPubkey: v.bls_public_key.to_bytes().into(),
+                    validatorAddress: v.execution_address,
+                    activationEpoch: 0,
+                    exitEpoch: 0,
+                    currentStatus: ConsensusRegistry::ValidatorStatus::Active,
+                    isRetired: false,
+                    isDelegated: false,
+                    stakeVersion: 0,
+                };
+                let proof = ConsensusRegistry::ProofOfPossession {
+                    uncompressedPubkey: v.bls_public_key.serialize().into(),
+                    uncompressedSignature: v.proof_of_possession.serialize().into(),
+                };
+
+                (validator, proof)
+            })
+            .unzip();
+
+        let total_stake_balance = initial_stake_config
+            .stakeAmount
+            .checked_mul(U256::from(validators.len()))
+            .ok_or_eyre("Failed to calculate total stake for consensus registry at genesis")?;
+        debug!(target: "engine", ?initial_stake_config, "calling constructor for consensus registry");
+
+        let constructor_args = ConsensusRegistry::constructorCall {
+            genesisConfig_: initial_stake_config,
+            initialValidators_: validators,
+            proofsOfPossession: proofs,
+            owner_: owner_address,
+        }
+        .abi_encode();
+
+        // generate calldata for creation
+        let registry_initcode_binding =
+            Self::fetch_value_from_json_str(CONSENSUS_REGISTRY_JSON, Some("bytecode.object"))?;
+        let registry_initcode_str =
+            registry_initcode_binding.as_str().ok_or_eyre("invalid registry json")?;
+        // link the BlsG1 library address into the registry bytecode
+        let linked_registry_initcode =
+            Self::link_solidity_library(registry_initcode_str, &blsg1_address.encode_hex())?;
+
+        let mut create_registry = linked_registry_initcode;
+        create_registry.extend(constructor_args);
+
+        // after adding bls proof of possession, registry precompile exceeds size limit so disable
+        // it for tmp chain
+        let mut tmp_evm_no_eip170 = reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header());
+        tmp_evm_no_eip170.cfg_env.limit_contract_code_size = Some(0x12000000);
+
+        // deploy registry now that it can use the previously deployed blsg1 lib
+        let tmp_registry_address = {
+            let mut tn_evm =
+                reth_env.evm_config.evm_factory().create_evm(&mut db, tmp_evm_no_eip170);
+            let ResultAndState { result, state } =
+                tn_evm.transact_pre_genesis_create(owner_address, create_registry.into())?;
+            debug!(target: "engine", "create consensus registry result:\n{:#?}", result);
+
+            tn_evm.db_mut().commit(state);
+
+            // tmp BlsG1 library address is owner's second create tx on tmp chain
+            owner_address.create(1)
+        };
+
+        // execute the transactions to get final bundle state
+        db.merge_transitions(BundleRetention::PlainState);
         let BundleState { state, contracts, reverts, state_size, reverts_size } = db.take_bundle();
 
         debug!(target: "engine", "contracts:\n{:#?}", contracts);
@@ -1012,27 +1058,83 @@ impl RethEnv {
         debug!(target: "engine", "state_size:{:#?}", state_size);
         debug!(target: "engine", "reverts_size:{:#?}", reverts_size);
 
-        // copy tmp values to real genesis
-        let tmp_address = owner_address.create(0);
-        let tmp_storage = state.get(&tmp_address).map(|account| {
+        // construct real genesis using known values & tmp chain storage result
+        let tmp_registry_storage = state.get(&tmp_registry_address).map(|account| {
             account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
         });
-
-        let deployed_bytecode_binding = Self::fetch_value_from_json_str(
+        let registry_runtimecode_binding = Self::fetch_value_from_json_str(
             CONSENSUS_REGISTRY_JSON,
             Some("deployedBytecode.object"),
         )?;
+        let registry_runtimecode_str =
+            registry_runtimecode_binding.as_str().ok_or_eyre("invalid registry json")?;
         let registry_runtimecode =
-            hex::decode(deployed_bytecode_binding.as_str().ok_or_eyre("invalid registry json")?)?;
-        let genesis = genesis.extend_accounts([(
-            CONSENSUS_REGISTRY_ADDRESS,
-            GenesisAccount::default()
-                .with_balance(U256::from(total_stake_balance))
-                .with_code(Some(registry_runtimecode.into()))
-                .with_storage(tmp_storage),
-        )]);
+            Self::link_solidity_library(registry_runtimecode_str, &blsg1_address.encode_hex())?;
+
+        let blsg1_runtimecode_binding =
+            Self::fetch_value_from_json_str(BLSG1_JSON, Some("deployedBytecode.object"))?;
+        let blsg1_runtimecode =
+            hex::decode(blsg1_runtimecode_binding.as_str().ok_or_eyre("invalid blsg1 json")?)?;
+        let genesis = genesis.extend_accounts([
+            (blsg1_address, GenesisAccount::default().with_code(Some(blsg1_runtimecode.into()))),
+            (
+                CONSENSUS_REGISTRY_ADDRESS,
+                GenesisAccount::default()
+                    .with_balance(U256::from(total_stake_balance))
+                    .with_code(Some(registry_runtimecode.into()))
+                    .with_storage(tmp_registry_storage),
+            ),
+        ]);
 
         Ok(genesis)
+    }
+
+    /// Links a library address into contract bytecode
+    ///
+    /// Replaces Solidity's `__$<34 chars of library hash>$__` placeholder
+    pub fn link_solidity_library(
+        bytecode_hex: &str,
+        library_address: &str,
+    ) -> eyre::Result<Vec<u8>> {
+        const PLACEHOLDER_PREFIX: &str = "__$";
+        const PLACEHOLDER_SUFFIX: &str = "$__";
+        const PLACEHOLDER_LEN: usize = 40; // __$ + 34 chars + $__
+        let library_address_unprefixed =
+            library_address.strip_prefix("0x").unwrap_or(library_address);
+        let mut result = String::with_capacity(bytecode_hex.len());
+        let mut chars = bytecode_hex.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            // check if we're at the start of a placeholder
+            if ch == '_' && chars.peek() == Some(&'_') {
+                let mut potential_placeholder = String::from("_");
+
+                // collect the next 39 characters (we already have the first _)
+                for _ in 1..PLACEHOLDER_LEN {
+                    if let Some(next_ch) = chars.next() {
+                        potential_placeholder.push(next_ch);
+                    } else {
+                        break;
+                    }
+                }
+
+                // check it matches the placeholder pattern
+                if potential_placeholder.starts_with(PLACEHOLDER_PREFIX)
+                    && potential_placeholder.ends_with(PLACEHOLDER_SUFFIX)
+                    && potential_placeholder.len() == PLACEHOLDER_LEN
+                {
+                    // it's a valid placeholder, replace with address
+                    result.push_str(library_address_unprefixed);
+                } else {
+                    // not a placeholder, add the characters back
+                    result.push_str(&potential_placeholder);
+                }
+            } else {
+                result.push(ch);
+            }
+        }
+
+        hex::decode(result).map_err(Into::into)
     }
 
     /// Fetches json info from the given string
@@ -1221,8 +1323,9 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng as _};
     use tempfile::TempDir;
     use tn_types::{
-        adiri_genesis, BlsKeypair, BlsSignature, Certificate, CommittedSubDag, ConsensusHeader,
-        ConsensusOutput, FromHex, NodeP2pInfo, ReputationScores, SignatureVerificationState,
+        generate_proof_of_possession_bls, BlsKeypair, BlsSignature, Certificate, CommittedSubDag,
+        ConsensusHeader, ConsensusOutput, FromHex, NodeP2pInfo, ReputationScores,
+        SignatureVerificationState,
     };
 
     /// Helper function for creating a consensus output for tests.
@@ -1308,12 +1411,14 @@ mod tests {
                 let mut rng = StdRng::seed_from_u64(i as u64);
                 let bls = BlsKeypair::generate(&mut rng);
                 let bls_pubkey = bls.public();
+                let pop =
+                    generate_proof_of_possession_bls(&bls, addr).expect("pop generation failed");
                 NodeInfo {
                     name: format!("validator-{i}"),
                     bls_public_key: *bls_pubkey,
                     p2p_info: NodeP2pInfo::default(),
                     execution_address: *addr,
-                    proof_of_possession: BlsSignature::default(),
+                    proof_of_possession: pop,
                 }
             })
             .collect();
@@ -1334,7 +1439,7 @@ mod tests {
         let mut governance_multisig =
             TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
         let governance = governance_multisig.address();
-        let tmp_genesis = adiri_genesis().extend_accounts([
+        let tmp_genesis = tn_types::test_genesis().extend_accounts([
             (
                 governance,
                 GenesisAccount::default().with_balance(U256::from((50_000_000 * 10) ^ 18)), // 50mil TEL
@@ -1371,8 +1476,13 @@ mod tests {
             U256::ZERO,
             calldata,
         );
+        let proof = ConsensusRegistry::ProofOfPossession {
+            uncompressedPubkey: new_validator.bls_public_key.serialize().into(),
+            uncompressedSignature: new_validator.proof_of_possession.serialize().into(),
+        };
         let calldata = ConsensusRegistry::stakeCall {
-            blsPubkey: new_validator.bls_public_key.compress().into(),
+            blsPubkey: new_validator.bls_public_key.to_bytes().into(),
+            proofOfPossession: proof,
         }
         .abi_encode()
         .into();

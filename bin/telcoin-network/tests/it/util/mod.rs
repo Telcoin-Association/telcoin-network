@@ -78,7 +78,7 @@ pub fn config_local_testnet(
         "--basefee-address",
         "0x9999999999999999999999999999999999999999",
         "--consensus-registry-owner",
-        "0x00000000000000000000000000000000000007e1", // doesn't matter for these tests
+        "0x00000000000000000000000000000000000007a0",
         "--dev-funded-account",
         "test-source",
         "--max-header-delay-ms",
