@@ -102,7 +102,7 @@ use system_calls::{
     EpochState, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
 };
 use tempfile::TempDir;
-use tn_config::{NodeInfo, BLSG1_JSON, CONSENSUS_REGISTRY_JSON};
+use tn_config::{NodeInfo, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, GOVERNANCE_SAFE_ADDRESS};
 use tn_types::{
     gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber, BlockHeader as _,
     BlockNumHash, BlockNumber, Epoch, ExecHeader, Genesis, GenesisAccount, RecoveredBlock,
@@ -154,22 +154,22 @@ pub mod worker;
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;
 
-/// This will contain the address to receive base fees.  It is set per chain (or not if None)
+/// This will contain the address to receive base fees.  It is set per chain and
 /// will not change.  Implemented as a static OnceLock to work around the Reth lib interface.
-static BASEFEE_ADDRESS: OnceLock<Option<Address>> = OnceLock::new();
+static BASEFEE_ADDRESS: OnceLock<Address> = OnceLock::new();
 
 /// Return the chains basefee address if set.
 /// Note the basefee address is set once for the chain and will not change (outside of a hard fork).
-pub fn basefee_address() -> Option<Address> {
-    *BASEFEE_ADDRESS.get()?
+pub fn basefee_address() -> Address {
+    *BASEFEE_ADDRESS.get().unwrap_or(&GOVERNANCE_SAFE_ADDRESS)
 }
 
 /// Set the basefee address.  This will only work on the first call and should be during program
 /// initialization. Calling more than once will do nothing, not calling early can lead to an unset
 /// basefee address and a chain fork.
 fn set_basefee_address(address: Option<Address>) {
-    // Ignore the error.  Should probably panic on error but this will break some test environments.
-    let _ = BASEFEE_ADDRESS.set(address);
+    // Ignore the error. Should probably panic on error but this will break some test environments.
+    let _ = BASEFEE_ADDRESS.set(address.unwrap_or(GOVERNANCE_SAFE_ADDRESS));
 }
 
 /// Rpc Server type, used for getting the node started.
@@ -920,6 +920,7 @@ impl RethEnv {
         chain: Arc<RethChainSpec>,
         db_path: P,
         task_manager: &TaskManager,
+        rewards: Option<RewardsCounter>,
     ) -> eyre::Result<Self> {
         let node_config = NodeConfig {
             datadir: DatadirArgs {
@@ -932,7 +933,7 @@ impl RethEnv {
         };
         let reth_config = RethConfig(node_config);
         let database = Self::new_database(&reth_config, db_path)?;
-        Self::new(&reth_config, task_manager, database, None, RewardsCounter::default())
+        Self::new(&reth_config, task_manager, database, None, rewards.unwrap_or_default())
     }
 
     /// Convenience method for compiling storage and bytecode to include genesis.
@@ -947,7 +948,7 @@ impl RethEnv {
         let task_manager = TaskManager::new("Temp Task Manager");
         let tmp_dir = TempDir::new().unwrap();
         let reth_env =
-            RethEnv::new_for_temp_chain(tmp_chain.clone(), tmp_dir.path(), &task_manager)?;
+            RethEnv::new_for_temp_chain(tmp_chain.clone(), tmp_dir.path(), &task_manager, None)?;
 
         let state = StateProviderDatabase::new(reth_env.latest()?);
         let mut cached_reads = CachedReads::default();
@@ -1508,7 +1509,8 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::new("Test Task Manager");
         let reth_env =
-            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager).unwrap();
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
         let mut expected_epoch = 0;
         let expected_committee = validators.iter().map(|v| v.execution_address).collect();
         let mut expected_epoch_info = ConsensusRegistry::EpochInfo {

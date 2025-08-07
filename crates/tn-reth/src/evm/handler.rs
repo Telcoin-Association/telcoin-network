@@ -23,12 +23,12 @@ use crate::basefee_address;
 /// This is only intended to overwrite basefee logic for now.
 pub(super) struct TNEvmHandler<EVM> {
     /// Address for basefees
-    basefee_address: Option<Address>,
+    basefee_address: Address,
     _phantom: core::marker::PhantomData<EVM>,
 }
 
 impl<EVM> TNEvmHandler<EVM> {
-    fn new(basefee_address: Option<Address>) -> Self {
+    fn new(basefee_address: Address) -> Self {
         Self { basefee_address, _phantom: core::marker::PhantomData }
     }
 }
@@ -84,14 +84,12 @@ where
             .balance
             .saturating_add(U256::from(coinbase_gas_price * gas_used));
 
-        if let Some(basefee_address) = self.basefee_address {
-            // Send the base fee portion to a basefee account for later processing
-            // (offchain).
-            let basefee_account = context.journal().load_account(basefee_address)?;
-            basefee_account.data.mark_touch();
-            basefee_account.data.info.balance =
-                basefee_account.data.info.balance.saturating_add(U256::from(basefee * gas_used));
-        }
+        // Send the base fee portion to a basefee account for later processing
+        // (offchain).
+        let basefee_account = context.journal().load_account(self.basefee_address)?;
+        basefee_account.data.mark_touch();
+        basefee_account.data.info.balance =
+            basefee_account.data.info.balance.saturating_add(U256::from(basefee * gas_used));
 
         Ok(())
     }
