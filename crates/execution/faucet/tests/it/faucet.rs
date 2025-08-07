@@ -236,8 +236,12 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
     let tmp_dir = TempDir::new().expect("temp dir");
 
     let task_manager = TaskManager::new("Temp Task Manager");
-    let tmp_reth_env =
-        RethEnv::new_for_temp_chain(pre_genesis_chain.clone(), tmp_dir.path(), &task_manager)?;
+    let tmp_reth_env = RethEnv::new_for_temp_chain(
+        pre_genesis_chain.clone(),
+        tmp_dir.path(),
+        &task_manager,
+        None,
+    )?;
     // fetch state to be set on the faucet proxy address
     let execution_bundle = tmp_reth_env
         .execution_outcome_for_tests(raw_txs, &pre_genesis_chain.sealed_genesis_header());
@@ -580,8 +584,12 @@ async fn test_with_creds_faucet_transfers_stablecoin_with_google_kms() -> eyre::
 
     let tmp_dir = TempDir::new().expect("temp dir");
     let task_manager = TaskManager::new("Temp Task Manager");
-    let tmp_reth_env =
-        RethEnv::new_for_temp_chain(pre_genesis_chain.clone(), tmp_dir.path(), &task_manager)?;
+    let tmp_reth_env = RethEnv::new_for_temp_chain(
+        pre_genesis_chain.clone(),
+        tmp_dir.path(),
+        &task_manager,
+        None,
+    )?;
     // fetch state to be set on the faucet proxy address
     let execution_bundle = tmp_reth_env
         .execution_outcome_for_tests(raw_txs, &pre_genesis_chain.sealed_genesis_header());

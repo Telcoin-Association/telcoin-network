@@ -31,7 +31,8 @@ fn random_batches(
     (payload, batches)
 }
 
-/// Creates one signed certificate from a set of signers - the signers must include the origin/author.
+/// Creates one signed certificate from a set of signers - the signers must include the
+/// origin/author.
 fn signed_cert<DB>(
     origin: AuthorityIdentifier,
     round: Round,
