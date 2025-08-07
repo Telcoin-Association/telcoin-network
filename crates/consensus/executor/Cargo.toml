@@ -24,7 +24,6 @@ consensus-metrics.workspace = true
 tn-primary = { workspace = true }
 
 [dev-dependencies]
-indexmap.workspace = true
 eyre = { workspace = true }
 tn-test-utils = { workspace = true }
 tn-primary = { workspace = true, features = ["test-utils"] }

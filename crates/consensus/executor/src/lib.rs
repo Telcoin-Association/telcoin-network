@@ -34,7 +34,6 @@ impl Executor {
         // Spawn the subscriber.
         spawn_subscriber(config, rx_shutdown, consensus_bus, task_manager, network);
 
-        // Return the handle.
         info!("Consensus subscriber successfully started");
     }
 }
