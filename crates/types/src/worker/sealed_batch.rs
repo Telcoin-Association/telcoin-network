@@ -272,4 +272,7 @@ pub enum BatchValidationError {
     /// The batch contains blob transactions EIP-4844.
     #[error("Proposed batch contains blob transaction. Tx hash: {0}")]
     InvalidTx4844(BlockHash),
+    /// The total allowable gas in the batch exceeds `u64::MAX`.
+    #[error("Overflow calculating max possible gas.")]
+    GasOverflow,
 }

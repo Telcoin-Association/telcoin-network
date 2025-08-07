@@ -44,6 +44,7 @@ impl From<WorkerNetworkError> for Option<Penalty> {
                     | BatchValidationError::InvalidBaseFee { .. }
                     | BatchValidationError::InvalidWorkerId { .. }
                     | BatchValidationError::InvalidDigest
+                    | BatchValidationError::GasOverflow
                     | BatchValidationError::TimestampIsInPast { .. }
                     | BatchValidationError::CalculateMaxPossibleGas
                     | BatchValidationError::HeaderMaxGasExceedsGasLimit { .. }
