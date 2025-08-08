@@ -5,7 +5,7 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
-    kad::KadStore,
+    kad::{KadRecord, KadStore},
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     types::{
@@ -21,7 +21,7 @@ use libp2p::{
         TopicHash,
     },
     identify::{self, Event as IdentifyEvent, Info as IdentifyInfo},
-    kad::{self, Mode, QueryId},
+    kad::{self, store::RecordStore, Mode, QueryId, Record},
     multiaddr::Protocol,
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
@@ -35,9 +35,10 @@ use std::{
     time::Duration,
 };
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
+use tn_storage::tables::KadRecords;
 use tn_types::{
-    encode, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair, NetworkPublicKey,
-    TaskSpawner,
+    decode, encode, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
+    NetworkPublicKey, TaskSpawner,
 };
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
@@ -114,7 +115,7 @@ where
     ///
     /// This set must be updated at the start of each epoch. It is used to verify messages
     /// published on certain topics. These are updated when the caller subscribes to a topic.
-    authorized_publishers: HashMap<String, Option<HashSet<PeerId>>>,
+    authorized_publishers: HashMap<String, Option<HashSet<BlsPublicKey>>>,
     /// The collection of pending _graceful_ disconnects.
     ///
     /// This node disconnects from new peers if it already has the target number of peers.
@@ -154,10 +155,6 @@ where
     kad_add_peers: bool,
     /// The public network key for this node.
     network_pubkey: NetworkPublicKey,
-    /// The hostname for the node provided by the [NetworkConfig].
-    ///
-    /// This is a human-readable representation for a node identity.
-    hostname: String,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
 }
@@ -238,15 +235,33 @@ where
         let twelve_hours = Some(Duration::from_secs(12 * 60 * 60));
         kad_config
             .set_record_ttl(two_days)
+            .set_record_filtering(kad::StoreInserts::FilterBoth)
             .set_publication_interval(twelve_hours)
             .set_query_timeout(Duration::from_secs(60))
             .set_provider_record_ttl(two_days);
-        let kad_store = KadStore::new(db, &key_config);
+        let kad_store = KadStore::new(db.clone(), &key_config);
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store, kad_config);
 
         // create custom behavior
-        let behavior =
+        let mut behavior =
             TNBehavior::new(identify, gossipsub, req_res, kademlia, network_config.peer_config());
+
+        // Load the Kad records from DB into the local peer cache.
+        for (_key, record) in db.iter::<KadRecords>() {
+            let record: KadRecord = decode(record.as_ref());
+            let record: Record = record.into();
+            match BlsPublicKey::from_literal_bytes(record.key.as_ref()) {
+                Ok(key) => {
+                    let record: NodeRecord = decode(&record.value);
+                    behavior.peer_manager.add_known_peer(key, record.info);
+                }
+                // How did we get a KAD record with a broken key?
+                Err(error) => {
+                    error!(target: "network-kad", ?error, "Invalid/corrupt KAD DB store!");
+                }
+            }
+        }
+
         let network_pubkey = keypair.public().into();
 
         // create swarm
@@ -290,7 +305,6 @@ where
             key_config,
             kad_add_peers: true,
             network_pubkey,
-            hostname: network_config.hostname().to_string(),
             task_spawner,
         })
     }
@@ -312,9 +326,11 @@ where
         let mut multiaddrs: Vec<Multiaddr> = self.swarm.external_addresses().cloned().collect();
 
         if multiaddrs.is_empty() {
-            warn!(target: "network-kad", ?multiaddrs, "call to create peer record, but external addresses are empty - using self-reported listeners");
             // fallback to listeners
             multiaddrs = self.swarm.listeners().cloned().collect();
+            warn!(target: "network-kad", "call to create peer record, but external addresses are empty - using self-reported listeners {multiaddrs:?}");
+        } else {
+            info!(target: "network-kad", ?multiaddrs, "call to create peer record, using our confirmed external addresses");
         }
 
         // use ipv4 or ipv6 multiaddr
@@ -333,12 +349,9 @@ where
 
         if let Some(addr) = multiaddr {
             let peer_id = *self.swarm.local_peer_id();
-            let node_record = NodeRecord::build(
-                self.network_pubkey.clone(),
-                addr,
-                self.hostname.clone(),
-                |data| self.key_config.request_signature_direct(data),
-            );
+            let node_record = NodeRecord::build(self.network_pubkey.clone(), addr, |data| {
+                self.key_config.request_signature_direct(data)
+            });
             Some(kad::Record {
                 key: key.clone(),
                 value: encode(&node_record),
@@ -375,10 +388,19 @@ where
         }
     }
 
-    /// Publish our network addresses and peer id under our BLS public key for discovery.
-    fn publish_our_data(&mut self) {
+    /// Publish our network addresses and peer id AND to the network under our BLS public key for
+    /// discovery.
+    fn publish_our_data_to_peer(&mut self, peer: PeerId) {
         if let Some(record) = self.get_peer_record() {
             info!(target: "network-kad", "Publishing our record to kademlia");
+            // Publish to the specified peer.
+            let _ = self.swarm.behaviour_mut().kademlia.put_record_to(
+                record.clone(),
+                vec![peer].into_iter(),
+                kad::Quorum::One,
+            );
+
+            // Also publish our record locally and to the network.
             if let Err(err) =
                 self.swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One)
             {
@@ -435,7 +457,7 @@ where
             SwarmEvent::ListenerError { listener_id, error } => {
                 // log listener errors
                 error!(
-                    target: "network::events",
+                    target: "network",
                     ?listener_id,
                     ?error,
                     "listener error"
@@ -475,16 +497,57 @@ where
                 let addrs = self.swarm.listeners().cloned().collect();
                 send_or_log_error!(reply, addrs, "GetListeners");
             }
-            NetworkCommand::AddExplicitPeer { peer_id, addr, reply } => {
+            NetworkCommand::AddTrustedPeerAndDial { bls_pubkey, network_pubkey, addr, reply } => {
                 // update peer manager
-                self.swarm.behaviour_mut().peer_manager.add_explicit_peer(
-                    peer_id,
-                    addr.clone(),
+                self.swarm.behaviour_mut().peer_manager.add_trusted_peer_and_dial(
+                    bls_pubkey,
+                    NetworkInfo { pubkey: network_pubkey, multiaddrs: vec![addr] },
                     reply,
                 );
             }
+            NetworkCommand::AddExplicitPeer { bls_pubkey, network_pubkey, addr, reply } => {
+                // update peer manager
+                self.swarm.behaviour_mut().peer_manager.add_known_peer(
+                    bls_pubkey,
+                    NetworkInfo { pubkey: network_pubkey, multiaddrs: vec![addr] },
+                );
+                let _ = reply.send(Ok(()));
+            }
+            NetworkCommand::AddBootstrapPeers { peers, reply } => {
+                // update peer manager
+                let peer = &mut self.swarm.behaviour_mut().peer_manager;
+                for (bls, info) in peers {
+                    if peer.auth_to_peer(bls).is_none() {
+                        peer.add_known_peer(
+                            bls,
+                            NetworkInfo {
+                                pubkey: info.network_key,
+                                multiaddrs: vec![info.network_address],
+                            },
+                        );
+                    }
+                }
+                let _ = reply.send(Ok(()));
+            }
             NetworkCommand::Dial { peer_id, peer_addr, reply } => {
-                self.swarm.behaviour_mut().peer_manager.dial_peer(peer_id, peer_addr, reply);
+                self.swarm.behaviour_mut().peer_manager.dial_peer(
+                    peer_id,
+                    vec![peer_addr],
+                    Some(reply),
+                );
+            }
+            NetworkCommand::DialBls { bls_key, reply } => {
+                if let Some((peer_id, peer_addr)) =
+                    self.swarm.behaviour().peer_manager.auth_to_peer(bls_key)
+                {
+                    self.swarm.behaviour_mut().peer_manager.dial_peer(
+                        peer_id,
+                        peer_addr,
+                        Some(reply),
+                    );
+                } else {
+                    let _ = reply.send(Err(NetworkError::PeerMissing));
+                }
             }
             NetworkCommand::LocalPeerId { reply } => {
                 let peer_id = *self.swarm.local_peer_id();
@@ -501,10 +564,22 @@ where
                 self.authorized_publishers.insert(topic, publishers);
                 send_or_log_error!(reply, res, "Subscribe");
             }
-            NetworkCommand::ConnectedPeers { reply } => {
+            NetworkCommand::ConnectedPeerIds { reply } => {
                 let res = self.swarm.behaviour().peer_manager.connected_or_dialing_peers();
-                debug!(target: "epoch-manager", ?res, "peer manager connected peers:");
+                debug!(target: "network", ?res, "peer manager connected peers:");
                 send_or_log_error!(reply, res, "ConnectedPeers");
+            }
+            NetworkCommand::ConnectedPeers { reply } => {
+                let peers = self
+                    .swarm
+                    .behaviour()
+                    .peer_manager
+                    .connected_or_dialing_peers()
+                    .iter()
+                    .flat_map(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id))
+                    .collect();
+                debug!(target: "network", ?peers, "peer manager connected peers:");
+                send_or_log_error!(reply, peers, "ConnectedPeers");
             }
             NetworkCommand::PeerScore { peer_id, reply } => {
                 let opt_score = self.swarm.behaviour().peer_manager.peer_score(&peer_id);
@@ -521,22 +596,32 @@ where
 
                 send_or_log_error!(reply, collection, "AllPeers");
             }
-            NetworkCommand::AllMeshPeers { reply } => {
-                let collection =
-                    self.swarm.behaviour_mut().gossipsub.all_mesh_peers().cloned().collect();
-                send_or_log_error!(reply, collection, "AllMeshPeers");
-            }
             NetworkCommand::MeshPeers { topic, reply } => {
+                let topic: IdentTopic = Topic::new(&topic);
                 let collection = self
                     .swarm
                     .behaviour_mut()
                     .gossipsub
-                    .mesh_peers(&TopicHash::from_raw(topic))
+                    .mesh_peers(&topic.into())
                     .cloned()
                     .collect();
                 send_or_log_error!(reply, collection, "MeshPeers");
             }
             NetworkCommand::SendRequest { peer, request, reply } => {
+                if let Some((peer, addr)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
+                    debug!(target: "network", "trying to send to {peer} at {addr:?}");
+                    let request_id = self
+                        .swarm
+                        .behaviour_mut()
+                        .req_res
+                        .send_request_with_addresses(&peer, request, addr);
+                    self.outbound_requests.insert((peer, request_id), reply);
+                } else {
+                    // Best effort to return an error to caller.
+                    let _ = reply.send(Err(NetworkError::PeerMissing));
+                }
+            }
+            NetworkCommand::SendRequestDirect { peer, request, reply } => {
                 let request_id = self.swarm.behaviour_mut().req_res.send_request(&peer, request);
                 self.outbound_requests.insert((peer, request_id), reply);
             }
@@ -559,8 +644,10 @@ where
                 let count = self.outbound_requests.len();
                 send_or_log_error!(reply, count, "SendResponse");
             }
-            NetworkCommand::ReportPenalty { peer_id, penalty } => {
-                self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, penalty);
+            NetworkCommand::ReportPenalty { peer, penalty } => {
+                if let Some((peer, _)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
+                    self.swarm.behaviour_mut().peer_manager.process_penalty(peer, penalty);
+                }
             }
             NetworkCommand::DisconnectPeer { peer_id, reply } => {
                 // this is called after timeout for disconnected peer exchanges
@@ -589,7 +676,7 @@ where
                 //
                 // for now, this only supports the current committee for the epoch
 
-                info!(target: "epoch-manager", this_node=?self.swarm.local_peer_id(), "network update for next committee - ensuring no committee members are banned");
+                info!(target: "network", this_node=?self.swarm.local_peer_id(), "network update for next committee - ensuring no committee members are banned");
                 // ensure that the next committee isn't banned
                 self.swarm.behaviour_mut().peer_manager.new_epoch(committee);
 
@@ -676,15 +763,20 @@ where
 
                 // process gossip in application layer
                 if valid {
-                    // forward gossip to handler
-                    if let Err(e) = self
-                        .event_stream
-                        .try_send(NetworkEvent::Gossip(message, propagation_source))
+                    // We should not be able to recieve a message from an unknown peer so this
+                    // should always work.
+                    if let Some(bls) =
+                        self.swarm.behaviour().peer_manager.peer_to_bls(&propagation_source)
                     {
-                        error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
-                        // ignore failures at the epoch boundary
-                        // During epoch change the event_stream reciever can be closed.
-                        return Ok(());
+                        // forward gossip to handler
+                        if let Err(e) =
+                            self.event_stream.try_send(NetworkEvent::Gossip(message, bls))
+                        {
+                            error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
+                            // ignore failures at the epoch boundary
+                            // During epoch change the event_stream reciever can be closed.
+                            return Ok(());
+                        }
                     }
                 } else {
                     let GossipMessage { source, topic, .. } = message;
@@ -726,21 +818,37 @@ where
             ReqResEvent::Message { peer, message, connection_id: _ } => {
                 match message {
                     request_response::Message::Request { request_id, request, channel } => {
-                        let (notify, cancel) = oneshot::channel();
-                        // forward request to handler without blocking other events
-                        if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
-                            peer,
-                            request,
+                        // We should not be able to recieve a message from an unknown peer so this
+                        // should always work. It is possible (mostly in
+                        // testing) to have a race where we don't know the requester YET.
+                        // If so send an error back but this should be so infrequent on a real
+                        // network that we can ignore and it should not
+                        // cause any lasting damage if triggered.
+                        if let Some(peer) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
+                            let (notify, cancel) = oneshot::channel();
+                            // forward request to handler without blocking other events
+                            if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
+                                peer,
+                                request,
+                                channel,
+                                cancel,
+                            }) {
+                                error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
+                                // ignore failures at the epoch boundary
+                                // During epoch change the event_stream reciever can be closed.
+                                return Ok(());
+                            }
+
+                            self.inbound_requests.insert(request_id, notify);
+                        } else if let Err(e) = self.event_stream.try_send(NetworkEvent::Error(
+                            "peer not currently known".to_string(),
                             channel,
-                            cancel,
-                        }) {
+                        )) {
                             error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
                             // ignore failures at the epoch boundary
                             // During epoch change the event_stream reciever can be closed.
                             return Ok(());
                         }
-
-                        self.inbound_requests.insert(request_id, notify);
                     }
                     request_response::Message::Response { request_id, response } => {
                         // check if response associated with PX disconnect
@@ -832,9 +940,12 @@ where
 
         // ensure publisher is authorized
         if gossip.source.is_some_and(|id| {
-            self.authorized_publishers
-                .get(topic.as_str())
-                .is_some_and(|auth| auth.is_none() || auth.as_ref().expect("is some").contains(&id))
+            let bls_key = self.swarm.behaviour().peer_manager.peer_to_bls(&id);
+            self.authorized_publishers.get(topic.as_str()).is_some_and(|auth| {
+                auth.is_none()
+                    || (bls_key.is_some()
+                        && auth.as_ref().expect("is some").contains(&bls_key.expect("is some")))
+            })
         }) {
             GossipAcceptance::Accept
         } else {
@@ -928,7 +1039,7 @@ where
                 self.swarm.add_peer_address(peer_id, addr.clone());
                 if self.kad_add_peers {
                     self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                    self.publish_our_data();
+                    self.publish_our_data_to_peer(peer_id);
                 }
 
                 // manage connected peers for
@@ -964,7 +1075,52 @@ where
     fn process_kad_event(&mut self, event: kad::Event) -> NetworkResult<()> {
         match event {
             kad::Event::InboundRequest { request } => {
-                trace!(target: "network-kad", "inbound {request:?}")
+                trace!(target: "network-kad", "inbound {request:?}");
+                match request {
+                    kad::InboundRequest::FindNode { num_closer_peers: _ } => {}
+                    kad::InboundRequest::GetProvider {
+                        num_closer_peers: _,
+                        num_provider_peers: _,
+                    } => {}
+                    kad::InboundRequest::AddProvider { record } => {
+                        if let Some(record) = record {
+                            self.swarm
+                                .behaviour_mut()
+                                .kademlia
+                                .store_mut()
+                                .add_provider(record)
+                                .map_err(|e| NetworkError::StoreKademliaRecord(e.to_string()))?;
+                        }
+                    }
+                    kad::InboundRequest::GetRecord { num_closer_peers: _, present_locally: _ } => {}
+                    kad::InboundRequest::PutRecord { source, connection: _, record } => {
+                        if let Some(record) = record {
+                            if let Some((key, value)) = self.peer_record_valid(&record) {
+                                self.swarm
+                                    .behaviour_mut()
+                                    .kademlia
+                                    .store_mut()
+                                    .put(record)
+                                    .map_err(|e| {
+                                        NetworkError::StoreKademliaRecord(e.to_string())
+                                    })?;
+                                trace!(target: "network-kad", "Got record {key} {value:?}");
+                                self.swarm
+                                    .behaviour_mut()
+                                    .peer_manager
+                                    .add_known_peer(key, value.info);
+                            } else {
+                                error!(target: "network-kad", "Received invalid peer record!");
+
+                                // assess penalty for invalid peer record
+                                self.swarm
+                                    .behaviour_mut()
+                                    .peer_manager
+                                    .process_penalty(source, Penalty::Severe);
+                            }
+                        }
+                    }
+                }
             }
             kad::Event::OutboundQueryProgressed { id: query_id, result, stats: _, step } => {
                 match result {
@@ -1030,7 +1186,7 @@ where
                     kad::QueryResult::PutRecord(Ok(kad::PutRecordOk { key })) => {
                         match BlsPublicKey::from_literal_bytes(key.as_ref()) {
                             Ok(key) => {
-                                debug!(target: "network-kad", "Successfully put record {key}")
+                                debug!(target: "network-kad", "Successfully put record {key}");
                             }
                             Err(err) => {
                                 error!(target: "network-kad", "Failed to decode a kad Key: {err:?}")
@@ -1088,6 +1244,12 @@ where
         query_id: &QueryId,
         result: NetworkResult<(BlsPublicKey, NetworkInfo)>,
     ) {
+        if let Ok((bls_key, info)) = &result {
+            // If we got a response to a specific bls key request then store it in the
+            // peer manager known peers.  This indicates it is a peer we care about (probably a
+            // validator) so keep it handy.
+            self.swarm.behaviour_mut().peer_manager.add_known_peer(*bls_key, info.clone());
+        }
         // ignore multiple query results
         if let Some(reply) = self.kad_requests.remove(query_id) {
             send_or_log_error!(reply, result, "kad");

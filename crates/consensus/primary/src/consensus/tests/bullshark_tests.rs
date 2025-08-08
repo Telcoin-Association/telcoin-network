@@ -1044,7 +1044,6 @@ async fn restart_with_new_committee() {
             config.node_storage().clone(),
             config.key_config().clone(),
             committee.clone(),
-            config.worker_cache().clone(),
             NetworkConfig::default(),
         )
         .unwrap();

@@ -63,9 +63,9 @@ pub fn set_genesis_defaults(genesis: &mut Genesis) {
     genesis.config.istanbul_block = Some(0);
     genesis.config.berlin_block = Some(0);
     genesis.config.london_block = Some(0);
-    genesis.config.cancun_time = None; //Some(0);
     genesis.config.shanghai_time = Some(0);
-    genesis.config.prague_time = None;
+    genesis.config.cancun_time = Some(0);
+    genesis.config.prague_time = Some(0);
     genesis.config.osaka_time = None;
     // Configure some misc genesis stuff.
     // chain_id and maybe timestamp should probably be a command line option...
@@ -114,13 +114,9 @@ fn _adiri_chain_spec_arc() -> Arc<ChainSpec> {
 /// - 0xe69151677e5aec0b4fc0a94bfcaf20f6f0f975eb
 pub const TESTNET_GENESIS: &str = include_str!("../../../chain-configs/testnet/genesis.yaml");
 pub const TESTNET_COMMITTEE: &str = include_str!("../../../chain-configs/testnet/committee.yaml");
-pub const TESTNET_WORKER_CACHE: &str =
-    include_str!("../../../chain-configs/testnet/worker_cache.yaml");
 pub const TESTNET_PARAMETERS: &str = include_str!("../../../chain-configs/testnet/parameters.yaml");
 
 // The raw strings for the mainnet genesis and config.
 pub const MAINNET_GENESIS: &str = include_str!("../../../chain-configs/mainnet/genesis.yaml");
 pub const MAINNET_COMMITTEE: &str = include_str!("../../../chain-configs/mainnet/committee.yaml");
-pub const MAINNET_WORKER_CACHE: &str =
-    include_str!("../../../chain-configs/mainnet/worker_cache.yaml");
 pub const MAINNET_PARAMETERS: &str = include_str!("../../../chain-configs/mainnet/parameters.yaml");

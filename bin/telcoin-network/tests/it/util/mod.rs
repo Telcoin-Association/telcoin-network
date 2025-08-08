@@ -60,7 +60,7 @@ pub fn config_local_testnet(
     // create validator info and copy to shared genesis dir
     for (v, addr) in validators.iter() {
         let dir = temp_path.join(v);
-        // init genesis ceremony to create committee / worker_cache files
+        // init genesis ceremony to create committee files
         create_validator_info(&dir, addr, passphrase.clone())?;
 
         // copy to shared genesis dir
@@ -78,7 +78,7 @@ pub fn config_local_testnet(
         "--basefee-address",
         "0x9999999999999999999999999999999999999999",
         "--consensus-registry-owner",
-        "0x00000000000000000000000000000000000007e1", // doesn't matter for these tests
+        "0x00000000000000000000000000000000000007a0",
         "--dev-funded-account",
         "test-source",
         "--max-header-delay-ms",
@@ -104,10 +104,6 @@ pub fn config_local_testnet(
             dir.join("genesis/committee.yaml"),
         )?;
         std::fs::copy(
-            shared_genesis_dir.join("genesis/worker_cache.yaml"),
-            dir.join("genesis/worker_cache.yaml"),
-        )?;
-        std::fs::copy(
             shared_genesis_dir.join("genesis/genesis.yaml"),
             dir.join("genesis/genesis.yaml"),
         )?;
@@ -120,10 +116,6 @@ pub fn config_local_testnet(
     std::fs::copy(
         shared_genesis_dir.join("genesis/committee.yaml"),
         dir.join("genesis/committee.yaml"),
-    )?;
-    std::fs::copy(
-        shared_genesis_dir.join("genesis/worker_cache.yaml"),
-        dir.join("genesis/worker_cache.yaml"),
     )?;
     std::fs::copy(
         shared_genesis_dir.join("genesis/genesis.yaml"),

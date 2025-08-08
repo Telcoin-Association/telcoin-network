@@ -103,7 +103,7 @@ pub fn execute_consensus_output(
             let batch_digest =
                 output.next_batch_digest().ok_or(TnEngineError::NextBlockDigestMissing)?;
             // use batch's base fee, gas limit, and withdrawals
-            let base_fee_per_gas = batch.base_fee_per_gas.unwrap_or_default();
+            let base_fee_per_gas = batch.base_fee_per_gas;
             let gas_limit = max_batch_gas(batch.timestamp);
 
             // apply XOR bitwise operator with worker's digest to ensure unique mixed hash per batch

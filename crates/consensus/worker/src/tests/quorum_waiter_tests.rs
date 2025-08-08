@@ -13,7 +13,6 @@ use tokio::sync::mpsc;
 async fn wait_for_quorum() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let committee = fixture.committee();
-    let worker_cache = fixture.worker_cache();
     let my_primary = fixture.authorities().next().unwrap();
     let node_metrics = Arc::new(WorkerMetrics::default());
     let task_manager = TaskManager::default();
@@ -22,14 +21,8 @@ async fn wait_for_quorum() {
     let (sender, mut network_rx) = mpsc::channel(100);
     let network = WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner());
     // Spawn a `QuorumWaiter` instance.
-    let quorum_waiter = QuorumWaiter::new(
-        my_primary.authority().clone(),
-        /* worker_id */ 0,
-        committee.clone(),
-        worker_cache.clone(),
-        network,
-        node_metrics,
-    );
+    let quorum_waiter =
+        QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network, node_metrics);
 
     // Make a batch.
     let sealed_batch = batch().seal_slow();

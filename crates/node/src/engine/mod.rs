@@ -21,8 +21,8 @@ use tn_reth::{
 use tn_rpc::EngineToPrimary;
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    BatchSender, BatchValidation, ConsensusOutput, ExecHeader, Noticer, SealedHeader, TaskSpawner,
-    WorkerId, B256,
+    BatchSender, BatchValidation, BlsPublicKey, ConsensusOutput, ExecHeader, Noticer, SealedHeader,
+    TaskSpawner, WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::{mpsc, RwLock};
@@ -187,5 +187,11 @@ impl ExecutionNode {
     pub async fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
         let guard = self.internal.read().await;
         guard.epoch_state_from_canonical_tip()
+    }
+
+    /// Read committee validator keys for epoch.
+    pub async fn validators_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<BlsPublicKey>> {
+        let guard = self.internal.read().await;
+        guard.validators_for_epoch(epoch)
     }
 }

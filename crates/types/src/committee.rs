@@ -4,7 +4,6 @@ use crate::{
     crypto::{BlsPublicKey, NetworkPublicKey},
     Address, Multiaddr,
 };
-use libp2p::{multihash::Multihash, PeerId};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IndexedRandom as _, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -22,23 +21,55 @@ pub type Epoch = u32;
 /// The voting power an authority has within the committee.
 pub type VotingPower = u64;
 
+/// A multiaddr and network public key for a libp2p node.
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct P2pNode {
+    /// The network address of the node.
+    pub network_address: Multiaddr,
+    /// Network key of the node.
+    pub network_key: NetworkPublicKey,
+}
+
+impl From<(Multiaddr, NetworkPublicKey)> for P2pNode {
+    fn from(value: (Multiaddr, NetworkPublicKey)) -> Self {
+        Self { network_address: value.0, network_key: value.1 }
+    }
+}
+
+impl From<(NetworkPublicKey, Multiaddr)> for P2pNode {
+    fn from(value: (NetworkPublicKey, Multiaddr)) -> Self {
+        Self { network_address: value.1, network_key: value.0 }
+    }
+}
+
+/// Bootstrap p2p server info to join the network.
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct BootstrapServer {
+    /// The p2p info the primary.
+    pub primary: P2pNode,
+    /// The p2p info the worker.
+    pub worker: P2pNode,
+}
+
+impl BootstrapServer {
+    pub fn new(primary_node: P2pNode, worker_node: P2pNode) -> Self {
+        Self { primary: primary_node, worker: worker_node }
+    }
+}
+
+/// Immutable authority data.
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
 struct AuthorityInner {
     /// The authority's main BlsPublicKey which is used to verify the content they sign.
     protocol_key: BlsPublicKey,
     /// The voting power of this authority.
     voting_power: VotingPower,
-    /// The network address of the primary.
-    primary_network_address: Multiaddr,
     /// The execution address for the authority.
     /// This address will be used as the suggested fee recipient.
     execution_address: Address,
-    /// Network key of the primary.
-    network_key: NetworkPublicKey,
-    /// The validator's hostname
-    hostname: String,
 }
 
+/// An Authority, a member of the committee.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Authority {
     inner: Arc<AuthorityInner>,
@@ -52,21 +83,9 @@ impl Authority {
     fn new(
         protocol_key: BlsPublicKey,
         voting_power: VotingPower,
-        primary_network_address: Multiaddr,
         execution_address: Address,
-        network_key: NetworkPublicKey,
-        hostname: String,
     ) -> Self {
-        Self {
-            inner: Arc::new(AuthorityInner {
-                protocol_key,
-                voting_power,
-                primary_network_address,
-                execution_address,
-                network_key,
-                hostname,
-            }),
-        }
+        Self { inner: Arc::new(AuthorityInner { protocol_key, voting_power, execution_address }) }
     }
 
     /// Version of new that can be called directly.  Useful for testing, if you are calling this
@@ -74,34 +93,19 @@ impl Authority {
     pub fn new_for_test(
         protocol_key: BlsPublicKey,
         voting_power: VotingPower,
-        primary_network_address: Multiaddr,
         execution_address: Address,
-        network_key: NetworkPublicKey,
-        hostname: String,
     ) -> Self {
-        Self {
-            inner: Arc::new(AuthorityInner {
-                protocol_key,
-                voting_power,
-                primary_network_address,
-                execution_address,
-                network_key,
-                hostname,
-            }),
-        }
+        Self { inner: Arc::new(AuthorityInner { protocol_key, voting_power, execution_address }) }
     }
 
     pub fn id(&self) -> AuthorityIdentifier {
-        self.inner.network_key.to_peer_id().into()
-    }
-
-    /// Return the peer id for the primary network.
-    pub fn peer_id(&self) -> PeerId {
-        self.inner.network_key.to_peer_id()
+        let bytes = self.inner.protocol_key.to_bytes();
+        let mut hasher = crate::DefaultHashFunction::new();
+        hasher.update(&bytes);
+        AuthorityIdentifier(Arc::new(*hasher.finalize().as_bytes()))
     }
 
     pub fn protocol_key(&self) -> &BlsPublicKey {
-        // Skip the assert here, this is called in testing before the initialise...
         &self.inner.protocol_key
     }
 
@@ -109,20 +113,8 @@ impl Authority {
         self.inner.voting_power
     }
 
-    pub fn primary_network_address(&self) -> &Multiaddr {
-        &self.inner.primary_network_address
-    }
-
     pub fn execution_address(&self) -> Address {
         self.inner.execution_address
-    }
-
-    pub fn network_key(&self) -> NetworkPublicKey {
-        self.inner.network_key.clone()
-    }
-
-    pub fn hostname(&self) -> &str {
-        self.inner.hostname.as_str()
     }
 }
 
@@ -162,6 +154,8 @@ struct CommitteeInner {
     /// The validity threshold (f+1)
     #[serde(skip)]
     validity_threshold: VotingPower,
+    /// The bootstrap servers to initially join a network (probably the initial committee).
+    bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
 }
 
 impl CommitteeInner {
@@ -195,7 +189,7 @@ impl CommitteeInner {
         NonZeroU64::new(total_votes.div_ceil(3)).unwrap_or(NonZeroU64::new(1).expect("1 is NOT 0!"))
     }
 
-    pub fn total_voting_power(&self) -> VotingPower {
+    fn total_voting_power(&self) -> VotingPower {
         self.authorities.values().map(|x| x.inner.voting_power).sum()
     }
 }
@@ -236,69 +230,58 @@ impl Eq for Committee {}
 
 // Every authority gets uniquely identified by the AuthorityIdentifier
 // The type can be easily swapped without needing to change anything else in the implementation.
-#[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Debug, Hash, Serialize, Deserialize)]
-pub struct AuthorityIdentifier(Arc<PeerId>);
+// Currently it is the hash of the authorities BLS key (which will be stable).
+#[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Hash, Serialize, Deserialize)]
+pub struct AuthorityIdentifier(Arc<[u8; 32]>);
 
 impl AuthorityIdentifier {
     pub fn dummy_for_test(byte: u8) -> Self {
-        let data = [byte; 32];
-        PeerId::from_multihash(
-            Multihash::wrap(0x0, &data).expect("The digest size is never too large"),
-        )
-        .expect("valid multihash bytes")
-        .into()
+        Self(Arc::new([byte; 32]))
     }
+}
 
-    pub fn peer_id(&self) -> PeerId {
-        self.into()
+impl From<BlsPublicKey> for AuthorityIdentifier {
+    fn from(value: BlsPublicKey) -> Self {
+        let bytes = value.to_bytes();
+        let mut hasher = crate::DefaultHashFunction::new();
+        hasher.update(&bytes);
+        AuthorityIdentifier(Arc::new(*hasher.finalize().as_bytes()))
     }
 }
 
 impl Default for AuthorityIdentifier {
     fn default() -> Self {
-        let data = [0_u8; 32];
-        PeerId::from_multihash(
-            Multihash::wrap(0x0, &data).expect("The digest size is never too large"),
-        )
-        .expect("valid multihash bytes")
-        .into()
+        Self(Arc::new([0_u8; 32]))
     }
 }
 
 impl Display for AuthorityIdentifier {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0.to_string().as_str())
+        f.write_str(&bs58::encode(&*self.0).into_string())
     }
 }
 
-impl From<PeerId> for AuthorityIdentifier {
-    fn from(value: PeerId) -> Self {
-        Self(Arc::new(value))
-    }
-}
-
-impl From<AuthorityIdentifier> for PeerId {
-    fn from(value: AuthorityIdentifier) -> Self {
-        *value.0
-    }
-}
-
-impl From<&AuthorityIdentifier> for PeerId {
-    fn from(value: &AuthorityIdentifier) -> Self {
-        *value.0
+impl std::fmt::Debug for AuthorityIdentifier {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&bs58::encode(&*self.0).into_string())
     }
 }
 
 impl Committee {
     /// Any committee should be created via the [CommitteeBuilder] - this is intentionally
     /// a private method.
-    fn new(authorities: BTreeMap<BlsPublicKey, Authority>, epoch: Epoch) -> Self {
+    fn new(
+        authorities: BTreeMap<BlsPublicKey, Authority>,
+        epoch: Epoch,
+        bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+    ) -> Self {
         let mut committee = CommitteeInner {
             authorities,
             epoch,
             authorities_by_id: Default::default(),
             validity_threshold: 0,
             quorum_threshold: 0,
+            bootstrap_servers,
         };
         committee.load();
 
@@ -316,13 +299,18 @@ impl Committee {
     ///
     /// Pass an optional epoch_boundary timestamp. Defaults to u64::MAX to disable epoch
     /// transitions.
-    pub fn new_for_test(authorities: BTreeMap<BlsPublicKey, Authority>, epoch: Epoch) -> Self {
+    pub fn new_for_test(
+        authorities: BTreeMap<BlsPublicKey, Authority>,
+        epoch: Epoch,
+        bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+    ) -> Self {
         let mut committee = CommitteeInner {
             authorities,
             epoch,
             authorities_by_id: Default::default(),
             validity_threshold: 0,
             quorum_threshold: 0,
+            bootstrap_servers,
         };
 
         committee.authorities_by_id = committee
@@ -434,7 +422,7 @@ impl Committee {
     pub fn others_primaries_by_id(
         &self,
         myself: Option<&AuthorityIdentifier>,
-    ) -> Vec<(AuthorityIdentifier, Multiaddr, NetworkPublicKey)> {
+    ) -> Vec<(AuthorityIdentifier, BlsPublicKey)> {
         self.inner
             .read()
             .authorities
@@ -448,20 +436,52 @@ impl Committee {
                     }
                 },
             )
-            .map(|(_, authority)| {
-                (
-                    authority.id(),
-                    authority.primary_network_address().clone(),
-                    authority.network_key(),
-                )
+            .map(|(_, authority)| (authority.id(), *authority.protocol_key()))
+            .collect()
+    }
+
+    /// Returns the bls keys of all members except `myself`.
+    pub fn others_keys_except(&self, myself: &BlsPublicKey) -> Vec<BlsPublicKey> {
+        self.inner
+            .read()
+            .authorities
+            .iter()
+            .filter_map(|(_, authority)| {
+                if authority.protocol_key() == myself {
+                    None
+                } else {
+                    Some(*authority.protocol_key())
+                }
             })
             .collect()
+    }
+
+    /// Return the bootstrap record for key if it exists.
+    pub fn get_bootstrap(&self, key: &BlsPublicKey) -> Option<BootstrapServer> {
+        self.inner.read().bootstrap_servers.get(key).cloned()
+    }
+
+    /// Return the map of bootstrap servers.
+    pub fn bootstrap_servers(&self) -> BTreeMap<BlsPublicKey, BootstrapServer> {
+        self.inner.read().bootstrap_servers.clone()
     }
 
     /// Used for testing - not recommended to use for any other case.
     /// It creates a new instance with updated epoch
     pub fn advance_epoch_for_test(&self, new_epoch: Epoch) -> Committee {
-        Committee::new_for_test(self.inner.read().authorities.clone(), new_epoch)
+        Committee::new_for_test(
+            self.inner.read().authorities.clone(),
+            new_epoch,
+            self.inner.read().bootstrap_servers.clone(),
+        )
+    }
+
+    /// Return the number of workers that are in use for this committee.
+    /// This is a protocol level value, all nodes have to agree on this and be
+    /// running the required number of workers.
+    /// Currently 1 but may change with a future fork on an epoch boundary.
+    pub fn number_of_workers(&self) -> usize {
+        1
     }
 }
 
@@ -493,12 +513,29 @@ pub struct CommitteeBuilder {
     epoch: Epoch,
     /// The map of [BlsPublicKey] for each [Authority] in the committee.
     authorities: BTreeMap<BlsPublicKey, Authority>,
+    /// The map of [BlsPublicKey] for each [BootstrapServer].
+    bootstrap_server: BTreeMap<BlsPublicKey, BootstrapServer>,
 }
 
 impl CommitteeBuilder {
     /// Create a new instance of [CommitteeBuilder] for making a new [Committee].
     pub fn new(epoch: Epoch) -> Self {
-        Self { epoch, authorities: BTreeMap::new() }
+        Self { epoch, authorities: BTreeMap::default(), bootstrap_server: BTreeMap::default() }
+    }
+
+    /// Add an authority and bootstrap server to the committee builder.
+    pub fn add_authority_and_bootstrap(
+        &mut self,
+        protocol_key: BlsPublicKey,
+        stake: VotingPower,
+        primary_node: P2pNode,
+        worker_node: P2pNode,
+        execution_address: Address,
+    ) {
+        let authority = Authority::new(protocol_key, stake, execution_address);
+        self.authorities.insert(protocol_key, authority);
+        let bootstrap = BootstrapServer::new(primary_node, worker_node);
+        self.bootstrap_server.insert(protocol_key, bootstrap);
     }
 
     /// Add an authority to the committee builder.
@@ -506,31 +543,33 @@ impl CommitteeBuilder {
         &mut self,
         protocol_key: BlsPublicKey,
         stake: VotingPower,
-        primary_network_address: Multiaddr,
         execution_address: Address,
-        network_key: NetworkPublicKey,
-        hostname: String,
     ) {
-        let authority = Authority::new(
-            protocol_key,
-            stake,
-            primary_network_address,
-            execution_address,
-            network_key,
-            hostname,
-        );
+        let authority = Authority::new(protocol_key, stake, execution_address);
         self.authorities.insert(protocol_key, authority);
     }
 
+    /// Add an authority to the committee builder.
+    pub fn add_bootstrap_server(
+        &mut self,
+        protocol_key: BlsPublicKey,
+        primary_node: P2pNode,
+        worker_node: P2pNode,
+    ) {
+        let bootstrap = BootstrapServer::new(primary_node, worker_node);
+        self.bootstrap_server.insert(protocol_key, bootstrap);
+    }
+
     pub fn build(self) -> Committee {
-        Committee::new(self.authorities, self.epoch)
+        Committee::new(self.authorities, self.epoch, self.bootstrap_server)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        Address, Authority, BlsKeypair, BlsPublicKey, Committee, Multiaddr, NetworkKeypair,
+        Address, Authority, BlsKeypair, BlsPublicKey, BootstrapServer, Committee, Multiaddr,
+        NetworkKeypair,
     };
     use rand::rng;
     use std::collections::BTreeMap;
@@ -542,26 +581,33 @@ mod tests {
         let num_of_authorities = 10;
 
         let authorities = (0..num_of_authorities)
-            .map(|i| {
+            .map(|_| {
                 let keypair = BlsKeypair::generate(&mut rng);
-                let network_keypair = NetworkKeypair::generate_ed25519();
                 let execution_address = Address::random();
 
-                let a = Authority::new(
-                    *keypair.public(),
-                    1,
-                    Multiaddr::empty(),
-                    execution_address,
-                    network_keypair.public().clone().into(),
-                    i.to_string(),
-                );
+                let a = Authority::new(*keypair.public(), 1, execution_address);
 
                 (*keypair.public(), a)
             })
             .collect::<BTreeMap<BlsPublicKey, Authority>>();
 
+        let bootstrap_servers = authorities
+            .keys()
+            .map(|key| {
+                let primary_keypair = NetworkKeypair::generate_ed25519();
+                let worker_keypair = NetworkKeypair::generate_ed25519();
+
+                let b = BootstrapServer::new(
+                    (Multiaddr::empty(), primary_keypair.public().clone().into()).into(),
+                    (Multiaddr::empty(), worker_keypair.public().clone().into()).into(),
+                );
+
+                (*key, b)
+            })
+            .collect::<BTreeMap<BlsPublicKey, BootstrapServer>>();
+
         // WHEN
-        let committee = Committee::new(authorities, 10);
+        let committee = Committee::new(authorities, 10, bootstrap_servers);
 
         // THEN
         assert_eq!(committee.inner.read().authorities_by_id.len() as u64, num_of_authorities);
@@ -577,10 +623,16 @@ mod tests {
 
         let guard = committee.inner.read();
         // AND ensure authorities are in both maps
-        for (public_key, authority_1) in guard.authorities.iter() {
+        let mut total = 0;
+        for ((public_key, authority_1), (boot_key, _)) in
+            guard.authorities.iter().zip(guard.bootstrap_servers.iter())
+        {
             assert_eq!(public_key, authority_1.protocol_key());
+            assert_eq!(public_key, boot_key);
             let authority_2 = guard.authorities_by_id.get(&authority_1.id()).unwrap();
             assert_eq!(authority_1, authority_2);
+            total += 1;
         }
+        assert_eq!(total, num_of_authorities);
     }
 }

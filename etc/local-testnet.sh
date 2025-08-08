@@ -51,7 +51,6 @@ GENESISDIR="genesis"
 VALIDATORSDIR="${GENESISDIR}/validators"
 SHARED_GENESISDIR="${ROOTDIR}/${VALIDATORSDIR}"
 COMMITTEE_PATH="${ROOTDIR}/${GENESISDIR}/committee.yaml"
-WORKER_CACHE_PATH="${ROOTDIR}/${GENESISDIR}/worker_cache.yaml"
 GENESIS_JSON_PATH="${ROOTDIR}/${GENESISDIR}/genesis.json"
 
 # number of validators
@@ -119,7 +118,7 @@ else
             --consensus-registry-owner $DEV_FUNDS
     fi
 
-    # Copy the generated genesis, committee, worker_cache and parameters to each validator.
+    # Copy the generated genesis, committee and parameters to each validator.
     for ((i=0; i<$LENGTH; i++)); do
         VALIDATOR="${VALIDATORS[$i]}"
         DATADIR="${ROOTDIR}/${VALIDATOR}"
@@ -128,7 +127,6 @@ else
         echo "copying validator info to shared genesis dir"
         cp "${ROOTDIR}/${GENESISDIR}/genesis.yaml" "${DATADIR}/genesis"
         cp "${ROOTDIR}/${GENESISDIR}/committee.yaml" "${DATADIR}/genesis"
-        cp "${ROOTDIR}/${GENESISDIR}/worker_cache.yaml" "${DATADIR}/genesis"
         cp "${ROOTDIR}/parameters.yaml" "${DATADIR}/"
         echo ""
         echo ""
@@ -144,7 +142,6 @@ else
         # Copy the chain config files over to the new observer config directories.
     cp "${ROOTDIR}/${GENESISDIR}/genesis.yaml" "${DATADIR}/genesis"
     cp "${ROOTDIR}/${GENESISDIR}/committee.yaml" "${DATADIR}/genesis"
-    cp "${ROOTDIR}/${GENESISDIR}/worker_cache.yaml" "${DATADIR}/genesis"
     cp "${ROOTDIR}/parameters.yaml" "${DATADIR}/"
 fi
 

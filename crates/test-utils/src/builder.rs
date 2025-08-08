@@ -8,13 +8,11 @@ use std::{
     collections::{BTreeMap, VecDeque},
     marker::PhantomData,
     num::NonZeroUsize,
-    sync::Arc,
 };
 use tn_config::{KeyConfig, NetworkConfig};
 use tn_types::{
-    get_available_udp_port, Address, Authority, AuthorityIdentifier, BlsKeypair, Committee,
-    Database, Epoch, Multiaddr, TimestampSec, VotingPower, WorkerCache, WorkerIndex,
-    DEFAULT_PRIMARY_PORT, DEFAULT_WORKER_PORT,
+    get_available_udp_port, Address, Authority, AuthorityIdentifier, BlsKeypair, BootstrapServer,
+    Committee, Database, Epoch, Multiaddr, TimestampSec, VotingPower, DEFAULT_WORKER_PORT,
 };
 
 /// The committee builder for tests.
@@ -121,6 +119,7 @@ where
         let mut committee_info = Vec::with_capacity(committee_size);
         #[allow(clippy::mutable_key_type)]
         let mut authorities = BTreeMap::new();
+        let mut bootstrap_servers = BTreeMap::new();
         // Pass 1 to make the authorities so we can make the committee struct we need later.
         for i in 0..committee_size {
             let primary_keypair = BlsKeypair::generate(&mut rng);
@@ -133,13 +132,24 @@ where
             };
             let primary_network_address: Multiaddr =
                 format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap();
+            let port = if self.randomize_ports {
+                get_available_udp_port(host).unwrap_or(DEFAULT_WORKER_PORT)
+            } else {
+                0
+            };
+            let worker_network_address: Multiaddr =
+                format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap();
             let authority = Authority::new_for_test(
                 key_config.primary_public_key(),
                 *self.voting_power.get(i).unwrap_or(&1),
-                primary_network_address,
                 Address::random_with(&mut rng),
-                key_config.primary_network_public_key(),
-                format!("authority{i}"),
+            );
+            bootstrap_servers.insert(
+                *authority.protocol_key(),
+                BootstrapServer::new(
+                    (primary_network_address, key_config.primary_network_public_key()).into(),
+                    (worker_network_address, key_config.worker_network_public_key()).into(),
+                ),
             );
             authorities.insert(
                 *authority.protocol_key(),
@@ -149,13 +159,7 @@ where
         // Reset the authority ids so they are in sort order.  Some tests require this.
         for (i, (_, (primary_keypair, key_config, authority))) in authorities.iter_mut().enumerate()
         {
-            let worker = WorkerFixture::generate(key_config.clone(), i as u16, |host| {
-                if self.randomize_ports {
-                    get_available_udp_port(host).unwrap_or(DEFAULT_PRIMARY_PORT)
-                } else {
-                    0
-                }
-            });
+            let worker = WorkerFixture::generate(key_config.clone(), i as u16);
             committee_info.push((
                 primary_keypair.copy(),
                 key_config.clone(),
@@ -168,20 +172,8 @@ where
         let committee = Committee::new_for_test(
             authorities.into_iter().map(|(k, (_, _, a))| (k, a)).collect(),
             0,
+            bootstrap_servers,
         );
-        // Build our worker cache.  This is map of authorities to it's worker (one per authority).
-        let worker_cache = WorkerCache {
-            epoch: self.epoch,
-            workers: Arc::new(
-                committee_info
-                    .iter()
-                    .map(|(primary_keypair, _key_config, _authority, worker, _network_config)| {
-                        let worker_index = vec![worker.info().clone()];
-                        (*primary_keypair.public(), WorkerIndex(worker_index))
-                    })
-                    .collect(),
-            ),
-        };
         // All the authorities use the same worker cache.
         let authorities: BTreeMap<AuthorityIdentifier, AuthorityFixture<DB>> = committee_info
             .into_iter()
@@ -195,7 +187,6 @@ where
                         committee.clone(),
                         (self.new_db)(),
                         worker,
-                        worker_cache.clone(),
                         network_config,
                     ),
                 )

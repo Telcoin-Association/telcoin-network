@@ -11,7 +11,7 @@ use crate::{
 };
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
-use tn_types::{network_public_key_to_libp2p, Database, TaskManager};
+use tn_types::{Database, TaskManager};
 use tracing::info;
 
 #[cfg(test)]
@@ -38,11 +38,8 @@ impl<DB: Database> Primary<DB> {
         config.parameters().tracing();
 
         // Some info statements
-        let own_peer_id =
-            network_public_key_to_libp2p(&config.key_config().primary_network_public_key());
         info!(
-            "Boot primary node with peer id {} and public key {:?}",
-            own_peer_id,
+            "Boot primary node with public key {:?}",
             config.authority().as_ref().map(|a| a.protocol_key().encode_base58()),
         );
 
@@ -116,7 +113,7 @@ impl<DB: Database> Primary<DB> {
         info!(
             "Primary {:?} successfully booted on {:?}",
             config.authority_id(),
-            config.authority().as_ref().map(|a| a.primary_network_address())
+            config.config().node_info.p2p_info.primary.network_address
         );
     }
 

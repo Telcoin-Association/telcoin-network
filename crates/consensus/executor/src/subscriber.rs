@@ -595,8 +595,6 @@ mod tests {
         let (certificates, _next_parents, batches) = create_test_data(1..=7, &fixture);
 
         // Set up mock worker.
-        let worker = primary.worker();
-        let _worker_address = &worker.info().worker_address;
         let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
         config.local_network().set_primary_to_worker_local_handler(mock_client);
 

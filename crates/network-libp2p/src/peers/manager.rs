@@ -12,15 +12,16 @@ use crate::{
     error::NetworkError,
     peers::status::ConnectionStatus,
     send_or_log_error,
-    types::{AuthorityInfoRequest, NetworkResult},
+    types::{AuthorityInfoRequest, NetworkInfo, NetworkResult},
 };
 use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
     task::Context,
 };
 use tn_config::PeerConfig;
+use tn_types::BlsPublicKey;
 use tokio::sync::oneshot;
 use tracing::{debug, error, trace, warn};
 
@@ -36,6 +37,13 @@ pub(crate) struct PeerManager {
     heartbeat: tokio::time::Interval,
     /// All peers for the manager.
     peers: AllPeers,
+    /// The collection of bls public keys to known peers.
+    /// This should incude the current and next couple of committee members network info.
+    /// This is used for bootstrapping and to make sure we know the network settings of committee
+    /// members.
+    known_peers: HashMap<BlsPublicKey, NetworkInfo>,
+    /// PeerId -> BlsPublicKey for know peers.
+    known_peerids: HashMap<PeerId, BlsPublicKey>,
     /// A queue of events that the `PeerManager` is waiting to produce.
     events: VecDeque<PeerEvent>,
     /// A queue of peers to dial.
@@ -81,38 +89,45 @@ impl PeerManager {
             config: *config,
             heartbeat,
             peers,
+            known_peers: Default::default(),
+            known_peerids: Default::default(),
             events: Default::default(),
             dial_requests: Default::default(),
             temporarily_banned,
         }
     }
 
-    /// Explicitly add a peer.
+    /// Explicitly add a "trusted" peer and dial it.
     ///
     /// These peers are considered "trusted" and do not receive penalties.
     /// This does not unban ips and should only be called during initialization.
-    pub(crate) fn add_explicit_peer(
+    pub(crate) fn add_trusted_peer_and_dial(
         &mut self,
-        peer_id: PeerId,
-        multiaddr: Multiaddr,
+        bls_key: BlsPublicKey,
+        info: NetworkInfo,
         reply: oneshot::Sender<NetworkResult<()>>,
     ) {
-        self.peers.add_trusted_peer(peer_id, multiaddr.clone());
+        let peer_id: PeerId = info.pubkey.clone().into();
+        let multiaddr = info.multiaddrs.clone();
+        self.peers.add_trusted_peer(bls_key, info.pubkey.clone(), multiaddr.clone());
 
         // remove from temporary banned and warn if peer was banned
         if self.temporarily_banned.remove(&peer_id) {
             warn!(target: "peer-manager", ?peer_id, "removed trusted peer from temporarily banned list");
         }
+        let peer_id: PeerId = info.pubkey.clone().into();
+        self.known_peerids.insert(peer_id, bls_key);
+        self.known_peers.insert(bls_key, info);
 
-        self.dial_peer(peer_id, multiaddr, reply);
+        self.dial_peer(peer_id, multiaddr, Some(reply));
     }
 
     /// Process the request to dial a peer.
     pub(crate) fn dial_peer(
         &mut self,
         peer_id: PeerId,
-        multiaddr: Multiaddr,
-        reply: oneshot::Sender<NetworkResult<()>>,
+        multiaddrs: Vec<Multiaddr>,
+        reply: Option<oneshot::Sender<NetworkResult<()>>>,
     ) {
         // return early if peer is banned, connected, or currently being dialed
         if let Some(peer) = self.peers.get_peer(&peer_id) {
@@ -121,22 +136,43 @@ impl PeerManager {
                     // report error - dial banned peer
                     let error = NetworkError::DialBannedPeer(format!("Peer {peer_id} is banned"));
                     warn!(target: "peer-manager", ?error, "invalid dial request");
-                    send_or_log_error!(reply, Err(error), "DialPeer", peer = peer_id);
+                    if let Some(reply) = reply {
+                        send_or_log_error!(
+                            reply,
+                            Err(error),
+                            "DialPeer- Peer Banned",
+                            peer = peer_id
+                        );
+                    }
                     return;
                 }
                 ConnectionStatus::Dialing { .. } => {
                     // report error - dialing already in progress
                     let error = NetworkError::AlreadyDialing(format!("Already dialing {peer_id}"));
-                    warn!(target: "peer-manager", ?error, "invalid dial request");
-                    send_or_log_error!(reply, Err(error), "DialPeer", peer = peer_id);
+                    debug!(target: "peer-manager", ?error, "invalid dial request");
+                    if let Some(reply) = reply {
+                        send_or_log_error!(
+                            reply,
+                            Err(error),
+                            "DialPeer- Already dialing",
+                            peer = peer_id
+                        );
+                    }
                     return;
                 }
                 ConnectionStatus::Connected { .. } => {
                     // report error - dialing already connected
                     let error =
                         NetworkError::AlreadyConnected(format!("Already connected {peer_id}"));
-                    warn!(target: "peer-manager", ?error, "invalid dial request");
-                    send_or_log_error!(reply, Err(error), "DialPeer", peer = peer_id);
+                    debug!(target: "peer-manager", ?error, "invalid dial request");
+                    if let Some(reply) = reply {
+                        send_or_log_error!(
+                            reply,
+                            Err(error),
+                            "DialPeer- Already connected",
+                            peer = peer_id
+                        );
+                    }
                     return;
                 }
                 _ => { /* ignore */ }
@@ -144,7 +180,7 @@ impl PeerManager {
         }
         // schedule swarm to dial peer
         debug!(target: "peer-manager", ?peer_id, "sending dial request to swarm");
-        let request = DialRequest { peer_id, multiaddrs: vec![multiaddr], reply: Some(reply) };
+        let request = DialRequest { peer_id, multiaddrs, reply };
         self.dial_requests.push_back(request);
     }
 
@@ -261,8 +297,8 @@ impl PeerManager {
     /// `AllPeers` only tracks CVVs for now. (current voting validators)
     ///
     /// This method will be extended to support any staked validator.
-    pub(super) fn is_validator(&self, peer_id: &PeerId) -> bool {
-        self.peers.is_validator(peer_id)
+    pub(super) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
+        self.peers.is_peer_validator(peer_id)
     }
 
     /// Returns a boolean if the peer is connected.
@@ -443,7 +479,7 @@ impl PeerManager {
         let ready_to_prune = connected_peers
             .iter()
             .filter_map(|(peer_id, peer)| {
-                if !self.is_validator(peer_id) && !peer.is_trusted() {
+                if !self.is_peer_validator(peer_id) && !peer.is_trusted() {
                     Some(**peer_id)
                 } else {
                     None
@@ -481,10 +517,18 @@ impl PeerManager {
     ///
     /// Peers should be weary of these reported peers (eclipse attacks).
     pub(crate) fn process_peer_exchange(&mut self, peers: PeerExchangeMap) {
-        for (peer_id, addr) in peers.into_iter() {
-            // skip peers that are already known
-            if self.peers.get_peer(&peer_id).is_none() {
-                let multiaddrs = addr.into_iter().collect();
+        for (bls, (net_key, multiaddrs)) in peers.into_iter() {
+            let multiaddrs: Vec<Multiaddr> = multiaddrs.into_iter().collect();
+            let peer_id: PeerId = net_key.clone().into();
+            if !self.known_peers.contains_key(&bls) {
+                self.add_known_peer(
+                    bls,
+                    NetworkInfo { pubkey: net_key.clone(), multiaddrs: multiaddrs.clone() },
+                );
+            }
+            // skip peers that are already connected
+            let peer = self.peers.get_peer(&peer_id);
+            if peer.is_none() || peer.expect("have peer").can_dial() {
                 let request = DialRequest { peer_id, multiaddrs, reply: None };
                 self.dial_requests.push_back(request);
             }
@@ -503,26 +547,48 @@ impl PeerManager {
 
     /// Bool indicating if the peer is trusted or a validator.
     pub(crate) fn peer_is_important(&self, peer_id: &PeerId) -> bool {
-        self.is_validator(peer_id)
+        self.is_peer_validator(peer_id)
             || self.peers.get_peer(peer_id).map(|p| p.is_trusted()).unwrap_or_default()
     }
 
     /// Update the committee for the new epoch.
-    pub(crate) fn new_epoch(&mut self, committee: HashMap<PeerId, Multiaddr>) {
+    pub(crate) fn new_epoch(&mut self, committee: HashSet<BlsPublicKey>) {
         // remove from temporary banned and warn if validator was banned
-        for peer_id in committee.keys() {
-            if self.temporarily_banned.remove(peer_id) {
-                warn!(target: "peer-manager", ?peer_id, "removed committee member from temporarily banned list");
+        let mut exp_committee = Vec::default();
+        for bls_key in &committee {
+            if let Some(NetworkInfo { pubkey, multiaddrs: multiaddr }) =
+                self.known_peers.get(bls_key)
+            {
+                let peer_id: PeerId = pubkey.clone().into();
+                tracing::info!(target: "peer-manager", "adding committee member {bls_key}/{peer_id}");
+                if self.temporarily_banned.remove(&peer_id) {
+                    warn!(target: "peer-manager", ?peer_id, "removed committee member from temporarily banned list");
+                }
+                exp_committee.push((
+                    *bls_key,
+                    NetworkInfo { pubkey: pubkey.clone(), multiaddrs: multiaddr.clone() },
+                ));
+            } else {
+                warn!(target: "peer-manager", "unknown committee member with key {bls_key}");
             }
         }
 
         // add trusted peer record
-        let unban_actions = self.peers.new_epoch(committee);
+        let unban_actions = self.peers.new_epoch(exp_committee);
 
         // apply unban for any banned validators
         for (peer_id, action) in unban_actions {
             self.apply_peer_action(peer_id, action);
         }
+    }
+
+    /// Add a known peer to the known list.
+    /// Used for bootstrap servers or possibly committie members.
+    pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
+        self.known_peers.insert(bls_key, info.clone());
+        let peer_id: PeerId = info.pubkey.into();
+        self.known_peerids.insert(peer_id, bls_key);
     }
 
     /// Find authorities for the epoch manager.
@@ -531,9 +597,9 @@ impl PeerManager {
 
         // check all peers for authority and track missing
         for AuthorityInfoRequest { bls_key, reply } in authorities {
-            if let Some(info) = self.peers.find_authority(&bls_key) {
-                // reply.send(info)
-                send_or_log_error!(reply, Ok((bls_key, info)), "find authority");
+            if let Some(info) = self.known_peers.get(&bls_key) {
+                // ignore errors bc node manager is the only caller for now and drops receivers
+                let _ = reply.send(Ok((bls_key, info.clone())));
                 continue;
             }
 
@@ -543,5 +609,19 @@ impl PeerManager {
 
         // emit event for kad to try to discover
         self.events.push_back(PeerEvent::MissingAuthorities(missing));
+    }
+
+    /// Find the peer id for an authority.
+    pub(crate) fn auth_to_peer(&self, bls_key: BlsPublicKey) -> Option<(PeerId, Vec<Multiaddr>)> {
+        if let Some(NetworkInfo { pubkey, multiaddrs }) = self.known_peers.get(&bls_key) {
+            Some((pubkey.clone().into(), multiaddrs.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// Find the BlsPublicKey for a known PeerId.
+    pub(crate) fn peer_to_bls(&self, peer_id: &PeerId) -> Option<BlsPublicKey> {
+        self.known_peerids.get(peer_id).copied()
     }
 }

@@ -49,6 +49,12 @@ impl std::fmt::Display for BlsPublicKeyBytes {
     }
 }
 
+impl From<BlsPublicKeyBytes> for [u8; 96] {
+    fn from(value: BlsPublicKeyBytes) -> Self {
+        value.0
+    }
+}
+
 // Validator's main protocol public key.
 #[derive(Copy, Clone)]
 pub struct BlsPublicKey {

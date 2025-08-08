@@ -10,10 +10,15 @@ use rand::{rngs::StdRng, Rng as _, SeedableRng};
 use sha2::Sha256;
 use std::sync::Arc;
 use tn_types::{
-    encode, Address, BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner, DefaultHashFunction,
-    Intent, IntentMessage, IntentScope, NetworkKeypair, NetworkPublicKey, ProtocolSignature as _,
+    construct_proof_of_possession_message, Address, BlsKeypair, BlsPublicKey, BlsSignature,
+    BlsSigner, DefaultHashFunction, NetworkKeypair, NetworkPublicKey, ProtocolSignature as _,
     Signer,
 };
+
+/// The work factor for PBKDF2 is implemented through an iteration count, which is based on the
+/// internal hashing algorithm used. HMAC-SHA-256 is widely supported and is recommended by NIST.
+/// OWASP recommends 600,000 iterations for PBKDF2-HMAC-SHA256.
+const PBKDF2_HMAC_ROUNDS: u32 = 1_000_000;
 
 #[derive(Debug)]
 struct KeyConfigInner {
@@ -53,7 +58,12 @@ impl KeyConfig {
         let mut nonce_bytes = [0_u8; 12];
         rand::rng().fill(&mut nonce_bytes);
         let mut passphrase_bytes = [0_u8; 32];
-        pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), &salt, 1_000, &mut passphrase_bytes);
+        pbkdf2_hmac::<Sha256>(
+            passphrase.as_bytes(),
+            &salt,
+            PBKDF2_HMAC_ROUNDS,
+            &mut passphrase_bytes,
+        );
         let key = Key::<Aes256GcmSiv>::from_slice(&passphrase_bytes);
         let cipher = Aes256GcmSiv::new(key);
         let nonce = Nonce::from_slice(&nonce_bytes); // 96-bits
@@ -69,7 +79,12 @@ impl KeyConfig {
     /// key.
     fn unwrap_bls_key(bytes: &[u8], passphrase: &str) -> eyre::Result<BlsKeypair> {
         let mut passphrase_bytes = [0_u8; 32];
-        pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), &bytes[0..12], 1_000, &mut passphrase_bytes);
+        pbkdf2_hmac::<Sha256>(
+            passphrase.as_bytes(),
+            &bytes[0..12],
+            PBKDF2_HMAC_ROUNDS,
+            &mut passphrase_bytes,
+        );
         let nonce = Nonce::from_slice(&bytes[12..24]); // 96-bits
         let key = Key::<Aes256GcmSiv>::from_slice(&passphrase_bytes);
         let cipher = Aes256GcmSiv::new(key);
@@ -192,24 +207,21 @@ impl KeyConfig {
         self.worker_network_keypair().public().into()
     }
 
-    /// Creates a proof of that the authority account address is owned by the
+    /// Creates a proof that the authority account address is owned by the
     /// holder of authority protocol key, and also ensures that the authority
     /// protocol public key exists.
     ///
     /// The proof of possession is a [BlsSignature] committed over the intent message
     /// `intent || message` (See more at [IntentMessage] and [Intent]).
-    /// The message is constructed as: [BlsPublicKey] || [Genesis].
+    /// The message is constructed as: EIP2537([BlsPublicKey]) || [Address].
+    /// Where the public key is uncompressed with G2 point coordinates padded to 64-byte EVM words
     pub fn generate_proof_of_possession_bls(
         &self,
         address: &Address,
     ) -> eyre::Result<BlsSignature> {
-        let mut msg = self.primary_public_key().as_ref().to_vec();
-        let address_bytes = encode(address);
-        msg.extend_from_slice(address_bytes.as_slice());
-        let sig = BlsSignature::new_secure(
-            &IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg),
-            &self.inner.primary_keypair,
-        );
+        let msg = construct_proof_of_possession_message(&self.primary_public_key(), address)?;
+        let sig = BlsSignature::new_secure(&msg.clone(), &self.inner.primary_keypair);
+
         Ok(sig)
     }
 

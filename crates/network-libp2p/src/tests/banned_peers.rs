@@ -9,7 +9,7 @@ use std::net::Ipv4Addr;
 fn create_peer_with_ips(ips: Vec<IpAddr>) -> Peer {
     ensure_score_config(None);
 
-    let mut peer = Peer::default();
+    let mut peer = Peer::default_for_test();
 
     // add multiaddrs with the specified IPs
     for ip in ips {
@@ -93,7 +93,7 @@ fn test_add_peer_no_ip() {
     let mut banned_peers = BannedPeers::default();
 
     // Create a peer with no IP addresses
-    let peer = Peer::default();
+    let peer = Peer::default_for_test();
     banned_peers.add_banned_peer(&peer);
 
     // total should increment but no IPs should be banned

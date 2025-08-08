@@ -4,16 +4,77 @@ use std::{collections::VecDeque, str::FromStr as _, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tn_batch_builder::test_utils::execute_test_batch;
 use tn_engine::ExecutorEngine;
-use tn_reth::{test_utils::seeded_genesis_from_random_batches, FixedBytes, RethChainSpec};
+use tn_reth::{
+    test_utils::{
+        seeded_genesis_from_random_batches, BEACON_ROOTS_ADDRESS, HISTORY_STORAGE_ADDRESS,
+    },
+    FixedBytes, RethChainSpec, RethEnv,
+};
 use tn_test_utils::default_test_execution_node;
 use tn_types::{
-    gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc, test_genesis,
-    Address, BlockHash, Bloom, Bytes, Certificate, CommittedSubDag, ConsensusOutput, Hash as _,
-    Notifier, ReputationScores, TaskManager, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS,
-    MIN_PROTOCOL_BASE_FEE, U256,
+    adiri_genesis, gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc,
+    test_genesis, Address, BlockHash, Bloom, Bytes, Certificate, CommittedSubDag, ConsensusOutput,
+    Hash as _, Notifier, ReputationScores, SealedBlock, TaskManager, B256, EMPTY_OMMER_ROOT_HASH,
+    EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tokio::{sync::oneshot, time::timeout};
 use tracing::debug;
+
+/// The const used for EIP-4788 and EIP-2935
+const HISTORY_BUFFER_LENGTH: u64 = 8191;
+
+/// Helper function to assert EIP-4788 correctly executed. (cancun)
+fn assert_eip4788(
+    reth_env: &RethEnv,
+    block: &SealedBlock,
+    consensus_hash: B256,
+) -> eyre::Result<()> {
+    // for EIP-4788, the storage slot is derived from the timestamp:
+    //  - timestamp_slot = to_uint256_be(evm.timestamp) % HISTORY_BUFFER_LENGTH
+    //  - root_slot = timestamp_slot + HISTORY_BUFFER_LENGTH
+    let state_provider = reth_env.state_by_block_hash(block.hash())?;
+    // assert the timestamp was correctly written to the contract
+    let timestamp_storage_slot = U256::from(block.timestamp % HISTORY_BUFFER_LENGTH);
+    let stored_value = state_provider
+        .storage(BEACON_ROOTS_ADDRESS, timestamp_storage_slot.into())?
+        .unwrap_or_default();
+    assert_eq!(
+        stored_value,
+        U256::from(block.timestamp),
+        "Timestamp should be written to beacon roots contract at slot {}",
+        timestamp_storage_slot
+    );
+
+    // assert the block hash was correctly written to the contract
+    let root_storage_slot = timestamp_storage_slot + U256::from(HISTORY_BUFFER_LENGTH);
+    let expected_blockhash = U256::from_be_bytes(consensus_hash.0);
+    let stored_value =
+        state_provider.storage(BEACON_ROOTS_ADDRESS, root_storage_slot.into())?.unwrap_or_default();
+    assert_eq!(
+        stored_value, expected_blockhash,
+        "Consensus header hash should be written to beacon roots contract at slot {}",
+        root_storage_slot
+    );
+
+    Ok(())
+}
+
+/// Helper function to assert EIP-2935 correctly executed. (pectra)
+fn assert_eip2935(reth_env: &RethEnv, block: &SealedBlock) -> eyre::Result<()> {
+    // block.number-1 % HISTORY_BUFFER_LENGTH
+    let state_provider = reth_env.state_by_block_hash(block.hash())?;
+    let parent_storage_slot = U256::from((block.number - 1) % HISTORY_BUFFER_LENGTH);
+    let stored_value = state_provider
+        .storage(HISTORY_STORAGE_ADDRESS, parent_storage_slot.into())?
+        .unwrap_or_default();
+    assert_eq!(
+        stored_value,
+        block.parent_hash.into(),
+        "Genesis header hash should be written to history roots contract at slot {}",
+        parent_storage_slot
+    );
+    Ok(())
+}
 
 /// This tests that a single block is executed if the output from consensus contains no
 /// transactions.
@@ -25,9 +86,12 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     // are randomly generated
     //
     // for each tx, seed address with funds in genesis
+    let timestamp = now();
     let mut leader = Certificate::default();
     let sub_dag_index = 0;
     leader.header.round = sub_dag_index as u32;
+    // update timestamp so it's not default 0
+    leader.header.created_at = timestamp;
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let beneficiary = Address::from_str("0x5555555555555555555555555555555555555555")
@@ -47,8 +111,7 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     };
     let consensus_output_hash = consensus_output.consensus_header_hash();
 
-    let chain = test_chain_spec_arc();
-
+    let chain: Arc<RethChainSpec> = Arc::new(adiri_genesis().into());
     let tmp_dir = TempDir::new().expect("temp dir");
     // execution node components
     let execution_node = default_test_execution_node(Some(chain.clone()), None, tmp_dir.path())?;
@@ -143,8 +206,8 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     );
     // first block's parent is expected to be genesis
     assert_eq!(expected_block.parent_hash, chain.genesis_hash());
-    // expect state roots to be same because empty output has no state change
-    assert_eq!(expected_block.state_root, genesis_header.state_root);
+    // expect state roots are different after writing parent hash to BEACON_ROOT_CONTRACT
+    assert_ne!(expected_block.state_root, genesis_header.state_root);
     // expect header number genesis + 1
     assert_eq!(expected_block.number, expected_block_height);
 
@@ -171,6 +234,12 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     //
     // NOTE: this is currently always empty
     assert_eq!(expected_block.withdrawals_root, genesis_header.withdrawals_root);
+
+    // assert consensus output written to BEACON_ROOTS contract (cancun - eip4788)
+    assert_eip4788(&reth_env, &expected_block, consensus_output.consensus_header_hash())?;
+
+    // assert parent root is written to HISTORY_STORAGE_ADDRESS (pectra - eip2935)
+    assert_eip2935(&reth_env, &expected_block)?;
 
     Ok(())
 }
@@ -287,7 +356,7 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
     let all_batches = [batches_1.clone(), batches_2.clone()].concat();
 
     // use default genesis and seed accounts to execute batches
-    let genesis = test_genesis();
+    let genesis = adiri_genesis();
     let (genesis, txs_by_block, signers_by_block) =
         seeded_genesis_from_random_batches(genesis, all_batches.iter());
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
@@ -310,7 +379,7 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
 
         // update basefee and set beneficiary
         batch.beneficiary = Address::random();
-        batch.base_fee_per_gas = Some(inc_base_fee);
+        batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the block now
         execute_test_batch(batch, &parent);
@@ -326,7 +395,7 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
 
         // update basefee and set beneficiary
         batch.beneficiary = Address::random();
-        batch.base_fee_per_gas = Some(inc_base_fee);
+        batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the block now
         execute_test_batch(batch, &parent);
@@ -519,6 +588,12 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
             expected_batch_index = idx - 4;
         }
 
+        // assert consensus output written to BEACON_ROOTS contract (cancun - eip4788)
+        assert_eip4788(&reth_env, block.sealed_block(), expected_parent_beacon_block_root)?;
+
+        // assert parent root is written to HISTORY_STORAGE_ADDRESS (pectra - eip2935)
+        assert_eip2935(&reth_env, block.sealed_block())?;
+
         // beneficiary overwritten
         assert_eq!(&block.beneficiary, expected_beneficiary);
         // nonce matches subdag index and method all match
@@ -620,7 +695,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
 
         // update basefee and set beneficiary
         batch.beneficiary = Address::random();
-        batch.base_fee_per_gas = Some(inc_base_fee);
+        batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the block now
         execute_test_batch(batch, &parent);
@@ -636,7 +711,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
 
         // update basefee and set beneficiary
         batch.beneficiary = Address::random();
-        batch.base_fee_per_gas = Some(inc_base_fee);
+        batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the block now
         execute_test_batch(batch, &parent);
@@ -941,7 +1016,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
 
         // update basefee and set beneficiary
         batch.beneficiary = Address::random();
-        batch.base_fee_per_gas = Some(inc_base_fee);
+        batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the block now
         execute_test_batch(batch, &parent);
@@ -957,7 +1032,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
 
         // update basefee and set beneficiary
         batch.beneficiary = Address::random();
-        batch.base_fee_per_gas = Some(inc_base_fee);
+        batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the block now
         execute_test_batch(batch, &parent);

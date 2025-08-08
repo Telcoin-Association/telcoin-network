@@ -21,7 +21,7 @@ use std::{
     net::IpAddr,
     time::{Duration, Instant},
 };
-use tn_types::BlsPublicKey;
+use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 #[cfg(test)]
@@ -37,6 +37,9 @@ pub(super) struct AllPeers {
     peers: HashMap<PeerId, Peer>,
     /// The collection of staked current_committee at the beginning of each epoch.
     current_committee: HashSet<PeerId>,
+    /// The collection of staked current_committee pub key to peerid at the beginning of each
+    /// epoch.
+    current_committee_keys: HashMap<BlsPublicKey, Option<PeerId>>,
     /// Information for peers that scored poorly enough to become banned.
     banned_peers: BannedPeers,
     /// The number of peers that have disconnected from this node.
@@ -61,6 +64,7 @@ impl AllPeers {
         Self {
             peers: Default::default(),
             current_committee: Default::default(),
+            current_committee_keys: Default::default(),
             banned_peers: Default::default(),
             disconnected_peers: 0,
             pending_dials: Default::default(),
@@ -73,10 +77,32 @@ impl AllPeers {
     /// Create a peer that is "trusted".
     ///
     /// This overwrites peer records and unbans ips.
-    pub(super) fn add_trusted_peer(&mut self, peer_id: PeerId, addr: Multiaddr) {
-        let trusted_peer = Peer::new_trusted(Some(addr));
+    pub(super) fn add_trusted_peer(
+        &mut self,
+        bls_public_key: BlsPublicKey,
+        network_key: NetworkPublicKey,
+        addr: Vec<Multiaddr>,
+    ) {
+        let peer_id: PeerId = network_key.clone().into();
+        let trusted_peer = Peer::new_trusted(bls_public_key, network_key, addr);
         let _ = self.banned_peers.remove_banned_peer(trusted_peer.known_ip_addresses());
         self.peers.insert(peer_id, trusted_peer);
+    }
+
+    /// Create a peer.
+    pub(super) fn upsert_peer(
+        &mut self,
+        bls_public_key: BlsPublicKey,
+        network_key: NetworkPublicKey,
+        addrs: Vec<Multiaddr>,
+    ) {
+        let peer_id: PeerId = network_key.clone().into();
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.update_net(bls_public_key, network_key, addrs);
+        } else {
+            let peer = Peer::new(bls_public_key, network_key, addrs);
+            self.peers.insert(peer_id, peer);
+        }
     }
 
     /// Handle reported action.
@@ -163,7 +189,7 @@ impl AllPeers {
 
         self.peers
             .get(peer_id)
-            .map(|peer| peer.connection_status().clone())
+            .map(|peer| *peer.connection_status())
             .unwrap_or(ConnectionStatus::Unknown)
     }
 
@@ -608,12 +634,12 @@ impl AllPeers {
 
     /// Boolean indicating if this peer is a validator.
     /// This method will be updated to include nvvs as well.
-    pub(super) fn is_validator(&self, peer_id: &PeerId) -> bool {
-        self.is_cvv(peer_id)
+    pub(super) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
+        self.is_peer_cvv(peer_id)
     }
 
     /// Boolean indicating if this peer is in the current committee of voting validators.
-    pub(super) fn is_cvv(&self, peer_id: &PeerId) -> bool {
+    fn is_peer_cvv(&self, peer_id: &PeerId) -> bool {
         self.current_committee.contains(peer_id)
     }
 
@@ -666,9 +692,9 @@ impl AllPeers {
     pub(super) fn peer_exchange(&self) -> PeerExchangeMap {
         self.peers
             .iter()
-            .filter_map(|(id, peer)| {
+            .filter_map(|(_id, peer)| {
                 if peer.connection_status().is_connected() {
-                    Some((*id, peer.exchange_info()))
+                    peer.bls_public_key().and_then(|key| peer.exchange_info().map(|ei| (key, ei)))
                 } else {
                     None
                 }
@@ -797,15 +823,21 @@ impl AllPeers {
     /// so it won't incur any additional penalties.
     pub(super) fn new_epoch(
         &mut self,
-        committee: HashMap<PeerId, Multiaddr>,
+        committee: Vec<(BlsPublicKey, NetworkInfo)>,
     ) -> Vec<(PeerId, PeerAction)> {
         // update current committee
-        self.current_committee = committee.keys().cloned().collect();
+        self.current_committee.clear();
+        self.current_committee_keys.clear();
 
         let mut actions = Vec::with_capacity(committee.len());
-        for (peer_id, addr) in committee.into_iter() {
+        for (bls_key, NetworkInfo { pubkey, multiaddrs: addr }) in committee {
+            let peer_id: PeerId = pubkey.clone().into();
+            self.current_committee.insert(peer_id);
+            self.current_committee_keys.insert(bls_key, Some(peer_id));
             // the NewConnectionStatus doesn't affect this call
             let status = self.ensure_peer_exists(&peer_id, &NewConnectionStatus::Unbanned);
+            // We have all our network settings so go ahead and make sure they are set.
+            self.upsert_peer(bls_key, pubkey, addr.clone());
 
             match status {
                 ConnectionStatus::Disconnecting { banned } => {
@@ -840,17 +872,5 @@ impl AllPeers {
 
         // return any unban actions for committee peers
         actions
-    }
-
-    /// Find an authority to dial.
-    ///
-    /// Validators are unbanned at the beginning of each epoch when they are in the committee.
-    /// This method is called at the end of each epoch to give the peer manager time (2 epochs)
-    /// to find the committee peers.
-    ///
-    /// The peer manager tracks connections through kad and keeps track of peers of interest.
-    pub(super) fn find_authority(&self, _: &BlsPublicKey) -> Option<NetworkInfo> {
-        // TODO: see issue #301
-        None
     }
 }

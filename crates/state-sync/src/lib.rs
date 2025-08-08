@@ -7,12 +7,13 @@ use std::time::Duration;
 use consensus_metrics::monitored_future;
 use futures::{stream::FuturesUnordered, StreamExt};
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::PeerId;
 use tn_primary::{
     consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, NodeMode,
 };
 use tn_storage::tables::{Batches, ConsensusBlockNumbersByDigest, ConsensusBlocks};
-use tn_types::{ConsensusHeader, ConsensusOutput, Database, DbTxMut, TaskSpawner, TnSender};
+use tn_types::{
+    BlsPublicKey, ConsensusHeader, ConsensusOutput, Database, DbTxMut, TaskSpawner, TnSender,
+};
 use tracing::{debug, error, info};
 
 /// Return true if this node should be able to participate as a CVV, false otherwise.
@@ -392,13 +393,13 @@ async fn max_consensus_header_from_committee<DB: Database>(
     result //.filter(|block| block.sub_dag.leader_epoch() >= config.epoch())
 }
 
-/// Get a vector of ids for each peer.
-fn get_peers<DB: Database>(config: &ConsensusConfig<DB>) -> Vec<PeerId> {
+/// Get a vector of public keys for each peer.
+fn get_peers<DB: Database>(config: &ConsensusConfig<DB>) -> Vec<BlsPublicKey> {
     config
         .committee()
         .others_primaries_by_id(config.authority_id().as_ref())
         .into_iter()
-        .map(|(auth_id, _, _)| auth_id.peer_id())
+        .map(|(_, key)| key)
         .collect()
 }
 

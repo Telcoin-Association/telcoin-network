@@ -2,15 +2,14 @@
 use crate::{
     Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, Parameters, TelcoinDirs,
 };
-use libp2p::PeerId;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
 use tn_network_types::local::LocalNetwork;
 use tn_types::{
-    Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Database, Epoch,
-    Hash as _, Multiaddr, Notifier, WorkerCache, WorkerId,
+    Authority, AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee,
+    Database, Epoch, Hash as _, Multiaddr, NetworkPublicKey, Notifier,
 };
 use tracing::info;
 
@@ -37,7 +36,6 @@ struct ConsensusConfigInner<DB> {
 #[derive(Debug, Clone)]
 pub struct ConsensusConfig<DB> {
     inner: Arc<ConsensusConfigInner<DB>>,
-    worker_cache: WorkerCache,
     shutdown: Notifier,
 }
 
@@ -61,18 +59,9 @@ where
             Config::load_from_path_or_default(tn_datadir.committee_path(), ConfigFmt::YAML)?;
         committee.load();
         info!(target: "telcoin", "committee loaded");
-        let worker_cache: WorkerCache =
-            Config::load_from_path_or_default(tn_datadir.worker_cache_path(), ConfigFmt::YAML)?;
 
         info!(target: "telcoin", "worker cache loaded");
-        Self::new_with_committee(
-            config,
-            node_storage,
-            key_config,
-            committee,
-            worker_cache,
-            network_config,
-        )
+        Self::new_with_committee(config, node_storage, key_config, committee, network_config)
     }
 
     /// Creates a new configuration with a pre-loaded committee for testing purposes.
@@ -85,17 +74,9 @@ where
         node_storage: DB,
         key_config: KeyConfig,
         committee: Committee,
-        worker_cache: WorkerCache,
         network_config: NetworkConfig,
     ) -> eyre::Result<Self> {
-        Self::new_with_committee(
-            config,
-            node_storage,
-            key_config,
-            committee,
-            worker_cache,
-            network_config,
-        )
+        Self::new_with_committee(config, node_storage, key_config, committee, network_config)
     }
 
     /// Creates configuration for the next consensus epoch.
@@ -107,17 +88,9 @@ where
         node_storage: DB,
         key_config: KeyConfig,
         committee: Committee,
-        worker_cache: WorkerCache,
         network_config: NetworkConfig,
     ) -> eyre::Result<Self> {
-        Self::new_with_committee(
-            config,
-            node_storage,
-            key_config,
-            committee,
-            worker_cache,
-            network_config,
-        )
+        Self::new_with_committee(config, node_storage, key_config, committee, network_config)
     }
 
     /// Internal constructor that initializes consensus configuration with provided committee.
@@ -132,11 +105,9 @@ where
         node_storage: DB,
         key_config: KeyConfig,
         committee: Committee,
-        worker_cache: WorkerCache,
         network_config: NetworkConfig,
     ) -> eyre::Result<Self> {
-        let local_network =
-            LocalNetwork::new_from_public_key(&key_config.primary_network_public_key());
+        let local_network = LocalNetwork::new(key_config.primary_public_key());
 
         let primary_public_key = key_config.primary_public_key();
         let authority = committee.authority_by_key(&primary_public_key);
@@ -158,7 +129,6 @@ where
                 network_config,
                 genesis,
             }),
-            worker_cache,
             shutdown,
         })
     }
@@ -190,14 +160,6 @@ where
     /// for the current epoch.
     pub fn committee(&self) -> &Committee {
         &self.inner.committee
-    }
-
-    /// Returns a reference to the worker cache.
-    ///
-    /// The worker cache contains network topology information for all worker
-    /// processes across the committee.
-    pub fn worker_cache(&self) -> &WorkerCache {
-        &self.worker_cache
     }
 
     /// Returns a reference to the node's persistent storage database for the current epoch.
@@ -252,35 +214,18 @@ where
     }
 
     /// Committee network peer ids.
-    pub fn committee_peer_ids(&self) -> HashSet<PeerId> {
-        self.inner.committee.authorities().iter().map(|a| a.peer_id()).collect()
+    pub fn committee_pub_keys(&self) -> HashSet<BlsPublicKey> {
+        self.inner.committee.authorities().iter().map(|a| a.protocol_key()).copied().collect()
     }
 
     /// Retrieve the primaries network address.
-    /// Note if this node is not an authority, retrieve the next available udp port assigned by the
-    /// system.
     pub fn primary_address(&self) -> Multiaddr {
-        if let Some(authority) = self.authority() {
-            authority.primary_network_address().clone()
-        } else {
-            let host = std::env::var("TN_PRIMARY_HOST").unwrap_or("0.0.0.0".to_string());
-            let primary_udp_port = std::env::var("TN_PRIMARY_PORT").unwrap_or_else(|_| {
-                tn_types::get_available_udp_port(&host).unwrap_or(49584).to_string()
-            });
-            format!("/ip4/{}/udp/{}/quic-v1", &host, primary_udp_port)
-                .parse()
-                .expect("multiaddr parsed for primary consensus")
-        }
+        self.inner.config.node_info.p2p_info.primary.network_address.clone()
     }
 
-    /// Map of primary peer ids and multiaddrs in the current committee.
-    pub fn primary_network_map(&self) -> HashMap<PeerId, Multiaddr> {
-        self.inner
-            .committee
-            .authorities()
-            .iter()
-            .map(|a| (a.peer_id(), a.primary_network_address().clone()))
-            .collect()
+    /// Retrieve the primaries network address.
+    pub fn primary_networkkey(&self) -> NetworkPublicKey {
+        self.inner.config.node_info.p2p_info.primary.network_key.clone()
     }
 
     /// Bool indicating if an authority identifier is in the current committee.
@@ -289,27 +234,8 @@ where
     }
 
     /// Retrieve the worker's network address by id.
-    /// Note, will panic if id is not valid (not found in our worker cache) and the node is an
-    /// authority. Otherwise, retrieve the next available udp port assigned by the system.
-    pub fn worker_address(&self, id: &WorkerId) -> Multiaddr {
-        if let Some(authority) = self.authority() {
-            self.worker_cache()
-                .worker(authority.protocol_key(), id)
-                .expect("Our public key or worker id is not in the worker cache")
-                .worker_address
-        } else {
-            let host = std::env::var("TN_WORKER_HOST").unwrap_or("0.0.0.0".to_string());
-            let worker_udp_port = std::env::var("TN_WORKER_PORT").unwrap_or_else(|_| {
-                tn_types::get_available_udp_port(&host).unwrap_or(49594).to_string()
-            });
-            format!("/ip4/{}/udp/{}/quic-v1", &host, worker_udp_port)
-                .parse()
-                .expect("multiaddr parsed for worker consensus")
-        }
-    }
-
-    /// Map of worker peer ids and multiaddrs in the current committee.
-    pub fn worker_network_map(&self) -> HashMap<PeerId, Multiaddr> {
-        self.worker_cache().all_workers()
+    /// Note, will panic if id is not valid.
+    pub fn worker_address(&self) -> Multiaddr {
+        self.inner.config.node_info.p2p_info.worker.network_address.clone()
     }
 }

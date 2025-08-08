@@ -98,9 +98,15 @@ pub enum NetworkError {
     /// The retrieved peer record is invalid.
     #[error("Invalid bls signature for peer record.")]
     InvalidPeerRecord,
+    /// The requested peer is not on our local store.
+    #[error("Requested peer is not in our local store.")]
+    PeerMissing,
     /// Kademlia error.
     #[error("Failed to get kad record: {0}")]
     GetKademliaRecord(#[from] GetRecordError),
+    /// Kademlia store write error.
+    #[error("Failed to store kad record: {0}")]
+    StoreKademliaRecord(String),
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {

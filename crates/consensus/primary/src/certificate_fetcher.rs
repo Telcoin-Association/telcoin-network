@@ -15,13 +15,12 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::PeerId;
 use tn_network_types::FetchCertificatesResponse;
 use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::CertificateStore;
 use tn_types::{
-    validate_received_certificate, AuthorityIdentifier, Certificate, Committee, Database, Noticer,
-    Round, TaskManager, TnReceiver, TnSender,
+    validate_received_certificate, AuthorityIdentifier, BlsPublicKey, Certificate, Committee,
+    Database, Noticer, Round, TaskManager, TnReceiver, TnSender,
 };
 use tokio::{
     task::JoinSet,
@@ -352,11 +351,8 @@ async fn fetch_certificates_helper(
     trace!(target: "primary::cert_fetcher", "Start sending fetch certificates requests");
     // TODO: make this a config parameter.
     let request_interval = PARALLEL_FETCH_REQUEST_INTERVAL_SECS;
-    let mut peers: Vec<PeerId> = committee
-        .others_primaries_by_id(name)
-        .into_iter()
-        .map(|(auth_id, _, _)| auth_id.peer_id())
-        .collect();
+    let mut peers: Vec<BlsPublicKey> =
+        committee.others_primaries_by_id(name).into_iter().map(|(_, key)| key).collect();
     peers.shuffle(&mut ThreadRng::default());
     let fetch_timeout = PARALLEL_FETCH_REQUEST_INTERVAL_SECS
         * peers.len().try_into().expect("usize into secs duration")

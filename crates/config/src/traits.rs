@@ -135,8 +135,6 @@ pub trait TelcoinDirs: std::fmt::Debug + Send + Sync + 'static {
     fn node_info_path(&self) -> PathBuf;
     /// Return the path to the committee file.
     fn committee_path(&self) -> PathBuf;
-    /// Return the path to the worker cache file.
-    fn worker_cache_path(&self) -> PathBuf;
     /// Return the path to the chain spec file.
     fn genesis_file_path(&self) -> PathBuf;
     /// Return the path to consensus's node storage.
@@ -179,10 +177,6 @@ where
 
     fn committee_path(&self) -> PathBuf {
         self.genesis_path().join("committee.yaml")
-    }
-
-    fn worker_cache_path(&self) -> PathBuf {
-        self.genesis_path().join("worker_cache.yaml")
     }
 
     fn genesis_file_path(&self) -> PathBuf {

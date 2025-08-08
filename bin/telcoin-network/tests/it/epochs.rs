@@ -186,10 +186,6 @@ fn create_genesis_for_test(
         new_validator_path.join("genesis/committee.yaml"),
     )?;
     std::fs::copy(
-        shared_genesis_dir.join("genesis/worker_cache.yaml"),
-        new_validator_path.join("genesis/worker_cache.yaml"),
-    )?;
-    std::fs::copy(
         shared_genesis_dir.join("genesis/genesis.yaml"),
         new_validator_path.join("genesis/genesis.yaml"),
     )?;
@@ -218,7 +214,7 @@ fn config_committee(
     // create validator info and copy to shared genesis dir
     for (v, addr) in validators.iter() {
         let dir = temp_path.join(v);
-        // init genesis ceremony to create committee / worker_cache files
+        // init genesis ceremony to create committee files
         create_validator_info(&dir, &addr.to_string(), passphrase.clone())?;
 
         // copy to shared genesis dir
@@ -269,10 +265,6 @@ fn config_committee(
         std::fs::copy(
             shared_genesis_dir.join("genesis/committee.yaml"),
             dir.join("genesis/committee.yaml"),
-        )?;
-        std::fs::copy(
-            shared_genesis_dir.join("genesis/worker_cache.yaml"),
-            dir.join("genesis/worker_cache.yaml"),
         )?;
         std::fs::copy(
             shared_genesis_dir.join("genesis/genesis.yaml"),
@@ -358,8 +350,13 @@ fn generate_new_validator_txs(
     );
 
     // stake tx
+    let proof = ConsensusRegistry::ProofOfPossession {
+        uncompressedPubkey: new_validator_info.bls_public_key.serialize().into(),
+        uncompressedSignature: new_validator_info.proof_of_possession.serialize().into(),
+    };
     let calldata = ConsensusRegistry::stakeCall {
         blsPubkey: new_validator_info.bls_public_key.compress().into(),
+        proofOfPossession: proof,
     }
     .abi_encode()
     .into();

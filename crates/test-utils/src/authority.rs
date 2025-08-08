@@ -5,8 +5,7 @@ use std::num::NonZeroUsize;
 use tn_config::{Config, ConsensusConfig, KeyConfig, NetworkConfig};
 use tn_types::{
     Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, Certificate, Committee,
-    Database, Hash as _, Header, HeaderBuilder, Multiaddr, NetworkKeypair, NetworkPublicKey, Round,
-    Vote, WorkerCache,
+    Database, Hash as _, Header, HeaderBuilder, NetworkKeypair, NetworkPublicKey, Round, Vote,
 };
 
 /// Fixture representing an validator node within the network.
@@ -48,11 +47,6 @@ impl<DB: Database> AuthorityFixture<DB> {
     /// The authority's [Address] for execution layer.
     pub fn execution_address(&self) -> Address {
         self.authority.execution_address()
-    }
-
-    /// A reference to the authority's [Multiaddr] on the consensus network.
-    pub fn network_address(&self) -> &Multiaddr {
-        self.authority.primary_network_address()
     }
 
     /// Return a reference to a [WorkerFixture] for this authority.
@@ -109,13 +103,11 @@ impl<DB: Database> AuthorityFixture<DB> {
         committee: Committee,
         db: DB,
         worker: WorkerFixture,
-        worker_cache: WorkerCache,
         network_config: NetworkConfig,
     ) -> Self {
         let (primary_keypair, key_config) = keys;
         // Make sure our keys are correct.
         assert_eq!(&key_config.primary_public_key(), authority.protocol_key());
-        assert_eq!(key_config.primary_network_public_key(), authority.network_key());
         assert_eq!(primary_keypair.public(), &key_config.primary_public_key());
         // Currently only support one worker per node.
         // If/when this is relaxed then the key_config below will need to change.
@@ -125,14 +117,12 @@ impl<DB: Database> AuthorityFixture<DB> {
         let _ = config.update_protocol_key(key_config.primary_public_key());
         let _ = config.update_primary_network_key(key_config.primary_network_public_key());
         let _ = config.update_worker_network_key(key_config.worker_network_public_key());
-        config.node_info.p2p_info.network_address = authority.primary_network_address().clone();
 
         let consensus_config = ConsensusConfig::new_with_committee_for_test(
             config,
             db,
             key_config.clone(),
             committee,
-            worker_cache,
             network_config,
         )
         .expect("failed to generate config!");

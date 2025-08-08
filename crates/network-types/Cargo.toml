@@ -21,7 +21,6 @@ serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 eyre = { workspace = true }
-libp2p = { workspace = true }
 parking_lot = { workspace = true }
 
 [build-dependencies]

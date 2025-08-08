@@ -1,10 +1,9 @@
 //! Error types whenn validating types during consensus.
 
 use crate::{
-    crypto, BlockNumHash, CertificateDigest, Digest, Epoch, HeaderDigest, Round, SendError,
-    TimestampSec, VoteDigest, WorkerId,
+    crypto, BlockNumHash, BlsPublicKey, CertificateDigest, Digest, Epoch, HeaderDigest, Round,
+    SendError, TimestampSec, VoteDigest, WorkerId,
 };
-use libp2p::PeerId;
 use std::sync::Arc;
 use thiserror::Error;
 use tn_utils::sync::notify_once::NotifyOnce;
@@ -226,7 +225,7 @@ pub enum HeaderError {
     TooManyParents(usize, usize),
     /// Authority network key is missing from committee.
     #[error("Failed to find author in committee by network key: {0}")]
-    UnknownNetworkKey(PeerId),
+    UnknownNetworkKey(Box<BlsPublicKey>),
     /// The header wasn't proposed by the author.
     #[error("The proposing peer is not the author.")]
     PeerNotAuthor,
