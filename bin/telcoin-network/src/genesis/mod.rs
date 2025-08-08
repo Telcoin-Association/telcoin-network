@@ -168,7 +168,7 @@ impl GenesisArgs {
         // operations
         let genesis_with_consensus_registry = if tokio::runtime::Handle::try_current().is_ok() {
             // use the current runtime (ie - tests)
-            RethEnv::create_consensus_registry_genesis_account(
+            RethEnv::create_consensus_registry_genesis_accounts(
                 validators.clone(),
                 genesis,
                 initial_stake_config.clone(),
@@ -181,7 +181,7 @@ impl GenesisArgs {
                 .build()?;
 
             runtime.block_on(async {
-                RethEnv::create_consensus_registry_genesis_account(
+                RethEnv::create_consensus_registry_genesis_accounts(
                     validators.clone(),
                     genesis,
                     initial_stake_config,
