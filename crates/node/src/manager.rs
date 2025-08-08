@@ -92,7 +92,7 @@ pub struct EpochManager<P> {
 }
 
 /// When rejoining a network mid epoch this will accumulate any gas state for previous epoch blocks.
-fn catchup_accumulator<DB: TNDatabase>(
+pub fn catchup_accumulator<DB: TNDatabase>(
     db: &DB,
     reth_env: RethEnv,
     gas_accumulator: &GasAccumulator,
@@ -130,6 +130,7 @@ fn catchup_accumulator<DB: TNDatabase>(
             }
         }
     };
+
     Ok(())
 }
 
@@ -1059,6 +1060,7 @@ where
     ) -> eyre::Result<()> {
         // prime the recent_blocks watch with latest executed blocks
         let block_capacity = consensus_bus.recent_blocks().borrow().block_capacity();
+
         for recent_block in engine.last_executed_output_blocks(block_capacity).await? {
             consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(recent_block));
         }

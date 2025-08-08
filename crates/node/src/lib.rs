@@ -18,6 +18,7 @@ mod error;
 mod manager;
 pub mod primary;
 pub mod worker;
+pub use manager::catchup_accumulator;
 
 /// Launch all components for the node.
 ///
