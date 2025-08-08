@@ -90,7 +90,7 @@ impl Peer {
         use rand::{rngs::StdRng, SeedableRng as _};
         use tn_types::{BlsKeypair, NetworkKeypair};
         let mut rng = StdRng::from_seed([0; 32]);
-        let bls_public_key = BlsKeypair::generate(&mut rng).public().clone();
+        let bls_public_key = *BlsKeypair::generate(&mut rng).public();
         let network_key: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
         let listening_addrs = vec![Multiaddr::empty()];
         Self {

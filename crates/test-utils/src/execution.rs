@@ -24,6 +24,7 @@ pub fn default_test_execution_node(
     opt_chain: Option<Arc<RethChainSpec>>,
     opt_address: Option<Address>,
     tmp_dir: &Path,
+    rewards: Option<RewardsCounter>,
 ) -> eyre::Result<TestExecutionNode> {
     let (builder, _) = execution_builder::<NoArgs>(
         opt_chain.clone(),
@@ -36,10 +37,13 @@ pub fn default_test_execution_node(
     let engine = if let Some(chain) = opt_chain {
         ExecutionNode::new(
             &builder,
-            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir, &TaskManager::default())?,
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir, &TaskManager::default(), rewards)?,
         )?
     } else {
-        ExecutionNode::new(&builder, RethEnv::new_for_test(tmp_dir, &TaskManager::default())?)?
+        ExecutionNode::new(
+            &builder,
+            RethEnv::new_for_test(tmp_dir, &TaskManager::default(), rewards)?,
+        )?
     };
 
     Ok(engine)

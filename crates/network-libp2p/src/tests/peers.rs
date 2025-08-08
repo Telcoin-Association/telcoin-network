@@ -26,7 +26,7 @@ fn test_add_trusted_peer() {
     let addr = create_multiaddr(None);
 
     let mut rng = StdRng::from_seed([0; 32]);
-    let bls = BlsKeypair::generate(&mut rng).public().clone();
+    let bls = *BlsKeypair::generate(&mut rng).public();
     let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
     let peer_id: PeerId = net.clone().into();
     all_peers.add_trusted_peer(bls, net, vec![addr.clone()]);
@@ -122,7 +122,7 @@ fn test_peer_exchange() {
             },
         );
         let mut rng = StdRng::from_seed([i; 32]);
-        let bls = BlsKeypair::generate(&mut rng).public().clone();
+        let bls = *BlsKeypair::generate(&mut rng).public();
         all_peers.upsert_peer(bls, network_key, vec![addr]);
     }
 
@@ -133,7 +133,7 @@ fn test_peer_exchange() {
     let exchange = all_peers.peer_exchange();
     assert_eq!(exchange.0.len(), 3);
     let mut rng = StdRng::from_seed([0; 32]);
-    let bls = BlsKeypair::generate(&mut rng).public().clone();
+    let bls = *BlsKeypair::generate(&mut rng).public();
     assert!(!exchange.0.contains_key(&bls));
 }
 

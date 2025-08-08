@@ -458,6 +458,6 @@ mod tests {
     fn test_pk(i: u8) -> BlsPublicKey {
         use rand::SeedableRng;
         let mut rng = StdRng::from_seed([i; 32]);
-        BlsKeypair::generate(&mut rng).public().clone()
+        *BlsKeypair::generate(&mut rng).public()
     }
 }

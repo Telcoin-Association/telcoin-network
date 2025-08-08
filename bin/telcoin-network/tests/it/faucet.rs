@@ -258,8 +258,12 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
 
     let tmp_dir = tempfile::TempDir::new().unwrap();
     let task_manager = TaskManager::new("Temp Task Manager");
-    let tmp_reth_env =
-        RethEnv::new_for_temp_chain(pre_genesis_chain.clone(), tmp_dir.path(), &task_manager)?;
+    let tmp_reth_env = RethEnv::new_for_temp_chain(
+        pre_genesis_chain.clone(),
+        tmp_dir.path(),
+        &task_manager,
+        None,
+    )?;
     // fetch state to be set on the faucet proxy address
     let execution_bundle = tmp_reth_env
         .execution_outcome_for_tests(raw_txs, &pre_genesis_chain.sealed_genesis_header());

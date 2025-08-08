@@ -41,8 +41,7 @@ fn assert_eip4788(
     assert_eq!(
         stored_value,
         U256::from(block.timestamp),
-        "Timestamp should be written to beacon roots contract at slot {}",
-        timestamp_storage_slot
+        "Timestamp should be written to beacon roots contract at slot {timestamp_storage_slot}"
     );
 
     // assert the block hash was correctly written to the contract
@@ -52,8 +51,7 @@ fn assert_eip4788(
         state_provider.storage(BEACON_ROOTS_ADDRESS, root_storage_slot.into())?.unwrap_or_default();
     assert_eq!(
         stored_value, expected_blockhash,
-        "Consensus header hash should be written to beacon roots contract at slot {}",
-        root_storage_slot
+        "Consensus header hash should be written to beacon roots contract at slot {root_storage_slot}"
     );
 
     Ok(())
@@ -70,8 +68,7 @@ fn assert_eip2935(reth_env: &RethEnv, block: &SealedBlock) -> eyre::Result<()> {
     assert_eq!(
         stored_value,
         block.parent_hash.into(),
-        "Genesis header hash should be written to history roots contract at slot {}",
-        parent_storage_slot
+        "Genesis header hash should be written to history roots contract at slot {parent_storage_slot}"
     );
     Ok(())
 }
@@ -114,7 +111,8 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     let chain: Arc<RethChainSpec> = Arc::new(adiri_genesis().into());
     let tmp_dir = TempDir::new().expect("temp dir");
     // execution node components
-    let execution_node = default_test_execution_node(Some(chain.clone()), None, tmp_dir.path())?;
+    let execution_node =
+        default_test_execution_node(Some(chain.clone()), None, tmp_dir.path(), None)?;
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
     let reth_env = execution_node.get_reth_env().await;
@@ -279,7 +277,8 @@ async fn test_empty_output_executes_late_finalize() -> eyre::Result<()> {
 
     let tmp_dir = TempDir::new().expect("temp dir");
     // execution node components
-    let execution_node = default_test_execution_node(Some(chain.clone()), None, tmp_dir.path())?;
+    let execution_node =
+        default_test_execution_node(Some(chain.clone()), None, tmp_dir.path(), None)?;
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
     let reth_env = execution_node.get_reth_env().await;
@@ -362,8 +361,12 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
     // create execution node components
-    let execution_node =
-        default_test_execution_node(Some(chain.clone()), None, &tmp_dir.path().join("exc-node"))?;
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &tmp_dir.path().join("exc-node"),
+        None,
+    )?;
     let parent = chain.sealed_genesis_header();
 
     // execute batches to update headers with valid data
@@ -678,8 +681,12 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
     // create execution node components
-    let execution_node =
-        default_test_execution_node(Some(chain.clone()), None, &tmp_dir.path().join("exc-node"))?;
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &tmp_dir.path().join("exc-node"),
+        None,
+    )?;
     let parent = chain.sealed_genesis_header();
 
     // execute batches to update headers with valid data
@@ -999,8 +1006,12 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
     // create execution node components
-    let execution_node =
-        default_test_execution_node(Some(chain.clone()), None, &tmp_dir.path().join("exc-node"))?;
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &tmp_dir.path().join("exc-node"),
+        None,
+    )?;
     let parent = chain.sealed_genesis_header();
 
     // execute batches to update headers with valid data

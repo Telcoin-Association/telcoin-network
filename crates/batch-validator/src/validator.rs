@@ -312,7 +312,8 @@ mod tests {
     async fn test_tools(path: &Path, task_manager: &TaskManager) -> TestTools {
         // genesis with default TransactionFactory funded
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
-        let reth_env = RethEnv::new_for_temp_chain(chain.clone(), path, task_manager).unwrap();
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), path, task_manager, None).unwrap();
         let tx_pool = reth_env.init_txn_pool().unwrap();
         let validator =
             BatchValidator::new(reth_env, Some(tx_pool), 0, BaseFeeContainer::default());

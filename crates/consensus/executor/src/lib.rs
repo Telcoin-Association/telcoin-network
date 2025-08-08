@@ -34,7 +34,14 @@ impl Executor {
         // Spawn the subscriber.
         spawn_subscriber(config, rx_shutdown, consensus_bus, task_manager, network);
 
-        // Return the handle.
         info!("Consensus subscriber successfully started");
     }
+}
+
+#[cfg(test)]
+mod clippy {
+    use eyre as _;
+    use tn_network_libp2p as _;
+    use tn_reth as _;
+    use tn_test_utils as _;
 }
