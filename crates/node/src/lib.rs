@@ -80,3 +80,10 @@ impl<DB: Database> EngineToPrimary for EngineToPrimaryRpc<DB> {
         self.db.get::<ConsensusBlocks>(&number).ok().flatten()
     }
 }
+
+#[cfg(test)]
+mod clippy {
+    use rand as _;
+    use tn_network_types as _;
+    use tn_test_utils as _;
+}

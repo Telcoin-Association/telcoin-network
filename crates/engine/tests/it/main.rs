@@ -41,8 +41,7 @@ fn assert_eip4788(
     assert_eq!(
         stored_value,
         U256::from(block.timestamp),
-        "Timestamp should be written to beacon roots contract at slot {}",
-        timestamp_storage_slot
+        "Timestamp should be written to beacon roots contract at slot {timestamp_storage_slot}"
     );
 
     // assert the block hash was correctly written to the contract
@@ -52,8 +51,7 @@ fn assert_eip4788(
         state_provider.storage(BEACON_ROOTS_ADDRESS, root_storage_slot.into())?.unwrap_or_default();
     assert_eq!(
         stored_value, expected_blockhash,
-        "Consensus header hash should be written to beacon roots contract at slot {}",
-        root_storage_slot
+        "Consensus header hash should be written to beacon roots contract at slot {root_storage_slot}"
     );
 
     Ok(())
@@ -70,8 +68,7 @@ fn assert_eip2935(reth_env: &RethEnv, block: &SealedBlock) -> eyre::Result<()> {
     assert_eq!(
         stored_value,
         block.parent_hash.into(),
-        "Genesis header hash should be written to history roots contract at slot {}",
-        parent_storage_slot
+        "Genesis header hash should be written to history roots contract at slot {parent_storage_slot}"
     );
     Ok(())
 }

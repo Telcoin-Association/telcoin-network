@@ -1,8 +1,7 @@
 //! Node IT tests
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
-
 use rand::{rngs::StdRng, SeedableRng as _};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_engine::ExecutorEngine;
 use tn_executor::subscriber::spawn_subscriber;
@@ -32,7 +31,6 @@ use tracing::debug;
 
 #[tokio::test]
 async fn test_catchup_accumulator() -> eyre::Result<()> {
-    tn_types::test_utils::init_test_tracing();
     let tmp = temp_dir();
     // create deterministic committee fixture and use first authority's components
     let fixture = CommitteeFixture::builder(MemDatabase::default)
@@ -50,7 +48,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
 
     // fund accounts in genesis so txs execute
     let genesis = adiri_genesis();
-    let all_batches: Vec<_> = batches.iter().map(|(_, batch)| batch.clone()).collect();
+    let all_batches: Vec<_> = batches.values().cloned().collect();
     let (genesis, _, _) = seeded_genesis_from_random_batches(genesis, all_batches.iter());
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
@@ -178,5 +176,5 @@ fn spawn_consensus(
     // spawn consensus to await certificates
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    Consensus::spawn(config, &consensus_bus, bullshark, &task_manager);
+    Consensus::spawn(config, consensus_bus, bullshark, &task_manager);
 }
