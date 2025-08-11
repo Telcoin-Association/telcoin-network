@@ -37,9 +37,9 @@ use tn_storage::{
     DatabaseType,
 };
 use tn_types::{
-    gas_accumulator::GasAccumulator, AuthorityIdentifier, BatchValidation, BlsPublicKey, Committee,
+    gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, Committee,
     CommitteeBuilder, ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, Noticer,
-    Notifier, TaskManager, TaskSpawner, TimestampSec, B256, MIN_PROTOCOL_BASE_FEE,
+    Notifier, TaskManager, TaskSpawner, TimestampSec, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::{
@@ -134,7 +134,7 @@ pub fn catchup_accumulator<DB: TNDatabase>(
             debug!(target: "epoch-manager", ?epoch, ?round, block=current.number, "catchup from nonce:");
 
             // only increment leader count for new rounds
-            if last_round.map_or(true, |last| round != last) {
+            if last_round != Some(round) {
                 // this is a new round, increment the leader count
                 let consensus_digest =
                     current.parent_beacon_block_root.ok_or_eyre("consensus root missing")?;
