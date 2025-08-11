@@ -144,8 +144,9 @@ impl ExecutorEngine {
     /// Note: this is mainly for testing and debugging purposes.
     #[cfg(any(test, feature = "test-utils"))]
     fn has_reached_max_round(&self, progress: u64) -> bool {
+        let (_, round) = RethEnv::deconstruct_nonce(progress);
         let has_reached_max_round =
-            self.max_round.map(|target| progress >= target).unwrap_or_default();
+            self.max_round.map(|target| round as u64 >= target).unwrap_or_default();
         if has_reached_max_round {
             tracing::trace!(
                 target: "engine",

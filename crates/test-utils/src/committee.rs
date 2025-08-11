@@ -31,6 +31,11 @@ impl<DB: Database> CommitteeFixture<DB> {
         self.authorities.values()
     }
 
+    /// Return the [AuthorityFixture] by the [AuthorityIdentifier].
+    pub fn authority_by_id(&self, id: &AuthorityIdentifier) -> Option<&AuthorityFixture<DB>> {
+        self.authorities.get(id)
+    }
+
     /// Return a builder for the [CommitteeFixture].
     pub fn builder<F>(new_db: F) -> Builder<DB, F>
     where

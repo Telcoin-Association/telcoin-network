@@ -1,7 +1,11 @@
 //! Node IT tests
 
 use rand::{rngs::StdRng, SeedableRng as _};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+    time::Duration,
+};
 use tn_config::ConsensusConfig;
 use tn_engine::ExecutorEngine;
 use tn_executor::subscriber::spawn_subscriber;
@@ -31,6 +35,7 @@ use tracing::debug;
 
 #[tokio::test]
 async fn test_catchup_accumulator() -> eyre::Result<()> {
+    tn_types::test_utils::init_test_tracing();
     let tmp = temp_dir();
     // create deterministic committee fixture and use first authority's components
     let fixture = CommitteeFixture::builder(MemDatabase::default)
@@ -42,7 +47,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     let consensus_bus = ConsensusBus::new();
 
     // make certificates for rounds 1 to 7 with batches of txs
-    let max_round = 7;
+    let max_round = 21;
     let (certificates, _next_parents, batches) =
         create_signed_certificates_for_rounds(1..=max_round, &fixture);
 
@@ -54,6 +59,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
 
     // create execution env
     let gas_accumulator = GasAccumulator::new(1);
+    gas_accumulator.rewards_counter().set_committee(fixture.committee());
     let execution_node = default_test_execution_node(
         Some(chain.clone()),
         None,
@@ -63,7 +69,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
 
     // manually create engine
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
-    let max = Some(3);
+    let max = Some(max_round as u64 - 1); // consensus needs 1 extra round to commit
     let parent = chain.sealed_genesis_header();
 
     // start engine
@@ -99,17 +105,21 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
 
     // simulate epoch manager's role:
     // forward consensus output to engine until `max_round`
+    let mut rewards = HashMap::new();
     loop {
         tokio::select! {
             // forward output from consensus to engine
             Some(output) = consensus_output.recv() => {
-                debug!(target: "gas-test", ?output, "received output");
+                debug!(target: "gas-test", output=?output.leader(), round=output.leader().round(), "received output");
+                let leader = output.leader().origin().clone();
+                gas_accumulator.rewards_counter().inc_leader_count(&leader);
+                // manually track values as well
+                rewards.entry(leader).and_modify(|count| *count += 1).or_insert(1);
                 to_engine.send(output).await?;
             }
             // wait for engine to reach `max_round` or timeout
             engine_task = timeout(Duration::from_secs(5), &mut rx) => {
                 // engine shutdown
-                debug!(target: "gas-test", ?engine_task, "res:");
                 assert!(engine_task.is_ok());
                 break;
             }
@@ -121,11 +131,29 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     let worker_id = 0;
     // initialize a new gas accumulator to simulate node recovery
     let recovered = GasAccumulator::new(1);
+    recovered.rewards_counter().set_committee(fixture.committee());
     catchup_accumulator(&consensus_store, reth_env.clone(), &recovered)?;
     // assert recovered and active track the same expected values
+    //      G48pDy85GhyGMp9afPBvWgaNzgPAnvBtMxjReQTe1NiN: 3,
+    //      Agv7rsffEbxoa7ybTJj57TiAHchf27ia7ziB5CVrHNTk: 3,
+    //      73HL4cMSiCfGthUE7xM1F8JwwYfmM53wQi4r34ECrs3F: 3,
+    //      2VDmuopDmr9KZcp4z9q9ne2CAxkaF2ftMt6ejzp42FM7: 1,
     debug!(target: "gas-test", "recovered accumulator:\n{:#?}", recovered);
-    assert_eq!(gas_accumulator.get_values(worker_id), (39, 1638000, 1170000000));
+    assert_eq!(gas_accumulator.get_values(worker_id), (231, 9702000, 6930000000));
     assert_eq!(gas_accumulator.get_values(worker_id), recovered.get_values(worker_id));
+
+    // convert manually calculated rewards for assertion
+    let expected: BTreeMap<_, _> = rewards
+        .iter()
+        .map(|(auth, count)| {
+            (fixture.authority_by_id(auth).expect("in committee").execution_address(), *count)
+        })
+        .collect();
+
+    // assert rewards
+    assert_eq!(expected, gas_accumulator.rewards_counter().get_address_counts());
+    assert_eq!(expected, recovered.rewards_counter().get_address_counts());
+
     Ok(())
 }
 
