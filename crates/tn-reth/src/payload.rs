@@ -78,8 +78,8 @@ impl TNPayload {
     ) -> Self {
         // include leader's aggregate bls signature if this is the last payload for the epoch
         let close_epoch = output
-            .epoch_closing_index()
-            .is_some_and(|idx| idx == batch_index)
+            .close_epoch_for_last_batch()
+            .is_some_and(|last_batch| last_batch)
             .then(|| {
                 let randomness = output.leader().aggregated_signature().unwrap_or_else(|| {
                     error!(target: "engine", ?output, "BLS signature missing for leader - using default for closing epoch");
