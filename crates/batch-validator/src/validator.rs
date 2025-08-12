@@ -242,7 +242,7 @@ impl BatchValidation for NoopBatchValidator {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
-    use std::{path::Path, str::FromStr, sync::Arc, u64};
+    use std::{path::Path, str::FromStr, sync::Arc};
     use tempfile::TempDir;
     use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
     use tn_types::{

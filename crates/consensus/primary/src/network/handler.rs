@@ -433,8 +433,7 @@ where
         let requested_max = request.max_items;
         if requested_max > MAX_CERTIFICATES_PER_REQUEST {
             return Err(PrimaryNetworkError::InvalidRequest(format!(
-                "requested too many items: {}. max allowed: {}",
-                requested_max, MAX_CERTIFICATES_PER_REQUEST
+                "requested too many items: {requested_max}. max allowed: {MAX_CERTIFICATES_PER_REQUEST}"
             )));
         }
 
