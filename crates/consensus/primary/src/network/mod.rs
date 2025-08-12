@@ -30,6 +30,8 @@ mod message;
 #[path = "../tests/network_tests.rs"]
 mod network_tests;
 
+// Maximum number of certificates for one request.
+pub(crate) const MAX_CERTIFICATES_PER_REQUEST: usize = 2_000;
 /// Convenience type for Primary network.
 pub(crate) type Req = PrimaryRequest;
 /// Convenience type for Primary network.

@@ -2,7 +2,7 @@
 
 use crate::{
     error::{CertManagerError, CertManagerResult},
-    network::{MissingCertificatesRequest, PrimaryNetworkHandle},
+    network::{MissingCertificatesRequest, PrimaryNetworkHandle, MAX_CERTIFICATES_PER_REQUEST},
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
@@ -32,12 +32,10 @@ use tracing::{debug, error, instrument, trace};
 #[path = "tests/certificate_fetcher_tests.rs"]
 pub mod certificate_fetcher_tests;
 
-// Maximum number of certificates to fetch with one request.
-const MAX_CERTIFICATES_TO_FETCH: usize = 2_000;
-// Seconds to wait for a response before issuing another parallel fetch request.
+/// Seconds to wait for a response before issuing another parallel fetch request.
 const PARALLEL_FETCH_REQUEST_INTERVAL_SECS: Duration = Duration::from_secs(5);
-// The timeout for an iteration of parallel fetch requests over all peers would be
-// num peers * PARALLEL_FETCH_REQUEST_INTERVAL_SECS + PARALLEL_FETCH_REQUEST_ADDITIONAL_TIMEOUT
+/// The timeout for an iteration of parallel fetch requests over all peers would be
+/// num peers * PARALLEL_FETCH_REQUEST_INTERVAL_SECS + PARALLEL_FETCH_REQUEST_ADDITIONAL_TIMEOUT
 const PARALLEL_FETCH_REQUEST_ADDITIONAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug)]
@@ -316,7 +314,7 @@ async fn run_fetch_task<DB: Database>(
     let request = MissingCertificatesRequest::default()
         .set_bounds(gc_round, written_rounds)
         .map_err(|e| CertManagerError::RequestBounds(e.to_string()))?
-        .set_max_items(MAX_CERTIFICATES_TO_FETCH);
+        .set_max_items(MAX_CERTIFICATES_PER_REQUEST);
     let Some(response) = fetch_certificates_helper(
         state.authority_id.as_ref(),
         state.network.clone(),
@@ -420,10 +418,10 @@ async fn process_certificates_helper<DB: Database>(
     _metrics: Arc<PrimaryMetrics>,
 ) -> CertManagerResult<()> {
     trace!(target: "primary::cert_fetcher", "Start sending fetched certificates to processing");
-    if response.certificates.len() > MAX_CERTIFICATES_TO_FETCH {
+    if response.certificates.len() > MAX_CERTIFICATES_PER_REQUEST {
         return Err(CertManagerError::TooManyFetchedCertificatesReturned {
             response: response.certificates.len(),
-            request: MAX_CERTIFICATES_TO_FETCH,
+            request: MAX_CERTIFICATES_PER_REQUEST,
         });
     }
 
