@@ -173,12 +173,13 @@ impl BatchValidator {
         transactions: &[TransactionSigned],
         timestamp: u64,
     ) -> BatchValidationResult<()> {
-        // calculate total using tx gas limit
-        let total_possible_gas = transactions
-            .iter()
-            .map(|tx| tx.gas_limit())
-            .reduce(|total, size| total + size)
-            .ok_or(BatchValidationError::EmptyBatch)?;
+        // `Self::validate_batch_size_bytes` checks for empty batch
+        //
+        // calculate total using tx gas limit and return error for u64 overflow
+        let total_possible_gas =
+            transactions.iter().map(|tx| tx.gas_limit()).try_fold(0_u64, |total, gas| {
+                total.checked_add(gas).ok_or(BatchValidationError::GasOverflow)
+            })?;
 
         // ensure total tx gas limit fits into block's gas limit
         let max_tx_gas = max_batch_gas(timestamp);
@@ -241,7 +242,7 @@ impl BatchValidation for NoopBatchValidator {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
-    use std::{path::Path, str::FromStr, sync::Arc};
+    use std::{path::Path, str::FromStr, sync::Arc, u64};
     use tempfile::TempDir;
     use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
     use tn_types::{
@@ -437,6 +438,61 @@ mod tests {
                 total_possible_gas: _,
                 gas_limit: _
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_batch_gas_overflow() {
+        // Set excessive gas limit.
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
+        let (batch, _) = valid_batch.split();
+
+        // sign excessive transaction
+        let mut tx_factory = TransactionFactory::new();
+        let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
+        let gas_price = 7;
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+
+        // create transaction with max gas limit above the max allowed
+        let u64_max_transaction = tx_factory.create_eip1559_encoded(
+            chain.clone(),
+            Some(u64::MAX),
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let overflow_transaction = tx_factory.create_eip1559_encoded(
+            chain.clone(),
+            Some(1_000),
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let Batch { beneficiary, timestamp, base_fee_per_gas, received_at, parent_hash, .. } =
+            batch;
+        let invalid_batch = Batch {
+            transactions: vec![u64_max_transaction, overflow_transaction],
+            parent_hash,
+            beneficiary,
+            timestamp,
+            base_fee_per_gas,
+            worker_id: 0,
+            received_at,
+        };
+
+        let decoded_txs = validator
+            .decode_transactions(invalid_batch.transactions(), invalid_batch.digest())
+            .expect("txs decode correctly");
+
+        assert_matches!(
+            validator.validate_batch_gas(&decoded_txs, invalid_batch.timestamp),
+            Err(BatchValidationError::GasOverflow)
         );
     }
 
