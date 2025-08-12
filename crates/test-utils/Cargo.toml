@@ -15,6 +15,7 @@ tempfile = { workspace = true }
 eyre = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 rand = { workspace = true }
+indexmap = { workspace = true }
 tn-node = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 tn-types = { workspace = true }

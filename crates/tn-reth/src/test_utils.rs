@@ -24,12 +24,13 @@ use secp256k1::{
 };
 use std::{path::Path, str::FromStr, sync::Arc};
 use tn_types::{
-    address, calculate_transaction_root, keccak256, now, test_chain_spec_arc, test_genesis,
-    AccessList, Address, Batch, BlobTransactionSidecar, Block, BlockBody, BlockHash, Bytes,
-    Encodable2718, EthSignature, ExecHeader, ExecutionKeypair, Genesis, GenesisAccount,
-    RecoveredBlock, SealedHeader, TaskManager, Transaction, TransactionSigned, TxEip1559, TxHash,
-    TxKind, WorkerId, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS,
-    ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE, U256,
+    address, calculate_transaction_root, gas_accumulator::RewardsCounter, keccak256, now,
+    test_chain_spec_arc, test_genesis, AccessList, Address, Batch, BlobTransactionSidecar, Block,
+    BlockBody, BlockHash, Bytes, Encodable2718, EthSignature, ExecHeader, ExecutionKeypair,
+    Genesis, GenesisAccount, RecoveredBlock, SealedHeader, TaskManager, Transaction,
+    TransactionSigned, TxEip1559, TxHash, TxKind, WorkerId, B256, EMPTY_OMMER_ROOT_HASH,
+    EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE,
+    U256,
 };
 // re-export for engine tests
 pub use alloy::eips::{eip2935::HISTORY_STORAGE_ADDRESS, eip4788::BEACON_ROOTS_ADDRESS};
@@ -40,8 +41,9 @@ impl RethEnv {
     pub fn new_for_test<P: AsRef<Path>>(
         db_path: P,
         task_manager: &TaskManager,
+        rewards: Option<RewardsCounter>,
     ) -> eyre::Result<Self> {
-        Self::new_for_temp_chain(test_chain_spec_arc(), db_path, task_manager)
+        Self::new_for_temp_chain(test_chain_spec_arc(), db_path, task_manager, rewards)
     }
 
     /// Retrieve the state at the provided block hash.
