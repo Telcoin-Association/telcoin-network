@@ -111,9 +111,9 @@ impl Batch {
         }
     }
 
-    /// Size of the batch.
+    /// Size of the batch in bytes (including transactions).
     pub fn size(&self) -> usize {
-        size_of::<Self>()
+        size_of::<Self>() + self.transactions.iter().map(|tx| tx.len()).sum::<usize>()
     }
 
     /// Digest for this batch (the hash of the sealed header).
