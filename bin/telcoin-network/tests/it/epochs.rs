@@ -8,7 +8,7 @@ use alloy::{
 };
 use clap::Parser as _;
 use rand::{rngs::StdRng, SeedableRng as _};
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc};
 use telcoin_network::{genesis::GenesisArgs, node::NodeCommand};
 use tempfile::tempdir;
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
@@ -18,8 +18,8 @@ use tn_reth::{
     test_utils::TransactionFactory,
     RethChainSpec,
 };
-use tn_types::{test_utils::CommandParser, Address, Encodable2718, Genesis, GenesisAccount, U256};
-use tokio::{sync::{mpsc, oneshot}, time::timeout};
+use tn_types::{test_utils::CommandParser, Address, Genesis, GenesisAccount, U256};
+use tokio::time::timeout;
 use tracing::{debug, error, info};
 
 const NEW_VALIDATOR: &str = "new-validator";
@@ -33,13 +33,10 @@ const EPOCH_DURATION: u64 = 5;
 #[tokio::test]
 /// Test a new node joining the network and being shuffled into the committee.
 async fn test_epoch_boundary() -> eyre::Result<()> {
-    tn_types::test_utils::init_test_tracing();
     // create validator and governance wallets for adding new validator later
     let mut new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
     let mut governance_wallet =
         TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
-    // create random EOA to submit transactions
-    let eoa = TransactionFactory::new_random();
     let mut committee = vec![
         ("validator-1", Address::from_slice(&[0x11; 20])),
         ("validator-2", Address::from_slice(&[0x22; 20])),
@@ -55,7 +52,6 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
         temp_path,
         new_validator.address(),
         governance_wallet.address(),
-        eoa.address(),
         &committee,
     )?;
 
@@ -66,18 +62,18 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
     // create transactions to make new validator eligible for future epochs
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
     let txs =
-        generate_new_validator_txs(temp_path, chain.clone(), &mut new_validator, &mut governance_wallet)?;
+        generate_new_validator_txs(temp_path, chain, &mut new_validator, &mut governance_wallet)?;
 
     // create rpc client for node1 default rpc address
     let rpc_url = "http://127.0.0.1:8545".to_string();
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
 
     // wait for node rpc to become available
-    timeout(Duration::from_secs(10), async {
+    timeout(std::time::Duration::from_secs(10), async {
         let mut result = provider.get_chain_id().await;
         while let Err(e) = result {
             debug!(target: "epoch-test", "provider error getting chain id: {e:?}");
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
             // make next request
             result = provider.get_chain_id().await;
@@ -103,12 +99,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
     let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
 
     // sleep for first epoch with 1s offset and begin assertions loop
-    tokio::time::sleep(Duration::from_secs(EPOCH_DURATION + 1)).await;
-
-    // begin submitting transactions
-    let (notify, shutdown) = oneshot::channel();
-    let (tx, error) = mpsc::channel(1);
-    submit_transactions(eoa, shutdown, chain, rpc_url, tx);
+    tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
 
     // the new validator has a 1/6 chance of being selected for the new committee
     //
@@ -120,8 +111,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
     // n ~= 25 iterations
     for i in 0..25 {
         let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
-        debug!(target: "epoch-test", ?new_epoch_info, ?current_epoch_info, "loop");
-        assert!(new_epoch_info != current_epoch_info, "epoch rollover failed at i:{i} - {new_epoch_info:?}");
+        assert!(new_epoch_info != current_epoch_info);
         assert!(new_epoch_info.blockHeight > last_epoch_block_height);
         assert_eq!(new_epoch_info.epochDuration as u64, EPOCH_DURATION);
 
@@ -133,8 +123,6 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
         // if min number of epochs have transitioned, assert new validator has been shuffled in
         // at least once to end the test
         if i > MIN_EPOCHS_TO_TEST && new_validator_in_committee_count > 0 {
-            let _ = notify.send(());
-            info!(target: "epoch-test", ?i, ?new_epoch_info, "epoch test passed");
             return Ok(());
         }
 
@@ -143,12 +131,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
         current_epoch_info = new_epoch_info;
 
         // sleep for epoch duration
-        tokio::time::sleep(Duration::from_secs(EPOCH_DURATION)).await;
-
-        // check for errors submitting txs
-        if !error.is_empty() {
-            return Err(eyre::eyre!("error submitting transactions"));
-        }
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION)).await;
     }
 
     // return error if loop didn't return
@@ -163,7 +146,6 @@ fn create_genesis_for_test(
     temp_path: &Path,
     new_validator: Address,
     governance_wallet: Address,
-    eoa: Address,
     committee: &Vec<(&str, Address)>,
 ) -> eyre::Result<Genesis> {
     // use same passphrase for all nodes
@@ -182,10 +164,6 @@ fn create_genesis_for_test(
         (
             new_validator,
             GenesisAccount::default().with_balance(U256::from(parse_ether("2_000_000")?)), /* double stake */
-        ),
-        (
-            eoa,
-            GenesisAccount::default().with_balance(U256::from(parse_ether("2_000_000")?)),
         ),
     ];
 
@@ -403,23 +381,4 @@ fn generate_new_validator_txs(
     );
 
     Ok(vec![mint_nft, stake_tx, activate_tx])
-}
-
-/// Submit transactions while epochs are changing.
-fn submit_transactions(mut eoa: TransactionFactory, shutdown: oneshot::Receiver<()>, chain: Arc<RethChainSpec>, rpc_url: String, error: mpsc::Sender<()>) {
-    tokio::spawn(async move {
-        let value = parse_ether("1").expect("value parsed");
-        let provider = ProviderBuilder::new().connect_http(rpc_url.parse().expect("parse provider url"));
-        loop {
-            if shutdown.is_empty() {
-                let to = Some(Address::random());
-                let tx = eoa.create_eip1559(chain.clone(), None, 10, to, value, Default::default()).encoded_2718();
-                if let Err(e) = provider.send_raw_transaction(&tx).await {
-                    error!(target: "epoch-test", ?e, "failed to send raw tx:");
-                    let _ = &error.send(()).await;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-    });
 }

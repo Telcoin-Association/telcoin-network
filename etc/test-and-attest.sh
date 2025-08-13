@@ -31,37 +31,37 @@ COMMIT_HASH=$(git rev-parse HEAD)
 echo "attesting git hash: ${COMMIT_HASH}"
 
 # Use cast to call the contract and return early if current HEAD attestation present
-# ALREADY_ATTESTED=$(cast call --rpc-url ${RPC_ENDPOINT} \
-#     ${CONTRACT_ADDRESS} "${VERIFY_CALL}" "${COMMIT_HASH}" )
+ALREADY_ATTESTED=$(cast call --rpc-url ${RPC_ENDPOINT} \
+    ${CONTRACT_ADDRESS} "${VERIFY_CALL}" "${COMMIT_HASH}" )
 
-# # Check if the result is true (1) or false (0)
-# if [[ "${ALREADY_ATTESTED: -1}" == "1" ]]; then
-#     echo "Commit hash ${COMMIT_HASH} already attested on-chain."
-#     echo "Nothing to update."
-#     exit 0
-# fi
+# Check if the result is true (1) or false (0)
+if [[ "${ALREADY_ATTESTED: -1}" == "1" ]]; then
+    echo "Commit hash ${COMMIT_HASH} already attested on-chain."
+    echo "Nothing to update."
+    exit 0
+fi
 
-# # Navigate to the project root directory for workspace, .rustfmt.toml, etc.
-# cd "$(dirname "$0")/.."
+# Navigate to the project root directory for workspace, .rustfmt.toml, etc.
+cd "$(dirname "$0")/.."
 
-# echo "executing bash script from $(pwd)"
+echo "executing bash script from $(pwd)"
 
-# # set environment
-# CARGO_INCREMENTAL=0 # disable incremental compilation
-# RUSTFLAGS="-D warnings -D unused_extern_crates"
-# CARGO_TERM_COLOR=always
-# RUST_BACKTRACE=1
-# CARGO_PROFILE_DEV_DEBUG=0
+# set environment
+CARGO_INCREMENTAL=0 # disable incremental compilation
+RUSTFLAGS="-D warnings -D unused_extern_crates"
+CARGO_TERM_COLOR=always
+RUST_BACKTRACE=1
+CARGO_PROFILE_DEV_DEBUG=0
 
-# # Fetch the status of the git repository and filter for lines that indicate modified tracked files
-# MODIFIED_TRACKED_FILES=$(git status --porcelain --untracked-files=no)
+# Fetch the status of the git repository and filter for lines that indicate modified tracked files
+MODIFIED_TRACKED_FILES=$(git status --porcelain --untracked-files=no)
 
-# # Check the output - ignore untracked files
-# if [ -n "$MODIFIED_TRACKED_FILES" ]; then
-#     echo "Error: please commit changes before attesting HEAD commit hash."
-#     echo "$MODIFIED_TRACKED_FILES"
-#     exit 1
-# fi
+# Check the output - ignore untracked files
+if [ -n "$MODIFIED_TRACKED_FILES" ]; then
+    echo "Error: please commit changes before attesting HEAD commit hash."
+    echo "$MODIFIED_TRACKED_FILES"
+    exit 1
+fi
 
 # check cargo fmt first
 cargo +nightly fmt -- --check
