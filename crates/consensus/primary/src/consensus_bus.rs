@@ -11,8 +11,8 @@ use std::{error::Error, sync::Arc};
 use tn_config::Parameters;
 use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
 use tn_types::{
-    BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput,
-    Header, Round, TnSender, CHANNEL_CAPACITY,
+    BlockHash, BlockNumHash, BlsPublicKey, Certificate, CommittedSubDag, ConsensusHeader,
+    ConsensusOutput, EpochCertificate, Header, Round, TnSender, CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
@@ -128,6 +128,9 @@ struct ConsensusBusInner {
     /// Hold onto the recent sync_status to keep it "open"
     _rx_sync_status: watch::Receiver<NodeMode>,
 
+    /// Produce new epoch certs as they recieved.
+    new_epoch_certificates: MeteredMpscChannel<(BlsPublicKey, EpochCertificate)>,
+
     /// Hold onto the consensus_metrics (mostly for testing)
     consensus_metrics: Arc<ConsensusMetrics>,
     /// Hold onto the primary metrics (allow early creation)
@@ -242,6 +245,11 @@ impl ConsensusBus {
 
         let (consensus_header, _rx_consensus_header) = broadcast::channel(CHANNEL_CAPACITY);
 
+        let new_epoch_certificates = metered_channel::channel_sender(
+            CHANNEL_CAPACITY,
+            &primary_metrics.primary_channel_metrics.tx_new_certificates,
+        );
+
         Self {
             inner: Arc::new(ConsensusBusInner {
                 new_certificates,
@@ -270,6 +278,7 @@ impl ConsensusBus {
                 consensus_header,
                 tx_sync_status,
                 _rx_sync_status,
+                new_epoch_certificates,
                 consensus_metrics,
                 primary_metrics,
                 channel_metrics,
@@ -420,6 +429,11 @@ impl ConsensusBus {
     /// Hold onto the executor metrics
     pub fn executor_metrics(&self) -> &ExecutorMetrics {
         &self.inner.executor_metrics
+    }
+
+    /// New epoch certs as they are recieved.
+    pub fn new_epoch_certificates(&self) -> &impl TnSender<(BlsPublicKey, EpochCertificate)> {
+        &self.inner.new_epoch_certificates
     }
 
     /// Update consensus round watch channels.
