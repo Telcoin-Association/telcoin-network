@@ -3,7 +3,7 @@
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
 
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 use crate::{proposer::OurDigestMessage, state_sync::StateSynchronizer, ConsensusBus};
 use handler::RequestHandler;
@@ -217,10 +217,30 @@ impl PrimaryNetworkHandle {
     }
 }
 
+/// Wrap a network event stream to cache non-epoch close events when between epochs.
+/// We need to use the network to close the epoch but also need to avoid races with
+/// non epoch close events.
+struct NetworkEvents {
+    /// Receiver for network events.
+    network_events: mpsc::Receiver<NetworkEvent<Req, Res>>,
+    /// Cached event to replay when epoch starts.
+    cached_events: VecDeque<NetworkEvent<Req, Res>>,
+}
+
+impl NetworkEvents {
+    fn new(network_events: mpsc::Receiver<NetworkEvent<Req, Res>>) -> Self {
+        Self { network_events, cached_events: VecDeque::new() }
+    }
+
+    async fn recv(&mut self) -> Option<NetworkEvent<Req, Res>> {
+        self.network_events.recv().await
+    }
+}
+
 /// Handle inter-node communication between primaries.
 pub struct PrimaryNetwork<DB> {
     /// Receiver for network events.
-    network_events: mpsc::Receiver<NetworkEvent<Req, Res>>,
+    network_events: NetworkEvents, //XXXXmpsc::Receiver<NetworkEvent<Req, Res>>,
     /// Network handle to send commands.
     network_handle: PrimaryNetworkHandle,
     /// Request handler to process requests and return responses.
@@ -244,7 +264,12 @@ where
     ) -> Self {
         let request_handler =
             RequestHandler::new(consensus_config, consensus_bus, state_sync.clone());
-        Self { network_events, network_handle, request_handler, task_spawner }
+        Self {
+            network_events: NetworkEvents::new(network_events),
+            network_handle,
+            request_handler,
+            task_spawner,
+        }
     }
 
     pub fn handle(&self) -> &PrimaryNetworkHandle {
