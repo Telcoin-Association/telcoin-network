@@ -287,8 +287,6 @@ where
     NewEpoch {
         /// The epoch committee.
         committee: HashSet<BlsPublicKey>,
-        /// The new sender for events.
-        new_event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
     },
     /// Find authorities for a future committee by bls key and return to sender.
     FindAuthorities {
@@ -532,12 +530,8 @@ where
     }
 
     /// Create a [PeerExchangeMap] for exchanging peers.
-    pub async fn new_epoch(
-        &self,
-        committee: HashSet<BlsPublicKey>,
-        new_event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
-    ) -> NetworkResult<()> {
-        self.sender.send(NetworkCommand::NewEpoch { committee, new_event_stream }).await?;
+    pub async fn new_epoch(&self, committee: HashSet<BlsPublicKey>) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::NewEpoch { committee }).await?;
         Ok(())
     }
 

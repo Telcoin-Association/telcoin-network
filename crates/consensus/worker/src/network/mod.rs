@@ -17,7 +17,7 @@ use tn_network_types::{FetchBatchResponse, PrimaryToWorkerClient, WorkerSynchron
 use tn_storage::tables::Batches;
 use tn_types::{
     encode, now, Batch, BatchValidation, BlockHash, BlsPublicKey, Database, DbTxMut, SealedBatch,
-    TaskManager, TaskSpawner, WorkerId,
+    TaskManager, TaskSpawner, TnReceiver, WorkerId,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, trace, warn};
@@ -60,7 +60,7 @@ impl WorkerNetworkHandle {
     }
 
     /// Return a reference to the inner handle.
-    pub fn inner_handle(&self) -> &NetworkHandle<WorkerRequest, WorkerResponse> {
+    pub fn inner_handle(&self) -> &NetworkHandle<Req, Res> {
         &self.handle
     }
 
@@ -262,22 +262,23 @@ impl WorkerNetworkHandle {
 }
 
 /// Handle inter-node communication between primaries.
-pub struct WorkerNetwork<DB> {
+pub struct WorkerNetwork<DB, Events> {
     /// Receiver for network events.
-    network_events: mpsc::Receiver<NetworkEvent<Req, Res>>,
+    network_events: Events,
     /// Network handle to send commands.
     network_handle: WorkerNetworkHandle,
     // Request handler to process requests and return responses.
     request_handler: RequestHandler<DB>,
 }
 
-impl<DB> WorkerNetwork<DB>
+impl<DB, Events> WorkerNetwork<DB, Events>
 where
     DB: Database,
+    Events: TnReceiver<NetworkEvent<Req, Res>> + 'static,
 {
     /// Create a new instance of Self.
     pub fn new(
-        network_events: mpsc::Receiver<NetworkEvent<Req, Res>>,
+        network_events: Events,
         network_handle: WorkerNetworkHandle,
         consensus_config: ConsensusConfig<DB>,
         id: WorkerId,
