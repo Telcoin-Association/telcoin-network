@@ -18,7 +18,11 @@ use tn_types::{
 /// The work factor for PBKDF2 is implemented through an iteration count, which is based on the
 /// internal hashing algorithm used. HMAC-SHA-256 is widely supported and is recommended by NIST.
 /// OWASP recommends 600,000 iterations for PBKDF2-HMAC-SHA256.
+#[cfg(not(feature = "test-utils"))]
 const PBKDF2_HMAC_ROUNDS: u32 = 1_000_000;
+// prevent excessive delays during testing
+#[cfg(feature = "test-utils")]
+const PBKDF2_HMAC_ROUNDS: u32 = 1;
 
 #[derive(Debug)]
 struct KeyConfigInner {
