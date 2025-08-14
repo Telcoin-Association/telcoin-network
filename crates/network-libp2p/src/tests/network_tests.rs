@@ -870,11 +870,7 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
     let peer2_bls = config_2.key_config().primary_public_key();
 
     peer1
-        .add_explicit_peer(
-            peer2_bls,
-            config_2.primary_networkkey(),
-            config_2.primary_address(),
-        )
+        .add_explicit_peer(peer2_bls, config_2.primary_networkkey(), config_2.primary_address())
         .await?;
 
     // Connect peers
@@ -1328,10 +1324,9 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
     peer2.network_handle.start_listening(peer2_addr.clone()).await?;
 
     // Now simulate a new epoch where peer2 is in the committee with the same IP as banned peer1
-    let committee =
-        vec![*peer2.config.authority().as_ref().expect("authority").protocol_key()]
-            .into_iter()
-            .collect();
+    let committee = vec![*peer2.config.authority().as_ref().expect("authority").protocol_key()]
+        .into_iter()
+        .collect();
     let handle = target_peer.network_handle.clone();
     let (new_event_stream, _rx) = mpsc::channel(100);
     tokio::spawn(async move {

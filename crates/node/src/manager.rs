@@ -37,9 +37,9 @@ use tn_storage::{
     DatabaseType,
 };
 use tn_types::{
-    gas_accumulator::GasAccumulator, AuthorityIdentifier, BatchValidation, BlsPublicKey, Committee,
-    CommitteeBuilder, ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, Noticer,
-    Notifier, TaskManager, TaskSpawner, TimestampSec, B256, MIN_PROTOCOL_BASE_FEE,
+    gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, Committee, CommitteeBuilder,
+    ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, Noticer, Notifier,
+    TaskManager, TaskSpawner, TimestampSec, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::{
@@ -108,26 +108,50 @@ pub fn catchup_accumulator<DB: TNDatabase>(
 
         let blocks =
             reth_env.blocks_for_range(epoch_state.epoch_info.blockHeight..=block.number)?;
-        let mut consensus_leaders: HashMap<B256, AuthorityIdentifier> = HashMap::default();
+        let mut last_round: Option<u32> = None;
+
+        // loop through blocks to increment leader counts
         for current in blocks {
             let gas = current.gas_used;
             let limit = current.gas_limit;
+
+            // difficulty contains the worker id and batch index:
+            // `U256::from(payload.batch_index << 16 | payload.worker_id as usize)`
             let lower64 = current.difficulty.into_limbs()[0];
             let worker_id = (lower64 & 0xffff) as u16;
             gas_accumulator.inc_block(worker_id, gas, limit);
-            // increment or leader counts.
-            if let Some(hash) = current.parent_beacon_block_root {
-                if let Some(leader) = consensus_leaders.get(&hash) {
-                    gas_accumulator.rewards_counter().inc_leader_count(leader);
-                } else if let Some(number) = db.get::<ConsensusBlockNumbersByDigest>(&hash)? {
-                    if let Some(consensus_header) = db.get::<ConsensusBlocks>(&number)? {
-                        let leader = consensus_header.sub_dag.leader.origin();
-                        gas_accumulator.rewards_counter().inc_leader_count(leader);
-                        // Cache the leader.
-                        consensus_leaders.insert(hash, leader.clone());
-                    }
-                }
+
+            // extract epoch and round from nonce
+            // - epoch: first 32 bits
+            // - round: lower 32 bits
+            let nonce: u64 = current.nonce.into();
+            let (epoch, round) = RethEnv::deconstruct_nonce(nonce);
+            // skip genesis
+            if round == 0 {
+                continue;
             }
+
+            debug!(target: "epoch-manager", ?epoch, ?round, block=current.number, "catchup from nonce:");
+
+            // only increment leader count for new rounds
+            if last_round != Some(round) {
+                // this is a new round, increment the leader count
+                let consensus_digest =
+                    current.parent_beacon_block_root.ok_or_eyre("consensus root missing")?;
+                let consensus_block_num = db
+                    .get::<ConsensusBlockNumbersByDigest>(&consensus_digest)?
+                    .ok_or_eyre("consensus block number by digest missing")?;
+                let leader = db
+                    .get::<ConsensusBlocks>(&consensus_block_num)?
+                    .ok_or_eyre("missing consensus block")?
+                    .sub_dag
+                    .leader
+                    .origin()
+                    .clone();
+
+                gas_accumulator.rewards_counter().inc_leader_count(&leader);
+            }
+            last_round = Some(round);
         }
     };
 

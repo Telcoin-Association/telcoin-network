@@ -581,11 +581,7 @@ async fn test_fetch_certificates_handler() {
                 authorities
                     .clone()
                     .into_iter()
-                    .zip(
-                        skip_rounds_vec
-                            .into_iter()
-                            .map(|rounds| rounds.iter().map(|r| *r).collect()),
-                    )
+                    .zip(skip_rounds_vec.iter().map(|rounds| rounds.iter().copied().collect()))
                     .collect(),
             )
             .expect("boundary set")
