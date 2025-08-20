@@ -123,6 +123,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
         }
         last_pause = i;
         assert!(new_epoch_info != current_epoch_info);
+        assert!(new_epoch_info != current_epoch_info, "Old and new epoch equal on iteration {i}");
         assert!(new_epoch_info.blockHeight > last_epoch_block_height);
         assert_eq!(new_epoch_info.epochDuration as u64, EPOCH_DURATION);
 
@@ -142,7 +143,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
         current_epoch_info = new_epoch_info;
 
         // sleep for epoch duration
-        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
     }
 
     // return error if loop didn't return

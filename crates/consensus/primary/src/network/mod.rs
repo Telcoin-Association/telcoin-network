@@ -19,7 +19,7 @@ use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerTo
 use tn_storage::PayloadStore;
 use tn_types::{
     encode, BlockHash, BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader, Database,
-    Epoch, EpochCertificate, EpochRecord, Header, TaskSpawner, TnSender, Vote,
+    Epoch, EpochCertificate, EpochRecord, Header, TaskSpawner, TnReceiver, TnSender, Vote,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
@@ -240,9 +240,9 @@ impl NetworkEvents {
 }
 
 /// Handle inter-node communication between primaries.
-pub struct PrimaryNetwork<DB> {
+pub struct PrimaryNetwork<DB, Events> {
     /// Receiver for network events.
-    network_events: NetworkEvents, //XXXXmpsc::Receiver<NetworkEvent<Req, Res>>,
+    network_events: Events,
     /// Network handle to send commands.
     network_handle: PrimaryNetworkHandle,
     /// Request handler to process requests and return responses.
@@ -251,13 +251,14 @@ pub struct PrimaryNetwork<DB> {
     task_spawner: TaskSpawner,
 }
 
-impl<DB> PrimaryNetwork<DB>
+impl<DB, Events> PrimaryNetwork<DB, Events>
 where
     DB: Database,
+    Events: TnReceiver<NetworkEvent<Req, Res>> + 'static,
 {
     /// Create a new instance of Self.
     pub fn new(
-        network_events: mpsc::Receiver<NetworkEvent<Req, Res>>,
+        network_events: Events,
         network_handle: PrimaryNetworkHandle,
         consensus_config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
@@ -266,12 +267,7 @@ where
     ) -> Self {
         let request_handler =
             RequestHandler::new(consensus_config, consensus_bus, state_sync.clone());
-        Self {
-            network_events: NetworkEvents::new(network_events),
-            network_handle,
-            request_handler,
-            task_spawner,
-        }
+        Self { network_events, network_handle, request_handler, task_spawner }
     }
 
     pub fn handle(&self) -> &PrimaryNetworkHandle {
