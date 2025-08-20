@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Library for managing all components used by a full-node in a single process.
+// Library for managing all components used by a full-node in a single process.
 
 #![warn(unused_crate_dependencies)]
 
@@ -18,6 +18,7 @@ mod error;
 mod manager;
 pub mod primary;
 pub mod worker;
+pub use manager::catchup_accumulator;
 
 /// Launch all components for the node.
 ///
@@ -82,4 +83,11 @@ impl<DB: Database> EngineToPrimary for EngineToPrimaryRpc<DB> {
         let number = self.db.get::<ConsensusBlockNumbersByDigest>(&hash).ok().flatten()?;
         self.db.get::<ConsensusBlocks>(&number).ok().flatten()
     }
+}
+
+#[cfg(test)]
+mod clippy {
+    use rand as _;
+    use tn_network_types as _;
+    use tn_test_utils as _;
 }

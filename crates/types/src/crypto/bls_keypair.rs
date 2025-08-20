@@ -11,7 +11,6 @@ pub struct BlsKeypair {
 }
 
 pub const DST_G1: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_"; // min sig
-const _DST_G2: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_"; // min pk
 impl BlsKeypair {
     pub fn public(&self) -> &BlsPublicKey {
         &self.public

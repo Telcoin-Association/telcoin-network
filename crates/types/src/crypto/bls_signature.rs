@@ -4,7 +4,7 @@ use super::{BlsKeypair, BlsPublicKey, Intent, IntentMessage, IntentScope, Signer
 use crate::encode;
 use alloy::primitives::Address;
 use blst::min_sig::{
-    AggregateSignature as CoreBlsAggregateSignature, Signature as CoreBlsSignature,
+    AggregateSignature as CoreBlsAggregateSignature, PublicKey, Signature as CoreBlsSignature,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -152,18 +152,15 @@ impl std::fmt::Display for BlsAggregateSignature {
 ///
 /// The proof of possession is a [BlsSignature] committed over the intent message
 /// `intent || message` (See more at [IntentMessage] and [Intent]).
-/// The message is constructed as: [BlsPublicKey] || [Genesis].
+/// The message is constructed as: EIP2537([BlsPublicKey]) || [Address].
+/// Where the public key is uncompressed with G2 point coordinates padded to 64-byte EVM words
 pub fn generate_proof_of_possession_bls(
     keypair: &BlsKeypair,
     address: &Address,
 ) -> eyre::Result<BlsSignature> {
-    let mut msg = keypair.public().to_bytes().to_vec();
-    let address_bytes = encode(address);
-    msg.extend_from_slice(address_bytes.as_slice());
-    let sig = BlsSignature::new_secure(
-        &IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg),
-        keypair,
-    );
+    let msg = construct_proof_of_possession_message(keypair.public(), address)?;
+    let sig = BlsSignature::new_secure(&msg, keypair);
+
     Ok(sig)
 }
 
@@ -176,18 +173,26 @@ pub fn verify_proof_of_possession_bls(
     public_key: &BlsPublicKey,
     address: &Address,
 ) -> eyre::Result<()> {
-    public_key.validate().map_err(|_| eyre::eyre!("Bls Publkic Key not valid!"))?;
-    let mut msg = public_key.to_bytes().to_vec();
-    let address_bytes = encode(&address);
-    msg.extend_from_slice(address_bytes.as_slice());
-    if proof.verify_secure(
-        &IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg),
-        public_key,
-    ) {
+    public_key.validate().map_err(|_| eyre::eyre!("Bls Public Key not valid!"))?;
+    let msg = construct_proof_of_possession_message(public_key, address)?;
+    if proof.verify_secure(&msg, public_key) {
         Ok(())
     } else {
         Err(eyre::eyre!("Failed to verify proof of possession!"))
     }
+}
+
+pub fn construct_proof_of_possession_message(
+    bls_pubkey: &BlsPublicKey,
+    address: &Address,
+) -> eyre::Result<IntentMessage<Vec<u8>>> {
+    let mut msg_unprefixed = PublicKey::serialize(bls_pubkey).to_vec();
+    let address_bytes = encode(address);
+    msg_unprefixed.extend_from_slice(address_bytes.as_slice());
+
+    let msg = IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg_unprefixed);
+
+    Ok(msg)
 }
 
 /// A trait for sign and verify over an intent message, instead of the message itself. See more at
@@ -202,6 +207,13 @@ pub trait ProtocolSignature {
     fn verify_secure<T>(&self, value: &IntentMessage<T>, public_key: &BlsPublicKey) -> bool
     where
         T: Serialize;
+
+    /// Create a new signature over a raw byte array,
+    /// such as one produced by `construct_proof_of_possession_message`
+    fn new_secure_bytes(&self, msg: &[u8], secret: &dyn Signer) -> Self;
+
+    /// Verify the signature over an intent message against a public key.
+    fn verify_secure_bytes(&self, value: &[u8], public_key: &BlsPublicKey) -> bool;
 }
 
 impl ProtocolSignature for BlsSignature {
@@ -213,12 +225,20 @@ impl ProtocolSignature for BlsSignature {
         secret.sign(&message)
     }
 
+    fn new_secure_bytes(&self, msg: &[u8], secret: &dyn Signer) -> Self {
+        secret.sign(msg)
+    }
+
     fn verify_secure<T>(&self, value: &IntentMessage<T>, public_key: &BlsPublicKey) -> bool
     where
         T: Serialize,
     {
         let message = encode(&value);
         self.verify(true, &message, DST_G1, &[], public_key, true) == blst::BLST_ERROR::BLST_SUCCESS
+    }
+
+    fn verify_secure_bytes(&self, value: &[u8], public_key: &BlsPublicKey) -> bool {
+        self.verify(false, value, DST_G1, &[], public_key, true) == blst::BLST_ERROR::BLST_SUCCESS
     }
 }
 

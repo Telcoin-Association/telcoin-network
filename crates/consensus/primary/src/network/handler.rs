@@ -3,7 +3,7 @@
 use super::{message::MissingCertificatesRequest, PrimaryResponse};
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
-    network::message::PrimaryGossip,
+    network::{message::PrimaryGossip, MAX_CERTIFICATES_PER_REQUEST},
     state_sync::{CertificateCollector, StateSynchronizer},
     ConsensusBus,
 };
@@ -449,8 +449,16 @@ where
         &self,
         request: MissingCertificatesRequest,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
+        // ensure max items within bounds
+        let requested_max = request.max_items;
+        if requested_max > MAX_CERTIFICATES_PER_REQUEST {
+            return Err(PrimaryNetworkError::InvalidRequest(format!(
+                "requested too many items: {requested_max}. max allowed: {MAX_CERTIFICATES_PER_REQUEST}"
+            )));
+        }
+
         // Create a time-bounded iter for collecting certificates
-        let mut missing = Vec::with_capacity(request.max_items);
+        let mut missing = Vec::with_capacity(requested_max);
 
         // validates request is within limits
         let mut collector = CertificateCollector::new(request, self.consensus_config.clone())?;

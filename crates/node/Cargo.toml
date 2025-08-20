@@ -19,7 +19,6 @@ tokio-stream = { workspace = true }
 tracing = { workspace = true }
 tn-executor = { workspace = true }
 tn-primary = { workspace = true }
-prometheus = { workspace = true }
 tn-storage = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
@@ -40,4 +39,9 @@ jsonrpsee = { workspace = true }
 tn-faucet = { workspace = true }
 
 [dev-dependencies]
-tn-primary = { workspace = true }
+rand = { workspace = true }
+tn-primary = { workspace = true, features = ["test-utils"] }
+tn-types = { workspace = true, features = ["test-utils"] }
+tn-engine = { workspace = true, features = ["test-utils"] }
+tn-test-utils = { workspace = true }
+tn-network-types = { workspace = true }

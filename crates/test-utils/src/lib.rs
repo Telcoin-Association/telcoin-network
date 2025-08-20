@@ -8,6 +8,8 @@ mod builder;
 pub use builder::*;
 mod committee;
 pub use committee::*;
+mod consensus;
+pub use consensus::*;
 mod execution;
 pub use execution::*;
 mod temp_dirs;
