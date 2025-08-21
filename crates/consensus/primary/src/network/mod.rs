@@ -3,7 +3,7 @@
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
 
-use std::{collections::VecDeque, sync::Arc};
+use std::sync::Arc;
 
 use crate::{proposer::OurDigestMessage, state_sync::StateSynchronizer, ConsensusBus};
 use handler::RequestHandler;
@@ -216,26 +216,6 @@ impl PrimaryNetworkHandle {
     /// Retrieve the count of connected peers.
     pub async fn connected_peers_count(&self) -> NetworkResult<usize> {
         self.handle.connected_peer_count().await
-    }
-}
-
-/// Wrap a network event stream to cache non-epoch close events when between epochs.
-/// We need to use the network to close the epoch but also need to avoid races with
-/// non epoch close events.
-struct NetworkEvents {
-    /// Receiver for network events.
-    network_events: mpsc::Receiver<NetworkEvent<Req, Res>>,
-    /// Cached event to replay when epoch starts.
-    cached_events: VecDeque<NetworkEvent<Req, Res>>,
-}
-
-impl NetworkEvents {
-    fn new(network_events: mpsc::Receiver<NetworkEvent<Req, Res>>) -> Self {
-        Self { network_events, cached_events: VecDeque::new() }
-    }
-
-    async fn recv(&mut self) -> Option<NetworkEvent<Req, Res>> {
-        self.network_events.recv().await
     }
 }
 

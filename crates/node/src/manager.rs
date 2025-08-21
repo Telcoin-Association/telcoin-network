@@ -96,6 +96,9 @@ pub struct EpochManager<P, DB> {
     consensus_bus: ConsensusBus,
     /// Persistent event stream for worker network events.
     worker_event_stream: QueChannel<NetworkEvent<WorkerRequest, WorkerResponse>>,
+
+    /// The record for a just completed epoch.
+    epoch_record: Option<EpochRecord>,
 }
 
 /// When rejoining a network mid epoch this will accumulate any gas state for previous epoch blocks.
@@ -226,6 +229,7 @@ where
             consensus_db,
             consensus_bus,
             worker_event_stream,
+            epoch_record: None,
         })
     }
 
@@ -488,12 +492,13 @@ where
         let mut clear_tables_for_next_epoch = false;
 
         // New Epoch, should be able to collect the certs from the last epoch.
-        //XXXXself.collect_epoch_certs(&primary, engine, &epoch_task_manager).await?;
+        if let Some(epoch_rec) = self.epoch_record.take() {
+            let _ = self.collect_epoch_certs(&primary, epoch_rec, &epoch_task_manager).await;
+        }
 
         tokio::select! {
           // wait for epoch boundary to transition
-          //XXXXres = self.wait_for_epoch_boundary(&primary, to_engine, engine, consensus_output, consensus_shutdown.clone(), gas_accumulator) => {
-          res = self.wait_for_epoch_boundary(&primary, to_engine, engine, consensus_shutdown.clone(), gas_accumulator, consensus_output) => {
+          res = self.wait_for_epoch_boundary(to_engine, engine, consensus_shutdown.clone(), gas_accumulator, consensus_output) => {
                 res.inspect_err(|e| {
                     error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
                 })?;
@@ -512,6 +517,9 @@ where
                 info!(target: "epoch-manager", "epoch task manager exited - likely syncing with committee");
             },
         }
+
+        // Write the epoch record to DB and save in manager for next epoch.
+        self.write_epoch_record(&primary, engine).await?;
 
         consensus_shutdown.notify();
         // abort all epoch-related tasks
@@ -532,24 +540,15 @@ where
         Ok(())
     }
 
-    /// Start a task to collect the epoch record certs and load the previous epochs record.
-    /// This should run quickly at epoch end and make epoch records/certs available to syncing
-    /// nodes.
-    async fn collect_epoch_certs(
-        &self,
+    /// Record the epoch record for just completed epoch in our DB.
+    /// Also record this in the manager for posible signing/collection of signatures.
+    async fn write_epoch_record(
+        &mut self,
         primary: &PrimaryNode<DB>,
         engine: &ExecutionNode,
-        //epoch_task_manager: &TaskManager,
     ) -> eyre::Result<()> {
-        eprintln!("XXXX 1");
         let committee = primary.current_committee().await;
         let epoch = committee.epoch();
-        let consensus_db = self.consensus_db.clone();
-
-        // We already have a record for this epoch, nothing to do.
-        //XXXXif consensus_db.get::<EpochRecords>(&epoch).ok().flatten().is_none() {
-        //    return Ok(());
-        //}
 
         let committee_keys = engine.validators_for_epoch(epoch).await?;
         let next_committee_keys = engine.validators_for_epoch(epoch + 1).await?;
@@ -558,17 +557,14 @@ where
         } else if let Some(prev) = self.consensus_db.get::<EpochRecords>(&(epoch - 1))? {
             prev.digest()
         } else {
-            //XXXX- request the previous?
             error!(
                 target: "epoch-manager",
                 "failed to find previous epoch record when starting epoch",
             );
             return Err(eyre!("failed to find previous epoch record when starting epoch"));
         };
-        eprintln!("XXXX 2");
-        let consensus_bus = primary.consensus_bus().await;
-        let target_hash = consensus_bus.last_consensus_header().borrow().clone().digest();
-        let parent_state = consensus_bus.recent_blocks().borrow().latest_block_num_hash();
+        let target_hash = self.consensus_bus.last_consensus_header().borrow().clone().digest();
+        let parent_state = self.consensus_bus.recent_blocks().borrow().latest_block_num_hash();
 
         let epoch_rec = EpochRecord {
             epoch,
@@ -580,8 +576,30 @@ where
         };
         let epoch_hash = epoch_rec.digest();
 
+        self.consensus_db.insert::<EpochRecordsIndex>(&epoch_hash, &epoch)?;
+        self.consensus_db.insert::<EpochRecords>(&epoch, &epoch_rec)?;
+        self.epoch_record = Some(epoch_rec);
+        Ok(())
+    }
+
+    /// Start a task to collect the epoch record certs and load the previous epochs record.
+    /// This should run quickly at epoch end and make epoch records/certs available to syncing
+    /// nodes.
+    async fn collect_epoch_certs(
+        &self,
+        primary: &PrimaryNode<DB>,
+        epoch_rec: EpochRecord,
+        epoch_task_manager: &TaskManager,
+    ) -> eyre::Result<()> {
+        let mut committee_keys: HashSet<BlsPublicKey> =
+            epoch_rec.committee.iter().cloned().collect();
+        //XXXXprimary.current_committee().await.quorum_threshold()
+        let consensus_db = self.consensus_db.clone();
+
+        let epoch_hash = epoch_rec.digest();
+
         let mut certs: HashMap<B256, u64> = HashMap::default();
-        let mut committee_keys = committee.committee_keys();
+        //let mut committee_keys = committee.committee_keys();
         let me = self.builder.tn_config.primary_bls_key();
         let committee_size = committee_keys.len() as u64;
         // We are in the committee so sign and gossip the epoch record.
@@ -600,14 +618,14 @@ where
             //XXXX});
             //XXXX also send direct to other committee members.
         }
-        eprintln!("XXXX 3");
 
-        let quorum = committee.quorum_threshold();
-        //XXXXepoch_task_manager.spawn_task("epoch certificate collector", async move {
-        let mut reached_quorum = false;
-        let mut rx = consensus_bus.new_epoch_certificates().subscribe();
+        //XXXXlet quorum = committee.quorum_threshold();
+        let quorum = (((committee_keys.len() as f64 / 2.0) * 3.0) + 0.5) as u64;
+        let mut rx = self.consensus_bus.new_epoch_certificates().subscribe();
+        epoch_task_manager.spawn_task("Collect Epoch Signatures", async move {
+            let mut reached_quorum = false;
         while let Ok(Some((source, mut cert))) =
-            tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
+            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
         {
             if committee_keys.contains(&source) && cert.check_signature(&source) {
                 committee_keys.remove(&source);
@@ -621,23 +639,7 @@ where
                     if let Some(v) = certs.get_mut(&cert.epoch_hash) {
                         *v += 1;
                         if *v >= quorum {
-                            // If we have not saveid EpochRecord to our DB do so now that it has a quorum of signatures.
-                            if consensus_db
-                                .get::<EpochRecordsIndex>(&cert.epoch_hash)
-                                .ok()
-                                .flatten()
-                                .is_none()
-                            {
-                                let consensus_db = consensus_db.clone();
-                                let _ = consensus_db.insert::<EpochRecordsIndex>(
-                                    &cert.epoch_hash,
-                                    &epoch_rec.epoch,
-                                );
-                                let _ = consensus_db
-                                    .insert::<EpochRecords>(&epoch_rec.epoch, &epoch_rec);
-                                //break; //XXXX
-                                reached_quorum = true;
-                            }
+                            reached_quorum = true;
                             if *v >= committee_size {
                                 break;
                             }
@@ -652,19 +654,15 @@ where
                     );
                 }
             }
-            //if committee_keys.is_empty() {
-            //XXXX    break; // Cert is verified so we are done.
-            //}
         }
         if !reached_quorum {
             error!(
                 target: "epoch-manager",
                 "failed to reach quorum on epoch close",
             );
-            return Err(eyre!("failed to reach quorum on epoch close"));
+            //return Err(eyre!("failed to reach quorum on epoch close"));
         }
-        eprintln!("XXXX 4");
-        //XXXX});
+        });
         Ok(())
     }
 
@@ -674,7 +672,6 @@ where
     /// Once the epoch boundary is reached, the manager initiates the epoch transitions.
     async fn wait_for_epoch_boundary(
         &self,
-        primary: &PrimaryNode<DB>,
         to_engine: &mpsc::Sender<ConsensusOutput>,
         engine: &ExecutionNode,
         shutdown_consensus: Notifier,
@@ -706,19 +703,15 @@ where
                 to_engine.send(output).await?;
 
                 // begin consensus shutdown while engine executes
-                //XXXXshutdown_consensus.notify();
+                shutdown_consensus.notify();
 
                 // wait for execution result before proceeding
                 while let Some(output) = executed_output.next().await {
                     // ensure canonical tip is updated with closing epoch info
                     if output.tip().sealed_header().parent_beacon_block_root == Some(target_hash) {
-                        self.collect_epoch_certs(&primary, engine).await?;
-                        // return
-                        shutdown_consensus.notify(); // XXXX
                         break 'epoch;
                     }
                 }
-                shutdown_consensus.notify(); // XXXX
 
                 // `None` indicates all senders have dropped
                 error!(
