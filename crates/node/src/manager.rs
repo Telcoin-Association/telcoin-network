@@ -43,7 +43,7 @@ use tn_storage::{
 use tn_types::{
     gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, Committee, CommitteeBuilder,
     ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, Noticer, Notifier,
-    TaskManager, TaskSpawner, TimestampSec, TnReceiver, TnSender, MIN_PROTOCOL_BASE_FEE,
+    TaskManager, TaskSpawner, TimestampSec, TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc::{self};
@@ -484,13 +484,14 @@ where
         // indicate if the node is restarting to join the committe or if the epoch is changed and
         // tables should be cleared
         let mut clear_tables_for_next_epoch = false;
+        let mut target_hash = None;
 
         tokio::select! {
             // wait for epoch boundary to transition
-            res = self.wait_for_epoch_boundary(to_engine, engine, consensus_shutdown.clone(), gas_accumulator, consensus_output) => {
-                res.inspect_err(|e| {
+            res = self.wait_for_epoch_boundary(to_engine, gas_accumulator.clone(), consensus_output) => {
+                target_hash = Some(res.inspect_err(|e| {
                     error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
-                })?;
+                })?);
 
                 info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
 
@@ -505,6 +506,11 @@ where
                 })?;
                 info!(target: "epoch-manager", "epoch task manager exited - likely syncing with committee");
             },
+        }
+
+        if let Some(target_hash) = target_hash {
+            self.close_epoch(engine, consensus_shutdown.clone(), gas_accumulator, target_hash)
+                .await?;
         }
 
         consensus_shutdown.notify();
@@ -533,13 +539,11 @@ where
     async fn wait_for_epoch_boundary(
         &self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
-        engine: &ExecutionNode,
-        shutdown_consensus: Notifier,
         gas_accumulator: GasAccumulator,
         mut consensus_output: impl TnReceiver<ConsensusOutput>,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<B256> {
         // receive output from consensus and forward to engine
-        'epoch: while let Some(mut output) = consensus_output.recv().await {
+        while let Some(mut output) = consensus_output.recv().await {
             // observe epoch boundary to initiate epoch transition
             if output.committed_at() >= self.epoch_boundary {
                 info!(
@@ -549,9 +553,6 @@ where
                     epoch_boundary=?self.epoch_boundary,
                     "epoch boundary detected",
                 );
-                // subscribe to engine blocks to confirm epoch closed on-chain
-                let mut executed_output = engine.canonical_block_stream().await;
-
                 // update output so engine closes epoch
                 output.close_epoch = true;
 
@@ -561,41 +562,54 @@ where
                 gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
                 // forward the output to the engine
                 to_engine.send(output).await?;
-
-                // begin consensus shutdown while engine executes
-                shutdown_consensus.notify();
-
-                // wait for execution result before proceeding
-                while let Some(output) = executed_output.next().await {
-                    // ensure canonical tip is updated with closing epoch info
-                    if output.tip().sealed_header().parent_beacon_block_root == Some(target_hash) {
-                        // return
-                        break 'epoch;
-                    }
-                }
-
-                // `None` indicates all senders have dropped
-                error!(
-                    target: "epoch-manager",
-                    "canon state notifications dropped while awaiting engine execution for closing epoch",
-                );
-                return Err(eyre!("engine failed to report output for closing epoch"));
+                return Ok(target_hash);
             } else {
                 gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
                 // only forward the output to the engine
                 to_engine.send(output).await?;
             }
         }
-        // Use accumulated gas information to set each workers base fee for the epoch.
-        for worker_id in 0..gas_accumulator.num_workers() {
-            let worker_id = worker_id as u16;
-            let (_blocks, _gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
-            // Change this base fee to update base fee in batches workers create.
-            let _base_fee = gas_accumulator.base_fee(worker_id);
-        }
-        gas_accumulator.clear(); // Clear the accumlated values for next epoch.
+        Err(eyre::eyre!("invalid wait for epoch end"))
+    }
 
-        Ok(())
+    /// Close an epoch after wait_for_epoch_boundary returns.
+    ///
+    /// This is broken out so it can shutdown the epoch tasks and not suffer race conditions
+    /// in the run_epoch() select.
+    async fn close_epoch(
+        &self,
+        engine: &ExecutionNode,
+        shutdown_consensus: Notifier,
+        gas_accumulator: GasAccumulator,
+        target_hash: B256,
+    ) -> eyre::Result<()> {
+        // subscribe to engine blocks to confirm epoch closed on-chain
+        let mut executed_output = engine.canonical_block_stream().await;
+        // begin consensus shutdown while engine executes
+        shutdown_consensus.notify();
+
+        // wait for execution result before proceeding
+        while let Some(output) = executed_output.next().await {
+            // ensure canonical tip is updated with closing epoch info
+            if output.tip().sealed_header().parent_beacon_block_root == Some(target_hash) {
+                // Use accumulated gas information to set each workers base fee for the epoch.
+                for worker_id in 0..gas_accumulator.num_workers() {
+                    let worker_id = worker_id as u16;
+                    let (_blocks, _gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
+                    // Change this base fee to update base fee in batches workers create.
+                    let _base_fee = gas_accumulator.base_fee(worker_id);
+                }
+                gas_accumulator.clear(); // Clear the accumlated values for next epoch.
+                return Ok(());
+            }
+        }
+
+        // `None` indicates all senders have dropped
+        error!(
+            target: "epoch-manager",
+            "canon state notifications dropped while awaiting engine execution for closing epoch",
+        );
+        Err(eyre!("engine failed to report output for closing epoch"))
     }
 
     /// Helper method to create all engine components.

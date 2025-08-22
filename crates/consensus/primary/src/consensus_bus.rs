@@ -7,10 +7,8 @@ use crate::{
     proposer::OurDigestMessage, state_sync::CertificateManagerCommand, RecentBlocks,
 };
 use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
-use std::{
-    error::Error,
-    sync::{atomic::AtomicU32, Arc},
-};
+use parking_lot::Mutex;
+use std::{error::Error, sync::Arc};
 use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
 use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
@@ -22,7 +20,6 @@ use tokio::{
     sync::{
         broadcast, mpsc,
         watch::{self, error::RecvError},
-        Mutex,
     },
     time::error::Elapsed,
 };
@@ -32,14 +29,14 @@ use tokio::{
 /// will break.
 #[derive(Debug)]
 struct QueChanReceiver<T> {
-    receiver: Arc<Mutex<mpsc::Receiver<T>>>,
-    subs: Arc<AtomicU32>,
+    receiver: Option<mpsc::Receiver<T>>,
+    container: Arc<Mutex<Option<mpsc::Receiver<T>>>>,
 }
 
 /// Use the Drop to decrement subs.
 impl<T> Drop for QueChanReceiver<T> {
     fn drop(&mut self) {
-        self.subs.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        (*self.container.lock()) = self.receiver.take();
     }
 }
 
@@ -50,17 +47,15 @@ impl<T> Drop for QueChanReceiver<T> {
 pub struct QueChannel<T> {
     channel: mpsc::Sender<T>,
     // Putting this in a lock is unfortunate but if want an mpsc under the hood is needed.
-    receiver: Arc<Mutex<mpsc::Receiver<T>>>,
-    subs: Arc<AtomicU32>,
+    receiver: Arc<Mutex<Option<mpsc::Receiver<T>>>>,
 }
 
 impl<T> QueChannel<T> {
     /// Create a new QueChannel.
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let subs = Arc::new(AtomicU32::new(0));
-        let receiver = Arc::new(Mutex::new(rx));
-        Self { channel: tx, receiver, subs }
+        let receiver = Arc::new(Mutex::new(Some(rx)));
+        Self { channel: tx, receiver }
     }
 }
 
@@ -72,11 +67,7 @@ impl<T> Default for QueChannel<T> {
 
 impl<T> Clone for QueChannel<T> {
     fn clone(&self) -> Self {
-        Self {
-            channel: self.channel.clone(),
-            receiver: self.receiver.clone(),
-            subs: self.subs.clone(),
-        }
+        Self { channel: self.channel.clone(), receiver: self.receiver.clone() }
     }
 }
 
@@ -90,27 +81,25 @@ impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
     }
 
     fn subscribe(&self) -> impl TnReceiver<T> + 'static {
-        if self.subs.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        let receiver = self.receiver.lock().take();
+        if receiver.is_none() {
             panic!("Another subscription is already in use!")
         }
-        self.subs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        QueChanReceiver { receiver: self.receiver.clone(), subs: self.subs.clone() }
+        QueChanReceiver { receiver, container: self.receiver.clone() }
     }
 }
 
 impl<T: Send + 'static> TnReceiver<T> for QueChanReceiver<T> {
     async fn recv(&mut self) -> Option<T> {
-        self.receiver.lock().await.recv().await
+        self.receiver.as_mut().expect("receiver").recv().await
     }
 
     fn try_recv(&mut self) -> Result<T, tn_types::TryRecvError> {
-        // Can implement if ever needed but this will be tricky with the async lock and not being
-        // async. Can use blocking_lock but would need to tink this through...
-        panic!("try_recv() not implemented for this receiver!")
+        Ok(self.receiver.as_mut().expect("receiver").try_recv()?)
     }
 
-    fn poll_recv(&mut self, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<T>> {
-        panic!("poll_recv() not implemented for this receiver!")
+    fn poll_recv(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<T>> {
+        self.receiver.as_mut().expect("receiver").poll_recv(cx)
     }
 }
 
