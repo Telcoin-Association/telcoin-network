@@ -17,7 +17,7 @@ use tn_network_types::{FetchBatchResponse, PrimaryToWorkerClient, WorkerSynchron
 use tn_storage::tables::Batches;
 use tn_types::{
     encode, now, Batch, BatchValidation, BlockHash, BlsPublicKey, Database, DbTxMut, SealedBatch,
-    TaskManager, TaskSpawner, TnReceiver, WorkerId,
+    TaskSpawner, TnReceiver, WorkerId,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, trace, warn};
@@ -53,10 +53,9 @@ impl WorkerNetworkHandle {
 
     //// Convenience method for creating a new Self for tests- sends events no-where and does
     //// nothing.
-    pub fn new_for_test() -> Self {
+    pub fn new_for_test(task_spawner: TaskSpawner) -> Self {
         let (tx, _rx) = mpsc::channel(5);
-        let tm = TaskManager::default();
-        Self { handle: NetworkHandle::new(tx), task_spawner: tm.get_spawner() }
+        Self { handle: NetworkHandle::new(tx), task_spawner }
     }
 
     /// Return a reference to the inner handle.

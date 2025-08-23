@@ -1,6 +1,6 @@
 //! Task manager interface to spawn tasks to the tokio runtime.
 
-use crate::Notifier;
+use crate::{Noticer, Notifier};
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use std::{
     collections::HashMap,
@@ -71,6 +71,15 @@ pub struct TaskManager {
     name: String,
     new_task_rx: mpsc::Receiver<TaskHandle>,
     new_task_tx: mpsc::Sender<TaskHandle>,
+    /// Thgis is used to noitify any spawned tasks to exit when task manager id dropped.
+    /// Otherwise we will end up with orphaned tasks when epochs change.
+    local_shutdown: Notifier,
+}
+
+impl Drop for TaskManager {
+    fn drop(&mut self) {
+        self.local_shutdown.notify();
+    }
 }
 
 /// The type that can spawn tasks for a parent `TaskManager`.
@@ -81,6 +90,7 @@ pub struct TaskManager {
 pub struct TaskSpawner {
     /// The channel to forward task handles to the parent [TaskManager].
     new_task_tx: mpsc::Sender<TaskHandle>,
+    rx_shutdown: Noticer,
 }
 
 impl TaskSpawner {
@@ -114,8 +124,12 @@ impl TaskSpawner {
         F::Output: Send + 'static,
     {
         let name = name.to_string();
+        let rx_shutdown = self.rx_shutdown.clone();
         let handle = tokio::spawn(async move {
-            future.await;
+            tokio::select! {
+                _ = rx_shutdown => {}
+                _ = future => {}
+            }
         });
         if let Err(err) = self.new_task_tx.try_send(TaskHandle::new(name.clone(), handle, critical))
         {
@@ -149,12 +163,21 @@ impl TaskSpawner {
         let (tx, mut rx) = tokio::sync::broadcast::channel(1);
         // Need two join handles so do this channel dance to get them.
         // Required because the task manager needs one and this foreign Reth interface return one.
+        let rx_shutdown = self.rx_shutdown.clone();
         let f = async move {
-            let value = fut.await;
-            let _ = tx.send(value);
+            tokio::select! {
+                _ = rx_shutdown => {}
+                value = fut => {
+                    let _ = tx.send(value);
+                }
+            }
         };
+        let rx_shutdown = self.rx_shutdown.clone();
         let join = tokio::spawn(async move {
-            let _ = rx.recv().await;
+            tokio::select! {
+                _ = rx_shutdown => {}
+                _ = rx.recv() => {}
+            }
         });
 
         match (critical, blocking) {
@@ -209,6 +232,7 @@ impl TaskManager {
             name: name.to_string(),
             new_task_rx,
             new_task_tx,
+            local_shutdown: Notifier::default(),
         }
     }
 
@@ -242,15 +266,22 @@ impl TaskManager {
         F::Output: Send + 'static,
     {
         let name = name.to_string();
+        let rx_shutdown = self.local_shutdown.subscribe();
         let handle = tokio::spawn(async move {
-            future.await;
+            tokio::select! {
+                _ = rx_shutdown => {}
+                _ = future => {}
+            }
         });
         self.tasks.push(TaskHandle::new(name, handle, critical));
     }
 
     /// Return a clonable spawner (also implements Reth's TaskSpawner trait).
     pub fn get_spawner(&self) -> TaskSpawner {
-        TaskSpawner { new_task_tx: self.new_task_tx.clone() }
+        TaskSpawner {
+            new_task_tx: self.new_task_tx.clone(),
+            rx_shutdown: self.local_shutdown.subscribe(),
+        }
     }
 
     /// Return a mutable reference to a submanager.
@@ -303,7 +334,15 @@ impl TaskManager {
     /// Spawn blocking on tokio.  Here mostly for compat with old Reth interface.
     pub fn spawn_blocking(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
         let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || handle.block_on(fut))
+        let rx_shutdown = self.local_shutdown.subscribe();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                tokio::select! {
+                    _ = rx_shutdown => {}
+                    _ = fut => {}
+                }
+            })
+        })
     }
 
     /// Take any tasks on the new task queue and put them in the task list.
@@ -366,9 +405,9 @@ impl TaskManager {
                             if !info.critical {
                                 continue;
                             }
-                            tracing::error!(target: "tn::tasks", "{}: {} returned error {join_err}, node exiting", self.name, info.name);
                             // Ok exit is fine if we are shutting down.
                             if !rx_shutdown.noticed() {
+                                tracing::error!(target: "tn::tasks", "{}: {} returned error {join_err}, node exiting", self.name, info.name);
                                 result = Err(TaskJoinError::CriticalExitError(info.name, join_err));
                             }
                         }
@@ -376,7 +415,9 @@ impl TaskManager {
                     break;
                 }
                 Some((res, name)) = future_managers.next() => {
-                    tracing::error!(target: "tn::tasks", "{}: Sub-Task Manager {name} returned exited, node exiting", self.name);
+                    if !rx_shutdown.noticed() {
+                        tracing::error!(target: "tn::tasks", "{}: Sub-Task Manager {name} returned exited, node exiting", self.name);
+                    }
                     result = res;
                     break;
                 }
