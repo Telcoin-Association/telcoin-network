@@ -441,6 +441,12 @@ impl TaskManager {
                             info.name,
                         )
                     }
+                    Err((info, err)) if err.is_cancelled() => tracing::info!(
+                        target: "tn::tasks",
+                        "{}: {} was cancelled",
+                        self.name,
+                        info.name,
+                    ),
                     Err((info, err)) => tracing::error!(
                         target: "tn::tasks",
                         "{}: {} shutdown with error {err}",
