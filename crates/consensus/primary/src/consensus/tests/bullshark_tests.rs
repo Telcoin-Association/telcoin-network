@@ -446,7 +446,8 @@ async fn commit_one() {
 
     let cb = ConsensusBus::new();
     let mut rx_output = cb.sequence().subscribe();
-    Consensus::spawn(config, &cb, bullshark, &TaskManager::default());
+    let task_manager = TaskManager::default();
+    Consensus::spawn(config, &cb, bullshark, &task_manager);
     let cb_clone = cb.clone();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
@@ -512,7 +513,8 @@ async fn dead_node() {
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     let mut rx_output = cb.sequence().subscribe();
-    Consensus::spawn(config, &cb, bullshark, &TaskManager::default());
+    let task_manager = TaskManager::default();
+    Consensus::spawn(config, &cb, bullshark, &task_manager);
     let cb_clone = cb.clone();
     tokio::spawn(async move {
         let mut rx_primary = cb_clone.committed_certificates().subscribe();
@@ -647,7 +649,8 @@ async fn not_enough_support() {
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     let mut rx_output = cb.sequence().subscribe();
-    Consensus::spawn(config, &cb, bullshark, &TaskManager::default());
+    let task_manager = TaskManager::default();
+    Consensus::spawn(config, &cb, bullshark, &task_manager);
     let cb_clone = cb.clone();
     tokio::spawn(async move {
         let mut rx_primary = cb_clone.committed_certificates().subscribe();
@@ -748,7 +751,8 @@ async fn missing_leader() {
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     let mut rx_output = cb.sequence().subscribe();
-    Consensus::spawn(config, &cb, bullshark, &TaskManager::default());
+    let task_manager = TaskManager::default();
+    Consensus::spawn(config, &cb, bullshark, &task_manager);
     let cb_clone = cb.clone();
     tokio::spawn(async move {
         let mut rx_primary = cb_clone.committed_certificates().subscribe();

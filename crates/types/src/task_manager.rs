@@ -334,7 +334,15 @@ impl TaskManager {
     /// Spawn blocking on tokio.  Here mostly for compat with old Reth interface.
     pub fn spawn_blocking(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
         let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || handle.block_on(fut))
+        let rx_shutdown = self.local_shutdown.subscribe();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                tokio::select! {
+                    _ = rx_shutdown => {}
+                    _ = fut => {}
+                }
+            })
+        })
     }
 
     /// Take any tasks on the new task queue and put them in the task list.
