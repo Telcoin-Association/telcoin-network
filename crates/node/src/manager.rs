@@ -599,13 +599,11 @@ where
     ) -> eyre::Result<()> {
         let mut committee_keys: HashSet<BlsPublicKey> =
             epoch_rec.committee.iter().cloned().collect();
-        //XXXXprimary.current_committee().await.quorum_threshold()
         let consensus_db = self.consensus_db.clone();
 
         let epoch_hash = epoch_rec.digest();
 
         let mut certs: HashMap<B256, u64> = HashMap::default();
-        //let mut committee_keys = committee.committee_keys();
         let me = self.builder.tn_config.primary_bls_key();
         let committee_size = committee_keys.len() as u64;
         // We are in the committee so sign and gossip the epoch record.
@@ -615,59 +613,52 @@ where
             let epoch_cert = EpochCertificate { epoch_hash, signed_authorities };
             self.consensus_db.insert::<EpochCerts>(&epoch_hash, &epoch_cert)?;
             let primary_network = primary.network_handle().await;
-            // Publish the cert after a small delay.  The delay is to ease potential race conditions
-            // as nodes transition epochs.
-            //XXXXepoch_task_manager.spawn_task("epoch certificate delayed publish", async move {
-            //XXXXtokio::time::sleep(Duration::from_secs(2)).await;
             certs.insert(epoch_cert.epoch_hash, 1);
             let _ = primary_network.publish_epoch_certificate(epoch_cert).await;
-            //XXXX});
-            //XXXX also send direct to other committee members.
         }
 
-        //XXXXlet quorum = committee.quorum_threshold();
+        // Dumb 2/3 calc on quorum for the signed epoch cert.
         let quorum = (((committee_keys.len() as f64 / 2.0) * 3.0) + 0.5) as u64;
         let mut rx = self.consensus_bus.new_epoch_certificates().subscribe();
         epoch_task_manager.spawn_task("Collect Epoch Signatures", async move {
             let mut reached_quorum = false;
-        while let Ok(Some((source, mut cert))) =
-            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
-        {
-            if committee_keys.contains(&source) && cert.check_signature(&source) {
-                committee_keys.remove(&source);
-                if epoch_hash == cert.epoch_hash {
-                    if let Some(prev_cert) =
-                        consensus_db.get::<EpochCerts>(&cert.epoch_hash).ok().flatten()
-                    {
-                        cert.aggregate(&prev_cert.signed_authorities);
-                    }
-                    let _ = consensus_db.insert::<EpochCerts>(&cert.epoch_hash, &cert);
-                    if let Some(v) = certs.get_mut(&cert.epoch_hash) {
-                        *v += 1;
-                        if *v >= quorum {
-                            reached_quorum = true;
-                            if *v >= committee_size {
-                                break;
+            while let Ok(Some((source, mut cert))) =
+                tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
+            {
+                if committee_keys.contains(&source) && cert.check_signature(&source) {
+                    committee_keys.remove(&source);
+                    if epoch_hash == cert.epoch_hash {
+                        if let Some(prev_cert) =
+                            consensus_db.get::<EpochCerts>(&cert.epoch_hash).ok().flatten()
+                            {
+                                cert.aggregate(&prev_cert.signed_authorities);
                             }
-                        }
+                            let _ = consensus_db.insert::<EpochCerts>(&cert.epoch_hash, &cert);
+                            if let Some(v) = certs.get_mut(&cert.epoch_hash) {
+                                *v += 1;
+                                if *v >= quorum {
+                                    reached_quorum = true;
+                                    if *v >= committee_size {
+                                        break;
+                                    }
+                                }
+                            } else {
+                                certs.insert(cert.epoch_hash, 1);
+                            }
                     } else {
-                        certs.insert(cert.epoch_hash, 1);
+                        error!(
+                            target: "epoch-manager",
+                            "Received an epoch cert with incorrect hash {}, expected {}", cert.epoch_hash, epoch_hash
+                        );
                     }
-                } else {
-                    error!(
-                        target: "epoch-manager",
-                        "Received an epoch cert with incorrect hash {}, expected {}", cert.epoch_hash, epoch_hash
-                    );
                 }
             }
-        }
-        if !reached_quorum {
-            error!(
-                target: "epoch-manager",
-                "failed to reach quorum on epoch close",
-            );
-            //return Err(eyre!("failed to reach quorum on epoch close"));
-        }
+            if !reached_quorum {
+                error!(
+                    target: "epoch-manager",
+                    "failed to reach quorum on epoch close",
+                );
+            }
         });
         Ok(())
     }
@@ -813,7 +804,6 @@ where
         *initial_epoch = false;
 
         // set execution state for consensus
-        //XXXX        let consensus_bus = primary.consensus_bus().await;
         self.try_restore_state(engine).await?;
 
         let primary_network_handle = primary.network_handle().await;

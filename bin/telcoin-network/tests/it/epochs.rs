@@ -95,8 +95,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
     let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
     let mut current_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
 
-    let mut last_epoch_block_height = current_epoch_info.blockHeight; // XXXX 0;
-                                                                      //XXXXassert_eq!(current_epoch_info.blockHeight, last_epoch_block_height);
+    let mut last_epoch_block_height = current_epoch_info.blockHeight;
 
     // track the number of times the new validator was in the epoch committee
     let mut new_validator_in_committee_count = 0;
@@ -143,7 +142,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
         current_epoch_info = new_epoch_info;
 
         // sleep for epoch duration
-        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION)).await;
     }
 
     // return error if loop didn't return
