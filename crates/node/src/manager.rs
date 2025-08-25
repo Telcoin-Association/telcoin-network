@@ -36,14 +36,16 @@ use tn_storage::{
     open_db, open_network_db,
     tables::{
         CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
-        ConsensusBlockNumbersByDigest, ConsensusBlocks, LastProposed, Payload, Votes,
+        ConsensusBlockNumbersByDigest, ConsensusBlocks, EpochCerts, EpochRecords,
+        EpochRecordsIndex, LastProposed, Payload, Votes,
     },
     DatabaseType,
 };
 use tn_types::{
-    gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, Committee, CommitteeBuilder,
-    ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, Noticer, Notifier,
-    TaskManager, TaskSpawner, TimestampSec, TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
+    gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, BlsSigner, Committee,
+    CommitteeBuilder, ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch,
+    EpochCertificate, EpochRecord, Noticer, Notifier, TaskManager, TaskSpawner, TimestampSec,
+    TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc::{self};
@@ -67,7 +69,7 @@ pub(super) const WORKER_TASK_MANAGER_BASE: &str = "Worker Task Manager";
 
 /// The long-running type that oversees epoch transitions.
 #[derive(Debug)]
-pub struct EpochManager<P> {
+pub struct EpochManager<P, DB> {
     /// The builder for node configuration
     builder: TnBuilder,
     /// The data directory
@@ -86,10 +88,17 @@ pub struct EpochManager<P> {
     /// If the timestamp of the leader is >= the epoch_boundary then the
     /// manager closes the epoch after the engine executes all data.
     epoch_boundary: TimestampSec,
+    /// Reth DB, keep for entire execution.
+    reth_db: RethDb,
+    /// Consensus DB, keep for entire execution.
+    consensus_db: DB,
     /// ConsensusBus for the application life.
     consensus_bus: ConsensusBus,
-    /// Persistent event stream for woker network events.
+    /// Persistent event stream for worker network events.
     worker_event_stream: QueChannel<NetworkEvent<WorkerRequest, WorkerResponse>>,
+
+    /// The record for a just completed epoch.
+    epoch_record: Option<EpochRecord>,
 }
 
 /// When rejoining a network mid epoch this will accumulate any gas state for previous epoch blocks.
@@ -159,15 +168,33 @@ pub fn catchup_accumulator<DB: TNDatabase>(
     Ok(())
 }
 
-impl<P> EpochManager<P>
+/// Create the epoch directory for consensus data if it doesn't exist and open the consensus
+/// database connection.
+pub async fn open_consensus_db<P: TelcoinDirs + 'static>(
+    tn_datadir: &P,
+) -> eyre::Result<DatabaseType> {
+    let consensus_db_path = tn_datadir.consensus_db_path();
+
+    // ensure dir exists
+    let _ = std::fs::create_dir_all(&consensus_db_path);
+    let db = open_db(&consensus_db_path);
+
+    info!(target: "epoch-manager", ?consensus_db_path, "opened consensus storage");
+
+    Ok(db)
+}
+
+impl<P, DB> EpochManager<P, DB>
 where
     P: TelcoinDirs + 'static,
+    DB: TNDatabase,
 {
     /// Create a new instance of [Self].
-    pub fn new(
+    pub async fn new(
         builder: TnBuilder,
         tn_datadir: P,
         passphrase: Option<String>,
+        consensus_db: DB,
     ) -> eyre::Result<Self> {
         let passphrase =
             if std::fs::exists(tn_datadir.node_keys_path().join(tn_config::BLS_WRAPPED_KEYFILE))
@@ -187,6 +214,8 @@ where
         let consensus_bus = ConsensusBus::new_with_args(builder.tn_config.parameters.gc_depth);
         let worker_event_stream = QueChannel::new();
 
+        // create dbs to survive between sync state transitions
+        let reth_db = RethEnv::new_database(&builder.node_config, tn_datadir.reth_db_path())?;
         Ok(Self {
             builder,
             tn_datadir,
@@ -196,17 +225,16 @@ where
             node_shutdown,
             //consensus_output,
             epoch_boundary: Default::default(),
+            reth_db,
+            consensus_db,
             consensus_bus,
             worker_event_stream,
+            epoch_record: None,
         })
     }
 
     /// Run the node, handling epoch transitions.
     pub async fn run(&mut self) -> eyre::Result<()> {
-        // create dbs to survive between sync state transitions
-        let reth_db =
-            RethEnv::new_database(&self.builder.node_config, self.tn_datadir.reth_db_path())?;
-
         // Main task manager that manages tasks across epochs.
         // Long-running tasks for the lifetime of the node.
         let mut node_task_manager = TaskManager::new(NODE_TASK_MANAGER);
@@ -224,7 +252,7 @@ where
         // All nodes have to agree on the worker count, do not change this for an existing chain.
         let gas_accumulator = GasAccumulator::new(1);
         // create the engine
-        let engine = self.create_engine(&engine_task_manager, reth_db, &gas_accumulator)?;
+        let engine = self.create_engine(&engine_task_manager, &gas_accumulator)?;
         engine
             .start_engine(for_engine, self.node_shutdown.subscribe(), gas_accumulator.clone())
             .await?;
@@ -232,8 +260,7 @@ where
         // retrieve epoch information from canonical tip on startup
         let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
         debug!(target: "epoch-manager", ?epoch, "retrieved epoch state from canonical tip");
-        let consensus_db = self.open_consensus_db().await?;
-        catchup_accumulator(&consensus_db, engine.get_reth_env().await, &gas_accumulator)?;
+        catchup_accumulator(&self.consensus_db, engine.get_reth_env().await, &gas_accumulator)?;
 
         // read the network config or use the default
         let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
@@ -266,27 +293,13 @@ where
             }
 
             // loop through short-term epochs
-            epoch_result = self.run_epochs(&engine, consensus_db, network_config, to_engine, gas_accumulator) => epoch_result
+            epoch_result = self.run_epochs(&engine, network_config, to_engine, gas_accumulator) => epoch_result
         };
 
         // shutdown metrics
         metrics_shutdown.notify();
 
         result
-    }
-
-    /// Create the epoch directory for consensus data if it doesn't exist and open the consensus
-    /// database connection.
-    async fn open_consensus_db(&self) -> eyre::Result<DatabaseType> {
-        let consensus_db_path = self.tn_datadir.consensus_db_path();
-
-        // ensure dir exists
-        let _ = std::fs::create_dir_all(&consensus_db_path);
-        let db = open_db(&consensus_db_path);
-
-        info!(target: "epoch-manager", ?consensus_db_path, "opened consensus storage");
-
-        Ok(db)
     }
 
     /// Startup for the node. This creates all components on startup before starting the first
@@ -382,7 +395,6 @@ where
     async fn run_epochs(
         &mut self,
         engine: &ExecutionNode,
-        consensus_db: DatabaseType,
         network_config: NetworkConfig,
         to_engine: mpsc::Sender<ConsensusOutput>,
         gas_accumulator: GasAccumulator,
@@ -395,7 +407,6 @@ where
             let epoch_result = self
                 .run_epoch(
                     engine,
-                    consensus_db.clone(),
                     &network_config,
                     &to_engine,
                     &mut initial_epoch,
@@ -414,13 +425,9 @@ where
     }
 
     /// Run a single epoch.
-    ///
-    /// If it returns Ok(true) this indicates a mode change occurred and a restart
-    /// is required.
     async fn run_epoch(
         &mut self,
         engine: &ExecutionNode,
-        mut consensus_db: DatabaseType,
         network_config: &NetworkConfig,
         to_engine: &mpsc::Sender<ConsensusOutput>,
         initial_epoch: &mut bool,
@@ -439,7 +446,6 @@ where
         let (primary, worker_node) = self
             .create_consensus(
                 engine,
-                consensus_db.clone(),
                 &epoch_task_manager,
                 network_config,
                 initial_epoch,
@@ -486,6 +492,11 @@ where
         let mut clear_tables_for_next_epoch = false;
         let mut target_hash = None;
 
+        // New Epoch, should be able to collect the certs from the last epoch.
+        if let Some(epoch_rec) = self.epoch_record.take() {
+            let _ = self.collect_epoch_certs(&primary, epoch_rec, &epoch_task_manager).await;
+        }
+
         tokio::select! {
             // wait for epoch boundary to transition
             res = self.wait_for_epoch_boundary(to_engine, gas_accumulator.clone(), consensus_output) => {
@@ -513,6 +524,9 @@ where
                 .await?;
         }
 
+        // Write the epoch record to DB and save in manager for next epoch.
+        self.write_epoch_record(&primary, engine).await?;
+
         consensus_shutdown.notify();
         // abort all epoch-related tasks
         epoch_task_manager.abort_all_tasks();
@@ -526,9 +540,126 @@ where
 
         // clear tables
         if clear_tables_for_next_epoch {
-            self.clear_consensus_db_for_next_epoch(&mut consensus_db)?;
+            self.clear_consensus_db_for_next_epoch()?;
         }
 
+        Ok(())
+    }
+
+    /// Record the epoch record for just completed epoch in our DB.
+    /// Also record this in the manager for posible signing/collection of signatures.
+    async fn write_epoch_record(
+        &mut self,
+        primary: &PrimaryNode<DB>,
+        engine: &ExecutionNode,
+    ) -> eyre::Result<()> {
+        let committee = primary.current_committee().await;
+        let epoch = committee.epoch();
+
+        let committee_keys = engine.validators_for_epoch(epoch).await?;
+        let next_committee_keys = engine.validators_for_epoch(epoch + 1).await?;
+        let parent_hash = if epoch == 0 {
+            B256::default()
+        } else if let Some(prev) = self.consensus_db.get::<EpochRecords>(&(epoch - 1))? {
+            prev.digest()
+        } else {
+            error!(
+                target: "epoch-manager",
+                "failed to find previous epoch record when starting epoch",
+            );
+            return Err(eyre!("failed to find previous epoch record when starting epoch"));
+        };
+        let target_hash = self.consensus_bus.last_consensus_header().borrow().clone().digest();
+        let parent_state = self.consensus_bus.recent_blocks().borrow().latest_block_num_hash();
+
+        let epoch_rec = EpochRecord {
+            epoch,
+            committee: committee_keys,
+            next_committee: next_committee_keys,
+            parent_hash,
+            parent_state,
+            parent_consensus: target_hash,
+        };
+        let epoch_hash = epoch_rec.digest();
+
+        self.consensus_db.insert::<EpochRecordsIndex>(&epoch_hash, &epoch)?;
+        self.consensus_db.insert::<EpochRecords>(&epoch, &epoch_rec)?;
+        self.epoch_record = Some(epoch_rec);
+        Ok(())
+    }
+
+    /// Start a task to collect the epoch record certs and load the previous epochs record.
+    /// This should run quickly at epoch end and make epoch records/certs available to syncing
+    /// nodes.
+    async fn collect_epoch_certs(
+        &self,
+        primary: &PrimaryNode<DB>,
+        epoch_rec: EpochRecord,
+        epoch_task_manager: &TaskManager,
+    ) -> eyre::Result<()> {
+        let mut committee_keys: HashSet<BlsPublicKey> =
+            epoch_rec.committee.iter().cloned().collect();
+        let consensus_db = self.consensus_db.clone();
+
+        let epoch_hash = epoch_rec.digest();
+
+        let mut certs: HashMap<B256, u64> = HashMap::default();
+        let me = self.builder.tn_config.primary_bls_key();
+        let committee_size = committee_keys.len() as u64;
+        // We are in the committee so sign and gossip the epoch record.
+        if committee_keys.contains(me) {
+            committee_keys.remove(me);
+            let signed_authorities = self.key_config.request_signature_direct(epoch_hash.as_ref());
+            let epoch_cert = EpochCertificate { epoch_hash, signed_authorities };
+            self.consensus_db.insert::<EpochCerts>(&epoch_hash, &epoch_cert)?;
+            let primary_network = primary.network_handle().await;
+            certs.insert(epoch_cert.epoch_hash, 1);
+            let _ = primary_network.publish_epoch_certificate(epoch_cert).await;
+        }
+
+        // Dumb 2/3 calc on quorum for the signed epoch cert.
+        let quorum = (((committee_keys.len() as f64 / 2.0) * 3.0) + 0.5) as u64;
+        let mut rx = self.consensus_bus.new_epoch_certificates().subscribe();
+        epoch_task_manager.spawn_task("Collect Epoch Signatures", async move {
+            let mut reached_quorum = false;
+            while let Ok(Some((source, mut cert))) =
+                tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
+            {
+                if committee_keys.contains(&source) && cert.check_signature(&source) {
+                    committee_keys.remove(&source);
+                    if epoch_hash == cert.epoch_hash {
+                        if let Some(prev_cert) =
+                            consensus_db.get::<EpochCerts>(&cert.epoch_hash).ok().flatten()
+                            {
+                                cert.aggregate(&prev_cert.signed_authorities);
+                            }
+                            let _ = consensus_db.insert::<EpochCerts>(&cert.epoch_hash, &cert);
+                            if let Some(v) = certs.get_mut(&cert.epoch_hash) {
+                                *v += 1;
+                                if *v >= quorum {
+                                    reached_quorum = true;
+                                    if *v >= committee_size {
+                                        break;
+                                    }
+                                }
+                            } else {
+                                certs.insert(cert.epoch_hash, 1);
+                            }
+                    } else {
+                        error!(
+                            target: "epoch-manager",
+                            "Received an epoch cert with incorrect hash {}, expected {}", cert.epoch_hash, epoch_hash
+                        );
+                    }
+                }
+            }
+            if !reached_quorum {
+                error!(
+                    target: "epoch-manager",
+                    "failed to reach quorum on epoch close",
+                );
+            }
+        });
         Ok(())
     }
 
@@ -616,7 +747,6 @@ where
     fn create_engine(
         &self,
         engine_task_manager: &TaskManager,
-        reth_db: RethDb,
         gas_accumulator: &GasAccumulator,
     ) -> eyre::Result<ExecutionNode> {
         // create execution components (ie - reth env)
@@ -624,7 +754,7 @@ where
         let reth_env = RethEnv::new(
             &self.builder.node_config,
             engine_task_manager,
-            reth_db,
+            self.reth_db.clone(),
             basefee_address,
             gas_accumulator.rewards_counter(),
         )?;
@@ -639,15 +769,14 @@ where
     async fn create_consensus(
         &mut self,
         engine: &ExecutionNode,
-        consensus_db: DatabaseType,
         epoch_task_manager: &TaskManager,
         network_config: &NetworkConfig,
         initial_epoch: &mut bool,
         gas_accumulator: GasAccumulator,
-    ) -> eyre::Result<(PrimaryNode<DatabaseType>, WorkerNode<DatabaseType>)> {
+    ) -> eyre::Result<(PrimaryNode<DB>, WorkerNode<DB>)> {
         // create config for consensus
         let (consensus_config, preload_keys) =
-            self.configure_consensus(engine, network_config, &consensus_db).await?;
+            self.configure_consensus(engine, network_config).await?;
 
         let primary = self
             .create_primary_node_components(
@@ -658,7 +787,7 @@ where
             .await?;
 
         let engine_to_primary =
-            EngineToPrimaryRpc::new(primary.consensus_bus().await, consensus_db.clone());
+            EngineToPrimaryRpc::new(primary.consensus_bus().await, self.consensus_db.clone());
         // only spawns one worker for now
         let worker = self
             .spawn_worker_node_components(
@@ -675,7 +804,7 @@ where
         *initial_epoch = false;
 
         // set execution state for consensus
-        self.try_restore_state(&consensus_db, engine).await?;
+        self.try_restore_state(engine).await?;
 
         let primary_network_handle = primary.network_handle().await;
         let _mode = self.identify_node_mode(&consensus_config, &primary_network_handle).await?;
@@ -715,8 +844,7 @@ where
         &mut self,
         engine: &ExecutionNode,
         network_config: &NetworkConfig,
-        consensus_db: &DatabaseType,
-    ) -> eyre::Result<(ConsensusConfig<DatabaseType>, Vec<BlsPublicKey>)> {
+    ) -> eyre::Result<(ConsensusConfig<DB>, Vec<BlsPublicKey>)> {
         // retrieve epoch information from canonical tip
         let EpochState { epoch, epoch_info, validators, epoch_start } =
             engine.epoch_state_from_canonical_tip().await?;
@@ -745,7 +873,7 @@ where
         // create config for consensus
         let consensus_config = ConsensusConfig::new_for_epoch(
             self.builder.tn_config.clone(),
-            consensus_db.clone(),
+            self.consensus_db.clone(),
             self.key_config.clone(),
             committee,
             network_config.clone(),
@@ -794,7 +922,7 @@ where
     /// Create a [PrimaryNode].
     ///
     /// This also creates the [PrimaryNetwork].
-    async fn create_primary_node_components<DB: TNDatabase>(
+    async fn create_primary_node_components(
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
         epoch_task_spawner: TaskSpawner,
@@ -830,7 +958,7 @@ where
     }
 
     /// Create a [WorkerNode].
-    async fn spawn_worker_node_components<DB: TNDatabase>(
+    async fn spawn_worker_node_components(
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
         engine: &ExecutionNode,
@@ -894,7 +1022,7 @@ where
     /// Create the primary network for the specific epoch.
     ///
     /// This is not the swarm level, but the [PrimaryNetwork] interface.
-    async fn spawn_primary_network_for_epoch<DB: TNDatabase>(
+    async fn spawn_primary_network_for_epoch(
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
         state_sync: StateSynchronizer<DB>,
@@ -1014,7 +1142,7 @@ where
     }
 
     /// Create the worker network.
-    async fn spawn_worker_network_for_epoch<DB: TNDatabase>(
+    async fn spawn_worker_network_for_epoch(
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
         worker_id: &u16,
@@ -1090,11 +1218,7 @@ where
     }
 
     /// Helper method to restore execution state for the consensus components.
-    async fn try_restore_state(
-        &self,
-        db: &DatabaseType,
-        engine: &ExecutionNode,
-    ) -> eyre::Result<()> {
+    async fn try_restore_state(&self, engine: &ExecutionNode) -> eyre::Result<()> {
         // prime the recent_blocks watch with latest executed blocks
         let block_capacity = self.consensus_bus.recent_blocks().borrow().block_capacity();
 
@@ -1105,8 +1229,10 @@ where
         }
 
         // prime the last consensus header from the DB
-        let (_, last_db_block) =
-            db.last_record::<ConsensusBlocks>().unwrap_or_else(|| (0, ConsensusHeader::default()));
+        let (_, last_db_block) = self
+            .consensus_db
+            .last_record::<ConsensusBlocks>()
+            .unwrap_or_else(|| (0, ConsensusHeader::default()));
 
         // prime the watch channel with data from the db this will be updated by state-sync if this
         // node can_cvv
@@ -1121,7 +1247,7 @@ where
     /// - "Observer"
     ///
     /// This method also updates the `ConsensusBus::node_mode()`.
-    async fn identify_node_mode<DB: TNDatabase>(
+    async fn identify_node_mode(
         &self,
         consensus_config: &ConsensusConfig<DB>,
         primary_network_handle: &PrimaryNetworkHandle,
@@ -1181,16 +1307,13 @@ where
     ///
     /// These tables are epoch-specific. Complete historic data is stored
     /// in the `ConsensusBlocks` table.
-    fn clear_consensus_db_for_next_epoch(
-        &self,
-        consensus_db: &mut DatabaseType,
-    ) -> eyre::Result<()> {
-        consensus_db.clear_table::<LastProposed>()?;
-        consensus_db.clear_table::<Votes>()?;
-        consensus_db.clear_table::<Certificates>()?;
-        consensus_db.clear_table::<CertificateDigestByRound>()?;
-        consensus_db.clear_table::<CertificateDigestByOrigin>()?;
-        consensus_db.clear_table::<Payload>()?;
+    fn clear_consensus_db_for_next_epoch(&self) -> eyre::Result<()> {
+        self.consensus_db.clear_table::<LastProposed>()?;
+        self.consensus_db.clear_table::<Votes>()?;
+        self.consensus_db.clear_table::<Certificates>()?;
+        self.consensus_db.clear_table::<CertificateDigestByRound>()?;
+        self.consensus_db.clear_table::<CertificateDigestByOrigin>()?;
+        self.consensus_db.clear_table::<Payload>()?;
         Ok(())
     }
 }

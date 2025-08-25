@@ -41,12 +41,17 @@ where
         .enable_time()
         .build()?;
 
-    // create the epoch manager
     // run the node
     let res = runtime.block_on(async move {
-        let mut epoch_manager = EpochManager::new(builder, tn_datadir, passphrase)?;
+        let consensus_db = manager::open_consensus_db(&tn_datadir).await?;
+        // create the epoch manager
+        let mut epoch_manager =
+            EpochManager::new(builder, tn_datadir, passphrase, consensus_db).await?;
         epoch_manager.run().await
     });
+
+    // shutdown background tasks
+    runtime.shutdown_background();
 
     // return result after shutdown
     res
