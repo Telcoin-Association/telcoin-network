@@ -1,6 +1,6 @@
 //! Task manager interface to spawn tasks to the tokio runtime.
 
-use crate::{Noticer, Notifier};
+use crate::Notifier;
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use std::{
     collections::HashMap,
@@ -90,7 +90,7 @@ impl Drop for TaskManager {
 pub struct TaskSpawner {
     /// The channel to forward task handles to the parent [TaskManager].
     new_task_tx: mpsc::Sender<TaskHandle>,
-    rx_shutdown: Noticer,
+    local_shutdown: Notifier,
 }
 
 impl TaskSpawner {
@@ -124,7 +124,7 @@ impl TaskSpawner {
         F::Output: Send + 'static,
     {
         let name = name.to_string();
-        let rx_shutdown = self.rx_shutdown.clone();
+        let rx_shutdown = self.local_shutdown.subscribe();
         let handle = tokio::spawn(async move {
             tokio::select! {
                 _ = rx_shutdown => {}
@@ -140,6 +140,8 @@ impl TaskSpawner {
     /// Spawns a non-critical, blocking task on tokio and records the JoinHandle and name.
     ///
     /// Other tasks are unaffected when this task resolves.
+    /// Note: this essencially spawns a thread on the tokio blocking thread pool.
+    /// It WILL NOT be ended early when it's task manager is dropped so use wisely.
     pub fn spawn_blocking_task<F, S: ToString>(&self, name: S, task: F)
     where
         F: FnOnce() + Send + 'static,
@@ -163,7 +165,7 @@ impl TaskSpawner {
         let (tx, mut rx) = tokio::sync::broadcast::channel(1);
         // Need two join handles so do this channel dance to get them.
         // Required because the task manager needs one and this foreign Reth interface return one.
-        let rx_shutdown = self.rx_shutdown.clone();
+        let rx_shutdown = self.local_shutdown.subscribe();
         let f = async move {
             tokio::select! {
                 _ = rx_shutdown => {}
@@ -172,7 +174,7 @@ impl TaskSpawner {
                 }
             }
         };
-        let rx_shutdown = self.rx_shutdown.clone();
+        let rx_shutdown = self.local_shutdown.subscribe();
         let join = tokio::spawn(async move {
             tokio::select! {
                 _ = rx_shutdown => {}
@@ -280,7 +282,7 @@ impl TaskManager {
     pub fn get_spawner(&self) -> TaskSpawner {
         TaskSpawner {
             new_task_tx: self.new_task_tx.clone(),
-            rx_shutdown: self.local_shutdown.subscribe(),
+            local_shutdown: self.local_shutdown.clone(),
         }
     }
 
@@ -569,4 +571,153 @@ pub enum TaskJoinError {
     CriticalExitOk(String),
     #[error("Critical task {0} has exited unexpectedly: {1}")]
     CriticalExitError(String, JoinError),
+}
+
+#[cfg(test)]
+mod test {
+    use std::time::Duration;
+
+    use tokio::sync::mpsc::{self, Receiver, Sender};
+
+    use crate::TaskManager;
+
+    struct Ping {
+        ping_rx: Receiver<u32>,
+        pong_tx: Sender<u32>,
+    }
+
+    struct Pong {
+        ping_tx: Sender<u32>,
+        pong_rx: Receiver<u32>,
+    }
+
+    fn new_ping_pong() -> (Ping, Pong) {
+        let (ping_tx, ping_rx) = mpsc::channel(10);
+        let (pong_tx, pong_rx) = mpsc::channel(10);
+        (Ping { ping_rx, pong_tx }, Pong { ping_tx, pong_rx })
+    }
+
+    impl Ping {
+        async fn run(mut self) {
+            while let Some(p) = self.ping_rx.recv().await {
+                let _ = self.pong_tx.send(p).await;
+            }
+        }
+
+        fn run_blocking(mut self) {
+            while let Some(p) = self.ping_rx.blocking_recv() {
+                let _ = self.pong_tx.try_send(p);
+            }
+        }
+    }
+
+    impl Pong {
+        async fn ping(&mut self, p: u32) -> eyre::Result<u32> {
+            self.ping_tx.send(p).await?;
+            Ok(self.pong_rx.recv().await.map_or_else(|| Err(eyre::eyre!("No Pong!")), Ok)?)
+        }
+    }
+
+    /// Test that the various spawns work and that the spawned tasks are dropped when the spawning
+    /// TaskManager is dropped. Except for Spawner.spawn_block_task(), it does not spawn a
+    /// future and will not be killed forcefully on drop.
+    #[tokio::test]
+    async fn test_task_manager() {
+        let task_manager = TaskManager::default();
+        let (ping_crit, mut pong_crit) = new_ping_pong();
+        task_manager.spawn_critical_task("Crit", async move {
+            ping_crit.run().await;
+        });
+        assert_eq!(pong_crit.ping(1).await.unwrap(), 1);
+        assert_eq!(pong_crit.ping(2).await.unwrap(), 2);
+
+        let (ping_norm, mut pong_norm) = new_ping_pong();
+        task_manager.spawn_task("task", async move {
+            ping_norm.run().await;
+        });
+        assert_eq!(pong_norm.ping(1).await.unwrap(), 1);
+        assert_eq!(pong_norm.ping(2).await.unwrap(), 2);
+
+        let (ping_block, mut pong_block) = new_ping_pong();
+        task_manager.spawn_blocking(Box::pin(async move {
+            ping_block.run().await;
+        }));
+        assert_eq!(pong_block.ping(1).await.unwrap(), 1);
+        assert_eq!(pong_block.ping(2).await.unwrap(), 2);
+
+        let spawner = task_manager.get_spawner();
+        let (sping_crit, mut spong_crit) = new_ping_pong();
+        spawner.spawn_critical_task("Crit", async move {
+            sping_crit.run().await;
+        });
+        assert_eq!(spong_crit.ping(1).await.unwrap(), 1);
+        assert_eq!(spong_crit.ping(2).await.unwrap(), 2);
+
+        let (sping_norm, mut spong_norm) = new_ping_pong();
+        spawner.spawn_task("task", async move {
+            sping_norm.run().await;
+        });
+        assert_eq!(spong_norm.ping(1).await.unwrap(), 1);
+        assert_eq!(spong_norm.ping(2).await.unwrap(), 2);
+
+        let (sping_block, mut spong_block) = new_ping_pong();
+        spawner.spawn_blocking_task("SBlock", move || {
+            sping_block.run_blocking();
+        });
+        assert_eq!(spong_block.ping(1).await.unwrap(), 1);
+        assert_eq!(spong_block.ping(2).await.unwrap(), 2);
+
+        // Test the reth interface to the TaskSpawner.
+        use reth_tasks::TaskSpawner as _;
+        let (rsping_crit, mut rspong_crit) = new_ping_pong();
+        spawner.spawn_critical(
+            "Crit",
+            Box::pin(async move {
+                rsping_crit.run().await;
+            }),
+        );
+        assert_eq!(rspong_crit.ping(1).await.unwrap(), 1);
+        assert_eq!(rspong_crit.ping(2).await.unwrap(), 2);
+
+        let (rsping_norm, mut rspong_norm) = new_ping_pong();
+        spawner.spawn(Box::pin(async move {
+            rsping_norm.run().await;
+        }));
+        assert_eq!(rspong_norm.ping(1).await.unwrap(), 1);
+        assert_eq!(rspong_norm.ping(2).await.unwrap(), 2);
+
+        let (rsping_block, mut rspong_block) = new_ping_pong();
+        spawner.spawn_blocking(Box::pin(async move {
+            rsping_block.run().await;
+        }));
+        assert_eq!(rspong_block.ping(1).await.unwrap(), 1);
+        assert_eq!(rspong_block.ping(2).await.unwrap(), 2);
+
+        let (rsping_crit_block, mut rspong_crit_block) = new_ping_pong();
+        spawner.spawn_critical_blocking(
+            "Crit block",
+            Box::pin(async move {
+                rsping_crit_block.run().await;
+            }),
+        );
+        assert_eq!(rspong_crit_block.ping(1).await.unwrap(), 1);
+        assert_eq!(rspong_crit_block.ping(2).await.unwrap(), 2);
+
+        drop(task_manager);
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(pong_crit.ping(2).await.is_err());
+        assert!(pong_norm.ping(2).await.is_err());
+        assert!(pong_block.ping(2).await.is_err());
+
+        assert!(spong_crit.ping(2).await.is_err());
+        assert!(spong_norm.ping(2).await.is_err());
+        // Note this blocking task is NOT killed when task manager is dropped..
+        assert_eq!(spong_block.ping(3).await.unwrap(), 3);
+
+        assert!(rspong_crit.ping(2).await.is_err());
+        assert!(rspong_norm.ping(2).await.is_err());
+        assert!(rspong_block.ping(2).await.is_err());
+        assert!(rspong_crit_block.ping(2).await.is_err());
+    }
 }
