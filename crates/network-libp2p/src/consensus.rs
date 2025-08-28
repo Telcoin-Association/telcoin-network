@@ -417,9 +417,13 @@ where
 
         loop {
             tokio::select! {
-                event = self.swarm.select_next_some() => self.process_event(event).await?,
+                event = self.swarm.select_next_some() => self.process_event(event).await.inspect_err(|e| {
+                    error!(target: "network", ?e, "network event error")
+                })?,
                 command = self.commands.recv() => match command {
-                    Some(c) => self.process_command(c)?,
+                    Some(c) => self.process_command(c).inspect_err(|e| {
+                        error!(target: "network", ?e, "network command error")
+                    })?,
                     None => {
                         info!(target: "network", "network shutting down...");
                         return Ok(())
