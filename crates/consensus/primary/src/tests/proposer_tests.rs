@@ -21,7 +21,8 @@ async fn test_empty_proposal() {
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
     );
 
-    proposer.spawn(&TaskManager::default());
+    let task_manager = TaskManager::default();
+    proposer.spawn(&task_manager);
 
     // Ensure the proposer makes a correct empty header.
     let header = rx_headers.recv().await.unwrap();

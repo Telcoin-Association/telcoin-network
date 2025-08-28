@@ -30,7 +30,7 @@ async fn make_batch() {
         client,
         store.clone(),
         timeout,
-        WorkerNetworkHandle::new_for_test(),
+        WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
         &mut task_manager,
     );
 

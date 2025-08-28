@@ -52,7 +52,7 @@ async fn test_make_batch_el_to_cl() {
         network_client,
         store.clone(),
         timeout,
-        WorkerNetworkHandle::new_for_test(),
+        WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
         &mut task_manager,
     );
 

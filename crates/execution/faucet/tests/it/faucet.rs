@@ -295,7 +295,7 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
     let node_metrics = WorkerMetrics::default();
     let timeout = Duration::from_secs(5);
     let mut task_manager = TaskManager::default();
-    let worker_network = WorkerNetworkHandle::new_for_test();
+    let worker_network = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
     let batch_provider = Worker::new(
         0,
         Some(qw.clone()),
@@ -649,7 +649,7 @@ async fn test_with_creds_faucet_transfers_stablecoin_with_google_kms() -> eyre::
     execution_node
         .initialize_worker_components(
             worker_id,
-            WorkerNetworkHandle::new_for_test(),
+            WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
             EmptyEngToPrimary(),
         )
         .await?;

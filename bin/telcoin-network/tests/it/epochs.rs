@@ -33,6 +33,7 @@ const EPOCH_DURATION: u64 = 5;
 #[tokio::test]
 /// Test a new node joining the network and being shuffled into the committee.
 async fn test_epoch_boundary() -> eyre::Result<()> {
+    tn_types::test_utils::init_test_tracing();
     // create validator and governance wallets for adding new validator later
     let mut new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
     let mut governance_wallet =
@@ -111,7 +112,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
     // n ~= 25 iterations
     for i in 0..25 {
         let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
-        assert!(new_epoch_info != current_epoch_info);
+        assert!(new_epoch_info != current_epoch_info, "Old and new epoch equal on iteration {i}");
         assert!(new_epoch_info.blockHeight > last_epoch_block_height);
         assert_eq!(new_epoch_info.epochDuration as u64, EPOCH_DURATION);
 
@@ -131,7 +132,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
         current_epoch_info = new_epoch_info;
 
         // sleep for epoch duration
-        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
     }
 
     // return error if loop didn't return

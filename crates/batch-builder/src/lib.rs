@@ -363,7 +363,7 @@ mod tests {
         let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
         // task manger
-        let task_manager = TaskManager::new("Test Task Manager");
+        let mut task_manager = TaskManager::new("make_block_no_ack_txs_in_pool_still Task Manager");
         let tmp_dir = TempDir::new().unwrap();
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
@@ -378,7 +378,6 @@ mod tests {
         let qw = TestMakeBlockQuorumWaiter::new_test();
         let node_metrics = WorkerMetrics::default();
         let timeout = Duration::from_secs(5);
-        let mut task_manager = TaskManager::new("Batch Builder Test");
         let block_provider = Worker::new(
             0,
             Some(qw),
@@ -386,7 +385,7 @@ mod tests {
             client,
             store.clone(),
             timeout,
-            WorkerNetworkHandle::new_for_test(),
+            WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
             &mut task_manager,
         );
 
@@ -494,6 +493,8 @@ mod tests {
         /// - ChainSpec
         /// - TaskManager (so executor tasks don't drop)
         execution_components: TestExecutionComponents,
+        /// Own manager so executor's tasks don't drop.
+        task_manager: TaskManager,
     }
 
     /// Convenience type for holding execution components.
@@ -504,8 +505,6 @@ mod tests {
         txpool: WorkerTxPool,
         /// The chainspec with seeded genesis.
         chain: Arc<RethChainSpec>,
-        /// Own manager so executor's tasks don't drop (reth).
-        _manager: TaskManager,
     }
 
     /// Helper function to create common testing infrastructure.
@@ -526,9 +525,8 @@ mod tests {
             RethEnv::new_for_temp_chain(chain.clone(), path, &task_manager, None).unwrap();
         let txpool = reth_env.init_txn_pool().unwrap();
 
-        let execution_components =
-            TestExecutionComponents { reth_env, txpool, chain, _manager: task_manager };
-        TestTools { tx_factory, execution_components }
+        let execution_components = TestExecutionComponents { reth_env, txpool, chain };
+        TestTools { tx_factory, execution_components, task_manager }
     }
 
     /// Test all possible errors from the worker while trying to reach quorum from peers.
@@ -538,11 +536,11 @@ mod tests {
     #[tokio::test]
     async fn test_all_possible_error_outcomes() {
         let tmp_dir = TempDir::new().unwrap();
-        let TestTools { mut tx_factory, execution_components } = get_test_tools(tmp_dir.path());
+        let TestTools { mut tx_factory, execution_components, task_manager } =
+            get_test_tools(tmp_dir.path());
         let TestExecutionComponents { reth_env, txpool, chain, .. } = execution_components;
         let address = Address::from(U160::from(33));
         let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
-        let task_manager = TaskManager::default();
 
         // build execution block proposer
         let batch_builder = BatchBuilder::new(
@@ -689,11 +687,11 @@ mod tests {
     #[tokio::test]
     async fn test_pool_updates_after_txs_mined() {
         let tmp_dir = TempDir::new().unwrap();
-        let TestTools { mut tx_factory, execution_components } = get_test_tools(tmp_dir.path());
+        let TestTools { mut tx_factory, execution_components, task_manager } =
+            get_test_tools(tmp_dir.path());
         let TestExecutionComponents { reth_env, txpool, chain, .. } = execution_components;
         let address = Address::from(U160::from(33));
         let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
-        let task_manager = TaskManager::default();
 
         // build execution block proposer
         let batch_builder = BatchBuilder::new(

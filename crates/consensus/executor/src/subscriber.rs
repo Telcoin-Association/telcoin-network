@@ -29,8 +29,6 @@ use tracing::{debug, error, info};
 /// forward the certificates to the Executor.
 #[derive(Clone)]
 pub struct Subscriber<DB> {
-    /// Receiver for shutdown
-    rx_shutdown: Noticer,
     /// Used to get the sequence receiver
     consensus_bus: ConsensusBus,
     /// Consensus configuration (contains the consensus DB)
@@ -66,7 +64,6 @@ pub fn spawn_subscriber<DB: Database>(
     let client = config.local_network().clone();
     let mode = *consensus_bus.node_mode().borrow();
     let subscriber = Subscriber {
-        rx_shutdown,
         consensus_bus,
         config,
         network_handle,
@@ -80,7 +77,7 @@ pub fn spawn_subscriber<DB: Database>(
                 monitored_future!(
                     async move {
                         info!(target: "subscriber", "Starting subscriber: CVV");
-                        if let Err(e) = subscriber.run().await {
+                        if let Err(e) = subscriber.run(rx_shutdown).await {
                             error!(target: "subscriber", "Error subscriber consensus: {e}");
                         }
                     },
@@ -221,7 +218,7 @@ impl<DB: Database> Subscriber<DB> {
     }
 
     /// Main loop connecting to the consensus to listen to sequence messages.
-    async fn run(self) -> SubscriberResult<()> {
+    async fn run(self, rx_shutdown: Noticer) -> SubscriberResult<()> {
         // Make sure any old consensus that was not executed gets executed.
         let missing = get_missing_consensus(&self.config, &self.consensus_bus).await?;
         for consensus_header in missing.into_iter() {
@@ -286,7 +283,7 @@ impl<DB: Database> Subscriber<DB> {
                     }
                 },
 
-                _ = &self.rx_shutdown => {
+                _ = &rx_shutdown => {
                     return Ok(())
                 }
 

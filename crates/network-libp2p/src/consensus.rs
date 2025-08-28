@@ -38,10 +38,10 @@ use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
 use tn_storage::tables::KadRecords;
 use tn_types::{
     decode, encode, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
-    NetworkPublicKey, TaskSpawner,
+    NetworkPublicKey, TaskSpawner, TnSender,
 };
 use tokio::sync::{
-    mpsc::{self, Receiver, Sender},
+    mpsc::{Receiver, Sender},
     oneshot,
 };
 use tracing::{debug, error, info, instrument, trace, warn};
@@ -97,16 +97,17 @@ where
 /// - prevent a surge in one network message type from overwhelming all network traffic
 /// - provide more granular control over resource allocation
 /// - allow specific network configurations based on worker/primary needs
-pub struct ConsensusNetwork<Req, Res, DB>
+pub struct ConsensusNetwork<Req, Res, DB, Events>
 where
     Req: TNMessage,
     Res: TNMessage,
     DB: Database,
+    Events: TnSender<NetworkEvent<Req, Res>>,
 {
     /// The gossip network for flood publishing sealed batches.
     swarm: Swarm<TNBehavior<TNCodec<Req, Res>, DB>>,
     /// The stream for forwarding network events.
-    event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
+    event_stream: Events,
     /// The sender for network handles.
     handle: Sender<NetworkCommand<Req, Res>>,
     /// The receiver for processing network handle requests.
@@ -159,16 +160,17 @@ where
     task_spawner: TaskSpawner,
 }
 
-impl<Req, Res, DB> ConsensusNetwork<Req, Res, DB>
+impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
 where
     Req: TNMessage,
     Res: TNMessage,
     DB: Database,
+    Events: TnSender<NetworkEvent<Req, Res>> + Send + 'static,
 {
     /// Convenience method for spawning a primary network instance.
     pub fn new_for_primary(
         network_config: &NetworkConfig,
-        event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
+        event_stream: Events,
         key_config: KeyConfig,
         db: DB,
         task_manager: TaskSpawner,
@@ -180,7 +182,7 @@ where
     /// Convenience method for spawning a worker network instance.
     pub fn new_for_worker(
         network_config: &NetworkConfig,
-        event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
+        event_stream: Events,
         key_config: KeyConfig,
         db: DB,
         task_manager: TaskSpawner,
@@ -192,7 +194,7 @@ where
     /// Create a new instance of Self.
     pub fn new(
         network_config: &NetworkConfig,
-        event_stream: mpsc::Sender<NetworkEvent<Req, Res>>,
+        event_stream: Events,
         key_config: KeyConfig,
         keypair: NetworkKeypair,
         db: DB,
@@ -668,7 +670,7 @@ where
                 let peers = self.swarm.behaviour_mut().peer_manager.peers_for_exchange();
                 send_or_log_error!(reply, peers, "PeersForExchange");
             }
-            NetworkCommand::NewEpoch { committee, new_event_stream } => {
+            NetworkCommand::NewEpoch { committee } => {
                 // at the start of a new epoch, each node needs to know:
                 // - the current committee
                 // - all staked nodes who will vote at the end of the epoch
@@ -683,9 +685,6 @@ where
                 info!(target: "network", this_node=?self.swarm.local_peer_id(), "network update for next committee - ensuring no committee members are banned");
                 // ensure that the next committee isn't banned
                 self.swarm.behaviour_mut().peer_manager.new_epoch(committee);
-
-                // update the stream to forward events
-                self.event_stream = new_event_stream;
             }
             NetworkCommand::FindAuthorities { requests } => {
                 // this will trigger a PeerEvent to fetch records through kad if not in the peer map
@@ -1295,11 +1294,12 @@ impl From<GossipAcceptance> for MessageAcceptance {
     }
 }
 
-impl<Req, Res, DB> std::fmt::Debug for ConsensusNetwork<Req, Res, DB>
+impl<Req, Res, DB, Events> std::fmt::Debug for ConsensusNetwork<Req, Res, DB, Events>
 where
     Req: TNMessage,
     Res: TNMessage,
     DB: Database,
+    Events: TnSender<NetworkEvent<Req, Res>>,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConsensusNetwork")

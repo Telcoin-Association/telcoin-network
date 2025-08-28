@@ -37,7 +37,12 @@ fn create_test_peers<Req: TNMessage, Res: TNMessage>(
             let (tx, network_events) = mpsc::channel(10);
             let network_key = config.key_config().primary_network_keypair().clone();
             let db = MemDatabase::new_for_network();
-            let network = ConsensusNetwork::<Req, Res, MemDatabase>::new(
+            let network = ConsensusNetwork::<
+                Req,
+                Res,
+                MemDatabase,
+                mpsc::Sender<NetworkEvent<Req, Res>>,
+            >::new(
                 config.network_config(),
                 tx,
                 config.key_config().clone(),
@@ -76,7 +81,7 @@ where
     /// Network handle to send commands.
     network_handle: NetworkHandle<Req, Res>,
     /// The network task.
-    network: Option<ConsensusNetwork<Req, Res, MemDatabase>>,
+    network: Option<ConsensusNetwork<Req, Res, MemDatabase, mpsc::Sender<NetworkEvent<Req, Res>>>>,
 }
 /// A peer on TN
 struct NetworkPeer<Req, Res, DB = MemDatabase>
@@ -91,7 +96,7 @@ where
     /// Network handle to send commands.
     network_handle: NetworkHandle<Req, Res>,
     /// The network task.
-    network: ConsensusNetwork<Req, Res, MemDatabase>,
+    network: ConsensusNetwork<Req, Res, MemDatabase, mpsc::Sender<NetworkEvent<Req, Res>>>,
 }
 
 /// The type for holding testng components.
@@ -132,15 +137,16 @@ where
 
     // peer1
     let network_key_1 = config_1.key_config().primary_network_keypair().clone();
-    let peer1_network = ConsensusNetwork::<Req, Res, MemDatabase>::new(
-        config_1.network_config(),
-        tx1,
-        config_1.key_config().clone(),
-        network_key_1,
-        MemDatabase::new_for_network(),
-        task_manager.get_spawner(),
-    )
-    .expect("peer1 network created");
+    let peer1_network =
+        ConsensusNetwork::<Req, Res, MemDatabase, mpsc::Sender<NetworkEvent<Req, Res>>>::new(
+            config_1.network_config(),
+            tx1,
+            config_1.key_config().clone(),
+            network_key_1,
+            MemDatabase::new_for_network(),
+            task_manager.get_spawner(),
+        )
+        .expect("peer1 network created");
     let network_handle_1 = peer1_network.network_handle();
     let peer1 = NetworkPeer {
         config: config_1,
@@ -151,15 +157,16 @@ where
 
     // peer2
     let network_key_2 = config_2.key_config().primary_network_keypair().clone();
-    let peer2_network = ConsensusNetwork::<Req, Res, MemDatabase>::new(
-        config_2.network_config(),
-        tx2,
-        config_2.key_config().clone(),
-        network_key_2,
-        MemDatabase::new_for_network(),
-        task_manager.get_spawner(),
-    )
-    .expect("peer2 network created");
+    let peer2_network =
+        ConsensusNetwork::<Req, Res, MemDatabase, mpsc::Sender<NetworkEvent<Req, Res>>>::new(
+            config_2.network_config(),
+            tx2,
+            config_2.key_config().clone(),
+            network_key_2,
+            MemDatabase::new_for_network(),
+            task_manager.get_spawner(),
+        )
+        .expect("peer2 network created");
     let network_handle_2 = peer2_network.network_handle();
     let peer2 = NetworkPeer {
         config: config_2,
@@ -1207,12 +1214,8 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
 
     // Send NewEpoch command to peer1
     let handle = peer1.clone();
-    let (new_event_stream, _rx) = mpsc::channel(100);
     tokio::spawn(async move {
-        handle
-            .new_epoch(committee, new_event_stream)
-            .await
-            .expect("Failed to send NewEpoch command");
+        handle.new_epoch(committee).await.expect("Failed to send NewEpoch command");
     })
     .await?;
 
@@ -1328,12 +1331,8 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
         .into_iter()
         .collect();
     let handle = target_peer.network_handle.clone();
-    let (new_event_stream, _rx) = mpsc::channel(100);
     tokio::spawn(async move {
-        handle
-            .new_epoch(committee, new_event_stream)
-            .await
-            .expect("Failed to send NewEpoch command");
+        handle.new_epoch(committee).await.expect("Failed to send NewEpoch command");
     })
     .await?;
 
@@ -1412,12 +1411,8 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
 
     // Send NewEpoch command to peer1
     let handle = peer1.clone();
-    let (new_event_stream, _rx) = mpsc::channel(100);
     tokio::spawn(async move {
-        handle
-            .new_epoch(committee, new_event_stream)
-            .await
-            .expect("Failed to send NewEpoch command");
+        handle.new_epoch(committee).await.expect("Failed to send NewEpoch command");
     })
     .await?;
 
