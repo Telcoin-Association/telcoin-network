@@ -336,7 +336,7 @@ where
     /// Spawn a task to evaluate a peer's proposed header and return a response.
     fn process_report_batch(
         &self,
-        _peer: BlsPublicKey,
+        peer: BlsPublicKey,
         sealed_batch: SealedBatch,
         channel: ResponseChannel<WorkerResponse>,
         cancel: oneshot::Receiver<()>,
@@ -347,7 +347,7 @@ where
         let task_name = format!("process-report-batch-{}", sealed_batch.digest());
         self.network_handle.get_task_spawner().spawn_task(task_name, async move {
             tokio::select! {
-                res = request_handler.process_report_batch(sealed_batch) => {
+                res = request_handler.process_report_batch(peer, sealed_batch) => {
                     let response = match res {
                         Ok(()) => WorkerResponse::ReportBatch,
                         Err(err) => WorkerResponse::Error(message::WorkerRPCError(err.to_string())),

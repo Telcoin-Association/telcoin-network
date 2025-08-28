@@ -9,12 +9,12 @@ use tn_network_libp2p::GossipMessage;
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
 use tn_storage::tables::Batches;
 use tn_types::{
-    now, try_decode, Batch, BatchValidation, BlockHash, Database, SealedBatch, WorkerId,
+    now, try_decode, Batch, BatchValidation, BlockHash, BlsPublicKey, Database, SealedBatch, WorkerId
 };
 
 /// The type that handles requests from peers.
 #[derive(Clone)]
-pub struct RequestHandler<DB> {
+pub(super) struct RequestHandler<DB> {
     /// This worker's id.
     id: WorkerId,
     /// The type that validates batches received from peers.
@@ -30,7 +30,7 @@ where
     DB: Database,
 {
     /// Create a new instance of Self.
-    pub fn new(
+    pub(super) fn new(
         id: WorkerId,
         validator: Arc<dyn BatchValidation>,
         consensus_config: ConsensusConfig<DB>,
@@ -95,8 +95,14 @@ where
     /// Process a new reported batch.
     pub(crate) async fn process_report_batch(
         &self,
+        peer: BlsPublicKey,
         sealed_batch: SealedBatch,
     ) -> WorkerNetworkResult<()> {
+        // return error if reporter isn't in current committee
+        if !self.consensus_config.committee_pub_keys().contains(&peer) {
+            return Err(WorkerNetworkError::NonCommitteeBatch);
+        }
+
         let client = self.consensus_config.local_network().clone();
         let store = self.consensus_config.node_storage().clone();
         // validate batch - log error if invalid

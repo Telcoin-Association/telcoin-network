@@ -118,8 +118,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
             let timeout_res = tokio::time::timeout(timeout, async move {
                 let start_time = Instant::now();
                 // Broadcast the batch to the other workers.
-                let workers: Vec<_> =
-                    inner.committee.others_keys_except(inner.authority.protocol_key());
+                let workers = inner.committee.others_keys_except(inner.authority.protocol_key());
 
                 let handlers = inner.network.report_batch_to_peers(&workers, sealed_batch);
                 let _timer = inner.metrics.batch_broadcast_quorum_latency.start_timer();
