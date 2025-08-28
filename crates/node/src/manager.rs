@@ -1328,7 +1328,9 @@ where
         // start listening if the network needs to be initialized
         if *initial_epoch {
             // start listening for p2p messages
-            let primary_address = consensus_config.primary_address();
+            let primary_address = std::env::var("LISTENER_MULTIADDR")
+                .map(|addr| addr.parse())
+                .unwrap_or_else(|_| Ok(consensus_config.primary_address()))?;
             info!(target: "epoch-manager", ?primary_address, "listening to {primary_address}");
             network_handle.inner_handle().start_listening(primary_address).await?;
         }
@@ -1429,7 +1431,9 @@ where
 
         // start listening if the network needs to be initialized
         if *initial_epoch {
-            let worker_address = consensus_config.worker_address();
+            let worker_address = std::env::var("LISTENER_MULTIADDR")
+                .map(|addr| addr.parse())
+                .unwrap_or_else(|_| Ok(consensus_config.worker_address()))?;
             network_handle.inner_handle().start_listening(worker_address).await?;
             // Make sure we at least hove bootstrap peers on first epoch.
             network_handle
