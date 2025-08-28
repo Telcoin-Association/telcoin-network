@@ -12,8 +12,8 @@ pub use stores::*;
 pub use redb::database::ReDB;
 use tables::{
     Batches, CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
-    ConsensusBlockNumbersByDigest, ConsensusBlocks, KadProviderRecords, KadRecords, LastProposed,
-    Payload, Votes,
+    ConsensusBlockNumbersByDigest, ConsensusBlocks, KadProviderRecords, KadRecords,
+    KadWorkerProviderRecords, KadWorkerRecords, LastProposed, Payload, Votes,
 };
 // Always build redb, we use it as the default for persistant consensus data.
 pub mod layered_db;
@@ -49,6 +49,8 @@ const CONSENSUS_BLOCK_CF: &str = "consensus_block";
 const CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF: &str = "consensus_block_number_by_digest";
 const KAD_RECORD_CF: &str = "kad_record";
 const KAD_PROVIDER_RECORD_CF: &str = "kad_provider_record";
+const KAD_WORKER_RECORD_CF: &str = "kad_worker_record";
+const KAD_WORKER_PROVIDER_RECORD_CF: &str = "kad_worker_provider_record";
 
 macro_rules! tables {
     ( $($table:ident;$name:expr;<$K:ty, $V:ty>),*) => {
@@ -85,8 +87,10 @@ pub mod tables {
         ConsensusBlocks;crate::CONSENSUS_BLOCK_CF;<u64, ConsensusHeader>,
         ConsensusBlockNumbersByDigest;crate::CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF;<BlockHash, u64>,
         // These are used for network storage and separate from consensus
-        KadRecords;crate::KAD_RECORD_CF;<(u32, BlockHash), Vec<u8>>,
-        KadProviderRecords;crate::KAD_PROVIDER_RECORD_CF;<(u32, BlockHash), Vec<u8>>
+        KadRecords;crate::KAD_RECORD_CF;<BlockHash, Vec<u8>>,
+        KadProviderRecords;crate::KAD_PROVIDER_RECORD_CF;<BlockHash, Vec<u8>>,
+        KadWorkerRecords;crate::KAD_WORKER_RECORD_CF;<BlockHash, Vec<u8>>,
+        KadWorkerProviderRecords;crate::KAD_WORKER_PROVIDER_RECORD_CF;<BlockHash, Vec<u8>>
     );
 }
 
@@ -126,6 +130,8 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<ConsensusBlockNumbersByDigest>().expect("failed to open table!");
     db.open_table::<KadRecords>().expect("failed to open table!");
     db.open_table::<KadProviderRecords>().expect("failed to open table!");
+    db.open_table::<KadWorkerRecords>().expect("failed to open table!");
+    db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
 
     // Don't forget to add a new table to MemDatabase...
     let db = LayeredDatabase::open(db);
@@ -140,6 +146,8 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<ConsensusBlockNumbersByDigest>();
     db.open_table::<KadRecords>();
     db.open_table::<KadProviderRecords>();
+    db.open_table::<KadWorkerRecords>();
+    db.open_table::<KadWorkerProviderRecords>();
     db
 }
 
@@ -158,6 +166,8 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<ConsensusBlockNumbersByDigest>().expect("failed to open table!");
     db.open_table::<KadRecords>().expect("failed to open table!");
     db.open_table::<KadProviderRecords>().expect("failed to open table!");
+    db.open_table::<KadWorkerRecords>().expect("failed to open table!");
+    db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
 
     let db = LayeredDatabase::open(db);
     db.open_table::<LastProposed>();
@@ -171,6 +181,8 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<ConsensusBlockNumbersByDigest>();
     db.open_table::<KadRecords>();
     db.open_table::<KadProviderRecords>();
+    db.open_table::<KadWorkerRecords>();
+    db.open_table::<KadWorkerProviderRecords>();
     db
 }
 

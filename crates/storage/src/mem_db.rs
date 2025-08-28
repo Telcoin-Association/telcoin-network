@@ -169,6 +169,8 @@ impl Default for MemDatabase {
         db.open_table::<crate::tables::ConsensusBlockNumbersByDigest>();
         db.open_table::<crate::tables::KadRecords>();
         db.open_table::<crate::tables::KadProviderRecords>();
+        db.open_table::<crate::tables::KadWorkerRecords>();
+        db.open_table::<crate::tables::KadWorkerProviderRecords>();
         db
     }
 }

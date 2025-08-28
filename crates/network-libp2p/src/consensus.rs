@@ -5,7 +5,7 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
-    kad::{KadRecord, KadStore, PRIMARY_KAD_STORE_INDEX, WORKER_KAD_STORE_INDEX},
+    kad::{KadRecord, KadStore, KadStoreType},
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     types::{
@@ -183,7 +183,7 @@ where
             network_key,
             db,
             task_manager,
-            PRIMARY_KAD_STORE_INDEX,
+            KadStoreType::Primary,
         )
     }
 
@@ -203,7 +203,7 @@ where
             network_key,
             db,
             task_manager,
-            WORKER_KAD_STORE_INDEX,
+            KadStoreType::Worker,
         )
     }
 
@@ -215,7 +215,7 @@ where
         keypair: NetworkKeypair,
         db: DB,
         task_spawner: TaskSpawner,
-        kad_index: u32,
+        kad_type: KadStoreType,
     ) -> NetworkResult<Self> {
         let identify_config = identify::Config::new(
             network_config.libp2p_config().identify_protocol().to_string(),
@@ -258,7 +258,7 @@ where
             .set_publication_interval(twelve_hours)
             .set_query_timeout(Duration::from_secs(60))
             .set_provider_record_ttl(two_days);
-        let kad_store = KadStore::new(db.clone(), &key_config, kad_index);
+        let kad_store = KadStore::new(db.clone(), &key_config, kad_type);
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store, kad_config);
 
         // create custom behavior

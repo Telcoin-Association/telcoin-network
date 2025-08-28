@@ -303,12 +303,6 @@ where
         //=== PRIMARY
         //
 
-        // create network db
-        //XXXXlet primary_network_db = self.tn_datadir.network_db_path().join("primary");
-        //let _ = std::fs::create_dir_all(&primary_network_db);
-        //info!(target: "epoch-manager", ?primary_network_db, "opening primary network storage
-        // at:"); let primary_network_db = open_network_db(primary_network_db);
-
         // create long-running network task for primary
         let primary_network = ConsensusNetwork::new_for_primary(
             network_config,
@@ -341,12 +335,6 @@ where
         //
         // this is a temporary event stream - replaced at the start of every epoch
         //let (tmp_event_stream, _temp_rx) = mpsc::channel(1000);
-
-        // create network db
-        //XXXXlet worker_network_db = self.tn_datadir.network_db_path().join("worker");
-        //let _ = std::fs::create_dir_all(&worker_network_db);
-        //info!(target: "epoch-manager", ?worker_network_db, "opening worker network storage at:");
-        //let worker_network_db = open_network_db(worker_network_db);
 
         // create long-running network task for worker
         let worker_network = ConsensusNetwork::new_for_worker(

@@ -49,7 +49,7 @@ fn create_test_peers<Req: TNMessage, Res: TNMessage>(
                 network_key,
                 db,
                 task_manager.get_spawner(),
-                PRIMARY_KAD_STORE_INDEX,
+                KadStoreType::Primary,
             )
             .expect("peer1 network created");
 
@@ -146,7 +146,7 @@ where
             network_key_1,
             MemDatabase::default(),
             task_manager.get_spawner(),
-            PRIMARY_KAD_STORE_INDEX,
+            KadStoreType::Primary,
         )
         .expect("peer1 network created");
     let network_handle_1 = peer1_network.network_handle();
@@ -167,7 +167,7 @@ where
             network_key_2,
             MemDatabase::default(),
             task_manager.get_spawner(),
-            PRIMARY_KAD_STORE_INDEX,
+            KadStoreType::Primary,
         )
         .expect("peer2 network created");
     let network_handle_2 = peer2_network.network_handle();

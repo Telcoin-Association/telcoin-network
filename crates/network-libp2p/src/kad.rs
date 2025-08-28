@@ -17,7 +17,9 @@ use libp2p::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::{serde_as, DeserializeAs, SerializeAs};
 use tn_config::KeyConfig;
-use tn_storage::tables::{KadProviderRecords, KadRecords};
+use tn_storage::tables::{
+    KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords,
+};
 use tn_types::{decode, encode, BlockHash, Database, DefaultHashFunction};
 
 /// A record stored in the DHT.
@@ -144,10 +146,14 @@ fn instant_to_system(expires: &Option<Instant>) -> Option<SystemTime> {
     }
 }
 
-/// Index used for as a DB desciminate for primary network KAD records.
-pub const PRIMARY_KAD_STORE_INDEX: u32 = 0;
-/// Index used for as a DB desciminate for worker network KAD records.
-pub const WORKER_KAD_STORE_INDEX: u32 = 1;
+/// The type of the Kad store, primary or worker.
+#[derive(Copy, Clone, Debug)]
+pub enum KadStoreType {
+    /// Primary network KadStore.
+    Primary,
+    /// Worker network KadStore.
+    Worker,
+}
 
 /// Provide a persistant store for kademlia data.
 /// Wraps around the consensus DB.
@@ -165,32 +171,36 @@ pub struct KadStore<DB> {
     /// Tracks to number of provider records in DB.
     num_providers: usize,
     /// Index used for database retrieval with multiple KAD tables.
-    kad_index: u32,
+    kad_type: KadStoreType,
 }
 
 impl<DB: Database> KadStore<DB> {
     /// Create a new KadStore backed by db.
-    pub fn new(db: DB, key_config: &KeyConfig, kad_index: u32) -> Self {
+    pub fn new(db: DB, key_config: &KeyConfig, kad_type: KadStoreType) -> Self {
         let node_key = RecordKey::new(&encode(&key_config.primary_public_key()));
         // Defaults for sanity.
         let config = MemoryStoreConfig::default();
-        let num_records = db.iter::<KadRecords>().filter(|((i, _), _)| *i == kad_index).count();
-        let num_providers =
-            db.iter::<KadProviderRecords>().filter(|((i, _), _)| *i == kad_index).count();
-        Self { db, node_key, config, num_records, num_providers, kad_index }
+        let (num_records, num_providers) = match kad_type {
+            KadStoreType::Primary => {
+                (db.iter::<KadRecords>().count(), db.iter::<KadProviderRecords>().count())
+            }
+            KadStoreType::Worker => (
+                db.iter::<KadWorkerRecords>().count(),
+                db.iter::<KadWorkerProviderRecords>().count(),
+            ),
+        };
+        Self { db, node_key, config, num_records, num_providers, kad_type }
     }
 
-    fn key_to_hash(&self, key: &RecordKey) -> (u32, BlockHash) {
+    fn key_to_hash(&self, key: &RecordKey) -> BlockHash {
         let mut h = DefaultHashFunction::new();
         h.update(encode(key).as_ref());
-        (self.kad_index, BlockHash::from_slice(h.finalize().as_bytes()))
+        BlockHash::from_slice(h.finalize().as_bytes())
     }
 }
 
 /// Iterator of KAD records.
 pub struct RecordIter<'a> {
-    //db_iter: DBIter<'a, KadRecords>,
-    //kad_index: u32,
     data: Vec<Vec<u8>>,
     idx: usize,
     _casper: PhantomData<Cow<'a, Record>>,
@@ -213,17 +223,9 @@ impl<'a> Iterator for RecordIter<'a> {
         } else {
             None
         }
-        /*while let Some(((i, _), r)) = self.db_iter.next() {
-            if i == self.kad_index {
-                let r: KadRecord = decode(r.as_ref());
-                return Some(Cow::Owned(r.into()));
-            }
-        }
-        NoneXXXX*/
     }
 }
 
-// XXXX 699
 impl<DB: Database> RecordStore for KadStore<DB> {
     type RecordsIter<'a> = RecordIter<'a>;
 
@@ -234,7 +236,10 @@ impl<DB: Database> RecordStore for KadStore<DB> {
 
     fn get(&self, k: &RecordKey) -> Option<Cow<'_, Record>> {
         let key = self.key_to_hash(k);
-        let record = self.db.get::<KadRecords>(&key).ok()?;
+        let record = match self.kad_type {
+            KadStoreType::Primary => self.db.get::<KadRecords>(&key).ok()?,
+            KadStoreType::Worker => self.db.get::<KadWorkerRecords>(&key).ok()?,
+        };
         record.map(|r| {
             let r: KadRecord = decode(r.as_ref());
             Cow::Owned(r.into())
@@ -251,7 +256,16 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         if self.num_records >= self.config.max_records {
             return Err(Error::MaxRecords);
         }
-        self.db.insert::<KadRecords>(&key, &encode(&kr)).map_err(|_| Error::ValueTooLarge)?;
+        match self.kad_type {
+            KadStoreType::Primary => self
+                .db
+                .insert::<KadRecords>(&key, &encode(&kr))
+                .map_err(|_| Error::ValueTooLarge)?,
+            KadStoreType::Worker => self
+                .db
+                .insert::<KadWorkerRecords>(&key, &encode(&kr))
+                .map_err(|_| Error::ValueTooLarge)?,
+        }
         // Record went in so inc num_records.
         self.num_records += 1;
         Ok(())
@@ -259,20 +273,23 @@ impl<DB: Database> RecordStore for KadStore<DB> {
 
     fn remove(&mut self, k: &RecordKey) {
         let key = self.key_to_hash(k);
-        if self.db.remove::<KadRecords>(&key).is_ok() {
+        if match self.kad_type {
+            KadStoreType::Primary => self.db.remove::<KadRecords>(&key),
+            KadStoreType::Worker => self.db.remove::<KadWorkerRecords>(&key),
+        }
+        .is_ok()
+        {
             // Record was removed so dec num_records.
             self.num_records -= 1;
         }
     }
 
     fn records(&self) -> Self::RecordsIter<'_> {
-        let data = self
-            .db
-            .iter::<KadRecords>()
-            .filter_map(|((i, _), r)| if i == self.kad_index { Some(r) } else { None })
-            .collect();
-        //RecordIter { db_iter, kad_index: self.kad_index }
-        RecordIter { data, idx: 0, _casper: PhantomData::default() }
+        let data = match self.kad_type {
+            KadStoreType::Primary => self.db.iter::<KadRecords>().map(|(_, r)| r).collect(),
+            KadStoreType::Worker => self.db.iter::<KadWorkerRecords>().map(|(_, r)| r).collect(),
+        };
+        RecordIter { data, idx: 0, _casper: PhantomData }
     }
 
     fn add_provider(&mut self, record: ProviderRecord) -> libp2p::kad::store::Result<()> {
@@ -282,30 +299,39 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         let key = self.key_to_hash(&record.key);
         let kr: KadProviderRecord = record.into();
         let mut inc_providers = false;
-        let records: Vec<KadProviderRecord> =
-            if let Ok(Some(recs)) = self.db.get::<KadProviderRecords>(&key) {
-                let mut recs: Vec<KadProviderRecord> = decode(&recs);
-                let mut found = false;
-                for r in recs.iter_mut() {
-                    if r.provider == kr.provider {
-                        *r = kr.clone();
-                        found = true;
-                    }
+        let records: Vec<KadProviderRecord> = if let Ok(Some(recs)) = match self.kad_type {
+            KadStoreType::Primary => self.db.get::<KadProviderRecords>(&key),
+            KadStoreType::Worker => self.db.get::<KadWorkerProviderRecords>(&key),
+        } {
+            let mut recs: Vec<KadProviderRecord> = decode(&recs);
+            let mut found = false;
+            for r in recs.iter_mut() {
+                if r.provider == kr.provider {
+                    *r = kr.clone();
+                    found = true;
                 }
-                if !found {
-                    if recs.len() >= self.config.max_providers_per_key {
-                        return Err(Error::MaxProvidedKeys);
-                    }
-                    recs.push(kr);
+            }
+            if !found {
+                if recs.len() >= self.config.max_providers_per_key {
+                    return Err(Error::MaxProvidedKeys);
                 }
-                recs
-            } else {
-                inc_providers = true;
-                vec![kr]
-            };
-        self.db
-            .insert::<KadProviderRecords>(&key, &encode(&records))
-            .map_err(|_| libp2p::kad::store::Error::ValueTooLarge)?;
+                recs.push(kr);
+            }
+            recs
+        } else {
+            inc_providers = true;
+            vec![kr]
+        };
+        match self.kad_type {
+            KadStoreType::Primary => self
+                .db
+                .insert::<KadProviderRecords>(&key, &encode(&records))
+                .map_err(|_| libp2p::kad::store::Error::ValueTooLarge)?,
+            KadStoreType::Worker => self
+                .db
+                .insert::<KadWorkerProviderRecords>(&key, &encode(&records))
+                .map_err(|_| libp2p::kad::store::Error::ValueTooLarge)?,
+        }
         if inc_providers {
             // If this was a new record and it was inserted then inc num_providers.
             // I.E. Don't inc if this updated an existing provider record.
@@ -316,7 +342,10 @@ impl<DB: Database> RecordStore for KadStore<DB> {
 
     fn providers(&self, key: &RecordKey) -> Vec<ProviderRecord> {
         let key = self.key_to_hash(key);
-        if let Ok(Some(recs)) = self.db.get::<KadProviderRecords>(&key) {
+        if let Ok(Some(recs)) = match self.kad_type {
+            KadStoreType::Primary => self.db.get::<KadProviderRecords>(&key),
+            KadStoreType::Worker => self.db.get::<KadWorkerProviderRecords>(&key),
+        } {
             let records: Vec<KadProviderRecord> = decode(&recs);
             let records: Vec<ProviderRecord> = records.into_iter().map(|r| r.into()).collect();
             records
@@ -333,17 +362,32 @@ impl<DB: Database> RecordStore for KadStore<DB> {
 
     fn remove_provider(&mut self, key: &RecordKey, p: &PeerId) {
         let key = self.key_to_hash(key);
-        if let Ok(Some(recs)) = self.db.get::<KadProviderRecords>(&key) {
+        if let Ok(Some(recs)) = match self.kad_type {
+            KadStoreType::Primary => self.db.get::<KadProviderRecords>(&key),
+            KadStoreType::Worker => self.db.get::<KadWorkerProviderRecords>(&key),
+        } {
             let records: Vec<KadProviderRecord> = decode(&recs);
             let records: Vec<KadProviderRecord> =
                 records.into_iter().filter(|r| r.provider != *p).collect();
             if records.is_empty() {
-                if self.db.remove::<KadProviderRecords>(&key).is_ok() {
+                if match self.kad_type {
+                    KadStoreType::Primary => self.db.remove::<KadProviderRecords>(&key),
+                    KadStoreType::Worker => self.db.remove::<KadWorkerProviderRecords>(&key),
+                }
+                .is_ok()
+                {
                     // Provider is empty and we removed it so dec num_providers.
                     self.num_providers -= 1;
                 }
             } else {
-                let _ = self.db.insert::<KadProviderRecords>(&key, &encode(&records));
+                let _ = match self.kad_type {
+                    KadStoreType::Primary => {
+                        self.db.insert::<KadProviderRecords>(&key, &encode(&records))
+                    }
+                    KadStoreType::Worker => {
+                        self.db.insert::<KadWorkerProviderRecords>(&key, &encode(&records))
+                    }
+                };
             }
         }
     }
@@ -506,8 +550,8 @@ mod test {
         let db = open_db(tmp_dir.path());
         let key_config =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
-        let mut kad_store = KadStore::new(db.clone(), &key_config, PRIMARY_KAD_STORE_INDEX);
-        let mut kad_store_worker = KadStore::new(db, &key_config, WORKER_KAD_STORE_INDEX);
+        let mut kad_store = KadStore::new(db.clone(), &key_config, KadStoreType::Primary);
+        let mut kad_store_worker = KadStore::new(db, &key_config, KadStoreType::Worker);
 
         let rec = test_record(false);
         let rec2 = test_record(false);
