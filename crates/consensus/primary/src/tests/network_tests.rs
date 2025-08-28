@@ -37,12 +37,10 @@ fn test_missing_certs_request() {
     assert_eq!(expected_skip_rounds, decoded_skip_rounds);
 }
 
-/// The type for holding testng components.
+/// The type for holding testing components.
 struct TestTypes<DB = MemDatabase> {
     /// Committee committee with authorities that vote.
     committee: CommitteeFixture<DB>,
-    // /// The authority that receives messages.
-    // authority: &'a AuthorityFixture<DB>,
     /// The handler for requests.
     handler: RequestHandler<DB>,
     /// The parent execution result for all primary headers.
