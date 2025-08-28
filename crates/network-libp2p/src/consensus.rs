@@ -843,9 +843,18 @@ where
                                 return Ok(());
                             }
 
-                            self.inbound_requests.insert(request_id, notify);
+                            // store the request and cancel duplicate requests
+                            //
+                            // NOTE: the request id is internally generated, so this should not
+                            // happen
+                            if let Some(channel) = self.inbound_requests.insert(request_id, notify)
+                            {
+                                // cancel if this is a duplicate request
+                                warn!(target: "network", ?peer, "duplicate request id from peer");
+                                let _ = channel.send(());
+                            }
                         } else if let Err(e) = self.event_stream.try_send(NetworkEvent::Error(
-                            "peer not currently known".to_string(),
+                            "requesting peer unknown".to_string(),
                             channel,
                         )) {
                             error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
@@ -864,8 +873,7 @@ where
                         let _ = self
                             .outbound_requests
                             .remove(&(peer, request_id))
-                            .ok_or(NetworkError::PendingOutboundRequestChannelLost)?
-                            .send(Ok(response));
+                            .map(|ack| ack.send(Ok(response)));
                     }
                 }
             }
@@ -886,8 +894,7 @@ where
                 let _ = self
                     .outbound_requests
                     .remove(&(peer, request_id))
-                    .ok_or(NetworkError::PendingOutboundRequestChannelLost)?
-                    .send(Err(error.into()));
+                    .map(|ack| ack.send(Err(error.into())));
             }
             ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
                 debug!(target: "network", ?peer, ?error, "Inbound failure for req/res");
@@ -1001,8 +1008,7 @@ where
                     let _ = self
                         .outbound_requests
                         .remove(&k)
-                        .ok_or(NetworkError::PendingOutboundRequestChannelLost)?
-                        .send(Err(NetworkError::Disconnected));
+                        .map(|ack| ack.send(Err(NetworkError::Disconnected)));
                 }
             }
             PeerEvent::DisconnectPeerX(peer_id, peer_exchange) => {
