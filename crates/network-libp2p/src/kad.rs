@@ -3,6 +3,7 @@
 use std::{
     borrow::Cow,
     fmt, iter,
+    marker::PhantomData,
     time::{Instant, SystemTime},
 };
 
@@ -17,7 +18,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::{serde_as, DeserializeAs, SerializeAs};
 use tn_config::KeyConfig;
 use tn_storage::tables::{KadProviderRecords, KadRecords};
-use tn_types::{decode, encode, BlockHash, DBIter, Database, DefaultHashFunction};
+use tn_types::{decode, encode, BlockHash, Database, DefaultHashFunction};
 
 /// A record stored in the DHT.
 /// This is a "shadow" struct for a kad Record so we can serialize/deserialize
@@ -143,8 +144,13 @@ fn instant_to_system(expires: &Option<Instant>) -> Option<SystemTime> {
     }
 }
 
+/// Index used for as a DB desciminate for primary network KAD records.
+pub const PRIMARY_KAD_STORE_INDEX: u32 = 0;
+/// Index used for as a DB desciminate for worker network KAD records.
+pub const WORKER_KAD_STORE_INDEX: u32 = 1;
+
 /// Provide a persistant store for kademlia data.
-/// Wraps arounf the consensus DB.
+/// Wraps around the consensus DB.
 #[derive(Clone, Debug)]
 pub struct KadStore<DB> {
     db: DB,
@@ -158,29 +164,68 @@ pub struct KadStore<DB> {
     num_records: usize,
     /// Tracks to number of provider records in DB.
     num_providers: usize,
+    /// Index used for database retrieval with multiple KAD tables.
+    kad_index: u32,
 }
 
 impl<DB: Database> KadStore<DB> {
     /// Create a new KadStore backed by db.
-    pub fn new(db: DB, key_config: &KeyConfig) -> Self {
+    pub fn new(db: DB, key_config: &KeyConfig, kad_index: u32) -> Self {
         let node_key = RecordKey::new(&encode(&key_config.primary_public_key()));
         // Defaults for sanity.
         let config = MemoryStoreConfig::default();
-        let num_records = db.iter::<KadRecords>().count();
-        let num_providers = db.iter::<KadProviderRecords>().count();
-        Self { db, node_key, config, num_records, num_providers }
+        let num_records = db.iter::<KadRecords>().filter(|((i, _), _)| *i == kad_index).count();
+        let num_providers =
+            db.iter::<KadProviderRecords>().filter(|((i, _), _)| *i == kad_index).count();
+        Self { db, node_key, config, num_records, num_providers, kad_index }
     }
 
-    fn key_to_hash(key: &RecordKey) -> BlockHash {
+    fn key_to_hash(&self, key: &RecordKey) -> (u32, BlockHash) {
         let mut h = DefaultHashFunction::new();
         h.update(encode(key).as_ref());
-        BlockHash::from_slice(h.finalize().as_bytes())
+        (self.kad_index, BlockHash::from_slice(h.finalize().as_bytes()))
     }
 }
 
+/// Iterator of KAD records.
+pub struct RecordIter<'a> {
+    //db_iter: DBIter<'a, KadRecords>,
+    //kad_index: u32,
+    data: Vec<Vec<u8>>,
+    idx: usize,
+    _casper: PhantomData<Cow<'a, Record>>,
+}
+
+impl<'a> std::fmt::Debug for RecordIter<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Record Iterator")
+    }
+}
+
+impl<'a> Iterator for RecordIter<'a> {
+    type Item = Cow<'a, Record>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(r) = self.data.get(self.idx) {
+            self.idx += 1;
+            let r: KadRecord = decode(r.as_ref());
+            Some(Cow::Owned(r.into()))
+        } else {
+            None
+        }
+        /*while let Some(((i, _), r)) = self.db_iter.next() {
+            if i == self.kad_index {
+                let r: KadRecord = decode(r.as_ref());
+                return Some(Cow::Owned(r.into()));
+            }
+        }
+        NoneXXXX*/
+    }
+}
+
+// XXXX 699
 impl<DB: Database> RecordStore for KadStore<DB> {
-    type RecordsIter<'a> =
-        iter::Map<DBIter<'a, KadRecords>, fn((BlockHash, Vec<u8>)) -> Cow<'a, Record>>;
+    type RecordsIter<'a> = RecordIter<'a>;
 
     type ProvidedIter<'a> = iter::Map<
         std::vec::IntoIter<ProviderRecord>,
@@ -188,7 +233,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     >;
 
     fn get(&self, k: &RecordKey) -> Option<Cow<'_, Record>> {
-        let key = Self::key_to_hash(k);
+        let key = self.key_to_hash(k);
         let record = self.db.get::<KadRecords>(&key).ok()?;
         record.map(|r| {
             let r: KadRecord = decode(r.as_ref());
@@ -201,7 +246,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             return Err(Error::ValueTooLarge);
         }
 
-        let key = Self::key_to_hash(&r.key);
+        let key = self.key_to_hash(&r.key);
         let kr: KadRecord = r.into();
         if self.num_records >= self.config.max_records {
             return Err(Error::MaxRecords);
@@ -213,7 +258,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     }
 
     fn remove(&mut self, k: &RecordKey) {
-        let key = Self::key_to_hash(k);
+        let key = self.key_to_hash(k);
         if self.db.remove::<KadRecords>(&key).is_ok() {
             // Record was removed so dec num_records.
             self.num_records -= 1;
@@ -221,17 +266,20 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     }
 
     fn records(&self) -> Self::RecordsIter<'_> {
-        self.db.iter::<KadRecords>().map(|(_, r)| {
-            let r: KadRecord = decode(r.as_ref());
-            Cow::Owned(r.into())
-        })
+        let data = self
+            .db
+            .iter::<KadRecords>()
+            .filter_map(|((i, _), r)| if i == self.kad_index { Some(r) } else { None })
+            .collect();
+        //RecordIter { db_iter, kad_index: self.kad_index }
+        RecordIter { data, idx: 0, _casper: PhantomData::default() }
     }
 
     fn add_provider(&mut self, record: ProviderRecord) -> libp2p::kad::store::Result<()> {
         if self.config.max_provided_keys == self.num_providers {
             return Err(Error::MaxProvidedKeys);
         }
-        let key = Self::key_to_hash(&record.key);
+        let key = self.key_to_hash(&record.key);
         let kr: KadProviderRecord = record.into();
         let mut inc_providers = false;
         let records: Vec<KadProviderRecord> =
@@ -267,7 +315,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     }
 
     fn providers(&self, key: &RecordKey) -> Vec<ProviderRecord> {
-        let key = Self::key_to_hash(key);
+        let key = self.key_to_hash(key);
         if let Ok(Some(recs)) = self.db.get::<KadProviderRecords>(&key) {
             let records: Vec<KadProviderRecord> = decode(&recs);
             let records: Vec<ProviderRecord> = records.into_iter().map(|r| r.into()).collect();
@@ -284,7 +332,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     }
 
     fn remove_provider(&mut self, key: &RecordKey, p: &PeerId) {
-        let key = Self::key_to_hash(key);
+        let key = self.key_to_hash(key);
         if let Ok(Some(recs)) = self.db.get::<KadProviderRecords>(&key) {
             let records: Vec<KadProviderRecord> = decode(&recs);
             let records: Vec<KadProviderRecord> =
@@ -367,7 +415,7 @@ mod test {
     use rand::{rngs::StdRng, SeedableRng as _};
     use tempfile::TempDir;
     use tn_config::KeyConfig;
-    use tn_storage::open_network_db;
+    use tn_storage::open_db;
     use tn_types::{decode, encode, BlsKeypair};
 
     use super::*;
@@ -455,10 +503,11 @@ mod test {
     #[test]
     fn test_kad_store() {
         let tmp_dir = TempDir::new().expect("temp dir");
-        let db = open_network_db(tmp_dir.path());
+        let db = open_db(tmp_dir.path());
         let key_config =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
-        let mut kad_store = KadStore::new(db, &key_config);
+        let mut kad_store = KadStore::new(db.clone(), &key_config, PRIMARY_KAD_STORE_INDEX);
+        let mut kad_store_worker = KadStore::new(db, &key_config, WORKER_KAD_STORE_INDEX);
 
         let rec = test_record(false);
         let rec2 = test_record(false);
@@ -467,19 +516,32 @@ mod test {
         assert!(kad_store.get(&rec.key).is_none());
         assert_eq!(kad_store.records().count(), 0);
         kad_store.put(rec.clone()).expect("put record");
+        kad_store_worker.put(rec.clone()).expect("put record");
         test_rec(&rec, &kad_store);
+        test_rec(&rec, &kad_store_worker);
         assert_eq!(kad_store.records().count(), 1);
+        assert_eq!(kad_store_worker.records().count(), 1);
 
         kad_store.remove(&rec.key);
-        assert!(kad_store.get(&rec.key).is_none());
+        test_rec(&rec, &kad_store_worker);
         assert_eq!(kad_store.records().count(), 0);
+        assert_eq!(kad_store_worker.records().count(), 1);
+        kad_store_worker.remove(&rec.key);
+        assert!(kad_store.get(&rec.key).is_none());
+        assert!(kad_store_worker.get(&rec.key).is_none());
+        assert_eq!(kad_store.records().count(), 0);
+        assert_eq!(kad_store_worker.records().count(), 0);
 
         kad_store.put(rec.clone()).expect("put record");
+        kad_store_worker.put(rec.clone()).expect("put record");
         kad_store.put(rec2.clone()).expect("put record");
         kad_store.put(rec3.clone()).expect("put record");
         assert_eq!(kad_store.num_records, 3);
+        assert_eq!(kad_store_worker.num_records, 1);
         assert_eq!(kad_store.records().count(), 3);
+        assert_eq!(kad_store_worker.records().count(), 1);
         test_rec(&rec, &kad_store);
+        test_rec(&rec, &kad_store_worker);
         test_rec(&rec2, &kad_store);
         test_rec(&rec3, &kad_store);
 
@@ -512,6 +574,21 @@ mod test {
         assert_eq!(kad_store.providers(&provider_rec2.key).len(), 1);
         assert_eq!(kad_store.providers(&provider_rec3.key).len(), 1);
 
+        assert_eq!(kad_store_worker.num_providers, 0);
+        assert_eq!(kad_store_worker.provided().count(), 0);
+        kad_store_worker.add_provider(provider_rec1.clone()).expect("add provider");
+        kad_store_worker.add_provider(provider_rec2.clone()).expect("add provider");
+        kad_store_worker.add_provider(provider_rec3.clone()).expect("add provider");
+        assert_eq!(kad_store_worker.num_providers, 3);
+        assert_eq!(kad_store_worker.provided().count(), 1);
+        kad_store_worker.add_provider(provider_rec1_1.clone()).expect("add provider");
+        kad_store_worker.add_provider(provider_rec1_2.clone()).expect("add provider");
+        assert_eq!(kad_store_worker.num_providers, 3);
+        assert_eq!(kad_store_worker.provided().count(), 3);
+        assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 3);
+        assert_eq!(kad_store_worker.providers(&provider_rec2.key).len(), 1);
+        assert_eq!(kad_store_worker.providers(&provider_rec3.key).len(), 1);
+
         let recs_1 = kad_store.providers(&provider_rec1.key);
         assert_eq!(recs_1.len(), 3);
         assert_eq!(recs_1[0], provider_rec1);
@@ -530,6 +607,18 @@ mod test {
         assert_eq!(kad_store.provided().count(), 3);
         assert_eq!(kad_store.providers(&provider_rec1.key).len(), 3);
 
+        kad_store_worker.remove_provider(&provider_rec1_1.key, &provider_rec1_1.provider);
+        assert_eq!(kad_store_worker.num_providers, 3);
+        assert_eq!(kad_store_worker.provided().count(), 2);
+        assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 2);
+        kad_store_worker.add_provider(provider_rec1_1.clone()).expect("add provider");
+        assert_eq!(kad_store_worker.provided().count(), 3);
+        assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 3);
+        kad_store_worker.add_provider(provider_rec1_1.clone()).expect("add provider");
+        assert_eq!(kad_store_worker.num_providers, 3);
+        assert_eq!(kad_store_worker.provided().count(), 3);
+        assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 3);
+
         kad_store.remove_provider(&provider_rec1.key, &provider_rec1.provider);
         assert_eq!(kad_store.num_providers, 3);
         kad_store.remove_provider(&provider_rec1_1.key, &provider_rec1_1.provider);
@@ -542,10 +631,26 @@ mod test {
         assert_eq!(kad_store.num_providers, 1);
         assert_eq!(kad_store.providers(&provider_rec2.key).len(), 0);
 
+        kad_store_worker.remove_provider(&provider_rec1.key, &provider_rec1.provider);
+        assert_eq!(kad_store_worker.num_providers, 3);
+        kad_store_worker.remove_provider(&provider_rec1_1.key, &provider_rec1_1.provider);
+        assert_eq!(kad_store_worker.num_providers, 3);
+        kad_store_worker.remove_provider(&provider_rec1_2.key, &provider_rec1_2.provider);
+        assert_eq!(kad_store_worker.num_providers, 2);
+        assert_eq!(kad_store_worker.provided().count(), 0);
+        assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 0);
+        kad_store_worker.remove_provider(&provider_rec2.key, &provider_rec2.provider);
+        assert_eq!(kad_store_worker.num_providers, 1);
+        assert_eq!(kad_store_worker.providers(&provider_rec2.key).len(), 0);
+
         // Bogus remove, mismatches key and provider.
         kad_store.remove_provider(&provider_rec3.key, &provider_rec2.provider);
         assert_eq!(kad_store.num_providers, 1);
         kad_store.remove_provider(&provider_rec3.key, &provider_rec3.provider);
         assert_eq!(kad_store.num_providers, 0);
+        kad_store_worker.remove_provider(&provider_rec3.key, &provider_rec2.provider);
+        assert_eq!(kad_store_worker.num_providers, 1);
+        kad_store_worker.remove_provider(&provider_rec3.key, &provider_rec3.provider);
+        assert_eq!(kad_store_worker.num_providers, 0);
     }
 }

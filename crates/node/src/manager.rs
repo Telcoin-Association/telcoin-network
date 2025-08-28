@@ -33,7 +33,7 @@ use tn_reth::{
     CanonStateNotificationStream, RethDb, RethEnv,
 };
 use tn_storage::{
-    open_db, open_network_db,
+    open_db,
     tables::{
         CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
         ConsensusBlockNumbersByDigest, ConsensusBlocks, LastProposed, Payload, Votes,
@@ -237,7 +237,7 @@ where
 
         // read the network config or use the default
         let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
-        self.spawn_node_networks(node_task_spawner, &network_config).await?;
+        self.spawn_node_networks(node_task_spawner, &network_config, consensus_db.clone()).await?;
 
         // start consensus metrics for the epoch
         let metrics_shutdown = Notifier::new();
@@ -293,27 +293,28 @@ where
     /// epoch.
     ///
     /// This will create the long-running primary/worker [ConsensusNetwork]s for p2p swarm.
-    async fn spawn_node_networks(
+    async fn spawn_node_networks<DB: TNDatabase>(
         &mut self,
         node_task_spawner: TaskSpawner,
         network_config: &NetworkConfig,
+        db: DB,
     ) -> eyre::Result<()> {
         //
         //=== PRIMARY
         //
 
         // create network db
-        let primary_network_db = self.tn_datadir.network_db_path().join("primary");
-        let _ = std::fs::create_dir_all(&primary_network_db);
-        info!(target: "epoch-manager", ?primary_network_db, "opening primary network storage at:");
-        let primary_network_db = open_network_db(primary_network_db);
+        //XXXXlet primary_network_db = self.tn_datadir.network_db_path().join("primary");
+        //let _ = std::fs::create_dir_all(&primary_network_db);
+        //info!(target: "epoch-manager", ?primary_network_db, "opening primary network storage
+        // at:"); let primary_network_db = open_network_db(primary_network_db);
 
         // create long-running network task for primary
         let primary_network = ConsensusNetwork::new_for_primary(
             network_config,
             self.consensus_bus.primary_network_events_actual(),
             self.key_config.clone(),
-            primary_network_db,
+            db.clone(),
             node_task_spawner.clone(),
         )?;
         let primary_network_handle = primary_network.network_handle();
@@ -342,17 +343,17 @@ where
         //let (tmp_event_stream, _temp_rx) = mpsc::channel(1000);
 
         // create network db
-        let worker_network_db = self.tn_datadir.network_db_path().join("worker");
-        let _ = std::fs::create_dir_all(&worker_network_db);
-        info!(target: "epoch-manager", ?worker_network_db, "opening worker network storage at:");
-        let worker_network_db = open_network_db(worker_network_db);
+        //XXXXlet worker_network_db = self.tn_datadir.network_db_path().join("worker");
+        //let _ = std::fs::create_dir_all(&worker_network_db);
+        //info!(target: "epoch-manager", ?worker_network_db, "opening worker network storage at:");
+        //let worker_network_db = open_network_db(worker_network_db);
 
         // create long-running network task for worker
         let worker_network = ConsensusNetwork::new_for_worker(
             network_config,
             self.worker_event_stream.clone(),
             self.key_config.clone(),
-            worker_network_db,
+            db,
             node_task_spawner.clone(),
         )?;
         let worker_network_handle = worker_network.network_handle();

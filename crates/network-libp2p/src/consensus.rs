@@ -5,7 +5,7 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
-    kad::{KadRecord, KadStore},
+    kad::{KadRecord, KadStore, PRIMARY_KAD_STORE_INDEX, WORKER_KAD_STORE_INDEX},
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     types::{
@@ -176,7 +176,15 @@ where
         task_manager: TaskSpawner,
     ) -> NetworkResult<Self> {
         let network_key = key_config.primary_network_keypair().clone();
-        Self::new(network_config, event_stream, key_config, network_key, db, task_manager)
+        Self::new(
+            network_config,
+            event_stream,
+            key_config,
+            network_key,
+            db,
+            task_manager,
+            PRIMARY_KAD_STORE_INDEX,
+        )
     }
 
     /// Convenience method for spawning a worker network instance.
@@ -188,7 +196,15 @@ where
         task_manager: TaskSpawner,
     ) -> NetworkResult<Self> {
         let network_key = key_config.worker_network_keypair().clone();
-        Self::new(network_config, event_stream, key_config, network_key, db, task_manager)
+        Self::new(
+            network_config,
+            event_stream,
+            key_config,
+            network_key,
+            db,
+            task_manager,
+            WORKER_KAD_STORE_INDEX,
+        )
     }
 
     /// Create a new instance of Self.
@@ -199,6 +215,7 @@ where
         keypair: NetworkKeypair,
         db: DB,
         task_spawner: TaskSpawner,
+        kad_index: u32,
     ) -> NetworkResult<Self> {
         let identify_config = identify::Config::new(
             network_config.libp2p_config().identify_protocol().to_string(),
@@ -241,7 +258,7 @@ where
             .set_publication_interval(twelve_hours)
             .set_query_timeout(Duration::from_secs(60))
             .set_provider_record_ttl(two_days);
-        let kad_store = KadStore::new(db.clone(), &key_config);
+        let kad_store = KadStore::new(db.clone(), &key_config, kad_index);
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store, kad_config);
 
         // create custom behavior

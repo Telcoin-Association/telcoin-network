@@ -153,14 +153,6 @@ impl MemDatabase {
             }
         }
     }
-
-    /// Create a new instance of [Self] with network tables.
-    pub fn new_for_network() -> Self {
-        let db = Self::new();
-        db.open_table::<crate::tables::KadRecords>();
-        db.open_table::<crate::tables::KadProviderRecords>();
-        db
-    }
 }
 
 impl Default for MemDatabase {
@@ -175,6 +167,8 @@ impl Default for MemDatabase {
         db.open_table::<crate::tables::Batches>();
         db.open_table::<crate::tables::ConsensusBlocks>();
         db.open_table::<crate::tables::ConsensusBlockNumbersByDigest>();
+        db.open_table::<crate::tables::KadRecords>();
+        db.open_table::<crate::tables::KadProviderRecords>();
         db
     }
 }
