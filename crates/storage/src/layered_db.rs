@@ -75,7 +75,7 @@ fn db_run<DB: Database>(db: DB, rx: Receiver<DBMessage<DB>>) {
     let mut txn = None;
     let mut last_compact = Instant::now();
     if let Err(e) = db.compact() {
-        tracing::error!("DB ERROR compacting DB on startup (background): {e}");
+        tracing::error!(target: "layered_db_runner", "DB ERROR compacting DB on startup (background): {e}");
     }
     while let Ok(msg) = rx.recv() {
         match msg {
@@ -85,7 +85,9 @@ fn db_run<DB: Database>(db: DB, rx: Receiver<DBMessage<DB>>) {
                 } else {
                     match db.write_txn() {
                         Ok(ntxn) => txn = Some((ntxn, 1)),
-                        Err(e) => tracing::error!("DB ERROR getting write txn (background): {e}"),
+                        Err(e) => {
+                            tracing::error!(target: "layered_db_runner", "DB ERROR getting write txn (background): {e}")
+                        }
                     }
                 }
             }
@@ -93,7 +95,7 @@ fn db_run<DB: Database>(db: DB, rx: Receiver<DBMessage<DB>>) {
                 if let Some((current_txn, count)) = txn.take() {
                     if count <= 1 {
                         if let Err(e) = current_txn.commit() {
-                            tracing::error!("DB TXN Commit: {e}")
+                            tracing::error!(target: "layered_db_runner", "DB TXN Commit: {e}")
                         }
                     } else {
                         txn = Some((current_txn, count - 1));
@@ -103,28 +105,28 @@ fn db_run<DB: Database>(db: DB, rx: Receiver<DBMessage<DB>>) {
             DBMessage::Insert(ins) => {
                 if let Some((txn, _)) = &mut txn {
                     if let Err(e) = ins.insert_txn(txn) {
-                        tracing::error!("DB TXN Insert: {e}")
+                        tracing::error!(target: "layered_db_runner", "DB TXN Insert: {e}")
                     }
                 } else if let Err(e) = ins.insert(&db) {
-                    tracing::error!("DB Insert: {e}")
+                    tracing::error!(target: "layered_db_runner", "DB Insert: {e}")
                 }
             }
             DBMessage::Remove(rm) => {
                 if let Some((txn, _)) = &mut txn {
                     if let Err(e) = rm.remove_txn(txn) {
-                        tracing::error!("DB TXN Remove: {e}")
+                        tracing::error!(target: "layered_db_runner", "DB TXN Remove: {e}")
                     }
                 } else if let Err(e) = rm.remove(&db) {
-                    tracing::error!("DB Remove: {e}")
+                    tracing::error!(target: "layered_db_runner", "DB Remove: {e}")
                 }
             }
             DBMessage::Clear(clr) => {
                 if let Some((txn, _)) = &mut txn {
                     if let Err(e) = clr.clear_table_txn(txn) {
-                        tracing::error!("DB TXN Clear table: {e}")
+                        tracing::error!(target: "layered_db_runner", "DB TXN Clear table: {e}")
                     }
                 } else if let Err(e) = clr.clear_table(&db) {
-                    tracing::error!("DB Clear: {e}")
+                    tracing::error!(target: "layered_db_runner", "DB Clear: {e}")
                 }
             }
             DBMessage::Shutdown => break,
@@ -133,11 +135,11 @@ fn db_run<DB: Database>(db: DB, rx: Receiver<DBMessage<DB>>) {
         if last_compact.elapsed() > Duration::from_secs(86_400) {
             last_compact = Instant::now();
             if let Err(e) = db.compact() {
-                tracing::error!("DB ERROR compacting DB (background): {e}");
+                tracing::error!(target: "layered_db_runner", "DB ERROR compacting DB (background): {e}");
             }
         }
     }
-    tracing::info!("Layerd DB thread Shutdown complete");
+    tracing::info!(target: "layered_db_runner", "Layerd DB thread Shutdown complete");
 }
 
 /// Implement the Database trait with an in-memory store.
@@ -156,9 +158,9 @@ pub struct LayeredDatabase<DB: Database> {
 impl<DB: Database> Drop for LayeredDatabase<DB> {
     fn drop(&mut self) {
         if Arc::strong_count(self.thread.as_ref().expect("no db thread!")) == 1 {
-            tracing::info!("LayeredDatabase Dropping, shutting down DB thread");
+            tracing::info!(target: "layered_db", "LayeredDatabase Dropping, shutting down DB thread");
             if let Err(e) = self.tx.send(DBMessage::Shutdown) {
-                tracing::error!("Error while trying to send shutdown to layered DB thread {e}");
+                tracing::error!(target: "layered_db", "Error while trying to send shutdown to layered DB thread {e}");
                 return; // The thread may not shutdown so don't try to join...
             }
             // We can not be here without a thread handle
@@ -167,9 +169,9 @@ impl<DB: Database> Drop for LayeredDatabase<DB> {
                     .expect("only one strong `Arc` reference")
                     .join()
             {
-                tracing::error!("Error while waiting for shutdown of layered DB thread {e:?}");
+                tracing::error!(target: "layered_db", "Error while waiting for shutdown of layered DB thread {e:?}");
             } else {
-                tracing::info!("LayeredDatabase Dropped, DB thread is shutdown");
+                tracing::info!(target: "layered_db", "LayeredDatabase Dropped, DB thread is shutdown");
             }
         }
     }

@@ -3,7 +3,6 @@
 use std::{
     borrow::Cow,
     fmt, iter,
-    marker::PhantomData,
     time::{Instant, SystemTime},
 };
 
@@ -162,7 +161,7 @@ pub struct KadStore<DB> {
     db: DB,
     node_key: RecordKey,
     /// Provide some sanity defaults for store sizing.
-    /// Not bothing to expose these as knobs currenty since they are
+    /// Not bothering to expose these as knobs currenty since they are
     /// basically just here to prevent or mitigate attacks on the Kad store.
     /// Use the same settings as a Kad Memery store.
     config: MemoryStoreConfig,
@@ -201,9 +200,7 @@ impl<DB: Database> KadStore<DB> {
 
 /// Iterator of KAD records.
 pub struct RecordIter<'a> {
-    data: Vec<Vec<u8>>,
-    idx: usize,
-    _casper: PhantomData<Cow<'a, Record>>,
+    iter: Box<dyn Iterator<Item = (BlockHash, Vec<u8>)> + 'a>,
 }
 
 impl<'a> std::fmt::Debug for RecordIter<'a> {
@@ -216,13 +213,11 @@ impl<'a> Iterator for RecordIter<'a> {
     type Item = Cow<'a, Record>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(r) = self.data.get(self.idx) {
-            self.idx += 1;
+        //self.iter.next()self.iter.next()
+        self.iter.next().map(|(_, r)| {
             let r: KadRecord = decode(r.as_ref());
-            Some(Cow::Owned(r.into()))
-        } else {
-            None
-        }
+            Cow::Owned(r.into())
+        })
     }
 }
 
@@ -285,11 +280,11 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     }
 
     fn records(&self) -> Self::RecordsIter<'_> {
-        let data = match self.kad_type {
-            KadStoreType::Primary => self.db.iter::<KadRecords>().map(|(_, r)| r).collect(),
-            KadStoreType::Worker => self.db.iter::<KadWorkerRecords>().map(|(_, r)| r).collect(),
+        let iter = match self.kad_type {
+            KadStoreType::Primary => self.db.iter::<KadRecords>(),
+            KadStoreType::Worker => self.db.iter::<KadWorkerRecords>(),
         };
-        RecordIter { data, idx: 0, _casper: PhantomData }
+        RecordIter { iter }
     }
 
     fn add_provider(&mut self, record: ProviderRecord) -> libp2p::kad::store::Result<()> {

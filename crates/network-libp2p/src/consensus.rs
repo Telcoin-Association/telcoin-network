@@ -5,7 +5,7 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
-    kad::{KadRecord, KadStore, KadStoreType},
+    kad::{KadStore, KadStoreType},
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     types::{
@@ -21,7 +21,7 @@ use libp2p::{
         TopicHash,
     },
     identify::{self, Event as IdentifyEvent, Info as IdentifyInfo},
-    kad::{self, store::RecordStore, Mode, QueryId, Record},
+    kad::{self, store::RecordStore, Mode, QueryId},
     multiaddr::Protocol,
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
@@ -35,7 +35,6 @@ use std::{
     time::Duration,
 };
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
-use tn_storage::tables::KadRecords;
 use tn_types::{
     decode, encode, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
     NetworkPublicKey, TaskSpawner, TnSender,
@@ -259,16 +258,14 @@ where
             .set_query_timeout(Duration::from_secs(60))
             .set_provider_record_ttl(two_days);
         let kad_store = KadStore::new(db.clone(), &key_config, kad_type);
-        let kademlia = kad::Behaviour::with_config(peer_id, kad_store, kad_config);
+        let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
         // create custom behavior
         let mut behavior =
             TNBehavior::new(identify, gossipsub, req_res, kademlia, network_config.peer_config());
 
         // Load the Kad records from DB into the local peer cache.
-        for (_key, record) in db.iter::<KadRecords>() {
-            let record: KadRecord = decode(record.as_ref());
-            let record: Record = record.into();
+        for record in kad_store.records() {
             match BlsPublicKey::from_literal_bytes(record.key.as_ref()) {
                 Ok(key) => {
                     let record: NodeRecord = decode(&record.value);
