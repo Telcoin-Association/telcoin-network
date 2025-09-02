@@ -1,7 +1,10 @@
 //! Primary tests
 
 use crate::{
-    network::{handler::RequestHandler, MissingCertificatesRequest, PrimaryResponse},
+    network::{
+        handler::RequestHandler, MissingCertificatesRequest, PrimaryResponse,
+        MAX_CERTIFICATES_PER_REQUEST,
+    },
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
@@ -571,8 +574,29 @@ async fn test_fetch_certificates_handler() {
         // Check that round 2 and 4 are fetched for the last authority, skipping round 3.
         (1, vec![vec![], vec![], vec![3], vec![3]], 5, vec![2, 2, 2, 4]),
     ];
-    for (lower_bound_round, skip_rounds_vec, max_items, expected_rounds) in test_cases {
+    for (lower_bound_round, skip_rounds_vec, max_items, expected_rounds) in &test_cases {
         let missing_req = MissingCertificatesRequest::default()
+            .set_bounds(
+                *lower_bound_round,
+                authorities
+                    .clone()
+                    .into_iter()
+                    .zip(skip_rounds_vec.iter().map(|rounds| rounds.iter().copied().collect()))
+                    .collect(),
+            )
+            .expect("boundary set")
+            .set_max_items(*max_items);
+        let resp = handler.retrieve_missing_certs(missing_req).await.unwrap();
+        if let PrimaryResponse::RequestedCertificates(certs) = resp {
+            assert_eq!(certs.iter().map(|cert| cert.round()).collect::<Vec<_>>(), *expected_rounds);
+        } else {
+            panic!("did not get certs response!");
+        }
+    }
+
+    // assert error for valid requests that exceeds max items
+    for (lower_bound_round, skip_rounds_vec, _max_items, _expected_rounds) in test_cases {
+        let too_big = MissingCertificatesRequest::default()
             .set_bounds(
                 lower_bound_round,
                 authorities
@@ -582,13 +606,9 @@ async fn test_fetch_certificates_handler() {
                     .collect(),
             )
             .expect("boundary set")
-            .set_max_items(max_items);
-        let resp = handler.retrieve_missing_certs(missing_req).await.unwrap();
-        if let PrimaryResponse::RequestedCertificates(certs) = resp {
-            assert_eq!(certs.iter().map(|cert| cert.round()).collect::<Vec<_>>(), expected_rounds);
-        } else {
-            panic!("did not get certs response!");
-        }
+            .set_max_items(MAX_CERTIFICATES_PER_REQUEST + 1);
+        let resp = handler.retrieve_missing_certs(too_big).await;
+        assert!(resp.is_err());
     }
 }
 

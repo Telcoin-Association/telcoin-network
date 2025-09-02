@@ -111,9 +111,9 @@ impl Batch {
         }
     }
 
-    /// Size of the batch.
+    /// Size of the batch in bytes (including transactions).
     pub fn size(&self) -> usize {
-        size_of::<Self>()
+        size_of::<Self>() + self.transactions.iter().map(|tx| tx.len()).sum::<usize>()
     }
 
     /// Digest for this batch (the hash of the sealed header).
@@ -272,4 +272,7 @@ pub enum BatchValidationError {
     /// The batch contains blob transactions EIP-4844.
     #[error("Proposed batch contains blob transaction. Tx hash: {0}")]
     InvalidTx4844(BlockHash),
+    /// The total allowable gas in the batch exceeds `u64::MAX`.
+    #[error("Overflow calculating max possible gas.")]
+    GasOverflow,
 }

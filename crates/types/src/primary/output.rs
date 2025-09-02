@@ -112,12 +112,14 @@ impl ConsensusOutput {
         ConsensusHeader::digest_from_parts(self.parent_hash, &self.sub_dag, self.number)
     }
 
-    /// Return the index of the last batch if the epoch should be closed.
+    /// Return a `bool` if this is the last batch of the last output for the epoch.
     ///
     /// This is used by the engine to apply system calls at the end of the epoch.
-    pub fn epoch_closing_index(&self) -> Option<usize> {
-        // handle edge case for no batches at epoch boundary
-        self.close_epoch.then(|| self.batch_digests.len().saturating_sub(1))
+    /// Batches are `popped` in `Self::next_batch_digest`, so check if batches
+    /// are empty to apply system call on last processed batch. This logic also
+    /// works for empty outputs with no batches.
+    pub fn close_epoch_for_last_batch(&self) -> Option<bool> {
+        self.close_epoch.then_some(self.batch_digests.is_empty())
     }
 }
 

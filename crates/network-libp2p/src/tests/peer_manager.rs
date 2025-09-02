@@ -461,8 +461,8 @@ async fn test_process_peer_exchange() {
     let multiaddrs1 = HashSet::from([multiaddr1]);
     let multiaddrs2 = HashSet::from([multiaddr2]);
     let mut rng = StdRng::from_seed([0; 32]);
-    let bls1 = BlsKeypair::generate(&mut rng).public().clone();
-    let bls2 = BlsKeypair::generate(&mut rng).public().clone();
+    let bls1 = *BlsKeypair::generate(&mut rng).public();
+    let bls2 = *BlsKeypair::generate(&mut rng).public();
     let net1: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().clone().into();
     let net2: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().clone().into();
     exchange_map.insert(bls1, (net1, multiaddrs1));
@@ -534,14 +534,14 @@ async fn test_is_validator() {
     let authority_1 = authorities.next().expect("first authority");
     let config = authority_1.consensus_config();
     let mut peer_manager = PeerManager::new(config.network_config().peer_config());
-    let validator = authority_1.authority().protocol_key().clone();
+    let validator = *authority_1.authority().protocol_key();
     let random_peer_id = PeerId::random();
 
     let info = NetworkInfo {
         pubkey: config.key_config().primary_network_public_key(),
         multiaddrs: vec![config.primary_address()],
     };
-    peer_manager.add_known_peer(validator.clone(), info);
+    peer_manager.add_known_peer(validator, info);
 
     // update epoch with random multiaddr
     let committee = config.committee_pub_keys();
@@ -611,7 +611,7 @@ async fn test_peers_for_exchange() {
         let connection = ConnectionType::IncomingConnection { multiaddr };
         assert!(peer_manager.register_peer_connection(&peer_id, connection));
         let mut rng = StdRng::from_seed([i; 32]);
-        let bls = BlsKeypair::generate(&mut rng).public().clone();
+        let bls = *BlsKeypair::generate(&mut rng).public();
         peer_manager
             .add_known_peer(bls, NetworkInfo { pubkey: network_key, multiaddrs: vec![addr] });
     }

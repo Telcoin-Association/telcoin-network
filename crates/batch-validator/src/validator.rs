@@ -173,12 +173,13 @@ impl BatchValidator {
         transactions: &[TransactionSigned],
         timestamp: u64,
     ) -> BatchValidationResult<()> {
-        // calculate total using tx gas limit
-        let total_possible_gas = transactions
-            .iter()
-            .map(|tx| tx.gas_limit())
-            .reduce(|total, size| total + size)
-            .ok_or(BatchValidationError::EmptyBatch)?;
+        // `Self::validate_batch_size_bytes` checks for empty batch
+        //
+        // calculate total using tx gas limit and return error for u64 overflow
+        let total_possible_gas =
+            transactions.iter().map(|tx| tx.gas_limit()).try_fold(0_u64, |total, gas| {
+                total.checked_add(gas).ok_or(BatchValidationError::GasOverflow)
+            })?;
 
         // ensure total tx gas limit fits into block's gas limit
         let max_tx_gas = max_batch_gas(timestamp);
@@ -312,7 +313,8 @@ mod tests {
     async fn test_tools(path: &Path, task_manager: &TaskManager) -> TestTools {
         // genesis with default TransactionFactory funded
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
-        let reth_env = RethEnv::new_for_temp_chain(chain.clone(), path, task_manager).unwrap();
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), path, task_manager, None).unwrap();
         let tx_pool = reth_env.init_txn_pool().unwrap();
         let validator =
             BatchValidator::new(reth_env, Some(tx_pool), 0, BaseFeeContainer::default());
@@ -441,6 +443,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_invalid_batch_gas_overflow() {
+        // Set excessive gas limit.
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
+        let (batch, _) = valid_batch.split();
+
+        // sign excessive transaction
+        let mut tx_factory = TransactionFactory::new();
+        let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
+        let gas_price = 7;
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+
+        // create transaction with max gas limit above the max allowed
+        let u64_max_transaction = tx_factory.create_eip1559_encoded(
+            chain.clone(),
+            Some(u64::MAX),
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let overflow_transaction = tx_factory.create_eip1559_encoded(
+            chain.clone(),
+            Some(1_000),
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let Batch { beneficiary, timestamp, base_fee_per_gas, received_at, parent_hash, .. } =
+            batch;
+        let invalid_batch = Batch {
+            transactions: vec![u64_max_transaction, overflow_transaction],
+            parent_hash,
+            beneficiary,
+            timestamp,
+            base_fee_per_gas,
+            worker_id: 0,
+            received_at,
+        };
+
+        let decoded_txs = validator
+            .decode_transactions(invalid_batch.transactions(), invalid_batch.digest())
+            .expect("txs decode correctly");
+
+        assert_matches!(
+            validator.validate_batch_gas(&decoded_txs, invalid_batch.timestamp),
+            Err(BatchValidationError::GasOverflow)
+        );
+    }
+
+    #[tokio::test]
     async fn test_invalid_batch_wrong_size_in_bytes() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
@@ -525,7 +582,11 @@ mod tests {
 
         let invalid_txs = vec![too_big];
         block.transactions = invalid_txs;
+        // ensure size method correctly accounts for struct+txs
+        assert_eq!(block.size(), 1_000_202);
         let invalid_batch = block.seal_slow();
+        // ensure size method correct accounts for struct+txs+digest
+        assert_eq!(invalid_batch.size(), 1_000_234);
         assert_matches!(
             validator.validate_batch(invalid_batch),
             Err(BatchValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == expected_len

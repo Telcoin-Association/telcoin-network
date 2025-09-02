@@ -62,9 +62,6 @@ pub enum NetworkError {
     /// Libp2p `ResponseChannel` already closed due to timeout or loss of connection.
     #[error("Response channel closed.")]
     SendResponse,
-    /// The oneshot channel for an outbound request was lost. This is not expected to happen.
-    #[error("Pending outbound request channel lost. Unable to return peer's response to original caller.")]
-    PendingOutboundRequestChannelLost,
     /// Failed to send request/response outbound to peer.
     #[error("Outbound failure: {0}")]
     Outbound(#[from] OutboundFailure),

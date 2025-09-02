@@ -694,7 +694,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     let target_addr = target_peer.config.primary_address();
     let target_peer_id = target_peer.network_handle.local_peer_id().await?;
     let target_peer_bls =
-        target_peer.config.authority().as_ref().expect("authority").protocol_key().clone();
+        *target_peer.config.authority().as_ref().expect("authority").protocol_key();
     let target_peer_net = target_peer.config.primary_networkkey();
 
     debug!(target: "network", ?target_peer_id, "target peer");
@@ -730,7 +730,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
             .await?;
 
         // Connect to target
-        peer.network_handle.dial_by_bls(target_peer_bls.clone()).await?;
+        peer.network_handle.dial_by_bls(target_peer_bls).await?;
 
         // Give time for connection to establish
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -870,15 +870,11 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
     let peer2_bls = config_2.key_config().primary_public_key();
 
     peer1
-        .add_explicit_peer(
-            peer2_bls.clone(),
-            config_2.primary_networkkey(),
-            config_2.primary_address(),
-        )
+        .add_explicit_peer(peer2_bls, config_2.primary_networkkey(), config_2.primary_address())
         .await?;
 
     // Connect peers
-    peer1.dial_by_bls(peer2_bls.clone()).await?;
+    peer1.dial_by_bls(peer2_bls).await?;
 
     // Wait a beat for peer2 to recieve peer1 bls key.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1074,7 +1070,7 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
     // Start target peer listening
     target_peer.network_handle.start_listening(target_peer.config.primary_address()).await?;
 
-    let target_bls = target_peer.config.config().primary_bls_key().clone();
+    let target_bls = *target_peer.config.config().primary_bls_key();
     let target_addr = target_peer.config.primary_address();
     let target_net_key = target_peer.config.primary_networkkey();
 
@@ -1083,7 +1079,7 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
         .network_handle
         .subscribe_with_publishers(
             TEST_TOPIC.into(),
-            other_peers.iter().next().unwrap().config.committee_pub_keys(),
+            other_peers.first().unwrap().config.committee_pub_keys(),
         )
         .await?;
 
@@ -1205,7 +1201,7 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     assert_eq!(score, min_score, "Peer2 should have ban-level score");
 
     // Now simulate a new epoch where peer2 is in the committee
-    let committee = vec![config_2.authority().as_ref().expect("authority").protocol_key().clone()]
+    let committee = vec![*config_2.authority().as_ref().expect("authority").protocol_key()]
         .into_iter()
         .collect();
 
@@ -1328,10 +1324,9 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
     peer2.network_handle.start_listening(peer2_addr.clone()).await?;
 
     // Now simulate a new epoch where peer2 is in the committee with the same IP as banned peer1
-    let committee =
-        vec![peer2.config.authority().as_ref().expect("authority").protocol_key().clone()]
-            .into_iter()
-            .collect();
+    let committee = vec![*peer2.config.authority().as_ref().expect("authority").protocol_key()]
+        .into_iter()
+        .collect();
     let handle = target_peer.network_handle.clone();
     let (new_event_stream, _rx) = mpsc::channel(100);
     tokio::spawn(async move {
@@ -1382,13 +1377,13 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     let peer2_bls = config_2.key_config().primary_public_key();
     peer1
         .add_explicit_peer(
-            peer2_bls.clone(),
+            peer2_bls,
             config_2.key_config().primary_network_public_key(),
             config_2.primary_address(),
         )
         .await?;
     // Connect peers
-    peer1.dial_by_bls(peer2_bls.clone()).await?;
+    peer1.dial_by_bls(peer2_bls).await?;
 
     // Wait for connection to establish
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1401,7 +1396,7 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     // We need to apply penalties but not enough to cause immediate ban
     // First apply medium penalties
     for _ in 0..3 {
-        peer1.report_penalty(peer2_bls.clone(), Penalty::Medium).await;
+        peer1.report_penalty(peer2_bls, Penalty::Medium).await;
     }
 
     // Then apply a severe penalty - should trigger disconnect pending ban
@@ -1411,7 +1406,7 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Now simulate a new epoch where peer2 is in the committee
-    let committee = vec![config_2.authority().as_ref().expect("authority").protocol_key().clone()]
+    let committee = vec![*config_2.authority().as_ref().expect("authority").protocol_key()]
         .into_iter()
         .collect();
 
@@ -1435,7 +1430,7 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
 
     // Try reconnecting peer2 if it was disconnected during the process
     if !peer1.connected_peer_ids().await?.contains(&peer2_id) {
-        let dial_result = peer1.dial_by_bls(peer2_bls.clone()).await;
+        let dial_result = peer1.dial_by_bls(peer2_bls).await;
         assert!(dial_result.is_ok(), "Should be able to reconnect to peer2 after new epoch");
 
         // Wait for connection to reestablish
@@ -1501,7 +1496,7 @@ async fn test_get_kad_records() -> eyre::Result<()> {
         // Connect to target
         peer.network_handle
             .add_trusted_peer_and_dial(
-                target_peer_bls.clone(),
+                target_peer_bls,
                 target_peer_net.clone(),
                 target_addr.clone(),
             )
@@ -1545,7 +1540,7 @@ async fn test_get_kad_records() -> eyre::Result<()> {
     // add target peer as authorized publisher
     nvv.subscribe_with_publishers(
         TEST_TOPIC.into(),
-        vec![target_peer.config.authority().as_ref().expect("authority").protocol_key().clone()]
+        vec![*target_peer.config.authority().as_ref().expect("authority").protocol_key()]
             .into_iter()
             .collect(),
     )
