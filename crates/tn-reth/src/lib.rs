@@ -1081,15 +1081,14 @@ impl RethEnv {
         let issuance_runtimecode =
             hex::decode(issuance_json_binding.as_str().ok_or_eyre("invalid issuance json")?)?;
         let genesis = genesis.extend_accounts([
-            
             (blsg1_address, GenesisAccount::default().with_code(Some(blsg1_runtimecode.into()))),
             (
-                    CONSENSUS_REGISTRY_ADDRESS,
-                    GenesisAccount::default()
-                        .with_balance(U256::from(total_stake_balance))
-                        .with_code(Some(registry_runtimecode.into()))
-                        .with_storage(tmp_registry_storage),
-                ),
+                CONSENSUS_REGISTRY_ADDRESS,
+                GenesisAccount::default()
+                    .with_balance(U256::from(total_stake_balance))
+                    .with_code(Some(registry_runtimecode.into()))
+                    .with_storage(tmp_registry_storage),
+            ),
             (
                 ISSUANCE_ADDRESS,
                 GenesisAccount::default().with_code(Some(issuance_runtimecode.into())),

@@ -21,7 +21,7 @@ pub const ERC1967PROXY_JSON: &str =
     include_str!("../../../tn-contracts/artifacts/ERC1967Proxy.json");
 pub const BLSG1_JSON: &str = include_str!("../../../tn-contracts/artifacts/BlsG1.json");
 pub const ITS_CFG_YAML: &str =
-    include_str!("../../../tn-contracts/deployments/genesis/its-config.yaml");
+    include_str!("../../../tn-contracts/deployments/genesis/precompile-config.yaml");
 pub const GOVERNANCE_SAFE_ADDRESS: Address = address!("00000000000000000000000000000000000007a0");
 pub const ISSUANCE_ADDRESS: Address = address!("07a07a07a07a07a07a07a07a07a07a07a07a07a0");
 

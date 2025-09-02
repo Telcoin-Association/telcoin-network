@@ -4,7 +4,9 @@
 //! however, the RPC calls don't work. The beginning of the test is left
 //! because the proxy version may be re-prioritized later.
 use crate::util::{spawn_local_testnet, IT_TEST_MUTEX};
-use alloy::{hex, network::EthereumWallet, primitives::utils::parse_ether, providers::ProviderBuilder};
+use alloy::{
+    hex, network::EthereumWallet, primitives::utils::parse_ether, providers::ProviderBuilder,
+};
 use core::panic;
 use eyre::OptionExt;
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
@@ -12,7 +14,8 @@ use serde_json::Value;
 use std::time::Duration;
 use telcoin_network::args::clap_u256_parser_to_18_decimals;
 use tn_config::{
-    NetworkGenesis, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, DEPLOYMENTS_JSON, ISSUANCE_ADDRESS, ISSUANCE_JSON
+    NetworkGenesis, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, DEPLOYMENTS_JSON, ISSUANCE_ADDRESS,
+    ISSUANCE_JSON,
 };
 use tn_reth::{
     system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS},
@@ -162,7 +165,8 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
         CONSENSUS_REGISTRY_JSON,
         Some("deployedBytecode.object"),
     )?;
-    let unlinked_runtimecode = registry_runtimecode_binding.as_str().ok_or_eyre("Couldn't fetch bytecode")?;
+    let unlinked_runtimecode =
+        registry_runtimecode_binding.as_str().ok_or_eyre("Couldn't fetch bytecode")?;
     let tao_address_binding = RethEnv::fetch_value_from_json_str(DEPLOYMENTS_JSON, Some("Safe"))?;
     let tao_address =
         Address::from_hex(tao_address_binding.as_str().ok_or_eyre("Safe owner address")?)?;
@@ -172,7 +176,8 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
 
     let blsg1_runtimecode_binding =
         RethEnv::fetch_value_from_json_str(BLSG1_JSON, Some("deployedBytecode.object"))?;
-    let blsg1_deployed_bytecode = blsg1_runtimecode_binding.as_str().ok_or_eyre("invalid blsg1 json")?;
+    let blsg1_deployed_bytecode =
+        blsg1_runtimecode_binding.as_str().ok_or_eyre("invalid blsg1 json")?;
 
     let issuance_json_val =
         RethEnv::fetch_value_from_json_str(ISSUANCE_JSON, Some("deployedBytecode.object"))?;
@@ -208,9 +213,18 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
         .request("eth_getCode", rpc_params!(blsg1_address))
         .await
         .expect("Failed to fetch BLS G1 bytecode");
-    assert_eq!(Bytes::from_hex(&returned_registry_bytecode)?, Bytes::from(registry_deployed_bytecode));
-    assert_eq!(Bytes::from_hex(&returned_issuance_bytecode)?, Bytes::from_hex(issuance_deployed_bytecode)?);
-    assert_eq!(Bytes::from_hex(&returned_blsg1_bytecode)?, Bytes::from_hex(blsg1_deployed_bytecode)?);
+    assert_eq!(
+        Bytes::from_hex(&returned_registry_bytecode)?,
+        Bytes::from(registry_deployed_bytecode)
+    );
+    assert_eq!(
+        Bytes::from_hex(&returned_issuance_bytecode)?,
+        Bytes::from_hex(issuance_deployed_bytecode)?
+    );
+    assert_eq!(
+        Bytes::from_hex(&returned_blsg1_bytecode)?,
+        Bytes::from_hex(blsg1_deployed_bytecode)?
+    );
 
     let tx_factory = TransactionFactory::default();
     let signer = tx_factory.get_default_signer().expect("failed to fetch signer");
