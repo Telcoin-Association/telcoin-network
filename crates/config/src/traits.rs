@@ -149,10 +149,6 @@ pub trait TelcoinDirs: std::fmt::Debug + Send + Sync + 'static {
         let extension = format!("epoch_{epoch}");
         self.consensus_db_path().join(extension)
     }
-    /// Return the path to `network_db` file.
-    fn network_db_path(&self) -> PathBuf {
-        self.consensus_db_path().join("network_db")
-    }
 }
 
 impl<P> TelcoinDirs for P

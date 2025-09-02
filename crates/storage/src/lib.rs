@@ -12,8 +12,8 @@ pub use stores::*;
 pub use redb::database::ReDB;
 use tables::{
     Batches, CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
-    ConsensusBlockNumbersByDigest, ConsensusBlocks, KadProviderRecords, KadRecords, LastProposed,
-    Payload, Votes,
+    ConsensusBlockNumbersByDigest, ConsensusBlocks, KadProviderRecords, KadRecords,
+    KadWorkerProviderRecords, KadWorkerRecords, LastProposed, Payload, Votes,
 };
 // Always build redb, we use it as the default for persistant consensus data.
 pub mod layered_db;
@@ -52,6 +52,8 @@ const EPOCH_CERTS_CF: &str = "epoch_cert_by_number";
 const EPOCH_RECORDS_INDEX_CF: &str = "epoch_records_index";
 const KAD_RECORD_CF: &str = "kad_record";
 const KAD_PROVIDER_RECORD_CF: &str = "kad_provider_record";
+const KAD_WORKER_RECORD_CF: &str = "kad_worker_record";
+const KAD_WORKER_PROVIDER_RECORD_CF: &str = "kad_worker_provider_record";
 
 macro_rules! tables {
     ( $($table:ident;$name:expr;<$K:ty, $V:ty>),*) => {
@@ -93,7 +95,9 @@ pub mod tables {
         EpochRecordsIndex;crate::EPOCH_RECORDS_INDEX_CF;<B256, Epoch>,
         // These are used for network storage and separate from consensus
         KadRecords;crate::KAD_RECORD_CF;<BlockHash, Vec<u8>>,
-        KadProviderRecords;crate::KAD_PROVIDER_RECORD_CF;<BlockHash, Vec<u8>>
+        KadProviderRecords;crate::KAD_PROVIDER_RECORD_CF;<BlockHash, Vec<u8>>,
+        KadWorkerRecords;crate::KAD_WORKER_RECORD_CF;<BlockHash, Vec<u8>>,
+        KadWorkerProviderRecords;crate::KAD_WORKER_PROVIDER_RECORD_CF;<BlockHash, Vec<u8>>
     );
 }
 
@@ -113,19 +117,6 @@ pub fn open_db<Path: AsRef<std::path::Path> + Send>(store_path: Path) -> Databas
     return _open_mdbx(store_path);
     #[cfg(feature = "redb")]
     return _open_redb(store_path);
-    panic!("No DB configured!")
-}
-
-/// Open the configured network DB with the required tables.
-/// This will return a concrete type for the currently configured Database.
-#[allow(unreachable_code)] // Need this so it compiles cleanly with redb.
-pub fn open_network_db<Path: AsRef<std::path::Path> + Send>(store_path: Path) -> DatabaseType {
-    // Open the right DB based on feature flags.  The default is MDBX unless the redb flag is
-    // set.
-    #[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
-    return _open_network_mdbx(store_path);
-    #[cfg(feature = "redb")]
-    return _open_network_redb(store_path);
     panic!("No DB configured!")
 }
 
@@ -149,7 +140,12 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<EpochRecords>().expect("failed to open table!");
     db.open_table::<EpochCerts>().expect("failed to open table!");
     db.open_table::<EpochRecordsIndex>().expect("failed to open table!");
+    db.open_table::<KadRecords>().expect("failed to open table!");
+    db.open_table::<KadProviderRecords>().expect("failed to open table!");
+    db.open_table::<KadWorkerRecords>().expect("failed to open table!");
+    db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
 
+    // Don't forget to add a new table to MemDatabase...
     let db = LayeredDatabase::open(db);
     db.open_table::<LastProposed>();
     db.open_table::<Votes>();
@@ -163,6 +159,10 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<EpochRecords>();
     db.open_table::<EpochCerts>();
     db.open_table::<EpochRecordsIndex>();
+    db.open_table::<KadRecords>();
+    db.open_table::<KadProviderRecords>();
+    db.open_table::<KadWorkerRecords>();
+    db.open_table::<KadWorkerProviderRecords>();
     db
 }
 
@@ -184,6 +184,10 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<EpochRecords>().expect("failed to open table!");
     db.open_table::<EpochCerts>().expect("failed to open table!");
     db.open_table::<EpochRecordsIndex>().expect("failed to open table!");
+    db.open_table::<KadRecords>().expect("failed to open table!");
+    db.open_table::<KadProviderRecords>().expect("failed to open table!");
+    db.open_table::<KadWorkerRecords>().expect("failed to open table!");
+    db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
 
     let db = LayeredDatabase::open(db);
     db.open_table::<LastProposed>();
@@ -198,34 +202,10 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<EpochRecords>();
     db.open_table::<EpochCerts>();
     db.open_table::<EpochRecordsIndex>();
-    db
-}
-
-/// Open or reopen all the storage of the node backed by MDBX.
-#[cfg(feature = "reth-libmdbx")]
-fn _open_network_mdbx<P: AsRef<std::path::Path> + Send>(
-    store_path: P,
-) -> LayeredDatabase<MdbxDatabase> {
-    let db = MdbxDatabase::open(store_path).expect("Cannot open database");
-    db.open_table::<KadRecords>().expect("failed to open table!");
-    db.open_table::<KadProviderRecords>().expect("failed to open table!");
-
-    let db = LayeredDatabase::open(db);
     db.open_table::<KadRecords>();
     db.open_table::<KadProviderRecords>();
-    db
-}
-
-/// Open or reopen all the storage of the node backed by ReDB.
-#[cfg(feature = "redb")]
-fn _open_network_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabase<ReDB> {
-    let db = ReDB::open(store_path).expect("Cannot open database");
-    db.open_table::<KadRecords>().expect("failed to open kad records table!");
-    db.open_table::<KadProviderRecords>().expect("failed to open kad provider table!");
-
-    let db = LayeredDatabase::open(db);
-    db.open_table::<KadRecords>();
-    db.open_table::<KadProviderRecords>();
+    db.open_table::<KadWorkerRecords>();
+    db.open_table::<KadWorkerProviderRecords>();
     db
 }
 

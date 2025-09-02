@@ -50,6 +50,9 @@ struct TestTypes<DB = MemDatabase> {
     /// num: 0
     /// hash: 0x78dec18c6d7da925bbe773c315653cdc70f6444ed6c1de9ac30bdb36cff74c3b
     parent: SealedHeader,
+    /// Task manager the synchronizer (in RequestHandler) is spawned on.
+    /// Save it so that task is not dropped early if needed.
+    task_manager: TaskManager,
 }
 
 /// Helper function to create an instance of [RequestHandler] for the first authority in the
@@ -76,13 +79,14 @@ fn create_test_types() -> TestTypes {
         .expect("watch channel updates for default parent in primary handler tests");
 
     let handler = RequestHandler::new(config.clone(), cb.clone(), synchronizer);
-    TestTypes { committee, handler, parent }
+    TestTypes { committee, handler, parent, task_manager }
 }
 
 #[tokio::test]
 async fn test_vote_succeeds() -> eyre::Result<()> {
     // common types
-    let TestTypes { committee, handler, parent, .. } = create_test_types();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types();
 
     let parents = Vec::new();
 
@@ -104,7 +108,8 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_too_many_parents() -> eyre::Result<()> {
     // common types
-    let TestTypes { committee, handler, parent, .. } = create_test_types();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types();
 
     // last authority produced 2 certs for round 1
     let mut too_many_parents: Vec<_> = Certificate::genesis(&committee.committee());
@@ -129,7 +134,8 @@ async fn test_vote_fails_too_many_parents() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_wrong_authority_network_key() -> eyre::Result<()> {
     // common types
-    let TestTypes { committee, handler, parent, .. } = create_test_types();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types();
     let parents = Vec::new();
 
     // create valid header proposed by last peer in the committee for round 1
@@ -150,7 +156,8 @@ async fn test_vote_fails_wrong_authority_network_key() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_invalid_genesis_parent() -> eyre::Result<()> {
     // common types
-    let TestTypes { committee, handler, parent, .. } = create_test_types();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types();
 
     let parents = Vec::new();
 
@@ -180,7 +187,7 @@ async fn test_vote_fails_invalid_genesis_parent() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_unknown_execution_result() -> eyre::Result<()> {
     // common types
-    let TestTypes { committee, handler, .. } = create_test_types();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } = create_test_types();
 
     // create header proposed by last peer in the committee for round 1
     let header = committee.header_from_last_authority();
@@ -197,7 +204,7 @@ async fn test_vote_fails_unknown_execution_result() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_invalid_header_digest() -> eyre::Result<()> {
     // common types
-    let TestTypes { committee, handler, .. } = create_test_types();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } = create_test_types();
 
     let parents = Vec::new();
 
@@ -216,7 +223,8 @@ async fn test_vote_fails_invalid_header_digest() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_invalid_timestamp() -> eyre::Result<()> {
     // common types
-    let TestTypes { committee, handler, parent, .. } = create_test_types();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types();
 
     let parents = Vec::new();
 
@@ -239,7 +247,8 @@ async fn test_vote_fails_invalid_timestamp() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_wrong_epoch() -> eyre::Result<()> {
     // common types
-    let TestTypes { committee, handler, parent, .. } = create_test_types();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types();
 
     let parents = Vec::new();
 
@@ -263,7 +272,8 @@ async fn test_vote_fails_wrong_epoch() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
     // common types
-    let TestTypes { committee, handler, parent, .. } = create_test_types();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types();
 
     let parents = Vec::new();
 

@@ -33,7 +33,7 @@ use tn_reth::{
     CanonStateNotificationStream, RethDb, RethEnv,
 };
 use tn_storage::{
-    open_db, open_network_db,
+    open_db,
     tables::{
         CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
         ConsensusBlockNumbersByDigest, ConsensusBlocks, EpochCerts, EpochRecords,
@@ -315,18 +315,12 @@ where
         //=== PRIMARY
         //
 
-        // create network db
-        let primary_network_db = self.tn_datadir.network_db_path().join("primary");
-        let _ = std::fs::create_dir_all(&primary_network_db);
-        info!(target: "epoch-manager", ?primary_network_db, "opening primary network storage at:");
-        let primary_network_db = open_network_db(primary_network_db);
-
         // create long-running network task for primary
         let primary_network = ConsensusNetwork::new_for_primary(
             network_config,
             self.consensus_bus.primary_network_events_actual(),
             self.key_config.clone(),
-            primary_network_db,
+            self.consensus_db.clone(),
             node_task_spawner.clone(),
         )?;
         let primary_network_handle = primary_network.network_handle();
@@ -354,18 +348,12 @@ where
         // this is a temporary event stream - replaced at the start of every epoch
         //let (tmp_event_stream, _temp_rx) = mpsc::channel(1000);
 
-        // create network db
-        let worker_network_db = self.tn_datadir.network_db_path().join("worker");
-        let _ = std::fs::create_dir_all(&worker_network_db);
-        info!(target: "epoch-manager", ?worker_network_db, "opening worker network storage at:");
-        let worker_network_db = open_network_db(worker_network_db);
-
         // create long-running network task for worker
         let worker_network = ConsensusNetwork::new_for_worker(
             network_config,
             self.worker_event_stream.clone(),
             self.key_config.clone(),
-            worker_network_db,
+            self.consensus_db.clone(),
             node_task_spawner.clone(),
         )?;
         let worker_network_handle = worker_network.network_handle();
