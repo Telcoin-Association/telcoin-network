@@ -213,7 +213,6 @@ impl<'a> Iterator for RecordIter<'a> {
     type Item = Cow<'a, Record>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        //self.iter.next()self.iter.next()
         self.iter.next().map(|(_, r)| {
             let r: KadRecord = decode(r.as_ref());
             Cow::Owned(r.into())
