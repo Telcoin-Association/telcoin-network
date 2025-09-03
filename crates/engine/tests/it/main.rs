@@ -144,10 +144,10 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
 
     // spawn engine task
-    task_manager.spawn_blocking(Box::pin(async move {
+    task_manager.spawn_task("Test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
-    }));
+    });
 
     let engine_task = timeout(Duration::from_secs(10), rx).await?;
     assert!(engine_task.is_ok());
@@ -307,10 +307,10 @@ async fn test_empty_output_executes_late_finalize() -> eyre::Result<()> {
     let (tx, rx) = oneshot::channel();
 
     // spawn engine task
-    task_manager.spawn_blocking(Box::pin(async move {
+    task_manager.spawn_task("test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
-    }));
+    });
 
     let engine_task = timeout(Duration::from_secs(10), rx).await?;
     assert!(engine_task.is_ok());
@@ -514,10 +514,10 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
     // spawn engine task
     //
     // one output already queued up, one output waiting in broadcast stream
-    task_manager.spawn_blocking(Box::pin(async move {
+    task_manager.spawn_task("test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
-    }));
+    });
 
     let engine_task = timeout(Duration::from_secs(10), rx).await?;
     assert!(engine_task.is_ok());
@@ -849,10 +849,10 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     // spawn engine task
     //
     // one output already queued up, one output waiting in broadcast stream
-    task_manager.spawn_blocking(Box::pin(async move {
+    task_manager.spawn_task("test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
-    }));
+    });
 
     let engine_task = timeout(Duration::from_secs(10), rx).await?;
     assert!(engine_task.is_ok());
@@ -1147,10 +1147,10 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     // spawn engine task
     //
     // one output already queued up, one output waiting in broadcast stream
-    task_manager.spawn_blocking(Box::pin(async move {
+    task_manager.spawn_task("test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
-    }));
+    });
 
     let engine_task = timeout(Duration::from_secs(10), rx).await?;
     assert!(engine_task.is_ok());
