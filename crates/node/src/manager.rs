@@ -552,11 +552,13 @@ where
             if committee_keys != prev.next_committee {
                 error!(
                     target: "epoch-manager",
-                    "XXXX Committees are not the same on epoch record create, prev next {:?}, current {:?}",
+                    "Last epochs next committee not equal to this epochs committee! previous {:?}, current {:?}",
                     prev.next_committee,
                     committee_keys
                 );
-                return Err(eyre!("Committees are not the same on epoch record create"));
+                return Err(eyre!(
+                    "Last epochs next committee not equal to this epochs committee!"
+                ));
             }
             prev.digest()
         } else {
@@ -637,13 +639,9 @@ where
             let primary_network = primary.network_handle().await;
             info!(
                 target: "epoch-manager",
-                "XXXX Node {me} publising epoch record {epoch_hash}",
+                "publising epoch record {epoch_hash}",
             );
-            epoch_task_manager.spawn_task("Publish Epoch Cert", async move {
-                // Small pause to let everyone hopefully get to new epoch.
-                //XXXXtokio::time::sleep(Duration::from_secs(1)).await;
-                let _ = primary_network.publish_epoch_certificate(epoch_cert).await;
-            });
+            let _ = primary_network.publish_epoch_certificate(epoch_cert).await;
         }
 
         let mut rx = self.consensus_bus.new_epoch_certificates().subscribe();
@@ -652,7 +650,9 @@ where
             while let Ok(Some((source, cert))) =
                 tokio::time::timeout(Duration::from_secs(1), rx.recv()).await
             {
-                if let Some(source) = Self::signed_by_committee(&epoch_rec.committee, &cert, epoch_hash).await {
+                if let Some(source) =
+                    Self::signed_by_committee(&epoch_rec.committee, &cert, epoch_hash).await
+                {
                     if committee_keys.remove(&source) {
                         sigs.push(cert.signature);
                         if let Some(idx) = committee_index.get(&source) {
@@ -665,21 +665,10 @@ where
                             break;
                         }
                     }
-                } else if epoch_hash != cert.epoch_hash {
-                    error!(
-                        target: "epoch-manager",
-                        "XXXX Received an epoch cert with incorrect hash {}, expected {}", cert.epoch_hash, epoch_hash
-                    );
-                } else if committee_keys.contains(&source) {
-                    error!(
-                        target: "epoch-manager",
-                        "XXXX Received an invalid epoch cert from {source} for {}",
-                        cert.epoch_hash,
-                    );
                 } else {
                     error!(
                         target: "epoch-manager",
-                        "XXXX Received an epoch cert from {source} for {}, but not in committee",
+                        "Received an invalid epoch cert from {source} for {}.",
                         cert.epoch_hash,
                     );
                 }
@@ -687,14 +676,8 @@ where
             if reached_quorum {
                 info!(
                     target: "epoch-manager",
-                    "XXXX reached quorum on epoch close for {epoch_hash}",
+                    "reached quorum on epoch close for {epoch_hash}",
                 );
-                /*if epoch_rec.epoch == 0 {
-                    info!(
-                        target: "epoch-manager",
-                        "XXXX reached quorum on epoch close for {epoch_rec:?}",
-                    );
-                }*/
                 match BlsAggregateSignature::aggregate(&sigs[..], true) {
                     Ok(aggregated_signature) => {
                         let signature: BlsSignature = aggregated_signature.to_signature();
@@ -705,21 +688,21 @@ where
                         } else {
                             error!(
                                 target: "epoch-manager",
-                                "XXXX failed to verify epoch record and cert for {epoch_hash}",
+                                "failed to verify epoch record and cert for {epoch_hash}",
                             );
                         }
                     }
                     Err(_) => {
                         error!(
                             target: "epoch-manager",
-                            "XXXX failed to aggregate epoch record signatures for {epoch_hash}",
+                            "failed to aggregate epoch record signatures for {epoch_hash}",
                         );
                     }
                 }
             } else {
                 error!(
                     target: "epoch-manager",
-                    "XXXX failed to reach quorum on epoch close for {epoch_hash} {epoch_rec:?}",
+                    "failed to reach quorum on epoch close for {epoch_hash} {epoch_rec:?}",
                 );
             }
         });

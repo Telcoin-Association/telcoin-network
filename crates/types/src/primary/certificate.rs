@@ -11,7 +11,7 @@ use crate::{
     ensure,
     error::{CertificateError, CertificateResult, DagError, DagResult, HeaderError},
     now,
-    serde::CertificateSignatures,
+    serde::RoaringBitmapSerde,
     AuthorityIdentifier, BlockHash, Committee, Digest, Epoch, Hash, Header, Round, TimestampSec,
     VotingPower,
 };
@@ -29,7 +29,7 @@ pub struct Certificate {
     /// Container for [BlsAggregateSignatureBytes].
     pub signature_verification_state: SignatureVerificationState,
     /// Bitmap that indicates which authorities from committee signed this certificate.
-    #[serde_as(as = "CertificateSignatures")]
+    #[serde_as(as = "RoaringBitmapSerde")]
     signed_authorities: roaring::RoaringBitmap,
     /// Timestamp for certificate creation.
     ///

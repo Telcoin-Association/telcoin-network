@@ -4,9 +4,7 @@
 //! however, the RPC calls don't work. The beginning of the test is left
 //! because the proxy version may be re-prioritized later.
 use crate::util::{spawn_local_testnet, IT_TEST_MUTEX};
-use alloy::{
-    hex, network::EthereumWallet, primitives::utils::parse_ether, providers::ProviderBuilder,
-};
+use alloy::{network::EthereumWallet, primitives::utils::parse_ether, providers::ProviderBuilder};
 use core::panic;
 use eyre::OptionExt;
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};

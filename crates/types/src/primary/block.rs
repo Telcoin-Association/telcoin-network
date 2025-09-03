@@ -8,7 +8,7 @@
 
 use super::{CommittedSubDag, ConsensusOutput};
 use crate::{
-    crypto, encode, error::CertificateResult, serde::CertificateSignatures, BlockHash,
+    crypto, encode, error::CertificateResult, serde::RoaringBitmapSerde, BlockHash,
     BlsAggregateSignature, BlsPublicKey, BlsSignature, BlsSigner, Certificate, Committee, Epoch,
     Hash, Intent, IntentMessage, IntentScope, ValidatorAggregateSignature as _, B256,
 };
@@ -68,7 +68,6 @@ impl EpochRecord {
 
     pub fn verify_with_cert(&self, cert: &EpochCertificate) -> bool {
         if self.digest() != cert.epoch_hash {
-            eprintln!("XXXX hashes don't match, expect {}, got {}", self.digest(), cert.epoch_hash);
             // Record and cert don't match.
             return false;
         }
@@ -119,7 +118,7 @@ pub struct EpochCertificate {
     /// Signatures of a quorum of committee member for the epoch.
     pub signature: BlsSignature,
     /// Bitmap defining which committee members signed this certificate.
-    #[serde_as(as = "CertificateSignatures")]
+    #[serde_as(as = "RoaringBitmapSerde")]
     pub signed_authorities: roaring::RoaringBitmap,
 }
 

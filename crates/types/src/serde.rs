@@ -8,10 +8,10 @@ use serde::{
 };
 use serde_with::{DeserializeAs, SerializeAs};
 
-/// Serialized BLS signatures into a bitmap according to the roaring bitmap on-disk standard.
-pub struct CertificateSignatures;
+/// Serde interface to RoaringBitmap according to the roaring bitmap on-disk standard.
+pub struct RoaringBitmapSerde;
 
-impl SerializeAs<roaring::RoaringBitmap> for CertificateSignatures {
+impl SerializeAs<roaring::RoaringBitmap> for RoaringBitmapSerde {
     fn serialize_as<S>(source: &roaring::RoaringBitmap, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -29,7 +29,7 @@ impl SerializeAs<roaring::RoaringBitmap> for CertificateSignatures {
     }
 }
 
-impl<'de> DeserializeAs<'de, roaring::RoaringBitmap> for CertificateSignatures {
+impl<'de> DeserializeAs<'de, roaring::RoaringBitmap> for RoaringBitmapSerde {
     fn deserialize_as<D>(deserializer: D) -> Result<roaring::RoaringBitmap, D::Error>
     where
         D: Deserializer<'de>,
