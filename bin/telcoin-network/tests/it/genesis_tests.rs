@@ -11,7 +11,10 @@ use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_param
 use serde_json::Value;
 use std::time::Duration;
 use telcoin_network::args::clap_u256_parser_to_18_decimals;
-use tn_config::{NetworkGenesis, CONSENSUS_REGISTRY_JSON, DEPLOYMENTS_JSON};
+use tn_config::{
+    NetworkGenesis, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, DEPLOYMENTS_JSON, ISSUANCE_ADDRESS,
+    ISSUANCE_JSON,
+};
 use tn_reth::{
     system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS},
     test_utils::TransactionFactory,
@@ -151,16 +154,17 @@ async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
+async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
     let _guard = IT_TEST_MUTEX.lock();
     // sleep for other tests to cleanup
     std::thread::sleep(std::time::Duration::from_secs(5));
-    // fetch registry impl bytecode from compiled output in tn-contracts
-    let json_val = RethEnv::fetch_value_from_json_str(
+    // fetch registry, blsg1, and issuance bytecodes
+    let registry_runtimecode_binding = RethEnv::fetch_value_from_json_str(
         CONSENSUS_REGISTRY_JSON,
         Some("deployedBytecode.object"),
     )?;
-    let unlinked_runtimecode = json_val.as_str().ok_or_eyre("Couldn't fetch bytecode")?;
+    let unlinked_runtimecode =
+        registry_runtimecode_binding.as_str().ok_or_eyre("Couldn't fetch bytecode")?;
     let tao_address_binding = RethEnv::fetch_value_from_json_str(DEPLOYMENTS_JSON, Some("Safe"))?;
     let tao_address =
         Address::from_hex(tao_address_binding.as_str().ok_or_eyre("Safe owner address")?)?;
@@ -168,9 +172,19 @@ async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
     let registry_deployed_bytecode =
         RethEnv::link_solidity_library(unlinked_runtimecode, &blsg1_address)?;
 
+    let blsg1_runtimecode_binding =
+        RethEnv::fetch_value_from_json_str(BLSG1_JSON, Some("deployedBytecode.object"))?;
+    let blsg1_deployed_bytecode =
+        blsg1_runtimecode_binding.as_str().ok_or_eyre("invalid blsg1 json")?;
+
+    let issuance_json_val =
+        RethEnv::fetch_value_from_json_str(ISSUANCE_JSON, Some("deployedBytecode.object"))?;
+    let issuance_deployed_bytecode =
+        issuance_json_val.as_str().ok_or_eyre("fetch issuance runtime code")?;
+
     // spawn testnet for RPC calls
-    let temp_path =
-        tempfile::TempDir::with_suffix("genesis_with_consensus_registry").expect("tempdir is okay");
+    let temp_path = tempfile::TempDir::with_suffix("genesis_with_consensus_registry_accounts")
+        .expect("tempdir is okay");
     spawn_local_testnet(
         temp_path.path(),
         #[cfg(feature = "faucet")]
@@ -184,14 +198,31 @@ async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
     let rpc_url = "http://127.0.0.1:8545".to_string();
     let client = HttpClientBuilder::default().build(&rpc_url).expect("couldn't build rpc client");
 
-    // sanity check onchain spawned in genesis
-    let returned_impl_code: String = client
+    // sanity check onchain spawned both registry & issuance in genesis
+    let returned_registry_bytecode: String = client
         .request("eth_getCode", rpc_params!(CONSENSUS_REGISTRY_ADDRESS))
         .await
-        .expect("Failed to fetch registry impl bytecode");
-
-    // trim `0x` prefix
-    assert_eq!(Bytes::from_hex(&returned_impl_code)?, Bytes::from(registry_deployed_bytecode));
+        .expect("Failed to fetch registry bytecode");
+    let returned_issuance_bytecode: String = client
+        .request("eth_getCode", rpc_params!(ISSUANCE_ADDRESS))
+        .await
+        .expect("Failed to fetch issuance bytecode");
+    let returned_blsg1_bytecode: String = client
+        .request("eth_getCode", rpc_params!(blsg1_address))
+        .await
+        .expect("Failed to fetch BLS G1 bytecode");
+    assert_eq!(
+        Bytes::from_hex(&returned_registry_bytecode)?,
+        Bytes::from(registry_deployed_bytecode)
+    );
+    assert_eq!(
+        Bytes::from_hex(&returned_issuance_bytecode)?,
+        Bytes::from_hex(issuance_deployed_bytecode)?
+    );
+    assert_eq!(
+        Bytes::from_hex(&returned_blsg1_bytecode)?,
+        Bytes::from_hex(blsg1_deployed_bytecode)?
+    );
 
     let tx_factory = TransactionFactory::default();
     let signer = tx_factory.get_default_signer().expect("failed to fetch signer");

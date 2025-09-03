@@ -71,7 +71,7 @@ pub struct TaskManager {
     name: String,
     new_task_rx: mpsc::Receiver<TaskHandle>,
     new_task_tx: mpsc::Sender<TaskHandle>,
-    /// Thgis is used to noitify any spawned tasks to exit when task manager id dropped.
+    /// This is used to notify any spawned tasks to exit when task manager is dropped.
     /// Otherwise we will end up with orphaned tasks when epochs change.
     local_shutdown: Notifier,
 }
@@ -331,20 +331,6 @@ impl TaskManager {
         for manager in self.submanagers.values_mut() {
             manager.abort_all_tasks();
         }
-    }
-
-    /// Spawn blocking on tokio.  Here mostly for compat with old Reth interface.
-    pub fn spawn_blocking(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
-        let handle = tokio::runtime::Handle::current();
-        let rx_shutdown = self.local_shutdown.subscribe();
-        tokio::task::spawn_blocking(move || {
-            handle.block_on(async move {
-                tokio::select! {
-                    _ = rx_shutdown => {}
-                    _ = fut => {}
-                }
-            })
-        })
     }
 
     /// Take any tasks on the new task queue and put them in the task list.
@@ -638,13 +624,6 @@ mod test {
         assert_eq!(pong_norm.ping(1).await.unwrap(), 1);
         assert_eq!(pong_norm.ping(2).await.unwrap(), 2);
 
-        let (ping_block, mut pong_block) = new_ping_pong();
-        task_manager.spawn_blocking(Box::pin(async move {
-            ping_block.run().await;
-        }));
-        assert_eq!(pong_block.ping(1).await.unwrap(), 1);
-        assert_eq!(pong_block.ping(2).await.unwrap(), 2);
-
         let spawner = task_manager.get_spawner();
         let (sping_crit, mut spong_crit) = new_ping_pong();
         spawner.spawn_critical_task("Crit", async move {
@@ -708,7 +687,6 @@ mod test {
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(pong_crit.ping(2).await.is_err());
         assert!(pong_norm.ping(2).await.is_err());
-        assert!(pong_block.ping(2).await.is_err());
 
         assert!(spong_crit.ping(2).await.is_err());
         assert!(spong_norm.ping(2).await.is_err());

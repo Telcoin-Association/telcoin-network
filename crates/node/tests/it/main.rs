@@ -86,11 +86,11 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
         gas_accumulator.clone(),
     );
     let (tx, mut rx) = oneshot::channel();
-    task_manager.spawn_blocking(Box::pin(async move {
+    task_manager.spawn_task("test task eng", async move {
         let res = engine.await;
         debug!(target: "gas-test", ?res, "res:");
         let _ = tx.send(res);
-    }));
+    });
 
     // subscribe to output early
     let mut consensus_output = consensus_bus.consensus_output().subscribe();
