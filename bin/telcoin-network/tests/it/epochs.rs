@@ -33,7 +33,6 @@ const EPOCH_DURATION: u64 = 5;
 #[tokio::test]
 /// Test a new node joining the network and being shuffled into the committee.
 async fn test_epoch_boundary() -> eyre::Result<()> {
-    tn_types::test_utils::init_test_tracing();
     // create validator and governance wallets for adding new validator later
     let mut new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
     let mut governance_wallet =

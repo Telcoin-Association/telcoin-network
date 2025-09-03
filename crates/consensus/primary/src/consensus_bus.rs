@@ -538,7 +538,7 @@ impl ConsensusBus {
     }
 
     /// Return the channel for primary network events.  Returns a concrete clone.
-    pub fn primary_network_events_actual(
+    pub fn primary_network_events_cloned(
         &self,
     ) -> QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>> {
         self.inner_app.primary_network_events.clone()

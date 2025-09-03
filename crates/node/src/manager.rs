@@ -194,7 +194,6 @@ where
             worker_network_handle: None,
             key_config,
             node_shutdown,
-            //consensus_output,
             epoch_boundary: Default::default(),
             consensus_bus,
             worker_event_stream,
@@ -311,7 +310,7 @@ where
         // create long-running network task for primary
         let primary_network = ConsensusNetwork::new_for_primary(
             network_config,
-            self.consensus_bus.primary_network_events_actual(),
+            self.consensus_bus.primary_network_events_cloned(),
             self.key_config.clone(),
             primary_network_db,
             node_task_spawner.clone(),
@@ -334,12 +333,6 @@ where
 
         // primary network handle
         self.primary_network_handle = Some(PrimaryNetworkHandle::new(primary_network_handle));
-
-        //
-        //=== WORKER
-        //
-        // this is a temporary event stream - replaced at the start of every epoch
-        //let (tmp_event_stream, _temp_rx) = mpsc::channel(1000);
 
         // create network db
         let worker_network_db = self.tn_datadir.network_db_path().join("worker");
