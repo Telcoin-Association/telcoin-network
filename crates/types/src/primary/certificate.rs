@@ -28,7 +28,7 @@ pub struct Certificate {
     pub header: Header,
     /// Container for [BlsAggregateSignatureBytes].
     pub signature_verification_state: SignatureVerificationState,
-    /// Signatures of all authorities
+    /// Bitmap that indicates which authorities from committee signed this certificate.
     #[serde_as(as = "CertificateSignatures")]
     signed_authorities: roaring::RoaringBitmap,
     /// Timestamp for certificate creation.
@@ -124,7 +124,7 @@ impl Certificate {
             DagError::CertificateRequiresQuorum
         );
 
-        let sigs: Vec<&BlsSignature> = sigs.iter().map(|(_, sig)| sig).collect();
+        let sigs: Vec<BlsSignature> = sigs.iter().map(|(_, sig)| *sig).collect();
         let bls_signature = if sigs.is_empty() {
             BlsSignature::default()
         } else {

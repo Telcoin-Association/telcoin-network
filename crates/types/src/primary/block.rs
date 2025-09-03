@@ -8,15 +8,18 @@
 
 use super::{CommittedSubDag, ConsensusOutput};
 use crate::{
-    crypto, encode, error::CertificateResult, BlockHash, BlsAggregateSignature, BlsPublicKey,
-    BlsSignature, BlsSigner, Certificate, Committee, Epoch, Hash, B256,
+    crypto, encode, error::CertificateResult, serde::CertificateSignatures, BlockHash,
+    BlsAggregateSignature, BlsPublicKey, BlsSignature, BlsSigner, Certificate, Committee, Epoch,
+    Hash, Intent, IntentMessage, IntentScope, ValidatorAggregateSignature as _, B256,
 };
 use alloy::eips::BlockNumHash;
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
 use std::sync::Arc;
 
-/// Record of an Epoch.  Will be created at epoch start and signed by
-/// committee members.
+/// Record of an Epoch.  Will be created at epoch start for the previous epoch
+/// and signed by that epochs committee members.
 #[derive(PartialEq, Serialize, Deserialize, Clone, Debug)]
 pub struct EpochRecord {
     /// The epoch this record is for.
@@ -28,12 +31,12 @@ pub struct EpochRecord {
     pub next_committee: Vec<BlsPublicKey>,
     /// Hash of the previous EpochRecord.
     pub parent_hash: B256,
-    /// The block number and hash of the last execution state of previous committee.
-    /// Basically the execution genesis for this committee.
-    /// Also a signed checkpoint of execution state.
+    /// The block number and hash of the last execution state of this epoch.
+    /// Basically the execution genesis for the next epoch after this one.
+    /// Also a signed checkpoint of execution state (with the certificate).
     pub parent_state: BlockNumHash,
-    /// The hash of the last ['ConsensusHeader'] of previous epoch.
-    /// Can be used as a signed checkpoint for consensus.
+    /// The hash of the last ['ConsensusHeader'] of this epoch.
+    /// Can be used as a signed checkpoint for consensus (with the certificate).
     pub parent_consensus: B256,
 }
 
@@ -47,33 +50,96 @@ impl EpochRecord {
 
     pub fn sign<S: BlsSigner>(&self, signer: &S) -> EpochCertificate {
         let epoch_hash = self.digest();
-        let signed_authorities = signer.request_signature_direct(epoch_hash.as_ref());
-        EpochCertificate { epoch_hash, signed_authorities }
+        let intent =
+            encode(&IntentMessage::new(Intent::consensus(IntentScope::EpochRecord), epoch_hash));
+        let signature = signer.request_signature_direct(&intent);
+        let mut signed_authorities = RoaringBitmap::new();
+        let me = signer.public_key();
+        // Turn on our "bit" for our singleton cert.
+        for (i, c) in self.committee.iter().enumerate() {
+            if *c == me {
+                signed_authorities.insert(i as u32);
+                break;
+            }
+        }
+
+        EpochCertificate { epoch_hash, signature, signed_authorities }
+    }
+
+    pub fn verify_with_cert(&self, cert: &EpochCertificate) -> bool {
+        if self.digest() != cert.epoch_hash {
+            eprintln!("XXXX hashes don't match, expect {}, got {}", self.digest(), cert.epoch_hash);
+            // Record and cert don't match.
+            return false;
+        }
+
+        let auth_indexes = cert.signed_authorities.iter().collect::<Vec<_>>();
+        let mut auth_iter = 0;
+        let pks: Vec<BlsPublicKey> = self
+            .committee
+            .iter()
+            .enumerate()
+            .filter(|(i, _authority)| match auth_indexes.get(auth_iter) {
+                Some(index) if *index == *i as u32 => {
+                    auth_iter += 1;
+                    true
+                }
+                _ => false,
+            })
+            .map(|(_, key)| *key)
+            .collect();
+
+        let aggregate_signature = BlsAggregateSignature::from_signature(&cert.signature);
+        let intent =
+            IntentMessage::new(Intent::consensus(IntentScope::EpochRecord), cert.epoch_hash);
+        if auth_iter < self.simple_quorum() {
+            false
+        } else {
+            aggregate_signature.verify_secure(&intent, &pks[..])
+        }
+    }
+
+    /// Provide a simple quorum, this is 2/3 of committee size plus one.
+    /// With this many signers of an epoch record we should be safe.
+    pub fn simple_quorum(&self) -> usize {
+        ((self.committee.len() * 2) / 3) + 1
     }
 }
 
 /// Certificate of an ['EpochRecord'].
 /// Each committee member should gossip this on epoch start and other nodes
 /// should collect them and aggregate signatures.
+#[serde_as]
 #[derive(PartialEq, Serialize, Deserialize, Clone, Debug)]
 pub struct EpochCertificate {
     /// The hash of the ['EpochRecord'].
     /// Store the hash not the record to keep gossip size down.
     /// Other nodes can request the record once vs recieving it many times.
     pub epoch_hash: B256,
-    /// Signatures of a quorum od committee member for the epoch.
-    pub signed_authorities: BlsSignature,
+    /// Signatures of a quorum of committee member for the epoch.
+    pub signature: BlsSignature,
+    /// Bitmap defining which committee members signed this certificate.
+    #[serde_as(as = "CertificateSignatures")]
+    pub signed_authorities: roaring::RoaringBitmap,
 }
 
 impl EpochCertificate {
-    pub fn aggregate(&mut self, sig: &BlsSignature) {
-        let mut agg = BlsAggregateSignature::from_signature(sig);
-        agg.add_aggregate(&BlsAggregateSignature::from_signature(&self.signed_authorities));
-        self.signed_authorities = agg.to_signature();
+    /// Verify a single signature of the cert.
+    /// Used when receiving published "single" signer certs for agregation.
+    pub fn check_single_signature(&self, signer: &BlsPublicKey) -> bool {
+        let intent = encode(&IntentMessage::new(
+            Intent::consensus(IntentScope::EpochRecord),
+            self.epoch_hash,
+        ));
+        self.signature.verify_raw(&intent, signer)
     }
 
-    pub fn check_signature(&self, signer: &BlsPublicKey) -> bool {
-        self.signed_authorities.verify_raw(self.epoch_hash.as_ref(), signer)
+    /// Verify a groug of signatures against the cert.
+    pub fn check_signatures(&self, signers: &[BlsPublicKey]) -> bool {
+        let aggregate_signature = BlsAggregateSignature::from_signature(&self.signature);
+        let intent =
+            IntentMessage::new(Intent::consensus(IntentScope::EpochRecord), self.epoch_hash);
+        aggregate_signature.verify_secure(&intent, signers)
     }
 }
 

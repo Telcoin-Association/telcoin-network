@@ -93,7 +93,7 @@ impl Default for BlsSignature {
 
 impl BlsAggregateSignature {
     // Aggregate
-    pub fn aggregate(sigs: &[&BlsSignature], sigs_groupcheck: bool) -> eyre::Result<Self> {
+    pub fn aggregate(sigs: &[BlsSignature], sigs_groupcheck: bool) -> eyre::Result<Self> {
         let t_sigs: Vec<CoreBlsSignature> = sigs.iter().map(|s| s.0).collect();
         let sigs: Vec<&CoreBlsSignature> = t_sigs.iter().collect();
         let sig = CoreBlsAggregateSignature::aggregate(&sigs, sigs_groupcheck)

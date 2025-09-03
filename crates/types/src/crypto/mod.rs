@@ -214,6 +214,9 @@ pub trait BlsSigner: Clone + Send + Sync + Unpin + 'static {
         let handle = tokio::task::spawn_blocking(move || this.request_signature_direct(&msg));
         async move { handle.await.expect("Failed to receive signature from Signature Service") }
     }
+
+    /// Return the public key of this signer.
+    fn public_key(&self) -> BlsPublicKey;
 }
 
 /// Wrap a message in an intent message. Currently in Consensus, the scope is always
