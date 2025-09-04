@@ -5,7 +5,7 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
-    kad::{KadRecord, KadStore},
+    kad::{KadStore, KadStoreType},
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     types::{
@@ -21,7 +21,7 @@ use libp2p::{
         TopicHash,
     },
     identify::{self, Event as IdentifyEvent, Info as IdentifyInfo},
-    kad::{self, store::RecordStore, Mode, QueryId, Record},
+    kad::{self, store::RecordStore, Mode, QueryId},
     multiaddr::Protocol,
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
@@ -35,7 +35,6 @@ use std::{
     time::Duration,
 };
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
-use tn_storage::tables::KadRecords;
 use tn_types::{
     decode, encode, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
     NetworkPublicKey, TaskSpawner, TnSender,
@@ -176,7 +175,15 @@ where
         task_manager: TaskSpawner,
     ) -> NetworkResult<Self> {
         let network_key = key_config.primary_network_keypair().clone();
-        Self::new(network_config, event_stream, key_config, network_key, db, task_manager)
+        Self::new(
+            network_config,
+            event_stream,
+            key_config,
+            network_key,
+            db,
+            task_manager,
+            KadStoreType::Primary,
+        )
     }
 
     /// Convenience method for spawning a worker network instance.
@@ -188,7 +195,15 @@ where
         task_manager: TaskSpawner,
     ) -> NetworkResult<Self> {
         let network_key = key_config.worker_network_keypair().clone();
-        Self::new(network_config, event_stream, key_config, network_key, db, task_manager)
+        Self::new(
+            network_config,
+            event_stream,
+            key_config,
+            network_key,
+            db,
+            task_manager,
+            KadStoreType::Worker,
+        )
     }
 
     /// Create a new instance of Self.
@@ -199,6 +214,7 @@ where
         keypair: NetworkKeypair,
         db: DB,
         task_spawner: TaskSpawner,
+        kad_type: KadStoreType,
     ) -> NetworkResult<Self> {
         let identify_config = identify::Config::new(
             network_config.libp2p_config().identify_protocol().to_string(),
@@ -241,17 +257,15 @@ where
             .set_publication_interval(twelve_hours)
             .set_query_timeout(Duration::from_secs(60))
             .set_provider_record_ttl(two_days);
-        let kad_store = KadStore::new(db.clone(), &key_config);
-        let kademlia = kad::Behaviour::with_config(peer_id, kad_store, kad_config);
+        let kad_store = KadStore::new(db.clone(), &key_config, kad_type);
+        let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
         // create custom behavior
         let mut behavior =
             TNBehavior::new(identify, gossipsub, req_res, kademlia, network_config.peer_config());
 
         // Load the Kad records from DB into the local peer cache.
-        for (_key, record) in db.iter::<KadRecords>() {
-            let record: KadRecord = decode(record.as_ref());
-            let record: Record = record.into();
+        for record in kad_store.records() {
             match BlsPublicKey::from_literal_bytes(record.key.as_ref()) {
                 Ok(key) => {
                     let record: NodeRecord = decode(&record.value);
