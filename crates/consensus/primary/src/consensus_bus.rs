@@ -182,7 +182,7 @@ struct ConsensusBusAppInner {
     /// Hold onto the recent sync_status to keep it "open"
     _rx_sync_status: watch::Receiver<NodeMode>,
 
-    /// Produce new epoch certs as they recieved.
+    /// Produce new epoch certs as they are recieved.
     new_epoch_certificates: QueChannel<(BlsPublicKey, EpochCertificate)>,
     /// The que channel for primary network events.
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,

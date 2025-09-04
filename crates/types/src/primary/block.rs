@@ -66,6 +66,7 @@ impl EpochRecord {
         EpochCertificate { epoch_hash, signature, signed_authorities }
     }
 
+    /// Return true if cert contains a quorum of committee signatures for this EpochRecord.
     pub fn verify_with_cert(&self, cert: &EpochCertificate) -> bool {
         if self.digest() != cert.epoch_hash {
             // Record and cert don't match.
