@@ -49,9 +49,6 @@ where
         epoch_manager.run().await
     });
 
-    // shutdown background tasks
-    runtime.shutdown_background();
-
     // return result after shutdown
     res
 }
