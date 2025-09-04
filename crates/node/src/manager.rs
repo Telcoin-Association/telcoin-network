@@ -477,19 +477,19 @@ where
         // indicate if the node is restarting to join the committe or if the epoch is changed and
         // tables should be cleared
         let mut clear_tables_for_next_epoch = false;
-        let mut target_hash = None;
 
         tokio::select! {
             // wait for epoch boundary to transition
             res = self.wait_for_epoch_boundary(to_engine, gas_accumulator.clone(), consensus_output) => {
-                target_hash = Some(res.inspect_err(|e| {
-                    error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
-                })?);
-
-                info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
-
                 // toggle bool to clear tables
                 clear_tables_for_next_epoch = true;
+                let target_hash = res.inspect_err(|e| {
+                    error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
+                })?;
+                self.close_epoch(engine, consensus_shutdown.clone(), gas_accumulator, target_hash)
+                    .await?;
+
+                info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
             },
 
             // return any errors
@@ -499,11 +499,6 @@ where
                 })?;
                 info!(target: "epoch-manager", "epoch task manager exited - likely syncing with committee");
             },
-        }
-
-        if let Some(target_hash) = target_hash {
-            self.close_epoch(engine, consensus_shutdown.clone(), gas_accumulator, target_hash)
-                .await?;
         }
 
         consensus_shutdown.notify();
