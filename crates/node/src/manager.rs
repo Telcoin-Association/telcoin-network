@@ -19,10 +19,14 @@ use std::{
 use tn_config::{
     Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs,
 };
-use tn_network_libp2p::{error::NetworkError, types::NetworkHandle, ConsensusNetwork, TNMessage};
+use tn_network_libp2p::{
+    error::NetworkError,
+    types::{NetworkEvent, NetworkHandle},
+    ConsensusNetwork, TNMessage,
+};
 use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
-    ConsensusBus, NodeMode, StateSynchronizer,
+    ConsensusBus, NodeMode, QueChannel, StateSynchronizer,
 };
 use tn_reth::{
     system_calls::{ConsensusRegistry, EpochState},
@@ -39,13 +43,10 @@ use tn_storage::{
 use tn_types::{
     gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, Committee, CommitteeBuilder,
     ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, Noticer, Notifier,
-    TaskManager, TaskSpawner, TimestampSec, MIN_PROTOCOL_BASE_FEE,
+    TaskManager, TaskSpawner, TimestampSec, TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
 };
-use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
-use tokio::sync::{
-    broadcast,
-    mpsc::{self},
-};
+use tn_worker::{WorkerNetwork, WorkerNetworkHandle, WorkerRequest, WorkerResponse};
+use tokio::sync::mpsc::{self};
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 
@@ -79,16 +80,16 @@ pub struct EpochManager<P> {
     key_config: KeyConfig,
     /// The epoch manager's [Notifier] to shutdown all node processes.
     node_shutdown: Notifier,
-    /// Output channel for consensus blocks to be executed.
-    ///
-    /// This should only be accessed elsewhere through the epoch's [ConsensusBus].
-    consensus_output: broadcast::Sender<ConsensusOutput>,
     /// The timestamp to close the current epoch.
     ///
     /// The manager monitors leader timestamps for the epoch boundary.
     /// If the timestamp of the leader is >= the epoch_boundary then the
     /// manager closes the epoch after the engine executes all data.
     epoch_boundary: TimestampSec,
+    /// ConsensusBus for the application life.
+    consensus_bus: ConsensusBus,
+    /// Persistent event stream for woker network events.
+    worker_event_stream: QueChannel<NetworkEvent<WorkerRequest, WorkerResponse>>,
 }
 
 /// When rejoining a network mid epoch this will accumulate any gas state for previous epoch blocks.
@@ -182,7 +183,9 @@ where
 
         // shutdown long-running node components
         let node_shutdown = Notifier::new();
-        let (consensus_output, _rx_consensus_output) = broadcast::channel(100);
+
+        let consensus_bus = ConsensusBus::new_with_args(builder.tn_config.parameters.gc_depth);
+        let worker_event_stream = QueChannel::new();
 
         Ok(Self {
             builder,
@@ -191,8 +194,9 @@ where
             worker_network_handle: None,
             key_config,
             node_shutdown,
-            consensus_output,
             epoch_boundary: Default::default(),
+            consensus_bus,
+            worker_event_stream,
         })
     }
 
@@ -296,8 +300,6 @@ where
         //
         //=== PRIMARY
         //
-        // this is a temporary event stream - replaced at the start of every epoch
-        let (tmp_event_stream, _temp_rx) = mpsc::channel(1000);
 
         // create network db
         let primary_network_db = self.tn_datadir.network_db_path().join("primary");
@@ -308,7 +310,7 @@ where
         // create long-running network task for primary
         let primary_network = ConsensusNetwork::new_for_primary(
             network_config,
-            tmp_event_stream,
+            self.consensus_bus.primary_network_events_cloned(),
             self.key_config.clone(),
             primary_network_db,
             node_task_spawner.clone(),
@@ -332,12 +334,6 @@ where
         // primary network handle
         self.primary_network_handle = Some(PrimaryNetworkHandle::new(primary_network_handle));
 
-        //
-        //=== WORKER
-        //
-        // this is a temporary event stream - replaced at the start of every epoch
-        let (tmp_event_stream, _temp_rx) = mpsc::channel(1000);
-
         // create network db
         let worker_network_db = self.tn_datadir.network_db_path().join("worker");
         let _ = std::fs::create_dir_all(&worker_network_db);
@@ -347,7 +343,7 @@ where
         // create long-running network task for worker
         let worker_network = ConsensusNetwork::new_for_worker(
             network_config,
-            tmp_event_stream,
+            self.worker_event_stream.clone(),
             self.key_config.clone(),
             worker_network_db,
             node_task_spawner.clone(),
@@ -406,6 +402,7 @@ where
             })?;
 
             info!(target: "epoch-manager", "looping run epoch");
+            self.consensus_bus.reset_for_epoch();
         }
     }
 
@@ -429,7 +426,7 @@ where
         let mut epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
 
         // subscribe to output early to prevent missed messages
-        let consensus_output = self.consensus_output.subscribe();
+        let consensus_output = self.consensus_bus.consensus_output().subscribe();
 
         // create primary and worker nodes
         let (primary, worker_node) = self
@@ -483,15 +480,16 @@ where
 
         tokio::select! {
             // wait for epoch boundary to transition
-            res = self.wait_for_epoch_boundary(to_engine, engine, consensus_output, consensus_shutdown.clone(), gas_accumulator) => {
-                res.inspect_err(|e| {
-                    error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
-                })?;
-
-                info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
-
+            res = self.wait_for_epoch_boundary(to_engine, gas_accumulator.clone(), consensus_output) => {
                 // toggle bool to clear tables
                 clear_tables_for_next_epoch = true;
+                let target_hash = res.inspect_err(|e| {
+                    error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
+                })?;
+                self.close_epoch(engine, consensus_shutdown.clone(), gas_accumulator, target_hash)
+                    .await?;
+
+                info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
             },
 
             // return any errors
@@ -529,13 +527,11 @@ where
     async fn wait_for_epoch_boundary(
         &self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
-        engine: &ExecutionNode,
-        mut consensus_output: broadcast::Receiver<ConsensusOutput>,
-        shutdown_consensus: Notifier,
         gas_accumulator: GasAccumulator,
-    ) -> eyre::Result<()> {
+        mut consensus_output: impl TnReceiver<ConsensusOutput>,
+    ) -> eyre::Result<B256> {
         // receive output from consensus and forward to engine
-        'epoch: while let Ok(mut output) = consensus_output.recv().await {
+        while let Some(mut output) = consensus_output.recv().await {
             // observe epoch boundary to initiate epoch transition
             if output.committed_at() >= self.epoch_boundary {
                 info!(
@@ -545,9 +541,6 @@ where
                     epoch_boundary=?self.epoch_boundary,
                     "epoch boundary detected",
                 );
-                // subscribe to engine blocks to confirm epoch closed on-chain
-                let mut executed_output = engine.canonical_block_stream().await;
-
                 // update output so engine closes epoch
                 output.close_epoch = true;
 
@@ -557,41 +550,54 @@ where
                 gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
                 // forward the output to the engine
                 to_engine.send(output).await?;
-
-                // begin consensus shutdown while engine executes
-                shutdown_consensus.notify();
-
-                // wait for execution result before proceeding
-                while let Some(output) = executed_output.next().await {
-                    // ensure canonical tip is updated with closing epoch info
-                    if output.tip().sealed_header().parent_beacon_block_root == Some(target_hash) {
-                        // return
-                        break 'epoch;
-                    }
-                }
-
-                // `None` indicates all senders have dropped
-                error!(
-                    target: "epoch-manager",
-                    "canon state notifications dropped while awaiting engine execution for closing epoch",
-                );
-                return Err(eyre!("engine failed to report output for closing epoch"));
+                return Ok(target_hash);
             } else {
                 gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
                 // only forward the output to the engine
                 to_engine.send(output).await?;
             }
         }
-        // Use accumulated gas information to set each workers base fee for the epoch.
-        for worker_id in 0..gas_accumulator.num_workers() {
-            let worker_id = worker_id as u16;
-            let (_blocks, _gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
-            // Change this base fee to update base fee in batches workers create.
-            let _base_fee = gas_accumulator.base_fee(worker_id);
-        }
-        gas_accumulator.clear(); // Clear the accumlated values for next epoch.
+        Err(eyre::eyre!("invalid wait for epoch end"))
+    }
 
-        Ok(())
+    /// Close an epoch after wait_for_epoch_boundary returns.
+    ///
+    /// This is broken out so it can shutdown the epoch tasks and not suffer race conditions
+    /// in the run_epoch() select.
+    async fn close_epoch(
+        &self,
+        engine: &ExecutionNode,
+        shutdown_consensus: Notifier,
+        gas_accumulator: GasAccumulator,
+        target_hash: B256,
+    ) -> eyre::Result<()> {
+        // subscribe to engine blocks to confirm epoch closed on-chain
+        let mut executed_output = engine.canonical_block_stream().await;
+        // begin consensus shutdown while engine executes
+        shutdown_consensus.notify();
+
+        // wait for execution result before proceeding
+        while let Some(output) = executed_output.next().await {
+            // ensure canonical tip is updated with closing epoch info
+            if output.tip().sealed_header().parent_beacon_block_root == Some(target_hash) {
+                // Use accumulated gas information to set each workers base fee for the epoch.
+                for worker_id in 0..gas_accumulator.num_workers() {
+                    let worker_id = worker_id as u16;
+                    let (_blocks, _gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
+                    // Change this base fee to update base fee in batches workers create.
+                    let _base_fee = gas_accumulator.base_fee(worker_id);
+                }
+                gas_accumulator.clear(); // Clear the accumlated values for next epoch.
+                return Ok(());
+            }
+        }
+
+        // `None` indicates all senders have dropped
+        error!(
+            target: "epoch-manager",
+            "canon state notifications dropped while awaiting engine execution for closing epoch",
+        );
+        Err(eyre!("engine failed to report output for closing epoch"))
     }
 
     /// Helper method to create all engine components.
@@ -657,20 +663,16 @@ where
         *initial_epoch = false;
 
         // set execution state for consensus
-        let consensus_bus = primary.consensus_bus().await;
-        self.try_restore_state(&consensus_bus, &consensus_db, engine).await?;
+        self.try_restore_state(&consensus_db, engine).await?;
 
         let primary_network_handle = primary.network_handle().await;
-        let _mode = self
-            .identify_node_mode(&consensus_bus, &consensus_config, &primary_network_handle)
-            .await?;
+        let _mode = self.identify_node_mode(&consensus_config, &primary_network_handle).await?;
 
         // spawn task to update the latest execution results for consensus
         //
         // NOTE: this should live and die with epochs because it updates the consensus bus
         self.spawn_engine_update_task(
             consensus_config.shutdown().subscribe(),
-            consensus_bus.clone(),
             engine.canonical_block_stream().await,
             epoch_task_manager,
         );
@@ -786,11 +788,8 @@ where
         epoch_task_spawner: TaskSpawner,
         initial_epoch: &bool,
     ) -> eyre::Result<PrimaryNode<DB>> {
-        let consensus_bus = ConsensusBus::new_with_args(
-            consensus_config.config().parameters.gc_depth,
-            self.consensus_output.clone(),
-        );
-        let state_sync = StateSynchronizer::new(consensus_config.clone(), consensus_bus.clone());
+        let state_sync =
+            StateSynchronizer::new(consensus_config.clone(), self.consensus_bus.clone());
         let network_handle = self
             .primary_network_handle
             .as_ref()
@@ -800,7 +799,6 @@ where
         // create the epoch-specific `PrimaryNetwork`
         self.spawn_primary_network_for_epoch(
             consensus_config,
-            &consensus_bus,
             state_sync.clone(),
             epoch_task_spawner.clone(),
             &network_handle,
@@ -809,8 +807,12 @@ where
         .await?;
 
         // spawn primary - create node and spawn network
-        let primary =
-            PrimaryNode::new(consensus_config.clone(), consensus_bus, network_handle, state_sync);
+        let primary = PrimaryNode::new(
+            consensus_config.clone(),
+            self.consensus_bus.clone(),
+            network_handle,
+            state_sync,
+        );
 
         Ok(primary)
     }
@@ -883,14 +885,14 @@ where
     async fn spawn_primary_network_for_epoch<DB: TNDatabase>(
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
-        consensus_bus: &ConsensusBus,
         state_sync: StateSynchronizer<DB>,
         epoch_task_spawner: TaskSpawner,
         network_handle: &PrimaryNetworkHandle,
         initial_epoch: &bool,
     ) -> eyre::Result<()> {
-        // create event streams for the primary network handler
-        let (event_stream, rx_event_stream) = mpsc::channel(1000);
+        // get event streams for the primary network handler
+        let event_stream = self.consensus_bus.primary_network_events().clone();
+        let rx_event_stream = event_stream.subscribe();
 
         // set committee for network to prevent banning
         debug!(target: "epoch-manager", auth=?consensus_config.authority_id(), "spawning primary network for epoch");
@@ -916,7 +918,7 @@ where
                 .await?;
         }
 
-        network_handle.inner_handle().new_epoch(committee_keys.clone(), event_stream).await?;
+        network_handle.inner_handle().new_epoch(committee_keys.clone()).await?;
         debug!(target: "epoch-manager", auth=?consensus_config.authority_id(), "event stream updated!");
 
         // start listening if the network needs to be initialized
@@ -960,7 +962,7 @@ where
             rx_event_stream,
             network_handle.clone(),
             consensus_config.clone(),
-            consensus_bus.clone(),
+            self.consensus_bus.clone(),
             state_sync,
             epoch_task_spawner.clone(), // tasks should abort with epoch
         )
@@ -1009,8 +1011,8 @@ where
         network_handle: &WorkerNetworkHandle,
         initial_epoch: &bool,
     ) -> eyre::Result<()> {
-        // create event streams for the worker network handler
-        let (event_stream, rx_event_stream) = mpsc::channel(1000);
+        // get event streams for the worker network handler
+        let rx_event_stream = self.worker_event_stream.subscribe();
         debug!(target: "epoch-manager", "spawning worker network for epoch");
 
         let committe_keys: HashSet<BlsPublicKey> = consensus_config
@@ -1019,7 +1021,7 @@ where
             .into_iter()
             .map(|a| *a.protocol_key())
             .collect();
-        network_handle.inner_handle().new_epoch(committe_keys, event_stream).await?;
+        network_handle.inner_handle().new_epoch(committe_keys).await?;
 
         // start listening if the network needs to be initialized
         if *initial_epoch {
@@ -1078,15 +1080,16 @@ where
     /// Helper method to restore execution state for the consensus components.
     async fn try_restore_state(
         &self,
-        consensus_bus: &ConsensusBus,
         db: &DatabaseType,
         engine: &ExecutionNode,
     ) -> eyre::Result<()> {
         // prime the recent_blocks watch with latest executed blocks
-        let block_capacity = consensus_bus.recent_blocks().borrow().block_capacity();
+        let block_capacity = self.consensus_bus.recent_blocks().borrow().block_capacity();
 
         for recent_block in engine.last_executed_output_blocks(block_capacity).await? {
-            consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(recent_block));
+            self.consensus_bus
+                .recent_blocks()
+                .send_modify(|blocks| blocks.push_latest(recent_block));
         }
 
         // prime the last consensus header from the DB
@@ -1095,7 +1098,7 @@ where
 
         // prime the watch channel with data from the db this will be updated by state-sync if this
         // node can_cvv
-        consensus_bus.last_consensus_header().send(last_db_block)?;
+        self.consensus_bus.last_consensus_header().send(last_db_block)?;
 
         Ok(())
     }
@@ -1108,7 +1111,6 @@ where
     /// This method also updates the `ConsensusBus::node_mode()`.
     async fn identify_node_mode<DB: TNDatabase>(
         &self,
-        consensus_bus: &ConsensusBus,
         consensus_config: &ConsensusConfig<DB>,
         primary_network_handle: &PrimaryNetworkHandle,
     ) -> eyre::Result<NodeMode> {
@@ -1119,7 +1121,8 @@ where
             .unwrap_or(false);
         let mode = if !in_committee || self.builder.tn_config.observer {
             NodeMode::Observer
-        } else if state_sync::can_cvv(consensus_bus, consensus_config, primary_network_handle).await
+        } else if state_sync::can_cvv(&self.consensus_bus, consensus_config, primary_network_handle)
+            .await
         {
             NodeMode::CvvActive
         } else {
@@ -1128,7 +1131,7 @@ where
 
         debug!(target: "epoch-manager", ?mode, "node mode identified");
         // update consensus bus
-        consensus_bus.node_mode().send_modify(|v| *v = mode);
+        self.consensus_bus.node_mode().send_modify(|v| *v = mode);
 
         Ok(mode)
     }
@@ -1138,11 +1141,11 @@ where
     fn spawn_engine_update_task(
         &self,
         shutdown: Noticer,
-        consensus_bus: ConsensusBus,
         mut engine_state: CanonStateNotificationStream,
         epoch_task_manager: &TaskManager,
     ) {
         // spawn epoch-specific task to forward blocks from the engine to consensus
+        let consensus_bus = self.consensus_bus.clone();
         epoch_task_manager.spawn_critical_task("latest execution block", async move {
             loop {
                 tokio::select!(

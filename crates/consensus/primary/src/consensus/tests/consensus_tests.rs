@@ -126,6 +126,7 @@ async fn test_consensus_recovery_with_bullshark() {
 
     // AND shutdown consensus
     task_manager.abort();
+    drop(task_manager);
 
     certificate_store.clear().unwrap();
     consensus_store.clear_consensus_chain_for_test();
@@ -191,6 +192,7 @@ async fn test_consensus_recovery_with_bullshark() {
 
     // AND shutdown (crash) consensus
     task_manager.abort();
+    drop(task_manager);
 
     let bad_nodes_stake_threshold = 0;
     let bullshark = Bullshark::new(
@@ -206,7 +208,8 @@ async fn test_consensus_recovery_with_bullshark() {
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     let mut rx_output = cb.sequence().subscribe();
-    Consensus::spawn(config, &cb, bullshark, &TaskManager::default());
+    let task_manager = TaskManager::default();
+    Consensus::spawn(config, &cb, bullshark, &task_manager);
 
     // WHEN send the certificates of round >= 5 to trigger a leader election for round 4
     // and start committing.

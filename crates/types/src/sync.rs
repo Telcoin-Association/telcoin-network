@@ -195,6 +195,24 @@ impl<T: Send + Clone + 'static> TnSender<T> for broadcast::Sender<T> {
     }
 }
 
+impl<T: Send + 'static> TnSender<T> for mpsc::Sender<T> {
+    async fn send(&self, value: T) -> Result<(), SendError<T>> {
+        Ok(mpsc::Sender::send(self, value).await?)
+    }
+
+    fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
+        Ok(mpsc::Sender::try_send(self, value)?)
+    }
+
+    #[allow(unreachable_code)]
+    fn subscribe(&self) -> impl TnReceiver<T> + 'static {
+        panic!("mpsc Sender does not support subscibe!");
+        // This code is unreachable but the compiler needs it to infer the return type.
+        let (_tx, _rx) = mpsc::channel(1);
+        _rx
+    }
+}
+
 impl<T: Send + Clone> TnReceiver<T> for broadcast::Receiver<T> {
     async fn recv(&mut self) -> Option<T> {
         broadcast::Receiver::recv(self).await.ok()

@@ -86,17 +86,24 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
         gas_accumulator.clone(),
     );
     let (tx, mut rx) = oneshot::channel();
-    task_manager.spawn_blocking(Box::pin(async move {
+    task_manager.spawn_task("test task eng", async move {
         let res = engine.await;
         debug!(target: "gas-test", ?res, "res:");
         let _ = tx.send(res);
-    }));
+    });
 
     // subscribe to output early
     let mut consensus_output = consensus_bus.consensus_output().subscribe();
 
     // spawn consensus to send output to engine for full execution
-    spawn_consensus(&fixture, &consensus_bus, batches, config, consensus_store.clone());
+    spawn_consensus(
+        &fixture,
+        &consensus_bus,
+        batches,
+        config,
+        consensus_store.clone(),
+        &task_manager,
+    );
 
     // send certificates to trigger subdag commit
     for certificate in certificates.iter() {
@@ -164,10 +171,10 @@ fn spawn_consensus(
     batches: HashMap<B256, Batch>,
     config: ConsensusConfig<MemDatabase>,
     consensus_store: MemDatabase,
+    task_manager: &TaskManager,
 ) {
     // components for tasks
     let committee = fixture.committee();
-    let task_manager = TaskManager::new("subscriber tests");
     let rx_shutdown = config.shutdown().subscribe();
 
     let (tx, mut rx) = mpsc::channel(10);
@@ -181,7 +188,7 @@ fn spawn_consensus(
     let network = PrimaryNetworkHandle::new_for_test(tx);
 
     // spawn the executor
-    spawn_subscriber(config.clone(), rx_shutdown, consensus_bus.clone(), &task_manager, network);
+    spawn_subscriber(config.clone(), rx_shutdown, consensus_bus.clone(), task_manager, network);
 
     // Set up mock worker.
     let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
@@ -204,5 +211,5 @@ fn spawn_consensus(
     // spawn consensus to await certificates
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    Consensus::spawn(config, consensus_bus, bullshark, &task_manager);
+    Consensus::spawn(config, consensus_bus, bullshark, task_manager);
 }

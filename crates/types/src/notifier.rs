@@ -10,7 +10,9 @@ use std::{
 
 /// A Noticer is a future that will resolve when the Notifier it is subscribed to is notified.
 /// Used for simple notification schemes (like shutdown signals).
-#[derive(Clone, Debug)]
+/// Does not implement Clone on purpose- you will have race conditions with the Waker if it is
+/// cloned.
+#[derive(Debug)]
 pub struct Noticer {
     lock: Arc<Mutex<(bool, Option<Waker>)>>,
 }
@@ -33,8 +35,9 @@ impl Notifier {
 
     /// Get a Noticer that will resolve once this Notifier is notified.
     pub fn subscribe(&self) -> Noticer {
-        let noticer = Noticer { lock: Arc::new(Mutex::new((false, None))) };
-        self.noticers.lock().push(noticer.clone());
+        let lock = Arc::new(Mutex::new((false, None)));
+        let noticer = Noticer { lock: lock.clone() };
+        self.noticers.lock().push(Noticer { lock });
         noticer
     }
 
