@@ -86,7 +86,13 @@ fn test_certificate_iterator() {
         (1, vec![vec![], vec![], vec![3], vec![3]], 5, vec![2, 2, 2, 4]),
     ];
 
+    let sample_cert = &certificates[0];
+    let single_cert_size = tn_types::encode(sample_cert).len();
+    let message_overhead = tn_types::encode(&MissingCertificatesRequest::default()).len();
+
     for (lower_bound_round, skip_rounds_vec, max_items, expected_rounds) in test_cases {
+        // estimate response size based on max_items returned
+        let response_size = single_cert_size * max_items + message_overhead;
         let req = MissingCertificatesRequest::default()
             .set_bounds(
                 lower_bound_round,
@@ -97,10 +103,10 @@ fn test_certificate_iterator() {
                     .collect(),
             )
             .expect("bounds within range")
-            .set_max_items(max_items);
+            .set_max_response_size(response_size);
 
         // collect from database
-        let mut missing = Vec::with_capacity(req.max_items);
+        let mut missing = Vec::new();
         let collector = CertificateCollector::new(req, consensus_config.clone())
             .expect("certificate collector process valid request");
 

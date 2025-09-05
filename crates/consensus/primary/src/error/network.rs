@@ -69,10 +69,6 @@ impl From<PrimaryNetworkError> for Option<Penalty> {
                     | CertificateError::TooNew(_, _, _)
                     | CertificateError::Storage(_) => None,
                 },
-                // severe
-                CertManagerError::TooManyFetchedCertificatesReturned { .. } => {
-                    Some(Penalty::Severe)
-                }
                 // fatal
                 CertManagerError::UnverifiedSignature(_) => Some(Penalty::Fatal),
                 // ignore

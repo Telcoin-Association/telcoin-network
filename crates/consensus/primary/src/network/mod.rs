@@ -30,8 +30,6 @@ mod message;
 #[path = "../tests/network_tests.rs"]
 mod network_tests;
 
-// Maximum number of certificates for one request.
-pub(crate) const MAX_CERTIFICATES_PER_REQUEST: usize = 2_000;
 /// Convenience type for Primary network.
 pub(crate) type Req = PrimaryRequest;
 /// Convenience type for Primary network.
@@ -313,8 +311,10 @@ where
                 certs = request_handler.retrieve_missing_certs(request) => {
                     let response = certs.into_response();
 
-                    // TODO: penalize peer's reputation for bad request
-                    // if response.is_err() { }
+                    if response.is_err() {
+                        // indicates error with message bounds
+                        network_handle.report_penalty(peer, Penalty::Mild).await;
+                    }
 
                     let _ = network_handle.handle.send_response(response, channel).await;
                 }
