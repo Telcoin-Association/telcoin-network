@@ -14,6 +14,9 @@ pub enum TNRpcError {
     /// Handshake client provided an invalid signature for network key.
     #[error("Invalid proof of possession for provided network key or genesis.")]
     InvalidProofOfPossession,
+    /// Requested item not found.
+    #[error("Not Found.")]
+    NotFound,
 }
 
 impl From<TNRpcError> for jsonrpsee_types::ErrorObject<'static> {
@@ -21,7 +24,7 @@ impl From<TNRpcError> for jsonrpsee_types::ErrorObject<'static> {
         // TODO: update this when adding errors
         match error {
             TNRpcError::InvalidProofOfPossession => rpc_error(401, error.to_string(), None),
-            // _ => rpc_error(500, error.to_string(), None),
+            TNRpcError::NotFound => rpc_error(401, error.to_string(), None),
         }
     }
 }

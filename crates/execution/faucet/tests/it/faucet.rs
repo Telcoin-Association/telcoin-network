@@ -79,6 +79,14 @@ impl EngineToPrimary for EmptyEngToPrimary {
     ) -> Option<tn_types::ConsensusHeader> {
         None
     }
+
+    fn epoch(
+        &self,
+        _epoch: Option<tn_types::Epoch>,
+        _hash: Option<tn_types::BlockHash>,
+    ) -> Option<(tn_types::EpochRecord, tn_types::EpochCertificate)> {
+        None
+    }
 }
 
 #[tokio::test]

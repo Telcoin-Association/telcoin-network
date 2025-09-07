@@ -616,6 +616,7 @@ where
         let quorum = epoch_rec.simple_quorum();
         let mut sigs = Vec::new();
         let mut signed_authorities = roaring::RoaringBitmap::new();
+        let primary_network = primary.network_handle().await;
         // We are in the committee so sign and gossip the epoch record.
         if committee_keys.contains(me) {
             committee_keys.remove(me);
@@ -624,7 +625,6 @@ where
             if let Some(idx) = committee_index.get(&self.key_config.primary_public_key()) {
                 signed_authorities.insert(*idx as u32);
             }
-            let primary_network = primary.network_handle().await;
             info!(
                 target: "epoch-manager",
                 "publising epoch record {epoch_hash}",
@@ -692,6 +692,28 @@ where
                     target: "epoch-manager",
                     "failed to reach quorum on epoch close for {epoch_hash} {epoch_rec:?}",
                 );
+                // Try to recover by downloading the epoch record and cert from a peer.
+                for _ in 0..3 {
+                    match primary_network.request_epoch(None, Some(epoch_hash)).await {
+                        Ok((epoch_rec, cert)) => {
+                            if epoch_rec.digest() == epoch_hash
+                                && epoch_hash == cert.epoch_hash
+                                && epoch_rec.verify_with_cert(&cert)
+                            {
+                                let _ = consensus_db.insert::<EpochCerts>(&epoch_hash, &cert);
+                                info!(
+                                    target: "epoch-manager",
+                                    "retrieved cert for epoch {epoch_hash} from a peer",
+                                );
+                                break;
+                            }
+                        }
+                        Err(err) => error!(
+                            target: "epoch-manager",
+                            "failed to retrieve epoch from a peer {epoch_hash}: {err}",
+                        ),
+                    }
+                }
             }
         });
         Ok(())
