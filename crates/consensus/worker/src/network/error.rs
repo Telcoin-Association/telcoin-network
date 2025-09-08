@@ -23,6 +23,9 @@ pub(crate) enum WorkerNetworkError {
     // Network error.
     #[error("Network error occured: {0}")]
     Network(#[from] NetworkError),
+    /// The peer's request is invalid.
+    #[error("{0}")]
+    InvalidRequest(String),
 }
 
 impl From<WorkerNetworkError> for Option<Penalty> {
@@ -53,6 +56,7 @@ impl From<WorkerNetworkError> for Option<Penalty> {
                     }
                 }
             }
+            WorkerNetworkError::InvalidRequest(_) => Some(Penalty::Mild),
             // fatal
             WorkerNetworkError::Decode(_) => Some(Penalty::Fatal),
             // ignore

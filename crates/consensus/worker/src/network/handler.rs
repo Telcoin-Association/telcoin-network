@@ -3,7 +3,8 @@ use super::{
     message::WorkerGossip,
     WorkerNetworkHandle,
 };
-use std::sync::Arc;
+use crate::WorkerResponse;
+use std::sync::{Arc, LazyLock};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::GossipMessage;
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
@@ -11,6 +12,15 @@ use tn_storage::tables::Batches;
 use tn_types::{
     now, try_decode, Batch, BatchValidation, BlockHash, Database, SealedBatch, WorkerId,
 };
+use tracing::warn;
+
+/// The minimal length of a single, encoded, default [Batch] used to set a local min for
+/// message validation.
+static LOCAL_MIN_REQUEST_SIZE: LazyLock<usize> =
+    LazyLock::new(|| tn_types::encode(&Batch::default()).len());
+/// The minimal wrapper overhead using a default, empty message.
+static MESSAGE_OVERHEAD: LazyLock<usize> =
+    LazyLock::new(|| tn_types::encode(&WorkerResponse::RequestBatches(vec![])).len());
 
 /// The type that handles requests from peers.
 #[derive(Clone)]
@@ -123,9 +133,25 @@ where
     pub(crate) async fn process_request_batches(
         &self,
         batch_digests: Vec<BlockHash>,
+        max_response_size: usize,
     ) -> WorkerNetworkResult<Vec<Batch>> {
-        const MAX_REQUEST_BATCHES_RESPONSE_SIZE: usize = 6_000_000;
         const BATCH_DIGESTS_READ_CHUNK_SIZE: usize = 200;
+
+        // assume reasonable min is 1 encoded batch (no transactions)
+        // NOTE: caller needs to account for cert + msg overhead, and batches must have transactions
+        if max_response_size < *LOCAL_MIN_REQUEST_SIZE {
+            warn!(target: "cert-collector", "batch request max size too small: {}", max_response_size);
+            return Err(WorkerNetworkError::InvalidRequest("Request size too small".into()));
+        }
+
+        // use the min value between this node's max rpc message size and the requestor's reported
+        // max message size
+        //
+        // NOTE: assume safe overhead is accounted for because the codec will also compress messages
+        let local_max = self.consensus_config.network_config().libp2p_config().max_rpc_message_size
+            - *MESSAGE_OVERHEAD;
+        let max_message_size = max_response_size.min(local_max);
+
         let store = self.consensus_config.node_storage().clone();
 
         let digests_chunks = batch_digests
@@ -143,7 +169,7 @@ where
 
             for stored_batch in stored_batches.into_iter().flatten() {
                 let batch_size = stored_batch.size();
-                if total_size + batch_size <= MAX_REQUEST_BATCHES_RESPONSE_SIZE {
+                if total_size + batch_size <= max_message_size {
                     batches.push(stored_batch);
                     total_size += batch_size;
                 } else {

@@ -308,14 +308,15 @@ where
         let task_name = format!("MissingCertsReq-{peer}");
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
-                certs = request_handler.retrieve_missing_certs(request) => {
-                    let response = certs.into_response();
-
-                    if response.is_err() {
-                        // indicates error with message bounds
-                        network_handle.report_penalty(peer, Penalty::Mild).await;
+                result = request_handler.retrieve_missing_certs(request) => {
+                    // report penalty if any
+                    if let Err(ref e) = result {
+                        if let Some(penalty) = e.into() {
+                            network_handle.report_penalty(peer, penalty).await;
+                        }
                     }
 
+                    let response = result.into_response();
                     let _ = network_handle.handle.send_response(response, channel).await;
                 }
                 // cancel notification from network layer
@@ -360,7 +361,7 @@ where
         let task_name = format!("ProcessGossip-{source}");
         // spawn task to process gossip
         self.task_spawner.spawn_task(task_name, async move {
-            if let Err(e) = request_handler.process_gossip(&msg).await {
+            if let Err(ref e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "primary::network", ?e, "process_gossip");
                 // convert error into penalty to lower peer score
                 if let Some(penalty) = e.into() {
