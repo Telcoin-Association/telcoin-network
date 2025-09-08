@@ -18,7 +18,7 @@ use tracing::warn;
 /// message validation.
 static LOCAL_MIN_REQUEST_SIZE: LazyLock<usize> =
     LazyLock::new(|| tn_types::encode(&Batch::default()).len());
-/// The minimal wrapper overhead using a default, empty message.
+/// The minimal response wrapper using a default, empty message.
 static MESSAGE_OVERHEAD: LazyLock<usize> =
     LazyLock::new(|| tn_types::encode(&WorkerResponse::RequestBatches(vec![])).len());
 
@@ -138,7 +138,8 @@ where
         const BATCH_DIGESTS_READ_CHUNK_SIZE: usize = 200;
 
         // assume reasonable min is 1 encoded batch (no transactions)
-        // NOTE: caller needs to account for cert + msg overhead, and batches must have transactions
+        // NOTE: caller needs to account for batches + msg overhead, and batches must have
+        // transactions
         if max_response_size < *LOCAL_MIN_REQUEST_SIZE {
             warn!(target: "cert-collector", "batch request max size too small: {}", max_response_size);
             return Err(WorkerNetworkError::InvalidRequest("Request size too small".into()));

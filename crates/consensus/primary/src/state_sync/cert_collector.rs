@@ -4,7 +4,7 @@
 
 use crate::{
     error::{PrimaryNetworkError, PrimaryNetworkResult},
-    network::{MissingCertificatesRequest, PrimaryRequest},
+    network::{MissingCertificatesRequest, PrimaryResponse},
 };
 use std::{
     cmp::Reverse,
@@ -21,12 +21,9 @@ use tracing::{debug, warn};
 /// message validation.
 static LOCAL_MIN_REQUEST_SIZE: LazyLock<usize> =
     LazyLock::new(|| tn_types::encode(&Certificate::default()).len());
-/// The minimal wrapper overhead using a default, empty message.
+/// The minimal response wrapper using a default, empty message.
 static MESSAGE_OVERHEAD: LazyLock<usize> = LazyLock::new(|| {
-    tn_types::encode(&PrimaryRequest::MissingCertificates {
-        inner: MissingCertificatesRequest::default(),
-    })
-    .len()
+    tn_types::encode(&PrimaryResponse::RequestedCertificates(vec![])).len()
 });
 
 #[cfg(test)]
@@ -205,10 +202,10 @@ where
             Ok(Some(cert)) => {
                 debug!(target: "cert-collector", ?cert, "next cert Ok(Some)");
                 // encode the certificate and check size limits
-                let bytes = tn_types::encode(&cert);
+                let bytes = tn_types::encode(&cert).len();
 
                 // check accumulated total to ensure this cert doesn't exceed msg size limit
-                if self.would_exceed_size_limit(bytes.len()) {
+                if self.would_exceed_size_limit(bytes) {
                     debug!(
                         target: "cert-collector",
                         "Next certificate would exceed size limit. Current size: {} bytes",
@@ -219,7 +216,7 @@ where
                     return None;
                 }
 
-                self.accumulated_size += bytes.len();
+                self.accumulated_size += bytes;
                 Some(Ok(cert))
             }
             Ok(None) => {

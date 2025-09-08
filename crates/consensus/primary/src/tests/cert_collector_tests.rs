@@ -86,11 +86,12 @@ fn test_certificate_iterator() {
         (1, vec![vec![], vec![], vec![3], vec![3]], 5, vec![2, 2, 2, 4]),
     ];
 
+    // calculate reasonable response size
     let sample_cert = &certificates[0];
     let single_cert_size = tn_types::encode(sample_cert).len();
     let message_overhead = tn_types::encode(&MissingCertificatesRequest::default()).len();
 
-    for (lower_bound_round, skip_rounds_vec, max_items, expected_rounds) in test_cases {
+    for (lower_bound_round, skip_rounds_vec, max_items, expected_rounds) in test_cases.clone() {
         // estimate response size based on max_items returned
         let response_size = single_cert_size * max_items + message_overhead;
         let req = MissingCertificatesRequest::default()
@@ -116,5 +117,35 @@ fn test_certificate_iterator() {
         }
 
         assert_eq!(missing.iter().map(|cert| cert.round()).collect::<Vec<u32>>(), expected_rounds);
+    }
+
+    // assert MAX is capped by this node
+    for (lower_bound_round, skip_rounds_vec, _max_items, expected_rounds) in test_cases {
+        // estimate response size based on max_items returned
+        let req = MissingCertificatesRequest::default()
+            .set_bounds(
+                lower_bound_round,
+                authorities
+                    .clone()
+                    .into_iter()
+                    .zip(skip_rounds_vec.into_iter().map(|rounds| rounds.into_iter().collect()))
+                    .collect(),
+            )
+            .expect("bounds within range")
+            .set_max_response_size(usize::MAX);
+
+        // collect from database
+        let mut missing = Vec::new();
+        let collector = CertificateCollector::new(req, consensus_config.clone())
+            .expect("certificate collector process valid request");
+
+        // Collect certificates from iterator
+        for certs in collector {
+            missing.push(certs.expect("cert recovered correctly"));
+        }
+
+        // assert at least the expected rounds are returned
+        // NOTE: the expected_rounds tests requestor's limits are respected
+        assert!(missing.iter().map(|cert| cert.round()).collect::<Vec<u32>>() >= expected_rounds);
     }
 }

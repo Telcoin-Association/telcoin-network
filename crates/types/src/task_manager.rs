@@ -600,7 +600,7 @@ mod test {
     impl Pong {
         async fn ping(&mut self, p: u32) -> eyre::Result<u32> {
             self.ping_tx.send(p).await?;
-            Ok(self.pong_rx.recv().await.map_or_else(|| Err(eyre::eyre!("No Pong!")), Ok)?)
+            self.pong_rx.recv().await.map_or_else(|| Err(eyre::eyre!("No Pong!")), Ok)
         }
     }
 
