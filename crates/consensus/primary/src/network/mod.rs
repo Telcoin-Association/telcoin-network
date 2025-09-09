@@ -19,7 +19,8 @@ use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerTo
 use tn_storage::PayloadStore;
 use tn_types::{
     encode, BlockHash, BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader, Database,
-    Epoch, EpochCertificate, EpochRecord, Header, TaskSpawner, TnReceiver, TnSender, Vote,
+    Epoch, EpochCertificate, EpochRecord, EpochVote, Header, TaskSpawner, TnReceiver, TnSender,
+    Vote,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
@@ -78,17 +79,14 @@ impl PrimaryNetworkHandle {
         consensus_block_num: u64,
         consensus_header_hash: BlockHash,
     ) -> NetworkResult<()> {
-        let data = encode(&PrimaryGossip::Consenus(consensus_block_num, consensus_header_hash));
+        let data = encode(&PrimaryGossip::Consensus(consensus_block_num, consensus_header_hash));
         self.handle.publish("tn-primary".into(), data).await?;
         Ok(())
     }
 
     /// Publish a certificate to the consensus network.
-    pub async fn publish_epoch_certificate(
-        &self,
-        certificate: EpochCertificate,
-    ) -> NetworkResult<()> {
-        let data = encode(&PrimaryGossip::EpochCertificate(certificate));
+    pub async fn publish_epoch_vote(&self, vote: EpochVote) -> NetworkResult<()> {
+        let data = encode(&PrimaryGossip::EpochVote(Box::new(vote)));
         self.handle.publish("tn-primary".into(), data).await?;
         Ok(())
     }

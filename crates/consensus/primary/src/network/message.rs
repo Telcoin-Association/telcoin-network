@@ -10,7 +10,7 @@ use std::{
 use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, TNMessage};
 use tn_types::{
     AuthorityIdentifier, BlockHash, Certificate, CertificateDigest, ConsensusHeader, Epoch,
-    EpochCertificate, EpochRecord, Header, Round, Vote,
+    EpochCertificate, EpochRecord, EpochVote, Header, Round, Vote,
 };
 
 /// Primary messages on the gossip network.
@@ -25,9 +25,9 @@ pub enum PrimaryGossip {
     /// NOTE: `snappy` is slightly larger than uncompressed.
     Certificate(Box<Certificate>),
     /// Consensus output reached- publish the consensus chain height and new block hash.
-    Consenus(u64, BlockHash),
+    Consensus(u64, BlockHash),
     /// Signed hash sent out by committee memebers at epoch start.
-    EpochCertificate(EpochCertificate),
+    EpochVote(Box<EpochVote>),
 }
 
 // impl TNMessage trait for types

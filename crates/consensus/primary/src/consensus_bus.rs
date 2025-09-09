@@ -13,8 +13,8 @@ use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
 use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
 use tn_types::{
-    BlockHash, BlockNumHash, BlsPublicKey, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusOutput, EpochCertificate, Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
+    BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput,
+    EpochVote, Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
@@ -183,7 +183,7 @@ struct ConsensusBusAppInner {
     _rx_sync_status: watch::Receiver<NodeMode>,
 
     /// Produce new epoch certs as they are recieved.
-    new_epoch_certificates: QueChannel<(BlsPublicKey, EpochCertificate)>,
+    new_epoch_votes: QueChannel<EpochVote>,
     /// The que channel for primary network events.
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,
 
@@ -239,7 +239,7 @@ impl ConsensusBusAppInner {
             consensus_header,
             tx_sync_status,
             _rx_sync_status,
-            new_epoch_certificates: QueChannel::new(),
+            new_epoch_votes: QueChannel::new(),
             primary_network_events: QueChannel::new(),
             consensus_metrics,
             primary_metrics,
@@ -568,8 +568,8 @@ impl ConsensusBus {
     }
 
     /// New epoch certs as they are recieved.
-    pub fn new_epoch_certificates(&self) -> &impl TnSender<(BlsPublicKey, EpochCertificate)> {
-        &self.inner_app.new_epoch_certificates
+    pub fn new_epoch_votes(&self) -> &impl TnSender<EpochVote> {
+        &self.inner_app.new_epoch_votes
     }
 
     /// Update consensus round watch channels.

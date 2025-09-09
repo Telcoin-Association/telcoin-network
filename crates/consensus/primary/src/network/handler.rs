@@ -83,7 +83,7 @@ where
                 let unverified_cert = cert.validate_received().map_err(CertManagerError::from)?;
                 self.state_sync.process_peer_certificate(unverified_cert).await?;
             }
-            PrimaryGossip::Consenus(number, hash) => {
+            PrimaryGossip::Consensus(number, hash) => {
                 ensure!(
                     self.consensus_config.committee().authority_by_key(&source).is_some(),
                     PrimaryNetworkError::PeerNotInCommittee(Box::new(source))
@@ -97,8 +97,8 @@ where
                         self.consensus_bus.last_published_consensus_num_hash().send((number, hash));
                 }
             }
-            PrimaryGossip::EpochCertificate(cert) => {
-                let _ = self.consensus_bus.new_epoch_certificates().send((source, cert)).await;
+            PrimaryGossip::EpochVote(vote) => {
+                let _ = self.consensus_bus.new_epoch_votes().send(*vote).await;
             }
         }
 

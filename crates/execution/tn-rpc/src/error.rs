@@ -21,7 +21,6 @@ pub enum TNRpcError {
 
 impl From<TNRpcError> for jsonrpsee_types::ErrorObject<'static> {
     fn from(error: TNRpcError) -> Self {
-        // TODO: update this when adding errors
         match error {
             TNRpcError::InvalidProofOfPossession => rpc_error(401, error.to_string(), None),
             TNRpcError::NotFound => rpc_error(401, error.to_string(), None),

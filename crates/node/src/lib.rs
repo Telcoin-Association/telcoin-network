@@ -45,7 +45,7 @@ where
 
     // run the node
     let res = runtime.block_on(async move {
-        let consensus_db = manager::open_consensus_db(&tn_datadir).await?;
+        let consensus_db = manager::open_consensus_db(&tn_datadir)?;
         // create the epoch manager
         let mut epoch_manager = EpochManager::new(builder, tn_datadir, passphrase, consensus_db)?;
         epoch_manager.run().await

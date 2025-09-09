@@ -456,6 +456,7 @@ impl Committee {
             .collect()
     }
 
+    /// Return the Set of BlsPublicKey's for the current committee.
     pub fn committee_keys(&self) -> HashSet<BlsPublicKey> {
         self.inner.read().authorities.keys().copied().collect()
     }

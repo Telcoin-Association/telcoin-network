@@ -3,6 +3,7 @@
 use std::time::{Duration, SystemTime};
 mod block;
 mod certificate;
+mod epoch;
 mod header;
 mod info;
 mod output;
@@ -11,6 +12,7 @@ mod vote;
 
 pub use block::*;
 pub use certificate::*;
+pub use epoch::*;
 pub use header::*;
 pub use info::*;
 pub use output::*;
