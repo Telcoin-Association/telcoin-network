@@ -155,7 +155,7 @@ pub struct CommittedSubDag {
     pub reputation_score: ReputationScores,
     /// The timestamp that should identify this commit. This is guaranteed to be monotonically
     /// incremented. This is not necessarily the leader's timestamp. We compare the leader's
-    /// timestamp with the previously committed sud dag timestamp and we always keep the max.
+    /// timestamp with the previously committed sub dag timestamp and we always keep the max.
     /// Property is explicitly private so the method commit_timestamp() should be used instead
     /// which bears additional resolution logic.
     commit_timestamp: TimestampSec,

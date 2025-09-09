@@ -442,6 +442,7 @@ impl Committee {
 
     /// Returns the bls keys of all members except `myself`.
     pub fn others_keys_except(&self, myself: &BlsPublicKey) -> Vec<BlsPublicKey> {
+        // XXXX- OK as is?
         self.inner
             .read()
             .authorities
@@ -457,6 +458,7 @@ impl Committee {
     }
 
     pub fn committee_keys(&self) -> HashSet<BlsPublicKey> {
+        // XXXX- unused
         self.inner.read().authorities.keys().copied().collect()
     }
 

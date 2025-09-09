@@ -18,8 +18,9 @@ use tn_network_libp2p::{
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::PayloadStore;
 use tn_types::{
-    encode, BlockHash, BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader, Database,
-    Epoch, EpochCertificate, EpochRecord, Header, TaskSpawner, TnReceiver, TnSender, Vote,
+    encode, BlockHash, BlsPublicKey, BlsSignature, Certificate, CertificateDigest, ConsensusHeader,
+    Database, Epoch, EpochCertificate, EpochRecord, Header, TaskSpawner, TnReceiver, TnSender,
+    Vote,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
@@ -77,8 +78,15 @@ impl PrimaryNetworkHandle {
         &self,
         consensus_block_num: u64,
         consensus_header_hash: BlockHash,
+        key: BlsPublicKey,
+        signature: BlsSignature,
     ) -> NetworkResult<()> {
-        let data = encode(&PrimaryGossip::Consenus(consensus_block_num, consensus_header_hash));
+        let data = encode(&PrimaryGossip::Consenus(
+            consensus_block_num,
+            consensus_header_hash,
+            key,
+            signature,
+        ));
         self.handle.publish("tn-primary".into(), data).await?;
         Ok(())
     }

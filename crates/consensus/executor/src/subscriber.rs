@@ -18,9 +18,9 @@ use tn_primary::{
 };
 use tn_storage::CertificateStore;
 use tn_types::{
-    AuthorityIdentifier, Batch, BlockHash, CommittedSubDag, Committee, ConsensusHeader,
-    ConsensusOutput, Database, Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp, TnReceiver,
-    TnSender, B256,
+    encode, to_intent_message, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
+    CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database, Hash as _, Noticer,
+    TaskManager, TaskSpawner, Timestamp, TnReceiver, TnSender, B256,
 };
 use tracing::{debug, error, info};
 
@@ -254,7 +254,10 @@ impl<DB: Database> Subscriber<DB> {
                         error!(target: "subscriber", "error sending latest consensus header for authority {:?}: {}", self.inner.authority_id, e);
                         return Err(SubscriberError::ClosedChannel("failed to send last consensus header on bus".to_string()));
                     }
-                    if let Err(e) = self.network_handle.publish_consensus(number, last_parent).await {
+                    //XXXXlet sig = self.config.key_config().request_signature_direct(last_parent.as_ref());
+                    let sig =
+                        self.config.key_config().request_signature_direct(&encode(&to_intent_message(last_parent)));
+                    if let Err(e) = self.network_handle.publish_consensus(number, last_parent, self.config.key_config().public_key(), sig).await {
                         error!(target: "subscriber", "error publishing latest consensus to network {:?}: {}", self.inner.authority_id, e);
                     }
                     last_number += 1;

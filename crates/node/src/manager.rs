@@ -635,8 +635,7 @@ where
         let mut rx = self.consensus_bus.new_epoch_certificates().subscribe();
         epoch_task_manager.spawn_task("Collect Epoch Signatures", async move {
             let mut reached_quorum = false;
-            while let Ok(Some((source, cert))) =
-                tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
+            while let Ok(Some(cert)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
             {
                 if let Some(source) =
                     Self::signed_by_committee(&epoch_rec.committee, &cert, epoch_hash).await
@@ -656,7 +655,7 @@ where
                 } else {
                     error!(
                         target: "epoch-manager",
-                        "Received an invalid epoch cert from {source} for {}.",
+                        "Received an invalid epoch cert from for {}.",
                         cert.epoch_hash,
                     );
                 }

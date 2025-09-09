@@ -37,10 +37,13 @@ pub(crate) enum PrimaryNetworkError {
     Internal(String),
     /// Unknown consensus header.
     #[error("Unknown consensus header: {0}")]
-    UnknowConsensusHeaderNumber(u64),
+    UnknownConsensusHeaderNumber(u64),
     /// Unknown consensus header.
     #[error("Unknown consensus header: {0}")]
-    UnknowConsensusHeaderDigest(BlockHash),
+    UnknownConsensusHeaderDigest(BlockHash),
+    /// Unknown consensus header certificate.
+    #[error("Unknown consensus header certificate for: {0}")]
+    UnknownConsensusHeaderCert(BlockHash),
     /// Peer that is not committee published invalid gosip.
     #[error("Peer {0} is not in the committee!")]
     PeerNotInCommittee(Box<BlsPublicKey>),
@@ -102,9 +105,10 @@ impl From<PrimaryNetworkError> for Option<Penalty> {
                 | CertManagerError::TNSend(_) => None,
             },
             // mild
-            PrimaryNetworkError::UnknowConsensusHeaderNumber(_)
+            PrimaryNetworkError::UnknownConsensusHeaderNumber(_)
             | PrimaryNetworkError::InvalidRequest(_)
-            | PrimaryNetworkError::UnknowConsensusHeaderDigest(_) => Some(Penalty::Mild),
+            | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
+            | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),
             // medium
             PrimaryNetworkError::InvalidEpochRequest
             | PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),

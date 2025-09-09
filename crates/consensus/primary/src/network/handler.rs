@@ -24,9 +24,9 @@ use tn_storage::{
 use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
-    now, try_decode, AuthorityIdentifier, BlockHash, BlsPublicKey, Certificate, CertificateDigest,
-    ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, Hash as _, Header, Round,
-    SignatureVerificationState, TnSender as _, Vote,
+    now, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlsPublicKey, Certificate,
+    CertificateDigest, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, Hash as _,
+    Header, ProtocolSignature, Round, SignatureVerificationState, TnSender as _, Vote,
 };
 use tracing::{debug, error, warn};
 
@@ -69,7 +69,7 @@ where
     pub(super) async fn process_gossip(
         &self,
         msg: &GossipMessage,
-        source: BlsPublicKey,
+        _source: BlsPublicKey,
     ) -> PrimaryNetworkResult<()> {
         // deconstruct message
         let GossipMessage { data, .. } = msg;
@@ -83,22 +83,32 @@ where
                 let unverified_cert = cert.validate_received().map_err(CertManagerError::from)?;
                 self.state_sync.process_peer_certificate(unverified_cert).await?;
             }
-            PrimaryGossip::Consenus(number, hash) => {
+            PrimaryGossip::Consenus(number, hash, key, signature) => {
+                // XXXX need to get committee correctly?  If we are behind then may not have the
+                // current committee. This may be intractable until EpochRecords are
+                // caught up. XXXX- don't subscribe to gossip until we have caught
+                // up EpochRecords in general. Or NOT
                 ensure!(
-                    self.consensus_config.committee().authority_by_key(&source).is_some(),
-                    PrimaryNetworkError::PeerNotInCommittee(Box::new(source))
+                    self.consensus_config.committee().authority_by_key(&key).is_some(),
+                    PrimaryNetworkError::PeerNotInCommittee(Box::new(key))
                 );
+                ensure!(
+                    signature.verify_secure(&to_intent_message(hash), &key),
+                    PrimaryNetworkError::UnknownConsensusHeaderCert(hash)
+                );
+                // XXXX- need to have 1/3+1 certs before we can assume this is not malicious.
                 let (old_number, _old_hash) =
                     *self.consensus_bus.last_published_consensus_num_hash().borrow();
                 // Make sure we don't get old gossip and go backwards.
                 if number > old_number {
-                    // Other side of this needs to verify.
+                    // Other side of this needs to verify.  XXXX- we will check sigs so need to
+                    // verify once done.
                     let _ =
                         self.consensus_bus.last_published_consensus_num_hash().send((number, hash));
                 }
             }
             PrimaryGossip::EpochCertificate(cert) => {
-                let _ = self.consensus_bus.new_epoch_certificates().send((source, cert)).await;
+                let _ = self.consensus_bus.new_epoch_certificates().send(cert).await;
             }
         }
 
@@ -224,7 +234,7 @@ where
                 header.created_at() >= parent.header().created_at(),
                 HeaderError::InvalidParentTimestamp {
                     header: *header.created_at(),
-                    parent: *parent.created_at()
+                    parent: *parent.header.created_at()
                 }
                 .into()
             );
@@ -517,7 +527,7 @@ where
     fn get_header_by_number(&self, number: u64) -> PrimaryNetworkResult<ConsensusHeader> {
         match self.consensus_config.node_storage().get::<ConsensusBlocks>(&number)? {
             Some(header) => Ok(header),
-            None => Err(PrimaryNetworkError::UnknowConsensusHeaderNumber(number)),
+            None => Err(PrimaryNetworkError::UnknownConsensusHeaderNumber(number)),
         }
     }
 
@@ -528,7 +538,7 @@ where
             .consensus_config
             .node_storage()
             .get::<ConsensusBlockNumbersByDigest>(&hash)?
-            .ok_or(PrimaryNetworkError::UnknowConsensusHeaderDigest(hash))?;
+            .ok_or(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash))?;
 
         // then get the header using the block number
         self.get_header_by_number(number)
