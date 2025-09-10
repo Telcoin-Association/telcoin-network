@@ -80,13 +80,7 @@ impl TNPayload {
         let close_epoch = output
             .close_epoch_for_last_batch()
             .is_some_and(|last_batch| last_batch)
-            .then(|| {
-                let randomness = output.leader().aggregated_signature().unwrap_or_else(|| {
-                    error!(target: "engine", ?output, "BLS signature missing for leader - using default for closing epoch");
-                    BlsSignature::default()
-                });
-                keccak256(randomness.to_bytes())
-            });
+            .then(|| output.keccak_leader_sigs());
 
         Self {
             parent_header,

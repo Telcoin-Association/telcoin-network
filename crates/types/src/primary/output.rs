@@ -5,9 +5,10 @@ use super::{CertificateDigest, ConsensusHeader, SignatureVerificationState};
 use crate::{
     crypto, encode,
     error::{CertificateError, CertificateResult},
-    Address, Batch, BlockHash, Certificate, Committee, Digest, Epoch, Hash, ReputationScores,
-    Round, TimestampSec, B256,
+    Address, Batch, BlockHash, BlsSignature, Certificate, Committee, Digest, Epoch, Hash,
+    ReputationScores, Round, TimestampSec, B256,
 };
+use alloy::primitives::keccak256;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},
@@ -15,7 +16,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{error, warn};
 
 /// A global sequence number assigned to every CommittedSubDag.
 pub type SequenceNumber = u64;
@@ -120,6 +121,19 @@ impl ConsensusOutput {
     /// works for empty outputs with no batches.
     pub fn close_epoch_for_last_batch(&self) -> Option<bool> {
         self.close_epoch.then_some(self.batch_digests.is_empty())
+    }
+
+    /// Generate the source of randomness to shuffle future committees at the epoch boundary. The
+    /// source of randomness comes from the keccak hash of the leader's aggregate signature.
+    ///
+    /// NOTE: this cannot fail - uses [BlsSignature::default] and is considered acceptable with
+    /// permissioned validator set, but should never happen.
+    pub fn keccak_leader_sigs(&self) -> B256 {
+        let randomness = self.leader().aggregated_signature().unwrap_or_else(|| {
+            error!(target: "engine", ?self, "BLS signature missing for leader - using default for closing epoch");
+            BlsSignature::default()
+        });
+        keccak256(randomness.to_bytes())
     }
 }
 

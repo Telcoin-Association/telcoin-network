@@ -215,8 +215,6 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     assert_eq!(expected_block.mix_hash, consensus_output_hash);
     // bloom expected to be the same bc all proposed transactions should be good
     // ie) no duplicates, etc.
-    //
-    // TODO: randomly generate contract transactions as well!!!
     assert_eq!(expected_block.logs_bloom, genesis_header.logs_bloom);
     // gas limit should come from parent for empty execution
     assert_eq!(expected_block.gas_limit, genesis_header.gas_limit);
@@ -345,6 +343,7 @@ async fn test_empty_output_executes_late_finalize() -> eyre::Result<()> {
 /// parents is currently valid.
 #[tokio::test]
 async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Result<()> {
+    tn_types::test_utils::init_test_tracing();
     let tmp_dir = TempDir::new().expect("temp dir");
     // create batches for consensus output
     let mut batches_1 = tn_reth::test_utils::batches(4); // create 4 batches
@@ -467,6 +466,7 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
         parent_hash: consensus_output_1.consensus_header_hash(),
         number: 1,
         early_finalize: true,
+        close_epoch: true, // close epoch after 2nd output
         ..Default::default()
     };
     let consensus_output_2_hash = consensus_output_2.consensus_header_hash();
@@ -626,15 +626,18 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
         assert_eq!(block.mix_hash, expected_mix_hash);
         // bloom expected to be the same bc all proposed transactions should be good
         // ie) no duplicates, etc.
-        //
-        // TODO: randomly generate contract transactions as well!!!
         assert_eq!(block.logs_bloom, Bloom::default());
         // gas limit should come from batch
         assert_eq!(block.gas_limit, max_batch_gas(block.number));
         // difficulty should match the batch's index within consensus output
         assert_eq!(block.difficulty, U256::from(expected_batch_index << 16));
-        // assert batch digest match extra data
-        assert_eq!(block.extra_data, Bytes::default());
+        // assert closing epoch randomness matches extra data field in last block
+        let expected_extra = if idx == 7 {
+         Bytes::from(expected_output.keccak_leader_sigs().0)
+        } else {
+            Bytes::default()
+        };
+        assert_eq!(block.extra_data, expected_extra);
         // assert batch digest match requests hash
         assert_eq!(block.requests_hash, Some(all_batch_digests[idx]));
         // assert batch's withdrawals match
