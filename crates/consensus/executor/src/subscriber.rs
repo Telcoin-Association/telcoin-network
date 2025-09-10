@@ -340,7 +340,7 @@ impl<DB: Database> Subscriber<DB> {
         }
 
         let sub_dag = Arc::new(deliver);
-        let mut subscriber_output = ConsensusOutput {
+        let mut consensus_output = ConsensusOutput {
             sub_dag: sub_dag.clone(),
             batches: Vec::with_capacity(num_certs),
             beneficiary: address,
@@ -355,7 +355,7 @@ impl<DB: Database> Subscriber<DB> {
         for cert in &sub_dag.certificates {
             for (digest, _) in cert.header().payload().iter() {
                 batch_set.insert(*digest);
-                subscriber_output.batch_digests.push_back(*digest);
+                consensus_output.batch_digests.push_back(*digest);
             }
         }
 
@@ -371,8 +371,7 @@ impl<DB: Database> Subscriber<DB> {
         let fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
         drop(fetched_batches_timer);
 
-        // Map all fetched batches to their respective certificates and submit as
-        // consensus output
+        // map all fetched batches to their respective certificates for applying block rewards
         for cert in &sub_dag.certificates {
             let mut output_batches = Vec::with_capacity(cert.header().payload().len());
 
@@ -396,10 +395,10 @@ impl<DB: Database> Subscriber<DB> {
                 );
                 output_batches.push(batch.clone());
             }
-            subscriber_output.batches.push(output_batches);
+            consensus_output.batches.push((cert.header().author, output_batches));
         }
         debug!(target: "subscriber", "returning output to subscriber");
-        Ok(subscriber_output)
+        Ok(consensus_output)
     }
 
     async fn fetch_batches_from_peers(
