@@ -38,12 +38,18 @@ pub struct WorkerNetworkHandle {
     handle: NetworkHandle<Req, Res>,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
+    /// The max rpc message size (in bytes).
+    max_rpc_message_size: usize,
 }
 
 impl WorkerNetworkHandle {
     /// Create a new instance of [Self].
-    pub fn new(handle: NetworkHandle<Req, Res>, task_spawner: TaskSpawner) -> Self {
-        Self { handle, task_spawner }
+    pub fn new(
+        handle: NetworkHandle<Req, Res>,
+        task_spawner: TaskSpawner,
+        max_rpc_message_size: usize,
+    ) -> Self {
+        Self { handle, task_spawner, max_rpc_message_size }
     }
 
     /// Return a reference to the task spawner.
@@ -55,7 +61,7 @@ impl WorkerNetworkHandle {
     //// nothing.
     pub fn new_for_test(task_spawner: TaskSpawner) -> Self {
         let (tx, _rx) = mpsc::channel(5);
-        Self { handle: NetworkHandle::new(tx), task_spawner }
+        Self { handle: NetworkHandle::new(tx), task_spawner, max_rpc_message_size: 1024 * 1024 }
     }
 
     /// Return a reference to the inner handle.
@@ -132,7 +138,10 @@ impl WorkerNetworkHandle {
         batch_digests: Vec<BlockHash>,
         timeout: Duration,
     ) -> NetworkResult<Vec<Batch>> {
-        let request = WorkerRequest::RequestBatches { batch_digests: batch_digests.clone() };
+        let request = WorkerRequest::RequestBatches {
+            batch_digests: batch_digests.clone(),
+            max_response_size: self.max_rpc_message_size,
+        };
         let res = self.handle.send_request(request, peer).await?;
         let res =
             tokio::time::timeout(timeout, res).await.map_err(|_| NetworkError::Timeout)???;
@@ -307,8 +316,14 @@ where
                 WorkerRequest::ReportBatch { sealed_batch } => {
                     self.process_report_batch(peer, sealed_batch, channel, cancel);
                 }
-                WorkerRequest::RequestBatches { batch_digests } => {
-                    self.process_request_batches(peer, batch_digests, channel, cancel);
+                WorkerRequest::RequestBatches { batch_digests, max_response_size } => {
+                    self.process_request_batches(
+                        peer,
+                        batch_digests,
+                        max_response_size,
+                        channel,
+                        cancel,
+                    );
                 }
                 WorkerRequest::PeerExchange { peers } => {
                     // notify peer manager
@@ -365,6 +380,7 @@ where
         &self,
         peer: BlsPublicKey,
         batch_digests: Vec<BlockHash>,
+        max_response_size: usize,
         channel: ResponseChannel<WorkerResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
@@ -374,13 +390,18 @@ where
         let task_name = format!("process-request-batches-{peer}");
         self.network_handle.get_task_spawner().spawn_task(task_name, async move {
             tokio::select! {
-                res = request_handler.process_request_batches(batch_digests) => {
+                res = request_handler.process_request_batches(batch_digests, max_response_size) => {
                     let response = match res {
                         Ok(r) => WorkerResponse::RequestBatches(r),
-                        Err(err) => WorkerResponse::Error(message::WorkerRPCError(err.to_string())),
-                    };
+                        Err(err) => {
+                            let error = err.to_string();
+                            if let Some(penalty) = err.into() {
+                                network_handle.report_penalty(peer, penalty).await;
+                            }
 
-                    // TODO: penalize peer's reputation for bad request
+                            WorkerResponse::Error(message::WorkerRPCError(error))
+                        }
+                    };
 
                     let _ = network_handle.handle.send_response(response, channel).await;
                 }

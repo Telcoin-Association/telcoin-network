@@ -43,8 +43,8 @@ pub(crate) enum PrimaryNetworkError {
     UnknowConsensusHeaderDigest(BlockHash),
 }
 
-impl From<PrimaryNetworkError> for Option<Penalty> {
-    fn from(val: PrimaryNetworkError) -> Self {
+impl From<&PrimaryNetworkError> for Option<Penalty> {
+    fn from(val: &PrimaryNetworkError) -> Self {
         //
         // explicitly match every error type to ensure penalties are updated with changes
         //
@@ -69,10 +69,6 @@ impl From<PrimaryNetworkError> for Option<Penalty> {
                     | CertificateError::TooNew(_, _, _)
                     | CertificateError::Storage(_) => None,
                 },
-                // severe
-                CertManagerError::TooManyFetchedCertificatesReturned { .. } => {
-                    Some(Penalty::Severe)
-                }
                 // fatal
                 CertManagerError::UnverifiedSignature(_) => Some(Penalty::Fatal),
                 // ignore
@@ -106,7 +102,7 @@ impl From<PrimaryNetworkError> for Option<Penalty> {
 /// Helper function to convert `HeaderError` to `Penalty`.
 ///
 /// Header errors are responsible for more than one PrimaryNetworkHandle.
-fn penalty_from_header_error(error: HeaderError) -> Option<Penalty> {
+fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
     match error {
         // mild
         HeaderError::SyncBatches(_)

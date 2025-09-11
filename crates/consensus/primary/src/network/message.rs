@@ -77,8 +77,9 @@ pub struct MissingCertificatesRequest {
     /// Rounds that should be skipped while processing this request (by authority). The rounds are
     /// serialized as [RoaringBitmap]s.
     pub skip_rounds: Vec<(AuthorityIdentifier, Vec<u8>)>,
-    /// The maximum number of expected certificates included in the response.
-    pub max_items: usize,
+    /// The maximum size of the uncompressed response message (in bytes). The caller shares this so
+    /// the response doesn't get rejected by the request_response codec.
+    pub max_response_size: usize,
 }
 
 impl MissingCertificatesRequest {
@@ -128,8 +129,8 @@ impl MissingCertificatesRequest {
     }
 
     /// Specify the maximum number of expected certificates in the peer's response.
-    pub fn set_max_items(mut self, max_items: usize) -> Self {
-        self.max_items = max_items;
+    pub fn set_max_response_size(mut self, max_size: usize) -> Self {
+        self.max_response_size = max_size;
         self
     }
 }

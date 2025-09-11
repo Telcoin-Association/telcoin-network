@@ -391,8 +391,11 @@ mod tests {
             let data_clone = data.clone();
             let (tx, mut rx) = mpsc::channel(100);
             let task_manager = TaskManager::default();
-            let handle =
-                WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner());
+            let handle = WorkerNetworkHandle::new(
+                NetworkHandle::new(tx),
+                task_manager.get_spawner(),
+                1024 * 1024,
+            );
             tokio::spawn(async move {
                 let _owned = task_manager;
                 while let Some(r) = rx.recv().await {
@@ -402,12 +405,15 @@ mod tests {
                         }
                         NetworkCommand::SendRequest {
                             peer,
-                            request: WorkerRequest::RequestBatches { batch_digests: digests },
+                            request:
+                                WorkerRequest::RequestBatches {
+                                    batch_digests: digests,
+                                    max_response_size,
+                                },
                             reply,
                         } => {
                             // Use this to simulate server side response size limit in
                             // RequestBlocks
-                            const MAX_REQUEST_BATCHES_RESPONSE_SIZE: usize = 2;
                             const MAX_READ_BLOCK_DIGESTS: usize = 5;
 
                             let mut batches = Vec::new();
@@ -422,9 +428,10 @@ mod tests {
                                     if let Some(batch) =
                                         data_clone.lock().await.get(&peer).unwrap().get(&digest)
                                     {
-                                        if total_size < MAX_REQUEST_BATCHES_RESPONSE_SIZE {
+                                        let batch_size = batch.size();
+                                        if total_size + batch_size <= max_response_size {
                                             batches.push(batch.clone());
-                                            total_size += batch.size();
+                                            total_size += batch_size;
                                         } else {
                                             break;
                                         }

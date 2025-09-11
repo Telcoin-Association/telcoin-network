@@ -1,10 +1,7 @@
 //! Primary tests
 
 use crate::{
-    network::{
-        handler::RequestHandler, MissingCertificatesRequest, PrimaryResponse,
-        MAX_CERTIFICATES_PER_REQUEST,
-    },
+    network::{handler::RequestHandler, MissingCertificatesRequest, PrimaryResponse},
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
@@ -497,8 +494,8 @@ async fn test_fetch_certificates_handler() {
         .committee_size(NonZeroUsize::new(4).unwrap())
         .build();
     let primary = fixture.authorities().next().unwrap();
-
-    let certificate_store = primary.consensus_config().node_storage().clone();
+    let consensus_config = primary.consensus_config();
+    let certificate_store = consensus_config.node_storage().clone();
 
     let cb = ConsensusBus::new();
     let synchronizer = StateSynchronizer::new(primary.consensus_config(), cb.clone());
@@ -574,7 +571,13 @@ async fn test_fetch_certificates_handler() {
         // Check that round 2 and 4 are fetched for the last authority, skipping round 3.
         (1, vec![vec![], vec![], vec![3], vec![3]], 5, vec![2, 2, 2, 4]),
     ];
+
+    let sample_cert = &certificates[0];
+    let single_cert_size = tn_types::encode(sample_cert).len();
+    let message_overhead = tn_types::encode(&MissingCertificatesRequest::default()).len();
     for (lower_bound_round, skip_rounds_vec, max_items, expected_rounds) in &test_cases {
+        // estimate response size based on max_items returned
+        let response_size = single_cert_size * max_items + message_overhead;
         let missing_req = MissingCertificatesRequest::default()
             .set_bounds(
                 *lower_bound_round,
@@ -585,7 +588,7 @@ async fn test_fetch_certificates_handler() {
                     .collect(),
             )
             .expect("boundary set")
-            .set_max_items(*max_items);
+            .set_max_response_size(response_size);
         let resp = handler.retrieve_missing_certs(missing_req).await.unwrap();
         if let PrimaryResponse::RequestedCertificates(certs) = resp {
             assert_eq!(certs.iter().map(|cert| cert.round()).collect::<Vec<_>>(), *expected_rounds);
@@ -594,7 +597,7 @@ async fn test_fetch_certificates_handler() {
         }
     }
 
-    // assert error for valid requests that exceeds max items
+    // assert error for invalid requests with min too low
     for (lower_bound_round, skip_rounds_vec, _max_items, _expected_rounds) in test_cases {
         let too_big = MissingCertificatesRequest::default()
             .set_bounds(
@@ -606,7 +609,7 @@ async fn test_fetch_certificates_handler() {
                     .collect(),
             )
             .expect("boundary set")
-            .set_max_items(MAX_CERTIFICATES_PER_REQUEST + 1);
+            .set_max_response_size(0);
         let resp = handler.retrieve_missing_certs(too_big).await;
         assert!(resp.is_err());
     }

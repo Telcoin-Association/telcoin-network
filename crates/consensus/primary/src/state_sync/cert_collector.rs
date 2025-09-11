@@ -4,17 +4,27 @@
 
 use crate::{
     error::{PrimaryNetworkError, PrimaryNetworkResult},
-    network::MissingCertificatesRequest,
+    network::{MissingCertificatesRequest, PrimaryResponse},
 };
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, BinaryHeap},
+    sync::LazyLock,
 };
 use tn_config::ConsensusConfig;
 use tn_storage::CertificateStore;
 use tn_types::{AuthorityIdentifier, Certificate, Database, Round};
 use tokio::time::Instant;
 use tracing::{debug, warn};
+
+/// The minimal length of a single, encoded, default [Certificate] used to set a local min for
+/// message validation.
+static LOCAL_MIN_REQUEST_SIZE: LazyLock<usize> =
+    LazyLock::new(|| tn_types::encode(&Certificate::default()).len());
+/// The minimal response wrapper using a default, empty message.
+static MESSAGE_OVERHEAD: LazyLock<usize> = LazyLock::new(|| {
+    tn_types::encode(&PrimaryResponse::RequestedCertificates(vec![])).len()
+});
 
 #[cfg(test)]
 #[path = "../tests/cert_collector_tests.rs"]
@@ -30,10 +40,11 @@ pub(crate) struct CertificateCollector<DB> {
     config: ConsensusConfig<DB>,
     /// The start time for processing the missing certificates request.
     start_time: Instant,
-    /// The max items allowed from the request.
-    max_items: usize,
-    /// The number of items collected.
-    items_returned: usize,
+    /// The maximum uncompressed message size in bytes (with safety margin).
+    max_message_size: usize,
+    /// The current collection of uncompressed, encoded certificates (in bytes) used to ensure
+    /// appropriate message size.
+    accumulated_size: usize,
 }
 
 impl<DB> CertificateCollector<DB>
@@ -46,7 +57,22 @@ where
         config: ConsensusConfig<DB>,
     ) -> PrimaryNetworkResult<Self> {
         let start_time = Instant::now();
-        let max_items = request.max_items;
+
+        // assume reasonable min is 1 encoded certificate
+        // NOTE: caller needs to account for cert + msg overhead
+        if request.max_response_size < *LOCAL_MIN_REQUEST_SIZE {
+            warn!(target: "cert-collector", "missing cert request max size too small: {}", request.max_response_size);
+            return Err(PrimaryNetworkError::InvalidRequest("Request size too small".into()));
+        }
+
+        // use the min value between this node's max rpc message size and the requestor's reported
+        // max message size
+        //
+        // NOTE: assume safe overhead is accounted for because the codec will also compress messages
+        // unit tests show 318b uncompressed (response with 2 certs) -> 61b compressed
+        let local_max =
+            config.network_config().libp2p_config().max_rpc_message_size - *MESSAGE_OVERHEAD;
+        let max_message_size = request.max_response_size.min(local_max);
         let (lower_bound, skip_rounds) = request.get_bounds()?;
 
         // initialize the fetch queue with the first round for each authority
@@ -77,7 +103,14 @@ where
             start_time.elapsed().as_millis(),
         );
 
-        Ok(Self { fetch_queue, skip_rounds, config, start_time, max_items, items_returned: 0 })
+        Ok(Self {
+            fetch_queue,
+            skip_rounds,
+            config,
+            start_time,
+            max_message_size,
+            accumulated_size: 0,
+        })
     }
 
     /// Reference to the collector's start time.
@@ -130,17 +163,24 @@ where
 
     /// Return a bool representing the max limits for this function.
     ///
-    /// If the max limit is reached, the stream should end:
-    /// - items returned reaches the max
-    /// - time limit is reached
+    /// The stream should end:
+    /// - if there is less than the min request size left before reaching the max message size
+    /// - the time limit has expired
     fn max_limits_reached(&self) -> bool {
-        self.items_returned >= self.max_items
-            || self.start_time.elapsed()
-                >= self
-                    .config
-                    .network_config()
-                    .sync_config()
-                    .max_db_read_time_for_fetching_certificates
+        let size = self.max_message_size - self.accumulated_size <= *LOCAL_MIN_REQUEST_SIZE;
+        let time = self.start_time.elapsed()
+            >= self
+                .config
+                .network_config()
+                .sync_config()
+                .max_db_read_time_for_fetching_certificates;
+        debug!(target: "cert-collector", ?size, ?time, "limit reached?");
+        size || time
+    }
+
+    /// Check if adding an encoded certificate would exceed size limits.
+    fn would_exceed_size_limit(&self, cert_bytes: usize) -> bool {
+        self.accumulated_size + cert_bytes > self.max_message_size
     }
 }
 
@@ -153,7 +193,7 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         // check if any limits have been reached
         if self.max_limits_reached() {
-            debug!(target: "cert-collector", "timeout / max items hit! returning None");
+            debug!(target: "cert-collector", "max limit reached! returning None");
             return None;
         }
 
@@ -161,7 +201,22 @@ where
         match self.next_certificate() {
             Ok(Some(cert)) => {
                 debug!(target: "cert-collector", ?cert, "next cert Ok(Some)");
-                self.items_returned += 1;
+                // encode the certificate and check size limits
+                let bytes = tn_types::encode(&cert).len();
+
+                // check accumulated total to ensure this cert doesn't exceed msg size limit
+                if self.would_exceed_size_limit(bytes) {
+                    debug!(
+                        target: "cert-collector",
+                        "Next certificate would exceed size limit. Current size: {} bytes",
+                        self.accumulated_size
+                    );
+
+                    // put the certificate back for future requests
+                    return None;
+                }
+
+                self.accumulated_size += bytes;
                 Some(Ok(cert))
             }
             Ok(None) => {
