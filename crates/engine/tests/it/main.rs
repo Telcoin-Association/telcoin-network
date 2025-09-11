@@ -1,27 +1,53 @@
 //! Test execution engine for full batches.
+//!
+//! Grant takes full responsibility for maintaining this madness.
 
-use std::{collections::VecDeque, str::FromStr as _, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    io::Read,
+    str::FromStr as _,
+    sync::Arc,
+    time::Duration,
+};
 use tempfile::TempDir;
 use tn_batch_builder::test_utils::execute_test_batch;
+use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_engine::ExecutorEngine;
 use tn_reth::{
+    system_calls::{ConsensusRegistry, EpochState},
     test_utils::{
-        seeded_genesis_from_random_batches, BEACON_ROOTS_ADDRESS, HISTORY_STORAGE_ADDRESS,
+        seeded_genesis_from_random_batches, TransactionFactory, BEACON_ROOTS_ADDRESS,
+        HISTORY_STORAGE_ADDRESS,
     },
-    FixedBytes, RethChainSpec, RethEnv,
+    ChainSpec, FixedBytes, RethChainSpec, RethEnv,
 };
-use tn_test_utils::default_test_execution_node;
+use tn_test_utils::{default_test_execution_node, TestExecutionNode};
 use tn_types::{
     adiri_genesis, gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc,
-    test_genesis, Address, BlockHash, Bloom, Bytes, Certificate, CommittedSubDag, ConsensusOutput,
-    Hash as _, Notifier, ReputationScores, SealedBlock, TaskManager, B256, EMPTY_OMMER_ROOT_HASH,
-    EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE, U256,
+    test_genesis, Address, BlockHash, Bloom, BlsPublicKey, Bytes, Certificate, CommittedSubDag,
+    Committee, CommitteeBuilder, ConsensusOutput, Encodable2718, Hash as _, Notifier,
+    ReputationScores, SealedBlock, TaskManager, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS,
+    MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tokio::{sync::oneshot, time::timeout};
 use tracing::debug;
 
 /// The const used for EIP-4788 and EIP-2935
 const HISTORY_BUFFER_LENGTH: u64 = 8191;
+/// The amount of gas to transfer native tokens between EOAs. This is the expected cost for all test transactions.
+const TOTAL_GAS_PER_TX: u64 = 21_000;
+/// Arbitrary value used for priority fee calcs in tests.
+const MAX_PRIORITY_FEE_PER_GAS: u128 = 100;
+/// Arbitrary value used for priority fee calcs in tests.
+const MAX_FEE_PER_GAS: u128 = 100;
+
+/// Helper function to calculate expected priority fees for batch producer.
+fn calc_priority_fees(basefee: u128) -> u128 {
+    let effective_gas_price = MAX_FEE_PER_GAS.min(basefee + MAX_PRIORITY_FEE_PER_GAS);
+    let coinbase_gas_price = effective_gas_price - basefee;
+    debug!(target: "delete", ?effective_gas_price, ?coinbase_gas_price, "expected priority fees: {:?}", coinbase_gas_price * TOTAL_GAS_PER_TX as u128);
+    coinbase_gas_price * TOTAL_GAS_PER_TX as u128
+}
 
 /// Helper function to assert EIP-4788 correctly executed. (cancun)
 fn assert_eip4788(
@@ -73,6 +99,29 @@ fn assert_eip2935(reth_env: &RethEnv, block: &SealedBlock) -> eyre::Result<()> {
     Ok(())
 }
 
+/// Helper function to create a committee for tests from on-chain data.
+async fn create_committee_from_state(engine: &TestExecutionNode) -> eyre::Result<Committee> {
+    // retrieve epoch information from canonical tip
+    let EpochState { epoch, epoch_info, validators, .. } =
+        engine.epoch_state_from_canonical_tip().await?;
+    debug!(target: "epoch-manager", ?epoch_info, "epoch state from canonical tip for epoch {}", epoch);
+    let validators = validators
+        .iter()
+        .map(|v| {
+            let decoded_bls = BlsPublicKey::from_literal_bytes(v.blsPubkey.as_ref());
+            decoded_bls.map(|decoded| (decoded, v))
+        })
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|err| eyre::eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
+    let mut committee_builder = CommitteeBuilder::new(epoch);
+    for (bls_key, info) in validators {
+        committee_builder.add_authority(bls_key, 1, info.validatorAddress);
+    }
+    let committee = committee_builder.build();
+    committee.load();
+    Ok(committee)
+}
+
 /// This tests that a single block is executed if the output from consensus contains no
 /// transactions.
 #[tokio::test]
@@ -118,7 +167,6 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     let reth_env = execution_node.get_reth_env().await;
     let max_round = None;
     let genesis_header = chain.sealed_genesis_header();
-
     let shutdown = Notifier::default();
     let task_manager = TaskManager::default();
     let engine = ExecutorEngine::new(
@@ -187,7 +235,7 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
 
     // assert basefee is same as worker's block
     assert_eq!(expected_block.base_fee_per_gas, Some(expected_base_fee));
-    // beneficiary overwritten
+    // beneficiary overwritten for empty blocks
     assert_eq!(expected_block.beneficiary, beneficiary);
     // nonce matches subdag index and method all match
     assert_eq!(<FixedBytes<8> as Into<u64>>::into(expected_block.nonce), sub_dag_index);
@@ -349,43 +397,108 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
     let mut batches_1 = tn_reth::test_utils::batches(4); // create 4 batches
     let mut batches_2 = tn_reth::test_utils::batches(4); // create 4 batches
 
+    // add eip1559 transactions to set max priority fee per gas so batch producer earns fees
+    let genesis = adiri_genesis();
+    let mut tx_factory = TransactionFactory::new_random();
+    let encoded_tx_priority_fee_1 = tx_factory
+        .create_explicit_eip1559(
+            Some(genesis.config.chain_id),
+            None,
+            Some(MAX_PRIORITY_FEE_PER_GAS),
+            Some(MAX_FEE_PER_GAS),
+            None,
+            Some(Address::random()),
+            None,
+            None,
+            None,
+        )
+        .encoded_2718();
+    let encoded_tx_priority_fee_2 = tx_factory
+        .create_explicit_eip1559(
+            Some(genesis.config.chain_id),
+            None,
+            Some(MAX_PRIORITY_FEE_PER_GAS),
+            Some(MAX_FEE_PER_GAS),
+            None,
+            Some(Address::random()),
+            None,
+            None,
+            None,
+        )
+        .encoded_2718();
+    batches_1.first_mut().map(|batch| batch.transactions_mut().push(encoded_tx_priority_fee_1));
+    batches_2.first_mut().map(|batch| batch.transactions_mut().push(encoded_tx_priority_fee_2));
+
     // okay to clone these because they are only used to seed genesis, decode transactions, and
     // recover signers
     let all_batches = [batches_1.clone(), batches_2.clone()].concat();
 
     // use default genesis and seed accounts to execute batches
-    let genesis = adiri_genesis();
     let (genesis, txs_by_block, signers_by_block) =
         seeded_genesis_from_random_batches(genesis, all_batches.iter());
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
     // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
     let execution_node = default_test_execution_node(
         Some(chain.clone()),
         None,
         &tmp_dir.path().join("exc-node"),
-        None,
+        Some(gas_accumulator.rewards_counter()),
     )?;
     let parent = chain.sealed_genesis_header();
 
+    // create committee from genesis state
+    let committee = create_committee_from_state(&execution_node).await?;
+    let authority_1 =
+        committee.authorities().first().expect("first in 4 auth committee for tests").id();
+    let authority_2 =
+        committee.authorities().last().expect("last in 4 auth committee for tests").id();
+    let beneficiary_1 =
+        committee.authority(&authority_1).expect("authority in committee").execution_address();
+    let beneficiary_2 =
+        committee.authority(&authority_2).expect("authority in committee").execution_address();
+
     // execute batches to update headers with valid data
     let mut inc_base_fee = MIN_PROTOCOL_BASE_FEE;
+    let mut expected_base_fees = U256::ZERO;
 
     // updated batches separately because they are mutated in-place
     // and need to be passed to different outputs
     //
     // update first round
+    let batch_producer =
+        committee.authorities().iter().nth(2).expect("authority in committee").execution_address();
+    let committee_size = committee.size();
+    let mut expected_priority_fees = 0;
     for (idx, batch) in batches_1.iter_mut().enumerate() {
         // increase basefee
         inc_base_fee += idx as u64;
 
-        // update basefee and set beneficiary
-        batch.beneficiary = Address::random();
+        // update basefee and set beneficiary for priority fees to third validator
+        batch.beneficiary = batch_producer;
         batch.base_fee_per_gas = inc_base_fee;
 
-        // actually execute the block now
+        // actually execute the batch now
         execute_test_batch(batch, &parent);
-        debug!("{idx}\n{:?}\n", batch);
+
+        // all txs in test batches are EOA->EOA native token transfers
+        // which costs 21_000 gas
+        debug!(target: "delete", "batch basefee: {:?}", batch.base_fee_per_gas);
+        debug!(target: "delete", ?idx, "idx % committee: {:?}", idx % committee_size);
+        let batch_basefees = U256::from(
+            batch.transactions().len() as u64 * TOTAL_GAS_PER_TX * batch.base_fee_per_gas,
+        );
+        expected_base_fees = expected_base_fees
+            .checked_add(batch_basefees)
+            .expect("u256 did not overflow during add");
+
+        // calculate expected priority fees
+        // encoded_tx_priority_fee_1 is last tx in the first batch
+        if idx == 0 {
+            let priority_fees = calc_priority_fees(batch.base_fee_per_gas as u128);
+            expected_priority_fees += priority_fees;
+        }
     }
 
     // update second round
@@ -395,41 +508,56 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
         // this makes assertions easier at the end
         inc_base_fee += 4 + idx as u64;
 
-        // update basefee and set beneficiary
-        batch.beneficiary = Address::random();
+        // update basefee and set beneficiary for priority fees to third validator
+        batch.beneficiary = batch_producer;
         batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the block now
         execute_test_batch(batch, &parent);
-        debug!("{idx}\n{:?}\n", batch);
+        // all txs in test batches are EOA->EOA native token transfers
+        // 21_000 gas
+        debug!(target: "delete", "batch basefee: {:?}", batch.base_fee_per_gas);
+        let batch_basefees = U256::from(
+            batch.transactions().len() as u64 * TOTAL_GAS_PER_TX * batch.base_fee_per_gas,
+        );
+        expected_base_fees = expected_base_fees
+            .checked_add(batch_basefees)
+            .expect("u256 did not overflow during add");
+
+        // calculate expected priority fees
+        // encoded_tx_priority_fee_2 is last tx in the first batch
+        if idx == 0 {
+            let priority_fees = calc_priority_fees(batch.base_fee_per_gas as u128);
+            expected_priority_fees += priority_fees;
+        }
     }
+
     // Reload all_batches so we can calculate mix_hash properly later.
     let all_batches = [batches_1.clone(), batches_2.clone()].concat();
 
     //=== Consensus
-    //
+
     // create consensus output bc transactions in batches
     // are randomly generated
     //
     // for each tx, seed address with funds in genesis
     let timestamp = now();
     let mut leader_1 = Certificate::default();
-    // update timestamp
+    // update cert
     leader_1.update_created_at_for_test(timestamp);
+    leader_1.header_mut_for_test().author = authority_1;
     let sub_dag_index_1 = 1;
     leader_1.header.round = sub_dag_index_1 as u32;
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let mut batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
     let subdag_1 = Arc::new(CommittedSubDag::new(
-        vec![Certificate::default()],
+        vec![leader_1.clone(), Certificate::default()],
         leader_1,
         sub_dag_index_1,
         reputation_scores,
         previous_sub_dag,
     ));
-    let beneficiary_1 = Address::from_str("0x1111111111111111111111111111111111111111")
-        .expect("beneficiary address from str");
     let consensus_output_1 = ConsensusOutput {
         sub_dag: subdag_1.clone(),
         batches: vec![batches_1],
@@ -441,23 +569,22 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
 
     // create second output
     let mut leader_2 = Certificate::default();
-    // update timestamp
+    // update cert
     leader_2.update_created_at_for_test(timestamp + 2);
+    leader_2.header_mut_for_test().author = authority_2;
     let sub_dag_index_2 = 2;
     leader_2.header.round = sub_dag_index_2 as u32;
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = Some(subdag_1.as_ref());
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
     let subdag_2 = CommittedSubDag::new(
-        vec![Certificate::default()],
+        vec![leader_2.clone(), Certificate::default()],
         leader_2,
         sub_dag_index_2,
         reputation_scores,
         previous_sub_dag,
     )
     .into();
-    let beneficiary_2 = Address::from_str("0x2222222222222222222222222222222222222222")
-        .expect("beneficiary address from str");
     let consensus_output_2 = ConsensusOutput {
         sub_dag: subdag_2,
         batches: vec![batches_2],
@@ -476,11 +603,22 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
     let all_batch_digests: Vec<BlockHash> = batch_digests_1.into();
 
     //=== Execution
+    // setup rewards for first two rounds of consensus
+    let rewards_counter = gas_accumulator.rewards_counter();
+    rewards_counter.set_committee(committee.clone());
 
+    // inc leader counter - normally performed by `EpochManager`
+    debug!(target:"engine", "first output leader origin: {:#?}", consensus_output_1.leader().origin());
+    rewards_counter.inc_leader_count(&consensus_output_1.leader().origin());
+    rewards_counter.inc_leader_count(&consensus_output_2.leader().origin());
+    debug!(target:"engine", "address counts: {:#?}", gas_accumulator.rewards_counter().get_address_counts());
+
+    // retrieve rewards info for current epoch
+    let EpochState { epoch_info, .. } = execution_node.epoch_state_from_canonical_tip().await?;
+    // create engine
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
     let max_round = None;
     let parent = chain.sealed_genesis_header();
-
     let shutdown = Notifier::default();
     let task_manager = TaskManager::default();
     let reth_env = execution_node.get_reth_env().await;
@@ -491,12 +629,14 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
         parent,
         shutdown.subscribe(),
         task_manager.get_spawner(),
-        GasAccumulator::default(),
+        gas_accumulator.clone(),
     );
 
     // assert the canonical chain in-memory is empty
     let canonical_in_memory_state = reth_env.canonical_in_memory_state();
     assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    let (blocks, gas, gas_limits) = gas_accumulator.get_values(0);
+    assert_eq!((blocks + gas + gas_limits), 0, "gas accumulator didn't start at 0");
 
     // queue the first output - simulate already received from channel
     engine.push_back_queued_for_test(consensus_output_1.clone());
@@ -539,7 +679,65 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
     assert_eq!(canonical_tip.hash(), final_block.hash);
     // assert last executed output is correct and finalized
     let last_output = execution_node.last_executed_output().await?;
-    assert_eq!(last_output, consensus_output_2_hash); // round of consensus
+    assert_eq!(last_output, consensus_output_2_hash);
+    // assert block rewards for two rounds of consensus (output 2 closes epoch)
+    let first_leader_rewards = reth_env.retrieve_account(&beneficiary_1);
+    let second_leader_rewards = reth_env.retrieve_account(&beneficiary_2);
+    // let third_validator_account = reth_env
+    //     .retrieve_account(
+    //         &committee
+    //             .authorities()
+    //             .iter()
+    //             .nth(2)
+    //             .expect("4 validators in committee")
+    //             .execution_address(),
+    //     )?
+    //     .expect("third validator account has priority fees");
+    // assert_eq!(
+    //     third_validator_account.balance,
+    //     U256::from(total_gas_per_tx * 93 + total_gas_per_tx * 83)
+    // );
+    // debug!(target:"engine", "3rd validator account: {:#?}", third_validator_account);
+    debug!(target:"engine", "first leader account: {:#?}", first_leader_rewards);
+    debug!(target:"engine", "second leader account: {:#?}", second_leader_rewards);
+    debug!(target:"engine", "expected basefees: {:#?}", expected_base_fees);
+    let rewards_1 = reth_env.get_validator_rewards(final_block.hash, beneficiary_1)?;
+    let rewards_2 = reth_env.get_validator_rewards(final_block.hash, beneficiary_2)?;
+    debug!(target:"engine", "first leader rewards: {:#?}", rewards_1);
+    debug!(target:"engine", "second leader rewards: {:#?}", rewards_2);
+    // assert total epoch rewards distributed evenly for two beneficiaries with identical stake
+    assert_eq!(
+        rewards_1,
+        epoch_info.epochIssuance.div_ceil(U256::from(2)),
+        "block rewards for leader 1 incorrect"
+    );
+    assert_eq!(
+        rewards_2,
+        epoch_info.epochIssuance.div_ceil(U256::from(2)),
+        "block rewards for leader 2 incorrect"
+    );
+    // assert all basefees sent to governance safe
+    let governance_safe_genesis_balance = chain
+        .genesis()
+        .alloc
+        .get(&GOVERNANCE_SAFE_ADDRESS)
+        .map(|acct| acct.balance)
+        .unwrap_or(U256::ZERO);
+    let governance_safe = reth_env
+        .retrieve_account(&GOVERNANCE_SAFE_ADDRESS)?
+        .map(|acct| acct.balance)
+        .expect("governance safe has an account");
+    debug!(target:"engine", "governance safe account: {:#?}", governance_safe);
+    assert_eq!(
+        expected_base_fees,
+        governance_safe
+            .checked_sub(governance_safe_genesis_balance)
+            .expect("governance safe balance doesn't underflow")
+    );
+
+    debug!(target: "delete", ?beneficiary_1, ?beneficiary_2);
+
+    // assert gas went to batch creator
 
     // pull newly executed blocks from database (skip genesis)
     //
@@ -633,7 +831,7 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
         assert_eq!(block.difficulty, U256::from(expected_batch_index << 16));
         // assert closing epoch randomness matches extra data field in last block
         let expected_extra = if idx == 7 {
-         Bytes::from(expected_output.keccak_leader_sigs().0)
+            Bytes::from(expected_output.keccak_leader_sigs().0)
         } else {
             Bytes::default()
         };
@@ -971,8 +1169,6 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         assert_eq!(block.mix_hash, expected_mix_hash);
         // bloom expected to be the same bc all proposed transactions should be good
         // ie) no duplicates, etc.
-        //
-        // TODO: this doesn't actually test anything bc there are no contract txs
         assert_eq!(block.logs_bloom, Bloom::default());
         // gas limit should come from batch
         assert_eq!(block.gas_limit, max_batch_gas(block.number));

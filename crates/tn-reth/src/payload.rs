@@ -2,8 +2,7 @@
 
 use crate::RethEnv;
 use serde::{Deserialize, Serialize};
-use tn_types::{keccak256, Address, BlsSignature, ConsensusOutput, SealedHeader, WorkerId, B256};
-use tracing::error;
+use tn_types::{Address, ConsensusOutput, SealedHeader, WorkerId, B256};
 
 /// The type for building blocks that extend the canonical tip.
 #[derive(Debug)]

@@ -395,7 +395,9 @@ impl<DB: Database> Subscriber<DB> {
                 );
                 output_batches.push(batch.clone());
             }
-            consensus_output.batches.push((cert.header().author, output_batches));
+            // consensus_output.batches.push((cert.header().author, output_batches));
+
+            consensus_output.batches.push(output_batches);
         }
         debug!(target: "subscriber", "returning output to subscriber");
         Ok(consensus_output)

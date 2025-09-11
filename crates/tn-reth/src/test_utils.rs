@@ -1,6 +1,6 @@
 //! Transaction factory to create legit transactions for execution.
 
-use crate::{error::TnRethResult, recover_raw_transaction, RethEnv, WorkerTxPool};
+use crate::{error::TnRethResult, evm::TNEvm, recover_raw_transaction, system_calls::ConsensusRegistry, RethEnv, WorkerTxPool};
 use alloy::{
     consensus::{SignableTransaction as _, TxEip4844, TxEip4844Variant},
     eips::eip7594::BlobTransactionSidecarVariant,
@@ -9,14 +9,14 @@ use alloy::{
     signers::{
         k256::sha2::{Digest as _, Sha256},
         local::PrivateKeySigner,
-    },
+    }, sol_types::SolCall as _,
 };
 use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
-use reth_evm::{execute::Executor as _, ConfigureEvm};
-use reth_primitives::sign_message;
+use reth_evm::{execute::Executor as _, ConfigureEvm, EvmFactory as _};
+use reth_primitives::{sign_message, Account};
 use reth_primitives_traits::SignerRecoverable;
-use reth_provider::{StateProviderBox, StateProviderFactory};
-use reth_revm::{database::StateProviderDatabase, db::BundleState};
+use reth_provider::{AccountReader as _, StateProvider, StateProviderBox, StateProviderFactory};
+use reth_revm::{database::StateProviderDatabase, db::BundleState, State};
 use reth_transaction_pool::{EthPoolTransaction, EthPooledTransaction, PoolTransaction};
 use secp256k1::{
     rand::{rngs::StdRng, Rng, SeedableRng as _},
@@ -49,6 +49,27 @@ impl RethEnv {
     /// Retrieve the state at the provided block hash.
     pub fn state_by_block_hash(&self, hash: BlockHash) -> TnRethResult<StateProviderBox> {
         Ok(self.blockchain_provider.state_by_block_hash(hash)?)
+    }
+
+    /// Retrieve the account balance.
+    pub fn retrieve_account(&self, address: &Address) -> TnRethResult<Option<Account>> {
+        Ok(self.blockchain_provider.basic_account(address)?)
+    }
+
+    /// Create an EVM-environment from state provider.
+    ///
+    /// TODO: don't need this afterall?
+    pub fn tn_evm(&self, hash: BlockHash) -> eyre::Result<TNEvm<State<StateProviderDatabase<Box<dyn StateProvider>>>>> {
+        let header = self.header(hash)?.expect("provided hash in header table");
+        let state = self.state_by_block_hash(hash)?;
+        let db = State::builder()
+            .with_database(StateProviderDatabase::new(state))
+            .with_bundle_update()
+            .build();
+        Ok(self
+            .evm_config
+            .evm_factory()
+            .create_evm(db, self.evm_config.evm_env(&header)))
     }
 
     /// Test utility to execute batch and return execution outcome.
@@ -124,6 +145,15 @@ impl RethEnv {
             .expect("execute one block");
 
         res.state
+    }
+
+    /// Retrieve validator rewards.
+    pub fn get_validator_rewards(&self, hash: BlockHash, address: Address) -> eyre::Result<U256> {
+        let mut tn_evm = self.tn_evm(hash)?;
+        let calldata = ConsensusRegistry::getRewardsCall { validatorAddress: address }.abi_encode().into();
+        let rewards = self
+            .call_consensus_registry::<_, U256>(&mut tn_evm, calldata)?;
+        Ok(rewards)
     }
 }
 

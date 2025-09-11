@@ -29,6 +29,7 @@ tn-batch-builder = { workspace = true, features = ["test-utils"] }
 tn-types = { workspace = true, features = ["test-utils"] }
 tn-engine = { workspace = true, features = ["test-utils"] }
 tempfile = { workspace = true }
+tn-config = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 tn-primary = { workspace = true, features = ["test-utils"] }
 

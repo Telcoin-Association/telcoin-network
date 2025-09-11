@@ -84,6 +84,8 @@ where
             .balance
             .saturating_add(U256::from(coinbase_gas_price * gas_used));
 
+        tracing::debug!(target: "delete", ?beneficiary, ?basefee, ?effective_gas_price, ?coinbase_gas_price, ?gas_used);
+
         // Send the base fee portion to a basefee account for later processing
         // (offchain).
         let basefee_account = context.journal().load_account(self.basefee_address)?;
