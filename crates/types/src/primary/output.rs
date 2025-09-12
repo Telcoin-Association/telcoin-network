@@ -21,6 +21,15 @@ use tracing::{error, warn};
 /// A global sequence number assigned to every CommittedSubDag.
 pub type SequenceNumber = u64;
 
+#[derive(Debug, Clone)]
+/// Struct that contains all necessary information for executing a batch post-consensus.
+pub struct CertifiedBatch {
+    /// The ECDSA address of the authority that produced the batch. This address is used as the block beneficiary during
+    /// execution. This may not be unique within a single [ConsensusOutput].
+    pub address: Address,
+    /// The collection of batches (in order) that reached consensus.
+    pub batches: Vec<Batch>,
+}
 /// The output of Consensus, which includes all the blocks for each certificate in the sub dag
 /// It is sent to the the ExecutionState handle_consensus_transaction
 #[derive(Clone, Debug, Default)]
@@ -30,7 +39,7 @@ pub struct ConsensusOutput {
     ///
     /// This field is not included in [Self] digest. To validate,
     /// hash these batches and compare to [Self::batch_digests].
-    pub batches: Vec<Vec<Batch>>,
+    pub batches: Vec<CertifiedBatch>,
     /// The beneficiary for block rewards.
     pub beneficiary: Address,
     /// The ordered set of [BlockHash].
@@ -93,9 +102,18 @@ impl ConsensusOutput {
         self.batch_digests.pop_front()
     }
 
-    /// Flatten sequenced batches.
-    pub fn flatten_batches(&self) -> Vec<Batch> {
-        self.batches.iter().flat_map(|batches| batches.iter().cloned()).collect()
+    /// Create flat index mapping to retrieve certified batches during execution.
+    /// The first `usize` is the index for the [CertifiedBatch] which is used
+    /// to identify the authority that produced the batch. The second `usize`
+    /// is the batch's index within the committed certificate.
+    pub fn flatten_batches(&self) -> Vec<(usize, usize)> {
+        self.batches
+            .iter()
+            .enumerate()
+            .flat_map(|(cert_idx, cert_batch)| {
+                (0..cert_batch.batches.len()).map(move |batch_idx| (cert_idx, batch_idx))
+            })
+            .collect()
     }
 
     /// Build a new ConsensusHeader from this output.

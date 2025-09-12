@@ -1,6 +1,9 @@
 //! Transaction factory to create legit transactions for execution.
 
-use crate::{error::TnRethResult, evm::TNEvm, recover_raw_transaction, system_calls::ConsensusRegistry, RethEnv, WorkerTxPool};
+use crate::{
+    error::TnRethResult, evm::TNEvm, recover_raw_transaction, system_calls::ConsensusRegistry,
+    RethEnv, WorkerTxPool,
+};
 use alloy::{
     consensus::{SignableTransaction as _, TxEip4844, TxEip4844Variant},
     eips::eip7594::BlobTransactionSidecarVariant,
@@ -9,7 +12,8 @@ use alloy::{
     signers::{
         k256::sha2::{Digest as _, Sha256},
         local::PrivateKeySigner,
-    }, sol_types::SolCall as _,
+    },
+    sol_types::SolCall as _,
 };
 use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
 use reth_evm::{execute::Executor as _, ConfigureEvm, EvmFactory as _};
@@ -59,17 +63,17 @@ impl RethEnv {
     /// Create an EVM-environment from state provider.
     ///
     /// TODO: don't need this afterall?
-    pub fn tn_evm(&self, hash: BlockHash) -> eyre::Result<TNEvm<State<StateProviderDatabase<Box<dyn StateProvider>>>>> {
+    pub fn tn_evm(
+        &self,
+        hash: BlockHash,
+    ) -> eyre::Result<TNEvm<State<StateProviderDatabase<Box<dyn StateProvider>>>>> {
         let header = self.header(hash)?.expect("provided hash in header table");
         let state = self.state_by_block_hash(hash)?;
         let db = State::builder()
             .with_database(StateProviderDatabase::new(state))
             .with_bundle_update()
             .build();
-        Ok(self
-            .evm_config
-            .evm_factory()
-            .create_evm(db, self.evm_config.evm_env(&header)))
+        Ok(self.evm_config.evm_factory().create_evm(db, self.evm_config.evm_env(&header)))
     }
 
     /// Test utility to execute batch and return execution outcome.
@@ -150,9 +154,9 @@ impl RethEnv {
     /// Retrieve validator rewards.
     pub fn get_validator_rewards(&self, hash: BlockHash, address: Address) -> eyre::Result<U256> {
         let mut tn_evm = self.tn_evm(hash)?;
-        let calldata = ConsensusRegistry::getRewardsCall { validatorAddress: address }.abi_encode().into();
-        let rewards = self
-            .call_consensus_registry::<_, U256>(&mut tn_evm, calldata)?;
+        let calldata =
+            ConsensusRegistry::getRewardsCall { validatorAddress: address }.abi_encode().into();
+        let rewards = self.call_consensus_registry::<_, U256>(&mut tn_evm, calldata)?;
         Ok(rewards)
     }
 }

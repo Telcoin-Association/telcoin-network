@@ -561,7 +561,7 @@ impl RethEnv {
     pub fn build_block_from_batch_payload(
         &self,
         payload: TNPayload,
-        transactions: Vec<Vec<u8>>,
+        transactions: &Vec<Vec<u8>>,
     ) -> TnRethResult<ExecutedBlockWithTrieUpdates> {
         let parent_header = payload.parent_header.clone();
         debug!(target: "engine", ?parent_header, "retrieving state for next block");
@@ -585,8 +585,6 @@ impl RethEnv {
         // copy in case of error
         let batch_digest = payload.batch_digest;
 
-        // TODO: parallelize tx recovery when it's worth it (see
-        // TransactionSigned::recover_signers())
         let mut builder =
             self.evm_config.builder_for_next_block(&mut db, &parent_header, payload)?;
 
@@ -596,14 +594,15 @@ impl RethEnv {
 
         let basefee = builder.evm_mut().block().basefee;
 
-        for tx_bytes in &transactions {
+        for tx_bytes in transactions {
             let recovered = reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
                 .inspect_err(|e| {
                     error!(
-                    target: "engine",
-                    batch=?batch_digest,
-                    ?tx_bytes,
-                    "failed to recover signer: {e}")
+                        target: "engine",
+                        batch=?batch_digest,
+                        ?tx_bytes,
+                        "failed to recover signer: {e}"
+                    )
                 })?;
 
             let gas_used = match builder.execute_transaction(recovered.clone()) {
@@ -1381,7 +1380,7 @@ mod tests {
         payload: TNPayload,
         transactions: Vec<Vec<u8>>,
     ) -> eyre::Result<ExecutedBlockWithTrieUpdates> {
-        let block = reth_env.build_block_from_batch_payload(payload, transactions)?;
+        let block = reth_env.build_block_from_batch_payload(payload, &transactions)?;
         // update chain state - normally handled by tn_engine::payload_builder
         let canonical_header = block.recovered_block.clone_sealed_header();
         let canonical_in_memory_state = reth_env.blockchain_provider.canonical_in_memory_state();

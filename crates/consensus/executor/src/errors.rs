@@ -3,7 +3,7 @@
 use std::fmt::Debug;
 use thiserror::Error;
 use tn_storage::StoreError;
-use tn_types::{AuthorityIdentifier, CertificateDigest, WorkerId};
+use tn_types::{AuthorityIdentifier, BlockHash, CertificateDigest, WorkerId};
 
 /// Return an error if the condition is false.
 #[macro_export(local_inner_macros)]
@@ -54,4 +54,7 @@ pub enum SubscriberError {
 
     #[error("Attempts to query all peers has failed")]
     ClientRequestsFailed,
+
+    #[error("A fetched batch is missing from the collection.")]
+    MissingFetchedBatch(BlockHash),
 }

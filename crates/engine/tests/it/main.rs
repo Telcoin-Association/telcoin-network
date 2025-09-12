@@ -34,7 +34,8 @@ use tracing::debug;
 
 /// The const used for EIP-4788 and EIP-2935
 const HISTORY_BUFFER_LENGTH: u64 = 8191;
-/// The amount of gas to transfer native tokens between EOAs. This is the expected cost for all test transactions.
+/// The amount of gas to transfer native tokens between EOAs. This is the expected cost for all test
+/// transactions.
 const TOTAL_GAS_PER_TX: u64 = 21_000;
 /// Arbitrary value used for priority fee calcs in tests.
 const MAX_PRIORITY_FEE_PER_GAS: u128 = 100;
