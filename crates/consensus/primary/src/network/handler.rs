@@ -28,6 +28,7 @@ use tn_types::{
     ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, Hash as _, Header, Round,
     SignatureVerificationState, TnSender as _, Vote,
 };
+use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 
 /// The type that handles requests from peers.
@@ -72,18 +73,26 @@ where
         source: BlsPublicKey,
     ) -> PrimaryNetworkResult<()> {
         // deconstruct message
-        let GossipMessage { data, .. } = msg;
+        let GossipMessage { data, topic, .. } = msg;
 
         // gossip is uncompressed
         let gossip = try_decode(data)?;
 
         match gossip {
             PrimaryGossip::Certificate(cert) => {
+                ensure!(
+                    topic.to_string().eq(&tn_config::LibP2pConfig::primary_topic()),
+                    PrimaryNetworkError::InvalidTopic
+                );
                 // process certificate
                 let unverified_cert = cert.validate_received().map_err(CertManagerError::from)?;
                 self.state_sync.process_peer_certificate(unverified_cert).await?;
             }
             PrimaryGossip::Consensus(number, hash) => {
+                ensure!(
+                    topic.to_string().eq(&tn_config::LibP2pConfig::primary_topic()),
+                    PrimaryNetworkError::InvalidTopic
+                );
                 ensure!(
                     self.consensus_config.committee().authority_by_key(&source).is_some(),
                     PrimaryNetworkError::PeerNotInCommittee(Box::new(source))
@@ -98,7 +107,18 @@ where
                 }
             }
             PrimaryGossip::EpochVote(vote) => {
-                let _ = self.consensus_bus.new_epoch_votes().send(*vote).await;
+                ensure!(
+                    topic.to_string().eq(&tn_config::LibP2pConfig::epoch_vote_topic()),
+                    PrimaryNetworkError::InvalidTopic
+                );
+                let (tx, rx) = oneshot::channel();
+                let _ = self.consensus_bus.new_epoch_votes().send((*vote, tx)).await;
+                match rx.await {
+                    // Propogate any errors so the peer can be punished.
+                    Ok(res) => res?,
+                    // Don't punish the peer for an internal channel issue...
+                    Err(e) => error!(target: "primary", "error waiting on epoch vote result: {e}"),
+                }
             }
         }
 

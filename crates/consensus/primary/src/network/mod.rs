@@ -3,7 +3,7 @@
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use crate::{proposer::OurDigestMessage, state_sync::StateSynchronizer, ConsensusBus};
 use handler::RequestHandler;
@@ -69,7 +69,7 @@ impl PrimaryNetworkHandle {
     /// Publish a certificate to the consensus network.
     pub async fn publish_certificate(&self, certificate: Certificate) -> NetworkResult<()> {
         let data = encode(&PrimaryGossip::Certificate(Box::new(certificate)));
-        self.handle.publish("tn-primary".into(), data).await?;
+        self.handle.publish(tn_config::LibP2pConfig::primary_topic(), data).await?;
         Ok(())
     }
 
@@ -80,14 +80,14 @@ impl PrimaryNetworkHandle {
         consensus_header_hash: BlockHash,
     ) -> NetworkResult<()> {
         let data = encode(&PrimaryGossip::Consensus(consensus_block_num, consensus_header_hash));
-        self.handle.publish("tn-primary".into(), data).await?;
+        self.handle.publish(tn_config::LibP2pConfig::primary_topic(), data).await?;
         Ok(())
     }
 
     /// Publish a certificate to the consensus network.
     pub async fn publish_epoch_vote(&self, vote: EpochVote) -> NetworkResult<()> {
         let data = encode(&PrimaryGossip::EpochVote(Box::new(vote)));
-        self.handle.publish("tn-primary".into(), data).await?;
+        self.handle.publish(tn_config::LibP2pConfig::epoch_vote_topic(), data).await?;
         Ok(())
     }
 
@@ -99,12 +99,30 @@ impl PrimaryNetworkHandle {
         header: Header,
         parents: Vec<Certificate>,
     ) -> NetworkResult<RequestVoteResult> {
-        let request = PrimaryRequest::Vote { header: Arc::new(header), parents };
+        let header = Arc::new(header);
+        let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
         let res = self.handle.send_request(request, peer).await?;
-        let res = res.await??;
+        let mut res = res.await??;
+        let mut tries = 0;
+        while let PrimaryResponse::RecoverableError(PrimaryRPCError(s)) = res {
+            warn!(target: "primary::network", "Got recoverable error {s}, retrying");
+            eprintln!("XXXX res {s}");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
+            let res_raw = self.handle.send_request(request, peer).await?;
+            res = res_raw.await??;
+            tries += 1;
+            if tries > 5 {
+                break;
+            }
+        }
         match res {
             PrimaryResponse::Vote(vote) => Ok(RequestVoteResult::Vote(vote)),
-            PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
+            PrimaryResponse::RecoverableError(PrimaryRPCError(s))
+            | PrimaryResponse::Error(PrimaryRPCError(s)) => {
+                eprintln!("XXXX GOT ERROR {s}");
+                Err(NetworkError::RPCError(s))
+            }
             PrimaryResponse::RequestedCertificates(_vec) => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is requested certificates!".to_string(),
             )),
@@ -177,7 +195,7 @@ impl PrimaryNetworkHandle {
     }
 
     /// Request consensus header from a random peer up to three times from three different peers.
-    pub async fn request_epoch(
+    pub async fn request_epoch_cert(
         &self,
         epoch: Option<Epoch>,
         hash: Option<BlockHash>,

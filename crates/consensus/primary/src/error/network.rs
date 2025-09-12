@@ -53,6 +53,9 @@ pub(crate) enum PrimaryNetworkError {
     /// Invalid epoch request.
     #[error("Must suply an epoch or hash when requesting an epoch record")]
     InvalidEpochRequest,
+    /// Invalid topic- something was published to the wrong topic.
+    #[error("Gossip was published to the wrong topic")]
+    InvalidTopic,
 }
 
 impl From<PrimaryNetworkError> for Option<Penalty> {
@@ -109,7 +112,8 @@ impl From<PrimaryNetworkError> for Option<Penalty> {
             PrimaryNetworkError::InvalidEpochRequest
             | PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),
             // fatal
-            PrimaryNetworkError::Decode(_) => Some(Penalty::Fatal),
+            PrimaryNetworkError::InvalidTopic
+            | PrimaryNetworkError::Decode(_) => Some(Penalty::Fatal),
             // ignore
             PrimaryNetworkError::UnavailableEpoch(_)  // A node might not have this yet...
             | PrimaryNetworkError::UnavailableEpochDigest(_)  // A node might not have this yet....
