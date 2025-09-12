@@ -151,3 +151,82 @@ impl EpochCertificate {
         aggregate_signature.verify_secure(&intent, signers)
     }
 }
+
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
+
+    use rand::{rngs::StdRng, CryptoRng, RngCore, SeedableRng as _};
+    use roaring::RoaringBitmap;
+
+    use crate::{BlsKeypair, Signer as _};
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct TestBlsKeypair(Arc<BlsKeypair>);
+
+    impl TestBlsKeypair {
+        fn new<R: CryptoRng + RngCore>(rng: &mut R) -> Self {
+            Self(Arc::new(BlsKeypair::generate(rng)))
+        }
+    }
+
+    impl BlsSigner for TestBlsKeypair {
+        fn request_signature_direct(&self, msg: &[u8]) -> BlsSignature {
+            self.0.sign(msg)
+        }
+
+        fn public_key(&self) -> BlsPublicKey {
+            self.0.public().clone()
+        }
+    }
+
+    #[test]
+    fn test_epoch_records() {
+        let mut rng = StdRng::from_os_rng();
+        let com1 = TestBlsKeypair::new(&mut rng);
+        let com2 = TestBlsKeypair::new(&mut rng);
+        let com3 = TestBlsKeypair::new(&mut rng);
+        let record = EpochRecord {
+            epoch: 0,
+            committee: vec![com1.public_key(), com2.public_key(), com3.public_key()],
+            next_committee: vec![com1.public_key(), com2.public_key(), com3.public_key()],
+            parent_hash: B256::default(),
+            parent_state: BlockNumHash::default(),
+            parent_consensus: B256::default(),
+        };
+        let vote1 = record.sign_vote(&com1);
+        let vote2 = record.sign_vote(&com2);
+        let vote3 = record.sign_vote(&com3);
+        assert_eq!(vote1.public_key, com1.public_key());
+        assert_eq!(vote2.public_key, com2.public_key());
+        assert_eq!(vote3.public_key, com3.public_key());
+        assert!(vote1.check_signature(), "vote1 failed sig check");
+        assert!(vote2.check_signature(), "vote2 failed sig check");
+        assert!(vote3.check_signature(), "vote3 failed sig check");
+        let sigs = vec![vote1.signature, vote2.signature, vote3.signature];
+        match BlsAggregateSignature::aggregate(&sigs[..], true) {
+            Ok(aggregated_signature) => {
+                let signature: BlsSignature = aggregated_signature.to_signature();
+                let mut signed_authorities = RoaringBitmap::new();
+                signed_authorities.push(0);
+                signed_authorities.push(1);
+                signed_authorities.push(2);
+                let cert =
+                    EpochCertificate { epoch_hash: record.digest(), signature, signed_authorities };
+                assert!(record.verify_with_cert(&cert), "record failed to verify");
+                // leave out a sig.
+                let mut signed_authorities = RoaringBitmap::new();
+                signed_authorities.push(0);
+                signed_authorities.push(2);
+                let cert =
+                    EpochCertificate { epoch_hash: record.digest(), signature, signed_authorities };
+                assert!(!record.verify_with_cert(&cert), "record verified!");
+            }
+            Err(_) => {
+                panic!("failed to aggregate epoch record signatures",);
+            }
+        }
+    }
+}

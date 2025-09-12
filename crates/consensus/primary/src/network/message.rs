@@ -214,7 +214,7 @@ impl IntoRpcError<PrimaryNetworkError> for PrimaryResponse {
             | PrimaryNetworkError::Internal(_)
             | PrimaryNetworkError::UnknowConsensusHeaderNumber(_)
             | PrimaryNetworkError::UnknowConsensusHeaderDigest(_)
-            | PrimaryNetworkError::PeerNotInCommittee(_)
+            | PrimaryNetworkError::_PeerNotInCommittee(_)
             | PrimaryNetworkError::UnavailableEpoch(_)
             | PrimaryNetworkError::UnavailableEpochDigest(_)
             | PrimaryNetworkError::InvalidTopic

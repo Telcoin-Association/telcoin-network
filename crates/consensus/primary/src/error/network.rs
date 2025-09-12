@@ -42,8 +42,9 @@ pub(crate) enum PrimaryNetworkError {
     #[error("Unknown consensus header: {0}")]
     UnknowConsensusHeaderDigest(BlockHash),
     /// Peer that is not committee published invalid gosip.
+    /// Temparily disabled, will be back soon.
     #[error("Peer {0} is not in the committee!")]
-    PeerNotInCommittee(Box<BlsPublicKey>),
+    _PeerNotInCommittee(Box<BlsPublicKey>),
     /// Unavaliable epoch (either it is invalid or this node does not have it).
     #[error("Unknown epoch record: {0}")]
     UnavailableEpoch(Epoch),
@@ -113,7 +114,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             // ignore
             PrimaryNetworkError::UnavailableEpoch(_)  // A node might not have this yet...
             | PrimaryNetworkError::UnavailableEpochDigest(_)  // A node might not have this yet....
-            | PrimaryNetworkError::PeerNotInCommittee(_)
+            | PrimaryNetworkError::_PeerNotInCommittee(_)
             | PrimaryNetworkError::Storage(_)
             | PrimaryNetworkError::Internal(_) => None,
         }

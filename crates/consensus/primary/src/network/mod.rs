@@ -104,7 +104,6 @@ impl PrimaryNetworkHandle {
         let mut tries = 0;
         while let PrimaryResponse::RecoverableError(PrimaryRPCError(s)) = res {
             warn!(target: "primary::network", "Got recoverable error {s}, retrying");
-            eprintln!("XXXX res {s}");
             tokio::time::sleep(Duration::from_millis(250)).await;
             let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
             let res_raw = self.handle.send_request(request, peer).await?;
@@ -117,10 +116,7 @@ impl PrimaryNetworkHandle {
         match res {
             PrimaryResponse::Vote(vote) => Ok(RequestVoteResult::Vote(vote)),
             PrimaryResponse::RecoverableError(PrimaryRPCError(s))
-            | PrimaryResponse::Error(PrimaryRPCError(s)) => {
-                eprintln!("XXXX GOT ERROR {s}");
-                Err(NetworkError::RPCError(s))
-            }
+            | PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
             PrimaryResponse::RequestedCertificates(_vec) => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is requested certificates!".to_string(),
             )),
@@ -440,7 +436,7 @@ where
         let task_name = format!("ProcessGossip-{propogation_source}");
         // spawn task to process gossip
         self.task_spawner.spawn_task(task_name, async move {
-            if let Err(e) = request_handler.process_gossip(&msg, propogation_source).await {
+            if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "primary::network", ?e, "process_gossip");
                 // convert error into penalty to lower peer score
                 if let Some(penalty) = (&e).into() {

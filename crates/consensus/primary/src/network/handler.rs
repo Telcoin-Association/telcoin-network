@@ -67,11 +67,7 @@ where
     /// Peers gossip the CertificateDigest so peers can request the Certificate. This waits until
     /// the certificate can be retrieved and timesout after some time. It's important to give up
     /// after enough time to limit the DoS attack surface. Peers who timeout must lose reputation.
-    pub(super) async fn process_gossip(
-        &self,
-        msg: &GossipMessage,
-        source: BlsPublicKey,
-    ) -> PrimaryNetworkResult<()> {
+    pub(super) async fn process_gossip(&self, msg: &GossipMessage) -> PrimaryNetworkResult<()> {
         // deconstruct message
         let GossipMessage { data, topic, .. } = msg;
 
@@ -93,10 +89,8 @@ where
                     topic.to_string().eq(&tn_config::LibP2pConfig::primary_topic()),
                     PrimaryNetworkError::InvalidTopic
                 );
-                ensure!(
-                    self.consensus_config.committee().authority_by_key(&source).is_some(),
-                    PrimaryNetworkError::PeerNotInCommittee(Box::new(source))
-                );
+                // We must be in the committee to get here.
+                // More stringent checks are coming to this soon as well.
                 let (old_number, _old_hash) =
                     *self.consensus_bus.last_published_consensus_num_hash().borrow();
                 // Make sure we don't get old gossip and go backwards.

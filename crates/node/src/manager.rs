@@ -493,9 +493,6 @@ where
                 let target_hash = res.inspect_err(|e| {
                     error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
                 })?;
-                //if self.key_config.primary_public_key().as_ref()[0] % 2 == 0 {
-                //    tokio::time::sleep(Duration::from_millis(300)).await; // XXXX
-                //}
                 self.close_epoch(engine, consensus_shutdown.clone(), gas_accumulator, target_hash)
                     .await?;
 
