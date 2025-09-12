@@ -31,8 +31,6 @@ mod message;
 #[path = "../tests/network_tests.rs"]
 mod network_tests;
 
-// Maximum number of certificates for one request.
-pub(crate) const MAX_CERTIFICATES_PER_REQUEST: usize = 2_000;
 /// Convenience type for Primary network.
 pub(crate) type Req = PrimaryRequest;
 /// Convenience type for Primary network.
@@ -306,8 +304,8 @@ where
                     self.process_epoch_record_request(peer, epoch, hash, channel, cancel)
                 }
             },
-            NetworkEvent::Gossip(msg, source) => {
-                self.process_gossip(msg, source);
+            NetworkEvent::Gossip(msg, propogation_source) => {
+                self.process_gossip(msg, propogation_source);
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = PrimaryResponse::Error(PrimaryRPCError(msg));
@@ -361,12 +359,15 @@ where
         let task_name = format!("MissingCertsReq-{peer}");
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
-                certs = request_handler.retrieve_missing_certs(request) => {
-                    let response = certs.into_response();
+                result = request_handler.retrieve_missing_certs(request) => {
+                    // report penalty if any
+                    if let Err(ref e) = result {
+                        if let Some(penalty) = e.into() {
+                            network_handle.report_penalty(peer, penalty).await;
+                        }
+                    }
 
-                    // TODO: penalize peer's reputation for bad request
-                    // if response.is_err() { }
-
+                    let response = result.into_response();
                     let _ = network_handle.handle.send_response(response, channel).await;
                 }
                 // cancel notification from network layer
@@ -432,18 +433,18 @@ where
     }
 
     /// Process gossip from committee.
-    fn process_gossip(&self, msg: GossipMessage, source: BlsPublicKey) {
+    fn process_gossip(&self, msg: GossipMessage, propogation_source: BlsPublicKey) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        let task_name = format!("ProcessGossip-{source}");
+        let task_name = format!("ProcessGossip-{propogation_source}");
         // spawn task to process gossip
         self.task_spawner.spawn_task(task_name, async move {
-            if let Err(e) = request_handler.process_gossip(&msg, source).await {
+            if let Err(e) = request_handler.process_gossip(&msg, propogation_source).await {
                 warn!(target: "primary::network", ?e, "process_gossip");
                 // convert error into penalty to lower peer score
-                if let Some(penalty) = e.into() {
-                    network_handle.report_penalty(source, penalty).await;
+                if let Some(penalty) = (&e).into() {
+                    network_handle.report_penalty(propogation_source, penalty).await;
                 }
             }
         });

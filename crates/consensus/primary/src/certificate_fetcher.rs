@@ -2,7 +2,7 @@
 
 use crate::{
     error::{CertManagerError, CertManagerResult},
-    network::{MissingCertificatesRequest, PrimaryNetworkHandle, MAX_CERTIFICATES_PER_REQUEST},
+    network::{MissingCertificatesRequest, PrimaryNetworkHandle},
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
@@ -68,12 +68,12 @@ pub(crate) struct CertificateFetcher<DB> {
     /// Map of validator to target rounds that local store must catch up to.
     /// The targets are updated with each certificate missing parents sent from the core.
     /// Each fetch task may satisfy some / all / none of the targets.
-    /// TODO: rethink the stopping criteria for fetching, balance simplicity with completeness
-    /// of certificates (for avoiding jitters of voting / processing certificates instead of
-    /// correctness).
     targets: BTreeMap<AuthorityIdentifier, Round>,
     /// Keeps the handle to the (at most one) inflight fetch certificates task.
     fetch_certificates_task: JoinSet<()>,
+    /// The max allowable RPC message size shared with peers (in bytes).
+    /// This value should match the `request_response` codec's "max_rpc_message_size".
+    max_rpc_message_size: usize,
 }
 
 /// Thread-safe internal state of CertificateFetcher shared with its fetch task.
@@ -106,6 +106,7 @@ impl<DB: Database> CertificateFetcher<DB> {
             state_sync,
             metrics: consensus_bus.primary_metrics().node_metrics.clone(),
         });
+        let max_rpc_message_size = config.network_config().libp2p_config().max_rpc_message_size;
 
         task_manager.spawn_critical_task(
             "certificate fetcher task",
@@ -119,6 +120,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                         rx_shutdown,
                         targets: BTreeMap::new(),
                         fetch_certificates_task: JoinSet::new(),
+                        max_rpc_message_size,
                     }
                     .run()
                     .await
@@ -269,6 +271,7 @@ impl<DB: Database> CertificateFetcher<DB> {
 
         let state = self.state.clone();
         let committee = self.committee.clone();
+        let max_response_size = self.max_rpc_message_size;
 
         debug!(
             target: "primary::cert_fetcher",
@@ -281,7 +284,7 @@ impl<DB: Database> CertificateFetcher<DB> {
             state.metrics.certificate_fetcher_inflight_fetch.inc();
 
             let now = Instant::now();
-            match run_fetch_task(state.clone(), committee, gc_round, written_rounds).await {
+            match run_fetch_task(state.clone(), committee, gc_round, written_rounds, max_response_size).await {
                 Ok(_) => {
                     debug!(target: "primary::cert_fetcher",
                         "Finished task to fetch certificates successfully, elapsed = {}s",
@@ -309,12 +312,13 @@ async fn run_fetch_task<DB: Database>(
     committee: Committee,
     gc_round: Round,
     written_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>>,
+    max_response_size: usize,
 ) -> CertManagerResult<()> {
     // Send request to fetch certificates.
     let request = MissingCertificatesRequest::default()
         .set_bounds(gc_round, written_rounds)
         .map_err(|e| CertManagerError::RequestBounds(e.to_string()))?
-        .set_max_items(MAX_CERTIFICATES_PER_REQUEST);
+        .set_max_response_size(max_response_size);
     let Some(response) = fetch_certificates_helper(
         state.authority_id.as_ref(),
         state.network.clone(),
@@ -347,7 +351,6 @@ async fn fetch_certificates_helper(
 ) -> Option<FetchCertificatesResponse> {
     let _scope = monitored_scope("FetchingCertificatesFromPeers");
     trace!(target: "primary::cert_fetcher", "Start sending fetch certificates requests");
-    // TODO: make this a config parameter.
     let request_interval = PARALLEL_FETCH_REQUEST_INTERVAL_SECS;
     let mut peers: Vec<BlsPublicKey> =
         committee.others_primaries_by_id(name).into_iter().map(|(_, key)| key).collect();
@@ -418,12 +421,6 @@ async fn process_certificates_helper<DB: Database>(
     _metrics: Arc<PrimaryMetrics>,
 ) -> CertManagerResult<()> {
     trace!(target: "primary::cert_fetcher", "Start sending fetched certificates to processing");
-    if response.certificates.len() > MAX_CERTIFICATES_PER_REQUEST {
-        return Err(CertManagerError::TooManyFetchedCertificatesReturned {
-            response: response.certificates.len(),
-            request: MAX_CERTIFICATES_PER_REQUEST,
-        });
-    }
 
     // We should not be getting mixed versions of certificates from a
     // validator, so any individual certificate with mismatched versions

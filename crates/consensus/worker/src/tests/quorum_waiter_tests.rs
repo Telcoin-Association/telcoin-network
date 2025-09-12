@@ -14,12 +14,18 @@ async fn wait_for_quorum() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let committee = fixture.committee();
     let my_primary = fixture.authorities().next().unwrap();
+    let max_rpc_msg_size =
+        my_primary.consensus_config().network_config().libp2p_config().max_rpc_message_size;
     let node_metrics = Arc::new(WorkerMetrics::default());
     let task_manager = TaskManager::default();
 
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
-    let network = WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner());
+    let network = WorkerNetworkHandle::new(
+        NetworkHandle::new(sender),
+        task_manager.get_spawner(),
+        max_rpc_msg_size,
+    );
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter =
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network, node_metrics);
