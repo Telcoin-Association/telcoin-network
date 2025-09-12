@@ -3,7 +3,7 @@
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use crate::{proposer::OurDigestMessage, state_sync::StateSynchronizer, ConsensusBus};
 use handler::RequestHandler;
@@ -19,8 +19,8 @@ use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerTo
 use tn_storage::PayloadStore;
 use tn_types::{
     encode, BlockHash, BlsPublicKey, BlsSignature, Certificate, CertificateDigest, ConsensusHeader,
-    Database, Epoch, EpochCertificate, EpochRecord, Header, TaskSpawner, TnReceiver, TnSender,
-    Vote,
+    Database, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, TaskSpawner, TnReceiver,
+    TnSender, Vote,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
@@ -31,8 +31,6 @@ mod message;
 #[path = "../tests/network_tests.rs"]
 mod network_tests;
 
-// Maximum number of certificates for one request.
-pub(crate) const MAX_CERTIFICATES_PER_REQUEST: usize = 2_000;
 /// Convenience type for Primary network.
 pub(crate) type Req = PrimaryRequest;
 /// Convenience type for Primary network.
@@ -69,7 +67,7 @@ impl PrimaryNetworkHandle {
     /// Publish a certificate to the consensus network.
     pub async fn publish_certificate(&self, certificate: Certificate) -> NetworkResult<()> {
         let data = encode(&PrimaryGossip::Certificate(Box::new(certificate)));
-        self.handle.publish("tn-primary".into(), data).await?;
+        self.handle.publish(tn_config::LibP2pConfig::primary_topic(), data).await?;
         Ok(())
     }
 
@@ -92,12 +90,9 @@ impl PrimaryNetworkHandle {
     }
 
     /// Publish a certificate to the consensus network.
-    pub async fn publish_epoch_certificate(
-        &self,
-        certificate: EpochCertificate,
-    ) -> NetworkResult<()> {
-        let data = encode(&PrimaryGossip::EpochCertificate(certificate));
-        self.handle.publish("tn-primary".into(), data).await?;
+    pub async fn publish_epoch_vote(&self, vote: EpochVote) -> NetworkResult<()> {
+        let data = encode(&PrimaryGossip::EpochVote(Box::new(vote)));
+        self.handle.publish(tn_config::LibP2pConfig::epoch_vote_topic(), data).await?;
         Ok(())
     }
 
@@ -109,12 +104,26 @@ impl PrimaryNetworkHandle {
         header: Header,
         parents: Vec<Certificate>,
     ) -> NetworkResult<RequestVoteResult> {
-        let request = PrimaryRequest::Vote { header: Arc::new(header), parents };
+        let header = Arc::new(header);
+        let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
         let res = self.handle.send_request(request, peer).await?;
-        let res = res.await??;
+        let mut res = res.await??;
+        let mut tries = 0;
+        while let PrimaryResponse::RecoverableError(PrimaryRPCError(s)) = res {
+            warn!(target: "primary::network", "Got recoverable error {s}, retrying");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
+            let res_raw = self.handle.send_request(request, peer).await?;
+            res = res_raw.await??;
+            tries += 1;
+            if tries > 5 {
+                break;
+            }
+        }
         match res {
             PrimaryResponse::Vote(vote) => Ok(RequestVoteResult::Vote(vote)),
-            PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
+            PrimaryResponse::RecoverableError(PrimaryRPCError(s))
+            | PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
             PrimaryResponse::RequestedCertificates(_vec) => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is requested certificates!".to_string(),
             )),
@@ -187,7 +196,7 @@ impl PrimaryNetworkHandle {
     }
 
     /// Request consensus header from a random peer up to three times from three different peers.
-    pub async fn request_epoch(
+    pub async fn request_epoch_cert(
         &self,
         epoch: Option<Epoch>,
         hash: Option<BlockHash>,
@@ -298,8 +307,8 @@ where
                     self.process_epoch_record_request(peer, epoch, hash, channel, cancel)
                 }
             },
-            NetworkEvent::Gossip(msg, source) => {
-                self.process_gossip(msg, source);
+            NetworkEvent::Gossip(msg, propogation_source) => {
+                self.process_gossip(msg, propogation_source);
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = PrimaryResponse::Error(PrimaryRPCError(msg));
@@ -353,12 +362,15 @@ where
         let task_name = format!("MissingCertsReq-{peer}");
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
-                certs = request_handler.retrieve_missing_certs(request) => {
-                    let response = certs.into_response();
+                result = request_handler.retrieve_missing_certs(request) => {
+                    // report penalty if any
+                    if let Err(ref e) = result {
+                        if let Some(penalty) = e.into() {
+                            network_handle.report_penalty(peer, penalty).await;
+                        }
+                    }
 
-                    // TODO: penalize peer's reputation for bad request
-                    // if response.is_err() { }
-
+                    let response = result.into_response();
                     let _ = network_handle.handle.send_response(response, channel).await;
                 }
                 // cancel notification from network layer
@@ -424,18 +436,18 @@ where
     }
 
     /// Process gossip from committee.
-    fn process_gossip(&self, msg: GossipMessage, source: BlsPublicKey) {
+    fn process_gossip(&self, msg: GossipMessage, propogation_source: BlsPublicKey) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        let task_name = format!("ProcessGossip-{source}");
+        let task_name = format!("ProcessGossip-{propogation_source}");
         // spawn task to process gossip
         self.task_spawner.spawn_task(task_name, async move {
-            if let Err(e) = request_handler.process_gossip(&msg, source).await {
+            if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "primary::network", ?e, "process_gossip");
                 // convert error into penalty to lower peer score
-                if let Some(penalty) = e.into() {
-                    network_handle.report_penalty(source, penalty).await;
+                if let Some(penalty) = (&e).into() {
+                    network_handle.report_penalty(propogation_source, penalty).await;
                 }
             }
         });

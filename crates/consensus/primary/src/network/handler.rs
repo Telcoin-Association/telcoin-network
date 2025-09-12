@@ -3,7 +3,7 @@
 use super::{message::MissingCertificatesRequest, PrimaryResponse};
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
-    network::{message::PrimaryGossip, MAX_CERTIFICATES_PER_REQUEST},
+    network::message::PrimaryGossip,
     state_sync::{CertificateCollector, StateSynchronizer},
     ConsensusBus,
 };
@@ -28,6 +28,7 @@ use tn_types::{
     CertificateDigest, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, Hash as _,
     Header, ProtocolSignature, Round, SignatureVerificationState, TnSender as _, Vote,
 };
+use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 
 /// The type that handles requests from peers.
@@ -66,19 +67,19 @@ where
     /// Peers gossip the CertificateDigest so peers can request the Certificate. This waits until
     /// the certificate can be retrieved and timesout after some time. It's important to give up
     /// after enough time to limit the DoS attack surface. Peers who timeout must lose reputation.
-    pub(super) async fn process_gossip(
-        &self,
-        msg: &GossipMessage,
-        _source: BlsPublicKey,
-    ) -> PrimaryNetworkResult<()> {
+    pub(super) async fn process_gossip(&self, msg: &GossipMessage) -> PrimaryNetworkResult<()> {
         // deconstruct message
-        let GossipMessage { data, .. } = msg;
+        let GossipMessage { data, topic, .. } = msg;
 
         // gossip is uncompressed
         let gossip = try_decode(data)?;
 
         match gossip {
             PrimaryGossip::Certificate(cert) => {
+                ensure!(
+                    topic.to_string().eq(&tn_config::LibP2pConfig::primary_topic()),
+                    PrimaryNetworkError::InvalidTopic
+                );
                 // process certificate
                 let unverified_cert = cert.validate_received().map_err(CertManagerError::from)?;
                 self.state_sync.process_peer_certificate(unverified_cert).await?;
@@ -88,6 +89,10 @@ where
                 // current committee. This may be intractable until EpochRecords are
                 // caught up. XXXX- don't subscribe to gossip until we have caught
                 // up EpochRecords in general. Or NOT
+                ensure!(
+                    topic.to_string().eq(&tn_config::LibP2pConfig::primary_topic()),
+                    PrimaryNetworkError::InvalidTopic
+                );
                 ensure!(
                     self.consensus_config.committee().authority_by_key(&key).is_some(),
                     PrimaryNetworkError::PeerNotInCommittee(Box::new(key))
@@ -107,8 +112,19 @@ where
                         self.consensus_bus.last_published_consensus_num_hash().send((number, hash));
                 }
             }
-            PrimaryGossip::EpochCertificate(cert) => {
-                let _ = self.consensus_bus.new_epoch_certificates().send(cert).await;
+            PrimaryGossip::EpochVote(vote) => {
+                ensure!(
+                    topic.to_string().eq(&tn_config::LibP2pConfig::epoch_vote_topic()),
+                    PrimaryNetworkError::InvalidTopic
+                );
+                let (tx, rx) = oneshot::channel();
+                let _ = self.consensus_bus.new_epoch_votes().send((*vote, tx)).await;
+                match rx.await {
+                    // Propogate any errors so the peer can be punished.
+                    Ok(res) => res?,
+                    // Don't punish the peer for an internal channel issue...
+                    Err(e) => error!(target: "primary", "error waiting on epoch vote result: {e}"),
+                }
             }
         }
 
@@ -459,16 +475,8 @@ where
         &self,
         request: MissingCertificatesRequest,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
-        // ensure max items within bounds
-        let requested_max = request.max_items;
-        if requested_max > MAX_CERTIFICATES_PER_REQUEST {
-            return Err(PrimaryNetworkError::InvalidRequest(format!(
-                "requested too many items: {requested_max}. max allowed: {MAX_CERTIFICATES_PER_REQUEST}"
-            )));
-        }
-
         // Create a time-bounded iter for collecting certificates
-        let mut missing = Vec::with_capacity(requested_max);
+        let mut missing = Vec::new();
 
         // validates request is within limits
         let mut collector = CertificateCollector::new(request, self.consensus_config.clone())?;

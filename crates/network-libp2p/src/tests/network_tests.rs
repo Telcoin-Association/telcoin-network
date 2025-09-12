@@ -82,6 +82,7 @@ where
     /// Network handle to send commands.
     network_handle: NetworkHandle<Req, Res>,
     /// The network task.
+    #[allow(clippy::type_complexity)]
     network: Option<ConsensusNetwork<Req, Res, MemDatabase, mpsc::Sender<NetworkEvent<Req, Res>>>>,
 }
 /// A peer on TN

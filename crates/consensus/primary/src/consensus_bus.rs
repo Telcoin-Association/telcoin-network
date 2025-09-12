@@ -13,12 +13,12 @@ use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
 use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
 use tn_types::{
-    BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput,
-    EpochCertificate, Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
+    error::HeaderError, BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
+    ConsensusOutput, EpochVote, Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
-        broadcast, mpsc,
+        broadcast, mpsc, oneshot,
         watch::{self, error::RecvError},
     },
     time::error::Elapsed,
@@ -183,7 +183,7 @@ struct ConsensusBusAppInner {
     _rx_sync_status: watch::Receiver<NodeMode>,
 
     /// Produce new epoch certs as they are recieved.
-    new_epoch_certificates: QueChannel<EpochCertificate>,
+    new_epoch_votes: QueChannel<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)>,
     /// The que channel for primary network events.
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,
 
@@ -239,7 +239,7 @@ impl ConsensusBusAppInner {
             consensus_header,
             tx_sync_status,
             _rx_sync_status,
-            new_epoch_certificates: QueChannel::new(),
+            new_epoch_votes: QueChannel::new(),
             primary_network_events: QueChannel::new(),
             consensus_metrics,
             primary_metrics,
@@ -250,15 +250,16 @@ impl ConsensusBusAppInner {
 
     /// Reset for a new epoch.
     /// This is primarily so we can resubscribe to "one-time" subscription channels.
-    pub fn reset_for_epoch(&self) {
+    fn reset_for_epoch(&self) {
         let _ = self.tx_committed_round_updates.send(Round::default());
         let _ = self.tx_gc_round_updates.send(Round::default());
         let _ = self.tx_primary_round_updates.send(0u32);
-        let _ = self.tx_last_consensus_header.send(ConsensusHeader::default());
-        let _ = self.tx_last_published_consensus_num_hash.send((0, BlockHash::default()));
         let recent_blocks = self.tx_recent_blocks.borrow().block_capacity();
-        let _ = self.tx_recent_blocks.send(RecentBlocks::new(recent_blocks as usize));
-        let _ = self.tx_sync_status.send(NodeMode::default());
+        // Hang onto the last block of the previous epoch, clear the rest.
+        let latest = self.tx_recent_blocks.borrow().latest_block();
+        let mut recent_blocks = RecentBlocks::new(recent_blocks as usize);
+        recent_blocks.push_latest(latest);
+        let _ = self.tx_recent_blocks.send(recent_blocks);
     }
 }
 
@@ -568,8 +569,10 @@ impl ConsensusBus {
     }
 
     /// New epoch certs as they are recieved.
-    pub fn new_epoch_certificates(&self) -> &impl TnSender<EpochCertificate> {
-        &self.inner_app.new_epoch_certificates
+    pub fn new_epoch_votes(
+        &self,
+    ) -> &impl TnSender<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)> {
+        &self.inner_app.new_epoch_votes
     }
 
     /// Update consensus round watch channels.
@@ -593,6 +596,11 @@ impl ConsensusBus {
     ) -> Result<(), WaitForExecutionElapsed> {
         let mut watch_execution_result = self.recent_blocks().subscribe();
         let target_number = block.number;
+        // Make sure that our recent blocks is not empty.  If it is we can have a race around block
+        // 0.
+        while self.recent_blocks().borrow().is_empty() {
+            watch_execution_result.changed().await?;
+        }
         let mut current_number = self.recent_blocks().borrow().latest_block_num_hash().number;
         while current_number < target_number {
             watch_execution_result.changed().await?;

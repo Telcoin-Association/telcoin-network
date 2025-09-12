@@ -45,6 +45,7 @@ pub(crate) enum PrimaryNetworkError {
     #[error("Unknown consensus header certificate for: {0}")]
     UnknownConsensusHeaderCert(BlockHash),
     /// Peer that is not committee published invalid gosip.
+    /// Temparily disabled, will be back soon.
     #[error("Peer {0} is not in the committee!")]
     PeerNotInCommittee(Box<BlsPublicKey>),
     /// Unavaliable epoch (either it is invalid or this node does not have it).
@@ -56,10 +57,13 @@ pub(crate) enum PrimaryNetworkError {
     /// Invalid epoch request.
     #[error("Must suply an epoch or hash when requesting an epoch record")]
     InvalidEpochRequest,
+    /// Invalid topic- something was published to the wrong topic.
+    #[error("Gossip was published to the wrong topic")]
+    InvalidTopic,
 }
 
-impl From<PrimaryNetworkError> for Option<Penalty> {
-    fn from(val: PrimaryNetworkError) -> Self {
+impl From<&PrimaryNetworkError> for Option<Penalty> {
+    fn from(val: &PrimaryNetworkError) -> Self {
         //
         // explicitly match every error type to ensure penalties are updated with changes
         //
@@ -84,10 +88,6 @@ impl From<PrimaryNetworkError> for Option<Penalty> {
                     | CertificateError::TooNew(_, _, _)
                     | CertificateError::Storage(_) => None,
                 },
-                // severe
-                CertManagerError::TooManyFetchedCertificatesReturned { .. } => {
-                    Some(Penalty::Severe)
-                }
                 // fatal
                 CertManagerError::UnverifiedSignature(_) => Some(Penalty::Fatal),
                 // ignore
@@ -113,7 +113,8 @@ impl From<PrimaryNetworkError> for Option<Penalty> {
             PrimaryNetworkError::InvalidEpochRequest
             | PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),
             // fatal
-            PrimaryNetworkError::Decode(_) => Some(Penalty::Fatal),
+            PrimaryNetworkError::InvalidTopic
+            | PrimaryNetworkError::Decode(_) => Some(Penalty::Fatal),
             // ignore
             PrimaryNetworkError::UnavailableEpoch(_)  // A node might not have this yet...
             | PrimaryNetworkError::UnavailableEpochDigest(_)  // A node might not have this yet....
@@ -127,7 +128,7 @@ impl From<PrimaryNetworkError> for Option<Penalty> {
 /// Helper function to convert `HeaderError` to `Penalty`.
 ///
 /// Header errors are responsible for more than one PrimaryNetworkHandle.
-fn penalty_from_header_error(error: HeaderError) -> Option<Penalty> {
+fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
     match error {
         // mild
         HeaderError::SyncBatches(_)

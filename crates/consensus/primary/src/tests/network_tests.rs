@@ -30,7 +30,7 @@ fn test_missing_certs_request() {
     let missing_req = MissingCertificatesRequest::default()
         .set_bounds(expected_gc_round, expected_skip_rounds.clone())
         .expect("boundary set")
-        .set_max_items(max);
+        .set_max_response_size(max);
     let (decoded_gc_round, decoded_skip_rounds) =
         missing_req.get_bounds().expect("decode missing bounds");
     assert_eq!(expected_gc_round, decoded_gc_round);

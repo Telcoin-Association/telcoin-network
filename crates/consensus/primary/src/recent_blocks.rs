@@ -30,6 +30,10 @@ impl RecentBlocks {
     }
 
     /// Return the hash and number of the last executed block.
+    /// This will return a default BlockNumHash if recents blocks are empty.
+    /// This should only happen on node startup before any execution has taken
+    /// place.  Most callsites will be fine with this, call is_empty() if this
+    /// matters to you.
     pub fn latest_block_num_hash(&self) -> BlockNumHash {
         self.blocks.back().cloned().unwrap_or_else(Default::default).num_hash()
     }
@@ -47,5 +51,15 @@ impl RecentBlocks {
             }
         }
         false
+    }
+
+    /// Number of blocks actually stored.
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Do we have any blocks?
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
     }
 }

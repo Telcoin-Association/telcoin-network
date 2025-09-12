@@ -21,12 +21,14 @@ pub trait TelcoinNetworkRpcExtApi {
     #[method(name = "genesis")]
     async fn genesis(&self) -> TelcoinNetworkRpcResult<Genesis>;
     /// Get the header for epoch if available.
-    #[method(name = "epochHeader")]
-    async fn epoch(&self, epoch: Epoch)
-        -> TelcoinNetworkRpcResult<(EpochRecord, EpochCertificate)>;
+    #[method(name = "epochRecord")]
+    async fn epoch_record(
+        &self,
+        epoch: Epoch,
+    ) -> TelcoinNetworkRpcResult<(EpochRecord, EpochCertificate)>;
     /// Get the header for epoch by hash if available.
-    #[method(name = "epochHeaderByHash")]
-    async fn epoch_by_hash(
+    #[method(name = "epochRecordByHash")]
+    async fn epoch_record_by_hash(
         &self,
         hash: BlockHash,
     ) -> TelcoinNetworkRpcResult<(EpochRecord, EpochCertificate)>;
@@ -56,7 +58,7 @@ where
         Ok(self.chain.genesis().clone())
     }
 
-    async fn epoch(
+    async fn epoch_record(
         &self,
         epoch: Epoch,
     ) -> TelcoinNetworkRpcResult<(EpochRecord, EpochCertificate)> {
@@ -66,7 +68,7 @@ where
         }
     }
 
-    async fn epoch_by_hash(
+    async fn epoch_record_by_hash(
         &self,
         hash: BlockHash,
     ) -> TelcoinNetworkRpcResult<(EpochRecord, EpochCertificate)> {

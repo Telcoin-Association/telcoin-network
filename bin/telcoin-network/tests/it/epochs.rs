@@ -147,14 +147,16 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
 
     if shuffled {
         // Do a check to make sure all the nodes have valid (certified) Epoch Records.
+        // TODO issue 375, should use tn_latestHeader RPC for this when fixed.
+        let latest_epoch = last_pause;
         for p in 8540..=8545 {
             let rpc_url = format!("http://127.0.0.1:{p}");
             let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-            // TODO issue 375, should use tn_latestHeader RPC for this when fixed.
-            let latest_epoch = last_pause;
             for epoch in 0..=latest_epoch {
-                let (epoch_rec, cert): (EpochRecord, EpochCertificate) =
-                    provider.raw_request("tn_epochHeader".into(), (epoch,)).await.unwrap();
+                let (epoch_rec, cert): (EpochRecord, EpochCertificate) = provider
+                    .raw_request("tn_epochRecord".into(), (epoch,))
+                    .await
+                    .expect(&format!("Failed to get epoch record for epoch {epoch}, port {p}"));
                 assert!(epoch_rec.verify_with_cert(&cert), "invalid epoch record!");
             }
         }

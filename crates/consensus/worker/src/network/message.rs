@@ -23,7 +23,7 @@ pub enum WorkerRequest {
     /// Send a new batch to a peer.
     ReportBatch { sealed_batch: SealedBatch },
     /// Request batches by digest from a peer.
-    RequestBatches { batch_digests: Vec<BlockHash> },
+    RequestBatches { batch_digests: Vec<BlockHash>, max_response_size: usize },
     /// Exchange peer information.
     ///
     /// This "request" is sent to peers when this node disconnects
