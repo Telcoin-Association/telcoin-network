@@ -8,7 +8,7 @@ use tn_reth::{
     CanonicalInMemoryState, ExecutedBlockWithTrieUpdates, NewCanonicalChain, RethEnv,
 };
 use tn_types::{
-    gas_accumulator::GasAccumulator, max_batch_gas, CertifiedBatch, ConsensusOutput, Hash as _,
+    gas_accumulator::GasAccumulator, max_batch_gas, Address, ConsensusOutput, Hash as _,
     SealedHeader, B256,
 };
 use tracing::{debug, error};
@@ -78,8 +78,9 @@ pub fn execute_consensus_output(
 
         let payload = TNPayload::new(
             canonical_header,
+            Address::ZERO,
             0,
-            None, // no batch to digest
+            B256::ZERO, // no batch to digest
             &output,
             output_digest,
             base_fee_per_gas,
@@ -88,6 +89,7 @@ pub fn execute_consensus_output(
             0,             // Use worker 0 becuase we have to provide on.
         );
 
+        debug!(target: "delete", ?output_digest, "WRONG!!!");
         debug!(target: "engine", "executing empty batch payload");
 
         // execute the payload and update the current canonical header
@@ -115,8 +117,9 @@ pub fn execute_consensus_output(
             let mix_hash = output_digest ^ batch_digest;
             let payload = TNPayload::new(
                 canonical_header,
+                cert_batch.address,
                 batch_index,
-                Some(batch_digest),
+                batch_digest,
                 &output,
                 output_digest,
                 base_fee_per_gas,

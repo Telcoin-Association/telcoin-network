@@ -40,8 +40,8 @@ pub struct ConsensusOutput {
     /// This field is not included in [Self] digest. To validate,
     /// hash these batches and compare to [Self::batch_digests].
     pub batches: Vec<CertifiedBatch>,
-    /// The beneficiary for block rewards.
-    pub beneficiary: Address,
+    /// The leader's ECDSA address that receives block rewards once per output.
+    pub leader_address: Address,
     /// The ordered set of [BlockHash].
     ///
     /// This value is included in [Self] digest.
@@ -90,9 +90,9 @@ impl ConsensusOutput {
     /// Execution address of the leader for the round.
     ///
     /// The address is used in the executed block as the
-    /// beneficiary for block rewards.
-    pub fn beneficiary(&self) -> Address {
-        self.beneficiary
+    /// leader_address for block rewards.
+    pub fn leader_address(&self) -> Address {
+        self.leader_address
     }
 
     /// Pop the next batch digest.

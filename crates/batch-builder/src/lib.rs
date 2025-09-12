@@ -643,7 +643,7 @@ mod tests {
 
             // canonical update to wake up task
             let output = ConsensusOutput {
-                beneficiary: address,
+                leader_address: address,
                 early_finalize: true,
                 ..Default::default()
             };

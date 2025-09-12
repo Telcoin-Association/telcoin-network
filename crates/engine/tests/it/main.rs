@@ -4,7 +4,6 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    io::Read,
     str::FromStr as _,
     sync::Arc,
     time::Duration,
@@ -14,20 +13,20 @@ use tn_batch_builder::test_utils::execute_test_batch;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_engine::ExecutorEngine;
 use tn_reth::{
-    system_calls::{ConsensusRegistry, EpochState},
+    system_calls::EpochState,
     test_utils::{
-        seeded_genesis_from_random_batches, TransactionFactory, BEACON_ROOTS_ADDRESS,
-        HISTORY_STORAGE_ADDRESS,
+        calculate_withdrawals_root, seeded_genesis_from_random_batches, TransactionFactory,
+        BEACON_ROOTS_ADDRESS, EMPTY_REQUESTS_HASH, HISTORY_STORAGE_ADDRESS,
     },
-    ChainSpec, FixedBytes, RethChainSpec, RethEnv,
+    FixedBytes, RethChainSpec, RethEnv,
 };
 use tn_test_utils::{default_test_execution_node, TestExecutionNode};
 use tn_types::{
     adiri_genesis, gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc,
-    test_genesis, Address, BlockHash, Bloom, BlsPublicKey, Bytes, Certificate, CommittedSubDag,
-    Committee, CommitteeBuilder, ConsensusOutput, Encodable2718, Hash as _, Notifier,
-    ReputationScores, SealedBlock, TaskManager, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS,
-    MIN_PROTOCOL_BASE_FEE, U256,
+    test_genesis, Address, BlockHash, Bloom, BlsPublicKey, Bytes, Certificate, CertifiedBatch,
+    CommittedSubDag, Committee, CommitteeBuilder, ConsensusOutput, Encodable2718, Hash as _,
+    Notifier, ReputationScores, SealedBlock, TaskManager, B256, EMPTY_OMMER_ROOT_HASH,
+    EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tokio::{sync::oneshot, time::timeout};
 use tracing::debug;
@@ -141,8 +140,8 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     leader.header.created_at = timestamp;
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
-    let beneficiary = Address::from_str("0x5555555555555555555555555555555555555555")
-        .expect("beneficiary address from str");
+    let leader_address = Address::from_str("0x5555555555555555555555555555555555555555")
+        .expect("leader_address address from str");
     let consensus_output = ConsensusOutput {
         sub_dag: CommittedSubDag::new(
             vec![Certificate::default()],
@@ -152,7 +151,7 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
             previous_sub_dag,
         )
         .into(),
-        beneficiary,
+        leader_address,
         early_finalize: true,
         ..Default::default()
     };
@@ -236,8 +235,8 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
 
     // assert basefee is same as worker's block
     assert_eq!(expected_block.base_fee_per_gas, Some(expected_base_fee));
-    // beneficiary overwritten for empty blocks
-    assert_eq!(expected_block.beneficiary, beneficiary);
+    // leader's address used for empty blocks
+    assert_eq!(expected_block.beneficiary, leader_address);
     // nonce matches subdag index and method all match
     assert_eq!(<FixedBytes<8> as Into<u64>>::into(expected_block.nonce), sub_dag_index);
     assert_eq!(<FixedBytes<8> as Into<u64>>::into(expected_block.nonce), consensus_output.nonce());
@@ -304,8 +303,8 @@ async fn test_empty_output_executes_late_finalize() -> eyre::Result<()> {
     leader.header.round = sub_dag_index as u32;
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
-    let beneficiary = Address::from_str("0x5555555555555555555555555555555555555555")
-        .expect("beneficiary address from str");
+    let leader_address = Address::from_str("0x5555555555555555555555555555555555555555")
+        .expect("leader_address address from str");
     let consensus_output = ConsensusOutput {
         sub_dag: CommittedSubDag::new(
             vec![Certificate::default()],
@@ -315,7 +314,7 @@ async fn test_empty_output_executes_late_finalize() -> eyre::Result<()> {
             previous_sub_dag,
         )
         .into(),
-        beneficiary,
+        leader_address,
         early_finalize: false,
         ..Default::default()
     };
@@ -455,9 +454,9 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
         committee.authorities().first().expect("first in 4 auth committee for tests").id();
     let authority_2 =
         committee.authorities().last().expect("last in 4 auth committee for tests").id();
-    let beneficiary_1 =
+    let leader_address_1 =
         committee.authority(&authority_1).expect("authority in committee").execution_address();
-    let beneficiary_2 =
+    let leader_address_2 =
         committee.authority(&authority_2).expect("authority in committee").execution_address();
 
     // execute batches to update headers with valid data
@@ -561,8 +560,8 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
     ));
     let consensus_output_1 = ConsensusOutput {
         sub_dag: subdag_1.clone(),
-        batches: vec![batches_1],
-        beneficiary: beneficiary_1,
+        batches: vec![CertifiedBatch { address: batch_producer, batches: batches_1 }],
+        leader_address: leader_address_1,
         batch_digests: batch_digests_1.clone(),
         early_finalize: true,
         ..Default::default()
@@ -588,8 +587,8 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
     .into();
     let consensus_output_2 = ConsensusOutput {
         sub_dag: subdag_2,
-        batches: vec![batches_2],
-        beneficiary: beneficiary_2,
+        batches: vec![CertifiedBatch { address: batch_producer, batches: batches_2 }],
+        leader_address: leader_address_2,
         batch_digests: batch_digests_2.clone(),
         parent_hash: consensus_output_1.consensus_header_hash(),
         number: 1,
@@ -682,28 +681,25 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
     let last_output = execution_node.last_executed_output().await?;
     assert_eq!(last_output, consensus_output_2_hash);
     // assert block rewards for two rounds of consensus (output 2 closes epoch)
-    let first_leader_rewards = reth_env.retrieve_account(&beneficiary_1);
-    let second_leader_rewards = reth_env.retrieve_account(&beneficiary_2);
-    // let third_validator_account = reth_env
-    //     .retrieve_account(
-    //         &committee
-    //             .authorities()
-    //             .iter()
-    //             .nth(2)
-    //             .expect("4 validators in committee")
-    //             .execution_address(),
-    //     )?
-    //     .expect("third validator account has priority fees");
-    // assert_eq!(
-    //     third_validator_account.balance,
-    //     U256::from(total_gas_per_tx * 93 + total_gas_per_tx * 83)
-    // );
-    // debug!(target:"engine", "3rd validator account: {:#?}", third_validator_account);
+    let first_leader_rewards = reth_env.retrieve_account(&leader_address_1);
+    let second_leader_rewards = reth_env.retrieve_account(&leader_address_2);
+    let third_validator_account = reth_env
+        .retrieve_account(
+            &committee
+                .authorities()
+                .iter()
+                .nth(2)
+                .expect("4 validators in committee")
+                .execution_address(),
+        )?
+        .expect("third validator account has priority fees");
+    assert_eq!(third_validator_account.balance, U256::from(expected_priority_fees));
+    debug!(target:"engine", "3rd validator account: {:#?}", third_validator_account);
     debug!(target:"engine", "first leader account: {:#?}", first_leader_rewards);
     debug!(target:"engine", "second leader account: {:#?}", second_leader_rewards);
     debug!(target:"engine", "expected basefees: {:#?}", expected_base_fees);
-    let rewards_1 = reth_env.get_validator_rewards(final_block.hash, beneficiary_1)?;
-    let rewards_2 = reth_env.get_validator_rewards(final_block.hash, beneficiary_2)?;
+    let rewards_1 = reth_env.get_validator_rewards(final_block.hash, leader_address_1)?;
+    let rewards_2 = reth_env.get_validator_rewards(final_block.hash, leader_address_2)?;
     debug!(target:"engine", "first leader rewards: {:#?}", rewards_1);
     debug!(target:"engine", "second leader rewards: {:#?}", rewards_2);
     // assert total epoch rewards distributed evenly for two beneficiaries with identical stake
@@ -736,7 +732,7 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
             .expect("governance safe balance doesn't underflow")
     );
 
-    debug!(target: "delete", ?beneficiary_1, ?beneficiary_2);
+    debug!(target: "delete", ?leader_address_1, ?leader_address_2);
 
     // assert gas went to batch creator
 
@@ -772,7 +768,6 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
 
         // define re-usable variable here for asserting all values against expected output
         let mut expected_output = &consensus_output_1;
-        let mut expected_beneficiary = &beneficiary_1;
         let mut expected_subdag_index = &sub_dag_index_1;
         let mut output_digest = output_digest_1;
         let mut expected_parent_beacon_block_root = consensus_output_1.consensus_header_hash();
@@ -782,7 +777,6 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
         if idx >= 4 {
             // use different output for last 4 blocks
             expected_output = &consensus_output_2;
-            expected_beneficiary = &beneficiary_2;
             expected_subdag_index = &sub_dag_index_2;
             output_digest = output_digest_2;
             expected_parent_beacon_block_root = consensus_output_2.consensus_header_hash();
@@ -797,7 +791,7 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
         assert_eip2935(&reth_env, block.sealed_block())?;
 
         // beneficiary overwritten
-        assert_eq!(&block.beneficiary, expected_beneficiary);
+        assert_eq!(block.beneficiary, batch_producer);
         // nonce matches subdag index and method all match
         assert_eq!(<FixedBytes<8> as Into<u64>>::into(block.nonce), *expected_subdag_index);
         assert_eq!(<FixedBytes<8> as Into<u64>>::into(block.nonce), expected_output.nonce());
@@ -821,7 +815,7 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
         }
 
         // mix hash is xor batch's hash and consensus output digest
-        let expected_mix_hash = all_batches[idx].digest() ^ output_digest;
+        let expected_mix_hash = output_digest ^ all_batches[idx].digest();
         assert_eq!(block.mix_hash, expected_mix_hash);
         // bloom expected to be the same bc all proposed transactions should be good
         // ie) no duplicates, etc.
@@ -837,12 +831,20 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
             Bytes::default()
         };
         assert_eq!(block.extra_data, expected_extra);
-        // assert batch digest match requests hash
-        assert_eq!(block.requests_hash, Some(all_batch_digests[idx]));
+        // assert batch digest match ommers hash
+        assert_eq!(block.ommers_hash, all_batch_digests[idx]);
+        // assert requests hash empty
+        assert_eq!(block.requests_hash, Some(EMPTY_REQUESTS_HASH));
         // assert batch's withdrawals match
         //
         // NOTE: this is currently always empty
-        assert_eq!(block.withdrawals_root, Some(EMPTY_WITHDRAWALS));
+        let expected_withdrawals = if idx == 7 {
+            let withdrawals = gas_accumulator.rewards_counter().generate_withdrawals();
+            calculate_withdrawals_root(withdrawals.as_ref())
+        } else {
+            EMPTY_WITHDRAWALS
+        };
+        assert_eq!(block.withdrawals_root, Some(expected_withdrawals));
     }
 
     Ok(())
@@ -944,6 +946,9 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     assert_eq!(duplicate_batch_round_2.transactions(), duplicated_batch_for_round_2.transactions());
     assert_ne!(duplicate_batch_round_2, duplicated_batch_for_round_2);
 
+    // TODO: update this test - only doing this for compiler
+    let batch_producer = Address::random();
+
     //=== Consensus
     //
     // create consensus output bc transactions in batches
@@ -968,12 +973,12 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         reputation_scores,
         previous_sub_dag,
     ));
-    let beneficiary_1 = Address::from_str("0x1111111111111111111111111111111111111111")
+    let leader_address_1 = Address::from_str("0x1111111111111111111111111111111111111111")
         .expect("beneficiary address from str");
     let consensus_output_1 = ConsensusOutput {
         sub_dag: subdag_1.clone(),
-        batches: vec![batches_1],
-        beneficiary: beneficiary_1,
+        batches: vec![CertifiedBatch { address: batch_producer, batches: batches_1 }],
+        leader_address: leader_address_1,
         batch_digests: batch_digests_1.clone(),
         early_finalize: true,
         ..Default::default()
@@ -998,12 +1003,12 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         previous_sub_dag,
     )
     .into();
-    let beneficiary_2 = Address::from_str("0x2222222222222222222222222222222222222222")
+    let leader_address_2 = Address::from_str("0x2222222222222222222222222222222222222222")
         .expect("beneficiary address from str");
     let consensus_output_2 = ConsensusOutput {
         sub_dag: subdag_2,
-        batches: vec![batches_2],
-        beneficiary: beneficiary_2,
+        batches: vec![CertifiedBatch { address: batch_producer, batches: batches_2 }],
+        leader_address: leader_address_2,
         batch_digests: batch_digests_2.clone(),
         parent_hash: consensus_output_1.consensus_header_hash(),
         number: 1,
@@ -1126,7 +1131,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
 
         // define re-usable variable here for asserting all values against expected output
         let mut expected_output = &consensus_output_1;
-        let mut expected_beneficiary = &beneficiary_1;
+        let mut expected_beneficiary = &leader_address_1;
         let mut expected_subdag_index = &sub_dag_index_1;
         let mut output_digest = output_digest_1;
         // We just set this to default in the test...
@@ -1137,7 +1142,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         if idx >= 4 {
             // use different output for last 4 blocks
             expected_output = &consensus_output_2;
-            expected_beneficiary = &beneficiary_2;
+            expected_beneficiary = &leader_address_2;
             expected_subdag_index = &sub_dag_index_2;
             output_digest = output_digest_2;
             expected_parent_beacon_block_root = consensus_output_2.consensus_header_hash();
@@ -1250,6 +1255,9 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         debug!("{idx}\n{:?}\n", batch);
     }
 
+    // TODO: update this test - only doing this for compiler
+    let batch_producer = Address::random();
+
     //=== Consensus
     //
     // create consensus output bc transactions in batches
@@ -1272,12 +1280,12 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         reputation_scores,
         previous_sub_dag,
     ));
-    let beneficiary_1 = Address::from_str("0x1111111111111111111111111111111111111111")
+    let leader_address_1 = Address::from_str("0x1111111111111111111111111111111111111111")
         .expect("beneficiary address from str");
     let consensus_output_1 = ConsensusOutput {
         sub_dag: subdag_1.clone(),
-        batches: vec![batches_1],
-        beneficiary: beneficiary_1,
+        batches: vec![CertifiedBatch { address: batch_producer, batches: batches_1 }],
+        leader_address: leader_address_1,
         batch_digests: batch_digests_1,
         early_finalize: true,
         ..Default::default()
@@ -1301,12 +1309,12 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         previous_sub_dag,
     )
     .into();
-    let beneficiary_2 = Address::from_str("0x2222222222222222222222222222222222222222")
+    let leader_address_2 = Address::from_str("0x2222222222222222222222222222222222222222")
         .expect("beneficiary address from str");
     let consensus_output_2 = ConsensusOutput {
         sub_dag: subdag_2,
-        batches: vec![batches_2],
-        beneficiary: beneficiary_2,
+        batches: vec![CertifiedBatch { address: batch_producer, batches: batches_2 }],
+        leader_address: leader_address_2,
         batch_digests: batch_digests_2,
         parent_hash: consensus_output_1.consensus_header_hash(),
         number: 1,

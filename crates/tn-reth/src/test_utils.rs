@@ -36,8 +36,11 @@ use tn_types::{
     EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE,
     U256,
 };
-// re-export for engine tests
-pub use alloy::eips::{eip2935::HISTORY_STORAGE_ADDRESS, eip4788::BEACON_ROOTS_ADDRESS};
+// re-exports for engine tests
+pub use alloy::eips::{
+    eip2935::HISTORY_STORAGE_ADDRESS, eip4788::BEACON_ROOTS_ADDRESS, eip7685::EMPTY_REQUESTS_HASH,
+};
+pub use reth_primitives_traits::proofs::calculate_withdrawals_root;
 
 // methods for tests
 impl RethEnv {

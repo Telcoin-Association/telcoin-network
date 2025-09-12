@@ -489,7 +489,7 @@ async fn test_canonical_notification_updates_pool() {
             None,
         )
         .into(),
-        beneficiary: address,
+        leader_address: address,
         early_finalize: true,
         batch_digests,
         batches: vec![CertifiedBatch { address, batches: vec![first_batch] }],

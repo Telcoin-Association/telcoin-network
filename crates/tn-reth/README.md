@@ -64,3 +64,12 @@ The worker id and the batch index (relative to the subdag).
 The digest of the `ConsensusHeader` that committed the transactions being executed.
 
 See `evm/block.rs` for block execution details.
+
+#### ommers_hash
+
+The digest of the `Batch` that was executed to produce the EVM block.
+If the `ConsensusOutput` contains no batches, `B256::ZERO` is used instead.
+
+#### requests_hash
+
+Currently set to the default `EMPTY_REQUESTS_HASH`.

@@ -1352,8 +1352,8 @@ mod tests {
         leader.header.round = sub_dag_index as u32;
         let reputation_scores = ReputationScores::default();
         let previous_sub_dag = None;
-        let beneficiary = Address::from_hex("0x5555555555555555555555555555555555555555")
-            .expect("beneficiary address from str");
+        let leader_address = Address::from_hex("0x5555555555555555555555555555555555555555")
+            .expect("leader_address address from str");
         ConsensusOutput {
             sub_dag: CommittedSubDag::new(
                 vec![leader.clone(), Certificate::default()],
@@ -1365,7 +1365,7 @@ mod tests {
             .into(),
             close_epoch: true,
             batches: Default::default(), // empty
-            beneficiary,
+            leader_address,
             batch_digests: Default::default(), // empty
             parent_hash: ConsensusHeader::default().digest(),
             number: 0,

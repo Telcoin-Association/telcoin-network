@@ -27,8 +27,13 @@ impl BuildArguments {
 pub struct TNPayload {
     /// The previous canonical block's number and hash.
     pub parent_header: SealedHeader,
-    /// The beneficiary from the round of consensus.
+    /// The authority responsible for producing the batch.
+    /// This is used for block's coinbase where priority fees are sent.
     pub beneficiary: Address,
+    /// The leader for the committed subdag that triggered the production
+    /// of [ConsensusOutput]. This address earns block rewards for once
+    /// for the committed subdag.
+    pub block_rewards: Address,
     /// The index of the subdag, which equates to the round of consensus.
     ///
     /// Used as the executed block header's `nonce`.
@@ -39,8 +44,9 @@ pub struct TNPayload {
     pub batch_index: usize,
     /// Value for the `timestamp` field of the new payload
     pub timestamp: u64,
-    /// Value for the `extra_data` field in the new block.
-    pub batch_digest: Option<B256>,
+    /// This is used as the ommers hash.
+    /// The default is `B256::ZERO` (no batches to execute).
+    pub batch_digest: B256,
     /// Hash value for [ConsensusHeader]. Used as the executed block's "parent_beacon_block_root".
     pub consensus_header_digest: B256,
     /// The base fee per gas used to construct this block.
@@ -66,8 +72,9 @@ impl TNPayload {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         parent_header: SealedHeader,
+        beneficiary: Address,
         batch_index: usize,
-        batch_digest: Option<B256>,
+        batch_digest: B256,
         output: &ConsensusOutput,
         consensus_header_digest: B256,
         base_fee_per_gas: u64,
@@ -83,7 +90,8 @@ impl TNPayload {
 
         Self {
             parent_header,
-            beneficiary: output.beneficiary(),
+            beneficiary,
+            block_rewards: output.leader_address(),
             nonce: output.nonce(),
             batch_index,
             timestamp: output.committed_at(),
@@ -117,8 +125,9 @@ impl TNPayload {
     pub fn new_for_test(parent_header: SealedHeader, output: &ConsensusOutput) -> Self {
         use tn_types::{Hash as _, MIN_PROTOCOL_BASE_FEE};
 
+        let beneficiary = output.leader_address(); // assume same
         let batch_index = 0;
-        let batch_digest = Some(B256::random());
+        let batch_digest = B256::random();
         let consensus_header_digest = output.digest().into();
         let base_fee_per_gas = parent_header.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE);
         let gas_limit = parent_header.gas_limit;
@@ -126,6 +135,7 @@ impl TNPayload {
 
         Self::new(
             parent_header,
+            beneficiary,
             batch_index,
             batch_digest,
             output,

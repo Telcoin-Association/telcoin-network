@@ -18,9 +18,9 @@ use tn_primary::{
 };
 use tn_storage::CertificateStore;
 use tn_types::{
-    Address, AuthorityIdentifier, Batch, BlockHash, CommittedSubDag, Committee, ConsensusHeader,
-    ConsensusOutput, Database, Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp, TnReceiver,
-    TnSender, B256,
+    Address, AuthorityIdentifier, Batch, BlockHash, CertifiedBatch, CommittedSubDag, Committee,
+    ConsensusHeader, ConsensusOutput, Database, Hash as _, Noticer, TaskManager, TaskSpawner,
+    Timestamp, TnReceiver, TnSender, B256,
 };
 use tracing::{debug, error, info};
 
@@ -336,7 +336,7 @@ impl<DB: Database> Subscriber<DB> {
             debug!(target: "subscriber", "No blocks to fetch, payload is empty");
             return Ok(ConsensusOutput {
                 sub_dag: Arc::new(deliver),
-                beneficiary: address,
+                leader_address: address,
                 parent_hash,
                 number,
                 early_finalize,
@@ -348,7 +348,7 @@ impl<DB: Database> Subscriber<DB> {
         let mut consensus_output = ConsensusOutput {
             sub_dag: sub_dag.clone(),
             batches: Vec::with_capacity(num_certs),
-            beneficiary: address,
+            leader_address: address,
             parent_hash,
             number,
             early_finalize,
@@ -373,7 +373,7 @@ impl<DB: Database> Subscriber<DB> {
             .executor_metrics()
             .committed_subdag_block_count
             .observe(num_blocks as f64);
-        let fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
+        let mut fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
         drop(fetched_batches_timer);
 
         // map all fetched batches to their respective certificates for applying block rewards
@@ -389,7 +389,7 @@ impl<DB: Database> Subscriber<DB> {
             // retrieve fetched batch by digest
             for (digest, (_, _)) in cert.header().payload().iter() {
                 self.consensus_bus.executor_metrics().subscriber_processed_blocks.inc();
-                let batch = fetched_batches.remove(digest).ok_or(SubscriberError::MissingFetchedBatch(digest)).inspect_err(|_| {
+                let batch = fetched_batches.remove(digest).ok_or(SubscriberError::MissingFetchedBatch(*digest)).inspect_err(|_| {
                     error!(target: "subscriber", "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
                 })?;
 
@@ -403,7 +403,7 @@ impl<DB: Database> Subscriber<DB> {
 
             // main collection for execution
             consensus_output.batches.push(CertifiedBatch {
-                address: self.authority_execution_address(cert.origin()),
+                address: self.authority_execution_address(cert.origin())?,
                 batches: cert_batches,
             });
         }
