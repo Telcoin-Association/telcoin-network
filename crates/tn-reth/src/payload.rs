@@ -30,10 +30,6 @@ pub struct TNPayload {
     /// The authority responsible for producing the batch.
     /// This is used for block's coinbase where priority fees are sent.
     pub beneficiary: Address,
-    /// The leader for the committed subdag that triggered the production
-    /// of [ConsensusOutput]. This address earns block rewards for once
-    /// for the committed subdag.
-    pub block_rewards: Address,
     /// The index of the subdag, which equates to the round of consensus.
     ///
     /// Used as the executed block header's `nonce`.
@@ -91,7 +87,6 @@ impl TNPayload {
         Self {
             parent_header,
             beneficiary,
-            block_rewards: output.leader_address(),
             nonce: output.nonce(),
             batch_index,
             timestamp: output.committed_at(),
@@ -125,7 +120,7 @@ impl TNPayload {
     pub fn new_for_test(parent_header: SealedHeader, output: &ConsensusOutput) -> Self {
         use tn_types::{Hash as _, MIN_PROTOCOL_BASE_FEE};
 
-        let beneficiary = output.leader_address(); // assume same
+        let beneficiary = Address::random();
         let batch_index = 0;
         let batch_digest = B256::random();
         let consensus_header_digest = output.digest().into();

@@ -140,8 +140,6 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     leader.header.created_at = timestamp;
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
-    let leader_address = Address::from_str("0x5555555555555555555555555555555555555555")
-        .expect("leader_address address from str");
     let consensus_output = ConsensusOutput {
         sub_dag: CommittedSubDag::new(
             vec![Certificate::default()],
@@ -151,7 +149,6 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
             previous_sub_dag,
         )
         .into(),
-        leader_address,
         early_finalize: true,
         ..Default::default()
     };
@@ -235,8 +232,8 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
 
     // assert basefee is same as worker's block
     assert_eq!(expected_block.base_fee_per_gas, Some(expected_base_fee));
-    // leader's address used for empty blocks
-    assert_eq!(expected_block.beneficiary, leader_address);
+    // zero address used for empty blocks
+    assert_eq!(expected_block.beneficiary, Address::ZERO);
     // nonce matches subdag index and method all match
     assert_eq!(<FixedBytes<8> as Into<u64>>::into(expected_block.nonce), sub_dag_index);
     assert_eq!(<FixedBytes<8> as Into<u64>>::into(expected_block.nonce), consensus_output.nonce());
@@ -303,8 +300,6 @@ async fn test_empty_output_executes_late_finalize() -> eyre::Result<()> {
     leader.header.round = sub_dag_index as u32;
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
-    let leader_address = Address::from_str("0x5555555555555555555555555555555555555555")
-        .expect("leader_address address from str");
     let consensus_output = ConsensusOutput {
         sub_dag: CommittedSubDag::new(
             vec![Certificate::default()],
@@ -314,7 +309,6 @@ async fn test_empty_output_executes_late_finalize() -> eyre::Result<()> {
             previous_sub_dag,
         )
         .into(),
-        leader_address,
         early_finalize: false,
         ..Default::default()
     };
@@ -561,7 +555,6 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
     let consensus_output_1 = ConsensusOutput {
         sub_dag: subdag_1.clone(),
         batches: vec![CertifiedBatch { address: batch_producer, batches: batches_1 }],
-        leader_address: leader_address_1,
         batch_digests: batch_digests_1.clone(),
         early_finalize: true,
         ..Default::default()
@@ -588,7 +581,6 @@ async fn test_queued_output_executes_after_sending_channel_closed() -> eyre::Res
     let consensus_output_2 = ConsensusOutput {
         sub_dag: subdag_2,
         batches: vec![CertifiedBatch { address: batch_producer, batches: batches_2 }],
-        leader_address: leader_address_2,
         batch_digests: batch_digests_2.clone(),
         parent_hash: consensus_output_1.consensus_header_hash(),
         number: 1,
@@ -978,7 +970,6 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let consensus_output_1 = ConsensusOutput {
         sub_dag: subdag_1.clone(),
         batches: vec![CertifiedBatch { address: batch_producer, batches: batches_1 }],
-        leader_address: leader_address_1,
         batch_digests: batch_digests_1.clone(),
         early_finalize: true,
         ..Default::default()
@@ -1008,7 +999,6 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let consensus_output_2 = ConsensusOutput {
         sub_dag: subdag_2,
         batches: vec![CertifiedBatch { address: batch_producer, batches: batches_2 }],
-        leader_address: leader_address_2,
         batch_digests: batch_digests_2.clone(),
         parent_hash: consensus_output_1.consensus_header_hash(),
         number: 1,
@@ -1280,12 +1270,9 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         reputation_scores,
         previous_sub_dag,
     ));
-    let leader_address_1 = Address::from_str("0x1111111111111111111111111111111111111111")
-        .expect("beneficiary address from str");
     let consensus_output_1 = ConsensusOutput {
         sub_dag: subdag_1.clone(),
         batches: vec![CertifiedBatch { address: batch_producer, batches: batches_1 }],
-        leader_address: leader_address_1,
         batch_digests: batch_digests_1,
         early_finalize: true,
         ..Default::default()
@@ -1309,12 +1296,9 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         previous_sub_dag,
     )
     .into();
-    let leader_address_2 = Address::from_str("0x2222222222222222222222222222222222222222")
-        .expect("beneficiary address from str");
     let consensus_output_2 = ConsensusOutput {
         sub_dag: subdag_2,
         batches: vec![CertifiedBatch { address: batch_producer, batches: batches_2 }],
-        leader_address: leader_address_2,
         batch_digests: batch_digests_2,
         parent_hash: consensus_output_1.consensus_header_hash(),
         number: 1,

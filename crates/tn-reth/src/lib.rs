@@ -1336,7 +1336,7 @@ mod tests {
     use tempfile::TempDir;
     use tn_types::{
         generate_proof_of_possession_bls, BlsKeypair, BlsSignature, Certificate, CommittedSubDag,
-        ConsensusHeader, ConsensusOutput, FromHex, NodeP2pInfo, ReputationScores,
+        ConsensusHeader, ConsensusOutput, NodeP2pInfo, ReputationScores,
         SignatureVerificationState,
     };
 
@@ -1352,8 +1352,6 @@ mod tests {
         leader.header.round = sub_dag_index as u32;
         let reputation_scores = ReputationScores::default();
         let previous_sub_dag = None;
-        let leader_address = Address::from_hex("0x5555555555555555555555555555555555555555")
-            .expect("leader_address address from str");
         ConsensusOutput {
             sub_dag: CommittedSubDag::new(
                 vec![leader.clone(), Certificate::default()],
@@ -1364,8 +1362,7 @@ mod tests {
             )
             .into(),
             close_epoch: true,
-            batches: Default::default(), // empty
-            leader_address,
+            batches: Default::default(),       // empty
             batch_digests: Default::default(), // empty
             parent_hash: ConsensusHeader::default().digest(),
             number: 0,

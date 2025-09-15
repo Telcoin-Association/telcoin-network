@@ -30,18 +30,18 @@ pub struct CertifiedBatch {
     /// The collection of batches (in order) that reached consensus.
     pub batches: Vec<Batch>,
 }
+
 /// The output of Consensus, which includes all the blocks for each certificate in the sub dag
 /// It is sent to the the ExecutionState handle_consensus_transaction
 #[derive(Clone, Debug, Default)]
 pub struct ConsensusOutput {
+    /// The committed subdag that triggered this output.
     pub sub_dag: Arc<CommittedSubDag>,
     /// Matches certificates in the `sub_dag` one-to-one.
     ///
     /// This field is not included in [Self] digest. To validate,
     /// hash these batches and compare to [Self::batch_digests].
     pub batches: Vec<CertifiedBatch>,
-    /// The leader's ECDSA address that receives block rewards once per output.
-    pub leader_address: Address,
     /// The ordered set of [BlockHash].
     ///
     /// This value is included in [Self] digest.
@@ -85,14 +85,6 @@ impl ConsensusOutput {
     /// The leader's `nonce`.
     pub fn nonce(&self) -> SequenceNumber {
         self.sub_dag.leader.nonce()
-    }
-
-    /// Execution address of the leader for the round.
-    ///
-    /// The address is used in the executed block as the
-    /// leader_address for block rewards.
-    pub fn leader_address(&self) -> Address {
-        self.leader_address
     }
 
     /// Pop the next batch digest.

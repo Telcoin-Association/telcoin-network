@@ -326,9 +326,6 @@ impl<DB: Database> Subscriber<DB> {
     ) -> SubscriberResult<ConsensusOutput> {
         let num_blocks = deliver.num_primary_blocks();
         let num_certs = deliver.len();
-
-        // retrieve leader's execution address
-        let address = self.authority_execution_address(deliver.leader.origin())?;
         // active cvvs always finalize early bc they are the authorities
         let early_finalize = self.consensus_bus.node_mode().borrow().is_active_cvv();
 
@@ -336,7 +333,6 @@ impl<DB: Database> Subscriber<DB> {
             debug!(target: "subscriber", "No blocks to fetch, payload is empty");
             return Ok(ConsensusOutput {
                 sub_dag: Arc::new(deliver),
-                leader_address: address,
                 parent_hash,
                 number,
                 early_finalize,
@@ -348,7 +344,6 @@ impl<DB: Database> Subscriber<DB> {
         let mut consensus_output = ConsensusOutput {
             sub_dag: sub_dag.clone(),
             batches: Vec::with_capacity(num_certs),
-            leader_address: address,
             parent_hash,
             number,
             early_finalize,
