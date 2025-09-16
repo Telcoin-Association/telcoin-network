@@ -642,11 +642,7 @@ mod tests {
                 .await;
 
             // canonical update to wake up task
-            let output = ConsensusOutput {
-                leader_address: address,
-                early_finalize: true,
-                ..Default::default()
-            };
+            let output = ConsensusOutput { early_finalize: true, ..Default::default() };
             // execute output to trigger canonical update
             let args = BuildArguments::new(reth_env.clone(), output, parent);
             let final_header =

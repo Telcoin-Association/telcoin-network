@@ -70,7 +70,8 @@ impl RewardsCounter {
         result
     }
 
-    /// Generate the withdrawals from governance safe for the validator block rewards applied at the epoch boundary.
+    /// Generate the withdrawals from governance safe for the validator block rewards applied at the
+    /// epoch boundary.
     pub fn generate_withdrawals(&self) -> Withdrawals {
         Withdrawals::new(
             self.get_address_counts()

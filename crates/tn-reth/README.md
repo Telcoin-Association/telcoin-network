@@ -57,7 +57,12 @@ The default "empty" bytes is used otherwise.
 
 #### difficulty
 
-The worker id and the batch index (relative to the subdag).
+The batch index occupies the lower 16 bits, and the upper bits store the worker's id.
+Basefees are uniform across all workers with the same id.
+
+```rust
+U256::from(payload.batch_index << 16 | payload.worker_id as usize)
+```
 
 #### parent_beacon_block_root
 

@@ -24,8 +24,9 @@ pub type SequenceNumber = u64;
 #[derive(Debug, Clone)]
 /// Struct that contains all necessary information for executing a batch post-consensus.
 pub struct CertifiedBatch {
-    /// The ECDSA address of the authority that produced the batch. This address is used as the block beneficiary during
-    /// execution. This may not be unique within a single [ConsensusOutput].
+    /// The ECDSA address of the authority that produced the batch. This address is used as the
+    /// block beneficiary during execution. This may not be unique within a single
+    /// [ConsensusOutput].
     pub address: Address,
     /// The collection of batches (in order) that reached consensus.
     pub batches: Vec<Batch>,
