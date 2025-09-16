@@ -330,8 +330,8 @@ where
                     self.process_peer_exchange(peers, channel);
                 }
             },
-            NetworkEvent::Gossip(msg, propogation_source) => {
-                self.process_gossip(msg, propogation_source);
+            NetworkEvent::Gossip(msg, propagation_source) => {
+                self.process_gossip(msg, propagation_source);
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = WorkerResponse::Error(message::WorkerRPCError(msg));
@@ -412,11 +412,11 @@ where
     }
 
     /// Process gossip from a worker.
-    fn process_gossip(&self, msg: GossipMessage, propogation_source: BlsPublicKey) {
+    fn process_gossip(&self, msg: GossipMessage, propagation_source: BlsPublicKey) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        let task_name = format!("process-gossip-{propogation_source}");
+        let task_name = format!("process-gossip-{propagation_source}");
         self.network_handle.get_task_spawner().spawn_task(task_name, async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "worker::network", ?e, "process_gossip");
@@ -424,7 +424,7 @@ where
                     warn!(target: "worker::network", ?e, "process_gossip");
                     // convert error into penalty to lower peer score
                     if let Some(penalty) = e.into() {
-                        network_handle.report_penalty(propogation_source, penalty).await;
+                        network_handle.report_penalty(propagation_source, penalty).await;
                     }
                 }
             }

@@ -62,20 +62,14 @@ where
         &self,
         epoch: Epoch,
     ) -> TelcoinNetworkRpcResult<(EpochRecord, EpochCertificate)> {
-        match self.inner_node_network.epoch(Some(epoch), None) {
-            Some(r) => Ok(r),
-            None => Err(TNRpcError::NotFound),
-        }
+        self.inner_node_network.epoch(Some(epoch), None).ok_or(TNRpcError::NotFound)
     }
 
     async fn epoch_record_by_hash(
         &self,
         hash: BlockHash,
     ) -> TelcoinNetworkRpcResult<(EpochRecord, EpochCertificate)> {
-        match self.inner_node_network.epoch(None, Some(hash)) {
-            Some(r) => Ok(r),
-            None => Err(TNRpcError::NotFound),
-        }
+        self.inner_node_network.epoch(None, Some(hash)).ok_or(TNRpcError::NotFound)
     }
 }
 

@@ -309,8 +309,8 @@ where
                     self.process_epoch_record_request(peer, epoch, hash, channel, cancel)
                 }
             },
-            NetworkEvent::Gossip(msg, propogation_source) => {
-                self.process_gossip(msg, propogation_source);
+            NetworkEvent::Gossip(msg, propagation_source) => {
+                self.process_gossip(msg, propagation_source);
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = PrimaryResponse::Error(PrimaryRPCError(msg));
@@ -438,18 +438,18 @@ where
     }
 
     /// Process gossip from committee.
-    fn process_gossip(&self, msg: GossipMessage, propogation_source: BlsPublicKey) {
+    fn process_gossip(&self, msg: GossipMessage, propagation_source: BlsPublicKey) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        let task_name = format!("ProcessGossip-{propogation_source}");
+        let task_name = format!("ProcessGossip-{propagation_source}");
         // spawn task to process gossip
         self.task_spawner.spawn_task(task_name, async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "primary::network", ?e, "process_gossip");
                 // convert error into penalty to lower peer score
                 if let Some(penalty) = (&e).into() {
-                    network_handle.report_penalty(propogation_source, penalty).await;
+                    network_handle.report_penalty(propagation_source, penalty).await;
                 }
             }
         });
