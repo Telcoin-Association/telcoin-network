@@ -100,9 +100,7 @@ fn assert_eip2935(reth_env: &RethEnv, block: &SealedBlock) -> eyre::Result<()> {
 /// Helper function to create a committee for tests from on-chain data.
 async fn create_committee_from_state(engine: &TestExecutionNode) -> eyre::Result<Committee> {
     // retrieve epoch information from canonical tip
-    let EpochState { epoch, epoch_info, validators, .. } =
-        engine.epoch_state_from_canonical_tip().await?;
-    debug!(target: "epoch-manager", ?epoch_info, "epoch state from canonical tip for epoch {}", epoch);
+    let EpochState { epoch, validators, .. } = engine.epoch_state_from_canonical_tip().await?;
     let validators = validators
         .iter()
         .map(|v| {
@@ -383,7 +381,7 @@ async fn test_empty_output_executes_late_finalize() -> eyre::Result<()> {
 /// parents is currently valid.
 ///
 /// This test also adds transactions with priority fees to assert governance, batch producer, and
-/// block rewards go to the correct addresses.
+/// block rewards go to the correct addresses at the end of an epoch.
 #[tokio::test]
 async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> eyre::Result<()> {
     let tmp_dir = TempDir::new().expect("temp dir");
@@ -420,8 +418,12 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
             None,
         )
         .encoded_2718();
-    if let Some(batch) = batches_1.first_mut() { batch.transactions_mut().push(encoded_tx_priority_fee_1) }
-    if let Some(batch) = batches_2.first_mut() { batch.transactions_mut().push(encoded_tx_priority_fee_2) }
+    if let Some(batch) = batches_1.first_mut() {
+        batch.transactions_mut().push(encoded_tx_priority_fee_1)
+    }
+    if let Some(batch) = batches_2.first_mut() {
+        batch.transactions_mut().push(encoded_tx_priority_fee_2)
+    }
 
     // okay to clone these because they are only used to seed genesis, decode transactions, and
     // recover signers
@@ -664,11 +666,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     // assert priority fees went to batch producer
     let third_validator_account = reth_env
         .retrieve_account(
-            &committee
-                .authorities()
-                .get(2)
-                .expect("4 validators in committee")
-                .execution_address(),
+            &committee.authorities().get(2).expect("4 validators in committee").execution_address(),
         )?
         .expect("third validator account has priority fees");
     assert_eq!(third_validator_account.balance, U256::from(expected_priority_fees));
@@ -831,7 +829,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
 /// parents is currently valid.
 ///
 /// This test also adds transactions with priority fees to assert governance, batch producer, and
-/// block rewards go to the correct addresses.
+/// block rewards go to the correct addresses at the end of an epoch.
 #[tokio::test]
 async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<()> {
     let tmp_dir = TempDir::new().unwrap();
@@ -868,8 +866,12 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
             None,
         )
         .encoded_2718();
-    if let Some(batch) = batches_1.first_mut() { batch.transactions_mut().push(encoded_tx_priority_fee_1) }
-    if let Some(batch) = batches_2.first_mut() { batch.transactions_mut().push(encoded_tx_priority_fee_2) }
+    if let Some(batch) = batches_1.first_mut() {
+        batch.transactions_mut().push(encoded_tx_priority_fee_1)
+    }
+    if let Some(batch) = batches_2.first_mut() {
+        batch.transactions_mut().push(encoded_tx_priority_fee_2)
+    }
 
     // duplicate transactions in last batch for each round
     //
@@ -1393,9 +1395,6 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         debug!("{idx}\n{:?}\n", batch);
     }
 
-    // TODO: update this test - only doing this for compiler
-    let batch_producer = Address::random();
-
     //=== Consensus
     //
     // create consensus output bc transactions in batches
@@ -1420,7 +1419,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     ));
     let consensus_output_1 = ConsensusOutput {
         sub_dag: subdag_1.clone(),
-        batches: vec![CertifiedBatch { address: batch_producer, batches: batches_1 }],
+        batches: vec![CertifiedBatch { address: Address::random(), batches: batches_1 }],
         batch_digests: batch_digests_1,
         early_finalize: true,
         ..Default::default()
@@ -1446,7 +1445,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     .into();
     let consensus_output_2 = ConsensusOutput {
         sub_dag: subdag_2,
-        batches: vec![CertifiedBatch { address: batch_producer, batches: batches_2 }],
+        batches: vec![CertifiedBatch { address: Address::random(), batches: batches_2 }],
         batch_digests: batch_digests_2,
         parent_hash: consensus_output_1.consensus_header_hash(),
         number: 1,

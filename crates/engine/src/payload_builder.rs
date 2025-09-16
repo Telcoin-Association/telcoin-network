@@ -89,7 +89,6 @@ pub fn execute_consensus_output(
             0,             // Use worker 0 becuase we have to provide on.
         );
 
-        debug!(target: "delete", ?output_digest, "WRONG!!!");
         debug!(target: "engine", "executing empty batch payload");
 
         // execute the payload and update the current canonical header

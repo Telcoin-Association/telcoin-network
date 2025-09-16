@@ -64,8 +64,6 @@ impl RethEnv {
     }
 
     /// Create an EVM-environment from state provider.
-    ///
-    /// TODO: don't need this afterall?
     pub fn tn_evm(
         &self,
         hash: BlockHash,
