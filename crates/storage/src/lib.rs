@@ -47,6 +47,9 @@ const PAYLOAD_CF: &str = "payload";
 const BATCHES_CF: &str = "batches";
 const CONSENSUS_BLOCK_CF: &str = "consensus_block";
 const CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF: &str = "consensus_block_number_by_digest";
+const EPOCH_RECORDS_CF: &str = "epoch_record_by_number";
+const EPOCH_CERTS_CF: &str = "epoch_cert_by_number";
+const EPOCH_RECORDS_INDEX_CF: &str = "epoch_records_index";
 const KAD_RECORD_CF: &str = "kad_record";
 const KAD_PROVIDER_RECORD_CF: &str = "kad_provider_record";
 const KAD_WORKER_RECORD_CF: &str = "kad_worker_record";
@@ -71,7 +74,7 @@ pub mod tables {
     use super::{PayloadToken, ProposerKey};
     use tn_types::{
         AuthorityIdentifier, Batch, BlockHash, Certificate, CertificateDigest, ConsensusHeader,
-        Header, Round, VoteInfo, WorkerId,
+        Epoch, EpochCertificate, EpochRecord, Header, Round, VoteInfo, WorkerId, B256,
     };
 
     tables!(
@@ -86,6 +89,10 @@ pub mod tables {
         // These tables are for the consensus chain not the normal consensus.
         ConsensusBlocks;crate::CONSENSUS_BLOCK_CF;<u64, ConsensusHeader>,
         ConsensusBlockNumbersByDigest;crate::CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF;<BlockHash, u64>,
+        // These tables are for the epoch chain not the normal consensus.
+        EpochRecords;crate::EPOCH_RECORDS_CF;<Epoch, EpochRecord>,
+        EpochCerts;crate::EPOCH_CERTS_CF;<B256, EpochCertificate>,
+        EpochRecordsIndex;crate::EPOCH_RECORDS_INDEX_CF;<B256, Epoch>,
         // These are used for network storage and separate from consensus
         KadRecords;crate::KAD_RECORD_CF;<BlockHash, Vec<u8>>,
         KadProviderRecords;crate::KAD_PROVIDER_RECORD_CF;<BlockHash, Vec<u8>>,
@@ -118,6 +125,8 @@ pub fn open_db<Path: AsRef<std::path::Path> + Send>(store_path: Path) -> Databas
 /// Open or reopen all the storage of the node backed by MDBX.
 #[cfg(feature = "reth-libmdbx")]
 fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabase<MdbxDatabase> {
+    use tables::{EpochCerts, EpochRecords, EpochRecordsIndex};
+
     let db = MdbxDatabase::open(store_path).expect("Cannot open database");
     db.open_table::<LastProposed>().expect("failed to open table!");
     db.open_table::<Votes>().expect("failed to open table!");
@@ -128,6 +137,9 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<Batches>().expect("failed to open table!");
     db.open_table::<ConsensusBlocks>().expect("failed to open table!");
     db.open_table::<ConsensusBlockNumbersByDigest>().expect("failed to open table!");
+    db.open_table::<EpochRecords>().expect("failed to open table!");
+    db.open_table::<EpochCerts>().expect("failed to open table!");
+    db.open_table::<EpochRecordsIndex>().expect("failed to open table!");
     db.open_table::<KadRecords>().expect("failed to open table!");
     db.open_table::<KadProviderRecords>().expect("failed to open table!");
     db.open_table::<KadWorkerRecords>().expect("failed to open table!");
@@ -144,6 +156,9 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<Batches>();
     db.open_table::<ConsensusBlocks>();
     db.open_table::<ConsensusBlockNumbersByDigest>();
+    db.open_table::<EpochRecords>();
+    db.open_table::<EpochCerts>();
+    db.open_table::<EpochRecordsIndex>();
     db.open_table::<KadRecords>();
     db.open_table::<KadProviderRecords>();
     db.open_table::<KadWorkerRecords>();
@@ -154,6 +169,8 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
 /// Open or reopen all the storage of the node backed by ReDB.
 #[cfg(feature = "redb")]
 fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabase<ReDB> {
+    use tables::{EpochCerts, EpochRecords, EpochRecordsIndex};
+
     let db = ReDB::open(store_path).expect("Cannot open database");
     db.open_table::<LastProposed>().expect("failed to open table!");
     db.open_table::<Votes>().expect("failed to open table!");
@@ -164,6 +181,9 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<Batches>().expect("failed to open table!");
     db.open_table::<ConsensusBlocks>().expect("failed to open table!");
     db.open_table::<ConsensusBlockNumbersByDigest>().expect("failed to open table!");
+    db.open_table::<EpochRecords>().expect("failed to open table!");
+    db.open_table::<EpochCerts>().expect("failed to open table!");
+    db.open_table::<EpochRecordsIndex>().expect("failed to open table!");
     db.open_table::<KadRecords>().expect("failed to open table!");
     db.open_table::<KadProviderRecords>().expect("failed to open table!");
     db.open_table::<KadWorkerRecords>().expect("failed to open table!");
@@ -179,6 +199,9 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<Batches>();
     db.open_table::<ConsensusBlocks>();
     db.open_table::<ConsensusBlockNumbersByDigest>();
+    db.open_table::<EpochRecords>();
+    db.open_table::<EpochCerts>();
+    db.open_table::<EpochRecordsIndex>();
     db.open_table::<KadRecords>();
     db.open_table::<KadProviderRecords>();
     db.open_table::<KadWorkerRecords>();

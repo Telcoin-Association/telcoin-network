@@ -9,8 +9,8 @@ use std::{
 };
 use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, TNMessage};
 use tn_types::{
-    AuthorityIdentifier, BlockHash, Certificate, CertificateDigest, ConsensusHeader, Header, Round,
-    Vote,
+    error::HeaderError, AuthorityIdentifier, BlockHash, Certificate, CertificateDigest,
+    ConsensusHeader, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round, Vote,
 };
 
 /// Primary messages on the gossip network.
@@ -25,7 +25,9 @@ pub enum PrimaryGossip {
     /// NOTE: `snappy` is slightly larger than uncompressed.
     Certificate(Box<Certificate>),
     /// Consensus output reached- publish the consensus chain height and new block hash.
-    Consenus(u64, BlockHash),
+    Consensus(u64, BlockHash),
+    /// Signed hash sent out by committee memebers at epoch start.
+    EpochVote(Box<EpochVote>),
 }
 
 // impl TNMessage trait for types
@@ -64,6 +66,17 @@ pub enum PrimaryRequest {
     /// due to excess peers. The peer exchange is intended to support
     /// discovery.
     PeerExchange { peers: PeerExchangeMap },
+    /// Request an ['EpochRecord'] with ['EpochCertificate'].
+    ///
+    /// If both number and hash are set they should match (no need to set them both).
+    /// If neither number or hash are set then will return the latest epoch record the node has
+    /// available.
+    EpochRecord {
+        /// Block number requesting if not None.
+        epoch: Option<Epoch>,
+        /// Block hash requesting if not None.
+        hash: Option<BlockHash>,
+    },
 }
 
 // unit test for this struct in primary::src::tests::network_tests::test_missing_certs_request
@@ -161,12 +174,19 @@ pub enum PrimaryResponse {
     MissingParents(Vec<CertificateDigest>),
     /// The requested consensus header.
     ConsensusHeader(Arc<ConsensusHeader>),
+    /// The requested epoch record and certificate.
+    EpochRecord { record: EpochRecord, certificate: EpochCertificate },
     /// Exchange peer information.
     PeerExchange { peers: PeerExchangeMap },
     /// RPC error while handling request.
     ///
     /// This is an application-layer error response.
     Error(PrimaryRPCError),
+    /// RPC error while handling request.
+    ///
+    /// This is an application-layer error response.
+    /// This error is likely to succeed in the future and can be retried.
+    RecoverableError(PrimaryRPCError),
 }
 
 impl PrimaryResponse {
@@ -178,7 +198,30 @@ impl PrimaryResponse {
 
 impl IntoRpcError<PrimaryNetworkError> for PrimaryResponse {
     fn into_error(error: PrimaryNetworkError) -> Self {
-        Self::Error(PrimaryRPCError(error.to_string()))
+        match error {
+            PrimaryNetworkError::InvalidHeader(HeaderError::InvalidEpoch { ours, theirs })
+                if theirs == ours + 1 =>
+            {
+                // This is a common race condition on epoch restart so report as recoverable.
+                Self::RecoverableError(PrimaryRPCError(error.to_string()))
+            }
+            PrimaryNetworkError::InvalidHeader(_)
+            | PrimaryNetworkError::Decode(_)
+            | PrimaryNetworkError::Certificate(_)
+            | PrimaryNetworkError::StdIo(_)
+            | PrimaryNetworkError::Storage(_)
+            | PrimaryNetworkError::InvalidRequest(_)
+            | PrimaryNetworkError::Internal(_)
+            | PrimaryNetworkError::UnknowConsensusHeaderNumber(_)
+            | PrimaryNetworkError::UnknowConsensusHeaderDigest(_)
+            | PrimaryNetworkError::_PeerNotInCommittee(_)
+            | PrimaryNetworkError::UnavailableEpoch(_)
+            | PrimaryNetworkError::UnavailableEpochDigest(_)
+            | PrimaryNetworkError::InvalidTopic
+            | PrimaryNetworkError::InvalidEpochRequest => {
+                Self::Error(PrimaryRPCError(error.to_string()))
+            }
+        }
     }
 }
 

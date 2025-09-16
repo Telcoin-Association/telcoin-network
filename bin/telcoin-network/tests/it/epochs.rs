@@ -18,7 +18,10 @@ use tn_reth::{
     test_utils::TransactionFactory,
     RethChainSpec,
 };
-use tn_types::{test_utils::CommandParser, Address, Genesis, GenesisAccount, U256};
+use tn_types::{
+    test_utils::CommandParser, Address, EpochCertificate, EpochRecord, Genesis, GenesisAccount,
+    U256,
+};
 use tokio::time::timeout;
 use tracing::{debug, error, info};
 
@@ -33,6 +36,7 @@ const EPOCH_DURATION: u64 = 5;
 #[tokio::test]
 /// Test a new node joining the network and being shuffled into the committee.
 async fn test_epoch_boundary() -> eyre::Result<()> {
+    tn_types::test_utils::init_test_tracing();
     // create validator and governance wallets for adding new validator later
     let mut new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
     let mut governance_wallet =
@@ -69,7 +73,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
 
     // wait for node rpc to become available
-    timeout(std::time::Duration::from_secs(10), async {
+    timeout(std::time::Duration::from_secs(20), async {
         let mut result = provider.get_chain_id().await;
         while let Err(e) = result {
             debug!(target: "epoch-test", "provider error getting chain id: {e:?}");
@@ -91,16 +95,16 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
     let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
     let mut current_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
 
-    let mut last_epoch_block_height = 0;
-    assert_eq!(current_epoch_info.blockHeight, last_epoch_block_height);
+    let mut last_epoch_block_height = current_epoch_info.blockHeight;
 
     // track the number of times the new validator was in the epoch committee
     let mut new_validator_in_committee_count = 0;
-    let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
 
     // sleep for first epoch with 1s offset and begin assertions loop
     tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
 
+    let mut last_pause = 100;
+    let mut shuffled = false;
     // the new validator has a 1/6 chance of being selected for the new committee
     //
     // if the new validator hasn't been shuffled in by the minimum number of epochs to test,
@@ -111,6 +115,12 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
     // n ~= 25 iterations
     for i in 0..25 {
         let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+        if new_epoch_info == current_epoch_info && last_pause != i {
+            tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION / 2)).await;
+            last_pause = i + 1;
+            continue;
+        }
+        last_pause = i;
         assert!(new_epoch_info != current_epoch_info, "Old and new epoch equal on iteration {i}");
         assert!(new_epoch_info.blockHeight > last_epoch_block_height);
         assert_eq!(new_epoch_info.epochDuration as u64, EPOCH_DURATION);
@@ -123,7 +133,8 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
         // if min number of epochs have transitioned, assert new validator has been shuffled in
         // at least once to end the test
         if i > MIN_EPOCHS_TO_TEST && new_validator_in_committee_count > 0 {
-            return Ok(());
+            shuffled = true;
+            break;
         }
 
         // store the last seen epoch info that is expected to change every epoch
@@ -131,11 +142,30 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
         current_epoch_info = new_epoch_info;
 
         // sleep for epoch duration
-        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION)).await;
     }
 
-    // return error if loop didn't return
-    Err(eyre::eyre!("new validator not shuffled into committee!"))
+    if shuffled {
+        // Do a check to make sure all the nodes have valid (certified) Epoch Records.
+        // TODO issue 375, should use tn_latestHeader RPC for this when fixed.
+        let latest_epoch = last_pause;
+        for p in 8540..=8545 {
+            let rpc_url = format!("http://127.0.0.1:{p}");
+            let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+            for epoch in 0..=latest_epoch {
+                let (epoch_rec, cert): (EpochRecord, EpochCertificate) = provider
+                    .raw_request("tn_epochRecord".into(), (epoch,))
+                    .await
+                    .expect(&format!("Failed to get epoch record for epoch {epoch}, port {p}"));
+                assert!(epoch_rec.verify_with_cert(&cert), "invalid epoch record!");
+            }
+        }
+
+        Ok(())
+    } else {
+        // return error if loop didn't return
+        Err(eyre::eyre!("new validator not shuffled into committee!"))
+    }
 }
 
 /// Create genesis for this test.

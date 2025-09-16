@@ -1,10 +1,13 @@
 //! RPC extension that supports state sync through NVV peer request.
 
-use crate::{error::TelcoinNetworkRpcResult, EngineToPrimary};
+use crate::{
+    error::{TNRpcError, TelcoinNetworkRpcResult},
+    EngineToPrimary,
+};
 use async_trait::async_trait;
 use jsonrpsee::proc_macros::rpc;
 use tn_reth::ChainSpec;
-use tn_types::{ConsensusHeader, Genesis};
+use tn_types::{BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, Genesis};
 
 /// Telcoin Network RPC namespace.
 ///
@@ -17,6 +20,18 @@ pub trait TelcoinNetworkRpcExtApi {
     /// Return the chain genesis.
     #[method(name = "genesis")]
     async fn genesis(&self) -> TelcoinNetworkRpcResult<Genesis>;
+    /// Get the header for epoch if available.
+    #[method(name = "epochRecord")]
+    async fn epoch_record(
+        &self,
+        epoch: Epoch,
+    ) -> TelcoinNetworkRpcResult<(EpochRecord, EpochCertificate)>;
+    /// Get the header for epoch by hash if available.
+    #[method(name = "epochRecordByHash")]
+    async fn epoch_record_by_hash(
+        &self,
+        hash: BlockHash,
+    ) -> TelcoinNetworkRpcResult<(EpochRecord, EpochCertificate)>;
 }
 
 /// The type that implements `tn` namespace trait.
@@ -35,11 +50,26 @@ where
     N: Send + Sync + 'static,
 {
     async fn latest_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader> {
+        // TODO fix me (JSON won't serialize)- issue 375.
         Ok(self.inner_node_network.get_latest_consensus_block())
     }
 
     async fn genesis(&self) -> TelcoinNetworkRpcResult<Genesis> {
         Ok(self.chain.genesis().clone())
+    }
+
+    async fn epoch_record(
+        &self,
+        epoch: Epoch,
+    ) -> TelcoinNetworkRpcResult<(EpochRecord, EpochCertificate)> {
+        self.inner_node_network.epoch(Some(epoch), None).ok_or(TNRpcError::NotFound)
+    }
+
+    async fn epoch_record_by_hash(
+        &self,
+        hash: BlockHash,
+    ) -> TelcoinNetworkRpcResult<(EpochRecord, EpochCertificate)> {
+        self.inner_node_network.epoch(None, Some(hash)).ok_or(TNRpcError::NotFound)
     }
 }
 

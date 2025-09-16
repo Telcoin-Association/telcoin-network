@@ -8,8 +8,10 @@ use manager::EpochManager;
 use tn_config::TelcoinDirs;
 use tn_primary::ConsensusBus;
 use tn_rpc::EngineToPrimary;
-use tn_storage::tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks};
-use tn_types::{BlockHash, ConsensusHeader, Database};
+use tn_storage::tables::{
+    ConsensusBlockNumbersByDigest, ConsensusBlocks, EpochCerts, EpochRecords, EpochRecordsIndex,
+};
+use tn_types::{BlockHash, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord};
 use tokio::runtime::Builder;
 use tracing::{instrument, warn};
 
@@ -41,10 +43,11 @@ where
         .enable_time()
         .build()?;
 
-    // create the epoch manager
     // run the node
     let res = runtime.block_on(async move {
-        let mut epoch_manager = EpochManager::new(builder, tn_datadir, passphrase)?;
+        let consensus_db = manager::open_consensus_db(&tn_datadir)?;
+        // create the epoch manager
+        let mut epoch_manager = EpochManager::new(builder, tn_datadir, passphrase, consensus_db)?;
         epoch_manager.run().await
     });
 
@@ -63,6 +66,21 @@ impl<DB: Database> EngineToPrimaryRpc<DB> {
     pub fn new(consensus_bus: ConsensusBus, db: DB) -> Self {
         Self { consensus_bus, db }
     }
+
+    /// Retrieve the consensus header by number.
+    fn get_epoch_by_number(&self, epoch: Epoch) -> Option<(EpochRecord, EpochCertificate)> {
+        let record = self.db.get::<EpochRecords>(&epoch).ok()??;
+        let digest = record.digest();
+        Some((record, self.db.get::<EpochCerts>(&digest).ok()??))
+    }
+
+    /// Retrieve the consensus header by hash
+    fn get_epoch_by_hash(&self, hash: BlockHash) -> Option<(EpochRecord, EpochCertificate)> {
+        let epoch = self.db.get::<EpochRecordsIndex>(&hash).ok()??;
+        let record = self.db.get::<EpochRecords>(&epoch).ok()??;
+        let digest = record.digest();
+        Some((record, self.db.get::<EpochCerts>(&digest).ok()??))
+    }
 }
 
 impl<DB: Database> EngineToPrimary for EngineToPrimaryRpc<DB> {
@@ -77,6 +95,18 @@ impl<DB: Database> EngineToPrimary for EngineToPrimaryRpc<DB> {
     fn consensus_block_by_hash(&self, hash: BlockHash) -> Option<ConsensusHeader> {
         let number = self.db.get::<ConsensusBlockNumbersByDigest>(&hash).ok().flatten()?;
         self.db.get::<ConsensusBlocks>(&number).ok().flatten()
+    }
+
+    fn epoch(
+        &self,
+        epoch: Option<Epoch>,
+        hash: Option<BlockHash>,
+    ) -> Option<(EpochRecord, EpochCertificate)> {
+        match (epoch, hash) {
+            (_, Some(hash)) => self.get_epoch_by_hash(hash),
+            (Some(epoch), _) => self.get_epoch_by_number(epoch),
+            (None, None) => None,
+        }
     }
 }
 

@@ -11824,6 +11824,7 @@ dependencies = [
  "eyre",
  "jsonrpsee",
  "rand 0.9.1",
+ "roaring",
  "state-sync",
  "thiserror 1.0.69",
  "tn-batch-builder",

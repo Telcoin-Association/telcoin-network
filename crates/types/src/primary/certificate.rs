@@ -11,7 +11,7 @@ use crate::{
     ensure,
     error::{CertificateError, CertificateResult, DagError, DagResult, HeaderError},
     now,
-    serde::CertificateSignatures,
+    serde::RoaringBitmapSerde,
     AuthorityIdentifier, BlockHash, Committee, Digest, Epoch, Hash, Header, Round, TimestampSec,
     VotingPower,
 };
@@ -28,8 +28,8 @@ pub struct Certificate {
     pub header: Header,
     /// Container for [BlsAggregateSignatureBytes].
     pub signature_verification_state: SignatureVerificationState,
-    /// Signatures of all authorities
-    #[serde_as(as = "CertificateSignatures")]
+    /// Bitmap that indicates which authorities from committee signed this certificate.
+    #[serde_as(as = "RoaringBitmapSerde")]
     signed_authorities: roaring::RoaringBitmap,
     /// Timestamp for certificate creation.
     ///
@@ -124,7 +124,7 @@ impl Certificate {
             DagError::CertificateRequiresQuorum
         );
 
-        let sigs: Vec<&BlsSignature> = sigs.iter().map(|(_, sig)| sig).collect();
+        let sigs: Vec<BlsSignature> = sigs.iter().map(|(_, sig)| *sig).collect();
         let bls_signature = if sigs.is_empty() {
             BlsSignature::default()
         } else {

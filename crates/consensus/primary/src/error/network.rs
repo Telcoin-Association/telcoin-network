@@ -5,7 +5,7 @@ use tn_network_libp2p::Penalty;
 use tn_storage::StoreError;
 use tn_types::{
     error::{CertificateError, HeaderError},
-    BcsError, BlockHash,
+    BcsError, BlockHash, BlsPublicKey, Epoch,
 };
 
 /// Result alias for results that possibly return [`PrimaryNetworkError`].
@@ -41,6 +41,22 @@ pub(crate) enum PrimaryNetworkError {
     /// Unknown consensus header.
     #[error("Unknown consensus header: {0}")]
     UnknowConsensusHeaderDigest(BlockHash),
+    /// Peer that is not committee published invalid gosip.
+    /// Temparily disabled, will be back soon.
+    #[error("Peer {0} is not in the committee!")]
+    _PeerNotInCommittee(Box<BlsPublicKey>),
+    /// Unavaliable epoch (either it is invalid or this node does not have it).
+    #[error("Unknown epoch record: {0}")]
+    UnavailableEpoch(Epoch),
+    /// Unavaliable epoch hash (either it is invalid or this node does not have it).
+    #[error("Unknown epoch record digest: {0}")]
+    UnavailableEpochDigest(BlockHash),
+    /// Invalid epoch request.
+    #[error("Must suply an epoch or hash when requesting an epoch record")]
+    InvalidEpochRequest,
+    /// Invalid topic- something was published to the wrong topic.
+    #[error("Gossip was published to the wrong topic")]
+    InvalidTopic,
 }
 
 impl From<&PrimaryNetworkError> for Option<Penalty> {
@@ -90,11 +106,17 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             | PrimaryNetworkError::InvalidRequest(_)
             | PrimaryNetworkError::UnknowConsensusHeaderDigest(_) => Some(Penalty::Mild),
             // medium
-            PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),
+            PrimaryNetworkError::InvalidEpochRequest
+            | PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),
             // fatal
-            PrimaryNetworkError::Decode(_) => Some(Penalty::Fatal),
+            PrimaryNetworkError::InvalidTopic
+            | PrimaryNetworkError::Decode(_) => Some(Penalty::Fatal),
             // ignore
-            PrimaryNetworkError::Storage(_) | PrimaryNetworkError::Internal(_) => None,
+            PrimaryNetworkError::UnavailableEpoch(_)  // A node might not have this yet...
+            | PrimaryNetworkError::UnavailableEpochDigest(_)  // A node might not have this yet....
+            | PrimaryNetworkError::_PeerNotInCommittee(_)
+            | PrimaryNetworkError::Storage(_)
+            | PrimaryNetworkError::Internal(_) => None,
         }
     }
 }

@@ -8,7 +8,7 @@ use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IndexedRandom as _, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fmt::{Display, Formatter},
     num::NonZeroU64,
     sync::Arc,
@@ -454,6 +454,11 @@ impl Committee {
                 }
             })
             .collect()
+    }
+
+    /// Return the Set of BlsPublicKey's for the current committee.
+    pub fn committee_keys(&self) -> HashSet<BlsPublicKey> {
+        self.inner.read().authorities.keys().copied().collect()
     }
 
     /// Return the bootstrap record for key if it exists.

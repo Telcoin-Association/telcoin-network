@@ -22,9 +22,8 @@ use tracing::{debug, warn};
 static LOCAL_MIN_REQUEST_SIZE: LazyLock<usize> =
     LazyLock::new(|| tn_types::encode(&Certificate::default()).len());
 /// The minimal response wrapper using a default, empty message.
-static MESSAGE_OVERHEAD: LazyLock<usize> = LazyLock::new(|| {
-    tn_types::encode(&PrimaryResponse::RequestedCertificates(vec![])).len()
-});
+static MESSAGE_OVERHEAD: LazyLock<usize> =
+    LazyLock::new(|| tn_types::encode(&PrimaryResponse::RequestedCertificates(vec![])).len());
 
 #[cfg(test)]
 #[path = "../tests/cert_collector_tests.rs"]

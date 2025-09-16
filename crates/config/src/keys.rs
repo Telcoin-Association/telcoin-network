@@ -244,6 +244,10 @@ impl BlsSigner for KeyConfig {
     fn request_signature_direct(&self, msg: &[u8]) -> BlsSignature {
         self.inner.primary_keypair.sign(msg)
     }
+
+    fn public_key(&self) -> BlsPublicKey {
+        self.primary_public_key()
+    }
 }
 
 #[cfg(test)]
