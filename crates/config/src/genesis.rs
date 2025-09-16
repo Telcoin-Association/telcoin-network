@@ -59,7 +59,8 @@ impl NetworkGenesis {
     }
 
     /// Load a list of validators by reading files in a directory.
-    fn load_validators_from_path<P>(
+    /// XXXX- keep pub?
+    pub fn load_validators_from_path<P>(
         telcoin_paths: &P,
     ) -> eyre::Result<Vec<(BlsPublicKey, NodeInfo)>>
     where

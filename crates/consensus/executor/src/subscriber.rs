@@ -254,10 +254,9 @@ impl<DB: Database> Subscriber<DB> {
                         error!(target: "subscriber", "error sending latest consensus header for authority {:?}: {}", self.inner.authority_id, e);
                         return Err(SubscriberError::ClosedChannel("failed to send last consensus header on bus".to_string()));
                     }
-                    //XXXXlet sig = self.config.key_config().request_signature_direct(last_parent.as_ref());
                     let sig =
                         self.config.key_config().request_signature_direct(&encode(&to_intent_message(last_parent)));
-                    if let Err(e) = self.network_handle.publish_consensus(number, last_parent, self.config.key_config().public_key(), sig).await {
+                    if let Err(e) = self.network_handle.publish_consensus(sub_dag.leader_epoch(), number, last_parent, self.config.key_config().public_key(), sig).await {
                         error!(target: "subscriber", "error publishing latest consensus to network {:?}: {}", self.inner.authority_id, e);
                     }
                     last_number += 1;

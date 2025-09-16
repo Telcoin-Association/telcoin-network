@@ -1,6 +1,9 @@
 //! Handle specific request types received from the network.
 
-use super::{message::MissingCertificatesRequest, PrimaryResponse};
+use super::{
+    message::{ConsensusResult, MissingCertificatesRequest},
+    PrimaryResponse,
+};
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
     network::message::PrimaryGossip,
@@ -84,13 +87,14 @@ where
                 let unverified_cert = cert.validate_received().map_err(CertManagerError::from)?;
                 self.state_sync.process_peer_certificate(unverified_cert).await?;
             }
-            PrimaryGossip::Consenus(number, hash, key, signature) => {
+            PrimaryGossip::Consenus(result) => {
+                let ConsensusResult { epoch: _, number, hash, validator: key, signature } = *result;
                 // XXXX need to get committee correctly?  If we are behind then may not have the
                 // current committee. This may be intractable until EpochRecords are
                 // caught up. XXXX- don't subscribe to gossip until we have caught
                 // up EpochRecords in general. Or NOT
                 ensure!(
-                    topic.to_string().eq(&tn_config::LibP2pConfig::primary_topic()),
+                    topic.to_string().eq(&tn_config::LibP2pConfig::consensus_output_topic()),
                     PrimaryNetworkError::InvalidTopic
                 );
                 ensure!(

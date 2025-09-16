@@ -7,8 +7,8 @@ use std::{sync::Arc, time::Duration};
 
 use crate::{proposer::OurDigestMessage, state_sync::StateSynchronizer, ConsensusBus};
 use handler::RequestHandler;
+use message::{ConsensusResult, PrimaryGossip, PrimaryRPCError};
 pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
-use message::{PrimaryGossip, PrimaryRPCError};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
@@ -74,18 +74,20 @@ impl PrimaryNetworkHandle {
     /// Publish a consensus block number and hash of the header.
     pub async fn publish_consensus(
         &self,
+        epoch: Epoch,
         consensus_block_num: u64,
         consensus_header_hash: BlockHash,
         key: BlsPublicKey,
         signature: BlsSignature,
     ) -> NetworkResult<()> {
-        let data = encode(&PrimaryGossip::Consenus(
-            consensus_block_num,
-            consensus_header_hash,
-            key,
+        let data = encode(&PrimaryGossip::Consenus(Box::new(ConsensusResult {
+            epoch,
+            number: consensus_block_num,
+            hash: consensus_header_hash,
+            validator: key,
             signature,
-        ));
-        self.handle.publish("tn-primary".into(), data).await?;
+        })));
+        self.handle.publish(tn_config::LibP2pConfig::consensus_output_topic(), data).await?;
         Ok(())
     }
 

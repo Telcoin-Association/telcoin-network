@@ -118,6 +118,11 @@ impl LibP2pConfig {
         String::from("tn-primary")
     }
 
+    /// Return topics for primary.
+    pub fn consensus_output_topic() -> String {
+        String::from("tn-consensus-output")
+    }
+
     /// Return topics for epoch votes.
     pub fn epoch_vote_topic() -> String {
         String::from("tn-epoch-vote")

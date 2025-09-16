@@ -17,7 +17,8 @@ use std::{
     time::Duration,
 };
 use tn_config::{
-    Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs,
+    Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, KeyConfig, NetworkConfig, NetworkGenesis,
+    TelcoinDirs,
 };
 use tn_network_libp2p::{
     error::NetworkError,
@@ -185,7 +186,7 @@ pub(crate) fn open_consensus_db<P: TelcoinDirs + 'static>(
 
 impl<P, DB> EpochManager<P, DB>
 where
-    P: TelcoinDirs + 'static,
+    P: TelcoinDirs + Clone + 'static,
     DB: TNDatabase,
 {
     /// Create a new instance of [Self].
@@ -269,6 +270,13 @@ where
             .inner_handle()
             .subscribe(tn_config::LibP2pConfig::epoch_vote_topic())
             .await?;
+        self.primary_network_handle
+            .as_ref()
+            .expect("primary network")
+            .inner_handle()
+            .subscribe(tn_config::LibP2pConfig::consensus_output_topic())
+            .await?;
+        self.spawn_epoch_record_collector(node_task_manager.get_spawner()).await?;
 
         // start consensus metrics for the epoch
         let metrics_shutdown = Notifier::new();
@@ -304,6 +312,113 @@ where
         metrics_shutdown.notify();
 
         result
+    }
+
+    /// Asks peers for records from last_epoch to requested_epoch.
+    /// Returns the Epoch that was last retrieved.
+    async fn collect_epoch_records(
+        last_epoch: Epoch,
+        requested_epoch: Epoch,
+        db: &DB,
+        primary_handle: &PrimaryNetworkHandle,
+        datadir: &P,
+    ) -> Epoch {
+        let mut result_epoch = last_epoch;
+        for epoch in last_epoch..=requested_epoch {
+            // If we already have epoch then continue.
+            if let Ok(Some(_)) = db.get::<EpochRecords>(&(epoch)) {
+                continue;
+            }
+            // Try to recover by downloading the epoch record and cert from a peer.
+            for _ in 0..3 {
+                match primary_handle.request_epoch_cert(Some(epoch), None).await {
+                    Ok((epoch_rec, cert)) => {
+                        let (parent_hash, committee) = if epoch == 0 {
+                            // If we can't load the genesis committee something is very wrong (i.e.
+                            // we have a broken config).
+                            let c = NetworkGenesis::load_validators_from_path(datadir)
+                                .expect("load genesis committee")
+                                .iter()
+                                .map(|(k, _)| *k)
+                                .collect();
+                            (B256::default(), c)
+                        } else if let Ok(Some(prev)) = db.get::<EpochRecords>(&(epoch - 1)) {
+                            (prev.digest(), prev.next_committee.clone())
+                        } else {
+                            // We are missing epoch records.
+                            // Should not be here but if so just skipping won't really help...
+                            // Reduce last_epoch by one and once this loop finishing skipping we can
+                            // try to get the missing epoch again.
+                            return epoch - 1;
+                        };
+                        // Verify the epoch has the expected parent and committee and is signed by
+                        // that committee.
+                        if parent_hash == epoch_rec.parent_hash
+                            && committee == epoch_rec.committee
+                            && epoch_rec.verify_with_cert(&cert)
+                        {
+                            let epoch_hash = epoch_rec.digest();
+                            let _ = db.insert::<EpochRecordsIndex>(&epoch_hash, &epoch);
+                            let _ = db.insert::<EpochRecords>(&epoch, &epoch_rec);
+                            let _ = db.insert::<EpochCerts>(&epoch_hash, &cert);
+                            result_epoch = epoch;
+                            info!(
+                                target: "epoch-manager",
+                                "retrieved cert for epoch {epoch}: {epoch_hash} from a peer",
+                            );
+                            break; // 0..3
+                        }
+                    }
+                    Err(err) => error!(
+                        target: "epoch-manager",
+                        "failed to retrieve epoch from a peer {epoch}: {err}",
+                    ),
+                }
+            }
+        }
+        result_epoch
+    }
+
+    /// Spawn a long running task to collect missing epoc records.
+    ///
+    /// Most likely because a node is syncing.
+    async fn spawn_epoch_record_collector(
+        &self,
+        node_task_spawner: TaskSpawner,
+    ) -> eyre::Result<()> {
+        let primary_handle = self.primary_network_handle.as_ref().expect("primary network").clone();
+        let mut epoch_rx = self.consensus_bus.requested_missing_epoch().subscribe();
+        let db = self.consensus_db.clone();
+        let node_shutdown = self.node_shutdown.subscribe();
+        let datadir = self.tn_datadir.clone();
+        node_task_spawner.spawn_critical_task("Epoch Record Collector", async move {
+            let mut last_epoch = if let Some((last_epoch, _)) = db.last_record::<EpochRecords>() {
+                last_epoch
+            } else {
+                0
+            };
+            loop {
+                let requested_epoch = *epoch_rx.borrow();
+                if requested_epoch > last_epoch {
+                    last_epoch = Self::collect_epoch_records(
+                        last_epoch,
+                        requested_epoch,
+                        &db,
+                        &primary_handle,
+                        &datadir,
+                    )
+                    .await;
+                }
+                // Wait until the watch is updated to indicate we have more work to do.
+                tokio::select!(
+                    _ = &node_shutdown => {
+                        break;  // Break the outer loop.
+                    },
+                    _ = epoch_rx.changed() => { }
+                );
+            }
+        });
+        Ok(())
     }
 
     /// Startup for the node. This creates all components on startup before starting the first

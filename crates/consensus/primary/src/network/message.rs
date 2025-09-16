@@ -14,6 +14,15 @@ use tn_types::{
     Round, Vote,
 };
 
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConsensusResult {
+    pub epoch: Epoch,
+    pub number: u64,
+    pub hash: BlockHash,
+    pub validator: BlsPublicKey,
+    pub signature: BlsSignature,
+}
+
 /// Primary messages on the gossip network.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum PrimaryGossip {
@@ -26,7 +35,7 @@ pub enum PrimaryGossip {
     /// NOTE: `snappy` is slightly larger than uncompressed.
     Certificate(Box<Certificate>),
     /// Consensus output reached- publish the consensus chain height and new block hash.
-    Consenus(u64, BlockHash, BlsPublicKey, BlsSignature),
+    Consenus(Box<ConsensusResult>),
     /// Signed hash sent out by committee memebers at epoch start.
     EpochVote(Box<EpochVote>),
 }

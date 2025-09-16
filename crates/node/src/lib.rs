@@ -35,7 +35,7 @@ pub fn launch_node<P>(
     passphrase: Option<String>,
 ) -> eyre::Result<()>
 where
-    P: TelcoinDirs + 'static,
+    P: TelcoinDirs + Clone + 'static,
 {
     let runtime = Builder::new_multi_thread()
         .thread_name("telcoin-network")
