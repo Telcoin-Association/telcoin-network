@@ -21,11 +21,11 @@ use tn_reth::{
 };
 use tn_test_utils::{default_test_execution_node, TestExecutionNode};
 use tn_types::{
-    adiri_genesis, gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc,
-    test_genesis, Address, BlockHash, Bloom, BlsPublicKey, Bytes, Certificate, CertifiedBatch,
-    CommittedSubDag, Committee, CommitteeBuilder, ConsensusOutput, Encodable2718, Hash as _,
-    Notifier, ReputationScores, SealedBlock, TaskManager, B256, EMPTY_WITHDRAWALS,
-    MIN_PROTOCOL_BASE_FEE, U256,
+    gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc, test_genesis,
+    Address, BlockHash, Bloom, BlsPublicKey, Bytes, Certificate, CertifiedBatch, CommittedSubDag,
+    Committee, CommitteeBuilder, ConsensusOutput, Encodable2718, Hash as _, Notifier,
+    ReputationScores, SealedBlock, TaskManager, B256, EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE,
+    U256,
 };
 use tokio::{sync::oneshot, time::timeout};
 use tracing::debug;
@@ -150,7 +150,7 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     };
     let consensus_output_hash = consensus_output.consensus_header_hash();
 
-    let chain: Arc<RethChainSpec> = Arc::new(adiri_genesis().into());
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
     let tmp_dir = TempDir::new().expect("temp dir");
     // execution node components
     let execution_node =
@@ -390,7 +390,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     let mut batches_2 = tn_reth::test_utils::batches(4); // create 4 batches
 
     // add eip1559 transactions to set max priority fee per gas so batch producer earns fees
-    let genesis = adiri_genesis();
+    let genesis = test_genesis();
     let mut tx_factory = TransactionFactory::new_random();
     let encoded_tx_priority_fee_1 = tx_factory
         .create_explicit_eip1559(
@@ -838,7 +838,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let mut batches_2 = tn_reth::test_utils::batches(4); // create 4 batches
 
     // add eip1559 transactions to set max priority fee per gas so batch producer earns fees
-    let genesis = adiri_genesis();
+    let genesis = test_genesis();
     let mut tx_factory = TransactionFactory::new_random();
     let encoded_tx_priority_fee_1 = tx_factory
         .create_explicit_eip1559(
