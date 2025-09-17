@@ -160,6 +160,7 @@ impl PrimaryNetworkHandle {
     }
 
     /// Request consensus header from specific peer.
+    /// Will verify the returned header matches hash if provided (strong) or number if not (weak).
     pub async fn request_consensus_from_peer(
         &self,
         peer: BlsPublicKey,
@@ -170,7 +171,27 @@ impl PrimaryNetworkHandle {
         let res = self.handle.send_request(request, peer).await?;
         let res = res.await??;
         match res {
-            PrimaryResponse::ConsensusHeader(header) => Ok(Arc::unwrap_or_clone(header)),
+            PrimaryResponse::ConsensusHeader(header) => match (hash, number) {
+                (Some(hash), _) => {
+                    if header.digest() == hash {
+                        Ok(Arc::unwrap_or_clone(header))
+                    } else {
+                        Err(NetworkError::RPCError(
+                            "Got wrong response, header does not match hash!".to_string(),
+                        ))
+                    }
+                }
+                (_, Some(number)) => {
+                    if header.number == number {
+                        Ok(Arc::unwrap_or_clone(header))
+                    } else {
+                        Err(NetworkError::RPCError(
+                            "Got wrong response, number does not match header!".to_string(),
+                        ))
+                    }
+                }
+                _ => Err(NetworkError::RPCError("Must provide a hash or number!".to_string())),
+            },
             PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
             _ => Err(NetworkError::RPCError(
                 "Got wrong response, not a consensus header!".to_string(),
@@ -179,6 +200,7 @@ impl PrimaryNetworkHandle {
     }
 
     /// Request consensus header from a random peer up to three times from three different peers.
+    /// Will verify the returned header matches hash if provided (strong) or number if not (weak).
     pub async fn request_consensus(
         &self,
         number: Option<u64>,
@@ -191,7 +213,23 @@ impl PrimaryNetworkHandle {
             let res = self.handle.send_request_any(request.clone()).await?;
             let res = res.await?;
             if let Ok(PrimaryResponse::ConsensusHeader(header)) = res {
-                return Ok(Arc::unwrap_or_clone(header));
+                match (hash, number) {
+                    (Some(hash), _) => {
+                        if header.digest() == hash {
+                            return Ok(Arc::unwrap_or_clone(header));
+                        }
+                    }
+                    (_, Some(number)) => {
+                        if header.number == number {
+                            return Ok(Arc::unwrap_or_clone(header));
+                        }
+                    }
+                    _ => {
+                        return Err(NetworkError::RPCError(
+                            "Must provide hash or number!".to_string(),
+                        ));
+                    }
+                }
             }
         }
         Err(NetworkError::RPCError("Could not get the consensus header!".to_string()))

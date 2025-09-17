@@ -518,8 +518,8 @@ impl ConsensusBus {
     }
 
     /// Track the latest published consensus header block number and hash seen on the gossip
-    /// network. This is straight from the pub/sub network and should be verified before taking
-    /// action with it.
+    /// network. This value will have been verified and can be trusted to be the correct hash
+    /// for block number.  DO NOT send unverified values to this watch.
     pub fn last_published_consensus_num_hash(&self) -> &watch::Sender<(u64, BlockHash)> {
         &self.inner_app.tx_last_published_consensus_num_hash
     }

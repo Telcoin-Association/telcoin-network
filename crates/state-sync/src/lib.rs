@@ -16,6 +16,11 @@ use tn_types::{
 };
 use tracing::{debug, error, info};
 
+mod epoch;
+pub use epoch::spawn_epoch_record_collector;
+mod consensus;
+use consensus::spawn_track_recent_consensus;
+
 /// Return true if this node should be able to participate as a CVV, false otherwise.
 ///
 /// Call this if you should be a committe member.  Currently it will determine if you have recent
@@ -257,43 +262,6 @@ pub async fn get_missing_consensus<DB: Database>(
 
     debug!(target: "state-sync", ?result, "missing consensus headers that need execution:");
     Ok(result)
-}
-
-/// Spawn a long running task on task_manager that will keep the last_consensus_header watch on
-/// consensus_bus up to date. This should only be used when NOT participating in active consensus.
-async fn spawn_track_recent_consensus<DB: Database>(
-    config: ConsensusConfig<DB>,
-    consensus_bus: ConsensusBus,
-    network: PrimaryNetworkHandle,
-) -> eyre::Result<()> {
-    let rx_shutdown = config.shutdown().subscribe();
-    let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
-    loop {
-        tokio::select! {
-            _ = rx_gossip_update.changed() => {
-                let (number, _hash) = *rx_gossip_update.borrow_and_update();
-                debug!(target: "state-sync", ?number, "tracking recent consensus and detected change through gossip - requesting consensus from peer");
-
-                // request consensus from any peer
-                if let Ok(header) = network.request_consensus(Some(number), None).await {
-                    match header.verify_certificates(config.committee()) {
-                        Ok(header) => {
-                            if header.number > consensus_bus.last_consensus_header().borrow().number {
-                                consensus_bus.last_consensus_header().send(header)?;
-                            }
-                        }
-                        Err(e) => {
-                            error!(target: "state-sync", "recieved a consensus header with invalid certs: {e}");
-                        }
-                    }
-                }
-            }
-
-            _ = &rx_shutdown => {
-                return Ok(())
-            }
-        }
-    }
 }
 
 /// Spawn a long running task on task_manager that will stream consensus headers from the

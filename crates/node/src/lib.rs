@@ -8,8 +8,9 @@ use manager::EpochManager;
 use tn_config::TelcoinDirs;
 use tn_primary::ConsensusBus;
 use tn_rpc::EngineToPrimary;
-use tn_storage::tables::{
-    ConsensusBlockNumbersByDigest, ConsensusBlocks, EpochCerts, EpochRecords, EpochRecordsIndex,
+use tn_storage::{
+    tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
+    EpochStore,
 };
 use tn_types::{BlockHash, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord};
 use tokio::runtime::Builder;
@@ -69,17 +70,12 @@ impl<DB: Database> EngineToPrimaryRpc<DB> {
 
     /// Retrieve the consensus header by number.
     fn get_epoch_by_number(&self, epoch: Epoch) -> Option<(EpochRecord, EpochCertificate)> {
-        let record = self.db.get::<EpochRecords>(&epoch).ok()??;
-        let digest = record.digest();
-        Some((record, self.db.get::<EpochCerts>(&digest).ok()??))
+        self.db.get_epoch_by_number(epoch)
     }
 
     /// Retrieve the consensus header by hash
     fn get_epoch_by_hash(&self, hash: BlockHash) -> Option<(EpochRecord, EpochCertificate)> {
-        let epoch = self.db.get::<EpochRecordsIndex>(&hash).ok()??;
-        let record = self.db.get::<EpochRecords>(&epoch).ok()??;
-        let digest = record.digest();
-        Some((record, self.db.get::<EpochCerts>(&digest).ok()??))
+        self.db.get_epoch_by_hash(hash)
     }
 }
 
