@@ -23,7 +23,7 @@ pub fn test_genesis() -> Genesis {
     let mut genesis = Genesis { timestamp: now(), ..Default::default() };
     set_genesis_defaults(&mut genesis);
     genesis.config.chain_id = 2017;
-    let default_factory_account = vec![
+    let default_factory_accounts = vec![
         (
             // Default transaction factory
             address!("0xb14d3c4f5fbfbcfb98af2d330000d49c95b93aa7"),
@@ -47,7 +47,12 @@ pub fn test_genesis() -> Genesis {
             GenesisAccount::default().with_balance(U256::MAX),
         ),
     ];
-    genesis.extend_accounts(default_factory_account)
+    // use testnet pre-compiles
+    let precompiles: Genesis =
+        serde_yaml::from_str(TESTNET_GENESIS).expect("bad testnet genesis yaml data");
+    let genesis = genesis.extend_accounts(precompiles.alloc);
+    // overwrite any conflicting accounts with specified values
+    genesis.extend_accounts(default_factory_accounts)
 }
 
 /// Set the genesis default config.

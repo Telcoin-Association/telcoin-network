@@ -18,9 +18,9 @@ use tn_primary::{
 };
 use tn_storage::CertificateStore;
 use tn_types::{
-    AuthorityIdentifier, Batch, BlockHash, CommittedSubDag, Committee, ConsensusHeader,
-    ConsensusOutput, Database, Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp, TnReceiver,
-    TnSender, B256,
+    Address, AuthorityIdentifier, Batch, BlockHash, CertifiedBatch, CommittedSubDag, Committee,
+    ConsensusHeader, ConsensusOutput, Database, Hash as _, Noticer, TaskManager, TaskSpawner,
+    Timestamp, TnReceiver, TnSender, B256,
 };
 use tracing::{debug, error, info};
 
@@ -296,6 +296,23 @@ impl<DB: Database> Subscriber<DB> {
         }
     }
 
+    /// Helper function to obtain authority's execution address based on their
+    /// `AuthorityIdentifier`. This address is used as the beneficiary during batch execution.
+    /// A fatal error is returned if the authority is missing from the committee.
+    fn authority_execution_address(
+        &self,
+        authority_id: &AuthorityIdentifier,
+    ) -> SubscriberResult<Address> {
+        self.inner
+            .committee
+            .authority(authority_id)
+            .map(|a| a.execution_address())
+            .ok_or(SubscriberError::UnexpectedAuthority(authority_id.clone()))
+            .inspect_err(|_| {
+                error!(target: "subscriber", ?authority_id, "Authority missing from committee");
+            })
+    }
+
     /// Turn a CommittedSubDag with consensus header info into ConsensusOutput.
     /// It will retrieve any missing Batches so the ConsensusOutput will be ready
     /// to execute.
@@ -309,29 +326,13 @@ impl<DB: Database> Subscriber<DB> {
     ) -> SubscriberResult<ConsensusOutput> {
         let num_blocks = deliver.num_primary_blocks();
         let num_certs = deliver.len();
-
-        // get the execution address of the authority or use zero address
-        let leader = self.inner.committee.authority(deliver.leader.origin());
-        let address = if let Some(authority) = leader {
-            authority.execution_address()
-        } else {
-            error!(target: "subscriber", "Execution address missing for {}", &deliver.leader.origin());
-            return Err(SubscriberError::UnexpectedAuthority(deliver.leader.origin().clone()));
-        };
-
-        let early_finalize = if self.consensus_bus.node_mode().borrow().is_active_cvv() {
-            // We are a CVV so we can finalize early.
-            true
-        } else {
-            // Not a CVV so be more conservative about finalizing blocks.
-            false
-        };
+        // active cvvs always finalize early bc they are the authorities
+        let early_finalize = self.consensus_bus.node_mode().borrow().is_active_cvv();
 
         if num_blocks == 0 {
             debug!(target: "subscriber", "No blocks to fetch, payload is empty");
             return Ok(ConsensusOutput {
                 sub_dag: Arc::new(deliver),
-                beneficiary: address,
                 parent_hash,
                 number,
                 early_finalize,
@@ -340,10 +341,9 @@ impl<DB: Database> Subscriber<DB> {
         }
 
         let sub_dag = Arc::new(deliver);
-        let mut subscriber_output = ConsensusOutput {
+        let mut consensus_output = ConsensusOutput {
             sub_dag: sub_dag.clone(),
             batches: Vec::with_capacity(num_certs),
-            beneficiary: address,
             parent_hash,
             number,
             early_finalize,
@@ -355,7 +355,7 @@ impl<DB: Database> Subscriber<DB> {
         for cert in &sub_dag.certificates {
             for (digest, _) in cert.header().payload().iter() {
                 batch_set.insert(*digest);
-                subscriber_output.batch_digests.push_back(*digest);
+                consensus_output.batch_digests.push_back(*digest);
             }
         }
 
@@ -368,38 +368,42 @@ impl<DB: Database> Subscriber<DB> {
             .executor_metrics()
             .committed_subdag_block_count
             .observe(num_blocks as f64);
-        let fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
+        let mut fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
         drop(fetched_batches_timer);
 
-        // Map all fetched batches to their respective certificates and submit as
-        // consensus output
+        // map all fetched batches to their respective certificates for applying block rewards
         for cert in &sub_dag.certificates {
-            let mut output_batches = Vec::with_capacity(cert.header().payload().len());
-
+            // create collection of batches to execute for this certificate
+            let mut cert_batches = Vec::with_capacity(cert.header().payload().len());
             self.consensus_bus.executor_metrics().subscriber_current_round.set(cert.round() as i64);
-
             self.consensus_bus
                 .executor_metrics()
                 .subscriber_certificate_latency
                 .observe(cert.created_at().elapsed().as_secs_f64());
 
+            // retrieve fetched batch by digest
             for (digest, (_, _)) in cert.header().payload().iter() {
                 self.consensus_bus.executor_metrics().subscriber_processed_blocks.inc();
-                let Some(batch) = fetched_batches.get(digest) else {
+                let batch = fetched_batches.remove(digest).ok_or(SubscriberError::MissingFetchedBatch(*digest)).inspect_err(|_| {
                     error!(target: "subscriber", "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
-                    return Err(SubscriberError::ClientRequestsFailed);
-                };
+                })?;
 
-                debug!(target: "subscriber",
+                debug!(
+                    target: "subscriber",
                     "Adding fetched batch {digest} from certificate {} to consensus output",
                     cert.digest()
                 );
-                output_batches.push(batch.clone());
+                cert_batches.push(batch);
             }
-            subscriber_output.batches.push(output_batches);
+
+            // main collection for execution
+            consensus_output.batches.push(CertifiedBatch {
+                address: self.authority_execution_address(cert.origin())?,
+                batches: cert_batches,
+            });
         }
         debug!(target: "subscriber", "returning output to subscriber");
-        Ok(subscriber_output)
+        Ok(consensus_output)
     }
 
     async fn fetch_batches_from_peers(
@@ -408,11 +412,11 @@ impl<DB: Database> Subscriber<DB> {
     ) -> SubscriberResult<HashMap<BlockHash, Batch>> {
         let mut fetched_blocks = HashMap::new();
 
-        debug!("Attempting to fetch {} digests peers", batch_digests.len(),);
+        debug!(target: "subscriber", "Attempting to fetch {} digests peers", batch_digests.len(),);
         let blocks = match self.inner.client.fetch_batches(batch_digests.clone()).await {
             Ok(resp) => resp,
             Err(e) => {
-                error!("Failed to fetch batches from peers: {e:?}");
+                error!(target: "subscriber", "Failed to fetch batches from peers: {e:?}");
                 return Err(SubscriberError::ClientRequestsFailed);
             }
         };
@@ -428,6 +432,7 @@ impl<DB: Database> Subscriber<DB> {
         if let Some(received_at) = batch.received_at() {
             let remote_duration = received_at.elapsed().as_secs_f64();
             debug!(
+                target: "subscriber",
                 "Batch was fetched for execution after being received from another worker {}s ago.",
                 remote_duration
             );
@@ -439,6 +444,7 @@ impl<DB: Database> Subscriber<DB> {
         } else {
             let local_duration = batch.created_at().elapsed().as_secs_f64();
             debug!(
+                target: "subscriber",
                 "Batch was fetched for execution after being created locally {}s ago.",
                 local_duration
             );
@@ -452,6 +458,7 @@ impl<DB: Database> Subscriber<DB> {
         let block_fetch_duration = batch.created_at().elapsed().as_secs_f64();
         self.consensus_bus.executor_metrics().block_execution_latency.observe(block_fetch_duration);
         debug!(
+            target: "subscriber",
             "Block {:?} took {} seconds since it has been created to when it has been fetched for execution",
             digest,
             block_fetch_duration,

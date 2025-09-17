@@ -10,7 +10,11 @@ use crate::{
 };
 use alloy::{
     consensus::{proofs, Block, BlockBody, Transaction, TxReceipt},
-    eips::{eip2935::HISTORY_STORAGE_ADDRESS, eip4788::BEACON_ROOTS_ADDRESS, eip7685::Requests},
+    eips::{
+        eip2935::HISTORY_STORAGE_ADDRESS,
+        eip4788::BEACON_ROOTS_ADDRESS,
+        eip7685::{Requests, EMPTY_REQUESTS_HASH},
+    },
     sol_types::SolCall as _,
 };
 use alloy_evm::{Database, Evm};
@@ -27,6 +31,7 @@ use reth_evm::{
     FromRecoveredTx, FromTxWithEncoded, OnStateHook,
 };
 use reth_primitives::logs_bloom;
+use reth_primitives_traits::proofs::calculate_withdrawals_root;
 use reth_provider::BlockExecutionResult;
 use reth_revm::{
     context::result::{ExecutionResult, ResultAndState},
@@ -36,7 +41,7 @@ use reth_revm::{
 use std::{collections::BTreeMap, sync::Arc};
 use tn_types::{
     gas_accumulator::RewardsCounter, Address, Bytes, Encodable2718, ExecHeader, Receipt,
-    TransactionSigned, Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_WITHDRAWALS, U256,
+    TransactionSigned, Withdrawals, B256, EMPTY_WITHDRAWALS, U256,
 };
 use tracing::{debug, error, trace};
 
@@ -45,15 +50,15 @@ use tracing::{debug, error, trace};
 pub struct TNBlockExecutionCtx {
     /// Parent block hash.
     pub parent_hash: B256,
-    /// Parent beacon block root.
+    /// Parent beacon block root - the digest of the `ConsensusHeader`.
     pub parent_beacon_block_root: Option<B256>,
     /// The index for the batch.
     pub nonce: u64,
     /// The batch digest.
     ///
-    /// This is the batch that was validated by consensus and is responsible for the
-    /// request for execution.
-    pub requests_hash: Option<B256>,
+    /// This is the batch that was validated by consensus and executed
+    /// to produce the EVM block.
+    pub ommers_hash: B256,
     /// Keccak hash of the bls signature for the leader certificate.
     ///
     /// Executor makes closing epoch system call when this if included.
@@ -614,25 +619,30 @@ where
         let receipts_root = Receipt::calculate_receipt_root_no_memo(receipts);
         let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| r.logs()));
 
-        let withdrawals = Some(Withdrawals::default());
-        let withdrawals_root = Some(EMPTY_WITHDRAWALS);
-
         // set excess blob gas 0
         let excess_blob_gas = Some(0);
         let blob_gas_used =
             Some(transactions.iter().map(|tx| tx.blob_gas_used().unwrap_or_default()).sum());
 
         // TN-specific values
-        let requests_hash = ctx.requests_hash; // prague inactive
+        let ommers_hash = ctx.ommers_hash; // batch hash (consensus)
         let nonce = ctx.nonce.into(); // subdag leader's nonce: ((epoch as u64) << 32) | self.round as u64
         let difficulty = ctx.difficulty; // worker id and batch index
 
         // use keccak256(bls_sig) if closing epoch or Bytes::default
         let extra_data = ctx.close_epoch.map(|hash| hash.to_vec().into()).unwrap_or_default();
+        let (withdrawals, withdrawals_root) = if ctx.close_epoch.is_some() {
+            // closing epoch so include rewards info
+            let withdrawals = ctx.rewards_counter.generate_withdrawals();
+            let withdrawals_root = calculate_withdrawals_root(withdrawals.as_ref());
+            (Some(withdrawals), Some(withdrawals_root))
+        } else {
+            (Some(Withdrawals::default()), Some(EMPTY_WITHDRAWALS))
+        };
 
         let header = ExecHeader {
             parent_hash: ctx.parent_hash,
-            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            ommers_hash,
             beneficiary: evm_env.block_env.beneficiary,
             state_root,
             transactions_root,
@@ -651,7 +661,7 @@ where
             parent_beacon_block_root: ctx.parent_beacon_block_root,
             blob_gas_used,
             excess_blob_gas,
-            requests_hash,
+            requests_hash: Some(EMPTY_REQUESTS_HASH),
         };
 
         Ok(Block {

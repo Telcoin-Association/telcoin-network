@@ -9,7 +9,11 @@ use std::{
     },
 };
 
-use alloy::{eips::eip1559::MIN_PROTOCOL_BASE_FEE, primitives::Address};
+use alloy::{
+    eips::eip1559::MIN_PROTOCOL_BASE_FEE,
+    primitives::Address,
+    rpc::types::{Withdrawal, Withdrawals},
+};
 use parking_lot::{Mutex, RwLock};
 
 use crate::{AuthorityIdentifier, Committee, WorkerId};
@@ -64,6 +68,22 @@ impl RewardsCounter {
             }
         }
         result
+    }
+
+    /// Generate the withdrawals from governance safe for the validator block rewards applied at the
+    /// epoch boundary.
+    pub fn generate_withdrawals(&self) -> Withdrawals {
+        Withdrawals::new(
+            self.get_address_counts()
+                .into_iter()
+                .map(|(address, amount)| Withdrawal {
+                    index: 0,
+                    validator_index: 0,
+                    address,
+                    amount: amount as u64,
+                })
+                .collect(),
+        )
     }
 }
 

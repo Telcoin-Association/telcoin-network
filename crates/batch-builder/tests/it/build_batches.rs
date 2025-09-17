@@ -17,9 +17,9 @@ use tn_reth::{
 use tn_storage::{open_db, tables::Batches};
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    test_genesis, Address, Batch, BatchValidation, Bytes, Certificate, CommittedSubDag,
-    ConsensusOutput, Database, Encodable2718, GenesisAccount, ReputationScores, SealedBatch,
-    TaskManager, U160, U256,
+    test_genesis, Address, Batch, BatchValidation, Bytes, Certificate, CertifiedBatch,
+    CommittedSubDag, ConsensusOutput, Database, Encodable2718, GenesisAccount, ReputationScores,
+    SealedBatch, TaskManager, U160, U256,
 };
 use tn_worker::{
     metrics::WorkerMetrics, test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle,
@@ -489,10 +489,9 @@ async fn test_canonical_notification_updates_pool() {
             None,
         )
         .into(),
-        beneficiary: address,
         early_finalize: true,
         batch_digests,
-        batches: vec![vec![first_batch]],
+        batches: vec![CertifiedBatch { address, batches: vec![first_batch] }],
         ..Default::default()
     };
 

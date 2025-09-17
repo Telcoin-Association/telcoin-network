@@ -5,9 +5,10 @@ use super::{CertificateDigest, ConsensusHeader, SignatureVerificationState};
 use crate::{
     crypto, encode,
     error::{CertificateError, CertificateResult},
-    Address, Batch, BlockHash, Certificate, Committee, Digest, Epoch, Hash, ReputationScores,
-    Round, TimestampSec, B256,
+    Address, Batch, BlockHash, BlsSignature, Certificate, Committee, Digest, Epoch, Hash,
+    ReputationScores, Round, TimestampSec, B256,
 };
+use alloy::primitives::keccak256;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},
@@ -15,23 +16,33 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{error, warn};
 
 /// A global sequence number assigned to every CommittedSubDag.
 pub type SequenceNumber = u64;
+
+#[derive(Debug, Clone)]
+/// Struct that contains all necessary information for executing a batch post-consensus.
+pub struct CertifiedBatch {
+    /// The ECDSA address of the authority that produced the batch. This address is used as the
+    /// block beneficiary during execution. This may not be unique within a single
+    /// [ConsensusOutput].
+    pub address: Address,
+    /// The collection of batches (in order) that reached consensus.
+    pub batches: Vec<Batch>,
+}
 
 /// The output of Consensus, which includes all the blocks for each certificate in the sub dag
 /// It is sent to the the ExecutionState handle_consensus_transaction
 #[derive(Clone, Debug, Default)]
 pub struct ConsensusOutput {
+    /// The committed subdag that triggered this output.
     pub sub_dag: Arc<CommittedSubDag>,
     /// Matches certificates in the `sub_dag` one-to-one.
     ///
     /// This field is not included in [Self] digest. To validate,
     /// hash these batches and compare to [Self::batch_digests].
-    pub batches: Vec<Vec<Batch>>,
-    /// The beneficiary for block rewards.
-    pub beneficiary: Address,
+    pub batches: Vec<CertifiedBatch>,
     /// The ordered set of [BlockHash].
     ///
     /// This value is included in [Self] digest.
@@ -77,14 +88,6 @@ impl ConsensusOutput {
         self.sub_dag.leader.nonce()
     }
 
-    /// Execution address of the leader for the round.
-    ///
-    /// The address is used in the executed block as the
-    /// beneficiary for block rewards.
-    pub fn beneficiary(&self) -> Address {
-        self.beneficiary
-    }
-
     /// Pop the next batch digest.
     ///
     /// This method is used when executing [Self].
@@ -92,9 +95,18 @@ impl ConsensusOutput {
         self.batch_digests.pop_front()
     }
 
-    /// Flatten sequenced batches.
-    pub fn flatten_batches(&self) -> Vec<Batch> {
-        self.batches.iter().flat_map(|batches| batches.iter().cloned()).collect()
+    /// Create flat index mapping to retrieve certified batches during execution.
+    /// The first `usize` is the index for the [CertifiedBatch] which is used
+    /// to identify the authority that produced the batch. The second `usize`
+    /// is the batch's index within the committed certificate.
+    pub fn flatten_batches(&self) -> Vec<(usize, usize)> {
+        self.batches
+            .iter()
+            .enumerate()
+            .flat_map(|(cert_idx, cert_batch)| {
+                (0..cert_batch.batches.len()).map(move |batch_idx| (cert_idx, batch_idx))
+            })
+            .collect()
     }
 
     /// Build a new ConsensusHeader from this output.
@@ -120,6 +132,19 @@ impl ConsensusOutput {
     /// works for empty outputs with no batches.
     pub fn close_epoch_for_last_batch(&self) -> Option<bool> {
         self.close_epoch.then_some(self.batch_digests.is_empty())
+    }
+
+    /// Generate the source of randomness to shuffle future committees at the epoch boundary. The
+    /// source of randomness comes from the keccak hash of the leader's aggregate signature.
+    ///
+    /// NOTE: this cannot fail - uses [BlsSignature::default] and is considered acceptable with
+    /// permissioned validator set, but should never happen.
+    pub fn keccak_leader_sigs(&self) -> B256 {
+        let randomness = self.leader().aggregated_signature().unwrap_or_else(|| {
+            error!(target: "engine", ?self, "BLS signature missing for leader - using default for closing epoch");
+            BlsSignature::default()
+        });
+        keccak256(randomness.to_bytes())
     }
 }
 
