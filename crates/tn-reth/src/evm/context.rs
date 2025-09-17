@@ -13,15 +13,7 @@ use reth_revm::{
 /// The Telcoin Network EVM context.
 pub(crate) type TNEvmContext<DB> = Context<BlockEnv, TxEnv, CfgEnv, DB>;
 
-// TODO: rename thissss
-// - RethEvm
-// - RevmEvm
-// - TNEvm
-// - TnEvm
-///
-///
-/// convenience type
-/// !!!! ~~~~
+/// Convenience type for TN mainnet's EVM.
 pub(crate) type MainnetEvm<CTX, INSP = ()> =
     Evm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PrecompilesMap>;
 

@@ -11712,6 +11712,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tn-batch-builder",
+ "tn-config",
  "tn-engine",
  "tn-primary",
  "tn-reth",

@@ -145,10 +145,12 @@ pub fn save_consensus<DB: Database>(
 ) -> eyre::Result<()> {
     match db.write_txn() {
         Ok(mut txn) => {
-            for batch in consensus_output.batches.iter().flatten() {
-                if let Err(e) = txn.insert::<Batches>(&batch.digest(), batch) {
-                    error!(target: "state-sync", ?e, "error saving a batch to persistant storage!");
-                    return Err(e);
+            for certified_batches in consensus_output.batches.iter() {
+                for batch in certified_batches.batches.iter() {
+                    if let Err(e) = txn.insert::<Batches>(&batch.digest(), batch) {
+                        error!(target: "state-sync", ?e, "error saving a batch to persistant storage!");
+                        return Err(e);
+                    }
                 }
             }
             let header: ConsensusHeader = consensus_output.into();

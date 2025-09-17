@@ -8,7 +8,8 @@ use tn_reth::{
     CanonicalInMemoryState, ExecutedBlockWithTrieUpdates, NewCanonicalChain, RethEnv,
 };
 use tn_types::{
-    gas_accumulator::GasAccumulator, max_batch_gas, ConsensusOutput, Hash as _, SealedHeader, B256,
+    gas_accumulator::GasAccumulator, max_batch_gas, Address, ConsensusOutput, Hash as _,
+    SealedHeader, B256,
 };
 use tracing::{debug, error};
 
@@ -77,8 +78,9 @@ pub fn execute_consensus_output(
 
         let payload = TNPayload::new(
             canonical_header,
+            Address::ZERO,
             0,
-            None, // no batch to digest
+            B256::ZERO, // no batch to digest
             &output,
             output_digest,
             base_fee_per_gas,
@@ -92,16 +94,19 @@ pub fn execute_consensus_output(
         // execute the payload and update the current canonical header
         canonical_header = execute_payload(
             payload,
-            vec![],
+            &vec![],
             &mut executed_blocks,
             &reth_env,
             &canonical_in_memory_state,
         )?;
     } else {
         // loop and construct blocks from batches with transactions
-        for (batch_index, batch) in batches.into_iter().enumerate() {
+        for (batch_index, (cert_idx, batch_idx_in_cert)) in batches.into_iter().enumerate() {
             let batch_digest =
                 output.next_batch_digest().ok_or(TnEngineError::NextBlockDigestMissing)?;
+            let cert_batch = &output.batches[cert_idx];
+            let batch = &cert_batch.batches[batch_idx_in_cert];
+
             // use batch's base fee, gas limit, and withdrawals
             let base_fee_per_gas = batch.base_fee_per_gas;
             let gas_limit = max_batch_gas(batch.timestamp);
@@ -111,8 +116,9 @@ pub fn execute_consensus_output(
             let mix_hash = output_digest ^ batch_digest;
             let payload = TNPayload::new(
                 canonical_header,
+                cert_batch.address,
                 batch_index,
-                Some(batch_digest),
+                batch_digest,
                 &output,
                 output_digest,
                 base_fee_per_gas,
@@ -123,9 +129,8 @@ pub fn execute_consensus_output(
 
             // execute the payload and update the current canonical header
             canonical_header = execute_payload(
-                // &mut canonical_header,
                 payload,
-                batch.transactions,
+                &batch.transactions,
                 &mut executed_blocks,
                 &reth_env,
                 &canonical_in_memory_state,
@@ -155,7 +160,7 @@ pub fn execute_consensus_output(
 /// Execute the transaction and update canon chain in-memory.
 fn execute_payload(
     payload: TNPayload,
-    transactions: Vec<Vec<u8>>,
+    transactions: &Vec<Vec<u8>>,
     executed_blocks: &mut Vec<ExecutedBlockWithTrieUpdates>,
     reth_env: &RethEnv,
     canonical_in_memory_state: &CanonicalInMemoryState,

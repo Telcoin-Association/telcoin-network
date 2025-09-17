@@ -57,10 +57,24 @@ The default "empty" bytes is used otherwise.
 
 #### difficulty
 
-The worker id and the batch index (relative to the subdag).
+The batch index occupies the lower 16 bits, and the upper bits store the worker's id.
+Basefees are uniform across all workers with the same id.
+
+```rust
+U256::from(payload.batch_index << 16 | payload.worker_id as usize)
+```
 
 #### parent_beacon_block_root
 
 The digest of the `ConsensusHeader` that committed the transactions being executed.
 
 See `evm/block.rs` for block execution details.
+
+#### ommers_hash
+
+The digest of the `Batch` that was executed to produce the EVM block.
+If the `ConsensusOutput` contains no batches, `B256::ZERO` is used instead.
+
+#### requests_hash
+
+Currently set to the default `EMPTY_REQUESTS_HASH`.

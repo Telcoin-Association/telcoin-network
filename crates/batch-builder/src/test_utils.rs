@@ -25,7 +25,7 @@ pub fn execute_test_batch(test_batch: &mut Batch, parent: &SealedHeader) {
 
     let batch_config = PendingBatchConfig::new(test_batch.beneficiary, parent_info);
     let args = BatchBuilderArgs { pool, batch_config };
-    let BatchBuilderOutput { batch, .. } = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+    let BatchBuilderOutput { batch, .. } = build_batch(args, 0, test_batch.base_fee_per_gas);
     test_batch.parent_hash = batch.parent_hash;
     test_batch.beneficiary = batch.beneficiary;
     test_batch.timestamp = batch.timestamp;

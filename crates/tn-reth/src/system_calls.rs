@@ -180,6 +180,10 @@ sol!(
         /// Activate node for committee selection.
         /// Normally called by staker after node is synced.
         function activate() external override whenNotPaused;
+
+        #[cfg(any(feature = "test-utils", test))]
+        /// Retrieve the claimable rewards accrued for a given validator address.
+        function getRewards(address validatorAddress) public view virtual returns (uint256);
     }
 
 );
