@@ -5,7 +5,8 @@ use std::num::NonZeroUsize;
 use tn_config::{Config, ConsensusConfig, KeyConfig, NetworkConfig};
 use tn_types::{
     Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, Certificate, Committee,
-    Database, Hash as _, Header, HeaderBuilder, NetworkKeypair, NetworkPublicKey, Round, Vote,
+    Database, Genesis, Hash as _, Header, HeaderBuilder, NetworkKeypair, NetworkPublicKey, Round,
+    Vote,
 };
 
 /// Fixture representing an validator node within the network.
@@ -104,7 +105,7 @@ impl<DB: Database> AuthorityFixture<DB> {
         db: DB,
         worker: WorkerFixture,
         network_config: NetworkConfig,
-        mut config: Config,
+        genesis: Genesis,
     ) -> Self {
         let (primary_keypair, key_config) = keys;
         // Make sure our keys are correct.
@@ -113,6 +114,7 @@ impl<DB: Database> AuthorityFixture<DB> {
         // Currently only support one worker per node.
         // If/when this is relaxed then the key_config below will need to change.
         assert_eq!(number_of_workers.get(), 1);
+        let mut config = Config::default_for_test_with_genesis(genesis);
         // These key updates don't return errors...
         let _ = config.update_protocol_key(key_config.primary_public_key());
         let _ = config.update_primary_network_key(key_config.primary_network_public_key());
