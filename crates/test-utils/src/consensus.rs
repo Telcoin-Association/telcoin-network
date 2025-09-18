@@ -7,8 +7,8 @@ use std::{
     ops::RangeInclusive,
 };
 use tn_types::{
-    now, AuthorityIdentifier, Batch, BlockHash, Certificate, CertificateDigest, Database,
-    Hash as _, HeaderBuilder, Round, TimestampSec, WorkerId,
+    now, test_chain_spec_arc, AuthorityIdentifier, Batch, BlockHash, Certificate,
+    CertificateDigest, Database, Hash as _, HeaderBuilder, Round, TimestampSec, WorkerId,
 };
 
 /// Create a random number of batches with signed transactions.
@@ -20,8 +20,9 @@ fn random_batches(
         IndexMap::with_capacity(number_of_batches);
     let mut batches = HashMap::with_capacity(number_of_batches);
 
+    let chain = test_chain_spec_arc();
     for _ in 0..number_of_batches {
-        let batch = tn_reth::test_utils::batch();
+        let batch = tn_reth::test_utils::batch(chain.clone());
         let batch_digest = batch.digest();
 
         payload.insert(batch_digest, (0, 0));

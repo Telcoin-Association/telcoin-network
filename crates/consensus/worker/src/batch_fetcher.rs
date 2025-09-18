@@ -169,7 +169,7 @@ mod tests {
     use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
     use tn_reth::test_utils::transaction;
     use tn_storage::open_db;
-    use tn_types::{BlsKeypair, BlsPublicKey, TaskManager};
+    use tn_types::{test_chain_spec_arc, BlsKeypair, BlsPublicKey, TaskManager};
     use tokio::sync::{mpsc, Mutex};
 
     #[tokio::test]
@@ -177,8 +177,9 @@ mod tests {
         let mut network = TestRequestBatchesNetwork::new();
         let temp_dir = TempDir::new().unwrap();
         let batch_store = open_db(temp_dir.path());
-        let batch1 = Batch { transactions: vec![transaction()], ..Default::default() };
-        let batch2 = Batch { transactions: vec![transaction()], ..Default::default() };
+        let chain = test_chain_spec_arc();
+        let batch1 = Batch { transactions: vec![transaction(chain.clone())], ..Default::default() };
+        let batch2 = Batch { transactions: vec![transaction(chain)], ..Default::default() };
         let digests = HashSet::from_iter(vec![batch1.digest(), batch2.digest()]);
         network.put(&[1, 2], batch1.clone()).await;
         network.put(&[2, 3], batch2.clone()).await;
@@ -219,9 +220,10 @@ mod tests {
         let mut network = TestRequestBatchesNetwork::new();
         let temp_dir = TempDir::new().unwrap();
         let batch_store = open_db(temp_dir.path());
-        let batch1 = Batch { transactions: vec![transaction()], ..Default::default() };
-        let batch2 = Batch { transactions: vec![transaction()], ..Default::default() };
-        let batch3 = Batch { transactions: vec![transaction()], ..Default::default() };
+        let chain = test_chain_spec_arc();
+        let batch1 = Batch { transactions: vec![transaction(chain.clone())], ..Default::default() };
+        let batch2 = Batch { transactions: vec![transaction(chain.clone())], ..Default::default() };
+        let batch3 = Batch { transactions: vec![transaction(chain)], ..Default::default() };
         let digests = HashSet::from_iter(vec![batch1.digest(), batch2.digest(), batch3.digest()]);
         for batch in &[&batch1, &batch2, &batch3] {
             batch_store.insert::<Batches>(&batch.digest(), batch).unwrap();
@@ -250,9 +252,10 @@ mod tests {
         let mut network = TestRequestBatchesNetwork::new();
         let temp_dir = TempDir::new().unwrap();
         let batch_store = open_db(temp_dir.path());
-        let batch1 = Batch { transactions: vec![transaction()], ..Default::default() };
-        let batch2 = Batch { transactions: vec![transaction()], ..Default::default() };
-        let batch3 = Batch { transactions: vec![transaction()], ..Default::default() };
+        let chain = test_chain_spec_arc();
+        let batch1 = Batch { transactions: vec![transaction(chain.clone())], ..Default::default() };
+        let batch2 = Batch { transactions: vec![transaction(chain.clone())], ..Default::default() };
+        let batch3 = Batch { transactions: vec![transaction(chain)], ..Default::default() };
         let digests = HashSet::from_iter(vec![batch1.digest(), batch2.digest(), batch3.digest()]);
         network.put(&[3, 4], batch1.clone()).await;
         network.put(&[2, 3], batch2.clone()).await;
@@ -287,9 +290,10 @@ mod tests {
         let mut network = TestRequestBatchesNetwork::new();
         let temp_dir = TempDir::new().unwrap();
         let batch_store = open_db(temp_dir.path());
-        let batch1 = Batch { transactions: vec![transaction()], ..Default::default() };
-        let batch2 = Batch { transactions: vec![transaction()], ..Default::default() };
-        let batch3 = Batch { transactions: vec![transaction()], ..Default::default() };
+        let chain = test_chain_spec_arc();
+        let batch1 = Batch { transactions: vec![transaction(chain.clone())], ..Default::default() };
+        let batch2 = Batch { transactions: vec![transaction(chain.clone())], ..Default::default() };
+        let batch3 = Batch { transactions: vec![transaction(chain)], ..Default::default() };
         let digests = HashSet::from_iter(vec![batch1.digest(), batch2.digest(), batch3.digest()]);
         batch_store.insert::<Batches>(&batch1.digest(), &batch1).unwrap();
         network.put(&[1, 2, 3], batch1.clone()).await;
@@ -333,8 +337,10 @@ mod tests {
         let mut expected_batches = Vec::new();
         let mut local_digests = Vec::new();
         // 6 batches available locally with response size limit of 2
+        let chain = test_chain_spec_arc();
         for _i in 0..num_digests / 2 {
-            let batch = Batch { transactions: vec![transaction()], ..Default::default() };
+            let batch =
+                Batch { transactions: vec![transaction(chain.clone())], ..Default::default() };
             local_digests.push(batch.digest());
             batch_store.insert::<Batches>(&batch.digest(), &batch).unwrap();
             network.put(&[1, 2, 3], batch.clone()).await;
@@ -342,7 +348,8 @@ mod tests {
         }
         // 6 batches available remotely with response size limit of 2
         for _i in (num_digests / 2)..num_digests {
-            let batch = Batch { transactions: vec![transaction()], ..Default::default() };
+            let batch =
+                Batch { transactions: vec![transaction(chain.clone())], ..Default::default() };
             network.put(&[1, 2, 3], batch.clone()).await;
             expected_batches.push(batch);
         }
