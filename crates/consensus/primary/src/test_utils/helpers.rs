@@ -9,13 +9,18 @@ use rand::{
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     ops::RangeInclusive,
+    sync::Arc,
 };
 use tempfile::TempDir;
-use tn_reth::test_utils::{batch, TransactionFactory};
+use tn_reth::{
+    test_utils::{batch, TransactionFactory},
+    RethChainSpec,
+};
 use tn_types::{
-    test_chain_spec_arc, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash,
-    BlsKeypair, BlsSignature, Bytes, Certificate, CertificateDigest, Committee, Epoch, ExecHeader,
-    Hash as _, HeaderBuilder, ProtocolSignature, Round, TimestampSec, VotingPower, WorkerId, U256,
+    test_chain_spec_arc, test_genesis, to_intent_message, Address, AuthorityIdentifier, Batch,
+    BlockHash, BlsKeypair, BlsSignature, Bytes, Certificate, CertificateDigest, Committee, Epoch,
+    ExecHeader, Hash as _, HeaderBuilder, ProtocolSignature, Round, TimestampSec, VotingPower,
+    WorkerId, U256,
 };
 
 pub fn temp_dir() -> TempDir {
@@ -36,8 +41,9 @@ pub fn random_key() -> BlsKeypair {
 pub fn fixture_payload(number_of_batches: u8) -> IndexMap<BlockHash, (WorkerId, TimestampSec)> {
     let mut payload: IndexMap<BlockHash, (WorkerId, TimestampSec)> = IndexMap::new();
 
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
     for _ in 0..number_of_batches {
-        let batch_digest = batch().digest();
+        let batch_digest = batch(chain.clone()).digest();
 
         payload.insert(batch_digest, (0, 0));
     }

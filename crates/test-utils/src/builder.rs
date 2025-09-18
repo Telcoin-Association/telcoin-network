@@ -9,7 +9,7 @@ use std::{
     marker::PhantomData,
     num::NonZeroUsize,
 };
-use tn_config::{KeyConfig, NetworkConfig};
+use tn_config::{Config, KeyConfig, NetworkConfig};
 use tn_types::{
     get_available_udp_port, Address, Authority, AuthorityIdentifier, BlsKeypair, BootstrapServer,
     Committee, Database, Epoch, Multiaddr, TimestampSec, VotingPower, DEFAULT_WORKER_PORT,
@@ -174,6 +174,7 @@ where
             0,
             bootstrap_servers,
         );
+        let config = Config::default_for_test();
         // All the authorities use the same worker cache.
         let authorities: BTreeMap<AuthorityIdentifier, AuthorityFixture<DB>> = committee_info
             .into_iter()
@@ -188,6 +189,7 @@ where
                         (self.new_db)(),
                         worker,
                         network_config,
+                        config.clone(),
                     ),
                 )
             })

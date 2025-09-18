@@ -42,6 +42,9 @@ pub use alloy::eips::{
 };
 pub use reth_primitives_traits::proofs::calculate_withdrawals_root;
 
+/// Typedef for a complex type to make clippy happy (and be a bit more readable?).
+pub type TNEvmTestType = TNEvm<State<StateProviderDatabase<Box<dyn StateProvider>>>>;
+
 // methods for tests
 impl RethEnv {
     /// Create a new RethEnv for testing only.
@@ -64,10 +67,7 @@ impl RethEnv {
     }
 
     /// Create an EVM-environment from state provider.
-    pub fn tn_evm(
-        &self,
-        hash: BlockHash,
-    ) -> eyre::Result<TNEvm<State<StateProviderDatabase<Box<dyn StateProvider>>>>> {
+    pub fn tn_evm(&self, hash: BlockHash) -> eyre::Result<TNEvmTestType> {
         let header = self.header(hash)?.expect("provided hash in header table");
         let state = self.state_by_block_hash(hash)?;
         let db = State::builder()
@@ -465,9 +465,8 @@ pub fn get_gas_price(reth_env: &RethEnv) -> u128 {
 }
 
 /// Create a random encoded transaction.
-pub fn transaction() -> Vec<u8> {
+pub fn transaction(chain: Arc<RethChainSpec>) -> Vec<u8> {
     let mut tx_factory = TransactionFactory::new_random();
-    let chain = Arc::new(test_genesis().into());
     let gas_price = 100_000;
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
 
@@ -485,36 +484,41 @@ pub fn transaction() -> Vec<u8> {
 /// will create a batch with randomly formed transactions
 /// dictated by the parameter number_of_transactions
 pub fn fixture_batch_with_transactions(number_of_transactions: u32) -> Batch {
-    let transactions = (0..number_of_transactions).map(|_v| transaction()).collect();
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    let transactions = (0..number_of_transactions).map(|_v| transaction(chain.clone())).collect();
 
     // Put some random bytes in the header so that tests will have unique headers.
     Batch { transactions, beneficiary: Address::random(), ..Default::default() }
 }
 
 /// Create a batch with two random, valid transactions. The rest of the [Batch] uses defaults.
-pub fn batch() -> Batch {
-    let transactions = vec![transaction(), transaction()];
+pub fn batch(chain: Arc<RethChainSpec>) -> Batch {
+    let transactions = vec![transaction(chain.clone()), transaction(chain)];
     Batch { transactions, ..Default::default() }
 }
 
 /// generate multiple fixture batches. The number of generated batches
 /// are dictated by the parameter num_of_batches.
-pub fn batches(num_of_batches: usize) -> Vec<Batch> {
+pub fn batches(chain: Arc<RethChainSpec>, num_of_batches: usize) -> Vec<Batch> {
     let mut batches = Vec::new();
 
     for i in 1..num_of_batches + 1 {
-        batches.push(batch_with_transactions(i, 0));
+        batches.push(batch_with_transactions(chain.clone(), i, 0));
     }
 
     batches
 }
 
 /// Create a batch with the specified number of transactions.
-pub fn batch_with_transactions(num_of_transactions: usize, worker_id: WorkerId) -> Batch {
+pub fn batch_with_transactions(
+    chain: Arc<RethChainSpec>,
+    num_of_transactions: usize,
+    worker_id: WorkerId,
+) -> Batch {
     let mut transactions = Vec::new();
 
     for _ in 0..num_of_transactions {
-        transactions.push(transaction());
+        transactions.push(transaction(chain.clone()));
     }
 
     Batch::new_for_test(transactions, ExecHeader::default(), worker_id)

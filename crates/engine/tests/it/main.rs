@@ -386,8 +386,9 @@ async fn test_empty_output_executes_late_finalize() -> eyre::Result<()> {
 async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> eyre::Result<()> {
     let tmp_dir = TempDir::new().expect("temp dir");
     // create batches for consensus output
-    let mut batches_1 = tn_reth::test_utils::batches(4); // create 4 batches
-    let mut batches_2 = tn_reth::test_utils::batches(4); // create 4 batches
+    let chain = test_chain_spec_arc();
+    let mut batches_1 = tn_reth::test_utils::batches(chain.clone(), 4); // create 4 batches
+    let mut batches_2 = tn_reth::test_utils::batches(chain, 4); // create 4 batches
 
     // add eip1559 transactions to set max priority fee per gas so batch producer earns fees
     let genesis = test_genesis();
@@ -834,8 +835,9 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
 async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<()> {
     let tmp_dir = TempDir::new().unwrap();
     // create batches for consensus output
-    let mut batches_1 = tn_reth::test_utils::batches(4); // create 4 batches
-    let mut batches_2 = tn_reth::test_utils::batches(4); // create 4 batches
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    let mut batches_1 = tn_reth::test_utils::batches(chain.clone(), 4); // create 4 batches
+    let mut batches_2 = tn_reth::test_utils::batches(chain, 4); // create 4 batches
 
     // add eip1559 transactions to set max priority fee per gas so batch producer earns fees
     let genesis = test_genesis();
@@ -1337,8 +1339,9 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
 async fn test_max_round_terminates_early() -> eyre::Result<()> {
     let tmp_dir = TempDir::new().unwrap();
     // create batches for consensus output
-    let mut batches_1 = tn_reth::test_utils::batches(4); // create 4 batches
-    let mut batches_2 = tn_reth::test_utils::batches(4); // create 4 batches
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    let mut batches_1 = tn_reth::test_utils::batches(chain.clone(), 4); // create 4 batches
+    let mut batches_2 = tn_reth::test_utils::batches(chain, 4); // create 4 batches
 
     // okay to clone these because they are only used to seed genesis, decode transactions, and
     // recover signers
