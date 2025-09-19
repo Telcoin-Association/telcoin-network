@@ -6,7 +6,7 @@ use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
 use tn_reth::test_utils::batch;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::TaskManager;
+use tn_types::{test_chain_spec_arc, TaskManager};
 use tokio::sync::mpsc;
 
 #[tokio::test]
@@ -31,7 +31,8 @@ async fn wait_for_quorum() {
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network, node_metrics);
 
     // Make a batch.
-    let sealed_batch = batch().seal_slow();
+    let chain = test_chain_spec_arc();
+    let sealed_batch = batch(chain.clone()).seal_slow();
 
     // Forward the batch along with the handlers to the `QuorumWaiter`.
     let attest_handle = quorum_waiter.verify_batch(
@@ -58,7 +59,7 @@ async fn wait_for_quorum() {
     assert!(attest_handle.await.unwrap().is_ok());
 
     // Send a second batch.
-    let sealed_batch2 = batch().seal_slow();
+    let sealed_batch2 = batch(chain).seal_slow();
 
     // Forward the batch along with the handlers to the `QuorumWaiter`.
     let attest2_handle = quorum_waiter.verify_batch(

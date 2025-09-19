@@ -45,11 +45,16 @@ impl ConfigTrait for Config {}
 impl Config {
     /// Create a Config for testing.
     pub fn default_for_test() -> Self {
+        Self::default_for_test_with_genesis(test_genesis())
+    }
+
+    /// Create a Config for testing.
+    pub fn default_for_test_with_genesis(genesis: Genesis) -> Self {
         Self {
             // defaults
             node_info: Default::default(),
             parameters: Default::default(),
-            genesis: test_genesis(),
+            genesis,
             observer: false,
             version: "UNKNOWN",
         }
