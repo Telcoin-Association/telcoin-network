@@ -35,11 +35,10 @@ use tn_reth::{
 use tn_storage::{
     open_db,
     tables::{
-        CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
-        ConsensusBlockNumbersByDigest, ConsensusBlocks, EpochCerts, EpochRecords, LastProposed,
-        Payload, Votes,
+        CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusBlocks,
+        EpochCerts, EpochRecords, LastProposed, Payload, Votes,
     },
-    DatabaseType, EpochStore as _,
+    ConsensusStore, DatabaseType, EpochStore as _,
 };
 use tn_types::{
     error::HeaderError, gas_accumulator::GasAccumulator, BatchValidation, BlsAggregateSignature,
@@ -148,11 +147,12 @@ pub fn catchup_accumulator<DB: TNDatabase>(
                 // this is a new round, increment the leader count
                 let consensus_digest =
                     current.parent_beacon_block_root.ok_or_eyre("consensus root missing")?;
-                let consensus_block_num = db
-                    .get::<ConsensusBlockNumbersByDigest>(&consensus_digest)?
-                    .ok_or_eyre("consensus block number by digest missing")?;
+                /*XXXXlet consensus_block_num = db
+                .get::<ConsensusBlockNumbersByDigest>(&consensus_digest)?
+                .ok_or_eyre("consensus block number by digest missing")?;*/
                 let leader = db
-                    .get::<ConsensusBlocks>(&consensus_block_num)?
+                    .get_consensus_by_hash(consensus_digest)
+                    //.get::<ConsensusBlocks>(&consensus_block_num)?
                     .ok_or_eyre("missing consensus block")?
                     .sub_dag
                     .leader
@@ -1357,9 +1357,8 @@ where
         // prime the last consensus header from the DB
         let (_, last_db_block) = self
             .consensus_db
-            .last_record::<ConsensusBlocks>() //XXXX- will last still work?
+            .last_record::<ConsensusBlocks>()
             .unwrap_or_else(|| (0, ConsensusHeader::default()));
-
         // prime the watch channel with data from the db this will be updated by state-sync if this
         // node can_cvv
         self.consensus_bus.last_consensus_header().send(last_db_block)?;
@@ -1376,21 +1375,24 @@ where
     async fn identify_node_mode(
         &self,
         consensus_config: &ConsensusConfig<DB>,
-        primary_network_handle: &PrimaryNetworkHandle,
+        _primary_network_handle: &PrimaryNetworkHandle, // XXXX
     ) -> eyre::Result<NodeMode> {
         debug!(target: "epoch-manager", authority_id=?consensus_config.authority_id(), "identifying node mode..." );
         let in_committee = consensus_config
             .authority_id()
             .map(|id| consensus_config.in_committee(&id))
             .unwrap_or(false);
+        state_sync::prime_consensus(&self.consensus_bus, consensus_config).await; // XXXX confirm we need this.
         let mode = if !in_committee || self.builder.tn_config.observer {
             NodeMode::Observer
-        } else if state_sync::can_cvv(&self.consensus_bus, consensus_config, primary_network_handle)
-            .await
-        {
-            NodeMode::CvvActive
+            /*XXXX } else if state_sync::can_cvv(&self.consensus_bus, consensus_config, primary_network_handle)
+                .await
+            {
+                NodeMode::CvvActive*/
         } else {
-            NodeMode::CvvInactive
+            //XXXXNodeMode::CvvInactive
+            // Assume we are caught up, will be demoted to inactive if this is not true...
+            NodeMode::CvvActive
         };
 
         debug!(target: "epoch-manager", ?mode, "node mode identified");

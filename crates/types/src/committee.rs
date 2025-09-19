@@ -8,7 +8,7 @@ use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IndexedRandom as _, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     fmt::{Display, Formatter},
     num::NonZeroU64,
     sync::Arc,
@@ -442,7 +442,6 @@ impl Committee {
 
     /// Returns the bls keys of all members except `myself`.
     pub fn others_keys_except(&self, myself: &BlsPublicKey) -> Vec<BlsPublicKey> {
-        // XXXX- OK as is?
         self.inner
             .read()
             .authorities
@@ -455,12 +454,6 @@ impl Committee {
                 }
             })
             .collect()
-    }
-
-    /// Return the Set of BlsPublicKey's for the current committee.
-    pub fn committee_keys(&self) -> HashSet<BlsPublicKey> {
-        // XXXX- unused
-        self.inner.read().authorities.keys().copied().collect()
     }
 
     /// Return the bootstrap record for key if it exists.

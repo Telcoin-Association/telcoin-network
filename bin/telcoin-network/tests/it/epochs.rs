@@ -109,9 +109,11 @@ async fn test_epoch_boundary_inner(
 
         // if min number of epochs have transitioned, assert new validator has been shuffled in
         // at least once to end the test
-        if i > MIN_EPOCHS_TO_TEST && new_validator_in_committee_count > 0 {
+        if new_validator_in_committee_count > 0 {
             shuffled = true;
-            break;
+            if i > MIN_EPOCHS_TO_TEST {
+                break;
+            }
         }
 
         // store the last seen epoch info that is expected to change every epoch

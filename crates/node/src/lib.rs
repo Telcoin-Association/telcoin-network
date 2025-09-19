@@ -8,10 +8,7 @@ use manager::EpochManager;
 use tn_config::TelcoinDirs;
 use tn_primary::ConsensusBus;
 use tn_rpc::EngineToPrimary;
-use tn_storage::{
-    tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
-    EpochStore,
-};
+use tn_storage::{ConsensusStore, EpochStore};
 use tn_types::{BlockHash, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord};
 use tokio::runtime::Builder;
 use tracing::{instrument, warn};
@@ -85,12 +82,11 @@ impl<DB: Database> EngineToPrimary for EngineToPrimaryRpc<DB> {
     }
 
     fn consensus_block_by_number(&self, number: u64) -> Option<ConsensusHeader> {
-        self.db.get::<ConsensusBlocks>(&number).ok().flatten()
+        self.db.get_consensus_by_number(number)
     }
 
     fn consensus_block_by_hash(&self, hash: BlockHash) -> Option<ConsensusHeader> {
-        let number = self.db.get::<ConsensusBlockNumbersByDigest>(&hash).ok().flatten()?;
-        self.db.get::<ConsensusBlocks>(&number).ok().flatten()
+        self.db.get_consensus_by_hash(hash)
     }
 
     fn epoch(

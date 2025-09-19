@@ -2,31 +2,12 @@
 
 use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
-use tn_storage::tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks};
-//use tn_storage::EpochStore;
+use tn_storage::{
+    tables::{ConsensusBlockNumbersByDigest, ConsensusBlocksCache},
+    ConsensusStore,
+};
 use tn_types::{Database as TNDatabase, DbTxMut as _, B256};
 use tracing::{debug, error};
-
-/* XXXX
-/// Spawn a long running task to collect missing epoc records.
-///
-/// Most likely because a node is syncing.
-pub async fn spawn_consensus_header_collector<DB, P>(
-    db: DB,
-    primary_handle: PrimaryNetworkHandle,
-    datadir: P,
-    consensus_bus: &ConsensusBus,
-    node_task_spawner: TaskSpawner,
-    node_shutdown: Noticer,
-) -> eyre::Result<()>
-where
-    P: TelcoinDirs + Clone + 'static,
-    DB: TNDatabase,
-{
-    let hash = B256::default(); // XXXX
-
-    Ok(())
-}*/
 
 /// Retrieve a consensus header from a peer.
 /// If we are requesting a hash then that hash should
@@ -39,10 +20,8 @@ async fn get_consensus_header<DB: TNDatabase>(
     network: &PrimaryNetworkHandle,
 ) -> Option<B256> {
     let db = config.node_storage();
-    if let Ok(Some(number)) = db.get::<ConsensusBlockNumbersByDigest>(&hash) {
-        if let Ok(Some(block)) = db.get::<ConsensusBlocks>(&number) {
-            return Some(block.parent_hash);
-        }
+    if let Some(block) = db.get_consensus_by_hash(hash) {
+        return Some(block.parent_hash);
     }
     // request consensus from any peer
     if let Ok(header) = network.request_consensus(None, Some(hash)).await {
@@ -50,7 +29,7 @@ async fn get_consensus_header<DB: TNDatabase>(
         let parent = header.parent_hash;
         match db.write_txn() {
             Ok(mut txn) => {
-                if let Err(e) = txn.insert::<ConsensusBlocks>(&header.number, &header) {
+                if let Err(e) = txn.insert::<ConsensusBlocksCache>(&header.number, &header) {
                     error!(target: "state-sync", ?e, "error saving a consensus header to persistant storage!");
                 }
                 if let Err(e) =
@@ -67,8 +46,8 @@ async fn get_consensus_header<DB: TNDatabase>(
             }
         }
         if header.number > consensus_bus.last_consensus_header().borrow().number {
+            //XXXX - Update our last seen valid consensus header if it is newer.
             let _ = consensus_bus.last_consensus_header().send(header);
-            //XXXX
         }
         Some(parent)
     } else {

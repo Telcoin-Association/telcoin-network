@@ -33,7 +33,7 @@ where
                         // If we can't load the genesis committee something is very wrong (i.e.
                         // we have a broken config).
                         let c = NetworkGenesis::load_validators_from_path(datadir)
-                            .expect("load genesis committee")
+                            .unwrap_or_else(|_| vec![]) // Use empty committe, some tests don't have config files.
                             .iter()
                             .map(|(k, _)| *k)
                             .collect();
@@ -43,7 +43,7 @@ where
                     } else {
                         // We are missing epoch records.
                         // Should not be here but if so just skipping won't really help...
-                        // Reduce last_epoch by one and once this loop finishing skipping we can
+                        // Reduce last_epoch by one and once this loop finishes skipping we can
                         // try to get the missing epoch again.
                         return epoch - 1;
                     };

@@ -24,7 +24,7 @@ impl<DB: Database> EpochStore for DB {
             // Try the exact epoch first for freshest committee (only would matter in rare cases of
             // a validator being removed).
             Some(epoch.committee)
-        } else if let Ok(Some(epoch)) = self.get::<EpochRecords>(&(epoch - 1)) {
+        } else if let Ok(Some(epoch)) = self.get::<EpochRecords>(&(epoch.saturating_sub(1))) {
             // If we don't have that epoch then try the previous and use it's next.
             // When using the latest epoch this could be triggered.
             Some(epoch.next_committee)

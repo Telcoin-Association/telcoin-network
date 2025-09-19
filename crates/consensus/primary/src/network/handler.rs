@@ -8,7 +8,7 @@ use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
     network::message::PrimaryGossip,
     state_sync::{CertificateCollector, StateSynchronizer},
-    ConsensusBus,
+    ConsensusBus, NodeMode,
 };
 use parking_lot::Mutex;
 use std::{
@@ -20,7 +20,7 @@ use tn_config::ConsensusConfig;
 use tn_network_libp2p::GossipMessage;
 use tn_storage::{
     tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
-    EpochStore, VoteDigestStore,
+    ConsensusStore, EpochStore, VoteDigestStore,
 };
 use tn_types::{
     ensure,
@@ -125,6 +125,16 @@ where
                     let sigs = consensus_certs.get(&hash).copied();
                     if let Some(sigs) = sigs {
                         if (sigs + 1) as usize >= enough_sigs {
+                            if matches!(
+                                *self.consensus_bus.node_mode().borrow(),
+                                NodeMode::CvvActive
+                            ) && old_number + 3 < number
+                            {
+                                // We seem to be too far behind to be an active CVV, try to go
+                                // inactive to catch up.
+                                let _ = self.consensus_bus.node_mode().send(NodeMode::CvvInactive);
+                                self.consensus_config.shutdown().notify();
+                            }
                             // Make sure we don't get old gossip and go backwards.
                             if number > old_number {
                                 // Only send this when we are sure it is valid.
@@ -571,7 +581,7 @@ where
 
     /// Retrieve the consensus header by number.
     fn get_header_by_number(&self, number: u64) -> PrimaryNetworkResult<ConsensusHeader> {
-        match self.consensus_config.node_storage().get::<ConsensusBlocks>(&number)? {
+        match self.consensus_config.node_storage().get_consensus_by_number(number) {
             Some(header) => Ok(header),
             None => Err(PrimaryNetworkError::UnknownConsensusHeaderNumber(number)),
         }

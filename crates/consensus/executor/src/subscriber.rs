@@ -162,7 +162,7 @@ impl<DB: Database> Subscriber<DB> {
 
     /// Catch up to current consensus and then try to rejoin as an active CVV.
     async fn catch_up_rejoin_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
-        // Get a receiver than stream any missing headers so we don't miss them.
+        // Get a receiver and then stream any missing headers so we don't miss them.
         let mut rx_consensus_headers = self.consensus_bus.consensus_header().subscribe();
         stream_missing_consensus(&self.config, &self.consensus_bus).await?;
         spawn_state_sync(

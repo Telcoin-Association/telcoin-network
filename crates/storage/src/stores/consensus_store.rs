@@ -1,9 +1,11 @@
 //! NOTE: tests for this module are in test-utils storage_tests.rs to avoid circular dependancies.
 
-use crate::tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks};
+// XXXX- fix docs
+use crate::tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache};
 use std::{cmp::max, collections::HashMap};
 use tn_types::{
-    AuthorityIdentifier, CommittedSubDag, ConsensusHeader, Database, DbTxMut, Epoch, Round,
+    AuthorityIdentifier, BlockHash, CommittedSubDag, ConsensusHeader, Database, DbTxMut, Epoch,
+    Round,
 };
 use tracing::debug;
 
@@ -36,6 +38,12 @@ pub trait ConsensusStore: Clone {
         &self,
         epoch: Epoch,
     ) -> Option<CommittedSubDag>;
+
+    /// Get a ConsensusHeader by hash.
+    fn get_consensus_by_hash(&self, hash: BlockHash) -> Option<ConsensusHeader>;
+
+    /// Get a ConsensusHeader by number.
+    fn get_consensus_by_number(&self, number: u64) -> Option<ConsensusHeader>;
 }
 
 impl<DB: Database> ConsensusStore for DB {
@@ -109,6 +117,30 @@ impl<DB: Database> ConsensusStore for DB {
         }
         debug!("No final reputation scores have been found");
         None
+    }
+
+    fn get_consensus_by_hash(&self, hash: BlockHash) -> Option<ConsensusHeader> {
+        if let Ok(Some(number)) = self.get::<ConsensusBlockNumbersByDigest>(&hash) {
+            if let Ok(Some(block)) = self.get::<ConsensusBlocks>(&number) {
+                Some(block)
+            } else if let Ok(Some(block)) = self.get::<ConsensusBlocksCache>(&number) {
+                Some(block)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    fn get_consensus_by_number(&self, number: u64) -> Option<ConsensusHeader> {
+        if let Ok(Some(block)) = self.get::<ConsensusBlocks>(&number) {
+            Some(block)
+        } else if let Ok(Some(block)) = self.get::<ConsensusBlocksCache>(&number) {
+            Some(block)
+        } else {
+            None
+        }
     }
 }
 

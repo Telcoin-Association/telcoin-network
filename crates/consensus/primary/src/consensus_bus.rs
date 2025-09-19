@@ -512,7 +512,8 @@ impl ConsensusBus {
         &self.inner_app.tx_recent_blocks
     }
 
-    /// Track the latest consensus header.
+    /// Track the latest consensus header we have seen.
+    /// Note, this should be a valid header (authenticated by it's epoch's committee).
     pub fn last_consensus_header(&self) -> &watch::Sender<ConsensusHeader> {
         &self.inner_app.tx_last_consensus_header
     }
