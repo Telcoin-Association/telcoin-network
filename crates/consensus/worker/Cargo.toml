@@ -33,8 +33,10 @@ tn-batch-validator = { workspace = true, features = ["test-utils"] }
 rand = { workspace = true }
 tempfile = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
+tn-types = { workspace = true, features = ["test-utils"] }
 tn-test-utils = { workspace = true }
 tn-worker = { workspace = true, features = ["test-utils"] }
+assert_matches = { workspace = true }
 
 [features]
 default = []

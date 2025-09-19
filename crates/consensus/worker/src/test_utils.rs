@@ -7,6 +7,8 @@ use std::{
 };
 use tn_types::{SealedBatch, TaskSpawner};
 use tokio::sync::oneshot;
+// quorum waiter tests
+pub use crate::network::message::WorkerRPCError;
 
 #[derive(Clone, Debug)]
 pub struct TestMakeBlockQuorumWaiter(pub Arc<Mutex<Option<SealedBatch>>>);

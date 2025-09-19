@@ -12047,6 +12047,7 @@ dependencies = [
 name = "tn-worker"
 version = "0.1.0"
 dependencies = [
+ "assert_matches",
  "async-trait",
  "consensus-metrics",
  "eyre",

@@ -1,11 +1,13 @@
 //! Unit tests for the worker's batch provider.
-use super::*;
-use crate::test_utils::TestMakeBlockQuorumWaiter;
+use std::{sync::Arc, time::Duration};
 use tempfile::TempDir;
-use tn_network_types::MockWorkerToPrimary;
+use tn_network_types::{local::LocalNetwork, MockWorkerToPrimary};
 use tn_reth::test_utils::transaction;
-use tn_storage::open_db;
-use tn_types::{test_chain_spec_arc, Batch};
+use tn_storage::{open_db, tables::Batches};
+use tn_types::{test_chain_spec_arc, Batch, Database, TaskManager};
+use tn_worker::{
+    metrics::WorkerMetrics, test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle,
+};
 
 #[tokio::test]
 async fn make_batch() {
