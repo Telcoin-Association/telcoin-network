@@ -6,7 +6,7 @@ use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
 use tn_reth::test_utils::batch;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::TaskManager;
+use tn_types::{test_chain_spec_arc, TaskManager};
 use tn_worker::{
     metrics::WorkerMetrics,
     quorum_waiter::{QuorumWaiter, QuorumWaiterError, QuorumWaiterTrait as _},
@@ -37,7 +37,8 @@ async fn test_wait_for_quorum_happy_path() {
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network, node_metrics);
 
     // Make a batch.
-    let sealed_batch = batch().seal_slow();
+    let chain = test_chain_spec_arc();
+    let sealed_batch = batch(chain).seal_slow();
 
     // Forward the batch along with the handlers to the `QuorumWaiter`.
     let attest_handle = quorum_waiter.verify_batch(
@@ -87,7 +88,8 @@ async fn test_batch_rejected_timeout() {
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network, node_metrics);
 
     // Make a batch.
-    let sealed_batch = batch().seal_slow();
+    let chain = test_chain_spec_arc();
+    let sealed_batch = batch(chain).seal_slow();
 
     // Forward the batch along with the handlers to the `QuorumWaiter`.
     let timeout = Duration::from_millis(150);
@@ -140,7 +142,8 @@ async fn test_batch_some_rejected_stake_still_passes() {
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network, node_metrics);
 
     // Make a batch.
-    let sealed_batch = batch().seal_slow();
+    let chain = test_chain_spec_arc();
+    let sealed_batch = batch(chain).seal_slow();
 
     // Forward the batch along with the handlers to the `QuorumWaiter`.
     let timeout = Duration::from_secs(10);
@@ -209,7 +212,8 @@ async fn test_batch_rejected_quorum() {
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network, node_metrics);
 
     // Make a batch.
-    let sealed_batch = batch().seal_slow();
+    let chain = test_chain_spec_arc();
+    let sealed_batch = batch(chain).seal_slow();
 
     // Forward the batch along with the handlers to the `QuorumWaiter`.
     let timeout = Duration::from_secs(10);
@@ -239,6 +243,11 @@ async fn test_batch_rejected_quorum() {
     assert_matches!(attest_handle.await.unwrap(), Err(QuorumWaiterError::QuorumRejected));
 }
 
+// test code
+// - threshold
+// - timeout
+// - num_messages to send
+
 #[tokio::test]
 async fn test_batch_rejected_antiquorum() {
     let fixture = CommitteeFixture::builder(MemDatabase::default)
@@ -264,7 +273,8 @@ async fn test_batch_rejected_antiquorum() {
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network, node_metrics);
 
     // Make a batch.
-    let sealed_batch = batch().seal_slow();
+    let chain = test_chain_spec_arc();
+    let sealed_batch = batch(chain).seal_slow();
 
     // Forward the batch along with the handlers to the `QuorumWaiter`.
     let timeout = Duration::from_secs(10);

@@ -4,7 +4,7 @@ use tempfile::TempDir;
 use tn_network_types::{local::LocalNetwork, MockWorkerToPrimary};
 use tn_reth::test_utils::transaction;
 use tn_storage::{open_db, tables::Batches};
-use tn_types::{Batch, Database, TaskManager};
+use tn_types::{test_chain_spec_arc, Batch, Database, TaskManager};
 use tn_worker::{
     metrics::WorkerMetrics, test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle,
 };
@@ -37,7 +37,8 @@ async fn make_batch() {
     );
 
     // Send enough transactions to seal a batch.
-    let tx = transaction();
+    let chain = test_chain_spec_arc();
+    let tx = transaction(chain);
     let new_batch = Batch { transactions: vec![tx.clone(), tx.clone()], ..Default::default() };
 
     batch_provider.seal(new_batch.clone().seal_slow()).await.unwrap();

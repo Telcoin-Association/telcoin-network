@@ -11,8 +11,9 @@ use std::{
 };
 use tn_config::{KeyConfig, NetworkConfig};
 use tn_types::{
-    get_available_udp_port, Address, Authority, AuthorityIdentifier, BlsKeypair, BootstrapServer,
-    Committee, Database, Epoch, Multiaddr, TimestampSec, VotingPower, DEFAULT_WORKER_PORT,
+    get_available_udp_port, test_genesis, Address, Authority, AuthorityIdentifier, BlsKeypair,
+    BootstrapServer, Committee, Database, Epoch, Multiaddr, TimestampSec, VotingPower,
+    DEFAULT_WORKER_PORT,
 };
 
 /// The committee builder for tests.
@@ -174,6 +175,7 @@ where
             0,
             bootstrap_servers,
         );
+        let genesis = test_genesis();
         // All the authorities use the same worker cache.
         let authorities: BTreeMap<AuthorityIdentifier, AuthorityFixture<DB>> = committee_info
             .into_iter()
@@ -188,6 +190,7 @@ where
                         (self.new_db)(),
                         worker,
                         network_config,
+                        genesis.clone(),
                     ),
                 )
             })
