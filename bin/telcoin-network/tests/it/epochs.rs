@@ -9,6 +9,7 @@ use alloy::{
 use clap::Parser as _;
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
+    panic,
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::Arc,
@@ -142,6 +143,16 @@ async fn test_epoch_boundary_inner(
     }
 }
 
+fn kill_procs(procs: &Vec<Arc<std::sync::Mutex<Child>>>) {
+    // We need to capture the result above and then kill all the procs.
+    for proc in procs.iter() {
+        let _ = proc.lock().unwrap().kill();
+    }
+    for proc in procs {
+        let _ = proc.lock().unwrap().wait();
+    }
+}
+
 #[ignore = "only run independently from all other it tests"]
 #[tokio::test]
 /// Test a new node joining the network and being shuffled into the committee.
@@ -172,16 +183,20 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
 
     // start nodes (committee + new validator)
     committee.push((NEW_VALIDATOR, new_validator.address()));
-    let mut procs = start_nodes(temp_path, &committee)?;
+    let procs = start_nodes(temp_path, &committee)?;
+    let procs: Vec<Arc<std::sync::Mutex<Child>>> =
+        procs.into_iter().map(|c| Arc::new(std::sync::Mutex::new(c))).collect();
+    let procs_clone = procs.clone();
+    // Use a panic hook to make sure we kill the node procs on a panic (assert failure).
+    let org_panic = panic::take_hook();
+    panic::set_hook(Box::new(move |a| {
+        kill_procs(&procs_clone);
+        org_panic(a);
+    }));
+
     let r =
         test_epoch_boundary_inner(genesis, governance_wallet, temp_path, &mut new_validator).await;
-    // We need to capture the result above and then kill all the procs.
-    for proc in procs.iter_mut() {
-        let _ = proc.kill();
-    }
-    for mut proc in procs {
-        let _ = proc.wait();
-    }
+    kill_procs(&procs);
     r
 }
 
