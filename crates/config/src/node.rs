@@ -35,7 +35,7 @@ pub struct Config {
     /// Is this an observer node?
     pub observer: bool,
 
-    /// Refernce to the apps version string.
+    /// Reference to the apps version string.
     #[serde(skip)]
     pub version: &'static str,
 }

@@ -9,9 +9,19 @@ use std::{
 };
 use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, TNMessage};
 use tn_types::{
-    error::HeaderError, AuthorityIdentifier, BlockHash, Certificate, CertificateDigest,
-    ConsensusHeader, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round, Vote,
+    error::HeaderError, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate,
+    CertificateDigest, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, EpochVote, Header,
+    Round, Vote,
 };
+
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConsensusResult {
+    pub epoch: Epoch,
+    pub number: u64,
+    pub hash: BlockHash,
+    pub validator: BlsPublicKey,
+    pub signature: BlsSignature,
+}
 
 /// Primary messages on the gossip network.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -25,7 +35,7 @@ pub enum PrimaryGossip {
     /// NOTE: `snappy` is slightly larger than uncompressed.
     Certificate(Box<Certificate>),
     /// Consensus output reached- publish the consensus chain height and new block hash.
-    Consensus(u64, BlockHash),
+    Consenus(Box<ConsensusResult>),
     /// Signed hash sent out by committee memebers at epoch start.
     EpochVote(Box<EpochVote>),
 }
@@ -212,12 +222,13 @@ impl IntoRpcError<PrimaryNetworkError> for PrimaryResponse {
             | PrimaryNetworkError::Storage(_)
             | PrimaryNetworkError::InvalidRequest(_)
             | PrimaryNetworkError::Internal(_)
-            | PrimaryNetworkError::UnknowConsensusHeaderNumber(_)
-            | PrimaryNetworkError::UnknowConsensusHeaderDigest(_)
-            | PrimaryNetworkError::_PeerNotInCommittee(_)
+            | PrimaryNetworkError::PeerNotInCommittee(_)
             | PrimaryNetworkError::UnavailableEpoch(_)
             | PrimaryNetworkError::UnavailableEpochDigest(_)
             | PrimaryNetworkError::InvalidTopic
+            | PrimaryNetworkError::UnknownConsensusHeaderNumber(_)
+            | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
+            | PrimaryNetworkError::UnknownConsensusHeaderCert(_)
             | PrimaryNetworkError::InvalidEpochRequest => {
                 Self::Error(PrimaryRPCError(error.to_string()))
             }

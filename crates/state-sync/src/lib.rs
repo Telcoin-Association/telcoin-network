@@ -10,11 +10,51 @@ use tn_config::ConsensusConfig;
 use tn_primary::{
     consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, NodeMode,
 };
-use tn_storage::tables::{Batches, ConsensusBlockNumbersByDigest, ConsensusBlocks};
+use tn_storage::{
+    tables::{Batches, ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache},
+    ConsensusStore,
+};
 use tn_types::{
     BlsPublicKey, ConsensusHeader, ConsensusOutput, Database, DbTxMut, TaskSpawner, TnSender,
 };
 use tracing::{debug, error, info};
+
+mod epoch;
+pub use epoch::spawn_epoch_record_collector;
+mod consensus;
+use consensus::spawn_track_recent_consensus;
+
+/// Sets some bus defaults.
+/// Called by can_cvv, so only call if not using can_cvv(). XXXX
+pub async fn prime_consensus<DB: Database>(
+    consensus_bus: &ConsensusBus,
+    config: &ConsensusConfig<DB>,
+) {
+    // Get the DB and load our last executed consensus block (note there may be unexecuted
+    // blocks, catch up will execute them).
+    let last_executed_block =
+        last_executed_consensus_block(consensus_bus, config).unwrap_or_default();
+
+    let current_epoch = config.epoch();
+
+    // check if the latest subdag is from the current epoch
+    // this function is called at startup and at each epoch boundary
+    let last_subdag = &last_executed_block.sub_dag;
+    let (_last_consensus_epoch, last_consensus_round) =
+        if last_subdag.leader_epoch() < current_epoch {
+            // new epoch
+            (current_epoch, 0)
+        } else {
+            // node recovery
+            (last_subdag.leader_epoch(), last_subdag.leader_round())
+        };
+
+    let _ = consensus_bus.update_consensus_rounds(ConsensusRound::new_with_gc_depth(
+        last_consensus_round,
+        config.parameters().gc_depth,
+    ));
+    let _ = consensus_bus.primary_round_updates().send(last_consensus_round);
+}
 
 /// Return true if this node should be able to participate as a CVV, false otherwise.
 ///
@@ -22,6 +62,7 @@ use tracing::{debug, error, info};
 /// enough DAG information to rejoin consensus or not.
 /// This function also sets some of the round watches on the consensus bus to proper defaults on
 /// startup.
+/// XXXX- parts of this need to happen even if it is removed.
 pub async fn can_cvv<DB: Database>(
     consensus_bus: &ConsensusBus,
     config: &ConsensusConfig<DB>,
@@ -159,6 +200,8 @@ pub fn save_consensus<DB: Database>(
                 error!(target: "state-sync", ?e, "error saving a consensus header number to persistant storage!");
                 return Err(e);
             }
+            // In case this was cached remove it.
+            let _ = txn.remove::<ConsensusBlocksCache>(&header.number);
             if let Err(e) = txn.commit() {
                 error!(target: "state-sync", ?e, "error saving committing to persistant storage!");
                 return Err(e);
@@ -186,8 +229,7 @@ pub fn last_executed_consensus_block<DB: Database>(
         .latest_block()
         .header()
         .parent_beacon_block_root
-        .and_then(|hash| db.get::<ConsensusBlockNumbersByDigest>(&hash).ok()?)
-        .and_then(|num| db.get::<ConsensusBlocks>(&num).ok()?);
+        .and_then(|hash| db.get_consensus_by_hash(hash));
 
     debug!(target: "state-sync", ?last, epoch=?config.epoch(), "last executed consensus block");
 
@@ -216,7 +258,7 @@ pub async fn stream_missing_consensus<DB: Database>(
     // forward the stored consensus block to engine for execution
     if last_db_block.number > last_executed_block.number {
         for consensus_block_number in last_executed_block.number + 1..=last_db_block.number {
-            if let Some(consensus_header) = db.get::<ConsensusBlocks>(&consensus_block_number)? {
+            if let Some(consensus_header) = db.get_consensus_by_number(consensus_block_number) {
                 debug!(target: "state-sync", ?consensus_header, "sending missed consensus block through consensus bus");
                 consensus_bus.consensus_header().send(consensus_header).await?;
             }
@@ -250,7 +292,7 @@ pub async fn get_missing_consensus<DB: Database>(
     // forward the stored consensus block to engine for execution
     if last_db_block.number > last_executed_block.number {
         for consensus_block_number in last_executed_block.number + 1..=last_db_block.number {
-            if let Some(consensus_header) = db.get::<ConsensusBlocks>(&consensus_block_number)? {
+            if let Some(consensus_header) = db.get_consensus_by_number(consensus_block_number) {
                 debug!(target: "state-sync", ?consensus_header, "collecting unexecuted consensus header");
                 result.push(consensus_header);
             }
@@ -259,43 +301,6 @@ pub async fn get_missing_consensus<DB: Database>(
 
     debug!(target: "state-sync", ?result, "missing consensus headers that need execution:");
     Ok(result)
-}
-
-/// Spawn a long running task on task_manager that will keep the last_consensus_header watch on
-/// consensus_bus up to date. This should only be used when NOT participating in active consensus.
-async fn spawn_track_recent_consensus<DB: Database>(
-    config: ConsensusConfig<DB>,
-    consensus_bus: ConsensusBus,
-    network: PrimaryNetworkHandle,
-) -> eyre::Result<()> {
-    let rx_shutdown = config.shutdown().subscribe();
-    let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
-    loop {
-        tokio::select! {
-            _ = rx_gossip_update.changed() => {
-                let (number, _hash) = *rx_gossip_update.borrow_and_update();
-                debug!(target: "state-sync", ?number, "tracking recent consensus and detected change through gossip - requesting consensus from peer");
-
-                // request consensus from any peer
-                if let Ok(header) = network.request_consensus(Some(number), None).await {
-                    match header.verify_certificates(config.committee()) {
-                        Ok(header) => {
-                            if header.number > consensus_bus.last_consensus_header().borrow().number {
-                                consensus_bus.last_consensus_header().send(header)?;
-                            }
-                        }
-                        Err(e) => {
-                            error!(target: "state-sync", "recieved a consensus header with invalid certs: {e}");
-                        }
-                    }
-                }
-            }
-
-            _ = &rx_shutdown => {
-                return Ok(())
-            }
-        }
-    }
 }
 
 /// Spawn a long running task on task_manager that will stream consensus headers from the
@@ -409,7 +414,7 @@ fn get_peers<DB: Database>(config: &ConsensusConfig<DB>) -> Vec<BlsPublicKey> {
 /// Queries peers for latest height and downloads and executes any missing consensus output.
 /// Returns the last ConsensusHeader that was applied on success.
 async fn catch_up_consensus_from_to<DB: Database>(
-    network: &PrimaryNetworkHandle,
+    _network: &PrimaryNetworkHandle, // XXXX
     config: &ConsensusConfig<DB>,
     consensus_bus: &ConsensusBus,
     from: ConsensusHeader,
@@ -433,24 +438,11 @@ async fn catch_up_consensus_from_to<DB: Database>(
         // optimization.
         let consensus_header = if number == max_consensus_height {
             max_consensus.clone()
-        } else if let Ok(Some(block)) = db.get::<ConsensusBlocks>(&number) {
+        } else if let Some(block) = db.get_consensus_by_number(number) {
             block
         } else {
-            let mut try_num = 0;
-            loop {
-                if try_num > 3 {
-                    return Err(eyre::eyre!("unable to read a valid consensus header!"));
-                }
-                let header = network.request_consensus(Some(number), None).await?;
-                // Validate all the certificates in this consensus header.
-                match header.verify_certificates(config.committee()) {
-                    Ok(header) => break header,
-                    Err(e) => {
-                        error!(target: "state-sync", "received an invalid consensus header {e:?}");
-                        try_num += 1;
-                    }
-                }
-            }
+            // We should have all the required headers in local storage by now...
+            return Ok(result_header);
         };
         let parent_hash = last_parent;
         last_parent =

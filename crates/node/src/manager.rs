@@ -35,11 +35,10 @@ use tn_reth::{
 use tn_storage::{
     open_db,
     tables::{
-        CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
-        ConsensusBlockNumbersByDigest, ConsensusBlocks, EpochCerts, EpochRecords,
-        EpochRecordsIndex, LastProposed, Payload, Votes,
+        CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusBlocks,
+        EpochCerts, EpochRecords, LastProposed, Payload, Votes,
     },
-    DatabaseType,
+    ConsensusStore, DatabaseType, EpochStore as _,
 };
 use tn_types::{
     error::HeaderError, gas_accumulator::GasAccumulator, BatchValidation, BlsAggregateSignature,
@@ -148,11 +147,12 @@ pub fn catchup_accumulator<DB: TNDatabase>(
                 // this is a new round, increment the leader count
                 let consensus_digest =
                     current.parent_beacon_block_root.ok_or_eyre("consensus root missing")?;
-                let consensus_block_num = db
-                    .get::<ConsensusBlockNumbersByDigest>(&consensus_digest)?
-                    .ok_or_eyre("consensus block number by digest missing")?;
+                /*XXXXlet consensus_block_num = db
+                .get::<ConsensusBlockNumbersByDigest>(&consensus_digest)?
+                .ok_or_eyre("consensus block number by digest missing")?;*/
                 let leader = db
-                    .get::<ConsensusBlocks>(&consensus_block_num)?
+                    .get_consensus_by_hash(consensus_digest)
+                    //.get::<ConsensusBlocks>(&consensus_block_num)?
                     .ok_or_eyre("missing consensus block")?
                     .sub_dag
                     .leader
@@ -185,7 +185,7 @@ pub(crate) fn open_consensus_db<P: TelcoinDirs + 'static>(
 
 impl<P, DB> EpochManager<P, DB>
 where
-    P: TelcoinDirs + 'static,
+    P: TelcoinDirs + Clone + 'static,
     DB: TNDatabase,
 {
     /// Create a new instance of [Self].
@@ -269,6 +269,21 @@ where
             .inner_handle()
             .subscribe(tn_config::LibP2pConfig::epoch_vote_topic())
             .await?;
+        self.primary_network_handle
+            .as_ref()
+            .expect("primary network")
+            .inner_handle()
+            .subscribe(tn_config::LibP2pConfig::consensus_output_topic())
+            .await?;
+        state_sync::spawn_epoch_record_collector(
+            self.consensus_db.clone(),
+            self.primary_network_handle.as_ref().expect("primary network").clone(),
+            self.tn_datadir.clone(),
+            self.consensus_bus.clone(),
+            node_task_manager.get_spawner(),
+            self.node_shutdown.subscribe(),
+        )
+        .await?;
 
         // start consensus metrics for the epoch
         let metrics_shutdown = Notifier::new();
@@ -575,10 +590,8 @@ where
             parent_state,
             parent_consensus: target_hash,
         };
-        let epoch_hash = epoch_rec.digest();
 
-        self.consensus_db.insert::<EpochRecordsIndex>(&epoch_hash, &epoch)?;
-        self.consensus_db.insert::<EpochRecords>(&epoch, &epoch_rec)?;
+        self.consensus_db.save_epoch_record(&epoch_rec);
         self.epoch_record = Some(epoch_rec);
         Ok(())
     }
@@ -1346,7 +1359,6 @@ where
             .consensus_db
             .last_record::<ConsensusBlocks>()
             .unwrap_or_else(|| (0, ConsensusHeader::default()));
-
         // prime the watch channel with data from the db this will be updated by state-sync if this
         // node can_cvv
         self.consensus_bus.last_consensus_header().send(last_db_block)?;
@@ -1363,21 +1375,24 @@ where
     async fn identify_node_mode(
         &self,
         consensus_config: &ConsensusConfig<DB>,
-        primary_network_handle: &PrimaryNetworkHandle,
+        _primary_network_handle: &PrimaryNetworkHandle, // XXXX
     ) -> eyre::Result<NodeMode> {
         debug!(target: "epoch-manager", authority_id=?consensus_config.authority_id(), "identifying node mode..." );
         let in_committee = consensus_config
             .authority_id()
             .map(|id| consensus_config.in_committee(&id))
             .unwrap_or(false);
+        state_sync::prime_consensus(&self.consensus_bus, consensus_config).await; // XXXX confirm we need this.
         let mode = if !in_committee || self.builder.tn_config.observer {
             NodeMode::Observer
-        } else if state_sync::can_cvv(&self.consensus_bus, consensus_config, primary_network_handle)
-            .await
-        {
-            NodeMode::CvvActive
+            /*XXXX } else if state_sync::can_cvv(&self.consensus_bus, consensus_config, primary_network_handle)
+                .await
+            {
+                NodeMode::CvvActive*/
         } else {
-            NodeMode::CvvInactive
+            //XXXXNodeMode::CvvInactive
+            // Assume we are caught up, will be demoted to inactive if this is not true...
+            NodeMode::CvvActive
         };
 
         debug!(target: "epoch-manager", ?mode, "node mode identified");

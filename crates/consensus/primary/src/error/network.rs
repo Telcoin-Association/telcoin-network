@@ -37,14 +37,17 @@ pub(crate) enum PrimaryNetworkError {
     Internal(String),
     /// Unknown consensus header.
     #[error("Unknown consensus header: {0}")]
-    UnknowConsensusHeaderNumber(u64),
+    UnknownConsensusHeaderNumber(u64),
     /// Unknown consensus header.
     #[error("Unknown consensus header: {0}")]
-    UnknowConsensusHeaderDigest(BlockHash),
+    UnknownConsensusHeaderDigest(BlockHash),
+    /// Unknown consensus header certificate.
+    #[error("Unknown consensus header certificate for: {0}")]
+    UnknownConsensusHeaderCert(BlockHash),
     /// Peer that is not committee published invalid gosip.
     /// Temparily disabled, will be back soon.
     #[error("Peer {0} is not in the committee!")]
-    _PeerNotInCommittee(Box<BlsPublicKey>),
+    PeerNotInCommittee(Box<BlsPublicKey>),
     /// Unavaliable epoch (either it is invalid or this node does not have it).
     #[error("Unknown epoch record: {0}")]
     UnavailableEpoch(Epoch),
@@ -66,57 +69,54 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
         //
         match val {
             PrimaryNetworkError::InvalidHeader(header_error) => {
-                penalty_from_header_error(header_error)
-            }
-            PrimaryNetworkError::Certificate(e) => match e {
-                CertManagerError::Certificate(certificate_error) => match certificate_error {
-                    CertificateError::Header(header_error) => {
                         penalty_from_header_error(header_error)
                     }
-                    // mild
-                    CertificateError::TooOld(_, _, _) => Some(Penalty::Mild),
-                    // fatal
-                    CertificateError::RecoverBlsAggregateSignatureBytes
-                    | CertificateError::Unsigned
-                    | CertificateError::Inquorate { .. }
-                    | CertificateError::InvalidSignature => Some(Penalty::Fatal),
-                    // ignore
-                    CertificateError::ResChannelClosed(_)
-                    | CertificateError::TooNew(_, _, _)
-                    | CertificateError::Storage(_) => None,
-                },
-                // fatal
-                CertManagerError::UnverifiedSignature(_) => Some(Penalty::Fatal),
-                // ignore
-                CertManagerError::PendingCertificateNotFound(_)
-                | CertManagerError::PendingParentsMismatch(_)
-                | CertManagerError::CertificateManagerOneshot
-                | CertManagerError::FatalForwardAcceptedCertificate
-                | CertManagerError::NoCertificateFetched
-                | CertManagerError::FatalAppendParent
-                | CertManagerError::GC(_)
-                | CertManagerError::JoinError
-                | CertManagerError::Pending(_)
-                | CertManagerError::Storage(_)
-                | CertManagerError::RequestBounds(_)
-                | CertManagerError::TNSend(_) => None,
-            },
-            // mild
-            PrimaryNetworkError::UnknowConsensusHeaderNumber(_)
-            | PrimaryNetworkError::InvalidRequest(_)
-            | PrimaryNetworkError::UnknowConsensusHeaderDigest(_) => Some(Penalty::Mild),
-            // medium
+            PrimaryNetworkError::Certificate(e) => match e {
+                        CertManagerError::Certificate(certificate_error) => match certificate_error {
+                            CertificateError::Header(header_error) => {
+                                penalty_from_header_error(header_error)
+                            }
+                            // mild
+                            CertificateError::TooOld(_, _, _) => Some(Penalty::Mild),
+                            // fatal
+                            CertificateError::RecoverBlsAggregateSignatureBytes
+                            | CertificateError::Unsigned
+                            | CertificateError::Inquorate { .. }
+                            | CertificateError::InvalidSignature => Some(Penalty::Fatal),
+                            // ignore
+                            CertificateError::ResChannelClosed(_)
+                            | CertificateError::TooNew(_, _, _)
+                            | CertificateError::Storage(_) => None,
+                        },
+                        // fatal
+                        CertManagerError::UnverifiedSignature(_) => Some(Penalty::Fatal),
+                        // ignore
+                        CertManagerError::PendingCertificateNotFound(_)
+                        | CertManagerError::PendingParentsMismatch(_)
+                        | CertManagerError::CertificateManagerOneshot
+                        | CertManagerError::FatalForwardAcceptedCertificate
+                        | CertManagerError::NoCertificateFetched
+                        | CertManagerError::FatalAppendParent
+                        | CertManagerError::GC(_)
+                        | CertManagerError::JoinError
+                        | CertManagerError::Pending(_)
+                        | CertManagerError::Storage(_)
+                        | CertManagerError::RequestBounds(_)
+                        | CertManagerError::TNSend(_) => None,
+                    },
+            PrimaryNetworkError::UnknownConsensusHeaderNumber(_)
+                    | PrimaryNetworkError::InvalidRequest(_)
+                    | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
+                    | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),
             PrimaryNetworkError::InvalidEpochRequest
-            | PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),
-            // fatal
+                    | PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),
             PrimaryNetworkError::InvalidTopic
-            | PrimaryNetworkError::Decode(_) => Some(Penalty::Fatal),
-            // ignore
+                    | PrimaryNetworkError::Decode(_) => Some(Penalty::Fatal),
             PrimaryNetworkError::UnavailableEpoch(_)  // A node might not have this yet...
-            | PrimaryNetworkError::UnavailableEpochDigest(_)  // A node might not have this yet....
-            | PrimaryNetworkError::_PeerNotInCommittee(_)
-            | PrimaryNetworkError::Storage(_)
-            | PrimaryNetworkError::Internal(_) => None,
+                    | PrimaryNetworkError::UnavailableEpochDigest(_)  // A node might not have this yet....
+                    | PrimaryNetworkError::PeerNotInCommittee(_)
+                    | PrimaryNetworkError::Storage(_)
+                    | PrimaryNetworkError::Internal(_) => None,
         }
     }
 }
