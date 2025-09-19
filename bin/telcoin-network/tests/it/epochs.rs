@@ -156,7 +156,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
                 let (epoch_rec, cert): (EpochRecord, EpochCertificate) = provider
                     .raw_request("tn_epochRecord".into(), (epoch,))
                     .await
-                    .expect(&format!("Failed to get epoch record for epoch {epoch}, port {p}"));
+                    .unwrap_or_else(|_| panic!("Failed to get epoch record for epoch {epoch}, port {p}"));
                 assert!(epoch_rec.verify_with_cert(&cert), "invalid epoch record!");
             }
         }

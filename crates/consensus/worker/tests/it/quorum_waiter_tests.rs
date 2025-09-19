@@ -241,7 +241,6 @@ async fn test_batch_rejected_quorum() {
 
 #[tokio::test]
 async fn test_batch_rejected_antiquorum() {
-    tn_types::test_utils::init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
         .committee_size(NonZeroUsize::new(10).unwrap())
