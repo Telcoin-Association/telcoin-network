@@ -8,11 +8,13 @@ use alloy::{
 };
 use clap::Parser as _;
 use rand::{rngs::StdRng, SeedableRng as _};
-use std::{path::Path, sync::Arc};
-use telcoin_network::{genesis::GenesisArgs, node::NodeCommand};
-use tempfile::tempdir;
+use std::{
+    path::{Path, PathBuf},
+    process::{Child, Command},
+    sync::Arc,
+};
+use telcoin_network::genesis::GenesisArgs;
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
-use tn_node::launch_node;
 use tn_reth::{
     system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS},
     test_utils::TransactionFactory,
@@ -23,7 +25,7 @@ use tn_types::{
     U256,
 };
 use tokio::time::timeout;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 const NEW_VALIDATOR: &str = "new-validator";
 const NODE_PASSWORD: &str = "sup3rsecuur";
@@ -32,41 +34,15 @@ const MIN_EPOCHS_TO_TEST: usize = 6;
 // 3s is too aggressive
 const EPOCH_DURATION: u64 = 5;
 
-#[ignore = "only run independently from all other it tests"]
-#[tokio::test]
-/// Test a new node joining the network and being shuffled into the committee.
-async fn test_epoch_boundary() -> eyre::Result<()> {
-    tn_types::test_utils::init_test_tracing();
-    // create validator and governance wallets for adding new validator later
-    let mut new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
-    let mut governance_wallet =
-        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
-    let mut committee = vec![
-        ("validator-1", Address::from_slice(&[0x11; 20])),
-        ("validator-2", Address::from_slice(&[0x22; 20])),
-        ("validator-3", Address::from_slice(&[0x33; 20])),
-        ("validator-4", Address::from_slice(&[0x44; 20])),
-        ("validator-5", Address::from_slice(&[0x55; 20])),
-    ];
-
-    // setup genesis
-    let temp_dir = tempdir()?;
-    let temp_path = temp_dir.path();
-    let genesis = create_genesis_for_test(
-        temp_path,
-        new_validator.address(),
-        governance_wallet.address(),
-        &committee,
-    )?;
-
-    // start nodes (committee + new validator)
-    committee.push((NEW_VALIDATOR, new_validator.address()));
-    start_nodes(temp_path, committee)?;
-
+async fn test_epoch_boundary_inner(
+    genesis: Genesis,
+    mut governance_wallet: TransactionFactory,
+    temp_path: &Path,
+    new_validator: &mut TransactionFactory,
+) -> eyre::Result<()> {
     // create transactions to make new validator eligible for future epochs
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
-    let txs =
-        generate_new_validator_txs(temp_path, chain, &mut new_validator, &mut governance_wallet)?;
+    let txs = generate_new_validator_txs(temp_path, chain, new_validator, &mut governance_wallet)?;
 
     // create rpc client for node1 default rpc address
     let rpc_url = "http://127.0.0.1:8545".to_string();
@@ -153,10 +129,8 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
             let rpc_url = format!("http://127.0.0.1:{p}");
             let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
             for epoch in 0..=latest_epoch {
-                let (epoch_rec, cert): (EpochRecord, EpochCertificate) = provider
-                    .raw_request("tn_epochRecord".into(), (epoch,))
-                    .await
-                    .expect(&format!("Failed to get epoch record for epoch {epoch}, port {p}"));
+                let (epoch_rec, cert): (EpochRecord, EpochCertificate) =
+                    provider.raw_request("tn_epochRecord".into(), (epoch,)).await?;
                 assert!(epoch_rec.verify_with_cert(&cert), "invalid epoch record!");
             }
         }
@@ -166,6 +140,49 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
         // return error if loop didn't return
         Err(eyre::eyre!("new validator not shuffled into committee!"))
     }
+}
+
+#[ignore = "only run independently from all other it tests"]
+#[tokio::test]
+/// Test a new node joining the network and being shuffled into the committee.
+async fn test_epoch_boundary() -> eyre::Result<()> {
+    tn_types::test_utils::init_test_tracing();
+    // create validator and governance wallets for adding new validator later
+    let mut new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
+    let mut committee = vec![
+        ("validator-1", Address::from_slice(&[0x11; 20])),
+        ("validator-2", Address::from_slice(&[0x22; 20])),
+        ("validator-3", Address::from_slice(&[0x33; 20])),
+        ("validator-4", Address::from_slice(&[0x44; 20])),
+        ("validator-5", Address::from_slice(&[0x55; 20])),
+    ];
+
+    // setup genesis
+    let temp_dir = tempfile::TempDir::with_prefix("epoch_boundary")?;
+    let temp_path = temp_dir.path();
+
+    let governance_wallet =
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+    let genesis = create_genesis_for_test(
+        temp_path,
+        new_validator.address(),
+        governance_wallet.address(),
+        &committee,
+    )?;
+
+    // start nodes (committee + new validator)
+    committee.push((NEW_VALIDATOR, new_validator.address()));
+    let mut procs = start_nodes(temp_path, &committee)?;
+    let r =
+        test_epoch_boundary_inner(genesis, governance_wallet, temp_path, &mut new_validator).await;
+    // We need to capture the result above and then kill all the procs.
+    for proc in procs.iter_mut() {
+        let _ = proc.kill();
+    }
+    for mut proc in procs {
+        let _ = proc.wait();
+    }
+    r
 }
 
 /// Create genesis for this test.
@@ -307,7 +324,8 @@ fn config_committee(
 }
 
 /// Start the network using the node cli command.
-fn start_nodes(temp_path: &Path, validators: Vec<(&str, Address)>) -> eyre::Result<()> {
+fn start_nodes(temp_path: &Path, validators: &Vec<(&str, Address)>) -> eyre::Result<Vec<Child>> {
+    let mut children = Vec::new();
     for (v, _) in validators.into_iter() {
         let dir = temp_path.join(v);
         let mut instance = v.chars().last().expect("validator instance").to_string();
@@ -317,39 +335,32 @@ fn start_nodes(temp_path: &Path, validators: Vec<(&str, Address)>) -> eyre::Resu
             instance = "6".to_string();
             info!(target: "epoch-test", ?v, "starting new validator");
         }
-
-        // for debugging errors
-        let name = v.to_string();
+        let mut exe_path = PathBuf::from(
+            std::env::var("CARGO_MANIFEST_DIR").expect("Missing CARGO_MANIFEST_DIR!"),
+        );
+        exe_path.push("../../target/debug/telcoin-network");
+        let mut command = Command::new(exe_path);
+        command
+            .env("TN_BLS_PASSPHRASE", NODE_PASSWORD.to_string())
+            .arg("node")
+            .arg("--datadir")
+            .arg(&*dir.to_string_lossy())
+            .arg("--instance")
+            .arg(format!("{}", instance))
+            .arg("--http");
 
         #[cfg(feature = "faucet")]
-        let command = NodeCommand::<tn_faucet::FaucetArgs>::parse_from([
-            "tn",
-            "--http",
-            "--instance",
-            &instance,
-            "--google-kms",
-            "--faucet-contract",
-            "0x0000000000000000000000000000000000000000",
-            "--public-key",
-            "0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99",
-        ]);
-        #[cfg(not(feature = "faucet"))]
-        let command = NodeCommand::parse_from(["tn", "--http", "--instance", &instance]);
+        command
+            .arg("--public-key") // If the binary is built with the faucet need this to start...
+            .arg("0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99")
+            .arg("--google-kms")
+            .arg("--faucet-contract")
+            .arg("0x0000000000000000000000000000000000000000");
 
-        std::thread::spawn(move || {
-            let err = command.execute(
-                dir,
-                Some(NODE_PASSWORD.to_string()),
-                |mut builder, faucet_args, tn_datadir, passphrase| {
-                    builder.opt_faucet_args = Some(faucet_args);
-                    launch_node(builder, tn_datadir, passphrase)
-                },
-            );
-            error!(target: "epoch-test", "{name} - {err:?}");
-        });
+        children.push(command.spawn().expect("failed to execute"));
     }
 
-    Ok(())
+    Ok(children)
 }
 
 /// Generate all the transactions needed for the new validator to be shuffled into the committee.
