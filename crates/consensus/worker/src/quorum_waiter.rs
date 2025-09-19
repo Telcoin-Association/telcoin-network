@@ -134,6 +134,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                         let task_name = format!("qw-peer-{i}");
                         spawner_clone.spawn_task(task_name, {
                             monitored_future!(async move {
+                                // forward result through oneshot channel
                                 let res = Self::waiter(name, handler, stake).await;
                                 let _ = tx.send(res);
                             })
