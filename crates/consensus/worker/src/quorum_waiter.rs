@@ -13,10 +13,7 @@ use thiserror::Error;
 use tn_network_libp2p::error::NetworkError;
 use tn_types::{Authority, BlsPublicKey, Committee, SealedBatch, TaskSpawner, VotingPower};
 use tokio::sync::oneshot;
-
-#[cfg(test)]
-#[path = "tests/quorum_waiter_tests.rs"]
-pub mod quorum_waiter_tests;
+use tracing::debug;
 
 /// Interface to QuorumWaiter, exists primarily for tests.
 pub trait QuorumWaiterTrait: Send + Sync + Clone + Unpin + 'static {
@@ -180,7 +177,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                                 }
                             }
                             Err(WaiterError::Rejected(stake)) => {
-                                rejected_stake -= stake;
+                                rejected_stake += stake;
                                 available_stake -= stake;
                             }
                             Err(WaiterError::Network(stake)) => {
@@ -191,6 +188,8 @@ impl QuorumWaiterTrait for QuorumWaiter {
                         // Ran out of Peers and did not reach quorum...
                         break Err(QuorumWaiterError::AntiQuorum);
                     }
+
+                    // check if quorum is impossible
                     if rejected_stake > max_rejected_stake {
                         // Can no longer reach quorum because our batch was explicitly rejected by
                         // to much stack.

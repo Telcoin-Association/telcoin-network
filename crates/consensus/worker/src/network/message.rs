@@ -47,12 +47,12 @@ impl From<PeerExchangeMap> for WorkerRequest {
 /// Response to worker requests.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkerResponse {
+    /// Status 200 response when a peer accepts a proposed batch.
     ReportBatch,
+    /// Provided the requested batches.
     RequestBatches(Vec<Batch>),
     /// Exchange peer information.
-    PeerExchange {
-        peers: PeerExchangeMap,
-    },
+    PeerExchange { peers: PeerExchangeMap },
     /// RPC error while handling request.
     ///
     /// This is an application-layer error response.
