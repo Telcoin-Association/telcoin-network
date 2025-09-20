@@ -463,11 +463,11 @@ where
         &self,
         request: MissingCertificatesRequest,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
-        // Create a time-bounded iter for collecting certificates
-        let mut missing = Vec::new();
-
         // validates request is within limits
         let mut collector = CertificateCollector::new(request, self.consensus_config.clone())?;
+
+        // Create a time-bounded iter for collecting certificates
+        let mut missing = Vec::new();
 
         // Collect certificates from the stream
         for cert in collector.by_ref() {

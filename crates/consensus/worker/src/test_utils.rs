@@ -14,7 +14,11 @@ use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
 use tn_types::{Batch, BlockHash, BlsKeypair, BlsPublicKey, SealedBatch, TaskManager, TaskSpawner};
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 // quorum waiter tests
-pub use crate::network::message::WorkerRPCError;
+pub use crate::network::{
+    error::WorkerNetworkError,
+    handler::RequestHandler,
+    message::{WorkerGossip, WorkerRPCError},
+};
 
 #[derive(Clone, Debug)]
 pub struct TestMakeBlockQuorumWaiter(pub Arc<Mutex<Option<SealedBatch>>>);
