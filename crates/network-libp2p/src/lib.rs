@@ -30,7 +30,9 @@ pub use peers::{PeerExchangeMap, Penalty};
 
 // re-export specific libp2p types
 pub use libp2p::{
-    gossipsub::Message as GossipMessage, identity::PeerId, request_response::ResponseChannel,
+    gossipsub::{Message as GossipMessage, TopicHash},
+    identity::PeerId,
+    request_response::ResponseChannel,
     Multiaddr,
 };
 #[cfg(test)]
