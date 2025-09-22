@@ -215,6 +215,7 @@ where
 
         // create dbs to survive between sync state transitions
         let reth_db = RethEnv::new_database(&builder.node_config, tn_datadir.reth_db_path())?;
+
         Ok(Self {
             builder,
             tn_datadir,
@@ -456,6 +457,30 @@ where
                 gas_accumulator.clone(),
             )
             .await?;
+
+        // Produce a "dummy" epoch 0 EpochRecord if missing.
+        // This will let us use simple code to find any epoch including 0 at startup.
+        if self.consensus_db.get_committee_keys(0).is_none() {
+            let current_epoch = primary.current_committee().await.epoch();
+            if current_epoch != 0 {
+                panic!("We have epoch 0 in our database if we are past epoch 0, on {current_epoch}")
+            }
+            // No keys for epoch 0, fix that.
+            // We are on epoch 0 so load up that committee in Db as well.
+            let committee: Vec<BlsPublicKey> = primary
+                .current_committee()
+                .await
+                .authorities()
+                .iter()
+                .map(|authority| *authority.protocol_key())
+                .collect();
+            let next_committee = committee.clone();
+            let epoch_rec =
+                EpochRecord { epoch: 0, committee, next_committee, ..Default::default() };
+            // Save the "dummy" record, should be overwritten once epoch 0 closes.
+            // This will NOT be signed.
+            self.consensus_db.save_epoch_record(&epoch_rec);
+        }
 
         gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
         // start primary
@@ -974,6 +999,7 @@ where
         // retrieve epoch information from canonical tip
         let EpochState { epoch, epoch_info, validators, epoch_start } =
             engine.epoch_state_from_canonical_tip().await?;
+        eprintln!("XXXX epoch {epoch}, start: {epoch_start}");
         debug!(target: "epoch-manager", ?epoch_info, "epoch state from canonical tip for epoch {}", epoch);
         let validators = validators
             .iter()

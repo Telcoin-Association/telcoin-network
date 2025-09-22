@@ -102,7 +102,7 @@ where
                 let (old_number, old_hash) =
                     *self.consensus_bus.last_published_consensus_num_hash().borrow();
                 if hash == old_hash {
-                    return Ok(());
+                    return Ok(()); // We have already dealt with this hash.
                 }
                 if let Some(committee) =
                     self.consensus_config.node_storage().get_committee_keys(epoch)
