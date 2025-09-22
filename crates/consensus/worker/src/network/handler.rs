@@ -106,11 +106,11 @@ where
     /// Process a new reported batch.
     pub(super) async fn process_report_batch(
         &self,
-        peer: BlsPublicKey,
+        peer: &BlsPublicKey,
         sealed_batch: SealedBatch,
     ) -> WorkerNetworkResult<()> {
         // return error if reporter isn't in current committee
-        if !self.consensus_config.committee_pub_keys().contains(&peer) {
+        if !self.consensus_config.committee_pub_keys().contains(peer) {
             return Err(WorkerNetworkError::NonCommitteeBatch);
         }
 
@@ -212,7 +212,7 @@ where
     /// See [Self::process_report_batch].
     pub async fn pub_process_report_batch(
         &self,
-        peer: BlsPublicKey,
+        peer: &BlsPublicKey,
         sealed_batch: SealedBatch,
     ) -> WorkerNetworkResult<()> {
         self.process_report_batch(peer, sealed_batch).await

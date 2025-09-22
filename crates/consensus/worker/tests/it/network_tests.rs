@@ -57,7 +57,7 @@ async fn test_report_batch_success() {
     let sealed_batch = SealedBatch::new(Default::default(), batch_digest);
     // batch proposed by committee member
     let good_peer = committee.last_authority().primary_public_key();
-    let res = handler.pub_process_report_batch(good_peer, sealed_batch).await;
+    let res = handler.pub_process_report_batch(&good_peer, sealed_batch).await;
     assert_matches!(res, Ok(()));
 }
 
@@ -68,7 +68,7 @@ async fn test_report_batch_fails_non_committee_peer() {
     let sealed_batch = SealedBatch::new(Default::default(), batch_digest);
     // invalid public key - cannot be within committee
     let bad_peer = BlsPublicKey::default();
-    let res = handler.pub_process_report_batch(bad_peer, sealed_batch).await;
+    let res = handler.pub_process_report_batch(&bad_peer, sealed_batch).await;
     assert_matches!(res, Err(WorkerNetworkError::NonCommitteeBatch));
 }
 

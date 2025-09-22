@@ -363,10 +363,16 @@ where
         let task_name = format!("process-report-batch-{}", sealed_batch.digest());
         self.network_handle.get_task_spawner().spawn_task(task_name, async move {
             tokio::select! {
-                res = request_handler.process_report_batch(peer, sealed_batch) => {
+                res = request_handler.process_report_batch(&peer, sealed_batch) => {
                     let response = match res {
                         Ok(()) => WorkerResponse::ReportBatch,
-                        Err(err) => WorkerResponse::Error(message::WorkerRPCError(err.to_string())),
+                        Err(err) => {
+                            let error = err.to_string();
+                            if let Some(penalty) = err.into() {
+                                network_handle.report_penalty(peer, penalty).await;
+                            }
+                            WorkerResponse::Error(message::WorkerRPCError(error))
+                        }
                     };
                     let _ = network_handle.handle.send_response(response, channel).await;
                 },
