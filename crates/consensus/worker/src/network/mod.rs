@@ -19,7 +19,7 @@ use tn_types::{
     encode, now, Batch, BatchValidation, BlockHash, BlsPublicKey, Database, DbTxMut, SealedBatch,
     TaskSpawner, TnReceiver, WorkerId,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tracing::{debug, trace, warn};
 
 pub(crate) mod error;
@@ -61,7 +61,7 @@ impl WorkerNetworkHandle {
     //// nothing.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_for_test(task_spawner: TaskSpawner) -> Self {
-        let (tx, _rx) = mpsc::channel(5);
+        let (tx, _rx) = tokio::sync::mpsc::channel(5);
         Self { handle: NetworkHandle::new(tx), task_spawner, max_rpc_message_size: 1024 * 1024 }
     }
 

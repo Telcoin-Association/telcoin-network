@@ -53,6 +53,12 @@ pub struct TestRequestBatchesNetwork {
     handle: WorkerNetworkHandle,
 }
 
+impl Default for TestRequestBatchesNetwork {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TestRequestBatchesNetwork {
     pub fn new() -> Self {
         let data: Arc<TokioMutex<HashMap<BlsPublicKey, HashMap<BlockHash, Batch>>>> =
