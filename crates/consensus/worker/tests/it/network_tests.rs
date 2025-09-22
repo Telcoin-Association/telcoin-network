@@ -1,7 +1,7 @@
 //! Test network handler tests.
 
 use assert_matches::assert_matches;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use tn_batch_validator::NoopBatchValidator;
 use tn_network_libp2p::{
     types::{NetworkCommand, NetworkHandle},
@@ -14,7 +14,7 @@ use tn_worker::{
     test_utils::{RequestHandler, WorkerGossip, WorkerNetworkError},
     WorkerNetworkHandle, WorkerRequest, WorkerResponse,
 };
-use tokio::{sync::mpsc, time::timeout};
+use tokio::sync::mpsc;
 
 /// The type for holding testng components.
 struct TestTypes<DB = MemDatabase> {
