@@ -178,7 +178,7 @@ mod test {
         }
 
         fn public_key(&self) -> BlsPublicKey {
-            self.0.public().clone()
+            *self.0.public()
         }
     }
 
