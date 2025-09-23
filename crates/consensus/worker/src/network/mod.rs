@@ -19,11 +19,11 @@ use tn_types::{
     encode, now, Batch, BatchValidation, BlockHash, BlsPublicKey, Database, DbTxMut, SealedBatch,
     TaskSpawner, TnReceiver, WorkerId,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tracing::{debug, trace, warn};
 
-mod error;
-mod handler;
+pub(crate) mod error;
+pub(crate) mod handler;
 pub(crate) mod message;
 
 /// Convenience type for Primary network.
@@ -59,8 +59,9 @@ impl WorkerNetworkHandle {
 
     //// Convenience method for creating a new Self for tests- sends events no-where and does
     //// nothing.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn new_for_test(task_spawner: TaskSpawner) -> Self {
-        let (tx, _rx) = mpsc::channel(5);
+        let (tx, _rx) = tokio::sync::mpsc::channel(5);
         Self { handle: NetworkHandle::new(tx), task_spawner, max_rpc_message_size: 1024 * 1024 }
     }
 
@@ -70,7 +71,7 @@ impl WorkerNetworkHandle {
     }
 
     /// Publish a batch digest to the worker network.
-    pub async fn publish_batch(&self, batch_digest: BlockHash) -> NetworkResult<()> {
+    pub(crate) async fn publish_batch(&self, batch_digest: BlockHash) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Batch(batch_digest));
         self.handle.publish("tn-worker".into(), data).await?;
         Ok(())
@@ -78,7 +79,7 @@ impl WorkerNetworkHandle {
 
     /// Publish a transaction (as raw bytes) worker network.
     /// Do this when not a committee member so a CVV can include the txn.
-    pub async fn publish_txn(&self, txn: Vec<u8>) -> NetworkResult<()> {
+    pub(crate) async fn publish_txn(&self, txn: Vec<u8>) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Txn(txn));
         self.handle.publish("tn-txn".into(), data).await?;
         Ok(())
@@ -108,7 +109,7 @@ impl WorkerNetworkHandle {
     }
 
     /// Report a new batch to peers.
-    pub fn report_batch_to_peers(
+    pub(crate) fn report_batch_to_peers(
         &self,
         peers: &[BlsPublicKey],
         sealed_batch: SealedBatch,
@@ -172,7 +173,7 @@ impl WorkerNetworkHandle {
     /// Request a group of batches by hashes.
     /// Sends request to all our connected peers at once and returns Ok when we
     /// get a valid response or Err if no one responds with the batches.
-    pub async fn request_batches(
+    pub(crate) async fn request_batches(
         &self,
         requested_digests: Vec<BlockHash>,
     ) -> NetworkResult<Vec<Batch>> {
@@ -351,7 +352,7 @@ where
     /// Spawn a task to evaluate a peer's proposed header and return a response.
     fn process_report_batch(
         &self,
-        _peer: BlsPublicKey,
+        peer: BlsPublicKey,
         sealed_batch: SealedBatch,
         channel: ResponseChannel<WorkerResponse>,
         cancel: oneshot::Receiver<()>,
@@ -362,10 +363,16 @@ where
         let task_name = format!("process-report-batch-{}", sealed_batch.digest());
         self.network_handle.get_task_spawner().spawn_task(task_name, async move {
             tokio::select! {
-                res = request_handler.process_report_batch(sealed_batch) => {
+                res = request_handler.process_report_batch(&peer, sealed_batch) => {
                     let response = match res {
                         Ok(()) => WorkerResponse::ReportBatch,
-                        Err(err) => WorkerResponse::Error(message::WorkerRPCError(err.to_string())),
+                        Err(err) => {
+                            let error = err.to_string();
+                            if let Some(penalty) = err.into() {
+                                network_handle.report_penalty(peer, penalty).await;
+                            }
+                            WorkerResponse::Error(message::WorkerRPCError(error))
+                        }
                     };
                     let _ = network_handle.handle.send_response(response, channel).await;
                 },

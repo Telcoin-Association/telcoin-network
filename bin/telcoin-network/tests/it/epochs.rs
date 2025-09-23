@@ -341,7 +341,7 @@ fn config_committee(
 /// Start the network using the node cli command.
 fn start_nodes(temp_path: &Path, validators: &Vec<(&str, Address)>) -> eyre::Result<Vec<Child>> {
     let mut children = Vec::new();
-    for (v, _) in validators.into_iter() {
+    for (v, _) in validators.iter() {
         let dir = temp_path.join(v);
         let mut instance = v.chars().last().expect("validator instance").to_string();
 
@@ -356,12 +356,12 @@ fn start_nodes(temp_path: &Path, validators: &Vec<(&str, Address)>) -> eyre::Res
         exe_path.push("../../target/debug/telcoin-network");
         let mut command = Command::new(exe_path);
         command
-            .env("TN_BLS_PASSPHRASE", NODE_PASSWORD.to_string())
+            .env("TN_BLS_PASSPHRASE", NODE_PASSWORD)
             .arg("node")
             .arg("--datadir")
             .arg(&*dir.to_string_lossy())
             .arg("--instance")
-            .arg(format!("{}", instance))
+            .arg(&instance)
             .arg("--http");
 
         #[cfg(feature = "faucet")]

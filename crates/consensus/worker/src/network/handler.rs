@@ -10,9 +10,10 @@ use tn_network_libp2p::GossipMessage;
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
 use tn_storage::tables::Batches;
 use tn_types::{
-    now, try_decode, Batch, BatchValidation, BlockHash, Database, SealedBatch, WorkerId,
+    now, try_decode, Batch, BatchValidation, BlockHash, BlsPublicKey, Database, SealedBatch,
+    WorkerId,
 };
-use tracing::warn;
+use tracing::debug;
 
 /// The minimal length of a single, encoded, default [Batch] used to set a local min for
 /// message validation.
@@ -103,10 +104,16 @@ where
     }
 
     /// Process a new reported batch.
-    pub(crate) async fn process_report_batch(
+    pub(super) async fn process_report_batch(
         &self,
+        peer: &BlsPublicKey,
         sealed_batch: SealedBatch,
     ) -> WorkerNetworkResult<()> {
+        // return error if reporter isn't in current committee
+        if !self.consensus_config.committee_pub_keys().contains(peer) {
+            return Err(WorkerNetworkError::NonCommitteeBatch);
+        }
+
         let client = self.consensus_config.local_network().clone();
         let store = self.consensus_config.node_storage().clone();
         // validate batch - log error if invalid
@@ -130,7 +137,7 @@ where
     }
 
     /// Attempt to return requested batches.
-    pub(crate) async fn process_request_batches(
+    pub(super) async fn process_request_batches(
         &self,
         batch_digests: Vec<BlockHash>,
         max_response_size: usize,
@@ -141,8 +148,14 @@ where
         // NOTE: caller needs to account for batches + msg overhead, and batches must have
         // transactions
         if max_response_size < *LOCAL_MIN_REQUEST_SIZE {
-            warn!(target: "cert-collector", "batch request max size too small: {}", max_response_size);
+            debug!(target: "cert-collector", "batch request max size too small: {}", max_response_size);
             return Err(WorkerNetworkError::InvalidRequest("Request size too small".into()));
+        }
+
+        // return error for empty batches
+        if batch_digests.is_empty() {
+            debug!(target: "cert-collector", "batch request empty");
+            return Err(WorkerNetworkError::InvalidRequest("Empty batch digests".into()));
         }
 
         // use the min value between this node's max rpc message size and the requestor's reported
@@ -180,5 +193,38 @@ where
         }
 
         Ok(batches)
+    }
+}
+
+// support IT tests
+#[cfg(any(test, feature = "test-utils"))]
+impl<DB> RequestHandler<DB>
+where
+    DB: Database,
+{
+    /// Publicly available for tests.
+    /// See [Self::process_gossip].
+    pub async fn pub_process_gossip(&self, msg: &GossipMessage) -> WorkerNetworkResult<()> {
+        self.process_gossip(msg).await
+    }
+
+    /// Publicly available for tests.
+    /// See [Self::process_report_batch].
+    pub async fn pub_process_report_batch(
+        &self,
+        peer: &BlsPublicKey,
+        sealed_batch: SealedBatch,
+    ) -> WorkerNetworkResult<()> {
+        self.process_report_batch(peer, sealed_batch).await
+    }
+
+    /// Publicly available for tests.
+    /// See [Self::process_request_batches].
+    pub async fn pub_process_request_batches(
+        &self,
+        batch_digests: Vec<BlockHash>,
+        max_response_size: usize,
+    ) -> WorkerNetworkResult<Vec<Batch>> {
+        self.process_request_batches(batch_digests, max_response_size).await
     }
 }

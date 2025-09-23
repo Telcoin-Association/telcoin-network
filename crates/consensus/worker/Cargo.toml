@@ -27,10 +27,10 @@ eyre = { workspace = true }
 tn-network-libp2p = { workspace = true }
 serde = { workspace = true }
 consensus-metrics = { workspace = true }
+rand = { workspace = true, optional = true }
 
 [dev-dependencies]
 tn-batch-validator = { workspace = true, features = ["test-utils"] }
-rand = { workspace = true }
 tempfile = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 tn-types = { workspace = true, features = ["test-utils"] }
@@ -40,4 +40,4 @@ assert_matches = { workspace = true }
 
 [features]
 default = []
-test-utils = []
+test-utils = ["dep:rand"]
