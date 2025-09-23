@@ -7,13 +7,16 @@ pub type WorkerNetworkResult<T> = Result<T, WorkerNetworkError>;
 
 /// Core error variants when executing the output from consensus and extending the canonical block.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum WorkerNetworkError {
+pub enum WorkerNetworkError {
     /// Error decoding with bcs.
     #[error("Failed to decode gossip message: {0}")]
     Decode(#[from] BcsError),
     /// Batch validation error occured.
     #[error("Failed batch validation: {0}")]
     BatchValidation(#[from] BatchValidationError),
+    /// The batch reporter is not in the current committee.
+    #[error("Batch reported from outside committee.")]
+    NonCommitteeBatch,
     /// Internal error occurred.
     #[error("Internal error: {0}")]
     Internal(String),
@@ -57,6 +60,8 @@ impl From<WorkerNetworkError> for Option<Penalty> {
                 }
             }
             WorkerNetworkError::InvalidRequest(_) => Some(Penalty::Mild),
+            // may occur at epoch boundaries
+            WorkerNetworkError::NonCommitteeBatch => Some(Penalty::Medium),
             // fatal
             WorkerNetworkError::Decode(_) => Some(Penalty::Fatal),
             // ignore

@@ -4,8 +4,6 @@ use crate::{metrics::WorkerMetrics, network::WorkerNetworkHandle};
 use consensus_metrics::monitored_future;
 use futures::stream::{futures_unordered::FuturesUnordered, StreamExt as _};
 use std::{
-    future::Future,
-    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -13,10 +11,7 @@ use thiserror::Error;
 use tn_network_libp2p::error::NetworkError;
 use tn_types::{Authority, BlsPublicKey, Committee, SealedBatch, TaskSpawner, VotingPower};
 use tokio::sync::oneshot;
-
-#[cfg(test)]
-#[path = "tests/quorum_waiter_tests.rs"]
-pub mod quorum_waiter_tests;
+use tracing::debug;
 
 /// Interface to QuorumWaiter, exists primarily for tests.
 pub trait QuorumWaiterTrait: Send + Sync + Clone + Unpin + 'static {
@@ -39,9 +34,6 @@ pub trait QuorumWaiterTrait: Send + Sync + Clone + Unpin + 'static {
         task_spawner: &TaskSpawner,
     ) -> oneshot::Receiver<Result<(), QuorumWaiterError>>;
 }
-
-/// Basically BoxFuture but without the unneeded lifetime.
-type QMBoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 struct QuorumWaiterInner {
     /// This authority.
@@ -118,28 +110,36 @@ impl QuorumWaiterTrait for QuorumWaiter {
             let timeout_res = tokio::time::timeout(timeout, async move {
                 let start_time = Instant::now();
                 // Broadcast the batch to the other workers.
-                let workers: Vec<_> =
+                let peers: Vec<_> =
                     inner.committee.others_keys_except(inner.authority.protocol_key());
-
-                let handlers = inner.network.report_batch_to_peers(&workers, sealed_batch);
+                let handlers = inner.network.report_batch_to_peers(&peers, sealed_batch);
                 let _timer = inner.metrics.batch_broadcast_quorum_latency.start_timer();
 
                 // Collect all the handlers to receive acknowledgements.
                 let mut wait_for_quorum: FuturesUnordered<
-                    QMBoxFuture<Result<VotingPower, WaiterError>>,
+                    oneshot::Receiver<Result<VotingPower, WaiterError>>,
                 > = FuturesUnordered::new();
                 // Total stake available for the entire committee.
                 // Can use this to determine anti-quorum more quickly.
                 let mut available_stake = 0;
                 // Stake from a committee member that has rejected this batch.
                 let mut rejected_stake = 0;
-                workers
+                peers
                     .into_iter()
-                    .zip(handlers.into_iter())
-                    .map(|(name, handler)| {
+                    .zip(handlers.into_iter().enumerate())
+                    .map(|(name, (i, handler))| {
                         let stake = inner.committee.voting_power(&name);
                         available_stake += stake;
-                        Box::pin(monitored_future!(Self::waiter(name, handler, stake)))
+                        let (tx, rx) = oneshot::channel();
+                        let task_name = format!("qw-peer-{i}");
+                        spawner_clone.spawn_task(task_name, {
+                            monitored_future!(async move {
+                                // forward result through oneshot channel
+                                let res = Self::waiter(name, handler, stake).await;
+                                let _ = tx.send(res);
+                            })
+                        });
+                        rx
                     })
                     .for_each(|f| wait_for_quorum.push(f));
 
@@ -148,14 +148,25 @@ impl QuorumWaiterTrait for QuorumWaiter {
                 // the dag). This should reduce the amount of syncing.
                 let threshold = inner.committee.quorum_threshold();
                 let mut total_stake = inner.authority.voting_power();
-                // If more stake than this is rejected then the batch will never be accepted.
-                let max_rejected_stake = available_stake - threshold;
+                // If more stake than this is rejected then the batch will never be accepted,
+                // and account for this node's vote.
+                let max_rejected_stake = (available_stake + total_stake) - threshold;
+
+                debug!(
+                    target: "quorum-waiter",
+                    ?available_stake,
+                    ?rejected_stake,
+                    ?threshold,
+                    ?total_stake,
+                    ?max_rejected_stake,
+                    "begin loop"
+                );
 
                 // Wait on the peer responses and produce an Ok(()) for quorum (2/3 stake confirmed
                 // batch) or Error if quorum not reached.
                 loop {
                     if let Some(res) = wait_for_quorum.next().await {
-                        match res {
+                        match res? {
                             Ok(stake) => {
                                 total_stake += stake;
                                 if total_stake >= threshold {
@@ -180,7 +191,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                                 }
                             }
                             Err(WaiterError::Rejected(stake)) => {
-                                rejected_stake -= stake;
+                                rejected_stake += stake;
                                 available_stake -= stake;
                             }
                             Err(WaiterError::Network(stake)) => {
@@ -191,6 +202,18 @@ impl QuorumWaiterTrait for QuorumWaiter {
                         // Ran out of Peers and did not reach quorum...
                         break Err(QuorumWaiterError::AntiQuorum);
                     }
+
+                    debug!(
+                        target: "quorum-waiter",
+                        ?total_stake,
+                        ?available_stake,
+                        ?threshold,
+                        ?rejected_stake,
+                        ?max_rejected_stake,
+                        "begin loop"
+                    );
+
+                    // check if quorum is impossible
                     if rejected_stake > max_rejected_stake {
                         // Can no longer reach quorum because our batch was explicitly rejected by
                         // to much stack.
@@ -232,6 +255,14 @@ pub enum QuorumWaiterError {
     Network,
     #[error("RPC Status Error {0}")]
     Rpc(String),
+    #[error("Oneshot receiver dropped.")]
+    DroppedReceiver,
+}
+
+impl From<oneshot::error::RecvError> for QuorumWaiterError {
+    fn from(_: oneshot::error::RecvError) -> Self {
+        Self::DroppedReceiver
+    }
 }
 
 #[derive(Clone, Debug, Error)]

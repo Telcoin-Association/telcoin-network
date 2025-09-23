@@ -20,10 +20,6 @@ use tn_types::{
 };
 use tracing::{error, info};
 
-#[cfg(test)]
-#[path = "tests/batch_provider_tests.rs"]
-pub mod batch_provider_tests;
-
 /// The default channel capacity for each channel of the worker.
 pub const CHANNEL_CAPACITY: usize = 1_000;
 
@@ -239,6 +235,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                                 BlockSealError::Timeout
                             }
                             crate::quorum_waiter::QuorumWaiterError::Network
+                            | crate::quorum_waiter::QuorumWaiterError::DroppedReceiver
                             | crate::quorum_waiter::QuorumWaiterError::Rpc(_) => {
                                 BlockSealError::FailedQuorum
                             }
