@@ -128,12 +128,16 @@ where
                             if matches!(
                                 *self.consensus_bus.node_mode().borrow(),
                                 NodeMode::CvvActive
-                            ) && old_number + 3 < number
+                            ) && old_hash != BlockHash::default()  // Ignore initial empty value.
+                                && old_number + 3 < number
                             {
+                                eprintln!("XXXX CVV INACTIVE NOW old {old_number}, num {number}");
                                 // We seem to be too far behind to be an active CVV, try to go
                                 // inactive to catch up.
                                 let _ = self.consensus_bus.node_mode().send(NodeMode::CvvInactive);
                                 self.consensus_config.shutdown().notify();
+                                consensus_certs.clear();
+                                return Ok(());
                             }
                             // Make sure we don't get old gossip and go backwards.
                             if number > old_number {

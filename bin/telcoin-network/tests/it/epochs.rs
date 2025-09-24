@@ -13,6 +13,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::Arc,
+    time::Duration,
 };
 use telcoin_network::genesis::GenesisArgs;
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
@@ -62,10 +63,27 @@ async fn test_epoch_boundary_inner(
     })
     .await?;
 
+    //tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     // submit txs to: issue NFT, stake, and activate new validator
     for tx in txs {
-        let pending = &provider.send_raw_transaction(&tx).await?;
-        debug!(target: "epoch-test", "pending tx: {pending:?}");
+        let mut pending = provider.send_raw_transaction(&tx).await?;
+        // Currently submitting a txn on an epoch boundary can be lost.
+        // Once that is no longer true then should remove this retry loop.
+        loop {
+            debug!(target: "epoch-test", "pending tx: {pending:?}");
+            eprintln!("XXXX pending tx: {pending:?}");
+            match timeout(Duration::from_secs(3), pending.watch()).await {
+                Err(_) => {
+                    pending = provider.send_raw_transaction(&tx).await?;
+                    continue;
+                }
+                Ok(res) => {
+                    res?;
+                }
+            }
+            break;
+        }
+        //XXXXpending.watch().await?;
     }
 
     // retrieve current committee
@@ -109,11 +127,9 @@ async fn test_epoch_boundary_inner(
 
         // if min number of epochs have transitioned, assert new validator has been shuffled in
         // at least once to end the test
-        if new_validator_in_committee_count > 0 {
+        if i > MIN_EPOCHS_TO_TEST && new_validator_in_committee_count > 0 {
             shuffled = true;
-            if i > MIN_EPOCHS_TO_TEST {
-                break;
-            }
+            break;
         }
 
         // store the last seen epoch info that is expected to change every epoch

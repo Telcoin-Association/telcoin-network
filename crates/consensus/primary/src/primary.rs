@@ -11,7 +11,7 @@ use crate::{
 };
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
-use tn_types::{Database, TaskManager};
+use tn_types::{Database, TaskManager, TnReceiver, TnSender};
 use tracing::info;
 
 #[cfg(test)]
@@ -95,6 +95,15 @@ impl<DB: Database> Primary<DB> {
             );
 
             proposer.spawn(task_manager);
+        } else {
+            // XXXX ProcessGosip-tn-primary-XXXX still gets cancelled, figure it out...
+            // This is a dumb task to keep the parents channel clear when not
+            // a cvv.  Otherwise the senders to this channel will eventually "back up"
+            // and cause hung tasks.  Not the end of the workd but wastes resources.
+            let mut parents_rx = consensus_bus.parents().subscribe();
+            task_manager.spawn_critical_task("Clear parent certs for non-CVV", async move {
+                while let Some(_) = parents_rx.recv().await {}
+            });
         }
 
         if let Some(authority_id) = config.authority_id() {

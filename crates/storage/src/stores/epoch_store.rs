@@ -41,7 +41,8 @@ impl<DB: Database> EpochStore for DB {
                 // Ignoring errors.  We won't get any unless the DB is broken and the app will be
                 // dieing in short order.
                 if epoch_rec.epoch == 0 {
-                    // Should have a "dummy" epoch 0 record, remove just in case the backend has a dumb insert or something.
+                    // Should have a "dummy" epoch 0 record, remove just in case the backend has a
+                    // dumb insert or something.
                     let _ = tx.remove::<EpochRecords>(&epoch);
                 }
                 let _ = tx.insert::<EpochRecordsIndex>(&epoch_hash, &epoch);

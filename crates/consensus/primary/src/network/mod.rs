@@ -190,7 +190,8 @@ impl PrimaryNetworkHandle {
                         ))
                     }
                 }
-                _ => Err(NetworkError::RPCError("Must provide a hash or number!".to_string())),
+                _ => Ok(Arc::unwrap_or_clone(header)),
+                //XXXXErr(NetworkError::RPCError("Must provide a hash or number!".to_string())),
             },
             PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
             _ => Err(NetworkError::RPCError(
@@ -480,7 +481,7 @@ where
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        let task_name = format!("ProcessGossip-{propagation_source}");
+        let task_name = format!("ProcessGossip-{}-{propagation_source}", msg.topic);
         // spawn task to process gossip
         self.task_spawner.spawn_task(task_name, async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {

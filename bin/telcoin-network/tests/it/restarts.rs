@@ -59,19 +59,20 @@ fn kill_child(child: &mut Child) {
     }
 }
 
-fn send_and_confirm(
+fn send_and_confirm_internal(
     node: &str,
     node_test: &str,
     key: &str,
     to_account: Address,
     nonce: u128,
+    iteration: u32,
 ) -> eyre::Result<()> {
     let basefee_address = address!("0x9999999999999999999999999999999999999999");
     let current = get_balance(node, &to_account.to_string(), 1)?;
     let current_basefee = get_balance(node, &basefee_address.to_string(), 1)?;
     let amount = 10 * WEI_PER_TEL; // 10 TEL
     let expected = current + amount;
-    send_tel(node, key, to_account, amount, 250, 21000, nonce)?;
+    send_tel(node, key, to_account, amount, 250, 21000 + iteration as u128, nonce)?;
 
     // sleep
     std::thread::sleep(Duration::from_millis(1000));
@@ -79,6 +80,16 @@ fn send_and_confirm(
 
     // get positive bal and kill child2 if error
     let bal = get_balance_above_with_retry(node_test, &to_account.to_string(), expected - 1)?;
+    /*XXXXlet bal = match get_balance_above_with_retry(node_test, &to_account.to_string(), expected - 1) {
+        Ok(bal) => bal,
+        Err(e) => {
+            return if iteration < 3 {
+                send_and_confirm_internal(node, node_test, key, to_account, nonce, iteration + 1)
+            } else {
+                Err(e)
+            }
+        }
+    };*/
 
     if expected != bal {
         error!(target: "restart-test", "{expected} != {bal} - returning error!");
@@ -91,6 +102,16 @@ fn send_and_confirm(
         return Err(Report::msg("Expected a basefee increment!".to_string()));
     }
     Ok(())
+}
+
+fn send_and_confirm(
+    node: &str,
+    node_test: &str,
+    key: &str,
+    to_account: Address,
+    nonce: u128,
+) -> eyre::Result<()> {
+    send_and_confirm_internal(node, node_test, key, to_account, nonce, 0)
 }
 
 /// Run the first part tests, broken up like this to allow more robust node shutdown.
@@ -270,6 +291,7 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
         }
     };
 
+    std::thread::sleep(Duration::from_secs(5));
     // send SIGTERM to all children (child2 should already be dead)
     // This lets them start shutting down in parrallel.
     for (i, child) in children.iter_mut().enumerate() {

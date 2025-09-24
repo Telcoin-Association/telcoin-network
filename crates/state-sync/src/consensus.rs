@@ -27,6 +27,7 @@ async fn get_consensus_header<DB: TNDatabase>(
     if let Ok(header) = network.request_consensus(None, Some(hash)).await {
         // The header we got will match hash (request_consensus() contract).
         let parent = header.parent_hash;
+        eprintln!("XXXX got consensus {hash}");
         match db.write_txn() {
             Ok(mut txn) => {
                 if let Err(e) = txn.insert::<ConsensusBlocksCache>(&header.number, &header) {

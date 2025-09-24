@@ -15,7 +15,8 @@ use tn_storage::{
     ConsensusStore,
 };
 use tn_types::{
-    BlsPublicKey, ConsensusHeader, ConsensusOutput, Database, DbTxMut, TaskSpawner, TnSender,
+    BlockHash, BlsPublicKey, ConsensusHeader, ConsensusOutput, Database, DbTxMut, TaskSpawner,
+    TnSender,
 };
 use tracing::{debug, error, info};
 
@@ -54,6 +55,16 @@ pub async fn prime_consensus<DB: Database>(
         config.parameters().gc_depth,
     ));
     let _ = consensus_bus.primary_round_updates().send(last_consensus_round);
+    let (_old_number, old_hash) = *consensus_bus.last_published_consensus_num_hash().borrow();
+    if old_hash == BlockHash::default() {
+        if let Some((number, last_consensus)) =
+            config.node_storage().last_record::<ConsensusBlocks>()
+        {
+            let _ = consensus_bus
+                .last_published_consensus_num_hash()
+                .send((number, last_consensus.digest()));
+        }
+    }
 }
 
 /// Return true if this node should be able to participate as a CVV, false otherwise.
@@ -114,15 +125,18 @@ pub async fn can_cvv<DB: Database>(
     // - node restarted in the current epoch
     // - node restarted outside of gc round
     if max_epoch < current_epoch {
+        eprintln!("XXXX cancvv 1");
         info!(target: "state-sync", "Node is joining consensus for new epoch");
         true
     } else if max_epoch == last_consensus_epoch // still in current epoch
         && (last_consensus_round + config.parameters().gc_depth) > max_round
     {
+        eprintln!("XXXX cancvv 2");
         info!(target: "state-sync", "Node is attempting to rejoin consensus.");
         // We should be able to pick up consensus where we left off.
         true
     } else {
+        eprintln!("XXXX cancvv 3");
         info!(target: "state-sync", "Node has fallen too far behind to rejoin consensus - syncing...");
         false
     }
@@ -332,9 +346,10 @@ async fn spawn_stream_consensus_headers<DB: Database>(
                         &config,
                         &consensus_bus,
                         last_consensus_header,
-                        header,
+                        header.clone(), // XXXX- no clone
                     )
                     .await?;
+                    eprintln!("XXXX num {}, last {}, new last {}", header.number, last_consensus_height, last_consensus_header.number);
                     last_consensus_height = last_consensus_header.number;
                 }
             }

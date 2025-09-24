@@ -69,54 +69,54 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
         //
         match val {
             PrimaryNetworkError::InvalidHeader(header_error) => {
+                penalty_from_header_error(header_error)
+            }
+            PrimaryNetworkError::Certificate(e) => match e {
+                CertManagerError::Certificate(certificate_error) => match certificate_error {
+                    CertificateError::Header(header_error) => {
                         penalty_from_header_error(header_error)
                     }
-            PrimaryNetworkError::Certificate(e) => match e {
-                        CertManagerError::Certificate(certificate_error) => match certificate_error {
-                            CertificateError::Header(header_error) => {
-                                penalty_from_header_error(header_error)
-                            }
-                            // mild
-                            CertificateError::TooOld(_, _, _) => Some(Penalty::Mild),
-                            // fatal
-                            CertificateError::RecoverBlsAggregateSignatureBytes
-                            | CertificateError::Unsigned
-                            | CertificateError::Inquorate { .. }
-                            | CertificateError::InvalidSignature => Some(Penalty::Fatal),
-                            // ignore
-                            CertificateError::ResChannelClosed(_)
-                            | CertificateError::TooNew(_, _, _)
-                            | CertificateError::Storage(_) => None,
-                        },
-                        // fatal
-                        CertManagerError::UnverifiedSignature(_) => Some(Penalty::Fatal),
-                        // ignore
-                        CertManagerError::PendingCertificateNotFound(_)
-                        | CertManagerError::PendingParentsMismatch(_)
-                        | CertManagerError::CertificateManagerOneshot
-                        | CertManagerError::FatalForwardAcceptedCertificate
-                        | CertManagerError::NoCertificateFetched
-                        | CertManagerError::FatalAppendParent
-                        | CertManagerError::GC(_)
-                        | CertManagerError::JoinError
-                        | CertManagerError::Pending(_)
-                        | CertManagerError::Storage(_)
-                        | CertManagerError::RequestBounds(_)
-                        | CertManagerError::TNSend(_) => None,
-                    },
+                    // mild
+                    CertificateError::TooOld(_, _, _) => Some(Penalty::Mild),
+                    // fatal
+                    CertificateError::RecoverBlsAggregateSignatureBytes
+                    | CertificateError::Unsigned
+                    | CertificateError::Inquorate { .. }
+                    | CertificateError::InvalidSignature => Some(Penalty::Fatal),
+                    // ignore
+                    CertificateError::ResChannelClosed(_)
+                    | CertificateError::TooNew(_, _, _)
+                    | CertificateError::Storage(_) => None,
+                },
+                // fatal
+                CertManagerError::UnverifiedSignature(_) => Some(Penalty::Fatal),
+                // ignore
+                CertManagerError::PendingCertificateNotFound(_)
+                | CertManagerError::PendingParentsMismatch(_)
+                | CertManagerError::CertificateManagerOneshot
+                | CertManagerError::FatalForwardAcceptedCertificate
+                | CertManagerError::NoCertificateFetched
+                | CertManagerError::FatalAppendParent
+                | CertManagerError::GC(_)
+                | CertManagerError::JoinError
+                | CertManagerError::Pending(_)
+                | CertManagerError::Storage(_)
+                | CertManagerError::RequestBounds(_)
+                | CertManagerError::TNSend(_) => None,
+            },
             PrimaryNetworkError::UnknownConsensusHeaderNumber(_)
-                    | PrimaryNetworkError::InvalidRequest(_)
-                    | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
-                    | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),
+            | PrimaryNetworkError::InvalidRequest(_)
+            | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
+            | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),
             PrimaryNetworkError::InvalidEpochRequest
-                    | PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),
+            | PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),
             PrimaryNetworkError::InvalidTopic
-                    | PrimaryNetworkError::Decode(_) => Some(Penalty::Fatal),
+            | PrimaryNetworkError::Decode(_) => Some(Penalty::Fatal),
             PrimaryNetworkError::UnavailableEpoch(_)  // A node might not have this yet...
-                    | PrimaryNetworkError::UnavailableEpochDigest(_)  // A node might not have this yet....
-                    | PrimaryNetworkError::PeerNotInCommittee(_)
-                    | PrimaryNetworkError::Storage(_)
-                    | PrimaryNetworkError::Internal(_) => None,
+            | PrimaryNetworkError::UnavailableEpochDigest(_)  // A node might not have this yet....
+            | PrimaryNetworkError::PeerNotInCommittee(_)
+            | PrimaryNetworkError::Storage(_)
+            | PrimaryNetworkError::Internal(_) => None,
         }
     }
 }

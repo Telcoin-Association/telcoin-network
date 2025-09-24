@@ -1403,6 +1403,11 @@ where
         consensus_config: &ConsensusConfig<DB>,
         _primary_network_handle: &PrimaryNetworkHandle, // XXXX
     ) -> eyre::Result<NodeMode> {
+        if matches!(*self.consensus_bus.node_mode().borrow(), NodeMode::CvvInactive) {
+            // If we have an inactive mode then it was set so keep it for now.
+            eprintln!("XXXX CVV INACTIVE");
+            return Ok(NodeMode::CvvInactive);
+        }
         debug!(target: "epoch-manager", authority_id=?consensus_config.authority_id(), "identifying node mode..." );
         let in_committee = consensus_config
             .authority_id()
@@ -1410,14 +1415,18 @@ where
             .unwrap_or(false);
         state_sync::prime_consensus(&self.consensus_bus, consensus_config).await; // XXXX confirm we need this.
         let mode = if !in_committee || self.builder.tn_config.observer {
+            eprintln!("XXXX OBSERVER: {}", consensus_config.key_config().primary_public_key());
             NodeMode::Observer
-            /*XXXX } else if state_sync::can_cvv(&self.consensus_bus, consensus_config, primary_network_handle)
+            /*XXXX} else if state_sync::can_cvv(&self.consensus_bus, consensus_config, primary_network_handle)
                 .await
             {
+                eprintln!("XXXX CVV");
                 NodeMode::CvvActive*/
         } else {
+            //eprintln!("XXXX CVV INACTIVE");
             //XXXXNodeMode::CvvInactive
             // Assume we are caught up, will be demoted to inactive if this is not true...
+            eprintln!("XXXX CVV");
             NodeMode::CvvActive
         };
 
