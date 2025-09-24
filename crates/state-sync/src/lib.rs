@@ -2,10 +2,7 @@
 //! Currently used by nodes that are not participating in consensus
 //! to follow along with consensus and execute blocks.
 
-use std::time::Duration;
-
 use consensus_metrics::monitored_future;
-use futures::{stream::FuturesUnordered, StreamExt};
 use tn_config::ConsensusConfig;
 use tn_primary::{
     consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, NodeMode,
@@ -14,10 +11,7 @@ use tn_storage::{
     tables::{Batches, ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache},
     ConsensusStore,
 };
-use tn_types::{
-    BlockHash, BlsPublicKey, ConsensusHeader, ConsensusOutput, Database, DbTxMut, TaskSpawner,
-    TnSender,
-};
+use tn_types::{ConsensusHeader, ConsensusOutput, Database, DbTxMut, TaskSpawner, TnSender};
 use tracing::{debug, error, info};
 
 mod epoch;
@@ -26,7 +20,7 @@ mod consensus;
 use consensus::spawn_track_recent_consensus;
 
 /// Sets some bus defaults.
-/// Called by can_cvv, so only call if not using can_cvv(). XXXX
+/// Call this somewhere when starting an epoch.
 pub async fn prime_consensus<DB: Database>(
     consensus_bus: &ConsensusBus,
     config: &ConsensusConfig<DB>,
@@ -55,91 +49,6 @@ pub async fn prime_consensus<DB: Database>(
         config.parameters().gc_depth,
     ));
     let _ = consensus_bus.primary_round_updates().send(last_consensus_round);
-    let (_old_number, old_hash) = *consensus_bus.last_published_consensus_num_hash().borrow();
-    if old_hash == BlockHash::default() {
-        if let Some((number, last_consensus)) =
-            config.node_storage().last_record::<ConsensusBlocks>()
-        {
-            let _ = consensus_bus
-                .last_published_consensus_num_hash()
-                .send((number, last_consensus.digest()));
-        }
-    }
-}
-
-/// Return true if this node should be able to participate as a CVV, false otherwise.
-///
-/// Call this if you should be a committe member.  Currently it will determine if you have recent
-/// enough DAG information to rejoin consensus or not.
-/// This function also sets some of the round watches on the consensus bus to proper defaults on
-/// startup.
-/// XXXX- parts of this need to happen even if it is removed.
-pub async fn can_cvv<DB: Database>(
-    consensus_bus: &ConsensusBus,
-    config: &ConsensusConfig<DB>,
-    network: &PrimaryNetworkHandle,
-) -> bool {
-    // Get the DB and load our last executed consensus block (note there may be unexecuted
-    // blocks, catch up will execute them).
-    let last_executed_block =
-        last_executed_consensus_block(consensus_bus, config).unwrap_or_default();
-
-    let current_epoch = config.epoch();
-
-    // check if the latest subdag is from the current epoch
-    // this function is called at startup and at each epoch boundary
-    let last_subdag = &last_executed_block.sub_dag;
-    let (last_consensus_epoch, last_consensus_round) = if last_subdag.leader_epoch() < current_epoch
-    {
-        // new epoch
-        (current_epoch, 0)
-    } else {
-        // node recovery
-        (last_subdag.leader_epoch(), last_subdag.leader_round())
-    };
-
-    let _ = consensus_bus.update_consensus_rounds(ConsensusRound::new_with_gc_depth(
-        last_consensus_round,
-        config.parameters().gc_depth,
-    ));
-    let _ = consensus_bus.primary_round_updates().send(last_consensus_round);
-
-    let max_consensus_header = max_consensus_header_from_committee(network, config)
-        .await
-        .unwrap_or_else(|| last_executed_block.clone());
-    debug!(target: "state-sync", ?max_consensus_header, "max consensus header from committee");
-
-    let max_epoch = max_consensus_header.sub_dag.leader_epoch();
-    let max_round = max_consensus_header.sub_dag.leader_round();
-
-    // update consensus header
-    let _ = consensus_bus.last_consensus_header().send(max_consensus_header);
-
-    info!(target: "state-sync",
-        "CATCH UP params for epoch {current_epoch} {max_epoch}, {max_round}, leader epoch: {last_consensus_epoch}, leader round: {last_consensus_round}, gc: {}",
-        config.parameters().gc_depth
-    );
-
-    // see if:
-    // - node reached epoch boundary
-    // - node restarted in the current epoch
-    // - node restarted outside of gc round
-    if max_epoch < current_epoch {
-        eprintln!("XXXX cancvv 1");
-        info!(target: "state-sync", "Node is joining consensus for new epoch");
-        true
-    } else if max_epoch == last_consensus_epoch // still in current epoch
-        && (last_consensus_round + config.parameters().gc_depth) > max_round
-    {
-        eprintln!("XXXX cancvv 2");
-        info!(target: "state-sync", "Node is attempting to rejoin consensus.");
-        // We should be able to pick up consensus where we left off.
-        true
-    } else {
-        eprintln!("XXXX cancvv 3");
-        info!(target: "state-sync", "Node has fallen too far behind to rejoin consensus - syncing...");
-        false
-    }
 }
 
 /// Spawn the state sync tasks.
@@ -156,13 +65,12 @@ pub fn spawn_state_sync<DB: Database>(
         NodeMode::CvvInactive | NodeMode::Observer => {
             // If we are not an active CVV then follow latest consensus from peers.
             let (config_clone, consensus_bus_clone) = (config.clone(), consensus_bus.clone());
-            let network_clone = network.clone();
             task_manager.spawn_task(
                 "state sync: track latest consensus header from peers",
                 monitored_future!(
                     async move {
                         info!(target: "state-sync", "Starting state sync: track latest consensus header from peers");
-                        if let Err(e) = spawn_track_recent_consensus(config_clone, consensus_bus_clone, network_clone).await {
+                        if let Err(e) = spawn_track_recent_consensus(config_clone, consensus_bus_clone, network).await {
                             error!(target: "state-sync", "Error tracking latest consensus headers: {e}");
                         }
                     },
@@ -174,7 +82,7 @@ pub fn spawn_state_sync<DB: Database>(
                 monitored_future!(
                     async move {
                         info!(target: "state-sync", "Starting state sync: stream consensus header from peers");
-                        if let Err(e) = spawn_stream_consensus_headers(config, consensus_bus, network).await {
+                        if let Err(e) = spawn_stream_consensus_headers(config, consensus_bus).await {
                             error!(target: "state-sync", "Error streaming consensus headers: {e}");
                         }
                     },
@@ -323,7 +231,6 @@ pub async fn get_missing_consensus<DB: Database>(
 async fn spawn_stream_consensus_headers<DB: Database>(
     config: ConsensusConfig<DB>,
     consensus_bus: ConsensusBus,
-    network: PrimaryNetworkHandle,
 ) -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
 
@@ -342,14 +249,12 @@ async fn spawn_stream_consensus_headers<DB: Database>(
 
                 if header.number > last_consensus_height {
                     last_consensus_header = catch_up_consensus_from_to(
-                        &network,
                         &config,
                         &consensus_bus,
                         last_consensus_header,
-                        header.clone(), // XXXX- no clone
+                        header,
                     )
                     .await?;
-                    eprintln!("XXXX num {}, last {}, new last {}", header.number, last_consensus_height, last_consensus_header.number);
                     last_consensus_height = last_consensus_header.number;
                 }
             }
@@ -360,76 +265,10 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     }
 }
 
-/// Returns the latest consensus header retrieved from a committee member.
-/// Note: this is only for use by committee members, otherwise they may not be peers (used by
-/// can_cvv).
-///
-/// Will allow three seconds per client and three attempts to get the consensus info.
-async fn max_consensus_header_from_committee<DB: Database>(
-    network: &PrimaryNetworkHandle,
-    config: &ConsensusConfig<DB>,
-) -> Option<ConsensusHeader> {
-    let peers = get_peers(config);
-    let committee = config.committee();
-    let mut result: Option<ConsensusHeader> = None;
-    let mut waiting = FuturesUnordered::new();
-    // Ask all our peers for their latest consensus height.
-    for peer in peers.iter() {
-        waiting.push(tokio::time::timeout(
-            Duration::from_secs(3), /* Three seconds should be plenty of time to get the
-                                     * consensus header. */
-            network.request_consensus_from_peer(*peer, None, None),
-        ));
-    }
-    while let Some(res) = waiting.next().await {
-        match res {
-            Ok(Ok(consensus_header)) => {
-                // Validate all the certificates in this consensus header.
-                let consensus_header = consensus_header.verify_certificates(committee).ok()?;
-                result = if let Some(last) = result {
-                    let (epoch, last_epoch) =
-                        (consensus_header.sub_dag.leader.epoch(), last.sub_dag.leader.epoch());
-                    let (round, last_round) =
-                        (consensus_header.sub_dag.leader.round(), last.sub_dag.leader.round());
-                    if epoch > last_epoch || (epoch == last_epoch && round > last_round) {
-                        Some(consensus_header)
-                    } else {
-                        Some(last)
-                    }
-                } else {
-                    Some(consensus_header)
-                };
-            }
-            Ok(Err(e)) => {
-                // An error with one peer should not derail us...  But log it.
-                error!(target: "state-sync", "error requesting peer consensus {e:?}")
-            }
-            Err(e) => {
-                // An error with one peer should not derail us...  But log it.
-                error!(target: "state-sync", "error awaiting peer consensus {e:?}")
-            }
-        }
-    }
-
-    // only return block if it greater than or equal to the current epoch
-    result //.filter(|block| block.sub_dag.leader_epoch() >= config.epoch())
-}
-
-/// Get a vector of public keys for each peer.
-fn get_peers<DB: Database>(config: &ConsensusConfig<DB>) -> Vec<BlsPublicKey> {
-    config
-        .committee()
-        .others_primaries_by_id(config.authority_id().as_ref())
-        .into_iter()
-        .map(|(_, key)| key)
-        .collect()
-}
-
 /// Applies consensus output "from" (exclusive) to height "max_consensus_height" (inclusive).
 /// Queries peers for latest height and downloads and executes any missing consensus output.
 /// Returns the last ConsensusHeader that was applied on success.
 async fn catch_up_consensus_from_to<DB: Database>(
-    _network: &PrimaryNetworkHandle, // XXXX
     config: &ConsensusConfig<DB>,
     consensus_bus: &ConsensusBus,
     from: ConsensusHeader,

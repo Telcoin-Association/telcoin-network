@@ -178,8 +178,8 @@ impl<DB: Database> Subscriber<DB> {
             {
                 // We are caught up enough so try to jump back into consensus
                 info!(target: "subscriber", "attempting to rejoin consensus, consensus block height {consensus_header_number}");
-                eprintln!("XXXX attempting to rejoin consensus, consensus block height {consensus_header_number}");
                 let _ = self.consensus_bus.node_mode().send(NodeMode::CvvActive);
+                self.config.shutdown().notify();
                 return Ok(());
             }
         }

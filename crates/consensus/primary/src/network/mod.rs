@@ -191,7 +191,6 @@ impl PrimaryNetworkHandle {
                     }
                 }
                 _ => Ok(Arc::unwrap_or_clone(header)),
-                //XXXXErr(NetworkError::RPCError("Must provide a hash or number!".to_string())),
             },
             PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
             _ => Err(NetworkError::RPCError(

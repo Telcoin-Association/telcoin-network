@@ -125,13 +125,23 @@ where
                     let sigs = consensus_certs.get(&hash).copied();
                     if let Some(sigs) = sigs {
                         if (sigs + 1) as usize >= enough_sigs {
+                            // Last consensus block we have executed, us this to determine if we are
+                            // too far behind.
+                            let exec_number = self
+                                .consensus_config
+                                .node_storage()
+                                .last_record::<ConsensusBlocks>()
+                                .map(|(n, _)| n)
+                                .unwrap_or(0);
+                            // Use GC depth to estimate how many blocks we can be behind (roughly
+                            // one block every two rounds).
+                            let allowed_behind =
+                                (self.consensus_config.parameters().gc_depth / 2) - 2;
                             if matches!(
                                 *self.consensus_bus.node_mode().borrow(),
                                 NodeMode::CvvActive
-                            ) && old_hash != BlockHash::default()  // Ignore initial empty value.
-                                && old_number + 3 < number
+                            ) && (exec_number + allowed_behind as u64) < number
                             {
-                                eprintln!("XXXX CVV INACTIVE NOW old {old_number}, num {number}");
                                 // We seem to be too far behind to be an active CVV, try to go
                                 // inactive to catch up.
                                 let _ = self.consensus_bus.node_mode().send(NodeMode::CvvInactive);
@@ -158,8 +168,9 @@ where
                 } else {
                     let latest_missing = *self.consensus_bus.requested_missing_epoch().borrow();
                     if epoch > latest_missing {
-                        // XXXX can we sanity check epoch at all to avoid trying to download bogus
-                        // records. Send a request to get this epoch record.
+                        // Not sure we can sanity check this epoch.  However if it is bogus the code
+                        // to handle it should be fine and will reset requested_missing_epoch to
+                        // sanity.
                         let _ = self.consensus_bus.requested_missing_epoch().send(epoch);
                     }
                 }

@@ -1,6 +1,5 @@
 //! NOTE: tests for this module are in test-utils storage_tests.rs to avoid circular dependancies.
 
-// XXXX- fix docs
 use crate::tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache};
 use std::{cmp::max, collections::HashMap};
 use tn_types::{
@@ -9,10 +8,11 @@ use tn_types::{
 };
 use tracing::debug;
 
-/// Implement persistent storage of the sequencer.
+/// Implement persistent storage of the consensus chain.
 /// Uses DB tables:
-///   - LastCommitted<AuthorityIdentifier, Round>: The latest committed round of each validator.
-///   - CommittedSubDag<SequenceNumber, ConsensusCommit>: The global consensus sequence
+///   - ConsensusBlocks
+///   - ConsensusBlockNumbersByDigest
+///   - ConsensusBlocksCache
 pub trait ConsensusStore: Clone {
     /// Persist the sub dag to the consensus chain for some storage tests.
     /// This uses garbage parent hash and number and is ONLY for testing.
@@ -20,7 +20,7 @@ pub trait ConsensusStore: Clone {
     /// to the consensus chain
     fn write_subdag_for_test(&self, number: u64, sub_dag: CommittedSubDag);
 
-    /// Clear the consesus chain, ONLY for testing.
+    /// Clear the consensus chain, ONLY for testing.
     /// Will panic on an error.
     fn clear_consensus_chain_for_test(&self);
 

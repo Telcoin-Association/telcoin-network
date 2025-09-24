@@ -96,13 +96,12 @@ impl<DB: Database> Primary<DB> {
 
             proposer.spawn(task_manager);
         } else {
-            // XXXX ProcessGosip-tn-primary-XXXX still gets cancelled, figure it out...
             // This is a dumb task to keep the parents channel clear when not
             // a cvv.  Otherwise the senders to this channel will eventually "back up"
-            // and cause hung tasks.  Not the end of the workd but wastes resources.
+            // and cause hung tasks.  Not the end of the world but wastes resources.
             let mut parents_rx = consensus_bus.parents().subscribe();
             task_manager.spawn_critical_task("Clear parent certs for non-CVV", async move {
-                while let Some(_) = parents_rx.recv().await {}
+                while (parents_rx.recv().await).is_some() {}
             });
         }
 

@@ -147,9 +147,6 @@ pub fn catchup_accumulator<DB: TNDatabase>(
                 // this is a new round, increment the leader count
                 let consensus_digest =
                     current.parent_beacon_block_root.ok_or_eyre("consensus root missing")?;
-                /*XXXXlet consensus_block_num = db
-                .get::<ConsensusBlockNumbersByDigest>(&consensus_digest)?
-                .ok_or_eyre("consensus block number by digest missing")?;*/
                 let leader = db
                     .get_consensus_by_hash(consensus_digest)
                     //.get::<ConsensusBlocks>(&consensus_block_num)?
@@ -264,22 +261,19 @@ where
         // read the network config or use the default
         let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
         self.spawn_node_networks(node_task_spawner, &network_config).await?;
-        self.primary_network_handle
-            .as_ref()
-            .expect("primary network")
+        let primary_network_handle =
+            self.primary_network_handle.as_ref().expect("primary network").clone();
+        primary_network_handle
             .inner_handle()
             .subscribe(tn_config::LibP2pConfig::epoch_vote_topic())
             .await?;
-        self.primary_network_handle
-            .as_ref()
-            .expect("primary network")
+        primary_network_handle
             .inner_handle()
             .subscribe(tn_config::LibP2pConfig::consensus_output_topic())
             .await?;
         state_sync::spawn_epoch_record_collector(
             self.consensus_db.clone(),
-            self.primary_network_handle.as_ref().expect("primary network").clone(),
-            self.tn_datadir.clone(),
+            primary_network_handle,
             self.consensus_bus.clone(),
             node_task_manager.get_spawner(),
             self.node_shutdown.subscribe(),
@@ -407,6 +401,7 @@ where
         // initialize long-running components for node startup
         let mut initial_epoch = true;
 
+        let node_ended_sub = self.node_shutdown.subscribe();
         // loop through epochs
         loop {
             let epoch_result = self
@@ -426,6 +421,10 @@ where
 
             info!(target: "epoch-manager", "looping run epoch");
             self.consensus_bus.reset_for_epoch();
+            // Make sure we don't start a new epoch when we are shutting down.
+            if node_ended_sub.noticed() {
+                break Ok(());
+            }
         }
     }
 
@@ -439,10 +438,13 @@ where
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<()> {
         info!(target: "epoch-manager", "Starting epoch");
+        let node_ended = self.node_shutdown.subscribe();
 
         // The task manager that resets every epoch and manages
         // short-running tasks for the lifetime of the epoch.
         let mut epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
+        // Do not wait long for tasks to exit, just drop them and move on to next epoch.
+        epoch_task_manager.set_join_wait(200);
 
         // subscribe to output early to prevent missed messages
         let consensus_output = self.consensus_bus.consensus_output().subscribe();
@@ -525,7 +527,11 @@ where
             let _ = self.collect_epoch_votes(&primary, epoch_rec, &epoch_task_manager).await;
         }
 
+        let mut need_join = false;
         tokio::select! {
+            _ = node_ended => {
+                need_join = true;
+            },
             // wait for epoch boundary to transition
             res = self.wait_for_epoch_boundary(to_engine, gas_accumulator.clone(), consensus_output) => {
                 // toggle bool to clear tables
@@ -540,10 +546,11 @@ where
                 self.write_epoch_record(&primary, engine).await?;
 
                 info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
+                need_join = true;
             },
 
             // return any errors
-            res = epoch_task_manager.join_until_exit(consensus_shutdown_clone) => {
+            res = epoch_task_manager.join(consensus_shutdown_clone) => {
                 res.inspect_err(|e| {
                     error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
                 })?;
@@ -551,16 +558,19 @@ where
             },
         }
 
-        consensus_shutdown.notify();
-        // abort all epoch-related tasks
-        epoch_task_manager.abort_all_tasks();
-        // Expect complaints from join so swallow those errors...
-        // If we timeout here something is not playing nice and shutting down so return the timeout.
-        let _ = tokio::time::timeout(
-            Duration::from_secs(5),
-            epoch_task_manager.join(consensus_shutdown),
-        )
-        .await?;
+        if need_join {
+            consensus_shutdown.notify();
+            // abort all epoch-related tasks
+            epoch_task_manager.abort_all_tasks();
+            // Expect complaints from join so swallow those errors...
+            // If we timeout here something is not playing nice and shutting down so return the
+            // timeout.
+            let _ = tokio::time::timeout(
+                Duration::from_millis(500),
+                epoch_task_manager.join(consensus_shutdown),
+            )
+            .await?;
+        }
 
         // clear tables
         if clear_tables_for_next_epoch {
@@ -957,8 +967,7 @@ where
         // set execution state for consensus
         self.try_restore_state(engine).await?;
 
-        let primary_network_handle = primary.network_handle().await;
-        let _mode = self.identify_node_mode(&consensus_config, &primary_network_handle).await?;
+        let _mode = self.identify_node_mode(&consensus_config).await?;
 
         // spawn task to update the latest execution results for consensus
         //
@@ -999,7 +1008,6 @@ where
         // retrieve epoch information from canonical tip
         let EpochState { epoch, epoch_info, validators, epoch_start } =
             engine.epoch_state_from_canonical_tip().await?;
-        eprintln!("XXXX epoch {epoch}, start: {epoch_start}");
         debug!(target: "epoch-manager", ?epoch_info, "epoch state from canonical tip for epoch {}", epoch);
         let validators = validators
             .iter()
@@ -1401,11 +1409,9 @@ where
     async fn identify_node_mode(
         &self,
         consensus_config: &ConsensusConfig<DB>,
-        _primary_network_handle: &PrimaryNetworkHandle, // XXXX
     ) -> eyre::Result<NodeMode> {
         if matches!(*self.consensus_bus.node_mode().borrow(), NodeMode::CvvInactive) {
             // If we have an inactive mode then it was set so keep it for now.
-            eprintln!("XXXX CVV INACTIVE");
             return Ok(NodeMode::CvvInactive);
         }
         debug!(target: "epoch-manager", authority_id=?consensus_config.authority_id(), "identifying node mode..." );
@@ -1413,20 +1419,11 @@ where
             .authority_id()
             .map(|id| consensus_config.in_committee(&id))
             .unwrap_or(false);
-        state_sync::prime_consensus(&self.consensus_bus, consensus_config).await; // XXXX confirm we need this.
+        state_sync::prime_consensus(&self.consensus_bus, consensus_config).await;
         let mode = if !in_committee || self.builder.tn_config.observer {
-            eprintln!("XXXX OBSERVER: {}", consensus_config.key_config().primary_public_key());
             NodeMode::Observer
-            /*XXXX} else if state_sync::can_cvv(&self.consensus_bus, consensus_config, primary_network_handle)
-                .await
-            {
-                eprintln!("XXXX CVV");
-                NodeMode::CvvActive*/
         } else {
-            //eprintln!("XXXX CVV INACTIVE");
-            //XXXXNodeMode::CvvInactive
             // Assume we are caught up, will be demoted to inactive if this is not true...
-            eprintln!("XXXX CVV");
             NodeMode::CvvActive
         };
 

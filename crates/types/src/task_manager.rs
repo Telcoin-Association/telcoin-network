@@ -74,6 +74,8 @@ pub struct TaskManager {
     /// This is used to notify any spawned tasks to exit when task manager is dropped.
     /// Otherwise we will end up with orphaned tasks when epochs change.
     local_shutdown: Notifier,
+    /// How long to wait for joins to complete.  This will be sued twice (so double it).
+    join_wait_millis: u64,
 }
 
 impl Drop for TaskManager {
@@ -235,7 +237,15 @@ impl TaskManager {
             new_task_rx,
             new_task_tx,
             local_shutdown: Notifier::default(),
+            join_wait_millis: 2000,
         }
+    }
+
+    /// Sets the amount of time this task manager will wait on tasks/submanagers to complete.
+    /// Will be used twice in join, once for tasks and once for subtasks so max wait will
+    /// 2x this value (min).
+    pub fn set_join_wait(&mut self, millis: u64) {
+        self.join_wait_millis = millis;
     }
 
     /// Spawns a non-critical task on tokio and records it's JoinHandle and name. Other tasks are
@@ -351,10 +361,14 @@ impl TaskManager {
         do_exit: bool,
     ) -> Result<(), TaskJoinError> {
         let shutdown_ref = &shutdown;
+        let sub_wait_millis = (self.join_wait_millis / 4) * 3;
         let mut future_managers: FuturesUnordered<_> = self
             .submanagers
             .drain()
-            .map(|(name, mut sub)| async move { (sub.join(shutdown_ref.clone()).await, name) })
+            .map(|(name, mut sub)| async move {
+                sub.set_join_wait(sub_wait_millis);
+                (sub.join(shutdown_ref.clone()).await, name)
+            })
             .collect();
         let rx_shutdown = shutdown.subscribe();
         let mut result = Ok(());
@@ -415,9 +429,10 @@ impl TaskManager {
         // cleanly.
         shutdown.notify();
         let task_name = self.name.clone();
+        let join_wait = Duration::from_millis(self.join_wait_millis);
         // wait some time for shutdown...
         // 2 seconds for our tasks to end...
-        if tokio::time::timeout(Duration::from_secs(2), async move {
+        if tokio::time::timeout(join_wait, async move {
             tracing::debug!(target: "tn::tasks", "awaiting shutdown for task manager\n{self:?}");
             while let Some(res) = self.tasks.next().await {
                 match res {
@@ -453,7 +468,7 @@ impl TaskManager {
 
         // Another 2 seconds for any of our sub tasks to end...
         let task_name_clone = task_name.clone();
-        if tokio::time::timeout(Duration::from_secs(2), async move {
+        if tokio::time::timeout(join_wait, async move {
             while let Some((_, name)) = future_managers.next().await {
                 tracing::info!(
                     target: "tn::tasks",

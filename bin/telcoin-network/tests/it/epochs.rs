@@ -71,7 +71,6 @@ async fn test_epoch_boundary_inner(
         // Once that is no longer true then should remove this retry loop.
         loop {
             debug!(target: "epoch-test", "pending tx: {pending:?}");
-            eprintln!("XXXX pending tx: {pending:?}");
             match timeout(Duration::from_secs(3), pending.watch()).await {
                 Err(_) => {
                     pending = provider.send_raw_transaction(&tx).await?;
@@ -83,7 +82,6 @@ async fn test_epoch_boundary_inner(
             }
             break;
         }
-        //XXXXpending.watch().await?;
     }
 
     // retrieve current committee
@@ -145,7 +143,6 @@ async fn test_epoch_boundary_inner(
         // TODO issue 375, should use tn_latestHeader RPC for this when fixed.
         let latest_epoch = last_pause;
         for p in 8540..=8545 {
-            eprintln!("XXXX trying port {p}");
             let rpc_url = format!("http://127.0.0.1:{p}");
             let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
             for epoch in 0..=latest_epoch {

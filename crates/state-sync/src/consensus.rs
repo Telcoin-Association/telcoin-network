@@ -27,7 +27,6 @@ async fn get_consensus_header<DB: TNDatabase>(
     if let Ok(header) = network.request_consensus(None, Some(hash)).await {
         // The header we got will match hash (request_consensus() contract).
         let parent = header.parent_hash;
-        eprintln!("XXXX got consensus {hash}");
         match db.write_txn() {
             Ok(mut txn) => {
                 if let Err(e) = txn.insert::<ConsensusBlocksCache>(&header.number, &header) {
@@ -47,7 +46,7 @@ async fn get_consensus_header<DB: TNDatabase>(
             }
         }
         if header.number > consensus_bus.last_consensus_header().borrow().number {
-            //XXXX - Update our last seen valid consensus header if it is newer.
+            // Update our last seen valid consensus header if it is newer.
             let _ = consensus_bus.last_consensus_header().send(header);
         }
         Some(parent)
