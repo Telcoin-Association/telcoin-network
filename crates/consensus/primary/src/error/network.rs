@@ -147,12 +147,12 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::ParentMissingSignature
         | HeaderError::InvalidParentTimestamp { .. }
         | HeaderError::UnkownWorkerId
-        | HeaderError::InvalidEpoch { .. }
         | HeaderError::InvalidHeaderDigest
         | HeaderError::UnknownAuthority(_) => Some(Penalty::Fatal),
         // ignore
         HeaderError::PendingCertificateOneshot
         | HeaderError::TNSend(_)
+        | HeaderError::InvalidEpoch { .. }
         | HeaderError::ClosedWatchChannel => None,
     }
 }
