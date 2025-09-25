@@ -676,6 +676,7 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
 /// Test peer exchanges when too many peers connect
 #[tokio::test]
 async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
+    tn_types::test_utils::init_test_tracing();
     // Create a custom config with very low peer limits for testing
     let mut network_config = NetworkConfig::default();
     network_config.peer_config_mut().target_num_peers = 4;
@@ -693,7 +694,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     let mut target_network = target_peer.network.take().expect("target network is some");
     // Need to disable kademlia peers or the various networks will connect on their own and trip up
     // the test...
-    target_network.no_kad_peers_for_test();
+    // target_network.no_kad_peers_for_test();
     let id = target_peer.config.authority().as_ref().expect("authority").id();
     tokio::spawn(async move {
         let res = target_network.run().await;
@@ -768,6 +769,14 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     tokio::spawn(async move {
         network.run().await.expect("network run failed!");
     });
+    debug!(target: "network", "all ids");
+    debug!(target: "network", ?target_peer_id);
+    for peer in &other_peers {
+        let peer_id = peer.network_handle.local_peer_id().await?;
+        debug!(target: "network", ?peer_id);
+    }
+    let nvv_id = nvv.local_peer_id().await?;
+    debug!(target: "network", ?nvv_id);
 
     target_peer
         .network_handle
@@ -785,7 +794,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     nvv.subscribe_with_publishers(TEST_TOPIC.into(), vec![target_peer_bls].into_iter().collect())
         .await?;
 
-    // connect to target
+    // connect to target which has too many peers
     nvv.dial_by_bls(target_peer_bls).await?;
 
     // give time for connection to establish
@@ -808,12 +817,19 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     // allow dial attempts to be made
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
 
+    // assert target is disconnected from nvv
+    assert!(!target_peer
+        .network_handle
+        .connected_peers()
+        .await?
+        .contains(nvv_config.config().primary_bls_key()));
+
     // assert nvv is connected with other peers
     let connected = nvv.connected_peer_ids().await?;
     assert!(!connected.contains(&target_peer_id));
     for peer in other_peers.iter() {
         let id = peer.network_handle.local_peer_id().await?;
-        assert!(connected.contains(&id));
+        assert!(connected.contains(&id), "missing peer {id:?}");
     }
 
     // publish random batch
@@ -1446,6 +1462,7 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
 /// Test kad records available to new node joining the network.
 #[tokio::test]
 async fn test_get_kad_records() -> eyre::Result<()> {
+    tn_types::test_utils::init_test_tracing();
     // used later
     let num_network_peers = 5;
 
@@ -1532,6 +1549,10 @@ async fn test_get_kad_records() -> eyre::Result<()> {
 
     nvv.start_listening(nvv_config.primary_address()).await?;
 
+    // delete this
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
+    info!(target: "network-kad", "dialing target!!!!");
+
     // connect to target
     nvv.add_trusted_peer_and_dial(target_peer_bls, target_peer_net.clone(), target_addr.clone())
         .await?;
@@ -1551,6 +1572,7 @@ async fn test_get_kad_records() -> eyre::Result<()> {
     // find other committee members through kad
     let authorities: Vec<BlsPublicKey> =
         committee.iter().map(|peer| peer.config.key_config().primary_public_key()).collect();
+    info!(target: "network", "finding authorities!!!");
     let node_records = nvv.find_authorities(authorities.clone()).await?;
 
     for record in node_records {
