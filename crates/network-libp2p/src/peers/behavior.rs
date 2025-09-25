@@ -3,7 +3,7 @@
 use super::{manager::PeerManager, types::DialRequest, PeerEvent};
 use crate::peers::types::ConnectionType;
 use libp2p::{
-    core::{multiaddr::Protocol, transport::PortUse, ConnectedPoint, Endpoint},
+    core::{transport::PortUse, ConnectedPoint, Endpoint},
     swarm::{
         behaviour::ConnectionEstablished,
         dial_opts::{DialOpts, PeerCondition},
@@ -13,10 +13,7 @@ use libp2p::{
     },
     Multiaddr, PeerId,
 };
-use std::{
-    net::IpAddr,
-    task::{Context, Poll},
-};
+use std::task::{Context, Poll};
 use tracing::{debug, error, info, trace};
 
 impl NetworkBehaviour for PeerManager {
@@ -30,16 +27,12 @@ impl NetworkBehaviour for PeerManager {
         _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
     ) -> Result<(), ConnectionDenied> {
-        // only allow ipv4 and ipv6
-        let ip = match remote_addr.iter().next() {
-            Some(Protocol::Ip4(ip)) => IpAddr::V4(ip),
-            Some(Protocol::Ip6(ip)) => IpAddr::V6(ip),
-            _ => {
-                return Err(ConnectionDenied::new(format!(
-                    "Connection to peer rejected: invalid multiaddr: {remote_addr}"
-                )))
-            }
-        };
+        // only support ipv4 and ipv6
+        let ip = self.extract_supported_protocol_from_multiaddr(remote_addr).ok_or_else(|| {
+            ConnectionDenied::new(format!(
+                "Connection to peer rejected: invalid protocol: {remote_addr}"
+            ))
+        })?;
 
         // ensure ip address is not banned
         if self.is_ip_banned(&ip) {

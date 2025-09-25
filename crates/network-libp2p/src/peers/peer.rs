@@ -236,6 +236,9 @@ impl Peer {
     }
 
     /// True if this peer can be dialed in it's current state.
+    ///
+    /// This method implicitly evaluates peers which are in the process
+    /// of being banned (connected/disconnecting).
     pub(super) fn can_dial(&self) -> bool {
         match self.connection_status {
             ConnectionStatus::Disconnecting { banned } => !banned,

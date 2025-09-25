@@ -1274,18 +1274,22 @@ where
                 }
             }
             kad::Event::UnroutablePeer { peer } => {
-                // NOOP
+                // unknown peer queried a record - noop
                 debug!(target: "network-kad", "unroutable peer {peer:?}")
             }
             kad::Event::RoutablePeer { peer, address } => {
                 // kad discovered a new peer
                 debug!(target: "network-kad", "routable peer {peer:?}/{address:?}");
 
-                // TODO:???
-                // self.swarm.behaviour_mut().kademlia.add_address(peer, address)
+                // TODO: does kademlia enforce strict peer id verification?
+
+                // notify peer manager
+                self.swarm.behaviour_mut().peer_manager.process_routable_peer(peer, address);
             }
             kad::Event::PendingRoutablePeer { peer, address } => {
                 debug!(target: "network-kad", "pending routable peer {peer:?}/{address:?}")
+                // TODO: should this also notify peer manager?
+                //  - confirm default kad flow
             }
             kad::Event::ModeChanged { new_mode } => {
                 debug!(target: "network-kad", "mode changed {new_mode:?}")
