@@ -500,6 +500,10 @@ where
                 // TNBehavior::handle_pending_outbound_connection
                 error!(target: "peer-manager", ?peer_id, ?connection_id, "DIALING PEER!!!");
             }
+            // TODO: kad emits SwarmEvent::NewExternalAddrOfPeer - update PM here?
+            // - no, do this on routing updated?
+            // - this should match node record
+            //
             // other events handled by peer manager and other behaviors
             _ => {}
         }
@@ -1065,14 +1069,17 @@ where
                 // register peer for request-response behaviour
                 // NOTE: gossipsub handles `FromSwarm::ConnectionEstablished`
                 self.swarm.add_peer_address(peer_id, addr.clone());
+                // add as a kademlia peer
+                let routing_update =
+                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                // TODO: pass routing update to PM for prioritizing prune operations
+                // - heirarchy:
+                //      - success
+                //          - update here or when RoutingUpdated event?
+                //      - pending
+                //      - failed
 
-                // TODO: review add_address method
-                // - is this sufficient for ensuring bucket doesn't overflow?
-                // - does kad process connections?
-                //      - RoutingUpdate::Pending initiates dial attempt
-                //
-                // - examples show calling this on every `BOOT_NODE`
-                self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                // TODO: publish data here to PUSH or PULL?
                 self.publish_our_data_to_peer(peer_id);
 
                 // manage connected peers for
@@ -1090,10 +1097,11 @@ where
                 // - connecting with peer first also improves changes of retrieving record
             }
             PeerEvent::Banned(peer_id) => {
-                // TODO: remove from kad table
                 warn!(target: "network", ?peer_id, "peer banned");
                 // blacklist gossipsub
                 self.swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
+                // remove from kad routing table
+                self.swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
             }
             PeerEvent::Unbanned(peer_id) => {
                 debug!(target: "network", ?peer_id, "peer unbanned");
@@ -1278,6 +1286,23 @@ where
                 //  - this should happen on peer connected PM event
                 //      - confirmed this is the current approach, so good here
                 //  - see `add_address` doc comment for additional considerations
+                //
+                // - this also happens when the kbucket entry is already present in kad::on_connection
+                //      - is_new_peer = false
+                //      - call PM to check update IP addresses
+                //          - ensure none are banned, otherwise disconnect
+                //
+                //
+                // TODO: update old_peer in PM as candidate for pruning
+                // flow:
+                //  - kad discovers better peer
+                // - initiates dial attempt
+                //      - PM does not filter dials based on target counts
+                // - connection established, evict old_peer
+                // - updated peer info to indicate no longer part of the routing table
+                // - pruning will prioritize peers that aren't part of kad
+                //      - should be okay since target peer count is higher than K-target
+                // - this method will always update peer's routing status bc it is always emitted after successful add_address
 
                 // TODO: add to peer manager - see issue #301
                 if self.swarm.behaviour().peer_manager.peer_is_important(&peer) {
