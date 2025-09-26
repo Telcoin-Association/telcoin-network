@@ -1,16 +1,18 @@
 //! NOTE: tests for this module are in test-utils storage_tests.rs to avoid circular dependancies.
 
-use crate::tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks};
+use crate::tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache};
 use std::{cmp::max, collections::HashMap};
 use tn_types::{
-    AuthorityIdentifier, CommittedSubDag, ConsensusHeader, Database, DbTxMut, Epoch, Round,
+    AuthorityIdentifier, BlockHash, CommittedSubDag, ConsensusHeader, Database, DbTxMut, Epoch,
+    Round,
 };
 use tracing::debug;
 
-/// Implement persistent storage of the sequencer.
+/// Implement persistent storage of the consensus chain.
 /// Uses DB tables:
-///   - LastCommitted<AuthorityIdentifier, Round>: The latest committed round of each validator.
-///   - CommittedSubDag<SequenceNumber, ConsensusCommit>: The global consensus sequence
+///   - ConsensusBlocks
+///   - ConsensusBlockNumbersByDigest
+///   - ConsensusBlocksCache
 pub trait ConsensusStore: Clone {
     /// Persist the sub dag to the consensus chain for some storage tests.
     /// This uses garbage parent hash and number and is ONLY for testing.
@@ -18,7 +20,7 @@ pub trait ConsensusStore: Clone {
     /// to the consensus chain
     fn write_subdag_for_test(&self, number: u64, sub_dag: CommittedSubDag);
 
-    /// Clear the consesus chain, ONLY for testing.
+    /// Clear the consensus chain, ONLY for testing.
     /// Will panic on an error.
     fn clear_consensus_chain_for_test(&self);
 
@@ -36,6 +38,12 @@ pub trait ConsensusStore: Clone {
         &self,
         epoch: Epoch,
     ) -> Option<CommittedSubDag>;
+
+    /// Get a ConsensusHeader by hash.
+    fn get_consensus_by_hash(&self, hash: BlockHash) -> Option<ConsensusHeader>;
+
+    /// Get a ConsensusHeader by number.
+    fn get_consensus_by_number(&self, number: u64) -> Option<ConsensusHeader>;
 }
 
 impl<DB: Database> ConsensusStore for DB {
@@ -109,6 +117,30 @@ impl<DB: Database> ConsensusStore for DB {
         }
         debug!("No final reputation scores have been found");
         None
+    }
+
+    fn get_consensus_by_hash(&self, hash: BlockHash) -> Option<ConsensusHeader> {
+        if let Ok(Some(number)) = self.get::<ConsensusBlockNumbersByDigest>(&hash) {
+            if let Ok(Some(block)) = self.get::<ConsensusBlocks>(&number) {
+                Some(block)
+            } else if let Ok(Some(block)) = self.get::<ConsensusBlocksCache>(&number) {
+                Some(block)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    fn get_consensus_by_number(&self, number: u64) -> Option<ConsensusHeader> {
+        if let Ok(Some(block)) = self.get::<ConsensusBlocks>(&number) {
+            Some(block)
+        } else if let Ok(Some(block)) = self.get::<ConsensusBlocksCache>(&number) {
+            Some(block)
+        } else {
+            None
+        }
     }
 }
 

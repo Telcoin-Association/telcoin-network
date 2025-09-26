@@ -8,6 +8,7 @@ use tn_config::ConsensusConfig;
 use tn_storage::ConsensusStore;
 use tn_types::{
     error::HeaderResult, Certificate, CertificateDigest, Database, Header, Round, TaskManager,
+    TaskSpawner,
 };
 mod cert_collector;
 mod cert_manager;
@@ -37,7 +38,11 @@ where
     DB: Database,
 {
     /// Create a new instance of Self.
-    pub fn new(config: ConsensusConfig<DB>, consensus_bus: ConsensusBus) -> Self {
+    pub fn new(
+        config: ConsensusConfig<DB>,
+        consensus_bus: ConsensusBus,
+        task_spawner: TaskSpawner,
+    ) -> Self {
         let header_validator = HeaderValidator::new(config.clone(), consensus_bus.clone());
         // load highest round number from the ConsensusBlock table
         let highest_process_round = config
@@ -54,6 +59,7 @@ where
             AtomicRound::new(0),
             AtomicRound::new(highest_process_round),
             AtomicRound::new(0),
+            task_spawner,
         );
 
         Self { certificate_validator, header_validator }

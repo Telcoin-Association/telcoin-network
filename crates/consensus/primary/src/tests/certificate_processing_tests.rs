@@ -37,16 +37,16 @@ struct TestTypes<DB = MemDatabase> {
 fn create_all_test_types() -> TestTypes<MemDatabase> {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let primary = fixture.authorities().last().unwrap();
-    let (manager, validator, cb) = create_core_test_types(primary);
-    let task_manager = TaskManager::default();
+    let (manager, validator, cb, task_manager) = create_core_test_types(primary);
 
     TestTypes { manager, validator, cb, fixture, task_manager }
 }
 
 // reused in other tests
-fn create_core_test_types<DB: Database>(
+fn create_core_test_types_with_tasks<DB: Database>(
     primary: &AuthorityFixture<DB>,
-) -> (CertificateManager<DB>, CertificateValidator<DB>, ConsensusBus) {
+    task_manager: TaskManager,
+) -> (CertificateManager<DB>, CertificateValidator<DB>, ConsensusBus, TaskManager) {
     let cb = ConsensusBus::new();
     let config = primary.consensus_config();
     let gc_round = AtomicRound::new(0);
@@ -68,9 +68,18 @@ fn create_core_test_types<DB: Database>(
         gc_round.clone(),
         highest_processed_round,
         highest_received_round,
+        task_manager.get_spawner(),
     );
 
-    (manager, validator, cb)
+    (manager, validator, cb, task_manager)
+}
+
+// reused in other tests
+fn create_core_test_types<DB: Database>(
+    primary: &AuthorityFixture<DB>,
+) -> (CertificateManager<DB>, CertificateValidator<DB>, ConsensusBus, TaskManager) {
+    let task_manager = TaskManager::default();
+    create_core_test_types_with_tasks(primary, task_manager)
 }
 
 /// Helper to sort certificates by digest
@@ -304,8 +313,8 @@ async fn test_node_restart_syncs_state() -> eyre::Result<()> {
     // so the round hasn't advanced
     //
 
-    let (manager_first_recovery, validator_first_recovery, cb_first_recovery) =
-        create_core_test_types(primary);
+    let (manager_first_recovery, validator_first_recovery, cb_first_recovery, task_manager) =
+        create_core_test_types_with_tasks(primary, task_manager);
 
     task_manager.spawn_critical_task("recovered manager", manager_first_recovery.run());
 
@@ -333,7 +342,8 @@ async fn test_node_restart_syncs_state() -> eyre::Result<()> {
     // reached to advance the round before crash
     //
 
-    let (manager_second_recovery, _validator, cb_second_recovery) = create_core_test_types(primary);
+    let (manager_second_recovery, _validator, cb_second_recovery, task_manager) =
+        create_core_test_types_with_tasks(primary, task_manager);
 
     task_manager.spawn_critical_task("recovered manager", manager_second_recovery.run());
 

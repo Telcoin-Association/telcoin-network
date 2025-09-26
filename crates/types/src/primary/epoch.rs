@@ -17,7 +17,7 @@ use serde_with::serde_as;
 
 /// Record of an Epoch.  Will be created at epoch start for the previous epoch
 /// and signed by that epochs committee members.
-#[derive(PartialEq, Serialize, Deserialize, Clone, Debug)]
+#[derive(PartialEq, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct EpochRecord {
     /// The epoch this record is for.
     pub epoch: Epoch,
@@ -230,3 +230,5 @@ mod test {
         }
     }
 }
+
+// If we have the record but not the cert then wait a beat for it to show up.

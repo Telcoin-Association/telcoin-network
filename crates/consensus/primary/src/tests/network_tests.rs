@@ -64,8 +64,9 @@ fn create_test_types() -> TestTypes {
     let cb = ConsensusBus::new();
 
     // spawn the synchronizer
-    let synchronizer = StateSynchronizer::new(config.clone(), cb.clone());
     let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), cb.clone(), task_manager.get_spawner());
     synchronizer.spawn(&task_manager);
 
     // last execution result

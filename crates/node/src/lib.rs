@@ -8,9 +8,7 @@ use manager::EpochManager;
 use tn_config::TelcoinDirs;
 use tn_primary::ConsensusBus;
 use tn_rpc::EngineToPrimary;
-use tn_storage::tables::{
-    ConsensusBlockNumbersByDigest, ConsensusBlocks, EpochCerts, EpochRecords, EpochRecordsIndex,
-};
+use tn_storage::{ConsensusStore, EpochStore};
 use tn_types::{BlockHash, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord};
 use tokio::runtime::Builder;
 use tracing::{instrument, warn};
@@ -35,7 +33,7 @@ pub fn launch_node<P>(
     passphrase: Option<String>,
 ) -> eyre::Result<()>
 where
-    P: TelcoinDirs + 'static,
+    P: TelcoinDirs + Clone + 'static,
 {
     let runtime = Builder::new_multi_thread()
         .thread_name("telcoin-network")
@@ -69,17 +67,20 @@ impl<DB: Database> EngineToPrimaryRpc<DB> {
 
     /// Retrieve the consensus header by number.
     fn get_epoch_by_number(&self, epoch: Epoch) -> Option<(EpochRecord, EpochCertificate)> {
-        let record = self.db.get::<EpochRecords>(&epoch).ok()??;
-        let digest = record.digest();
-        Some((record, self.db.get::<EpochCerts>(&digest).ok()??))
+        if let Some((r, Some(c))) = self.db.get_epoch_by_number(epoch) {
+            Some((r, c))
+        } else {
+            None
+        }
     }
 
     /// Retrieve the consensus header by hash
     fn get_epoch_by_hash(&self, hash: BlockHash) -> Option<(EpochRecord, EpochCertificate)> {
-        let epoch = self.db.get::<EpochRecordsIndex>(&hash).ok()??;
-        let record = self.db.get::<EpochRecords>(&epoch).ok()??;
-        let digest = record.digest();
-        Some((record, self.db.get::<EpochCerts>(&digest).ok()??))
+        if let Some((r, Some(c))) = self.db.get_epoch_by_hash(hash) {
+            Some((r, c))
+        } else {
+            None
+        }
     }
 }
 
@@ -89,12 +90,11 @@ impl<DB: Database> EngineToPrimary for EngineToPrimaryRpc<DB> {
     }
 
     fn consensus_block_by_number(&self, number: u64) -> Option<ConsensusHeader> {
-        self.db.get::<ConsensusBlocks>(&number).ok().flatten()
+        self.db.get_consensus_by_number(number)
     }
 
     fn consensus_block_by_hash(&self, hash: BlockHash) -> Option<ConsensusHeader> {
-        let number = self.db.get::<ConsensusBlockNumbersByDigest>(&hash).ok().flatten()?;
-        self.db.get::<ConsensusBlocks>(&number).ok().flatten()
+        self.db.get_consensus_by_hash(hash)
     }
 
     fn epoch(

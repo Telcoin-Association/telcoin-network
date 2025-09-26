@@ -10,8 +10,8 @@ use tn_primary::test_utils::make_optimal_signed_certificates;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
 use tn_types::{
-    BlsSignature, Certificate, Hash as _, Round, SignatureVerificationState, TnReceiver as _,
-    TnSender,
+    BlsSignature, Certificate, Hash as _, Round, SignatureVerificationState, TaskManager,
+    TnReceiver as _, TnSender,
 };
 
 struct TestTypes<DB = MemDatabase> {
@@ -21,6 +21,8 @@ struct TestTypes<DB = MemDatabase> {
     cb: ConsensusBus,
     /// The committee fixture.
     fixture: CommitteeFixture<DB>,
+    /// Task manager controlling spawned tasks.
+    task_manager: TaskManager,
 }
 
 fn create_test_types() -> TestTypes<MemDatabase> {
@@ -34,20 +36,22 @@ fn create_test_types() -> TestTypes<MemDatabase> {
     let highest_processed_round = AtomicRound::new(0);
     let highest_received_round = AtomicRound::new(0);
 
+    let task_manager = TaskManager::default();
     let validator = CertificateValidator::new(
         config,
         cb.clone(),
         gc_round,
         highest_processed_round,
         highest_received_round,
+        task_manager.get_spawner(),
     );
 
-    TestTypes { validator, cb, fixture }
+    TestTypes { validator, cb, fixture, task_manager }
 }
 
 #[tokio::test]
 async fn test_certificates_verified() -> eyre::Result<()> {
-    let TestTypes { validator, cb, fixture } = create_test_types();
+    let TestTypes { validator, cb, fixture, task_manager: _task_manager } = create_test_types();
 
     // receive parent updates
     let mut parents_rx = cb.parents().subscribe();
@@ -98,7 +102,7 @@ async fn test_certificates_verified() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_process_fetched_certificates_in_parallel() -> eyre::Result<()> {
-    let TestTypes { validator, cb, fixture } = create_test_types();
+    let TestTypes { validator, cb, fixture, task_manager: _task_manager } = create_test_types();
 
     // receive verified certificates
     let mut certificate_manager_rx = cb.certificate_manager().subscribe();

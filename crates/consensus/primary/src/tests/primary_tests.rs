@@ -41,8 +41,9 @@ async fn test_request_vote_has_missing_execution_block() {
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    let synchronizer = StateSynchronizer::new(target.consensus_config(), cb.clone());
     let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(target.consensus_config(), cb.clone(), task_manager.get_spawner());
     synchronizer.spawn(&task_manager);
     let handler = RequestHandler::new(target.consensus_config(), cb.clone(), synchronizer.clone());
 
@@ -110,8 +111,9 @@ async fn test_request_vote_older_execution_block() {
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(SealedHeader::seal_slow(dummy)));
     dummy = ExecHeader { nonce: 120_u64.into(), ..Default::default() };
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(SealedHeader::seal_slow(dummy)));
-    let synchronizer = StateSynchronizer::new(target.consensus_config(), cb.clone());
     let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(target.consensus_config(), cb.clone(), task_manager.get_spawner());
     synchronizer.spawn(&task_manager);
     let handler = RequestHandler::new(target.consensus_config(), cb.clone(), synchronizer.clone());
 
@@ -173,8 +175,9 @@ async fn test_request_vote_has_missing_parents() {
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    let synchronizer = StateSynchronizer::new(target.consensus_config(), cb.clone());
     let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(target.consensus_config(), cb.clone(), task_manager.get_spawner());
     synchronizer.spawn(&task_manager);
     let handler = RequestHandler::new(target.consensus_config(), cb.clone(), synchronizer.clone());
 
@@ -261,8 +264,9 @@ async fn test_request_vote_accept_missing_parents() {
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    let synchronizer = StateSynchronizer::new(target.consensus_config(), cb.clone());
     let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(target.consensus_config(), cb.clone(), task_manager.get_spawner());
     synchronizer.spawn(&task_manager);
     let handler = RequestHandler::new(target.consensus_config(), cb.clone(), synchronizer.clone());
 
@@ -351,8 +355,9 @@ async fn test_request_vote_missing_batches() {
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    let synchronizer = StateSynchronizer::new(primary.consensus_config(), cb.clone());
     let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
     synchronizer.spawn(&task_manager);
     let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer.clone());
 
@@ -413,8 +418,9 @@ async fn test_request_vote_already_voted() {
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    let synchronizer = StateSynchronizer::new(primary.consensus_config(), cb.clone());
     let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
     synchronizer.spawn(&task_manager);
     let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer.clone());
 
@@ -498,8 +504,9 @@ async fn test_fetch_certificates_handler() {
     let certificate_store = consensus_config.node_storage().clone();
 
     let cb = ConsensusBus::new();
-    let synchronizer = StateSynchronizer::new(primary.consensus_config(), cb.clone());
     let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
     synchronizer.spawn(&task_manager);
     let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer.clone());
 
@@ -635,8 +642,9 @@ async fn test_request_vote_created_at_in_future() {
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    let synchronizer = StateSynchronizer::new(primary.consensus_config(), cb.clone());
     let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
     synchronizer.spawn(&task_manager);
     let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer.clone());
 
