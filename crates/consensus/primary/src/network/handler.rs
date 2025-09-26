@@ -18,10 +18,7 @@ use std::{
 };
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::GossipMessage;
-use tn_storage::{
-    tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
-    ConsensusStore, EpochStore, VoteDigestStore,
-};
+use tn_storage::{tables::ConsensusBlocks, ConsensusStore, EpochStore, VoteDigestStore};
 use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
@@ -101,7 +98,7 @@ where
                 let ConsensusResult { epoch, number, hash, validator: key, signature } = *result;
                 let (old_number, old_hash) =
                     *self.consensus_bus.last_published_consensus_num_hash().borrow();
-                if hash == old_hash {
+                if hash == old_hash || old_number >= number {
                     return Ok(()); // We have already dealt with this hash.
                 }
                 if let Some(committee) =
@@ -127,12 +124,12 @@ where
                         if (sigs + 1) as usize >= enough_sigs {
                             // Last consensus block we have executed, us this to determine if we are
                             // too far behind.
-                            let exec_number = self
+                            let (exec_number, exec_epoch) = self
                                 .consensus_config
                                 .node_storage()
                                 .last_record::<ConsensusBlocks>()
-                                .map(|(n, _)| n)
-                                .unwrap_or(0);
+                                .map(|(n, h)| (n, h.sub_dag.leader_epoch()))
+                                .unwrap_or((0, 0));
                             // Use GC depth to estimate how many blocks we can be behind (roughly
                             // one block every two rounds).
                             let allowed_behind =
@@ -140,7 +137,8 @@ where
                             if matches!(
                                 *self.consensus_bus.node_mode().borrow(),
                                 NodeMode::CvvActive
-                            ) && (exec_number + allowed_behind as u64) < number
+                            ) && ((exec_number + allowed_behind as u64) < number
+                                || (epoch > exec_epoch && exec_number + 1 < number))
                             {
                                 // We seem to be too far behind to be an active CVV, try to go
                                 // inactive to catch up.
@@ -586,8 +584,8 @@ where
         hash: Option<BlockHash>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         let (record, certificate) = match (epoch, hash) {
-            (_, Some(hash)) => self.get_epoch_by_hash(hash)?,
-            (Some(epoch), _) => self.get_epoch_by_number(epoch)?,
+            (_, Some(hash)) => self.get_epoch_by_hash(hash).await?,
+            (Some(epoch), _) => self.get_epoch_by_number(epoch).await?,
             (None, None) => return Err(PrimaryNetworkError::InvalidEpochRequest),
         };
 
@@ -604,15 +602,10 @@ where
 
     /// Retrieve the consensus header by hash
     fn get_header_by_hash(&self, hash: BlockHash) -> PrimaryNetworkResult<ConsensusHeader> {
-        // get the block number from the hash
-        let number = self
-            .consensus_config
-            .node_storage()
-            .get::<ConsensusBlockNumbersByDigest>(&hash)?
-            .ok_or(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash))?;
-
-        // then get the header using the block number
-        self.get_header_by_number(number)
+        match self.consensus_config.node_storage().get_consensus_by_hash(hash) {
+            Some(header) => Ok(header),
+            None => Err(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash)),
+        }
     }
 
     /// Retrieve the last record in consensus blocks table.
@@ -625,23 +618,47 @@ where
     }
 
     /// Retrieve the consensus header by number.
-    fn get_epoch_by_number(
+    async fn get_epoch_by_number(
         &self,
         epoch: Epoch,
     ) -> PrimaryNetworkResult<(EpochRecord, EpochCertificate)> {
         match self.consensus_config.node_storage().get_epoch_by_number(epoch) {
-            Some((record, cert)) => Ok((record, cert)),
+            Some((record, Some(cert))) => Ok((record, cert)),
+            Some((_record, None)) => {
+                // If we have the record but not the cert then wait a beat for it to show up.
+                for _ in 0..5 {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    if let Some((record, Some(cert))) =
+                        self.consensus_config.node_storage().get_epoch_by_number(epoch)
+                    {
+                        return Ok((record, cert));
+                    }
+                }
+                Err(PrimaryNetworkError::UnavailableEpoch(epoch))
+            }
             None => Err(PrimaryNetworkError::UnavailableEpoch(epoch)),
         }
     }
 
     /// Retrieve the consensus header by hash
-    fn get_epoch_by_hash(
+    async fn get_epoch_by_hash(
         &self,
         hash: BlockHash,
     ) -> PrimaryNetworkResult<(EpochRecord, EpochCertificate)> {
         match self.consensus_config.node_storage().get_epoch_by_hash(hash) {
-            Some((record, cert)) => Ok((record, cert)),
+            Some((record, Some(cert))) => Ok((record, cert)),
+            Some((_record, None)) => {
+                // If we have the record but not the cert then wait a beat for it to show up.
+                for _ in 0..5 {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    if let Some((record, Some(cert))) =
+                        self.consensus_config.node_storage().get_epoch_by_hash(hash)
+                    {
+                        return Ok((record, cert));
+                    }
+                }
+                Err(PrimaryNetworkError::UnavailableEpochDigest(hash))
+            }
             None => Err(PrimaryNetworkError::UnavailableEpochDigest(hash)),
         }
     }

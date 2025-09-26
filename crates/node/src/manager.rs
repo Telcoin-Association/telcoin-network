@@ -589,6 +589,17 @@ where
     ) -> eyre::Result<()> {
         let committee = primary.current_committee().await;
         let epoch = committee.epoch();
+        if epoch == 0 {
+            if let Some((epoch_rec, Some(_))) = self.consensus_db.get_epoch_by_number(epoch) {
+                // We already have this record...
+                self.epoch_record = Some(epoch_rec);
+                return Ok(());
+            }
+        } else if let Some((epoch_rec, _)) = self.consensus_db.get_epoch_by_number(epoch) {
+            // We already have this record...
+            self.epoch_record = Some(epoch_rec);
+            return Ok(());
+        }
 
         let committee_keys = engine.validators_for_epoch(epoch).await?;
         let next_committee_keys = engine.validators_for_epoch(epoch + 1).await?;
@@ -657,6 +668,11 @@ where
         epoch_rec: EpochRecord,
         epoch_task_manager: &TaskManager,
     ) -> eyre::Result<()> {
+        if let Some((_, Some(_))) = self.consensus_db.get_epoch_by_number(epoch_rec.epoch) {
+            // We already have this record and cert...
+            return Ok(());
+        }
+
         let mut committee_keys: HashSet<BlsPublicKey> =
             epoch_rec.committee.iter().copied().collect();
         let committee_index: HashMap<BlsPublicKey, usize> =
@@ -1088,8 +1104,11 @@ where
         epoch_task_spawner: TaskSpawner,
         initial_epoch: &bool,
     ) -> eyre::Result<PrimaryNode<DB>> {
-        let state_sync =
-            StateSynchronizer::new(consensus_config.clone(), self.consensus_bus.clone());
+        let state_sync = StateSynchronizer::new(
+            consensus_config.clone(),
+            self.consensus_bus.clone(),
+            epoch_task_spawner.clone(),
+        );
         let network_handle = self
             .primary_network_handle
             .as_ref()

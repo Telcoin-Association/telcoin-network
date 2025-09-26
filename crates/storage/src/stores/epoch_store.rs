@@ -13,9 +13,10 @@ pub trait EpochStore {
     /// Save an epoch record with it's certificate.
     fn save_epoch_record_with_cert(&self, epoch_rec: &EpochRecord, cert: &EpochCertificate);
     /// Retrieve the consensus header by number.
-    fn get_epoch_by_number(&self, epoch: Epoch) -> Option<(EpochRecord, EpochCertificate)>;
+    fn get_epoch_by_number(&self, epoch: Epoch) -> Option<(EpochRecord, Option<EpochCertificate>)>;
     /// Retrieve the consensus header by hash
-    fn get_epoch_by_hash(&self, hash: BlockHash) -> Option<(EpochRecord, EpochCertificate)>;
+    fn get_epoch_by_hash(&self, hash: BlockHash)
+        -> Option<(EpochRecord, Option<EpochCertificate>)>;
 }
 
 impl<DB: Database> EpochStore for DB {
@@ -69,16 +70,19 @@ impl<DB: Database> EpochStore for DB {
         }
     }
 
-    fn get_epoch_by_number(&self, epoch: Epoch) -> Option<(EpochRecord, EpochCertificate)> {
+    fn get_epoch_by_number(&self, epoch: Epoch) -> Option<(EpochRecord, Option<EpochCertificate>)> {
         let record = self.get::<EpochRecords>(&epoch).ok()??;
         let digest = record.digest();
-        Some((record, self.get::<EpochCerts>(&digest).ok()??))
+        Some((record, self.get::<EpochCerts>(&digest).ok()?))
     }
 
-    fn get_epoch_by_hash(&self, hash: BlockHash) -> Option<(EpochRecord, EpochCertificate)> {
+    fn get_epoch_by_hash(
+        &self,
+        hash: BlockHash,
+    ) -> Option<(EpochRecord, Option<EpochCertificate>)> {
         let epoch = self.get::<EpochRecordsIndex>(&hash).ok()??;
         let record = self.get::<EpochRecords>(&epoch).ok()??;
         let digest = record.digest();
-        Some((record, self.get::<EpochCerts>(&digest).ok()??))
+        Some((record, self.get::<EpochCerts>(&digest).ok()?))
     }
 }

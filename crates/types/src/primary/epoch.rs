@@ -230,3 +230,5 @@ mod test {
         }
     }
 }
+
+// If we have the record but not the cert then wait a beat for it to show up.

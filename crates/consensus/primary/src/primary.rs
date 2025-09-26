@@ -61,9 +61,9 @@ impl<DB: Database> Primary<DB> {
         leader_schedule: LeaderSchedule,
         task_manager: &TaskManager,
     ) {
-        if consensus_bus.node_mode().borrow().is_active_cvv() {
-            self.state_sync.spawn(task_manager);
-        }
+        // Probably don't need this for a non-committee member but it keeps channels drained and is
+        // not a problem.
+        self.state_sync.spawn(task_manager);
 
         Certifier::spawn(
             config.clone(),

@@ -67,12 +67,20 @@ impl<DB: Database> EngineToPrimaryRpc<DB> {
 
     /// Retrieve the consensus header by number.
     fn get_epoch_by_number(&self, epoch: Epoch) -> Option<(EpochRecord, EpochCertificate)> {
-        self.db.get_epoch_by_number(epoch)
+        if let Some((r, Some(c))) = self.db.get_epoch_by_number(epoch) {
+            Some((r, c))
+        } else {
+            None
+        }
     }
 
     /// Retrieve the consensus header by hash
     fn get_epoch_by_hash(&self, hash: BlockHash) -> Option<(EpochRecord, EpochCertificate)> {
-        self.db.get_epoch_by_hash(hash)
+        if let Some((r, Some(c))) = self.db.get_epoch_by_hash(hash) {
+            Some((r, c))
+        } else {
+            None
+        }
     }
 }
 

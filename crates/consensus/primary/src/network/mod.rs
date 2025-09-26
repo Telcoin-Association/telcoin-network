@@ -246,8 +246,7 @@ impl PrimaryNetworkHandle {
         // This could be a lot more complicated but this KISS method should work fine.
         for _ in 0..3 {
             let res = self.handle.send_request_any(request.clone()).await?;
-            let res = res.await?;
-            if let Ok(PrimaryResponse::EpochRecord { record, certificate }) = res {
+            if let Ok(Ok(PrimaryResponse::EpochRecord { record, certificate })) = res.await {
                 return Ok((record, certificate));
             }
         }
