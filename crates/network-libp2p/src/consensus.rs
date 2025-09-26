@@ -151,8 +151,6 @@ where
     connected_peers: VecDeque<PeerId>,
     /// Key manager, provide the BLS public key and sign peer records published to kademlia.
     key_config: KeyConfig,
-    /// If true then add peers to kademlia- useful for testing to set false.
-    kad_add_peers: bool,
     /// The public network key for this node.
     network_pubkey: NetworkPublicKey,
     /// The type to spawn tasks.
@@ -321,15 +319,9 @@ where
             connected_peers: VecDeque::new(),
             pending_px_disconnects,
             key_config,
-            kad_add_peers: true,
             network_pubkey,
             task_spawner,
         })
-    }
-
-    /// After this call peers will not be added to kademlia, for testing.
-    pub fn no_kad_peers_for_test(&mut self) {
-        self.kad_add_peers = false;
     }
 
     /// Return a [NetworkHandle] to send commands to this network.
@@ -501,6 +493,12 @@ where
                     error!(target: "network", ?addresses, "no listeners for swarm - network shutting down");
                     return Err(NetworkError::AllListenersClosed);
                 }
+            }
+            SwarmEvent::Dialing { peer_id, connection_id } => {
+                // kad initiates dial attempts
+                // - register
+                // TNBehavior::handle_pending_outbound_connection
+                error!(target: "peer-manager", ?peer_id, ?connection_id, "DIALING PEER!!!");
             }
             // other events handled by peer manager and other behaviors
             _ => {}
@@ -1067,16 +1065,23 @@ where
                 // register peer for request-response behaviour
                 // NOTE: gossipsub handles `FromSwarm::ConnectionEstablished`
                 self.swarm.add_peer_address(peer_id, addr.clone());
-                if self.kad_add_peers {
-                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                    self.publish_our_data_to_peer(peer_id);
-                }
+
+                // TODO: review add_address method
+                // - is this sufficient for ensuring bucket doesn't overflow?
+                // - does kad process connections?
+                //      - RoutingUpdate::Pending initiates dial attempt
+                //
+                // - examples show calling this on every `BOOT_NODE`
+                self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                self.publish_our_data_to_peer(peer_id);
 
                 // manage connected peers for
                 self.connected_peers.push_back(peer_id);
 
                 // if this is a trusted/validator (important) peer, mark it as explicit in gossipsub
                 if self.swarm.behaviour().peer_manager.peer_is_important(&peer_id) {
+                    // TODO: is this a potential issue with lots of validators?
+                    // - only validators on the gossip network?
                     self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                 }
 
@@ -1085,7 +1090,7 @@ where
                 // - connecting with peer first also improves changes of retrieving record
             }
             PeerEvent::Banned(peer_id) => {
-                // TODO: remove from kad table?
+                // TODO: remove from kad table
                 warn!(target: "network", ?peer_id, "peer banned");
                 // blacklist gossipsub
                 self.swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
@@ -1152,7 +1157,7 @@ where
                                 self.swarm
                                     .behaviour_mut()
                                     .peer_manager
-                                    .process_penalty(source, Penalty::Severe);
+                                    .process_penalty(source, Penalty::Fatal);
                             }
                         }
                     }
@@ -1245,6 +1250,12 @@ where
                     kad::QueryResult::StartProviding(Err(err)) => {
                         error!(target: "network-kad", "Failed to put provider record: {err:?}");
                     }
+                    kad::QueryResult::Bootstrap(Ok(todo)) => {
+                        // todo!()
+                    }
+                    kad::QueryResult::GetClosestPeers(Ok(todo)) => {
+                        // todo!()
+                    }
                     _ => {}
                 }
             }
@@ -1272,6 +1283,8 @@ where
                 if self.swarm.behaviour().peer_manager.peer_is_important(&peer) {
                     // add to kad cache #301
                 }
+
+                // self.swarm.behaviour_mut().kademlia.remove
             }
             kad::Event::UnroutablePeer { peer } => {
                 // unknown peer queried a record - noop
@@ -1284,7 +1297,11 @@ where
                 // TODO: does kademlia enforce strict peer id verification?
 
                 // notify peer manager
-                self.swarm.behaviour_mut().peer_manager.process_routable_peer(peer, address);
+                // self.swarm.behaviour_mut().peer_manager.process_routable_peer(peer, address);
+
+                // see L1323 `on_connection_updated`:
+                // - this is what to do, except L1409:
+                //      - pass dial to PM, not swarm
             }
             kad::Event::PendingRoutablePeer { peer, address } => {
                 debug!(target: "network-kad", "pending routable peer {peer:?}/{address:?}")

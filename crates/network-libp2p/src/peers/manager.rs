@@ -71,6 +71,11 @@ pub(crate) struct PeerManager {
     temporarily_banned: BannedPeerCache<PeerId>,
     /// Kademlia reported a `RoutablePeer`. These peers are used for discovery.
     // - `RoutablePeer` calls PM to add to map
+    //      - Kademlia connection already established
+    //      - PM will have `unknown` -> `connected`
+    //          - is this okay?
+    //      - just check if peer is banned then call disconnect
+    //          - kad::remove_peer
     //
     // later in loop...
     // - PM heartbeat detects low peers dialing/connected
@@ -82,6 +87,7 @@ pub(crate) struct PeerManager {
     //                  - but also might compete with kad logic
     //      - heartbeat should prune this
     //          - timestamps on `DiscoveryPeer` struct?
+    //      - bootstrap kad event?
     // - PM `PeerConnected` event triggers NodeRecord lookup/put/whatever flow
     //      - currently publishes data to peer (publish_our_data_to_peer)
     //          - but this should be pull so malicious can't withhold
@@ -107,7 +113,7 @@ pub(crate) struct PeerManager {
     // - heartbeat loop repeats
     //      - initiates more dial attemps / pruning
     // - TODO: how to handle bootstrap peers?
-    routable_peers: HashMap<PeerId, Multiaddr>,
+    routable_peers: Vec<(PeerId, Multiaddr)>,
 }
 
 impl PeerManager {
@@ -226,6 +232,13 @@ impl PeerManager {
         self.dial_requests.push_back(request);
     }
 
+    /// Check if this peer is already registered as dialing.
+    ///
+    /// Self and kad behaviors can initiate dial attempts. This is used to filter pending outbound connections.
+    pub(super) fn dial_attempt_already_registered(&self, peer_id: &PeerId) -> bool {
+        self.peers.get_peer(peer_id).is_some_and(|peer| peer.connection_status().is_dialing())
+    }
+
     /// Push a [PeerEvent].
     pub(super) fn push_event(&mut self, event: PeerEvent) {
         self.events.push_back(event);
@@ -288,11 +301,14 @@ impl PeerManager {
 
         // TODO: Issue #254 update metrics
 
+        // enforce connection limits
         self.prune_connected_peers();
 
+        // update timestamps
         self.unban_temp_banned_peers();
 
         // TODO: if connected/dialing peers are 0 then initiate dialing requests
+        self.discovery_heartbeat();
     }
 
     /// Apply a [PeerAction].
@@ -733,39 +749,80 @@ impl PeerManager {
         self.known_peerids.get(peer_id).copied()
     }
 
+    /// Visibility helper for behavior to evaluate pending outbound connection attempts.
+    pub(super) fn can_dial(&self, peer_id: &PeerId) -> bool {
+        self.peers.can_dial(peer_id)
+    }
+
     /// Method to extract supported protocols from [Multiaddr].
     ///
     /// This is used to identify banned IPs for peer discovery and pending inbound connections.
-    pub(super) fn extract_supported_protocol_from_multiaddr(
+    pub(super) fn extract_supported_protocol_from_multiaddrs(
         &self,
-        multiaddr: &Multiaddr,
-    ) -> Option<IpAddr> {
+        multiaddr: &[Multiaddr],
+    ) -> Vec<IpAddr> {
         // only support ipv4 and ipv6
-        match multiaddr.iter().next() {
-            Some(Protocol::Ip4(ip)) => Some(IpAddr::V4(ip)),
-            Some(Protocol::Ip6(ip)) => Some(IpAddr::V6(ip)),
-            _ => None,
-        }
+        multiaddr
+            .iter()
+            .filter_map(|addr| match addr.iter().next() {
+                Some(Protocol::Ip4(ip)) => Some(IpAddr::V4(ip)),
+                Some(Protocol::Ip6(ip)) => Some(IpAddr::V6(ip)),
+                _ => None,
+            })
+            .collect()
     }
 
-    /// Process a newly discovered peer as a result of kademlia's `RoutablePeer` event.
-    ///
-    /// The peer manager is the source of truth for managing peer connections. Eligible peers are stored in-memory and dialed to maintain target peer counts.
-    pub(crate) fn process_routable_peer(&mut self, peer_id: PeerId, multiaddr: Multiaddr) {
-        // check if protocol supported and IP is not banned
-        let ip_address_valid = self
-            .extract_supported_protocol_from_multiaddr(&multiaddr)
-            .is_some_and(|ip| !self.is_ip_banned(&ip));
+    // /// Helper method to check if peer is eligible for discovery.
+    // fn eligible_for_discovery(&self, peer_id: &PeerId, multiaddr: &[Multiaddr]) -> bool {
+    //     // check if protocol supported and IP is not banned
+    //     let ip_address_valid = self
+    //         .extract_supported_protocol_from_multiaddrs(multiaddr)
+    //         .is_some_and(|ip| !self.is_ip_banned(&ip));
 
-        // unknown, disconnected, and not banned
-        let peer_eligble = self.peers.can_dial(&peer_id);
+    //     // unknown, disconnected, and not banned
+    //     let peer_eligble = self.peers.can_dial(peer_id);
 
-        // store peer info for possible dial attempt during heartbeat
-        if ip_address_valid && peer_eligble {
-            // heartbeat maintains map size
-            //
-            // NOTE: this replaces matching peer ids
-            self.routable_peers.insert(peer_id, multiaddr);
-        }
+    //     ip_address_valid && peer_eligble
+    // }
+
+    // /// Process a newly discovered peer as a result of kademlia's `RoutablePeer` event.
+    // ///
+    // /// The peer manager is the source of truth for managing peer connections. Eligible peers are stored in-memory and dialed to maintain target peer counts.
+    // pub(crate) fn process_routable_peer(&mut self, peer_id: PeerId, multiaddr: Multiaddr) {
+    //     // store peer info for possible dial attempt during heartbeat
+    //     if self.eligible_for_discovery(&peer_id, &[multiaddr]) {
+    //         // heartbeat maintains map size
+    //         //
+    //         // NOTE: this replaces matching peer ids
+    //         self.routable_peers.push((peer_id, multiaddr));
+    //     }
+    // }
+
+    /// Check peer counts and initiate dial attempts to maintain connection targets.
+    fn discovery_heartbeat(&mut self) {
+        // for pruning:
+        // - filter collection
+        //      - eligible_for_discovery
+        // - check numbers
+        //      - emit bootstrap event if low
+        //
+        // for discovery:
+        // - check connected/dialing
+        // - calculate delta from target
+        // - shuffle vs timestamp?
+        //      - what data struct to use?
+        // - confirm can_dial still
+        // - initiate dial attempts
+        // - kad::bootstrap is called periodically already
+        //      - update
+
+        // filter ineligible peers
+        // let filtered: Vec<_> = self
+        //     .routable_peers
+        //     .into_iter()
+        //     .filter(|(peer_id, addr)| self.eligible_for_discovery(peer_id, addr))
+        //     .collect();
+
+        // todo!()
     }
 }

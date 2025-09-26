@@ -20,6 +20,52 @@ impl NetworkBehaviour for PeerManager {
     type ConnectionHandler = ConnectionHandler;
     type ToSwarm = PeerEvent;
 
+    fn handle_pending_outbound_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        maybe_peer: Option<PeerId>,
+        addresses: &[Multiaddr],
+        effective_role: Endpoint,
+    ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
+        // kademlia can initiate dial attempts
+        error!(target: "peer-manager", ?connection_id, ?maybe_peer, ?addresses, ?effective_role, "pending outbound connection!!!");
+
+        // ensure PeerId isn't banned if known and register dial attempt
+        if let Some(peer_id) = maybe_peer {
+            // PeerManager and Kad may initiate dials
+            // intercept kad dial attempts, sanitize, and register
+            if self.dial_attempt_already_registered(&peer_id) {
+                return Ok(vec![]);
+            }
+
+            // peer is not registered, ensure can be dialed
+            if self.can_dial(&peer_id) {
+                trace!(target: "peer-manager", ?peer_id, "can_dial success");
+                self.register_dial_attempt(peer_id, None);
+            } else {
+                debug!(target: "peer-manager", ?peer_id, "can_dial failed");
+                return Err(ConnectionDenied::new(format!(
+                    "Outbound connection to peer denied: peer cannot be dialed"
+                )));
+            }
+        }
+
+        // ensure multiaddr contains ip that isn't banned
+        debug!(target: "peer-manager", ?addresses, "sanitizing addresses:");
+        self.sanitize_pending_connection(addresses)?;
+
+        // TODO
+        //
+        //
+        // - check peer limits?
+        //      - what if kad has to dial this peer anyway?
+        //      - how to sync peer counts?
+
+        // NOTE: kademplia extends addresses by default
+        // See swarm `WithPeerId::build` -> DialOpts
+        Ok(vec![])
+    }
+
     // filter connections
     fn handle_pending_inbound_connection(
         &mut self,
@@ -27,21 +73,7 @@ impl NetworkBehaviour for PeerManager {
         _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
     ) -> Result<(), ConnectionDenied> {
-        // only support ipv4 and ipv6
-        let ip = self.extract_supported_protocol_from_multiaddr(remote_addr).ok_or_else(|| {
-            ConnectionDenied::new(format!(
-                "Connection to peer rejected: invalid protocol: {remote_addr}"
-            ))
-        })?;
-
-        // ensure ip address is not banned
-        if self.is_ip_banned(&ip) {
-            return Err(ConnectionDenied::new(format!(
-                "Connection to peer rejected: peer {ip} is banned"
-            )));
-        }
-
-        Ok(())
+        self.sanitize_pending_connection(&[remote_addr.clone()])
     }
 
     fn handle_established_inbound_connection(
@@ -159,6 +191,32 @@ impl NetworkBehaviour for PeerManager {
 }
 
 impl PeerManager {
+    /// Logic to ensure a pending connection supports ipv4 or ipv6, and that the ip address isn't banned.
+    fn sanitize_pending_connection(
+        &self,
+        remote_addr: &[Multiaddr],
+    ) -> Result<(), ConnectionDenied> {
+        // only support ipv4 and ipv6
+        let ips = self.extract_supported_protocol_from_multiaddrs(remote_addr);
+
+        if ips.is_empty() {
+            return Err(ConnectionDenied::new(format!(
+                "Connection to peer denied: missing ip addr"
+            )));
+        }
+
+        // block connection if associated with ANY banned ip
+        for ip in &ips {
+            if self.is_ip_banned(ip) {
+                return Err(ConnectionDenied::new(format!(
+                    "Connection to peer denied: peer {ip} is banned"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Handle on connection established event from the swarm.
     ///
     /// The ConnectionEstablished event must be handled separately because
