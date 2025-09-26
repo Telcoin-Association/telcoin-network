@@ -873,4 +873,13 @@ impl AllPeers {
         // return any unban actions for committee peers
         actions
     }
+
+    /// Check if a peer is eligible for dial attempt.
+    ///
+    /// This method implicitly evaluates peers which are in the process
+    /// of being banned (connected/disconnecting).
+    pub(super) fn can_dial(&self, peer_id: &PeerId) -> bool {
+        // unknown peers are eligible for dial attempts
+        self.peers.get(peer_id).map(|peer| peer.can_dial()).unwrap_or(true)
+    }
 }

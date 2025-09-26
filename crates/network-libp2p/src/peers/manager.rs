@@ -14,7 +14,7 @@ use crate::{
     send_or_log_error,
     types::{AuthorityInfoRequest, NetworkInfo, NetworkResult},
 };
-use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
+use libp2p::{core::ConnectedPoint, multiaddr::Protocol, Multiaddr, PeerId};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
@@ -41,6 +41,8 @@ pub(crate) struct PeerManager {
     /// This should incude the current and next couple of committee members network info.
     /// This is used for bootstrapping and to make sure we know the network settings of committee
     /// members.
+    ///
+    /// TODO: these should have verified kad records?
     known_peers: HashMap<BlsPublicKey, NetworkInfo>,
     /// PeerId -> BlsPublicKey for know peers.
     known_peerids: HashMap<PeerId, BlsPublicKey>,
@@ -67,6 +69,51 @@ pub(crate) struct PeerManager {
     /// The implementation uses `FnvHashSet` instead of the default Rust hasher `SipHash`
     /// for improved performance for short keys.
     temporarily_banned: BannedPeerCache<PeerId>,
+    /// Kademlia reported a `RoutablePeer`. These peers are used for discovery.
+    // - `RoutablePeer` calls PM to add to map
+    //      - Kademlia connection already established
+    //      - PM will have `unknown` -> `connected`
+    //          - is this okay?
+    //      - just check if peer is banned then call disconnect
+    //          - kad::remove_peer
+    //
+    // later in loop...
+    // - PM heartbeat detects low peers dialing/connected
+    //      - shuffle and remove peer from discovery_peers
+    //          - initiates dial attempt
+    //          - maybe sort by instant instead of shuffle for oldest -> newest peers?
+    //              - kad suggested this peer
+    //              - random still might be more secure
+    //                  - but also might compete with kad logic
+    //      - heartbeat should prune this
+    //          - timestamps on `DiscoveryPeer` struct?
+    //      - bootstrap kad event?
+    // - PM `PeerConnected` event triggers NodeRecord lookup/put/whatever flow
+    //      - currently publishes data to peer (publish_our_data_to_peer)
+    //          - but this should be pull so malicious can't withhold
+    //          - ensure timeout to prevent withholding these requests
+    //      - do this before or after kad.add_address ?
+    //          - add_address
+    //          - then request record
+    //              - expect peer to have their own record
+    // - picked up by `kad::QueryResult::GetRecord` event
+    //      - verify record
+    //          - cache validator records
+    //          - review publish_our_data_to_peer for other considerations
+    //      - this is where vulnerability is
+    //      - currently call `peer_record_valid` in two places
+    //          - inbound request to `PutRecord`
+    //          - GetRecord query result
+    //              - should be `Fatal` not severe if invalid
+    //                  - this will trigger disconnect
+    // !!           - success calls PM to `add_known_peer`
+    //                  - map for verified peers only
+    //                      - is this necessary?
+    //                      - better to use `AllPeers::Peer` instead?
+    // - heartbeat loop repeats
+    //      - initiates more dial attemps / pruning
+    // - TODO: how to handle bootstrap peers?
+    routable_peers: Vec<(PeerId, Multiaddr)>,
 }
 
 impl PeerManager {
@@ -94,6 +141,7 @@ impl PeerManager {
             events: Default::default(),
             dial_requests: Default::default(),
             temporarily_banned,
+            routable_peers: Default::default(),
         }
     }
 
@@ -184,6 +232,13 @@ impl PeerManager {
         self.dial_requests.push_back(request);
     }
 
+    /// Check if this peer is already registered as dialing.
+    ///
+    /// Self and kad behaviors can initiate dial attempts. This is used to filter pending outbound connections.
+    pub(super) fn dial_attempt_already_registered(&self, peer_id: &PeerId) -> bool {
+        self.peers.get_peer(peer_id).is_some_and(|peer| peer.connection_status().is_dialing())
+    }
+
     /// Push a [PeerEvent].
     pub(super) fn push_event(&mut self, event: PeerEvent) {
         self.events.push_back(event);
@@ -246,9 +301,14 @@ impl PeerManager {
 
         // TODO: Issue #254 update metrics
 
+        // enforce connection limits
         self.prune_connected_peers();
 
+        // update timestamps
         self.unban_temp_banned_peers();
+
+        // TODO: if connected/dialing peers are 0 then initiate dialing requests
+        self.discovery_heartbeat();
     }
 
     /// Apply a [PeerAction].
@@ -517,6 +577,71 @@ impl PeerManager {
     ///
     /// Peers should be weary of these reported peers (eclipse attacks).
     pub(crate) fn process_peer_exchange(&mut self, peers: PeerExchangeMap) {
+        // loop through peer exchange
+        // - if peer unknown, try to dial
+        // - if peer known, skip
+        // - need to cap this to prevent too many dial attempts
+        // - prioritize validators? can't trust peer scores
+        //
+        // - need to track this map as potential peers for discovery
+        // - try to dial/connect with peers to reach target
+        //      - max_peers minus dialing/connected total
+        // - randomly shuffle peers?
+        //
+        // simplest approach:
+        // - shuffle map
+        // - randomly dial diff peers up to max_peers
+        //  - ignore previously attempted peers
+        //      - best to check known peers?
+        //      - don't dial banned peers
+        // - add heartbeat check to dial bootstrap nodes if
+        //      - connected peers 0
+        //      - dialing peers 0
+        //      - redial bootstrap nodes for new map and repeat
+        // - heartbeat responsible for dialing on startup too
+        //
+        //
+        // - this won't work bc peers are temp banned after disconnect
+        // - store peerx and dial as needed?
+        //
+        // - does KAD work as a backup for 0 peers?
+        // - then use bootstrap?
+        // let mut max_new_peers = self.config.max_peers();
+        //
+        // 1) this node just received a PX map
+        //  - no trust
+        // 2) Store this in-memory for heartbeat event
+        // - heartbeat should detect 0 peers and initiate dial attempts
+        // - dial attempts for bootstrap nodes and PX peers
+        // 3) for PX peer:
+        //  - look up kad table to see if peers can be found
+        //  - if so, verify node record then dial
+        // 4)
+        //
+        // - how does KAD put records happen? Will this node have them in their db through discovery?
+        //
+
+        // check if peer is known or banned
+        //  - indicates eligible for peer discovery
+        // check if peer is in discovery map
+        //  - add to discovery peers
+        // heartbeat will:
+        //  - trigger dial requests for discovery
+        //  - purge old peer discoveries
+        //
+        // rename `FindAuthorities` -> `FindPeers`
+        //  - used for discovery too (not just validators)
+        //
+        //
+        //
+        // kad dials peers in bootstrap mode
+        //
+        // my biggest concern is that there may be a loop where
+        // - kad dials peer (or banned peer)
+        // - peer manager disconnects peer (too many or banned)
+        // - kad dials again -> peer manager disconnects again (repeat)
+        //
+        //
         for (bls, (net_key, multiaddrs)) in peers.into_iter() {
             let multiaddrs: Vec<Multiaddr> = multiaddrs.into_iter().collect();
             let peer_id: PeerId = net_key.clone().into();
@@ -526,11 +651,10 @@ impl PeerManager {
                     NetworkInfo { pubkey: net_key.clone(), multiaddrs: multiaddrs.clone() },
                 );
             }
-            // skip peers that are already connected
-            let peer = self.peers.get_peer(&peer_id);
-            if peer.is_none() || peer.expect("have peer").can_dial() {
-                let request = DialRequest { peer_id, multiaddrs, reply: None };
-                self.dial_requests.push_back(request);
+
+            // dial peers that are unknown or can be dialed
+            if self.peers.can_dial(&peer_id) {
+                self.dial_peer(peer_id, multiaddrs, None);
             }
         }
     }
@@ -623,5 +747,82 @@ impl PeerManager {
     /// Find the BlsPublicKey for a known PeerId.
     pub(crate) fn peer_to_bls(&self, peer_id: &PeerId) -> Option<BlsPublicKey> {
         self.known_peerids.get(peer_id).copied()
+    }
+
+    /// Visibility helper for behavior to evaluate pending outbound connection attempts.
+    pub(super) fn can_dial(&self, peer_id: &PeerId) -> bool {
+        self.peers.can_dial(peer_id)
+    }
+
+    /// Method to extract supported protocols from [Multiaddr].
+    ///
+    /// This is used to identify banned IPs for peer discovery and pending inbound connections.
+    pub(super) fn extract_supported_protocol_from_multiaddrs(
+        &self,
+        multiaddr: &[Multiaddr],
+    ) -> Vec<IpAddr> {
+        // only support ipv4 and ipv6
+        multiaddr
+            .iter()
+            .filter_map(|addr| match addr.iter().next() {
+                Some(Protocol::Ip4(ip)) => Some(IpAddr::V4(ip)),
+                Some(Protocol::Ip6(ip)) => Some(IpAddr::V6(ip)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // /// Helper method to check if peer is eligible for discovery.
+    // fn eligible_for_discovery(&self, peer_id: &PeerId, multiaddr: &[Multiaddr]) -> bool {
+    //     // check if protocol supported and IP is not banned
+    //     let ip_address_valid = self
+    //         .extract_supported_protocol_from_multiaddrs(multiaddr)
+    //         .is_some_and(|ip| !self.is_ip_banned(&ip));
+
+    //     // unknown, disconnected, and not banned
+    //     let peer_eligble = self.peers.can_dial(peer_id);
+
+    //     ip_address_valid && peer_eligble
+    // }
+
+    // /// Process a newly discovered peer as a result of kademlia's `RoutablePeer` event.
+    // ///
+    // /// The peer manager is the source of truth for managing peer connections. Eligible peers are stored in-memory and dialed to maintain target peer counts.
+    // pub(crate) fn process_routable_peer(&mut self, peer_id: PeerId, multiaddr: Multiaddr) {
+    //     // store peer info for possible dial attempt during heartbeat
+    //     if self.eligible_for_discovery(&peer_id, &[multiaddr]) {
+    //         // heartbeat maintains map size
+    //         //
+    //         // NOTE: this replaces matching peer ids
+    //         self.routable_peers.push((peer_id, multiaddr));
+    //     }
+    // }
+
+    /// Check peer counts and initiate dial attempts to maintain connection targets.
+    fn discovery_heartbeat(&mut self) {
+        // for pruning:
+        // - filter collection
+        //      - eligible_for_discovery
+        // - check numbers
+        //      - emit bootstrap event if low
+        //
+        // for discovery:
+        // - check connected/dialing
+        // - calculate delta from target
+        // - shuffle vs timestamp?
+        //      - what data struct to use?
+        // - confirm can_dial still
+        // - initiate dial attempts
+        // - kad::bootstrap is called periodically already
+        //      - update
+
+        // filter ineligible peers
+        // let filtered: Vec<_> = self
+        //     .routable_peers
+        //     .into_iter()
+        //     .filter(|(peer_id, addr)| self.eligible_for_discovery(peer_id, addr))
+        //     .collect();
+
+        // todo!()
     }
 }

@@ -151,8 +151,6 @@ where
     connected_peers: VecDeque<PeerId>,
     /// Key manager, provide the BLS public key and sign peer records published to kademlia.
     key_config: KeyConfig,
-    /// If true then add peers to kademlia- useful for testing to set false.
-    kad_add_peers: bool,
     /// The public network key for this node.
     network_pubkey: NetworkPublicKey,
     /// The type to spawn tasks.
@@ -249,6 +247,8 @@ where
         );
         let peer_id: PeerId = keypair.public().into();
         let mut kad_config = libp2p::kad::Config::new(DEFAULT_KAD_PROTO_NAME);
+        // manually add peers
+        kad_config.set_kbucket_inserts(kad::BucketInserts::Manual);
         let two_days = Some(Duration::from_secs(48 * 60 * 60));
         let twelve_hours = Some(Duration::from_secs(12 * 60 * 60));
         kad_config
@@ -319,15 +319,9 @@ where
             connected_peers: VecDeque::new(),
             pending_px_disconnects,
             key_config,
-            kad_add_peers: true,
             network_pubkey,
             task_spawner,
         })
-    }
-
-    /// After this call peers will not be added to kademlia, for testing.
-    pub fn no_kad_peers_for_test(&mut self) {
-        self.kad_add_peers = false;
     }
 
     /// Return a [NetworkHandle] to send commands to this network.
@@ -416,6 +410,11 @@ where
                 kad::Quorum::One,
             );
 
+            //
+            // TODO: do we need to do this every time we publish to peer?
+            // - this could get noisy
+            // - need to understand `put_record_to` implications
+            //
             // Also publish our record locally and to the network.
             if let Err(err) =
                 self.swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One)
@@ -495,6 +494,16 @@ where
                     return Err(NetworkError::AllListenersClosed);
                 }
             }
+            SwarmEvent::Dialing { peer_id, connection_id } => {
+                // kad initiates dial attempts
+                // - register
+                // TNBehavior::handle_pending_outbound_connection
+                error!(target: "peer-manager", ?peer_id, ?connection_id, "DIALING PEER!!!");
+            }
+            // TODO: kad emits SwarmEvent::NewExternalAddrOfPeer - update PM here?
+            // - no, do this on routing updated?
+            // - this should match node record
+            //
             // other events handled by peer manager and other behaviors
             _ => {}
         }
@@ -1060,23 +1069,39 @@ where
                 // register peer for request-response behaviour
                 // NOTE: gossipsub handles `FromSwarm::ConnectionEstablished`
                 self.swarm.add_peer_address(peer_id, addr.clone());
-                if self.kad_add_peers {
+                // add as a kademlia peer
+                let routing_update =
                     self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                    self.publish_our_data_to_peer(peer_id);
-                }
+                // TODO: pass routing update to PM for prioritizing prune operations
+                // - heirarchy:
+                //      - success
+                //          - update here or when RoutingUpdated event?
+                //      - pending
+                //      - failed
+
+                // TODO: publish data here to PUSH or PULL?
+                self.publish_our_data_to_peer(peer_id);
 
                 // manage connected peers for
                 self.connected_peers.push_back(peer_id);
 
                 // if this is a trusted/validator (important) peer, mark it as explicit in gossipsub
                 if self.swarm.behaviour().peer_manager.peer_is_important(&peer_id) {
+                    // TODO: is this a potential issue with lots of validators?
+                    // - only validators on the gossip network?
                     self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                 }
+
+                // TODO: request record here
+                // - if record is invalid, the normal flow should cause disconnect
+                // - connecting with peer first also improves changes of retrieving record
             }
             PeerEvent::Banned(peer_id) => {
                 warn!(target: "network", ?peer_id, "peer banned");
                 // blacklist gossipsub
                 self.swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
+                // remove from kad routing table
+                self.swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
             }
             PeerEvent::Unbanned(peer_id) => {
                 debug!(target: "network", ?peer_id, "peer unbanned");
@@ -1095,6 +1120,7 @@ where
         Ok(())
     }
 
+    /// Process event from kademlia behavior.
     fn process_kad_event(&mut self, event: kad::Event) -> NetworkResult<()> {
         match event {
             kad::Event::InboundRequest { request } => {
@@ -1139,7 +1165,7 @@ where
                                 self.swarm
                                     .behaviour_mut()
                                     .peer_manager
-                                    .process_penalty(source, Penalty::Severe);
+                                    .process_penalty(source, Penalty::Fatal);
                             }
                         }
                     }
@@ -1232,27 +1258,80 @@ where
                     kad::QueryResult::StartProviding(Err(err)) => {
                         error!(target: "network-kad", "Failed to put provider record: {err:?}");
                     }
+                    kad::QueryResult::Bootstrap(Ok(todo)) => {
+                        // todo!()
+                    }
+                    kad::QueryResult::GetClosestPeers(Ok(todo)) => {
+                        // todo!()
+                    }
                     _ => {}
                 }
             }
             kad::Event::RoutingUpdated { peer, is_new_peer, addresses, bucket_range, old_peer } => {
-                let behaviour = self.swarm.behaviour_mut();
-                if behaviour.peer_manager.peer_banned(&peer) {
-                    behaviour.kademlia.remove_peer(&peer);
-                    warn!(target: "network-kad", "Removing banned peer from routing peer {peer:?} addresses {addresses:?}")
-                }
-                debug!(target: "network-kad", "routing updated peer {peer:?} new {is_new_peer} addrs {addresses:?} bucketr {bucket_range:?} old {old_peer:?}")
+                // let behaviour = self.swarm.behaviour_mut();
+                // if behaviour.peer_manager.peer_banned(&peer) {
+                //     behaviour.kademlia.remove_peer(&peer);
+                //     warn!(target: "network-kad", "Removing banned peer from routing peer {peer:?} addresses {addresses:?}")
+                // }
+                // debug!(target: "network-kad", "routing updated peer {peer:?} new {is_new_peer} addrs {addresses:?} bucketr {bucket_range:?} old {old_peer:?}")
+
+                // TODO: if old_peer, then kad removed from routing table
+                // - should PM be notified to prioritize them for disconnect?
+                //
+                // - if !is_new_peer, the addresses updated
+                //      - notify PM
+
+                // TODO:
+                // this is triggerd when `add_address` is called on Kad
+                //  - this should happen on peer connected PM event
+                //      - confirmed this is the current approach, so good here
+                //  - see `add_address` doc comment for additional considerations
+                //
+                // - this also happens when the kbucket entry is already present in kad::on_connection
+                //      - is_new_peer = false
+                //      - call PM to check update IP addresses
+                //          - ensure none are banned, otherwise disconnect
+                //
+                //
+                // TODO: update old_peer in PM as candidate for pruning
+                // flow:
+                //  - kad discovers better peer
+                // - initiates dial attempt
+                //      - PM does not filter dials based on target counts
+                // - connection established, evict old_peer
+                // - updated peer info to indicate no longer part of the routing table
+                // - pruning will prioritize peers that aren't part of kad
+                //      - should be okay since target peer count is higher than K-target
+                // - this method will always update peer's routing status bc it is always emitted after successful add_address
 
                 // TODO: add to peer manager - see issue #301
+                if self.swarm.behaviour().peer_manager.peer_is_important(&peer) {
+                    // add to kad cache #301
+                }
+
+                // self.swarm.behaviour_mut().kademlia.remove
             }
             kad::Event::UnroutablePeer { peer } => {
+                // unknown peer queried a record - noop
                 debug!(target: "network-kad", "unroutable peer {peer:?}")
             }
             kad::Event::RoutablePeer { peer, address } => {
-                debug!(target: "network-kad", "routable peer {peer:?}/{address:?}")
+                // kad discovered a new peer
+                debug!(target: "network-kad", "routable peer {peer:?}/{address:?}");
+
+                // TODO: does kademlia enforce strict peer id verification?
+
+                // notify peer manager
+                // self.swarm.behaviour_mut().peer_manager.process_routable_peer(peer, address);
+
+                // see L1323 `on_connection_updated`:
+                // - this is what to do, except L1409:
+                //      - pass dial to PM, not swarm
             }
             kad::Event::PendingRoutablePeer { peer, address } => {
                 debug!(target: "network-kad", "pending routable peer {peer:?}/{address:?}")
+                // TODO: should this also notify peer manager?
+                //  - confirm default kad flow
             }
             kad::Event::ModeChanged { new_mode } => {
                 debug!(target: "network-kad", "mode changed {new_mode:?}")

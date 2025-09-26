@@ -323,11 +323,11 @@ impl Default for PeerConfig {
     fn default() -> Self {
         Self {
             heartbeat_interval: 30,
-            target_num_peers: 5,
+            target_num_peers: 30,
             dial_timeout: Duration::from_secs(15),
             min_score_for_disconnect: -20.0,
             min_score_for_ban: -50.0,
-            peer_excess_factor: 0.2,
+            peer_excess_factor: 0.3,
             priority_peer_excess: 0.2,
             target_outbound_only_factor: 0.3,
             min_outbound_only_factor: 0.2,
