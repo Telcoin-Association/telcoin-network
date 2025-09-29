@@ -4,6 +4,8 @@ Telcoin Network can synchronize a node trustlessly from genesis (the genesis com
 
 ## The Epoch Chain
 
+See struct EpochHeader in crates/types/src/primay/epoch.rs
+
 This is composed of epoch records that contain:
 - Epoch number (block number for this "chain")
 - The BLS public keys of that epoch's committee
@@ -29,6 +31,8 @@ This will leave the node with knowledge of all committees for all epochs.  The c
 Note: the onchain committee state is the source of truth for committee members but this is used to acquire this information without the execution state.  It is possible for an epoch record to contain a committee with a validator that was dropped, this should be exceptionally rare but needs to be accounted for when validating next committees.  With a quorum of 2/3 + 1 this should not cause a problem.
 
 ## The Consensus Chain
+
+See struct ConsensusHeader crates/types/src/primay/block.rs
 
 This is composed of consensus records that contain:
 - The hash of the previous consensus header (creating a chain)

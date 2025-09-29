@@ -149,7 +149,6 @@ pub fn catchup_accumulator<DB: TNDatabase>(
                     current.parent_beacon_block_root.ok_or_eyre("consensus root missing")?;
                 let leader = db
                     .get_consensus_by_hash(consensus_digest)
-                    //.get::<ConsensusBlocks>(&consensus_block_num)?
                     .ok_or_eyre("missing consensus block")?
                     .sub_dag
                     .leader
