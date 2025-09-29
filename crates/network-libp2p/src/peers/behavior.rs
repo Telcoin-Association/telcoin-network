@@ -197,23 +197,11 @@ impl PeerManager {
         remote_addr: &[Multiaddr],
     ) -> Result<(), ConnectionDenied> {
         // only support ipv4 and ipv6
-        let ips = self.extract_supported_protocol_from_multiaddrs(remote_addr);
-
-        if ips.is_empty() {
-            return Err(ConnectionDenied::new(format!(
-                "Connection to peer denied: missing ip addr"
-            )));
+        if !self.has_valid_unbanned_ips(remote_addr) {
+            return Err(ConnectionDenied::new(
+                "Connection denied: peer has no valid unbanned IP addresses".to_string(),
+            ));
         }
-
-        // block connection if associated with ANY banned ip
-        for ip in &ips {
-            if self.is_ip_banned(ip) {
-                return Err(ConnectionDenied::new(format!(
-                    "Connection to peer denied: peer {ip} is banned"
-                )));
-            }
-        }
-
         Ok(())
     }
 

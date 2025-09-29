@@ -1272,8 +1272,13 @@ where
                     kad::QueryResult::Bootstrap(Ok(todo)) => {
                         // todo!()
                     }
-                    kad::QueryResult::GetClosestPeers(Ok(todo)) => {
-                        // todo!()
+                    kad::QueryResult::GetClosestPeers(Ok(result)) => {
+                        // process peers for potential discovery attempts
+                        debug!(target: "network-kad", ?result, "GetClosestPeers for discovery");
+                        self.swarm
+                            .behaviour_mut()
+                            .peer_manager
+                            .process_peers_for_discovery(result.peers);
                     }
                     _ => {}
                 }

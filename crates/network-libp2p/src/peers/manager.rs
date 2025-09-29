@@ -14,7 +14,7 @@ use crate::{
     send_or_log_error,
     types::{AuthorityInfoRequest, NetworkInfo, NetworkResult},
 };
-use libp2p::{core::ConnectedPoint, multiaddr::Protocol, Multiaddr, PeerId};
+use libp2p::{core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, Multiaddr, PeerId};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
@@ -125,9 +125,6 @@ pub(crate) struct PeerManager {
     //
     //
     // Outstanding TODOs:
-    //  - track routable peers
-    //      - updated on `add_address` and `old_peer` for RoutingUpdated
-    //          - cleaner to always handle on RoutingUpdated???
     // - heartbeat event to trigger discovery
     //      - query closest peers
     //      - add to discovery map
@@ -175,7 +172,7 @@ pub(crate) struct PeerManager {
     // - heartbeat loop repeats
     //      - initiates more dial attemps / pruning
     // - TODO: how to handle bootstrap peers?
-    routable_peers: Vec<(PeerId, Multiaddr)>,
+    discovery_peers: HashSet<(PeerId, Vec<Multiaddr>)>,
 }
 
 impl PeerManager {
@@ -203,7 +200,7 @@ impl PeerManager {
             events: Default::default(),
             dial_requests: Default::default(),
             temporarily_banned,
-            routable_peers: Default::default(),
+            discovery_peers: Default::default(),
         }
     }
 
@@ -816,49 +813,54 @@ impl PeerManager {
         self.peers.can_dial(peer_id)
     }
 
-    /// Method to extract supported protocols from [Multiaddr].
+    /// Extract IP addresses from multiaddrs and check if any are banned.
     ///
-    /// This is used to identify banned IPs for peer discovery and pending inbound connections.
-    pub(super) fn extract_supported_protocol_from_multiaddrs(
-        &self,
-        multiaddr: &[Multiaddr],
-    ) -> Vec<IpAddr> {
-        // only support ipv4 and ipv6
-        multiaddr
-            .iter()
-            .filter_map(|addr| match addr.iter().next() {
-                Some(Protocol::Ip4(ip)) => Some(IpAddr::V4(ip)),
-                Some(Protocol::Ip6(ip)) => Some(IpAddr::V6(ip)),
-                _ => None,
-            })
-            .collect()
+    /// Returns `true` if the peer has valid IP addresses and NONE are banned.
+    /// Returns `false` if no valid IPs found OR any IP is banned.
+    pub(super) fn has_valid_unbanned_ips(&self, multiaddrs: &[Multiaddr]) -> bool {
+        let mut found_valid_ip = false;
+
+        for addr in multiaddrs {
+            if let Some(ip) = Self::extract_ip_from_multiaddr(addr) {
+                found_valid_ip = true;
+                if self.is_ip_banned(&ip) {
+                    return false; // Early return on first banned IP
+                }
+            }
+        }
+
+        found_valid_ip
     }
 
-    // /// Helper method to check if peer is eligible for discovery.
-    // fn eligible_for_discovery(&self, peer_id: &PeerId, multiaddr: &[Multiaddr]) -> bool {
-    //     // check if protocol supported and IP is not banned
-    //     let ip_address_valid = self
-    //         .extract_supported_protocol_from_multiaddrs(multiaddr)
-    //         .is_some_and(|ip| !self.is_ip_banned(&ip));
+    /// Extract IP address from a single multiaddr.
+    ///
+    /// Only supports IPv4 and IPv6.
+    fn extract_ip_from_multiaddr(addr: &Multiaddr) -> Option<IpAddr> {
+        addr.iter().find_map(|protocol| match protocol {
+            Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+            Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+            _ => None,
+        })
+    }
 
-    //     // unknown, disconnected, and not banned
-    //     let peer_eligble = self.peers.can_dial(peer_id);
+    /// Check if peer is eligible for discovery.
+    ///
+    /// A peer is eligible if:
+    /// - it has at least one valid ip address (ipv4/ipv6)
+    /// - none of its ip addresses are banned
+    /// - it can be dialed (not connected/dialing/banned)
+    fn eligible_for_discovery(&self, info: &PeerInfo) -> bool {
+        self.has_valid_unbanned_ips(&info.addrs) && self.peers.can_dial(&info.peer_id)
+    }
 
-    //     ip_address_valid && peer_eligble
-    // }
-
-    // /// Process a newly discovered peer as a result of kademlia's `RoutablePeer` event.
-    // ///
-    // /// The peer manager is the source of truth for managing peer connections. Eligible peers are stored in-memory and dialed to maintain target peer counts.
-    // pub(crate) fn process_routable_peer(&mut self, peer_id: PeerId, multiaddr: Multiaddr) {
-    //     // store peer info for possible dial attempt during heartbeat
-    //     if self.eligible_for_discovery(&peer_id, &[multiaddr]) {
-    //         // heartbeat maintains map size
-    //         //
-    //         // NOTE: this replaces matching peer ids
-    //         self.routable_peers.push((peer_id, multiaddr));
-    //     }
-    // }
+    /// Process newly discovered peers for potential dial attempts.
+    ///
+    /// Only eligible peers are stored for dialing during heartbeat.
+    pub(crate) fn process_peers_for_discovery(&mut self, mut peers: Vec<PeerInfo>) {
+        peers.retain(|peer| self.eligible_for_discovery(peer));
+        let peers: HashSet<_> = peers.into_iter().map(|info| (info.peer_id, info.addrs)).collect();
+        self.discovery_peers.extend(peers);
+    }
 
     /// Check peer counts and initiate dial attempts to maintain connection targets.
     fn discovery_heartbeat(&mut self) {

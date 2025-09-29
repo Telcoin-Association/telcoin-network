@@ -7,6 +7,7 @@ use libp2p::swarm::{ConnectionId, NetworkBehaviour as _};
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
     collections::{HashMap, HashSet},
+    net::{Ipv4Addr, Ipv6Addr},
     time::Duration,
 };
 use tn_config::{KeyConfig, NetworkConfig, ScoreConfig};
@@ -694,4 +695,236 @@ async fn test_banned_peer_dial_fails_and_ip_ban() {
     let dial_attempt =
         peer_manager.handle_pending_inbound_connection(connection_id, &local, &multiaddr);
     assert!(dial_attempt.is_err());
+}
+
+#[test]
+fn test_extract_ip_from_multiaddr() {
+    // test ipv4
+    let ipv4 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+    let addr = Multiaddr::empty().with(ipv4.into()).with(Protocol::Tcp(8080));
+    assert_eq!(PeerManager::extract_ip_from_multiaddr(&addr), Some(ipv4));
+
+    // test ipv6
+    let ipv6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+    let addr = Multiaddr::empty().with(ipv6.into()).with(Protocol::Tcp(8080));
+    assert_eq!(PeerManager::extract_ip_from_multiaddr(&addr), Some(ipv6));
+
+    // test no ip (e.g., only tcp)
+    let addr = Multiaddr::empty().with(Protocol::Tcp(8080));
+    assert_eq!(PeerManager::extract_ip_from_multiaddr(&addr), None);
+
+    // test unsupported protocol
+    let addr = Multiaddr::empty().with(Protocol::Dns("example.com".into()));
+    assert_eq!(PeerManager::extract_ip_from_multiaddr(&addr), None);
+}
+
+#[tokio::test]
+async fn test_has_valid_unbanned_ips_with_valid_ips() {
+    let peer_manager = create_test_peer_manager(None);
+    let addr = create_multiaddr(None);
+    assert!(peer_manager.has_valid_unbanned_ips(&[addr]));
+}
+
+#[tokio::test]
+async fn test_has_valid_unbanned_ips_with_no_valid_ips() {
+    let peer_manager = create_test_peer_manager(None);
+    let addr = Multiaddr::empty().with(Protocol::Tcp(8080)); // No IP
+
+    assert!(!peer_manager.has_valid_unbanned_ips(&[addr]));
+}
+
+#[tokio::test]
+async fn test_has_valid_unbanned_ips_with_banned_ip() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let addr = create_multiaddr(None);
+    let peer_id = PeerId::random();
+
+    // connect and ban the peer to ban the ip
+    let connection = ConnectionType::IncomingConnection { multiaddr: addr.clone() };
+    peer_manager.register_peer_connection(&peer_id, connection);
+    peer_manager.process_penalty(peer_id, Penalty::Fatal);
+    peer_manager.register_disconnected(&peer_id);
+
+    // create another peer with same ip (need 2 peers from same ip for ip ban)
+    let peer_id2 = PeerId::random();
+    let connection2 = ConnectionType::IncomingConnection { multiaddr: addr.clone() };
+    peer_manager.register_peer_connection(&peer_id2, connection2);
+    peer_manager.process_penalty(peer_id2, Penalty::Fatal);
+    peer_manager.register_disconnected(&peer_id2);
+
+    // IP should be banned
+    assert!(!peer_manager.has_valid_unbanned_ips(&[addr]));
+}
+
+#[tokio::test]
+async fn test_has_valid_unbanned_ips_early_return_on_banned() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let banned_ip = random_ip_addr();
+    let valid_ip = random_ip_addr();
+
+    // ban the first ip
+    let peer_id = PeerId::random();
+    let addr1 = create_multiaddr(Some(banned_ip));
+    let connection = ConnectionType::IncomingConnection { multiaddr: addr1.clone() };
+    peer_manager.register_peer_connection(&peer_id, connection);
+    peer_manager.process_penalty(peer_id, Penalty::Fatal);
+    peer_manager.register_disconnected(&peer_id);
+
+    let peer_id2 = PeerId::random();
+    let connection2 = ConnectionType::IncomingConnection { multiaddr: addr1.clone() };
+    peer_manager.register_peer_connection(&peer_id2, connection2);
+    peer_manager.process_penalty(peer_id2, Penalty::Fatal);
+    peer_manager.register_disconnected(&peer_id2);
+
+    // create multiaddrs with banned ip first, valid ip second
+    let addr2 = create_multiaddr(Some(valid_ip));
+
+    // should return false on first banned ip (early return)
+    assert!(!peer_manager.has_valid_unbanned_ips(&[addr1, addr2]));
+}
+
+#[tokio::test]
+async fn test_process_peers_for_discovery_filters_duplicates() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = PeerId::random();
+    let addr = create_multiaddr(None);
+    let peer_info = PeerInfo { peer_id, addrs: vec![addr.clone()] };
+
+    // Add same peer twice
+    peer_manager.process_peers_for_discovery(vec![peer_info.clone()]);
+    peer_manager.process_peers_for_discovery(vec![peer_info.clone()]);
+
+    // Should only have one entry
+    assert_eq!(peer_manager.discovery_peers.len(), 1);
+    assert!(peer_manager.discovery_peers.contains(&(peer_id, vec![addr])));
+}
+
+#[tokio::test]
+async fn test_process_peers_for_discovery_filters_no_valid_ip() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = PeerId::random();
+    let invalid_addr = Multiaddr::empty().with(Protocol::Tcp(8080)); // No IP
+    let peer_info = PeerInfo { peer_id, addrs: vec![invalid_addr] };
+
+    peer_manager.process_peers_for_discovery(vec![peer_info]);
+
+    // Should not be added
+    assert_eq!(peer_manager.discovery_peers.len(), 0);
+}
+
+#[tokio::test]
+async fn test_process_peers_for_discovery_filters_banned_ip() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let addr = create_multiaddr(None);
+
+    // ban the ip first (need 2 peers from same ip)
+    let banned_peer1 = PeerId::random();
+    let connection1 = ConnectionType::IncomingConnection { multiaddr: addr.clone() };
+    peer_manager.register_peer_connection(&banned_peer1, connection1);
+    peer_manager.process_penalty(banned_peer1, Penalty::Fatal);
+    peer_manager.register_disconnected(&banned_peer1);
+
+    let banned_peer2 = PeerId::random();
+    let connection2 = ConnectionType::IncomingConnection { multiaddr: addr.clone() };
+    peer_manager.register_peer_connection(&banned_peer2, connection2);
+    peer_manager.process_penalty(banned_peer2, Penalty::Fatal);
+    peer_manager.register_disconnected(&banned_peer2);
+
+    // try to add a new peer with banned ip
+    let new_peer = PeerId::random();
+    let peer_info = PeerInfo { peer_id: new_peer, addrs: vec![addr] };
+
+    peer_manager.process_peers_for_discovery(vec![peer_info]);
+
+    // should not be added
+    assert_eq!(peer_manager.discovery_peers.len(), 0);
+}
+
+#[tokio::test]
+async fn test_process_peers_for_discovery_filters_connected_peers() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = PeerId::random();
+    let addr = create_multiaddr(None);
+
+    // connect the peer first
+    let connection = ConnectionType::IncomingConnection { multiaddr: addr.clone() };
+    peer_manager.register_peer_connection(&peer_id, connection);
+
+    // try to add to discovery
+    let peer_info = PeerInfo { peer_id, addrs: vec![addr] };
+
+    peer_manager.process_peers_for_discovery(vec![peer_info]);
+
+    // should not be added (can't dial connected peers)
+    assert_eq!(peer_manager.discovery_peers.len(), 0);
+}
+
+#[tokio::test]
+async fn test_process_peers_for_discovery_filters_dialing_peers() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = PeerId::random();
+    let addr = create_multiaddr(Some(random_ip_addr()));
+
+    // register dial attempt
+    peer_manager.register_dial_attempt(peer_id, None);
+
+    // try to add to discovery
+    let peer_info = PeerInfo { peer_id, addrs: vec![addr] };
+
+    peer_manager.process_peers_for_discovery(vec![peer_info]);
+
+    // should not be added (already dialing)
+    assert_eq!(peer_manager.discovery_peers.len(), 0);
+}
+
+#[tokio::test]
+async fn test_process_peers_for_discovery_accepts_valid_peers() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // Create multiple valid peers
+    let peer1 = PeerInfo {
+        peer_id: PeerId::random(),
+        addrs: vec![create_multiaddr(Some(random_ip_addr()))],
+    };
+    let peer2 = PeerInfo {
+        peer_id: PeerId::random(),
+        addrs: vec![create_multiaddr(Some(random_ip_addr()))],
+    };
+    let peer3 = PeerInfo {
+        peer_id: PeerId::random(),
+        addrs: vec![create_multiaddr(Some(random_ip_addr()))],
+    };
+
+    peer_manager.process_peers_for_discovery(vec![peer1, peer2, peer3]);
+
+    // all should be added
+    assert_eq!(peer_manager.discovery_peers.len(), 3);
+}
+
+#[tokio::test]
+async fn test_process_peers_for_discovery_mixed_valid_invalid() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    let valid_peer = PeerInfo {
+        peer_id: PeerId::random(),
+        addrs: vec![create_multiaddr(Some(random_ip_addr()))],
+    };
+
+    let invalid_peer_no_ip = PeerInfo {
+        peer_id: PeerId::random(),
+        addrs: vec![Multiaddr::empty().with(Protocol::Tcp(8080))],
+    };
+
+    let connected_peer_id = PeerId::random();
+    let addr = create_multiaddr(Some(random_ip_addr()));
+    peer_manager.register_peer_connection(
+        &connected_peer_id,
+        ConnectionType::IncomingConnection { multiaddr: addr.clone() },
+    );
+    let connected_peer = PeerInfo { peer_id: connected_peer_id, addrs: vec![addr] };
+
+    peer_manager.process_peers_for_discovery(vec![valid_peer, invalid_peer_no_ip, connected_peer]);
+
+    // only the valid peer should be added
+    assert_eq!(peer_manager.discovery_peers.len(), 1);
 }
