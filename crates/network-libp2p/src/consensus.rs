@@ -21,7 +21,7 @@ use libp2p::{
         TopicHash,
     },
     identify::{self, Event as IdentifyEvent, Info as IdentifyInfo},
-    kad::{self, store::RecordStore, Mode, QueryId},
+    kad::{self, store::RecordStore, Mode, QueryId, RoutingUpdate},
     multiaddr::Protocol,
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
@@ -1072,6 +1072,17 @@ where
                 // add as a kademlia peer
                 let routing_update =
                     self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                match routing_update {
+                    RoutingUpdate::Success => {
+                        trace!(target: "network-kad", ?routing_update, ?peer_id, "peer added to routing table");
+                        // TODO: update peer to indicate they are in kbucket
+                        // - ensure this is updated when old peer replaced by kad as well in RoutingUpdated event
+                    }
+                    _ => {
+                        // do nothing
+                        trace!(target: "network-kad", ?routing_update, ?peer_id, "routing updated for peer add_address");
+                    }
+                }
                 // TODO: pass routing update to PM for prioritizing prune operations
                 // - heirarchy:
                 //      - success
@@ -1309,7 +1320,13 @@ where
                     // add to kad cache #301
                 }
 
-                // self.swarm.behaviour_mut().kademlia.remove
+                // update routable peer
+                self.swarm.behaviour_mut().peer_manager.update_routing_for_peer(&peer, true);
+
+                // update old peer if evicted from routing table
+                if let Some(old) = old_peer {
+                    self.swarm.behaviour_mut().peer_manager.update_routing_for_peer(&old, false);
+                }
             }
             kad::Event::UnroutablePeer { peer } => {
                 // unknown peer queried a record - noop

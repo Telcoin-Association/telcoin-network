@@ -44,6 +44,10 @@ pub(super) struct Peer {
     ///
     /// `None` if this peer was never connected.
     connection_direction: Option<ConnectionDirection>,
+    /// Indicates if the peer is part of the node's kademlia routing table.
+    ///
+    /// Routable peers are used to query kad records and are prioritized connections. Peer manager prioritizes non-routable peers during connection limit pruning. If a peer is not in the routing table and this node needs to prune connections, then the peer may be disconnected.
+    routable: bool,
 }
 
 impl Peer {
@@ -63,6 +67,7 @@ impl Peer {
             multiaddrs: Default::default(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
+            routable: false,
         }
     }
 
@@ -82,6 +87,7 @@ impl Peer {
             multiaddrs: Default::default(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
+            routable: false,
         }
     }
 
@@ -103,6 +109,7 @@ impl Peer {
             multiaddrs: Default::default(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
+            routable: false,
         }
     }
 
@@ -323,5 +330,15 @@ impl Peer {
             }
         }
         res
+    }
+
+    /// Update peer record to indicate participation in kad as a routable peer.
+    pub(super) fn update_routability(&mut self, routable: bool) {
+        self.routable = routable;
+    }
+
+    /// Bool indicating if the peer is a known participant in kademlia routing table.
+    pub(super) fn is_routable(&self) -> bool {
+        self.routable
     }
 }

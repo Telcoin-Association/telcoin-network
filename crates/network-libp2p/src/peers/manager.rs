@@ -77,6 +77,68 @@ pub(crate) struct PeerManager {
     //      - just check if peer is banned then call disconnect
     //          - kad::remove_peer
     //
+    // - kad initiates dial attempt
+    // - PM::on_pending_outbound_connection
+    //      - filters bad dial attempts
+    //      - register peer as dialing
+    // - kad connects
+    //      - `fn connection_updated`
+    //          - ignore events and use `add_address` as source of truth
+    //      - checks kbucket, but ultimately NOOP
+    //          - entry present
+    //              - `RoutingUpdated`
+    //                  - is_new_peer: false
+    //                  - handle new IP address?
+    // !!!                    - NO, NodeRecord is source of truth
+    //              - pending entry
+    //                  - noop?
+    //              - absent
+    //                  - manual entry emits `RoutablePeer` event
+    //                      - PM will also emit `PeerConnected`
+    //                          - PM tracks multiaddr `on_connection`
+    // - PM emits PeerConnected
+    //      - this calls kad::add_address
+    //          - match on `RoutingUpdate`
+    //          - already present
+    //              - Success
+    //              - Noop
+    //          - pending
+    //              - TODO: should this be tracked?
+    //                  - peer already connected, but not added to kbucket
+    //                  - other protocols need this
+    //          - absent
+    //              - Inserted
+    //                  - RoutingUpdated event
+    //                      - is_new_peer: true
+    //                  - Noop
+    //                  - Success
+    //              - Full
+    //                  - Failed
+    //              - Pending
+    //                  - initiates dial attempt
+    //                      - should be noop since this was AFTER PM connected event
+    //
+    // - How should PM react to failed `add_address` attempts?
+    //      - PM tracks peer as not in routing table
+    //          - used as lower priority when pruning peer counts
+    //      - need to update this info for `old_peer` as well when routing updated
+    //
+    //
+    // Outstanding TODOs:
+    //  - track routable peers
+    //      - updated on `add_address` and `old_peer` for RoutingUpdated
+    //          - cleaner to always handle on RoutingUpdated???
+    // - heartbeat event to trigger discovery
+    //      - query closest peers
+    //      - add to discovery map
+    //      - remove these on dial
+    //          - remove on dialing to prevent double dials
+    //          - register dialing cleans up discovery map bc kademlia might initiate dial attempts
+    // - flow for records
+    //      - put vs pull
+    //
+    //
+    //
     // later in loop...
     // - PM heartbeat detects low peers dialing/connected
     //      - shuffle and remove peer from discovery_peers
@@ -527,7 +589,7 @@ impl PeerManager {
     /// removed until excess peer count reaches target.
     fn prune_connected_peers(&mut self) {
         // connected peers sorted from lowest to highest aggregate score
-        let connected_peers = self.peers.connected_peers_by_score();
+        let connected_peers = self.peers.connected_peers_by_score_and_routability();
         let mut excess_peer_count =
             connected_peers.len().saturating_sub(self.config.target_num_peers);
         if excess_peer_count == 0 {
@@ -824,5 +886,10 @@ impl PeerManager {
         //     .collect();
 
         // todo!()
+    }
+
+    /// Update a peer's status in the routing table.
+    pub(crate) fn update_routing_for_peer(&mut self, peer_id: &PeerId, routable: bool) {
+        self.peers.update_routing_for_peer(peer_id, routable);
     }
 }

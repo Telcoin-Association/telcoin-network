@@ -486,8 +486,9 @@ async fn test_prune_connected_peers() {
     let mut peer_manager = create_test_peer_manager(None);
 
     // Register many peers
+    let max_peers = peer_manager.config.max_peers();
     let mut peer_ids = Vec::new();
-    for _ in 0..20 {
+    for _ in 0..(max_peers * 2) {
         let peer_id = register_peer(&mut peer_manager, None);
         peer_ids.push(peer_id);
     }
