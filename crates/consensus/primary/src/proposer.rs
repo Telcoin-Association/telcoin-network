@@ -31,7 +31,7 @@ use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::ProposerStore;
 use tn_types::{
     now, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, Epoch, Hash as _,
-    Header, Noticer, Round, TaskManager, TimestampSec, TnReceiver, TnSender, WorkerId,
+    Header, Noticer, Round, TaskManager, TaskSpawner, TimestampSec, TnReceiver, TnSender, WorkerId,
 };
 use tokio::{
     sync::oneshot,
@@ -134,6 +134,8 @@ pub struct Proposer<DB: ProposerStore> {
     leader_schedule: LeaderSchedule,
     /// Flag if enough conditions are met to advance the round.
     advance_round: bool,
+    /// Spawner for our tasks- want to confine them to the current epoch.
+    task_spawner: TaskSpawner,
 }
 
 impl<DB: Database> Proposer<DB> {
@@ -146,6 +148,7 @@ impl<DB: Database> Proposer<DB> {
         authority_id: AuthorityIdentifier, // We need to be a validator so must have an id.
         consensus_bus: ConsensusBus,
         leader_schedule: LeaderSchedule,
+        task_spawner: TaskSpawner,
     ) -> Self {
         let rx_shutdown = config.shutdown().subscribe();
         let genesis = Certificate::genesis(config.committee());
@@ -174,6 +177,7 @@ impl<DB: Database> Proposer<DB> {
             proposed_headers: BTreeMap::new(),
             leader_schedule,
             advance_round: true,
+            task_spawner,
         }
     }
 
@@ -671,7 +675,7 @@ impl<DB: Database> Proposer<DB> {
                 self.last_parents.clear();
 
                 let consensus_bus = self.consensus_bus.clone();
-                tokio::task::spawn(async move {
+                self.task_spawner.spawn_task("re-propose header", async move {
                     // use this instead of store_and_send to because rx always expects a Header
                     let res =
                         Proposer::repropose_header(header, proposer_store, &consensus_bus, reason)
@@ -705,7 +709,7 @@ impl<DB: Database> Proposer<DB> {
 
                 let consensus_bus = self.consensus_bus.clone();
                 // spawn tokio task to create, store, and send new header to certifier
-                tokio::task::spawn(async move {
+                self.task_spawner.spawn_task("propose header", async move {
                     let proposal = Proposer::propose_header(
                         current_round,
                         current_epoch,
@@ -865,6 +869,9 @@ impl<DB: Database> Proposer<DB> {
             let should_create_header = enough_parents
                 && (max_delay_timed_out
                     || (self.advance_round && (enough_digests || min_delay_timed_out)));
+            // If we have not proposed a header in more than a max_header_delay time then repropose.
+            // We may be in a race condition on a network restart...
+            let should_repropose_header = !should_create_header && max_delay_timed_out;
 
             debug!(
                 target: "primary::proposer",
@@ -906,6 +913,27 @@ impl<DB: Database> Proposer<DB> {
                 pending_header = Some(self.propose_next_header(reason.to_string())?);
                 max_delay_timed_out = false;
                 min_delay_timed_out = false;
+            } else if should_repropose_header {
+                if let Ok(Some(last_proposed)) = self.proposer_store.get_last_proposed() {
+                    warn!(target: "primary::proposer", interval=?self.max_delay_interval.period(), "re-proposing last header after max delay interval expired for round {}", self.round);
+                    let (tx, rx) = oneshot::channel();
+                    let consensus_bus = self.consensus_bus.clone();
+                    let proposer_store = self.proposer_store.clone();
+                    self.task_spawner.spawn_task("re-propose header after delay", async move {
+                        // use this instead of store_and_send to because rx always expects a Header
+                        let res = Proposer::repropose_header(
+                            last_proposed,
+                            proposer_store,
+                            &consensus_bus,
+                            "repropose header after delay".to_string(),
+                        )
+                        .await;
+                        let _ = tx.send(res);
+                    });
+                    max_delay_timed_out = false;
+                    min_delay_timed_out = false;
+                    pending_header = Some(rx);
+                }
             }
         }
     }
