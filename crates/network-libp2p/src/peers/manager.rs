@@ -15,6 +15,7 @@ use crate::{
     types::{AuthorityInfoRequest, NetworkInfo, NetworkResult},
 };
 use libp2p::{core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, Multiaddr, PeerId};
+use rand::seq::IteratorRandom as _;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
@@ -172,7 +173,7 @@ pub(crate) struct PeerManager {
     // - heartbeat loop repeats
     //      - initiates more dial attemps / pruning
     // - TODO: how to handle bootstrap peers?
-    discovery_peers: HashSet<(PeerId, Vec<Multiaddr>)>,
+    discovery_peers: HashMap<PeerId, Vec<Multiaddr>>,
 }
 
 impl PeerManager {
@@ -586,11 +587,12 @@ impl PeerManager {
     /// removed until excess peer count reaches target.
     fn prune_connected_peers(&mut self) {
         // connected peers sorted from lowest to highest aggregate score
+        // peers that do not participate in the kad routing table are prioritized as well
         let connected_peers = self.peers.connected_peers_by_score_and_routability();
         let mut excess_peer_count =
             connected_peers.len().saturating_sub(self.config.target_num_peers);
         if excess_peer_count == 0 {
-            // target num peers within range
+            // no excess peers
             return;
         }
 
@@ -606,7 +608,7 @@ impl PeerManager {
             })
             .collect::<Vec<_>>();
 
-        // disconnect peers until excess_peer_count is 0
+        // disconnect peers until excess_peer_count is 0 or no more peers
         for peer_id in ready_to_prune {
             if excess_peer_count > 0 {
                 self.disconnect_peer(peer_id, true);
@@ -869,25 +871,66 @@ impl PeerManager {
         //      - eligible_for_discovery
         // - check numbers
         //      - emit bootstrap event if low
-        //
-        // for discovery:
-        // - check connected/dialing
-        // - calculate delta from target
-        // - shuffle vs timestamp?
-        //      - what data struct to use?
-        // - confirm can_dial still
-        // - initiate dial attempts
-        // - kad::bootstrap is called periodically already
-        //      - update
+        let mut discovery_peers = std::mem::take(&mut self.discovery_peers);
+        discovery_peers.retain(|peer_id, addrs| {
+            let peer_info = PeerInfo { peer_id: *peer_id, addrs: addrs.clone() };
+            self.eligible_for_discovery(&peer_info)
+        });
 
-        // filter ineligible peers
-        // let filtered: Vec<_> = self
-        //     .routable_peers
-        //     .into_iter()
-        //     .filter(|(peer_id, addr)| self.eligible_for_discovery(peer_id, addr))
-        //     .collect();
+        // calculate dial attempts
+        let connected_or_dialing = self.connected_or_dialing_peers().len();
+        let peers_needed = self.config.target_num_peers.saturating_sub(connected_or_dialing);
 
-        // todo!()
+        // used for random selections
+        let mut rng = rand::rng();
+
+        // initiate dial attempts
+        if peers_needed > 0 {
+            // randomly select peers to dial
+            let to_dial: Vec<(PeerId, Vec<Multiaddr>)> = discovery_peers
+                .iter()
+                .map(|(id, addrs)| (*id, addrs.clone()))
+                .choose_multiple(&mut rng, peers_needed);
+
+            // remove from discovery and dial discovery candidate
+            for (peer, addrs) in to_dial {
+                debug!(target: "peer-manager", ?peer, "dialing peer for discovery");
+                discovery_peers.remove(&peer);
+                self.dial_peer(peer, addrs, None);
+            }
+        }
+
+        // TODO: should this take into consideration potential validators?
+        // - I don't think so, but where else do we try to dial validators?
+        //      - check this flow to ensure:
+        //              - not harassing validators
+        //              - not ignoring validators
+        let max_discovery_peers = self.config.max_discovery_peers();
+        let current_count = discovery_peers.len();
+
+        // manage discovery peer counts
+        if current_count > max_discovery_peers {
+            // prune excess
+            let excess = current_count - max_discovery_peers;
+            let to_remove: Vec<PeerId> =
+                discovery_peers.iter().map(|(id, _addrs)| *id).choose_multiple(&mut rng, excess);
+            for peer in to_remove {
+                discovery_peers.remove(&peer);
+            }
+
+            debug!(
+                target: "peer-manager",
+                pruned = excess,
+                remaining = discovery_peers.len(),
+                "pruned excess discovery peers"
+            );
+        } else if current_count < max_discovery_peers {
+            // emit discovery event to find closest peers
+            self.events.push_back(PeerEvent::Discovery);
+        }
+
+        // store discovery peers
+        self.discovery_peers = discovery_peers;
     }
 
     /// Update a peer's status in the routing table.

@@ -1126,6 +1126,11 @@ where
                     self.kad_requests.insert(query_id, reply);
                 }
             }
+            PeerEvent::Discovery => {
+                let peer_id = PeerId::random();
+                // TODO: save query id?
+                self.swarm.behaviour_mut().kademlia.get_closest_peers(peer_id);
+            }
         }
 
         Ok(())

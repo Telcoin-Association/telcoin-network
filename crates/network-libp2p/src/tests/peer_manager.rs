@@ -790,13 +790,13 @@ async fn test_process_peers_for_discovery_filters_duplicates() {
     let addr = create_multiaddr(None);
     let peer_info = PeerInfo { peer_id, addrs: vec![addr.clone()] };
 
-    // Add same peer twice
+    // add same peer twice
     peer_manager.process_peers_for_discovery(vec![peer_info.clone()]);
     peer_manager.process_peers_for_discovery(vec![peer_info.clone()]);
 
-    // Should only have one entry
+    // should only have one entry
     assert_eq!(peer_manager.discovery_peers.len(), 1);
-    assert!(peer_manager.discovery_peers.contains(&(peer_id, vec![addr])));
+    assert_eq!(peer_manager.discovery_peers.remove(&peer_id), Some(vec![addr]));
 }
 
 #[tokio::test]
@@ -808,7 +808,7 @@ async fn test_process_peers_for_discovery_filters_no_valid_ip() {
 
     peer_manager.process_peers_for_discovery(vec![peer_info]);
 
-    // Should not be added
+    // should not be added
     assert_eq!(peer_manager.discovery_peers.len(), 0);
 }
 
@@ -927,4 +927,138 @@ async fn test_process_peers_for_discovery_mixed_valid_invalid() {
 
     // only the valid peer should be added
     assert_eq!(peer_manager.discovery_peers.len(), 1);
+}
+
+#[tokio::test]
+async fn test_discovery_heartbeat_filters_ineligible_peers() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // add a valid peer to discovery
+    let valid_peer = PeerId::random();
+    let valid_addr = create_multiaddr(None);
+    peer_manager.discovery_peers.insert(valid_peer, vec![valid_addr.clone()]);
+
+    // add a peer with no valid ip
+    let invalid_peer = PeerId::random();
+    let invalid_addr = Multiaddr::empty().with(Protocol::Tcp(8080));
+    peer_manager.discovery_peers.insert(invalid_peer, vec![invalid_addr]);
+
+    // add a connected peer (ineligible)
+    let connected_peer = PeerId::random();
+    let connected_addr = create_multiaddr(None);
+    peer_manager.register_peer_connection(
+        &connected_peer,
+        ConnectionType::IncomingConnection { multiaddr: connected_addr.clone() },
+    );
+    peer_manager.discovery_peers.insert(connected_peer, vec![connected_addr]);
+
+    // run heartbeat
+    peer_manager.discovery_heartbeat();
+
+    // assert valid peer is dialing
+    let valid_peer_dial_request =
+        peer_manager.dial_requests.pop_front().expect("valid peer dial request");
+
+    assert_matches!(
+        valid_peer_dial_request,
+        DialRequest { peer_id, multiaddrs, .. }
+        if peer_id == valid_peer && multiaddrs == vec![valid_addr]
+    );
+    // assert all discoveries are empty
+    assert!(!peer_manager.discovery_peers.contains_key(&valid_peer));
+    assert!(!peer_manager.discovery_peers.contains_key(&invalid_peer));
+    assert!(!peer_manager.discovery_peers.contains_key(&connected_peer));
+    // assert discovery event emitted
+    let event = peer_manager.events.pop_front().expect("discovery event");
+    assert_matches!(event, PeerEvent::Discovery);
+}
+
+#[tokio::test]
+async fn test_discovery_heartbeat_respects_target_peers() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // connect enough peers to meet target
+    let target = peer_manager.config.target_num_peers;
+    for _ in 0..target {
+        let peer_id = PeerId::random();
+        let addr = create_multiaddr(None);
+        peer_manager.register_peer_connection(
+            &peer_id,
+            ConnectionType::IncomingConnection { multiaddr: addr },
+        );
+    }
+
+    // add max discovery peers
+    let target = peer_manager.config.max_discovery_peers();
+    for _ in 0..target {
+        let discovery_peer = PeerId::random();
+        peer_manager.discovery_peers.insert(discovery_peer, vec![create_multiaddr(None)]);
+    }
+
+    let initial_discovery_count = peer_manager.discovery_peers.len();
+
+    // run heartbeat
+    peer_manager.discovery_heartbeat();
+
+    // should not dial any peers (target reached)
+    assert_eq!(peer_manager.dial_requests.len(), 0);
+    // do not emit discovery event
+    assert_eq!(peer_manager.events.len(), 0);
+    // discovery peers should still be in the pool
+    assert_eq!(peer_manager.discovery_peers.len(), initial_discovery_count);
+}
+
+#[tokio::test]
+async fn test_discovery_heartbeat_prunes_excess_peers() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let max_discovery = peer_manager.config.max_discovery_peers();
+
+    // Add more than max discovery peers
+    let excess_count = max_discovery + 10;
+    for _ in 0..excess_count {
+        let peer_id = PeerId::random();
+        peer_manager.discovery_peers.insert(peer_id, vec![create_multiaddr(None)]);
+    }
+
+    // too many before heartbeat
+    assert!(peer_manager.discovery_peers.len() > max_discovery);
+
+    // run heartbeat
+    peer_manager.discovery_heartbeat();
+
+    // should prune down to max (or slightly less if some were dialed)
+    assert!(peer_manager.discovery_peers.len() <= max_discovery);
+}
+
+#[tokio::test]
+async fn test_discovery_heartbeat_removes_banned_ip_peers() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let addr = create_multiaddr(None);
+
+    // Ban the IP by banning 2 peers from that IP
+    let banned_peer1 = PeerId::random();
+    peer_manager.register_peer_connection(
+        &banned_peer1,
+        ConnectionType::IncomingConnection { multiaddr: addr.clone() },
+    );
+    peer_manager.process_penalty(banned_peer1, Penalty::Fatal);
+    peer_manager.register_disconnected(&banned_peer1);
+
+    let banned_peer2 = PeerId::random();
+    peer_manager.register_peer_connection(
+        &banned_peer2,
+        ConnectionType::IncomingConnection { multiaddr: addr.clone() },
+    );
+    peer_manager.process_penalty(banned_peer2, Penalty::Fatal);
+    peer_manager.register_disconnected(&banned_peer2);
+
+    // add a discovery peer with the banned ip
+    let discovery_peer = PeerId::random();
+    peer_manager.discovery_peers.insert(discovery_peer, vec![addr]);
+
+    // run heartbeat
+    peer_manager.discovery_heartbeat();
+
+    // discovery peer with banned ip should be removed
+    assert!(!peer_manager.discovery_peers.contains_key(&discovery_peer));
 }

@@ -372,6 +372,11 @@ impl PeerConfig {
             * (1.0 + self.peer_excess_factor + self.priority_peer_excess / 2.0))
             .ceil() as usize
     }
+
+    /// The max number of peers to maintain for potential discovery attempts.
+    pub fn max_discovery_peers(&self) -> usize {
+        self.target_num_peers * 2
+    }
 }
 
 /// Configuration for peer scoring parameters

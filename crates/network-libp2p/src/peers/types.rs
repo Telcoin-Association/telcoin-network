@@ -29,6 +29,8 @@ pub(crate) enum PeerEvent {
     Unbanned(PeerId),
     /// Authorities are missing from the peer map. This triggers discovery attempts.
     MissingAuthorities(Vec<AuthorityInfoRequest>),
+    /// Initiate a discovery attempt because discovery peer counts are low.
+    Discovery,
 }
 
 /// The action to take after a peer's reputation or connection status changes.
@@ -84,6 +86,7 @@ pub enum Penalty {
 }
 
 /// Request for dialing peers.
+#[derive(Debug)]
 pub(crate) struct DialRequest {
     /// The peer's network id.
     pub(crate) peer_id: PeerId,
@@ -95,6 +98,7 @@ pub(crate) struct DialRequest {
 }
 
 /// Types of connections between peers.
+#[derive(Debug)]
 pub(super) enum ConnectionType {
     /// A peer has successfully dialed this node.
     IncomingConnection {
