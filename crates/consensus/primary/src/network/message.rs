@@ -7,7 +7,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
-use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, TNMessage};
+use tn_network_libp2p::{
+    types::{IntoRpcError, NodeRecord, NodeRecordRequest, NodeRecordResponse},
+    PeerExchangeMap, TNMessage,
+};
 use tn_types::{
     error::HeaderError, AuthorityIdentifier, BlockHash, Certificate, CertificateDigest,
     ConsensusHeader, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round, Vote,
@@ -33,6 +36,30 @@ pub enum PrimaryGossip {
 // impl TNMessage trait for types
 impl TNMessage for PrimaryRequest {}
 impl TNMessage for PrimaryResponse {}
+impl NodeRecordRequest for PrimaryRequest {
+    fn node_record_request() -> Self {
+        Self::NodeRecord
+    }
+    fn is_node_record_request(&self) -> bool {
+        matches!(self, PrimaryRequest::NodeRecord)
+    }
+}
+impl NodeRecordResponse for PrimaryResponse {
+    fn from_record(record: NodeRecord) -> Self {
+        Self::NodeRecord(record)
+    }
+
+    fn is_node_record_response(&self) -> bool {
+        matches!(self, PrimaryResponse::NodeRecord(_))
+    }
+
+    fn into_parts(self) -> Option<(BlsPublicKey, NodeRecord)> {
+        match self {
+            Self::NodeRecord { key, record } => Some((key, record)),
+            _ => None,
+        }
+    }
+}
 
 /// Requests from Primary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -77,6 +104,8 @@ pub enum PrimaryRequest {
         /// Block hash requesting if not None.
         hash: Option<BlockHash>,
     },
+    /// Request the peer's [NodeRecord]
+    NodeRecord,
 }
 
 // unit test for this struct in primary::src::tests::network_tests::test_missing_certs_request
@@ -187,6 +216,13 @@ pub enum PrimaryResponse {
     /// This is an application-layer error response.
     /// This error is likely to succeed in the future and can be retried.
     RecoverableError(PrimaryRPCError),
+    /// This node's signed [NodeRecord] and public verifying key.
+    NodeRecord {
+        /// The public key used to verify the record's signature.
+        key: BlsPublicKey,
+        /// The signed record.
+        record: NodeRecord,
+    },
 }
 
 impl PrimaryResponse {

@@ -126,14 +126,9 @@ pub(crate) struct PeerManager {
     //
     //
     // Outstanding TODOs:
-    // - heartbeat event to trigger discovery
-    //      - query closest peers
-    //      - add to discovery map
-    //      - remove these on dial
-    //          - remove on dialing to prevent double dials
-    //          - register dialing cleans up discovery map bc kademlia might initiate dial attempts
     // - flow for records
     //      - put vs pull
+    // - stream protocol
     //
     //
     //
@@ -910,7 +905,7 @@ impl PeerManager {
 
         // manage discovery peer counts
         if current_count > max_discovery_peers {
-            // prune excess
+            // randomly prune excess
             let excess = current_count - max_discovery_peers;
             let to_remove: Vec<PeerId> =
                 discovery_peers.iter().map(|(id, _addrs)| *id).choose_multiple(&mut rng, excess);

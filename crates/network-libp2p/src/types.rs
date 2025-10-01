@@ -47,6 +47,26 @@ pub trait IntoRpcError<E> {
     fn into_error(error: E) -> Self;
 }
 
+/// Trait for requesting node records.
+pub trait NodeRecordRequest {
+    /// Create request for [NodeRecord].
+    fn node_record_request() -> Self;
+    /// Bool indicating if the request is for a node record. These requests are handled by the network layer, not the application layer.
+    fn is_node_record_request(&self) -> bool;
+}
+
+/// Trait for returning node record requests.
+//
+// TODO: better to use trait methods or From/Into
+pub trait NodeRecordResponse /* From<NodeRecord> + Into<NodeRecord> */ {
+    /// Create a response from [NodeRecord].
+    fn from_record(record: NodeRecord) -> Self;
+    /// Bool indicating if the response is a node record.
+    fn is_node_record_response(&self) -> bool;
+    /// Create a [NodeRecord] from response. Just panic??????
+    fn into_parts(self) -> Option<(BlsPublicKey, NodeRecord)>;
+}
+
 /// The topic for NVVs to subscribe to for published worker batches.
 pub const WORKER_BATCH_TOPIC: &str = "tn_batches";
 /// The topic for NVVs to subscribe to for published primary certificates.
@@ -561,7 +581,7 @@ where
 /// List of addresses for a node, signature will be the nodes BLS signature
 /// over the addresses to verify they are from the node in question.
 /// Used to publish this to kademlia.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct NodeRecord {
     /// The network information contained within the record.
     pub info: NetworkInfo,
@@ -601,7 +621,7 @@ impl NodeRecord {
 }
 
 /// The network information needed for consensus.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct NetworkInfo {
     /// The node's [NetworkPublicKey].
     pub pubkey: NetworkPublicKey,

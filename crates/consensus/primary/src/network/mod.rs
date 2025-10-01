@@ -132,6 +132,9 @@ impl PrimaryNetworkHandle {
             PrimaryResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is peer exchange!".to_string(),
             )),
+            PrimaryResponse::NodeRecord(_) => Err(NetworkError::RPCError(
+                "Got wrong response, not a vote is node record!".to_string(),
+            )),
         }
     }
 
@@ -298,6 +301,10 @@ where
                 }
                 PrimaryRequest::EpochRecord { epoch, hash } => {
                     self.process_epoch_record_request(peer, epoch, hash, channel, cancel)
+                }
+                PrimaryRequest::NodeRecord => {
+                    // this should be intercepted by network layer
+                    warn!(target: "primary::network", "request for primary's node record received in application layer");
                 }
             },
             NetworkEvent::Gossip(msg, propagation_source) => {

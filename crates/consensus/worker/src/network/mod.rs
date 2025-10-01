@@ -105,6 +105,9 @@ impl WorkerNetworkHandle {
                 "Got wrong response, not a report batch is peer exchange!".to_string(),
             )),
             WorkerResponse::Error(WorkerRPCError(s)) => Err(NetworkError::RPCError(s)),
+            WorkerResponse::NodeRecord(_) => Err(NetworkError::RPCError(
+                "Got wrong response, not a report batch is node record!".to_string(),
+            )),
         }
     }
 
@@ -152,6 +155,9 @@ impl WorkerNetworkHandle {
             )),
             WorkerResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a request batches is peer exchange!".to_string(),
+            )),
+            WorkerResponse::NodeRecord(_) => Err(NetworkError::RPCError(
+                "Got wrong response, not a request batches is node record!".to_string(),
             )),
             WorkerResponse::RequestBatches(batches) => {
                 for batch in &batches {
@@ -329,6 +335,10 @@ where
                 WorkerRequest::PeerExchange { peers } => {
                     // notify peer manager
                     self.process_peer_exchange(peers, channel);
+                }
+                WorkerRequest::NodeRecord => {
+                    // this should be intercepted by network layer
+                    warn!(target: "worker::network", "request for worker's node record received in application layer");
                 }
             },
             NetworkEvent::Gossip(msg, propagation_source) => {

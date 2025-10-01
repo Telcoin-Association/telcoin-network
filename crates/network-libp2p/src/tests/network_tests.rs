@@ -19,7 +19,7 @@ use tokio::{sync::mpsc, time::timeout};
 const TEST_TOPIC: &str = "test-topic";
 
 /// Helper function to create peers.
-fn create_test_peers<Req: TNMessage, Res: TNMessage>(
+fn create_test_peers<Req: TNMessage + NodeRecordRequest, Res: TNMessage + NodeRecordResponse>(
     num_peers: NonZeroUsize,
     network_config: Option<NetworkConfig>,
 ) -> (TestPeer<Req, Res>, Vec<TestPeer<Req, Res>>, TaskManager) {
@@ -72,8 +72,8 @@ fn create_test_peers<Req: TNMessage, Res: TNMessage>(
 /// A peer on TN
 struct TestPeer<Req, Res, DB = MemDatabase>
 where
-    Req: TNMessage,
-    Res: TNMessage,
+    Req: TNMessage + NodeRecordRequest,
+    Res: TNMessage + NodeRecordResponse,
 {
     /// Peer's node config.
     config: ConsensusConfig<DB>,
@@ -88,8 +88,8 @@ where
 /// A peer on TN
 struct NetworkPeer<Req, Res, DB = MemDatabase>
 where
-    Req: TNMessage,
-    Res: TNMessage,
+    Req: TNMessage + NodeRecordRequest,
+    Res: TNMessage + NodeRecordResponse,
 {
     /// Peer's node config.
     config: ConsensusConfig<DB>,
@@ -104,8 +104,8 @@ where
 /// The type for holding testng components.
 struct TestTypes<Req, Res, DB = MemDatabase>
 where
-    Req: TNMessage,
-    Res: TNMessage,
+    Req: TNMessage + NodeRecordRequest,
+    Res: TNMessage + NodeRecordResponse,
 {
     /// The first authority in the committee.
     peer1: NetworkPeer<Req, Res, DB>,
@@ -119,8 +119,8 @@ where
 /// committee.
 fn create_test_types<Req, Res>() -> TestTypes<Req, Res>
 where
-    Req: TNMessage,
-    Res: TNMessage,
+    Req: TNMessage + NodeRecordRequest,
+    Res: TNMessage + NodeRecordResponse,
 {
     // custom network config with short heartbeat interval for peer manager
     let mut network_config = NetworkConfig::default();
@@ -285,16 +285,16 @@ async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
         .await?;
     peer1.dial_by_bls(config_2.key_config().primary_public_key()).await?;
 
-    // expect no pending requests yet
+    // expect pending request for node record
     let count = peer1.get_pending_request_count().await?;
-    assert_eq!(count, 0);
+    assert_eq!(count, 1);
 
     // send request and wait for response
     let _reply = peer1.send_request_direct(batch_req.clone(), peer2_id).await?;
 
-    // peer1 has a pending_request now
+    // peer1 has a 2nd pending request now
     let count = peer1.get_pending_request_count().await?;
-    assert_eq!(count, 1);
+    assert_eq!(count, 2);
 
     // another sanity check
     let connected_peers = peer1.connected_peer_ids().await?;
@@ -358,17 +358,17 @@ async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
         .await?;
     peer1.dial_by_bls(config_2.key_config().primary_public_key()).await?;
 
-    // expect no pending requests yet
+    // expect pending requests for node record
     let count = peer1.get_pending_request_count().await?;
-    assert_eq!(count, 0);
+    assert_eq!(count, 1);
 
     // send request and wait for response
     let max_time = Duration::from_secs(5);
     let _response = peer1.send_request_direct(batch_req.clone(), peer2_id).await?;
 
-    // peer1 has a pending_request now
+    // peer1 has a 2nd request now
     let count = peer1.get_pending_request_count().await?;
-    assert_eq!(count, 1);
+    assert_eq!(count, 2);
 
     // another sanity check
     let connected_peers = peer1.connected_peer_ids().await?;

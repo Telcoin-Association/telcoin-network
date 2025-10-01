@@ -10,7 +10,7 @@ use crate::{
     send_or_log_error,
     types::{
         AuthorityInfoRequest, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo,
-        NetworkResult, NodeRecord,
+        NetworkResult, NodeRecord, NodeRecordRequest, NodeRecordResponse,
     },
     PeerExchangeMap,
 };
@@ -98,8 +98,8 @@ where
 /// - allow specific network configurations based on worker/primary needs
 pub struct ConsensusNetwork<Req, Res, DB, Events>
 where
-    Req: TNMessage,
-    Res: TNMessage,
+    Req: TNMessage + NodeRecordRequest,
+    Res: TNMessage + NodeRecordResponse,
     DB: Database,
     Events: TnSender<NetworkEvent<Req, Res>>,
 {
@@ -159,8 +159,8 @@ where
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
 where
-    Req: TNMessage,
-    Res: TNMessage,
+    Req: TNMessage + NodeRecordRequest,
+    Res: TNMessage + NodeRecordResponse,
     DB: Database,
     Events: TnSender<NetworkEvent<Req, Res>> + Send + 'static,
 {
@@ -329,10 +329,10 @@ where
         NetworkHandle::new(self.handle.clone())
     }
 
-    /// Return a kademlia record keyed on our BlsPublicKey with our peer_id and network addresses.
-    /// Return None if we don't have any confirmed external addresses yet.
-    fn get_peer_record(&self) -> Option<kad::Record> {
-        let key = kad::RecordKey::new(&self.key_config.primary_public_key());
+    /// Create this node's [NodeRecord].
+    ///
+    /// TODO: keep a cached version on `Self`. check the multiaddrs match, otherwise resign the record
+    fn create_node_record(&self) -> Option<NodeRecord> {
         let mut multiaddrs: Vec<Multiaddr> = self.swarm.external_addresses().cloned().collect();
 
         if multiaddrs.is_empty() {
@@ -358,10 +358,23 @@ where
             .cloned();
 
         if let Some(addr) = multiaddr {
-            let peer_id = *self.swarm.local_peer_id();
             let node_record = NodeRecord::build(self.network_pubkey.clone(), addr, |data| {
                 self.key_config.request_signature_direct(data)
             });
+            Some(node_record)
+        } else {
+            warn!(target: "network-kad", "No suitable multiaddr found for get_peer_record");
+            None
+        }
+    }
+
+    /// Return a kademlia record keyed on our BlsPublicKey with our peer_id and network addresses.
+    /// Return None if we don't have any confirmed external addresses yet.
+    fn get_peer_record(&self) -> Option<kad::Record> {
+        let key = kad::RecordKey::new(&self.key_config.primary_public_key());
+
+        if let Some(node_record) = self.create_node_record() {
+            let peer_id = *self.swarm.local_peer_id();
             Some(kad::Record {
                 key: key.clone(),
                 value: encode(&node_record),
@@ -375,7 +388,7 @@ where
     }
 
     /// Verify the address list in Record was signed by the key.
-    fn peer_record_valid(&self, record: &kad::Record) -> Option<(BlsPublicKey, NodeRecord)> {
+    fn verify_kad_record(&self, record: &kad::Record) -> Option<(BlsPublicKey, NodeRecord)> {
         let key = BlsPublicKey::from_literal_bytes(record.key.as_ref()).ok()?;
         let node_record = try_decode::<NodeRecord>(record.value.as_ref()).ok()?;
         node_record.verify(&key)
@@ -396,6 +409,17 @@ where
                 error!(target: "network-kad", "Failed to start providing key: {err}");
             }
         }
+    }
+
+    /// Request the node record from a newly connected peer.
+    ///
+    /// TODO: issue #430 create this once on startup
+    fn request_node_record(&mut self, peer: PeerId) {
+        // TODO: track this request - should be Option
+        let request_id =
+            self.swarm.behaviour_mut().req_res.send_request(&peer, Req::node_record_request());
+        let (tx, _) = oneshot::channel();
+        self.outbound_requests.insert((peer, request_id), tx);
     }
 
     /// Publish our network addresses and peer id AND to the network under our BLS public key for
@@ -494,17 +518,6 @@ where
                     return Err(NetworkError::AllListenersClosed);
                 }
             }
-            SwarmEvent::Dialing { peer_id, connection_id } => {
-                // kad initiates dial attempts
-                // - register
-                // TNBehavior::handle_pending_outbound_connection
-                error!(target: "peer-manager", ?peer_id, ?connection_id, "DIALING PEER!!!");
-            }
-            // TODO: kad emits SwarmEvent::NewExternalAddrOfPeer - update PM here?
-            // - no, do this on routing updated?
-            // - this should match node record
-            //
-            // other events handled by peer manager and other behaviors
             _ => {}
         }
         Ok(())
@@ -844,6 +857,20 @@ where
             ReqResEvent::Message { peer, message, connection_id: _ } => {
                 match message {
                     request_response::Message::Request { request_id, request, channel } => {
+                        // peers request node records after initial connection
+                        // process these requests in the network layer
+                        //
+                        // TODO: issue #430
+                        if request.is_node_record_request() {
+                            let node_record = self.create_node_record().expect("node record");
+                            let _ = self
+                                .swarm
+                                .behaviour_mut()
+                                .req_res
+                                .send_response(channel, Res::from_record(node_record));
+                            return Ok(());
+                        }
+
                         // We should not be able to recieve a message from an unknown peer so this
                         // should always work. It is possible (mostly in
                         // testing) to have a race where we don't know the requester YET.
@@ -869,6 +896,9 @@ where
                             //
                             // NOTE: the request id is internally generated, so this should not
                             // happen
+                            //
+                            //
+                            // TODO: these are not removed on `NetworkCommand::SendResponse`?????????
                             if let Some(channel) = self.inbound_requests.insert(request_id, notify)
                             {
                                 // cancel if this is a duplicate request
@@ -889,6 +919,33 @@ where
                         // check if response associated with PX disconnect
                         if self.pending_px_disconnects.remove(&request_id).is_some() {
                             let _ = self.swarm.disconnect_peer_id(peer);
+                        }
+
+                        if response.is_node_record_response() {
+                            // TODO: verify node record
+                            // - check if this bls key is associated with a different peer?
+                            //      - how to stop nodes impersonating?
+                            //          - handshake w/ random data?
+                            // assert peer id matches node record
+                            //
+                            // - TODO: pass peer id to verify method?
+                            //      - what about put records?
+                            //          - can these be a different source?
+                            //
+
+                            // verify signed record and contents match reporting peer
+                            if let Some((key, record)) = response.into_parts() {
+                                // TODO: does verify need to return both of these still?
+                                let id: PeerId = record.info.pubkey.clone().into();
+                                if record.verify(&key).is_some_and(|(_, record)| id == peer) {
+                                    todo!()
+                                }
+                            } else {
+                                // this should never happen
+                                // fail
+                                todo!()
+                            }
+                            return Ok(());
                         }
 
                         // try to forward response to original caller
@@ -1069,26 +1126,8 @@ where
                 // register peer for request-response behaviour
                 // NOTE: gossipsub handles `FromSwarm::ConnectionEstablished`
                 self.swarm.add_peer_address(peer_id, addr.clone());
-                // add as a kademlia peer
-                let routing_update =
-                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                match routing_update {
-                    RoutingUpdate::Success => {
-                        trace!(target: "network-kad", ?routing_update, ?peer_id, "peer added to routing table");
-                        // TODO: update peer to indicate they are in kbucket
-                        // - ensure this is updated when old peer replaced by kad as well in RoutingUpdated event
-                    }
-                    _ => {
-                        // do nothing
-                        trace!(target: "network-kad", ?routing_update, ?peer_id, "routing updated for peer add_address");
-                    }
-                }
-                // TODO: pass routing update to PM for prioritizing prune operations
-                // - heirarchy:
-                //      - success
-                //          - update here or when RoutingUpdated event?
-                //      - pending
-                //      - failed
+                // add as a kademlia routable peer - emits kad event `RoutingUpdated`
+                self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
 
                 // TODO: publish data here to PUSH or PULL?
                 self.publish_our_data_to_peer(peer_id);
@@ -1103,9 +1142,8 @@ where
                     self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                 }
 
-                // TODO: request record here
-                // - if record is invalid, the normal flow should cause disconnect
-                // - connecting with peer first also improves changes of retrieving record
+                // request peer's record
+                self.request_node_record(peer_id);
             }
             PeerEvent::Banned(peer_id) => {
                 warn!(target: "network", ?peer_id, "peer banned");
@@ -1160,7 +1198,7 @@ where
                     kad::InboundRequest::GetRecord { num_closer_peers: _, present_locally: _ } => {}
                     kad::InboundRequest::PutRecord { source, connection: _, record } => {
                         if let Some(record) = record {
-                            if let Some((key, value)) = self.peer_record_valid(&record) {
+                            if let Some((key, value)) = self.verify_kad_record(&record) {
                                 self.swarm
                                     .behaviour_mut()
                                     .kademlia
@@ -1212,7 +1250,7 @@ where
                     kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(
                         kad::PeerRecord { record, peer },
                     ))) => {
-                        if let Some((key, value)) = self.peer_record_valid(&record) {
+                        if let Some((key, value)) = self.verify_kad_record(&record) {
                             trace!(target: "network-kad", "Got record {key} {value:?}");
                             self.return_kad_result(&query_id, Ok((key, value.info.clone())));
                         } else {
@@ -1331,6 +1369,8 @@ where
                 }
 
                 // update routable peer
+                // TODO: is_new_peer would update routing, otherwise this is an updated address change?
+                // but the address should be in the node record
                 self.swarm.behaviour_mut().peer_manager.update_routing_for_peer(&peer, true);
 
                 // update old peer if evicted from routing table
@@ -1416,8 +1456,8 @@ impl From<GossipAcceptance> for MessageAcceptance {
 
 impl<Req, Res, DB, Events> std::fmt::Debug for ConsensusNetwork<Req, Res, DB, Events>
 where
-    Req: TNMessage,
-    Res: TNMessage,
+    Req: TNMessage + NodeRecordRequest,
+    Res: TNMessage + NodeRecordResponse,
     DB: Database,
     Events: TnSender<NetworkEvent<Req, Res>>,
 {

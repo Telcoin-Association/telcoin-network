@@ -1,6 +1,10 @@
 //! Fixtures used in multiple tests.
 
-use crate::{peers::GLOBAL_SCORE_CONFIG, PeerExchangeMap, TNMessage};
+use crate::{
+    peers::GLOBAL_SCORE_CONFIG,
+    types::{NodeRecord, NodeRecordRequest, NodeRecordResponse},
+    PeerExchangeMap, TNMessage,
+};
 use libp2p::Multiaddr;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -9,7 +13,9 @@ use std::{
     sync::{Arc, Once},
 };
 use tn_config::ScoreConfig;
-use tn_types::{BlockHash, Certificate, CertificateDigest, Header, SealedBatch, Vote};
+use tn_types::{
+    BlockHash, BlsPublicKey, Certificate, CertificateDigest, Header, SealedBatch, Vote,
+};
 
 /// Default heartbeat for tests.
 #[allow(dead_code)] // used in network_tests.rs
@@ -34,7 +40,54 @@ impl TNMessage for TestWorkerRequest {}
 impl TNMessage for TestWorkerResponse {}
 impl TNMessage for TestPrimaryRequest {}
 impl TNMessage for TestPrimaryResponse {}
+impl NodeRecordRequest for TestPrimaryRequest {
+    fn node_record_request() -> Self {
+        Self::NodeRecord
+    }
+    fn is_node_record_request(&self) -> bool {
+        matches!(self, TestPrimaryRequest::NodeRecord)
+    }
+}
+impl NodeRecordResponse for TestPrimaryResponse {
+    fn from_record(record: NodeRecord) -> Self {
+        Self::NodeRecord(record)
+    }
 
+    fn is_node_record_response(&self) -> bool {
+        matches!(self, TestPrimaryResponse::NodeRecord(_))
+    }
+
+    fn into_parts(self) -> Option<(BlsPublicKey, NodeRecord)> {
+        match self {
+            Self::NodeRecord { key, record } => Some((key, record)),
+            _ => None,
+        }
+    }
+}
+impl NodeRecordRequest for TestWorkerRequest {
+    fn node_record_request() -> Self {
+        Self::NodeRecord
+    }
+    fn is_node_record_request(&self) -> bool {
+        matches!(self, TestWorkerRequest::NodeRecord)
+    }
+}
+impl NodeRecordResponse for TestWorkerResponse {
+    fn from_record(record: NodeRecord) -> Self {
+        Self::NodeRecord(record)
+    }
+
+    fn is_node_record_response(&self) -> bool {
+        matches!(self, TestWorkerResponse::NodeRecord(_))
+    }
+
+    fn into_parts(self) -> Option<(BlsPublicKey, NodeRecord)> {
+        match self {
+            Self::NodeRecord { key, record } => Some((key, record)),
+            _ => None,
+        }
+    }
+}
 /// Requests between workers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(super) enum TestWorkerRequest {
@@ -46,6 +99,8 @@ pub(super) enum TestWorkerRequest {
     MissingBatches(Vec<BlockHash>),
     /// Peer exchange.
     PeerExchange(PeerExchangeMap),
+    /// Node record.
+    NodeRecord,
 }
 
 /// Response to worker requests.
@@ -60,6 +115,13 @@ pub(super) enum TestWorkerResponse {
     },
     /// Peer exchange.
     PeerExchange(PeerExchangeMap),
+    /// Node record
+    NodeRecord {
+        /// The public key used to verify the record's signature.
+        key: BlsPublicKey,
+        /// The signed record.
+        record: NodeRecord,
+    },
 }
 
 /// Requests from Primary.
@@ -67,6 +129,7 @@ pub(super) enum TestWorkerResponse {
 pub(super) enum TestPrimaryRequest {
     NewCertificate { certificate: Certificate },
     Vote { header: Header, parents: Vec<Certificate> },
+    NodeRecord,
 }
 
 /// Response to primary requests.
@@ -75,6 +138,12 @@ pub(super) enum TestPrimaryResponse {
     Vote(Vote),
     MissingCertificates(Vec<Certificate>),
     MissingParents(Vec<CertificateDigest>),
+    NodeRecord {
+        /// The public key used to verify the record's signature.
+        key: BlsPublicKey,
+        /// The signed record.
+        record: NodeRecord,
+    },
 }
 
 impl From<PeerExchangeMap> for TestWorkerRequest {
