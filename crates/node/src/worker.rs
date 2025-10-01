@@ -1,5 +1,5 @@
 //! Hierarchical type to hold tasks spawned for a worker in the network.
-use crate::manager::WORKER_TASK_MANAGER_BASE;
+use crate::manager::WORKER_TASK_BASE;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_types::{BatchValidation, Database as ConsensusDatabase, WorkerId};
@@ -79,5 +79,5 @@ impl<CDB: ConsensusDatabase> WorkerNode<CDB> {
 
 /// Helper method to create a worker's task manager name by id.
 pub fn worker_task_manager_name(id: WorkerId) -> String {
-    format!("{WORKER_TASK_MANAGER_BASE} - {id}")
+    format!("{WORKER_TASK_BASE} - {id}")
 }

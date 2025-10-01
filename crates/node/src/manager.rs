@@ -60,11 +60,8 @@ const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
 /// The execution engine task manager name.
 const ENGINE_TASK_MANAGER: &str = "Engine Task Manager";
 
-/// The primary task manager name.
-pub(super) const PRIMARY_TASK_MANAGER: &str = "Primary Task Manager";
-
 /// The worker's base task manager name. This is used by `fn worker_task_manager_name(id)`.
-pub(super) const WORKER_TASK_MANAGER_BASE: &str = "Worker Task Manager";
+pub(super) const WORKER_TASK_BASE: &str = "Worker Task";
 
 /// The long-running type that oversees epoch transitions.
 #[derive(Debug)]
@@ -488,8 +485,7 @@ where
 
         gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
         // start primary
-        let mut primary_task_manager = TaskManager::new(PRIMARY_TASK_MANAGER);
-        primary.start(&primary_task_manager).await?;
+        primary.start(&epoch_task_manager).await?;
 
         let worker_task_manager_name = worker_task_manager_name(worker_node.id().await);
         // start batch builder
@@ -509,10 +505,7 @@ where
             .await?;
 
         // update tasks
-        primary_task_manager.update_tasks();
-
-        // add epoch-specific tasks to manager
-        epoch_task_manager.add_task_manager(primary_task_manager);
+        epoch_task_manager.update_tasks();
 
         info!(target: "epoch-manager", tasks=?epoch_task_manager, "EPOCH TASKS\n");
 
