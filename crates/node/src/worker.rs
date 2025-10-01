@@ -2,7 +2,7 @@
 use crate::manager::WORKER_TASK_MANAGER_BASE;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
-use tn_types::{BatchValidation, Database as ConsensusDatabase, TaskManager, WorkerId};
+use tn_types::{BatchValidation, Database as ConsensusDatabase, WorkerId};
 use tn_worker::{
     metrics::Metrics, new_worker, quorum_waiter::QuorumWaiter, Worker, WorkerNetworkHandle,
 };
@@ -27,9 +27,7 @@ impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
     /// If the node is already running then this method will return an error instead.
     ///
     /// Return the task manager for the worker and the [Worker] struct for spawning execution tasks.
-    async fn start(&mut self) -> eyre::Result<(TaskManager, Worker<CDB, QuorumWaiter>)> {
-        let task_manager_name = worker_task_manager_name(self.id);
-        let mut task_manager = TaskManager::new(task_manager_name);
+    async fn new_worker(&mut self) -> eyre::Result<Worker<CDB, QuorumWaiter>> {
         let metrics = Metrics::default();
 
         let batch_provider = new_worker(
@@ -38,10 +36,9 @@ impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
             metrics,
             self.consensus_config.clone(),
             self.network_handle.clone(),
-            &mut task_manager,
         );
 
-        Ok((task_manager, batch_provider))
+        Ok(batch_provider)
     }
 }
 
@@ -62,15 +59,21 @@ impl<CDB: ConsensusDatabase> WorkerNode<CDB> {
         Self { internal: Arc::new(RwLock::new(inner)) }
     }
 
-    pub async fn start(&self) -> eyre::Result<(TaskManager, Worker<CDB, QuorumWaiter>)> {
+    pub async fn new_worker(&self) -> eyre::Result<Worker<CDB, QuorumWaiter>> {
         let mut guard = self.internal.write().await;
-        guard.start().await
+        guard.new_worker().await
     }
 
     /// Return the workers network handle.
     pub async fn network_handle(&self) -> WorkerNetworkHandle {
         let guard = self.internal.read().await;
         guard.network_handle.clone()
+    }
+
+    /// Return the worker id.
+    pub async fn id(&self) -> WorkerId {
+        let guard = self.internal.read().await;
+        guard.id
     }
 }
 

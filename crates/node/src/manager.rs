@@ -6,7 +6,7 @@
 use crate::{
     engine::{ExecutionNode, TnBuilder},
     primary::PrimaryNode,
-    worker::WorkerNode,
+    worker::{worker_task_manager_name, WorkerNode},
     EngineToPrimaryRpc,
 };
 use consensus_metrics::start_prometheus_server;
@@ -459,6 +459,9 @@ where
             )
             .await?;
 
+        // This needs to be created early so required machinery for other tasks exists when needed.
+        let mut worker = worker_node.new_worker().await?;
+
         // Produce a "dummy" epoch 0 EpochRecord if missing.
         // This will let us use simple code to find any epoch including 0 at startup.
         if self.consensus_db.get_committee_keys(0).is_none() {
@@ -485,10 +488,12 @@ where
 
         gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
         // start primary
-        let mut primary_task_manager = primary.start().await?;
+        let mut primary_task_manager = TaskManager::new(PRIMARY_TASK_MANAGER);
+        primary.start(&primary_task_manager).await?;
 
-        // start worker
-        let (mut worker_task_manager, worker) = worker_node.start().await?;
+        let worker_task_manager_name = worker_task_manager_name(worker_node.id().await);
+        // start batch builder
+        worker.spawn_batch_builder(&worker_task_manager_name, &epoch_task_manager);
 
         // consensus config for shutdown subscribers
         let consensus_shutdown = primary.shutdown_signal().await;
@@ -505,11 +510,9 @@ where
 
         // update tasks
         primary_task_manager.update_tasks();
-        worker_task_manager.update_tasks();
 
         // add epoch-specific tasks to manager
         epoch_task_manager.add_task_manager(primary_task_manager);
-        epoch_task_manager.add_task_manager(worker_task_manager);
 
         info!(target: "epoch-manager", tasks=?epoch_task_manager, "EPOCH TASKS\n");
 

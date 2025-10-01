@@ -363,7 +363,7 @@ mod tests {
         let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
         // task manger
-        let mut task_manager = TaskManager::new("make_block_no_ack_txs_in_pool_still Task Manager");
+        let task_manager = TaskManager::new("make_block_no_ack_txs_in_pool_still Task Manager");
         let tmp_dir = TempDir::new().unwrap();
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
@@ -378,7 +378,7 @@ mod tests {
         let qw = TestMakeBlockQuorumWaiter::new_test();
         let node_metrics = WorkerMetrics::default();
         let timeout = Duration::from_secs(5);
-        let block_provider = Worker::new(
+        let mut block_provider = Worker::new(
             0,
             Some(qw),
             Arc::new(node_metrics),
@@ -386,8 +386,8 @@ mod tests {
             store.clone(),
             timeout,
             WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
-            &mut task_manager,
         );
+        block_provider.spawn_batch_builder("test batch builder", &task_manager);
 
         // build execution block proposer
         let batch_builder = BatchBuilder::new(
