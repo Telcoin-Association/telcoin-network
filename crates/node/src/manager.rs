@@ -6,7 +6,7 @@
 use crate::{
     engine::{ExecutionNode, TnBuilder},
     primary::PrimaryNode,
-    worker::WorkerNode,
+    worker::{worker_task_manager_name, WorkerNode},
     EngineToPrimaryRpc,
 };
 use consensus_metrics::start_prometheus_server;
@@ -60,11 +60,8 @@ const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
 /// The execution engine task manager name.
 const ENGINE_TASK_MANAGER: &str = "Engine Task Manager";
 
-/// The primary task manager name.
-pub(super) const PRIMARY_TASK_MANAGER: &str = "Primary Task Manager";
-
 /// The worker's base task manager name. This is used by `fn worker_task_manager_name(id)`.
-pub(super) const WORKER_TASK_MANAGER_BASE: &str = "Worker Task Manager";
+pub(super) const WORKER_TASK_BASE: &str = "Worker Task";
 
 /// The long-running type that oversees epoch transitions.
 #[derive(Debug)]
@@ -459,6 +456,9 @@ where
             )
             .await?;
 
+        // This needs to be created early so required machinery for other tasks exists when needed.
+        let mut worker = worker_node.new_worker().await?;
+
         // Produce a "dummy" epoch 0 EpochRecord if missing.
         // This will let us use simple code to find any epoch including 0 at startup.
         if self.consensus_db.get_committee_keys(0).is_none() {
@@ -485,10 +485,11 @@ where
 
         gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
         // start primary
-        let mut primary_task_manager = primary.start().await?;
+        primary.start(&epoch_task_manager).await?;
 
-        // start worker
-        let (mut worker_task_manager, worker) = worker_node.start().await?;
+        let worker_task_manager_name = worker_task_manager_name(worker_node.id().await);
+        // start batch builder
+        worker.spawn_batch_builder(&worker_task_manager_name, &epoch_task_manager);
 
         // consensus config for shutdown subscribers
         let consensus_shutdown = primary.shutdown_signal().await;
@@ -504,12 +505,7 @@ where
             .await?;
 
         // update tasks
-        primary_task_manager.update_tasks();
-        worker_task_manager.update_tasks();
-
-        // add epoch-specific tasks to manager
-        epoch_task_manager.add_task_manager(primary_task_manager);
-        epoch_task_manager.add_task_manager(worker_task_manager);
+        epoch_task_manager.update_tasks();
 
         info!(target: "epoch-manager", tasks=?epoch_task_manager, "EPOCH TASKS\n");
 

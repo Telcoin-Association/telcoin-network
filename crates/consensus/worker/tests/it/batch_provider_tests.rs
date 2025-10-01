@@ -24,7 +24,7 @@ async fn make_batch() {
     let id = 0;
     let qw = TestMakeBlockQuorumWaiter::new_test();
     let timeout = Duration::from_secs(5);
-    let mut task_manager = TaskManager::default();
+    let task_manager = TaskManager::default();
     let batch_provider = Worker::new(
         id,
         Some(qw.clone()),
@@ -33,7 +33,6 @@ async fn make_batch() {
         store.clone(),
         timeout,
         WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
-        &mut task_manager,
     );
 
     // Send enough transactions to seal a batch.

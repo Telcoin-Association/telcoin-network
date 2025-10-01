@@ -30,7 +30,7 @@ use tracing::debug;
 #[tokio::test]
 async fn test_make_batch_el_to_cl() {
     let tmp_dir = TempDir::new().expect("temp dir");
-    let mut task_manager = TaskManager::default();
+    let task_manager = TaskManager::default();
     //
     //=== Consensus Layer
     //
@@ -45,7 +45,7 @@ async fn test_make_batch_el_to_cl() {
 
     let qw = TestMakeBlockQuorumWaiter::new_test();
     let timeout = Duration::from_secs(5);
-    let batch_provider = Worker::new(
+    let mut batch_provider = Worker::new(
         0,
         Some(qw.clone()),
         Arc::new(node_metrics),
@@ -53,8 +53,8 @@ async fn test_make_batch_el_to_cl() {
         store.clone(),
         timeout,
         WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
-        &mut task_manager,
     );
+    batch_provider.spawn_batch_builder("test builder", &task_manager);
 
     //
     //=== Execution Layer

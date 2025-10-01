@@ -15,8 +15,8 @@ use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::tables::Batches;
 use tn_types::{
-    error::BlockSealError, BatchSender, BatchValidation, Database, SealedBatch, TaskManager,
-    WorkerId,
+    error::BlockSealError, BatchReceiver, BatchSender, BatchValidation, Database, SealedBatch,
+    TaskManager, WorkerId,
 };
 use tracing::{error, info};
 
@@ -32,7 +32,6 @@ pub fn new_worker<DB: Database>(
     metrics: Metrics,
     consensus_config: ConsensusConfig<DB>,
     network_handle: WorkerNetworkHandle,
-    task_manager: &mut TaskManager,
 ) -> Worker<DB, QuorumWaiter> {
     info!(target: "worker::worker", "Boot worker node with id {} key {:?}", id, consensus_config.key_config().primary_public_key());
 
@@ -58,7 +57,6 @@ pub fn new_worker<DB: Database>(
         node_metrics,
         consensus_config.local_network().clone(),
         network_handle.clone(),
-        task_manager,
     );
 
     // NOTE: This log entry is used to compute performance.
@@ -78,7 +76,6 @@ fn new_worker_internal<DB: Database>(
     node_metrics: Arc<WorkerMetrics>,
     client: LocalNetwork,
     network_handle: WorkerNetworkHandle,
-    task_manager: &mut TaskManager,
 ) -> Worker<DB, QuorumWaiter> {
     info!(target: "worker::worker", "Starting handler for transactions");
 
@@ -102,12 +99,10 @@ fn new_worker_internal<DB: Database>(
         consensus_config.node_storage().clone(),
         consensus_config.parameters().batch_vote_timeout,
         network_handle,
-        task_manager,
     )
 }
 
 /// Process batch from EL into sealed batches for CL.
-#[derive(Clone)]
 pub struct Worker<DB, QW> {
     /// Our worker's id.
     id: WorkerId,
@@ -121,10 +116,32 @@ pub struct Worker<DB, QW> {
     store: DB,
     /// Channel sender for alternate batch submision if not calling seal directly.
     tx_batches: BatchSender,
+    /// Channel receiver for alternate batch submision if not calling seal directly.
+    /// This will be "taken" on batch spawn and become None.
+    rx_batches: Option<BatchReceiver>,
     /// The amount of time to wait on a reply from peer before timing out.
     timeout: Duration,
     /// Worker network handle.
     network_handle: WorkerNetworkHandle,
+}
+
+// Need to imlement clone directly because of the rx_batches field.
+// This field is a use once field when spawning the batch manager so this is fine.
+// Code will panic quickly if this is messed up.
+impl<DB: Clone, QW: Clone> Clone for Worker<DB, QW> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            quorum_waiter: self.quorum_waiter.clone(),
+            node_metrics: self.node_metrics.clone(),
+            client: self.client.clone(),
+            store: self.store.clone(),
+            tx_batches: self.tx_batches.clone(),
+            rx_batches: None,
+            timeout: self.timeout,
+            network_handle: self.network_handle.clone(),
+        }
+    }
 }
 
 impl<DB, QW> std::fmt::Debug for Worker<DB, QW> {
@@ -143,23 +160,27 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         store: DB,
         timeout: Duration,
         network_handle: WorkerNetworkHandle,
-        task_manager: &mut TaskManager,
     ) -> Self {
-        let (tx_batches, mut rx_batches) = tokio::sync::mpsc::channel(1000);
-        let this = Self {
+        let (tx_batches, rx_batches) = tokio::sync::mpsc::channel(1000);
+        Self {
             id,
             quorum_waiter,
             node_metrics,
             client,
             store,
             tx_batches,
+            rx_batches: Some(rx_batches),
             timeout,
             network_handle,
-        };
-        let this_clone = this.clone();
-        // Spawn a little task to accept batches from a channel and seal them that way.
-        // Allows the engine to remain removed from the worker.
-        task_manager.spawn_critical_task("batch-builder", async move {
+        }
+    }
+
+    /// Spawn a little task to accept batches from a channel and seal them that way.
+    /// Allows the engine to remain removed from the worker.
+    pub fn spawn_batch_builder(&mut self, prefix: &str, task_manager: &TaskManager) {
+        let this_clone = self.clone();
+        let mut rx_batches = self.rx_batches.take().expect("have batch receive");
+        task_manager.spawn_critical_task(&format!("{prefix} batch-builder"), async move {
             while let Some((batch, tx)) = rx_batches.recv().await {
                 let res = this_clone.seal(batch).await;
                 if tx.send(res).is_err() {
@@ -167,7 +188,6 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                 }
             }
         });
-        this
     }
 
     pub fn id(&self) -> WorkerId {

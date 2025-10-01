@@ -92,6 +92,7 @@ impl<DB: Database> Primary<DB> {
                 config.authority_id().expect("CVV has an auth id"),
                 consensus_bus.clone(),
                 leader_schedule,
+                task_manager.get_spawner(),
             );
 
             proposer.spawn(task_manager);

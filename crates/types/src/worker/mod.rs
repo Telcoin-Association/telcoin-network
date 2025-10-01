@@ -1,6 +1,9 @@
 //! Worker types.
 
-use tokio::sync::{mpsc::Sender, oneshot};
+use tokio::sync::{
+    mpsc::{Receiver, Sender},
+    oneshot,
+};
 mod sealed_batch;
 pub use sealed_batch::*;
 mod pending_batch;
@@ -14,6 +17,7 @@ pub use pending_batch::*;
 ///
 /// The receiving half (CL) broadcasts to peers and tries to reach quorum.
 pub type BatchSender = Sender<(SealedBatch, oneshot::Sender<Result<(), BlockSealError>>)>;
+pub type BatchReceiver = Receiver<(SealedBatch, oneshot::Sender<Result<(), BlockSealError>>)>;
 
 /// The default worker udp port for consensus messages.
 pub const DEFAULT_WORKER_PORT: u16 = 44895;

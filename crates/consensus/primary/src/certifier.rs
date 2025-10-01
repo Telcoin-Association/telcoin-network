@@ -315,7 +315,7 @@ impl<DB: Database> Certifier<DB> {
                 },
                 _ = rx_headers.recv() => {
                     warn!(target: "primary::certifier", ?authority_id, "canceling Header proposal {header} for round {}", header.round());
-                    // This allows us to inturupt the propose_header future- just put it back on the headers channel to get picked up in outer select.
+                    // This allows us to interupt the propose_header future- just put it back on the headers channel to get picked up in outer select.
                     let _ = self.consensus_bus.headers().send(header).await;
                     return Err(DagError::Canceled)
                 },
