@@ -1375,7 +1375,7 @@ where
         // update the authorized publishers for gossip every epoch
         network_handle
             .inner_handle()
-            .subscribe(consensus_config.network_config().libp2p_config().worker_txn_topic())
+            .subscribe(tn_config::LibP2pConfig::worker_txn_topic())
             .await?;
 
         // spawn worker network
