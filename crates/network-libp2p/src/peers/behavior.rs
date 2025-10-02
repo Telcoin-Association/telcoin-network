@@ -44,9 +44,7 @@ impl NetworkBehaviour for PeerManager {
                 self.register_dial_attempt(peer_id, None);
             } else {
                 debug!(target: "peer-manager", ?peer_id, "can_dial failed");
-                return Err(ConnectionDenied::new(format!(
-                    "Outbound connection to peer denied: peer cannot be dialed"
-                )));
+                return Err(ConnectionDenied::new("Outbound connection to peer denied: peer cannot be dialed".to_string()));
             }
         }
 

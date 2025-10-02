@@ -740,7 +740,7 @@ impl PeerManager {
             // prune excess
             let excess = current_count - max_discovery_peers;
             let to_remove: Vec<PeerId> =
-                discovery_peers.iter().map(|(id, _addrs)| *id).choose_multiple(&mut rng, excess);
+                discovery_peers.keys().copied().choose_multiple(&mut rng, excess);
             for peer in to_remove {
                 discovery_peers.remove(&peer);
             }

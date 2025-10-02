@@ -888,6 +888,6 @@ impl AllPeers {
 
     /// Update a peer's status in the routing table.
     pub(super) fn update_routing_for_peer(&mut self, peer_id: &PeerId, routable: bool) {
-        self.peers.get_mut(peer_id).map(|peer| peer.update_routability(routable));
+        if let Some(peer) = self.peers.get_mut(peer_id) { peer.update_routability(routable) }
     }
 }
